@@ -1,6 +1,6 @@
 use crate::schema::RESERVED_TABLE_PREFIXES;
-use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
+use crate::translate::semantic::context::SemanticContext;
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
 use crate::util::{escape_sql_string_literal, normalize_ident};
@@ -88,7 +88,7 @@ pub(crate) fn create_trigger_to_sql(
 #[allow(clippy::too_many_arguments)]
 pub fn translate_create_trigger(
     trigger_name: QualifiedName,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     temporary: bool,
     if_not_exists: bool,
     time: Option<ast::TriggerTime>,
@@ -110,12 +110,12 @@ pub fn translate_create_trigger(
     }
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
     let database_id =
-        resolve_create_trigger_database_id(resolver, &trigger_name, &tbl_name, temporary)?;
+        resolve_create_trigger_database_id(catalog, &trigger_name, &tbl_name, temporary)?;
     let target_table_database_id = if temporary {
         // A temp trigger's target table can be in any schema.
-        resolver.resolve_existing_table_database_id_qualified(&tbl_name)?
+        catalog.resolve_existing_table_database_id_qualified(&tbl_name)?
     } else if tbl_name.namespace.is_some() {
-        resolver.resolve_database_id(&tbl_name)?
+        catalog.resolve_database_id(&tbl_name)?
     } else {
         database_id
     };
@@ -125,7 +125,7 @@ pub fn translate_create_trigger(
             .namespace
             .as_ref()
             .map(|db_name| db_name.as_str().to_string())
-            .or_else(|| resolver.namespace_name(target_table_database_id))
+            .or_else(|| catalog.database_name_by_index(target_table_database_id))
             .unwrap_or_else(|| "main".to_string());
         bail_parse_error!(
             "trigger {} cannot reference objects in database {}",
@@ -134,7 +134,7 @@ pub fn translate_create_trigger(
         );
     }
 
-    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     program.begin_write_operation()?;
 
@@ -142,7 +142,7 @@ pub fn translate_create_trigger(
     // access objects across schemas. Ordinary triggers stay schema-local.
     if database_id != crate::TEMP_DB_ID {
         validate_trigger_no_cross_db_refs(
-            resolver,
+            catalog,
             database_id,
             &normalized_trigger_name,
             commands,
@@ -155,7 +155,7 @@ pub fn translate_create_trigger(
     }
 
     // Check if trigger already exists
-    if resolver.with_schema(database_id, |s| {
+    if catalog.with_schema(database_id, |s| {
         s.get_trigger(&normalized_trigger_name).is_some()
     }) {
         if if_not_exists {
@@ -177,7 +177,7 @@ pub fn translate_create_trigger(
     // SQLite allows only INSTEAD OF triggers on views (sqlite3BeginTrigger in
     // trigger.c). A materialized view's storage is registered as a table, so
     // check for views before the table lookup.
-    if resolver.with_schema(target_table_database_id, |s| {
+    if catalog.with_schema(target_table_database_id, |s| {
         s.get_view(&normalized_table_name).is_some()
             || s.materialized_view_exists(&normalized_table_name)
     }) {
@@ -192,7 +192,7 @@ pub fn translate_create_trigger(
     }
 
     // Verify the table exists (use the table's database, not the trigger's).
-    let table = resolver.with_schema(target_table_database_id, |s| {
+    let table = catalog.with_schema(target_table_database_id, |s| {
         s.get_table(&normalized_table_name)
     });
     let Some(table) = table else {
@@ -205,8 +205,8 @@ pub fn translate_create_trigger(
                 crate::util::table_name_for_error(&tbl_name)
             );
         }
-        let db_name = resolver
-            .namespace_name(target_table_database_id)
+        let db_name = catalog
+            .database_name_by_index(target_table_database_id)
             .unwrap_or_else(|| "main".to_string());
         bail_parse_error!("no such table: {}.{}", db_name, tbl_name.name.as_str());
     };
@@ -218,7 +218,7 @@ pub fn translate_create_trigger(
     program.extend(&opts);
 
     // Open cursor to sqlite_schema table (in the trigger's database)
-    let table = resolver
+    let table = catalog
         .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
         .unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
@@ -231,7 +231,7 @@ pub fn translate_create_trigger(
     // Add the trigger entry to sqlite_schema
     emit_schema_entry(
         program,
-        resolver,
+        catalog,
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for triggers
         SchemaEntryType::Trigger,
@@ -242,7 +242,7 @@ pub fn translate_create_trigger(
     )?;
 
     // Update schema version
-    let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
+    let schema_version = catalog.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
         cookie: Cookie::SchemaVersion,
@@ -265,7 +265,7 @@ pub fn translate_create_trigger(
 }
 
 fn resolve_create_trigger_database_id(
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_name: &QualifiedName,
     tbl_name: &QualifiedName,
     temporary: bool,
@@ -275,12 +275,12 @@ fn resolve_create_trigger_database_id(
         return Ok(crate::TEMP_DB_ID);
     }
     if trigger_name.namespace.is_some() {
-        return resolver.resolve_database_id(trigger_name);
+        return catalog.resolve_database_id(trigger_name);
     }
 
     // Unqualified trigger names default to main, except when the trigger is
     // attached to a temp object. SQLite stores those triggers in temp.
-    match resolver.resolve_existing_table_database_id_qualified(tbl_name)? {
+    match catalog.resolve_existing_table_database_id_qualified(tbl_name)? {
         crate::TEMP_DB_ID => Ok(crate::TEMP_DB_ID),
         _ => Ok(crate::MAIN_DB_ID),
     }
@@ -290,14 +290,14 @@ fn resolve_create_trigger_database_id(
 /// database other than the trigger's own database. SQLite forbids this with:
 ///   "trigger X cannot reference objects in database Y"
 fn validate_trigger_no_cross_db_refs(
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_db_id: usize,
     trigger_name: &str,
     commands: &[ast::TriggerCmd],
     when_clause: Option<&ast::Expr>,
 ) -> Result<()> {
     let ctx = CrossDbCheckCtx {
-        resolver,
+        catalog,
         trigger_db_id,
         trigger_name,
     };
@@ -342,7 +342,7 @@ fn validate_trigger_no_cross_db_refs(
 }
 
 struct CrossDbCheckCtx<'a> {
-    resolver: &'a Resolver<'a>,
+    catalog: &'a SemanticContext<'a>,
     trigger_db_id: usize,
     trigger_name: &'a str,
 }
@@ -350,7 +350,7 @@ struct CrossDbCheckCtx<'a> {
 impl CrossDbCheckCtx<'_> {
     fn check_qname(&self, qn: &QualifiedName) -> Result<()> {
         if let Some(ref db_name) = qn.namespace {
-            let resolved = self.resolver.resolve_database_id(qn)?;
+            let resolved = self.catalog.resolve_database_id(qn)?;
             if resolved != self.trigger_db_id {
                 bail_parse_error!(
                     "trigger {} cannot reference objects in database {}",
@@ -512,19 +512,19 @@ fn check_select_table_ref(
 
 /// Translate DROP TRIGGER statement
 pub fn translate_drop_trigger(
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_name: &ast::QualifiedName,
     if_exists: bool,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = resolver.resolve_existing_trigger_database_id(trigger_name)?;
-    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    let database_id = catalog.resolve_existing_trigger_database_id(trigger_name)?;
+    let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     program.begin_write_operation()?;
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
 
     // Check if trigger exists
-    if resolver.with_schema(database_id, |s| {
+    if catalog.with_schema(database_id, |s| {
         s.get_trigger(&normalized_trigger_name).is_none()
     }) {
         if if_exists {
@@ -537,7 +537,7 @@ pub fn translate_drop_trigger(
     program.extend(&opts);
 
     // Open cursor to sqlite_schema table (structure is the same for all databases)
-    let table = resolver.with_schema(MAIN_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let table = catalog.with_schema(MAIN_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -621,7 +621,7 @@ pub fn translate_drop_trigger(
     program.preassign_label_to_next_insn(rewind_done_label);
 
     // Update schema version
-    let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
+    let schema_version = catalog.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
         cookie: Cookie::SchemaVersion,

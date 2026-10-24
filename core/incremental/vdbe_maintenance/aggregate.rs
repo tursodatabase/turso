@@ -1,4 +1,4 @@
-use super::binding::{remap_bound_expr, seed_ephemeral_stream_cache, stream_table_references};
+use super::binding::StreamRow;
 use super::consolidate::{consolidate_delta, ConsolidatedDelta};
 use super::members::{
     emit_add_to_member, emit_exact_value_record, emit_first_member, emit_member_columns,
@@ -12,31 +12,30 @@ use super::stream::{
 };
 use super::MaintenanceInput;
 use crate::function::AggFunc;
-use crate::incremental::dag;
+use crate::incremental::dag::{self, Aggregate};
 use crate::schema::Schema;
 use crate::sync::Arc;
-use crate::translate::emitter::Resolver;
-use crate::translate::expr::{
-    translate_condition_expr, translate_expr_no_constant_opt, ConditionMetadata,
-    NoConstantOptReason,
+use crate::translate::expr::ConditionMetadata;
+use crate::translate::semantic::hir::{self, HirDocument};
+use crate::translate::semantic_lowering::{
+    translate_condition_expr, translate_expr_no_constant_opt,
 };
-use crate::translate::plan::Aggregate;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
     to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, IvmSumData, IvmSumFinalizeData,
     IvmSumKind, RegisterOrLiteral,
 };
-use crate::{Connection, LimboError, Result};
-use turso_parser::ast;
+use crate::{LimboError, Result};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_group_aggregate(
     program: &mut ProgramBuilder,
+    document: &HirDocument,
     view_name: &str,
     node_id: dag::NodeId,
     channel: &EphemeralDelta,
-    group_exprs: &[ast::Expr],
+    group_exprs: &[hir::Expr],
     group_keys: &[dag::KeyColumn],
     aggregates: &[Aggregate],
     multiset_keys: &[Option<dag::KeyColumn>],
@@ -45,7 +44,6 @@ pub(super) fn emit_group_aggregate(
     output_contract: &NodeOutputContract,
     operator_state: &OperatorStateDef,
     schema: &Schema,
-    connection: &Arc<Connection>,
 ) -> Result<EmittedNodeOutput> {
     let output = open_ephemeral_delta(
         program,
@@ -61,6 +59,7 @@ pub(super) fn emit_group_aggregate(
     )?;
     emit_group_aggregate_rows(
         program,
+        document,
         view_name,
         &channel,
         group_exprs,
@@ -72,7 +71,6 @@ pub(super) fn emit_group_aggregate(
         input,
         operator_state,
         schema,
-        connection,
     )?;
 
     let state_table_name = operator_state.state_table_name()?;
@@ -100,9 +98,10 @@ pub(super) fn emit_group_aggregate(
 #[allow(clippy::too_many_arguments)]
 fn emit_group_aggregate_rows(
     program: &mut ProgramBuilder,
+    document: &HirDocument,
     view_name: &str,
     channel: &ConsolidatedDelta,
-    group_exprs: &[ast::Expr],
+    group_exprs: &[hir::Expr],
     group_keys: &[dag::KeyColumn],
     aggregates: &[Aggregate],
     multiset_keys: &[Option<dag::KeyColumn>],
@@ -111,7 +110,6 @@ fn emit_group_aggregate_rows(
     input: MaintenanceInput,
     operator_state: &OperatorStateDef,
     schema: &Schema,
-    connection: &Arc<Connection>,
 ) -> Result<()> {
     let num_view_columns = output.width;
     turso_assert!(
@@ -162,19 +160,7 @@ fn emit_group_aggregate_rows(
             ))
         })?;
 
-    let syms = connection.syms.read();
-    let mut resolver = Resolver::new(
-        schema,
-        connection.database_schemas(),
-        &connection.temp.database,
-        connection.attached_databases(),
-        connection.namespaces(),
-        &syms,
-        connection.experimental_custom_types_enabled(),
-        connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
-        None,
-    );
+    let bound_registers = program.expression_register_count();
 
     turso_assert!(
         channel.weight_column == channel.value_start + channel.width
@@ -182,7 +168,6 @@ fn emit_group_aggregate_rows(
         "aggregate delta channel layout must match its declared input"
     );
     let input_cursor_id = channel.cursor_id;
-    let (table_references, binding_remap) = stream_table_references(program, &channel.schema);
 
     let state_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(state_table.clone()));
     program.emit_insn(Insn::OpenWrite {
@@ -327,24 +312,11 @@ fn emit_group_aggregate_rows(
         dest: weight_reg,
         default: None,
     });
-    seed_ephemeral_stream_cache(
-        program,
-        channel,
-        &binding_remap,
-        &table_references,
-        &mut resolver,
-    )?;
+    let row = StreamRow::load(program, channel);
 
     for (i, group_expr) in group_exprs.iter().enumerate() {
-        let bound = remap_bound_expr(group_expr, &binding_remap)?;
-        translate_expr_no_constant_opt(
-            program,
-            Some(&table_references),
-            &bound,
-            incoming_group_start + i,
-            &resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+        row.bind(program, document, group_expr);
+        translate_expr_no_constant_opt(program, document, group_expr, incoming_group_start + i)?;
     }
     program.emit_insn(Insn::Copy {
         src_reg: incoming_group_start,
@@ -512,34 +484,25 @@ fn emit_group_aggregate_rows(
         let is_minmax = matches!(agg.func, AggFunc::Min | AggFunc::Max);
         let is_distinct = tracks_distinct_values(agg);
         let aggregate_done_label = program.allocate_label();
-        if let Some(filter_expr) = &agg.filter_expr {
+        if let Some(filter_expr) = &agg.filter {
             let apply_aggregate_label = program.allocate_label();
-            let bound_filter = remap_bound_expr(filter_expr, &binding_remap)?;
+            row.bind(program, document, filter_expr);
             translate_condition_expr(
                 program,
-                &table_references,
-                &bound_filter,
+                document,
+                filter_expr,
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
                     jump_target_when_true: apply_aggregate_label,
                     jump_target_when_false: aggregate_done_label,
-                    jump_target_when_null: aggregate_done_label,
                 },
-                &resolver,
             )?;
             program.preassign_label_to_next_insn(apply_aggregate_label);
         }
         let col_reg = match agg.args.first() {
             Some(arg_expr) => {
-                let bound = remap_bound_expr(arg_expr, &binding_remap)?;
-                translate_expr_no_constant_opt(
-                    program,
-                    Some(&table_references),
-                    &bound,
-                    arg_reg,
-                    &resolver,
-                    NoConstantOptReason::RegisterReuse,
-                )?;
+                row.bind(program, document, arg_expr);
+                translate_expr_no_constant_opt(program, document, arg_expr, arg_reg)?;
                 Some(arg_reg)
             }
             None => None,
@@ -1106,7 +1069,7 @@ fn emit_group_aggregate_rows(
         program.preassign_label_to_next_insn(ensure_done);
     }
 
-    drop(syms);
+    program.truncate_expression_registers(bound_registers);
     Ok(())
 }
 

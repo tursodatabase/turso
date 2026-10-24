@@ -55,6 +55,31 @@ expect {
     bob|2
 }
 
+# A covering scan of an expression index reads the indexed expression from
+# the index, since no table cursor is open to compute it from.
+test expr-index-covering-scan-projects-the-expression {
+    CREATE TABLE t3(a INTEGER, b INTEGER);
+    INSERT INTO t3 VALUES (1, 2), (3, 4), (5, 6);
+    CREATE INDEX t3_sum ON t3(a + b);
+    SELECT a + b FROM t3;
+}
+expect {
+    3
+    7
+    11
+}
+
+test expr-index-covering-scan-filters-on-the-expression {
+    CREATE TABLE t4(a INTEGER, b INTEGER);
+    INSERT INTO t4 VALUES (1, 2), (3, 4), (5, 6);
+    CREATE INDEX t4_sum ON t4(a + b);
+    SELECT (a + b) * 2 FROM t4 WHERE a + b > 4;
+}
+expect {
+    14
+    22
+}
+
 # An expression index stores the value for a real row. A LEFT JOIN can replace
 # that row with NULL, so SQLite computes the expression again.
 @cross-check-integrity
@@ -148,4 +173,34 @@ expect {
     1|{"x":1}|12
     1|{"x":2}|-1
     2|{"x":1}|22
+}
+
+# The index stores b->>'x', which two aggregates read. The group row keeps
+# the stored value once and both aggregates read it from there.
+@cross-check-integrity
+test group-by-aggregates-share-one-stored-index-expression {
+    CREATE TABLE shared_input(a INTEGER, b TEXT, c INTEGER, d INTEGER);
+    CREATE INDEX shared_input_idx ON shared_input(d, a, b->>'x', c);
+    INSERT INTO shared_input VALUES
+        (1, '{"x":1}', 12, 3),
+        (1, '{"x":2}', 4, 5),
+        (1, '{"x":1}', 6, 11),
+        (2, '{"x":1}', 22, 3),
+        (2, '{"x":2}', 4, 5),
+        (3, '{"x":1}', 6, 7);
+
+    SELECT a,
+           sum(1),
+           sum(CASE WHEN b->>'x'=1 THEN 1 END),
+           sum(c),
+           sum(CASE WHEN b->>'x'=1 THEN c END)
+      FROM shared_input INDEXED BY shared_input_idx
+     WHERE d BETWEEN 0 AND 10
+     GROUP BY a
+     ORDER BY a;
+}
+expect {
+    1|2|1|16|12
+    2|2|1|26|22
+    3|1|1|6|6
 }

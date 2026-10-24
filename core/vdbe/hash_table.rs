@@ -2283,7 +2283,19 @@ impl HashTable {
             .unwrap_or(0)
     }
 
-    /// Check if a specific partition is loaded and ready for probing.
+    /// Whether a partition's build rows are on disk, so a probe into it in
+    /// the main probe loop is buffered for grace processing. This holds even
+    /// when an unmatched-row scan of an earlier probe pass left the
+    /// partition loaded: grace reloads every spilled partition, which would
+    /// drop the matches a direct probe recorded. A partition without build
+    /// rows has nothing to wait for: a probe into it misses at once.
+    pub fn partition_waits_on_disk(&self, partition_idx: usize) -> bool {
+        self.spill_state
+            .as_ref()
+            .and_then(|s| s.find_partition(partition_idx))
+            .is_some_and(|p| !p.chunks.is_empty())
+    }
+
     pub fn is_partition_loaded(&self, partition_idx: usize) -> bool {
         self.spill_state
             .as_ref()
@@ -2904,8 +2916,11 @@ impl HashTable {
         Ok(IOResult::Done(()))
     }
 
-    /// Initialize grace processing. Builds partition list, frees in-memory build partitions.
-    /// Returns true if there are partitions to process. No IO.
+    /// Initialize grace processing. Builds the partition list. Partitions that
+    /// never spilled stay in memory, since they have no copy on disk and a
+    /// later probe pass of the same table (a probe loop nested in another
+    /// loop) still needs them. Returns true if there are partitions to
+    /// process. No IO.
     pub fn grace_begin(&mut self) -> Result<bool> {
         if self.probe_spill_state.is_none() || self.spill_state.is_none() {
             return Ok(false);
@@ -2923,11 +2938,9 @@ impl HashTable {
         };
 
         if partitions_to_process.is_empty() {
+            self.end_probe_pass();
             return Ok(false);
         }
-
-        // Free in-memory build partitions -- initial probe is done with them
-        self.free_in_memory_build_partitions();
 
         self.grace_state = Some(GraceState {
             probe_entries: vec![],
@@ -2961,6 +2974,7 @@ impl HashTable {
         loop {
             let grace = self.grace_state.as_ref().expect("grace state must exist");
             if grace.partition_list_idx >= grace.partitions_to_process.len() {
+                self.end_probe_pass();
                 return Ok(IOResult::Done(false));
             }
 
@@ -3054,24 +3068,22 @@ impl HashTable {
         grace.probe_entries.clear();
         grace.probe_entry_cursor = 0;
         grace.load_state = GracePartitionLoadState::NeedBuildLoad;
-        grace.partition_list_idx < grace.partitions_to_process.len()
+        if grace.partition_list_idx < grace.partitions_to_process.len() {
+            return true;
+        }
+        self.end_probe_pass();
+        false
     }
 
-    /// Free all in-memory build partitions (InMemory state).
-    fn free_in_memory_build_partitions(&mut self) {
-        if let Some(spill_state) = self.spill_state.as_mut() {
-            for partition in &mut spill_state.partitions {
-                if matches!(partition.state, PartitionState::InMemory) {
-                    partition.buckets.clear();
-                    partition.state = PartitionState::OnDisk;
-                    partition.resident_mem = 0;
-                }
-            }
-        }
-        // Also free the main buckets
-        self.buckets.clear();
-        self.loaded_partitions_lru.borrow_mut().clear();
-        self.loaded_partitions_mem = 0;
+    /// Put the table back in the state `finalize_build` left it in, so the
+    /// next probe pass starts clean: drop the probe rows this pass set aside
+    /// (otherwise the next grace run would join them again) and leave every
+    /// spilled partition on disk.
+    fn end_probe_pass(&mut self) {
+        self.evict_all_loaded_partitions();
+        self.grace_state = None;
+        self.probe_spill_state = None;
+        self.state = HashTableState::Probing;
     }
 
     /// Evict all currently loaded build partitions.

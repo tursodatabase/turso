@@ -1,10 +1,10 @@
 use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
-use crate::{bail_parse_error, turso_assert_eq, turso_assert_ne};
-use turso_parser::{
-    ast::{self, TableInternalId},
-    parser::Parser,
-};
+use crate::translate::plan::ColumnMask;
+use crate::translate::semantic::context::SemanticContext;
+use crate::translate::semantic_lowering::{PlannedSelect, ScanValue};
+use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq, turso_assert_ne};
+use turso_parser::{ast, parser::Parser};
 
 use super::{
     index::emit_refill_index,
@@ -13,19 +13,14 @@ use super::{
     update::translate_update_for_schema_change,
 };
 use crate::{
+    error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
     schema::{
-        collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Column, ColumnLayout,
-        ForeignKey, FromDefinitionFlags, Index, Schema, Table, EXPR_INDEX_SENTINEL,
-        RESERVED_TABLE_PREFIXES,
+        collect_column_dependencies_of_expr, CheckConstraint, Column, ColumnLayout, ForeignKey,
+        FromDefinitionFlags, Index, Schema, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES,
     },
     translate::{
-        emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
-        expr::{emit_stored_column, walk_expr, walk_expr_mut, WalkControl},
-        plan::{
-            ColumnMask, ColumnUsedMask, JoinedTable, Operation, OuterQueryReference,
-            TableReferences,
-        },
+        expr::{walk_expr, walk_expr_mut, WalkControl},
         trigger::create_trigger_to_sql,
     },
     util::{
@@ -35,7 +30,7 @@ use crate::{
     },
     vdbe::{
         affinity::Affinity,
-        builder::{CursorType, DmlColumnContext, ProgramBuilder},
+        builder::{CursorType, ProgramBuilder},
         insn::{to_u32, AddColumnData, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
@@ -68,14 +63,14 @@ struct SchemaTriggerEntry {
     trigger: Arc<crate::schema::Trigger>,
 }
 
-fn schema_table_name_for_db(resolver: &Resolver, database_id: usize) -> String {
+fn schema_table_name_for_db(catalog: &SemanticContext<'_>, database_id: usize) -> String {
     if database_id == crate::MAIN_DB_ID {
         SQLITE_TABLEID.to_string()
     } else if database_id == crate::TEMP_DB_ID {
         format!("temp.{SQLITE_TABLEID}")
     } else {
-        let db_name = resolver
-            .namespace_name(database_id)
+        let db_name = catalog
+            .database_name_by_index(database_id)
             .unwrap_or_else(|| "main".to_string());
         format!("{db_name}.{SQLITE_TABLEID}")
     }
@@ -86,7 +81,7 @@ fn database_uses_mvcc(connection: &Arc<crate::Connection>, database_id: usize) -
 }
 
 fn collect_triggers_for_alter_target(
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     target_database_id: usize,
 ) -> Vec<SchemaTriggerEntry> {
     let mut database_ids = vec![target_database_id];
@@ -96,7 +91,7 @@ fn collect_triggers_for_alter_target(
 
     let mut triggers = Vec::new();
     for database_id in database_ids {
-        let schema_triggers = resolver.with_schema(database_id, |schema| {
+        let schema_triggers = catalog.with_schema(database_id, |schema| {
             schema
                 .triggers
                 .values()
@@ -178,7 +173,7 @@ fn default_requires_empty_table(expr: &ast::Expr) -> bool {
 /// and `schema.tables` happens in `op_rename_table`.
 fn emit_rename_autoincrement_backing_table_entry(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     connection: &Arc<crate::Connection>,
     database_id: usize,
     old_table_name_norm: &str,
@@ -194,7 +189,7 @@ fn emit_rename_autoincrement_backing_table_entry(
     let new_backing_sql = sequence_backing_table_sql(&new_seq_name);
 
     let Some(sqlite_schema) =
-        resolver.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
+        catalog.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
     else {
         return;
     };
@@ -284,13 +279,13 @@ fn emit_rename_autoincrement_backing_table_entry(
 
 fn emit_rename_sqlite_sequence_entry(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     connection: &Arc<crate::Connection>,
     database_id: usize,
     old_table_name_norm: &str,
     new_table_name_norm: &str,
 ) {
-    let Some(sqlite_sequence) = resolver.with_schema(database_id, |s| {
+    let Some(sqlite_sequence) = catalog.with_schema(database_id, |s| {
         s.get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
     }) else {
         return;
@@ -365,7 +360,9 @@ fn emit_rename_sqlite_sequence_entry(
             cursor: seq_cursor_id,
             key_reg: rowid,
             record_reg,
-            flag: crate::translate::insert::autoincrement_bookkeeping_insert_flags(),
+            flag: crate::vdbe::insn::InsertFlags::new()
+                .skip_last_rowid()
+                .skip_all_change_counts(),
             table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
         });
 
@@ -375,11 +372,11 @@ fn emit_rename_sqlite_sequence_entry(
 
 fn emit_delete_sqlite_sequence_entry(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     database_id: usize,
     table_name_norm: &str,
 ) {
-    let Some(sqlite_sequence) = resolver.with_schema(database_id, |s| {
+    let Some(sqlite_sequence) = catalog.with_schema(database_id, |s| {
         s.get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
     }) else {
         return;
@@ -562,16 +559,20 @@ fn emit_add_column_default_type_validation(
     Ok(())
 }
 
-/// Validate NOT NULL and CHECK constraints for a new or altered column by
-/// scanning each existing row, computing virtual generated columns as needed.
-#[allow(clippy::too_many_arguments)]
+/// Check NOT NULL and the CHECK constraints of a new or altered column
+/// against every existing row, as SQLite does. The rows are read through a
+/// planned HIR SELECT of the table as it will be, which `catalog` must
+/// hold: a new column reads its DEFAULT with the column's affinity, a
+/// virtual generated column computes its expression, and any other column
+/// is read as stored. Like DML, a CHECK reads custom-typed columns as
+/// stored. A STRICT table also checks the column's domain.
 fn emit_column_constraints_validation(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
     column: &Column,
     constraints: &[ast::NamedColumnConstraint],
-    resolver: &Resolver,
     connection: &Arc<crate::Connection>,
+    catalog: &SemanticContext<'_>,
     database_id: usize,
 ) -> Result<()> {
     let has_notnull = column.notnull();
@@ -591,7 +592,7 @@ fn emit_column_constraints_validation(
         })
         .collect();
     if table.is_strict {
-        let (_, domain_checks) = resolver.with_schema(database_id, |schema| {
+        let (_, domain_checks) = catalog.with_schema(database_id, |schema| {
             schema.column_domain_constraints(column)
         })?;
         check_constraints.extend(domain_checks);
@@ -600,136 +601,83 @@ fn emit_column_constraints_validation(
     if !has_notnull && check_constraints.is_empty() {
         return Ok(());
     }
-
-    let mut resolved_table = table.clone();
-    resolved_table.prepare_generated_columns()?;
-    let new_column_name = column
+    let column_name = column
         .name
         .as_deref()
-        .ok_or_else(|| LimboError::ParseError("generated column name is missing".to_string()))?;
-    let (new_column_idx, _) = resolved_table.get_column(new_column_name).ok_or_else(|| {
-        LimboError::ParseError(format!(
-            "new generated column unexpectedly missing from table {}",
-            resolved_table.name
-        ))
-    })?;
+        .ok_or_else(|| LimboError::ParseError("column name is missing".to_string()))?;
 
-    let resolved_table_arc = Arc::new(resolved_table.clone());
-    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(resolved_table_arc.clone()));
-    program.emit_insn(Insn::OpenRead {
-        cursor_id,
-        root_page: resolved_table_arc.root_page,
-        db: database_id,
-    });
-
-    let skip_label = program.allocate_label();
-    let loop_start = program.allocate_label();
-    program.emit_insn(Insn::Rewind {
-        cursor_id,
-        pc_if_empty: skip_label,
-    });
-    program.preassign_label_to_next_insn(loop_start);
-
-    let rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::RowId {
-        cursor_id,
-        dest: rowid_reg,
-    });
-
-    let layout = resolved_table.column_layout()?;
-    let base_dest_reg = program.alloc_registers(layout.column_count());
-    for (idx, table_column) in resolved_table.columns().iter().enumerate() {
-        if table_column.is_virtual_generated() || table_column.is_rowid_alias() {
-            continue;
-        }
-
-        program.emit_column_or_rowid(cursor_id, idx, layout.to_register(base_dest_reg, idx));
+    let mut values = Vec::with_capacity(check_constraints.len() + 1);
+    for check in &check_constraints {
+        values.push(ScanValue::Stored(ast::Expr::clone(&check.expr)));
     }
-
-    let dml_ctx =
-        DmlColumnContext::layout(resolved_table.columns(), base_dest_reg, rowid_reg, layout);
-    compute_virtual_columns(
-        program,
-        &resolved_table.columns_topo_sort()?,
-        &dml_ctx,
-        resolver,
-        &resolved_table_arc,
-    )?;
-    let result_reg = dml_ctx.to_column_reg(new_column_idx);
-
-    if !check_constraints.is_empty() {
-        let table = Table::BTree(resolved_table_arc.clone());
-        let table_references = TableReferences::new(
-            vec![JoinedTable {
-                op: Operation::default_scan_for(&table),
-                unmatched_right_rows_plan: None,
-                table,
-                identifier: resolved_table.name.clone(),
-                internal_id: program.table_reference_counter.next(),
-                join_info: None,
-                col_used_mask: ColumnUsedMask::default(),
-                column_use_counts: Vec::new(),
-                expression_index_usages: Vec::new(),
-                database_id,
-                indexed: None,
-                plan_estimate: None,
-            }],
-            vec![],
-        );
-        let mut check_resolver = resolver.fork();
-        let skip_row_label = program.allocate_label();
-        emit_check_constraints(
-            program,
-            &check_constraints,
-            &mut check_resolver,
-            resolved_table.name.as_str(),
-            rowid_reg,
-            resolved_table
-                .columns()
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, col)| {
-                    col.name
-                        .as_deref()
-                        .map(|name| (name, dml_ctx.to_column_reg(idx)))
-                }),
-            connection,
-            ast::ResolveType::Abort,
-            skip_row_label,
-            Some(&table_references),
-        )?;
-    }
-
     if has_notnull {
-        let notnull_passed = program.allocate_label();
-        program.emit_insn(Insn::NotNull {
-            reg: result_reg,
-            target_pc: notnull_passed,
-        });
-        program.emit_insn(Insn::Halt {
-            constraint_info: None,
-            err_code: 1,
-            description: "NOT NULL constraint failed".to_string(),
-            on_error: None,
-            description_reg: None,
-        });
-        program.preassign_label_to_next_insn(notnull_passed);
+        values.push(ScanValue::Expr(ast::Expr::Id(ast::Name::exact(
+            column_name.to_string(),
+        ))));
     }
+    let database = connection
+        .namespaces()
+        .name(database_id)
+        .ok_or_else(|| LimboError::InternalError(format!("no database with id {database_id}")))?;
+    let select = PlannedSelect::scan(
+        values,
+        database,
+        table.name.clone(),
+        None,
+        catalog,
+        connection,
+    )?;
+    select.emit_each_row(program, |program, values| {
+        // Like SQLite, a NULL value is reported before a failed CHECK of
+        // the same row.
+        if has_notnull {
+            let notnull_passed = program.allocate_label();
+            program.emit_insn(Insn::NotNull {
+                reg: values + check_constraints.len(),
+                target_pc: notnull_passed,
+            });
+            program.emit_insn(Insn::Halt {
+                constraint_info: None,
+                err_code: 1,
+                description: "NOT NULL constraint failed".to_string(),
+                on_error: None,
+                description_reg: None,
+            });
+            program.preassign_label_to_next_insn(notnull_passed);
+        }
+        for (i, check) in check_constraints.iter().enumerate() {
+            emit_check_result(program, values + i, &check.error_description());
+        }
+        Ok(())
+    })
+}
 
-    program.emit_insn(Insn::Next {
-        cursor_id,
-        pc_if_next: loop_start,
-        fullscan: false,
-        is_index: false,
+/// Halt with a CHECK constraint error unless `result_reg` holds NULL or a
+/// true value, as SQLite passes a CHECK whose result is unknown.
+fn emit_check_result(program: &mut ProgramBuilder, result_reg: usize, description: &str) {
+    let check_passed_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg: result_reg,
+        target_pc: check_passed_label,
     });
-
-    program.preassign_label_to_next_insn(skip_label);
-    Ok(())
+    program.emit_insn(Insn::If {
+        reg: result_reg,
+        target_pc: check_passed_label,
+        jump_if_null: false,
+    });
+    program.emit_insn(Insn::Halt {
+        constraint_info: None,
+        err_code: SQLITE_CONSTRAINT_CHECK,
+        description: description.to_string(),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(check_passed_label);
 }
 
 pub fn translate_alter_table(
     alter: ast::AlterTable,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     input: &str,
@@ -738,23 +686,23 @@ pub fn translate_alter_table(
         name: qualified_name,
         body: alter_table,
     } = alter;
-    let database_id = resolver.resolve_existing_table_database_id_qualified(&qualified_name)?;
-    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    let database_id = catalog.resolve_existing_table_database_id_qualified(&qualified_name)?;
+    let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     program.begin_write_operation()?;
     let table_name = qualified_name.name.as_str();
     // For attached databases, qualify sqlite_schema with the database name
     // so that the UPDATE targets the correct database's schema table.
-    let qualified_schema_table = schema_table_name_for_db(resolver, database_id);
-    let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
+    let qualified_schema_table = schema_table_name_for_db(catalog, database_id);
+    let schema_version = catalog.with_schema(database_id, |s| s.schema_version);
     validate(&alter_table, table_name)?;
-    reject_alter_of_view(&alter_table, table_name, resolver, database_id)?;
+    reject_alter_of_view(&alter_table, table_name, catalog, database_id)?;
 
-    let table_indexes = resolver.with_schema(database_id, |s| {
+    let table_indexes = catalog.with_schema(database_id, |s| {
         s.get_indices(table_name).cloned().collect::<Vec<_>>()
     });
 
-    let Some(table) = resolver.with_schema(database_id, |s| s.get_table(table_name)) else {
+    let Some(table) = catalog.with_schema(database_id, |s| s.get_table(table_name)) else {
         return Err(LimboError::ParseError(format!(
             "no such table: {}",
             crate::util::table_name_for_error(&qualified_name)
@@ -768,7 +716,7 @@ pub fn translate_alter_table(
                 tbl,
                 table_name,
                 new_name_norm,
-                resolver,
+                catalog,
                 connection,
                 database_id,
             );
@@ -779,7 +727,7 @@ pub fn translate_alter_table(
     };
 
     // Check if this table has dependent materialized views
-    let dependent_views = resolver.with_schema(database_id, |s| {
+    let dependent_views = catalog.with_schema(database_id, |s| {
         s.get_dependent_materialized_views(table_name)
     });
     if !dependent_views.is_empty() {
@@ -863,52 +811,8 @@ pub fn translate_alter_table(
                     }
                 }
                 // Referenced in partial index
-                if index.where_clause.is_some() {
-                    let mut table_references = TableReferences::new(
-                        vec![],
-                        vec![OuterQueryReference {
-                            identifier: table_name.to_string(),
-                            internal_id: TableInternalId::from(0),
-                            table: Table::BTree(Arc::new(btree.clone())),
-                            join_info: None,
-                            col_used_mask: ColumnUsedMask::default(),
-                            cte_select: None,
-                            cte_explicit_columns: vec![],
-                            cte_id: None,
-                            cte_definition_only: false,
-                            rowid_referenced: false,
-                            outer_join_may_null_extend: false,
-                            scope_depth: 0,
-                        }],
-                    );
-                    let where_copy = index
-                        .bind_where_expr(Some(&mut table_references), resolver)?
-                        .ok_or_else(|| {
-                            LimboError::ParseError(
-                                "index where clause unexpectedly missing".to_string(),
-                            )
-                        })?;
-                    let mut column_referenced = false;
-                    walk_expr(
-                        &where_copy,
-                        &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
-                            if let ast::Expr::Column {
-                                table,
-                                column: column_index,
-                                ..
-                            } = e
-                            {
-                                if *table == TableInternalId::from(0)
-                                    && *column_index == dropped_index
-                                {
-                                    column_referenced = true;
-                                    return Ok(WalkControl::SkipChildren);
-                                }
-                            }
-                            Ok(WalkControl::Continue)
-                        },
-                    )?;
-                    if column_referenced {
+                if let Some(where_clause) = index.where_clause.as_deref() {
+                    if check_expr_references_column(where_clause, &col_normalized) {
                         return Err(LimboError::ParseError(format!(
                             "cannot drop column \"{column_name}\": indexed"
                         )));
@@ -989,11 +893,11 @@ pub fn translate_alter_table(
                 t
             };
             let table_name_norm = normalize_ident(table_name);
-            for trigger_entry in collect_triggers_for_alter_target(resolver, database_id) {
+            for trigger_entry in collect_triggers_for_alter_target(catalog, database_id) {
                 if let Some(missing_table) = validate_trigger_table_refs_after_rename(
                     &trigger_entry.trigger,
                     &table_name_norm,
-                    resolver,
+                    catalog,
                     trigger_entry.database_id,
                     database_id,
                 )? {
@@ -1006,7 +910,7 @@ pub fn translate_alter_table(
                     &trigger_entry.trigger,
                     &table_name_norm,
                     &btree,
-                    resolver,
+                    catalog,
                     trigger_entry.database_id,
                     database_id,
                 )? {
@@ -1019,7 +923,7 @@ pub fn translate_alter_table(
                     &trigger_entry.trigger,
                     &table_name_norm,
                     &post_drop_btree,
-                    resolver,
+                    catalog,
                     trigger_entry.database_id,
                     database_id,
                 )? {
@@ -1076,10 +980,11 @@ pub fn translate_alter_table(
             let mut rewrite_rows_result = Ok(());
             translate_update_for_schema_change(
                 update,
-                resolver,
+                catalog,
                 program,
                 connection,
                 input,
+                catalog,
                 |program| {
                     if let Some((source_column_by_schema_idx, layout)) = &rewrite_rows {
                         rewrite_rows_result = emit_rewrite_table_rows(
@@ -1089,7 +994,8 @@ pub fn translate_alter_table(
                             source_column_by_schema_idx,
                             layout,
                             None,
-                            resolver,
+                            catalog,
+                            catalog,
                             connection,
                             database_id,
                         );
@@ -1180,8 +1086,8 @@ pub fn translate_alter_table(
                 // Domain types require STRICT tables because domain constraints
                 // (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables.
                 if !is_builtin && !btree.is_strict {
-                    let type_def = resolver
-                        .schema()
+                    let type_def = catalog
+                        .main_schema()
                         .get_type_def_unchecked(&normalize_ident(ty));
                     if let Some(td) = type_def {
                         if td.is_domain {
@@ -1193,8 +1099,8 @@ pub fn translate_alter_table(
                 }
 
                 if !is_builtin && btree.is_strict {
-                    let type_def = resolver
-                        .schema()
+                    let type_def = catalog
+                        .main_schema()
                         .get_type_def_unchecked(&normalize_ident(ty));
                     if type_def.is_none() {
                         return Err(LimboError::ParseError(format!(
@@ -1210,8 +1116,8 @@ pub fn translate_alter_table(
             // one, propagate the type-level DEFAULT to the column so that
             // existing rows get the type default instead of NULL.
             if column.default.is_none() {
-                if let Ok(Some(resolved)) = resolver
-                    .schema()
+                if let Ok(Some(resolved)) = catalog
+                    .main_schema()
                     .resolve_type(&column.ty_str, btree.is_strict)
                 {
                     if let Some(type_default) = resolved.default_expr() {
@@ -1297,7 +1203,7 @@ pub fn translate_alter_table(
                             .iter()
                             .filter_map(|c| c.name.as_deref())
                             .collect();
-                        validate_check_expr(expr, &btree.name, &column_names, resolver)?;
+                        validate_check_expr(expr, &btree.name, &column_names, catalog)?;
                         btree.check_constraints.push(CheckConstraint::new(
                             constraint.name.as_ref(),
                             expr,
@@ -1314,7 +1220,7 @@ pub fn translate_alter_table(
             // Propagate domain CHECK and NOT NULL constraints to the newly
             // added column. Without this, columns typed with a domain would
             // silently skip domain-level enforcement after ALTER TABLE.
-            resolver.with_schema(database_id, |schema| {
+            catalog.with_schema(database_id, |schema| {
                 btree.propagate_domain_constraints(schema)
             })?;
             // Refresh local `column` from btree so that domain NOT NULL is
@@ -1341,10 +1247,16 @@ pub fn translate_alter_table(
                 ));
             };
 
+            // The constraints read the table with the new column.
+            let added_catalog = catalog.with_altered_table(
+                crate::translate::semantic::hir::DatabaseId::new(database_id),
+                Arc::new(crate::schema::Table::BTree(Arc::new(btree.clone()))),
+                table_indexes,
+            );
             if !is_generated {
                 // Check if we need to verify the table is empty at runtime.
-                let type_default = resolver
-                    .schema()
+                let type_default = catalog
+                    .main_schema()
                     .resolve_type(&column.ty_str, btree.is_strict)
                     .ok()
                     .flatten()
@@ -1400,23 +1312,23 @@ pub fn translate_alter_table(
                     emit_add_column_default_type_validation(program, &original_btree, database_id)?;
                 }
             }
-
             emit_column_constraints_validation(
                 program,
                 &btree,
                 &column,
                 &constraints,
-                resolver,
                 connection,
+                &added_catalog,
                 database_id,
             )?;
 
             translate_update_for_schema_change(
                 update,
-                resolver,
+                catalog,
                 program,
                 connection,
                 input,
+                catalog,
                 |program| {
                     program.emit_insn(Insn::SetCookie {
                         db: database_id,
@@ -1444,7 +1356,7 @@ pub fn translate_alter_table(
 
             // Views whose SQL failed to load are absent from the schema maps
             // but their rows are still in sqlite_schema, so the name is taken.
-            let new_name_taken = resolver.with_schema(database_id, |s| {
+            let new_name_taken = catalog.with_schema(database_id, |s| {
                 s.get_object_type(&normalized_new_name).is_some()
                     || s.broken_views.contains(&normalized_new_name)
                     || s.incompatible_views.contains(&normalized_new_name)
@@ -1455,11 +1367,11 @@ pub fn translate_alter_table(
                 )));
             }
 
-            for trigger_entry in collect_triggers_for_alter_target(resolver, database_id) {
+            for trigger_entry in collect_triggers_for_alter_target(catalog, database_id) {
                 if let Some(missing_table) = validate_trigger_table_refs_after_rename(
                     &trigger_entry.trigger,
                     &normalized_old_name,
-                    resolver,
+                    catalog,
                     trigger_entry.database_id,
                     database_id,
                 )? {
@@ -1473,7 +1385,7 @@ pub fn translate_alter_table(
                         normalize_ident(&trigger_entry.trigger.table_name) == normalized_old_name
                             && match trigger_entry.trigger.target_database_id {
                                 Some(target_db) => target_db == database_id,
-                                None => resolver.with_schema(crate::TEMP_DB_ID, |schema| {
+                                None => catalog.with_schema(crate::TEMP_DB_ID, |schema| {
                                     schema.get_table(&normalized_old_name).is_none()
                                 }),
                             };
@@ -1483,8 +1395,8 @@ pub fn translate_alter_table(
                     // (or is unqualified). Otherwise a temp trigger
                     // referencing `aux.t` would be wrongly rewritten
                     // during `ALTER TABLE main.t RENAME TO ...`.
-                    let renamed_db_name = resolver
-                        .namespace_name(database_id)
+                    let renamed_db_name = catalog
+                        .database_name_by_index(database_id)
                         .unwrap_or_else(|| "main".to_string());
                     let new_sql = rewrite_trigger_sql_for_table_rename(
                         &trigger_entry.trigger.sql,
@@ -1503,14 +1415,14 @@ pub fn translate_alter_table(
             }
 
             let temp_schema_version = if !temp_triggers_to_rewrite.is_empty() {
-                let schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
+                let schema_cookie = catalog.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
                 program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie)?;
                 Some(schema_cookie)
             } else {
                 None
             };
 
-            let sqlite_schema = resolver
+            let sqlite_schema = catalog
                 .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
                 .ok_or_else(|| {
                     LimboError::ParseError("sqlite_schema table not found in schema".to_string())
@@ -1583,7 +1495,7 @@ pub fn translate_alter_table(
 
             emit_rename_sqlite_sequence_entry(
                 program,
-                resolver,
+                catalog,
                 connection,
                 database_id,
                 &normalized_old_name,
@@ -1597,7 +1509,7 @@ pub fn translate_alter_table(
             // reopen. Cheap no-op for non-AUTOINCREMENT tables: we look up
             // the implicit sequence via `autoincrement_sequence_name` and
             // only emit the sweep when the descriptor is present.
-            let has_implicit_seq = resolver.with_schema(database_id, |s| {
+            let has_implicit_seq = catalog.with_schema(database_id, |s| {
                 s.get_sequence(&crate::schema::autoincrement_sequence_name(
                     &normalized_old_name,
                 ))
@@ -1606,7 +1518,7 @@ pub fn translate_alter_table(
             if has_implicit_seq {
                 emit_rename_autoincrement_backing_table_entry(
                     program,
-                    resolver,
+                    catalog,
                     connection,
                     database_id,
                     &normalized_old_name,
@@ -1617,7 +1529,7 @@ pub fn translate_alter_table(
             for (trigger_name, new_sql, renames_target) in temp_triggers_to_rewrite {
                 let escaped_sql = escape_sql_string_literal(&new_sql);
                 let escaped_trigger_name = escape_sql_string_literal(&trigger_name);
-                let qualified_schema_table = schema_table_name_for_db(resolver, crate::TEMP_DB_ID);
+                let qualified_schema_table = schema_table_name_for_db(catalog, crate::TEMP_DB_ID);
                 let tbl_name_update = if renames_target {
                     let escaped_new_name = escape_sql_string_literal(new_name);
                     format!(", tbl_name = '{escaped_new_name}'")
@@ -1646,10 +1558,11 @@ pub fn translate_alter_table(
 
                 translate_update_for_schema_change(
                     update,
-                    resolver,
+                    catalog,
                     program,
                     connection,
                     input,
+                    catalog,
                     |_program| {},
                 )?;
             }
@@ -1773,7 +1686,7 @@ pub fn translate_alter_table(
                             && strict_column_type_changed(
                                 old_column,
                                 &replacement_column,
-                                resolver.schema(),
+                                catalog.main_schema(),
                             );
                         let rewrites_physical_layout = becomes_generated
                             || virtuality_changed
@@ -1838,7 +1751,7 @@ pub fn translate_alter_table(
             let altered_table = if let Some(replacement_column) = &replacement_column {
                 let mut table = btree.clone();
                 table.columns_mut()[column_index] = replacement_column.clone();
-                table.resolve_custom_type_affinities(resolver.schema());
+                table.resolve_custom_type_affinities(catalog.main_schema());
                 table.prepare_generated_columns()?;
                 let column_names: Vec<&str> = table
                     .columns()
@@ -1847,7 +1760,7 @@ pub fn translate_alter_table(
                     .collect();
                 for constraint in &definition.constraints {
                     if let ast::ColumnConstraint::Check { expr, .. } = &constraint.constraint {
-                        validate_check_expr(expr, &table.name, &column_names, resolver)?;
+                        validate_check_expr(expr, &table.name, &column_names, catalog)?;
                     }
                 }
                 Some(table)
@@ -1883,11 +1796,11 @@ pub fn translate_alter_table(
                 // incomplete detection heuristics that miss expression-level refs
                 // (e.g., `SELECT b FROM src` in a trigger on a different table).
                 let target_table_name = normalize_ident(table_name);
-                for trigger_entry in collect_triggers_for_alter_target(resolver, database_id) {
+                for trigger_entry in collect_triggers_for_alter_target(catalog, database_id) {
                     if let Some(missing_table) = validate_trigger_table_refs_after_rename(
                         &trigger_entry.trigger,
                         &target_table_name,
-                        resolver,
+                        catalog,
                         trigger_entry.database_id,
                         database_id,
                     )? {
@@ -1903,7 +1816,7 @@ pub fn translate_alter_table(
                         col_name,
                         trigger_entry.database_id,
                         database_id,
-                        resolver,
+                        catalog,
                     ) {
                         Ok(new_sql) => {
                             if new_sql != trigger_entry.trigger.sql {
@@ -1939,12 +1852,13 @@ pub fn translate_alter_table(
                         }
                     }
                 }
-                let target_db_name = resolver.namespace_name(database_id).ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "unknown database id {database_id} during ALTER TABLE"
-                    ))
-                })?;
-                views_to_rewrite = resolver.with_schema(database_id, |s| -> Result<_> {
+                let target_db_name =
+                    catalog.database_name_by_index(database_id).ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "unknown database id {database_id} during ALTER TABLE"
+                        ))
+                    })?;
+                views_to_rewrite = catalog.with_schema(database_id, |s| -> Result<_> {
                     let mut rewrites = Vec::new();
                     for (view_name, view) in s.views.iter() {
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename(
@@ -1964,7 +1878,7 @@ pub fn translate_alter_table(
                 // (temp views can reference main/attached tables).
                 if database_id != crate::TEMP_DB_ID {
                     let temp_rewrites =
-                        resolver.with_schema(crate::TEMP_DB_ID, |s| -> Result<_> {
+                        catalog.with_schema(crate::TEMP_DB_ID, |s| -> Result<_> {
                             let mut rewrites = Vec::new();
                             for (view_name, view) in s.views.iter() {
                                 if let Some(rewritten) = rewrite_view_sql_for_column_rename(
@@ -1994,14 +1908,14 @@ pub fn translate_alter_table(
                     .iter()
                     .any(|(db, _, _)| *db == crate::TEMP_DB_ID);
             let temp_schema_version = if has_temp_rewrites {
-                let schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
+                let schema_cookie = catalog.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
                 program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie)?;
                 Some(schema_cookie)
             } else {
                 None
             };
 
-            let sqlite_schema = resolver
+            let sqlite_schema = catalog
                 .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
                 .ok_or_else(|| {
                     LimboError::ParseError("sqlite_schema table not found in schema".to_string())
@@ -2083,8 +1997,7 @@ pub fn translate_alter_table(
             for (trigger_database_id, trigger_name, new_sql) in triggers_to_rewrite.clone() {
                 let escaped_sql = escape_sql_string_literal(&new_sql);
                 let escaped_trigger_name = escape_sql_string_literal(&trigger_name);
-                let qualified_schema_table =
-                    schema_table_name_for_db(resolver, trigger_database_id);
+                let qualified_schema_table = schema_table_name_for_db(catalog, trigger_database_id);
                 let update_stmt = format!(
                     r#"
                         UPDATE {qualified_schema_table}
@@ -2107,10 +2020,11 @@ pub fn translate_alter_table(
 
                 translate_update_for_schema_change(
                     update,
-                    resolver,
+                    catalog,
                     program,
                     connection,
                     input,
+                    catalog,
                     |_program| {},
                 )?;
             }
@@ -2118,7 +2032,7 @@ pub fn translate_alter_table(
             // Update view SQL for renamed columns
             for (view_database_id, view_name, new_sql) in views_to_rewrite {
                 let escaped_sql = escape_sql_string_literal(&new_sql);
-                let view_schema_table = schema_table_name_for_db(resolver, view_database_id);
+                let view_schema_table = schema_table_name_for_db(catalog, view_database_id);
                 let update_stmt = format!(
                     r#"
                         UPDATE {view_schema_table}
@@ -2141,10 +2055,11 @@ pub fn translate_alter_table(
 
                 translate_update_for_schema_change(
                     update,
-                    resolver,
+                    catalog,
                     program,
                     connection,
                     input,
+                    catalog,
                     |_program| {},
                 )?;
             }
@@ -2160,13 +2075,33 @@ pub fn translate_alter_table(
 
             if let Some(altered_table) = altered_table {
                 let altered_table = Arc::new(altered_table);
+                // The catalog still holds the column under its old name and
+                // type; constraints and index keys read the altered table
+                // and its indexes as they will be.
+                let altered_indexes = table_indexes
+                    .iter()
+                    .map(|index| {
+                        indexes_to_rewrite
+                            .iter()
+                            .find(|rewritten| rewritten.name == index.name)
+                            .unwrap_or(index)
+                            .clone()
+                    })
+                    .collect();
+                let altered_catalog = catalog.with_altered_table(
+                    crate::translate::semantic::hir::DatabaseId::new(database_id),
+                    Arc::new(crate::schema::Table::BTree(altered_table.clone())),
+                    altered_indexes,
+                );
+                let original_catalog = catalog;
+                let catalog = &altered_catalog;
                 emit_column_constraints_validation(
                     program,
                     &altered_table,
                     &altered_table.columns()[column_index],
                     &definition.constraints,
-                    resolver,
                     connection,
+                    catalog,
                     database_id,
                 )?;
                 if rewrites_physical_layout {
@@ -2207,14 +2142,16 @@ pub fn translate_alter_table(
                         &source_column_by_schema_idx,
                         &layout,
                         converted_column,
-                        resolver,
+                        original_catalog,
+                        catalog,
                         connection,
                         database_id,
                     )?;
                 }
                 emit_rewrite_table_indexes(
                     program,
-                    resolver,
+                    connection,
+                    catalog,
                     database_id,
                     &altered_table,
                     &indexes_to_rewrite,
@@ -2223,7 +2160,7 @@ pub fn translate_alter_table(
 
             if clears_autoincrement_sequence {
                 let table_name_norm = normalize_ident(table_name);
-                emit_delete_sqlite_sequence_entry(program, resolver, database_id, &table_name_norm);
+                emit_delete_sqlite_sequence_entry(program, catalog, database_id, &table_name_norm);
             }
 
             program.emit_insn(Insn::SetCookie {
@@ -2255,10 +2192,10 @@ pub fn translate_alter_table(
 fn reject_alter_of_view(
     alter_table: &ast::AlterTableBody,
     table_name: &str,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     database_id: usize,
 ) -> Result<()> {
-    let is_view = resolver.with_schema(database_id, |s| {
+    let is_view = catalog.with_schema(database_id, |s| {
         s.get_view(table_name).is_some() || s.materialized_view_exists(table_name)
     });
     if !is_view {
@@ -2475,7 +2412,8 @@ fn strict_column_type_changed(old: &Column, new: &Column, schema: &Schema) -> bo
 
 fn emit_rewrite_table_indexes(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    catalog: &SemanticContext<'_>,
     database_id: usize,
     rewritten_table: &Arc<BTreeTable>,
     indexes: &[Arc<Index>],
@@ -2484,7 +2422,8 @@ fn emit_rewrite_table_indexes(
         let index_cursor_id = program.alloc_cursor_index(None, index)?;
         emit_refill_index(
             program,
-            resolver,
+            connection,
+            catalog,
             database_id,
             rewritten_table,
             index,
@@ -2499,8 +2438,15 @@ fn emit_rewrite_table_indexes(
 /// Rewrite every row in `original_btree` into the physical layout of `rewritten_table`.
 ///
 /// `source_column_by_schema_idx` is indexed by the rewritten table's schema order. Each
-/// entry is either the physical column index to read from the old row image or `None`
-/// for virtual generated columns, which are omitted from the stored record entirely.
+/// entry is either the column index to read from the old row or `None` for a column
+/// without a value on the old row: a virtual generated column, which is omitted from
+/// the stored record entirely, or a column that becomes stored, which is NULL.
+///
+/// The old row is read as DML reads its target: as stored, with a column added with
+/// a DEFAULT filled with its encoded default. The column `converted_column` is read
+/// decoded, as a query reads it, and converted to its new type the same way INSERT
+/// converts a new value: checked against the type it accepts, encoded with its new
+/// custom type (if any), and checked against the storage type.
 #[allow(clippy::too_many_arguments)]
 fn emit_rewrite_table_rows(
     program: &mut ProgramBuilder,
@@ -2509,7 +2455,8 @@ fn emit_rewrite_table_rows(
     source_column_by_schema_idx: &[Option<usize>],
     layout: &ColumnLayout,
     converted_column: Option<usize>,
-    resolver: &Resolver,
+    original_catalog: &SemanticContext<'_>,
+    catalog: &SemanticContext<'_>,
     connection: &Arc<crate::Connection>,
     database_id: usize,
 ) -> Result<()> {
@@ -2518,11 +2465,61 @@ fn emit_rewrite_table_rows(
         rewritten_table.columns().len()
     );
 
+    let column_count = rewritten_table.columns().len();
     let non_virtual_column_count = layout.num_non_virtual_cols();
     let root_page = rewritten_table.root_page;
     let table_name = rewritten_table.name.clone();
     let affinity_str = non_virtual_affinity_str(rewritten_table);
-    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+    let database = connection
+        .namespaces()
+        .name(database_id)
+        .ok_or_else(|| LimboError::InternalError(format!("no database with id {database_id}")))?;
+    let column_name = |column: &Column| -> Result<ast::Expr> {
+        let name = column.name.clone().ok_or_else(|| {
+            LimboError::InternalError(format!("unnamed column in table {table_name}"))
+        })?;
+        Ok(ast::Expr::Id(ast::Name::exact(name)))
+    };
+    let values = source_column_by_schema_idx
+        .iter()
+        .enumerate()
+        .map(|(schema_idx, source_column_idx)| {
+            let Some(source_column_idx) = source_column_idx else {
+                return Ok(ScanValue::Expr(ast::Expr::Literal(ast::Literal::Null)));
+            };
+            let column = column_name(&original_btree.columns()[*source_column_idx])?;
+            Ok(if converted_column == Some(schema_idx) {
+                ScanValue::Expr(column)
+            } else {
+                ScanValue::Stored(column)
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let reads = PlannedSelect::scan(
+        values,
+        database.clone(),
+        original_btree.name.clone(),
+        None,
+        original_catalog,
+        connection,
+    )?;
+    let conversion = converted_column
+        .filter(|_| rewritten_table.is_strict)
+        .map(|column_index| {
+            let column = column_name(&rewritten_table.columns()[column_index])?;
+            let select = PlannedSelect::scan(
+                vec![ScanValue::Expr(column)],
+                database,
+                rewritten_table.name.clone(),
+                None,
+                catalog,
+                connection,
+            )?;
+            Ok::<_, LimboError>((select, column_index))
+        })
+        .transpose()?;
+    let rewritten_table = Arc::new(rewritten_table.clone());
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree));
 
     program.emit_insn(Insn::OpenWrite {
         cursor_id,
@@ -2531,41 +2528,32 @@ fn emit_rewrite_table_rows(
     });
 
     program.cursor_loop(cursor_id, |program, rowid| -> Result<()> {
-        // Initialize all destination slots to NULL so that columns without a
-        // source value (e.g. when a virtual generated column becomes stored,
-        // there is no pre-existing value on the old row image) default to NULL.
-        let base_dest_reg = program.alloc_registers_and_init_w_null(non_virtual_column_count);
-        for (schema_idx, source_column_idx) in source_column_by_schema_idx.iter().enumerate() {
-            let Some(source_column_idx) = source_column_idx else {
-                continue;
-            };
-
-            emit_stored_column(
-                program,
-                cursor_id,
-                *source_column_idx,
-                layout.to_register(base_dest_reg, schema_idx),
-                resolver,
-            )?;
+        let row = program.alloc_registers(column_count);
+        reads.emit_values_from_cursor(program, cursor_id, row)?;
+        if let Some((conversion, column_index)) = &conversion {
+            conversion.emit_custom_type_writes(program, &rewritten_table, row, &[*column_index])?;
         }
-
-        if let Some(column_index) = converted_column {
-            if rewritten_table.is_strict {
-                emit_strict_column_conversion(
-                    program,
-                    resolver,
-                    column_index,
-                    &original_btree,
-                    rewritten_table,
-                    base_dest_reg,
-                    layout,
-                )?;
+        let stored = match layout {
+            ColumnLayout::Identity { .. } => row,
+            ColumnLayout::Mapped { .. } => {
+                let stored = program.alloc_registers(non_virtual_column_count);
+                for (schema_idx, column) in rewritten_table.columns().iter().enumerate() {
+                    if column.is_virtual_generated() {
+                        continue;
+                    }
+                    program.emit_insn(Insn::Copy {
+                        src_reg: row + schema_idx,
+                        dst_reg: layout.to_register(stored, schema_idx),
+                        extra_amount: 0,
+                    });
+                }
+                stored
             }
-        }
+        };
 
         let record = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(base_dest_reg),
+            start_reg: to_u32(stored),
             count: to_u32(non_virtual_column_count),
             dest_reg: to_u32(record),
             index_name: None,
@@ -2591,59 +2579,6 @@ fn emit_rewrite_table_rows(
     })
 }
 
-/// Convert the stored value of the altered column the same way INSERT
-/// converts a new value: decode it with the old custom type (if any), check it
-/// against the new type, encode it with the new custom type (if any), and check
-/// the encoded value against the storage type.
-fn emit_strict_column_conversion(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    column_index: usize,
-    original_table: &BTreeTable,
-    rewritten_table: &BTreeTable,
-    start_reg: usize,
-    layout: &ColumnLayout,
-) -> Result<()> {
-    let mut column_mask = ColumnMask::default();
-    column_mask.set(column_index)?;
-    let rewritten_table = Arc::new(rewritten_table.clone());
-
-    crate::translate::expr::emit_custom_type_decode_columns(
-        program,
-        resolver,
-        original_table.columns(),
-        start_reg,
-        Some(&column_mask),
-        layout,
-    )?;
-    program.emit_insn(Insn::TypeCheck {
-        start_reg,
-        count: layout.num_non_virtual_cols(),
-        check_generated: false,
-        table_reference: BTreeTable::input_type_check_table_ref(
-            &rewritten_table,
-            resolver.schema(),
-            Some(&column_mask),
-        )?,
-    });
-    crate::translate::expr::emit_custom_type_encode_columns(
-        program,
-        resolver,
-        rewritten_table.columns(),
-        start_reg,
-        Some(&column_mask),
-        &rewritten_table.name,
-        layout,
-    )?;
-    program.emit_insn(Insn::TypeCheck {
-        start_reg,
-        count: layout.num_non_virtual_cols(),
-        check_generated: false,
-        table_reference: BTreeTable::type_check_table_ref(&rewritten_table, resolver.schema()),
-    });
-    Ok(())
-}
-
 fn non_virtual_affinity_str(table: &BTreeTable) -> String {
     table
         .columns()
@@ -2658,11 +2593,11 @@ fn translate_rename_virtual_table(
     vtab: Arc<VirtualTable>,
     old_name: &str,
     new_name_norm: String,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     connection: &Arc<crate::Connection>,
     database_id: usize,
 ) -> Result<()> {
-    let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
+    let schema_version = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_operation()?;
     let vtab_cur = program.alloc_cursor_id(CursorType::VirtualTable(vtab));
     program.emit_insn(Insn::VOpen {
@@ -2675,8 +2610,8 @@ fn translate_rename_virtual_table(
         new_name_reg,
     });
     // Rewrite sqlite_schema entry
-    let sqlite_schema = resolver
-        .schema()
+    let sqlite_schema = catalog
+        .main_schema()
         .get_btree_table(SQLITE_TABLEID)
         .ok_or_else(|| {
             LimboError::ParseError("sqlite_schema table not found in schema".to_string())
@@ -2864,7 +2799,7 @@ fn rewrite_trigger_sql_for_column_rename(
     new_column_name: &str,
     trigger_database_id: usize,
     target_database_id: usize,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
 ) -> Result<String> {
     // Parse the trigger SQL
     let mut parser = Parser::new(trigger_sql.as_bytes());
@@ -2894,7 +2829,7 @@ fn rewrite_trigger_sql_for_column_rename(
     // Get the trigger's owning table to check unqualified column references
     let trigger_table_name_raw = tbl_name.name.as_str();
     let trigger_table_name = normalize_ident(trigger_table_name_raw);
-    let trigger_table = resolver
+    let trigger_table = catalog
         .with_schema(trigger_database_id, |schema| {
             schema.get_btree_table(&trigger_table_name)
         })
@@ -2905,7 +2840,7 @@ fn rewrite_trigger_sql_for_column_rename(
     // Check if this trigger references the column being renamed
     // We need to check if the column exists in the table being renamed
     let target_table_name = normalize_ident(table_name);
-    if resolver
+    if catalog
         .with_schema(target_database_id, |schema| {
             schema.get_btree_table(&target_table_name)
         })
@@ -3001,7 +2936,7 @@ fn rewrite_trigger_sql_for_column_rename(
             &old_col_norm,
             &new_col_norm,
             trigger_database_id,
-            resolver,
+            catalog,
         )?;
         new_commands.push(new_cmd);
     }
@@ -3015,7 +2950,7 @@ fn rewrite_trigger_sql_for_column_rename(
         &target_table_name,
         &old_col_norm,
         trigger_database_id,
-        resolver,
+        catalog,
     )?;
 
     // Reconstruct the SQL
@@ -3067,7 +3002,7 @@ fn rewrite_trigger_sql_for_column_rename(
             &rewritten_trigger,
             &target_table_name,
             trigger_table.as_ref(),
-            resolver,
+            catalog,
             trigger_database_id,
             target_database_id,
         )? {
@@ -3111,7 +3046,7 @@ impl TargetQualifiers {
         target_table_name: &str,
         old_col_norm: &str,
         database_id: usize,
-        resolver: &Resolver,
+        catalog: &SemanticContext<'_>,
     ) -> Result<Self> {
         let mut names = self.names.clone();
         let mut from_has_target_table = false;
@@ -3141,10 +3076,10 @@ impl TargetQualifiers {
                     if !is_cte =>
                 {
                     other_table_has_column |=
-                        trigger_from_table_has_column(resolver, database_id, name, old_col_norm);
+                        trigger_from_table_has_column(catalog, database_id, name, old_col_norm);
                 }
                 _ => {
-                    other_table_has_column |= resolver
+                    other_table_has_column |= catalog
                         .with_schema(database_id, |schema| {
                             crate::util::select_table_column_names(select_table, schema, &self.ctes)
                         })?
@@ -3163,21 +3098,21 @@ impl TargetQualifiers {
 }
 
 fn trigger_from_table_has_column(
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     table_name: &ast::QualifiedName,
     col_norm: &str,
 ) -> bool {
     let table_name_norm = normalize_ident(table_name.name.as_str());
     let Some(database_id) = trigger_table_database_id(
-        resolver,
+        catalog,
         trigger_database_id,
         &table_name_norm,
         table_name.namespace.as_ref().map(|db| db.as_str()),
     ) else {
         return false;
     };
-    resolver.with_schema(database_id, |schema| {
+    catalog.with_schema(database_id, |schema| {
         if let Some(table) = schema.get_table(&table_name_norm) {
             return table.get_column_by_name(col_norm).is_some();
         }
@@ -3348,7 +3283,7 @@ fn apply_expr_for_column_rename(
     context_table_name: Option<&str>,
     from_target_qualifiers: &TargetQualifiers,
     database_id: usize,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
 ) -> Result<()> {
     let is_renaming_trigger_table = trigger_table_name.eq_ignore_ascii_case(target_table_name);
 
@@ -3357,10 +3292,10 @@ fn apply_expr_for_column_rename(
     {
         let ctx_name_norm = normalize_ident(ctx_name);
         let is_renaming = ctx_name_norm == *target_table_name;
-        let table = resolve_trigger_command_table_for_alter(resolver, database_id, &ctx_name_norm)
+        let table = resolve_trigger_command_table_for_alter(catalog, database_id, &ctx_name_norm)
             .ok_or_else(|| {
-                LimboError::ParseError(format!("context table not found: {ctx_name_norm}"))
-            })?;
+            LimboError::ParseError(format!("context table not found: {ctx_name_norm}"))
+        })?;
         Some((table, ctx_name_norm, is_renaming))
     } else {
         None
@@ -3381,7 +3316,7 @@ fn apply_expr_for_column_rename(
                     old_col_norm,
                     from_target_qualifiers,
                     database_id,
-                    resolver,
+                    catalog,
                 )?;
             }
             ast::Expr::Subquery(select) => {
@@ -3394,7 +3329,7 @@ fn apply_expr_for_column_rename(
                     old_col_norm,
                     from_target_qualifiers,
                     database_id,
-                    resolver,
+                    catalog,
                 )?;
             }
             ast::Expr::InSelect { rhs, .. } => {
@@ -3407,7 +3342,7 @@ fn apply_expr_for_column_rename(
                     old_col_norm,
                     from_target_qualifiers,
                     database_id,
-                    resolver,
+                    catalog,
                 )?;
             }
             _ => {
@@ -3443,7 +3378,7 @@ fn apply_result_expr_for_column_rename(
     old_col_norm: &str,
     visible_target_qualifiers: &TargetQualifiers,
     database_id: usize,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
 ) -> Result<()> {
     let traversal = match mode {
         ColumnRenameMode::Validate => ColumnRenameExprTraversal::Normal,
@@ -3460,7 +3395,7 @@ fn apply_result_expr_for_column_rename(
         None,
         visible_target_qualifiers,
         database_id,
-        resolver,
+        catalog,
     )
 }
 
@@ -3474,7 +3409,7 @@ fn apply_upsert_for_column_rename(
     insert_table_name: &str,
     old_col_norm: &str,
     database_id: usize,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
 ) -> Result<()> {
     let insert_table_name_norm = normalize_ident(insert_table_name);
     let insert_targets_renamed_table = insert_table_name_norm == *target_table_name;
@@ -3492,7 +3427,7 @@ fn apply_upsert_for_column_rename(
                 Some(&insert_table_name_norm),
                 &TargetQualifiers::default(),
                 database_id,
-                resolver,
+                catalog,
             )?;
             if insert_targets_renamed_table {
                 if let Some(new_col_norm) = mode.rewritten_name() {
@@ -3512,7 +3447,7 @@ fn apply_upsert_for_column_rename(
                 Some(&insert_table_name_norm),
                 &TargetQualifiers::default(),
                 database_id,
-                resolver,
+                catalog,
             )?;
             if insert_targets_renamed_table {
                 if let Some(new_col_norm) = mode.rewritten_name() {
@@ -3546,7 +3481,7 @@ fn apply_upsert_for_column_rename(
                 Some(&insert_table_name_norm),
                 &TargetQualifiers::default(),
                 database_id,
-                resolver,
+                catalog,
             )?;
             if insert_targets_renamed_table {
                 if let Some(new_col_norm) = mode.rewritten_name() {
@@ -3566,7 +3501,7 @@ fn apply_upsert_for_column_rename(
                 Some(&insert_table_name_norm),
                 &TargetQualifiers::default(),
                 database_id,
-                resolver,
+                catalog,
             )?;
             if insert_targets_renamed_table {
                 if let Some(new_col_norm) = mode.rewritten_name() {
@@ -3586,7 +3521,7 @@ fn apply_upsert_for_column_rename(
             insert_table_name,
             old_col_norm,
             database_id,
-            resolver,
+            catalog,
         )?;
     }
 
@@ -3603,10 +3538,10 @@ fn apply_select_for_column_rename(
     old_col_norm: &str,
     outer_target_qualifiers: &TargetQualifiers,
     database_id: usize,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
 ) -> Result<()> {
     let outer_target_qualifiers = &TargetQualifiers {
-        ctes: resolver.with_schema(database_id, |schema| {
+        ctes: catalog.with_schema(database_id, |schema| {
             crate::util::extract_cte_columns(&select.with, schema, &outer_target_qualifiers.ctes)
         })?,
         ..outer_target_qualifiers.clone()
@@ -3622,7 +3557,7 @@ fn apply_select_for_column_rename(
                 old_col_norm,
                 outer_target_qualifiers,
                 database_id,
-                resolver,
+                catalog,
             )?;
         }
     }
@@ -3636,7 +3571,7 @@ fn apply_select_for_column_rename(
         old_col_norm,
         outer_target_qualifiers,
         database_id,
-        resolver,
+        catalog,
     )?;
 
     for compound in &mut select.body.compounds {
@@ -3649,7 +3584,7 @@ fn apply_select_for_column_rename(
             old_col_norm,
             outer_target_qualifiers,
             database_id,
-            resolver,
+            catalog,
         )?;
     }
 
@@ -3659,7 +3594,7 @@ fn apply_select_for_column_rename(
             target_table_name,
             old_col_norm,
             database_id,
-            resolver,
+            catalog,
         )?,
         ast::OneSelect::Values(_) => outer_target_qualifiers.clone(),
     };
@@ -3684,7 +3619,7 @@ fn apply_select_for_column_rename(
             None,
             &body_target_qualifiers,
             database_id,
-            resolver,
+            catalog,
         )?;
     }
 
@@ -3700,7 +3635,7 @@ fn apply_select_for_column_rename(
             None,
             &body_target_qualifiers,
             database_id,
-            resolver,
+            catalog,
         )?;
         if let Some(ref mut offset) = limit.offset {
             apply_expr_for_column_rename(
@@ -3714,7 +3649,7 @@ fn apply_select_for_column_rename(
                 None,
                 &body_target_qualifiers,
                 database_id,
-                resolver,
+                catalog,
             )?;
         }
     }
@@ -3732,7 +3667,7 @@ fn apply_one_select_for_column_rename(
     old_col_norm: &str,
     outer_target_qualifiers: &TargetQualifiers,
     database_id: usize,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
 ) -> Result<()> {
     match one_select {
         ast::OneSelect::Select {
@@ -3748,7 +3683,7 @@ fn apply_one_select_for_column_rename(
                 target_table_name,
                 old_col_norm,
                 database_id,
-                resolver,
+                catalog,
             )?;
 
             for col in columns {
@@ -3762,7 +3697,7 @@ fn apply_one_select_for_column_rename(
                         old_col_norm,
                         &visible_target_qualifiers,
                         database_id,
-                        resolver,
+                        catalog,
                     )?;
                 }
             }
@@ -3777,7 +3712,7 @@ fn apply_one_select_for_column_rename(
                     old_col_norm,
                     outer_target_qualifiers,
                     database_id,
-                    resolver,
+                    catalog,
                 )?;
             }
 
@@ -3793,7 +3728,7 @@ fn apply_one_select_for_column_rename(
                     None,
                     &visible_target_qualifiers,
                     database_id,
-                    resolver,
+                    catalog,
                 )?;
             }
 
@@ -3810,7 +3745,7 @@ fn apply_one_select_for_column_rename(
                         None,
                         &visible_target_qualifiers,
                         database_id,
-                        resolver,
+                        catalog,
                     )?;
                 }
                 if let Some(ref mut having_expr) = group_by.having {
@@ -3825,7 +3760,7 @@ fn apply_one_select_for_column_rename(
                         None,
                         &visible_target_qualifiers,
                         database_id,
-                        resolver,
+                        catalog,
                     )?;
                 }
             }
@@ -3840,7 +3775,7 @@ fn apply_one_select_for_column_rename(
                     old_col_norm,
                     &visible_target_qualifiers,
                     database_id,
-                    resolver,
+                    catalog,
                 )?;
             }
         }
@@ -3858,7 +3793,7 @@ fn apply_one_select_for_column_rename(
                         None,
                         outer_target_qualifiers,
                         database_id,
-                        resolver,
+                        catalog,
                     )?;
                 }
             }
@@ -3877,7 +3812,7 @@ fn apply_from_clause_for_column_rename(
     old_col_norm: &str,
     visible_target_qualifiers: &TargetQualifiers,
     database_id: usize,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
 ) -> Result<()> {
     apply_select_table_for_column_rename(
         mode,
@@ -3888,7 +3823,7 @@ fn apply_from_clause_for_column_rename(
         old_col_norm,
         visible_target_qualifiers,
         database_id,
-        resolver,
+        catalog,
     )?;
     for join_index in 0..from_clause.joins.len() {
         let lateral_target_qualifiers;
@@ -3906,7 +3841,7 @@ fn apply_from_clause_for_column_rename(
                 target_table_name,
                 old_col_norm,
                 database_id,
-                resolver,
+                catalog,
             )?;
             &lateral_target_qualifiers
         } else {
@@ -3922,7 +3857,7 @@ fn apply_from_clause_for_column_rename(
             target_table_name,
             old_col_norm,
             database_id,
-            resolver,
+            catalog,
         )?;
         let join = &mut from_clause.joins[join_index];
         apply_select_table_for_column_rename(
@@ -3934,7 +3869,7 @@ fn apply_from_clause_for_column_rename(
             old_col_norm,
             table_target_qualifiers,
             database_id,
-            resolver,
+            catalog,
         )?;
         if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
             apply_expr_for_column_rename(
@@ -3948,7 +3883,7 @@ fn apply_from_clause_for_column_rename(
                 None,
                 &on_target_qualifiers,
                 database_id,
-                resolver,
+                catalog,
             )?;
         }
     }
@@ -3965,7 +3900,7 @@ fn apply_select_table_for_column_rename(
     old_col_norm: &str,
     outer_target_qualifiers: &TargetQualifiers,
     database_id: usize,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
 ) -> Result<()> {
     match select_table {
         ast::SelectTable::Select { select, .. } => {
@@ -3978,7 +3913,7 @@ fn apply_select_table_for_column_rename(
                 old_col_norm,
                 outer_target_qualifiers,
                 database_id,
-                resolver,
+                catalog,
             )?;
         }
         ast::SelectTable::Sub(from_clause, _) => {
@@ -3991,7 +3926,7 @@ fn apply_select_table_for_column_rename(
                 old_col_norm,
                 outer_target_qualifiers,
                 database_id,
-                resolver,
+                catalog,
             )?;
         }
         ast::SelectTable::TableCall(_, args, _) => {
@@ -4007,7 +3942,7 @@ fn apply_select_table_for_column_rename(
                     None,
                     outer_target_qualifiers,
                     database_id,
-                    resolver,
+                    catalog,
                 )?;
             }
         }
@@ -4027,7 +3962,7 @@ fn apply_window_for_column_rename(
     old_col_norm: &str,
     visible_target_qualifiers: &TargetQualifiers,
     database_id: usize,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
 ) -> Result<()> {
     for expr in &mut window.partition_by {
         apply_expr_for_column_rename(
@@ -4041,7 +3976,7 @@ fn apply_window_for_column_rename(
             None,
             visible_target_qualifiers,
             database_id,
-            resolver,
+            catalog,
         )?;
     }
 
@@ -4057,7 +3992,7 @@ fn apply_window_for_column_rename(
             None,
             visible_target_qualifiers,
             database_id,
-            resolver,
+            catalog,
         )?;
     }
 
@@ -4073,7 +4008,7 @@ fn apply_trigger_cmd_for_column_rename(
     target_table_name: &str,
     old_col_norm: &str,
     database_id: usize,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
 ) -> Result<()> {
     match cmd {
         ast::TriggerCmd::Update {
@@ -4090,7 +4025,7 @@ fn apply_trigger_cmd_for_column_rename(
                 target_table_name,
                 old_col_norm,
                 database_id,
-                resolver,
+                catalog,
             )?;
 
             if is_renaming_update_table {
@@ -4119,7 +4054,7 @@ fn apply_trigger_cmd_for_column_rename(
                     Some(&update_table_name_norm),
                     &from_target_qualifiers,
                     database_id,
-                    resolver,
+                    catalog,
                 )?;
             }
 
@@ -4135,7 +4070,7 @@ fn apply_trigger_cmd_for_column_rename(
                     Some(&update_table_name_norm),
                     &from_target_qualifiers,
                     database_id,
-                    resolver,
+                    catalog,
                 )?;
             }
 
@@ -4149,7 +4084,7 @@ fn apply_trigger_cmd_for_column_rename(
                     old_col_norm,
                     &TargetQualifiers::default(),
                     database_id,
-                    resolver,
+                    catalog,
                 )?;
             }
         }
@@ -4181,7 +4116,7 @@ fn apply_trigger_cmd_for_column_rename(
                 old_col_norm,
                 &TargetQualifiers::default(),
                 database_id,
-                resolver,
+                catalog,
             )?;
 
             if let Some(upsert) = upsert {
@@ -4194,7 +4129,7 @@ fn apply_trigger_cmd_for_column_rename(
                     tbl_name.as_str(),
                     old_col_norm,
                     database_id,
-                    resolver,
+                    catalog,
                 )?;
             }
         }
@@ -4215,7 +4150,7 @@ fn apply_trigger_cmd_for_column_rename(
                     Some(&delete_table_name_norm),
                     &TargetQualifiers::default(),
                     database_id,
-                    resolver,
+                    catalog,
                 )?;
             }
         }
@@ -4229,7 +4164,7 @@ fn apply_trigger_cmd_for_column_rename(
                 old_col_norm,
                 &TargetQualifiers::default(),
                 database_id,
-                resolver,
+                catalog,
             )?;
         }
     }
@@ -4247,7 +4182,7 @@ fn validate_trigger_after_column_rename(
     target_table_name: &str,
     old_col_norm: &str,
     database_id: usize,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
 ) -> Result<()> {
     let mut event = event.clone();
     if trigger_table_name.eq_ignore_ascii_case(target_table_name) {
@@ -4273,7 +4208,7 @@ fn validate_trigger_after_column_rename(
             None,
             &TargetQualifiers::default(),
             database_id,
-            resolver,
+            catalog,
         )?;
     }
 
@@ -4287,7 +4222,7 @@ fn validate_trigger_after_column_rename(
             target_table_name,
             old_col_norm,
             database_id,
-            resolver,
+            catalog,
         )?;
     }
     Ok(())
@@ -4328,7 +4263,7 @@ fn rewrite_trigger_cmd_for_column_rename(
     old_col_norm: &str,
     new_col_norm: &str,
     database_id: usize,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
 ) -> Result<ast::TriggerCmd> {
     let mut cmd = cmd;
     apply_trigger_cmd_for_column_rename(
@@ -4339,7 +4274,7 @@ fn rewrite_trigger_cmd_for_column_rename(
         target_table_name,
         old_col_norm,
         database_id,
-        resolver,
+        catalog,
     )?;
     Ok(cmd)
 }
@@ -4353,7 +4288,7 @@ fn validate_trigger_columns_after_drop(
     trigger: &crate::schema::Trigger,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Result<Option<String>> {
@@ -4367,7 +4302,7 @@ fn validate_trigger_columns_after_drop(
     {
         Some(referenceable_column_names(post_drop_table))
     } else {
-        resolver.with_schema(trigger_database_id, |s| {
+        catalog.with_schema(trigger_database_id, |s| {
             s.get_table(&trigger_table_norm)
                 .and_then(|t| t.btree().map(|bt| referenceable_column_names(&bt)))
         })
@@ -4383,7 +4318,7 @@ fn validate_trigger_columns_after_drop(
                 allow_bare_owning_columns,
                 altered_table_norm,
                 post_drop_table,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             )? {
@@ -4406,7 +4341,7 @@ fn validate_trigger_columns_after_drop(
                     &cmd_table_norm,
                     altered_table_norm,
                     post_drop_table,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                     None,
@@ -4420,7 +4355,7 @@ fn validate_trigger_columns_after_drop(
                         allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )? {
@@ -4432,7 +4367,7 @@ fn validate_trigger_columns_after_drop(
                             from_clause,
                             altered_table_norm,
                             post_drop_table,
-                            resolver,
+                            catalog,
                             trigger_database_id,
                             altered_database_id,
                         ),
@@ -4450,7 +4385,7 @@ fn validate_trigger_columns_after_drop(
                         allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )? {
@@ -4465,7 +4400,7 @@ fn validate_trigger_columns_after_drop(
                         allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )? {
@@ -4484,7 +4419,7 @@ fn validate_trigger_columns_after_drop(
                     allow_bare_owning_columns,
                     altered_table_norm,
                     post_drop_table,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 )? {
@@ -4501,7 +4436,7 @@ fn validate_trigger_columns_after_drop(
                     &cmd_table_norm,
                     altered_table_norm,
                     post_drop_table,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                     None,
@@ -4514,7 +4449,7 @@ fn validate_trigger_columns_after_drop(
                         allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )? {
@@ -4530,7 +4465,7 @@ fn validate_trigger_columns_after_drop(
                     allow_bare_owning_columns,
                     altered_table_norm,
                     post_drop_table,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 )? {
@@ -4546,7 +4481,7 @@ fn validate_trigger_columns_after_drop(
 fn validate_trigger_table_refs_after_rename(
     trigger: &crate::schema::Trigger,
     altered_table_norm: &str,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Result<Option<String>> {
@@ -4554,7 +4489,7 @@ fn validate_trigger_table_refs_after_rename(
         &trigger.table_name,
         None,
         altered_table_norm,
-        resolver,
+        catalog,
         trigger_database_id,
         altered_database_id,
     ) {
@@ -4565,7 +4500,7 @@ fn validate_trigger_table_refs_after_rename(
         if let Some(missing_table) = validate_expr_table_refs_after_rename(
             when_expr,
             altered_table_norm,
-            resolver,
+            catalog,
             trigger_database_id,
             altered_database_id,
         )? {
@@ -4577,7 +4512,7 @@ fn validate_trigger_table_refs_after_rename(
         if let Some(missing_table) = validate_trigger_cmd_table_refs_after_rename(
             cmd,
             altered_table_norm,
-            resolver,
+            catalog,
             trigger_database_id,
             altered_database_id,
         )? {
@@ -4591,7 +4526,7 @@ fn validate_trigger_table_refs_after_rename(
 fn validate_trigger_cmd_table_refs_after_rename(
     cmd: &ast::TriggerCmd,
     altered_table_norm: &str,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Result<Option<String>> {
@@ -4607,7 +4542,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
                 tbl_name.as_str(),
                 None,
                 altered_table_norm,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             ) {
@@ -4618,7 +4553,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
                 if let Some(missing_table) = validate_from_clause_table_refs_after_rename(
                     from_clause,
                     altered_table_norm,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 )? {
@@ -4630,7 +4565,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
                 if let Some(missing_table) = validate_expr_table_refs_after_rename(
                     &set.expr,
                     altered_table_norm,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 )? {
@@ -4642,7 +4577,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
                 if let Some(missing_table) = validate_expr_table_refs_after_rename(
                     where_expr,
                     altered_table_norm,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 )? {
@@ -4660,7 +4595,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
                 tbl_name.as_str(),
                 None,
                 altered_table_norm,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             ) {
@@ -4670,7 +4605,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
             if let Some(missing_table) = validate_select_table_refs_after_rename(
                 select,
                 altered_table_norm,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             )? {
@@ -4681,7 +4616,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
                 if let Some(missing_table) = validate_upsert_table_refs_after_rename(
                     upsert,
                     altered_table_norm,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 )? {
@@ -4697,7 +4632,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
                 tbl_name.as_str(),
                 None,
                 altered_table_norm,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             ) {
@@ -4708,7 +4643,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
                 if let Some(missing_table) = validate_expr_table_refs_after_rename(
                     where_expr,
                     altered_table_norm,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 )? {
@@ -4720,7 +4655,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
             if let Some(missing_table) = validate_select_table_refs_after_rename(
                 select,
                 altered_table_norm,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             )? {
@@ -4735,7 +4670,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
 fn validate_expr_table_refs_after_rename(
     expr: &ast::Expr,
     altered_table_norm: &str,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Result<Option<String>> {
@@ -4744,7 +4679,7 @@ fn validate_expr_table_refs_after_rename(
             return validate_select_table_refs_after_rename(
                 select,
                 altered_table_norm,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             );
@@ -4753,7 +4688,7 @@ fn validate_expr_table_refs_after_rename(
             if let Some(missing_table) = validate_expr_table_refs_after_rename(
                 lhs,
                 altered_table_norm,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             )? {
@@ -4762,7 +4697,7 @@ fn validate_expr_table_refs_after_rename(
             return validate_select_table_refs_after_rename(
                 rhs,
                 altered_table_norm,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             );
@@ -4780,7 +4715,7 @@ fn validate_expr_table_refs_after_rename(
                 missing_table = validate_select_table_refs_after_rename(
                     select,
                     altered_table_norm,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 )?;
@@ -4790,7 +4725,7 @@ fn validate_expr_table_refs_after_rename(
                 missing_table = validate_expr_table_refs_after_rename(
                     lhs,
                     altered_table_norm,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 )?;
@@ -4798,7 +4733,7 @@ fn validate_expr_table_refs_after_rename(
                     missing_table = validate_select_table_refs_after_rename(
                         rhs,
                         altered_table_norm,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )?;
@@ -4815,7 +4750,7 @@ fn validate_expr_table_refs_after_rename(
 fn validate_select_table_refs_after_rename(
     select: &ast::Select,
     altered_table_norm: &str,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Result<Option<String>> {
@@ -4824,7 +4759,7 @@ fn validate_select_table_refs_after_rename(
             if let Some(missing_table) = validate_select_table_refs_after_rename(
                 &cte.select,
                 altered_table_norm,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             )? {
@@ -4836,7 +4771,7 @@ fn validate_select_table_refs_after_rename(
     if let Some(missing_table) = validate_one_select_table_refs_after_rename(
         &select.body.select,
         altered_table_norm,
-        resolver,
+        catalog,
         trigger_database_id,
         altered_database_id,
     )? {
@@ -4847,7 +4782,7 @@ fn validate_select_table_refs_after_rename(
         if let Some(missing_table) = validate_one_select_table_refs_after_rename(
             &compound.select,
             altered_table_norm,
-            resolver,
+            catalog,
             trigger_database_id,
             altered_database_id,
         )? {
@@ -4859,7 +4794,7 @@ fn validate_select_table_refs_after_rename(
         if let Some(missing_table) = validate_expr_table_refs_after_rename(
             &sorted_col.expr,
             altered_table_norm,
-            resolver,
+            catalog,
             trigger_database_id,
             altered_database_id,
         )? {
@@ -4871,7 +4806,7 @@ fn validate_select_table_refs_after_rename(
         if let Some(missing_table) = validate_expr_table_refs_after_rename(
             &limit.expr,
             altered_table_norm,
-            resolver,
+            catalog,
             trigger_database_id,
             altered_database_id,
         )? {
@@ -4881,7 +4816,7 @@ fn validate_select_table_refs_after_rename(
             if let Some(missing_table) = validate_expr_table_refs_after_rename(
                 offset,
                 altered_table_norm,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             )? {
@@ -4896,7 +4831,7 @@ fn validate_select_table_refs_after_rename(
 fn validate_one_select_table_refs_after_rename(
     one_select: &ast::OneSelect,
     altered_table_norm: &str,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Result<Option<String>> {
@@ -4913,7 +4848,7 @@ fn validate_one_select_table_refs_after_rename(
                 if let Some(missing_table) = validate_from_clause_table_refs_after_rename(
                     from_clause,
                     altered_table_norm,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 )? {
@@ -4926,7 +4861,7 @@ fn validate_one_select_table_refs_after_rename(
                     if let Some(missing_table) = validate_expr_table_refs_after_rename(
                         expr,
                         altered_table_norm,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )? {
@@ -4939,7 +4874,7 @@ fn validate_one_select_table_refs_after_rename(
                 if let Some(missing_table) = validate_expr_table_refs_after_rename(
                     where_expr,
                     altered_table_norm,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 )? {
@@ -4952,7 +4887,7 @@ fn validate_one_select_table_refs_after_rename(
                     if let Some(missing_table) = validate_expr_table_refs_after_rename(
                         expr,
                         altered_table_norm,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )? {
@@ -4963,7 +4898,7 @@ fn validate_one_select_table_refs_after_rename(
                     if let Some(missing_table) = validate_expr_table_refs_after_rename(
                         having,
                         altered_table_norm,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )? {
@@ -4977,7 +4912,7 @@ fn validate_one_select_table_refs_after_rename(
                     if let Some(missing_table) = validate_expr_table_refs_after_rename(
                         partition,
                         altered_table_norm,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )? {
@@ -4988,7 +4923,7 @@ fn validate_one_select_table_refs_after_rename(
                     if let Some(missing_table) = validate_expr_table_refs_after_rename(
                         &order.expr,
                         altered_table_norm,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )? {
@@ -5003,7 +4938,7 @@ fn validate_one_select_table_refs_after_rename(
                     if let Some(missing_table) = validate_expr_table_refs_after_rename(
                         expr,
                         altered_table_norm,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )? {
@@ -5020,14 +4955,14 @@ fn validate_one_select_table_refs_after_rename(
 fn validate_from_clause_table_refs_after_rename(
     from_clause: &ast::FromClause,
     altered_table_norm: &str,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Result<Option<String>> {
     if let Some(missing_table) = validate_select_table_refs_after_rename_in_table(
         &from_clause.select,
         altered_table_norm,
-        resolver,
+        catalog,
         trigger_database_id,
         altered_database_id,
     )? {
@@ -5038,7 +4973,7 @@ fn validate_from_clause_table_refs_after_rename(
         if let Some(missing_table) = validate_select_table_refs_after_rename_in_table(
             &join.table,
             altered_table_norm,
-            resolver,
+            catalog,
             trigger_database_id,
             altered_database_id,
         )? {
@@ -5049,7 +4984,7 @@ fn validate_from_clause_table_refs_after_rename(
             if let Some(missing_table) = validate_expr_table_refs_after_rename(
                 expr,
                 altered_table_norm,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             )? {
@@ -5064,7 +4999,7 @@ fn validate_from_clause_table_refs_after_rename(
 fn validate_select_table_refs_after_rename_in_table(
     select_table: &ast::SelectTable,
     altered_table_norm: &str,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Result<Option<String>> {
@@ -5074,7 +5009,7 @@ fn validate_select_table_refs_after_rename_in_table(
                 qualified_name.name.as_str(),
                 qualified_name.namespace.as_ref().map(|db| db.as_str()),
                 altered_table_norm,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             ) {
@@ -5088,7 +5023,7 @@ fn validate_select_table_refs_after_rename_in_table(
                 if let Some(missing_table) = validate_expr_table_refs_after_rename(
                     arg,
                     altered_table_norm,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 )? {
@@ -5100,14 +5035,14 @@ fn validate_select_table_refs_after_rename_in_table(
         ast::SelectTable::Select { select, .. } => validate_select_table_refs_after_rename(
             select,
             altered_table_norm,
-            resolver,
+            catalog,
             trigger_database_id,
             altered_database_id,
         ),
         ast::SelectTable::Sub(from_clause, _) => validate_from_clause_table_refs_after_rename(
             from_clause,
             altered_table_norm,
-            resolver,
+            catalog,
             trigger_database_id,
             altered_database_id,
         ),
@@ -5117,7 +5052,7 @@ fn validate_select_table_refs_after_rename_in_table(
 fn validate_upsert_table_refs_after_rename(
     upsert: &ast::Upsert,
     altered_table_norm: &str,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Result<Option<String>> {
@@ -5126,7 +5061,7 @@ fn validate_upsert_table_refs_after_rename(
             if let Some(missing_table) = validate_expr_table_refs_after_rename(
                 &target.expr,
                 altered_table_norm,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             )? {
@@ -5137,7 +5072,7 @@ fn validate_upsert_table_refs_after_rename(
             if let Some(missing_table) = validate_expr_table_refs_after_rename(
                 where_clause,
                 altered_table_norm,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             )? {
@@ -5151,7 +5086,7 @@ fn validate_upsert_table_refs_after_rename(
             if let Some(missing_table) = validate_expr_table_refs_after_rename(
                 &set.expr,
                 altered_table_norm,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             )? {
@@ -5162,7 +5097,7 @@ fn validate_upsert_table_refs_after_rename(
             if let Some(missing_table) = validate_expr_table_refs_after_rename(
                 expr,
                 altered_table_norm,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             )? {
@@ -5175,7 +5110,7 @@ fn validate_upsert_table_refs_after_rename(
         return validate_upsert_table_refs_after_rename(
             next,
             altered_table_norm,
-            resolver,
+            catalog,
             trigger_database_id,
             altered_database_id,
         );
@@ -5188,20 +5123,20 @@ fn table_reference_exists_after_rename(
     table_name: &str,
     explicit_db_name: Option<&str>,
     altered_table_norm: &str,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> bool {
     let table_name_norm = normalize_ident(table_name);
     let lookup_database_id = if let Some(db_name) = explicit_db_name {
-        resolver
+        catalog
             .resolve_database_id(&ast::QualifiedName::fullname(
                 ast::Name::exact(db_name.to_string()),
                 ast::Name::exact(table_name.to_string()),
             ))
             .ok()
     } else if trigger_database_id == crate::TEMP_DB_ID {
-        if resolver.with_schema(crate::TEMP_DB_ID, |s| {
+        if catalog.with_schema(crate::TEMP_DB_ID, |s| {
             s.get_table(&table_name_norm).is_some()
                 || s.get_view(&table_name_norm).is_some()
                 || s.get_materialized_view(&table_name_norm).is_some()
@@ -5222,7 +5157,7 @@ fn table_reference_exists_after_rename(
         return true;
     }
 
-    resolver.with_schema(lookup_database_id, |s| {
+    catalog.with_schema(lookup_database_id, |s| {
         s.get_table(&table_name_norm).is_some()
             || s.get_view(&table_name_norm).is_some()
             || s.get_materialized_view(&table_name_norm).is_some()
@@ -5237,7 +5172,7 @@ fn validate_expr_column_refs_after_drop(
     allow_bare_owning_columns: bool,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Result<Option<String>> {
@@ -5250,7 +5185,7 @@ fn validate_expr_column_refs_after_drop(
                 allow_bare_owning_columns,
                 altered_table_norm,
                 post_drop_table,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             );
@@ -5263,7 +5198,7 @@ fn validate_expr_column_refs_after_drop(
                 allow_bare_owning_columns,
                 altered_table_norm,
                 post_drop_table,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             )?;
@@ -5277,7 +5212,7 @@ fn validate_expr_column_refs_after_drop(
                 allow_bare_owning_columns,
                 altered_table_norm,
                 post_drop_table,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             );
@@ -5290,7 +5225,7 @@ fn validate_expr_column_refs_after_drop(
                 allow_bare_owning_columns,
                 altered_table_norm,
                 post_drop_table,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             ) {
@@ -5313,7 +5248,7 @@ fn validate_expr_column_refs_after_drop(
                     allow_bare_owning_columns,
                     altered_table_norm,
                     post_drop_table,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 )?;
@@ -5327,7 +5262,7 @@ fn validate_expr_column_refs_after_drop(
                     allow_bare_owning_columns,
                     altered_table_norm,
                     post_drop_table,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 )?;
@@ -5339,7 +5274,7 @@ fn validate_expr_column_refs_after_drop(
                         allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )?;
@@ -5354,7 +5289,7 @@ fn validate_expr_column_refs_after_drop(
                     allow_bare_owning_columns,
                     altered_table_norm,
                     post_drop_table,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 );
@@ -5377,7 +5312,7 @@ fn validate_select_column_refs_after_drop(
     allow_bare_owning_columns: bool,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Result<Option<String>> {
@@ -5390,7 +5325,7 @@ fn validate_select_column_refs_after_drop(
                 allow_bare_owning_columns,
                 altered_table_norm,
                 post_drop_table,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             )? {
@@ -5406,7 +5341,7 @@ fn validate_select_column_refs_after_drop(
         allow_bare_owning_columns,
         altered_table_norm,
         post_drop_table,
-        resolver,
+        catalog,
         trigger_database_id,
         altered_database_id,
     )? {
@@ -5421,7 +5356,7 @@ fn validate_select_column_refs_after_drop(
             allow_bare_owning_columns,
             altered_table_norm,
             post_drop_table,
-            resolver,
+            catalog,
             trigger_database_id,
             altered_database_id,
         )? {
@@ -5439,7 +5374,7 @@ fn validate_select_column_refs_after_drop(
                         from,
                         altered_table_norm,
                         post_drop_table,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )
@@ -5457,7 +5392,7 @@ fn validate_select_column_refs_after_drop(
             allow_bare_owning_columns,
             altered_table_norm,
             post_drop_table,
-            resolver,
+            catalog,
             trigger_database_id,
             altered_database_id,
         )? {
@@ -5473,7 +5408,7 @@ fn validate_select_column_refs_after_drop(
             allow_bare_owning_columns,
             altered_table_norm,
             post_drop_table,
-            resolver,
+            catalog,
             trigger_database_id,
             altered_database_id,
         )? {
@@ -5487,7 +5422,7 @@ fn validate_select_column_refs_after_drop(
                 allow_bare_owning_columns,
                 altered_table_norm,
                 post_drop_table,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             )? {
@@ -5507,7 +5442,7 @@ fn validate_one_select_column_refs_after_drop(
     allow_bare_owning_columns: bool,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Result<Option<String>> {
@@ -5529,7 +5464,7 @@ fn validate_one_select_column_refs_after_drop(
                             from,
                             altered_table_norm,
                             post_drop_table,
-                            resolver,
+                            catalog,
                             trigger_database_id,
                             altered_database_id,
                         )
@@ -5545,7 +5480,7 @@ fn validate_one_select_column_refs_after_drop(
                     allow_bare_owning_columns,
                     altered_table_norm,
                     post_drop_table,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 )? {
@@ -5562,7 +5497,7 @@ fn validate_one_select_column_refs_after_drop(
                         allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )? {
@@ -5579,7 +5514,7 @@ fn validate_one_select_column_refs_after_drop(
                     allow_bare_owning_columns,
                     altered_table_norm,
                     post_drop_table,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 )? {
@@ -5596,7 +5531,7 @@ fn validate_one_select_column_refs_after_drop(
                         allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )? {
@@ -5611,7 +5546,7 @@ fn validate_one_select_column_refs_after_drop(
                         allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )? {
@@ -5629,7 +5564,7 @@ fn validate_one_select_column_refs_after_drop(
                         allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )? {
@@ -5644,7 +5579,7 @@ fn validate_one_select_column_refs_after_drop(
                         allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )? {
@@ -5663,7 +5598,7 @@ fn validate_one_select_column_refs_after_drop(
                         allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
-                        resolver,
+                        catalog,
                         trigger_database_id,
                         altered_database_id,
                     )? {
@@ -5685,7 +5620,7 @@ fn validate_from_clause_column_refs_after_drop(
     allow_bare_owning_columns: bool,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Result<Option<String>> {
@@ -5697,7 +5632,7 @@ fn validate_from_clause_column_refs_after_drop(
         allow_bare_owning_columns,
         altered_table_norm,
         post_drop_table,
-        resolver,
+        catalog,
         trigger_database_id,
         altered_database_id,
     )? {
@@ -5709,7 +5644,7 @@ fn validate_from_clause_column_refs_after_drop(
             &from_clause.select,
             altered_table_norm,
             post_drop_table,
-            resolver,
+            catalog,
             trigger_database_id,
             altered_database_id,
         ),
@@ -5722,7 +5657,7 @@ fn validate_from_clause_column_refs_after_drop(
             allow_bare_owning_columns,
             altered_table_norm,
             post_drop_table,
-            resolver,
+            catalog,
             trigger_database_id,
             altered_database_id,
         )? {
@@ -5732,7 +5667,7 @@ fn validate_from_clause_column_refs_after_drop(
             &join.table,
             altered_table_norm,
             post_drop_table,
-            resolver,
+            catalog,
             trigger_database_id,
             altered_database_id,
         );
@@ -5745,7 +5680,7 @@ fn validate_from_clause_column_refs_after_drop(
                 allow_bare_owning_columns,
                 altered_table_norm,
                 post_drop_table,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             )? {
@@ -5765,7 +5700,7 @@ fn validate_select_table_column_refs_after_drop(
     allow_bare_owning_columns: bool,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Result<Option<String>> {
@@ -5777,7 +5712,7 @@ fn validate_select_table_column_refs_after_drop(
             allow_bare_owning_columns,
             altered_table_norm,
             post_drop_table,
-            resolver,
+            catalog,
             trigger_database_id,
             altered_database_id,
         ),
@@ -5788,7 +5723,7 @@ fn validate_select_table_column_refs_after_drop(
             allow_bare_owning_columns,
             altered_table_norm,
             post_drop_table,
-            resolver,
+            catalog,
             trigger_database_id,
             altered_database_id,
         ),
@@ -5801,7 +5736,7 @@ fn validate_select_table_column_refs_after_drop(
                     allow_bare_owning_columns,
                     altered_table_norm,
                     post_drop_table,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                 )? {
@@ -5818,7 +5753,7 @@ fn collect_from_clause_visible_columns(
     from_clause: &ast::FromClause,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Vec<String> {
@@ -5826,7 +5761,7 @@ fn collect_from_clause_visible_columns(
         &from_clause.select,
         altered_table_norm,
         post_drop_table,
-        resolver,
+        catalog,
         trigger_database_id,
         altered_database_id,
     );
@@ -5837,7 +5772,7 @@ fn collect_from_clause_visible_columns(
                 &join.table,
                 altered_table_norm,
                 post_drop_table,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             ),
@@ -5850,7 +5785,7 @@ fn collect_select_table_visible_columns(
     select_table: &ast::SelectTable,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Vec<String> {
@@ -5861,7 +5796,7 @@ fn collect_select_table_visible_columns(
                 alias.as_ref(),
                 altered_table_norm,
                 post_drop_table,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             )
@@ -5872,7 +5807,7 @@ fn collect_select_table_visible_columns(
                 alias.as_ref(),
                 altered_table_norm,
                 post_drop_table,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
             )
@@ -5888,7 +5823,7 @@ fn collect_qualified_table_visible_columns(
     alias: Option<&ast::As>,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Vec<String> {
@@ -5896,7 +5831,7 @@ fn collect_qualified_table_visible_columns(
         &normalize_ident(qualified_name.name.as_str()),
         altered_table_norm,
         post_drop_table,
-        resolver,
+        catalog,
         trigger_database_id,
         altered_database_id,
         qualified_name.namespace.as_ref().map(|name| name.as_str()),
@@ -5954,7 +5889,7 @@ fn check_column_ref_valid(
     allow_bare_owning_columns: bool,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Option<String> {
@@ -5997,7 +5932,7 @@ fn check_column_ref_valid(
                     &ns_norm,
                     altered_table_norm,
                     post_drop_table,
-                    resolver,
+                    catalog,
                     trigger_database_id,
                     altered_database_id,
                     None,
@@ -6028,7 +5963,7 @@ fn check_column_ref_valid(
                 &table_norm,
                 altered_table_norm,
                 post_drop_table,
-                resolver,
+                catalog,
                 trigger_database_id,
                 altered_database_id,
                 Some(db_name.as_str()),
@@ -6049,13 +5984,13 @@ fn get_table_columns(
     table_name_norm: &str,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     altered_database_id: usize,
     explicit_db_name: Option<&str>,
 ) -> Option<Vec<String>> {
     let lookup_database_id = trigger_table_database_id(
-        resolver,
+        catalog,
         trigger_database_id,
         table_name_norm,
         explicit_db_name,
@@ -6064,7 +5999,7 @@ fn get_table_columns(
     if lookup_database_id == altered_database_id && table_name_norm == altered_table_norm {
         Some(referenceable_column_names(post_drop_table))
     } else {
-        resolver.with_schema(lookup_database_id, |s| {
+        catalog.with_schema(lookup_database_id, |s| {
             s.get_table(table_name_norm)
                 .and_then(|t| t.btree().map(|bt| referenceable_column_names(&bt)))
         })
@@ -6072,20 +6007,20 @@ fn get_table_columns(
 }
 
 fn trigger_table_database_id(
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     table_name_norm: &str,
     explicit_db_name: Option<&str>,
 ) -> Option<usize> {
     if let Some(db_name) = explicit_db_name {
-        resolver
+        catalog
             .resolve_database_id(&ast::QualifiedName::fullname(
                 ast::Name::exact(db_name.to_string()),
                 ast::Name::exact(table_name_norm.to_string()),
             ))
             .ok()
     } else if trigger_database_id == crate::TEMP_DB_ID {
-        if resolver.with_schema(crate::TEMP_DB_ID, |s| {
+        if catalog.with_schema(crate::TEMP_DB_ID, |s| {
             s.get_table(table_name_norm).is_some()
         }) {
             Some(crate::TEMP_DB_ID)
@@ -6116,22 +6051,22 @@ fn referenceable_column_names(table: &BTreeTable) -> Vec<String> {
 }
 
 fn resolve_trigger_command_table_for_alter(
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     trigger_database_id: usize,
     table_name_norm: &str,
 ) -> Option<Arc<BTreeTable>> {
     if trigger_database_id == crate::TEMP_DB_ID {
-        resolver
+        catalog
             .with_schema(crate::TEMP_DB_ID, |schema| {
                 schema.get_btree_table(table_name_norm)
             })
             .or_else(|| {
-                resolver.with_schema(crate::MAIN_DB_ID, |schema| {
+                catalog.with_schema(crate::MAIN_DB_ID, |schema| {
                     schema.get_btree_table(table_name_norm)
                 })
             })
     } else {
-        resolver.with_schema(trigger_database_id, |schema| {
+        catalog.with_schema(trigger_database_id, |schema| {
             schema.get_btree_table(table_name_norm)
         })
     }

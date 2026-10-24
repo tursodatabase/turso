@@ -32,7 +32,7 @@ set test_files {
   affinity3            pass
   aggerror             fail
   aggnested            fail
-  aggorderby           fail
+  aggorderby           pass
   alias                fail
   alter                fail
   alter2               fail
@@ -197,7 +197,7 @@ set test_files {
   descidx3             pass
   diskfull             fail
   distinct             fail
-  distinct2            fail
+  distinct2            pass
   distinctagg          fail
   e_blobbytes          pass
   e_blobclose          fail
@@ -310,7 +310,7 @@ set test_files {
   init                 fail
   insert               fail
   insert2              pass
-  insert3              fail
+  insert3              pass
   insert4              fail
   insert5              pass
   instr                pass
@@ -501,7 +501,7 @@ set test_files {
   seekscan1            pass
   select1              pass
   select2              pass
-  select3              fail
+  select3              pass
   select4              fail
   select5              pass
   select6              fail
@@ -550,7 +550,7 @@ set test_files {
   subjournal           fail
   subquery             fail
   subquery2            pass
-  subselect            fail
+  subselect            pass
   substr               pass
   subtype1             fail
   swarmvtab            fail
@@ -598,7 +598,7 @@ set test_files {
   tkt-7a31705a7e6      pass
   tkt-7bbfb7d442       pass
   tkt-80ba201079       fail
-  tkt-80e031a00f       fail
+  tkt-80e031a00f       pass
   tkt-8454a207b9       fail
   tkt-868145d012       pass
   tkt-8c63ff0ec        pass
@@ -635,7 +635,7 @@ set test_files {
   tkt1443              pass
   tkt1444              pass
   tkt1449              pass
-  tkt1473              fail
+  tkt1473              pass
   tkt1501              pass
   tkt1512              fail
   tkt1514              fail
@@ -656,7 +656,7 @@ set test_files {
   tkt2409              fail
   tkt2450              pass
   tkt2565              fail
-  tkt2640              fail
+  tkt2640              pass
   tkt2643              pass
   tkt2686              pass
   tkt2767              pass
@@ -682,7 +682,7 @@ set test_files {
   tkt3442              fail
   tkt3461              fail
   tkt3493              pass
-  tkt3508              fail
+  tkt3508              pass
   tkt3522              pass
   tkt3527              pass
   tkt3541              pass
@@ -843,7 +843,7 @@ set test_files {
   window1              fail
   window2              pass
   window3              pass
-  window4              fail
+  window4              pass
   window5              fail
   window6              fail
   window7              pass

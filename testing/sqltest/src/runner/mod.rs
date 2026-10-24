@@ -45,6 +45,9 @@ pub struct RunOptions {
     pub snapshot_update_mode: SnapshotUpdateMode,
     /// Path to binary used for cross-checking integrity (None = disabled)
     pub cross_check_binary: Option<PathBuf>,
+    /// Compare EXPLAIN QUERY PLAN output without instruction ids, generated
+    /// name ids and the order of subquery rows, to compare two planners.
+    pub normalize_plans: bool,
     /// Check every live materialized view after each successful statement.
     pub verify_materialized_views: bool,
 }
@@ -140,12 +143,26 @@ impl Runnable for TestCase {
         assert!(results.len() == 1);
         let result = results.first().unwrap();
         let expectation = self.expectations.for_backend(options.backend_type);
-        let comparison = compare(result, expectation);
+        let comparison = if options.normalize_plans && explains_query_plan(&self.sql) {
+            crate::comparison::compare_plans(result, expectation)
+        } else {
+            compare(result, expectation)
+        };
         match comparison {
             ComparisonResult::Match => TestOutcome::Passed,
             ComparisonResult::Mismatch { reason } => TestOutcome::Failed { reason },
         }
     }
+}
+
+/// Whether a test runs EXPLAIN QUERY PLAN, so its rows are plans and not
+/// data that happens to look like plan rows.
+fn explains_query_plan(sql: &str) -> bool {
+    sql.to_ascii_uppercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(3)
+        .any(|words| words == ["EXPLAIN", "QUERY", "PLAN"])
 }
 
 #[async_trait]
@@ -907,6 +924,8 @@ pub struct RunnerConfig {
     /// Path to binary for cross-checking integrity (None = disabled).
     /// Used by tests annotated with `@cross-check-integrity`.
     pub cross_check_binary: Option<PathBuf>,
+    /// See [RunOptions::normalize_plans].
+    pub normalize_plans: bool,
 }
 
 impl Default for RunnerConfig {
@@ -918,6 +937,7 @@ impl Default for RunnerConfig {
             snapshot_update_mode: SnapshotUpdateMode::Auto,
             snapshot_filter: None,
             cross_check_binary: None,
+            normalize_plans: false,
         }
     }
 }
@@ -950,6 +970,11 @@ impl RunnerConfig {
 
     pub fn with_cross_check_binary(mut self, binary: PathBuf) -> Self {
         self.cross_check_binary = Some(binary);
+        self
+    }
+
+    pub fn with_normalize_plans(mut self, normalize: bool) -> Self {
+        self.normalize_plans = normalize;
         self
     }
 }
@@ -1030,6 +1055,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     // Tests don't use snapshots, but we still need the field
                     snapshot_update_mode: SnapshotUpdateMode::No,
                     cross_check_binary: self.config.cross_check_binary.clone(),
+                    normalize_plans: self.config.normalize_plans,
                     verify_materialized_views: test_file.verify_materialized_views
                         && self.backend.supports_materialized_view_verification(),
                 };
@@ -1102,6 +1128,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     backend_is_sqlite: self.backend.is_sqlite(),
                     snapshot_update_mode: self.config.snapshot_update_mode,
                     cross_check_binary: self.config.cross_check_binary.clone(),
+                    normalize_plans: self.config.normalize_plans,
                     verify_materialized_views: false,
                 };
 
@@ -1160,6 +1187,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                         backend_is_sqlite: self.backend.is_sqlite(),
                         snapshot_update_mode: self.config.snapshot_update_mode,
                         cross_check_binary: self.config.cross_check_binary.clone(),
+                        normalize_plans: self.config.normalize_plans,
                         verify_materialized_views: false,
                     };
 
@@ -1522,6 +1550,7 @@ expect {
                 snapshot_update_mode: SnapshotUpdateMode::No,
                 cross_check_binary: None,
                 verify_materialized_views: false,
+                normalize_plans: false,
             };
             let backend = Arc::new(OneRowBackend { backend_type });
             let result = run_single(backend, file.tests[0].clone(), options).await;
@@ -1578,6 +1607,7 @@ expect {
                 backend_is_sqlite: false,
                 snapshot_update_mode: SnapshotUpdateMode::No,
                 cross_check_binary: None,
+                normalize_plans: false,
                 verify_materialized_views: false,
             };
             let backend = Arc::new(SetupFailsBackend { backend_type });

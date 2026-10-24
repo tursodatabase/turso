@@ -30,7 +30,7 @@ use turso_parser::ast;
 use crate::incremental::dag;
 use crate::schema::Schema;
 use crate::sync::Arc;
-use crate::translate::emitter::Resolver;
+use crate::translate::{capture_catalog, semantic_context};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::{PreparedProgram, Program};
 use crate::{Connection, LimboError, QueryMode, Result};
@@ -132,7 +132,7 @@ pub(crate) fn compile_maintenance_program(
     view_root_page: i64,
     num_view_columns: usize,
     input: MaintenanceInput,
-    schema: &Schema,
+    schema: &Arc<Schema>,
     connection: &Arc<Connection>,
 ) -> Result<Program> {
     let key = MaintenanceProgramCacheKey {
@@ -191,7 +191,6 @@ fn compile_maintenance_plan(
             num_columns: num_view_columns,
         },
         schema,
-        connection,
     )?;
     program.epilogue(schema);
     program.build(
@@ -232,33 +231,24 @@ impl Connection {
     }
 }
 
-/// Build the bound maintenance plan with a transient connection resolver.
+/// Analyze the view's query against the connection's catalog and build its
+/// maintenance plan. The plan itself pins the view's unqualified table names
+/// to the main database, the way CREATE resolved them (#9456).
 fn build_plan_for_connection(
     view_name: &str,
     select: &ast::Select,
-    schema: &Schema,
+    schema: &Arc<Schema>,
     connection: &Arc<Connection>,
 ) -> Result<MaintenancePlan> {
+    let catalog = capture_catalog(schema, connection, None)?;
     let syms = connection.syms.read();
-    let resolver = Resolver::new(
-        schema,
-        connection.database_schemas(),
-        &connection.temp.database,
-        connection.attached_databases(),
-        connection.namespaces(),
+    let context = semantic_context(
+        &catalog,
         &syms,
-        connection.experimental_custom_types_enabled(),
-        connection.get_dqs_dml().into(),
+        connection,
         Arc::new(crate::dialect::SqliteDialect),
-        None,
-    );
-    // Re-planning for maintenance must resolve the view's unqualified table
-    // names the same way CREATE did: within the view's own database, never
-    // through a TEMP table that happens to share a source table's name
-    // (#9456). Materialized views always live in main.
-    resolver.with_view_scope(crate::MAIN_DB_ID, view_name.to_string(), || {
-        plan_view(view_name, select, &resolver, connection)
-    })
+    )?;
+    plan_view(view_name, select, &context)
 }
 
 /// Emit every node once in DAG topological order.
@@ -272,9 +262,9 @@ fn emit_plan_nodes(
     plan: &MaintenancePlan,
     input: MaintenanceInput,
     schema: &Schema,
-    connection: &Arc<Connection>,
 ) -> Result<NodeOutput> {
     let dag = plan.dag();
+    let document = plan.document();
     let operator_states = plan.operator_states();
     let mut outputs: Vec<Option<NodeOutput>> = vec![None; dag.nodes.len()];
     for node_id in 0..dag.nodes.len() {
@@ -296,13 +286,12 @@ fn emit_plan_nodes(
                     materialize_node_output(program, view_name, upstream_id, upstream, input)?;
                 emit_filter(
                     program,
+                    document,
                     view_name,
                     node_id,
                     &upstream,
                     output_contract,
                     predicate,
-                    schema,
-                    connection,
                 )?
             }
             dag::OpNode::Project {
@@ -324,13 +313,12 @@ fn emit_plan_nodes(
                 )?;
                 emit_project(
                     program,
+                    document,
                     view_name,
                     node_id,
                     &upstream,
                     projections,
                     output_contract,
-                    schema,
-                    connection,
                 )?
             }
             dag::OpNode::Alias {
@@ -364,16 +352,16 @@ fn emit_plan_nodes(
                 match kind {
                     dag::JoinKind::Inner => emit_inner_join(
                         program,
+                        document,
                         view_name,
                         node_id,
                         output_contract,
                         &contract,
                         input,
-                        schema,
-                        connection,
                     )?,
                     dag::JoinKind::Semi | dag::JoinKind::Anti => emit_semi_or_anti_join(
                         program,
+                        document,
                         view_name,
                         node_id,
                         *kind,
@@ -382,7 +370,6 @@ fn emit_plan_nodes(
                         input,
                         operator_state,
                         schema,
-                        connection,
                     )?,
                 }
             }
@@ -467,6 +454,7 @@ fn emit_plan_nodes(
                     materialize_node_output(program, view_name, upstream_id, upstream, input)?;
                 emit_group_aggregate(
                     program,
+                    document,
                     view_name,
                     node_id,
                     &upstream,
@@ -479,7 +467,6 @@ fn emit_plan_nodes(
                     output_contract,
                     operator_state,
                     schema,
-                    connection,
                 )?
             }
         };
@@ -510,9 +497,8 @@ fn emit_plan_to_sink(
     input: MaintenanceInput,
     sink: &ViewSink,
     schema: &Schema,
-    connection: &Arc<Connection>,
 ) -> Result<()> {
-    let node_output = emit_plan_nodes(program, view_name, plan, input, schema, connection)?;
+    let node_output = emit_plan_nodes(program, view_name, plan, input, schema)?;
     let root = plan.dag().root;
     let stream = materialize_node_output(program, view_name, root, &node_output, input)?;
     let stream = consolidate_delta(program, &format!("{view_name}_sink_input"), &stream)?;

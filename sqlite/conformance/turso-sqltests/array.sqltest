@@ -1846,3 +1846,84 @@ expect {
     {a,z}
     {b,a}
 }
+
+# A value compared with an array column is read as an array of the column's
+# element type, the way a write to the column reads it, so a text literal
+# matches the stored array.
+test array-column-equals-text-literal {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, tags text[]) STRICT;
+    INSERT INTO a VALUES (1, '{x,y}'), (2, '{z}'), (3, NULL);
+    SELECT id FROM a WHERE tags = '{z}';
+    SELECT id FROM a WHERE '{x,y}' = tags;
+    SELECT id FROM a WHERE tags <> '{z}';
+    SELECT id FROM a WHERE tags < '{z}';
+    SELECT id FROM a WHERE tags IS NULL;
+}
+expect {
+    2
+    1
+    1
+    1
+    3
+}
+
+test array-column-equals-literal-through-index {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, tags text[]) STRICT;
+    INSERT INTO a VALUES (1, '{x,y}'), (2, '{z}'), (3, NULL);
+    CREATE INDEX a1 ON a(tags);
+    EXPLAIN QUERY PLAN SELECT id FROM a WHERE tags = '{z}';
+    SELECT id FROM a WHERE tags = '{z}';
+    SELECT id FROM a WHERE tags = CAST('{z}' AS text[]);
+    SELECT id FROM a WHERE tags = '{x, y}';
+}
+expect {
+    1|0|0|SEARCH a USING COVERING INDEX a1 (tags=?)
+    2
+    2
+    1
+}
+
+test integer-array-column-equals-text-literal {
+    CREATE TABLE b(id INTEGER PRIMARY KEY, n integer[]) STRICT;
+    INSERT INTO b VALUES (1, '{1,2}'), (2, '{3}');
+    SELECT id FROM b WHERE n = '{1, 2}';
+    SELECT id FROM b WHERE n = ARRAY[3];
+}
+expect {
+    1
+    2
+}
+
+test array-column-compared-with-a-non-array-errors {
+    CREATE TABLE b(id INTEGER PRIMARY KEY, n integer[]) STRICT;
+    INSERT INTO b VALUES (1, '{1,2}');
+    SELECT id FROM b WHERE n = 5;
+}
+expect error {
+    cannot store non-array value in INTEGER\[\]
+}
+
+# CAST to an array type builds the array, checking each element against the
+# element type.
+test cast-text-to-array-builds-the-array {
+    SELECT typeof(CAST('{1,2}' AS integer[])), CAST('{1,2}' AS integer[]);
+    SELECT CAST(ARRAY[1,2] AS text[]), CAST('{a, "b c"}' AS text[]);
+}
+expect {
+    blob|{1,2}
+    {1,2}|{a,"b c"}
+}
+
+test cast-to-array-rejects-a-bad-element {
+    SELECT CAST('{a}' AS integer[]);
+}
+expect error {
+    cannot store TEXT value in INTEGER
+}
+
+test cast-to-array-rejects-a-non-array {
+    SELECT CAST('x' AS integer[]);
+}
+expect error {
+    cannot store non-array value in INTEGER\[\]
+}

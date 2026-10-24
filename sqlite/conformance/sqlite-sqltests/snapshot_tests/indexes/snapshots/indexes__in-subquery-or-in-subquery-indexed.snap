@@ -16,8 +16,8 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
+|--MULTI-INDEX OR in_or_values (idx_in_or_values_a, idx_in_or_values_b)
 |--LIST SUBQUERY 1
 |  `--SCAN in_or_rhs_a
-|--LIST SUBQUERY 2
-|  `--SCAN in_or_rhs_b
-`--MULTI-INDEX OR in_or_values (idx_in_or_values_a, idx_in_or_values_b)
+`--LIST SUBQUERY 2
+   `--SCAN in_or_rhs_b

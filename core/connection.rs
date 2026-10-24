@@ -211,8 +211,8 @@ pub struct ReparseSchemaInner {
     phase: ReparsePhase,
 }
 
-/// Test-only control over correlated-subquery rewrites.
-#[cfg(feature = "simulator")]
+/// How correlated subqueries are planned. Only the simulator sets it;
+/// every other connection plans by cost.
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
 pub enum SubqueryUnnestingMode {
     /// Let the cost model choose between the correlated and rewritten plans.
@@ -900,9 +900,17 @@ impl Connection {
         self.bump_prepare_context_generation();
     }
 
-    #[cfg(feature = "simulator")]
+    /// How correlated subqueries are planned: by cost unless the simulator
+    /// forces or disables the rewrite.
     pub(crate) fn subquery_unnesting_mode(&self) -> SubqueryUnnestingMode {
-        self.subquery_unnesting_mode.get()
+        #[cfg(feature = "simulator")]
+        {
+            self.subquery_unnesting_mode.get()
+        }
+        #[cfg(not(feature = "simulator"))]
+        {
+            SubqueryUnnestingMode::Auto
+        }
     }
 
     /// check if connection executes nested program (so it must not do any "finalization" work as parent program will handle it)
@@ -1479,7 +1487,7 @@ impl Connection {
             };
             match &mut inner.phase {
                 ReparsePhase::ParseSchema { parse } => {
-                    // Resolver so attached-db qualifiers in temp triggers can be
+                    // Name lookup so attached-db qualifiers in temp triggers can be
                     // mapped to their actual index on this connection.
                     let attached_resolver = |name: &str| -> Option<usize> {
                         self.namespaces

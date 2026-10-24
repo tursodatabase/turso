@@ -1,1288 +1,12 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
-use super::{
-    collate::{get_expr_collation_ctx_with_symbols, CollationSeq},
-    compound_select::emit_program_for_compound_select,
-    emitter::{
-        delete::emit_program_for_delete, select::emit_program_for_select,
-        update::emit_program_for_update,
-    },
-    expr::{
-        bind_and_rewrite_expr, emit_stored_column, emit_table_column,
-        translate_expr_no_constant_opt, walk_expr, BindingBehavior, NoConstantOptReason,
-        WalkControl,
-    },
-    group_by::GroupByMetadata,
-    main_loop::{LeftJoinMetadata, LoopLabels, RightJoinMetadata, SemiAntiJoinMetadata},
-    order_by::SortMetadata,
-    plan::{
-        BitSet, HashJoinType, JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn,
-        TableReferences,
-    },
-    planner::{TableMask, ROWID_STRS},
-    trigger_exec::{get_triggers_including_temp, has_triggers_including_temp},
-    window::WindowMetadata,
-};
-use crate::alloc::{TryClone, TursoIteratorExt};
-use crate::instrument;
-use crate::schema::{
-    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, Index, IndexColumn, Schema,
-    Table, EXPR_INDEX_SENTINEL,
-};
-use crate::translate::fkeys::FkActionCompileStack;
-use crate::translate::plan::{Aggregate, ColumnMask};
+use crate::schema::{BTreeTable, Column, Schema};
+use crate::translate::semantic::context::SemanticContext;
 use crate::vdbe::{
-    affinity::Affinity,
-    builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
-    insn::{to_u32, ConstraintInfo, InsertFlags, Insn},
-    BranchOffset, CursorID,
+    builder::{CursorType, ProgramBuilder},
+    insn::{to_u32, InsertFlags, Insn},
 };
-use crate::{
-    error::SQLITE_CONSTRAINT_CHECK,
-    function::Func,
-    sync::Arc,
-    turso_assert_ne,
-    util::{
-        check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
-    },
-    CaptureDataChangesExt, Connection, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable,
-};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::borrow::Cow;
-use std::cell::RefCell;
-use turso_parser::ast::{
-    self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
-};
-
-pub(crate) mod delete;
-pub(crate) mod gencol;
-pub(crate) mod select;
-pub(crate) mod update;
-
-/// Initialize EXISTS subquery result registers to 0, but only for subqueries that haven't
-/// been evaluated yet (i.e., correlated subqueries that will be evaluated in the loop).
-/// Non-correlated EXISTS subqueries are evaluated before the loop and their result_reg
-/// is already properly initialized and populated by emit_non_from_clause_subquery.
-fn init_exists_result_regs(
-    program: &mut ProgramBuilder,
-    expr: &ast::Expr,
-    non_from_clause_subqueries: &[NonFromClauseSubquery],
-) {
-    let _ = walk_expr(expr, &mut |e| {
-        if let ast::Expr::SubqueryResult {
-            subquery_id,
-            query_type: SubqueryType::Exists { result_reg },
-            ..
-        } = e
-        {
-            // Only initialize if the subquery hasn't been evaluated yet.
-            // Non-correlated EXISTS subqueries are evaluated before the loop and their
-            // result_reg is already set correctly. Initializing them here would overwrite
-            // the correct result with 0.
-            let already_evaluated = non_from_clause_subqueries
-                .iter()
-                .find(|s| s.internal_id == *subquery_id)
-                .is_some_and(|s| s.has_been_evaluated());
-            if !already_evaluated {
-                program.emit_insn(Insn::Integer {
-                    value: 0,
-                    dest: *result_reg,
-                });
-            }
-        }
-        Ok(WalkControl::Continue)
-    });
-}
-
-// Would make more sense to not have RwLock for the attached databases and get all the schemas on prepare,
-// because there could be some data race where at 1 point you check the attached db, it has a table,
-// but after some write it could not be there anymore. However, leaving it as it is to avoid more complicated logic on something that is experimental
-#[derive(Debug, Clone)]
-pub struct CachedExprReg<'a> {
-    pub expr: Cow<'a, ast::Expr>,
-    pub reg: usize,
-    pub needs_decode: bool,
-    pub collation: CachedExprCollation,
-}
-
-pub type CachedExprCollation = Option<(CollationSeq, bool)>;
-pub type CachedExprRegHit = (usize, bool, CachedExprCollation);
-
-/// Whether SQLite's DQS (double-quoted strings) misfeature is enabled for DML.
-/// When `Enabled`, unresolved double-quoted identifiers fall back to string literals;
-/// when `Disabled`, they raise "no such column" errors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DoubleQuotedDml {
-    Enabled,
-    Disabled,
-}
-
-impl DoubleQuotedDml {
-    pub fn is_enabled(self) -> bool {
-        matches!(self, DoubleQuotedDml::Enabled)
-    }
-}
-
-impl From<bool> for DoubleQuotedDml {
-    fn from(value: bool) -> Self {
-        if value {
-            DoubleQuotedDml::Enabled
-        } else {
-            DoubleQuotedDml::Disabled
-        }
-    }
-}
-
-pub struct Resolver<'a> {
-    schema: &'a Schema,
-    database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
-    temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
-    attached_databases: &'a RwLock<DatabaseCatalog>,
-    namespaces: &'a crate::Namespaces,
-    non_main_schema_cache: RefCell<HashMap<usize, Arc<Schema>>>,
-    pub symbol_table: &'a SymbolTable,
-    pub expr_to_reg_cache_enabled: bool,
-    /// Cache entries for previously translated expressions.
-    /// The `needs_custom_type_decode` flag is true for hash-join payload registers
-    /// that contain raw encoded values and need DECODE applied when read.
-    pub expr_to_reg_cache: Vec<CachedExprReg<'a>>,
-    /// Maps register indices to column affinities for expression index evaluation.
-    /// Populated temporarily during UPDATE new-image expression index key computation,
-    /// where column references have been rewritten to Expr::Register and comparison
-    /// operators need the original column affinity. Analogous to SQLite's iSelfTab
-    /// mechanism, but operates as a side-channel since limbo rewrites the AST rather
-    /// than redirecting column reads at codegen time.
-    pub register_affinities: HashMap<usize, Affinity>,
-    /// Maps register indices to declared column collations, the collation
-    /// counterpart of `register_affinities`: when column references are
-    /// rewritten to Expr::Register (UPSERT DO UPDATE WHERE/SET), comparisons
-    /// must still use the column's implicit collation per SQLite's rule 2.
-    pub register_collations: HashMap<usize, CollationSeq>,
-    /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
-    /// This lets comparison affinity follow SQLite rules for expressions like
-    /// `(SELECT text_col FROM ...) > some_numeric_expr`.
-    pub(crate) subquery_affinities: RefCell<HashMap<TableInternalId, Affinity>>,
-    /// Context and metadata for resolving Expr::Column values that use
-    /// [TableInternalId::SELF_TABLE] as a placeholder.
-    self_table_scope: RefCell<Option<SelfTableScope>>,
-    /// One list per enclosing query, mirroring SQLite's NameContext chain
-    /// (resolve.c `resolveExprStep`). An aggregate whose argument columns
-    /// belong to an enclosing query is computed by that query, not by the
-    /// subquery it is written in. When a subquery resolves such an aggregate it
-    /// adds it to the enclosing query's list here (the last entry) instead of
-    /// keeping it, so the outer query never has to reach in and take it out
-    /// later. Each query adds an empty list before planning its subqueries and
-    /// removes it — folding the collected aggregates into its own aggregate
-    /// list — afterwards.
-    enclosing_query_aggregates: RefCell<Vec<Vec<Aggregate>>>,
-    pub enable_custom_types: bool,
-    /// Controls whether unresolved double-quoted identifiers fall back to string
-    /// literals (SQLite's DQS misfeature) in DML statements.
-    pub dqs_dml: DoubleQuotedDml,
-    #[cfg(feature = "simulator")]
-    subquery_unnesting_mode: crate::SubqueryUnnestingMode,
-    /// Schema dialect of the database being compiled against; used when a
-    /// fresh placeholder schema must be constructed during resolution.
-    pub(crate) dialect: Arc<dyn crate::dialect::Dialect>,
-    /// When set, we are compiling the body of a trigger or a (non-materialized)
-    /// view for this database. Ordinary triggers and views are restricted to
-    /// their own database, but temp-backed triggers follow SQLite's looser
-    /// resolution rules and may access objects across schemas. A `RefCell`
-    /// because the view-expansion caller (`parse_table` in planner.rs) only
-    /// holds a shared `&Resolver`; see `with_database_scope`.
-    pub(crate) database_scope: RefCell<Option<DatabaseScopeContext>>,
-    /// Cached flag: true when this connection has an active temp database.
-    ///
-    /// Computed once at Resolver construction to avoid repeated
-    /// `RwLock` reads on every table-name resolution. Safe because a
-    /// `Resolver` is short-lived (single translate pass) and a
-    /// connection is single-threaded at the VDBE layer: the temp
-    /// database can only be initialized / torn down *between*
-    /// Resolvers on the same connection, not during. If you add a
-    /// path that can initialize the temp database *inside* translate
-    /// (e.g. via a nested sub-program), update this field on that
-    /// path or switch to a live read.
-    has_temp_schema: bool,
-    /// Foreign-key action programs currently being compiled by this resolver.
-    ///
-    /// This is shared with forked resolvers because `translate_inner` can fork
-    /// the resolver while compiling generated foreign-key action SQL. Without
-    /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
-    /// that its own action program is already being built.
-    pub(super) fk_action_compile_stack: FkActionCompileStack,
-    /// The databases that a name without a namespace is looked up in, in
-    /// order, from the connection's search path. Temp comes before them.
-    /// The first one is where CREATE puts an object whose name has no
-    /// namespace.
-    search_order: Vec<usize>,
-}
-
-#[derive(Clone)]
-struct SelfTableScope {
-    context: SelfTableContext,
-    affinities: Option<Arc<[Affinity]>>,
-}
-
-impl SelfTableScope {
-    fn new(context: SelfTableContext) -> Self {
-        let affinities = match &context {
-            SelfTableContext::ForDML { table, .. } => {
-                Some(table.columns().iter().map(|c| c.affinity()).collect())
-            }
-            SelfTableContext::ForSelect {
-                table_ref_id,
-                referenced_tables,
-            } => referenced_tables
-                .find_table_by_internal_id(*table_ref_id)
-                .and_then(|(_, table_ref)| table_ref.btree())
-                .map(|btree| btree.columns().iter().map(|c| c.affinity()).collect()),
-        };
-
-        Self {
-            context,
-            affinities,
-        }
-    }
-
-    fn affinity(&self, column: usize) -> Option<Affinity> {
-        self.affinities
-            .as_ref()
-            .and_then(|affinities| affinities.get(column).copied())
-    }
-
-    fn column_type_str(&self, column: usize) -> Option<String> {
-        match &self.context {
-            SelfTableContext::ForDML { table, .. } => {
-                table.columns().get(column).map(|c| c.ty_str.clone())
-            }
-            SelfTableContext::ForSelect {
-                table_ref_id,
-                referenced_tables,
-            } => referenced_tables
-                .find_table_by_internal_id(*table_ref_id)
-                .and_then(|(_, table_ref)| table_ref.columns().get(column))
-                .map(|c| c.ty_str.clone()),
-        }
-    }
-}
-
-/// Context for restricting table resolution while compiling the body of a
-/// database object (a trigger or a view). Mirrors SQLite's view/trigger
-/// schema fixer (`sqlite3FixSelect`/`DbFixer` in `src/fix.c`): unqualified
-/// table names inside the object's body resolve within the database the
-/// object itself lives in, not through the normal temp-first search.
-#[derive(Debug, Clone)]
-pub(crate) struct DatabaseScopeContext {
-    /// The database ID the object belongs to.
-    database_id: usize,
-    /// "trigger" or "view" (for error messages).
-    kind: &'static str,
-    /// The object's own name (for error messages).
-    object_name: String,
-}
-
-impl DatabaseScopeContext {
-    fn restricts_db_references(&self) -> bool {
-        self.database_id != crate::TEMP_DB_ID
-    }
-}
-
-impl<'a> Resolver<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        schema: &'a Schema,
-        database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
-        temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
-        attached_databases: &'a RwLock<DatabaseCatalog>,
-        namespaces: &'a crate::Namespaces,
-        symbol_table: &'a SymbolTable,
-        enable_custom_types: bool,
-        dqs_dml: DoubleQuotedDml,
-        dialect: Arc<dyn crate::dialect::Dialect>,
-        search_path: Option<&[String]>,
-    ) -> Self {
-        let has_temp_schema = temp_database.read().is_some();
-        Self {
-            schema,
-            database_schemas,
-            temp_database,
-            attached_databases,
-            namespaces,
-            non_main_schema_cache: RefCell::new(HashMap::default()),
-            symbol_table,
-            expr_to_reg_cache_enabled: false,
-            expr_to_reg_cache: Vec::new(),
-            register_affinities: HashMap::default(),
-            register_collations: HashMap::default(),
-            subquery_affinities: RefCell::new(HashMap::default()),
-            self_table_scope: RefCell::new(None),
-            enclosing_query_aggregates: RefCell::new(Vec::new()),
-            enable_custom_types,
-            dqs_dml,
-            #[cfg(feature = "simulator")]
-            subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
-            dialect,
-            database_scope: RefCell::new(None),
-            has_temp_schema,
-            fk_action_compile_stack: FkActionCompileStack::default(),
-            search_order: namespaces.search_order(search_path),
-        }
-    }
-
-    pub fn schema(&self) -> &Schema {
-        self.schema
-    }
-
-    #[cfg(feature = "simulator")]
-    pub(crate) fn set_subquery_unnesting_mode(&mut self, mode: crate::SubqueryUnnestingMode) {
-        self.subquery_unnesting_mode = mode;
-    }
-
-    #[cfg(feature = "simulator")]
-    pub(crate) fn subquery_unnesting_mode(&self) -> crate::SubqueryUnnestingMode {
-        self.subquery_unnesting_mode
-    }
-
-    pub fn has_temp_database(&self) -> bool {
-        self.has_temp_schema
-    }
-
-    pub fn fork(&self) -> Resolver<'a> {
-        Resolver {
-            schema: self.schema,
-            database_schemas: self.database_schemas,
-            temp_database: self.temp_database,
-            attached_databases: self.attached_databases,
-            namespaces: self.namespaces,
-            non_main_schema_cache: RefCell::new(HashMap::default()),
-            symbol_table: self.symbol_table,
-            expr_to_reg_cache_enabled: false,
-            expr_to_reg_cache: Vec::new(),
-            register_affinities: HashMap::default(),
-            register_collations: HashMap::default(),
-            subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
-            self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
-            enclosing_query_aggregates: RefCell::new(Vec::new()),
-            enable_custom_types: self.enable_custom_types,
-            dqs_dml: self.dqs_dml,
-            #[cfg(feature = "simulator")]
-            subquery_unnesting_mode: self.subquery_unnesting_mode,
-            dialect: self.dialect.clone(),
-            database_scope: RefCell::new(self.database_scope.borrow().clone()),
-            has_temp_schema: self.has_temp_schema,
-            fk_action_compile_stack: self.fk_action_compile_stack.clone(),
-            search_order: self.search_order.clone(),
-        }
-    }
-
-    pub fn fork_with_expr_cache(&self) -> Resolver<'a> {
-        Resolver {
-            schema: self.schema,
-            database_schemas: self.database_schemas,
-            temp_database: self.temp_database,
-            attached_databases: self.attached_databases,
-            namespaces: self.namespaces,
-            non_main_schema_cache: RefCell::new(HashMap::default()),
-            symbol_table: self.symbol_table,
-            expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
-            expr_to_reg_cache: self.expr_to_reg_cache.clone(),
-            register_affinities: self.register_affinities.clone(),
-            register_collations: self.register_collations.clone(),
-            subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
-            self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
-            enclosing_query_aggregates: RefCell::new(Vec::new()),
-            enable_custom_types: self.enable_custom_types,
-            dqs_dml: self.dqs_dml,
-            #[cfg(feature = "simulator")]
-            subquery_unnesting_mode: self.subquery_unnesting_mode,
-            dialect: self.dialect.clone(),
-            database_scope: RefCell::new(self.database_scope.borrow().clone()),
-            has_temp_schema: self.has_temp_schema,
-            fk_action_compile_stack: self.fk_action_compile_stack.clone(),
-            search_order: self.search_order.clone(),
-        }
-    }
-
-    pub fn require_custom_types(&self, feature: &str) -> crate::Result<()> {
-        if !self.enable_custom_types {
-            crate::bail_parse_error!("{} require --experimental-custom-types flag", feature);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn with_self_table_context<T>(
-        &self,
-        program: &mut ProgramBuilder,
-        ctx: Option<&SelfTableContext>,
-        f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> Result<T>,
-    ) -> Result<T> {
-        match ctx {
-            Some(ctx) => {
-                let scope = SelfTableScope::new(ctx.clone());
-                let prev = self.self_table_scope.borrow_mut().replace(scope);
-                let result = f(program, Some(ctx));
-                *self.self_table_scope.borrow_mut() = prev;
-                result
-            }
-            None => f(program, None),
-        }
-    }
-
-    pub(crate) fn with_existing_self_table_context<T>(
-        &self,
-        f: impl FnOnce(Option<&SelfTableContext>) -> Result<T>,
-    ) -> Result<T> {
-        let ctx = self
-            .self_table_scope
-            .borrow()
-            .as_ref()
-            .map(|scope| scope.context.clone());
-        f(ctx.as_ref())
-    }
-
-    pub(crate) fn self_table_affinity(&self, column: usize) -> Option<Affinity> {
-        self.self_table_scope
-            .borrow()
-            .as_ref()
-            .and_then(|scope| scope.affinity(column))
-    }
-
-    pub(crate) fn self_table_collation(&self, column: Option<usize>) -> Option<CollationSeq> {
-        let scope = self.self_table_scope.borrow();
-        let context = &scope.as_ref()?.context;
-        let table = match context {
-            SelfTableContext::ForDML { table, .. } => Arc::clone(table),
-            SelfTableContext::ForSelect {
-                table_ref_id,
-                referenced_tables,
-            } => referenced_tables
-                .find_table_by_internal_id(*table_ref_id)?
-                .1
-                .btree()?,
-        };
-        match column {
-            Some(column) => table.columns().get(column)?.collation_opt(),
-            None => table.get_rowid_alias_column()?.1.collation_opt(),
-        }
-    }
-
-    pub(crate) fn self_table_with_custom_type_operators(&self) -> Option<Arc<BTreeTable>> {
-        match &self.self_table_scope.borrow().as_ref()?.context {
-            SelfTableContext::ForDML {
-                table,
-                uses_custom_type_operators: true,
-                ..
-            } => Some(Arc::clone(table)),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn self_table_column_type_str(&self, column: usize) -> Option<String> {
-        self.self_table_scope
-            .borrow()
-            .as_ref()
-            .and_then(|scope| scope.column_type_str(column))
-    }
-
-    fn cached_non_main_schema(&self, database_id: usize) -> Arc<Schema> {
-        turso_assert_ne!(database_id, crate::MAIN_DB_ID);
-
-        if let Some(schema) = self
-            .non_main_schema_cache
-            .borrow()
-            .get(&database_id)
-            .cloned()
-        {
-            return schema;
-        }
-
-        // TEMP uses `temp_db.db.schema` as its single source of truth; skip
-        // `database_schemas` which is never populated for TEMP.
-        if database_id != crate::TEMP_DB_ID {
-            if let Some(schema) = self.database_schemas.read().get(&database_id).cloned() {
-                self.non_main_schema_cache
-                    .borrow_mut()
-                    .insert(database_id, schema.clone());
-                return schema;
-            }
-        }
-
-        let loaded_schema = match database_id {
-            crate::TEMP_DB_ID => self
-                .temp_database
-                .read()
-                .as_ref()
-                .map(|temp_db| temp_db.db.schema.lock().clone())
-                .unwrap_or_else(|| {
-                    // with_options only fails if built-in type SQL is malformed (programmer bug).
-                    let mut schema =
-                        Schema::with_options(self.enable_custom_types, self.dialect.as_ref())
-                            .expect("built-in type definitions are malformed");
-                    schema.copy_table_valued_functions(self.schema);
-                    Arc::new(schema)
-                }),
-            _ => {
-                let attached_dbs = self.attached_databases.read();
-                let entry = attached_dbs
-                    .index_to_data
-                    .get(&database_id)
-                    .expect("Database ID should be valid after resolve_database_id");
-                let schema = entry.db.schema.lock().clone();
-                schema
-            }
-        };
-
-        self.non_main_schema_cache
-            .borrow_mut()
-            .insert(database_id, loaded_schema.clone());
-        loaded_schema
-    }
-
-    /// Run `f` with table resolution restricted to `database_id`, restoring
-    /// whatever scope was active before once `f` returns (including on an
-    /// early `Err` return). Callers that only hold a shared `&Resolver` use
-    /// this directly (e.g. a view's body is planned as a FROM-clause
-    /// subquery with only `&Resolver` in hand); `f` needs no access to
-    /// `self` because it can simply capture a copy of the shared reference.
-    ///
-    /// For trigger subprogram compilation, which must re-borrow the
-    /// `Resolver` mutably on every statement it compiles, see
-    /// `with_database_scope_mut` instead — a guard holding a live borrow of
-    /// `self` across that loop would conflict with those reborrows.
-    pub(crate) fn with_database_scope<T>(
-        &self,
-        database_id: usize,
-        kind: &'static str,
-        object_name: String,
-        f: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
-        let previous = self
-            .database_scope
-            .borrow_mut()
-            .replace(DatabaseScopeContext {
-                database_id,
-                kind,
-                object_name,
-            });
-        let result = f();
-        *self.database_scope.borrow_mut() = previous;
-        result
-    }
-
-    /// Like `with_database_scope`, but for callers that hold `&mut Resolver`
-    /// and need to pass it on mutably to `f` (trigger subprogram compilation
-    /// calls `translate_inner`, which takes `&mut Resolver`, once per trigger
-    /// command). `f` receives the same `&mut Resolver` back so it can keep
-    /// reborrowing it, instead of capturing it from the environment, which
-    /// would fight the mutable borrow this method itself takes.
-    pub(crate) fn with_database_scope_mut<T>(
-        &mut self,
-        database_id: usize,
-        kind: &'static str,
-        object_name: String,
-        f: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        let previous = self
-            .database_scope
-            .borrow_mut()
-            .replace(DatabaseScopeContext {
-                database_id,
-                kind,
-                object_name,
-            });
-        let result = f(self);
-        *self.database_scope.borrow_mut() = previous;
-        result
-    }
-
-    /// Restrict table resolution to the trigger's own database while `f` runs.
-    pub(crate) fn with_trigger_scope<T>(
-        &mut self,
-        database_id: usize,
-        trigger_name: String,
-        f: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        self.with_database_scope_mut(database_id, "trigger", trigger_name, f)
-    }
-
-    /// Restrict table resolution to the view's own database while `f` runs,
-    /// the same way `with_trigger_scope` does for triggers: a persistent
-    /// view's unqualified table names resolve within the database the view
-    /// lives in, never through a TEMP table that happens to share a source
-    /// table's name, matching SQLite's view schema fixer.
-    pub(crate) fn with_view_scope<T>(
-        &self,
-        database_id: usize,
-        view_name: String,
-        f: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
-        self.with_database_scope(database_id, "view", view_name, f)
-    }
-
-    pub fn resolve_function(
-        &self,
-        func_name: &str,
-        arg_count: usize,
-    ) -> Result<Option<Func>, LimboError> {
-        // The dialect owns the function name surface of user SQL; extension
-        // functions resolve after it.
-        match self.dialect.resolve_function(func_name, arg_count)? {
-            Some(func) => Ok(Some(func)),
-            None => Ok(self
-                .symbol_table
-                .resolve_function(func_name, arg_count)
-                .map(Func::External)),
-        }
-    }
-
-    pub(crate) fn enable_expr_to_reg_cache(&mut self) {
-        self.expr_to_reg_cache_enabled = true;
-    }
-
-    /// Start collecting aggregates that this query's subqueries find to belong
-    /// to this query, before planning those subqueries.
-    /// [`Self::take_aggregates_from_subqueries`] retrieves them afterwards.
-    pub(crate) fn begin_collecting_aggregates_from_subqueries(&self) {
-        self.enclosing_query_aggregates
-            .borrow_mut()
-            .push(Vec::new());
-    }
-
-    /// Stop collecting and return the aggregates this query's subqueries moved
-    /// up to it.
-    pub(crate) fn take_aggregates_from_subqueries(&self) -> Vec<Aggregate> {
-        self.enclosing_query_aggregates
-            .borrow_mut()
-            .pop()
-            .unwrap_or_default()
-    }
-
-    /// Number of aggregates moved up so far to the innermost collecting query.
-    pub(crate) fn count_aggregates_moved_from_subqueries(&self) -> usize {
-        self.enclosing_query_aggregates
-            .borrow()
-            .last()
-            .map_or(0, Vec::len)
-    }
-
-    /// The function name of the aggregate at `index` among those moved up to
-    /// the innermost collecting query, if there is one.
-    pub(crate) fn aggregate_moved_from_subqueries(&self, index: usize) -> Option<String> {
-        self.enclosing_query_aggregates
-            .borrow()
-            .last()
-            .and_then(|collected| collected.get(index))
-            .map(|agg| agg.func.to_string())
-    }
-
-    /// Move an aggregate up to the innermost enclosing query that is
-    /// collecting. Returns false when there is none — the aggregate then stays
-    /// with the query that resolved it.
-    pub(crate) fn move_aggregate_to_enclosing_query(&self, agg: Aggregate) -> bool {
-        match self.enclosing_query_aggregates.borrow_mut().last_mut() {
-            Some(collected) => {
-                collected.push(agg);
-                true
-            }
-            None => false,
-        }
-    }
-
-    pub fn cache_expr_reg(
-        &mut self,
-        expr: Cow<'a, ast::Expr>,
-        reg: usize,
-        needs_decode: bool,
-        collation: CachedExprCollation,
-    ) {
-        self.expr_to_reg_cache.push(CachedExprReg {
-            expr,
-            reg,
-            needs_decode,
-            collation,
-        });
-    }
-
-    /// Cache a scalar expression result together with the collation metadata that
-    /// standalone expression translation would have propagated to a parent comparison.
-    pub fn cache_scalar_expr_reg(
-        &mut self,
-        expr: Cow<'a, ast::Expr>,
-        reg: usize,
-        needs_decode: bool,
-        referenced_tables: &TableReferences,
-    ) -> Result<()> {
-        let collation = get_expr_collation_ctx_with_symbols(
-            expr.as_ref(),
-            referenced_tables,
-            Some(self.symbol_table),
-        )?;
-        self.cache_expr_reg(expr, reg, needs_decode, collation);
-        Ok(())
-    }
-
-    pub fn resolve_collation(&self, name: &str) -> Result<CollationSeq> {
-        if let Some(collation) = self.symbol_table.resolve_collation(name) {
-            return Ok(collation);
-        }
-        CollationSeq::new(name)
-    }
-
-    /// Returns the register, decode flag, and collation metadata for a previously translated expression.
-    ///
-    /// We scan from newest to oldest so later translations win when equivalent
-    /// expressions are seen multiple times in the same translation pass.
-    /// Returns `(register, needs_custom_type_decode, collation_ctx)`.
-    pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<CachedExprRegHit> {
-        if self.expr_to_reg_cache_enabled {
-            self.expr_to_reg_cache
-                .iter()
-                .rev()
-                .find(|entry| exprs_are_equivalent(expr, &entry.expr))
-                .map(|entry| (entry.reg, entry.needs_decode, entry.collation))
-        } else {
-            None
-        }
-    }
-
-    /// Access schema for a database using a closure pattern to avoid cloning
-    pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
-        match database_id {
-            crate::MAIN_DB_ID => f(self.schema),
-            _ => {
-                let schema = self.cached_non_main_schema(database_id);
-                f(&schema)
-            }
-        }
-    }
-
-    pub(crate) fn attached_database_ids_in_search_order(&self) -> Result<BitSet> {
-        Ok(self
-            .attached_databases
-            .read()
-            .index_to_data
-            .keys()
-            .copied()
-            .try_collect()?)
-    }
-
-    pub(crate) fn resolve_unqualified_existing_database_id<F>(
-        &self,
-        object_name: &str,
-        schema_contains_object: F,
-    ) -> Result<usize>
-    where
-        F: Fn(&Schema, &str) -> bool,
-    {
-        self.find_unqualified_existing_database_id(object_name, schema_contains_object)
-            .ok_or_else(|| LimboError::ParseError(format!("no such object: {object_name}")))
-    }
-
-    /// The database of an object named without a namespace: temp when it
-    /// has the object, else the first database of the search order that
-    /// has it. When none has it, the first database of the search order,
-    /// where the caller reports the object missing or does nothing for IF
-    /// EXISTS. None only when the search order is empty.
-    fn find_unqualified_existing_database_id<F>(
-        &self,
-        object_name: &str,
-        schema_contains_object: F,
-    ) -> Option<usize>
-    where
-        F: Fn(&Schema, &str) -> bool,
-    {
-        // Only check the temp schema when a temp database actually exists.
-        // This avoids expensive schema construction/lookup on every table
-        // resolution when no temp objects have been created.
-        if self.has_temp_schema
-            && self.with_schema(crate::TEMP_DB_ID, |schema| {
-                schema_contains_object(schema, object_name)
-            })
-        {
-            return Some(crate::TEMP_DB_ID);
-        }
-
-        self.search_order
-            .iter()
-            .copied()
-            .find(|&database_id| {
-                self.with_schema(database_id, |schema| {
-                    schema_contains_object(schema, object_name)
-                })
-            })
-            .or_else(|| self.search_order.first().copied())
-    }
-
-    fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
-        schema.get_table(table_name).is_some()
-            || schema.get_view(table_name).is_some()
-            || schema.get_materialized_view(table_name).is_some()
-    }
-
-    fn schema_has_index(schema: &Schema, index_name: &str) -> bool {
-        schema
-            .indexes
-            .values()
-            .flat_map(|indexes| indexes.iter())
-            .any(|index| index.name.eq_ignore_ascii_case(index_name))
-    }
-
-    fn schema_has_trigger(schema: &Schema, trigger_name: &str) -> bool {
-        schema.get_trigger(trigger_name).is_some()
-    }
-
-    fn resolve_schema_table_database_id(table_name: &str) -> Option<usize> {
-        if table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME)
-            || table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT)
-        {
-            return Some(crate::TEMP_DB_ID);
-        }
-
-        if table_name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME)
-            || table_name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME_ALT)
-        {
-            return Some(crate::MAIN_DB_ID);
-        }
-
-        None
-    }
-
-    pub(crate) fn resolve_existing_table_database_id_qualified(
-        &self,
-        qualified_name: &ast::QualifiedName,
-    ) -> Result<usize> {
-        self.find_existing_table_database_id_qualified(qualified_name)?
-            .ok_or_else(|| {
-                LimboError::ParseError(format!("no such object: {}", qualified_name.name.as_str()))
-            })
-    }
-
-    pub(crate) fn resolve_existing_table_database_id(&self, table_name: &str) -> Result<usize> {
-        self.find_existing_table_database_id(table_name)
-            .ok_or_else(|| LimboError::ParseError(format!("no such object: {table_name}")))
-    }
-
-    pub(crate) fn find_existing_table_database_id_qualified(
-        &self,
-        qualified_name: &ast::QualifiedName,
-    ) -> Result<Option<usize>> {
-        if qualified_name.namespace.is_some() {
-            return self.resolve_database_id(qualified_name).map(Some);
-        }
-        Ok(self.find_existing_table_database_id(qualified_name.name.as_str()))
-    }
-
-    fn find_existing_table_database_id(&self, table_name: &str) -> Option<usize> {
-        // A TEMP view or trigger carries a scope (so explicit `aux.table`
-        // references still see its own database below), but the scope does
-        // not restrict unqualified names: SQLite's schema fixer skips TEMP
-        // objects entirely (`bTemp` in sqlite3FixInit, attach.c:547, checked
-        // by fixSelectCb at attach.c:495), so a TEMP view resolves names the
-        // same way a top-level query does, sqlite_schema included.
-        if let Some(ctx) = self.database_scope.borrow().as_ref() {
-            if ctx.restricts_db_references() {
-                return Some(ctx.database_id);
-            }
-        }
-
-        if let Some(database_id) = Self::resolve_schema_table_database_id(table_name) {
-            return Some(database_id);
-        }
-
-        self.find_unqualified_existing_database_id(table_name, Self::schema_has_table_like_object)
-    }
-
-    pub(crate) fn resolve_existing_index_database_id(
-        &self,
-        qualified_name: &ast::QualifiedName,
-    ) -> Result<usize> {
-        self.find_existing_index_database_id(qualified_name)?
-            .ok_or_else(|| {
-                LimboError::ParseError(format!(
-                    "no such object: {}",
-                    normalize_ident(qualified_name.name.as_str())
-                ))
-            })
-    }
-
-    pub(crate) fn find_existing_index_database_id(
-        &self,
-        qualified_name: &ast::QualifiedName,
-    ) -> Result<Option<usize>> {
-        if qualified_name.namespace.is_some() {
-            return self.resolve_database_id(qualified_name).map(Some);
-        }
-
-        let index_name = normalize_ident(qualified_name.name.as_str());
-        Ok(self.find_unqualified_existing_database_id(&index_name, Self::schema_has_index))
-    }
-
-    pub(crate) fn resolve_existing_trigger_database_id(
-        &self,
-        qualified_name: &ast::QualifiedName,
-    ) -> Result<usize> {
-        if qualified_name.namespace.is_some() {
-            return self.resolve_database_id(qualified_name);
-        }
-
-        let trigger_name = qualified_name.name.as_str();
-        self.resolve_unqualified_existing_database_id(trigger_name, Self::schema_has_trigger)
-    }
-
-    /// The database of a sequence named without a namespace: the first
-    /// database of the search order that has it, or the first database of
-    /// the search order when none has it.
-    pub(crate) fn resolve_existing_sequence_database_id(&self, seq_name: &str) -> Result<usize> {
-        self.find_existing_sequence_database_id(seq_name)
-            .ok_or_else(|| LimboError::ParseError(format!("no such object: {seq_name}")))
-    }
-
-    pub(crate) fn find_existing_sequence_database_id(&self, seq_name: &str) -> Option<usize> {
-        self.find_unqualified_existing_database_id(seq_name, |schema, seq_name| {
-            schema.get_sequence(seq_name).is_some()
-        })
-    }
-
-    /// `seq_name` qualified with the database it resolved to, for the
-    /// opcodes that look a sequence up again by its name when the statement
-    /// runs.
-    pub(crate) fn runtime_sequence_name(&self, database_id: usize, seq_name: &str) -> String {
-        let database_name = self
-            .namespace_name(database_id)
-            .expect("the database of a sequence has a name");
-        format!("{database_name}.{seq_name}")
-    }
-
-    /// Resolve database ID from a qualified name
-    pub(crate) fn resolve_database_id(&self, qualified_name: &ast::QualifiedName) -> Result<usize> {
-        // Check if this is a qualified name (database.table) or unqualified
-        let resolved_id = if let Some(db_name) = &qualified_name.namespace {
-            let db_name_normalized = normalize_ident(db_name.as_str());
-            self.namespace_database_id(&db_name_normalized)
-                .ok_or_else(|| {
-                    LimboError::InvalidArgument(format!("no such database: {db_name_normalized}"))
-                })
-        } else {
-            // Unqualified table name — when compiling the body of a trigger
-            // or a view, resolve to that object's own database (matching
-            // SQLite behavior). Otherwise default to main.
-            if let Some(ctx) = self.database_scope.borrow().as_ref() {
-                if ctx.restricts_db_references() {
-                    Ok(ctx.database_id)
-                } else {
-                    Ok(crate::MAIN_DB_ID)
-                }
-            } else {
-                Ok(0)
-            }
-        }?;
-
-        // A trigger or view can only reference tables in its own database.
-        // This only fires for explicitly qualified names (e.g. "aux.table")
-        // since unqualified names already resolve to the object's own
-        // database above.
-        if let Some(ctx) = self.database_scope.borrow().as_ref() {
-            if !ctx.restricts_db_references() {
-                return Ok(resolved_id);
-            }
-            if resolved_id != ctx.database_id {
-                let db_name = qualified_name
-                    .namespace
-                    .as_ref()
-                    .map(|n| n.as_str())
-                    .unwrap_or("main");
-                return Err(LimboError::ParseError(format!(
-                    "{} {} cannot reference objects in database {}",
-                    ctx.kind, ctx.object_name, db_name
-                )));
-            }
-        }
-
-        Ok(resolved_id)
-    }
-
-    /// Resolve the database that CREATE puts an object named `qualified_name`
-    /// in.
-    pub(crate) fn resolve_database_id_for_create(
-        &self,
-        qualified_name: &ast::QualifiedName,
-    ) -> Result<usize> {
-        if qualified_name.namespace.is_some() {
-            return self.resolve_database_id(qualified_name);
-        }
-        self.search_order.first().copied().ok_or_else(|| {
-            LimboError::ParseError("no schema has been selected to create in".to_string())
-        })
-    }
-
-    /// The database that namespace `name` refers to. `name` is normalized.
-    pub(crate) fn namespace_database_id(&self, name: &str) -> Option<usize> {
-        self.namespaces.database_id(name)
-    }
-
-    /// Get the database name for a given database index.
-    /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
-    pub(crate) fn namespace_name(&self, index: usize) -> Option<String> {
-        self.namespaces.name(index)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct LimitCtx {
-    /// Register holding the LIMIT value (e.g. LIMIT 5)
-    pub reg_limit: usize,
-    /// Whether to initialize the LIMIT counter to the LIMIT value;
-    /// There are cases like compound SELECTs where all the sub-selects
-    /// utilize the same limit register, but it is initialized only once.
-    pub initialize_counter: bool,
-}
-
-/// Identifies a value stored in a materialized hash-build input.
-///
-/// These references are used to map payload registers back to the original
-/// table expressions during hash-probe evaluation. They are deliberately
-/// table-qualified so payloads can span multiple tables when the build input
-/// is derived from a join prefix.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum MaterializedColumnRef {
-    /// A concrete column from a specific table, including rowid alias metadata.
-    Column {
-        table_id: TableInternalId,
-        column_idx: usize,
-        is_rowid_alias: bool,
-    },
-    /// The implicit rowid (or integer primary key) of a specific table.
-    RowId { table_id: TableInternalId },
-}
-
-/// Describes how a hash-join build input was materialized.
-///
-/// Rowid-only materialization preserves prior join constraints while keeping
-/// the hash table payload small, but requires `SeekRowid` into the build table
-/// during probing. Key+payload materialization stores the join keys and needed
-/// payload columns directly so the hash build can operate without seeking.
-#[derive(Debug, Clone)]
-pub enum MaterializedBuildInputMode {
-    /// Ephemeral table contains only build-side rowids.
-    RowidOnly,
-    /// Ephemeral table contains join keys followed by payload columns.
-    KeyPayload {
-        /// Number of join keys stored at the start of each row.
-        num_keys: usize,
-        /// Payload columns (after the keys) in ephemeral-table order.
-        payload_columns: Vec<MaterializedColumnRef>,
-    },
-}
-
-/// Metadata for a materialized build input keyed by build table index.
-///
-/// The cursor refers to the ephemeral table containing the materialized rows.
-/// `prefix_tables` tracks which join-prefix tables were captured so we can
-/// prune redundant scans from downstream join orders.
-#[derive(Debug, Clone)]
-pub struct MaterializedBuildInput {
-    /// Cursor id for the ephemeral table holding the materialized rows.
-    pub cursor_id: CursorID,
-    /// Encoding mode for the materialized rows.
-    pub mode: MaterializedBuildInputMode,
-    /// Join-prefix table indices folded into this materialization.
-    pub prefix_tables: TableMask,
-}
-
-impl MaterializedBuildInput {
-    pub(crate) fn requires_build_table(&self) -> bool {
-        matches!(self.mode, MaterializedBuildInputMode::RowidOnly)
-    }
-}
-
-impl LimitCtx {
-    pub fn new(program: &mut ProgramBuilder) -> Self {
-        Self {
-            reg_limit: program.alloc_register(),
-            initialize_counter: true,
-        }
-    }
-
-    pub fn new_shared(reg_limit: usize) -> Self {
-        Self {
-            reg_limit,
-            initialize_counter: false,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct HashLabels {
-    /// Label for hash join match processing (points to just after HashProbe instruction)
-    /// Used by HashNext to jump back to process additional matches without re-probing
-    pub match_found: BranchOffset,
-    /// Label for advancing to the next hash match (points to HashNext instruction).
-    /// When conditions fail within a hash join, they should jump here to try the next
-    /// hash match, rather than jumping to the outer loop's next label.
-    pub next: BranchOffset,
-    /// Jump target for unmatched probe rows (outer joins only).
-    pub check_outer: Option<BranchOffset>,
-    /// Entry label for the inner-loop subroutine.
-    pub inner_loop_gosub: Option<BranchOffset>,
-    /// Return label for the inner-loop subroutine.
-    pub inner_loop_return: Option<BranchOffset>,
-    /// Label that skips past the subroutine body (resolved after Return).
-    pub inner_loop_skip: Option<BranchOffset>,
-    /// Label for the grace loop's own HashNext (resolved during grace loop emission).
-    pub grace_hash_next: Option<BranchOffset>,
-}
-
-impl HashLabels {
-    pub fn new(match_found: BranchOffset, next: BranchOffset) -> Self {
-        Self {
-            match_found,
-            next,
-            check_outer: None,
-            inner_loop_gosub: None,
-            inner_loop_return: None,
-            inner_loop_skip: None,
-            grace_hash_next: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct HashCtx {
-    pub match_reg: usize,
-    pub hash_table_reg: usize,
-    pub labels: HashLabels,
-    /// Starting register where payload columns are stored after HashProbe/HashNext.
-    /// None if payload optimization is not used for this hash join.
-    pub payload_start_reg: Option<usize>,
-    /// Column references stored in payload, in order.
-    /// `payload_start_reg + i` contains the value for `payload_columns[i]`.
-    /// These references may point at multiple tables when a build input was
-    /// materialized from a join prefix.
-    pub payload_columns: Vec<MaterializedColumnRef>,
-    pub build_table_cursor_id: Option<CursorID>,
-    pub join_type: HashJoinType,
-    /// Gosub register for the inner-loop subroutine wrapping subsequent tables.
-    /// Outer hash joins wrap inner loops so unmatched-row paths can re-enter via Gosub.
-    pub inner_loop_gosub_reg: Option<usize>,
-    /// Probe-side rowid register for grace hash join (from RowId before HashProbe).
-    pub probe_rowid_reg: Option<usize>,
-    /// Starting register for probe key values.
-    pub key_start_reg: usize,
-    /// Number of join keys.
-    pub num_keys: usize,
-    /// Register: 0 during main probe loop, 1 during grace loop.
-    /// Used by IfPos dispatch before HashNext to route to the grace loop's HashNext.
-    pub grace_flag_reg: Option<usize>,
-}
-
-/// The TranslateCtx struct holds various information and labels used during bytecode generation.
-/// It is used for maintaining state and control flow during the bytecode
-/// generation process.
-pub struct TranslateCtx<'a> {
-    // A typical query plan is a nested loop. Each loop has its own LoopLabels (see the definition of LoopLabels for more details)
-    pub labels_main_loop: Vec<LoopLabels>,
-    // label for the instruction that jumps to the next phase of the query after the main loop
-    // we don't know ahead of time what that is (GROUP BY, ORDER BY, etc.)
-    pub label_main_loop_end: Option<BranchOffset>,
-    // First register of the aggregation results
-    pub reg_agg_start: Option<usize>,
-    // In non-group-by statements with aggregations (e.g. SELECT foo, bar, sum(baz) FROM t),
-    // we want to emit the non-aggregate columns (foo and bar) only once.
-    // This register is a flag that tracks whether we have already done that.
-    pub reg_nonagg_emit_once_flag: Option<usize>,
-    // First register of the result columns of the query
-    pub reg_result_cols_start: Option<usize>,
-    pub limit_ctx: Option<LimitCtx>,
-    // The register holding the offset value, if any.
-    pub reg_offset: Option<usize>,
-    // The register holding the limit+offset value, if any.
-    pub reg_limit_offset_sum: Option<usize>,
-    // metadata for the group by operator
-    pub meta_group_by: Option<GroupByMetadata>,
-    // metadata for the order by operator
-    pub meta_sort: Option<SortMetadata>,
-    /// Match state for each JOIN that keeps unmatched left rows.
-    ///
-    /// Left-row and right-row match state are separate because a FULL JOIN needs both.
-    /// This matches SQLite's `WhereLevel.iLeftJoin` and `WhereLevel.pRJ` fields.
-    pub meta_left_joins: Vec<Option<LeftJoinMetadata>>,
-    /// Match state for each JOIN that keeps unmatched right rows.
-    pub meta_right_joins: Vec<Option<RightJoinMetadata>>,
-    /// mapping between table loop index and associated metadata (for semi/anti joins)
-    pub meta_semi_anti_joins: Vec<Option<SemiAntiJoinMetadata>>,
-    pub resolver: Resolver<'a>,
-    /// Hash table contexts for hash joins, keyed by build table index.
-    pub hash_table_contexts: HashMap<usize, HashCtx>,
-    /// Materialized build inputs for hash joins, keyed by build table index.
-    /// These entries are reused during nested materialization so we avoid
-    /// re-scanning prefix tables and preserve prior join constraints.
-    pub materialized_build_inputs: HashMap<usize, MaterializedBuildInput>,
-    /// A list of expressions that are not aggregates, along with a flag indicating
-    /// whether the expression should be included in the output for each group.
-    ///
-    /// Each entry is a tuple:
-    /// - `&'ast Expr`: the expression itself
-    /// - `bool`: `true` if the expression should be included in the output for each group, `false` otherwise.
-    ///
-    /// The order of expressions is **significant**:
-    /// - First: all `GROUP BY` expressions, in the order they appear in the `GROUP BY` clause.
-    /// - Then: remaining non-aggregate expressions that are not part of `GROUP BY`.
-    pub non_aggregate_expressions: Vec<(&'a Expr, bool)>,
-    /// Unique leaf column expressions extracted from aggregate function arguments.
-    /// Only populated when GROUP BY uses a sorter, enabling deferred expression
-    /// evaluation: the sorter stores raw columns instead of pre-computed expressions,
-    /// and full expressions are re-evaluated from the pseudo cursor during aggregation.
-    /// An expression that the selected index stores is kept whole.
-    pub agg_leaf_columns: Vec<Expr>,
-    /// Cursor id for cdc table (if capture_data_changes PRAGMA is set and query can modify the data)
-    pub cdc_cursor_id: Option<usize>,
-    pub meta_window: Option<WindowMetadata<'a>>,
-    /// Metadata stored during `open_loop` for `Search::InSeek`, consumed by `close_loop`.
-    pub meta_in_seeks: Vec<Option<InSeekMetadata>>,
-    pub unsafe_testing: bool,
-}
-
-/// Metadata for the two-level loop emitted by `Search::InSeek`.
-#[derive(Debug)]
-pub struct InSeekMetadata {
-    pub ephemeral_cursor_id: CursorID,
-    pub outer_loop_start: BranchOffset,
-    pub next_val_label: BranchOffset,
-}
-
-impl<'a> TranslateCtx<'a> {
-    pub fn new(
-        program: &mut ProgramBuilder,
-        resolver: Resolver<'a>,
-        table_count: usize,
-        unsafe_testing: bool,
-    ) -> Self {
-        TranslateCtx {
-            labels_main_loop: (0..table_count).map(|_| LoopLabels::new(program)).collect(),
-            label_main_loop_end: None,
-            reg_agg_start: None,
-            reg_nonagg_emit_once_flag: None,
-            limit_ctx: None,
-            reg_offset: None,
-            reg_limit_offset_sum: None,
-            reg_result_cols_start: None,
-            meta_group_by: None,
-            meta_left_joins: (0..table_count).map(|_| None).collect(),
-            meta_right_joins: (0..table_count).map(|_| None).collect(),
-            meta_semi_anti_joins: (0..table_count).map(|_| None).collect(),
-            meta_sort: None,
-            hash_table_contexts: HashMap::default(),
-            materialized_build_inputs: HashMap::default(),
-            resolver,
-            non_aggregate_expressions: Vec::new(),
-            agg_leaf_columns: Vec::new(),
-            cdc_cursor_id: None,
-            meta_window: None,
-            meta_in_seeks: (0..table_count).map(|_| None).collect(),
-            unsafe_testing,
-        }
-    }
-}
+use crate::{function::Func, sync::Arc, CaptureDataChangesExt, Result};
 
 #[derive(Debug, Clone)]
 /// Update row source for UPDATE statements
@@ -1292,13 +16,6 @@ impl<'a> TranslateCtx<'a> {
 pub enum UpdateRowSource {
     /// Iterate over the table itself or an index on the table
     Normal,
-    /// Iterate over an ephemeral table containing the target rowids to update
-    PrebuiltEphemeralTable {
-        /// The cursor id of the ephemeral table that is being used to iterate the target rowids to update.
-        ephemeral_table_cursor_id: usize,
-        /// The table that is being updated.
-        target_table: Arc<JoinedTable>,
-    },
 }
 
 /// Used to distinguish database operations
@@ -1320,36 +37,9 @@ pub enum TransactionMode {
     Concurrent,
 }
 
-/// Main entry point for emitting bytecode for a SQL query
-/// Takes a query plan and generates the corresponding bytecode program
-#[instrument(skip_all, level = tracing::Level::DEBUG)]
-#[turso_macros::trace_stack]
-pub fn emit_program(
-    connection: &Arc<Connection>,
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
-    plan: Plan,
-    after: impl FnOnce(&mut ProgramBuilder),
-) -> Result<()> {
-    match plan {
-        Plan::Select(plan) => emit_program_for_select(program, resolver, *plan),
-        Plan::Delete(plan) => emit_program_for_delete(connection, resolver, program, *plan),
-        Plan::Update(plan) => emit_program_for_update(connection, resolver, program, *plan, after),
-        mut plan @ Plan::CompoundSelect { .. } => {
-            emit_program_for_compound_select(program, resolver, &mut plan).map(|_| ())
-        }
-        Plan::RecursiveCte(mut recursive_cte) => {
-            super::recursive_cte::emit_recursive_cte(program, resolver, &mut recursive_cte)
-                .map(|_| ())
-        }
-    }
-}
-
-/// Returns the single-column schema used by rowid-only hash build inputs.
-fn build_rowid_column() -> Column {
-    Column::new_default_integer(Some("build_rowid".to_string()), "INTEGER".to_string(), None)
-}
-
+/// Open the CDC table's cursor when the statement captures changes.
+/// `database_id` is the database of the changed table: changes to temp
+/// tables are not captured.
 pub fn prepare_cdc_if_necessary(
     program: &mut ProgramBuilder,
     schema: &Schema,
@@ -1389,76 +79,12 @@ pub fn prepare_cdc_if_necessary(
     Ok(Some((cursor_id, cdc_btree)))
 }
 
-pub fn emit_cdc_patch_record(
-    program: &mut ProgramBuilder,
-    table: &Table,
-    columns_reg: usize,
-    record_reg: usize,
-    rowid_reg: usize,
-    layout: &ColumnLayout,
-) -> usize {
-    let columns = table.columns();
-    let rowid_alias_position = columns.iter().position(|x| x.is_rowid_alias());
-    if let Some(rowid_alias_position) = rowid_alias_position {
-        let record_reg = program.alloc_register();
-        program.emit_insn(Insn::Copy {
-            src_reg: rowid_reg,
-            dst_reg: layout.to_register(columns_reg, rowid_alias_position),
-            extra_amount: 0,
-        });
-        let storable_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
-        let affinity_str = columns
-            .iter()
-            .filter(|col| !col.is_virtual_generated())
-            .map(|col| col.affinity().aff_mask())
-            .collect::<String>();
-
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(columns_reg),
-            count: to_u32(storable_count),
-            dest_reg: to_u32(record_reg),
-            index_name: None,
-            affinity_str: Some(affinity_str),
-        });
-        record_reg
-    } else {
-        record_reg
-    }
-}
-
-pub(super) fn emit_make_record<'a>(
-    program: &mut ProgramBuilder,
-    cols: impl IntoIterator<Item = &'a Column>,
-    start_reg: usize,
-    dest_reg: usize,
-) {
-    let storable_cols: Vec<&Column> = cols
-        .into_iter()
-        .filter(|c| !c.is_virtual_generated())
-        .collect();
-    let storable_count = storable_cols.len();
-
-    let affinity_str: String = storable_cols
-        .iter()
-        .map(|c| c.affinity().aff_mask())
-        .collect();
-
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(start_reg),
-        count: to_u32(storable_count),
-        dest_reg: to_u32(dest_reg),
-        index_name: None,
-        affinity_str: Some(affinity_str),
-    });
-}
-
 pub fn emit_cdc_full_record(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     columns: &[Column],
     table_cursor_id: usize,
     rowid_reg: usize,
-) -> Result<usize> {
+) -> usize {
     let storable_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
     let columns_reg = program.alloc_registers(storable_count + 1);
     let mut slot = 0;
@@ -1473,13 +99,7 @@ pub fn emit_cdc_full_record(
                 extra_amount: 0,
             });
         } else {
-            emit_stored_column(
-                program,
-                table_cursor_id,
-                i,
-                columns_reg + 1 + slot,
-                resolver,
-            )?;
+            program.emit_column_or_rowid(table_cursor_id, i, columns_reg + 1 + slot);
         }
         slot += 1;
     }
@@ -1496,7 +116,7 @@ pub fn emit_cdc_full_record(
         index_name: None,
         affinity_str: Some(affinity_str),
     });
-    Ok(columns_reg)
+    columns_reg
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1512,19 +132,28 @@ pub fn emit_cdc_full_record(
 /// mode we keep the cheaper `NewRowid` (max rowid + 1) assignment; the WAL push
 /// loop does not depend on the sequence watermark, so its insert path is
 /// unchanged and pays no per-row sequence cost.
-fn emit_cdc_change_id(
+/// Where the change ids of CDC rows come from.
+pub enum CdcChangeIds<'a> {
+    /// WAL: one more than the CDC table's largest rowid.
+    NewRowid,
+    /// MVCC: the CDC table's AUTOINCREMENT sequence.
+    Sequence {
+        database: usize,
+        backing_table: Arc<BTreeTable>,
+        sqlite_sequence: Option<Arc<BTreeTable>>,
+        name: &'a str,
+        sequence: &'a crate::schema::Sequence,
+    },
+}
+
+/// Run `emit` with the change ids found through `catalog`.
+fn with_cdc_change_ids<T>(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    cdc_cursor_id: usize,
-    dest_reg: usize,
-) -> Result<()> {
+    catalog: &SemanticContext<'_>,
+    emit: impl FnOnce(&mut ProgramBuilder, &CdcChangeIds<'_>) -> Result<T>,
+) -> Result<T> {
     if !program.is_mvcc_enabled() {
-        program.emit_insn(Insn::NewRowid {
-            cursor: cdc_cursor_id,
-            rowid_reg: dest_reg,
-            prev_largest_reg: 0,
-        });
-        return Ok(());
+        return emit(program, &CdcChangeIds::NewRowid);
     }
     let Some(cdc_table) = program
         .capture_data_changes_info()
@@ -1536,27 +165,100 @@ fn emit_cdc_change_id(
         ));
     };
     let seq_name = crate::schema::autoincrement_sequence_name(&cdc_table);
-    let seq = resolver
+    let seq = catalog
         .with_schema(crate::MAIN_DB_ID, |s| s.get_sequence(&seq_name).cloned())
         .ok_or_else(|| {
             crate::LimboError::InternalError(format!(
                 "missing implicit AUTOINCREMENT sequence for CDC table \"{cdc_table}\""
             ))
         })?;
-    crate::translate::sequence::emit_disk_read_nextval(
-        program,
-        resolver,
+    let backing_table = crate::translate::sequence::resolve_sequence_backing_table(
+        catalog,
         crate::MAIN_DB_ID,
         &seq_name,
-        &seq,
-        dest_reg,
+    )?;
+    let sqlite_sequence = crate::translate::sequence::resolve_autoincrement_sqlite_sequence(
+        catalog,
+        crate::MAIN_DB_ID,
+        &seq_name,
+    );
+    emit(
+        program,
+        &CdcChangeIds::Sequence {
+            database: crate::MAIN_DB_ID,
+            backing_table,
+            sqlite_sequence,
+            name: &seq_name,
+            sequence: &seq,
+        },
     )
+}
+
+fn emit_cdc_change_id(
+    program: &mut ProgramBuilder,
+    change_ids: &CdcChangeIds<'_>,
+    cdc_cursor_id: usize,
+    dest_reg: usize,
+) -> Result<()> {
+    match change_ids {
+        CdcChangeIds::NewRowid => {
+            program.emit_insn(Insn::NewRowid {
+                cursor: cdc_cursor_id,
+                rowid_reg: dest_reg,
+                prev_largest_reg: 0,
+            });
+            Ok(())
+        }
+        CdcChangeIds::Sequence {
+            database,
+            backing_table,
+            sqlite_sequence,
+            name,
+            sequence,
+        } => crate::translate::sequence::emit_disk_read_nextval(
+            program,
+            *database,
+            backing_table.clone(),
+            sqlite_sequence.clone(),
+            name,
+            sequence,
+            dest_reg,
+        ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn emit_cdc_insns(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
+    operation_mode: OperationMode,
+    cdc_cursor_id: usize,
+    rowid_reg: usize,
+    before_record_reg: Option<usize>,
+    after_record_reg: Option<usize>,
+    updates_record_reg: Option<usize>,
+    table_name: &str,
+) -> Result<()> {
+    with_cdc_change_ids(program, catalog, |program, change_ids| {
+        emit_cdc_row(
+            program,
+            change_ids,
+            operation_mode,
+            cdc_cursor_id,
+            rowid_reg,
+            before_record_reg,
+            after_record_reg,
+            updates_record_reg,
+            table_name,
+        )
+    })
+}
+
+/// Write one CDC row for a changed row of `table_name`.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_cdc_row(
+    program: &mut ProgramBuilder,
+    change_ids: &CdcChangeIds<'_>,
     operation_mode: OperationMode,
     cdc_cursor_id: usize,
     rowid_reg: usize,
@@ -1569,7 +271,7 @@ pub fn emit_cdc_insns(
     match cdc_info.map(|info| info.cdc_version()) {
         Some(crate::CdcVersion::V2) => emit_cdc_insns_v2(
             program,
-            resolver,
+            change_ids,
             operation_mode,
             cdc_cursor_id,
             rowid_reg,
@@ -1704,9 +406,10 @@ fn emit_cdc_insns_v1(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_cdc_insns_v2(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    change_ids: &CdcChangeIds<'_>,
     operation_mode: OperationMode,
     cdc_cursor_id: usize,
     rowid_reg: usize,
@@ -1740,7 +443,7 @@ fn emit_cdc_insns_v2(
     // for get-or-set. In MVCC mode this draws from the CDC AUTOINCREMENT sequence
     // (see `emit_cdc_change_id`); in WAL mode it is a plain NewRowid.
     let candidate_reg = program.alloc_register();
-    emit_cdc_change_id(program, resolver, cdc_cursor_id, candidate_reg)?;
+    emit_cdc_change_id(program, change_ids, cdc_cursor_id, candidate_reg)?;
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
@@ -1833,7 +536,18 @@ fn emit_cdc_insns_v2(
 /// change_type=2, all other data fields NULL.
 pub fn emit_cdc_commit_insns(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
+    cdc_cursor_id: usize,
+) -> Result<()> {
+    with_cdc_change_ids(program, catalog, |program, change_ids| {
+        emit_cdc_commit_row(program, change_ids, cdc_cursor_id)
+    })
+}
+
+/// Write a CDC COMMIT record (v2 only).
+fn emit_cdc_commit_row(
+    program: &mut ProgramBuilder,
+    change_ids: &CdcChangeIds<'_>,
     cdc_cursor_id: usize,
 ) -> Result<()> {
     // v2 COMMIT record: (NULL, unixepoch(), conn_txn_id(-1), 2, NULL, NULL, NULL, NULL, NULL)
@@ -1887,7 +601,7 @@ pub fn emit_cdc_commit_insns(
     // (the CDC AUTOINCREMENT sequence in MVCC mode) so COMMIT and row change ids
     // stay in one monotonic, never-reused stream.
     let rowid_reg = program.alloc_register();
-    emit_cdc_change_id(program, resolver, cdc_cursor_id, rowid_reg)?;
+    emit_cdc_change_id(program, change_ids, cdc_cursor_id, rowid_reg)?;
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
@@ -1910,12 +624,13 @@ pub fn emit_cdc_commit_insns(
     Ok(())
 }
 
-/// Emit the CDC COMMIT record at the end of a statement, once, when in autocommit mode (v2 only).
-/// Only the root statement writes it; a trigger or FK action subprogram never does.
+/// Emit the CDC COMMIT record at the end of a schema statement, once, when in autocommit
+/// mode (v2 only). Only the root statement writes it; a trigger or FK action subprogram
+/// never does.
 pub fn emit_cdc_autocommit_commit(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    cdc_cursor_id: Option<usize>,
+    catalog: &SemanticContext<'_>,
+    cdc_cursor_id: usize,
 ) -> Result<()> {
     if program.flags.is_subprogram() {
         return Ok(());
@@ -1924,12 +639,28 @@ pub fn emit_cdc_autocommit_commit(
     if !cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
         return Ok(());
     }
-    if cdc_cursor_id.is_none() && !program.has_emitted_program_call() {
-        // Our own target table was not captured (e.g. a TEMP table), and no trigger or FK
-        // action ran during this statement that could have captured a row elsewhere.
-        return Ok(());
-    }
+    with_cdc_change_ids(program, catalog, |program, change_ids| {
+        emit_cdc_statement_commit(program, change_ids, CdcCommitCursor::Open(cdc_cursor_id))
+    })
+}
 
+/// The CDC table cursor a statement's COMMIT record is written through.
+pub(crate) enum CdcCommitCursor {
+    /// The cursor the statement captured its own rows through.
+    Open(usize),
+    /// The statement's own table is not captured (a TEMP table). The CDC
+    /// table is opened, and the record written, only when a trigger or FK
+    /// action that ran during the statement captured a row.
+    OpenWhenCaptured(Arc<BTreeTable>),
+}
+
+/// At the end of a statement in autocommit mode, write a CDC COMMIT record
+/// (v2 only).
+pub(crate) fn emit_cdc_statement_commit(
+    program: &mut ProgramBuilder,
+    change_ids: &CdcChangeIds<'_>,
+    cursor: CdcCommitCursor,
+) -> Result<()> {
     // Check if we're in autocommit mode; if so, emit a COMMIT record.
     let is_autocommit_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
@@ -1951,11 +682,10 @@ pub fn emit_cdc_autocommit_commit(
         jump_if_null: true,
     });
 
-    let cdc_cursor_id = match cdc_cursor_id {
-        Some(cdc_cursor_id) => cdc_cursor_id,
-        None => {
-            // A trigger or FK action fired during this statement may have captured a row
-            // elsewhere. Only write the COMMIT record when something was actually captured.
+    let cdc_cursor_id = match cursor {
+        CdcCommitCursor::Open(cdc_cursor_id) => cdc_cursor_id,
+        CdcCommitCursor::OpenWhenCaptured(cdc_table) => {
+            // `conn_txn_id(-1)` is -1 until a row is captured.
             let minus_one_reg = program.alloc_register();
             program.emit_int(-1, minus_one_reg);
             let txn_id_reg = program.alloc_register();
@@ -1975,17 +705,19 @@ pub fn emit_cdc_autocommit_commit(
                 flags: crate::vdbe::insn::CmpInsFlags::default(),
                 collation: None,
             });
-            let (cursor_id, _) =
-                prepare_cdc_if_necessary(program, resolver.schema(), crate::MAIN_DB_ID, None)?
-                    .expect("CDC is active, so prepare_cdc_if_necessary must return a cursor");
+            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(cdc_table.clone()));
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id,
+                root_page: cdc_table.root_page.into(),
+                db: crate::MAIN_DB_ID,
+            });
             cursor_id
         }
     };
 
-    emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
+    emit_cdc_commit_row(program, change_ids, cdc_cursor_id)?;
 
     program.preassign_label_to_next_insn(skip_label);
-
     Ok(())
 }
 
@@ -2008,7 +740,7 @@ pub fn emit_cdc_autocommit_commit(
 pub fn emit_cdc_explicit_commit_insns(
     program: &mut ProgramBuilder,
     schema: &Schema,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
 ) -> Result<()> {
     let minus_one_reg = program.alloc_register();
     program.emit_int(-1, minus_one_reg);
@@ -2046,634 +778,9 @@ pub fn emit_cdc_explicit_commit_insns(
     if let Some((cdc_cursor_id, _)) =
         prepare_cdc_if_necessary(program, schema, crate::MAIN_DB_ID, None)?
     {
-        emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
+        emit_cdc_commit_insns(program, catalog, cdc_cursor_id)?;
     }
 
     program.preassign_label_to_next_insn(skip_label);
     Ok(())
-}
-/// Initialize the limit/offset counters and registers.
-/// In case of compound SELECTs, the limit counter is initialized only once,
-/// hence [LimitCtx::initialize_counter] being false in those cases.
-pub(crate) fn init_limit(
-    program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx,
-    limit: &Option<Box<Expr>>,
-    offset: &Option<Box<Expr>>,
-    end_label: BranchOffset,
-) -> Result<()> {
-    if t_ctx.limit_ctx.is_none() && limit.is_some() {
-        t_ctx.limit_ctx = Some(LimitCtx::new(program));
-    }
-    let Some(limit_ctx) = &t_ctx.limit_ctx else {
-        return Ok(());
-    };
-
-    if limit_ctx.initialize_counter {
-        if let Some(expr) = limit {
-            match expr.as_ref() {
-                Expr::Literal(Literal::Numeric(n)) => match parse_numeric_literal(n)? {
-                    crate::types::Value::Numeric(crate::Numeric::Integer(value)) => {
-                        program.add_comment(program.offset(), "LIMIT counter");
-                        program.emit_insn(Insn::Integer {
-                            value,
-                            dest: limit_ctx.reg_limit,
-                        });
-                    }
-                    crate::types::Value::Numeric(crate::Numeric::Float(value)) => {
-                        program.emit_insn(Insn::Real {
-                            value: value.into(),
-                            dest: limit_ctx.reg_limit,
-                        });
-                        program.add_comment(program.offset(), "LIMIT counter");
-                        program.emit_insn(Insn::MustBeInt {
-                            reg: limit_ctx.reg_limit,
-                            target_pc: None,
-                        });
-                    }
-                    _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
-                },
-                _ => {
-                    let r = limit_ctx.reg_limit;
-
-                    _ = translate_expr_no_constant_opt(
-                        program,
-                        None,
-                        expr,
-                        r,
-                        &t_ctx.resolver,
-                        NoConstantOptReason::RegisterReuse,
-                    )?;
-                    program.emit_insn(Insn::MustBeInt {
-                        reg: r,
-                        target_pc: None,
-                    });
-                }
-            }
-        }
-    }
-
-    if t_ctx.reg_offset.is_none() {
-        if let Some(expr) = offset {
-            let offset_reg = program.alloc_register();
-            t_ctx.reg_offset = Some(offset_reg);
-            match expr.as_ref() {
-                Expr::Literal(Literal::Numeric(n)) => match parse_numeric_literal(n)? {
-                    crate::types::Value::Numeric(crate::Numeric::Integer(value)) => {
-                        program.emit_insn(Insn::Integer {
-                            value,
-                            dest: offset_reg,
-                        });
-                    }
-                    crate::types::Value::Numeric(crate::Numeric::Float(value)) => {
-                        program.emit_insn(Insn::Real {
-                            value: value.into(),
-                            dest: offset_reg,
-                        });
-                        program.emit_insn(Insn::MustBeInt {
-                            reg: offset_reg,
-                            target_pc: None,
-                        });
-                    }
-                    _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
-                },
-                _ => {
-                    _ = translate_expr_no_constant_opt(
-                        program,
-                        None,
-                        expr,
-                        offset_reg,
-                        &t_ctx.resolver,
-                        NoConstantOptReason::RegisterReuse,
-                    )?;
-                }
-            }
-            program.add_comment(program.offset(), "OFFSET counter");
-            program.emit_insn(Insn::MustBeInt {
-                reg: offset_reg,
-                target_pc: None,
-            });
-
-            let combined_reg = program.alloc_register();
-            t_ctx.reg_limit_offset_sum = Some(combined_reg);
-            program.add_comment(program.offset(), "OFFSET + LIMIT");
-            program.emit_insn(Insn::OffsetLimit {
-                limit_reg: limit_ctx.reg_limit,
-                offset_reg,
-                combined_reg,
-            });
-        }
-    }
-
-    // exit early if LIMIT 0
-    program.emit_insn(Insn::IfNot {
-        reg: limit_ctx.reg_limit,
-        target_pc: end_label,
-        jump_if_null: false,
-    });
-
-    Ok(())
-}
-
-/// Emits `target_columns`, plus the stored columns needed by `target_columns`, into a
-/// DML row context. This takes into account stored columns, and any stored columns
-/// required by virtual columns in `target_columns`.
-///
-/// Non-rowid target columns are allocated in target order. Rowid-alias columns resolve
-/// to `rowid_reg`, so callers that need an unpacked contiguous key or record must
-/// materialize one from `DmlColumnContext::to_column_reg`.
-pub(crate) fn emit_columns_and_dependencies(
-    program: &mut ProgramBuilder,
-    table: &BTreeTable,
-    cursor_id: usize,
-    rowid_reg: usize,
-    target_columns: impl IntoIterator<Item = usize>,
-    resolver: &Resolver,
-) -> Result<DmlColumnContext> {
-    let targets: Vec<usize> = target_columns.into_iter().collect();
-    let target_mask: ColumnMask = targets.iter().copied().try_collect()?;
-    let non_rowid_targets: Vec<usize> = targets
-        .iter()
-        .copied()
-        .filter(|&idx| !table.columns()[idx].is_rowid_alias())
-        .collect();
-    let mut non_rowid_target_positions = vec![None; table.columns().len()];
-    for (pos, idx) in non_rowid_targets.iter().copied().enumerate() {
-        non_rowid_target_positions[idx] = Some(pos);
-    }
-    let dependencies = table.dependencies_of_columns(targets.iter().copied())?;
-
-    let target_base = if non_rowid_targets.is_empty() {
-        0
-    } else {
-        program.alloc_registers(non_rowid_targets.len())
-    };
-    let extra_base = {
-        let mut dependencies_not_in_targets: ColumnMask = dependencies.try_clone()?;
-        dependencies_not_in_targets -= &target_mask;
-
-        let extra_count = table
-            .columns()
-            .iter()
-            .enumerate()
-            .filter(|(idx, col)| dependencies_not_in_targets.get(*idx) && !col.is_rowid_alias())
-            .count();
-
-        if extra_count > 0 {
-            program.alloc_registers(extra_count)
-        } else {
-            0
-        }
-    };
-
-    let mut extra_idx = 0;
-    let mut pairs = Vec::with_capacity(table.columns().len());
-    for (idx, col) in table.columns().iter().enumerate() {
-        let reg = if let Some(pos) = non_rowid_target_positions[idx] {
-            let reg = target_base + pos;
-            if !col.is_virtual_generated() {
-                emit_stored_column(program, cursor_id, idx, reg, resolver)?;
-            }
-            reg
-        } else if col.is_rowid_alias() {
-            rowid_reg
-        } else if dependencies.get(idx) {
-            let reg = extra_base + extra_idx;
-            emit_stored_column(program, cursor_id, idx, reg, resolver)?;
-            extra_idx += 1;
-            reg
-        } else {
-            0
-        };
-        pairs.push((col, reg));
-    }
-    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs.into_iter());
-    if targets
-        .iter()
-        .all(|&idx| !table.columns()[idx].is_rowid_alias())
-    {
-        debug_assert!(targets
-            .windows(2)
-            .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 }));
-    }
-
-    let table_arc = Arc::new(table.clone());
-    gencol::compute_virtual_columns(
-        program,
-        &table.columns_topo_sort()?,
-        &dml_ctx,
-        resolver,
-        &table_arc,
-    )?;
-
-    Ok(dml_ctx)
-}
-
-/// Emit code to load the value of an IndexColumn from the OLD image of the row being updated.
-/// Handling expression indexes and regular columns
-pub(crate) fn emit_index_column_value_old_image(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    table_references: &mut TableReferences,
-    table_cursor_id: usize,
-    table_internal_id: TableInternalId,
-    idx_col: &IndexColumn,
-    dest_reg: usize,
-) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
-        bind_and_rewrite_expr(
-            &mut expr,
-            Some(table_references),
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
-
-        let self_table_context = SelfTableContext::ForSelect {
-            table_ref_id: table_internal_id,
-            referenced_tables: table_references.clone(),
-        };
-        resolver.with_self_table_context(program, Some(&self_table_context), |program, _| {
-            translate_expr_no_constant_opt(
-                program,
-                Some(table_references),
-                &expr,
-                dest_reg,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
-            Ok(())
-        })?;
-        // For virtual generated column references, apply the column's
-        // declared affinity to the computed expression result.
-        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
-            if let Some(table) = program.btree_table_from_cursor(table_cursor_id) {
-                let column = &table.columns()[idx_col.pos_in_table];
-                if column.is_virtual_generated() {
-                    program.emit_column_affinity(dest_reg, column.affinity());
-                }
-            }
-        }
-    } else if let Some(generated_column) = generated_column(program, table_cursor_id, idx_col) {
-        emit_table_column(
-            program,
-            table_cursor_id,
-            table_internal_id,
-            table_references,
-            &generated_column,
-            idx_col.pos_in_table,
-            dest_reg,
-            resolver,
-        )?;
-    } else {
-        emit_stored_column(
-            program,
-            table_cursor_id,
-            idx_col.pos_in_table,
-            dest_reg,
-            resolver,
-        )?;
-    }
-    Ok(())
-}
-
-/// Emit code that evaluates a partial index's WHERE for the row under the table
-/// cursor, and return the register that holds the result. Return None for an
-/// index without a WHERE. The columns are read from the table cursor because it
-/// can be on a different row than a scan cursor, e.g. the row that REPLACE deletes.
-pub(crate) fn emit_partial_index_where_old_image(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    table_references: &mut TableReferences,
-    table_cursor_id: usize,
-    table_internal_id: TableInternalId,
-    index: &Index,
-) -> Result<Option<usize>> {
-    let Some(where_clause) = index.bind_where_expr(Some(table_references), resolver)? else {
-        return Ok(None);
-    };
-    let result_reg = program.alloc_register();
-    let table_cursor = [(CursorKey::table(table_internal_id), table_cursor_id)];
-    program.with_cursor_overrides(&table_cursor, |program| {
-        translate_expr_no_constant_opt(
-            program,
-            Some(table_references),
-            &where_clause,
-            result_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )
-    })?;
-    Ok(Some(result_reg))
-}
-
-fn generated_column(
-    program: &mut ProgramBuilder,
-    table_cursor_id: usize,
-    idx_col: &IndexColumn,
-) -> Option<Column> {
-    program
-        .btree_table_from_cursor(table_cursor_id)
-        .iter()
-        .cloned()
-        .flat_map(|table| {
-            table
-                .columns()
-                .get(idx_col.pos_in_table)
-                .filter(|col| col.is_virtual_generated())
-                .cloned()
-        })
-        .next()
-}
-
-/// Emit code to load the value of an IndexColumn from the NEW image of the row being updated.
-/// Handling expression indexes and regular columns
-#[allow(clippy::too_many_arguments)]
-fn emit_index_column_value_new_image(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    columns: &[Column],
-    columns_start_reg: usize,
-    rowid_reg: usize,
-    idx_col: &IndexColumn,
-    dest_reg: usize,
-    layout: &ColumnLayout,
-    table: &Arc<BTreeTable>,
-) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let expr = expr.as_ref().clone();
-        let mut column_regs: Vec<usize> = columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| {
-                if col.is_rowid_alias() {
-                    rowid_reg
-                } else {
-                    layout.to_register(columns_start_reg, i)
-                }
-            })
-            .collect();
-        crate::translate::expr::emit_dml_expr_index_value(
-            program,
-            resolver,
-            expr,
-            columns,
-            &mut column_regs,
-            table,
-            dest_reg,
-            idx_col.pos_in_table == EXPR_INDEX_SENTINEL,
-        )?;
-    } else {
-        let col_in_table = columns
-            .get(idx_col.pos_in_table)
-            .expect("column index out of bounds");
-        match col_in_table.generated_type() {
-            GeneratedType::Virtual { ref expr, .. } => {
-                gencol::emit_gencol_expr_from_registers(
-                    program,
-                    expr,
-                    dest_reg,
-                    columns_start_reg,
-                    columns,
-                    resolver,
-                    rowid_reg,
-                    layout,
-                    table,
-                )?;
-                program.emit_column_affinity(dest_reg, col_in_table.affinity());
-            }
-            GeneratedType::NotGenerated => {
-                let src_reg = if col_in_table.is_rowid_alias() {
-                    rowid_reg
-                } else {
-                    layout.to_register(columns_start_reg, idx_col.pos_in_table)
-                };
-                program.emit_insn(Insn::Copy {
-                    src_reg,
-                    dst_reg: dest_reg,
-                    extra_amount: 0,
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Emit bytecode for evaluating CHECK constraints.
-/// Assumes the resolver cache is already populated with column-to-register mappings.
-#[allow(clippy::too_many_arguments)]
-fn emit_check_constraint_bytecode(
-    program: &mut ProgramBuilder,
-    check_constraints: &[CheckConstraint],
-    resolver: &mut Resolver,
-    or_conflict: ResolveType,
-    skip_row_label: BranchOffset,
-    referenced_tables: Option<&TableReferences>,
-    table_name: &str,
-    column_mappings: &[(&str, usize)],
-) -> Result<()> {
-    for check_constraint in check_constraints {
-        let expr_result_reg = program.alloc_register();
-
-        let mut rewritten_expr = check_constraint.expr.clone();
-        if let Some(referenced_tables) = referenced_tables {
-            let mut binding_tables = referenced_tables.clone();
-            if let Some(joined_table) = binding_tables.joined_tables_mut().first_mut() {
-                // CHECK expressions come from schema SQL and may use the base table name
-                // even when the query references the table through an alias.
-                joined_table.identifier = table_name.to_string();
-            }
-            bind_and_rewrite_expr(
-                &mut rewritten_expr,
-                Some(&mut binding_tables),
-                None,
-                resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            )?;
-        }
-
-        translate_expr_no_constant_opt(
-            program,
-            referenced_tables,
-            &rewritten_expr,
-            expr_result_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
-
-        // CHECK constraint passes if the result is NULL or non-zero (truthy)
-        let constraint_passed_label = program.allocate_label();
-
-        // NULL means unknown, which passes CHECK constraints in SQLite
-        program.emit_insn(Insn::IsNull {
-            reg: expr_result_reg,
-            target_pc: constraint_passed_label,
-        });
-
-        program.emit_insn(Insn::If {
-            reg: expr_result_reg,
-            target_pc: constraint_passed_label,
-            jump_if_null: false,
-        });
-
-        // SQLite reports a failed CHECK by its constraint name, or by the
-        // expression's source text exactly as the user wrote it.
-        let constraint_name = match (&check_constraint.name, &check_constraint.source) {
-            (Some(name), _) => name.clone(),
-            (None, Some(source)) => crate::util::dequote(source),
-            (None, None) => format!("{}", check_constraint.expr),
-        };
-
-        match or_conflict {
-            ResolveType::Ignore => {
-                program.emit_insn(Insn::Goto {
-                    target_pc: skip_row_label,
-                });
-            }
-            // In SQLite, REPLACE does not apply to CHECK constraints — it aborts,
-            // same as Abort/Fail/Rollback.
-            ResolveType::Abort
-            | ResolveType::Fail
-            | ResolveType::Rollback
-            | ResolveType::Replace => {
-                let col_regs: Vec<usize> = column_mappings.iter().map(|(_, r)| *r).collect();
-                let col_names: Vec<String> =
-                    column_mappings.iter().map(|(n, _)| n.to_string()).collect();
-                program.emit_insn(Insn::Halt {
-                    constraint_info: Some(Box::new(ConstraintInfo::check(
-                        table_name,
-                        check_constraint.name.clone(),
-                        col_regs,
-                        col_names,
-                    ))),
-                    err_code: SQLITE_CONSTRAINT_CHECK,
-                    description: constraint_name.to_string(),
-                    on_error: program.constraint_halt_on_error(or_conflict),
-                    description_reg: None,
-                });
-            }
-        }
-
-        program.preassign_label_to_next_insn(constraint_passed_label);
-    }
-    Ok(())
-}
-
-/// Returns true if the CHECK constraint expression references any column whose
-/// normalized name is in `column_names`. This is used during UPDATE to skip
-/// CHECK constraints that only reference columns not in the SET clause, matching
-/// SQLite's optimization behavior.
-fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<String>) -> bool {
-    column_names
-        .iter()
-        .any(|name| check_expr_references_column(expr, name))
-}
-
-/// Emit CHECK constraint evaluation with resolver cache setup and teardown.
-/// Takes column-to-register mappings as an iterator to avoid heap allocation.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_check_constraints<'a>(
-    program: &mut ProgramBuilder,
-    check_constraints: &[CheckConstraint],
-    resolver: &mut Resolver,
-    table_name: &str,
-    rowid_reg: usize,
-    column_mappings: impl Iterator<Item = (&'a str, usize)>,
-    connection: &Arc<Connection>,
-    or_conflict: ResolveType,
-    skip_row_label: BranchOffset,
-    referenced_tables: Option<&TableReferences>,
-) -> Result<()> {
-    if connection.check_constraints_ignored() || check_constraints.is_empty() {
-        return Ok(());
-    }
-
-    let column_mappings: Vec<(&str, usize)> = column_mappings.collect();
-    let initial_cache_size = resolver.expr_to_reg_cache.len();
-    let joined_table = referenced_tables.and_then(|tables| tables.joined_tables().first());
-
-    // Map rowid aliases to the actual rowid register.
-    // We cache both unqualified (Expr::Id) and qualified (Expr::Qualified) forms
-    // so that CHECK expressions like `CHECK(rowid > 0)` and `CHECK(t.rowid > 0)` both resolve.
-    for rowid_name in ROWID_STRS {
-        let rowid_expr = ast::Expr::Id(ast::Name::exact(rowid_name.to_string()));
-        resolver.cache_expr_reg(Cow::Owned(rowid_expr), rowid_reg, false, None);
-        let qualified_expr = ast::Expr::Qualified(
-            ast::Name::exact(table_name.to_string()),
-            ast::Name::exact(rowid_name.to_string()),
-        );
-        resolver.cache_expr_reg(Cow::Owned(qualified_expr), rowid_reg, false, None);
-    }
-
-    // Map each column to its register (both unqualified and qualified forms).
-    for (col_name, register) in column_mappings.iter().copied() {
-        let collation = joined_table
-            .and_then(|table| {
-                table.columns().iter().find(|col| {
-                    col.name
-                        .as_ref()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(col_name))
-                })
-            })
-            .map(|col| (col.collation(), false));
-        let column_expr = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
-        resolver.cache_expr_reg(Cow::Owned(column_expr), register, false, collation);
-        let qualified_expr = ast::Expr::Qualified(
-            ast::Name::exact(table_name.to_string()),
-            ast::Name::exact(col_name.to_string()),
-        );
-        resolver.cache_expr_reg(Cow::Owned(qualified_expr), register, false, collation);
-    }
-
-    if let Some(joined_table) = joined_table {
-        resolver.cache_expr_reg(
-            Cow::Owned(ast::Expr::RowId {
-                database: None,
-                table: joined_table.internal_id,
-            }),
-            rowid_reg,
-            false,
-            None,
-        );
-
-        for (col_name, register) in column_mappings.iter().copied() {
-            if let Some((idx, col)) = joined_table.columns().iter().enumerate().find(|(_, c)| {
-                c.name
-                    .as_ref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(col_name))
-            }) {
-                resolver.cache_expr_reg(
-                    Cow::Owned(ast::Expr::Column {
-                        database: None,
-                        table: joined_table.internal_id,
-                        column: idx,
-                        is_rowid_alias: col.is_rowid_alias(),
-                    }),
-                    register,
-                    false,
-                    Some((col.collation(), false)),
-                );
-            }
-        }
-    }
-
-    resolver.enable_expr_to_reg_cache();
-
-    let result = emit_check_constraint_bytecode(
-        program,
-        check_constraints,
-        resolver,
-        or_conflict,
-        skip_row_label,
-        referenced_tables,
-        table_name,
-        &column_mappings,
-    );
-
-    // Always restore resolver state, even on error.
-    resolver.expr_to_reg_cache.truncate(initial_cache_size);
-    resolver.expr_to_reg_cache_enabled = false;
-
-    result
 }

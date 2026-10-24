@@ -988,6 +988,122 @@ fn test_fts_order_by_and_limit(tmp_db: TempDatabase) {
         });
 }
 
+/// Queries read an FTS index through its query pattern: a query
+/// shaped like one of the index's patterns scans the index, reads scores
+/// from it, and leaves ORDER BY and LIMIT to it; in a join, the FTS table is
+/// read first through the index. Without the index,
+/// `fts_score` is always 0 and a ranked LIMIT returns rows that do not match.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn fts_queries_through_hir_use_the_index(tmp_db: TempDatabase) {
+    let hir = tmp_db.connect_limbo();
+    for sql in [
+        "CREATE TABLE articles(id INTEGER PRIMARY KEY, title TEXT, body TEXT)",
+        "CREATE INDEX fts_articles ON articles USING fts (title, body)",
+        "INSERT INTO articles VALUES (1, 'hello world', 'this is a test')",
+        "INSERT INTO articles VALUES (2, 'another', 'hello again')",
+        "INSERT INTO articles VALUES (3, 'no match', 'something else')",
+    ] {
+        hir.execute(sql).unwrap();
+    }
+    // Articles 1 and 2 mention hello, article 1 scoring lower; article 3
+    // does not match and is not scored.
+    let scored = |rows: Vec<Vec<rusqlite::types::Value>>| {
+        rows.into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|value| match value {
+                        rusqlite::types::Value::Real(score) => {
+                            rusqlite::types::Value::Text(format!("score {}", score > 1.0))
+                        }
+                        other => other,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let text = |value: &str| rusqlite::types::Value::Text(value.to_string());
+    let int = rusqlite::types::Value::Integer;
+    for (sql, expected) in [
+        (
+            "SELECT fts_score(title, body, 'hello') AS score FROM articles ORDER BY score DESC LIMIT -1",
+            vec![vec![text("score true")], vec![text("score false")]],
+        ),
+        (
+            "SELECT fts_score(title, body, 'hello') AS score FROM articles ORDER BY score DESC LIMIT 1",
+            vec![vec![text("score true")]],
+        ),
+        (
+            "SELECT id, fts_score(title, body, 'hello') AS score FROM articles \
+             WHERE fts_match(title, body, 'hello') ORDER BY score DESC",
+            vec![
+                vec![int(2), text("score true")],
+                vec![int(1), text("score false")],
+            ],
+        ),
+        (
+            "SELECT id FROM articles WHERE fts_match(title, body, 'hello') AND id > 1",
+            vec![vec![int(2)]],
+        ),
+        (
+            "SELECT count(*) FROM articles WHERE fts_match(body, title, 'hello')",
+            vec![vec![int(2)]],
+        ),
+    ] {
+        let plan = limbo_exec_rows(&hir, &format!("EXPLAIN QUERY PLAN {sql}"));
+        assert!(
+            format!("{plan:?}").contains("QUERY INDEX METHOD fts"),
+            "{sql}: {plan:?}"
+        );
+        assert_eq!(scored(limbo_exec_rows(&hir, sql)), expected, "{sql}");
+    }
+    // In an inner join the FTS table is read first, through the index.
+    hir.execute("CREATE TABLE authors(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    hir.execute("INSERT INTO authors VALUES (1, 'ann'), (2, 'bob')")
+        .unwrap();
+    let join = "SELECT a.id, u.name FROM articles a JOIN authors u ON a.id = u.id \
+                WHERE fts_match(a.title, a.body, 'hello') ORDER BY a.id";
+    let plan = limbo_exec_rows(&hir, &format!("EXPLAIN QUERY PLAN {join}"));
+    assert!(
+        format!("{plan:?}").contains("QUERY INDEX METHOD fts"),
+        "{plan:?}"
+    );
+    assert_eq!(
+        limbo_exec_rows(&hir, join),
+        vec![vec![int(1), text("ann")], vec![int(2), text("bob")]]
+    );
+    // The columns of an FTS function may come in any order; legacy then
+    // reads the score as 0.
+    assert_eq!(
+        limbo_exec_rows(
+            &hir,
+            "SELECT id, fts_score(body, title, 'hello') > 0 FROM articles \
+             WHERE fts_match(title, body, 'hello') ORDER BY id",
+        ),
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(1)
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Integer(1)
+            ],
+        ]
+    );
+    // The index applies LIMIT only without OFFSET; legacy drops the OFFSET
+    // here and returns the best row instead of the second one.
+    assert_eq!(
+        limbo_exec_rows(
+            &hir,
+            "SELECT id FROM articles WHERE fts_match(title, body, 'hello') \
+             ORDER BY fts_score(title, body, 'hello') DESC LIMIT 1 OFFSET 1",
+        ),
+        vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
+}
+
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test]
 fn test_fts_match_with_order_by_column_and_limit(tmp_db: TempDatabase) {
@@ -1682,6 +1798,54 @@ fn test_fts_score_uses_selected_match_index(tmp_db: TempDatabase) {
         first > &0.0 && second > first,
         "expected ranked scores: {rows:?}"
     );
+}
+
+/// The planner tells the index which of its columns a query names after the
+/// query text, so a query text that looks like a column number is still a
+/// search term.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_numeric_query_text_is_a_search_term(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(title, body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'room 7', 'floor 0'), (2, 'room 0', 'floor 7')")
+        .unwrap();
+    for (query, expected) in [
+        (
+            "SELECT id FROM docs WHERE fts_match(title, '7')",
+            vec![row![1]],
+        ),
+        (
+            "SELECT id FROM docs WHERE fts_match(body, '7')",
+            vec![row![2]],
+        ),
+        (
+            "SELECT id FROM docs WHERE fts_match(body, '0')",
+            vec![row![1]],
+        ),
+        (
+            "SELECT id FROM docs WHERE fts_match(body, title, '7') ORDER BY id",
+            vec![row![1], row![2]],
+        ),
+        (
+            "SELECT id FROM docs WHERE (title, body) MATCH '0' ORDER BY id",
+            vec![row![1], row![2]],
+        ),
+        (
+            "SELECT id FROM docs WHERE fts_match(title, '99') OR fts_match(title, '7')",
+            vec![],
+        ),
+    ] {
+        if expected.is_empty() {
+            let error = conn.prepare(query).expect_err(query);
+            assert!(error.to_string().contains("FTS"), "{query}: {error}");
+        } else {
+            assert_eq!(limbo_exec_rows(&conn, query), expected, "{query}");
+        }
+    }
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]

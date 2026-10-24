@@ -35,7 +35,7 @@ addr  opcode         p1  p2  p3  p4              p5  comment
   10    ColumnRange   2   1   4  2                0  r[4..5]=former_employees.name..department
   11    IdxDelete     0   4   2                   0
   12  Next            2  10   0                   1
-  13  Rewind          0  16   0                   0  Rewind  ephemeral(compound_dedupe)
+  13  Rewind          0  17   0                   0  Rewind index ephemeral(compound_dedupe)
   14    ColumnRange   0   0   6  2                0  r[6..7]=ephemeral(compound_dedupe).name..department
   15    ResultRow     6   2   0                   0  output=r[6..7]
   16  Next            0  14   0                   0

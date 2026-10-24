@@ -1,11 +1,9 @@
 use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType, RESERVED_TABLE_PREFIXES};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
+use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
+use crate::translate::semantic::context::SemanticContext;
 use crate::translate::sequence::bind_sequence_names_in_select;
-use crate::translate::{
-    emitter::Resolver,
-    schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
-};
 use crate::util::{
     escape_sql_string_literal, extract_view_columns, normalize_ident,
     PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
@@ -18,7 +16,7 @@ use turso_parser::ast;
 fn validate_materialized(
     connection: &Arc<crate::Connection>,
     database_id: usize,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     normalized_view_name: &str,
 ) -> Result<()> {
     // Check if experimental views are enabled
@@ -43,7 +41,7 @@ fn validate_materialized(
 
     // Check if view already exists (including broken sqlite_schema rows,
     // which must be dropped before the name can be reused)
-    if resolver.with_schema(database_id, |s| {
+    if catalog.with_schema(database_id, |s| {
         s.materialized_view_exists(normalized_view_name)
             || s.broken_views.contains(normalized_view_name)
     }) {
@@ -56,7 +54,7 @@ fn validate_materialized(
 
 pub fn translate_create_materialized_view(
     view_name: &ast::QualifiedName,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     select_stmt: &ast::Select,
     columns: &[ast::IndexedColumn],
     if_not_exists: bool,
@@ -66,13 +64,13 @@ pub fn translate_create_materialized_view(
     if connection.mvcc_enabled() {
         bail_parse_error!("Materialized views are not supported in MVCC mode");
     }
-    let database_id = resolver.resolve_database_id_for_create(view_name)?;
-    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    let database_id = catalog.resolve_database_id(view_name)?;
+    let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
     if if_not_exists
-        && resolver.with_schema(database_id, |s| {
+        && catalog.with_schema(database_id, |s| {
             s.get_view(&normalized_view_name).is_some()
                 || s.materialized_view_exists(&normalized_view_name)
                 || s.broken_views.contains(&normalized_view_name)
@@ -84,13 +82,13 @@ pub fn translate_create_materialized_view(
     // Validate the view can be created and extract its columns
     // This validation happens before updating sqlite_master to prevent
     // storing invalid view definitions
-    validate_materialized(&connection, database_id, resolver, &normalized_view_name)?;
+    validate_materialized(&connection, database_id, catalog, &normalized_view_name)?;
 
     // Check for cross-database table references first
     crate::util::validate_select_for_views(select_stmt, view_name.namespace.as_ref())?;
 
     let mut view_column_schema =
-        resolver.with_schema(database_id, |s| extract_view_columns(select_stmt, s))?;
+        catalog.with_schema(database_id, |s| extract_view_columns(select_stmt, s))?;
     // The parser checks the column count when it can count the SELECT's
     // columns; a `*` is only expanded here.
     if !columns.is_empty() && columns.len() != view_column_schema.columns.len() {
@@ -113,17 +111,9 @@ pub fn translate_create_materialized_view(
     // names to the database it was created in rather than searching temp
     // first (#9456): a TEMP table that happens to share a source table's
     // name must not shadow it here.
-    let maintenance_plan =
-        resolver.with_view_scope(database_id, normalized_view_name.clone(), || {
-            resolver.with_schema(database_id, |_| {
-                crate::incremental::vdbe_maintenance::plan_view(
-                    &normalized_view_name,
-                    select_stmt,
-                    resolver,
-                    &connection,
-                )
-            })
-        })?;
+    let maintenance_plan = catalog.with_schema(database_id, |_| {
+        crate::incremental::vdbe_maintenance::plan_view(&normalized_view_name, select_stmt, catalog)
+    })?;
     if maintenance_plan.output_arity() != view_columns.len() {
         return Err(crate::LimboError::InternalError(format!(
             "materialized view result schema has {} columns but its maintenance DAG emits {}",
@@ -208,7 +198,7 @@ pub fn translate_create_materialized_view(
     program.preassign_label_to_next_insn(clear_done_label);
 
     // Open cursor to sqlite_schema table
-    let table = resolver.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let table = catalog.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -219,7 +209,7 @@ pub fn translate_create_materialized_view(
     // Add the materialized view entry to sqlite_schema
     emit_schema_entry(
         program,
-        resolver,
+        catalog,
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for views
         SchemaEntryType::View,
@@ -242,7 +232,7 @@ pub fn translate_create_materialized_view(
         });
         emit_schema_entry(
             program,
-            resolver,
+            catalog,
             sqlite_schema_cursor_id,
             None,
             SchemaEntryType::Table,
@@ -266,7 +256,7 @@ pub fn translate_create_materialized_view(
             );
             emit_schema_entry(
                 program,
-                resolver,
+                catalog,
                 sqlite_schema_cursor_id,
                 None,
                 SchemaEntryType::Index,
@@ -291,7 +281,7 @@ pub fn translate_create_materialized_view(
         trigger_target_database_id: None,
     });
 
-    let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
+    let schema_version = catalog.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
         cookie: Cookie::SchemaVersion,
@@ -305,12 +295,12 @@ pub fn translate_create_materialized_view(
         cursors: cursor_info,
     });
 
-    program.epilogue(resolver.schema());
+    program.epilogue(catalog.main_schema());
     Ok(())
 }
 
 fn validate_create_view(
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     database_id: usize,
     view_name: &ast::Name,
     normalized_view_name: &str,
@@ -318,7 +308,7 @@ fn validate_create_view(
     // Check if view already exists. A broken view (unparseable sqlite_schema
     // row) also counts: creating over it would produce a duplicate row, so
     // the user must DROP VIEW it first.
-    if resolver.with_schema(database_id, |s| {
+    if catalog.with_schema(database_id, |s| {
         s.get_view(normalized_view_name).is_some()
             || s.materialized_view_exists(normalized_view_name)
             || s.broken_views.contains(normalized_view_name)
@@ -339,7 +329,7 @@ fn validate_create_view(
 
 pub fn translate_create_view(
     view_name: &ast::QualifiedName,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     select_stmt: &ast::Select,
     columns: &[ast::IndexedColumn],
     temporary: bool,
@@ -351,14 +341,14 @@ pub fn translate_create_view(
     let database_id = if temporary {
         crate::TEMP_DB_ID
     } else {
-        resolver.resolve_database_id_for_create(view_name)?
+        catalog.resolve_database_id(view_name)?
     };
-    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
     if if_not_exists
-        && resolver.with_schema(database_id, |s| {
+        && catalog.with_schema(database_id, |s| {
             s.get_view(&normalized_view_name).is_some()
                 || s.materialized_view_exists(&normalized_view_name)
                 || s.broken_views.contains(&normalized_view_name)
@@ -367,16 +357,11 @@ pub fn translate_create_view(
         return Ok(());
     }
 
-    validate_create_view(
-        resolver,
-        database_id,
-        &view_name.name,
-        &normalized_view_name,
-    )?;
+    validate_create_view(catalog, database_id, &view_name.name, &normalized_view_name)?;
 
     // Check for name conflicts with existing schema objects
     if let Some(object_type) =
-        resolver.with_schema(database_id, |s| s.get_object_type(&normalized_view_name))
+        catalog.with_schema(database_id, |s| s.get_object_type(&normalized_view_name))
     {
         // IF NOT EXISTS suppresses errors for table/view conflicts, matching
         // CREATE TABLE IF NOT EXISTS behavior
@@ -404,13 +389,16 @@ pub fn translate_create_view(
     crate::util::validate_select_for_views(select_stmt, view_name.namespace.as_ref())?;
 
     let mut select_stmt = select_stmt.clone();
-    if resolver.dialect.binds_names_at_create() {
-        bind_sequence_names_in_select(&mut select_stmt, resolver)?;
+    if catalog.dialect().binds_names_at_create() {
+        bind_sequence_names_in_select(&mut select_stmt, catalog)?;
     }
     let sql = create_view_to_str("VIEW", &view_name.name.as_ident(), columns, &select_stmt);
 
     // Open cursor to sqlite_schema table
-    let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+    let table = catalog
+        .main_schema()
+        .get_btree_table(SQLITE_TABLEID)
+        .unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -421,7 +409,7 @@ pub fn translate_create_view(
     // Add the view entry to sqlite_schema
     emit_schema_entry(
         program,
-        resolver,
+        catalog,
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for views
         SchemaEntryType::View,
@@ -439,7 +427,7 @@ pub fn translate_create_view(
         trigger_target_database_id: None,
     });
 
-    let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
+    let schema_version = catalog.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
         cookie: Cookie::SchemaVersion,
@@ -468,7 +456,7 @@ fn create_view_to_str(
 }
 
 pub fn translate_drop_view(
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     view_name: &ast::QualifiedName,
     if_exists: bool,
     program: &mut ProgramBuilder,
@@ -476,15 +464,18 @@ pub fn translate_drop_view(
     // Unqualified names search the temp schema first, then main, then
     // attached databases, so DROP VIEW finds temp views like SQLite does.
     let normalized_view_name = normalize_ident(view_name.name.as_str());
-    let Some(database_id) = resolver.find_existing_table_database_id_qualified(view_name)? else {
-        if if_exists {
-            return Ok(());
+    // With no such view in any database the name can name, IF EXISTS does
+    // nothing.
+    let database_id = match catalog.resolve_existing_table_database_id_qualified(view_name) {
+        Ok(database_id) => database_id,
+        Err(_) if if_exists => return Ok(()),
+        Err(_) => {
+            return Err(crate::LimboError::ParseError(format!(
+                "no such view: {normalized_view_name}"
+            )))
         }
-        return Err(crate::LimboError::ParseError(format!(
-            "no such view: {normalized_view_name}"
-        )));
     };
-    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
     // Check if view exists: regular, materialized, or a broken sqlite_schema
@@ -492,7 +483,7 @@ pub fn translate_drop_view(
     // in-memory representation, but DROP VIEW must still delete their row so
     // affected databases can be cleaned up.
     let (is_regular_view, is_materialized_view, is_broken_view) =
-        resolver.with_schema(database_id, |s| {
+        catalog.with_schema(database_id, |s| {
             (
                 s.get_view(&normalized_view_name).is_some(),
                 s.materialized_view_exists(&normalized_view_name),
@@ -513,7 +504,7 @@ pub fn translate_drop_view(
     }
 
     if is_materialized_view || is_regular_view {
-        let dependent_views = resolver.with_schema(database_id, |s| {
+        let dependent_views = catalog.with_schema(database_id, |s| {
             s.get_dependent_materialized_views(&normalized_view_name)
         });
         if !dependent_views.is_empty() {
@@ -534,7 +525,7 @@ pub fn translate_drop_view(
     // multiset) — those that exist for its shape.
     let internal_table_names: Vec<String> = if is_materialized_view {
         if let Some(table) =
-            resolver.with_schema(database_id, |s| s.get_table(&normalized_view_name))
+            catalog.with_schema(database_id, |s| s.get_table(&normalized_view_name))
         {
             if let Some(btree_table) = table.btree() {
                 // Destroy the btree for the materialized view
@@ -545,7 +536,7 @@ pub fn translate_drop_view(
                     is_temp: 0,
                 });
             }
-        } else if let Some(root_page) = resolver.with_schema(database_id, |s| {
+        } else if let Some(root_page) = catalog.with_schema(database_id, |s| {
             s.incompatible_materialized_view_root(&normalized_view_name)
         }) {
             program.emit_insn(Insn::Destroy {
@@ -560,7 +551,7 @@ pub fn translate_drop_view(
         // incompatible older storage versions. Ownership parses the complete
         // node/branch suffix so similarly prefixed view names cannot steal
         // each other's state.
-        resolver.with_schema(database_id, |s| {
+        catalog.with_schema(database_id, |s| {
             s.tables
                 .keys()
                 .filter(|table_name| {
@@ -578,7 +569,7 @@ pub fn translate_drop_view(
 
     // Destroy the internal tables' btrees and indexes (those that exist).
     for internal_table_name in &internal_table_names {
-        let internal_indexes: Vec<_> = resolver.with_schema(database_id, |s| {
+        let internal_indexes: Vec<_> = catalog.with_schema(database_id, |s| {
             s.get_indices(internal_table_name).cloned().collect()
         });
         for index in &internal_indexes {
@@ -591,7 +582,7 @@ pub fn translate_drop_view(
         }
 
         if let Some(internal_table) =
-            resolver.with_schema(database_id, |s| s.get_table(internal_table_name))
+            catalog.with_schema(database_id, |s| s.get_table(internal_table_name))
         {
             if let Some(internal_btree) = internal_table.btree() {
                 program.emit_insn(Insn::Destroy {
@@ -606,7 +597,7 @@ pub fn translate_drop_view(
 
     // Open cursor to sqlite_schema table (structure is the same for all databases)
     let schema_table =
-        resolver.with_schema(MAIN_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+        catalog.with_schema(MAIN_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -814,7 +805,7 @@ pub fn translate_drop_view(
     });
 
     // Update schema version (increment schema cookie)
-    let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
+    let schema_version = catalog.with_schema(database_id, |s| s.schema_version);
     let schema_version_reg = program.alloc_register();
     program.emit_insn(Insn::Integer {
         dest: schema_version_reg,
@@ -827,6 +818,6 @@ pub fn translate_drop_view(
         p5: 1, // update version
     });
 
-    program.epilogue(resolver.schema());
+    program.epilogue(catalog.main_schema());
     Ok(())
 }

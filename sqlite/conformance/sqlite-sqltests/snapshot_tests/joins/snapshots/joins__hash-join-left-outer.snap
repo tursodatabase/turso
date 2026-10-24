@@ -19,65 +19,65 @@ QUERY PLAN
 `--SCAN h_orders AS h
 
 BYTECODE
-addr  opcode              p1  p2  p3  p4                                        p5  comment
-   0  Init                 0  59   0                                             0  Start at 59
-   1  OpenRead             0   2   0  k(3,B,B,B)                                 0  table=h_orders, root=2, iDb=0
-   2  OpenRead             1   3   0  k(4,B,B,B,B)                               0  table=h_items, root=3, iDb=0
-   3  Integer              0   4   0                                             0  r[4]=0
-   4  Once                14   0   0                                             0  goto 14
-   5  OpenRead             2   2   0  k(3,B,B,B)                                 0  table=h_orders, root=2, iDb=0
-   6  Rewind               2  13   0                                             0  Rewind table h_orders
-   7    Column             2   1   5                                             0  r[5]=h_orders.customer_name
-   8    Affinity           5   1   0                                             0  r[5..6] = A
-   9    RowId              2   6   0                                             0  r[6]=h_orders.rowid
-  10    Column             2   1   7                                             0  r[7]=h_orders.customer_name
-  11    HashBuild          2   5   1  r=[1] budget=67108864 payload=r[6]..r[7]   0
-  12  Next                 2   7   0                                             0
-  13  HashBuildFinalize    1   0   0                                             0
-  14  HashResetMatched     1   0   0                                             0
-  15  Rewind               1  33   0                                             0  Rewind table h_items
-  16    Column             1   1   8                                             0  r[8]=h_items.order_name
-  17    Affinity           8   1   0                                             0  r[8..9] = A
-  18    RowId              1  11   0                                             0  r[11]=h_items.rowid
-  19    Integer            0  12   0                                             0  r[12]=0
-  20    HashProbe          1   8   1  r[13]=32 payload=r[9]..r[10]               0
-  21    HashMarkMatched    1   0   0                                             0
-  22    Gosub             14  24   0                                             0
-  23    Goto               0  29   0                                             0
-  24    Copy               9   1   0                                             0  r[1]=r[9]
-  25    Copy              10   2   0                                             0  r[2]=r[10]
-  26    Column             1   2   3                                             0  r[3]=h_items.product
-  27    ResultRow          1   3   0                                             0  output=r[1..3]
-  28    Return            14   0   0                                             0
-  29    IfPos             12  46   0                                             0  r[12]>0 -> r[12]-=0, goto 46
-  30    HashNext           1  13  32   payload=r[9]..r[10]                       0
-  31    Goto               0  21   0                                             0
-  32  Next                 1  16   0                                             0
-  33  NullRow              1   0   0                                             0  Set cursor 1 to a (pseudo) NULL row
-  34  HashScanUnmatched    1  13  39                                             0  hash_table_id=1 payload=r[9]..r[10]
-  35  SeekRowid            0  13  39                                             0  if (r[13]!=cursor 0 for table h_orders.rowid) goto 39
-  36  Gosub               14  24   0                                             0
-  37  HashNextUnmatched    1  13  39                                             0  hash_table_id=1 payload=r[9]..r[10]
-  38  Goto                 0  35   0                                             0
-  39  HashGraceInit        1   0  57                                             0  hash_table_id=1
-  40  Integer              1  12   0                                             0  r[12]=1
-  41  HashGraceLoadPart    1   0  56                                             0  hash_table_id=1
-  42  HashGraceNextProbe   1   8  48                                             0  hash_table_id=1 keys=r[8]..r[8] probe_rowid_dest=r[11]
-  43  SeekRowid            1  11  42                                             0  if (r[11]!=cursor 1 for table h_items.rowid) goto 42
-  44  HashProbe            1   8   1  r[13]=42 payload=r[9]..r[10]               0
-  45  Goto                 0  21   0                                             0
-  46  HashNext             1  13  42   payload=r[9]..r[10]                       0
-  47  Goto                 0  21   0                                             0
-  48  NullRow              1   0   0                                             0  Set cursor 1 to a (pseudo) NULL row
-  49  HashScanUnmatched    1  13  54                                             0  hash_table_id=1 payload=r[9]..r[10]
-  50  SeekRowid            0  13  54                                             0  if (r[13]!=cursor 0 for table h_orders.rowid) goto 54
-  51  Gosub               14  24   0                                             0
-  52  HashNextUnmatched    1  13  54                                             0  hash_table_id=1 payload=r[9]..r[10]
-  53  Goto                 0  50   0                                             0
-  54  HashGraceAdvPart     1   0  56                                             0  hash_table_id=1
-  55  Goto                 0  41   0                                             0
-  56  Integer              0  12   0                                             0  r[12]=0
-  57  HashClose            1   0   0                                             0
-  58  Halt                 0   0   0                                             0
-  59  Transaction          0   1   3                                             0  iDb=0 tx_mode=Read
-  60  Goto                 0   1   0                                             0
+addr  opcode                       p1  p2  p3  p4                                                 p5  comment
+   0  Init                          0  59   0                                                      0  Start at 59
+   1  OpenRead                      0   3   0  k(4,B,B,B,B)                                        0  table=h_items, root=3, iDb=0
+   2  Integer                       0   9   0                                                      0  r[9]=0
+   3  OpenEphemeral                 2   1   0                                                      0  cursor=2 is_table=true
+   4  Null                          0  11   0                                                      0  r[11]=NULL
+   5  MakeRecord                   11   1  12                                                      0  r[12]=mkrec(r[11..11])
+   6  Rewind                        0  35   0                                                      0  Rewind table h_items
+   7    IfPos                       9  20   0                                                      0  r[9]>0 -> r[9]-=0, goto 20
+   8    Once                       20   0   0                                                      0  goto 20
+   9    OpenRead                    1   2   0  k(3,B,B,B)                                          0  table=h_orders, root=2, iDb=0
+  10    Null                        0   1   3                                                      0  r[1..3]=NULL
+  11    Rewind                      1  18   0                                                      0  Rewind table h_orders
+  12      Column                    1   1   5                                                      0  r[5]=h_orders.customer_name
+  13      Affinity                  5   1   0                                                      0  r[5..6] = A
+  14      RowId                     1   1   0                                                      0  r[1]=h_orders.rowid
+  15      Column                    1   1   2                                                      0  r[2]=h_orders.customer_name
+  16      HashBuild                 1   5   1  r=[1073741824] budget=67108864 payload=r[1]..r[3]   0
+  17    Next                        1  12   0                                                      1
+  18    HashBuildFinalize  1073741824   0   0                                                      0
+  19    Integer                     1   9   0                                                      0  r[9]=1
+  20    Column                      0   1   6                                                      0  r[6]=h_items.order_name
+  21    Affinity                    6   1   0                                                      0  r[6..7] = A
+  22    RowId                       0   7   0                                                      0  r[7]=h_items.rowid
+  23    Integer                     0   8   0                                                      0  r[8]=0
+  24    HashProbe          1073741824   6   1  r[4]=34 payload=r[1]..r[3]                          0
+  25    Copy                        4  13   0                                                      0  r[13]=r[4]
+  26    Insert                      2  12  13                                                      6  intkey=r[13] data=r[12]
+  27    Copy                        4  14   0                                                      0  r[14]=r[4]
+  28    Copy                        2  15   0                                                      0  r[15]=r[2]
+  29    Column                      0   2  16                                                      0  r[16]=h_items.product
+  30    ResultRow                  14   3   0                                                      0  output=r[14..16]
+  31    IfPos                       8  42   0                                                      0  r[8]>0 -> r[8]-=0, goto 42
+  32    HashNext           1073741824   4  34   payload=r[1]..r[3]                                 0
+  33    Goto                        0  25   0                                                      0
+  34  Next                          0   7   0                                                      1
+  35  HashGraceInit        1073741824   0  47                                                      0  hash_table_id=1073741824
+  36  Integer                       1   8   0                                                      0  r[8]=1
+  37  HashGraceLoadPart    1073741824   0  46                                                      0  hash_table_id=1073741824
+  38  HashGraceNextProbe   1073741824   6  44                                                      0  hash_table_id=1073741824 keys=r[6]..r[6] probe_rowid_dest=r[7]
+  39  SeekRowid                     0   7  38                                                      0  if (r[7]!=cursor 0.rowid) goto 38
+  40  HashProbe            1073741824   6   1  r[4]=38 payload=r[1]..r[3]                          0
+  41  Goto                          0  25   0                                                      0
+  42  HashNext             1073741824   4  38   payload=r[1]..r[3]                                 0
+  43  Goto                          0  25   0                                                      0
+  44  HashGraceAdvPart     1073741824   0  46                                                      0  hash_table_id=1073741824
+  45  Goto                          0  37   0                                                      0
+  46  Integer                       0   8   0                                                      0  r[8]=0
+  47  NullRow                       0   0   0                                                      0  Set cursor 0 to a (pseudo) NULL row
+  48  OpenRead                      3   2   0  k(3,B,B,B)                                          0  table=h_orders, root=2, iDb=0
+  49  Rewind                        3  58   0                                                      0  Rewind table h_orders
+  50    RowId                       3  17   0                                                      0  r[17]=h_orders.rowid
+  51    NotExists                   2  53  17                                                      0
+  52    Goto                        0  57   0                                                      0
+  53    RowId                       3  19   0                                                      0  r[19]=h_orders.rowid
+  54    Column                      3   1  20                                                      0  r[20]=h_orders.customer_name
+  55    Column                      0   2  21                                                      0  r[21]=h_items.product
+  56    ResultRow                  19   3   0                                                      0  output=r[19..21]
+  57  Next                          3  50   0                                                      1
+  58  Halt                          0   0   0                                                      0
+  59  Transaction                   0   1   3                                                      0  iDb=0 tx_mode=Read
+  60  Goto                          0   1   0                                                      0

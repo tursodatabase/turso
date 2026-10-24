@@ -874,6 +874,67 @@ expect {
     400
 }
 
+# =============================================================================
+# 31. Grace hash join probed again by an outer loop
+# =============================================================================
+
+# The hash join's probe loop runs once per row of `a`, and each run sets aside
+# the probe rows whose build partition is on disk. Each run must join only
+# its own rows, and must still find the build rows that stayed in memory.
+@cross-check-integrity
+test grace-probe-loop-runs-again {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x INT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, pad TEXT);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k INT, pad TEXT);
+    INSERT INTO a SELECT value, value FROM generate_series(1, 3);
+    INSERT INTO b SELECT value, value % 500, printf('%050d', value) FROM generate_series(1, 3000);
+    INSERT INTO c SELECT value, value % 700, printf('%050d', value) FROM generate_series(1, 3000);
+    SELECT count(*), sum(b.id), sum(c.id) FROM a, b JOIN c ON b.k = c.k;
+}
+expect {
+    39600|58879800|57274200
+}
+
+# =============================================================================
+# 32. FULL OUTER grace hash join with probe rows set aside
+# =============================================================================
+
+# A probe row whose build partition is on disk waits for grace processing,
+# which emits it with its matches or with a NULL build side. The probe loop
+# must not also emit it as unmatched.
+@cross-check-integrity
+test grace-full-outer-set-aside-probe-rows {
+    CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, pad TEXT);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k INT, pad TEXT);
+    INSERT INTO b SELECT value, CASE WHEN value % 13 THEN value % 500 END, printf('%050d', value) FROM generate_series(1, 3000);
+    INSERT INTO c SELECT value, CASE WHEN value % 13 THEN value % 700 END, printf('%050d', value) FROM generate_series(1, 3000);
+    SELECT count(*), sum(b.id), sum(c.id) FROM b FULL JOIN c ON b.k = c.k;
+}
+expect {
+    12465|17079801|17820541
+}
+
+# =============================================================================
+# 33. A hash join built from the rows of an earlier hash join
+# =============================================================================
+
+# `c` probes the hash table built from `d`, and `b` probes a hash table
+# built from the `c`/`d` rows that joined (the materialized build input).
+# Both hash tables spill to disk at this size.
+@cross-check-integrity
+test grace-hash-join-chain {
+    CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, pad TEXT);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k INT, pad TEXT);
+    CREATE TABLE d(id INTEGER PRIMARY KEY, k INT, pad TEXT);
+    INSERT INTO b SELECT value, CASE WHEN value % 13 THEN value % 500 END, printf('%050d', value) FROM generate_series(1, 3000);
+    INSERT INTO c SELECT value, CASE WHEN value % 13 THEN value % 700 END, printf('%050d', value) FROM generate_series(1, 3000);
+    INSERT INTO d SELECT value, CASE WHEN value % 13 THEN value % 300 END, printf('%050d', value) FROM generate_series(1, 2000);
+    SELECT count(*), sum(b.id), sum(c.id), sum(d.id) FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k;
+}
+expect {
+    44458|61706490|64355890|44512790
+}
+
 # Compare Turso with SQLite across join types, join keys, filters, and limits.
 setup hash-join-matrix-rows {
     CREATE TABLE matrix_left(id INTEGER PRIMARY KEY, k, k2, flag, payload);

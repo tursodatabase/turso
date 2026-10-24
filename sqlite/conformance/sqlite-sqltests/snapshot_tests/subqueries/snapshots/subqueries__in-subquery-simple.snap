@@ -18,6 +18,6 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--LIST SUBQUERY 1
-|  `--SCAN categories
-`--SEARCH products USING INDEX idx_products_category (category_id=?)
+|--SEARCH products USING INDEX idx_products_category (category_id=?)
+`--LIST SUBQUERY 1
+   `--SCAN categories

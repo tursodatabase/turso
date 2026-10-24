@@ -49,110 +49,195 @@ QUERY PLAN
 `--SEARCH part USING INTEGER PRIMARY KEY (rowid=?)
 
 BYTECODE
-addr  opcode       p1  p2  p3  p4                                     p5  comment
-   0  Init          0  67   0                                          0  Start at 67
-   1  Null          0   2   0                                          0  r[2]=NULL
-   2  OpenRead      0  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
-   3  OpenRead      1   4   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=part, root=4, iDb=0
-   4  Rewind        0  63   0                                          0  Rewind table lineitem
-   5    Column      0  14   3                                          0  r[3]=lineitem.L_SHIPMODE
-   6    Eq          3   4   8  Binary                                  0  if r[3]==r[4] goto 8
-   7    Ne          3   5  62  Binary                                  0  if r[3]!=r[5] goto 62
-   8    Column      0  13   7                                          0  r[7]=lineitem.L_SHIPINSTRUCT
-   9    Ne          7   8  62  Binary                                  0  if r[7]!=r[8] goto 62
-  10    Column      0   1   9                                          0  r[9]=lineitem.L_PARTKEY
-  11    SeekRowid   1   9  62                                          0  if (r[9]!=cursor 1 for table part.rowid) goto 62
-  12    Column      1   3  11                                          0  r[11]=part.P_BRAND
-  13    Ne         11  12  25  Binary                                  0  if r[11]!=r[12] goto 25
-  14    Column      1   6  13                                          0  r[13]=part.P_CONTAINER
-  15    Eq         13  14  19  Binary                                  0  if r[13]==r[14] goto 19
-  16    Eq         13  15  19  Binary                                  0  if r[13]==r[15] goto 19
-  17    Eq         13  16  19  Binary                                  0  if r[13]==r[16] goto 19
-  18    Ne         13  17  25  Binary                                  0  if r[13]!=r[17] goto 25
-  19    Column      0   4  19                                          0  r[19]=lineitem.L_QUANTITY
-  20    Lt         19  20  25  Binary                                  0  if r[19]<r[20] goto 25
-  21    Column      0   4  22                                          0  r[22]=lineitem.L_QUANTITY
-  22    Gt         22  23  25  Binary                                  0  if r[22]>r[23] goto 25
-  23    Column      1   5  27                                          0  r[27]=part.P_SIZE
-  24    Le         27  28  51  Binary                                  0  if r[27]<=r[28] goto 51
-  25    Column      1   3  30                                          0  r[30]=part.P_BRAND
-  26    Ne         30  31  38  Binary                                  0  if r[30]!=r[31] goto 38
-  27    Column      1   6  32                                          0  r[32]=part.P_CONTAINER
-  28    Eq         32  33  32  Binary                                  0  if r[32]==r[33] goto 32
-  29    Eq         32  34  32  Binary                                  0  if r[32]==r[34] goto 32
-  30    Eq         32  35  32  Binary                                  0  if r[32]==r[35] goto 32
-  31    Ne         32  36  38  Binary                                  0  if r[32]!=r[36] goto 38
-  32    Column      0   4  38                                          0  r[38]=lineitem.L_QUANTITY
-  33    Lt         38  39  38  Binary                                  0  if r[38]<r[39] goto 38
-  34    Column      0   4  41                                          0  r[41]=lineitem.L_QUANTITY
-  35    Gt         41  42  38  Binary                                  0  if r[41]>r[42] goto 38
-  36    Column      1   5  45                                          0  r[45]=part.P_SIZE
-  37    Le         45  46  51  Binary                                  0  if r[45]<=r[46] goto 51
-  38    Column      1   3  48                                          0  r[48]=part.P_BRAND
-  39    Ne         48  49  62  Binary                                  0  if r[48]!=r[49] goto 62
-  40    Column      1   6  50                                          0  r[50]=part.P_CONTAINER
-  41    Eq         50  51  45  Binary                                  0  if r[50]==r[51] goto 45
-  42    Eq         50  52  45  Binary                                  0  if r[50]==r[52] goto 45
-  43    Eq         50  53  45  Binary                                  0  if r[50]==r[53] goto 45
-  44    Ne         50  54  62  Binary                                  0  if r[50]!=r[54] goto 62
-  45    Column      0   4  56                                          0  r[56]=lineitem.L_QUANTITY
-  46    Lt         56  57  62  Binary                                  0  if r[56]<r[57] goto 62
-  47    Column      0   4  59                                          0  r[59]=lineitem.L_QUANTITY
-  48    Gt         59  60  62  Binary                                  0  if r[59]>r[60] goto 62
-  49    Column      1   5  64                                          0  r[64]=part.P_SIZE
-  50    Gt         64  65  62  Binary                                  0  if r[64]>r[65] goto 62
-  51    Column      1   3  66                                          0  r[66]=part.P_BRAND
-  52    Eq         66  67  55  Binary                                  0  if r[66]==r[67] goto 55
-  53    Eq         66  68  55  Binary                                  0  if r[66]==r[68] goto 55
-  54    Ne         66  69  62  Binary                                  0  if r[66]!=r[69] goto 62
-  55    Column      1   5  71                                          0  r[71]=part.P_SIZE
-  56    Lt         71  72  62  Binary                                  0  if r[71]<r[72] goto 62
-  57    Column      0   5  74                                          0  r[74]=lineitem.L_EXTENDEDPRICE
-  58    Column      0   6  77                                          0  r[77]=lineitem.L_DISCOUNT
-  59    Subtract   76  77  75                                          0  r[75]=r[76]-r[77]
-  60    Multiply   74  75  73                                          0  r[73]=r[74]*r[75]
-  61    AggStep     0  73   2  sum                                     0  accum=r[2] step(r[73])
-  62  Next          0   5   0                                          1
-  63  AggFinal      0   2   0  sum                                     0  accum=r[2]
-  64  Copy          2   1   0                                          0  r[1]=r[2]
-  65  ResultRow     1   1   0                                          0  output=r[1]
-  66  Halt          0   0   0                                          0
-  67  Transaction   0   1   8                                          0  iDb=0 tx_mode=Read
-  68  String8       0   4   0  AIR                                     0  r[4]='AIR'
-  69  String8       0   5   0  AIR REG                                 0  r[5]='AIR REG'
-  70  String8       0   8   0  DELIVER IN PERSON                       0  r[8]='DELIVER IN PERSON'
-  71  String8       0  12   0  Brand#22                                0  r[12]='Brand#22'
-  72  String8       0  14   0  SM CASE                                 0  r[14]='SM CASE'
-  73  String8       0  15   0  SM BOX                                  0  r[15]='SM BOX'
-  74  String8       0  16   0  SM PACK                                 0  r[16]='SM PACK'
-  75  String8       0  17   0  SM PKG                                  0  r[17]='SM PKG'
-  76  Integer       8  20   0                                          0  r[20]=8
-  77  Integer       8  24   0                                          0  r[24]=8
-  78  Integer      10  25   0                                          0  r[25]=10
-  79  Add          24  25  23                                          0  r[23]=r[24]+r[25]
-  80  Integer       5  28   0                                          0  r[28]=5
-  81  String8       0  31   0  Brand#23                                0  r[31]='Brand#23'
-  82  String8       0  33   0  MED BAG                                 0  r[33]='MED BAG'
-  83  String8       0  34   0  MED BOX                                 0  r[34]='MED BOX'
-  84  String8       0  35   0  MED PKG                                 0  r[35]='MED PKG'
-  85  String8       0  36   0  MED PACK                                0  r[36]='MED PACK'
-  86  Integer      10  39   0                                          0  r[39]=10
-  87  Integer      10  43   0                                          0  r[43]=10
-  88  Add          43  43  42                                          0  r[42]=r[43]+r[43]
-  89  Integer      10  46   0                                          0  r[46]=10
-  90  String8       0  49   0  Brand#12                                0  r[49]='Brand#12'
-  91  String8       0  51   0  LG CASE                                 0  r[51]='LG CASE'
-  92  String8       0  52   0  LG BOX                                  0  r[52]='LG BOX'
-  93  String8       0  53   0  LG PACK                                 0  r[53]='LG PACK'
-  94  String8       0  54   0  LG PKG                                  0  r[54]='LG PKG'
-  95  Integer      24  57   0                                          0  r[57]=24
-  96  Integer      24  61   0                                          0  r[61]=24
-  97  Integer      10  62   0                                          0  r[62]=10
-  98  Add          61  62  60                                          0  r[60]=r[61]+r[62]
-  99  Integer      15  65   0                                          0  r[65]=15
- 100  String8       0  67   0  Brand#22                                0  r[67]='Brand#22'
- 101  String8       0  68   0  Brand#23                                0  r[68]='Brand#23'
- 102  String8       0  69   0  Brand#12                                0  r[69]='Brand#12'
- 103  Integer       1  72   0                                          0  r[72]=1
- 104  Integer       1  76   0                                          0  r[76]=1
- 105  Goto          0   1   0                                          0
+addr  opcode        p1   p2   p3  p4                                     p5  comment
+   0  Init           0  173    0                                          0  Start at 173
+   1  Null           0    1    0                                          0  r[1]=NULL
+   2  OpenRead       0   10    0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
+   3  OpenRead       1    4    0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=part, root=4, iDb=0
+   4  Integer        0    2    0                                          0  r[2]=0
+   5  Rewind         0  169    0                                          0  Rewind table lineitem
+   6    Null         0    4    0                                          0  r[4]=NULL
+   7    Column       0   14    5                                          0  r[5]=lineitem.L_SHIPMODE
+   8    BitAnd       5    5    6                                          0  r[6]=r[5]&r[5]
+   9    String8      0    7    0  AIR                                     0  r[7]='AIR'
+  10    BitAnd       6    7    6                                          0  r[6]=r[6]&r[7]
+  11    Eq           5    7   17  Binary                                  0  if r[5]==r[7] goto 17
+  12    String8      0    8    0  AIR REG                                 0  r[8]='AIR REG'
+  13    BitAnd       6    8    6                                          0  r[6]=r[6]&r[8]
+  14    Eq           5    8   17  Binary                                  0  if r[5]==r[8] goto 17
+  15    IsNull       6   19    0                                          0  if (r[6]==NULL) goto 19
+  16    Goto         0   18    0                                          0
+  17    Integer      1    4    0                                          0  r[4]=1
+  18    AddImm       4    0    0                                          0  r[4]=r[4]+0
+  19    Copy         4    3    0                                          0  r[3]=r[4]
+  20    IfNot        3  168    1                                          0  if !r[3] goto 168
+  21    Column       0   13    9                                          0  r[9]=lineitem.L_SHIPINSTRUCT
+  22    Ne           9   10  168  Binary                                  0  if r[9]!=r[10] goto 168
+  23    Column       0    1   11                                          0  r[11]=lineitem.L_PARTKEY
+  24    SeekRowid    1   11  168                                          0  if (r[11]!=cursor 1.rowid) goto 168
+  25    Column       1    3   12                                          0  r[12]=part.P_BRAND
+  26    Ne          12   13   65  Binary                                  0  if r[12]!=r[13] goto 65
+  27    Null         0   15    0                                          0  r[15]=NULL
+  28    Column       1    6   16                                          0  r[16]=part.P_CONTAINER
+  29    BitAnd      16   16   17                                          0  r[17]=r[16]&r[16]
+  30    String8      0   18    0  SM CASE                                 0  r[18]='SM CASE'
+  31    BitAnd      17   18   17                                          0  r[17]=r[17]&r[18]
+  32    Eq          16   18   44  Binary                                  0  if r[16]==r[18] goto 44
+  33    String8      0   19    0  SM BOX                                  0  r[19]='SM BOX'
+  34    BitAnd      17   19   17                                          0  r[17]=r[17]&r[19]
+  35    Eq          16   19   44  Binary                                  0  if r[16]==r[19] goto 44
+  36    String8      0   20    0  SM PACK                                 0  r[20]='SM PACK'
+  37    BitAnd      17   20   17                                          0  r[17]=r[17]&r[20]
+  38    Eq          16   20   44  Binary                                  0  if r[16]==r[20] goto 44
+  39    String8      0   21    0  SM PKG                                  0  r[21]='SM PKG'
+  40    BitAnd      17   21   17                                          0  r[17]=r[17]&r[21]
+  41    Eq          16   21   44  Binary                                  0  if r[16]==r[21] goto 44
+  42    IsNull      17   46    0                                          0  if (r[17]==NULL) goto 46
+  43    Goto         0   45    0                                          0
+  44    Integer      1   15    0                                          0  r[15]=1
+  45    AddImm      15    0    0                                          0  r[15]=r[15]+0
+  46    Copy        15   14    0                                          0  r[14]=r[15]
+  47    IfNot       14   65    1                                          0  if !r[14] goto 65
+  48    Column       0    4   22                                          0  r[22]=lineitem.L_QUANTITY
+  49    Lt          22   23   65  Binary                                  0  if r[22]<r[23] goto 65
+  50    Column       0    4   24                                          0  r[24]=lineitem.L_QUANTITY
+  51    Gt          24   25   65  Binary                                  0  if r[24]>r[25] goto 65
+  52    Column       1    5   29                                          0  r[29]=part.P_SIZE
+  53    Integer      1   31    0                                          0  r[31]=1
+  54    Copy        29   34    0                                          0  r[34]=r[29]
+  55    Integer      1   30    0                                          0  r[30]=1
+  56    Ge          34   31   58  Binary                                  0  if r[34]>=r[31] goto 58
+  57    ZeroOrNull  34   30   31                                          0  ((r[34]=NULL)|(r[31]=NULL)) ? r[30]=NULL : r[30]=0
+  58    Integer      5   33    0                                          0  r[33]=5
+  59    Copy        29   35    0                                          0  r[35]=r[29]
+  60    Integer      1   32    0                                          0  r[32]=1
+  61    Le          35   33   63  Binary                                  0  if r[35]<=r[33] goto 63
+  62    ZeroOrNull  35   32   33                                          0  ((r[35]=NULL)|(r[33]=NULL)) ? r[32]=NULL : r[32]=0
+  63    And         32   30   28                                          0  r[28]=(r[30] && r[32])
+  64    If          28  145    0                                          0  if r[28] goto 145
+  65    Column       1    3   36                                          0  r[36]=part.P_BRAND
+  66    Ne          36   37  105  Binary                                  0  if r[36]!=r[37] goto 105
+  67    Null         0   39    0                                          0  r[39]=NULL
+  68    Column       1    6   40                                          0  r[40]=part.P_CONTAINER
+  69    BitAnd      40   40   41                                          0  r[41]=r[40]&r[40]
+  70    String8      0   42    0  MED BAG                                 0  r[42]='MED BAG'
+  71    BitAnd      41   42   41                                          0  r[41]=r[41]&r[42]
+  72    Eq          40   42   84  Binary                                  0  if r[40]==r[42] goto 84
+  73    String8      0   43    0  MED BOX                                 0  r[43]='MED BOX'
+  74    BitAnd      41   43   41                                          0  r[41]=r[41]&r[43]
+  75    Eq          40   43   84  Binary                                  0  if r[40]==r[43] goto 84
+  76    String8      0   44    0  MED PKG                                 0  r[44]='MED PKG'
+  77    BitAnd      41   44   41                                          0  r[41]=r[41]&r[44]
+  78    Eq          40   44   84  Binary                                  0  if r[40]==r[44] goto 84
+  79    String8      0   45    0  MED PACK                                0  r[45]='MED PACK'
+  80    BitAnd      41   45   41                                          0  r[41]=r[41]&r[45]
+  81    Eq          40   45   84  Binary                                  0  if r[40]==r[45] goto 84
+  82    IsNull      41   86    0                                          0  if (r[41]==NULL) goto 86
+  83    Goto         0   85    0                                          0
+  84    Integer      1   39    0                                          0  r[39]=1
+  85    AddImm      39    0    0                                          0  r[39]=r[39]+0
+  86    Copy        39   38    0                                          0  r[38]=r[39]
+  87    IfNot       38  105    1                                          0  if !r[38] goto 105
+  88    Column       0    4   46                                          0  r[46]=lineitem.L_QUANTITY
+  89    Lt          46   47  105  Binary                                  0  if r[46]<r[47] goto 105
+  90    Column       0    4   48                                          0  r[48]=lineitem.L_QUANTITY
+  91    Gt          48   49  105  Binary                                  0  if r[48]>r[49] goto 105
+  92    Column       1    5   52                                          0  r[52]=part.P_SIZE
+  93    Integer      1   54    0                                          0  r[54]=1
+  94    Copy        52   57    0                                          0  r[57]=r[52]
+  95    Integer      1   53    0                                          0  r[53]=1
+  96    Ge          57   54   98  Binary                                  0  if r[57]>=r[54] goto 98
+  97    ZeroOrNull  57   53   54                                          0  ((r[57]=NULL)|(r[54]=NULL)) ? r[53]=NULL : r[53]=0
+  98    Integer     10   56    0                                          0  r[56]=10
+  99    Copy        52   58    0                                          0  r[58]=r[52]
+ 100    Integer      1   55    0                                          0  r[55]=1
+ 101    Le          58   56  103  Binary                                  0  if r[58]<=r[56] goto 103
+ 102    ZeroOrNull  58   55   56                                          0  ((r[58]=NULL)|(r[56]=NULL)) ? r[55]=NULL : r[55]=0
+ 103    And         55   53   51                                          0  r[51]=(r[53] && r[55])
+ 104    If          51  145    0                                          0  if r[51] goto 145
+ 105    Column       1    3   59                                          0  r[59]=part.P_BRAND
+ 106    Ne          59   60  168  Binary                                  0  if r[59]!=r[60] goto 168
+ 107    Null         0   62    0                                          0  r[62]=NULL
+ 108    Column       1    6   63                                          0  r[63]=part.P_CONTAINER
+ 109    BitAnd      63   63   64                                          0  r[64]=r[63]&r[63]
+ 110    String8      0   65    0  LG CASE                                 0  r[65]='LG CASE'
+ 111    BitAnd      64   65   64                                          0  r[64]=r[64]&r[65]
+ 112    Eq          63   65  124  Binary                                  0  if r[63]==r[65] goto 124
+ 113    String8      0   66    0  LG BOX                                  0  r[66]='LG BOX'
+ 114    BitAnd      64   66   64                                          0  r[64]=r[64]&r[66]
+ 115    Eq          63   66  124  Binary                                  0  if r[63]==r[66] goto 124
+ 116    String8      0   67    0  LG PACK                                 0  r[67]='LG PACK'
+ 117    BitAnd      64   67   64                                          0  r[64]=r[64]&r[67]
+ 118    Eq          63   67  124  Binary                                  0  if r[63]==r[67] goto 124
+ 119    String8      0   68    0  LG PKG                                  0  r[68]='LG PKG'
+ 120    BitAnd      64   68   64                                          0  r[64]=r[64]&r[68]
+ 121    Eq          63   68  124  Binary                                  0  if r[63]==r[68] goto 124
+ 122    IsNull      64  126    0                                          0  if (r[64]==NULL) goto 126
+ 123    Goto         0  125    0                                          0
+ 124    Integer      1   62    0                                          0  r[62]=1
+ 125    AddImm      62    0    0                                          0  r[62]=r[62]+0
+ 126    Copy        62   61    0                                          0  r[61]=r[62]
+ 127    IfNot       61  168    1                                          0  if !r[61] goto 168
+ 128    Column       0    4   69                                          0  r[69]=lineitem.L_QUANTITY
+ 129    Lt          69   70  168  Binary                                  0  if r[69]<r[70] goto 168
+ 130    Column       0    4   71                                          0  r[71]=lineitem.L_QUANTITY
+ 131    Gt          71   72  168  Binary                                  0  if r[71]>r[72] goto 168
+ 132    Column       1    5   76                                          0  r[76]=part.P_SIZE
+ 133    Integer      1   78    0                                          0  r[78]=1
+ 134    Copy        76   81    0                                          0  r[81]=r[76]
+ 135    Integer      1   77    0                                          0  r[77]=1
+ 136    Ge          81   78  138  Binary                                  0  if r[81]>=r[78] goto 138
+ 137    ZeroOrNull  81   77   78                                          0  ((r[81]=NULL)|(r[78]=NULL)) ? r[77]=NULL : r[77]=0
+ 138    Integer     15   80    0                                          0  r[80]=15
+ 139    Copy        76   82    0                                          0  r[82]=r[76]
+ 140    Integer      1   79    0                                          0  r[79]=1
+ 141    Le          82   80  143  Binary                                  0  if r[82]<=r[80] goto 143
+ 142    ZeroOrNull  82   79   80                                          0  ((r[82]=NULL)|(r[80]=NULL)) ? r[79]=NULL : r[79]=0
+ 143    And         79   77   75                                          0  r[75]=(r[77] && r[79])
+ 144    IfNot       75  168    1                                          0  if !r[75] goto 168
+ 145    Null         0   84    0                                          0  r[84]=NULL
+ 146    Column       1    3   85                                          0  r[85]=part.P_BRAND
+ 147    BitAnd      85   85   86                                          0  r[86]=r[85]&r[85]
+ 148    String8      0   87    0  Brand#22                                0  r[87]='Brand#22'
+ 149    BitAnd      86   87   86                                          0  r[86]=r[86]&r[87]
+ 150    Eq          85   87  159  Binary                                  0  if r[85]==r[87] goto 159
+ 151    String8      0   88    0  Brand#23                                0  r[88]='Brand#23'
+ 152    BitAnd      86   88   86                                          0  r[86]=r[86]&r[88]
+ 153    Eq          85   88  159  Binary                                  0  if r[85]==r[88] goto 159
+ 154    String8      0   89    0  Brand#12                                0  r[89]='Brand#12'
+ 155    BitAnd      86   89   86                                          0  r[86]=r[86]&r[89]
+ 156    Eq          85   89  159  Binary                                  0  if r[85]==r[89] goto 159
+ 157    IsNull      86  161    0                                          0  if (r[86]==NULL) goto 161
+ 158    Goto         0  160    0                                          0
+ 159    Integer      1   84    0                                          0  r[84]=1
+ 160    AddImm      84    0    0                                          0  r[84]=r[84]+0
+ 161    Copy        84   83    0                                          0  r[83]=r[84]
+ 162    IfNot       83  168    1                                          0  if !r[83] goto 168
+ 163    Column       0    5   91                                          0  r[91]=lineitem.L_EXTENDEDPRICE
+ 164    Column       0    6   94                                          0  r[94]=lineitem.L_DISCOUNT
+ 165    Subtract    93   94   92                                          0  r[92]=r[93]-r[94]
+ 166    Multiply    91   92   90                                          0  r[90]=r[91]*r[92]
+ 167    AggStep      0   90    1  sum                                     0  accum=r[1] step(r[90])
+ 168  Next           0    6    0                                          1
+ 169  AggFinal       0    1    0  sum                                     0  accum=r[1]
+ 170  Copy           1   95    0                                          0  r[95]=r[1]
+ 171  ResultRow     95    1    0                                          0  output=r[95]
+ 172  Halt           0    0    0                                          0
+ 173  Transaction    0    1    8                                          0  iDb=0 tx_mode=Read
+ 174  String8        0   10    0  DELIVER IN PERSON                       0  r[10]='DELIVER IN PERSON'
+ 175  String8        0   13    0  Brand#22                                0  r[13]='Brand#22'
+ 176  Integer        8   23    0                                          0  r[23]=8
+ 177  Integer        8   26    0                                          0  r[26]=8
+ 178  Integer       10   27    0                                          0  r[27]=10
+ 179  Add           26   27   25                                          0  r[25]=r[26]+r[27]
+ 180  String8        0   37    0  Brand#23                                0  r[37]='Brand#23'
+ 181  Integer       10   47    0                                          0  r[47]=10
+ 182  Integer       10   50    0                                          0  r[50]=10
+ 183  Add           50   50   49                                          0  r[49]=r[50]+r[50]
+ 184  String8        0   60    0  Brand#12                                0  r[60]='Brand#12'
+ 185  Integer       24   70    0                                          0  r[70]=24
+ 186  Integer       24   73    0                                          0  r[73]=24
+ 187  Integer       10   74    0                                          0  r[74]=10
+ 188  Add           73   74   72                                          0  r[72]=r[73]+r[74]
+ 189  Integer        1   93    0                                          0  r[93]=1
+ 190  Goto           0    1    0                                          0

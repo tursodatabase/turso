@@ -55,11 +55,13 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN part
-|--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=?)
-|--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
-|--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
-|--SEARCH region USING INTEGER PRIMARY KEY (rowid=?)
+|--MATERIALIZE hash build input for supplier
+|  |--MATERIALIZE hash build input for nation
+|  |  |--HASH JOIN nation
+|  |  `--SCAN region
+|  `--HASH JOIN supplier
+|--HASH JOIN partsupp
+|--SEARCH part USING INTEGER PRIMARY KEY (rowid=?)
 |--CORRELATED SCALAR SUBQUERY 1
 |  |--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=?)
 |  |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)

@@ -1,6 +1,18 @@
 use rustc_hash::FxHashMap as HashMap;
 use std::num::NonZero;
 
+/// The spelling that introduced a parameter slot in SQL.
+///
+/// The index alone cannot distinguish a bare `?` from `?N`. That distinction
+/// is observable through `sqlite3_bind_parameter_name`, so semantic HIR keeps
+/// it until bytecode lowering registers the parameter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParameterSpelling {
+    Anonymous,
+    Numbered,
+    Named(String),
+}
+
 #[derive(Clone, Debug)]
 pub enum Parameter {
     Indexed(NonZero<usize>),

@@ -1,190 +1,338 @@
+//! Binding the values of a delta stream to the expressions that read them.
+//!
+//! An operator's expressions are the analyzed expressions of the view's
+//! query. They read the view's sources as [`hir::Expr::Column`] and
+//! [`hir::Expr::RowId`], and the values earlier operators publish as the
+//! expressions those operators were built from. Before an expression is
+//! lowered, every one of its nodes that a stream value stands for is bound
+//! to the register that holds the value, so the shared expression lowering
+//! never reads a cursor of its own.
+
 use super::stream::EphemeralDelta;
-use rustc_hash::FxHashMap;
-use turso_parser::ast::{self, TableInternalId};
-
-use crate::incremental::dag;
-use crate::schema::BTreeTable;
-use crate::sync::Arc;
-use crate::translate::emitter::Resolver;
-use crate::translate::expr::{walk_expr_mut, WalkControl};
-use crate::translate::plan::{
-    ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
-};
-use crate::turso_assert;
-use crate::vdbe::builder::ProgramBuilder;
+use crate::translate::semantic::hir::{self, HirDocument, SourceId};
+use crate::vdbe::builder::{ProgramBuilder, SourceBinding};
 use crate::vdbe::insn::Insn;
-use crate::{LimboError, Result};
 
-/// A [`JoinedTable`] scan entry for synthesized maintenance-program bindings.
-/// Expressions are already planner-bound, so no SQL name resolution or
-/// USING/NATURAL metadata is reconstructed here.
-pub(super) fn make_joined_table(
-    table: &Arc<BTreeTable>,
-    identifier: &str,
-    id: TableInternalId,
-) -> JoinedTable {
-    JoinedTable {
-        op: Operation::Scan(Scan::BTreeTable {
-            iter_dir: IterationDirection::Forwards,
-            index: None,
-        }),
-        unmatched_right_rows_plan: None,
-        table: crate::schema::Table::BTree(table.clone()),
-        identifier: identifier.to_string(),
-        internal_id: id,
-        join_info: None,
-        col_used_mask: ColumnUsedMask::default(),
-        column_use_counts: Vec::new(),
-        expression_index_usages: Vec::new(),
-        database_id: 0,
-        indexed: None,
-        plan_estimate: None,
+/// The registers one row of a stream was loaded into.
+#[derive(Default)]
+pub(super) struct StreamRow<'a> {
+    /// Each published value with its register.
+    columns: Vec<(&'a hir::Expr, usize)>,
+    /// The rowid register of each source whose rowid the stream carries.
+    rowids: Vec<(SourceId, usize)>,
+}
+
+impl<'a> StreamRow<'a> {
+    pub(super) fn new() -> Self {
+        Self::default()
     }
-}
 
-pub(super) type BindingRemap = FxHashMap<TableInternalId, TableInternalId>;
-
-pub(super) fn stream_table_references(
-    program: &mut ProgramBuilder,
-    schema: &dag::StreamSchema,
-) -> (TableReferences, BindingRemap) {
-    let mut remap = FxHashMap::default();
-    let tables = schema
-        .bindings
-        .iter()
-        .map(|binding| {
-            let phase_id = program.table_reference_counter.next();
-            let previous = remap.insert(binding.logical_id, phase_id);
-            turso_assert!(
-                previous.is_none(),
-                "a stream schema must expose each logical binding exactly once"
-            );
-            make_joined_table(&binding.table, &binding.identifier, phase_id)
-        })
-        .collect();
-    (TableReferences::new(tables, vec![]), remap)
-}
-
-/// Retarget a planner-bound expression to one emitter phase's cursor
-/// bindings. This is a mechanical id substitution: identifier spelling,
-/// DQS, aliases, and rowid-name resolution never run a second time.
-pub(super) fn remap_bound_expr(expr: &ast::Expr, remap: &BindingRemap) -> Result<ast::Expr> {
-    let mut bound = expr.clone();
-    walk_expr_mut(&mut bound, &mut |node| {
-        let logical_id = match node {
-            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => Some(table),
-            ast::Expr::Id(_) | ast::Expr::Qualified(_, _) | ast::Expr::DoublyQualified(_, _, _) => {
-                return Err(LimboError::InternalError(
-                    "maintenance DAG contains an unresolved identifier".to_string(),
-                ));
-            }
-            _ => None,
-        };
-        if let Some(logical_id) = logical_id {
-            *logical_id = *remap.get(logical_id).ok_or_else(|| {
-                LimboError::InternalError(
-                    "maintenance expression references a binding outside its declared input"
-                        .to_string(),
-                )
-            })?;
+    pub(super) fn add_column(&mut self, expression: Option<&'a hir::Expr>, register: usize) {
+        if let Some(expression) = expression {
+            self.columns.push((expression, register));
         }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(bound)
-}
-
-pub(super) fn seed_ephemeral_stream_cache<'a>(
-    program: &mut ProgramBuilder,
-    channel: &EphemeralDelta,
-    remap: &BindingRemap,
-    table_references: &TableReferences,
-    resolver: &mut Resolver<'a>,
-) -> Result<()> {
-    resolver.enable_expr_to_reg_cache();
-    for (column, stream_expr) in channel.schema.columns.iter().enumerate() {
-        let Some(expr) = stream_expr else {
-            continue;
-        };
-        let value_reg = program.alloc_register();
-        program.emit_insn(Insn::Column {
-            cursor_id: channel.cursor_id,
-            column: channel.value_start + column,
-            dest: value_reg,
-            default: None,
-        });
-        let bound = remap_bound_expr(expr, remap)?;
-        cache_stream_expr_reg(resolver, bound, value_reg, table_references)?;
     }
-    turso_assert!(
-        channel.binding_rowid_columns.len() == channel.schema.bindings.len(),
-        "rowid provenance must have one entry per stream binding",
+
+    pub(super) fn add_rowid(&mut self, source: SourceId, register: usize) {
+        self.rowids.push((source, register));
+    }
+
+    /// Read the current row of `channel` into fresh registers.
+    pub(super) fn load(program: &mut ProgramBuilder, channel: &'a EphemeralDelta) -> Self {
+        let mut row = Self::new();
+        for (column, expression) in channel.schema.columns.iter().enumerate() {
+            let Some(expression) = expression else {
+                continue;
+            };
+            let register = program.alloc_register();
+            program.emit_insn(Insn::Column {
+                cursor_id: channel.cursor_id,
+                column: channel.value_start + column,
+                dest: register,
+                default: None,
+            });
+            row.add_column(Some(expression), register);
+        }
+        for (rowid_column, binding) in channel
+            .binding_rowid_columns
+            .iter()
+            .zip(channel.schema.bindings.iter())
         {
-            "provenance_count": channel.binding_rowid_columns.len(),
-            "binding_count": channel.schema.bindings.len()
+            let Some(rowid_column) = rowid_column else {
+                continue;
+            };
+            let register = program.alloc_register();
+            program.emit_insn(Insn::Column {
+                cursor_id: channel.cursor_id,
+                column: *rowid_column,
+                dest: register,
+                default: None,
+            });
+            row.add_rowid(binding.source, register);
         }
-    );
-    for (binding_rowid_column, binding) in channel
-        .binding_rowid_columns
-        .iter()
-        .zip(channel.schema.bindings.iter())
-    {
-        let Some(binding_rowid_column) = binding_rowid_column else {
-            continue;
-        };
-        let value_reg = program.alloc_register();
-        program.emit_insn(Insn::Column {
-            cursor_id: channel.cursor_id,
-            column: *binding_rowid_column,
-            dest: value_reg,
-            default: None,
+        row
+    }
+
+    fn register_of(&self, node: &hir::Expr) -> Option<usize> {
+        if let hir::Expr::RowId(source) = node {
+            if let Some((_, register)) = self.rowids.iter().find(|(bound, _)| bound == source) {
+                return Some(*register);
+            }
+        }
+        self.columns
+            .iter()
+            .find(|(published, _)| published.equivalent(node))
+            .map(|(_, register)| *register)
+    }
+
+    /// Make every read of a stream value in `expression` read its register.
+    /// The bindings are keyed by the expression's own nodes, so they hold
+    /// for exactly this expression until the program drops them.
+    pub(super) fn bind(
+        &self,
+        program: &mut ProgramBuilder,
+        document: &HirDocument,
+        expression: &hir::Expr,
+    ) {
+        bind_expression(program, document, expression, &mut |node| {
+            self.register_of(node)
         });
-        let phase_id = *remap.get(&binding.logical_id).ok_or_else(|| {
-            LimboError::InternalError(
-                "rowid stream identity has no phase-local binding".to_string(),
-            )
-        })?;
-        let expr = ast::Expr::RowId {
-            database: None,
-            table: phase_id,
-        };
-        resolver.cache_expr_reg(std::borrow::Cow::Owned(expr), value_reg, false, None);
+        // A source whose columns the stream carries whole, in order, is also
+        // bound as a register row, so a read the published values do not
+        // name one by one, such as a merged USING column, finds it.
+        for binding in self.whole_sources(document) {
+            program.bind_source(binding.0, binding.1);
+        }
+    }
+
+    /// The sources every column of which this row holds, in column order
+    /// and in consecutive registers.
+    fn whole_sources(&self, document: &HirDocument) -> Vec<(SourceId, SourceBinding)> {
+        let mut bindings = Vec::new();
+        let mut sources: Vec<SourceId> = Vec::new();
+        for (expression, _) in &self.columns {
+            if let hir::Expr::Column(column) = expression {
+                if !sources.contains(&column.source) {
+                    sources.push(column.source);
+                }
+            }
+        }
+        for source in sources {
+            let Some(definition) = document.source(source) else {
+                continue;
+            };
+            let column_count = definition.columns.len();
+            let first = self.columns.iter().position(|(expression, _)| {
+                matches!(expression, hir::Expr::Column(column)
+                    if column.source == source && column.column == 0)
+            });
+            let Some(first) = first else {
+                continue;
+            };
+            let whole = (0..column_count).all(|index| {
+                self.columns
+                    .get(first + index)
+                    .is_some_and(|(expression, register)| {
+                        matches!(expression, hir::Expr::Column(column)
+                        if column.source == source && column.column == index)
+                            && *register == self.columns[first].1 + index
+                    })
+            });
+            if !whole {
+                continue;
+            }
+            let rowid = self
+                .rowids
+                .iter()
+                .find(|(bound, _)| *bound == source)
+                .map(|(_, register)| *register);
+            bindings.push((
+                source,
+                SourceBinding::Registers {
+                    start: self.columns[first].1,
+                    rowid,
+                },
+            ));
+        }
+        bindings
+    }
+}
+
+/// Bind every node of `expression` for which `lookup` names a register, not
+/// descending into a bound node. A reference to an output of the query is
+/// followed into the output's expression, which the lowering evaluates in
+/// its place.
+pub(super) fn bind_expression(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    expression: &hir::Expr,
+    lookup: &mut impl FnMut(&hir::Expr) -> Option<usize>,
+) {
+    if let Some(register) = lookup(expression) {
+        program.bind_expression_register(expression, register);
+        return;
+    }
+    if let hir::Expr::Output(output) = expression {
+        if let Some(output) = document.output(*output) {
+            bind_expression(program, document, &output.expr, lookup);
+        }
+        return;
+    }
+    let mut index = 0;
+    while let Some(child) = expression.child(index) {
+        bind_expression(program, document, child, lookup);
+        index += 1;
+    }
+}
+
+/// Visit every node of `expression`, following references to outputs of
+/// the query into their expressions. `visit` returns whether to descend
+/// into the node's children.
+pub(super) fn visit_expression(
+    document: &HirDocument,
+    expression: &hir::Expr,
+    visit: &mut impl FnMut(&hir::Expr) -> crate::Result<bool>,
+) -> crate::Result<()> {
+    if !visit(expression)? {
+        return Ok(());
+    }
+    if let hir::Expr::Output(output) = expression {
+        if let Some(output) = document.output(*output) {
+            visit_expression(document, &output.expr, visit)?;
+        }
+        return Ok(());
+    }
+    let mut index = 0;
+    while let Some(child) = expression.child(index) {
+        visit_expression(document, child, visit)?;
+        index += 1;
     }
     Ok(())
 }
 
-/// Cache one materialized stream value with the collation context a regular
-/// column read would have produced.
-///
-/// Stateful operators publish synthetic expressions such as `SUM(x)`. Those
-/// results do not inherit the argument column's collation, so only SQL's
-/// column-like forms and an explicit `COLLATE` carry context across the
-/// physical stream boundary.
-pub(super) fn cache_stream_expr_reg<'a>(
-    resolver: &mut Resolver<'a>,
-    expr: ast::Expr,
-    value_reg: usize,
-    table_references: &TableReferences,
-) -> Result<()> {
-    fn carries_collation(expr: &ast::Expr) -> bool {
-        match expr {
-            ast::Expr::Column { .. } | ast::Expr::RowId { .. } | ast::Expr::Collate(_, _) => true,
-            ast::Expr::Cast { expr, .. } | ast::Expr::Unary(ast::UnaryOperator::Positive, expr) => {
-                carries_collation(expr)
+/// Replace every node of `expression` for which `replace` gives a
+/// replacement, not descending into a replaced node. Returns whether any
+/// node was replaced.
+pub(super) fn replace_expression(
+    expression: &mut hir::Expr,
+    replace: &impl Fn(&hir::Expr) -> Option<hir::Expr>,
+) -> bool {
+    if let Some(replacement) = replace(expression) {
+        *expression = replacement;
+        return true;
+    }
+    let mut replaced = false;
+    let mut visit = |child: &mut hir::Expr| replaced |= replace_expression(child, replace);
+    match expression {
+        hir::Expr::Literal(_)
+        | hir::Expr::Parameter(_)
+        | hir::Expr::Column(_)
+        | hir::Expr::RowId(_)
+        | hir::Expr::Output(_)
+        | hir::Expr::Subquery(
+            hir::SubqueryExpr::Scalar { .. }
+            | hir::SubqueryExpr::Row { .. }
+            | hir::SubqueryExpr::Exists(_),
+        ) => {}
+        hir::Expr::MergedColumn(column) => {
+            visit(&mut column.left);
+            visit(&mut column.right);
+        }
+        hir::Expr::Unary { expr, .. }
+        | hir::Expr::IsNull(expr)
+        | hir::Expr::NotNull(expr)
+        | hir::Expr::TruthTest { expr, .. }
+        | hir::Expr::Collate { expr, .. }
+        | hir::Expr::Cast { expr, .. } => visit(expr),
+        hir::Expr::Binary { lhs, rhs, .. } => {
+            visit(lhs);
+            visit(rhs);
+        }
+        hir::Expr::Between {
+            expr, start, end, ..
+        } => {
+            visit(expr);
+            visit(start);
+            visit(end);
+        }
+        hir::Expr::Case {
+            base,
+            when_then,
+            else_expr,
+            ..
+        } => {
+            if let Some(base) = base {
+                visit(base);
             }
-            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => carries_collation(&exprs[0]),
-            _ => false,
+            for (when, then) in when_then {
+                visit(when);
+                visit(then);
+            }
+            if let Some(else_expr) = else_expr {
+                visit(else_expr);
+            }
+        }
+        hir::Expr::Function(call) => {
+            match &mut call.arguments {
+                hir::FunctionArguments::Star => {}
+                hir::FunctionArguments::Expressions {
+                    values, order_by, ..
+                } => {
+                    for value in values {
+                        visit(value);
+                    }
+                    for term in order_by {
+                        visit(&mut term.expr);
+                    }
+                }
+                hir::FunctionArguments::OrderedSet { direct, order_by } => {
+                    for value in direct {
+                        visit(value);
+                    }
+                    visit(&mut order_by.expr);
+                }
+            }
+            match &mut call.evaluation {
+                hir::FunctionEvaluation::Scalar => {}
+                hir::FunctionEvaluation::Aggregate { filter, .. }
+                | hir::FunctionEvaluation::Window { filter, .. } => {
+                    if let Some(filter) = filter {
+                        visit(filter);
+                    }
+                }
+            }
+        }
+        hir::Expr::InList { lhs, values, .. } => {
+            visit(lhs);
+            for value in values {
+                visit(value);
+            }
+        }
+        hir::Expr::Subquery(hir::SubqueryExpr::In { lhs, .. }) => visit(lhs),
+        hir::Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            visit(lhs);
+            visit(rhs);
+            if let Some(escape) = escape {
+                visit(escape);
+            }
+        }
+        hir::Expr::Row(expressions) | hir::Expr::Array(expressions) => {
+            for expression in expressions {
+                visit(expression);
+            }
+        }
+        hir::Expr::Subscript { base, index } => {
+            visit(base);
+            visit(index);
+        }
+        hir::Expr::FieldAccess(access) => visit(&mut access.base),
+        hir::Expr::Raise { message, .. } => {
+            if let Some(message) = message {
+                visit(message);
+            }
         }
     }
-
-    if carries_collation(&expr) {
-        resolver.cache_scalar_expr_reg(
-            std::borrow::Cow::Owned(expr),
-            value_reg,
-            false,
-            table_references,
-        )
-    } else {
-        resolver.cache_expr_reg(std::borrow::Cow::Owned(expr), value_reg, false, None);
-        Ok(())
-    }
+    replaced
 }

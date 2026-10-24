@@ -88,6 +88,15 @@ pub trait TursoFromIteratorIn<T, A>: Sized {
 }
 
 pub trait TursoIteratorExt: Iterator + Sized {
+    /// Like `Iterator::collect` into the allocator `Vec`: aborts on
+    /// allocation failure as the standard collections do.
+    #[inline]
+    fn collect_vec(self) -> crate::alloc::Vec<Self::Item> {
+        let mut values = <crate::alloc::Vec<Self::Item> as TursoAllocExt>::new();
+        values.extend(self);
+        values
+    }
+
     #[inline(always)]
     fn try_collect<C>(self) -> Result<C, TryReserveError>
     where

@@ -1,33 +1,27 @@
-use rustc_hash::{FxHashMap, FxHashSet};
-use turso_parser::ast::{self, TableInternalId};
+use rustc_hash::FxHashSet;
+use turso_parser::ast;
 
+use super::binding::{replace_expression, visit_expression};
 use super::output::NodeOutputContract;
 use super::stream::{binding_rowid_metadata_width, DeltaIdentity};
-use crate::function::{AggFunc, Func};
-use crate::incremental::dag;
+use crate::alloc::TursoIteratorExt;
+use crate::function::{AggFunc, Deterministic, Func};
+use crate::incremental::dag::{self, Aggregate};
 use crate::schema::BTreeTable;
 use crate::sync::Arc;
-use crate::translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
-use crate::translate::emitter::Resolver;
-use crate::translate::expr::{expr_contains_nondeterministic_scalar_function, WalkControl};
-use crate::translate::optimizer::optimize_plan;
-use crate::translate::optimizer::unnest::rewrite_correlated_subqueries;
-use crate::translate::plan::{
-    Aggregate, JoinType, Plan, QueryDestination, SelectPlan, SubqueryState, TableReferences,
-};
-use crate::translate::planner::resolve_window_and_aggregate_functions;
-use crate::translate::select::prepare_select_plan;
-use crate::util::walk_expr_with_subqueries;
+use crate::translate::collate::CollationSeq;
+use crate::translate::semantic::context::SemanticContext;
+use crate::translate::semantic::hir::{self, HirDocument, QueryBlockId, QueryId, SourceId};
+use crate::translate::semantic::{analyze_root, SemanticRootInput};
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
-use crate::{Connection, LimboError, QueryMode, Result};
+use crate::{LimboError, Result};
 
 /// Whether an aggregate's accumulator must see each distinct argument value
 /// exactly once, tracked through the value multiset table. MIN/MAX see each
 /// value once by definition, so DISTINCT changes nothing for them — their
 /// multiset participation is about extremes, not distinctness.
 pub(super) fn tracks_distinct_values(agg: &Aggregate) -> bool {
-    agg.distinctness.is_distinct() && !matches!(agg.func, AggFunc::Min | AggFunc::Max)
+    agg.distinct && !matches!(agg.func, AggFunc::Min | AggFunc::Max)
 }
 
 fn unsupported<T>(what: &str) -> Result<T> {
@@ -36,104 +30,81 @@ fn unsupported<T>(what: &str) -> Result<T> {
     )))
 }
 
+/// Whether `expression` is one of the values `schema` publishes.
+fn is_published(schema: &dag::StreamSchema, expression: &hir::Expr) -> bool {
+    schema.columns.iter().any(|column| {
+        column
+            .as_ref()
+            .is_some_and(|published| published.equivalent(expression))
+    })
+}
+
 /// Validate an expression against the values and rowids published by one
 /// operator edge.
 ///
-/// Downstream expression compilation seeds exactly these expressions into
-/// the translator's register cache. Validating the same contract here keeps
-/// composition independent of the upstream operator kind: an aggregate
-/// result remains usable through any number of linear operators, while a
-/// source value that was not published cannot leak across the boundary.
+/// Downstream expression compilation binds exactly these expressions to
+/// registers. Validating the same contract here keeps composition
+/// independent of the upstream operator kind: an aggregate result remains
+/// usable through any number of linear operators, while a source value that
+/// was not published cannot leak across the boundary.
 fn validate_stream_expr(
-    expr: &ast::Expr,
+    document: &HirDocument,
+    expr: &hir::Expr,
     schema: &dag::StreamSchema,
     binding_rowids: &[bool],
     unavailable_value: &str,
 ) -> Result<()> {
-    walk_expr_with_subqueries(expr, &mut |e: &ast::Expr| {
-        let published_value = schema.columns.iter().any(|column| {
-            column
-                .as_ref()
-                .is_some_and(|published| crate::util::exprs_are_equivalent(published, e))
-        });
-        match e {
-            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
-                return Err(LimboError::ParseError(
-                    "materialized views with subqueries are not yet supported".to_string(),
-                ));
-            }
-            ast::Expr::FunctionCall { name, args, .. } => {
+    visit_expression(document, expr, &mut |node: &hir::Expr| {
+        let published = is_published(schema, node);
+        match node {
+            hir::Expr::Subquery(_) => Err(LimboError::ParseError(
+                "materialized views with subqueries are not yet supported".to_string(),
+            )),
+            hir::Expr::Function(call)
                 if matches!(
-                    Func::resolve_function(name.as_str(), args.len()),
-                    Ok(Some(Func::Agg(_)))
-                ) {
-                    if published_value {
-                        return Ok(WalkControl::SkipChildren);
-                    }
-                    return unsupported("expressions over aggregate results");
-                }
-                if published_value {
-                    return Ok(WalkControl::SkipChildren);
-                }
-            }
-            ast::Expr::FunctionCallStar { name, .. } => {
-                if matches!(
-                    Func::resolve_function(name.as_str(), 0),
-                    Ok(Some(Func::Agg(_)))
-                ) {
-                    if published_value {
-                        return Ok(WalkControl::SkipChildren);
-                    }
-                    return unsupported("expressions over aggregate results");
-                }
-                if published_value {
-                    return Ok(WalkControl::SkipChildren);
+                    call.evaluation,
+                    hir::FunctionEvaluation::Aggregate { .. }
+                        | hir::FunctionEvaluation::Window { .. }
+                ) =>
+            {
+                if published {
+                    Ok(false)
+                } else {
+                    unsupported("expressions over aggregate results")
                 }
             }
-            ast::Expr::Variable(_) => {
-                return Err(LimboError::ParseError(
-                    "materialized views with bound parameters are not supported".to_string(),
-                ));
-            }
-            ast::Expr::Id(_) | ast::Expr::Qualified(_, _) | ast::Expr::DoublyQualified(_, _, _) => {
-                return Err(LimboError::InternalError(
-                    "maintenance expression contains an unresolved identifier".to_string(),
-                ));
-            }
-            ast::Expr::Column { .. } => {
-                if !published_value {
-                    return unsupported(unavailable_value);
+            hir::Expr::Parameter(_) => Err(LimboError::ParseError(
+                "materialized views with bound parameters are not supported".to_string(),
+            )),
+            hir::Expr::Column(_) => {
+                if published {
+                    Ok(false)
+                } else {
+                    unsupported(unavailable_value)
                 }
-                return Ok(WalkControl::SkipChildren);
             }
-            ast::Expr::RowId { table, .. } => {
-                let available = published_value
+            hir::Expr::RowId(source) => {
+                let available = published
                     || schema
                         .bindings
                         .iter()
                         .zip(binding_rowids.iter())
-                        .any(|(binding, available)| binding.logical_id == *table && *available);
-                if !available {
-                    return unsupported("rowids not published by their input stream");
+                        .any(|(binding, available)| binding.source == *source && *available);
+                if available {
+                    Ok(false)
+                } else {
+                    unsupported("rowids not published by their input stream")
                 }
-                return Ok(WalkControl::SkipChildren);
             }
-            _ if published_value => return Ok(WalkControl::SkipChildren),
-            _ => {}
+            _ => Ok(!published),
         }
-        Ok(WalkControl::Continue)
     })
 }
 
-/// Reject collected aggregates the maintenance codegen cannot invert.
-///
-/// Aggregate recognition and deduplication use the planner's own collector
-/// ([`resolve_window_and_aggregate_functions`]); this is only the IVM gate on
-/// top of it.
+/// Aggregate recognition and deduplication use the analyzed query's own
+/// aggregate identities, so this only decides what maintenance can do with
+/// each aggregate.
 fn validate_supported_aggregate(agg: &Aggregate) -> Result<()> {
-    if !agg.order_by().is_empty() {
-        return unsupported("ORDER BY in aggregates");
-    }
     match agg.func {
         AggFunc::Count0
         | AggFunc::Count
@@ -152,75 +123,136 @@ fn validate_supported_aggregate(agg: &Aggregate) -> Result<()> {
     Ok(())
 }
 
-/// Lower the main query planner's bound relational plan into the maintenance
-/// DAG. Parser spelling (aliases, stars, USING expansion, ordinal GROUP BY,
-/// and compound arity) has already been resolved by this point.
-fn build_dag_from_plan(plan: &Plan, resolver: &Resolver) -> Result<dag::MaintenanceDag> {
+/// Lower the analyzed query of a view into the maintenance DAG. Names,
+/// stars, USING columns, ordinal GROUP BY terms and compound arity were
+/// resolved by semantic analysis; correlated subqueries that can become
+/// joins already have.
+fn build_dag(document: &HirDocument) -> Result<dag::MaintenanceDag> {
+    let hir::HirRoot::Query(root) = &document.root else {
+        return Err(LimboError::InternalError(
+            "materialized view analysis did not produce a query".to_string(),
+        ));
+    };
     let mut builder = dag::DagBuilder::new();
-    let root = build_plan_dag_node(&mut builder, plan, resolver)?;
+    let root = build_query_dag(&mut builder, document, root.query)?;
     builder.finish(root)
 }
 
-fn build_plan_dag_node(
-    builder: &mut dag::DagBuilder,
-    plan: &Plan,
-    resolver: &Resolver,
-) -> Result<dag::NodeId> {
-    let root = match plan {
-        Plan::Select(select) => build_select_plan_dag(builder, select, resolver)?,
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => {
-            let mut inputs = Vec::with_capacity(left.len() + 1);
-            for (branch, _) in left {
-                inputs.push(build_select_plan_dag(builder, branch, resolver)?);
-            }
-            inputs.push(build_select_plan_dag(builder, right_most, resolver)?);
-
-            let operators: Vec<_> = left.iter().map(|(_, operator)| *operator).collect();
-            let prefix_len = operators
-                .iter()
-                .rposition(|operator| *operator != ast::CompoundOperator::UnionAll)
-                .map_or(0, |last_dedup| last_dedup + 2);
-            let arity = right_most.result_columns.len();
-            let key_columns = if prefix_len == 0 {
-                Vec::new()
-            } else {
-                let branches = left
-                    .iter()
-                    .map(|(branch, _)| branch)
-                    .chain(std::iter::once(right_most.as_ref()))
-                    .take(prefix_len)
-                    .collect::<Vec<_>>();
-                (0..arity)
-                    .map(|index| set_op_key_column(&branches, index, resolver))
-                    .collect::<Result<Vec<_>>>()?
-            };
-            builder.push(dag::OpNode::SetOp {
-                inputs,
-                operators,
-                arity,
-                prefix_len,
-                key_columns,
-            })?
-        }
-        Plan::Delete(_) | Plan::Update(_) => {
-            return Err(LimboError::InternalError(
-                "materialized view planner produced a DML plan".to_string(),
-            ));
-        }
-        Plan::RecursiveCte(_) => return unsupported("recursive CTEs"),
-    };
-    Ok(root)
+fn query(document: &HirDocument, id: QueryId) -> Result<&hir::Query> {
+    document
+        .query(id)
+        .ok_or_else(|| LimboError::InternalError(format!("HIR query {id:?} is missing")))
 }
 
-fn synthesized_derived_table(
-    name: &str,
-    columns: crate::alloc::Vec<crate::schema::Column>,
-) -> BTreeTable {
-    BTreeTable::new(
+fn block(document: &HirDocument, id: QueryBlockId) -> Result<&hir::QueryBlock> {
+    document
+        .query_block(id)
+        .ok_or_else(|| LimboError::InternalError(format!("HIR query block {id:?} is missing")))
+}
+
+fn source(document: &HirDocument, id: SourceId) -> Result<&hir::Source> {
+    document
+        .source(id)
+        .ok_or_else(|| LimboError::InternalError(format!("HIR source {id:?} is missing")))
+}
+
+fn build_query_dag(
+    builder: &mut dag::DagBuilder,
+    document: &HirDocument,
+    query_id: QueryId,
+) -> Result<dag::NodeId> {
+    let query = query(document, query_id)?;
+    if !query.order_by.is_empty() {
+        return unsupported("ORDER BY");
+    }
+    if query.limit.is_some() {
+        return unsupported("LIMIT or OFFSET");
+    }
+    if query.compounds.is_empty() {
+        return build_block_dag(builder, document, query.first);
+    }
+    let blocks = std::iter::once(query.first)
+        .chain(query.compounds.iter().map(|arm| arm.block))
+        .collect::<Vec<_>>();
+    let mut inputs = Vec::with_capacity(blocks.len());
+    for block_id in &blocks {
+        inputs.push(build_block_dag(builder, document, *block_id)?);
+    }
+    let operators: Vec<_> = query.compounds.iter().map(|arm| arm.operator).collect();
+    let prefix_len = operators
+        .iter()
+        .rposition(|operator| *operator != ast::CompoundOperator::UnionAll)
+        .map_or(0, |last_dedup| last_dedup + 2);
+    let arity = block(document, query.first)?.outputs.len();
+    let key_columns = if prefix_len == 0 {
+        Vec::new()
+    } else {
+        let branches = blocks
+            .iter()
+            .take(prefix_len)
+            .map(|block_id| block(document, *block_id))
+            .collect::<Result<Vec<_>>>()?;
+        (0..arity)
+            .map(|index| set_op_key_column(document, &branches, index))
+            .collect::<Result<Vec<_>>>()?
+    };
+    builder.push(dag::OpNode::SetOp {
+        inputs,
+        operators,
+        arity,
+        prefix_len,
+        key_columns,
+    })
+}
+
+/// The join kind of one FROM step, with `Inner` for the first source.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StepJoin {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Semi,
+    Anti,
+}
+
+/// `expression` with every reference to an output of the query replaced by
+/// the output's expression, as SQLite expands an alias in GROUP BY or
+/// HAVING, and every column of a parenthesized join group replaced by the
+/// value the group's own sources supply for it.
+fn expand_outputs(document: &HirDocument, expression: &hir::Expr) -> hir::Expr {
+    let mut expression = expression.clone();
+    replace_expression(&mut expression, &|node| match node {
+        hir::Expr::Output(output) => document
+            .output(*output)
+            .map(|output| expand_outputs(document, &output.expr)),
+        hir::Expr::Column(column) => match document.source(column.source).map(|s| &s.kind) {
+            Some(hir::SourceKind::FromGroup(group)) => group
+                .columns
+                .get(column.column)
+                .map(|value| expand_outputs(document, value)),
+            _ => None,
+        },
+        _ => None,
+    });
+    expression
+}
+
+fn synthesized_derived_table(source: &hir::Source) -> Result<BTreeTable> {
+    let columns: crate::alloc::Vec<crate::schema::Column> = source
+        .columns
+        .iter()
+        .map(|column| {
+            crate::schema::Column::new_default_text(
+                Some(column.name.to_string()),
+                String::new(),
+                None,
+            )
+        })
+        .try_collect()?;
+    Ok(BTreeTable::new(
         0,
-        name.to_string(),
+        source.alias.clone().unwrap_or_else(|| source.name.clone()),
         crate::alloc::vec![],
         columns,
         crate::schema::BTreeCharacteristics::empty(),
@@ -228,140 +260,259 @@ fn synthesized_derived_table(
         crate::alloc::vec![],
         crate::alloc::vec![],
         None,
-    )
+    ))
 }
 
-fn build_select_plan_dag(
+/// The DAG input of one FROM source: a scan of its table, or the aliased
+/// DAG of the query it stands for.
+fn build_source_dag(
     builder: &mut dag::DagBuilder,
-    plan: &SelectPlan,
-    resolver: &Resolver,
+    document: &HirDocument,
+    source_id: SourceId,
 ) -> Result<dag::NodeId> {
-    if !plan.order_by.is_empty() {
-        return unsupported("ORDER BY");
-    }
-    if plan.limit.is_some() || plan.offset.is_some() {
-        return unsupported("LIMIT or OFFSET");
-    }
-    if !plan.values.is_empty() {
-        return unsupported("VALUES");
-    }
-    if plan.window.is_some() {
-        return unsupported("window functions");
-    }
-    if !plan.non_from_clause_subqueries.is_empty() {
-        return unsupported("subqueries");
-    }
-
-    let joined_tables = plan.table_references.joined_tables();
-    if joined_tables.is_empty() {
-        return unsupported("SELECT without a FROM clause");
-    }
-    // The first table has no join; it behaves as the left side of the rest.
-    let join_types = joined_tables
-        .iter()
-        .map(|table| {
-            table
-                .join_info
-                .as_ref()
-                .map_or(JoinType::Inner, |join| join.join_type)
-        })
-        .collect::<Vec<_>>();
-
-    let mut inputs = Vec::with_capacity(joined_tables.len());
-    for joined in joined_tables {
-        let input = match &joined.table {
+    let source = source(document, source_id)?;
+    match &source.kind {
+        hir::SourceKind::Table(table) => match table.value() {
             crate::schema::Table::BTree(table) => builder.push(dag::OpNode::Scan {
                 table: table.clone(),
-                identifier: joined.identifier.clone(),
-                logical_id: joined.internal_id,
-            })?,
-            crate::schema::Table::FromClauseSubquery(subquery) => {
-                let input = build_plan_dag_node(builder, &subquery.plan, resolver)?;
-                let table = Arc::new(synthesized_derived_table(
-                    &subquery.name,
-                    subquery.columns.clone(),
-                ));
-                builder.push(dag::OpNode::Alias {
-                    input,
-                    table,
-                    identifier: joined.identifier.clone(),
-                    logical_id: joined.internal_id,
-                })?
-            }
-            crate::schema::Table::Virtual(_) => return unsupported("virtual-table FROM sources"),
-            crate::schema::Table::RecursiveCteInput(_) => {
-                return unsupported("recursive CTE inputs")
-            }
-        };
-        inputs.push(input);
+                source: source_id,
+            }),
+            crate::schema::Table::Virtual(_) => unsupported("virtual-table FROM sources"),
+            _ => unsupported("this kind of FROM source"),
+        },
+        hir::SourceKind::Derived(query_id) => {
+            let input = build_query_dag(builder, document, *query_id)?;
+            builder.push(dag::OpNode::Alias {
+                input,
+                table: Arc::new(synthesized_derived_table(source)?),
+                source: source_id,
+            })
+        }
+        hir::SourceKind::Cte(cte_id) => {
+            let cte = document.cte(*cte_id).ok_or_else(|| {
+                LimboError::InternalError(format!("HIR CTE {cte_id:?} is missing"))
+            })?;
+            let hir::CteBody::Query(query_id) = &cte.body else {
+                return unsupported("recursive CTEs");
+            };
+            let input = build_query_dag(builder, document, *query_id)?;
+            builder.push(dag::OpNode::Alias {
+                input,
+                table: Arc::new(synthesized_derived_table(source)?),
+                source: source_id,
+            })
+        }
+        hir::SourceKind::TableFunction { .. } => unsupported("table-valued function FROM sources"),
+        hir::SourceKind::RecursiveInput(_) => unsupported("recursive CTE inputs"),
+        // A parenthesized join is joined on its own. Its stream keeps the
+        // columns of the sources inside it, which the rest of the query
+        // reads directly; a read through the group is expanded to the value
+        // the group supplies for it (see `expand_outputs`).
+        hir::SourceKind::FromGroup(group) => build_from_dag(builder, document, &group.from, None),
+        hir::SourceKind::Pseudo { .. } | hir::SourceKind::SchemaExpression => {
+            unsupported("this kind of FROM source")
+        }
     }
+}
 
-    let binding_positions = joined_tables
-        .iter()
-        .enumerate()
-        .map(|(position, table)| (table.internal_id, position))
-        .collect::<FxHashMap<_, _>>();
-    // The tables whose columns the join at `step` fills with NULLs.
-    let nulls_filled_by = |step: usize| match join_types[step] {
-        JoinType::LeftOuter => step..step + 1,
-        JoinType::RightOuter => 0..step,
-        JoinType::FullOuter => 0..step + 1,
-        JoinType::Inner | JoinType::Semi | JoinType::Anti => 0..0,
+/// The ON predicates of one join: its ON expression, or one equality per
+/// USING or NATURAL column.
+fn join_predicates(document: &HirDocument, constraint: &hir::JoinConstraint) -> Vec<hir::Expr> {
+    match constraint {
+        hir::JoinConstraint::None => Vec::new(),
+        hir::JoinConstraint::On(expression) => vec![expand_outputs(document, expression)],
+        hir::JoinConstraint::Using(columns) | hir::JoinConstraint::Natural(columns) => columns
+            .iter()
+            .map(|column| hir::Expr::Binary {
+                lhs: Box::new(expand_outputs(document, &column.left)),
+                operator: ast::Operator::Equals,
+                rhs: Box::new(hir::Expr::Column(column.right)),
+                array_concat: false,
+                custom: None,
+                comparison: Some(hir::ComparisonSemantics {
+                    components: vec![hir::ComparisonComponent {
+                        affinity: column.affinity,
+                        collation: column.collation.clone(),
+                        array: false,
+                    }],
+                }),
+            })
+            .collect(),
+    }
+}
+
+/// The conjuncts of a WHERE or HAVING expression.
+fn conjuncts(expression: &hir::Expr, into: &mut Vec<hir::Expr>) {
+    match expression {
+        hir::Expr::Binary {
+            lhs,
+            operator: ast::Operator::And,
+            rhs,
+            ..
+        } => {
+            conjuncts(lhs, into);
+            conjuncts(rhs, into);
+        }
+        other => into.push(other.clone()),
+    }
+}
+
+/// Every aggregate call of a block, each once, in the order of its identity.
+fn block_aggregates(document: &HirDocument, block: &hir::QueryBlock) -> Result<Vec<Aggregate>> {
+    let mut calls: Vec<(hir::AggregateId, Aggregate)> = Vec::new();
+    let mut collect = |expression: &hir::Expr| -> Result<()> {
+        visit_expression(document, expression, &mut |node| {
+            let hir::Expr::Function(call) = node else {
+                return Ok(true);
+            };
+            let hir::FunctionEvaluation::Aggregate { id, filter } = &call.evaluation else {
+                return Ok(true);
+            };
+            if calls.iter().any(|(known, _)| known == id) {
+                return Ok(false);
+            }
+            let func = match call.function.value() {
+                Func::Agg(func) => func.clone(),
+                Func::External(_) => return unsupported("extension aggregates"),
+                _ => {
+                    return Err(LimboError::InternalError(
+                        "aggregate call resolves to a non-aggregate function".to_string(),
+                    ))
+                }
+            };
+            let (args, distinct) = match &call.arguments {
+                hir::FunctionArguments::Star => (Vec::new(), false),
+                hir::FunctionArguments::Expressions { order_by, .. } if !order_by.is_empty() => {
+                    return unsupported("ORDER BY in aggregates")
+                }
+                hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness,
+                    ..
+                } => (
+                    values
+                        .iter()
+                        .map(|value| expand_outputs(document, value))
+                        .collect(),
+                    matches!(distinctness, Some(ast::Distinctness::Distinct)),
+                ),
+                hir::FunctionArguments::OrderedSet { .. } => {
+                    return unsupported("ordered-set aggregates")
+                }
+            };
+            calls.push((
+                *id,
+                Aggregate {
+                    func,
+                    args,
+                    distinct,
+                    filter: filter
+                        .as_deref()
+                        .map(|filter| expand_outputs(document, filter)),
+                    published: Some(expand_outputs(document, node)),
+                },
+            ));
+            Ok(false)
+        })
     };
-    // ON and USING terms belong to their join. A WHERE term may run below a
-    // join only if no join from there on fills one of its tables with NULLs:
-    // in `a RIGHT JOIN b ... WHERE a.x > b.y`, running the term on `a`
-    // first would let `b` rows find no match and be padded instead of
-    // being removed. Otherwise it runs after the last such join. On an inner
+    for output in &block.outputs {
+        collect(&output.expr)?;
+    }
+    if let hir::QueryBlockBody::Select {
+        grouping: Some(grouping),
+        ..
+    } = &block.body
+    {
+        if let Some(having) = &grouping.having {
+            collect(having)?;
+        }
+    }
+    calls.sort_by_key(|(id, _)| id.index);
+    Ok(calls.into_iter().map(|(_, aggregate)| aggregate).collect())
+}
+
+fn hidden_count_aggregate() -> Aggregate {
+    Aggregate {
+        func: AggFunc::Count0,
+        args: Vec::new(),
+        distinct: false,
+        filter: None,
+        published: None,
+    }
+}
+
+/// Build the DAG of one FROM clause: its sources joined in order, with the
+/// WHERE terms of `filter` placed at the lowest join they may run below.
+fn build_from_dag(
+    builder: &mut dag::DagBuilder,
+    document: &HirDocument,
+    from: &hir::From,
+    filter: Option<&hir::Expr>,
+) -> Result<dag::NodeId> {
+    // The first source has no join; it behaves as the left side of the rest.
+    let mut sources = vec![from.first];
+    let mut join_types = vec![StepJoin::Inner];
+    let mut on_by_step: Vec<Vec<hir::Expr>> = vec![Vec::new()];
+    for join in &from.joins {
+        sources.push(join.right);
+        join_types.push(match join.kind {
+            hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross => StepJoin::Inner,
+            hir::JoinKind::Left => StepJoin::Left,
+            hir::JoinKind::Right => StepJoin::Right,
+            hir::JoinKind::Full => StepJoin::Full,
+            hir::JoinKind::Semi => StepJoin::Semi,
+            hir::JoinKind::Anti => StepJoin::Anti,
+        });
+        on_by_step.push(join_predicates(document, &join.constraint));
+    }
+    let mut inputs = Vec::with_capacity(sources.len());
+    for source_id in &sources {
+        inputs.push(build_source_dag(builder, document, *source_id)?);
+    }
+    let position_of = |source: SourceId| sources.iter().position(|known| *known == source);
+
+    // The sources whose columns the join at `step` fills with NULLs.
+    let nulls_filled_by = |step: usize| match join_types[step] {
+        StepJoin::Left => step..step + 1,
+        StepJoin::Right => 0..step,
+        StepJoin::Full => 0..step + 1,
+        StepJoin::Inner | StepJoin::Semi | StepJoin::Anti => 0..0,
+    };
+    // ON terms belong to their join. A WHERE term may run below a join only
+    // if no join from there on fills one of its sources with NULLs: in
+    // `a RIGHT JOIN b ... WHERE a.x > b.y`, running the term on `a` first
+    // would let `b` rows find no match and be padded instead of being
+    // removed. Otherwise it runs after the last such join. On an inner
     // join, running a term after it and adding it to ON are the same.
     //
-    // The table of a semi or anti join is invisible after its join, so every
-    // term that reads it is part of that join's ON. The planner puts the
-    // EXISTS subquery's WHERE terms there when it turns the subquery into a
-    // join.
-    let mut on_by_step = vec![Vec::new(); inputs.len()];
-    let mut filters_by_step = vec![Vec::new(); inputs.len()];
-    for term in &plan.where_clause {
-        if let Some(origin) = term.origin.join_origin() {
-            let step = *binding_positions
-                .get(&origin.right_table())
-                .ok_or_else(|| {
-                    LimboError::InternalError(
-                        "join predicate belongs to a table outside the FROM clause".to_string(),
-                    )
-                })?;
-            let outer_join = matches!(
-                join_types[step],
-                JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter
-            );
-            if step == 0 || origin.is_outer() != outer_join {
-                return Err(LimboError::InternalError(
-                    "join predicate does not match the join that owns it".to_string(),
-                ));
-            }
-            on_by_step[step].push(term.expr.clone());
-            continue;
-        }
-        let positions = referenced_binding_positions(&term.expr, &binding_positions)?;
+    // The source of a semi or anti join is invisible after its join, so
+    // every term that reads it is part of that join's ON.
+    let mut filters_by_step: Vec<Vec<hir::Expr>> = vec![Vec::new(); inputs.len()];
+    let mut where_terms = Vec::new();
+    if let Some(filter) = filter {
+        conjuncts(&expand_outputs(document, filter), &mut where_terms);
+    }
+    for term in where_terms {
+        let positions = referenced_positions(document, &term, &position_of)?;
         let mut step = positions.iter().copied().max().unwrap_or(0);
-        let reads_hidden_table =
-            |position: usize| matches!(join_types[position], JoinType::Semi | JoinType::Anti);
+        let reads_hidden_source =
+            |position: usize| matches!(join_types[position], StepJoin::Semi | StepJoin::Anti);
         if positions
             .iter()
-            .any(|position| reads_hidden_table(*position))
+            .any(|position| reads_hidden_source(*position))
         {
-            // Its table must be the last one the term reads, or a later join
-            // would need a column that is already gone.
+            // Its source must be the last one the term reads, or a later
+            // join would need a column that is already gone.
             if positions
                 .iter()
-                .any(|position| *position != step && reads_hidden_table(*position))
-                || !reads_hidden_table(step)
+                .any(|position| *position != step && reads_hidden_source(*position))
+                || !reads_hidden_source(step)
             {
                 return Err(LimboError::InternalError(
-                    "a predicate reads a semi or anti join table outside that join".to_string(),
+                    "a predicate reads a semi or anti join source outside that join".to_string(),
                 ));
             }
-            on_by_step[step].push(term.expr.clone());
+            on_by_step[step].push(term);
             continue;
         }
         for later in step + 1..inputs.len() {
@@ -370,10 +521,10 @@ fn build_select_plan_dag(
                 step = later;
             }
         }
-        if step > 0 && join_types[step] == JoinType::Inner {
-            on_by_step[step].push(term.expr.clone());
+        if step > 0 && join_types[step] == StepJoin::Inner {
+            on_by_step[step].push(term);
         } else {
-            filters_by_step[step].push(term.expr.clone());
+            filters_by_step[step].push(term);
         }
     }
 
@@ -383,20 +534,20 @@ fn build_select_plan_dag(
             let pair = [node, inputs[step]];
             let on = std::mem::take(&mut on_by_step[step]);
             node = match join_types[step] {
-                JoinType::Inner => builder.push(dag::OpNode::Join {
+                StepJoin::Inner => builder.push(dag::OpNode::Join {
                     inputs: pair,
                     on,
                     kind: dag::JoinKind::Inner,
                 })?,
-                JoinType::LeftOuter => push_outer_join(builder, pair, on, true, false)?,
-                JoinType::RightOuter => push_outer_join(builder, pair, on, false, true)?,
-                JoinType::FullOuter => push_outer_join(builder, pair, on, true, true)?,
-                JoinType::Semi => builder.push(dag::OpNode::Join {
+                StepJoin::Left => push_outer_join(builder, pair, on, true, false)?,
+                StepJoin::Right => push_outer_join(builder, pair, on, false, true)?,
+                StepJoin::Full => push_outer_join(builder, pair, on, true, true)?,
+                StepJoin::Semi => builder.push(dag::OpNode::Join {
                     inputs: pair,
                     on,
                     kind: dag::JoinKind::Semi,
                 })?,
-                JoinType::Anti => builder.push(dag::OpNode::Join {
+                StepJoin::Anti => builder.push(dag::OpNode::Join {
                     inputs: pair,
                     on,
                     kind: dag::JoinKind::Anti,
@@ -411,40 +562,64 @@ fn build_select_plan_dag(
         }
     }
 
-    if plan.group_by.is_some() || !plan.aggregates.is_empty() {
-        let (group_exprs, group_keys, scalar) = if plan
-            .group_by
-            .as_ref()
-            .is_some_and(|group_by| !group_by.exprs.is_empty())
-        {
-            let group_by = plan.group_by.as_ref().unwrap();
-            let mut exprs = Vec::with_capacity(group_by.exprs.len());
-            let mut keys = Vec::with_capacity(group_by.exprs.len());
-            for expr in &group_by.exprs {
-                keys.push(key_column(expr, &plan.table_references, resolver)?);
-                exprs.push(expr.clone());
+    Ok(node)
+}
+
+fn build_block_dag(
+    builder: &mut dag::DagBuilder,
+    document: &HirDocument,
+    block_id: QueryBlockId,
+) -> Result<dag::NodeId> {
+    let block = block(document, block_id)?;
+    if !block.windows.is_empty() || block.window_function_count != 0 {
+        return unsupported("window functions");
+    }
+    let hir::QueryBlockBody::Select {
+        distinctness,
+        filter,
+        grouping,
+    } = &block.body
+    else {
+        return unsupported("VALUES");
+    };
+    let Some(from) = &block.from else {
+        return unsupported("SELECT without a FROM clause");
+    };
+
+    let mut node = build_from_dag(builder, document, from, filter.as_ref())?;
+
+    let aggregates = block_aggregates(document, block)?;
+    if grouping.is_some() || !aggregates.is_empty() {
+        let (group_exprs, group_keys, scalar) = match grouping {
+            Some(grouping) if !grouping.keys.is_empty() => {
+                let mut exprs = Vec::with_capacity(grouping.keys.len());
+                let mut keys = Vec::with_capacity(grouping.keys.len());
+                for (key, collation) in grouping.keys.iter().zip(&grouping.key_collations) {
+                    let expr = expand_outputs(document, key);
+                    keys.push(key_column(
+                        document,
+                        &expr,
+                        collation.as_ref().map(|collation| *collation.value()),
+                    )?);
+                    exprs.push(expr);
+                }
+                (exprs, keys, false)
             }
-            (exprs, keys, false)
-        } else {
-            // The one group of a scalar aggregate is the constant 0.
-            (
-                vec![ast::Expr::Literal(ast::Literal::Numeric("0".to_string()))],
+            _ => (
+                // The one group of a scalar aggregate is the constant 0.
+                vec![hir::Expr::Literal(ast::Literal::Numeric("0".to_string()))],
                 vec![dag::KeyColumn {
                     collation: CollationSeq::Binary,
                     ambiguous: false,
                 }],
                 true,
-            )
+            ),
         };
 
-        let mut aggregates = hidden_count_aggregate(resolver)?;
-        for aggregate in &plan.aggregates {
-            let mut normalized = aggregate.clone();
-            normalized.fraction_reg = None;
-            aggregates.push(normalized);
-        }
-        let mut multiset_keys = Vec::with_capacity(aggregates.len());
-        for aggregate in &aggregates {
+        let mut all_aggregates = vec![hidden_count_aggregate()];
+        all_aggregates.extend(aggregates);
+        let mut multiset_keys = Vec::with_capacity(all_aggregates.len());
+        for aggregate in &all_aggregates {
             if !uses_multiset(aggregate) {
                 multiset_keys.push(None);
                 continue;
@@ -454,28 +629,25 @@ fn build_select_plan_dag(
                     "a MIN/MAX or DISTINCT aggregate has no argument".to_string(),
                 )
             })?;
-            multiset_keys.push(Some(key_column(
-                argument,
-                &plan.table_references,
-                resolver,
-            )?));
+            let collation = aggregate_argument_collation(aggregate);
+            multiset_keys.push(Some(key_column(document, argument, collation)?));
         }
         node = builder.push(dag::OpNode::Aggregate {
             input: node,
             group_exprs,
             group_keys,
-            aggregates,
+            aggregates: all_aggregates,
             multiset_keys,
             scalar,
         })?;
 
-        if let Some(having) = plan
-            .group_by
+        if let Some(having) = grouping
             .as_ref()
-            .and_then(|group_by| group_by.having.as_ref())
+            .and_then(|grouping| grouping.having.as_ref())
         {
-            let normalized = having.to_vec();
-            if let Some(predicate) = combine_predicates(normalized) {
+            let mut terms = Vec::new();
+            conjuncts(&expand_outputs(document, having), &mut terms);
+            if let Some(predicate) = combine_predicates(terms) {
                 node = builder.push(dag::OpNode::Filter {
                     input: node,
                     predicate,
@@ -484,26 +656,36 @@ fn build_select_plan_dag(
         }
     }
 
-    let result_exprs = plan
-        .result_columns
+    let result_exprs = block
+        .outputs
         .iter()
-        .map(|column| column.expr.clone())
+        .map(|output| expand_outputs(document, &output.expr))
         .collect::<Vec<_>>();
     node = builder.push(dag::OpNode::Project {
         input: node,
         projections: result_exprs.clone(),
     })?;
 
-    if plan.distinctness.is_distinct() {
+    if distinctness.is_some() {
         let group_keys = result_exprs
             .iter()
-            .map(|expr| key_column(expr, &plan.table_references, resolver))
+            .zip(&block.outputs)
+            .map(|(expr, output)| {
+                key_column(
+                    document,
+                    expr,
+                    output
+                        .collation
+                        .as_ref()
+                        .map(|collation| *collation.value()),
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         node = builder.push(dag::OpNode::Aggregate {
             input: node,
             group_exprs: result_exprs.clone(),
             group_keys,
-            aggregates: hidden_count_aggregate(resolver)?,
+            aggregates: vec![hidden_count_aggregate()],
             multiset_keys: vec![None],
             scalar: false,
         })?;
@@ -514,6 +696,22 @@ fn build_select_plan_dag(
     }
 
     Ok(node)
+}
+
+/// The collation of a MIN/MAX or DISTINCT aggregate's argument, as the
+/// analyzer resolved it.
+fn aggregate_argument_collation(aggregate: &Aggregate) -> Option<CollationSeq> {
+    let hir::Expr::Function(call) = aggregate.published.as_ref()? else {
+        return None;
+    };
+    let hir::FunctionArguments::Expressions { facts, .. } = &call.arguments else {
+        return None;
+    };
+    facts
+        .first()?
+        .collation
+        .as_ref()
+        .map(|collation| *collation.value())
 }
 
 /// Build an outer join from simpler operators: the inner join, plus the
@@ -527,7 +725,7 @@ fn build_select_plan_dag(
 fn push_outer_join(
     builder: &mut dag::DagBuilder,
     inputs: [dag::NodeId; 2],
-    on: Vec<ast::Expr>,
+    on: Vec<hir::Expr>,
     keep_left_rows: bool,
     keep_right_rows: bool,
 ) -> Result<dag::NodeId> {
@@ -573,81 +771,65 @@ fn push_outer_join(
     })
 }
 
-fn combine_predicates(mut predicates: Vec<ast::Expr>) -> Option<ast::Expr> {
+fn combine_predicates(mut predicates: Vec<hir::Expr>) -> Option<hir::Expr> {
     let first = predicates.pop()?;
-    Some(predicates.into_iter().fold(first, |right, left| {
-        ast::Expr::Binary(Box::new(left), ast::Operator::And, Box::new(right))
-    }))
+    Some(
+        predicates
+            .into_iter()
+            .fold(first, |right, left| hir::Expr::Binary {
+                lhs: Box::new(left),
+                operator: ast::Operator::And,
+                rhs: Box::new(right),
+                array_concat: false,
+                custom: None,
+                comparison: None,
+            }),
+    )
 }
 
-/// The FROM positions of the tables an expression reads.
-fn referenced_binding_positions(
-    expr: &ast::Expr,
-    binding_positions: &FxHashMap<TableInternalId, usize>,
+/// The FROM positions of the sources an expression reads.
+fn referenced_positions(
+    document: &HirDocument,
+    expr: &hir::Expr,
+    position_of: &impl Fn(SourceId) -> Option<usize>,
 ) -> Result<Vec<usize>> {
     let mut positions = Vec::new();
-    walk_expr_with_subqueries(expr, &mut |node| {
-        let binding = match node {
-            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => Some(*table),
-            ast::Expr::Id(_) | ast::Expr::Qualified(_, _) | ast::Expr::DoublyQualified(_, _, _) => {
-                return Err(LimboError::InternalError(
-                    "maintenance predicate contains an unresolved identifier".to_string(),
-                ));
-            }
+    visit_expression(document, expr, &mut |node| {
+        let source = match node {
+            hir::Expr::Column(column) => Some(column.source),
+            hir::Expr::RowId(source) => Some(*source),
             _ => None,
         };
-        if let Some(binding) = binding {
-            let position = binding_positions.get(&binding).ok_or_else(|| {
+        if let Some(source) = source {
+            let position = position_of(source).ok_or_else(|| {
                 LimboError::InternalError(
-                    "maintenance predicate references a binding outside its FROM clause"
-                        .to_string(),
+                    "maintenance predicate references a source outside its FROM clause".to_string(),
                 )
             })?;
-            positions.push(*position);
+            positions.push(position);
         }
-        Ok(WalkControl::Continue)
+        Ok(true)
     })?;
     Ok(positions)
 }
 
-fn hidden_count_aggregate(resolver: &Resolver) -> Result<Vec<Aggregate>> {
-    let count_star = ast::Expr::FunctionCallStar {
-        name: ast::Name::exact("count".to_string()),
-        filter_over: ast::FunctionTail {
-            filter_clause: None,
-            over_clause: None,
-        },
-    };
-    let mut aggregates = Vec::new();
-    resolve_window_and_aggregate_functions(&count_star, resolver, &mut aggregates, None, &mut [])?;
-    Ok(aggregates)
-}
-
-fn plan_expr_collation(
-    expr: &ast::Expr,
-    tables: &TableReferences,
-    resolver: &Resolver,
-) -> Result<Option<CollationSeq>> {
-    let collation = get_collseq_from_expr_with_symbols(expr, tables, Some(resolver.symbol_table))?;
-    if collation.is_some_and(|collation| collation.is_custom()) {
-        return unsupported("custom collations on grouping or dedup keys");
-    }
-    Ok(collation.map(|collation| match collation {
-        CollationSeq::Unset => CollationSeq::Binary,
-        other => other,
-    }))
-}
-
-/// The key column a stateful operator uses for `expr`.
+/// The key column a stateful operator uses for `expr`, which compares under
+/// `collation`.
 fn key_column(
-    expr: &ast::Expr,
-    tables: &TableReferences,
-    resolver: &Resolver,
+    document: &HirDocument,
+    expr: &hir::Expr,
+    collation: Option<CollationSeq>,
 ) -> Result<dag::KeyColumn> {
-    let collation = plan_expr_collation(expr, tables, resolver)?.unwrap_or(CollationSeq::Binary);
+    let collation = match collation.unwrap_or(CollationSeq::Binary) {
+        CollationSeq::Unset => CollationSeq::Binary,
+        collation if collation.is_custom() => {
+            return unsupported("custom collations on grouping or dedup keys")
+        }
+        collation => collation,
+    };
     Ok(dag::KeyColumn {
         collation,
-        ambiguous: collation != CollationSeq::Binary || stored_affinity(expr, tables).is_none(),
+        ambiguous: collation != CollationSeq::Binary || stored_affinity(document, expr).is_none(),
     })
 }
 
@@ -656,20 +838,31 @@ fn key_column(
 /// BINARY a class holds one exact value only when no branch can produce an
 /// integer that another branch produces as an equal real.
 fn set_op_key_column(
-    branches: &[&SelectPlan],
+    document: &HirDocument,
+    branches: &[&hir::QueryBlock],
     index: usize,
-    resolver: &Resolver,
 ) -> Result<dag::KeyColumn> {
     let mut collation = None;
     let mut affinities = Vec::with_capacity(branches.len());
     for branch in branches {
-        let expr = &branch.result_columns[index].expr;
+        let output = branch.outputs.get(index).ok_or_else(|| {
+            LimboError::InternalError("compound arm has too few result columns".to_string())
+        })?;
         if collation.is_none() {
-            collation = plan_expr_collation(expr, &branch.table_references, resolver)?;
+            collation = output
+                .collation
+                .as_ref()
+                .map(|collation| *collation.value());
         }
-        affinities.push(stored_affinity(expr, &branch.table_references));
+        affinities.push(stored_affinity(document, &output.expr));
     }
-    let collation = collation.unwrap_or(CollationSeq::Binary);
+    let collation = match collation.unwrap_or(CollationSeq::Binary) {
+        CollationSeq::Unset => CollationSeq::Binary,
+        collation if collation.is_custom() => {
+            return unsupported("custom collations on grouping or dedup keys")
+        }
+        collation => collation,
+    };
     let mixes_integers_and_reals =
         affinities.contains(&Some(Affinity::Integer)) && affinities.contains(&Some(Affinity::Real));
     Ok(dag::KeyColumn {
@@ -686,15 +879,19 @@ fn set_op_key_column(
 /// number as a real, and TEXT stores numbers as text. `None` for anything
 /// else (an expression, a derived-table column, or a column without such an
 /// affinity), which may hold both the integer 2 and the real 2.0.
-fn stored_affinity(expr: &ast::Expr, tables: &TableReferences) -> Option<Affinity> {
+fn stored_affinity(document: &HirDocument, expr: &hir::Expr) -> Option<Affinity> {
     match expr {
-        ast::Expr::RowId { .. } => Some(Affinity::Integer),
-        ast::Expr::Column { table, column, .. } => {
-            let joined = tables.find_joined_table_by_internal_id(*table)?;
-            let crate::schema::Table::BTree(table) = &joined.table else {
+        hir::Expr::RowId(_) => Some(Affinity::Integer),
+        hir::Expr::Output(output) => stored_affinity(document, &document.output(*output)?.expr),
+        hir::Expr::Column(column) => {
+            let source = document.source(column.source)?;
+            let hir::SourceKind::Table(table) = &source.kind else {
                 return None;
             };
-            match table.columns().get(*column)?.affinity() {
+            let crate::schema::Table::BTree(table) = table.value() else {
+                return None;
+            };
+            match table.columns().get(column.column)?.affinity() {
                 Affinity::Integer | Affinity::Numeric => Some(Affinity::Integer),
                 Affinity::Real => Some(Affinity::Real),
                 Affinity::Text => Some(Affinity::Text),
@@ -841,6 +1038,8 @@ impl OperatorStateCatalog {
 /// the accepted-query set, hidden schema, and bytecode dispatcher from
 /// evolving as three independent shape classifiers.
 pub(crate) struct MaintenancePlan {
+    /// The analyzed query every DAG expression refers to.
+    document: Arc<HirDocument>,
     dag: dag::MaintenanceDag,
     operator_states: OperatorStateCatalog,
     output_arity: usize,
@@ -848,6 +1047,10 @@ pub(crate) struct MaintenancePlan {
 }
 
 impl MaintenancePlan {
+    pub(super) fn document(&self) -> &HirDocument {
+        &self.document
+    }
+
     pub(super) fn dag(&self) -> &dag::MaintenanceDag {
         &self.dag
     }
@@ -886,7 +1089,7 @@ impl MaintenancePlan {
                 .position(|column| {
                     column
                         .as_ref()
-                        .is_some_and(|column| crate::util::exprs_are_equivalent(column, expr))
+                        .is_some_and(|column| column.equivalent(expr))
                 })
                 .and_then(|position| chosen[input][position])
         };
@@ -979,86 +1182,39 @@ impl MaintenancePlan {
 }
 
 /// Validate a view and build its executable maintenance plan.
+///
+/// The view's unqualified table names resolve within the main database,
+/// where every materialized view lives, never through a TEMP table that
+/// happens to share a source table's name. Every correlated subquery the
+/// planner can turn into a join becomes one (EXISTS and IN into semi joins,
+/// NOT EXISTS into anti joins), whatever its cost: maintenance cannot run a
+/// correlated subquery, and the view's plan is rebuilt whenever the schema
+/// changes, so the choice must not depend on cost.
 pub(crate) fn plan_view(
     view_name: &str,
     select: &ast::Select,
-    resolver: &Resolver,
-    connection: &Arc<Connection>,
+    catalog: &SemanticContext<'_>,
 ) -> Result<MaintenancePlan> {
-    let mut planner_program = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        None,
-        ProgramBuilderOpts::new(8, 32, 8),
-        connection.mvcc_enabled(),
-    );
-    let mut relational_plan = prepare_select_plan(
-        select.clone(),
-        resolver,
-        &mut planner_program,
-        &[],
-        QueryDestination::ResultRows,
-        connection,
+    let context = catalog.scoped_to_database(hir::DatabaseId::new(crate::MAIN_DB_ID));
+    let statement = ast::Stmt::Select(select.clone());
+    let document = analyze_root(&context, SemanticRootInput::Statement(&statement))?;
+    let (document, _) = crate::translate::semantic_unnest::unnest_correlated_subqueries(
+        Arc::new(document),
+        context.main_schema(),
+        crate::translate::optimizer::cost_model_params(),
+        crate::SubqueryUnnestingMode::Forced,
     )?;
-    unnest_correlated_subqueries(&mut relational_plan, resolver)?;
-    // Lower the same optimized plan regular execution runs. Maintenance does
-    // not depend on its access paths: no operator state depends on the order
-    // in which a query would meet the rows.
-    optimize_plan(&mut planner_program, &mut relational_plan, resolver)?;
-    let dag = build_dag_from_plan(&relational_plan, resolver)?;
-    let operator_states = plan_operator_states(view_name, &dag, resolver)?;
+    let dag = build_dag(&document)?;
+    let operator_states = plan_operator_states(view_name, &document, &dag)?;
     let output_arity = dag.root_schema().len();
     let version_marker = version_marker_table(view_name);
     Ok(MaintenancePlan {
+        document,
         dag,
         operator_states,
         output_arity,
         version_marker,
     })
-}
-
-/// Turn every correlated subquery the regular planner can rewrite into a join
-/// (EXISTS and IN into semi joins, NOT EXISTS into anti joins, scalar
-/// aggregates into LEFT JOINs), in this plan and in every FROM-clause
-/// subquery.
-///
-/// The regular optimizer chooses between a correlated subquery and its
-/// rewrite by cost. Maintenance cannot run a correlated subquery, and the
-/// view's plan is rebuilt whenever the schema changes, so the choice must not
-/// depend on cost: a new index could otherwise make an accepted view
-/// impossible to maintain.
-fn unnest_correlated_subqueries(plan: &mut Plan, resolver: &Resolver) -> Result<()> {
-    match plan {
-        Plan::Select(select) => unnest_select_subqueries(select, resolver),
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => {
-            for (branch, _) in left.iter_mut() {
-                unnest_select_subqueries(branch, resolver)?;
-            }
-            unnest_select_subqueries(right_most, resolver)
-        }
-        Plan::Delete(_) | Plan::Update(_) | Plan::RecursiveCte(_) => Ok(()),
-    }
-}
-
-fn unnest_select_subqueries(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
-    // Inner queries first: a subquery whose own FROM or WHERE holds another
-    // subquery can only become a join after that one has.
-    for subquery in &mut plan.non_from_clause_subqueries {
-        if let SubqueryState::Unevaluated {
-            plan: Some(inner), ..
-        } = &mut subquery.state
-        {
-            unnest_correlated_subqueries(inner, resolver)?;
-        }
-    }
-    for table in plan.table_references.joined_tables_mut() {
-        if let crate::schema::Table::FromClauseSubquery(subquery) = &mut table.table {
-            unnest_correlated_subqueries(&mut Arc::make_mut(subquery).plan, resolver)?;
-        }
-    }
-    rewrite_correlated_subqueries(plan, resolver)?;
-    Ok(())
 }
 
 fn version_marker_table(view_name: &str) -> HiddenTableDef {
@@ -1078,19 +1234,20 @@ fn version_marker_table(view_name: &str) -> HiddenTableDef {
 /// Validation therefore cannot accept a shape that has no physical contract,
 /// and it may inspect only contracts already established for declared inputs.
 fn validate_planned_node(
+    document: &HirDocument,
     dag: &dag::MaintenanceDag,
     node_id: dag::NodeId,
     operator_states: &OperatorStateCatalog,
-    resolver: &Resolver,
 ) -> Result<()> {
     let node = &dag.nodes[node_id];
     let check_expr =
-        |expr: &ast::Expr, input: dag::NodeId, unavailable_value: &str| -> Result<()> {
-            if changes_between_statements(expr, resolver)? {
+        |expr: &hir::Expr, input: dag::NodeId, unavailable_value: &str| -> Result<()> {
+            if changes_between_statements(document, expr)? {
                 return unsupported("non-deterministic expressions");
             }
             let input = &operator_states.for_node(input)?.output;
             validate_stream_expr(
+                document,
                 expr,
                 &input.schema,
                 &input.binding_rowids,
@@ -1163,10 +1320,11 @@ fn validate_planned_node(
                 .flat_map(|input| input.binding_rowids.iter().copied())
                 .collect::<Vec<_>>();
             for expr in on {
-                if changes_between_statements(expr, resolver)? {
+                if changes_between_statements(document, expr)? {
                     return unsupported("non-deterministic expressions");
                 }
                 validate_stream_expr(
+                    document,
                     expr,
                     &joined_schema,
                     &joined_rowids,
@@ -1254,7 +1412,7 @@ fn validate_planned_node(
                         "aggregate arguments referencing values outside their input stream",
                     )?;
                 }
-                if let Some(expr) = &aggregate.filter_expr {
+                if let Some(expr) = &aggregate.filter {
                     check_expr(
                         expr,
                         *input,
@@ -1270,25 +1428,29 @@ fn validate_planned_node(
 /// Whether `expr` can give a different value in a later statement than it gave
 /// when a row was added to the view: a non-deterministic function, or
 /// `CURRENT_DATE`, `CURRENT_TIME` or `CURRENT_TIMESTAMP`. Those literals are
-/// fixed within one statement, so the shared helper treats them as
-/// deterministic, but a view keeps its rows across statements.
-fn changes_between_statements(expr: &ast::Expr, resolver: &Resolver) -> Result<bool> {
-    if expr_contains_nondeterministic_scalar_function(expr, resolver)? {
-        return Ok(true);
-    }
+/// fixed within one statement, but a view keeps its rows across statements.
+fn changes_between_statements(document: &HirDocument, expr: &hir::Expr) -> Result<bool> {
     let mut found = false;
-    crate::util::walk_expr_with_subqueries(expr, &mut |node| -> Result<WalkControl> {
-        if matches!(
-            node,
-            ast::Expr::Literal(
+    visit_expression(document, expr, &mut |node| {
+        match node {
+            hir::Expr::Function(call) => {
+                let function = call.function.value();
+                let aggregate_or_window = matches!(function, Func::Agg(_) | Func::Window(_))
+                    || matches!(
+                        function,
+                        Func::External(external)
+                            if matches!(external.func, crate::function::ExtFunc::Aggregate { .. })
+                    );
+                found |= !aggregate_or_window && !function.is_deterministic();
+            }
+            hir::Expr::Literal(
                 ast::Literal::CurrentDate
-                    | ast::Literal::CurrentTime
-                    | ast::Literal::CurrentTimestamp
-            )
-        ) {
-            found = true;
+                | ast::Literal::CurrentTime
+                | ast::Literal::CurrentTimestamp,
+            ) => found = true,
+            _ => {}
         }
-        Ok(WalkControl::Continue)
+        Ok(true)
     })?;
     Ok(found)
 }
@@ -1423,8 +1585,8 @@ fn plan_node_output(
                     }
                     for (index, available) in rowids.iter_mut().enumerate() {
                         *available &= branch.binding_rowids[index]
-                            && branch.schema.bindings[index].logical_id
-                                == schema.bindings[index].logical_id;
+                            && branch.schema.bindings[index].source
+                                == schema.bindings[index].source;
                     }
                 }
                 (DeltaIdentity::OperatorKey(2), rowids.into())
@@ -1514,8 +1676,8 @@ fn node_requires_output_arrangement(
 /// storage selection depends only on node and edge contracts.
 fn plan_operator_states(
     view_name: &str,
+    document: &HirDocument,
     dag: &dag::MaintenanceDag,
-    resolver: &Resolver,
 ) -> Result<OperatorStateCatalog> {
     use crate::incremental::view::DBSP_CIRCUIT_VERSION;
 
@@ -1591,7 +1753,7 @@ fn plan_operator_states(
             }
         }
         catalog.nodes.push(state);
-        validate_planned_node(dag, node_id, &catalog, resolver)?;
+        validate_planned_node(document, dag, node_id, &catalog)?;
     }
     validate_terminal_delta_identity(&catalog, dag.root)?;
     Ok(catalog)
@@ -1951,85 +2113,37 @@ mod tests {
         ))
     }
 
-    fn sum_expr(column: usize) -> ast::Expr {
-        ast::Expr::FunctionCall {
-            name: ast::Name::exact("sum".to_string()),
-            distinctness: None,
-            args: vec![Box::new(ast::Expr::Column {
-                database: None,
-                table: TableInternalId::from(1),
-                column,
-                is_rowid_alias: false,
-            })],
-            order_by: Vec::new(),
-            within_group: Vec::new(),
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
+    fn empty_document() -> HirDocument {
+        HirDocument {
+            snapshot: hir::CatalogSnapshot::from_id(0),
+            databases: Vec::new(),
+            root: hir::HirRoot::Query(hir::QueryRoot {
+                query: QueryId::new(0),
+            }),
+            queries: Vec::new(),
+            sources: Vec::new(),
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
         }
     }
 
-    fn abs_expr(column: usize) -> ast::Expr {
-        ast::Expr::FunctionCall {
-            name: ast::Name::exact("abs".to_string()),
-            distinctness: None,
-            args: vec![Box::new(ast::Expr::Column {
-                database: None,
-                table: TableInternalId::from(1),
-                column,
-                is_rowid_alias: false,
-            })],
-            order_by: Vec::new(),
-            within_group: Vec::new(),
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
+    fn plus_one(expr: hir::Expr) -> hir::Expr {
+        hir::Expr::Binary {
+            lhs: Box::new(expr),
+            operator: ast::Operator::Add,
+            rhs: Box::new(hir::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+            array_concat: false,
+            custom: None,
+            comparison: None,
         }
     }
 
     #[test]
     fn expression_validation_depends_only_on_published_values() {
-        let sum = sum_expr(0);
-        let input = NodeOutputContract {
-            schema: Arc::new(dag::StreamSchema {
-                columns: vec![Some(sum.clone())],
-                bindings: Vec::new(),
-            }),
-            binding_rowids: Vec::<bool>::new().into(),
-            emitted_identity: DeltaIdentity::OperatorRowid,
-            published_identity: DeltaIdentity::OperatorRowid,
-        };
-        let expression = ast::Expr::Binary(
-            Box::new(sum),
-            ast::Operator::Add,
-            Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
-        );
-
-        validate_stream_expr(
-            &expression,
-            &input.schema,
-            &input.binding_rowids,
-            "unpublished value",
-        )
-        .unwrap();
-
-        let error = validate_stream_expr(
-            &sum_expr(1),
-            &input.schema,
-            &input.binding_rowids,
-            "unpublished value",
-        )
-        .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("expressions over aggregate results"));
-    }
-
-    #[test]
-    fn expression_validation_stops_at_published_scalar_functions() {
-        let published = abs_expr(0);
+        let document = empty_document();
+        let source = SourceId::new(1);
+        let published = hir::Expr::column(source, 0);
         let input = NodeOutputContract {
             schema: Arc::new(dag::StreamSchema {
                 columns: vec![Some(published.clone())],
@@ -2041,6 +2155,43 @@ mod tests {
         };
 
         validate_stream_expr(
+            &document,
+            &plus_one(published),
+            &input.schema,
+            &input.binding_rowids,
+            "unpublished value",
+        )
+        .unwrap();
+
+        let error = validate_stream_expr(
+            &document,
+            &hir::Expr::column(source, 1),
+            &input.schema,
+            &input.binding_rowids,
+            "unpublished value",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unpublished value"));
+    }
+
+    #[test]
+    fn expression_validation_stops_at_published_expressions() {
+        let document = empty_document();
+        let published = plus_one(hir::Expr::column(SourceId::new(1), 0));
+        let input = NodeOutputContract {
+            schema: Arc::new(dag::StreamSchema {
+                columns: vec![Some(published.clone())],
+                bindings: Vec::new(),
+            }),
+            binding_rowids: Vec::<bool>::new().into(),
+            emitted_identity: DeltaIdentity::OperatorRowid,
+            published_identity: DeltaIdentity::OperatorRowid,
+        };
+
+        // The column inside the published expression is not published on
+        // its own; reading the whole expression is what the stream offers.
+        validate_stream_expr(
+            &document,
             &published,
             &input.schema,
             &input.binding_rowids,
@@ -2052,19 +2203,12 @@ mod tests {
     #[test]
     fn node_output_contract_reuses_dag_schema() {
         let table = test_table();
+        let source = SourceId::new(1);
         let schema = Arc::new(dag::StreamSchema {
             columns: Vec::new(),
-            bindings: vec![dag::StreamBinding {
-                table: table.clone(),
-                identifier: "t".to_string(),
-                logical_id: TableInternalId::from(1),
-            }],
+            bindings: vec![dag::StreamBinding { source }],
         });
-        let node = dag::OpNode::Scan {
-            table,
-            identifier: "t".to_string(),
-            logical_id: TableInternalId::from(1),
-        };
+        let node = dag::OpNode::Scan { table, source };
 
         let output = plan_node_output(schema.clone(), &node, &[]).unwrap();
 

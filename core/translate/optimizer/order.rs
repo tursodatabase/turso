@@ -1,47 +1,54 @@
-use crate::schema::{impl_effective_nulls_order, Table};
-use crate::turso_assert_greater_than_or_equal;
+use crate::schema::Table;
 use crate::{
-    schema::{FromClauseSubquery, Index, Schema},
+    schema::{Index, Schema},
     translate::{
-        collate::{get_collseq_from_expr, CollationSeq},
-        expression_index::normalize_expr_for_index_matching,
+        collate::CollationSeq,
         optimizer::access_method::AccessMethodParams,
-        optimizer::constraints::{
-            usable_constraints_for_lhs_mask, RangeConstraintRef, TableConstraints,
-        },
-        plan::{
-            GroupBy, IterationDirection, JoinInfo, JoinedTable, Operation, Plan, Scan,
-            SimpleAggregate, TableReferences,
-        },
-        planner::{table_mask_from_expr, TableMask},
+        optimizer::constraints::RangeConstraintRef,
+        plan::{HirPlanSource, HirPlannedSource, IterationDirection},
+        planner::TableMask,
+        semantic::hir,
     },
-    util::exprs_are_equivalent,
+    LimboError, Result,
 };
-use turso_parser::ast::{self, SortOrder, TableInternalId};
+use turso_parser::ast::{self, SortOrder};
 
 use super::{access_method::AccessMethod, cost::index_access_is_unique_point_lookup, join::JoinN};
 
 /// Target component in an ORDER BY/GROUP BY that may be a plain column or an expression.
 #[derive(Debug, PartialEq, Clone)]
-pub enum ColumnTarget {
+pub enum ColumnTarget<E> {
     Column(usize),
     RowId,
-    /// We know that the ast lives at least as long as the Statement/Program,
-    /// so we store a raw pointer here to avoid cloning yet another ast::Expr
-    Expr(*const ast::Expr),
+    Expr(E),
 }
 
 /// A convenience struct for representing a (table_no, column_target, [SortOrder]) tuple.
 #[derive(Debug, PartialEq, Clone)]
-pub struct ColumnOrder {
-    pub table_id: TableInternalId,
-    pub target: ColumnTarget,
+pub struct ColumnOrder<I, E> {
+    pub source: I,
+    pub target: ColumnTarget<E>,
     pub order: SortOrder,
     pub collation: CollationSeq,
     pub nulls_order: Option<ast::NullsOrder>,
 }
 
-impl_effective_nulls_order!(ColumnOrder);
+impl<I, E> ColumnOrder<I, E> {
+    pub fn effective_nulls_order_when_iterated(
+        &self,
+        iter_dir: IterationDirection,
+    ) -> ast::NullsOrder {
+        match iter_dir {
+            IterationDirection::Forwards => self.effective_nulls_order(),
+            IterationDirection::Backwards => self.effective_nulls_order().reverse(),
+        }
+    }
+
+    pub fn effective_nulls_order(&self) -> ast::NullsOrder {
+        self.nulls_order
+            .unwrap_or_else(|| ast::NullsOrder::default_for(self.order))
+    }
+}
 
 #[derive(Debug, PartialEq, Clone)]
 /// If an [OrderTarget] is satisfied, then [EliminatesSort] describes which part
@@ -66,10 +73,15 @@ pub enum OrderTargetPurpose {
 /// An [OrderTarget] is considered in join optimization and index selection,
 /// so that if a given join ordering and its access methods satisfy the [OrderTarget],
 /// then the join ordering and its access methods are preferred, all other things being equal.
-pub struct OrderTarget {
-    pub columns: Vec<ColumnOrder>,
+pub struct OrderTarget<I, E> {
+    pub columns: Vec<ColumnOrder<I, E>>,
     pub purpose: OrderTargetPurpose,
 }
+
+pub type HirOrderTarget<'a> = OrderTarget<
+    crate::translate::semantic::hir::SourceId,
+    &'a crate::translate::semantic::hir::Expr,
+>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EqualityPrefixScope {
@@ -82,336 +94,212 @@ pub enum EqualityPrefixScope {
     ConstantEquality,
 }
 
-impl OrderTarget {
-    /// Build an `OrderTarget` from a list of expressions if they can all be
-    /// satisfied by a single-table ordering (needed for index satisfaction).
-    fn maybe_from_iterator<'a>(
-        list: impl Iterator<Item = (&'a ast::Expr, SortOrder, Option<ast::NullsOrder>)> + Clone,
-        tables: &crate::translate::plan::TableReferences,
-        purpose: OrderTargetPurpose,
-    ) -> Option<Self> {
-        if list.clone().count() == 0 {
-            return None;
-        }
-        let mut cols = Vec::new();
-        for (expr, order, nulls) in list {
-            let col = expr_to_column_order(expr, order, nulls, tables)?;
-            cols.push(col);
-        }
-        Some(OrderTarget {
-            columns: cols,
-            purpose,
-        })
-    }
-
+impl<I, E> OrderTarget<I, E> {
     pub fn is_extremum(&self) -> bool {
         matches!(self.purpose, OrderTargetPurpose::Extremum)
     }
 }
 
-/// Build the synthetic ordering requirement used by simple MIN/MAX aggregation.
-pub fn simple_aggregate_order_target(
-    simple_aggregate: &SimpleAggregate,
-    tables: &TableReferences,
-) -> Option<OrderTarget> {
-    let SimpleAggregate::MinMax(min_max) = simple_aggregate else {
-        return None;
-    };
-
-    let mut target = OrderTarget::maybe_from_iterator(
-        std::iter::once((&min_max.argument, min_max.order, None)),
-        tables,
-        OrderTargetPurpose::Extremum,
-    )?;
-    if let Some(coll) = min_max.collation {
-        target.columns[0].collation = coll;
-    }
-    Some(target)
-}
-
-/// Compute an [OrderTarget] for the join optimizer to use.
-/// Ideally, a join order is both efficient in joining the tables
-/// but also returns the results in an order that minimizes the amount of
-/// sorting that needs to be done later (either in GROUP BY, ORDER BY, or both).
-///
-/// TODO: this does not currently handle the case where we definitely cannot eliminate
-/// the ORDER BY sorter, but we could still eliminate the GROUP BY sorter.
-pub fn compute_order_target(
-    order_by: &mut Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
-    group_by_opt: Option<&mut GroupBy>,
-    tables: &TableReferences,
-) -> Option<OrderTarget> {
-    match (order_by.is_empty(), group_by_opt) {
-        // No ordering demands - we don't care what order the joined result rows are in
-        (true, None) => None,
-        // Only ORDER BY - we would like the joined result rows to be in the order specified by the ORDER BY
-        (false, None) => OrderTarget::maybe_from_iterator(
-            order_by
-                .iter()
-                .map(|(expr, order, nulls)| (expr.as_ref(), *order, *nulls)),
-            tables,
-            OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
-        ),
-        // Only GROUP BY - we would like the joined result rows to be in the order specified by the GROUP BY
-        (true, Some(group_by)) => OrderTarget::maybe_from_iterator(
-            group_by
-                .exprs
-                .iter()
-                .map(|expr| (expr, SortOrder::Asc, None)),
-            tables,
-            OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group),
-        ),
-        // Both ORDER BY and GROUP BY:
-        // If the GROUP BY does not contain all the expressions in the ORDER BY,
-        // then we must separately sort the result rows for ORDER BY anyway.
-        // However, in that case we can use the GROUP BY expressions as the target order for the join,
-        // so that we don't have to sort twice.
-        //
-        // If the GROUP BY contains all the expressions in the ORDER BY,
-        // then we again can use the GROUP BY expressions as the target order for the join;
-        // however in this case we must take the ASC/DESC from ORDER BY into account.
-        (false, Some(group_by)) => {
-            // Does the group by contain all expressions in the order by?
-            let group_by_contains_all = order_by.iter().all(|(expr, _, _)| {
-                group_by
-                    .exprs
-                    .iter()
-                    .any(|group_by_expr| exprs_are_equivalent(expr, group_by_expr))
-            });
-            // If not, let's try to target an ordering that matches the group by -- we don't care about ASC/DESC
-            if !group_by_contains_all {
-                return OrderTarget::maybe_from_iterator(
-                    group_by
-                        .exprs
-                        .iter()
-                        .map(|expr| (expr, SortOrder::Asc, None)),
-                    tables,
-                    OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group),
-                );
-            }
-            // If yes, let's try to target an ordering that matches the GROUP BY columns,
-            // but the ORDER BY orderings. First, we need to reorder the GROUP BY columns to match the ORDER BY columns.
-            group_by.exprs.sort_by_key(|expr| {
-                order_by
-                    .iter()
-                    .position(|(order_by_expr, _, _)| exprs_are_equivalent(expr, order_by_expr))
-                    .map_or(usize::MAX, |i| i)
-            });
-
-            // Now, regardless of whether we can eventually eliminate the sorting entirely in the optimizer,
-            // we know that we don't need ORDER BY sorting anyway, because the GROUP BY will sort the result since
-            // it contains all the necessary columns required for the ORDER BY, and the GROUP BY columns are now in the correct order.
-            // First, however, we need to make sure the GROUP BY sorter's column sort directions and NULLS
-            // ordering match the ORDER BY requirements.
-            turso_assert_greater_than_or_equal!(group_by.exprs.len(), order_by.len());
-            for (i, (_, order_by_dir, order_by_nulls)) in order_by.iter().enumerate() {
-                group_by.sort_order[i] = *order_by_dir;
-                group_by.nulls_order[i] = *order_by_nulls;
-            }
-            // The sort_by_key above reordered group_by.exprs but not sort_order,
-            // so remaining positions may have stale values. GROUP BY columns not
-            // in ORDER BY should default to ASC (matching SQLite's tie-breaking).
-            for i in order_by.len()..group_by.sort_order.len() {
-                group_by.sort_order[i] = SortOrder::Asc;
-                group_by.nulls_order[i] = None;
-            }
-            // Now we can remove the ORDER BY from the query.
-            order_by.clear();
-
-            OrderTarget::maybe_from_iterator(
-                group_by
-                    .exprs
-                    .iter()
-                    .zip(group_by.sort_order.iter())
-                    .zip(group_by.nulls_order.iter())
-                    .map(|((expr, dir), nulls)| (expr, *dir, *nulls)),
-                tables,
-                OrderTargetPurpose::EliminatesSort(EliminatesSortBy::GroupByAndOrder),
-            )
-        }
-    }
-}
-
-/// Check if the plan's row iteration order matches the [OrderTarget]'s column order.
-/// If yes, and this plan is selected, then a sort operation can be eliminated.
-pub fn plan_satisfies_order_target(
+/// Prove that the selected HIR B-tree loops supply the complete requested
+/// order. Plans with
+/// an outer join or a loop that is not a plain B-tree access keep their
+/// sorter.
+pub(crate) fn hir_plan_satisfies_order_target(
     plan: &JoinN,
-    access_methods_arena: &[AccessMethod],
-    joined_tables: &[JoinedTable],
-    table_constraints: &[TableConstraints],
-    order_target: &OrderTarget,
+    access_methods: &[AccessMethod],
+    sources: &[HirPlanSource],
+    document: &hir::HirDocument,
+    order_target: &HirOrderTarget<'_>,
     schema: &Schema,
-) -> bool {
-    // SQLite always sorts after a RIGHT JOIN or FULL JOIN. The unmatched
-    // right rows run after the normal loops, so no scan order is sufficient.
-    if joined_tables.iter().any(|table| {
-        table
-            .join_info
-            .as_ref()
-            .is_some_and(JoinInfo::keeps_right_rows)
-    }) {
-        return false;
-    }
-    let mut hash_join_build_tables = TableMask::default();
-    for (_, access_method_index) in plan.data.iter() {
-        let access_method = &access_methods_arena[*access_method_index];
-        if let AccessMethodParams::HashJoin {
+) -> Result<bool> {
+    // A hash build is read into an unordered hash table, so its scan order
+    // never orders the output; the loops before the build keep theirs. A
+    // build input folds the loops before the probe into the table, so none
+    // of them orders the output, and an outer hash join emits its unmatched
+    // build rows in hash order.
+    let mut hash_build_sources = TableMask::default();
+    for (_, method) in &plan.data {
+        if let Some(AccessMethodParams::HashJoin {
             build_table_idx,
             join_type,
             materialize_build_input,
             ..
-        } = &access_method.params
+        }) = access_methods.get(*method).map(|method| &method.params)
         {
-            hash_join_build_tables
-                .set(*build_table_idx)
-                .expect("a plan cannot contain more than the table limit");
-            // We bail out early because as soon as there's a hash join that materializes its
-            // build side, we can't rely on any of the relations to the left of its probe table
-            // in the join order. This is because translation retransforms the join order later on
-            // (see `prune_join_order_for_materialized_inputs`)
-            // Eventually, we could narrow down this check to consider the ordering of the relations
-            // at, or to the right of, the rightmost probe table, but for now this'll do.
-            if *materialize_build_input {
-                return false;
-            }
-            // Outer hash joins emit unmatched rows in hash-bucket order, not scan order.
-            if join_type.keeps_unmatched_build_rows() {
-                return false;
+            hash_build_sources.set(*build_table_idx)?;
+            if *materialize_build_input || join_type.keeps_unmatched_build_rows() {
+                return Ok(false);
             }
         }
     }
-
-    let mut target_col_idx = 0;
-    let mut prior_tables = TableMask::default();
-    let num_cols_in_order_target = order_target.columns.len();
-    for (loop_pos, (table_index, access_method_index)) in plan.data.iter().enumerate() {
-        let access_method = &access_methods_arena[*access_method_index];
-        let table_ref = &joined_tables[*table_index];
-
-        // A hash build is consumed into an unordered hash table and omitted
-        // from the execution loop order. Its scan order cannot order output.
-        if hash_join_build_tables.get(*table_index) {
-            return false;
+    // A RIGHT or FULL join adds its unmatched rows after every loop ends.
+    let join_kind = |source_position: usize| {
+        sources
+            .get(source_position)
+            .and_then(|source| source.join_info())
+            .map(|join| join.kind)
+    };
+    if plan.data.iter().any(|(source_position, _)| {
+        matches!(
+            join_kind(*source_position),
+            Some(hir::JoinKind::Right | hir::JoinKind::Full)
+        )
+    }) {
+        return Ok(false);
+    }
+    let columns = order_target.columns.len();
+    let mut consumed_columns = 0;
+    for (loop_position, (source_position, access_method_position)) in plan.data.iter().enumerate() {
+        if hash_build_sources.get(*source_position) {
+            return Ok(false);
         }
-
-        // Outer joins can emit an extra row with NULLs on the right-hand side
-        // when no match is found. Because that row is produced after the scan or
-        // seek, we cannot rely on the right-hand table's access order to satisfy
-        // ORDER BY / GROUP BY terms that reference that table.
-        if table_ref
-            .join_info
-            .as_ref()
-            .is_some_and(|join_info| join_info.is_outer())
-            && order_target.columns[target_col_idx..]
+        // A LEFT JOIN adds a NULL row after its scan or seek, so
+        // its order cannot give the terms that read its own columns. The
+        // terms before them keep the order of the loops before it.
+        if join_kind(*source_position) == Some(hir::JoinKind::Left)
+            && order_target.columns[consumed_columns..]
                 .iter()
-                .any(|target_col| target_col.table_id == table_ref.internal_id)
+                .any(|column| {
+                    sources
+                        .get(*source_position)
+                        .is_some_and(|source| source.source() == column.source)
+                })
         {
-            return false;
+            return Ok(false);
         }
-
-        // Check if this table has an access method that provides the right ordering.
-        let consumed = match &access_method.params {
-            AccessMethodParams::BTreeTable {
-                iter_dir,
-                index: index_opt,
-                build_index,
-                constraint_refs,
-            } => {
-                if *build_index {
-                    let constraint_refs = usable_constraints_for_lhs_mask(
-                        &table_constraints[*table_index].constraints,
-                        &table_constraints[*table_index].temporary_index_terms,
-                        &prior_tables,
-                        *table_index,
-                    );
-                    temporary_index_order_consumed(
-                        table_ref,
-                        *iter_dir,
-                        &constraint_refs,
-                        order_target,
-                        target_col_idx,
-                        schema,
-                    )
-                } else {
-                    btree_access_order_consumed(
-                        table_ref,
-                        *iter_dir,
-                        index_opt.as_deref(),
+        let source = match sources.get(*source_position) {
+            Some(HirPlanSource::BTree(source)) => source,
+            // A FROM subquery or CTE that is scanned returns its rows in its
+            // own order.
+            Some(
+                HirPlanSource::Derived {
+                    source: subquery_source,
+                    output_order,
+                    ..
+                }
+                | HirPlanSource::Cte {
+                    source: subquery_source,
+                    output_order,
+                    ..
+                },
+            ) => {
+                let Some(access_method) = access_methods.get(*access_method_position) else {
+                    return Ok(false);
+                };
+                let consumed = match &access_method.params {
+                    AccessMethodParams::Subquery { iter_dir } => OrderConsumption {
+                        consumed: hir_subquery_intrinsic_order_consumed(
+                            *subquery_source,
+                            output_order,
+                            *iter_dir,
+                            &order_target.columns[consumed_columns..],
+                        ),
+                        includes_rowid: false,
+                    },
+                    // Read through its temporary index, the subquery's rows
+                    // come out in the index's order after the seek prefix.
+                    AccessMethodParams::MaterializedSubquery {
+                        index,
                         constraint_refs,
+                        iter_dir,
+                    } => hir_materialized_subquery_order_consumed(
+                        *subquery_source,
+                        index,
+                        constraint_refs,
+                        *iter_dir,
                         order_target,
-                        target_col_idx,
+                        consumed_columns,
                         schema,
                         EqualityPrefixScope::ConstantEquality,
-                    )
-                }
-            }
-            AccessMethodParams::MaterializedSubquery {
-                index,
-                constraint_refs,
-                iter_dir,
-            } => btree_access_order_consumed(
-                table_ref,
-                *iter_dir,
-                Some(index.as_ref()),
-                constraint_refs,
-                order_target,
-                target_col_idx,
-                schema,
-                EqualityPrefixScope::ConstantEquality,
-            ),
-            AccessMethodParams::Subquery { iter_dir } => {
-                let Table::FromClauseSubquery(from_clause_subquery) = &table_ref.table else {
-                    unreachable!(
-                        "access_method.params::Subquery must be for a FromClauseSubquery table"
-                    );
-                };
-                OrderConsumption {
-                    consumed: subquery_intrinsic_order_consumed(
-                        table_ref.internal_id,
-                        from_clause_subquery,
-                        *iter_dir,
-                        &order_target.columns[target_col_idx..],
-                        schema,
                     ),
-                    includes_rowid: false,
+                    _ => return Ok(false),
+                };
+                if consumed.consumed == 0 {
+                    return Ok(false);
                 }
+                consumed_columns += consumed.consumed;
+                if consumed_columns == columns {
+                    return Ok(true);
+                }
+                // The loop may repeat the values ordered so far, unless it
+                // finds at most one row.
+                let next_comes_from_later_loop = order_target
+                    .columns
+                    .get(consumed_columns)
+                    .is_some_and(|column| {
+                        plan.data[loop_position + 1..].iter().any(|(later, _)| {
+                            sources
+                                .get(*later)
+                                .is_some_and(|later| later.source() == column.source)
+                        })
+                    });
+                if next_comes_from_later_loop
+                    && !access_method_emits_unique_order_prefix(access_method, &consumed)
+                {
+                    return Ok(false);
+                }
+                continue;
             }
-            _ => return false,
+            _ => return Ok(false),
         };
-
+        let Some(definition) = document.source(source.internal_id) else {
+            return Err(LimboError::InternalError(format!(
+                "HIR order proof references missing source {}",
+                source.internal_id
+            )));
+        };
+        let Some(access_method) = access_methods.get(*access_method_position) else {
+            return Err(LimboError::InternalError(format!(
+                "HIR order proof references missing access method {access_method_position}"
+            )));
+        };
+        let AccessMethodParams::BTreeTable {
+            iter_dir,
+            index,
+            build_index: false,
+            constraint_refs,
+        } = &access_method.params
+        else {
+            return Ok(false);
+        };
+        let consumed = hir_btree_access_order_consumed(
+            &HirOrderSource::new(source, definition),
+            *iter_dir,
+            index.as_deref(),
+            constraint_refs,
+            order_target,
+            consumed_columns,
+            schema,
+            EqualityPrefixScope::ConstantEquality,
+        )?;
         if consumed.consumed == 0 {
-            return false;
+            return Ok(false);
         }
-        target_col_idx += consumed.consumed;
-        if target_col_idx == num_cols_in_order_target {
-            return true;
+        consumed_columns += consumed.consumed;
+        if consumed_columns == columns {
+            return Ok(true);
         }
-
-        // The next ORDER BY column can only come from a deeper loop if the rows
-        // output by this loop are unique for the columns so far. If they're not unique,
-        // the inner loop would repeat the same values for each duplicate, resulting in
-        // an output like `A B C ... A B C ...` instead of the correct fully sorted order `A A B B ...`.
-        let next_term_comes_from_later_loop =
+        // A later loop can supply the next ORDER BY term only
+        // if this loop never repeats the values ordered so far, or the inner
+        // loop would restart its order for each repeat.
+        let next_comes_from_later_loop =
             order_target
                 .columns
-                .get(target_col_idx)
-                .is_some_and(|target_col| {
-                    plan.data[loop_pos + 1..]
-                        .iter()
-                        .any(|(later_table_index, _)| {
-                            joined_tables[*later_table_index].internal_id == target_col.table_id
-                        })
+                .get(consumed_columns)
+                .is_some_and(|column| {
+                    plan.data[loop_position + 1..].iter().any(|(later, _)| {
+                        sources
+                            .get(*later)
+                            .is_some_and(|later| later.source() == column.source)
+                    })
                 });
-        if next_term_comes_from_later_loop
+        if next_comes_from_later_loop
             && !access_method_emits_unique_order_prefix(access_method, &consumed)
         {
-            return false;
+            return Ok(false);
         }
-        prior_tables
-            .set(*table_index)
-            .expect("a plan cannot contain more than the table limit");
     }
-    target_col_idx == num_cols_in_order_target
+    Ok(consumed_columns == columns)
 }
 
 fn access_method_emits_unique_order_prefix(
@@ -440,121 +328,63 @@ fn access_method_emits_unique_order_prefix(
             ..
         } => index_access_is_unique_point_lookup(Some(index.as_ref()), constraint_refs),
         AccessMethodParams::Subquery { .. }
-        | AccessMethodParams::RecursiveCteInput
         | AccessMethodParams::HashJoin { .. }
         | AccessMethodParams::VirtualTable { .. }
-        | AccessMethodParams::IndexMethod { .. }
-        | AccessMethodParams::MultiIndexScan { .. }
         | AccessMethodParams::InSeek { .. } => false,
     }
 }
 
-/// Return how many leading target columns a FROM-subquery can provide from its
-/// own output order, without fabricating an extra probe index.
-///
-/// We recognize three sources of intrinsic order:
-/// 1. An explicit final `ORDER BY` on the subquery.
-/// 2. GROUP BY keys (we always use a sorter, never hashing - FOR NOW).
-/// 3. A simple single-source finalized scan whose output order is already known.
-pub fn subquery_intrinsic_order_consumed(
-    table_id: TableInternalId,
-    subquery: &FromClauseSubquery,
+/// One output column of a planned HIR query, in the order the query returns
+/// its rows: rows are ordered by the first entry, then the second, and so on.
+/// `nulls` is the effective NULLS placement, so a later reversal flips it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HirOutputOrder {
+    pub(crate) column: usize,
+    pub(crate) order: SortOrder,
+    pub(crate) collation: CollationSeq,
+    pub(crate) nulls: ast::NullsOrder,
+}
+
+/// How many leading `target` columns a HIR FROM subquery or CTE returns its
+/// rows in when read in `iter_dir`. `output_order` is the order the
+/// subquery's plan returns its rows in; see `HirPlannedQuery`.
+pub(crate) fn hir_subquery_intrinsic_order_consumed(
+    source: hir::SourceId,
+    output_order: &[HirOutputOrder],
     iter_dir: IterationDirection,
-    target: &[ColumnOrder],
-    schema: &Schema,
+    target: &[ColumnOrder<hir::SourceId, &hir::Expr>],
 ) -> usize {
-    let Plan::Select(select_plan) = subquery.plan.as_ref() else {
-        // Don't consider sort elision for compound selects
-        return 0;
-    };
-    // Explicit ORDER BY takes priority.
-    if !select_plan.order_by.is_empty() {
-        let intrinsic = build_intrinsic_order(
-            table_id,
-            select_plan,
-            select_plan
-                .order_by
-                .iter()
-                .map(|(expr, order, nulls)| (expr.as_ref(), *order, *nulls)),
-        );
-        return match_intrinsic_order(&intrinsic, iter_dir, target);
-    }
-    // When ORDER BY was merged into GROUP BY and cleared, the GROUP BY
-    // sort_order still describes the output row order.
-    if let Some(group_by) = &select_plan.group_by {
-        let intrinsic = build_intrinsic_order(
-            table_id,
-            select_plan,
-            group_by
-                .exprs
-                .iter()
-                .zip(group_by.sort_order.iter().copied())
-                .zip(group_by.nulls_order.iter().copied())
-                .map(|((expr, order), nulls)| (expr, order, nulls)),
-        );
-        let consumed = match_intrinsic_order(&intrinsic, iter_dir, target);
-        if consumed > 0 {
-            return consumed;
-        }
-    }
-    finalized_scan_subquery_order_consumed(table_id, select_plan, iter_dir, target, schema)
+    let intrinsic = output_order
+        .iter()
+        .map(|column| ColumnOrder {
+            source,
+            target: ColumnTarget::<()>::Column(column.column),
+            order: column.order,
+            collation: column.collation,
+            nulls_order: Some(column.nulls),
+        })
+        .collect::<Vec<_>>();
+    match_intrinsic_order_by(&intrinsic, iter_dir, target, |intrinsic, target| {
+        intrinsic.source == target.source
+            && matches!(
+                (&intrinsic.target, &target.target),
+                (ColumnTarget::Column(a), ColumnTarget::Column(b)) if a == b
+            )
+    })
 }
 
-/// Build a `ColumnOrder` list from expressions and sort directions by mapping
-/// each expression to a result column position.
-fn build_intrinsic_order(
-    table_id: TableInternalId,
-    select_plan: &crate::translate::plan::SelectPlan,
-    exprs: impl Iterator<
-        Item = (
-            impl std::borrow::Borrow<ast::Expr>,
-            SortOrder,
-            Option<ast::NullsOrder>,
-        ),
-    >,
-) -> Vec<ColumnOrder> {
-    let mut intrinsic = Vec::new();
-    for (expr, order, nulls) in exprs {
-        let expr = expr.borrow();
-        let Some((col_idx, result_col)) = select_plan
-            .result_columns
-            .iter()
-            .enumerate()
-            .find(|(_, result_col)| exprs_are_equivalent(expr, &result_col.expr))
-        else {
-            break;
-        };
-        let Ok(collation) = get_collseq_from_expr(expr, &select_plan.table_references) else {
-            break;
-        };
-        intrinsic.push(ColumnOrder {
-            table_id,
-            target: ColumnTarget::Column(col_idx),
-            order,
-            collation: collation.unwrap_or_else(|| {
-                get_collseq_from_expr(&result_col.expr, &select_plan.table_references)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default()
-            }),
-            nulls_order: nulls,
-        });
-    }
-    intrinsic
-}
-
-/// Compare a subquery's intrinsic column order against an outer order target,
-/// accounting for iteration direction. Returns how many leading target columns
-/// are satisfied.
-fn match_intrinsic_order(
-    intrinsic: &[ColumnOrder],
+/// [match_intrinsic_order] for any column representation: `same_column`
+/// decides whether an intrinsic column is the target column; direction,
+/// collation and NULLS order are compared the same way for every caller.
+fn match_intrinsic_order_by<I, E, J, F>(
+    intrinsic: &[ColumnOrder<J, F>],
     iter_dir: IterationDirection,
-    target: &[ColumnOrder],
+    target: &[ColumnOrder<I, E>],
+    same_column: impl Fn(&ColumnOrder<J, F>, &ColumnOrder<I, E>) -> bool,
 ) -> usize {
     let target_len = target.len().min(intrinsic.len());
     for (intrinsic_col, target_col) in intrinsic.iter().zip(target.iter()).take(target_len) {
-        if intrinsic_col.table_id != target_col.table_id
-            || intrinsic_col.target != target_col.target
+        if !same_column(intrinsic_col, target_col)
             || intrinsic_col.collation != target_col.collation
         {
             return 0;
@@ -580,202 +410,150 @@ fn match_intrinsic_order(
     target_len
 }
 
-/// Derive subquery output order from the finalized inner scan when there is no
-/// explicit `ORDER BY`.
-///
-/// This intentionally starts narrow: single-source, non-aggregate,
-/// non-window, non-distinct SELECTs only. Those are the cases where insertion
-/// order into the materialized table is just the underlying scan order.
-fn finalized_scan_subquery_order_consumed(
-    table_id: TableInternalId,
-    select_plan: &crate::translate::plan::SelectPlan,
-    iter_dir: IterationDirection,
-    target: &[ColumnOrder],
-    schema: &Schema,
-) -> usize {
-    if select_plan.group_by.is_some()
-        || !select_plan.aggregates.is_empty()
-        || select_plan.limit.is_some()
-        || select_plan.offset.is_some()
-        || select_plan.window.is_some()
-        || select_plan.distinctness.is_distinct()
-        || !select_plan.values.is_empty()
-        || select_plan.join_order.len() != 1
-        || select_plan.joined_tables().len() != 1
-    {
-        return 0;
+trait OrderedSource<I, E> {
+    fn id(&self) -> I;
+    /// Whether column `col_no` has a custom type. Such a column stores
+    /// encoded blobs, whose byte order is not the type's order.
+    fn column_has_custom_type(&self, col_no: usize, schema: &Schema) -> bool;
+    /// Whether column `col_no` may hold NULL. False for a NOT NULL column.
+    fn column_can_be_null(&self, col_no: usize) -> bool;
+    fn expressions_match(&self, target: E, indexed: E) -> bool;
+}
+
+pub(crate) struct HirOrderSource<'a> {
+    planned: &'a HirPlannedSource,
+    definition: &'a hir::Source,
+}
+
+impl<'a> HirOrderSource<'a> {
+    pub(crate) fn new(planned: &'a HirPlannedSource, definition: &'a hir::Source) -> Self {
+        debug_assert_eq!(planned.internal_id, definition.id);
+        Self {
+            planned,
+            definition,
+        }
     }
 
-    let joined_table = &select_plan.joined_tables()[select_plan.join_order[0].original_idx];
-
-    // Extract inner iteration direction from the scan operation.
-    let inner_iter_dir = match &joined_table.op {
-        Operation::Scan(Scan::BTreeTable { iter_dir, .. })
-        | Operation::Scan(Scan::Subquery { iter_dir }) => *iter_dir,
-        _ => return 0,
-    };
-
-    // The outer scan direction composes with the direction used to populate the
-    // materialized table. Reversing a backwards-populated table restores the
-    // original key order.
-    let effective_iter_dir = match (inner_iter_dir, iter_dir) {
-        (IterationDirection::Forwards, IterationDirection::Forwards)
-        | (IterationDirection::Backwards, IterationDirection::Backwards) => {
-            IterationDirection::Forwards
-        }
-        (IterationDirection::Forwards, IterationDirection::Backwards)
-        | (IterationDirection::Backwards, IterationDirection::Forwards) => {
-            IterationDirection::Backwards
-        }
-    };
-
-    // Map outer target columns to inner scan columns through result column expressions.
-    let mut mapped_target = Vec::with_capacity(target.len());
-    for target_col in target {
-        if target_col.table_id != table_id {
-            return 0;
-        }
-        let ColumnTarget::Column(result_col_idx) = target_col.target else {
-            return 0;
-        };
-        let Some(result_col) = select_plan.result_columns.get(result_col_idx) else {
-            return 0;
-        };
-        // The outer query sees result columns of the materialized subquery, but
-        // the ordering proof has to be checked against the inner scan columns.
-        let Some(mut inner_target_col) = expr_to_column_order(
-            &result_col.expr,
-            target_col.order,
-            target_col.nulls_order,
-            &select_plan.table_references,
-        ) else {
-            return 0;
-        };
-        if inner_target_col.table_id != joined_table.internal_id
-            || inner_target_col.collation != target_col.collation
-        {
-            return 0;
-        }
-        inner_target_col.order = target_col.order;
-        mapped_target.push(inner_target_col);
+    fn table(&self) -> &Table {
+        &self.planned.table
     }
 
-    match &joined_table.op {
-        Operation::Scan(Scan::BTreeTable { index, .. }) => {
-            btree_access_order_consumed(
-                joined_table,
-                effective_iter_dir,
-                index.as_deref(),
-                &[],
-                &OrderTarget {
-                    columns: mapped_target,
-                    purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
-                },
-                0,
-                schema,
-                EqualityPrefixScope::ConstantEquality,
-            )
-            .consumed
-        }
-        Operation::Scan(Scan::Subquery { .. }) => {
-            let Table::FromClauseSubquery(from_clause_subquery) = &joined_table.table else {
-                return 0;
-            };
-            subquery_intrinsic_order_consumed(
-                joined_table.internal_id,
-                from_clause_subquery,
-                effective_iter_dir,
-                &mapped_target,
-                schema,
-            )
-        }
-        _ => 0,
+    fn index_expressions(&self, index: &Index) -> Result<&'a hir::IndexExpressions> {
+        self.definition
+            .index_expressions
+            .iter()
+            .find(|expressions| std::ptr::eq(expressions.index.value(), index))
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "HIR source {} has no frozen expressions for index {}",
+                    self.definition.id, index.name
+                ))
+            })
     }
 }
 
-fn expr_to_column_order(
-    expr: &ast::Expr,
-    order: SortOrder,
-    nulls_order: Option<ast::NullsOrder>,
-    tables: &TableReferences,
-) -> Option<ColumnOrder> {
-    match expr {
-        ast::Expr::Column {
-            table: table_id,
-            column,
-            ..
-        } => {
-            let table = tables.find_joined_table_by_internal_id(*table_id)?;
-            let col = table.columns().get(*column)?;
-            return Some(ColumnOrder {
-                table_id: *table_id,
-                target: ColumnTarget::Column(*column),
-                order,
-                collation: col.collation(),
-                nulls_order,
-            });
-        }
-        ast::Expr::Collate(expr, collation) => {
-            if let ast::Expr::Column {
-                table: table_id,
-                column,
-                ..
-            } = expr.as_ref()
-            {
-                let collation = CollationSeq::new(collation.as_str()).unwrap_or_default();
-                return Some(ColumnOrder {
-                    table_id: *table_id,
-                    target: ColumnTarget::Column(*column),
-                    order,
-                    collation,
-                    nulls_order,
-                });
-            };
-        }
-        ast::Expr::RowId { table, .. } => {
-            return Some(ColumnOrder {
-                table_id: *table,
-                target: ColumnTarget::RowId,
-                order,
-                collation: CollationSeq::default(),
-                nulls_order,
-            });
-        }
-        _ => {}
+impl<'a> OrderedSource<hir::SourceId, &'a hir::Expr> for HirOrderSource<'a> {
+    fn id(&self) -> hir::SourceId {
+        self.definition.id
     }
-    let mask = table_mask_from_expr(expr, tables, &[]).ok()?;
-    if mask.count() != 1 {
-        return None;
+
+    fn column_has_custom_type(&self, col_no: usize, schema: &Schema) -> bool {
+        self.table().columns().get(col_no).is_some_and(|column| {
+            schema
+                .get_type_def(&column.ty_str, self.table().is_strict())
+                .is_some()
+        })
     }
-    let collation = get_collseq_from_expr(expr, tables)
-        .ok()?
-        .unwrap_or_default();
-    let table_no = tables
-        .joined_tables()
-        .iter()
-        .enumerate()
-        .find_map(|(i, _)| mask.get(i).then_some(i))?;
-    let table_id = tables.joined_tables()[table_no].internal_id;
-    Some(ColumnOrder {
-        table_id,
-        target: ColumnTarget::Expr(expr as *const ast::Expr),
-        order,
-        collation,
-        nulls_order,
-    })
+
+    fn column_can_be_null(&self, col_no: usize) -> bool {
+        self.table()
+            .columns()
+            .get(col_no)
+            .is_none_or(|column| !column.notnull())
+    }
+
+    fn expressions_match(&self, target: &'a hir::Expr, indexed: &'a hir::Expr) -> bool {
+        target.equivalent(indexed)
+    }
+}
+
+/// A FROM subquery or CTE read through the temporary index over its stored
+/// rows. Its columns are the subquery's outputs: none has a custom type the
+/// index would store encoded, and the index has no expression columns.
+struct SubqueryOrderSource(hir::SourceId);
+
+impl<'a> OrderedSource<hir::SourceId, &'a hir::Expr> for SubqueryOrderSource {
+    fn id(&self) -> hir::SourceId {
+        self.0
+    }
+
+    fn column_has_custom_type(&self, _col_no: usize, _schema: &Schema) -> bool {
+        false
+    }
+
+    fn column_can_be_null(&self, _col_no: usize) -> bool {
+        true
+    }
+
+    fn expressions_match(&self, _target: &'a hir::Expr, _indexed: &'a hir::Expr) -> bool {
+        false
+    }
+}
+
+/// How many leading `order_target` columns from `start_col` a FROM subquery
+/// or CTE supplies when its stored rows are read through `index`, the
+/// temporary index [`crate::translate::optimizer::access_method::find_best_hir_access_method_for_subquery`]
+/// builds over them, seeking it with `constraint_refs` in `iter_dir`. The
+/// index holds the key columns first and then every other column, all
+/// ascending, so after an equality-pinned prefix the rows come out in the
+/// order of the remaining index columns.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn hir_materialized_subquery_order_consumed<'a>(
+    source: hir::SourceId,
+    index: &Index,
+    constraint_refs: &[RangeConstraintRef],
+    iter_dir: IterationDirection,
+    order_target: &HirOrderTarget<'a>,
+    start_col: usize,
+    schema: &Schema,
+    equality_prefix_scope: EqualityPrefixScope,
+) -> OrderConsumption {
+    let target_columns = &order_target.columns[start_col..];
+    if target_columns.is_empty() {
+        return OrderConsumption::NONE;
+    }
+    index_columns_order_consumed(
+        &SubqueryOrderSource(source),
+        iter_dir,
+        constraint_refs,
+        order_target,
+        target_columns,
+        schema,
+        equality_prefix_scope,
+        index.columns.iter().map(|column| IndexOrderColumn {
+            pos_in_table: column.pos_in_table,
+            order: column.order,
+            nulls_order: column.nulls_order,
+            collation: column.collation,
+            expr: None,
+        }),
+        index.columns.len(),
+        false,
+        None,
+    )
 }
 
 /// The index column values needed to check its row order.
 #[derive(Clone, Copy)]
-struct IndexOrderColumn<'a> {
+struct IndexOrderColumn<E> {
     pos_in_table: usize,
     order: SortOrder,
     nulls_order: Option<ast::NullsOrder>,
     collation: Option<CollationSeq>,
-    expr: Option<&'a ast::Expr>,
+    expr: Option<E>,
 }
 
-impl IndexOrderColumn<'_> {
+impl<E: Copy> IndexOrderColumn<E> {
     /// Return the NULL order for this scan direction.
     fn nulls_order(self, iter_dir: IterationDirection) -> ast::NullsOrder {
         let nulls_order = self
@@ -789,29 +567,21 @@ impl IndexOrderColumn<'_> {
 }
 
 /// Return true when an order term names this index column.
-fn target_matches_order_column(
-    target_col: &ColumnOrder,
-    idx_col: IndexOrderColumn<'_>,
-    table_ref: &JoinedTable,
-) -> bool {
-    if target_col.table_id != table_ref.internal_id {
+fn target_matches_order_column<I, E>(
+    target_col: &ColumnOrder<I, E>,
+    idx_col: IndexOrderColumn<E>,
+    source: &impl OrderedSource<I, E>,
+) -> bool
+where
+    I: Copy + Eq,
+    E: Copy,
+{
+    if target_col.source != source.id() {
         return false;
     }
     match (&target_col.target, idx_col.expr) {
         (ColumnTarget::Column(col_no), _) => idx_col.pos_in_table == *col_no,
-        (ColumnTarget::Expr(expr), Some(idx_expr)) => {
-            let target_expr = unsafe { &**expr };
-            if exprs_are_equivalent(target_expr, idx_expr) {
-                return true;
-            }
-            // Expression indexes are compared against the normalized form that
-            // was stored in the schema. A query may write the same expression in
-            // a slightly different but equivalent way, so normalize before the
-            // final comparison.
-            let refs = TableReferences::new(vec![table_ref.clone()], Vec::new());
-            let normalized = normalize_expr_for_index_matching(target_expr, table_ref, &refs);
-            exprs_are_equivalent(&normalized, idx_expr)
-        }
+        (ColumnTarget::Expr(expr), Some(indexed)) => source.expressions_match(*expr, indexed),
         _ => false,
     }
 }
@@ -835,168 +605,123 @@ impl OrderConsumption {
     };
 }
 
-/// Return how many leading `order_target` columns this single-table btree
-/// access path can satisfy.
-///
-/// This is shared by both candidate scoring and final ORDER BY / GROUP BY
-/// elimination so they use the same column-matching, collation, custom-type,
-/// and hidden-rowid-suffix rules. The caller supplies
-/// [`EqualityPrefixScope`] because candidate scoring may skip any equality
-/// prefix in the chosen seek key, while final global ordering proof may only
-/// skip prefixes that are constant across all output rows.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn btree_access_order_consumed(
-    table_ref: &JoinedTable,
+fn rowid_order_consumed<I, E>(
+    source: &impl OrderedSource<I, E>,
+    first_target: &ColumnOrder<I, E>,
     iter_dir: IterationDirection,
-    index: Option<&Index>,
-    constraint_refs: &[RangeConstraintRef],
-    order_target: &OrderTarget,
-    start_col: usize,
-    schema: &Schema,
-    equality_prefix_scope: EqualityPrefixScope,
-) -> OrderConsumption {
-    let target_columns = &order_target.columns[start_col..];
-    let Some(first_target_col) = target_columns.first() else {
+    rowid_alias_col: Option<usize>,
+) -> OrderConsumption
+where
+    I: Copy + Eq,
+    E: Copy,
+{
+    if first_target.source != source.id() {
         return OrderConsumption::NONE;
+    }
+    match first_target.target {
+        ColumnTarget::RowId => {}
+        ColumnTarget::Column(column) if rowid_alias_col == Some(column) => {}
+        ColumnTarget::Column(_) | ColumnTarget::Expr(_) => return OrderConsumption::NONE,
+    }
+    let correct_order = if iter_dir == IterationDirection::Forwards {
+        first_target.order == SortOrder::Asc
+    } else {
+        first_target.order == SortOrder::Desc
     };
-
-    let rowid_alias_col = table_ref
-        .table
-        .columns()
-        .iter()
-        .position(|c| c.is_rowid_alias());
-
-    match index {
-        None => {
-            // Without an index, only rowid order is available.
-            if first_target_col.table_id != table_ref.internal_id {
-                return OrderConsumption::NONE;
-            }
-            match first_target_col.target {
-                ColumnTarget::RowId => {}
-                ColumnTarget::Column(col_no) => {
-                    let Some(rowid_alias_col) = rowid_alias_col else {
-                        return OrderConsumption::NONE;
-                    };
-                    if col_no != rowid_alias_col {
-                        return OrderConsumption::NONE;
-                    }
-                }
-                ColumnTarget::Expr(_) => return OrderConsumption::NONE,
-            }
-            let correct_order = if iter_dir == IterationDirection::Forwards {
-                first_target_col.order == SortOrder::Asc
-            } else {
-                first_target_col.order == SortOrder::Desc
-            };
-            OrderConsumption {
-                consumed: usize::from(correct_order),
-                includes_rowid: correct_order,
-            }
-        }
-        Some(index) => index_columns_order_consumed(
-            table_ref,
-            iter_dir,
-            constraint_refs,
-            order_target,
-            target_columns,
-            schema,
-            equality_prefix_scope,
-            index.columns.iter().map(|column| IndexOrderColumn {
-                pos_in_table: column.pos_in_table,
-                order: column.order,
-                nulls_order: column.nulls_order,
-                collation: column.collation,
-                expr: column.expr.as_deref(),
-            }),
-            index.columns.len(),
-            index.has_rowid,
-            rowid_alias_col,
-        ),
+    OrderConsumption {
+        consumed: usize::from(correct_order),
+        includes_rowid: correct_order,
     }
 }
 
-/// Check the order supplied by a temporary index without building its columns.
-fn temporary_index_order_consumed(
-    table_ref: &JoinedTable,
+#[allow(clippy::too_many_arguments)]
+pub(super) fn hir_btree_access_order_consumed<'a>(
+    source: &HirOrderSource<'a>,
     iter_dir: IterationDirection,
+    index: Option<&Index>,
     constraint_refs: &[RangeConstraintRef],
-    order_target: &OrderTarget,
+    order_target: &HirOrderTarget<'a>,
     start_col: usize,
     schema: &Schema,
-) -> OrderConsumption {
+    equality_prefix_scope: EqualityPrefixScope,
+) -> Result<OrderConsumption> {
     let target_columns = &order_target.columns[start_col..];
-    if target_columns.is_empty() {
-        return OrderConsumption::NONE;
-    }
-    let columns = table_ref.columns();
-    let column_count = columns
+    let Some(first_target) = target_columns.first() else {
+        return Ok(OrderConsumption::NONE);
+    };
+    let rowid_alias_col = source
+        .table()
+        .columns()
         .iter()
-        .enumerate()
-        .filter(|(column_idx, _)| table_ref.column_is_used(*column_idx))
-        .count();
-    let rowid_alias_col = columns.iter().position(|column| column.is_rowid_alias());
-    let key_columns = constraint_refs.iter().map(|constraint| {
-        constraint
-            .table_col_pos
-            .expect("a temporary index key must name a table column")
-    });
-    let other_columns = columns
-        .iter()
-        .enumerate()
-        .filter(|(column_pos, _)| table_ref.column_is_used(*column_pos))
-        .filter(|(column_pos, _)| {
-            !constraint_refs
-                .iter()
-                .any(|constraint| constraint.table_col_pos == Some(*column_pos))
-        })
-        .map(|(column_pos, _)| column_pos);
-    let index_columns = key_columns.chain(other_columns).map(|column_pos| {
-        let column = &columns[column_pos];
-        IndexOrderColumn {
-            pos_in_table: column_pos,
-            order: SortOrder::Asc,
-            nulls_order: None,
-            collation: column.collation_opt(),
-            expr: column.generated_expr(),
-        }
-    });
+        .position(|column| column.is_rowid_alias());
 
-    index_columns_order_consumed(
-        table_ref,
+    let Some(index) = index else {
+        return Ok(rowid_order_consumed(
+            source,
+            first_target,
+            iter_dir,
+            rowid_alias_col,
+        ));
+    };
+    let expressions = source.index_expressions(index)?;
+    if expressions.columns.len() != index.columns.len() {
+        return Err(LimboError::InternalError(format!(
+            "HIR index {} has {} physical columns but {} frozen expressions",
+            index.name,
+            index.columns.len(),
+            expressions.columns.len()
+        )));
+    }
+
+    Ok(index_columns_order_consumed(
+        source,
         iter_dir,
         constraint_refs,
         order_target,
         target_columns,
         schema,
-        EqualityPrefixScope::ConstantEquality,
-        index_columns,
-        column_count,
-        table_ref.table.btree().is_some_and(|table| table.has_rowid),
+        equality_prefix_scope,
+        index
+            .columns
+            .iter()
+            .zip(&expressions.columns)
+            .map(|(column, expression)| IndexOrderColumn {
+                pos_in_table: column.pos_in_table,
+                order: column.order,
+                nulls_order: column.nulls_order,
+                collation: column.collation,
+                expr: expression.as_ref(),
+            }),
+        index.columns.len(),
+        index.has_rowid,
         rowid_alias_col,
-    )
+    ))
 }
 
 /// Return how many order terms these index columns supply.
 #[allow(clippy::too_many_arguments)]
-fn index_columns_order_consumed<'a>(
-    table_ref: &JoinedTable,
+fn index_columns_order_consumed<I, E>(
+    source: &impl OrderedSource<I, E>,
     iter_dir: IterationDirection,
     constraint_refs: &[RangeConstraintRef],
-    order_target: &OrderTarget,
-    target_columns: &[ColumnOrder],
+    order_target: &OrderTarget<I, E>,
+    target_columns: &[ColumnOrder<I, E>],
     schema: &Schema,
     equality_prefix_scope: EqualityPrefixScope,
-    index_columns: impl Iterator<Item = IndexOrderColumn<'a>>,
+    index_columns: impl Iterator<Item = IndexOrderColumn<E>>,
     column_count: usize,
     has_rowid: bool,
     rowid_alias_col: Option<usize>,
-) -> OrderConsumption {
+) -> OrderConsumption
+where
+    I: Copy + Eq,
+    E: Copy,
+{
     let mut col_idx = 0;
     let mut matched_columns = 0;
     let mut index_columns = index_columns.enumerate();
     let mut includes_rowid = false;
-    let target_is_rowid = |target_col: &ColumnOrder| match target_col.target {
+    let target_is_rowid = |target_col: &ColumnOrder<I, E>| match target_col.target {
         ColumnTarget::RowId => true,
         ColumnTarget::Column(col_no) => rowid_alias_col == Some(col_no),
         ColumnTarget::Expr(_) => false,
@@ -1006,7 +731,7 @@ fn index_columns_order_consumed<'a>(
             break;
         };
         let target_col = &target_columns[col_idx];
-        if target_col.table_id != table_ref.internal_id {
+        if target_col.source != source.id() {
             break;
         }
         let eq_prefix_usable = constraint_refs.iter().any(|constraint| {
@@ -1016,7 +741,7 @@ fn index_columns_order_consumed<'a>(
                 })
         });
         if eq_prefix_usable {
-            if target_matches_order_column(target_col, idx_col, table_ref) {
+            if target_matches_order_column(target_col, idx_col, source) {
                 if target_col.collation != idx_col.collation.unwrap_or_default() {
                     break;
                 }
@@ -1026,20 +751,15 @@ fn index_columns_order_consumed<'a>(
             continue;
         }
 
-        if !target_matches_order_column(target_col, idx_col, table_ref) {
+        if !target_matches_order_column(target_col, idx_col, source) {
             break;
         }
 
         // Custom type columns store encoded blobs. The B-tree's byte order
         // does not match the custom type's order.
         if let ColumnTarget::Column(col_no) = &target_col.target {
-            if let Some(col) = table_ref.table.columns().get(*col_no) {
-                if schema
-                    .get_type_def(&col.ty_str, table_ref.table.is_strict())
-                    .is_some()
-                {
-                    break;
-                }
+            if source.column_has_custom_type(*col_no, schema) {
+                break;
             }
         }
 
@@ -1055,7 +775,7 @@ fn index_columns_order_consumed<'a>(
             break;
         }
         if !order_target.is_extremum()
-            && target_can_be_null(target_col, table_ref)
+            && target_can_be_null(target_col, source)
             && target_col.effective_nulls_order() != idx_col.nulls_order(iter_dir)
         {
             break;
@@ -1075,10 +795,7 @@ fn index_columns_order_consumed<'a>(
         } else {
             target_col.order == SortOrder::Desc
         };
-        if target_col.table_id == table_ref.internal_id
-            && target_is_rowid(target_col)
-            && correct_order
-        {
+        if target_col.source == source.id() && target_is_rowid(target_col) && correct_order {
             col_idx += 1;
             includes_rowid = true;
         }
@@ -1090,10 +807,179 @@ fn index_columns_order_consumed<'a>(
     }
 }
 
-fn target_can_be_null(target_col: &ColumnOrder, table_ref: &JoinedTable) -> bool {
+/// Whether an order term may be NULL, so that its NULLS placement must
+/// match the index's. A rowid and a NOT NULL column never are.
+fn target_can_be_null<I, E>(
+    target_col: &ColumnOrder<I, E>,
+    source: &impl OrderedSource<I, E>,
+) -> bool {
     match target_col.target {
         ColumnTarget::RowId => false,
-        ColumnTarget::Column(col_no) => !table_ref.table.columns()[col_no].notnull(),
+        ColumnTarget::Column(col_no) => source.column_can_be_null(col_no),
         ColumnTarget::Expr(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, IndexColumn, Type},
+        sync::Arc,
+        translate::{
+            plan::{ColumnUsedMask, HirPlannedSource},
+            semantic::hir::{
+                CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression, DatabaseId,
+                Expr, IndexCoverage, IndexExpressions, IndexHint, Source, SourceColumn, SourceId,
+                SourceKind, SourceOwner, TypeFact,
+            },
+        },
+        vdbe::affinity::Affinity,
+    };
+    use turso_parser::ast::Operator;
+
+    #[test]
+    fn hir_order_target_borrows_resolved_expression() {
+        let source = SourceId::new(3);
+        let expression = Expr::column(source, 1);
+        let target: HirOrderTarget<'_> = OrderTarget {
+            columns: vec![ColumnOrder {
+                source,
+                target: ColumnTarget::Expr(&expression),
+                order: SortOrder::Asc,
+                collation: CollationSeq::Binary,
+                nulls_order: None,
+            }],
+            purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
+        };
+
+        let ColumnTarget::Expr(stored) = target.columns[0].target else {
+            panic!("HIR expression target is preserved");
+        };
+        assert!(std::ptr::eq(stored, &expression));
+        assert_eq!(target.columns[0].source, source);
+    }
+
+    #[test]
+    fn hir_index_order_matches_frozen_expression() {
+        let source_id = SourceId::new(3);
+        let table = Table::BTree(Arc::new(BTreeTable::new(
+            2,
+            "items".to_string(),
+            crate::alloc::vec![],
+            crate::alloc::vec![Column::new(
+                Some("value".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef::default(),
+            )],
+            BTreeCharacteristics::HAS_ROWID,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        )));
+        let resolved_table = CatalogObject::new(
+            CatalogObjectId::new(1),
+            CatalogSnapshot::from_id(1),
+            Some(DatabaseId::new(0)),
+            Arc::new(table.clone()),
+        );
+        let indexed_expression = Expr::Binary {
+            lhs: Box::new(Expr::column(source_id, 0)),
+            operator: Operator::Add,
+            rhs: Box::new(Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        };
+        let index = CatalogObject::new(
+            CatalogObjectId::new(2),
+            CatalogSnapshot::from_id(1),
+            Some(DatabaseId::new(0)),
+            Arc::new(Index {
+                constraint_name: None,
+                name: "items_plus_one".to_string(),
+                table_name: "items".to_string(),
+                root_page: 3,
+                columns: crate::alloc::vec![IndexColumn::new("value + 1", 0)],
+                unique: false,
+                ephemeral: false,
+                has_rowid: true,
+                where_clause: None,
+                index_method: None,
+                on_conflict: None,
+            }),
+        );
+        let definition = Source {
+            id: source_id,
+            owner: SourceOwner::Root,
+            database: Some(DatabaseId::new(0)),
+            name: "items".to_string(),
+            alias: None,
+            kind: SourceKind::Table(resolved_table),
+            columns: crate::sync::Arc::from(vec![SourceColumn {
+                name: "value".into(),
+                type_fact: TypeFact::known(Type::Integer),
+                affinity: Affinity::Integer,
+                has_affinity: true,
+                collation: None,
+                hidden: false,
+                rowid_alias: false,
+            }]),
+            generated_expressions: vec![ColumnReadExpression::Absent],
+            default_expressions: vec![ColumnReadExpression::Absent],
+            column_type_programs: vec![None],
+            check_constraints: None,
+            rowid_available: true,
+            index_hint: IndexHint::None,
+            index_expressions: vec![IndexExpressions {
+                index: index.clone(),
+                columns: vec![Some(indexed_expression.clone())],
+                predicate: None,
+            }],
+            index_coverage: IndexCoverage::Complete {
+                indexes: vec![index.id()],
+            },
+            index_method_patterns: Vec::new(),
+        };
+        let planned = HirPlannedSource {
+            table,
+            internal_id: source_id,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            indexed: IndexHint::None,
+        };
+        let target_expression = indexed_expression;
+        let target = OrderTarget {
+            columns: vec![ColumnOrder {
+                source: source_id,
+                target: ColumnTarget::Expr(&target_expression),
+                order: SortOrder::Asc,
+                collation: CollationSeq::Binary,
+                nulls_order: None,
+            }],
+            purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
+        };
+
+        let consumption = hir_btree_access_order_consumed(
+            &HirOrderSource::new(&planned, &definition),
+            IterationDirection::Forwards,
+            Some(index.value()),
+            &[],
+            &target,
+            0,
+            &Schema::new(),
+            EqualityPrefixScope::ConstantEquality,
+        )
+        .expect("frozen HIR expression metadata is complete");
+
+        assert_eq!(consumption.consumed, 1);
+        assert!(!consumption.includes_rowid);
     }
 }

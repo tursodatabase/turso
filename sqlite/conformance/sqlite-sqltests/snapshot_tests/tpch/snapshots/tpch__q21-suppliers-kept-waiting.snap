@@ -58,6 +58,5 @@ QUERY PLAN
 |--SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)
 |--SEARCH l2 USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
 |--SEARCH l3 USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
-|--SCAN nation
 |--USE SORTER FOR GROUP BY
 `--USE SORTER FOR ORDER BY

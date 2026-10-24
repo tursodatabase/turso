@@ -1225,3 +1225,33 @@ expect {
     1|2
     2|1
 }
+
+# The loop reads an index and no SET value reads a table column, so the
+# table cursor's seek is still pending when the row is rewritten.
+@cross-check-integrity
+test update-through-index-loop-without-column-read {
+    CREATE TABLE t7 (id INTEGER PRIMARY KEY, a TEXT, b TEXT);
+    INSERT INTO t7 VALUES (1000976225, 'a', 'alpha');
+    INSERT INTO t7 VALUES (5, 'b', 'beta');
+    CREATE INDEX t7_id ON t7 (id);
+    UPDATE t7 SET a = 'z', b = 'zeta' WHERE -267659;
+    SELECT * FROM t7 ORDER BY id;
+}
+expect {
+    5|z|zeta
+    1000976225|z|zeta
+}
+
+@cross-check-integrity
+test update-through-index-range-without-column-read {
+    CREATE TABLE t8 (a, b, c);
+    INSERT INTO t8 VALUES (1, 'x', 1), (2, 'y', 2), (3, 'z', 3);
+    CREATE INDEX t8_b ON t8 (b);
+    UPDATE t8 SET c = 9 WHERE b > 'x';
+    SELECT * FROM t8 ORDER BY a;
+}
+expect {
+    1|x|1
+    2|y|9
+    3|z|9
+}

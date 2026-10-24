@@ -34,3 +34,249 @@ test correlated-in-outer-alias-no-match {
 }
 expect {
 }
+
+# A correlated IN that is a whole WHERE term can run like EXISTS with an
+# extra `lhs = value` test, stopping at the first match. These cases cover
+# NULLs, affinity, collation, and the forms that must keep the full list.
+
+setup in-probe-schema {
+    CREATE TABLE o(id INTEGER PRIMARY KEY, k INT, a, t TEXT, c TEXT COLLATE NOCASE);
+    CREATE TABLE i(k INT, a, t TEXT, c TEXT COLLATE NOCASE, n INT);
+    CREATE TABLE j(k INT, m INT);
+    INSERT INTO o VALUES (1,1,1,'1','a'),(2,1,NULL,'x','B'),(3,2,'2','2','c'),(4,2,2.0,'02',NULL),(5,3,5,'5','E'),(6,NULL,1,'1','a');
+    INSERT INTO i VALUES (1,1,1,'A',1),(1,NULL,'x','b',2),(2,2,2,'C',3),(2,'2','2',NULL,4),(3,7,7,'e',5),(NULL,1,1,'a',6);
+    INSERT INTO j VALUES (1,1),(2,3),(3,5);
+}
+
+@setup in-probe-schema
+test correlated-in-untyped-values {
+    SELECT id FROM o WHERE a IN (SELECT i.a FROM i WHERE i.k = o.k) ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+}
+
+@setup in-probe-schema
+test correlated-in-text-left-side {
+    SELECT id FROM o WHERE t IN (SELECT i.a FROM i WHERE i.k = o.k) ORDER BY id;
+}
+expect {
+    3
+}
+
+@setup in-probe-schema
+test correlated-in-text-subquery-column {
+    SELECT id FROM o WHERE a IN (SELECT i.t FROM i WHERE i.k = o.k) ORDER BY id;
+}
+expect {
+    3
+}
+
+@setup in-probe-schema
+test correlated-in-nocase-both-sides {
+    SELECT id FROM o WHERE c IN (SELECT i.c FROM i WHERE i.k = o.k) ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    5
+}
+
+@setup in-probe-schema
+test correlated-in-nocase-subquery-column {
+    SELECT id FROM o WHERE t IN (SELECT i.c FROM i WHERE i.k = o.k) ORDER BY id;
+}
+expect {
+}
+
+@setup in-probe-schema
+test correlated-in-nocase-left-side {
+    SELECT id FROM o WHERE c IN (SELECT i.t FROM i WHERE i.k = o.k) ORDER BY id;
+}
+expect {
+}
+
+@setup in-probe-schema
+test correlated-in-or-term-keeps-list {
+    SELECT id FROM o WHERE a IN (SELECT i.a FROM i WHERE i.k = o.k) OR id = 6 ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+    6
+}
+
+@setup in-probe-schema
+test correlated-in-not-in-keeps-list {
+    SELECT id FROM o WHERE a NOT IN (SELECT i.a FROM i WHERE i.k = o.k) ORDER BY id;
+}
+expect {
+    5
+    6
+}
+
+@setup in-probe-schema
+test correlated-in-distinct-subquery {
+    SELECT id FROM o WHERE a IN (SELECT DISTINCT i.a FROM i WHERE i.k = o.k) ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+}
+
+@setup in-probe-schema
+test correlated-in-left-side-expression {
+    SELECT id FROM o WHERE a + 0 IN (SELECT i.a FROM i WHERE i.k = o.k) ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+}
+
+@setup in-probe-schema
+test correlated-in-limit-keeps-list {
+    SELECT id FROM o WHERE a IN (SELECT i.a FROM i WHERE i.k = o.k ORDER BY i.n LIMIT 1) ORDER BY id;
+}
+expect {
+    1
+    4
+}
+
+@setup in-probe-schema
+test correlated-in-select-list-keeps-list {
+    SELECT id, a IN (SELECT i.a FROM i WHERE i.k = o.k) FROM o ORDER BY id;
+}
+expect {
+    1|1
+    2|
+    3|1
+    4|1
+    5|0
+    6|0
+}
+
+@setup in-probe-schema
+test correlated-in-among-other-terms {
+    SELECT id FROM o WHERE id > 0 AND a IN (SELECT i.a FROM i WHERE i.k = o.k) AND k < 3 ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+}
+
+@setup in-probe-schema
+test correlated-in-is-correlation {
+    SELECT id FROM o WHERE a IN (SELECT i.a FROM i WHERE i.k IS o.k) ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+    6
+}
+
+@setup in-probe-schema
+test correlated-in-integer-subquery-column {
+    SELECT id FROM o WHERE a IN (SELECT i.n FROM i WHERE i.k = o.k) ORDER BY id;
+}
+expect {
+    1
+    5
+}
+
+@setup in-probe-schema
+test correlated-in-in-parentheses {
+    SELECT id FROM o WHERE (a IN (SELECT i.a FROM i WHERE i.k = o.k)) ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+}
+
+@setup in-probe-schema
+test correlated-in-subquery-returns-outer-column {
+    SELECT id FROM o WHERE a IN (SELECT o.a FROM i WHERE i.k = o.k) ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+    5
+}
+
+@setup in-probe-schema
+test correlated-in-subquery-returns-expression {
+    SELECT id FROM o WHERE a IN (SELECT i.a + 0 FROM i WHERE i.k = o.k) ORDER BY id;
+}
+expect {
+    1
+    4
+}
+
+@setup in-probe-schema
+test correlated-in-two-in-terms {
+    SELECT id FROM o WHERE a IN (SELECT i.a FROM i WHERE i.k = o.k) AND a IN (SELECT i.n FROM i WHERE i.k = o.k) ORDER BY id;
+}
+expect {
+    1
+}
+
+@setup in-probe-schema
+test correlated-in-count-of-matches {
+    SELECT count(*) FROM o WHERE a IN (SELECT i.a FROM i WHERE i.k = o.k);
+}
+expect {
+    3
+}
+
+@setup in-probe-schema
+test correlated-in-left-join-outer-table {
+    SELECT o.id, j.m FROM o LEFT JOIN j ON j.k = o.k WHERE j.m IN (SELECT i.n FROM i WHERE i.k = j.k) ORDER BY 2;
+}
+expect {
+    1|1
+    2|1
+    3|3
+    4|3
+    5|5
+}
+
+@setup in-probe-schema
+test correlated-in-correlated-by-nocase {
+    SELECT id FROM o WHERE id IN (SELECT i.n FROM i WHERE i.c = o.c) ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    5
+    6
+}
+
+@setup in-probe-schema
+test correlated-in-cast-left-side-keeps-list {
+    SELECT id FROM o WHERE CAST(a AS TEXT) IN (SELECT i.t FROM i WHERE i.k = o.k) ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup in-probe-schema
+test correlated-in-union-keeps-list {
+    SELECT id FROM o WHERE a IN (SELECT i.a FROM i WHERE i.k = o.k UNION SELECT 99) ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+}
+

@@ -1,5 +1,6 @@
 use crate::schema::Schema;
-use crate::translate::emitter::{emit_cdc_explicit_commit_insns, Resolver, TransactionMode};
+use crate::translate::emitter::{emit_cdc_explicit_commit_insns, TransactionMode};
+use crate::translate::semantic::context::SemanticContext;
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
 use crate::Result;
@@ -8,7 +9,7 @@ use turso_parser::ast::{Name, TransactionType};
 pub fn translate_tx_begin(
     tx_type: Option<TransactionType>,
     _tx_name: Option<Name>,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     program.extend(&ProgramBuilderOpts {
@@ -16,7 +17,7 @@ pub fn translate_tx_begin(
         approx_num_insns: 0,
         approx_num_labels: 0,
     });
-    let schema = resolver.schema();
+    let schema = catalog.main_schema();
     let tx_type = tx_type.unwrap_or(TransactionType::Deferred);
     match tx_type {
         TransactionType::Deferred => {
@@ -38,14 +39,14 @@ pub fn translate_tx_begin(
                 tx_mode: TransactionMode::Write,
                 schema_cookie: schema.schema_version,
             });
-            let temp_schema_cookie = temp_schema_cookie(resolver);
+            let temp_schema_cookie = temp_schema_cookie(catalog);
             program.emit_insn(Insn::Transaction {
                 db: crate::TEMP_DB_ID,
                 tx_mode: TransactionMode::Write,
                 schema_cookie: temp_schema_cookie,
             });
-            for db_id in resolver.attached_database_ids_in_search_order()? {
-                let cookie = resolver.with_schema(db_id, |s| s.schema_version);
+            for db_id in catalog.attached_database_ids_in_search_order()? {
+                let cookie = catalog.with_schema(db_id, |s| s.schema_version);
                 program.emit_insn(Insn::Transaction {
                     db: db_id,
                     tx_mode: TransactionMode::Write,
@@ -74,10 +75,10 @@ pub fn translate_tx_begin(
 
 /// Schema cookie for the temp Transaction emitted by BEGIN. Without a temp
 /// database the cookie is 0, the version of an empty schema; avoid
-/// `with_schema`, which would build a throwaway empty temp schema.
-fn temp_schema_cookie(resolver: &Resolver) -> u32 {
-    if resolver.has_temp_database() {
-        resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version)
+/// `with_schema`, which would need a throwaway empty temp schema.
+fn temp_schema_cookie(catalog: &SemanticContext<'_>) -> u32 {
+    if catalog.has_temp_database() {
+        catalog.with_schema(crate::TEMP_DB_ID, |s| s.schema_version)
     } else {
         0
     }
@@ -86,14 +87,14 @@ fn temp_schema_cookie(resolver: &Resolver) -> u32 {
 pub fn translate_tx_commit(
     _tx_name: Option<Name>,
     schema: &Schema,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     program.extend(&ProgramBuilderOpts::new(0, 0, 0));
 
     let cdc_info = program.capture_data_changes_info().as_ref();
     if cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
-        emit_cdc_explicit_commit_insns(program, schema, resolver)?;
+        emit_cdc_explicit_commit_insns(program, schema, catalog)?;
     }
 
     program.emit_insn(Insn::AutoCommit {

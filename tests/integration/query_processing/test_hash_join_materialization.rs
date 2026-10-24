@@ -351,36 +351,50 @@ fn hash_join_unmatched_rows_apply_payload_backed_predicates() {
     sqlite_conn.execute("COMMIT", []).unwrap();
     limbo_exec_rows(&conn, "ANALYZE");
 
-    for predicate in [
-        "t3.d IS t4.d",
-        "t3.d IS NOT t4.d",
-        "ifnull(t3.d, -9) = ifnull(t4.d, -9)",
-    ] {
-        let query = format!(
-            "SELECT count(*) FROM t1 \
+    // The unmatched rows a hash join NULL-extends must still be filtered
+    // by the predicate.
+    {
+        let conn = tmp_db.connect_limbo();
+        for predicate in [
+            "t3.d IS t4.d",
+            "t3.d IS NOT t4.d",
+            "ifnull(t3.d, -9) = ifnull(t4.d, -9)",
+        ] {
+            let query = format!(
+                "SELECT count(*) FROM t1 \
 JOIN t2 ON t1.d = t2.d \
 LEFT JOIN t3 ON t2.c = t3.c \
 JOIN t4 ON {predicate}"
-        );
-
-        assert_that!(limbo_exec_rows(&conn, &format!("EXPLAIN {query}")))
-            .named(format!("opcodes of the join on `{predicate}`"))
-            .column(1)
-            .contains(Cell::from("HashScanUnmatched"));
-
-        let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
-        assert_that!(limbo_exec_rows(&conn, &query))
-            .named(format!("rows for `{predicate}`"))
-            .is_equal_to(sqlite_rows.clone());
-        // Guard against the comparison passing because both sides return nothing.
-        assert_that!(sqlite_rows)
-            .named(format!("sqlite count for `{predicate}`"))
-            .column(0)
-            .single_element()
-            .satisfies_with_message(
-                "be more than zero",
-                |count| matches!(count, Value::Integer(count) if *count > 0),
             );
+
+            // The LEFT JOIN runs as a hash join that keeps its unmatched
+            // build rows, so those rows reach the predicate.
+            let plan = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN FORMAT=JSON {query}"));
+            let Value::Text(plan) = &plan[0][0] else {
+                panic!("query plan must be text");
+            };
+            let plan: serde_json::Value = serde_json::from_str(plan).unwrap();
+            let left_hash_join = plan["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| node["detail"] == "HASH JOIN t3" && node["op"]["join"] == "left");
+            assert!(left_hash_join, "plan of the join on `{predicate}`: {plan}");
+
+            let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
+            assert_that!(limbo_exec_rows(&conn, &query))
+                .named(format!("rows for `{predicate}`"))
+                .is_equal_to(sqlite_rows.clone());
+            // Guard against the comparison passing because both sides return nothing.
+            assert_that!(sqlite_rows)
+                .named(format!("sqlite count for `{predicate}`"))
+                .column(0)
+                .single_element()
+                .satisfies_with_message(
+                    "be more than zero",
+                    |count| matches!(count, Value::Integer(count) if *count > 0),
+                );
+        }
     }
 }
 

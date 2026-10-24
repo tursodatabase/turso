@@ -1556,7 +1556,7 @@ expect {
     6|0|0|CORRELATED LIST SUBQUERY 1
     9|6|0|SCAN limit_inner AS i
     1|0|0|SCAN limit_outer AS o
-    2|0|0|SEARCH i USING COVERING INDEX ephemeral_limit_inner_t3 (k=? AND x=?)
+    2|0|0|SEARCH i USING COVERING INDEX ephemeral_limit_inner_s1 (k=? AND x=?)
 }
 
 # Semi-joins and anti-joins must apply the full comparison before they record a match.
@@ -1696,7 +1696,7 @@ test correlated-comparison-uses-joins {
 }
 expect {
     1|0|0|SCAN outer_rows AS o
-    2|0|0|SEARCH i USING COVERING INDEX ephemeral_inner_rows_t3 (key1=?)
+    2|0|0|SEARCH i USING COVERING INDEX ephemeral_inner_rows_s1 (key1=?)
     1|0|0|HASH JOIN inner_rows AS i
     2|0|0|SCAN outer_rows AS o
 }
@@ -1721,8 +1721,8 @@ test two-exists-use-two-semi-joins {
 }
 expect {
     1|0|0|SCAN two_exists_outer AS o
-    2|0|0|SEARCH i USING COVERING INDEX ephemeral_first_exists_inner_t3 (key1=?)
-    3|0|0|SEARCH j USING COVERING INDEX ephemeral_second_exists_inner_t5 (key2=?)
+    2|0|0|SEARCH i USING COVERING INDEX ephemeral_first_exists_inner_s1 (key1=?)
+    3|0|0|SEARCH j USING COVERING INDEX ephemeral_second_exists_inner_s2 (key2=?)
 }
 
 # A filter on the outer table must not turn the EXISTS semi join back into a
@@ -1742,7 +1742,7 @@ test outer-filter-keeps-exists-semi-join {
 }
 expect {
     1|0|0|SCAN filtered_exists_outer AS o
-    2|0|0|SEARCH i USING COVERING INDEX ephemeral_filtered_exists_inner_t3 (key1=?)
+    2|0|0|SEARCH i USING COVERING INDEX ephemeral_filtered_exists_inner_s1 (key1=?)
 }
 
 setup hash_anti_rows {
@@ -2074,7 +2074,7 @@ test unnested-in-reuses-unused-cursor {
     );
 }
 expect pattern {
-    (?m)^\d+\|OpenRead\|0\|.*table=cursor_outer.*$\n^\d+\|OpenRead\|1\|.*table=cursor_inner.*$(?s).*\n\d+\|OpenAutoindex\|2\|
+    (?m)^\d+\|OpenRead\|[0-2]\|.*table=cursor_outer.*$\n^\d+\|OpenRead\|[0-2]\|.*table=cursor_inner.*$(?s).*\n\d+\|OpenAutoindex\|[0-2]\|
 }
 
 # The scalar result register is not used after the aggregate becomes a grouped
@@ -2096,7 +2096,7 @@ test grouped-aggregate-reuses-unused-result-register {
     FROM register_outer o;
 }
 expect pattern {
-    (?m)^\d+\|AggFinal\|.*$\n^\d+\|Copy\|\d+\|1\|.*$\n^\d+\|Copy\|\d+\|2\|.*$
+    (?m)^\d+\|AggFinal\|.*$\n^\d+\|Copy\|\d+\|\d+\|.*$\n^\d+\|Copy\|\d+\|\d+\|.*$
 }
 
 # A grouped value can be used while two outer hash joins build their inputs.

@@ -88,6 +88,17 @@ pub fn insn_to_row(
             name.to_string()
         }
     };
+    // "table" or "index". A cursor allocated without a key, as the HIR
+    // lowering allocates them, is described by its type.
+    let cursor_kind = |cursor_id: usize| -> &'static str {
+        match &program.cursor_ref[cursor_id] {
+            (Some(cursor_key), _) if cursor_key.index.is_some() => "index",
+            (Some(_), _) => "table",
+            (None, CursorType::BTreeIndex(_)) => "index",
+            (None, CursorType::BTreeTable(_) | CursorType::MaterializedView(..)) => "table",
+            (None, _) => "",
+        }
+    };
     match insn {
             Insn::Init { target_pc } => (
                 "Init",
@@ -448,17 +459,7 @@ pub fn insn_to_row(
                             .1.get_explain_description()),
                 0,
                 {
-                    let cursor_type =
-                        program.cursor_ref[*cursor_id]
-                            .0
-                            .as_ref()
-                            .map_or("", |cursor_key| {
-                                if cursor_key.index.is_some() {
-                                    "index"
-                                } else {
-                                    "table"
-                                }
-                            });
+                    let cursor_type = cursor_kind(*cursor_id);
                     format!(
                         "{}={}, root={}, iDb={}",
                         cursor_type,
@@ -476,17 +477,7 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 {
-                    let cursor_type =
-                        program.cursor_ref[*cursor_id]
-                            .0
-                            .as_ref()
-                            .map_or("", |cursor_key| {
-                                if cursor_key.index.is_some() {
-                                    "index"
-                                } else {
-                                    "table"
-                                }
-                            });
+                    let cursor_type = cursor_kind(*cursor_id);
                     format!("{} {}", cursor_type, get_table_or_index_name(*cursor_id),)
                 },
             ),
@@ -607,17 +598,7 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 {
-                    let cursor_type =
-                        program.cursor_ref[*cursor_id]
-                            .0
-                            .as_ref()
-                            .map_or("", |cursor_key| {
-                                if cursor_key.index.is_some() {
-                                    "index"
-                                } else {
-                                    "table"
-                                }
-                            });
+                    let cursor_type = cursor_kind(*cursor_id);
                     format!(
                         "Rewind {} {}",
                         cursor_type,
@@ -755,10 +736,14 @@ pub fn insn_to_row(
                 0,
                 Value::build_text(""),
                 0,
-                format!(
-                    "{}.{} ({})",
-                    data.table_name, data.col_name, data.element_type
-                ),
+                if data.table_name.is_empty() {
+                    format!("CAST ({}[])", data.element_type)
+                } else {
+                    format!(
+                        "{}.{} ({})",
+                        data.table_name, data.col_name, data.element_type
+                    )
+                },
             ),
             Insn::ArrayDecode { reg } => (
                 "ArrayDecode",

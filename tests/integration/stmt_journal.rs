@@ -129,6 +129,22 @@ fn insert_autoincrement_notnull(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An INSERT prepared through HIR sets the same flags for AUTOINCREMENT.
+#[turso_macros::test(
+    init_sql = "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v NOT NULL);"
+)]
+fn insert_autoincrement_through_hir(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    assert!(needs_stmt_journal(&conn, "INSERT INTO t (v) VALUES (1)"));
+    conn.execute("CREATE TABLE u (id INTEGER PRIMARY KEY AUTOINCREMENT, v)")?;
+    assert!(!needs_stmt_journal(&conn, "INSERT INTO u (v) VALUES (1)"));
+    assert!(needs_stmt_journal(
+        &conn,
+        "INSERT INTO u (v) VALUES (1), (2)"
+    ));
+    Ok(())
+}
+
 /// INSERT with SELECT as source is multi-row.
 #[turso_macros::test(init_sql = "CREATE TABLE t (a NOT NULL);")]
 fn insert_select_source(tmp_db: TempDatabase) -> anyhow::Result<()> {

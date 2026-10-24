@@ -1,4 +1,4 @@
-use super::binding::{cache_stream_expr_reg, make_joined_table, remap_bound_expr, BindingRemap};
+use super::binding::StreamRow;
 use super::output::{DeltaSource, EmittedNodeOutput, NodeOutput, NodeOutputContract};
 use super::plan::OperatorStateDef;
 use super::stream::{
@@ -9,14 +9,13 @@ use super::MaintenanceInput;
 use crate::incremental::dag;
 use crate::schema::Schema;
 use crate::sync::Arc;
-use crate::translate::emitter::Resolver;
-use crate::translate::expr::{translate_condition_expr, ConditionMetadata};
-use crate::translate::plan::TableReferences;
+use crate::translate::expr::ConditionMetadata;
+use crate::translate::semantic::hir::{self, HirDocument};
+use crate::translate::semantic_lowering::translate_condition_expr;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
-use crate::{Connection, LimboError, Result};
-use turso_parser::ast;
+use crate::{LimboError, Result};
 
 const JOIN_ARITY: usize = 2;
 
@@ -34,13 +33,13 @@ struct JoinInputContract {
 /// The complete physical contract of one binary join node.
 pub(super) struct JoinContract {
     inputs: [JoinInputContract; JOIN_ARITY],
-    on: Vec<ast::Expr>,
+    on: Vec<hir::Expr>,
 }
 
 impl JoinContract {
     pub(super) fn from_outputs(
         outputs: [&NodeOutput; JOIN_ARITY],
-        on: &[ast::Expr],
+        on: &[hir::Expr],
     ) -> Result<Self> {
         let input = |position: usize| -> Result<JoinInputContract> {
             let output = outputs[position];
@@ -238,7 +237,7 @@ fn emit_join_input_identity(
 #[allow(clippy::too_many_arguments)]
 fn emit_join_phase(
     program: &mut ProgramBuilder,
-    resolver: &mut Resolver,
+    document: &HirDocument,
     view_name: &str,
     contract: &JoinContract,
     sides: &[JoinSide; JOIN_ARITY],
@@ -246,31 +245,7 @@ fn emit_join_phase(
     w_reg: usize,
     sink: &mut JoinPhaseSink<'_>,
 ) -> Result<()> {
-    // A physical input may carry several SQL bindings after a previous binary
-    // join. Bound expressions are retargeted to fresh phase ids and every
-    // column is seeded from the one physical cursor declared by that edge.
-    let mut binding_remap = BindingRemap::default();
-    let mut phase_bindings = Vec::new();
-    for input in &contract.inputs {
-        for binding in &input.schema.bindings {
-            let phase_id = program.table_reference_counter.next();
-            let previous = binding_remap.insert(binding.logical_id, phase_id);
-            turso_assert!(
-                previous.is_none(),
-                "a join phase must expose each logical binding exactly once"
-            );
-            phase_bindings.push((binding, phase_id));
-        }
-    }
-    let table_references = TableReferences::new(
-        phase_bindings
-            .iter()
-            .map(|(binding, phase_id)| {
-                make_joined_table(&binding.table, &binding.identifier, *phase_id)
-            })
-            .collect(),
-        vec![],
-    );
+    let bound_registers = program.expression_register_count();
 
     let mut open_input = |position: usize| -> Result<usize> {
         let input = &contract.inputs[position];
@@ -366,11 +341,11 @@ fn emit_join_phase(
         }
     }
 
-    // Bind every logical column to the physical arrangement/delta slot used
-    // in this phase. This keeps expression translation independent of record
+    // Load every logical column from the physical arrangement/delta slot used
+    // in this phase. This keeps expression lowering independent of record
     // layout (aggregate arrangements can project away accumulator payloads,
     // while ephemeral deltas carry identity before their values).
-    resolver.enable_expr_to_reg_cache();
+    let mut row = StreamRow::new();
     for pos in 0..JOIN_ARITY {
         let input = &contract.inputs[pos];
         for (logical_column, column) in input.schema.columns.iter().enumerate() {
@@ -396,8 +371,7 @@ fn emit_join_phase(
                 }
                 _ => program.emit_column_or_rowid(cursor_ids[pos], physical_column, value_reg),
             }
-            let bound = remap_bound_expr(expr, &binding_remap)?;
-            cache_stream_expr_reg(&mut *resolver, bound, value_reg, &table_references)?;
+            row.add_column(Some(expr), value_reg);
         }
         for (binding_index, binding) in input.schema.bindings.iter().enumerate() {
             let rowid_reg = program.alloc_register();
@@ -412,20 +386,7 @@ fn emit_join_phase(
             ) {
                 continue;
             }
-            let phase_id = *binding_remap.get(&binding.logical_id).ok_or_else(|| {
-                LimboError::InternalError(
-                    "join binding rowid has no phase-local binding".to_string(),
-                )
-            })?;
-            resolver.cache_expr_reg(
-                std::borrow::Cow::Owned(ast::Expr::RowId {
-                    database: None,
-                    table: phase_id,
-                }),
-                rowid_reg,
-                false,
-                None,
-            );
+            row.add_rowid(binding.source, rowid_reg);
         }
     }
 
@@ -433,22 +394,21 @@ fn emit_join_phase(
     // is not a join output.
     let innermost_next = next_labels[JOIN_ARITY - 1];
     for condition in &contract.on {
-        let bound = remap_bound_expr(condition, &binding_remap)?;
         let pred_true = program.allocate_label();
+        row.bind(program, document, condition);
         translate_condition_expr(
             program,
-            &table_references,
-            &bound,
+            document,
+            condition,
             ConditionMetadata {
                 jump_if_condition_is_true: false,
                 jump_target_when_true: pred_true,
                 jump_target_when_false: innermost_next,
-                jump_target_when_null: innermost_next,
             },
-            resolver,
         )?;
         program.preassign_label_to_next_insn(pred_true);
     }
+    program.truncate_expression_registers(bound_registers);
 
     // Signed weight: the product of the delta weights times the phase sign.
     program.emit_int(if negate { -1 } else { 1 }, w_reg);
@@ -492,13 +452,12 @@ fn emit_join_phase(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_inner_join(
     program: &mut ProgramBuilder,
+    document: &HirDocument,
     view_name: &str,
     node_id: dag::NodeId,
     output_contract: &NodeOutputContract,
     contract: &JoinContract,
     input: MaintenanceInput,
-    schema: &Schema,
-    connection: &Arc<Connection>,
 ) -> Result<EmittedNodeOutput> {
     let width = output_contract.schema.len();
     let natural_width = contract
@@ -527,20 +486,6 @@ pub(super) fn emit_inner_join(
     let eph_rowid_reg = program.alloc_register();
     let eph_record_reg = program.alloc_register();
 
-    let syms = connection.syms.read();
-    let mut resolver = Resolver::new(
-        schema,
-        connection.database_schemas(),
-        &connection.temp.database,
-        connection.attached_databases(),
-        connection.namespaces(),
-        &syms,
-        connection.experimental_custom_types_enabled(),
-        connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
-        None,
-    );
-
     let emit_eph_insert = |program: &mut ProgramBuilder| {
         program.emit_insn(Insn::MakeRecord {
             start_reg: to_u32(eph_rec_start),
@@ -566,7 +511,7 @@ pub(super) fn emit_inner_join(
     for &(sides, negate) in binary_join_phases(input) {
         emit_join_phase(
             program,
-            &mut resolver,
+            document,
             view_name,
             contract,
             &sides,
@@ -700,7 +645,6 @@ pub(super) fn emit_inner_join(
         )?;
     }
 
-    drop(syms);
     EmittedNodeOutput::from_ephemeral(node_id, channel, output_contract)
 }
 
@@ -728,6 +672,7 @@ pub(super) fn emit_inner_join(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_semi_or_anti_join(
     program: &mut ProgramBuilder,
+    document: &HirDocument,
     view_name: &str,
     node_id: dag::NodeId,
     kind: dag::JoinKind,
@@ -736,7 +681,6 @@ pub(super) fn emit_semi_or_anti_join(
     input: MaintenanceInput,
     operator_state: &OperatorStateDef,
     schema: &Schema,
-    connection: &Arc<Connection>,
 ) -> Result<EmittedNodeOutput> {
     let keeps_matched_rows = match kind {
         dag::JoinKind::Semi => true,
@@ -774,20 +718,6 @@ pub(super) fn emit_semi_or_anti_join(
             "semi or anti join state {state_name} of materialized view {view_name} not found"
         ))
     })?;
-
-    let syms = connection.syms.read();
-    let mut resolver = Resolver::new(
-        schema,
-        connection.database_schemas(),
-        &connection.temp.database,
-        connection.attached_databases(),
-        connection.namespaces(),
-        &syms,
-        connection.experimental_custom_types_enabled(),
-        connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
-        None,
-    );
 
     let state_cursor = program.alloc_cursor_id(CursorType::BTreeTable(state_table.clone()));
     program.emit_insn(Insn::OpenWrite {
@@ -923,7 +853,7 @@ pub(super) fn emit_semi_or_anti_join(
     for &(sides, negate) in binary_join_phases(input) {
         emit_join_phase(
             program,
-            &mut resolver,
+            document,
             view_name,
             contract,
             &sides,
@@ -1234,7 +1164,6 @@ pub(super) fn emit_semi_or_anti_join(
         description_reg: None,
     });
     program.preassign_label_to_next_insn(end_label);
-    drop(syms);
     EmittedNodeOutput::from_ephemeral(node_id, output, output_contract)
 }
 
