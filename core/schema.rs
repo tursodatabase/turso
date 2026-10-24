@@ -3920,7 +3920,14 @@ impl BTreeTable {
                 col.ty_str = "ANY".to_string();
                 col.override_affinity(Affinity::Blob);
             } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
-                col.ty_str = type_def.value_input_type().to_uppercase();
+                let input_type = type_def.value_input_type();
+                // Transparent domain aliases must reach TypeCheck as a primitive.
+                col.ty_str = schema
+                    .resolve_type_unchecked(input_type)?
+                    .filter(|resolved| resolved.chain.iter().all(|td| td.is_domain))
+                    .map(|resolved| resolved.primitive)
+                    .unwrap_or_else(|| input_type.to_string())
+                    .to_uppercase();
             }
         }
         Ok(Arc::new(modified))
