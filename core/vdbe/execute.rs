@@ -8313,7 +8313,12 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
             }
         }
         AggFunc::Min | AggFunc::Max => payload[0].clone(),
-        AggFunc::GroupConcat | AggFunc::StringAgg => payload[0].clone(),
+        AggFunc::GroupConcat | AggFunc::StringAgg => match payload {
+            [Value::Null, Value::Numeric(Numeric::Integer(count)), ..] if *count > 0 => {
+                Value::build_text(String::new())
+            }
+            _ => payload[0].clone(),
+        },
         AggFunc::ArrayAgg => {
             // payload[0] = count, payload[1..] = accumulated values.
             // Serialize to a record blob only once at finalization.
@@ -9326,7 +9331,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             };
             let remove_len = value_len.checked_add(separator_len).or_overflow()?;
             let Value::Text(text) = acc else {
-                unreachable!("GroupConcat accumulator is Text after a non-NULL xStep");
+                return Ok(());
             };
             let accumulated_len = text.as_str().len();
             if remove_len < accumulated_len && !text.as_str().is_char_boundary(remove_len) {
