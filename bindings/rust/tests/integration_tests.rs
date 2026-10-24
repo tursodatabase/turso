@@ -1103,6 +1103,42 @@ async fn test_prepare_cached_reprepare_on_query_only_change() {
 }
 
 #[tokio::test]
+async fn test_held_select_star_reprepares_after_drop_column() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t (a TEXT, other TEXT, b TEXT)", ())
+        .await
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES ('a0', 'discard', 'b0')", ())
+        .await
+        .unwrap();
+
+    let mut select = conn.prepare("SELECT * FROM t").await.unwrap();
+    {
+        let mut rows = select.query(()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.column_count(), 3);
+        assert_eq!(row.get::<String>(0).unwrap(), "a0");
+        assert_eq!(row.get::<String>(1).unwrap(), "discard");
+        assert_eq!(row.get::<String>(2).unwrap(), "b0");
+        assert!(rows.next().await.unwrap().is_none());
+    }
+
+    conn.execute("ALTER TABLE t DROP COLUMN other", ())
+        .await
+        .unwrap();
+
+    let mut rows = select.query(()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.column_count(), 2);
+    assert_eq!(row.get::<String>(0).unwrap(), "a0");
+    assert_eq!(row.get::<String>(1).unwrap(), "b0");
+    assert_eq!(rows.column_count(), 2);
+    assert_eq!(select.column_count(), 2);
+    assert!(rows.next().await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn test_drop_column_after_schema_change_in_txn_with_live_index_statement() {
     let db = Builder::new_local(":memory:").build().await.unwrap();
     let conn = db.connect().unwrap();
