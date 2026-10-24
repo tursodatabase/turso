@@ -609,12 +609,9 @@ dependencies = [
 
 [[package]]
 name = "branches"
-version = "0.4.3"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21ab2097ac67710acd7d6034dd11b719c086a440ab65b92aa625be166f5995e9"
-dependencies = [
- "rustc_version",
-]
+checksum = "570b591f2c5947596f3e5b0fcf59a71068ece15aa710446ce7eb670c3620350c"
 
 [[package]]
 name = "bstr"
