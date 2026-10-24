@@ -2408,15 +2408,52 @@ impl Connection {
             .wal
             .as_ref()
             .is_none_or(|wal| wal.should_checkpoint_on_close());
-        if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
+        let main_checkpoint_result = if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
             && !self.db.is_readonly()
             && !is_memory_db
             && should_checkpoint_on_close
         {
-            self.pager
-                .load()
-                .checkpoint_shutdown(self.wal_auto_actions(), self.get_sync_mode())?;
+            Some(
+                self.pager
+                    .load()
+                    .checkpoint_shutdown(self.wal_auto_actions(), self.get_sync_mode()),
+            )
+        } else {
+            None
         };
+        let attached_checkpoint_result = self.checkpoint_attached_databases_on_close();
+        if let Some(result) = main_checkpoint_result {
+            result?;
+        }
+        attached_checkpoint_result
+    }
+
+    fn checkpoint_attached_databases_on_close(&self) -> Result<()> {
+        let attached_databases: Vec<_> = self
+            .attached_databases
+            .read()
+            .index_to_data
+            .values()
+            .map(|entry| (entry.db.clone(), entry.pager.clone(), entry.sync_mode))
+            .collect();
+
+        for (database, pager, sync_mode) in attached_databases {
+            // The attached pager is held directly; this counter tracks any separate Connections.
+            if database.n_connections.load(Ordering::SeqCst) != 0
+                || database.is_readonly()
+                || is_memory_like(&database.path)
+                || database.get_mv_store().is_some()
+            {
+                continue;
+            }
+            let Some(wal) = pager.wal.as_ref() else {
+                continue;
+            };
+            if !wal.should_checkpoint_on_close() {
+                continue;
+            }
+            pager.checkpoint_shutdown(self.wal_auto_actions(), sync_mode)?;
+        }
         Ok(())
     }
 
@@ -5285,6 +5322,28 @@ mod tests {
 
         let reopened = open_connection(&aux_path);
         assert_eq!(query_single_i64(&reopened, "SELECT x FROM t"), 7);
+    }
+
+    // The Windows PlatformIO test path cannot reopen the attached database's lock handle.
+    #[cfg(not(windows))]
+    #[test]
+    fn test_close_checkpoints_attached_database_wal() {
+        let temp_dir = TempDir::new().unwrap();
+        let main_path = temp_dir.path().join("main.db");
+        let aux_path = temp_dir.path().join("aux.db");
+        let copied_path = temp_dir.path().join("aux-copy.db");
+        let conn = open_connection_with_opts(&main_path, DatabaseOpts::new().with_attach(true));
+
+        drive_attach(&conn, aux_path.to_str().unwrap(), "aux").unwrap();
+        conn.execute("CREATE TABLE aux.t(x INTEGER); INSERT INTO aux.t VALUES(7)")
+            .unwrap();
+        assert_eq!(conn.get_tx_state(), TransactionState::None);
+        conn.close().unwrap();
+        drop(conn);
+
+        std::fs::copy(&aux_path, &copied_path).unwrap();
+        let copied = open_connection(&copied_path);
+        assert_eq!(query_single_i64(&copied, "SELECT x FROM t"), 7);
     }
 
     #[test]
