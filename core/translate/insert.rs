@@ -25,7 +25,8 @@ use crate::{
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
             emit_guarded_fk_decrement, emit_skip_if_any_null, fk_constraint_info, index_probe,
-            index_scan_match_any, open_read_index, open_read_table, ForeignKeyActions,
+            index_scan_match_any, open_read_index, open_read_table, table_scan_match_any,
+            ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -4309,58 +4310,20 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 Ok(())
             })?;
         } else {
-            // fallback scan :(
-            let ccur = open_read_table(program, child_tbl, database_id);
-            let done = program.allocate_label();
-            program.emit_insn(Insn::Rewind {
-                cursor_id: ccur,
-                pc_if_empty: done,
-            });
-            let loop_top = program.allocate_label();
-            let next_row = program.allocate_label();
-            program.preassign_label_to_next_insn(loop_top);
-
-            for (i, child_name) in child_cols.iter().enumerate() {
-                let (pos, _) = child_tbl.get_column(child_name).ok_or_else(|| {
-                    crate::LimboError::InternalError(format!("child col {child_name} missing"))
-                })?;
-                let tmp = program.alloc_register();
-                program.emit_insn(Insn::Column {
-                    cursor_id: ccur,
-                    column: pos,
-                    dest: tmp,
-                    default: None,
-                });
-
-                program.emit_insn(Insn::IsNull {
-                    reg: tmp,
-                    target_pc: next_row,
-                });
-
-                let cont = program.allocate_label();
-                program.emit_insn(Insn::Eq {
-                    lhs: tmp,
-                    rhs: new_pk_start + i,
-                    target_pc: cont,
-                    flags: CmpInsFlags::default().jump_if_null(),
-                    collation: Some(super::collate::CollationSeq::Binary),
-                });
-                program.emit_insn(Insn::Goto {
-                    target_pc: next_row,
-                });
-                program.preassign_label_to_next_insn(cont);
-            }
-            // Matched one child row: guarded decrement of counter
-            emit_guarded_fk_decrement(program, next_row, pref.fk.deferred);
-            program.preassign_label_to_next_insn(next_row);
-            program.emit_insn(Insn::Next {
-                cursor_id: ccur,
-                pc_if_next: loop_top,
-                fullscan: false,
-                is_index: false,
-            });
-            program.preassign_label_to_next_insn(done);
-            program.emit_insn(Insn::Close { cursor_id: ccur });
+            table_scan_match_any(
+                program,
+                &pref,
+                new_pk_start,
+                None,
+                database_id,
+                resolver,
+                |p| {
+                    let next = p.allocate_label();
+                    emit_guarded_fk_decrement(p, next, pref.fk.deferred);
+                    p.preassign_label_to_next_insn(next);
+                    Ok(())
+                },
+            )?;
         }
         program.preassign_label_to_next_insn(skip_fk);
     }
