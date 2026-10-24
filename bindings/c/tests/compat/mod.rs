@@ -33,6 +33,7 @@ struct sqlite3_stmt {
     link(name = "turso_sqlite3", kind = "raw-dylib")
 )]
 extern "C" {
+    fn turso_enable_experimental();
     fn sqlite3_libversion() -> *const libc::c_char;
     fn sqlite3_libversion_number() -> i32;
     fn sqlite3_close(db: *mut sqlite3) -> i32;
@@ -2311,6 +2312,64 @@ mod tests {
             // Test with non-existent database name
             let filename = sqlite3_db_filename(db, c"temp".as_ptr());
             assert!(filename.is_null());
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_db_filename_for_attached_database() {
+        unsafe {
+            turso_enable_experimental();
+
+            let attached_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let attached_path = attached_file.path().to_string_lossy().replace('\'', "''");
+            let attach_sql =
+                std::ffi::CString::new(format!("ATTACH '{}' AS aux", attached_path)).unwrap();
+
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    attach_sql.as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+
+            let filename = sqlite3_db_filename(db, c"aux".as_ptr());
+            assert!(!filename.is_null());
+            let filename_path =
+                std::fs::canonicalize(std::ffi::CStr::from_ptr(filename).to_str().unwrap())
+                    .unwrap();
+            assert_eq!(filename_path, attached_file.path().canonicalize().unwrap());
+
+            let other_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let other_path = other_file.path().to_string_lossy().replace('\'', "''");
+            let other_attach_sql =
+                std::ffi::CString::new(format!("ATTACH '{}' AS other", other_path)).unwrap();
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    other_attach_sql.as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(filename).to_str().unwrap(),
+                attached_file
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            );
 
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
