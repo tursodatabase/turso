@@ -2410,6 +2410,11 @@ impl PostgreSQLTranslator {
         ) {
             return self.translate_json_to_record(func_name, range_func, &args, alias);
         }
+        if !range_func.coldeflist.is_empty() {
+            return Err(not_supported(format!(
+                "a column definition list on {func_name}()"
+            )));
+        }
         if func_name == "generate_series" {
             if let Some(range_alias) = &range_func.alias {
                 let names = alias_column_names(range_alias)?;
@@ -2420,24 +2425,21 @@ impl PostgreSQLTranslator {
                         names.len()
                     )));
                 }
-                if let Some(column_name) = names.into_iter().next() {
-                    return Ok(ast::SelectTable::Select {
-                        select: single_column_function_select(
-                            qualified_name,
-                            args,
-                            "value",
-                            column_name,
-                        ),
-                        alias,
-                        lateral: true,
-                    });
-                }
+                let column_name = names
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| range_alias.aliasname.clone());
+                return Ok(ast::SelectTable::Select {
+                    select: single_column_function_select(
+                        qualified_name,
+                        args,
+                        "value",
+                        column_name,
+                    ),
+                    alias,
+                    lateral: true,
+                });
             }
-        }
-        if !range_func.coldeflist.is_empty() {
-            return Err(not_supported(format!(
-                "a column definition list on {func_name}()"
-            )));
         }
         reject_column_aliases(&range_func.alias, "a function")?;
 
