@@ -121,6 +121,8 @@ The `<` operator is special: it controls how values of this type are sorted in O
 - **`OPERATOR '<' my_compare`**: Uses `my_compare(a, b)` as a custom comparator. The function must return a negative integer if `a < b`, zero if `a = b`, and a positive integer if `a > b`.
 - **No `<` operator**: The type cannot be used in ORDER BY or CREATE INDEX.
 
+When a type has no operator functions (it declares no operators, or declares `<` or `=` without a function) and a column of that type, a domain over it, or a CAST to it is compared with a quoted string or a bound parameter (`=`, `<`, `BETWEEN`, `IN`, `CASE col WHEN`), the string or parameter is first converted the same way an inserted value would be: ENCODE, then DECODE. For example, `uuid_col = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'` matches the lowercase stored UUID, and a string that ENCODE rejects raises the type's error. The string is read the same way `CAST(... AS type)` reads it, so partial values no longer compare as text prefixes: on a `date` column `d < '2027'` compares with Julian day 2027 (`-4707-06-12`), and on a `timestamp` column `ts < '2026-10'` raises an error. Number literals are not converted. Types with parameters, such as `varchar(3)`, skip the ENCODE step, so `col = 'abcd'` is false rather than an error.
+
 ```sql
 -- Use base type comparison for ordering
 CREATE TYPE cents BASE integer
@@ -202,7 +204,7 @@ This is useful for converting values to the encoded form outside of INSERT/UPDAT
 
 ## CHECK Constraints with Custom Types
 
-In STRICT tables with custom types, CHECK constraints operate on the **decoded** (presentation) values. When comparing a column of a custom type against a literal, use CAST to encode the literal:
+In STRICT tables with custom types, CHECK constraints operate on the **decoded** (presentation) values. Quoted strings are converted to the column's type automatically (see Ordering with OPERATOR '<' above), but number literals are not. When comparing a column of a custom type against a number, use CAST to encode it:
 
 ```sql
 CREATE TYPE cents BASE integer

@@ -103,6 +103,14 @@ pub(super) fn translate_in_list(
         let _ = translate_expr(program, referenced_tables, expr, rhs_reg, resolver)?;
 
         if lhs_arity == 1 {
+            let rhs_reg = emit_comparison_value_as_column_type(
+                program,
+                referenced_tables,
+                expr,
+                rhs_reg,
+                lhs,
+                resolver,
+            )?;
             // Scalar comparison path
             if check_null_reg != 0 && expr.can_be_null() {
                 program.emit_insn(Insn::BitAnd {

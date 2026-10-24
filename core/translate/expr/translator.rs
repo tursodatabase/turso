@@ -677,14 +677,25 @@ fn translate_case_expr(
         )?;
         match base_reg {
             // CASE 1 WHEN 0 THEN 0 ELSE 1 becomes 1==0, Ne branch to next clause
-            Some(base_reg) => program.emit_insn(Insn::Ne {
-                lhs: base_reg,
-                rhs: expr_reg,
-                target_pc: next_case_label,
-                // A NULL result is considered untrue when evaluating WHEN terms.
-                flags: CmpInsFlags::default().jump_if_null(),
-                collation: program.curr_collation(),
-            }),
+            Some(base_reg) => {
+                let when_reg = emit_comparison_value_as_column_type(
+                    program,
+                    referenced_tables,
+                    when_expr,
+                    expr_reg,
+                    base.as_deref()
+                        .expect("CASE with a base register has a base expression"),
+                    resolver,
+                )?;
+                program.emit_insn(Insn::Ne {
+                    lhs: base_reg,
+                    rhs: when_reg,
+                    target_pc: next_case_label,
+                    // A NULL result is considered untrue when evaluating WHEN terms.
+                    flags: CmpInsFlags::default().jump_if_null(),
+                    collation: program.curr_collation(),
+                })
+            }
             // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
             None => program.emit_insn(Insn::IfNot {
                 reg: expr_reg,

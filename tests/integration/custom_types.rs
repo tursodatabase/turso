@@ -634,4 +634,31 @@ mod tests {
             vec![("2025-01-08".to_string(), "2025-01-02".to_string())]
         );
     }
+
+    #[test]
+    fn test_timestamp_compared_with_bound_text_parameter() {
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t1(ts timestamp) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES ('2026-10-08 12:00:00')")
+            .unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT count(*) FROM t1 WHERE ts = ?1 AND ts >= ?1")
+            .unwrap();
+        stmt.bind_at(
+            1.try_into().unwrap(),
+            turso_core::Value::from_text("2026-10-08T12:00:00".to_string()),
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            rows.push(row.get::<i64>(0)?);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, vec![1]);
+    }
 }

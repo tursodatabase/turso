@@ -273,7 +273,15 @@ fn emit_in_seek_multi_index_branch(
         target_pc: next_value_label,
     });
 
-    if let Some(branch_cursor_id) = branch_cursor_id {
+    if let (Some(branch_cursor_id), Some(index)) = (branch_cursor_id, branch.index.as_ref()) {
+        encode_subquery_in_seek_key(
+            program,
+            table_references,
+            &t_ctx.resolver,
+            index,
+            source,
+            seek_reg,
+        )?;
         let branch_loop_start = program.allocate_label();
         let branch_next = program.allocate_label();
         program.emit_insn(Insn::SeekGE {

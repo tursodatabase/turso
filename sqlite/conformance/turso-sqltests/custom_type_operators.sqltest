@@ -808,3 +808,21 @@ expect {
     1
     3
 }
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test type-without-operators-converts-literal-same-with-and-without-index {
+    CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE plain(x upper_text) STRICT;
+    CREATE TABLE indexed(x upper_text PRIMARY KEY) STRICT;
+    INSERT INTO plain VALUES ('hello');
+    INSERT INTO indexed VALUES ('hello');
+    SELECT
+        (SELECT count(*) FROM plain WHERE x = 'hello'),
+        (SELECT count(*) FROM indexed WHERE x = 'hello'),
+        (SELECT count(*) FROM plain WHERE x IN ('hello', 'HELLO')),
+        (SELECT count(*) FROM indexed WHERE x IN ('hello', 'HELLO'));
+}
+expect {
+    1|1|1|1
+}
