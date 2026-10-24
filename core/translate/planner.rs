@@ -2129,8 +2129,10 @@ fn parse_table(
     }
 
     // Resolve table using connection's with_schema method
-    let database_id = resolver.resolve_existing_table_database_id_qualified(qualified_name)?;
-    let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
+    let resolved = resolver.resolve_existing_table(qualified_name)?;
+    let database_id = resolved.database_id();
+    let stored_name = resolved.stored_name.as_str();
+    let table = resolver.with_schema(database_id, |schema| schema.get_table(stored_name));
 
     if let Some(table) = table {
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
@@ -2165,8 +2167,7 @@ fn parse_table(
         return Ok(());
     };
 
-    let regular_view =
-        resolver.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
+    let regular_view = resolver.with_schema(database_id, |schema| schema.get_view(stored_name));
     if let Some(view) = regular_view {
         // Views are essentially query aliases, so just Expand the view as a subquery.
         let view_alias = maybe_alias
@@ -2180,18 +2181,19 @@ fn parse_table(
         // sqlite3FixSelect/sqlite3FixSrcList): a view's unqualified names are
         // fixed to the database it was created in, not resolved TEMP-first
         // like an ordinary top-level query.
-        let view_plan = resolver.with_view_scope(database_id, view.name.clone(), || {
-            program.with_view_expansion(database_id, &view.name, |program| {
-                prepare_select_plan(
-                    view.select_stmt.clone(),
-                    resolver,
-                    program,
-                    table_references.outer_query_refs(),
-                    QueryDestination::placeholder_for_subquery(),
-                    connection,
-                )
-            })
-        })?;
+        let view_plan =
+            resolver.with_view_scope(resolved.namespace.clone(), view.name.clone(), || {
+                program.with_view_expansion(database_id, &view.name, |program| {
+                    prepare_select_plan(
+                        view.select_stmt.clone(),
+                        resolver,
+                        program,
+                        table_references.outer_query_refs(),
+                        QueryDestination::placeholder_for_subquery(),
+                        connection,
+                    )
+                })
+            })?;
         table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
             view_alias,
             view_plan,
@@ -2205,13 +2207,13 @@ fn parse_table(
     }
 
     let view = resolver.with_schema(database_id, |schema| {
-        schema.get_materialized_view(table_name.as_str())
+        schema.get_materialized_view(stored_name)
     });
     if let Some(view) = view {
         // Every materialized view carries an explicit storage-version marker,
         // including circuits with no stateful operators.
         let has_compatible_storage = resolver.with_schema(database_id, |schema| {
-            schema.has_compatible_materialized_view_storage(table_name.as_str())
+            schema.has_compatible_materialized_view_storage(stored_name)
         });
 
         if !has_compatible_storage {
@@ -2302,9 +2304,7 @@ fn parse_table(
 
     // Check if this is an incompatible view
     let is_incompatible = resolver.with_schema(database_id, |schema| {
-        schema
-            .incompatible_views
-            .contains(&normalized_qualified_name)
+        schema.incompatible_views.contains(stored_name)
     });
 
     if is_incompatible {
@@ -2320,7 +2320,7 @@ fn parse_table(
 
     // A view row whose stored SQL failed to parse at schema load
     let is_broken_view = resolver.with_schema(database_id, |schema| {
-        schema.broken_views.contains(&normalized_qualified_name)
+        schema.broken_views.contains(stored_name)
     });
 
     if is_broken_view {

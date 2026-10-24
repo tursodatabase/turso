@@ -1,4 +1,4 @@
-use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType, RESERVED_TABLE_PREFIXES};
+use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::sequence::bind_sequence_names_in_select;
@@ -19,6 +19,7 @@ fn validate_materialized(
     connection: &Arc<crate::Connection>,
     database_id: usize,
     resolver: &Resolver,
+    view_name: &str,
     normalized_view_name: &str,
 ) -> Result<()> {
     // Check if experimental views are enabled
@@ -34,11 +35,8 @@ fn validate_materialized(
     if database_id != crate::MAIN_DB_ID {
         crate::bail_parse_error!("materialized views are not supported on attached databases");
     }
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| normalized_view_name.starts_with(prefix))
-    {
-        bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
+    if crate::namespace::is_reserved_object_name(view_name) {
+        bail_parse_error!("Object name reserved for internal use: {view_name}",);
     }
 
     // Check if view already exists (including broken sqlite_schema rows,
@@ -66,10 +64,12 @@ pub fn translate_create_materialized_view(
     if connection.mvcc_enabled() {
         bail_parse_error!("Materialized views are not supported in MVCC mode");
     }
-    let database_id = resolver.resolve_database_id_for_create(view_name)?;
+    let resolved = resolver.resolve_for_create(view_name, false)?;
+    let database_id = resolved.database_id();
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
+    let view_name_in_sql = resolved.namespace.name_in_sql(&view_name.name);
+    let normalized_view_name = resolved.stored_name;
 
     if if_not_exists
         && resolver.with_schema(database_id, |s| {
@@ -84,7 +84,13 @@ pub fn translate_create_materialized_view(
     // Validate the view can be created and extract its columns
     // This validation happens before updating sqlite_master to prevent
     // storing invalid view definitions
-    validate_materialized(&connection, database_id, resolver, &normalized_view_name)?;
+    validate_materialized(
+        &connection,
+        database_id,
+        resolver,
+        &resolved.name,
+        &normalized_view_name,
+    )?;
 
     // Check for cross-database table references first
     crate::util::validate_select_for_views(select_stmt, view_name.namespace.as_ref())?;
@@ -114,7 +120,7 @@ pub fn translate_create_materialized_view(
     // first (#9456): a TEMP table that happens to share a source table's
     // name must not shadow it here.
     let maintenance_plan =
-        resolver.with_view_scope(database_id, normalized_view_name.clone(), || {
+        resolver.with_view_scope(resolved.namespace, normalized_view_name.clone(), || {
             resolver.with_schema(database_id, |_| {
                 crate::incremental::vdbe_maintenance::plan_view(
                     &normalized_view_name,
@@ -139,7 +145,7 @@ pub fn translate_create_materialized_view(
     // Reconstruct the SQL string for storage
     let sql = create_view_to_str(
         "MATERIALIZED VIEW",
-        &view_name.name.as_ident(),
+        &view_name_in_sql.as_ident(),
         columns,
         select_stmt,
     );
@@ -328,11 +334,8 @@ fn validate_create_view(
             crate::util::identifier_token_for_error(view_name)
         )));
     }
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| normalized_view_name.starts_with(prefix))
-    {
-        bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
+    if crate::namespace::is_reserved_object_name(&normalize_ident(view_name.as_str())) {
+        bail_parse_error!("Object name reserved for internal use: {view_name}",);
     }
     Ok(())
 }
@@ -348,14 +351,12 @@ pub fn translate_create_view(
 ) -> Result<()> {
     // TEMP views always live in the temp schema. The parser rejects
     // CREATE TEMP VIEW with a database name other than "temp".
-    let database_id = if temporary {
-        crate::TEMP_DB_ID
-    } else {
-        resolver.resolve_database_id_for_create(view_name)?
-    };
+    let resolved = resolver.resolve_for_create(view_name, temporary)?;
+    let database_id = resolved.database_id();
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
+    let view_name_in_sql = resolved.namespace.name_in_sql(&view_name.name);
+    let normalized_view_name = resolved.stored_name;
 
     if if_not_exists
         && resolver.with_schema(database_id, |s| {
@@ -407,7 +408,7 @@ pub fn translate_create_view(
     if resolver.dialect.binds_names_at_create() {
         bind_sequence_names_in_select(&mut select_stmt, resolver)?;
     }
-    let sql = create_view_to_str("VIEW", &view_name.name.as_ident(), columns, &select_stmt);
+    let sql = create_view_to_str("VIEW", &view_name_in_sql.as_ident(), columns, &select_stmt);
 
     // Open cursor to sqlite_schema table
     let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
@@ -475,15 +476,17 @@ pub fn translate_drop_view(
 ) -> Result<()> {
     // Unqualified names search the temp schema first, then main, then
     // attached databases, so DROP VIEW finds temp views like SQLite does.
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
-    let Some(database_id) = resolver.find_existing_table_database_id_qualified(view_name)? else {
+    let Some(resolved) = resolver.find_existing_table(view_name)? else {
         if if_exists {
             return Ok(());
         }
         return Err(crate::LimboError::ParseError(format!(
-            "no such view: {normalized_view_name}"
+            "no such view: {}",
+            normalize_ident(view_name.name.as_str())
         )));
     };
+    let database_id = resolved.database_id();
+    let normalized_view_name = resolved.stored_name;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 

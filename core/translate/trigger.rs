@@ -1,5 +1,4 @@
-use crate::schema::RESERVED_TABLE_PREFIXES;
-use crate::translate::emitter::Resolver;
+use crate::translate::emitter::{ResolvedName, Resolver};
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
@@ -92,33 +91,45 @@ pub fn translate_create_trigger(
     temporary: bool,
     if_not_exists: bool,
     time: Option<ast::TriggerTime>,
+    event: &ast::TriggerEvent,
     tbl_name: QualifiedName,
+    for_each_row: bool,
     program: &mut ProgramBuilder,
-    sql: String,
     commands: &[ast::TriggerCmd],
     when_clause: Option<&ast::Expr>,
 ) -> Result<()> {
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| normalized_trigger_name.starts_with(prefix))
-    {
+    if crate::namespace::is_reserved_object_name(&normalized_trigger_name) {
         bail_parse_error!(
             "Object name reserved for internal use: {}",
             trigger_name.name.as_str()
         );
     }
-    let normalized_table_name = normalize_ident(tbl_name.name.as_str());
-    let database_id =
-        resolve_create_trigger_database_id(resolver, &trigger_name, &tbl_name, temporary)?;
-    let target_table_database_id = if temporary {
+    let trigger = resolve_create_trigger(resolver, &trigger_name, &tbl_name, temporary)?;
+    let database_id = trigger.database_id();
+    let trigger_name_in_sql = trigger.namespace.qualified_name_in_sql(&trigger_name);
+    let normalized_trigger_name = trigger.stored_name;
+    let target_table = if temporary {
         // A temp trigger's target table can be in any schema.
-        resolver.resolve_existing_table_database_id_qualified(&tbl_name)?
+        resolver.resolve_existing_table(&tbl_name)?
     } else if tbl_name.namespace.is_some() {
-        resolver.resolve_database_id(&tbl_name)?
+        resolver.resolve_object(&tbl_name)?
     } else {
-        database_id
+        ResolvedName::in_namespace(trigger.namespace, &normalize_ident(tbl_name.name.as_str()))
     };
+    let target_table_database_id = target_table.database_id();
+    let sql = create_trigger_to_sql(
+        temporary,
+        if_not_exists,
+        &trigger_name_in_sql,
+        time,
+        event,
+        &target_table.namespace.qualified_name_in_sql(&tbl_name),
+        for_each_row,
+        when_clause,
+        commands,
+    );
+    let normalized_table_name = target_table.stored_name;
     // Temp triggers are allowed to reference tables in other databases.
     if target_table_database_id != database_id && database_id != crate::TEMP_DB_ID {
         let table_db_name = tbl_name
@@ -264,26 +275,30 @@ pub fn translate_create_trigger(
     Ok(())
 }
 
-fn resolve_create_trigger_database_id(
+fn resolve_create_trigger(
     resolver: &Resolver,
     trigger_name: &QualifiedName,
     tbl_name: &QualifiedName,
     temporary: bool,
-) -> Result<usize> {
+) -> Result<ResolvedName> {
     // TEMP triggers always live in the temp schema.
     if temporary {
-        return Ok(crate::TEMP_DB_ID);
+        return Ok(resolver.resolved_in_database(
+            crate::TEMP_DB_ID,
+            &normalize_ident(trigger_name.name.as_str()),
+        ));
     }
     if trigger_name.namespace.is_some() {
-        return resolver.resolve_database_id(trigger_name);
+        return resolver.resolve_object(trigger_name);
     }
 
     // Unqualified trigger names default to main, except when the trigger is
     // attached to a temp object. SQLite stores those triggers in temp.
-    match resolver.resolve_existing_table_database_id_qualified(tbl_name)? {
-        crate::TEMP_DB_ID => Ok(crate::TEMP_DB_ID),
-        _ => Ok(crate::MAIN_DB_ID),
-    }
+    let database_id = match resolver.resolve_existing_table(tbl_name)?.database_id() {
+        crate::TEMP_DB_ID => crate::TEMP_DB_ID,
+        _ => crate::MAIN_DB_ID,
+    };
+    Ok(resolver.resolved_in_database(database_id, &normalize_ident(trigger_name.name.as_str())))
 }
 
 /// Validate that no table or expression reference in a trigger body points to a
@@ -517,11 +532,12 @@ pub fn translate_drop_trigger(
     if_exists: bool,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = resolver.resolve_existing_trigger_database_id(trigger_name)?;
+    let resolved = resolver.resolve_existing_trigger(trigger_name)?;
+    let database_id = resolved.database_id();
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     program.begin_write_operation()?;
-    let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
+    let normalized_trigger_name = resolved.stored_name;
 
     // Check if trigger exists
     if resolver.with_schema(database_id, |s| {

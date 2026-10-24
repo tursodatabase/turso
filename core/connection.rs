@@ -412,6 +412,9 @@ pub struct Connection {
     /// The names that qualify object names in SQL, each referring to a
     /// database.
     pub(super) namespaces: crate::Namespaces,
+    /// Whether the connection is running DDL that the engine wrote, which
+    /// may name the objects the engine reserves for itself.
+    pub(super) runs_engine_ddl: AtomicBool,
     /// The namespace names that a name without a namespace is looked up
     /// through, in order. None means main, then the other databases by id.
     pub(super) search_path: RwLock<Option<Vec<String>>>,
@@ -2951,9 +2954,9 @@ impl Connection {
 
     pub fn attached_database_names(&self) -> Vec<String> {
         self.namespaces
-            .others()
+            .attached_databases()
             .into_iter()
-            .map(|(_, name)| name)
+            .map(|namespace| namespace.name)
             .collect()
     }
 
@@ -3194,7 +3197,7 @@ impl Connection {
 
     /// Get the database id for a schema name ("main", "temp", or an attached db alias).
     pub(crate) fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
-        self.namespaces
+        self.namespaces()
             .database_id(&crate::util::normalize_ident(name))
             .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {name}")))
     }
@@ -3220,9 +3223,9 @@ impl Connection {
 
     pub(crate) fn is_attached(&self, alias: &str) -> bool {
         self.namespaces
-            .others()
+            .attached_databases()
             .iter()
-            .any(|(_, name)| name == alias)
+            .any(|namespace| namespace.name == alias)
     }
 
     /// List all attached database aliases
@@ -3320,14 +3323,24 @@ impl Connection {
         &self.attached_databases
     }
 
-    pub(crate) fn namespaces(&self) -> &crate::Namespaces {
-        &self.namespaces
+    /// The namespaces of the connection: the ones added to it and the ones
+    /// stored in the main database, as of the latest schema the connection
+    /// can adopt.
+    pub(crate) fn namespaces(&self) -> crate::Namespaces {
+        self.maybe_update_schema();
+        let schema = self.schema.read().clone();
+        self.namespaces_in(&schema)
     }
 
-    /// Adds namespace `name`, which refers to database `database_id`, so
-    /// that `name.t` names the objects of that database.
-    pub fn add_namespace(&self, name: &str, database_id: usize) {
-        self.namespaces.add(name, database_id);
+    /// The namespaces of the connection as of `schema`, the main database's
+    /// schema.
+    pub(crate) fn namespaces_in(&self, schema: &Schema) -> crate::Namespaces {
+        self.namespaces.with_stored(schema.namespaces.values())
+    }
+
+    /// Adds `namespace` under its name, so that `name.t` names its objects.
+    pub fn add_namespace(&self, namespace: crate::Namespace) {
+        self.namespaces.add(namespace);
         self.bump_prepare_context_generation();
     }
 
@@ -3338,9 +3351,92 @@ impl Connection {
         database_id
     }
 
-    /// The name of the namespace that refers to database `database_id`.
+    /// Creates namespace `name` in the main database, as DDL of the
+    /// connection's transaction, and returns it. The namespace's objects
+    /// are stored under its id, so `name` can be anything that no
+    /// namespace is called yet.
+    pub fn create_stored_namespace(self: &Arc<Self>, name: &str) -> Result<crate::Namespace> {
+        let namespaces = self.namespaces();
+        if namespaces.get(name).is_some() {
+            return Err(LimboError::InvalidArgument(format!(
+                "namespace {name} already exists"
+            )));
+        }
+        let id = self
+            .schema
+            .read()
+            .namespaces
+            .values()
+            .filter_map(|namespace| namespace.id)
+            .max()
+            .map_or(1, |id| id + 1);
+        let namespace = crate::Namespace::stored(name, id);
+        let marker_table = namespace
+            .marker_table()
+            .expect("a stored namespace has a marker table");
+        self.run_engine_ddl(format!(
+            "CREATE TABLE main.\"{}\" (name TEXT)",
+            marker_table.replace('"', "\"\"")
+        ))?;
+        Ok(namespace)
+    }
+
+    /// Drops namespace `name` from the main database, as DDL of the
+    /// connection's transaction. Its objects stay stored under its id, so
+    /// the caller drops them first.
+    pub fn drop_stored_namespace(self: &Arc<Self>, name: &str) -> Result<()> {
+        let marker_table = self
+            .namespaces()
+            .get(name)
+            .and_then(|namespace| namespace.marker_table())
+            .ok_or_else(|| {
+                LimboError::InvalidArgument(format!("no such stored namespace: {name}"))
+            })?;
+        self.run_engine_ddl(format!(
+            "DROP TABLE main.\"{}\"",
+            marker_table.replace('"', "\"\"")
+        ))
+    }
+
+    /// Runs `sql`, DDL that the engine wrote, as a statement of the
+    /// connection's transaction. The statement may name the objects the
+    /// engine reserves for itself.
+    fn run_engine_ddl(self: &Arc<Self>, sql: String) -> Result<()> {
+        struct Done<'a>(&'a Connection);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.runs_engine_ddl.store(false, Ordering::SeqCst);
+            }
+        }
+        self.runs_engine_ddl.store(true, Ordering::SeqCst);
+        let _done = Done(self);
+        self.prepare_sqlite(sql)?.run_ignore_rows()
+    }
+
+    pub fn runs_engine_ddl(&self) -> bool {
+        self.runs_engine_ddl.load(Ordering::SeqCst)
+    }
+
+    /// The name of the namespace that is the whole of database `database_id`.
     pub fn namespace_name(&self, database_id: usize) -> Option<String> {
-        self.namespaces.name(database_id)
+        self.namespaces()
+            .of_database(database_id)
+            .map(|namespace| namespace.name)
+    }
+
+    /// The namespace called `name`. `name` is normalized.
+    pub fn namespace(&self, name: &str) -> Option<crate::Namespace> {
+        self.namespaces().get(name)
+    }
+
+    /// The database that namespace `name` refers to. `name` is normalized.
+    pub fn namespace_database_id(&self, name: &str) -> Option<usize> {
+        self.namespaces().database_id(name)
+    }
+
+    /// The namespaces other than main and temp.
+    pub fn other_namespaces(&self) -> Vec<crate::Namespace> {
+        self.namespaces().others()
     }
 
     /// Sets the namespace names that a name without a namespace is looked
@@ -3358,11 +3454,11 @@ impl Connection {
         self.search_path.read().clone()
     }
 
-    /// The databases that a name without a namespace is looked up in, in
+    /// The namespaces that a name without a namespace is looked up in, in
     /// order. The first one is where CREATE puts an object whose name has
     /// no namespace.
-    pub fn search_order(&self) -> Vec<usize> {
-        self.namespaces
+    pub fn search_order(&self) -> Vec<crate::Namespace> {
+        self.namespaces()
             .search_order(self.search_path.read().as_deref())
     }
 
@@ -3428,13 +3524,14 @@ impl Connection {
 
         // Add attached databases
         let attached_dbs = self.attached_databases.read();
-        for (seq_number, alias) in self.namespaces.others() {
+        for namespace in self.namespaces.attached_databases() {
+            let seq_number = namespace.database_id;
             let file_path = if let Some(entry) = attached_dbs.index_to_data.get(&seq_number) {
                 Self::get_canonical_path_for_database(&entry.db)
             } else {
                 String::new()
             };
-            databases.push((seq_number, alias, file_path));
+            databases.push((seq_number, namespace.name, file_path));
         }
 
         // Sort by sequence number to ensure consistent ordering
@@ -3589,26 +3686,32 @@ impl Connection {
         let not_found = |seq_name: &str| {
             LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
         };
-        let get = |db_id: usize, seq_name: &str| {
-            self.with_schema(db_id, |schema| {
-                schema.get_sequence(seq_name).map(Arc::clone)
+        let get = |namespace: &crate::Namespace, seq_name: &str| {
+            let stored_name = namespace.stored_name(seq_name);
+            self.with_schema(namespace.database_id, |schema| {
+                schema.get_sequence(&stored_name).map(Arc::clone)
             })
-            .map(|sequence| (db_id, sequence))
+            .map(|sequence| (namespace.database_id, sequence))
         };
-        if let Some((schema, seq)) = name.split_once('.') {
-            let db_id = self.get_database_id_by_name(schema)?;
+        if let Some((namespace, seq)) = name.split_once('.') {
+            let namespace = self
+                .namespaces()
+                .get(&crate::util::normalize_ident(namespace))
+                .ok_or_else(|| {
+                    LimboError::InvalidArgument(format!("no such database: {namespace}"))
+                })?;
             let seq_name = crate::util::normalize_ident(seq);
-            return get(db_id, &seq_name).ok_or_else(|| not_found(&seq_name));
+            return get(&namespace, &seq_name).ok_or_else(|| not_found(&seq_name));
         }
         let seq_name = crate::util::normalize_ident(name);
-        let mut databases = Vec::new();
+        let mut namespaces = Vec::new();
         if self.temp.database.read().is_some() {
-            databases.push(TEMP_DB_ID);
+            namespaces.extend(self.namespaces.of_database(TEMP_DB_ID));
         }
-        databases.extend(self.search_order());
-        databases
-            .into_iter()
-            .find_map(|db_id| get(db_id, &seq_name))
+        namespaces.extend(self.search_order());
+        namespaces
+            .iter()
+            .find_map(|namespace| get(namespace, &seq_name))
             .ok_or_else(|| not_found(&seq_name))
     }
 
@@ -5147,6 +5250,18 @@ mod tests {
         }
     }
 
+    /// Like `query_single_i64`, but runs the statement to its end so that
+    /// what it wrote is committed.
+    fn run_single_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let value = match stmt.step().unwrap() {
+            StepResult::Row => stmt.row().unwrap().get::<i64>(0).unwrap(),
+            other => panic!("expected a row, got {other:?}"),
+        };
+        while !matches!(stmt.step().unwrap(), StepResult::Done) {}
+        value
+    }
+
     fn text_value(value: &Value) -> &str {
         match value {
             Value::Text(text) => text.as_str(),
@@ -5259,6 +5374,127 @@ mod tests {
         assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
         conn.execute("CREATE TABLE v(z INTEGER)").unwrap();
         assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM main.v"), 0);
+    }
+
+    #[test]
+    fn test_a_stored_namespace_names_the_objects_stored_under_its_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(&temp_dir.path().join("main.db"), DatabaseOpts::new());
+        conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(1)")
+            .unwrap();
+        let app = conn.create_stored_namespace("app").unwrap();
+        assert_eq!(app, crate::Namespace::stored("app", 1));
+        assert_eq!(conn.namespace("app"), Some(app));
+        assert!(conn.create_stored_namespace("app").is_err());
+        assert!(conn.create_stored_namespace("main").is_err());
+        conn.execute("CREATE TABLE app.t(x INTEGER); INSERT INTO app.t VALUES(5)")
+            .unwrap();
+
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.t"), 5);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM __turso_ns1_t"), 5);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 1);
+        conn.execute("INSERT INTO app.t VALUES(6)").unwrap();
+        conn.execute("UPDATE app.t SET x = x + 10 WHERE x = 6")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT sum(x) FROM app.t"), 21);
+        conn.execute("DELETE FROM app.t WHERE x = 16").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM app.t"), 1);
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM t"), 1);
+        assert!(conn
+            .execute("CREATE TABLE __turso_ns1_u(x INTEGER)")
+            .is_err());
+        assert!(conn
+            .execute("CREATE TABLE app.__turso_ns1_u(x INTEGER)")
+            .is_err());
+        assert!(conn
+            .execute("CREATE TABLE __turso_internal_namespace_2_shop(x INTEGER)")
+            .is_err());
+        assert!(conn
+            .execute("DROP TABLE __turso_internal_namespace_1_app")
+            .is_err());
+
+        conn.execute("DROP TABLE app.t").unwrap();
+        assert!(conn.prepare("SELECT x FROM app.t").is_err());
+        assert!(conn.prepare("SELECT x FROM __turso_ns1_t").is_err());
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 1);
+        conn.drop_stored_namespace("app").unwrap();
+        assert_eq!(conn.namespace("app"), None);
+        assert!(conn.prepare("SELECT x FROM app.t").is_err());
+        assert!(conn.drop_stored_namespace("app").is_err());
+        assert!(conn.drop_stored_namespace("main").is_err());
+        let shop = conn.create_stored_namespace("shop").unwrap();
+        assert_eq!(shop.id, Some(1));
+    }
+
+    #[test]
+    fn test_a_stored_namespace_is_part_of_its_transaction_and_seen_by_other_connections() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("main.db");
+        let conn = open_connection_with_opts(&path, DatabaseOpts::new());
+        let other = conn.db.connect(ConnectOpts::new()).unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        conn.create_stored_namespace("app").unwrap();
+        conn.execute("CREATE TABLE app.t(x INTEGER); INSERT INTO app.t VALUES(5)")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.t"), 5);
+        assert_eq!(other.namespace("app"), None);
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(conn.namespace("app"), None);
+        assert!(conn.prepare("SELECT x FROM app.t").is_err());
+
+        conn.execute("BEGIN").unwrap();
+        conn.create_stored_namespace("app").unwrap();
+        conn.execute("CREATE TABLE app.t(x INTEGER); INSERT INTO app.t VALUES(5)")
+            .unwrap();
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(
+            other.namespace("app"),
+            Some(crate::Namespace::stored("app", 1))
+        );
+        assert_eq!(query_single_i64(&other, "SELECT x FROM app.t"), 5);
+
+        drop(other);
+        drop(conn);
+        let reopened = open_connection(&path);
+        assert_eq!(
+            reopened.namespace("app"),
+            Some(crate::Namespace::stored("app", 1))
+        );
+        assert_eq!(query_single_i64(&reopened, "SELECT x FROM app.t"), 5);
+    }
+
+    #[test]
+    fn test_the_search_path_finds_objects_through_a_stored_namespace() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(&temp_dir.path().join("main.db"), DatabaseOpts::new());
+        conn.create_stored_namespace("app").unwrap();
+        conn.execute("CREATE TABLE app.t(x INTEGER); INSERT INTO app.t VALUES(5)")
+            .unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(1)")
+            .unwrap();
+        conn.execute("CREATE SEQUENCE app.s START WITH 100")
+            .unwrap();
+        conn.execute("CREATE SEQUENCE s START WITH 1").unwrap();
+
+        conn.set_search_path(Some(vec!["app".to_string()]));
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
+        assert_eq!(run_single_i64(&conn, "SELECT nextval('s')"), 100);
+        assert_eq!(query_single_i64(&conn, "SELECT currval('s')"), 100);
+        assert_eq!(run_single_i64(&conn, "SELECT nextval('app.s')"), 101);
+        assert_eq!(run_single_i64(&conn, "SELECT nextval('main.s')"), 1);
+        assert_eq!(conn.search_order()[0].name, "app");
+
+        conn.set_search_path(Some(vec!["main".to_string(), "app".to_string()]));
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 1);
+        assert_eq!(run_single_i64(&conn, "SELECT nextval('s')"), 2);
+        conn.execute("DROP TABLE t").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
+
+        conn.set_search_path(Some(vec!["app".to_string(), "main".to_string()]));
+        conn.execute("DROP SEQUENCE s").unwrap();
+        assert!(conn.prepare("SELECT nextval('app.s')").is_err());
+        assert_eq!(run_single_i64(&conn, "SELECT nextval('s')"), 3);
     }
 
     #[test]

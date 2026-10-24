@@ -20,7 +20,7 @@ use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
-use crate::translate::emitter::{Resolver, TransactionMode};
+use crate::translate::emitter::{ResolvedName, Resolver, TransactionMode};
 use crate::translate::plan::BitSet;
 use crate::util::{
     normalize_ident, parse_signed_number, parse_string, IOExt as _,
@@ -28,6 +28,7 @@ use crate::util::{
 };
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
+use crate::Namespace;
 use crate::{
     bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Result, Value,
     CDC_VERSION_CURRENT,
@@ -93,41 +94,41 @@ fn normalize_table_pragma_lookup_name(database_id: usize, name: &str) -> String 
     }
 }
 
-fn resolve_table_pragma_database_id(
+fn resolve_table_pragma_name(
     resolver: &Resolver,
-    default_database_id: usize,
-    schema_was_explicit: bool,
+    explicit_namespace: Option<&Namespace>,
     table_name: &str,
-) -> crate::Result<usize> {
-    if schema_was_explicit {
-        return Ok(default_database_id);
+) -> crate::Result<ResolvedName> {
+    if let Some(namespace) = explicit_namespace {
+        return Ok(ResolvedName::in_namespace(namespace.clone(), table_name));
     }
 
     if table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME)
         || table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT)
     {
-        return Ok(crate::TEMP_DB_ID);
+        return Ok(resolver.resolved_in_database(crate::TEMP_DB_ID, table_name));
     }
-    resolver.resolve_existing_table_database_id(table_name)
+    resolver.resolve_existing_table_named(table_name)
 }
 
-fn resolve_index_pragma_database_id(
+fn resolve_index_pragma_name(
     resolver: &Resolver,
-    default_database_id: usize,
-    schema_was_explicit: bool,
+    explicit_namespace: Option<&Namespace>,
     index_name: &str,
-) -> crate::Result<usize> {
-    if schema_was_explicit {
-        return Ok(default_database_id);
+) -> crate::Result<ResolvedName> {
+    if let Some(namespace) = explicit_namespace {
+        return Ok(ResolvedName::in_namespace(namespace.clone(), index_name));
     }
 
     let has_index =
         |schema: &Schema, name: &str| !matches!(find_index_by_name(schema, name), Ok(None));
-    let database_id = resolver.resolve_unqualified_existing_database_id(index_name, has_index)?;
-    if resolver.with_schema(database_id, |schema| has_index(schema, index_name)) {
-        return Ok(database_id);
+    let index = resolver.resolve_unqualified_existing(index_name, has_index)?;
+    if resolver.with_schema(index.database_id(), |schema| {
+        has_index(schema, &index.stored_name)
+    }) {
+        return Ok(index);
     }
-    resolver.resolve_unqualified_existing_database_id(index_name, |schema, name| {
+    resolver.resolve_unqualified_existing(index_name, |schema, name| {
         schema
             .get_btree_table(name)
             .is_some_and(|table| !table.has_rowid)
@@ -247,14 +248,15 @@ pub fn translate_pragma(
         return Ok(());
     }
 
-    let database_id = resolver.resolve_database_id(name)?;
+    let pragma_namespace = resolver.resolve_object(name)?.namespace;
+    let database_id = pragma_namespace.database_id;
 
     let Some(pragma) = parse_pragma_name(name.name.as_str()) else {
         // SQLite silently ignores unknown PRAGMA names.
         return Ok(());
     };
 
-    let schema_was_explicit = name.namespace.is_some();
+    let explicit_namespace = name.namespace.is_some().then_some(&pragma_namespace);
     let query_only = connection.get_query_only();
 
     let mode = match body {
@@ -265,7 +267,7 @@ pub fn translate_pragma(
             pager,
             connection,
             database_id,
-            schema_was_explicit,
+            explicit_namespace,
             program,
         )?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
@@ -286,7 +288,7 @@ pub fn translate_pragma(
                 pager,
                 connection,
                 database_id,
-                schema_was_explicit,
+                explicit_namespace,
                 program,
             )?,
             _ => update_pragma(
@@ -296,7 +298,7 @@ pub fn translate_pragma(
                 pager,
                 connection,
                 database_id,
-                schema_was_explicit,
+                explicit_namespace,
                 program,
             )?,
         },
@@ -332,7 +334,7 @@ fn update_pragma(
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     database_id: usize,
-    schema_was_explicit: bool,
+    explicit_namespace: Option<&Namespace>,
     program: &mut ProgramBuilder,
 ) -> crate::Result<TransactionMode> {
     let parse_pragma_enabled = |expr: &ast::Expr| -> bool {
@@ -434,7 +436,7 @@ fn update_pragma(
                 pager,
                 connection,
                 database_id,
-                schema_was_explicit,
+                explicit_namespace,
                 program,
             )
         }
@@ -470,7 +472,7 @@ fn update_pragma(
                 pager,
                 connection,
                 database_id,
-                schema_was_explicit,
+                explicit_namespace,
                 program,
             )
         }
@@ -481,7 +483,7 @@ fn update_pragma(
             pager,
             connection,
             database_id,
-            schema_was_explicit,
+            explicit_namespace,
             program,
         ),
         PragmaName::ModuleList => Ok(TransactionMode::None),
@@ -492,7 +494,7 @@ fn update_pragma(
             pager,
             connection,
             database_id,
-            schema_was_explicit,
+            explicit_namespace,
             program,
         ),
         PragmaName::MaxPageCount => {
@@ -664,7 +666,7 @@ fn update_pragma(
             pager,
             connection,
             database_id,
-            schema_was_explicit,
+            explicit_namespace,
             program,
         ),
         PragmaName::FreelistCount => query_pragma(
@@ -674,7 +676,7 @@ fn update_pragma(
             pager,
             connection,
             database_id,
-            schema_was_explicit,
+            explicit_namespace,
             program,
         ),
         PragmaName::EncryptionKey => {
@@ -843,7 +845,7 @@ fn update_pragma(
             pager,
             connection,
             database_id,
-            schema_was_explicit,
+            explicit_namespace,
             program,
         ),
     }
@@ -857,7 +859,7 @@ fn query_pragma(
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     database_id: usize,
-    schema_was_explicit: bool,
+    explicit_namespace: Option<&Namespace>,
     program: &mut ProgramBuilder,
 ) -> crate::Result<TransactionMode> {
     let schema = resolver.schema();
@@ -1097,12 +1099,9 @@ fn query_pragma(
             program.alloc_registers(2);
 
             if let Some(index_name) = index_name {
-                let index_database_id = resolve_index_pragma_database_id(
-                    resolver,
-                    database_id,
-                    schema_was_explicit,
-                    &index_name,
-                )?;
+                let index = resolve_index_pragma_name(resolver, explicit_namespace, &index_name)?;
+                let index_database_id = index.database_id();
+                let index_name = index.stored_name;
                 resolver.with_schema(index_database_id, |schema| -> Result<()> {
                     if let Some(index) =
                         find_index_or_without_rowid_primary_key(schema, &index_name)?
@@ -1135,12 +1134,9 @@ fn query_pragma(
             program.alloc_registers(5);
 
             if let Some(index_name) = index_name {
-                let index_database_id = resolve_index_pragma_database_id(
-                    resolver,
-                    database_id,
-                    schema_was_explicit,
-                    &index_name,
-                )?;
+                let index = resolve_index_pragma_name(resolver, explicit_namespace, &index_name)?;
+                let index_database_id = index.database_id();
+                let index_name = index.stored_name;
                 resolver.with_schema(index_database_id, |schema| -> Result<()> {
                     if let Some(index) =
                         find_index_or_without_rowid_primary_key(schema, &index_name)?
@@ -1215,12 +1211,9 @@ fn query_pragma(
             program.alloc_registers(4);
 
             if let Some(table_name) = table_name {
-                let table_database_id = resolve_table_pragma_database_id(
-                    resolver,
-                    database_id,
-                    schema_was_explicit,
-                    &table_name,
-                )?;
+                let table = resolve_table_pragma_name(resolver, explicit_namespace, &table_name)?;
+                let table_database_id = table.database_id();
+                let table_name = table.stored_name;
                 resolver.with_schema(table_database_id, |schema| -> Result<()> {
                     if let Some(table) = schema.get_table(&table_name) {
                         let btree = table.btree();
@@ -1289,13 +1282,10 @@ fn query_pragma(
             program.alloc_registers(7);
 
             if let Some(table_name) = table_name {
-                let table_name = table_name.as_str();
-                let table_database_id = resolve_table_pragma_database_id(
-                    resolver,
-                    database_id,
-                    schema_was_explicit,
-                    table_name,
-                )?;
+                let table =
+                    resolve_table_pragma_name(resolver, explicit_namespace, table_name.as_str())?;
+                let table_database_id = table.database_id();
+                let table_name = table.stored_name.as_str();
                 resolver.with_schema(table_database_id, |schema| {
                     let Some(table) = schema.get_table(table_name).and_then(|table| table.btree())
                     else {
@@ -1353,7 +1343,7 @@ fn query_pragma(
             // 6 columns: schema, name, type, ncol, wr, strict
             program.alloc_registers(5);
 
-            let database_ids = if schema_was_explicit {
+            let database_ids = if explicit_namespace.is_some() {
                 [database_id].into_iter().try_collect::<BitSet>()?
             } else {
                 visible_database_ids_for_table_list(connection.as_ref())?
@@ -1390,13 +1380,10 @@ fn query_pragma(
             // we need 6 registers, but first register was allocated at the beginning  of the "query_pragma" function
             program.alloc_registers(5);
             if let Some(name) = name {
-                let table_database_id = resolve_table_pragma_database_id(
-                    resolver,
-                    database_id,
-                    schema_was_explicit,
-                    &name,
-                )?;
-                let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
+                let table = resolve_table_pragma_name(resolver, explicit_namespace, &name)?;
+                let table_database_id = table.database_id();
+                let lookup_name =
+                    normalize_table_pragma_lookup_name(table_database_id, &table.stored_name);
                 resolver.with_schema(table_database_id, |db_schema| -> Result<()> {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
                         let primary_key_columns = match table.as_ref() {
@@ -1451,13 +1438,10 @@ fn query_pragma(
             // we need 7 registers, but first register was allocated at the beginning  of the "query_pragma" function
             program.alloc_registers(6);
             if let Some(name) = name {
-                let table_database_id = resolve_table_pragma_database_id(
-                    resolver,
-                    database_id,
-                    schema_was_explicit,
-                    &name,
-                )?;
-                let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
+                let table = resolve_table_pragma_name(resolver, explicit_namespace, &name)?;
+                let table_database_id = table.database_id();
+                let lookup_name =
+                    normalize_table_pragma_lookup_name(table_database_id, &table.stored_name);
                 resolver.with_schema(table_database_id, |db_schema| -> Result<()> {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
                         let primary_key_columns = match table.as_ref() {

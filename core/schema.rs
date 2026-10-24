@@ -7,6 +7,7 @@ use crate::incremental::view::{
     create_dbsp_state_index, dbsp_version_marker_table_name, DBSP_CIRCUIT_VERSION,
 };
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
+use crate::namespace::Namespace;
 use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
@@ -819,6 +820,8 @@ pub struct Schema {
     pub generated_columns_enabled: bool,
     /// Named sequences (CREATE SEQUENCE)
     pub sequences: HashMap<String, Arc<Sequence>>,
+    /// The namespaces stored in this schema, by name: one per marker table.
+    pub namespaces: HashMap<String, Namespace>,
 }
 
 impl Default for Schema {
@@ -963,6 +966,7 @@ impl Schema {
             type_registry,
             generated_columns_enabled: false,
             sequences: HashMap::default(),
+            namespaces: HashMap::default(),
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -1583,6 +1587,9 @@ impl Schema {
         #[cfg(feature = "conn_raw_api")]
         self.table_names_by_root_page
             .insert(table.root_page, name.clone());
+        if let Some(namespace) = Namespace::of_marker_table(&name) {
+            self.namespaces.insert(namespace.name.clone(), namespace);
+        }
         self.tables.insert(name, Table::BTree(table).into());
         Ok(())
     }
@@ -1617,6 +1624,9 @@ impl Schema {
         #[cfg(not(feature = "conn_raw_api"))]
         {
             self.tables.remove(&name);
+        }
+        if let Some(namespace) = Namespace::of_marker_table(&name) {
+            self.namespaces.remove(&namespace.name);
         }
         self.analyze_stats.remove_table(&name);
 
@@ -3107,6 +3117,7 @@ crate::alloc::impl_try_clone_via_clone!(
 // forwarding to `Clone` is correct today. TODO(alloc): give these real
 // fallible impls when their fields become allocator-aware.
 crate::alloc::impl_try_clone_via_clone!(Column, IndexColumn, CheckConstraint, UniqueSetColumn);
+crate::alloc::impl_try_clone_via_clone!(Namespace);
 
 impl Schema {
     #[turso_macros::allocation_site(crate::alloc::SchemaAllocationSite::MakeMut)]
@@ -3313,6 +3324,7 @@ impl TryClone for Schema {
             type_registry: self.type_registry.try_clone()?,
             generated_columns_enabled: self.generated_columns_enabled,
             sequences: self.sequences.try_clone()?,
+            namespaces: self.namespaces.try_clone()?,
         })
     }
 }
