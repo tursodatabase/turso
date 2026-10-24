@@ -6,12 +6,7 @@ use crate::json::error::{Error as PError, Result as PResult};
 use crate::json::Conv;
 use crate::types::{value_blob_from_slice, ValueBlob};
 use crate::{bail_parse_error, LimboError, Result};
-use std::{
-    borrow::Cow,
-    collections::{HashMap, VecDeque},
-    fmt::Write,
-    str::from_utf8,
-};
+use std::{borrow::Cow, collections::HashMap, fmt::Write, str::from_utf8};
 
 use super::path::{JsonPath, PathElement};
 
@@ -3250,124 +3245,130 @@ impl Jsonb {
             return Ok(());
         }
 
-        let result = self;
-
-        let mut work_stack = VecDeque::with_capacity(10);
-        work_stack.push_back((
-            JsonPath {
+        self.patch_object(
+            patch,
+            0,
+            &JsonPath {
                 elements: vec![PathElement::Root()],
             },
             0,
-        ));
+        )
+    }
 
-        while let Some((path, patch_cursor)) = work_stack.pop_front() {
-            let (patch_obj_header, patch_obj_header_size) = patch.read_header(patch_cursor)?;
+    /// Merge the object that starts at `patch_cursor` into the value at `path`.
+    /// SQLite's `jsonMergePatch()` applies the patch members in the order the
+    /// patch lists them and recurses into an object value as soon as it reaches
+    /// it; applying the object members in a later round lets one of them write
+    /// into a member a later `null` has already removed.
+    fn patch_object(
+        &mut self,
+        patch: &Jsonb,
+        patch_cursor: usize,
+        path: &JsonPath,
+        depth: usize,
+    ) -> Result<()> {
+        // The recursion goes one level deeper per nesting level of the patch, so
+        // without this a deeply nested patch would abort the process instead of
+        // raising an error.
+        if depth > MAX_JSON_DEPTH {
+            bail_parse_error!("Too deep");
+        }
 
-            if patch_obj_header.0 != ElementType::OBJECT {
-                continue;
+        let (patch_obj_header, patch_obj_header_size) = patch.read_header(patch_cursor)?;
+
+        if patch_obj_header.0 != ElementType::OBJECT {
+            return Ok(());
+        }
+
+        let patch_end = patch_cursor + patch_obj_header_size + patch_obj_header.1;
+        let mut patch_key_cursor = patch_cursor + patch_obj_header_size;
+
+        while patch_key_cursor < patch_end {
+            let (key_header, key_header_size) = patch.read_header(patch_key_cursor)?;
+            if !key_header.0.is_valid_key() {
+                return Err(LimboError::ParseError("Invalid key type".to_string()));
             }
 
-            let patch_end = patch_cursor + patch_obj_header_size + patch_obj_header.1;
-            let mut patch_key_cursor = patch_cursor + patch_obj_header_size;
+            let key_start = patch_key_cursor + key_header_size;
+            let key_text = read_text_payload(&patch.data, key_start, key_header.1)?;
 
-            let mut key_values = Vec::new();
+            // Read the value
+            let value_cursor = key_start + key_header.1;
+            let (value_header, value_header_size) = patch.read_header(value_cursor)?;
+            let key_text = if matches!(
+                key_header.0,
+                ElementType::TEXT5 | ElementType::TEXTJ | ElementType::TEXTRAW
+            ) {
+                Cow::Owned(unescape_string(key_text))
+            } else {
+                Cow::Borrowed(key_text)
+            };
+            let value_type = value_header.0;
+            let value_size = value_header.1;
+            patch_key_cursor = value_cursor + value_header_size + value_size;
 
-            while patch_key_cursor < patch_end {
-                let (key_header, key_header_size) = patch.read_header(patch_key_cursor)?;
-                if !key_header.0.is_valid_key() {
-                    return Err(LimboError::ParseError("Invalid key type".to_string()));
+            // Create a path to this key
+            let mut key_path = path.clone();
+
+            key_path.elements.push(PathElement::Key(key_text, false));
+
+            match value_type {
+                ElementType::NULL => {
+                    let mut op = DeleteOperation::new();
+
+                    let _ = self.operate_on_path(&key_path, &mut op);
                 }
+                ElementType::OBJECT => {
+                    self.merge_object_member(patch, value_cursor, &key_path, depth)?;
+                }
+                _ => {
+                    let value_data =
+                        &patch.data[value_cursor..value_cursor + value_header_size + value_size];
+                    let patch_value = Jsonb::from_raw_data(value_data)?;
 
-                let key_start = patch_key_cursor + key_header_size;
-                let key_text = read_text_payload(&patch.data, key_start, key_header.1)?;
+                    let mut op = SetOperation::new(patch_value);
 
-                // Read the value
-                let value_cursor = key_start + key_header.1;
-                let (value_header, value_header_size) = patch.read_header(value_cursor)?;
-                let key_text = if matches!(
-                    key_header.0,
-                    ElementType::TEXT5 | ElementType::TEXTJ | ElementType::TEXTRAW
-                ) {
-                    Cow::Owned(unescape_string(key_text))
-                } else {
-                    Cow::Borrowed(key_text)
-                };
-
-                key_values.push((
-                    key_text,
-                    value_header.0,
-                    value_cursor,
-                    value_header_size,
-                    value_header.1,
-                ));
-
-                patch_key_cursor = value_cursor + value_header_size + value_header.1;
-            }
-
-            for (key_text, value_type, value_cursor, value_header_size, value_size) in key_values {
-                // Create a path to this key
-                let mut key_path = path.clone();
-
-                key_path.elements.push(PathElement::Key(key_text, false));
-
-                match value_type {
-                    ElementType::NULL => {
-                        let mut op = DeleteOperation::new();
-
-                        let _ = result.operate_on_path(&key_path, &mut op);
-                    }
-                    ElementType::OBJECT => {
-                        let value_data = &patch.data
-                            [value_cursor..value_cursor + value_header_size + value_size];
-
-                        let target_path_result =
-                            result.navigate_path(&key_path, PathOperationMode::ReplaceExisting);
-
-                        if let Ok(target_stack) = target_path_result {
-                            let target_value_idx = target_stack
-                                .last()
-                                .ok_or_else(|| {
-                                    LimboError::InternalError(
-                                        "target stack should not be empty".to_string(),
-                                    )
-                                })?
-                                .field_value_index;
-                            let (target_header, _) = result.read_header(target_value_idx)?;
-
-                            if target_header.0 == ElementType::OBJECT {
-                                work_stack.push_back((key_path, value_cursor));
-                            } else {
-                                let patch_obj = Jsonb::from_raw_data(value_data)?;
-                                let mut op = ReplaceOperation::new(patch_obj);
-                                result.operate_on_path(&key_path, &mut op)?;
-                                let _ = result.operate_on_path(&key_path, &mut op);
-
-                                work_stack.push_back((key_path, value_cursor));
-                            }
-                        } else {
-                            let empty_obj = Jsonb::from_raw_data(
-                                JsonbHeader::make_obj().into_bytes().as_bytes(),
-                            )?;
-                            let mut op = SetOperation::new(empty_obj);
-                            let _ = result.operate_on_path(&key_path, &mut op);
-
-                            work_stack.push_back((key_path, value_cursor));
-                        }
-                    }
-                    _ => {
-                        let value_data = &patch.data
-                            [value_cursor..value_cursor + value_header_size + value_size];
-                        let patch_value = Jsonb::from_raw_data(value_data)?;
-
-                        let mut op = SetOperation::new(patch_value);
-
-                        let _ = result.operate_on_path(&key_path, &mut op);
-                    }
+                    let _ = self.operate_on_path(&key_path, &mut op);
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Merge the object value that starts at `value_cursor` into the member at
+    /// `key_path`. A member that is missing or is not an object becomes an empty
+    /// object first, like SQLite does, so two patch members that share a key end
+    /// up merged into the same member instead of the second one replacing the
+    /// first.
+    fn merge_object_member(
+        &mut self,
+        patch: &Jsonb,
+        value_cursor: usize,
+        key_path: &JsonPath,
+        depth: usize,
+    ) -> Result<()> {
+        let empty_obj = Jsonb::from_raw_data(JsonbHeader::make_obj().into_bytes().as_bytes())?;
+
+        if let Ok(target_stack) = self.navigate_path(key_path, PathOperationMode::ReplaceExisting) {
+            let target_value_idx = target_stack
+                .last()
+                .ok_or_else(|| {
+                    LimboError::InternalError("target stack should not be empty".to_string())
+                })?
+                .field_value_index;
+            let (target_header, _) = self.read_header(target_value_idx)?;
+
+            if target_header.0 != ElementType::OBJECT {
+                let mut op = ReplaceOperation::new(empty_obj);
+                self.operate_on_path(key_path, &mut op)?;
+            }
+        } else {
+            let mut op = SetOperation::new(empty_obj);
+            let _ = self.operate_on_path(key_path, &mut op);
+        }
+
+        self.patch_object(patch, value_cursor, key_path, depth + 1)
     }
 
     pub fn array_iterator(&self) -> Result<ArrayIteratorState> {
