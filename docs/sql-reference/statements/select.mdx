@@ -625,6 +625,9 @@ return no rows. Select `tableoid` explicitly; it is not included in `SELECT *`.
 
 In the PostgreSQL frontend, `generate_series(...)` and
 `pg_catalog.generate_series(...)` are available even when `search_path` is empty.
+A table alias also names the output column: `FROM generate_series(1, 3) AS s`
+allows `SELECT s` or `SELECT s.s`. An explicit column alias such as `AS s(n)`
+uses `n` instead.
 
 ## See Also
 

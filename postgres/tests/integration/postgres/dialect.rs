@@ -2486,7 +2486,7 @@ fn test_postgres_generate_series(db: TempDatabase) {
 
     // generate_series with alias
     let mut stmt = conn
-        .prepare("SELECT value FROM generate_series(1, 3) AS s")
+        .prepare("SELECT s FROM generate_series(1, 3) AS s")
         .unwrap();
     let mut results: Vec<i64> = Vec::new();
     loop {
@@ -2513,7 +2513,7 @@ fn test_postgres_generate_series(db: TempDatabase) {
         .unwrap();
 
     let mut stmt = conn
-        .prepare("SELECT items.name, gs.value FROM items, generate_series(1, 2) AS gs ORDER BY items.id, gs.value")
+        .prepare("SELECT items.name, gs.gs FROM items, generate_series(1, 2) AS gs ORDER BY items.id, gs.gs")
         .unwrap();
     let mut results: Vec<String> = Vec::new();
     loop {

@@ -128,6 +128,38 @@ expect {
     6
 }
 
+test generate-series-table-alias-names-column {
+    SELECT s, s.s FROM generate_series(1, 3) AS s ORDER BY s;
+}
+expect {
+    1|1
+    2|2
+    3|3
+}
+
+test generate-series-quoted-table-alias-names-column {
+    SELECT "series value" FROM generate_series(1, 3) AS "series value"
+    ORDER BY "series value";
+}
+expect {
+    1
+    2
+    3
+}
+
+test generate-series-alias-used-as-array-subscript {
+    SET search_path TO '';
+    SELECT a.elements[s]
+    FROM (VALUES (ARRAY[10, 20, 30])) AS a(elements),
+         pg_catalog.generate_series(1, array_upper(a.elements, 1)) AS s
+    ORDER BY s;
+}
+expect {
+    10
+    20
+    30
+}
+
 test select-null-renders-empty {
     SELECT NULL;
 }

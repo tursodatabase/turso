@@ -1024,3 +1024,17 @@ test pg-publication-rel-tableoid-is-selectable {
     FROM pg_catalog.pg_publication_rel;
 }
 expect {}
+
+test pg-publication-rel-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT tableoid, oid, prpubid, prrelid,
+           pg_catalog.pg_get_expr(prqual, prrelid) AS prrelqual,
+           CASE WHEN pr.prattrs IS NOT NULL THEN
+               (SELECT array_agg(attname)
+                FROM pg_catalog.generate_series(0, pg_catalog.array_upper(pr.prattrs::pg_catalog.int2[], 1)) s,
+                     pg_catalog.pg_attribute
+                WHERE attrelid = pr.prrelid AND attnum = prattrs[s])
+           ELSE NULL END AS prattrs
+    FROM pg_catalog.pg_publication_rel pr;
+}
+expect {}
