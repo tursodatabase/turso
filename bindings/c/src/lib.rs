@@ -848,7 +848,7 @@ pub unsafe extern "C" fn sqlite3_db_filename(
     }
     if !db_name.is_null() {
         let name = CStr::from_ptr(db_name);
-        if name.to_bytes() != b"main" {
+        if !name.to_bytes().eq_ignore_ascii_case(b"main") {
             return std::ptr::null();
         }
     }
@@ -3908,6 +3908,20 @@ mod tests {
     }
     use super::*;
     use std::ptr;
+
+    #[test]
+    fn sqlite3_db_filename_resolves_main_case_insensitively() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            let filename = sqlite3_db_filename(db, c"MAIN".as_ptr());
+
+            assert!(!filename.is_null());
+            assert_eq!(CStr::from_ptr(filename).to_bytes(), b"");
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
 
     /// sqlite3_errmsg must return the bare message SQLite produces — no
     /// "Runtime error:" prefix and no "(19)" suffix; those are sqlite3
