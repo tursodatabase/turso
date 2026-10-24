@@ -215,6 +215,8 @@ const SQLITE3_TEXT: i32 = 3;
 const SQLITE_BLOB: i32 = 4;
 const SQLITE_NULL: i32 = 5;
 const SQLITE_UTF8: i32 = 1;
+const SQLITE_PERM: i32 = 3;
+const SQLITE_OPEN_READONLY: i32 = 0x00000001;
 const SQLITE_OPEN_READWRITE: i32 = 0x00000002;
 const SQLITE_OPEN_CREATE: i32 = 0x00000004;
 const SQLITE_OPEN_URI: i32 = 0x00000040;
@@ -3820,6 +3822,183 @@ mod tests {
             assert_eq!(
                 sqlite3_strnicmp(c"\xc3\xa9".as_ptr(), c"\xc3\x89".as_ptr(), 2),
                 (0xa9_i32) - (0x89_i32)
+            );
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_open_v2_flag_validation_and_cantopen() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("nonexistent.db");
+            let db_path_str = db_path.to_str().unwrap();
+            let db_path_cstr = std::ffi::CString::new(db_path_str).unwrap();
+
+            let mut db: *mut sqlite3 = ptr::null_mut();
+
+            // Flags without READONLY or READWRITE must be rejected with SQLITE_MISUSE
+            assert_eq!(
+                sqlite3_open_v2(db_path_cstr.as_ptr(), &mut db, 0, ptr::null()),
+                SQLITE_MISUSE
+            );
+            assert_eq!(
+                sqlite3_open_v2(
+                    db_path_cstr.as_ptr(),
+                    &mut db,
+                    SQLITE_OPEN_CREATE,
+                    ptr::null()
+                ),
+                SQLITE_MISUSE
+            );
+            assert_eq!(
+                sqlite3_open_v2(
+                    db_path_cstr.as_ptr(),
+                    &mut db,
+                    SQLITE_OPEN_READONLY | SQLITE_OPEN_READWRITE,
+                    ptr::null()
+                ),
+                SQLITE_MISUSE
+            );
+            assert_eq!(
+                sqlite3_open_v2(
+                    db_path_cstr.as_ptr(),
+                    &mut db,
+                    SQLITE_OPEN_READONLY | SQLITE_OPEN_CREATE,
+                    ptr::null()
+                ),
+                SQLITE_MISUSE
+            );
+            assert_eq!(
+                sqlite3_open_v2(
+                    db_path_cstr.as_ptr(),
+                    &mut db,
+                    SQLITE_OPEN_READONLY | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                    ptr::null()
+                ),
+                SQLITE_MISUSE
+            );
+            assert!(
+                !db_path.exists(),
+                "file must not be created when flags validation fails"
+            );
+
+            // READWRITE without CREATE on non-existent file must fail with SQLITE_CANTOPEN
+            assert_eq!(
+                sqlite3_open_v2(
+                    db_path_cstr.as_ptr(),
+                    &mut db,
+                    SQLITE_OPEN_READWRITE,
+                    ptr::null()
+                ),
+                SQLITE_CANTOPEN
+            );
+            assert!(
+                !db_path.exists(),
+                "file must not be created on READWRITE without CREATE"
+            );
+
+            // READONLY on non-existent file must fail with SQLITE_CANTOPEN
+            assert_eq!(
+                sqlite3_open_v2(
+                    db_path_cstr.as_ptr(),
+                    &mut db,
+                    SQLITE_OPEN_READONLY,
+                    ptr::null()
+                ),
+                SQLITE_CANTOPEN
+            );
+            assert!(
+                !db_path.exists(),
+                "file must not be created on READONLY without CREATE"
+            );
+
+            // READWRITE | CREATE creates the file
+            assert_eq!(
+                sqlite3_open_v2(
+                    db_path_cstr.as_ptr(),
+                    &mut db,
+                    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                    ptr::null()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert!(db_path.exists(), "file should exist after CREATE");
+
+            // Once the file exists, opening with READWRITE (no CREATE) succeeds
+            let mut db2: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(
+                    db_path_cstr.as_ptr(),
+                    &mut db2,
+                    SQLITE_OPEN_READWRITE,
+                    ptr::null()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(db2), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_open_v2_uri_modes() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("uri_mode_test.db");
+            let db_path_str = db_path.to_str().unwrap();
+
+            let mut db: *mut sqlite3 = ptr::null_mut();
+
+            // URI mode=rw on non-existent file fails with CANTOPEN
+            let uri_rw = format!("file:{db_path_str}?mode=rw");
+            let uri_rw_cstr = std::ffi::CString::new(uri_rw).unwrap();
+            assert_eq!(
+                sqlite3_open_v2(
+                    uri_rw_cstr.as_ptr(),
+                    &mut db,
+                    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+                    ptr::null()
+                ),
+                SQLITE_CANTOPEN
+            );
+            assert!(!db_path.exists());
+
+            // URI mode=rwc cannot escalate when open flags lack CREATE -> SQLITE_PERM
+            let uri_rwc = format!("file:{db_path_str}?mode=rwc");
+            let uri_rwc_cstr = std::ffi::CString::new(uri_rwc).unwrap();
+            assert_eq!(
+                sqlite3_open_v2(
+                    uri_rwc_cstr.as_ptr(),
+                    &mut db,
+                    SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI,
+                    ptr::null()
+                ),
+                SQLITE_PERM
+            );
+            assert!(!db_path.exists());
+
+            // URI mode=rw cannot escalate from READONLY -> SQLITE_PERM
+            assert_eq!(
+                sqlite3_open_v2(
+                    uri_rw_cstr.as_ptr(),
+                    &mut db,
+                    SQLITE_OPEN_READONLY | SQLITE_OPEN_URI,
+                    ptr::null()
+                ),
+                SQLITE_PERM
+            );
+
+            // Unknown mode -> SQLITE_ERROR
+            let uri_unknown = format!("file:{db_path_str}?mode=invalid_mode");
+            let uri_unknown_cstr = std::ffi::CString::new(uri_unknown).unwrap();
+            assert_eq!(
+                sqlite3_open_v2(
+                    uri_unknown_cstr.as_ptr(),
+                    &mut db,
+                    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+                    ptr::null()
+                ),
+                SQLITE_ERROR
             );
         }
     }
