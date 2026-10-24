@@ -210,6 +210,10 @@ pub fn translate_inner(
         bail_parse_error!("Cannot execute write statement in query_only mode")
     }
 
+    if is_write && connection.is_tx_read_only() {
+        return Err(crate::LimboError::ReadOnly);
+    }
+
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
     let is_dml = matches!(
         stmt,
@@ -248,7 +252,12 @@ pub fn translate_inner(
                 connection.clone(),
             )?;
         }
-        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
+        ast::Stmt::Begin {
+            typ,
+            name,
+            access_mode,
+            isolation_level: _,
+        } => translate_tx_begin(typ, name, access_mode, resolver, program)?,
         ast::Stmt::Commit { name } => {
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }

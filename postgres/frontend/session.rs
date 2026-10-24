@@ -11,7 +11,8 @@ use crate::settings::{PgSessionState, SettingScope};
 use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    check_set_transaction, is_comment_on, is_refresh_matview, try_extract_copy_from,
+    begin_access_mode, check_set_transaction, is_begin, is_comment_on, is_commit_or_rollback,
+    is_refresh_matview, set_transaction_access_mode, try_extract_copy_from,
     try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
     unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt,
     PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
@@ -84,9 +85,23 @@ impl PgConnection {
     }
 
     pub fn prepare(&self, sql: impl AsRef<str>) -> crate::Result<crate::Statement> {
-        prepare_statement(&self.inner, sql.as_ref())
-            .map(crate::Statement::new)
-            .map_err(Into::into)
+        prepare_pg_statement(&self.inner, sql.as_ref())
+    }
+
+    pub fn prepare_for_describe(&self, sql: impl AsRef<str>) -> crate::Result<crate::Statement> {
+        let pg_conn = &self.inner;
+        let sql = sql.as_ref().trim();
+        if let Ok(parse_result) = turso_pg_parser::parse(sql) {
+            let has_state_change = is_begin(&parse_result)
+                || is_commit_or_rollback(&parse_result)
+                || check_set_transaction(&parse_result).unwrap_or(false);
+            if has_state_change {
+                return noop_statement(&pg_conn.conn)
+                    .map(crate::Statement::new)
+                    .map_err(Into::into);
+            }
+        }
+        prepare_statement(pg_conn, sql).map_err(Into::into)
     }
 
     pub fn query(&self, sql: impl AsRef<str>) -> crate::Result<Option<crate::Statement>> {
@@ -151,13 +166,24 @@ impl Iterator for PgQueryRunner<'_> {
 
         let sql = &self.stmts[self.index];
         self.index += 1;
-        Some(
-            prepare_statement(self.conn, sql)
-                .map(crate::Statement::new)
-                .map(Some)
-                .map_err(Into::into),
-        )
+        Some(prepare_pg_statement(self.conn, sql).map(Some))
     }
+}
+
+fn prepare_pg_statement(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
+) -> crate::Result<crate::Statement> {
+    let sql = sql.trim();
+    if let Ok(parse_result) = turso_pg_parser::parse(sql) {
+        if is_commit_or_rollback(&parse_result) {
+            return prepare_tx_terminal(pg_conn, sql, &parse_result);
+        }
+        if is_begin(&parse_result) {
+            return prepare_begin(pg_conn, sql, &parse_result);
+        }
+    }
+    prepare_statement(pg_conn, sql).map_err(Into::into)
 }
 
 pub fn split_statements(sql: &str) -> crate::Result<Vec<String>> {
@@ -168,7 +194,85 @@ pub fn split_statements(sql: &str) -> crate::Result<Vec<String>> {
     }
 }
 
-fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Statement> {
+fn prepare_tx_terminal(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
+    parse_result: &turso_pg_parser::ParseResult,
+) -> crate::Result<crate::Statement> {
+    let translator = PostgreSQLTranslator::new();
+    let translated = translator
+        .translate_with_prereqs(parse_result)
+        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+    debug_assert!(
+        translated.prereqs.is_empty(),
+        "COMMIT/ROLLBACK should never produce prerequisite statements"
+    );
+    let inner = pg_conn
+        .conn
+        .prepare_translated_cmd(translated.cmd, sql)
+        .map_err(crate::Error::from)?;
+    let post_run = std::sync::Arc::new(move |result: crate::Result<()>| match result {
+        Err(ref e) if is_no_active_tx_error(e) => Ok(()),
+        other => other,
+    });
+    Ok(crate::Statement::new_with_post_run(inner, post_run))
+}
+
+fn prepare_begin(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
+    parse_result: &turso_pg_parser::ParseResult,
+) -> crate::Result<crate::Statement> {
+    let translator = PostgreSQLTranslator::new();
+    let translated = translator
+        .translate_with_prereqs(parse_result)
+        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+    debug_assert!(
+        translated.prereqs.is_empty(),
+        "BEGIN should never produce prerequisite statements"
+    );
+    let inner = pg_conn
+        .conn
+        .prepare_translated_cmd(translated.cmd, sql)
+        .map_err(crate::Error::from)?;
+    // For a non-nested BEGIN: the VDBE sets tx_read_only when the instruction
+    // executes, so post_run has nothing to do on success.
+    //
+    // For a nested BEGIN (PostgreSQL warns but keeps the transaction): the VDBE
+    // errors with "cannot start a transaction within a transaction" and never
+    // runs, so we apply the access mode directly here.
+    let access_mode = begin_access_mode(parse_result);
+    let conn = pg_conn.conn.clone();
+    let post_run = std::sync::Arc::new(move |result: crate::Result<()>| match result {
+        Ok(()) => Ok(()),
+        Err(ref e) if is_nested_begin_error(e) => {
+            if let Some(ro) = access_mode {
+                apply_tx_access_mode(&conn, ro)?;
+            }
+            Ok(())
+        }
+        other => other,
+    });
+    Ok(crate::Statement::new_with_post_run(inner, post_run))
+}
+
+fn apply_tx_access_mode(conn: &Arc<Connection>, read_only: bool) -> crate::Result<()> {
+    if !read_only && conn.is_tx_read_only() && conn.tx_has_started() {
+        return Err(crate::Error::read_write_mode_after_first_query());
+    }
+    conn.set_tx_read_only(read_only);
+    Ok(())
+}
+
+fn is_no_active_tx_error(e: &crate::Error) -> bool {
+    matches!(e.core_error(), LimboError::NoActiveTransaction { .. })
+}
+
+fn is_nested_begin_error(e: &crate::Error) -> bool {
+    matches!(e.core_error(), LimboError::TransactionAlreadyActive)
+}
+
+fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crate::Statement> {
     let sql = sql.trim();
     if sql.is_empty() {
         return Err(LimboError::InvalidArgument(
@@ -216,7 +320,15 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         stmt.run_ignore_rows()?;
     }
 
-    pg_conn.conn.prepare_translated_cmd(translated.cmd, &sql)
+    let inner = pg_conn.conn.prepare_translated_cmd(translated.cmd, &sql)?;
+    let conn = pg_conn.conn.clone();
+    let post_run = std::sync::Arc::new(move |result: crate::Result<()>| {
+        if !conn.get_auto_commit() {
+            conn.set_tx_has_started(true);
+        }
+        result
+    });
+    Ok(crate::Statement::new_with_post_run(inner, post_run))
 }
 
 /// The schema that a CREATE TABLE statement naming its table without a
@@ -351,7 +463,10 @@ fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
     Ok(())
 }
 
-fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Option<Statement>> {
+fn try_prepare_special(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
+) -> Result<Option<crate::Statement>> {
     let parse_result = match turso_pg_parser::parse(sql) {
         Ok(result) => result,
         Err(_) => return Ok(None),
@@ -359,47 +474,74 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
 
     if let Some(set_stmt) = try_extract_set(&parse_result) {
         let stmt = handle_pg_set(pg_conn, &set_stmt)?;
-        return Ok(Some(stmt));
+        return Ok(Some(crate::Statement::new(stmt)));
     }
 
     if check_set_transaction(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))? {
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
+        return Ok(Some(prepare_set_transaction(pg_conn, &parse_result)?));
     }
 
     if let Some(show_stmt) = try_extract_show(&parse_result) {
-        return Ok(Some(handle_pg_show(pg_conn, &show_stmt)?));
+        return Ok(Some(crate::Statement::new(handle_pg_show(
+            pg_conn, &show_stmt,
+        )?)));
     }
 
     if let Some(stmt) = try_extract_create_schema(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?
     {
         handle_pg_create_schema(pg_conn, &stmt)?;
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
+        return Ok(Some(crate::Statement::new(noop_statement(&pg_conn.conn)?)));
     }
 
     if let Some(stmt) = try_extract_drop_schema(&parse_result) {
         handle_pg_drop_schema(&pg_conn.conn, &stmt)?;
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
+        return Ok(Some(crate::Statement::new(noop_statement(&pg_conn.conn)?)));
     }
 
     if is_refresh_matview(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))? {
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
+        return Ok(Some(crate::Statement::new(noop_statement(&pg_conn.conn)?)));
     }
 
     if is_comment_on(&parse_result) {
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
+        return Ok(Some(crate::Statement::new(noop_statement(&pg_conn.conn)?)));
     }
 
     if let Some(stmt) =
         try_extract_copy_from(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))?
     {
         let rows_inserted = handle_pg_copy_from(&pg_conn.conn, &stmt)?;
+        if !pg_conn.conn.get_auto_commit() {
+            pg_conn.conn.set_tx_has_started(true);
+        }
         let stmt = noop_statement(&pg_conn.conn)?;
         stmt.set_n_change(rows_inserted as i64);
-        return Ok(Some(stmt));
+        return Ok(Some(crate::Statement::new(stmt)));
     }
 
     Ok(None)
+}
+
+/// PostgreSQL applies SET TRANSACTION only inside a transaction block;
+/// outside one it warns and changes nothing.
+fn prepare_set_transaction(
+    pg_conn: &Arc<PgConnectionInner>,
+    parse_result: &turso_pg_parser::ParseResult,
+) -> Result<crate::Statement> {
+    let access_mode = set_transaction_access_mode(parse_result);
+    let inner = noop_statement(&pg_conn.conn)?;
+    let conn = pg_conn.conn.clone();
+    let post_run = std::sync::Arc::new(move |result: crate::Result<()>| {
+        result?;
+        if conn.get_auto_commit() {
+            return Ok(());
+        }
+        if let Some(read_only) = access_mode {
+            apply_tx_access_mode(&conn, read_only)?;
+        }
+        Ok(())
+    });
+    Ok(crate::Statement::new_with_post_run(inner, post_run))
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
@@ -664,10 +806,11 @@ fn handle_pg_create_schema(
         search_path = format!("{search_path}, {rest}");
     }
     set_search_path(conn, Some(&search_path), SettingScope::Session)?;
-    let result = stmt
-        .elements
-        .iter()
-        .try_for_each(|sql| prepare_statement(pg_conn, sql)?.run_ignore_rows());
+    let result = stmt.elements.iter().try_for_each(|sql| {
+        prepare_statement(pg_conn, sql)?
+            .run_ignore_rows()
+            .map_err(|e| e.core_error().clone())
+    });
     set_search_path(conn, setting.as_deref(), SettingScope::Session)?;
     if let Err(err) = result {
         handle_pg_drop_schema(
@@ -946,5 +1089,384 @@ mod tests {
         ] {
             assert!(search_path_parser().parse(input).has_errors(), "{input:?}");
         }
+    }
+
+    fn test_connection() -> super::PgConnection {
+        let (io, db) = super::open_database(
+            ":memory:",
+            None,
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+        )
+        .unwrap();
+        drop(io);
+        super::PgConnection::connect(&db).unwrap()
+    }
+
+    #[test]
+    fn set_transaction_read_only_applies_inside_transaction() {
+        let conn = test_connection();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("SET TRANSACTION READ ONLY").unwrap();
+        assert!(
+            conn.inner().is_tx_read_only(),
+            "SET TRANSACTION READ ONLY inside a transaction must set tx read-only mode"
+        );
+        conn.execute("SET TRANSACTION READ WRITE").unwrap();
+        assert!(
+            !conn.inner().is_tx_read_only(),
+            "SET TRANSACTION READ WRITE inside a transaction must clear tx read-only mode"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn set_transaction_read_only_outside_transaction_is_ignored() {
+        let conn = test_connection();
+        conn.execute("SET TRANSACTION READ ONLY").unwrap();
+        assert!(
+            !conn.inner().is_tx_read_only(),
+            "SET TRANSACTION outside a transaction block must change nothing"
+        );
+    }
+
+    #[test]
+    fn set_transaction_read_write_after_first_query_is_rejected() {
+        let conn = test_connection();
+        conn.execute("BEGIN READ ONLY").unwrap();
+        conn.execute("SELECT 1").unwrap();
+        let err = conn.execute("SET TRANSACTION READ WRITE").unwrap_err();
+        assert_eq!(err.sqlstate, "25001");
+        assert_eq!(
+            err.message,
+            "transaction read-write mode must be set before any query"
+        );
+        assert!(
+            conn.inner().is_tx_read_only(),
+            "the rejected access-mode change must leave the transaction read-only"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn set_transaction_read_only_after_first_query_is_allowed() {
+        let conn = test_connection();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("SELECT 1").unwrap();
+        conn.execute("SET TRANSACTION READ ONLY").unwrap();
+        assert!(
+            conn.inner().is_tx_read_only(),
+            "downgrading to READ ONLY after the first query must be allowed"
+        );
+        let err = conn.execute("SET TRANSACTION READ WRITE").unwrap_err();
+        assert_eq!(
+            err.sqlstate, "25001",
+            "upgrading back to READ WRITE after the first query must be rejected"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn set_transaction_same_mode_after_first_query_is_allowed() {
+        let conn = test_connection();
+        conn.execute("BEGIN READ ONLY").unwrap();
+        conn.execute("SELECT 1").unwrap();
+        conn.execute("SET TRANSACTION READ ONLY").unwrap();
+        conn.execute("ROLLBACK").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("SELECT 1").unwrap();
+        conn.execute("SET TRANSACTION READ WRITE").unwrap();
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn set_transaction_does_not_count_as_a_query() {
+        let conn = test_connection();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("SET TRANSACTION READ ONLY").unwrap();
+        conn.execute("SET TRANSACTION READ WRITE").unwrap();
+        assert!(
+            !conn.inner().is_tx_read_only(),
+            "SET TRANSACTION itself must not block later access-mode changes"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn set_transaction_prepared_but_never_run_changes_nothing() {
+        let conn = test_connection();
+        conn.execute("BEGIN").unwrap();
+        let mut stmt = conn.prepare("SET TRANSACTION READ ONLY").unwrap();
+        assert!(
+            !conn.inner().is_tx_read_only(),
+            "preparing SET TRANSACTION must not apply the access mode"
+        );
+        stmt.run_ignore_rows().unwrap();
+        assert!(
+            conn.inner().is_tx_read_only(),
+            "running the prepared SET TRANSACTION must apply the access mode"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn set_transaction_prepared_inside_transaction_runs_against_execute_time_state() {
+        let conn = test_connection();
+        conn.execute("BEGIN").unwrap();
+        let mut stmt = conn.prepare("SET TRANSACTION READ ONLY").unwrap();
+        conn.execute("ROLLBACK").unwrap();
+        stmt.run_ignore_rows().unwrap();
+        assert!(
+            !conn.inner().is_tx_read_only(),
+            "SET TRANSACTION run outside a transaction block must change nothing, \
+             even when it was prepared inside one"
+        );
+    }
+
+    #[test]
+    fn set_transaction_applies_last_access_mode_option() {
+        let conn = test_connection();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("SET TRANSACTION READ WRITE, READ ONLY")
+            .unwrap();
+        assert!(
+            conn.inner().is_tx_read_only(),
+            "the last access-mode option must win"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn nested_begin_keeps_transaction_and_applies_access_mode() {
+        let conn = test_connection();
+        conn.execute("CREATE TABLE t (a int)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("BEGIN READ ONLY").unwrap();
+        assert!(
+            !conn.inner().get_auto_commit(),
+            "nested BEGIN must keep the open transaction"
+        );
+        assert!(
+            conn.inner().is_tx_read_only(),
+            "nested BEGIN READ ONLY must apply its access mode"
+        );
+        let err = conn.execute("BEGIN READ WRITE").unwrap_err();
+        assert_eq!(
+            err.sqlstate, "25001",
+            "nested BEGIN READ WRITE after the first query of a read-only \
+             transaction must be rejected like SET TRANSACTION READ WRITE"
+        );
+        assert!(
+            conn.inner().is_tx_read_only(),
+            "the rejected access-mode change must leave the transaction read-only"
+        );
+        conn.execute("ROLLBACK").unwrap();
+        let mut stmt = conn.query("SELECT count(*) FROM t").unwrap().unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(rows, vec![vec![turso_core::Value::from_i64(0)]]);
+    }
+
+    #[test]
+    fn commit_and_rollback_outside_transaction_succeed() {
+        let conn = test_connection();
+        conn.execute("COMMIT").unwrap();
+        conn.execute("ROLLBACK").unwrap();
+        conn.execute("END").unwrap();
+        conn.execute("ABORT").unwrap();
+    }
+
+    #[test]
+    fn error_inside_read_only_transaction_does_not_leak_read_only_mode() {
+        let conn = test_connection();
+        conn.execute("CREATE TABLE t (a int)").unwrap();
+        conn.execute("BEGIN READ ONLY").unwrap();
+        assert!(conn.inner().is_tx_read_only());
+        conn.execute("SELECT 1/0").unwrap_err();
+        conn.execute("ROLLBACK").unwrap();
+        assert!(
+            !conn.inner().is_tx_read_only(),
+            "read-only mode must end with the transaction, even after an error aborted it"
+        );
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    }
+
+    #[test]
+    fn savepoint_survives_runtime_error_inside_transaction() {
+        let conn = test_connection();
+        conn.execute("CREATE TABLE t (a int)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("SAVEPOINT s").unwrap();
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        conn.execute("SELECT 1/0").unwrap_err();
+        assert!(
+            !conn.inner().get_auto_commit(),
+            "a failed read statement must not roll back the transaction"
+        );
+        conn.execute("ROLLBACK TO s").unwrap();
+        conn.execute("COMMIT").unwrap();
+        let mut stmt = conn.query("SELECT a FROM t").unwrap().unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(rows, vec![vec![turso_core::Value::from_i64(1)]]);
+    }
+
+    #[test]
+    fn statement_prepared_before_begin_read_only_cannot_write() {
+        let conn = test_connection();
+        conn.execute("CREATE TABLE t (a int)").unwrap();
+        let mut insert = conn.prepare("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("BEGIN READ ONLY").unwrap();
+        insert.run_ignore_rows().unwrap_err();
+        conn.execute("ROLLBACK").unwrap();
+        insert.run_ignore_rows().unwrap();
+    }
+
+    #[test]
+    fn prepare_for_describe_does_not_change_tx_read_only() {
+        let (io, db) = super::open_database(
+            ":memory:",
+            None,
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+        )
+        .unwrap();
+        drop(io);
+        let conn = super::PgConnection::connect(&db).unwrap();
+        conn.execute("BEGIN READ ONLY").unwrap();
+        assert!(
+            conn.inner().is_tx_read_only(),
+            "BEGIN READ ONLY must set tx read-only mode"
+        );
+        let _stmt = conn.prepare_for_describe("COMMIT").unwrap();
+        assert!(
+            conn.inner().is_tx_read_only(),
+            "prepare_for_describe(COMMIT) must not clear tx read-only mode"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn prepared_commit_actually_commits_when_run_in_transaction() {
+        let conn = test_connection();
+        conn.execute("CREATE TABLE t (v INT)").unwrap();
+        // Prepare COMMIT while idle — must not bake in a noop.
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        // Prepare ROLLBACK while idle — same requirement.
+        let mut rollback = conn.prepare("ROLLBACK").unwrap();
+
+        // Run the prepared COMMIT while still idle — must succeed without error.
+        commit.run_ignore_rows().unwrap();
+
+        // Now start a transaction, insert a row, and commit with the prepared statement.
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        commit.run_ignore_rows().unwrap();
+        let rows = conn
+            .prepare("SELECT count(*) FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![turso_core::Value::from_i64(1)]],
+            "INSERT must be committed"
+        );
+
+        // Now start another transaction, insert, and roll back with the prepared statement.
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        rollback.run_ignore_rows().unwrap();
+        let rows = conn
+            .prepare("SELECT count(*) FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![turso_core::Value::from_i64(1)]],
+            "INSERT must be rolled back"
+        );
+
+        // Run ROLLBACK while idle — must succeed without error.
+        rollback.run_ignore_rows().unwrap();
+    }
+
+    #[test]
+    fn prepared_begin_read_only_run_inside_transaction_keeps_transaction_and_applies_mode() {
+        let conn = test_connection();
+        // Prepare BEGIN READ ONLY while idle.
+        let mut begin_ro = conn.prepare("BEGIN READ ONLY").unwrap();
+        conn.execute("BEGIN").unwrap();
+        // Run the prepared BEGIN READ ONLY while already in a transaction.
+        // Must succeed (warning-level, like PostgreSQL), keep the transaction
+        // open, and apply the READ ONLY access mode.
+        begin_ro.run_ignore_rows().unwrap();
+        assert!(
+            conn.inner().is_tx_read_only(),
+            "nested prepared BEGIN READ ONLY must apply read-only mode"
+        );
+        assert!(
+            !conn.inner().get_auto_commit(),
+            "nested prepared BEGIN READ ONLY must keep the transaction open"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn prepared_begin_inside_transaction_starts_new_transaction_after_commit() {
+        let conn = test_connection();
+        conn.execute("CREATE TABLE t (v INT)").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        // Prepare BEGIN while already inside a transaction. The returned statement
+        // must compile the real BEGIN, not a noop — otherwise re-using it after
+        // this transaction ends would silently skip starting a new transaction.
+        let mut begin = conn.prepare("BEGIN").unwrap();
+        conn.execute("COMMIT").unwrap();
+
+        // Execute the prepared BEGIN: must start a real transaction.
+        begin.run_ignore_rows().unwrap();
+        conn.execute("INSERT INTO t VALUES (42)").unwrap();
+        conn.execute("ROLLBACK").unwrap();
+
+        // If BEGIN was a noop, the INSERT auto-committed and count would be 1.
+        let rows = conn
+            .prepare("SELECT count(*) FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![turso_core::Value::from_i64(0)]],
+            "ROLLBACK must have undone the INSERT (prepared BEGIN must start a real transaction)"
+        );
+    }
+
+    #[test]
+    fn prepared_commit_does_not_clear_read_only_mode_before_it_runs() {
+        let conn = test_connection();
+        conn.execute("CREATE TABLE t (v INT)").unwrap();
+
+        conn.execute("BEGIN READ ONLY").unwrap();
+        assert!(
+            conn.inner().is_tx_read_only(),
+            "BEGIN READ ONLY must set tx read-only mode"
+        );
+        // Preparing COMMIT must not immediately clear tx read-only: the transaction
+        // is still open and write attempts before running COMMIT must be rejected.
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        assert!(
+            conn.inner().is_tx_read_only(),
+            "prepare(COMMIT) must not clear tx read-only mode before it runs"
+        );
+        // Running the prepared COMMIT must clear tx read-only.
+        commit.run_ignore_rows().unwrap();
+        assert!(
+            !conn.inner().is_tx_read_only(),
+            "running the prepared COMMIT must clear tx read-only mode"
+        );
+        // Writes must now be allowed.
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
     }
 }

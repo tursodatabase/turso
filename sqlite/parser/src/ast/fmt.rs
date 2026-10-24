@@ -275,7 +275,7 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
-            Self::Begin { typ, name } => {
+            Self::Begin { typ, name, .. } => {
                 s.append(TK_BEGIN, None)?;
                 if let Some(typ) = typ {
                     typ.to_tokens(s, context)?;
