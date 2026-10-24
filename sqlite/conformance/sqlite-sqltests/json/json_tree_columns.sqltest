@@ -1,8 +1,8 @@
 @database :memory:
 
 # json_tree and json_each expose rowid like any virtual table, so a query
-# can select or join on rt.rowid. The value itself is the engine's own
-# row counter, so only its presence and type are checked here.
+# can select or join on rt.rowid. As in SQLite, rowid counts the rows of a
+# scan from 0, separately from the id column.
 
 test json-tree-rowid-is-selectable {
     SELECT count(*) FROM (SELECT rt.rowid AS n FROM json_tree('{"a":[1,2]}') AS rt WHERE rt.type NOT IN ('object','array'));
@@ -26,6 +26,59 @@ test json-tree-rowid-into-table {
 expect {
     $.a[0]|1
     $.a[1]|2
+}
+
+test json-each-rowid-counts-rows-from-zero {
+    SELECT typeof(rowid), rowid, value FROM json_each('[5,[6],7]');
+}
+expect {
+    integer|0|5
+    integer|1|[6]
+    integer|2|7
+}
+
+test json-each-rowid-of-primitive-root {
+    SELECT rowid, value FROM json_each('5');
+}
+expect {
+    0|5
+}
+
+test json-tree-rowid-counts-rows-from-zero {
+    SELECT typeof(rowid), rowid, fullkey FROM json_tree('[5,[6,{"a":1}],7]');
+}
+expect {
+    integer|0|$
+    integer|1|$[0]
+    integer|2|$[1]
+    integer|3|$[1][0]
+    integer|4|$[1][1]
+    integer|5|$[1][1].a
+    integer|6|$[2]
+}
+
+test json-tree-rowid-of-primitive-root {
+    SELECT rowid, value FROM json_tree('5');
+}
+expect {
+    0|5
+}
+
+test json-each-rowid-restarts-for-each-outer-row {
+    SELECT a.value, b.rowid FROM json_each('[1,2]') AS a, json_each('[3,4]') AS b;
+}
+expect {
+    1|0
+    1|1
+    2|0
+    2|1
+}
+
+test json-each-rowid-is-null-on-unmatched-left-join-row {
+    SELECT x, typeof(j.rowid) FROM (SELECT 1 AS x) LEFT JOIN json_each('[]') AS j;
+}
+expect {
+    1|null
 }
 
 # fullkey quotes an object key unless it starts with an ASCII letter and

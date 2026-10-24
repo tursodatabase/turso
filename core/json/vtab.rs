@@ -190,6 +190,7 @@ impl std::fmt::Debug for JsonVirtualTable {
 
 pub struct JsonEachCursor {
     rowid: i64,
+    id: i64,
     json: Jsonb,
     path_to_current_value: InPlaceJsonPath,
     traversal_states: Vec<TraversalState>,
@@ -208,6 +209,7 @@ impl JsonEachCursor {
     fn empty(traversal_mode: JsonTraversalMode) -> Self {
         Self {
             rowid: 0,
+            id: 0,
             json: Jsonb::empty(),
             traversal_states: Vec::new(),
             path_to_current_value: InPlaceJsonPath::new_root(),
@@ -228,7 +230,7 @@ impl JsonEachCursor {
             .or(Some(0));
 
         let innermost_container = match iterator_state {
-            IteratorState::Object(_) | IteratorState::Array(_) => Some(self.rowid),
+            IteratorState::Object(_) | IteratorState::Array(_) => Some(self.id),
             _ => parent_id,
         };
 
@@ -254,6 +256,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
     ) -> Result<bool, LimboError> {
         self.traversal_states.clear();
         self.rowid = 0;
+        self.id = 0;
 
         if args.is_empty() || args[0] == Value::Null {
             return Ok(false);
@@ -297,13 +300,13 @@ impl InternalVirtualTableCursor for JsonEachCursor {
 
         let key = self.path_to_current_value.key().to_owned();
         match self.traversal_mode {
-            JsonTraversalMode::Each => self.next(),
+            JsonTraversalMode::Each => self.advance(),
             JsonTraversalMode::Tree => {
                 let state = self.peek_state().ok_or_else(|| {
                     crate::LimboError::InternalError("state stack should not be empty".to_string())
                 })?;
                 if matches!(state.iterator_state, IteratorState::Primitive(_)) {
-                    self.next()
+                    self.advance()
                 } else {
                     self.columns = Columns::new(
                         key,
@@ -322,6 +325,31 @@ impl InternalVirtualTableCursor for JsonEachCursor {
 
     fn next(&mut self) -> Result<bool, LimboError> {
         self.rowid += 1;
+        self.advance()
+    }
+
+    fn rowid(&self) -> i64 {
+        self.rowid
+    }
+
+    fn column(&self, idx: usize) -> Result<Value, LimboError> {
+        Ok(match idx {
+            COL_KEY => self.columns.key(),
+            COL_VALUE => self.columns.value()?,
+            COL_TYPE => self.columns.ttype(),
+            COL_ATOM => self.columns.atom()?,
+            COL_ID => Value::from_i64(self.id),
+            COL_PARENT => self.columns.parent(),
+            COL_FULLKEY => self.columns.fullkey(),
+            COL_PATH => self.columns.path(),
+            _ => Value::Null,
+        })
+    }
+}
+
+impl JsonEachCursor {
+    fn advance(&mut self) -> Result<bool, LimboError> {
+        self.id += 1;
         if self.traversal_states.is_empty() {
             return Ok(false);
         }
@@ -340,7 +368,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             IteratorState::Array(state) => {
                 let Some(((idx, value), new_state)) = self.json.array_iterator_next(&state)? else {
                     self.path_to_current_value.pop();
-                    return self.next();
+                    return self.advance();
                 };
 
                 let recursing_iterator = if matches!(self.traversal_mode, JsonTraversalMode::Tree) {
@@ -379,7 +407,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                     self.json.object_iterator_next(&state)?
                 else {
                     self.path_to_current_value.pop();
-                    return self.next();
+                    return self.advance();
                 };
 
                 self.push_state(
@@ -429,24 +457,6 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         };
 
         Ok(true)
-    }
-
-    fn rowid(&self) -> i64 {
-        self.rowid
-    }
-
-    fn column(&self, idx: usize) -> Result<Value, LimboError> {
-        Ok(match idx {
-            COL_KEY => self.columns.key(),
-            COL_VALUE => self.columns.value()?,
-            COL_TYPE => self.columns.ttype(),
-            COL_ATOM => self.columns.atom()?,
-            COL_ID => Value::from_i64(self.rowid),
-            COL_PARENT => self.columns.parent(),
-            COL_FULLKEY => self.columns.fullkey(),
-            COL_PATH => self.columns.path(),
-            _ => Value::Null,
-        })
     }
 }
 
