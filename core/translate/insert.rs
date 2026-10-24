@@ -2791,8 +2791,15 @@ fn build_insertion<'a>(
 }
 
 fn has_nextval_default(column: &Column) -> bool {
+    let mut default = column.default.as_deref();
+    while let Some(Expr::Parenthesized(exprs)) = default {
+        default = match exprs.as_slice() {
+            [inner] => Some(inner.as_ref()),
+            _ => None,
+        };
+    }
     matches!(
-        column.default.as_deref(),
+        default,
         Some(Expr::FunctionCall { name, .. }) if name.as_str().eq_ignore_ascii_case("nextval")
     )
 }

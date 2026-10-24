@@ -4023,3 +4023,26 @@ fn test_postgres_unnamed_index_keeps_its_name_after_reprepare(db: TempDatabase) 
         ]
     );
 }
+
+#[turso_macros::test]
+fn test_postgres_omitted_int_primary_key_with_nextval_default_gets_next_rowid(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SEQUENCE sq").unwrap();
+    conn.execute("CREATE TABLE n (id int PRIMARY KEY DEFAULT nextval('sq'), v text)")
+        .unwrap();
+    // Older versions gave omitted keys a rowid without advancing the sequence.
+    conn.execute("INSERT INTO n VALUES (1, 'x'), (2, 'y')")
+        .unwrap();
+    conn.execute("INSERT INTO n (v) VALUES ('z')").unwrap();
+    assert_eq!(
+        conn.prepare("SELECT id, v FROM n ORDER BY id")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![
+            vec![Value::from_i64(1), Value::build_text("x")],
+            vec![Value::from_i64(2), Value::build_text("y")],
+            vec![Value::from_i64(3), Value::build_text("z")],
+        ]
+    );
+}

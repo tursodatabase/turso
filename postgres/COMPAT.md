@@ -138,8 +138,8 @@ bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types. An integer primary
 key is stored as the rowid, but behaves as in PostgreSQL: an INSERT that leaves
 it out uses its DEFAULT, and an INSERT or UPDATE that makes it NULL fails with
-a NOT NULL error. A serial primary key that is left out still gets the next
-rowid rather than a value from its sequence.
+a NOT NULL error. A serial primary key, or one whose DEFAULT is `nextval()`,
+still gets the next rowid when left out rather than a value from its sequence.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
