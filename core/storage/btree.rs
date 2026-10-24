@@ -239,7 +239,9 @@ enum DeleteState {
     /// so we must ensure we skip over it. I.e., when BTreeCursor::next() is called, it will move past the cell
     /// that holds the replaced content.
     /// See: https://github.com/tursodatabase/turso/issues/3045
-    PostInteriorNodeReplacement,
+    PostInteriorNodeReplacement {
+        post_balancing_seek_key: Option<CursorContext>,
+    },
     Balancing {
         /// If provided, will also balance an ancestor page at depth `balance_ancestor_at_depth`.
         /// If not provided, balancing will stop as soon as a level is encountered where no balancing is required.
@@ -914,6 +916,10 @@ pub struct BTreeCursor {
     count: usize,
     /// Stores the cursor context before rebalancing so that a seek can be done later
     context: Option<CursorContext>,
+    /// Key of the row most recently deleted by this cursor before moving to a
+    /// new cell, used to convert a post-delete cursor into a deferred re-seek
+    /// when a peer cursor modifies the btree.
+    post_delete_context: Option<CursorContext>,
     /// Store whether the Cursor is in a valid state. Meaning if it is pointing to a valid cell index or not
     pub valid_state: CursorValidState,
     seek_state: CursorSeekState,
@@ -1318,6 +1324,7 @@ impl BTreeCursor {
             index_info,
             count: 0,
             context: None,
+            post_delete_context: None,
             valid_state,
             seek_state: CursorSeekState::Start,
             read_overflow_state: None,
@@ -6422,7 +6429,10 @@ impl BTreeCursor {
     /// be >= the rowid being inserted — in which case the caller must re-seek
     /// from the root.
     pub fn is_positioned_past_page_start(&self) -> bool {
-        self.has_record() && self.stack.current_cell_index() > 0
+        self.valid_state == CursorValidState::Valid
+            && self.stack.current_page >= 0
+            && self.has_record()
+            && self.stack.current_cell_index() > 0
     }
 
     /// True iff the cursor has run off the last cell of the table's rightmost
@@ -6544,6 +6554,7 @@ impl BTreeCursor {
     #[inline]
     fn clear_saved_seek(&mut self) {
         self.context = None;
+        self.post_delete_context = None;
         self.valid_state = CursorValidState::Valid;
         self.skip_advance = false;
     }
@@ -6602,6 +6613,9 @@ impl BTreeCursor {
                         // SQLite's CURSOR_SKIPNEXT (btree.c:915).
                         self.skip_advance = true;
                         self.valid_state = CursorValidState::Valid;
+                        if !self.has_record {
+                            self.post_delete_context = Some(ctx);
+                        }
                         Ok(IOResult::Done(()))
                     }
                 }
@@ -6745,12 +6759,14 @@ impl CursorTrait for BTreeCursor {
         if self.can_advance_within_leaf() {
             self.stack.advance();
             self.invalidate_record();
+            self.post_delete_context = None;
             return Ok(IOResult::Done(()));
         }
         if self.is_on_last_cell_of_tree() {
             self.stack.advance();
             self.invalidate_record();
             self.set_has_record(false);
+            self.post_delete_context = None;
             return Ok(IOResult::Done(()));
         }
         if self.valid_state == CursorValidState::Invalid {
@@ -6775,6 +6791,7 @@ impl CursorTrait for BTreeCursor {
                             let has_record = cell_idx >= 0 && cell_idx < cell_count as i32;
                             if has_record {
                                 self.set_has_record(true);
+                                self.post_delete_context = None;
                                 self.read_overflow_state = None;
                                 return Ok(IOResult::Done(()));
                             }
@@ -6785,6 +6802,7 @@ impl CursorTrait for BTreeCursor {
                 AdvanceState::Advance => {
                     return_if_io!(self.get_next_record());
                     self.advance_state = AdvanceState::Start;
+                    self.post_delete_context = None;
                     self.read_overflow_state = None;
                     return Ok(IOResult::Done(()));
                 }
@@ -6801,6 +6819,7 @@ impl CursorTrait for BTreeCursor {
         if self.can_advance_within_leaf() {
             self.stack.advance();
             self.invalidate_record();
+            self.post_delete_context = None;
             return CursorStep::Row;
         }
         match self.next() {
@@ -6853,6 +6872,7 @@ impl CursorTrait for BTreeCursor {
                 AdvanceState::Advance => {
                     return_if_io!(self.get_prev_record());
                     self.advance_state = AdvanceState::Start;
+                    self.post_delete_context = None;
                     self.read_overflow_state = None;
                     return Ok(IOResult::Done(()));
                 }
@@ -6914,6 +6934,7 @@ impl CursorTrait for BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip(self, key), level = Level::DEBUG))]
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
         self.skip_advance = false;
+        self.post_delete_context = None;
         // Empty trace to capture the span information
         tracing::trace!("");
         // We need to clear the null flag for the table cursor before seeking,
@@ -6932,6 +6953,7 @@ impl CursorTrait for BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip(self, registers), level = Level::DEBUG))]
     fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> IOResultOr<SeekResult> {
         self.skip_advance = false;
+        self.post_delete_context = None;
         // Empty trace to capture the span information
         tracing::trace!("");
         // We need to clear the null flag for the table cursor before seeking,
@@ -7004,6 +7026,8 @@ impl CursorTrait for BTreeCursor {
         self.blob_cache.reset();
         // saveAllCursors at the head of sqlite3BtreeInsert (btree.c:9348).
         return_if_io!(self.drive_pending_peer_save(key.maybe_rowid()));
+        self.post_delete_context = None;
+        self.skip_advance = false;
         return_if_io!(self.insert_into_page(key));
         self.invalidate_count_cache();
         if key.maybe_rowid().is_some() {
@@ -7034,6 +7058,7 @@ impl CursorTrait for BTreeCursor {
             // blob cursors whether the deletion hits their pinned row.
             let deleted_rowid = self.current_table_leaf_rowid();
             return_if_io!(self.drive_pending_peer_save(deleted_rowid));
+            self.post_delete_context = None;
             self.invalidate_count_cache();
             self.state = CursorState::Delete(DeleteState::Start);
         }
@@ -7068,14 +7093,8 @@ impl CursorTrait for BTreeCursor {
 
                 DeleteState::DeterminePostBalancingSeekKey => {
                     let page = self.stack.top_ref();
-                    let cell_idx = self.stack.current_cell_index() as usize;
-                    if !delete_may_need_balancing(page.get_contents(), cell_idx, usable_space)? {
-                        self.state = CursorState::Delete(DeleteState::LoadPage {
-                            post_balancing_seek_key: None,
-                        });
-                        continue;
-                    }
-                    let target_key = if page.is_index()? {
+                    let is_index = page.is_index()?;
+                    let target_key = if is_index {
                         let record = match return_if_io!(self.record()) {
                             Some(record) => record.clone(),
                             None => unreachable!("there should've been a record"),
@@ -7370,18 +7389,28 @@ impl CursorTrait for BTreeCursor {
                             // so we must ensure we skip over it. I.e., when BTreeCursor::next() is called, it will move past the cell
                             // that holds the replaced content.
                             self.state =
-                                CursorState::Delete(DeleteState::PostInteriorNodeReplacement);
+                                CursorState::Delete(DeleteState::PostInteriorNodeReplacement {
+                                    post_balancing_seek_key: post_balancing_seek_key.take(),
+                                });
                         } else {
                             // If we didn't replace an interior node, we are done,
                             // except we need to retreat, so that the next call to BTreeCursor::next() lands at the next record (because we deleted the current one)
+                            self.post_delete_context = post_balancing_seek_key.take();
                             self.stack.retreat();
                             self.state = CursorState::None;
                             return Ok(IOResult::Done(()));
                         }
                     }
                 }
-                DeleteState::PostInteriorNodeReplacement => {
+                DeleteState::PostInteriorNodeReplacement { .. } => {
                     return_if_io!(self.get_next_record());
+                    let CursorState::Delete(DeleteState::PostInteriorNodeReplacement {
+                        ref mut post_balancing_seek_key,
+                    }) = self.state
+                    else {
+                        unreachable!("expected post interior node replacement state");
+                    };
+                    self.post_delete_context = post_balancing_seek_key.take();
                     self.state = CursorState::None;
                     return Ok(IOResult::Done(()));
                 }
@@ -7706,6 +7735,10 @@ impl CursorTrait for BTreeCursor {
     fn invalidate_btree_cache(&mut self) {
         self.stack.clear();
         self.has_record = false;
+        self.skip_advance = false;
+        self.post_delete_context = None;
+        self.advance_state = AdvanceState::Start;
+        self.iteration_pending_descent = None;
         self.noted_payload = NotedPayload::NONE;
         self.move_to_right_state.1 = None;
         self.invalidate_count_cache();
@@ -7765,16 +7798,28 @@ impl CursorTrait for BTreeCursor {
         // Idempotent, so safe across IO re-entry into this function.
         self.move_to_right_state.1 = None;
         self.invalidate_count_cache();
-        if self.valid_state != CursorValidState::Valid || !self.has_record() {
-            // Nothing to save: cursor has no live position. No invalidation
-            // needed either — the stack is already in a state where the next
-            // entry point will re-navigate from the root.
+        if self.valid_state != CursorValidState::Valid {
             return Ok(IOResult::Done(SavePositionResult::Saved));
         }
         // A peer mid-Insert/Delete may not yet have reached its own
         // save_context-at-balance point, so we can't claim it's saved. Fall
         // back to invalidation; the peer will re-navigate on next use.
         if !matches!(self.state, CursorState::None) {
+            return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
+        }
+        if let Some(ctx) = self.post_delete_context.take() {
+            self.save_context(ctx);
+            self.stack.clear();
+            self.has_record = false;
+            self.skip_advance = false;
+            self.advance_state = AdvanceState::Start;
+            self.iteration_pending_descent = None;
+            return Ok(IOResult::Done(SavePositionResult::Saved));
+        }
+        if !self.has_record() {
+            if self.stack.current_page < 0 {
+                return Ok(IOResult::Done(SavePositionResult::Saved));
+            }
             return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
         }
         if self.stack.current_page < 0
@@ -10788,6 +10833,7 @@ pub fn payload_overflow_threshold_min(_page_type: PageType, usable_space: usize)
 
 /// Same rule as `sqlite3BtreeDelete`: an interior delete may always need balancing, and a leaf
 /// delete needs it when the freed cell and its 2-byte cell pointer leave more than 2/3 of the page free.
+#[cfg(test)]
 fn delete_may_need_balancing(
     page: &PageContent,
     cell_idx: usize,
@@ -15311,6 +15357,237 @@ mod tests {
                 Some(5),
                 "peer must observe its saved rowid after a left-of-it peer insert"
             );
+        }
+
+        #[test]
+        fn peer_delete_freeing_leaf_after_outer_deletes_last_cell_does_not_corrupt_next() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut outer = make_registered_cursor(&pager, root_page, 1);
+            let payload = Value::Blob(crate::alloc::vec![b'x'; 256]);
+            for rowid in 1..=35 {
+                insert_record(&mut outer, &pager, rowid, payload.clone()).unwrap();
+            }
+
+            // Position outer at the final row and delete it, leaving outer past
+            // the end of the rightmost leaf (`!has_record && skip_advance`).
+            run_until_done(
+                || outer.seek(SeekKey::TableRowId(35), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            run_until_done(|| outer.delete(), pager.deref()).unwrap();
+
+            // Simulate a self-referencing ON DELETE CASCADE opening a peer
+            // cursor after outer's delete and freeing the rightmost leaf.
+            let mut cascade = make_registered_cursor(&pager, root_page, 1);
+            for rowid in 30..=34 {
+                run_until_done(
+                    || cascade.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }),
+                    pager.deref(),
+                )
+                .unwrap();
+                run_until_done(|| cascade.delete(), pager.deref()).unwrap();
+            }
+
+            run_until_done(|| outer.next(), pager.deref()).unwrap();
+            assert!(!outer.has_record());
+            assert_eq!(scan_rowids(&pager, root_page), (1..=29).collect::<Vec<_>>());
+        }
+
+        #[test]
+        fn peer_delete_after_cell_zero_delete_preserves_remaining_scan() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut outer = make_registered_cursor(&pager, root_page, 1);
+            let payload = Value::Blob(crate::alloc::vec![b'y'; 100]);
+            for rowid in 1..=100 {
+                insert_record(&mut outer, &pager, rowid, payload.clone()).unwrap();
+            }
+
+            // Delete cell 0 on the leftmost leaf (`current_cell == -1`, `!has_record()`),
+            // then run a peer delete elsewhere and verify `outer.next()` still visits all
+            // remaining rows instead of stopping early on `MustInvalidate`.
+            run_until_done(
+                || outer.seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            run_until_done(|| outer.delete(), pager.deref()).unwrap();
+
+            let mut peer = make_registered_cursor(&pager, root_page, 1);
+            run_until_done(
+                || peer.seek(SeekKey::TableRowId(90), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            run_until_done(|| peer.delete(), pager.deref()).unwrap();
+
+            let mut visited = Vec::new();
+            loop {
+                run_until_done(|| outer.next(), pager.deref()).unwrap();
+                if !outer.has_record() {
+                    break;
+                }
+                let rowid = run_until_done(|| outer.rowid(), pager.deref())
+                    .unwrap()
+                    .unwrap();
+                visited.push(rowid);
+            }
+            let expected: Vec<i64> = (2..=100).filter(|&r| r != 90).collect();
+            assert_eq!(visited, expected);
+        }
+
+        #[test]
+        fn peer_delete_freeing_and_reusing_early_leaf_preserves_remaining_scan() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut outer = make_registered_cursor(&pager, root_page, 1);
+            let payload = Value::Blob(crate::alloc::vec![b'z'; 256]);
+            for rowid in 1..=35 {
+                insert_record(&mut outer, &pager, rowid, payload.clone()).unwrap();
+            }
+
+            run_until_done(
+                || outer.seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            run_until_done(|| outer.delete(), pager.deref()).unwrap();
+
+            let mut cascade = make_registered_cursor(&pager, root_page, 1);
+            for rowid in 2..=15 {
+                run_until_done(
+                    || cascade.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }),
+                    pager.deref(),
+                )
+                .unwrap();
+                run_until_done(|| cascade.delete(), pager.deref()).unwrap();
+            }
+            for rowid in 116..=130 {
+                insert_record(&mut cascade, &pager, rowid, payload.clone()).unwrap();
+            }
+
+            let mut visited = Vec::new();
+            loop {
+                run_until_done(|| outer.next(), pager.deref()).unwrap();
+                if !outer.has_record() {
+                    break;
+                }
+                let rowid = run_until_done(|| outer.rowid(), pager.deref())
+                    .unwrap()
+                    .unwrap();
+                visited.push(rowid);
+            }
+            let expected: Vec<i64> = (16..=35).chain(116..=130).collect();
+            assert_eq!(visited, expected);
+        }
+
+        #[test]
+        fn index_peer_opened_after_cell_zero_delete_preserves_remaining_scan() {
+            let (pager, _, _db, _conn) = empty_btree();
+            let root_page = run_until_done(
+                || pager.btree_create(&crate::storage::pager::CreateBTreeFlags::new_index()),
+                pager.deref(),
+            )
+            .unwrap() as i64;
+            let index = Index {
+                name: "peer_idx".to_string(),
+                where_clause: None,
+                columns: IndexColumn::new_many(["k".to_string(), "pad".to_string()]),
+                table_name: "peer_tbl".to_string(),
+                root_page,
+                unique: false,
+                ephemeral: false,
+                has_rowid: true,
+                index_method: None,
+                on_conflict: None,
+                constraint_name: None,
+            };
+
+            let mut outer =
+                Box::new(BTreeCursor::new_index(pager.clone(), root_page, &index, 2).unwrap());
+            (*outer).register_with_pager();
+
+            let pad = Value::Blob(crate::alloc::vec![b'p'; 100]);
+            let make_key = |k: i64| {
+                let regs = [
+                    Register::Value(Value::from_i64(k)),
+                    Register::Value(pad.clone()),
+                    Register::Value(Value::from_i64(k)),
+                ];
+                ImmutableRecord::from_registers(&regs, regs.len()).unwrap()
+            };
+            for k in 1..=100 {
+                let rec = make_key(k);
+                run_until_done(
+                    || {
+                        outer.seek(
+                            SeekKey::IndexKey(rec.as_record_ref()),
+                            SeekOp::GE { eq_only: true },
+                        )
+                    },
+                    pager.deref(),
+                )
+                .unwrap();
+                run_until_done(
+                    || outer.insert(&BTreeKey::new_index_key(rec.as_record_ref())),
+                    pager.deref(),
+                )
+                .unwrap();
+            }
+
+            // `outer` deletes cell 0 BEFORE any peer cursor is registered (`has_peers == false`).
+            let key_1 = make_key(1);
+            run_until_done(
+                || {
+                    outer.seek(
+                        SeekKey::IndexKey(key_1.as_record_ref()),
+                        SeekOp::GE { eq_only: true },
+                    )
+                },
+                pager.deref(),
+            )
+            .unwrap();
+            run_until_done(|| outer.delete(), pager.deref()).unwrap();
+
+            // Now a trigger/subprogram opens a peer cursor on the same index and deletes key 90.
+            let mut peer =
+                Box::new(BTreeCursor::new_index(pager.clone(), root_page, &index, 2).unwrap());
+            (*peer).register_with_pager();
+            let key_90 = make_key(90);
+            run_until_done(
+                || {
+                    peer.seek(
+                        SeekKey::IndexKey(key_90.as_record_ref()),
+                        SeekOp::GE { eq_only: true },
+                    )
+                },
+                pager.deref(),
+            )
+            .unwrap();
+            run_until_done(|| peer.delete(), pager.deref()).unwrap();
+
+            let mut visited = Vec::new();
+            loop {
+                run_until_done(|| outer.next(), pager.deref()).unwrap();
+                if !outer.has_record() {
+                    break;
+                }
+                let val = run_until_done(
+                    || {
+                        Ok(outer.record()?.map(|opt| {
+                            opt.map(|rec| rec.get_value(0).unwrap().to_owned().unwrap())
+                        }))
+                    },
+                    pager.deref(),
+                )
+                .unwrap()
+                .unwrap();
+                let Value::Numeric(Numeric::Integer(k)) = val else {
+                    panic!("expected integer index key, got {val:?}");
+                };
+                visited.push(k);
+            }
+            let expected: Vec<i64> = (2..=100).filter(|&k| k != 90).collect();
+            assert_eq!(visited, expected);
         }
     }
 
