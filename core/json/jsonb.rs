@@ -1905,8 +1905,6 @@ impl Jsonb {
                     });
                 }
 
-                // SQLite reports a bad escape at the character after the
-                // backslash.
                 let esc_pos = pos;
                 let esc = input[pos];
                 pos += 1;
@@ -2183,12 +2181,11 @@ impl Jsonb {
             len += 1;
             has_digit = true;
 
-            // Like SQLite, '0x' starts a hex number only when a hex digit
-            // follows; otherwise the number is just '0'.
             if pos + 1 < input.len()
                 && (input[pos] == b'x' || input[pos] == b'X')
                 && is_hex_digit(input[pos + 1])
             {
+                // Hexadecimal number
                 self.data.push(input[pos]);
                 pos += 1;
                 len += 1;
@@ -2316,8 +2313,7 @@ impl Jsonb {
                         len += 1;
                     }
 
-                    // Exponent must have at least one digit. SQLite reports
-                    // the 'e', or the sign after it.
+                    // Exponent must have at least one digit
                     if pos >= input.len() || !input[pos].is_ascii_digit() {
                         return Err(PError::Message {
                             msg: "malformed JSON".to_string(),
