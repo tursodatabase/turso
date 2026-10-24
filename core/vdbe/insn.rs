@@ -2266,10 +2266,12 @@ pub enum Insn {
         hash_table_id: usize,
     },
 
-    /// Reset all matched_bits in a hash table to false.
-    /// Emitted at the start of each outer-loop iteration so that marks from
-    /// a previous probe pass don't suppress NULL-fill rows in the current one.
-    HashResetMatched {
+    /// Start a probe pass over an already built hash table.
+    /// The build side is built once (under `Once`) but probed again every time
+    /// the join runs inside an outer loop or a correlated subquery, so this
+    /// drops what the previous pass left behind: buffered and spilled probe
+    /// rows, grace progress, loaded build partitions and the matched marks.
+    HashProbeInit {
         hash_table_id: usize,
     },
 
@@ -2596,7 +2598,7 @@ impl InsnVariants {
             InsnVariants::HashClose => execute::op_hash_close,
             InsnVariants::HashClear => execute::op_hash_clear,
             InsnVariants::HashMarkMatched => execute::op_hash_mark_matched,
-            InsnVariants::HashResetMatched => execute::op_hash_reset_matched,
+            InsnVariants::HashProbeInit => execute::op_hash_probe_init,
             InsnVariants::HashScanUnmatched => execute::op_hash_scan_unmatched,
             InsnVariants::HashNextUnmatched => execute::op_hash_next_unmatched,
             InsnVariants::HashGraceInit => execute::op_hash_grace_init,

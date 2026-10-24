@@ -143,7 +143,7 @@ addr  opcode               p1   p2   p3  p4                                     
   75    FilterAdd           2   41    2                                               0  bloom_filter_add(r[41..43])
   76  Next                  2   71    0                                               0
   77  HashBuildFinalize     4    0    0                                               0
-  78  HashResetMatched      4    0    0                                               0
+  78  HashProbeInit         4    0    0                                               0
   79  Rewind                8  105    0                                               0  Rewind table lineitem
   80    ColumnRange         8    1   47  2                                            0  r[47..48]=lineitem.L_PARTKEY..L_SUPPKEY
   81    Affinity           47    2    0                                               0  r[47..49] = C, C

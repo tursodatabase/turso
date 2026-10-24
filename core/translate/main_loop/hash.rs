@@ -672,11 +672,10 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         let hash_table_id: usize = build_table.internal_id.into();
         let num_keys = self.hash_join_op.join_keys.len();
 
-        // A prior probe pass must not hide unmatched build rows in this pass.
-        if self.hash_join_op.join_type.keeps_unmatched_build_rows() {
-            self.program
-                .emit_insn(Insn::HashResetMatched { hash_table_id });
-        }
+        // The build runs once; every pass through this loop probes it again and
+        // must not see probe rows, grace progress or matched marks of a prior pass.
+        self.program
+            .emit_insn(Insn::HashProbeInit { hash_table_id });
 
         self.program.emit_insn(Insn::Rewind {
             cursor_id: self.probe_cursor_id,
