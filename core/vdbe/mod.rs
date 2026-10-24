@@ -1174,6 +1174,9 @@ pub struct ProgramState {
     pub(crate) is_active_write: bool,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
+    /// Whether this write opened an MVCC statement savepoint because it joined
+    /// an autocommit transaction a sibling statement holds open.
+    shared_auto_txn_savepoint: bool,
     pub n_change: AtomicI64,
     pub n_total_change: AtomicI64,
     /// The connection's MvStore handle, revalidated with one pointer compare
@@ -1274,6 +1277,7 @@ impl ProgramState {
             uses_subjournal: false,
             is_active_write: false,
             has_stmt_transaction: false,
+            shared_auto_txn_savepoint: false,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
             n_total_change: AtomicI64::new(0),
@@ -1446,6 +1450,7 @@ impl ProgramState {
         self.uses_subjournal = false;
         self.is_active_write = false;
         self.has_stmt_transaction = false;
+        self.shared_auto_txn_savepoint = false;
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
         *self.n_change.get_mut() = 0;
@@ -1706,8 +1711,10 @@ impl ProgramState {
     /// when each DB's Transaction opcode is executed.
     ///
     /// Pager/MVCC savepoints are only opened for write statements inside an
-    /// explicit transaction. In autocommit mode, a statement abort is a
-    /// transaction abort, so savepoints are unnecessary.
+    /// explicit transaction, or for MVCC writes that join an autocommit
+    /// transaction a sibling statement holds open. Otherwise, in autocommit
+    /// mode a statement abort is a transaction abort, so savepoints are
+    /// unnecessary.
     pub fn begin_statement(
         &mut self,
         connection: &Connection,
@@ -1715,11 +1722,19 @@ impl ProgramState {
         write: bool,
     ) -> IOResultOr<()> {
         let in_explicit_txn = !connection.auto_commit.load(Ordering::SeqCst);
-        if write && in_explicit_txn {
+        // Like SQLite's OP_Transaction, which opens a statement journal when
+        // `db->nVdbeRead > 1` even in autocommit: earlier statements in the
+        // shared transaction already returned, so a failing write must only
+        // undo its own changes.
+        let joins_shared_mvcc_auto_txn = !in_explicit_txn
+            && connection.mv_store().is_some()
+            && connection.n_active_root_statements.load(Ordering::SeqCst) > 1;
+        if write && (in_explicit_txn || joins_shared_mvcc_auto_txn) {
             // Check if MVCC is active - if so, use MVCC savepoints instead of pager savepoints
             if let Some(mv_store) = connection.mv_store().as_ref() {
                 if let Some(tx_id) = connection.get_mv_tx_id() {
                     mv_store.begin_savepoint(tx_id);
+                    self.shared_auto_txn_savepoint = joins_shared_mvcc_auto_txn;
                 }
             } else {
                 // Non-MVCC mode: use pager savepoints
@@ -3683,6 +3698,20 @@ impl Program {
                 // Schema updated errors do not cause a rollback; the statement will be reprepared and retried,
                 // and the caller is expected to handle transaction cleanup explicitly if needed.
                 Some(LimboError::SchemaUpdated) => {}
+                // A write that joined an autocommit transaction a sibling
+                // statement still holds open cannot be the one committing, so
+                // its conflict came from the write-time check, which fails
+                // before the row is touched. Its statement savepoint was rolled
+                // back above, and the statements that already returned keep
+                // their changes, as they would in SQLite.
+                Some(LimboError::WriteWriteConflict)
+                    if state.shared_auto_txn_savepoint
+                        && !can_autocommit_now
+                        && state.auto_txn_cleanup == TxnCleanup::RollbackTxn
+                        && state.sequence_inner_tx_pending.is_none() =>
+                {
+                    self.connection.set_changes(0);
+                }
                 Some(LimboError::WriteWriteConflict | LimboError::SchemaConflict) => {
                     // These MVCC errors mean the current transaction cannot
                     // commit. Roll it back even if this statement opened a

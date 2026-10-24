@@ -5265,7 +5265,20 @@ pub fn op_transaction_inner(
                 let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
                 let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
                 let in_explicit_txn = !auto_commit;
-                if needs_stmt_journal {
+                // A write joining an autocommit transaction that a sibling
+                // statement holds open needs a statement savepoint even when it
+                // writes a single row: the transaction outlives it, so a
+                // conflict must undo only this statement (see `begin_statement`).
+                let joins_shared_mvcc_auto_txn = statement_writes_db
+                    && auto_commit
+                    && is_main_db
+                    && program.connection.mv_store().is_some()
+                    && program
+                        .connection
+                        .n_active_root_statements
+                        .load(Ordering::SeqCst)
+                        > 1;
+                if needs_stmt_journal || joins_shared_mvcc_auto_txn {
                     if is_main_db {
                         let res = state.begin_statement(
                             &program.connection,

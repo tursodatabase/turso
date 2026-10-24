@@ -644,6 +644,110 @@ fn test_mvcc_concurrent_conflicting_update_2() {
     assert!(matches!(err, LimboError::WriteWriteConflict));
 }
 
+/// Steps `stmt` until it returns a row.
+fn step_to_row(tmp_db: &TempDatabase, stmt: &mut Statement) {
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => return,
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            other => panic!("expected a row, got {other:?}"),
+        }
+    }
+}
+
+// A write that joins an autocommit transaction a sibling reader holds open
+// and hits a write-write conflict must only undo itself. The INSERT before it
+// already returned Ok, so it must commit when the reader finishes.
+#[test]
+fn test_mvcc_conflict_keeps_earlier_writes_of_shared_autocommit_txn() {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_conflict_shared_autocommit.db");
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+    let observer = tmp_db.connect_limbo();
+    conn1
+        .execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)")
+        .unwrap();
+    conn1
+        .execute("CREATE TABLE audit (id INTEGER PRIMARY KEY, note TEXT)")
+        .unwrap();
+    conn1
+        .execute("INSERT INTO accounts VALUES (1, 100), (2, 200)")
+        .unwrap();
+
+    let mut reader = conn2
+        .prepare("SELECT id FROM accounts ORDER BY id")
+        .unwrap();
+    step_to_row(&tmp_db, &mut reader);
+    conn2
+        .execute("INSERT INTO audit VALUES (1, 'payment recorded')")
+        .unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("UPDATE accounts SET balance = 150 WHERE id = 1")
+        .unwrap();
+    let conflict = conn2.execute("UPDATE accounts SET balance = 90 WHERE id = 1");
+    assert!(matches!(conflict, Err(LimboError::WriteWriteConflict)));
+
+    // The reader still runs in the transaction and commits it when done.
+    step_to_row(&tmp_db, &mut reader);
+    assert_eq!(reader.row().unwrap().get::<i64>(0).unwrap(), 2);
+    reader.run_ignore_rows().unwrap();
+    drop(reader);
+    conn1.execute("COMMIT").unwrap();
+
+    let audit: Vec<(i64,)> = observer.exec_rows("SELECT count(*) FROM audit");
+    assert_eq!(audit, vec![(1,)]);
+    let balances: Vec<(i64, i64)> =
+        observer.exec_rows("SELECT id, balance FROM accounts ORDER BY id");
+    assert_eq!(balances, vec![(1, 150), (2, 200)]);
+}
+
+// Same as above, but the conflicting write updates a row before it hits the
+// conflict. Its statement savepoint must undo that row and nothing else.
+#[test]
+fn test_mvcc_conflict_mid_statement_undoes_only_that_statement_in_shared_autocommit_txn() {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_conflict_shared_autocommit_multi.db");
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+    let observer = tmp_db.connect_limbo();
+    conn1
+        .execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)")
+        .unwrap();
+    conn1
+        .execute("CREATE TABLE audit (id INTEGER PRIMARY KEY, note TEXT)")
+        .unwrap();
+    conn1
+        .execute("INSERT INTO accounts VALUES (1, 100), (2, 200)")
+        .unwrap();
+
+    let mut reader = conn2
+        .prepare("SELECT id FROM accounts ORDER BY id")
+        .unwrap();
+    step_to_row(&tmp_db, &mut reader);
+    conn2
+        .execute("INSERT INTO audit VALUES (1, 'fees charged')")
+        .unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("UPDATE accounts SET balance = 250 WHERE id = 2")
+        .unwrap();
+    // Updates row 1, then conflicts on row 2.
+    let conflict = conn2.execute("UPDATE accounts SET balance = balance - 10");
+    assert!(matches!(conflict, Err(LimboError::WriteWriteConflict)));
+
+    reader.run_ignore_rows().unwrap();
+    drop(reader);
+    conn1.execute("COMMIT").unwrap();
+
+    let audit: Vec<(i64,)> = observer.exec_rows("SELECT count(*) FROM audit");
+    assert_eq!(audit, vec![(1,)]);
+    let balances: Vec<(i64, i64)> =
+        observer.exec_rows("SELECT id, balance FROM accounts ORDER BY id");
+    assert_eq!(balances, vec![(1, 100), (2, 250)]);
+}
+
 #[test]
 fn test_mvcc_checkpoint_works() {
     let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_checkpoint_works.db");
