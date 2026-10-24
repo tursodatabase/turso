@@ -1,10 +1,11 @@
 use crate::{
     alloc::{TursoFromIterator, TursoIteratorExt},
     emit_explain,
+    function::AggFunc,
     schema::{BTreeCharacteristics, BTreeTable},
     sync::Arc,
     translate::{
-        aggregation::emit_ungrouped_aggregation,
+        aggregation::{emit_ungrouped_aggregation, init_ungrouped_column_regs},
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
             MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
@@ -117,15 +118,27 @@ pub fn emit_query<'a>(
     // Emit FROM clause subqueries first so the results can be read in the main query loop.
     emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
 
+    let has_group_by_exprs = plan
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| !gb.exprs.is_empty());
+
+    if !plan.aggregates.is_empty() && !has_group_by_exprs {
+        t_ctx.ungrouped_column_regs = init_ungrouped_column_regs(program, plan)?;
+    }
+
     // For non-grouped aggregation queries that also have non-aggregate columns,
     // we need to ensure non-aggregate columns are only emitted once.
     // This flag helps track whether we've already emitted these columns.
+    // Like in SQLite, a column read outside an aggregate function also reads
+    // the first row only, or with MIN/MAX the row holding the MIN/MAX value.
     // It also tells whether any row reached the aggregate, which a correlated
     // subquery in the result columns needs even when every column contains an
     // aggregate: if no row did, the subquery runs again against the NULL row.
     let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
-        && plan.group_by.is_none()
+        && !has_group_by_exprs
         && (plan.result_columns.iter().any(|c| !c.contains_aggregates)
+            || !t_ctx.ungrouped_column_regs.is_empty()
             || plan
                 .non_from_clause_subqueries
                 .iter()
@@ -135,6 +148,13 @@ pub fn emit_query<'a>(
         let flag = program.alloc_register();
         program.emit_int(0, flag); // Initialize flag to 0 (not yet emitted)
         t_ctx.reg_nonagg_emit_once_flag = Some(flag);
+        if plan
+            .aggregates
+            .iter()
+            .any(|agg| matches!(agg.func, AggFunc::Min | AggFunc::Max))
+        {
+            t_ctx.reg_min_max_changed = Some(program.alloc_registers_and_init_w_null(1));
+        }
     }
 
     // Allocate registers for result columns
@@ -155,11 +175,6 @@ pub fn emit_query<'a>(
             }
         }
     }
-
-    let has_group_by_exprs = plan
-        .group_by
-        .as_ref()
-        .is_some_and(|gb| !gb.exprs.is_empty());
 
     // Initialize cursors and other resources needed for query execution
     if !plan.order_by.is_empty() {
