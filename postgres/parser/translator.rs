@@ -2117,21 +2117,25 @@ impl PostgreSQLTranslator {
                     self.translate_range_var(range_var)?
                 }
                 Some(pg_query::protobuf::node::Node::JoinExpr(join_expr)) => {
-                    // A JoinExpr as a comma-separated item — flatten its joins
-                    let nested = self.translate_join_expr(join_expr)?;
-                    if nested.joins.iter().any(join_keeps_unmatched_right_rows) {
-                        return Err(ParseError::ParseError(
-                            "RIGHT and FULL joins after a comma in FROM are not supported"
-                                .to_string(),
-                        ));
+                    if join_expr.alias.is_some() {
+                        self.translate_join_group(join_expr)?
+                    } else {
+                        // A JoinExpr as a comma-separated item — flatten its joins
+                        let nested = self.translate_join_expr(join_expr)?;
+                        if nested.joins.iter().any(join_keeps_unmatched_right_rows) {
+                            return Err(ParseError::ParseError(
+                                "RIGHT and FULL joins after a comma in FROM are not supported"
+                                    .to_string(),
+                            ));
+                        }
+                        from_clause.joins.push(ast::JoinedSelectTable {
+                            operator: ast::JoinOperator::Comma,
+                            table: nested.select,
+                            constraint: None,
+                        });
+                        from_clause.joins.extend(nested.joins);
+                        continue;
                     }
-                    from_clause.joins.push(ast::JoinedSelectTable {
-                        operator: ast::JoinOperator::Comma,
-                        table: nested.select,
-                        constraint: None,
-                    });
-                    from_clause.joins.extend(nested.joins);
-                    continue;
                 }
                 Some(pg_query::protobuf::node::Node::RangeFunction(range_func)) => {
                     self.translate_range_function(range_func)?
@@ -2168,7 +2172,14 @@ impl PostgreSQLTranslator {
                 })
             }
             Some(pg_query::protobuf::node::Node::JoinExpr(join_expr)) => {
-                self.translate_join_expr(join_expr)
+                if join_expr.alias.is_some() {
+                    Ok(ast::FromClause {
+                        select: Box::new(self.translate_join_group(join_expr)?),
+                        joins: vec![],
+                    })
+                } else {
+                    self.translate_join_expr(join_expr)
+                }
             }
             Some(pg_query::protobuf::node::Node::RangeSubselect(range_sub)) => {
                 let select_table = self.translate_range_subselect(range_sub)?;
@@ -2679,14 +2690,24 @@ impl PostgreSQLTranslator {
         })
     }
 
+    fn translate_join_group(
+        &self,
+        join_expr: &pg_query::protobuf::JoinExpr,
+    ) -> Result<ast::SelectTable, ParseError> {
+        reject_column_aliases(&join_expr.alias, "a parenthesized JOIN")?;
+        let from_clause = self.translate_join_expr(join_expr)?;
+        let alias = join_expr
+            .alias
+            .as_ref()
+            .map(|alias| ast::As::Elided(ast::Name::from_string(&alias.aliasname)));
+        Ok(ast::SelectTable::Sub(from_clause, alias))
+    }
+
     fn flatten_join_tree(
         &self,
         join_expr: &pg_query::protobuf::JoinExpr,
         joins: &mut Vec<ast::JoinedSelectTable>,
     ) -> Result<ast::SelectTable, ParseError> {
-        if join_expr.alias.is_some() {
-            return Err(not_supported("an alias on a parenthesized JOIN"));
-        }
         if join_expr.join_using_alias.is_some() {
             return Err(not_supported("JOIN ... USING (...) AS alias"));
         }
@@ -2698,7 +2719,11 @@ impl PostgreSQLTranslator {
                     self.translate_range_var(range_var)?
                 }
                 Some(pg_query::protobuf::node::Node::JoinExpr(nested_join)) => {
-                    self.flatten_join_tree(nested_join, joins)?
+                    if nested_join.alias.is_some() {
+                        self.translate_join_group(nested_join)?
+                    } else {
+                        self.flatten_join_tree(nested_join, joins)?
+                    }
                 }
                 Some(pg_query::protobuf::node::Node::RangeSubselect(range_sub)) => {
                     self.translate_range_subselect(range_sub)?
@@ -2726,7 +2751,7 @@ impl PostgreSQLTranslator {
                     self.translate_range_var(range_var)?
                 }
                 Some(pg_query::protobuf::node::Node::JoinExpr(nested_join)) => {
-                    ast::SelectTable::Sub(self.translate_join_expr(nested_join)?, None)
+                    self.translate_join_group(nested_join)?
                 }
                 Some(pg_query::protobuf::node::Node::RangeSubselect(range_sub)) => {
                     self.translate_range_subselect(range_sub)?
