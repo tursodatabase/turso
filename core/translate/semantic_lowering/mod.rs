@@ -289,7 +289,7 @@ impl PlannedSelect {
                 // qualifies it, unless it has an alias.
                 let name = match column.value {
                     ResolvedResultValue::Column(source) if !column.name_is_alias => {
-                        source.column_name().to_string()
+                        source.column_name
                     }
                     ResolvedResultValue::RowId { name, .. } if !column.name_is_alias => name,
                     _ => column.name,
@@ -795,70 +795,15 @@ pub(crate) enum ResolvedResultValue {
     },
 }
 
-/// A catalog table column keeps its table and reads its names and type
-/// from the schema when asked; a subquery or CTE column keeps them.
 #[derive(Debug, Clone)]
-pub(crate) enum ResolvedResultSourceColumn {
-    Table {
-        table: Arc<crate::schema::Table>,
-        column: usize,
-    },
-    Query {
-        table_name: String,
-        column_name: String,
-        /// Declared type text, empty when the column has none.
-        declared_type: String,
-        ty: Type,
-        array_dimensions: u32,
-    },
-}
-
-impl ResolvedResultSourceColumn {
-    pub(crate) fn table_name(&self) -> &str {
-        match self {
-            Self::Table { table, .. } => table.get_name(),
-            Self::Query { table_name, .. } => table_name,
-        }
-    }
-
-    pub(crate) fn column_name(&self) -> &str {
-        match self {
-            Self::Table { table, column } => {
-                table.columns()[*column].name.as_deref().unwrap_or_default()
-            }
-            Self::Query { column_name, .. } => column_name,
-        }
-    }
-
-    pub(crate) fn declared_type(&self) -> &str {
-        match self {
-            Self::Table { table, column } => &table.columns()[*column].ty_str,
-            Self::Query { declared_type, .. } => declared_type,
-        }
-    }
-
-    pub(crate) fn ty(&self) -> Type {
-        match self {
-            Self::Table { table, column } => table.columns()[*column].ty(),
-            Self::Query { ty, .. } => *ty,
-        }
-    }
-
-    pub(crate) fn array_dimensions(&self) -> u32 {
-        match self {
-            Self::Table { table, column } => table.columns()[*column].array_dimensions(),
-            Self::Query {
-                array_dimensions, ..
-            } => *array_dimensions,
-        }
-    }
-
-    pub(crate) fn table_is_strict(&self) -> bool {
-        match self {
-            Self::Table { table, .. } => table.is_strict(),
-            Self::Query { .. } => false,
-        }
-    }
+pub(crate) struct ResolvedResultSourceColumn {
+    pub(crate) table_name: String,
+    pub(crate) column_name: String,
+    /// Declared type text, empty when the column has none.
+    pub(crate) declared_type: String,
+    pub(crate) ty: Type,
+    pub(crate) array_dimensions: u32,
+    pub(crate) table_is_strict: bool,
 }
 
 fn resolved_result_columns(
@@ -1117,18 +1062,20 @@ fn resolved_result_value(
         hir::Expr::MergedColumn(merged) => resolved_result_value(document, &merged.left),
         hir::Expr::Column(reference) => {
             let source = source_of(reference.source)?;
-            if let Some(table) = catalog_table_object(source) {
-                if table.value().get_column_at(reference.column).is_none() {
-                    return Err(LimboError::InternalError(format!(
+            if let Some(table) = catalog_table(source) {
+                let column = table.get_column_at(reference.column).ok_or_else(|| {
+                    LimboError::InternalError(format!(
                         "HIR result references missing column {reference:?}"
-                    )));
-                }
-                return Ok(ResolvedResultValue::Column(
-                    ResolvedResultSourceColumn::Table {
-                        table: table.handle(),
-                        column: reference.column,
-                    },
-                ));
+                    ))
+                })?;
+                return Ok(ResolvedResultValue::Column(ResolvedResultSourceColumn {
+                    table_name: table.get_name().to_string(),
+                    column_name: column.name.clone().unwrap_or_default(),
+                    declared_type: column.ty_str.clone(),
+                    ty: column.ty(),
+                    array_dimensions: column.array_dimensions(),
+                    table_is_strict: table.is_strict(),
+                }));
             }
             let column = source.columns.get(reference.column).ok_or_else(|| {
                 LimboError::InternalError(format!(
@@ -1161,23 +1108,21 @@ fn resolved_result_value(
                         .unwrap_or(Type::Null),
                 )
             };
-            Ok(ResolvedResultValue::Column(
-                ResolvedResultSourceColumn::Query {
-                    // A FROM subquery is reported by its alias and a CTE by its
-                    // name.
-                    table_name: match (&source.kind, &source.alias) {
-                        (
-                            hir::SourceKind::Derived(_) | hir::SourceKind::FromGroup(_),
-                            Some(alias),
-                        ) => alias.clone(),
-                        _ => source.name.clone(),
-                    },
-                    column_name: column.name().to_string(),
-                    declared_type,
-                    ty,
-                    array_dimensions: declared.map_or(0, |declared| declared.array_dimensions),
+            Ok(ResolvedResultValue::Column(ResolvedResultSourceColumn {
+                // A FROM subquery is reported by its alias and a CTE by its
+                // name.
+                table_name: match (&source.kind, &source.alias) {
+                    (hir::SourceKind::Derived(_) | hir::SourceKind::FromGroup(_), Some(alias)) => {
+                        alias.clone()
+                    }
+                    _ => source.name.clone(),
                 },
-            ))
+                column_name: column.name().to_string(),
+                declared_type,
+                ty,
+                array_dimensions: declared.map_or(0, |declared| declared.array_dimensions),
+                table_is_strict: false,
+            }))
         }
         hir::Expr::RowId(source) => {
             let alias = catalog_table(source_of(*source)?)
@@ -1203,14 +1148,10 @@ fn resolved_result_value(
 }
 
 fn catalog_table(source: &hir::Source) -> Option<&crate::schema::Table> {
-    catalog_table_object(source).map(|table| table.value())
-}
-
-fn catalog_table_object(source: &hir::Source) -> Option<&hir::ResolvedTable> {
     match &source.kind {
         hir::SourceKind::Table(table)
         | hir::SourceKind::TableFunction { table, .. }
-        | hir::SourceKind::Pseudo { table, .. } => Some(table),
+        | hir::SourceKind::Pseudo { table, .. } => Some(table.value()),
         hir::SourceKind::SchemaExpression
         | hir::SourceKind::Cte(_)
         | hir::SourceKind::Derived(_)

@@ -734,7 +734,7 @@ pub fn program_plan_json(program: &Program) -> String {
                 crate::translate::semantic_lowering::ResolvedResultValue::Column(source)
                     if !column.name_is_alias =>
                 {
-                    source.column_name().to_string()
+                    source.column_name.clone()
                 }
                 crate::translate::semantic_lowering::ResolvedResultValue::RowId {
                     name, ..
