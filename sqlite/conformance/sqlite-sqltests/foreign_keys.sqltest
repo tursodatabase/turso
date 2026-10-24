@@ -4790,3 +4790,44 @@ snapshot fk-upsert-column-no-child-points-at {
 snapshot fk-upsert-parent-key-with-cascade-child {
     INSERT INTO parent(id, k, v) VALUES (1, 10, 2) ON CONFLICT(id) DO UPDATE SET k = excluded.k;
 }
+
+# A parent DELETE where one child row references the parent through both a
+# CASCADE foreign key and an immediate NO ACTION foreign key must succeed: the
+# CASCADE removes the child, so at statement end no row references the deleted
+# parent. Turso used to fail with "FOREIGN KEY constraint failed" because the
+# NO ACTION check bumps the immediate violation counter, but the cascade that
+# clears the reference runs in a subprogram with its own counter, so the
+# decrement never reached the parent statement's counter (issue #9290).
+@cross-check-integrity
+test fk-delete-cascade-and-immediate-noaction-same-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE TABLE c(pid REFERENCES p(id) ON DELETE CASCADE, pname REFERENCES p(name));
+    INSERT INTO p VALUES(1,'a');
+    INSERT INTO c VALUES(1,'a');
+    DELETE FROM p WHERE id=1;
+    SELECT count(*) FROM p;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+    0
+}
+
+# Same shape across several rows: the cascade subprogram fires for each deleted
+# parent row, and the shared immediate counter must net back to zero every time.
+@cross-check-integrity
+test fk-delete-cascade-and-immediate-noaction-multiple-rows {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE TABLE c(pid REFERENCES p(id) ON DELETE CASCADE, pname REFERENCES p(name));
+    INSERT INTO p VALUES(1,'a'),(2,'b'),(3,'c');
+    INSERT INTO c VALUES(1,'a'),(2,'b'),(3,'c');
+    DELETE FROM p WHERE id IN (1,3);
+    SELECT id FROM p ORDER BY id;
+    SELECT pid FROM c ORDER BY pid;
+}
+expect {
+    2
+    2
+}
