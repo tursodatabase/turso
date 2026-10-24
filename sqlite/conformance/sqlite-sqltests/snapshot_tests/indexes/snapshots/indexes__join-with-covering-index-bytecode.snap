@@ -22,7 +22,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode               p1  p2  p3  p4                                          p5  comment
-   0  Init                  0  55   0                                               0  Start at 55
+   0  Init                  0  56   0                                               0  Start at 56
    1  OpenEphemeral         0   1   0                                               0  cursor=0 is_table=true
    2  OpenRead              1   7   0  k(3,B,B)                                     0  index=idx_orders_customer_date, root=7, iDb=0
    3  Integer             100   6   0                                               0  r[6]=100
@@ -48,35 +48,36 @@ addr  opcode               p1  p2  p3  p4                                       
   23    FilterAdd           0  15   1                                               0  bloom_filter_add(r[15..16])
   24  Next                  0  19   0                                               0
   25  HashBuildFinalize     1   0   0                                               0
-  26  Rewind                2  41   0                                               0  Rewind table inventory
-  27    Column              2   2  20                                               0  r[20]=inventory.product_id
-  28    Affinity           20   1   0                                               0  r[20..21] = C
-  29    Filter              0  40  20                                               1  if !bloom_filter(r[20..21]) goto 40
-  30    RowId               2  25   0                                               0  r[25]=inventory.rowid
-  31    Integer             0  26   0                                               0  r[26]=0
-  32    HashProbe           1  20   1  r[27]=40 payload=r[21]..r[24]                0
-  33    Copy               21  12   0                                               0  r[12]=r[21]
-  34    Copy               23  13   0                                               0  r[13]=r[23]
-  35    Column              2   3  14                                               0  r[14]=inventory.quantity
-  36    ResultRow          12   3   0                                               0  output=r[12..14]
-  37    IfPos              26  48   0                                               0  r[26]>0 -> r[26]-=0, goto 48
-  38    HashNext            1  27  40   payload=r[21]..r[24]                        0
-  39    Goto                0  33   0                                               0
-  40  Next                  2  27   0                                               0
-  41  HashGraceInit         1   0  53                                               0  hash_table_id=1
-  42  Integer               1  26   0                                               0  r[26]=1
-  43  HashGraceLoadPart     1   0  52                                               0  hash_table_id=1
-  44  HashGraceNextProbe    1  20  50                                               0  hash_table_id=1 keys=r[20]..r[20] probe_rowid_dest=r[25]
-  45  SeekRowid             2  25  44                                               0  if (r[25]!=cursor 2 for table inventory.rowid) goto 44
-  46  HashProbe             1  20   1  r[27]=44 payload=r[21]..r[24]                0
-  47  Goto                  0  33   0                                               0
-  48  HashNext              1  27  44   payload=r[21]..r[24]                        0
-  49  Goto                  0  33   0                                               0
-  50  HashGraceAdvPart      1   0  52                                               0  hash_table_id=1
-  51  Goto                  0  43   0                                               0
-  52  Integer               0  26   0                                               0  r[26]=0
-  53  HashClose             1   0   0                                               0
-  54  Halt                  0   0   0                                               0
-  55  Transaction           0   1  14                                               0  iDb=0 tx_mode=Read
-  56  Integer             100   9   0                                               0  r[9]=100
-  57  Goto                  0   1   0                                               0
+  26  HashProbeInit         1   0   0                                               0
+  27  Rewind                2  42   0                                               0  Rewind table inventory
+  28    Column              2   2  20                                               0  r[20]=inventory.product_id
+  29    Affinity           20   1   0                                               0  r[20..21] = C
+  30    Filter              0  41  20                                               1  if !bloom_filter(r[20..21]) goto 41
+  31    RowId               2  25   0                                               0  r[25]=inventory.rowid
+  32    Integer             0  26   0                                               0  r[26]=0
+  33    HashProbe           1  20   1  r[27]=41 payload=r[21]..r[24]                0
+  34    Copy               21  12   0                                               0  r[12]=r[21]
+  35    Copy               23  13   0                                               0  r[13]=r[23]
+  36    Column              2   3  14                                               0  r[14]=inventory.quantity
+  37    ResultRow          12   3   0                                               0  output=r[12..14]
+  38    IfPos              26  49   0                                               0  r[26]>0 -> r[26]-=0, goto 49
+  39    HashNext            1  27  41   payload=r[21]..r[24]                        0
+  40    Goto                0  34   0                                               0
+  41  Next                  2  28   0                                               0
+  42  HashGraceInit         1   0  54                                               0  hash_table_id=1
+  43  Integer               1  26   0                                               0  r[26]=1
+  44  HashGraceLoadPart     1   0  53                                               0  hash_table_id=1
+  45  HashGraceNextProbe    1  20  51                                               0  hash_table_id=1 keys=r[20]..r[20] probe_rowid_dest=r[25]
+  46  SeekRowid             2  25  45                                               0  if (r[25]!=cursor 2 for table inventory.rowid) goto 45
+  47  HashProbe             1  20   1  r[27]=45 payload=r[21]..r[24]                0
+  48  Goto                  0  34   0                                               0
+  49  HashNext              1  27  45   payload=r[21]..r[24]                        0
+  50  Goto                  0  34   0                                               0
+  51  HashGraceAdvPart      1   0  53                                               0  hash_table_id=1
+  52  Goto                  0  44   0                                               0
+  53  Integer               0  26   0                                               0  r[26]=0
+  54  HashClose             1   0   0                                               0
+  55  Halt                  0   0   0                                               0
+  56  Transaction           0   1  14                                               0  iDb=0 tx_mode=Read
+  57  Integer             100   9   0                                               0  r[9]=100
+  58  Goto                  0   1   0                                               0

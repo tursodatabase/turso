@@ -2215,6 +2215,52 @@ mod tests {
         db.connect(ConnectOpts::new())
     }
 
+    /// A hash join inside a correlated subquery is built once and probed once per
+    /// outer row. The budget is forced down so the build spills in every build
+    /// profile; the second and third passes then go through the grace phase and
+    /// must count the same rows as the first (#9774).
+    #[test]
+    fn test_spilled_hash_join_counts_the_same_on_every_probe_pass() {
+        let conn = open_test_connection().unwrap();
+        for sql in [
+            "CREATE TABLE a(x INTEGER PRIMARY KEY, y INT)",
+            "CREATE TABLE c(k INT, v INT)",
+            "CREATE TABLE d(k INT, w INT)",
+            "INSERT INTO a VALUES (1, 0), (2, 1000000), (3, 1000000)",
+            "INSERT INTO c SELECT value % 50, value FROM generate_series(1, 1000)",
+            "INSERT INTO d SELECT value % 70, value FROM generate_series(1, 1000)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT a.x, (SELECT count(*) FROM c JOIN d ON c.k = d.k AND d.w < a.y) FROM a",
+            )
+            .unwrap();
+        let mut hash_builds = 0;
+        for (insn, _) in &mut Arc::make_mut(&mut stmt.program.prepared).insns {
+            if let vdbe::insn::Insn::HashBuild { data } = insn {
+                data.mem_budget = 32 * 1024;
+                hash_builds += 1;
+            }
+        }
+        assert_eq!(hash_builds, 1, "the join must be built once and reused");
+
+        let rows = stmt.run_collect_rows().unwrap();
+        let expected: Vec<Vec<Value>> = [[1, 0], [2, 14400], [3, 14400]]
+            .iter()
+            .map(|row| row.iter().copied().map(Value::from_i64).collect())
+            .collect();
+        assert_eq!(rows, expected);
+
+        let metrics = stmt.metrics().hash_join;
+        assert!(metrics.spill_chunks > 0, "build did not spill: {metrics:?}");
+        assert!(
+            metrics.grace_partitions_processed > 0,
+            "no pass went through grace: {metrics:?}"
+        );
+    }
+
     #[test]
     fn test_expanded_sql() {
         let conn = open_test_connection().unwrap();
