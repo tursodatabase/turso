@@ -2741,8 +2741,11 @@ fn test_postgres_insert_default(db: TempDatabase) {
     conn.execute("INSERT INTO t (id, name, score) VALUES (2, 'alice', DEFAULT), (3, DEFAULT, 99)")
         .unwrap();
 
-    // All columns DEFAULT
-    conn.execute("INSERT INTO t (id, name, score) VALUES (DEFAULT, DEFAULT, DEFAULT)")
+    // id has no default, so DEFAULT gives NULL, which the primary key rejects
+    assert!(conn
+        .execute("INSERT INTO t (id, name, score) VALUES (DEFAULT, DEFAULT, DEFAULT)")
+        .is_err());
+    conn.execute("INSERT INTO t (id, name, score) VALUES (4, DEFAULT, DEFAULT)")
         .unwrap();
 
     // Verify results
@@ -2765,15 +2768,63 @@ fn test_postgres_insert_default(db: TempDatabase) {
             _ => {}
         }
     }
-    // id=DEFAULT → NULL (no default defined), all others get their defaults
-    // INTEGER PRIMARY KEY with NULL → auto-assigned rowid
     assert_eq!(
         results,
         vec![
             "1,unknown,42", // name=DEFAULT → 'unknown'
             "2,alice,0",    // score=DEFAULT → 0
             "3,unknown,99", // name=DEFAULT → 'unknown'
-            "4,unknown,0",  // all DEFAULT
+            "4,unknown,0",  // name and score DEFAULT
+        ]
+    );
+}
+
+#[test]
+fn test_postgres_int_primary_key_table_from_existing_file() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("existing.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            "CREATE TABLE p (id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO p VALUES (1, 'x'), (2, 'y');
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema
+                SET sql = '/* turso_frontend:postgres */ CREATE TABLE p (id int primary key, v text)'
+              WHERE name = 'p';",
+        )
+        .unwrap();
+    drop(sqlite);
+
+    let db = turso_pg::open_database_with_io(
+        std::sync::Arc::new(turso_core::PlatformIO::new().unwrap()),
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new().with_custom_types(true),
+    )
+    .unwrap();
+    let conn = turso_pg::Connection::connect(&db).unwrap();
+
+    assert!(conn.execute("INSERT INTO p (v) VALUES ('z')").is_err());
+    assert!(conn.execute("INSERT INTO p VALUES (NULL, 'z')").is_err());
+    assert!(conn.execute("INSERT INTO p VALUES (1, 'dup')").is_err());
+    conn.execute("INSERT INTO p VALUES (3, 'z')").unwrap();
+    assert_eq!(
+        conn.prepare("SELECT id, v FROM p WHERE id = 2")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(2), Value::build_text("y")]]
+    );
+    assert_eq!(
+        conn.prepare("SELECT id FROM p ORDER BY id")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(2)],
+            vec![Value::from_i64(3)]
         ]
     );
 }
