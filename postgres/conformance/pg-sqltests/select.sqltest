@@ -160,6 +160,54 @@ expect {
     30
 }
 
+test generate-series-column-named-after-function {
+    SELECT generate_series FROM generate_series(1, 3);
+    SELECT generate_series.generate_series FROM generate_series(4, 4);
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+test generate-series-column-named-after-table-alias {
+    SELECT g FROM generate_series(1, 3) g;
+    SELECT g.g FROM generate_series(4, 4) AS g;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+test generate-series-select-star-column-name {
+    SELECT * FROM generate_series(1, 2) g, generate_series(3, 3) ORDER BY g.g;
+}
+expect {
+    1|3
+    2|3
+}
+
+test generate-series-has-no-value-column {
+    SELECT value FROM generate_series(1, 3);
+}
+expect error {
+}
+
+test generate-series-rejects-aggregate-argument {
+    SELECT * FROM generate_series(1, count(*));
+}
+expect error {
+}
+
+test generate-series-rejects-window-function-argument {
+    SELECT * FROM generate_series(1, 3, rank() OVER ()) AS g(n);
+}
+expect error {
+}
+
 test select-null-renders-empty {
     SELECT NULL;
 }

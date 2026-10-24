@@ -2446,7 +2446,7 @@ fn test_postgres_generate_series(db: TempDatabase) {
 
     // Basic generate_series(start, stop)
     let mut stmt = conn
-        .prepare("SELECT value FROM generate_series(1, 5)")
+        .prepare("SELECT generate_series FROM generate_series(1, 5)")
         .unwrap();
     let mut results: Vec<i64> = Vec::new();
     loop {
@@ -2466,7 +2466,7 @@ fn test_postgres_generate_series(db: TempDatabase) {
 
     // generate_series with step
     let mut stmt = conn
-        .prepare("SELECT value FROM generate_series(0, 10, 3)")
+        .prepare("SELECT generate_series FROM generate_series(0, 10, 3)")
         .unwrap();
     let mut results: Vec<i64> = Vec::new();
     loop {
@@ -2529,6 +2529,16 @@ fn test_postgres_generate_series(db: TempDatabase) {
         }
     }
     assert_eq!(results, vec!["alpha,1", "alpha,2", "beta,1", "beta,2"]);
+    drop(stmt);
+
+    for (sql, expected) in [
+        ("SELECT * FROM generate_series(1, 3)", "generate_series"),
+        ("SELECT * FROM generate_series(1, 3) g", "g"),
+        ("SELECT * FROM generate_series(1, 3) AS g(n)", "n"),
+    ] {
+        let stmt = conn.prepare(sql).unwrap();
+        assert_eq!(stmt.get_column_name(0), expected, "{sql}");
+    }
 }
 
 #[turso_macros::test(mvcc)]
