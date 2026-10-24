@@ -459,6 +459,111 @@ fn test_cdc_failed_op(db: TempDatabase) {
     );
 }
 
+#[turso_macros::test()]
+fn test_cdc_records_nothing_for_a_failed_write_to_a_temp_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
+        .unwrap();
+    conn.execute("CREATE TEMP TABLE t (x INTEGER PRIMARY KEY, y TEXT NOT NULL)")
+        .unwrap();
+    assert_failed_write_leaves_no_change(&conn, "temp.t", vec![]);
+}
+
+#[turso_macros::test()]
+fn test_cdc_failed_write_to_attached_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    let aux_path = db.path.with_extension("cdc_failed_write_aux.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
+        .unwrap();
+    conn.execute("CREATE TABLE aux.t (x INTEGER PRIMARY KEY, y TEXT NOT NULL)")
+        .unwrap();
+    assert_failed_write_leaves_no_change(
+        &conn,
+        "aux.t",
+        vec![vec![Value::Integer(1), Value::Integer(3)]],
+    );
+}
+
+#[turso_macros::test()]
+fn test_cdc_records_nothing_for_a_write_to_a_temp_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
+        .unwrap();
+    conn.execute("CREATE TEMP TABLE t (x INTEGER PRIMARY KEY, y TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO temp.t VALUES (1, 'a')").unwrap();
+    conn.execute("UPDATE temp.t SET y = 'b'").unwrap();
+    conn.execute("DELETE FROM temp.t").unwrap();
+    assert!(limbo_exec_rows(&conn, "SELECT x, y FROM temp.t").is_empty());
+    assert_other_connection_sees_changes_of_t(&db, vec![]);
+}
+
+#[turso_macros::test()]
+fn test_cdc_write_to_attached_table_is_committed(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    let aux_path = db.path.with_extension("cdc_committed_aux.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
+        .unwrap();
+    conn.execute("CREATE TABLE aux.t (x INTEGER PRIMARY KEY, y TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO aux.t VALUES (1, 'a')").unwrap();
+    conn.execute("UPDATE aux.t SET y = 'b'").unwrap();
+    conn.execute("DELETE FROM aux.t").unwrap();
+    assert_other_connection_sees_changes_of_t(
+        &db,
+        vec![
+            vec![Value::Integer(1), Value::Integer(1)],
+            vec![Value::Integer(0), Value::Integer(1)],
+            vec![Value::Integer(-1), Value::Integer(1)],
+        ],
+    );
+}
+
+fn assert_failed_write_leaves_no_change(
+    conn: &Arc<turso_core::Connection>,
+    table: &str,
+    expected_cdc_rows: Vec<Vec<Value>>,
+) {
+    let err = conn
+        .execute(format!("INSERT INTO {table} VALUES (1, 'a'), (2, NULL)"))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("NOT NULL constraint failed"),
+        "{err}"
+    );
+    conn.execute(format!("INSERT INTO {table} VALUES (3, 'c')"))
+        .unwrap();
+    assert_eq!(
+        limbo_exec_rows(conn, &format!("SELECT x, y FROM {table}")),
+        vec![vec![Value::Integer(3), Value::Text("c".to_string())]]
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            conn,
+            "SELECT change_type, id FROM turso_cdc WHERE table_name = 't'"
+        ),
+        expected_cdc_rows
+    );
+}
+
+fn assert_other_connection_sees_changes_of_t(
+    db: &TempDatabase,
+    expected_cdc_rows: Vec<Vec<Value>>,
+) {
+    let other = db.connect_limbo();
+    assert_eq!(
+        limbo_exec_rows(
+            &other,
+            "SELECT change_type, id FROM turso_cdc WHERE table_name = 't' ORDER BY change_id"
+        ),
+        expected_cdc_rows
+    );
+}
+
 // TODO: cannot use mvcc because of indexes
 #[turso_macros::test()]
 fn test_cdc_uncaptured_connection(db: TempDatabase) {
