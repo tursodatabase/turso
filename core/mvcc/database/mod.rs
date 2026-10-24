@@ -4115,6 +4115,14 @@ pub enum BootstrapState {
     Recover {
         recover_st: RecoverLogicalLogState,
     },
+    /// Rebuild the schema after the logical log replayed committed frames
+    /// (non-blocking). The schema built during replay has no CREATE TYPE or
+    /// CREATE DOMAIN definitions, because those are rows of
+    /// __turso_internal_types that are only readable once replay is done.
+    ReparseAfterReplay {
+        reparse_st: crate::connection::ReparseSchemaState,
+        dropped_root_pages: HashSet<i64>,
+    },
     /// Recover sequence descriptors from each backing table (non-blocking).
     /// The pre-replay reparse missed backing tables created by committed-but-
     /// not-checkpointed CREATE SEQUENCE statements; this pass registers pure
@@ -5276,9 +5284,42 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     // reads from the pager-backed schema, so recovery can merge
                     // checkpointed sqlite_schema rows with non-checkpointed rows
                     // from log replay.
-                    return_if_io!(self.maybe_recover_logical_log(bootstrap_conn, recover_st));
+                    let replayed_frames =
+                        return_if_io!(self.maybe_recover_logical_log(bootstrap_conn, recover_st));
                     // Recovery done; switch back to regular MVCC reads.
                     bootstrap_conn.promote_to_regular_connection();
+                    let has_types_table = bootstrap_conn.experimental_custom_types_enabled()
+                        && bootstrap_conn.with_schema(crate::MAIN_DB_ID, |s| {
+                            s.tables.contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+                        });
+                    if replayed_frames && has_types_table {
+                        let dropped_root_pages = bootstrap_conn.with_schema_mut(|schema| {
+                            std::mem::take(&mut schema.dropped_root_pages)
+                        })?;
+                        *st = BootstrapState::ReparseAfterReplay {
+                            reparse_st: crate::connection::ReparseSchemaState::default(),
+                            dropped_root_pages,
+                        };
+                    } else {
+                        *st = BootstrapState::LoadSequences {
+                            load_st: crate::connection::LoadSequenceDescriptorsState::default(),
+                        };
+                    }
+                }
+                BootstrapState::ReparseAfterReplay {
+                    reparse_st,
+                    dropped_root_pages,
+                } => {
+                    if self.global_header.read().is_none() {
+                        let pager = bootstrap_conn.pager.load();
+                        let header = return_if_io!(pager.with_header(|header| *header));
+                        self.global_header.write().replace(header);
+                    }
+                    return_if_io!(bootstrap_conn.reparse_schema_nonblock(reparse_st));
+                    let dropped_root_pages = std::mem::take(dropped_root_pages);
+                    bootstrap_conn.with_schema_mut(|schema| {
+                        schema.dropped_root_pages = dropped_root_pages;
+                    })?;
                     *st = BootstrapState::LoadSequences {
                         load_st: crate::connection::LoadSequenceDescriptorsState::default(),
                     };
@@ -9714,7 +9755,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     self.last_committed_tx_ts
                         .store(max_commit_ts_seen, Ordering::SeqCst);
                     *st = RecoverLogicalLogState::Done;
-                    return Ok(IOResult::Done(true));
+                    return Ok(IOResult::Done(max_commit_ts_seen > persistent_tx_ts_max));
                 }
                 RecoverLogicalLogState::Done => {
                     return Ok(IOResult::Done(false));

@@ -19430,6 +19430,125 @@ fn test_create_type_visible_to_second_connection_under_mvcc() {
     conn2.close().unwrap();
 }
 
+/// What this test checks: domains that are only in the logical log still apply
+/// NOT NULL, CHECK and DEFAULT to their columns after the database reopens.
+/// Why this matters: the types table rows are replayed from the log after the
+/// schema is loaded, so the domains were missing and every value was accepted.
+#[test]
+fn test_domains_in_logical_log_apply_after_restart() {
+    let mut db =
+        MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_custom_types(true));
+    {
+        let conn = db.connect();
+        conn.execute("CREATE DOMAIN n AS integer DEFAULT 3 NOT NULL")
+            .unwrap();
+        conn.execute("CREATE DOMAIN p AS integer CHECK (value > 0)")
+            .unwrap();
+        conn.execute("CREATE TABLE w(a n, b p) STRICT").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.connect();
+    assert!(conn.execute("INSERT INTO w VALUES (NULL, 1)").is_err());
+    assert!(conn.execute("INSERT INTO w(b) VALUES (-1)").is_err());
+    conn.execute("INSERT INTO w(b) VALUES (1)").unwrap();
+    let rows = get_rows(&conn, "SELECT a, b FROM w");
+    assert_eq!(rows, vec![vec![Value::from_i64(3), Value::from_i64(1)]]);
+}
+
+/// What this test checks: a database whose domains and tables are already
+/// checkpointed reopens, and the table has exactly one CHECK from its domain.
+/// Why this matters: the domains were read through MVCC before the bootstrap
+/// set the database header, so the reopen failed.
+#[test]
+fn test_reopen_with_checkpointed_domain_keeps_one_domain_check() {
+    let mut db =
+        MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_custom_types(true));
+    {
+        let conn = db.connect();
+        conn.execute("CREATE DOMAIN p AS integer CHECK (value > 0)")
+            .unwrap();
+        conn.execute("CREATE TABLE w(b p) STRICT").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.connect();
+    let checks = conn.with_schema(crate::MAIN_DB_ID, |schema| {
+        schema.get_btree_table("w").unwrap().check_constraints.len()
+    });
+    assert_eq!(checks, 1);
+}
+
+/// What this test checks: a domain dropped after the last checkpoint stays
+/// dropped after the database reopens.
+/// Why this matters: the checkpointed types table still has the domain, and
+/// only the replayed logical log removes it.
+#[test]
+fn test_domain_dropped_in_logical_log_is_gone_after_restart() {
+    let mut db =
+        MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_custom_types(true));
+    {
+        let conn = db.connect();
+        conn.execute("CREATE DOMAIN p AS integer CHECK (value > 0)")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("DROP DOMAIN p").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.connect();
+    assert!(conn.execute("CREATE TABLE w(b p) STRICT").is_err());
+    conn.execute("CREATE DOMAIN p AS integer CHECK (value > 0)")
+        .unwrap();
+}
+
+/// What this test checks: switching to MVCC with a domain in the database
+/// keeps the rows inserted afterwards across a reopen.
+/// Why this matters: the switch runs the MVCC bootstrap on the user's own
+/// connection, and loading the domains there must not change how later
+/// writes reach the logical log.
+#[test]
+fn test_insert_after_switch_to_mvcc_with_domain_survives_restart() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("test.db");
+    let opts = DatabaseOpts::new().with_custom_types(true);
+    let db = Database::open_file_with_flags(
+        Arc::new(PlatformIO::new().unwrap()),
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE DOMAIN p AS integer").unwrap();
+    conn.execute("CREATE TABLE w(b)").unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("INSERT INTO w VALUES (1)").unwrap();
+    conn.close().unwrap();
+    let mut db = MvccTestDbNoConn {
+        db: Some(db),
+        path: Some(path.to_str().unwrap().to_string()),
+        opts,
+        enc_opts: None,
+        _temp_dir: Some(temp_dir),
+    };
+
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT count(*) FROM w");
+    assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
+}
+
 /// Dropped roots that are still live roots must not be walked twice.
 #[test]
 fn test_integrity_check_ignores_dropped_root_that_is_live_after_recovery() {

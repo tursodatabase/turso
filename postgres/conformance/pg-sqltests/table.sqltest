@@ -381,3 +381,20 @@ expect {
     1|1|0
     2|2|1
 }
+
+test table-domain-not-null-default-fills-omitted-column {
+    CREATE DOMAIN nn_default AS int NOT NULL DEFAULT 3;
+    CREATE TABLE t (a nn_default, b int);
+    INSERT INTO t(b) VALUES (2);
+    SELECT a, b FROM t;
+}
+expect {
+    3|2
+}
+
+test table-domain-not-null-default-rejects-explicit-null {
+    CREATE DOMAIN nn_default AS int NOT NULL DEFAULT 3;
+    CREATE TABLE t (a nn_default, b int);
+    INSERT INTO t VALUES (NULL, 2);
+}
+expect error {}
