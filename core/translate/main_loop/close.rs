@@ -401,13 +401,13 @@ fn emit_unmatched_right_rows(
             program.emit_insn(Insn::OpenRead {
                 cursor_id: table_cursor_id,
                 root_page: btree.root_page,
-                db: table.database_id,
+                db: table.namespace.database_id,
             });
             for (index, index_cursor_id) in &unmatched_index_cursors {
                 program.emit_insn(Insn::OpenRead {
                     cursor_id: *index_cursor_id,
                     root_page: index.root_page,
-                    db: table.database_id,
+                    db: table.namespace.database_id,
                 });
             }
         }

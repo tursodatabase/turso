@@ -1,7 +1,7 @@
 use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
-use crate::namespace::NamespaceId;
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
@@ -182,7 +182,7 @@ pub fn emit_program_for_update(
                 col_used_mask: Default::default(),
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
-                database_id: MAIN_DB_ID,
+                namespace: NamespaceRef::root_of(MAIN_DB_ID),
                 indexed: None,
                 plan_estimate: None,
             }],
@@ -192,7 +192,7 @@ pub fn emit_program_for_update(
             identifier: target_table.identifier.clone(),
             internal_id: target_table.internal_id,
             table: target_table.table.clone(),
-            database_id: target_table.database_id,
+            namespace: target_table.namespace,
             join_info: None,
             col_used_mask: target_table.col_used_mask.try_clone()?,
             cte_select: None,
@@ -304,7 +304,7 @@ pub fn emit_program_for_update(
     )?;
 
     // Prepare index cursors
-    let target_database_id = target_table.database_id;
+    let target_database_id = target_table.namespace.database_id;
     let mut index_cursors = Vec::with_capacity(plan.indexes_to_update.len());
     for index in &plan.indexes_to_update {
         let index_cursor = if let Some(cursor) = program.resolve_cursor_id_safe(&CursorKey::index(
@@ -382,7 +382,7 @@ pub fn emit_program_for_update(
     let all_index_cursors = if any_replace {
         let table_name = target_table.table.get_name();
         let all_indexes: Vec<_> = resolver.with_schema(target_database_id, |s| {
-            s.get_indices(NamespaceId::ROOT, table_name)
+            s.get_indices(target_table.namespace.id, table_name)
                 .cloned()
                 .collect()
         });
@@ -683,14 +683,15 @@ fn emit_replace_delete<'a>(
     all_index_cursors: &[(Arc<Index>, usize)],
     conflicting_rowid_reg: usize,
     new_row_registers: Option<(usize, usize)>,
-    update_database_id: usize,
+    update_namespace: NamespaceRef,
     t_ctx: &mut TranslateCtx<'a>,
 ) -> crate::Result<()> {
+    let update_database_id = update_namespace.database_id;
     let table_name = target_table.table.get_name();
     let internal_id = target_table.internal_id;
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
         let prepared = if t_ctx.resolver.with_schema(update_database_id, |s| {
-            s.any_resolved_fks_referencing(NamespaceId::ROOT, table_name)
+            s.any_resolved_fks_referencing(update_namespace.id, table_name)
         }) {
             ForeignKeyActions::prepare_fk_delete_actions(
                 program,
@@ -699,13 +700,13 @@ fn emit_replace_delete<'a>(
                 target_table_cursor_id,
                 conflicting_rowid_reg,
                 new_row_registers,
-                update_database_id,
+                update_namespace,
             )?
         } else {
             ForeignKeyActions::default()
         };
         if t_ctx.resolver.with_schema(update_database_id, |s| {
-            s.has_child_fks(NamespaceId::ROOT, table_name)
+            s.has_child_fks(update_namespace.id, table_name)
         }) {
             emit_fk_child_decrement_on_delete(
                 program,
@@ -716,7 +717,7 @@ fn emit_replace_delete<'a>(
                 table_name,
                 target_table_cursor_id,
                 conflicting_rowid_reg,
-                update_database_id,
+                update_namespace,
                 &t_ctx.resolver,
             )?;
         }
@@ -1213,7 +1214,8 @@ fn emit_update_insns<'a>(
     };
 
     let not_exists_check_required = updates_rowid || iteration_cursor_id != target_table_cursor_id;
-    let update_database_id = target_table.database_id;
+    let update_namespace = target_table.namespace;
+    let update_database_id = update_namespace.database_id;
     let updated_column_indices: ColumnMask = set_clauses
         .iter()
         .map(|set_clause| set_clause.column_index)
@@ -1225,7 +1227,7 @@ fn emit_update_insns<'a>(
     let has_any_update_triggers = if let Some(btree_table) = target_table.table.btree() {
         has_triggers_including_temp(
             &t_ctx.resolver,
-            update_database_id,
+            update_namespace,
             TriggerEvent::Update,
             Some(&updated_column_names),
             &btree_table,
@@ -1312,7 +1314,7 @@ fn emit_update_insns<'a>(
             &t_ctx.resolver,
             table,
             &updated_column_indices,
-            update_database_id,
+            update_namespace,
         )?,
         _ => crate::alloc::vec![],
     };
@@ -1351,7 +1353,7 @@ fn emit_update_insns<'a>(
     let relevant_before_update_triggers = match target_table.table.btree() {
         Some(btree_table) => get_triggers_including_temp(
             &t_ctx.resolver,
-            update_database_id,
+            update_namespace,
             TriggerEvent::Update,
             TriggerTime::Before,
             Some(&updated_column_names),
@@ -1402,7 +1404,7 @@ fn emit_update_insns<'a>(
         if let Some(btree_table) = target_table.table.btree() {
             has_after_triggers = has_triggers_including_temp(
                 &t_ctx.resolver,
-                update_database_id,
+                update_namespace,
                 TriggerEvent::Update,
                 Some(&updated_column_names),
                 &btree_table,
@@ -1482,7 +1484,7 @@ fn emit_update_insns<'a>(
                         trigger,
                         &trigger_ctx,
                         connection,
-                        update_database_id,
+                        update_namespace,
                         trigger_ignore_jump_label,
                     )?;
                 }
@@ -2060,7 +2062,7 @@ fn emit_update_insns<'a>(
                         all_index_cursors,
                         idx_rowid_reg,
                         Some((start, effective_rowid_reg)),
-                        update_database_id,
+                        update_namespace,
                         t_ctx,
                     )?;
 
@@ -2159,7 +2161,7 @@ fn emit_update_insns<'a>(
             all_index_cursors,
             target_reg,
             Some((start, effective_rowid_reg)),
-            update_database_id,
+            update_namespace,
             t_ctx,
         )?;
 
@@ -2230,11 +2232,9 @@ fn emit_update_insns<'a>(
     // the parent-side checks above.
     if connection.foreign_keys_enabled() {
         if let Some(table_btree) = target_table.table.btree() {
-            if t_ctx
-                .resolver
-                .schema()
-                .has_child_fks(NamespaceId::ROOT, table_name)
-            {
+            if t_ctx.resolver.with_schema(update_database_id, |s| {
+                s.has_child_fks(update_namespace.id, table_name)
+            }) {
                 emit_fk_child_update_counters(
                     program,
                     &table_btree,
@@ -2244,7 +2244,7 @@ fn emit_update_insns<'a>(
                     effective_rowid_reg,
                     &affected_columns,
                     !affected_parent_fks.is_empty(),
-                    update_database_id,
+                    update_namespace,
                     &t_ctx.resolver,
                     &layout,
                 )?;
@@ -2517,7 +2517,9 @@ fn emit_update_insns<'a>(
                 && table.has_autoincrement
                 && connection.mv_store_for_db(update_database_id).is_some()
             {
-                let seq_name = crate::schema::autoincrement_sequence_name(&target_table.identifier);
+                let seq_name = crate::schema::autoincrement_sequence_name(
+                    &t_ctx.resolver.stored_name(update_namespace, &table.name),
+                );
                 let seq = t_ctx
                     .resolver
                     .with_schema(update_database_id, |s| {
@@ -2532,7 +2534,7 @@ fn emit_update_insns<'a>(
                 crate::translate::sequence::emit_disk_advance_past(
                     program,
                     &t_ctx.resolver,
-                    update_database_id,
+                    NamespaceRef::root_of(update_database_id),
                     &seq_name,
                     &seq,
                     effective_rowid_reg,
@@ -2564,7 +2566,7 @@ fn emit_update_insns<'a>(
                     start, // new_values_start
                     effective_rowid_reg,
                     connection,
-                    update_database_id,
+                    update_namespace,
                     &affected_parent_fks,
                 )?;
             }
@@ -2594,7 +2596,7 @@ fn emit_update_insns<'a>(
                         .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
                     {
                         let rerun_for_target_scan = subquery
-                            .reads_table(target_table.database_id, target_table.table.get_name());
+                            .reads_table(target_table.namespace, target_table.table.get_name());
                         let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
                         emit_non_from_clause_subquery(
                             program,
@@ -2632,7 +2634,7 @@ fn emit_update_insns<'a>(
             if let Some(btree_table) = target_table.table.btree() {
                 let relevant_triggers = get_triggers_including_temp(
                     &t_ctx.resolver,
-                    update_database_id,
+                    update_namespace,
                     TriggerEvent::Update,
                     TriggerTime::After,
                     Some(&updated_column_names),
@@ -2701,7 +2703,7 @@ fn emit_update_insns<'a>(
                             trigger,
                             &trigger_ctx_after,
                             connection,
-                            update_database_id,
+                            update_namespace,
                             after_trigger_done,
                         )?;
                     }

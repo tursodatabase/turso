@@ -168,12 +168,13 @@ fn emit_group_aggregate_rows(
         })?;
 
     let syms = connection.syms.read();
+    let namespaces = connection.namespaces_in(schema);
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
-        connection.namespaces(),
+        &namespaces,
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),

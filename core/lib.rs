@@ -31,7 +31,7 @@ pub mod json;
 ))]
 mod multiprocess_tests;
 pub mod mvcc;
-mod namespace;
+pub mod namespace;
 pub mod native_ext;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
@@ -158,7 +158,7 @@ pub use io::{
     CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO, SharedBufferData,
     SyscallIO, WriteCompletion, IO,
 };
-pub use namespace::{NamespaceId, NamespaceRef, Namespaces};
+pub use namespace::{Namespace, NamespaceId, NamespaceRef, Namespaces};
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
 pub use storage::{

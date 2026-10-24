@@ -1,5 +1,6 @@
+use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
-use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType, RESERVED_TABLE_PREFIXES};
+use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::sequence::bind_sequence_names_in_select;
@@ -36,10 +37,10 @@ fn validate_materialized(
     if database_id != crate::MAIN_DB_ID {
         crate::bail_parse_error!("materialized views are not supported on attached databases");
     }
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| normalized_view_name.starts_with(prefix))
-    {
+    if !namespace.id.is_root() {
+        crate::bail_parse_error!("materialized views are not supported in a schema");
+    }
+    if is_reserved_object_name(normalized_view_name) {
         bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
     }
 
@@ -92,8 +93,9 @@ pub fn translate_create_materialized_view(
     // Check for cross-database table references first
     crate::util::validate_select_for_views(select_stmt, view_name.namespace.as_ref())?;
 
-    let mut view_column_schema =
-        resolver.with_schema(database_id, |s| extract_view_columns(select_stmt, s))?;
+    let mut view_column_schema = resolver.with_schema(database_id, |s| {
+        extract_view_columns(namespace.id, select_stmt, s)
+    })?;
     // The parser checks the column count when it can count the SELECT's
     // columns; a `*` is only expanded here.
     if !columns.is_empty() && columns.len() != view_column_schema.columns.len() {
@@ -334,10 +336,7 @@ fn validate_create_view(
             crate::util::identifier_token_for_error(view_name)
         )));
     }
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| normalized_view_name.starts_with(prefix))
-    {
+    if is_reserved_object_name(normalized_view_name) {
         bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
     }
     Ok(())
@@ -409,7 +408,13 @@ pub fn translate_create_view(
     if resolver.dialect.binds_names_at_create() {
         bind_sequence_names_in_select(&mut select_stmt, resolver)?;
     }
-    let sql = create_view_to_str("VIEW", &view_name.name.as_ident(), columns, &select_stmt);
+    let stored_view_name = resolver.stored_name(namespace, &normalized_view_name);
+    let sql = create_view_to_str(
+        "VIEW",
+        &resolver.name_in_sql(namespace, &view_name.name).as_ident(),
+        columns,
+        &select_stmt,
+    );
 
     // Open cursor to sqlite_schema table
     let table = resolver
@@ -430,14 +435,14 @@ pub fn translate_create_view(
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for views
         SchemaEntryType::View,
-        &normalized_view_name,
-        &normalized_view_name,
+        &stored_view_name,
+        &stored_view_name,
         0, // Regular views don't have a btree
         Some(sql),
     )?;
 
     // Parse schema to load the new view
-    let escaped_view_name = escape_sql_string_literal(&normalized_view_name);
+    let escaped_view_name = escape_sql_string_literal(&stored_view_name);
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!("name = '{escaped_view_name}'")),
@@ -631,7 +636,7 @@ pub fn translate_drop_view(
     // Set the view name and type we're looking for
     program.emit_insn(Insn::String8 {
         dest: view_name_reg,
-        value: normalized_view_name.clone(),
+        value: resolver.stored_name(namespace, &normalized_view_name),
     });
     program.emit_insn(Insn::String8 {
         dest: type_reg,
@@ -819,6 +824,7 @@ pub fn translate_drop_view(
     // Remove the view from the in-memory schema
     program.emit_insn(Insn::DropView {
         db: database_id,
+        namespace: namespace.id,
         view_name: normalized_view_name,
     });
 

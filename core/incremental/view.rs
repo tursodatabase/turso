@@ -1,5 +1,6 @@
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::io::{Buffer, Completion, File, TempFile, IO};
+use crate::namespace::NamespaceId;
 use crate::schema::{BTreeTable, Schema};
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
@@ -715,7 +716,7 @@ impl IncrementalView {
                 columns,
                 select,
             }) => {
-                let mut column_schema = extract_view_columns(&select, schema)?;
+                let mut column_schema = extract_view_columns(NamespaceId::ROOT, &select, schema)?;
                 column_schema.rename_columns(&columns);
                 Ok(Self {
                     name: view_name.name.as_str().to_string(),

@@ -21,7 +21,7 @@
 //! Both flags default to `true` (conservative). Each DML translate path calls
 //! into this module to set them to `false` when safe.
 
-use crate::namespace::NamespaceId;
+use crate::namespace::NamespaceRef;
 use crate::translate::emitter::Resolver;
 use crate::translate::plan::{ColumnMask, DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_triggers_including_temp;
@@ -59,14 +59,14 @@ pub(crate) fn any_effective_replace(
 fn table_has_fks(
     connection: &crate::Connection,
     resolver: &Resolver,
-    database_id: usize,
+    namespace: NamespaceRef,
     table_name: &str,
 ) -> bool {
     connection.foreign_keys_enabled()
-        && (resolver.with_schema(database_id, |s| {
-            s.has_child_fks(NamespaceId::ROOT, table_name)
-        }) || resolver.with_schema(database_id, |s| {
-            s.any_resolved_fks_referencing(NamespaceId::ROOT, table_name)
+        && (resolver.with_schema(namespace.database_id, |s| {
+            s.has_child_fks(namespace.id, table_name)
+        }) || resolver.with_schema(namespace.database_id, |s| {
+            s.any_resolved_fks_referencing(namespace.id, table_name)
         }))
 }
 
@@ -128,7 +128,7 @@ pub(crate) fn constraint_may_abort(
 pub(crate) fn set_insert_stmt_journal_flags(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    database_id: usize,
+    namespace: NamespaceRef,
     table: &crate::schema::BTreeTable,
     has_statement_conflict: bool,
     statement_conflict: ResolveType,
@@ -141,11 +141,12 @@ pub(crate) fn set_insert_stmt_journal_flags(
     notnull_col_exists: bool,
     has_unique: bool,
 ) {
-    let index_modes: Vec<(Option<ResolveType>, bool)> = resolver.with_schema(database_id, |s| {
-        s.get_indices(NamespaceId::ROOT, &table.name)
-            .map(|idx| (idx.on_conflict, idx.unique))
-            .collect()
-    });
+    let index_modes: Vec<(Option<ResolveType>, bool)> =
+        resolver.with_schema(namespace.database_id, |s| {
+            s.get_indices(namespace.id, &table.name)
+                .map(|idx| (idx.on_conflict, idx.unique))
+                .collect()
+        });
     let any_replace = any_effective_replace(
         has_statement_conflict,
         statement_conflict,
@@ -207,7 +208,7 @@ pub(crate) fn set_update_stmt_journal_flags(
     let Some(btree_table) = target_table.btree() else {
         return Ok(()); // Virtual table — keep conservative defaults.
     };
-    let database_id = target_table.database_id;
+    let namespace = target_table.namespace;
 
     let updated_cols: ColumnMask = plan
         .set_clauses
@@ -221,12 +222,12 @@ pub(crate) fn set_update_stmt_journal_flags(
         .try_collect()?;
     let has_triggers = has_triggers_including_temp(
         resolver,
-        database_id,
+        namespace,
         TriggerEvent::Update,
         Some(&updated_col_names),
         &btree_table,
     );
-    let has_fks = table_has_fks(connection, resolver, database_id, btree_table.name.as_str());
+    let has_fks = table_has_fks(connection, resolver, namespace, btree_table.name.as_str());
 
     let or_conflict = plan.or_conflict.unwrap_or(ResolveType::Abort);
     let has_statement_conflict = plan.or_conflict.is_some();
@@ -287,7 +288,7 @@ pub(crate) fn set_delete_stmt_journal_flags(
     plan: &DeletePlan,
     resolver: &Resolver,
     connection: &Arc<Connection>,
-    database_id: usize,
+    _database_id: usize,
 ) -> Result<()> {
     let Some(target_table) = plan.table_references.joined_tables().first() else {
         crate::bail_parse_error!("DELETE should have one target table");
@@ -296,7 +297,12 @@ pub(crate) fn set_delete_stmt_journal_flags(
         return Ok(()); // Virtual table — keep conservative defaults.
     };
     let has_triggers = plan.safety.reasons.contains(&DmlSafetyReason::Trigger);
-    let has_fks = table_has_fks(connection, resolver, database_id, btree_table.name.as_str());
+    let has_fks = table_has_fks(
+        connection,
+        resolver,
+        target_table.namespace,
+        btree_table.name.as_str(),
+    );
 
     // After rowset rewriting (for triggers/safety), the target table op is reset to a
     // Scan, so affects_max_1_row correctly returns false — no false optimization.

@@ -329,7 +329,7 @@ impl<'a> Resolver<'a> {
             search_order: namespaces
                 .search_order(search_path)
                 .into_iter()
-                .map(NamespaceRef::root_of)
+                .map(|namespace| namespace.target)
                 .collect(),
         }
     }
@@ -952,14 +952,31 @@ impl<'a> Resolver<'a> {
         })
     }
 
-    /// `seq_name` qualified with the database it resolved to, for the
+    /// `seq_name` qualified with the namespace it resolved to, for the
     /// opcodes that look a sequence up again by its name when the statement
     /// runs.
     pub(crate) fn runtime_sequence_name(&self, namespace: NamespaceRef, seq_name: &str) -> String {
-        let database_name = self
-            .namespace_name(namespace.database_id)
-            .expect("the database of a sequence has a name");
-        format!("{database_name}.{seq_name}")
+        let namespace_name = self
+            .namespaces
+            .name_of(namespace)
+            .expect("the namespace of a sequence has a name");
+        format!("{namespace_name}.{seq_name}")
+    }
+
+    /// The name that object `name` of `namespace` is stored under in the
+    /// schema rows and the SQL text of its database.
+    pub(crate) fn stored_name(&self, namespace: NamespaceRef, name: &str) -> String {
+        crate::namespace::stored_name(namespace.id, name)
+    }
+
+    /// The name to write into SQL text for the object `written` of
+    /// `namespace`: the name as written for a root namespace, else the
+    /// stored name.
+    pub(crate) fn name_in_sql(&self, namespace: NamespaceRef, written: &ast::Name) -> ast::Name {
+        if namespace.id.is_root() {
+            return written.clone();
+        }
+        ast::Name::exact(self.stored_name(namespace, written.as_str()))
     }
 
     /// The namespace that the qualifier of `qualified_name` refers to, or
@@ -971,8 +988,9 @@ impl<'a> Resolver<'a> {
     ) -> Result<NamespaceRef> {
         let resolved = if let Some(db_name) = &qualified_name.namespace {
             let db_name_normalized = normalize_ident(db_name.as_str());
-            self.namespace_database_id(&db_name_normalized)
-                .map(NamespaceRef::root_of)
+            self.namespaces
+                .get(&db_name_normalized)
+                .map(|namespace| namespace.target)
                 .ok_or_else(|| {
                     LimboError::InvalidArgument(format!("no such database: {db_name_normalized}"))
                 })
@@ -1032,7 +1050,15 @@ impl<'a> Resolver<'a> {
     /// Get the database name for a given database index.
     /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
     pub(crate) fn namespace_name(&self, index: usize) -> Option<String> {
-        self.namespaces.name(index)
+        self.namespaces
+            .of_database(index)
+            .map(|namespace| namespace.name)
+    }
+
+    /// The name of `namespace`, for error messages: the database's name
+    /// for a root namespace, else the stored namespace's name.
+    pub(crate) fn name_of_namespace(&self, namespace: NamespaceRef) -> Option<String> {
+        self.namespaces.name_of(namespace)
     }
 }
 
@@ -1557,7 +1583,7 @@ fn emit_cdc_change_id(
     crate::translate::sequence::emit_disk_read_nextval(
         program,
         resolver,
-        crate::MAIN_DB_ID,
+        NamespaceRef::root_of(crate::MAIN_DB_ID),
         &seq_name,
         &seq,
         dest_reg,

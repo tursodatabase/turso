@@ -612,6 +612,201 @@ fn test_postgres_drop_schema_cascade(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn schemas_are_stored_in_the_main_database(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE SCHEMA empty").unwrap();
+    conn.execute("CREATE TABLE app.t (x int)").unwrap();
+    conn.execute("INSERT INTO app.t VALUES (1)").unwrap();
+    conn.execute("SET search_path TO app").unwrap();
+    conn.execute("CREATE TABLE u (x int)").unwrap();
+    conn.execute("CREATE INDEX u_x ON u (x)").unwrap();
+    conn.execute("CREATE VIEW v AS SELECT 3 AS x").unwrap();
+    conn.execute("INSERT INTO u VALUES (2)").unwrap();
+
+    let path = db.path.clone();
+    let io = db.io.clone();
+    drop(conn);
+    drop(db);
+    let files: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with("turso-postgres-schema"))
+        .collect();
+    assert_eq!(files, Vec::<String>::new());
+
+    let db = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = turso_pg::Connection::connect(&db).unwrap();
+    let mut rows = conn
+        .query("SELECT x FROM app.t UNION ALL SELECT x FROM app.u UNION ALL SELECT x FROM app.v")
+        .unwrap()
+        .unwrap();
+    let mut values = Vec::new();
+    while let StepResult::Row = rows.step().unwrap() {
+        values.push(rows.row().unwrap().get_value(0).to_string());
+    }
+    assert_eq!(values, ["1", "2", "3"]);
+    conn.execute("DROP INDEX app.u_x").unwrap();
+    assert!(conn.execute("CREATE SCHEMA empty").is_err());
+}
+
+#[turso_macros::test]
+fn create_schema_rolls_back_with_its_transaction_and_creates_no_files(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE app.t (x int)").unwrap();
+    conn.execute("INSERT INTO app.t VALUES (1)").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    let error = conn.execute("CREATE TABLE app.u (x int)").unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Parse error: schema \"app\" does not exist"
+    );
+    let files: Vec<String> = std::fs::read_dir(db.path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with("turso-postgres-schema"))
+        .collect();
+    assert_eq!(files, Vec::<String>::new());
+
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE app.t (x int)").unwrap();
+    let mut rows = conn
+        .query("SELECT count(*) FROM pg_namespace WHERE nspname = 'app'")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
+}
+
+#[turso_macros::test]
+fn a_transaction_changing_two_schemas_commits_as_one(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SCHEMA a").unwrap();
+    conn.execute("CREATE SCHEMA b").unwrap();
+    conn.execute("CREATE TABLE a.t (x int)").unwrap();
+    conn.execute("CREATE TABLE b.t (x int)").unwrap();
+    let other = db.connect_postgres();
+    let rows_of_both = |conn: &turso_pg::Connection| {
+        let mut rows = conn
+            .query("SELECT (SELECT count(*) FROM a.t) || '/' || (SELECT count(*) FROM b.t)")
+            .unwrap()
+            .unwrap();
+        let StepResult::Row = rows.step().unwrap() else {
+            panic!("expected row");
+        };
+        rows.row().unwrap().get_value(0).to_string()
+    };
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO a.t VALUES (1)").unwrap();
+    conn.execute("INSERT INTO b.t VALUES (2)").unwrap();
+    assert_eq!(rows_of_both(&other), "0/0");
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(rows_of_both(&other), "1/1");
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO a.t VALUES (3)").unwrap();
+    conn.execute("INSERT INTO b.t VALUES (4)").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(rows_of_both(&other), "1/1");
+    assert_eq!(rows_of_both(&conn), "1/1");
+}
+
+#[turso_macros::test]
+fn foreign_key_references_table_of_schema(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.pragma_update("foreign_keys", "ON").unwrap();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE app.parents (id int PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE app.children (parent_id int REFERENCES app.parents (id))")
+        .unwrap();
+    conn.execute("INSERT INTO app.parents VALUES (1)").unwrap();
+
+    conn.execute("INSERT INTO app.children VALUES (1)").unwrap();
+    assert!(conn.execute("INSERT INTO app.children VALUES (2)").is_err());
+}
+
+#[turso_macros::test]
+fn a_user_cannot_name_an_object_like_a_schema_stores_its_objects(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE app.t (x int)").unwrap();
+    for sql in [
+        "CREATE TABLE __turso_ns1_u (x int)",
+        "CREATE TABLE public.__turso_ns1_u (x int)",
+        "CREATE TABLE app.__turso_ns2_u (x int)",
+        "CREATE VIEW __turso_ns1_v AS SELECT 1 AS x",
+        "CREATE INDEX __turso_ns1_i ON app.t (x)",
+        "CREATE SEQUENCE __turso_ns1_s",
+        "ALTER TABLE app.t RENAME TO __turso_ns1_u",
+        "CREATE TABLE __turso_internal_namespace_2_shop (name text)",
+        "DROP TABLE __turso_internal_namespace_1_app",
+    ] {
+        let error = conn.execute(sql).unwrap_err().to_string();
+        assert!(
+            error.contains("reserved") || error.contains("system table"),
+            "{sql}: {error}"
+        );
+    }
+    assert_eq!(
+        conn.execute("CREATE TABLE __turso_ns1_t (x int)")
+            .unwrap_err()
+            .to_string(),
+        "Parse error: Object name reserved for internal use: __turso_ns1_t"
+    );
+    conn.execute("INSERT INTO app.t VALUES (1)").unwrap();
+    let mut rows = conn.query("SELECT x FROM app.t").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
+}
+
+#[turso_macros::test]
+fn a_schema_keeps_its_oid_and_id_while_others_come_and_go(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SCHEMA b").unwrap();
+    conn.execute("CREATE SCHEMA a").unwrap();
+    let oid_of = |schema: &str| {
+        let mut rows = conn
+            .query(format!(
+                "SELECT oid FROM pg_namespace WHERE nspname = '{schema}'"
+            ))
+            .unwrap()
+            .unwrap();
+        let StepResult::Row = rows.step().unwrap() else {
+            panic!("expected row");
+        };
+        rows.row().unwrap().get_value(0).to_string()
+    };
+    assert_eq!(oid_of("b"), "16385");
+    assert_eq!(oid_of("a"), "16386");
+    conn.execute("DROP SCHEMA b").unwrap();
+    assert_eq!(oid_of("a"), "16386");
+    conn.execute("CREATE SCHEMA c").unwrap();
+    assert_eq!(oid_of("c"), "16387");
+    assert_eq!(
+        conn.inner().namespace("c"),
+        Some(turso_core::Namespace::stored(
+            "c",
+            turso_core::NamespaceId::new(3)
+        ))
+    );
+}
+
+#[turso_macros::test]
 fn test_postgres_drop_schema_cascade_drops_tables_that_reference_each_other(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.pragma_update("foreign_keys", "ON").unwrap();
@@ -3979,6 +4174,55 @@ fn test_postgres_unnamed_index_keeps_its_name_after_reprepare(db: TempDatabase) 
         vec![
             vec![Value::build_text("t_a_idx")],
             vec![Value::build_text("t_b_idx")],
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE app.t1 (x int)").unwrap();
+    conn.execute("CREATE TABLE public.t2 (x int)").unwrap();
+    conn.execute("CREATE TABLE main.t3 (x int)").unwrap();
+    conn.execute(
+        "CREATE TABLE app.t4 (x int REFERENCES app.t1 (x), y int REFERENCES public.t2 (x))",
+    )
+    .unwrap();
+
+    let mut rows = conn
+        .inner()
+        .prepare_internal("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name != '__turso_internal_mvcc_meta' ORDER BY name")
+        .unwrap();
+    let mut stored = Vec::new();
+    while let StepResult::Row = rows.step().unwrap() {
+        let row = rows.row().unwrap();
+        stored.push((row.get_value(0).to_string(), row.get_value(1).to_string()));
+    }
+    assert_eq!(
+        stored,
+        [
+            (
+                "__turso_internal_namespace_1_app".to_string(),
+                "/* turso_frontend:postgres */ CREATE TABLE __turso_internal_namespace_1_app (name TEXT)"
+                    .to_string()
+            ),
+            (
+                "__turso_ns1_t1".to_string(),
+                "/* turso_frontend:postgres */ CREATE TABLE __turso_ns1_t1 (x int)".to_string()
+            ),
+            (
+                "__turso_ns1_t4".to_string(),
+                "/* turso_frontend:postgres */ CREATE TABLE __turso_ns1_t4 (x int REFERENCES __turso_ns1_t1 (x), y int REFERENCES t2 (x))".to_string()
+            ),
+            (
+                "t2".to_string(),
+                "/* turso_frontend:postgres */ CREATE TABLE t2 (x int)".to_string()
+            ),
+            (
+                "t3".to_string(),
+                "/* turso_frontend:postgres */ CREATE TABLE t3 (x int)".to_string()
+            ),
         ]
     );
 }

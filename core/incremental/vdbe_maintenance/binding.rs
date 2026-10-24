@@ -1,4 +1,5 @@
 use super::stream::EphemeralDelta;
+use crate::namespace::NamespaceRef;
 use rustc_hash::FxHashMap;
 use turso_parser::ast::{self, TableInternalId};
 
@@ -36,7 +37,7 @@ pub(super) fn make_joined_table(
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
-        database_id: 0,
+        namespace: NamespaceRef::root_of(crate::MAIN_DB_ID),
         indexed: None,
         plan_estimate: None,
     }

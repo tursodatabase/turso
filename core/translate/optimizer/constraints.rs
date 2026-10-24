@@ -383,7 +383,7 @@ fn estimate_in_selectivity(in_list_len: f64, row_count: f64, not: bool) -> f64 {
 #[allow(clippy::too_many_arguments)]
 fn estimate_selectivity(
     schema: &Schema,
-    table_name: &str,
+    table_reference: &JoinedTable,
     column: Option<&Column>,
     index: Option<&Index>,
     op: ConstraintOperator,
@@ -391,7 +391,10 @@ fn estimate_selectivity(
     is_rowid: bool,
 ) -> f64 {
     // Get ANALYZE stats for this table if available
-    let table_stats = schema.analyze_stats.table_stats(table_name);
+    let table_stats = schema.analyze_stats.table_stats(
+        table_reference.namespace.id,
+        table_reference.table.get_name(),
+    );
     let row_count = table_stats.and_then(|s| s.row_count).unwrap_or(0);
 
     match op {
@@ -475,7 +478,7 @@ fn estimate_constraint_selectivity(
     };
     estimate_selectivity(
         schema,
-        table_reference.table.get_name(),
+        table_reference,
         column,
         index,
         operator,
@@ -490,9 +493,10 @@ fn selectivity_index_for_column<'a>(
     available_indexes: &'a AvailableIndexes,
     column_pos: usize,
 ) -> Option<&'a Index> {
-    let table_stats = schema
-        .analyze_stats
-        .table_stats(table_reference.table.get_name());
+    let table_stats = schema.analyze_stats.table_stats(
+        table_reference.namespace.id,
+        table_reference.table.get_name(),
+    );
     available_indexes
         .btree_indexes_for_column(table_reference.internal_id, column_pos)
         .find(|index| {
@@ -1051,9 +1055,10 @@ pub fn constraints_from_where_clause(
                         subqueries,
                     )?)?;
                 }
-                let table_stats = schema
-                    .analyze_stats
-                    .table_stats(table_reference.table.get_name());
+                let table_stats = schema.analyze_stats.table_stats(
+                    table_reference.namespace.id,
+                    table_reference.table.get_name(),
+                );
                 let row_count = table_stats
                     .and_then(|s| s.row_count)
                     .unwrap_or(params.rows_per_table_fallback as u64)
@@ -1124,9 +1129,10 @@ pub fn constraints_from_where_clause(
                     .expect("subquery not found");
                 // Only use as constraint if NOT correlated
                 if !subquery.correlated {
-                    let table_stats = schema
-                        .analyze_stats
-                        .table_stats(table_reference.table.get_name());
+                    let table_stats = schema.analyze_stats.table_stats(
+                        table_reference.namespace.id,
+                        table_reference.table.get_name(),
+                    );
                     let row_count = table_stats
                         .and_then(|s| s.row_count)
                         .unwrap_or(params.rows_per_table_fallback as u64)

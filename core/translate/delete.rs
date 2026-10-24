@@ -228,7 +228,7 @@ pub fn prepare_delete_plan(
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
-        database_id,
+        namespace,
         indexed,
         plan_estimate: None,
     }];
@@ -284,9 +284,7 @@ pub fn prepare_delete_plan(
     // to skip the rowset materialization.
     let has_delete_triggers = btree_table_for_triggers
         .as_ref()
-        .map(|bt| {
-            has_triggers_including_temp(resolver, database_id, TriggerEvent::Delete, None, bt)
-        })
+        .map(|bt| has_triggers_including_temp(resolver, namespace, TriggerEvent::Delete, None, bt))
         .unwrap_or(false);
 
     let has_fk_actions = match btree_table_for_triggers.as_ref() {

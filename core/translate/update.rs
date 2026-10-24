@@ -298,7 +298,7 @@ fn prepare_update_plan(
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
-        database_id,
+        namespace,
         indexed,
         plan_estimate: None,
     };
@@ -345,7 +345,7 @@ fn prepare_update_plan(
     let mut non_from_clause_subqueries = vec![];
     // Reject fairly specific cases like UPDATE t SET x=5 FROM t.
     let illegal_target_reference = from_tables.joined_tables().iter().any(|joined| {
-        joined.database_id == database_id
+        joined.namespace == namespace
             && normalize_ident(joined.identifier.as_str()) == target_identifier
             && normalize_ident(joined.table.get_name()) == target_table_name
     });
@@ -680,7 +680,7 @@ fn check_update_from_column_ambiguity(
             .any(|preceding| preceding.identifier == table.identifier)
         {
             let db_name = connection
-                .namespace_name(table.database_id)
+                .namespace_name(table.namespace.database_id)
                 .unwrap_or_else(|| "main".to_string());
             bail_parse_error!(
                 "ambiguous column name: {db_name}.{}._ROWID_",

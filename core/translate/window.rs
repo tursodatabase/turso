@@ -1,5 +1,6 @@
 use crate::alloc::TursoSliceExt;
 use crate::function::{AccumulatorFunc, AggFunc, WindowFunc};
+use crate::namespace::NamespaceRef;
 use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Table};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
@@ -32,6 +33,7 @@ use turso_parser::ast::Name;
 use turso_parser::ast::{Expr, FrameBound, Literal, Over, SortOrder, TableInternalId};
 
 const SUBQUERY_DATABASE_ID: usize = 0;
+const SUBQUERY_NAMESPACE: NamespaceRef = NamespaceRef::root_of(SUBQUERY_DATABASE_ID);
 
 struct WindowSubqueryContext<'a> {
     resolver: &'a Resolver<'a>,
@@ -261,9 +263,9 @@ fn prepare_window_subquery(
     // Verify that the subquery has the expected database ID.
     // This is required to ensure that assumptions in `rewrite_terminal_expr` are valid.
     turso_assert_eq!(
-        subquery.database_id,
-        SUBQUERY_DATABASE_ID,
-        "subquery database id must be SUBQUERY_DATABASE_ID",
+        subquery.namespace,
+        SUBQUERY_NAMESPACE,
+        "subquery namespace must be SUBQUERY_NAMESPACE",
         {"SUBQUERY_DATABASE_ID": SUBQUERY_DATABASE_ID}
     );
 

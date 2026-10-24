@@ -2111,6 +2111,7 @@ fn append_view_column_schema(
 }
 
 fn view_source_from_select_table(
+    namespace: NamespaceId,
     select_table: &ast::SelectTable,
     schema: &Schema,
     ctes: &HashMap<String, ViewColumnSchema>,
@@ -2143,10 +2144,10 @@ fn view_source_from_select_table(
                     .map(|db| normalize_ident(db.as_str())),
                 alias: table_alias,
             });
-            let table = schema.get_table(NamespaceId::ROOT, &table_name);
+            let table = schema.get_table(namespace, &table_name);
             let view = table
                 .is_none()
-                .then(|| schema.get_view(NamespaceId::ROOT, &table_name))
+                .then(|| schema.get_view(namespace, &table_name))
                 .flatten();
             let source_columns: &[Column] = match (&table, &view) {
                 (Some(table), _) => table.columns(),
@@ -2168,7 +2169,7 @@ fn view_source_from_select_table(
             })
         }
         ast::SelectTable::Select { select, alias, .. } => {
-            let derived = extract_view_columns_inner(select, schema, ctes)?;
+            let derived = extract_view_columns_inner(namespace, select, schema, ctes)?;
             Ok(ViewSource {
                 qualifiers: alias
                     .as_ref()
@@ -2189,10 +2190,10 @@ fn view_source_from_select_table(
                 }
                 | ast::SelectTable::Sub(_, source_alias) => source_alias.clone_from(alias),
             }
-            view_source_from_select_table(&source_table, schema, ctes, tables)
+            view_source_from_select_table(namespace, &source_table, schema, ctes, tables)
         }
         ast::SelectTable::Sub(from, alias) => {
-            let sources = view_sources_from_clause(from, schema, ctes, tables)?;
+            let sources = view_sources_from_clause(namespace, from, schema, ctes, tables)?;
             Ok(ViewSource {
                 qualifiers: alias
                     .as_ref()
@@ -2218,7 +2219,7 @@ fn view_source_from_select_table(
                 alias: table_alias,
             });
             let columns = schema
-                .get_table(NamespaceId::ROOT, &table_name)
+                .get_table(namespace, &table_name)
                 .map(|table| {
                     table
                         .columns()
@@ -2263,12 +2264,13 @@ fn view_output_column(source: &ViewColumn) -> ViewColumn {
 ///
 /// Stored view metadata must use the same join-column rules as normal name binding.
 fn view_sources_from_clause(
+    namespace: NamespaceId,
     from: &ast::FromClause,
     schema: &Schema,
     ctes: &HashMap<String, ViewColumnSchema>,
     tables: &mut Vec<ViewTable>,
 ) -> Result<Vec<ViewSource>> {
-    let first = view_source_from_select_table(&from.select, schema, ctes, tables)?;
+    let first = view_source_from_select_table(namespace, &from.select, schema, ctes, tables)?;
     let mut sources = vec![first];
     // SQLite enables strict USING checks for the full list when any join keeps right rows.
     let has_right_or_full_join = from
@@ -2277,7 +2279,7 @@ fn view_sources_from_clause(
         .any(|join| JoinType::from_join_operator(&join.operator).keeps_right_rows());
 
     for join in &from.joins {
-        let right = view_source_from_select_table(&join.table, schema, ctes, tables)?;
+        let right = view_source_from_select_table(namespace, &join.table, schema, ctes, tables)?;
         let natural = matches!(
             join.operator,
             ast::JoinOperator::TypedJoin(Some(join_type))
@@ -2486,11 +2488,12 @@ fn deduplicate_view_column_name(column: &mut ViewColumn, counts: &mut HashMap<St
 }
 
 fn extract_view_columns_inner(
+    namespace: NamespaceId,
     select_stmt: &ast::Select,
     schema: &Schema,
     outer_ctes: &HashMap<String, ViewColumnSchema>,
 ) -> Result<ViewColumnSchema> {
-    let ctes = extract_cte_columns(&select_stmt.with, schema, outer_ctes)?;
+    let ctes = extract_cte_columns(namespace, &select_stmt.with, schema, outer_ctes)?;
 
     let mut tables = Vec::new();
     let mut columns = Vec::new();
@@ -2507,7 +2510,7 @@ fn extract_view_columns_inner(
 
     let sources = from
         .as_ref()
-        .map(|from| view_sources_from_clause(from, schema, &ctes, &mut tables))
+        .map(|from| view_sources_from_clause(namespace, from, schema, &ctes, &mut tables))
         .transpose()?
         .unwrap_or_default();
 
@@ -2568,13 +2571,14 @@ fn extract_view_columns_inner(
 }
 
 pub(crate) fn extract_cte_columns(
+    namespace: NamespaceId,
     with: &Option<ast::With>,
     schema: &Schema,
     outer_ctes: &HashMap<String, ViewColumnSchema>,
 ) -> Result<HashMap<String, ViewColumnSchema>> {
     let mut ctes = outer_ctes.clone();
     for cte in with.iter().flat_map(|with| &with.ctes) {
-        let mut derived = extract_view_columns_inner(&cte.select, schema, &ctes)?;
+        let mut derived = extract_view_columns_inner(namespace, &cte.select, schema, &ctes)?;
         for (column, explicit_name) in derived.columns.iter_mut().zip(&cte.columns) {
             column.column.name = Some(explicit_name.col_name.as_str().to_string());
         }
@@ -2584,11 +2588,13 @@ pub(crate) fn extract_cte_columns(
 }
 
 pub(crate) fn select_table_column_names(
+    namespace: NamespaceId,
     select_table: &ast::SelectTable,
     schema: &Schema,
     ctes: &HashMap<String, ViewColumnSchema>,
 ) -> Result<Vec<String>> {
-    let source = view_source_from_select_table(select_table, schema, ctes, &mut Vec::new())?;
+    let source =
+        view_source_from_select_table(namespace, select_table, schema, ctes, &mut Vec::new())?;
     Ok(source
         .columns
         .iter()
@@ -2676,10 +2682,11 @@ fn view_affinity_type_name(affinity: Affinity) -> &'static str {
 /// column from that particular source. A later RIGHT or FULL JOIN can change
 /// which source supplies a merged column.
 pub fn extract_view_columns(
+    namespace: NamespaceId,
     select_stmt: &ast::Select,
     schema: &Schema,
 ) -> Result<ViewColumnSchema> {
-    extract_view_columns_inner(select_stmt, schema, &HashMap::default())
+    extract_view_columns_inner(namespace, select_stmt, schema, &HashMap::default())
 }
 
 pub fn rewrite_fk_parent_cols_if_self_ref(
@@ -2825,7 +2832,7 @@ mod rename_column_view {
             let sql_changed =
                 rewrite_view_select_for_column_rename(&mut select, &ctx, &[], visiting_views)?;
 
-            let view_column_schema = extract_view_columns(&select, schema)?;
+            let view_column_schema = extract_view_columns(NamespaceId::ROOT, &select, schema)?;
             let mut final_columns = apply_view_column_rename(view_column_schema, &ctx);
 
             for (i, indexed_col) in view_columns.iter().enumerate() {
@@ -2901,7 +2908,7 @@ mod rename_column_view {
         schema: &Schema,
         explicit: &[ast::IndexedColumn],
     ) -> Result<crate::alloc::Vec<Column>> {
-        let view_column_schema = extract_view_columns(select, schema)?;
+        let view_column_schema = extract_view_columns(NamespaceId::ROOT, select, schema)?;
         let mut columns = view_column_schema.flat_columns()?;
         for (i, indexed_col) in explicit.iter().enumerate() {
             if let Some(col) = columns.get_mut(i) {
@@ -3672,7 +3679,7 @@ mod rename_column_view {
         ctx: &ViewRewriteCtx,
         apply_rename: bool,
     ) -> Result<Vec<String>> {
-        let view_columns = extract_view_columns(select, ctx.schema)?;
+        let view_columns = extract_view_columns(NamespaceId::ROOT, select, ctx.schema)?;
         let mut columns = view_columns.columns;
         if apply_rename {
             let target_norm = ctx.target_table_norm.as_str();

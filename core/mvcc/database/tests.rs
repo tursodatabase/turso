@@ -23888,8 +23888,14 @@ fn connect_async_yields_instead_of_spinning_on_preparing_commit_dependency() {
     };
     let schema = conn.schema.read();
     assert!(
-        schema.analyze_stats.table_stats("t1").is_some()
-            && schema.analyze_stats.table_stats("t2").is_some(),
+        schema
+            .analyze_stats
+            .table_stats(NamespaceId::ROOT, "t1")
+            .is_some()
+            && schema
+                .analyze_stats
+                .table_stats(NamespaceId::ROOT, "t2")
+                .is_some(),
         "connect_async should load the committed ANALYZE stats: {:?}",
         schema.analyze_stats
     );
@@ -23954,7 +23960,12 @@ fn dropping_connect_async_state_mid_wait_does_not_block() {
     drop(conn);
     // A fresh blocking connect works once nothing is parked.
     let conn = db.connect();
-    assert!(conn.schema.read().analyze_stats.table_stats("t1").is_some());
+    assert!(conn
+        .schema
+        .read()
+        .analyze_stats
+        .table_stats(NamespaceId::ROOT, "t1")
+        .is_some());
 }
 
 fn drive_statement_to_done(statement: &mut crate::Statement, pager_io: &Arc<dyn crate::IO>) {

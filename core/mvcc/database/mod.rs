@@ -4977,14 +4977,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.checkpoint_dirty_table_keys.clear();
         self.checkpoint_dirty_index_keys.clear();
         let root_pages = schema
-            .tables(NamespaceId::ROOT)
+            .all_tables()
             .filter_map(|table| match table.as_ref() {
                 Table::BTree(btree) => Some(btree.root_page),
                 _ => None,
             })
             .chain(
                 schema
-                    .indexes(NamespaceId::ROOT)
+                    .all_indexes()
                     .filter(|index| index.is_btree_backed())
                     .map(|index| index.root_page),
             )
@@ -5378,7 +5378,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let schema = bootstrap_conn.schema.read();
         let sqlite_schema_root_pages = {
             schema
-                .tables(NamespaceId::ROOT)
+                .all_tables()
                 .filter_map(|t| {
                     if let Table::BTree(btree) = t.as_ref() {
                         Some(btree.root_page)
@@ -5388,7 +5388,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 })
                 .chain(
                     schema
-                        .indexes(NamespaceId::ROOT)
+                        .all_indexes()
                         .filter(|index| index.is_btree_backed())
                         .map(|index| index.root_page),
                 )
@@ -9344,7 +9344,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .and_then(|e| e.value().root_page)
                 .map(|r| r as i64)
         };
-        for (_, table) in schema.tables_mut(NamespaceId::ROOT) {
+        for (_, table) in schema.all_tables_mut() {
             let needs = table
                 .btree()
                 .is_some_and(|b| resolve(b.root_page).is_some());
@@ -9359,7 +9359,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
             }
         }
-        for index in schema.indexes_mut(NamespaceId::ROOT) {
+        for index in schema.all_indexes_mut() {
             if let Some(rp) = resolve(index.root_page) {
                 Arc::make_mut(index).root_page = rp;
             }
@@ -9757,7 +9757,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let find_index_info =
             |schema: &Schema, root_page: i64| -> Result<Option<Arc<IndexInfo>>, TryReserveError> {
                 schema
-                    .indexes(NamespaceId::ROOT)
+                    .all_indexes()
                     .find(|idx| idx.root_page == root_page)
                     .map(|idx| {
                         IndexInfo::new_from_index_in(idx.as_ref(), self.alloc.clone()).map(Arc::new)
@@ -9766,9 +9766,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             };
 
         let schema_has_index_root = |schema: &Schema, root_page: i64| -> bool {
-            schema
-                .indexes(NamespaceId::ROOT)
-                .any(|idx| idx.root_page == root_page)
+            schema.all_indexes().any(|idx| idx.root_page == root_page)
         };
 
         let parsed_op_commit_ts = |op: &ParsedOp| match op {

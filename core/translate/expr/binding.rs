@@ -1,4 +1,5 @@
 use super::*;
+use crate::namespace::NamespaceRef;
 use crate::translate::plan::{
     merge_columns, resolve_unqualified_column, unqualified_column_sources, ColumnLookup,
     OuterQueryReference, ResolvedColumn,
@@ -369,7 +370,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         match resolve_qualified_name(
                             referenced_tables,
                             resolver,
-                            Some(namespace.database_id),
+                            Some(*namespace),
                             &tbl_name_str,
                             &normalized_col_name,
                         )? {
@@ -735,7 +736,7 @@ pub(in crate::translate) fn lookup_unqualified_column(
 fn resolve_qualified_name(
     table_references: &TableReferences,
     resolver: &Resolver<'_>,
-    database_id: Option<usize>,
+    namespace: Option<NamespaceRef>,
     table_name: &str,
     column_name: &str,
 ) -> Result<QualifiedNameMatch> {
@@ -747,7 +748,7 @@ fn resolve_qualified_name(
             &joined_table.table,
             joined_table.internal_id,
             &joined_table.identifier,
-            database_id_to_match(&joined_table.table, joined_table.database_id, database_id),
+            database_id_to_match(&joined_table.table, joined_table.namespace, namespace),
             table_name,
             column_name,
         )?;
@@ -792,7 +793,7 @@ fn resolve_qualified_name(
             &outer_ref.table,
             outer_ref.internal_id,
             &outer_ref.identifier,
-            database_id_to_match(&outer_ref.table, outer_ref.database_id, database_id),
+            database_id_to_match(&outer_ref.table, outer_ref.namespace, namespace),
             table_name,
             column_name,
         )?;
@@ -840,15 +841,13 @@ fn resolve_qualified_name(
 /// so the table can then be matched by its alias.
 fn database_id_to_match(
     table: &Table,
-    table_database_id: usize,
-    database_id: Option<usize>,
+    table_namespace: NamespaceRef,
+    namespace: Option<NamespaceRef>,
 ) -> Option<usize> {
-    if database_id == Some(table_database_id)
-        && matches!(table, Table::BTree(_) | Table::Virtual(_))
-    {
+    if namespace == Some(table_namespace) && matches!(table, Table::BTree(_) | Table::Virtual(_)) {
         None
     } else {
-        database_id
+        namespace.map(|namespace| namespace.database_id)
     }
 }
 

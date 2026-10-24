@@ -4,11 +4,12 @@ use crate::LimboError;
 
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
+use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES,
-    SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    BTreeTable, ColDef, Column, SchemaObjectType, Table, Type, SQLITE_SEQUENCE_TABLE_NAME,
+    TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -922,7 +923,7 @@ struct CtasInfo {
 /// Returns the plan (for reuse in emission) along with the complete schema SQL and column definitions.
 fn derive_ctas_schema(
     select: ast::Select,
-    table_name: &str,
+    table_name_in_sql: &str,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
@@ -1009,7 +1010,7 @@ fn derive_ctas_schema(
 
     let info = CtasInfo {
         plan,
-        schema_sql: format!("CREATE TABLE {table_name}({})", sql_parts.join(",")),
+        schema_sql: format!("CREATE TABLE {table_name_in_sql}({})", sql_parts.join(",")),
     };
     Ok((info, col_defs))
 }
@@ -1158,7 +1159,12 @@ pub fn translate_create_table(
         ast::CreateTableBody::AsSelect(select) => {
             let (info, col_defs) = derive_ctas_schema(
                 select,
-                &tbl_name.name.as_ident(),
+                &resolver
+                    .name_in_sql(
+                        resolver.resolve_namespace_for_create(&tbl_name)?,
+                        &tbl_name.name,
+                    )
+                    .as_ident(),
                 resolver,
                 program,
                 connection,
@@ -1182,6 +1188,12 @@ pub fn translate_create_table(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
+    let stored_tbl_name = resolver.stored_name(namespace, &normalized_tbl_name);
+    let tbl_name_in_sql = ast::QualifiedName {
+        namespace: None,
+        name: resolver.name_in_sql(namespace, &tbl_name.name),
+        alias: None,
+    };
     validate(&body, &normalized_tbl_name, resolver, connection)?;
     let bound_sequence_names = resolver.dialect.binds_names_at_create()
         && bind_default_sequence_names(&mut body, resolver)?;
@@ -1213,10 +1225,9 @@ pub fn translate_create_table(
     program.extend(&opts);
 
     if !connection.is_mvcc_bootstrap_connection()
-        && RESERVED_TABLE_PREFIXES
-            .iter()
-            .any(|prefix| normalized_tbl_name.starts_with(prefix))
+        && is_reserved_object_name(&normalized_tbl_name)
         && !connection.is_nested_stmt()
+        && !connection.runs_engine_ddl()
     {
         bail_parse_error!(
             "Object name reserved for internal use: {}",
@@ -1369,23 +1380,19 @@ pub fn translate_create_table(
     // input text).
     let sql = if let Some(ref info) = ctas_info {
         info.schema_sql.clone()
-    } else if bound_sequence_names {
+    } else if bound_sequence_names || (!namespace.id.is_root() && defaults_name_sequences(&body)) {
         connection
             .dialect()
             .format_rewritten_table_sql(&ast::Stmt::CreateTable {
                 temporary,
                 if_not_exists,
-                tbl_name: ast::QualifiedName {
-                    namespace: None,
-                    name: tbl_name.name,
-                    alias: None,
-                },
+                tbl_name: tbl_name_in_sql,
                 body: body.clone(),
             })?
     } else {
         connection
             .dialect()
-            .format_table_sql(input, &tbl_name, &body)?
+            .format_table_sql(input, &tbl_name_in_sql, &body)?
     };
 
     let parse_schema_label = program.allocate_label();
@@ -1429,7 +1436,7 @@ pub fn translate_create_table(
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L2856-L2871
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
 
-    let index_regs = collect_autoindexes(&body, program, &normalized_tbl_name)?;
+    let index_regs = collect_autoindexes(&body, program, &stored_tbl_name)?;
     if let Some(index_regs) = index_regs.as_ref() {
         for index_reg in index_regs.iter() {
             program.emit_insn(Insn::CreateBtree {
@@ -1464,8 +1471,8 @@ pub fn translate_create_table(
         sqlite_schema_cursor_id,
         cdc_table.as_ref().map(|x| x.0),
         SchemaEntryType::Table,
-        &normalized_tbl_name,
-        &normalized_tbl_name,
+        &stored_tbl_name,
+        &stored_tbl_name,
         table_root_reg,
         Some(sql),
     )?;
@@ -1474,7 +1481,7 @@ pub fn translate_create_table(
         for (idx, index_reg) in index_regs.into_iter().enumerate() {
             let index_name = format!(
                 "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_{}",
-                normalized_tbl_name,
+                stored_tbl_name,
                 idx + 1
             );
             emit_schema_entry(
@@ -1484,7 +1491,7 @@ pub fn translate_create_table(
                 None,
                 SchemaEntryType::Index,
                 &index_name,
-                &normalized_tbl_name,
+                &stored_tbl_name,
                 index_reg,
                 None,
             )?;
@@ -1497,11 +1504,11 @@ pub fn translate_create_table(
     // `__turso_internal_seq_<sequence-name>` table.
     // Skip if it already exists (e.g. VACUUM INTO copies all tables first).
     if has_autoincrement {
-        let autoinc_seq_name = crate::schema::autoincrement_sequence_name(&normalized_tbl_name);
+        let autoinc_seq_name = crate::schema::autoincrement_sequence_name(&stored_tbl_name);
         let backing_table_name =
             crate::translate::sequence::sequence_backing_table_name(&autoinc_seq_name);
         let already_exists = resolver.with_schema(database_id, |s| {
-            s.get_btree_table(namespace.id, &backing_table_name)
+            s.get_btree_table(NamespaceId::ROOT, &backing_table_name)
                 .is_some()
         });
         if !already_exists {
@@ -1529,7 +1536,7 @@ pub fn translate_create_table(
         p5: 0,
     });
 
-    let escaped_tbl_name = escape_sql_string_literal(&normalized_tbl_name);
+    let escaped_tbl_name = escape_sql_string_literal(&stored_tbl_name);
     let mut parse_schema_where_clause = String::with_capacity(
         "tbl_name = '' AND type != 'trigger'".len()
             + escaped_tbl_name.len()
@@ -1572,6 +1579,33 @@ pub fn translate_create_table(
     }
 
     Ok(())
+}
+
+/// Whether a column default of `body` calls a sequence function. The
+/// stored text of such a table in a stored namespace is the translated
+/// statement: the text as written would derive the sequence's name from
+/// the stored table name again when the schema loads.
+fn defaults_name_sequences(body: &ast::CreateTableBody) -> bool {
+    let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
+        return false;
+    };
+    columns.iter().any(|column| {
+        column.constraints.iter().any(|constraint| {
+            let ast::ColumnConstraint::Default(expr) = &constraint.constraint else {
+                return false;
+            };
+            let mut names_sequence = false;
+            let _ = crate::translate::expr::walk_expr(expr, &mut |expr: &ast::Expr| {
+                if let ast::Expr::FunctionCall { name, .. } = expr {
+                    if crate::translate::sequence::is_sequence_function(name.as_str()) {
+                        names_sequence = true;
+                    }
+                }
+                Ok::<_, LimboError>(crate::translate::expr::WalkControl::Continue)
+            });
+            names_sequence
+        })
+    })
 }
 
 /// Binds the sequences named in the column defaults of `body` to the
@@ -1918,6 +1952,7 @@ fn validate_drop_table(
     connection: &Arc<Connection>,
 ) -> Result<()> {
     if !connection.is_nested_stmt()
+        && !connection.runs_engine_ddl()
         && crate::schema::is_system_table(tbl_name)
         // special case, allow dropping `sqlite_stat1`
         && !tbl_name.eq_ignore_ascii_case(STATS_TABLE)
@@ -1965,6 +2000,7 @@ pub fn translate_drop_table(
         );
     };
     let database_id = namespace.database_id;
+    let stored_name = resolver.stored_name(namespace, &normalize_ident(name));
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
@@ -1986,7 +2022,7 @@ pub fn translate_drop_table(
             s.any_resolved_fks_referencing(namespace.id, name)
         })
     {
-        emit_fk_drop_table_check(program, resolver, name, connection, database_id)?;
+        emit_fk_drop_table_check(program, resolver, name, connection, namespace)?;
     }
     let cdc_table = prepare_cdc_if_necessary(
         program,
@@ -1998,7 +2034,7 @@ pub fn translate_drop_table(
     let null_reg = program.alloc_register(); //  r1
     program.emit_null(null_reg, None);
     let table_name_and_root_page_register = program.alloc_register(); //  r2, this register is special because it's first used to track table name and then moved root page
-    let table_reg = program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str())); //  r3
+    let table_reg = program.emit_string8_new_reg(stored_name.clone()); //  r3
     program.mark_last_insn_constant();
     let _table_type = program.emit_string8_new_reg("trigger".to_string()); //  r4
     program.mark_last_insn_constant();
@@ -2456,8 +2492,7 @@ pub fn translate_drop_table(
     }) {
         let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
         let seq_table_name_reg = program.alloc_register();
-        let dropped_table_name_reg =
-            program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()));
+        let dropped_table_name_reg = program.emit_string8_new_reg(stored_name.clone());
         program.mark_last_insn_constant();
 
         program.emit_insn(Insn::OpenWrite {
@@ -2528,8 +2563,7 @@ pub fn translate_drop_table(
             .map(|index| program.alloc_cursor_index(None, index))
             .transpose()?;
         let ver_table_name_reg = program.alloc_register();
-        let dropped_name_reg =
-            program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()));
+        let dropped_name_reg = program.emit_string8_new_reg(stored_name.clone());
         program.mark_last_insn_constant();
 
         program.emit_insn(Insn::OpenWrite {
@@ -2610,9 +2644,10 @@ pub fn translate_drop_table(
     // Drop the in-memory structures for the table
     program.emit_insn(Insn::DropTable {
         db: database_id,
+        namespace: namespace.id,
         _p2: 0,
         _p3: 0,
-        table_name: tbl_name.name.as_str().to_string(),
+        table_name: name.to_string(),
     });
 
     // If the dropped table owned an implicit AUTOINCREMENT sequence, tear
@@ -2627,12 +2662,11 @@ pub fn translate_drop_table(
     // sequence/backing-table is somehow already missing — same idempotency
     // contract as DROP SEQUENCE IF EXISTS.
     if table.btree().is_some_and(|bt| bt.has_autoincrement) {
-        let seq_name =
-            crate::schema::autoincrement_sequence_name(&normalize_ident(tbl_name.name.as_str()));
+        let seq_name = crate::schema::autoincrement_sequence_name(&stored_name);
         crate::translate::sequence::emit_drop_sequence_cleanup(
             program,
             resolver,
-            database_id,
+            NamespaceRef::root_of(database_id),
             &seq_name,
         )?;
     }

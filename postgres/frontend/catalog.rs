@@ -5,6 +5,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::{
     dialect::POSTGRES_TABLE_SQL_PREFIX,
+    namespace::stored_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Index, Schema, Table},
     Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions, Result, Statement,
@@ -145,10 +146,12 @@ impl Dialect for PostgresDialect {
     fn format_table_sql(
         &self,
         input: &str,
-        _tbl_name: &turso_parser::ast::QualifiedName,
+        tbl_name: &turso_parser::ast::QualifiedName,
         _body: &turso_parser::ast::CreateTableBody,
     ) -> Result<String> {
-        Ok(encode_pg_schema_sql(input))
+        let sql = turso_pg_parser::name_create_table(input, tbl_name.name.as_str())
+            .unwrap_or_else(|_| input.to_string());
+        Ok(encode_pg_schema_sql(&sql))
     }
 
     fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> Result<String> {
@@ -200,19 +203,54 @@ pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
     sql.strip_prefix(POSTGRES_TABLE_SQL_PREFIX)
 }
 
-/// Returns an iterator of (table_name, table_ref) for user tables in deterministic order.
-/// Both pg_class and pg_attribute must use this function to ensure consistent OID assignment.
-fn user_tables_sorted(schema: &Schema) -> Vec<(&str, &Arc<Table>)> {
-    let mut tables: Vec<_> = schema
-        .tables(NamespaceId::ROOT)
-        .map(|table| (table.get_name(), table))
-        .filter(|(name, table)| {
-            // Skip virtual tables and subqueries
-            !is_system_table_name(name) && matches!(table.as_ref(), Table::BTree(_))
-        })
-        .collect();
-    tables.sort_by_key(|(name, _)| *name);
+/// Returns the user tables of every namespace as (namespace, name, table)
+/// in deterministic order: the root namespace first, then the stored
+/// namespaces by id, each sorted by name. Every catalog that assigns OIDs
+/// to tables must use this function so the OIDs agree.
+fn user_tables_sorted(schema: &Schema) -> Vec<(NamespaceId, &str, &Arc<Table>)> {
+    let mut tables = Vec::new();
+    for namespace in namespaces_sorted(schema) {
+        let mut namespace_tables: Vec<_> = schema
+            .tables(namespace)
+            .map(|table| (namespace, table.get_name(), table))
+            .filter(|(_, name, table)| {
+                !is_system_table_name(name) && matches!(table.as_ref(), Table::BTree(_))
+            })
+            .collect();
+        namespace_tables.sort_by_key(|(_, name, _)| *name);
+        tables.extend(namespace_tables);
+    }
     tables
+}
+
+/// The namespaces of `schema`: the root first, then the stored ones by id.
+fn namespaces_sorted(schema: &Schema) -> Vec<NamespaceId> {
+    let mut namespaces: Vec<_> = schema.namespace_ids().collect();
+    namespaces.sort();
+    namespaces
+}
+
+/// The PostgreSQL schema name of `namespace`: public for the root of the
+/// main database, else the stored namespace's name.
+fn schema_name_of(schema: &Schema, namespace: NamespaceId) -> &str {
+    if namespace.is_root() {
+        return "public";
+    }
+    schema.namespace_name(namespace).unwrap_or("public")
+}
+
+/// OID of the public schema.
+const PUBLIC_NAMESPACE_OID: i64 = 2200;
+
+/// What is added to the id of a stored namespace to get the OID of its
+/// schema.
+const FIRST_USER_SCHEMA_OID: i64 = 16384;
+
+fn namespace_oid(namespace: NamespaceId) -> i64 {
+    if namespace.is_root() {
+        return PUBLIC_NAMESPACE_OID;
+    }
+    FIRST_USER_SCHEMA_OID + i64::from(namespace.as_u32())
 }
 
 /// Whether `name` is a table that the engine or this frontend owns, rather
@@ -257,12 +295,15 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
     }
 }
 
-/// Build a mapping from table name to OID for all user tables.
-fn table_oid_map(schema: &Schema) -> HashMap<String, i64> {
+/// Build a mapping from namespace and table name to OID for all user tables.
+fn table_oid_map(schema: &Schema) -> HashMap<(NamespaceId, String), i64> {
     let tables = user_tables_sorted(schema);
     let mut map = HashMap::default();
-    for (i, (name, _)) in tables.iter().enumerate() {
-        map.insert((*name).to_string(), USER_TABLE_OID_START + i as i64);
+    for (i, (namespace, name, _)) in tables.iter().enumerate() {
+        map.insert(
+            (*namespace, (*name).to_string()),
+            USER_TABLE_OID_START + i as i64,
+        );
     }
     map
 }
@@ -343,18 +384,14 @@ impl SnapshotRows for PgClassTable {
         let num_tables = tables.len() as i64;
         let relkind: &'static str = RelationKind::Table.into();
 
-        for (i, (table_name, table)) in tables.iter().enumerate() {
+        for (i, (namespace, table_name, table)) in tables.iter().enumerate() {
             let btree = match table.as_ref() {
                 Table::BTree(bt) => bt,
                 _ => continue,
             };
             let table_oid = USER_TABLE_OID_START + i as i64;
             let relnatts = btree.columns().len() as i64;
-            let relhasindex = if schema
-                .get_indices(NamespaceId::ROOT, table_name)
-                .next()
-                .is_some()
-            {
+            let relhasindex = if schema.get_indices(*namespace, table_name).next().is_some() {
                 1i64
             } else {
                 0
@@ -364,7 +401,7 @@ impl SnapshotRows for PgClassTable {
             rows.push(vec![
                 Value::from_i64(table_oid),                    // oid
                 Value::Text((*table_name).to_string().into()), // relname
-                Value::from_i64(2200),                         // relnamespace (public schema)
+                Value::from_i64(namespace_oid(*namespace)),    // relnamespace
                 Value::from_i64(0),                            // reltype
                 Value::from_i64(0),                            // reloftype
                 Value::from_i64(10),                           // relowner
@@ -401,46 +438,46 @@ impl SnapshotRows for PgClassTable {
         // Add index rows (relkind='i')
         let mut index_oid = USER_TABLE_OID_START + num_tables;
         let relkind: &'static str = RelationKind::Index.into();
-        for (table_name, _) in &tables {
-            for idx in schema.get_indices(NamespaceId::ROOT, table_name) {
+        for (namespace, table_name, _) in &tables {
+            for idx in schema.get_indices(*namespace, table_name) {
                 if idx.ephemeral {
                     continue;
                 }
                 let indnatts = idx.columns.len() as i64;
                 rows.push(vec![
-                    Value::from_i64(index_oid),           // oid
-                    Value::Text(idx.name.clone().into()), // relname
-                    Value::from_i64(2200),                // relnamespace (public)
-                    Value::from_i64(0),                   // reltype
-                    Value::from_i64(0),                   // reloftype
-                    Value::from_i64(10),                  // relowner
-                    Value::from_i64(403),                 // relam (btree)
-                    Value::from_i64(0),                   // relfilenode
-                    Value::from_i64(0),                   // reltablespace
-                    Value::from_i64(1),                   // relpages
-                    Value::from_f64(0.0),                 // reltuples
-                    Value::from_i64(0),                   // relallvisible
-                    Value::from_i64(0),                   // reltoastrelid
-                    Value::from_i64(0),                   // relhasindex
-                    Value::from_i64(0),                   // relisshared
-                    Value::Text("p".into()),              // relpersistence
-                    Value::build_text(relkind),           // relkind (index)
-                    Value::from_i64(indnatts),            // relnatts
-                    Value::from_i64(0),                   // relchecks
-                    Value::from_i64(0),                   // relhasrules
-                    Value::from_i64(0),                   // relhastriggers
-                    Value::from_i64(0),                   // relhassubclass
-                    Value::from_i64(0),                   // relrowsecurity
-                    Value::from_i64(0),                   // relforcerowsecurity
-                    Value::from_i64(1),                   // relispopulated
-                    Value::Text("d".into()),              // relreplident
-                    Value::from_i64(0),                   // relispartition
-                    Value::from_i64(0),                   // relrewrite
-                    Value::from_i64(0),                   // relfrozenxid
-                    Value::from_i64(0),                   // relminmxid
-                    Value::Null,                          // relacl
-                    Value::Null,                          // reloptions
-                    Value::Null,                          // relpartbound
+                    Value::from_i64(index_oid),                 // oid
+                    Value::Text(idx.name.clone().into()),       // relname
+                    Value::from_i64(namespace_oid(*namespace)), // relnamespace
+                    Value::from_i64(0),                         // reltype
+                    Value::from_i64(0),                         // reloftype
+                    Value::from_i64(10),                        // relowner
+                    Value::from_i64(403),                       // relam (btree)
+                    Value::from_i64(0),                         // relfilenode
+                    Value::from_i64(0),                         // reltablespace
+                    Value::from_i64(1),                         // relpages
+                    Value::from_f64(0.0),                       // reltuples
+                    Value::from_i64(0),                         // relallvisible
+                    Value::from_i64(0),                         // reltoastrelid
+                    Value::from_i64(0),                         // relhasindex
+                    Value::from_i64(0),                         // relisshared
+                    Value::Text("p".into()),                    // relpersistence
+                    Value::build_text(relkind),                 // relkind (index)
+                    Value::from_i64(indnatts),                  // relnatts
+                    Value::from_i64(0),                         // relchecks
+                    Value::from_i64(0),                         // relhasrules
+                    Value::from_i64(0),                         // relhastriggers
+                    Value::from_i64(0),                         // relhassubclass
+                    Value::from_i64(0),                         // relrowsecurity
+                    Value::from_i64(0),                         // relforcerowsecurity
+                    Value::from_i64(1),                         // relispopulated
+                    Value::Text("d".into()),                    // relreplident
+                    Value::from_i64(0),                         // relispartition
+                    Value::from_i64(0),                         // relrewrite
+                    Value::from_i64(0),                         // relfrozenxid
+                    Value::from_i64(0),                         // relminmxid
+                    Value::Null,                                // relacl
+                    Value::Null,                                // reloptions
+                    Value::Null,                                // relpartbound
                 ]);
                 index_oid += 1;
             }
@@ -492,17 +529,19 @@ impl SnapshotRows for PgNamespaceTable {
             ],
         ];
 
-        // Add attached schemas (CREATE SCHEMA creates attached databases)
-        let schema_names = conn.attached_database_names();
-        let mut oid = 16384i64;
-        for name in schema_names {
+        let schema = conn.current_schema();
+        let mut stored: Vec<_> = schema
+            .stored_namespaces()
+            .map(|(id, name)| (name.to_string(), id))
+            .collect();
+        stored.sort();
+        for (name, id) in stored {
             rows.push(vec![
-                Value::from_i64(oid),
+                Value::from_i64(namespace_oid(id)),
                 Value::build_text(name),
                 Value::from_i64(10), // nspowner (bootstrap superuser)
                 Value::Null,         // nspacl
             ]);
-            oid += 1;
         }
         rows
     }
@@ -590,7 +629,7 @@ impl SnapshotRows for PgAttributeTable {
 
         let mut oid_counter = USER_TABLE_OID_START;
 
-        for (_, table) in user_tables_sorted(&schema) {
+        for (_, _, table) in user_tables_sorted(&schema) {
             let table_oid = oid_counter;
             oid_counter += 1;
 
@@ -1017,17 +1056,18 @@ impl SnapshotRows for PgTablesTable {
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
+        let tables = user_tables_sorted(&schema);
 
-        for (table_name, _) in user_tables_sorted(&schema) {
+        for (namespace, table_name, _) in tables {
             rows.push(vec![
-                Value::Text("public".into()),               // schemaname
-                Value::Text(table_name.to_string().into()), // tablename
-                Value::Text("turso".into()),                // tableowner
-                Value::Null,                                // tablespace
-                Value::from_i64(0),                         // hasindexes
-                Value::from_i64(0),                         // hasrules
-                Value::from_i64(0),                         // hastriggers
-                Value::from_i64(0),                         // rowsecurity
+                Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
+                Value::Text(table_name.to_string().into()),                        // tablename
+                Value::Text("turso".into()),                                       // tableowner
+                Value::Null,                                                       // tablespace
+                Value::from_i64(0),                                                // hasindexes
+                Value::from_i64(0),                                                // hasrules
+                Value::from_i64(0),                                                // hastriggers
+                Value::from_i64(0),                                                // rowsecurity
             ]);
         }
 
@@ -1053,18 +1093,20 @@ impl SnapshotRows for PgIndexesTable {
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
+        let tables = user_tables_sorted(&schema);
 
-        for (table_name, _) in user_tables_sorted(&schema) {
-            for idx in schema.get_indices(NamespaceId::ROOT, table_name) {
+        for (namespace, table_name, _) in tables {
+            let schema_name = schema_name_of(&schema, namespace);
+            for idx in schema.get_indices(namespace, table_name) {
                 if idx.ephemeral {
                     continue;
                 }
                 rows.push(vec![
-                    Value::Text("public".into()),
+                    Value::build_text(schema_name.to_string()),
                     Value::Text(table_name.to_string().into()),
                     Value::Text(idx.name.clone().into()),
                     Value::Null,
-                    Value::build_text(index_definition("public", table_name, &idx.name, idx)),
+                    Value::build_text(index_definition(schema_name, table_name, &idx.name, idx)),
                 ]);
             }
         }
@@ -1534,9 +1576,12 @@ impl SnapshotRows for PgIndexTable {
         let tbl_oid_map = table_oid_map(&schema);
 
         let mut index_oid = USER_TABLE_OID_START + num_tables;
-        for (table_name, _) in &tables {
-            let table_oid = tbl_oid_map.get(*table_name).copied().unwrap_or(0);
-            for idx in schema.get_indices(NamespaceId::ROOT, table_name) {
+        for (namespace, table_name, _) in &tables {
+            let table_oid = tbl_oid_map
+                .get(&(*namespace, (*table_name).to_string()))
+                .copied()
+                .unwrap_or(0);
+            for idx in schema.get_indices(*namespace, table_name) {
                 if idx.ephemeral {
                     continue;
                 }
@@ -1650,8 +1695,8 @@ impl SnapshotRows for PgConstraintTable {
         // Build index_name -> index_oid map (same OID assignment as pg_class/pg_index)
         let mut index_oid_map: HashMap<String, i64> = HashMap::default();
         let mut next_index_oid = USER_TABLE_OID_START + num_tables;
-        for (table_name, _) in &tables {
-            for idx in schema.get_indices(NamespaceId::ROOT, table_name) {
+        for (namespace, table_name, _) in &tables {
+            for idx in schema.get_indices(*namespace, table_name) {
                 if idx.ephemeral {
                     continue;
                 }
@@ -1662,12 +1707,15 @@ impl SnapshotRows for PgConstraintTable {
 
         let mut constraint_oid = next_index_oid;
 
-        for (table_name, table) in &tables {
+        for (namespace, table_name, table) in &tables {
             let btree = match table.as_ref() {
                 Table::BTree(bt) => bt,
                 _ => continue,
             };
-            let table_oid = tbl_oid_map.get(*table_name).copied().unwrap_or(0);
+            let table_oid = tbl_oid_map
+                .get(&(*namespace, (*table_name).to_string()))
+                .copied()
+                .unwrap_or(0);
 
             // Synthesize PK constraint for rowid-alias tables when unique_sets has no PK
             let has_pk_in_unique_sets = btree.unique_sets.iter().any(|us| us.is_primary_key);
@@ -1810,14 +1858,17 @@ impl SnapshotRows for PgConstraintTable {
                     .collect::<Vec<_>>()
                     .join(" ");
 
-                let confrelid = tbl_oid_map.get(&fk.parent_table).copied().unwrap_or(0);
+                let confrelid = tbl_oid_map
+                    .get(&(fk.parent_namespace, fk.parent_table.clone()))
+                    .copied()
+                    .unwrap_or(0);
 
                 let confkey: String = fk
                     .parent_columns
                     .iter()
                     .map(|name| {
                         schema
-                            .get_btree_table(NamespaceId::ROOT, &fk.parent_table)
+                            .get_btree_table(fk.parent_namespace, &fk.parent_table)
                             .and_then(|parent_bt| {
                                 parent_bt
                                     .get_column(name)
@@ -1943,12 +1994,15 @@ impl SnapshotRows for PgAttrdefTable {
         // Use a high base to avoid collisions
         let mut attrdef_oid: i64 = 50000;
 
-        for (table_name, table) in &tables {
+        for (namespace, table_name, table) in &tables {
             let btree = match table.as_ref() {
                 Table::BTree(bt) => bt,
                 _ => continue,
             };
-            let table_oid = tbl_oid_map.get(*table_name).copied().unwrap_or(0);
+            let table_oid = tbl_oid_map
+                .get(&(*namespace, (*table_name).to_string()))
+                .copied()
+                .unwrap_or(0);
 
             for (col_idx, col) in btree.columns().iter().enumerate() {
                 if let Some(default_expr) = &col.default {
@@ -1992,19 +2046,26 @@ impl SnapshotRows for PgSequencesTable {
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let mut rows = Vec::new();
         let schema = conn.current_schema();
-        let sequences = schema.sequences_by_name(NamespaceId::ROOT);
-        let mut names: Vec<_> = sequences.keys().cloned().collect();
-        names.sort();
-        for name in names {
-            if let Some(seq) = sequences.get(&name) {
+        let namespaces = namespaces_sorted(&schema);
+        for namespace in namespaces {
+            let sequences = schema.sequences_by_name(namespace);
+            let mut names: Vec<_> = sequences.keys().cloned().collect();
+            names.sort();
+            for name in names {
+                let Some(seq) = sequences.get(&name) else {
+                    continue;
+                };
                 let seq_name = seq.name.clone();
                 // currval is per-connection; expose this connection's last
                 // value via the connection currval map, falling back to start.
                 let last_val = conn
-                    .get_sequence_currval(turso_core::MAIN_DB_ID, &seq_name)
+                    .get_sequence_currval(
+                        turso_core::MAIN_DB_ID,
+                        &stored_name(namespace, &seq_name),
+                    )
                     .unwrap_or(seq.start_value);
                 rows.push(vec![
-                    Value::build_text("public"),           // schemaname
+                    Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
                     Value::build_text(seq_name),           // sequencename
                     Value::build_text("turso"),            // sequenceowner
                     Value::build_text("bigint"),           // data_type
@@ -3372,8 +3433,8 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
 
     // Build index_name -> index_oid map (same as pg_constraint)
     let mut next_index_oid = USER_TABLE_OID_START + num_tables;
-    for (table_name, _) in &tables {
-        for idx in schema.get_indices(NamespaceId::ROOT, table_name) {
+    for (namespace, table_name, _) in &tables {
+        for idx in schema.get_indices(*namespace, table_name) {
             if !idx.ephemeral {
                 next_index_oid += 1;
             }
@@ -3382,7 +3443,7 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
 
     let mut constraint_oid = next_index_oid;
 
-    for (_, table) in &tables {
+    for (_, _, table) in &tables {
         let btree = match table.as_ref() {
             Table::BTree(bt) => bt,
             _ => continue,
@@ -3458,13 +3519,18 @@ pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<Stri
     let num_tables = tables.len() as i64;
 
     let mut index_oid = USER_TABLE_OID_START + num_tables;
-    for (table_name, _) in &tables {
-        for idx in schema.get_indices(NamespaceId::ROOT, table_name) {
+    for (namespace, table_name, _) in &tables {
+        for idx in schema.get_indices(*namespace, table_name) {
             if idx.ephemeral {
                 continue;
             }
             if index_oid == target_oid {
-                return Some(index_definition("public", table_name, &idx.name, idx));
+                return Some(index_definition(
+                    schema_name_of(&schema, *namespace),
+                    table_name,
+                    &idx.name,
+                    idx,
+                ));
             }
             index_oid += 1;
         }
@@ -3785,7 +3851,7 @@ mod tests {
                 .unwrap()
                 .run_collect_rows()
                 .unwrap(),
-            vec![vec![Value::from_i64(4)]]
+            vec![vec![Value::from_i64(3)]]
         );
         conn.execute("CREATE TRIGGER aux.catalog_check AFTER INSERT ON data BEGIN INSERT INTO counts SELECT COUNT(*) FROM pg_namespace; END").unwrap();
         conn.execute("INSERT INTO aux.data VALUES (5)").unwrap();
@@ -3794,7 +3860,7 @@ mod tests {
                 .unwrap()
                 .run_collect_rows()
                 .unwrap(),
-            vec![vec![Value::from_i64(4)]]
+            vec![vec![Value::from_i64(3)]]
         );
         let attached = crate::session::open_database_with_io(
             io.clone(),
