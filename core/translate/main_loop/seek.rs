@@ -28,7 +28,7 @@ fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
 /// scan does. Any other key is compared by the scan with the decoded column
 /// value as it is, so it is used as it is when stored and decoded values look
 /// the same, and encoded otherwise (uuid, boolean), which maps a decoded value
-/// of the type back to its stored form.
+/// of the type back to its stored form. Other dialects encode every key.
 pub(super) fn encode_seek_keys_for_custom_types(
     program: &mut ProgramBuilder,
     tables: &TableReferences,
@@ -82,11 +82,14 @@ pub(super) fn encode_seek_keys_for_custom_types(
                 continue;
             }
         }
-        if resolved.reads_stored_values_unchanged()
+        let converts_compared_values = resolver
+            .dialect
+            .converts_strings_compared_with_custom_types();
+        if (converts_compared_values && resolved.reads_stored_values_unchanged())
             || resolved
                 .chain
                 .iter()
-                .all(|td| td.encode_for_comparison_value().is_none())
+                .all(|td| seek_key_encode(td, converts_compared_values).is_none())
         {
             continue;
         }
@@ -96,7 +99,7 @@ pub(super) fn encode_seek_keys_for_custom_types(
             target_pc: skip_label,
         });
         for td in &resolved.chain {
-            if let Some(encode_expr) = td.encode_for_comparison_value() {
+            if let Some(encode_expr) = seek_key_encode(td, converts_compared_values) {
                 crate::translate::expr::emit_type_expr(
                     program,
                     encode_expr,
@@ -111,6 +114,14 @@ pub(super) fn encode_seek_keys_for_custom_types(
         program.preassign_label_to_next_insn(skip_label);
     }
     Ok(())
+}
+
+fn seek_key_encode(td: &crate::schema::TypeDef, converts_compared_values: bool) -> Option<&Expr> {
+    if converts_compared_values {
+        td.encode_for_comparison_value()
+    } else {
+        td.encode()
+    }
 }
 
 /// Seek-based loop setup.
