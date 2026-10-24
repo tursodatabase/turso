@@ -555,11 +555,11 @@ pub fn plan_subqueries_from_returning(
     Ok(())
 }
 
-/// Plan subqueries in a trigger WHEN clause expression.
-/// The WHEN clause has no FROM clause, so there are no outer query references.
-/// NEW/OLD references should already be rewritten to Expr::Register before calling this.
+/// Plan subqueries in an expression that has no FROM clause, such as a trigger
+/// WHEN clause or a VACUUM INTO path, so there are no outer query references.
+/// Trigger NEW/OLD references should already be rewritten to Expr::Register.
 #[turso_macros::trace_stack]
-pub fn plan_subqueries_from_trigger_when_clause(
+pub fn plan_subqueries_in_expr_without_from_clause(
     program: &mut ProgramBuilder,
     non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
     expr: &mut ast::Expr,
@@ -575,7 +575,7 @@ pub fn plan_subqueries_from_trigger_when_clause(
         std::iter::once(expr),
         connection,
         SubqueryPosition::Where,
-        SubqueryOrigin::TriggerWhen,
+        SubqueryOrigin::ExprWithoutFromClause,
         false,
         &mut Vec::new(),
         &mut Vec::new(),

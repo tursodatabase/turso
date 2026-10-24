@@ -662,6 +662,47 @@ fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER, path TEXT);")]
+fn test_vacuum_into_path_expression(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let dest_dir = TempDir::new()?;
+    let subquery_path = dest_dir.path().join("subquery.db");
+    let subquery_path_str = subquery_path.to_str().unwrap().to_string();
+    let concat_prefix = dest_dir.path().join("concat");
+    let concat_prefix_str = concat_prefix.to_str().unwrap();
+
+    conn.execute(format!(
+        "INSERT INTO t VALUES (42, '{}')",
+        escape_sqlite_string_literal(&subquery_path_str)
+    ))?;
+    conn.execute("VACUUM INTO (SELECT path FROM t)")?;
+    conn.execute(format!(
+        "VACUUM INTO '{}' || '.db'",
+        escape_sqlite_string_literal(concat_prefix_str)
+    ))?;
+    let parameter_path = dest_dir.path().join("parameter.db");
+    let mut stmt = conn.prepare("VACUUM INTO ?")?;
+    stmt.bind_at(
+        1.try_into()?,
+        Value::build_text(parameter_path.to_str().unwrap().to_string()),
+    )?;
+    stmt.run_ignore_rows()?;
+
+    for dest_path in [
+        subquery_path,
+        dest_dir.path().join("concat.db"),
+        parameter_path,
+    ] {
+        let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, tmp_db.db_opts);
+        let dest_conn = dest_db.connect_limbo();
+        assert_eq!(run_integrity_check(&dest_conn), "ok");
+        let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT a, path FROM t");
+        assert_eq!(rows, vec![(42, subquery_path_str.clone())]);
+    }
+
+    Ok(())
+}
+
 /// Test VACUUM INTO error cases: plain VACUUM, existing non-empty and empty
 /// files, within transaction, and query_only mode.
 #[turso_macros::test(mvcc)]

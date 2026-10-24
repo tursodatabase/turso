@@ -2333,8 +2333,8 @@ pub enum Insn {
     VacuumInto {
         /// Database name to vacuum
         schema_name: String,
-        /// Destination file path for the vacuumed database
-        dest_path: String,
+        /// Register holding the destination file path for the vacuumed database
+        dest_reg: usize,
     },
 
     /// In-place VACUUM - compact the database (by writing to a temporary location and then copying

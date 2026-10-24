@@ -2,7 +2,7 @@ use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
 use crate::translate::expr::WalkControl;
 use crate::translate::subquery::{
-    emit_non_from_clause_subquery, plan_subqueries_from_trigger_when_clause,
+    emit_non_from_clause_subquery, plan_subqueries_in_expr_without_from_clause,
 };
 use crate::translate::{
     emitter::Resolver,
@@ -892,7 +892,7 @@ pub fn fire_trigger(
             // Plan and emit any subqueries in the WHEN clause (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
             // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
             let mut subqueries = Vec::new();
-            plan_subqueries_from_trigger_when_clause(
+            plan_subqueries_in_expr_without_from_clause(
                 program,
                 &mut subqueries,
                 &mut when_expr,
