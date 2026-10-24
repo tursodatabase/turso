@@ -431,24 +431,7 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-test uuid-compare-with-uppercase-literal {
-    CREATE TABLE t1(u uuid) STRICT;
-    CREATE TABLE t2(u uuid) STRICT;
-    CREATE INDEX t2_u ON t2(u);
-    INSERT INTO t1 VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
-    INSERT INTO t2 VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
-    SELECT
-        (SELECT count(*) FROM t1 WHERE u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'),
-        (SELECT count(*) FROM t2 WHERE u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'),
-        (SELECT count(*) FROM t1 WHERE u IN ('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11')),
-        (SELECT count(*) FROM t2 WHERE u IN ('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'));
-}
-expect {
-    1|1|1|1
-}
-
-@requires strict "uses STRICT tables"
-test timestamp-compare-with-literal-in-other-format {
+test timestamp-compare-with-literal-in-other-format-compares-text {
     CREATE TABLE t1(ts timestamp) STRICT;
     CREATE TABLE t2(ts timestamp) STRICT;
     CREATE INDEX t2_ts ON t2(ts);
@@ -458,22 +441,22 @@ test timestamp-compare-with-literal-in-other-format {
         (SELECT count(*) FROM t1 WHERE ts = '2026-10-08T12:00:00'),
         (SELECT count(*) FROM t2 WHERE ts = '2026-10-08T12:00:00'),
         (SELECT count(*) FROM t1 WHERE ts >= '2026-10-08T12:00'),
-        (SELECT count(*) FROM t1 WHERE ts BETWEEN '2026-10-08T11:00' AND '2026-10-08T13:00');
+        (SELECT count(*) FROM t2 WHERE ts >= '2026-10-08T12:00');
 }
 expect {
-    1|1|1|1
+    0|0|0|0
 }
 
 @requires strict "uses STRICT tables"
-test boolean-compare-with-text-literal {
+test boolean-compare-with-text-literal-compares-text {
     CREATE TABLE t1(b boolean) STRICT;
     INSERT INTO t1 VALUES (1), (0);
     SELECT
         (SELECT count(*) FROM t1 WHERE b = 'true'),
-        (SELECT count(*) FROM t1 WHERE b = 'f');
+        (SELECT count(*) FROM t1 WHERE b = 1);
 }
 expect {
-    1|1
+    0|1
 }
 
 @requires strict "uses STRICT tables"
@@ -493,12 +476,13 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test date-compare-with-invalid-literal {
+test date-compare-with-invalid-literal-compares-text {
     CREATE TABLE t1(d date) STRICT;
     INSERT INTO t1 VALUES ('2026-10-08');
     SELECT count(*) FROM t1 WHERE d = 'garbage';
 }
-expect error {
+expect {
+    0
 }
 
 @requires strict "uses STRICT tables"
@@ -532,14 +516,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test date-compare-with-invalid-literal-empty-table {
-    CREATE TABLE t1(d date) STRICT;
-    SELECT count(*) FROM t1 WHERE d = 'garbage';
-}
-expect error {
-}
-
-@requires strict "uses STRICT tables"
 test date-and-timestamp-column-subtraction-uses-standard-operator {
     CREATE TABLE t1(d date, ts timestamp) STRICT;
     INSERT INTO t1 VALUES ('2026-10-08', '2026-10-08 12:00:00');
@@ -550,22 +526,44 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test domain-over-date-compare-with-literal {
+test domain-over-date-compare-with-literal-compares-text {
     CREATE DOMAIN recent AS date CHECK (value > '2000-01-01');
     CREATE TABLE dm(id INTEGER PRIMARY KEY, r recent) STRICT;
     INSERT INTO dm VALUES (1, '2026-01-05');
-    SELECT id FROM dm WHERE r = '2026-01-05 00:00';
+    SELECT
+        (SELECT count(*) FROM dm WHERE r = '2026-01-05 00:00'),
+        (SELECT count(*) FROM dm WHERE r = '2026-01-05');
 }
 expect {
-    1
+    0|1
 }
 
 @requires strict "uses STRICT tables"
-test cast-to-custom-type-compare-with-literal {
+test cast-to-date-compare-with-literal-compares-text {
     SELECT
         CAST('2026-01-05' AS date) = '2026-01-05 00:00',
-        CAST('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' AS uuid) = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11';
+        CAST('2026-01-05' AS date) = '2026-01-05';
 }
 expect {
-    1|1
+    0|1
+}
+
+@requires strict "uses STRICT tables"
+test date-and-timestamptz-compare-with-text-prefix {
+    CREATE TABLE t1(d date, ts timestamptz) STRICT;
+    CREATE TABLE t2(d date, ts timestamptz) STRICT;
+    CREATE INDEX t2_d ON t2(d);
+    CREATE INDEX t2_ts ON t2(ts);
+    INSERT INTO t1 VALUES ('2026-10-08', '2026-10-08 12:00:00');
+    INSERT INTO t2 VALUES ('2026-10-08', '2026-10-08 12:00:00');
+    SELECT
+        (SELECT count(*) FROM t1 WHERE d < '2027'),
+        (SELECT count(*) FROM t2 WHERE d < '2027'),
+        (SELECT count(*) FROM t1 WHERE ts < '2026-11'),
+        (SELECT count(*) FROM t2 WHERE ts < '2026-11'),
+        (SELECT count(*) FROM t1 WHERE ts > 'abc'),
+        (SELECT count(*) FROM t2 WHERE ts > 'abc');
+}
+expect {
+    1|1|1|1|0|0
 }

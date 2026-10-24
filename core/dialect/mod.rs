@@ -205,6 +205,17 @@ pub trait Dialect: Send + Sync + 'static {
     fn errors_on_zero_divisor(&self) -> bool {
         false
     }
+
+    /// Whether a quoted string or a bound parameter compared with a value of
+    /// a custom type is first converted to that type, the way it would be
+    /// when stored.
+    ///
+    /// PostgreSQL converts it, so `date_col = '20261008'` matches and
+    /// `date_col < '2027'` is an invalid date. SQLite compares the string as
+    /// it is.
+    fn converts_strings_compared_with_custom_types(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

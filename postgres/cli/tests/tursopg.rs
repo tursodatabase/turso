@@ -1634,6 +1634,22 @@ fn wire_datetime_typed_params() {
     });
 }
 
+#[test]
+fn wire_untyped_param_compared_with_timestamp_column() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE t(ts timestamp)");
+        c.query_command_tags("INSERT INTO t VALUES ('2026-10-08 12:00:00')");
+        assert_eq!(
+            c.query_with_typed_param(
+                "SELECT count(*) FROM t WHERE ts = $1 AND ts >= $1",
+                0,
+                "2026-10-08T12:00:00"
+            ),
+            Ok("1".to_string())
+        );
+    });
+}
+
 /// Direct table-column references take the schema-tagged path: a column
 /// declared INTEGER reports INT4, TEXT reports TEXT, and so on. The wire
 /// layer must not regress to TEXT here.

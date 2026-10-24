@@ -636,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn test_timestamp_compared_with_bound_text_parameter() {
+    fn test_timestamp_compared_with_bound_text_parameter_compares_text() {
         let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
         let db = TempDatabase::builder().with_opts(opts).build();
         let conn = db.connect_limbo();
@@ -659,6 +659,6 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(rows, vec![1]);
+        assert_eq!(rows, vec![0]);
     }
 }

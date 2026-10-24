@@ -449,8 +449,9 @@ fn comparison_type_of(
 }
 
 /// Converts `value_expr` to the custom type described by `chain` when it is a
-/// quoted string or a bound parameter and the type compares its values with
-/// the standard comparison. Returns None when the value is left as it is.
+/// quoted string or a bound parameter, the type compares its values with the
+/// standard comparison, and the dialect converts such values (PostgreSQL).
+/// Returns None when the value is left as it is.
 ///
 /// The conversion only depends on the value, so it is computed once per
 /// execution, before the first row is read, whenever the type's ENCODE and
@@ -464,6 +465,12 @@ pub(crate) fn emit_untyped_value_as_type(
     form: ValueForm,
     resolver: &Resolver,
 ) -> Result<Option<usize>> {
+    if !resolver
+        .dialect
+        .converts_strings_compared_with_custom_types()
+    {
+        return Ok(None);
+    }
     let Some(leaf_type) = chain.first() else {
         return Ok(None);
     };
