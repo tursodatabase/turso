@@ -281,7 +281,7 @@ pub fn prepare_delete_plan(
 
     let has_fk_actions = match btree_table_for_triggers.as_ref() {
         Some(bt) if connection.foreign_keys_enabled() => resolver
-            .with_schema(database_id, |s| s.resolved_fks_referencing(&bt.name))?
+            .with_schema(database_id, |s| s.resolved_fks_referencing(&bt.name, None))?
             .iter()
             .any(|fk_ref| !matches!(fk_ref.fk.on_delete, RefAct::NoAction | RefAct::Restrict)),
         _ => false,
