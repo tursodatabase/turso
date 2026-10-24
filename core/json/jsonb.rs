@@ -1897,6 +1897,18 @@ impl Jsonb {
                     location: Some(pos),
                 });
             } else if c == b'\\' {
+                // SQLite allows only \uXXXX escapes in unquoted keys and
+                // reports anything else at the backslash.
+                let starts_unicode_escape = input.get(pos) == Some(&b'u')
+                    && input.len() >= pos + 5
+                    && input[pos + 1..pos + 5].iter().all(|&h| is_hex_digit(h));
+                if !quoted && !starts_unicode_escape {
+                    return Err(PError::Message {
+                        msg: "Invalid character in unquoted object key".to_string(),
+                        location: Some(pos - 1),
+                    });
+                }
+
                 // Handle escape sequences
                 if pos >= input.len() {
                     return Err(PError::Message {
@@ -1908,14 +1920,6 @@ impl Jsonb {
                 let esc_pos = pos;
                 let esc = input[pos];
                 pos += 1;
-
-                // SQLite allows only \uXXXX escapes in unquoted keys.
-                if !quoted && esc != b'u' {
-                    return Err(PError::Message {
-                        msg: "Invalid character in unquoted object key".to_string(),
-                        location: Some(pos),
-                    });
-                }
 
                 // A standard escape upgrades plain TEXT to TEXTJ but
                 // never demotes TEXT5: earlier JSON5 syntax keeps the
@@ -2028,7 +2032,7 @@ impl Jsonb {
                         len += 2;
                         element_type = ElementType::TEXT5;
                     }
-                    b'0' => {
+                    b'0' if !input.get(pos).is_some_and(u8::is_ascii_digit) => {
                         self.data.extend_from_slice(b"\\0");
                         len += 2;
                         element_type = ElementType::TEXT5;
