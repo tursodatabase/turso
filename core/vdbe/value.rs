@@ -8,7 +8,7 @@ use crate::{
     LimboError, Result, Value,
 };
 
-// we use math functions from Rust stdlib in order to be as portable as possible for the production version of the tursodb
+// Most production math functions use Rust's standard library for portability.
 #[cfg(not(test))]
 mod cmath {
     pub fn exp(x: f64) -> f64 {
@@ -62,6 +62,15 @@ mod cmath {
     pub fn atan(x: f64) -> f64 {
         x.atan()
     }
+    #[cfg(not(target_family = "wasm"))]
+    pub fn atanh(x: f64) -> f64 {
+        extern "C" {
+            #[link_name = "atanh"]
+            fn native_atanh(x: f64) -> f64;
+        }
+        unsafe { native_atanh(x) }
+    }
+    #[cfg(target_family = "wasm")]
     pub fn atanh(x: f64) -> f64 {
         x.atanh()
     }

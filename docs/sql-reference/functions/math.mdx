@@ -181,6 +181,8 @@ atanh(X)
 
 **Returns:** REAL. The inverse hyperbolic tangent of X. Returns NULL if X is outside (-1.0, 1.0).
 
+Native builds use the platform's C math implementation, as SQLite does. This preserves rounding behavior when `atanh()` is composed with functions such as `ceil()` near an integer boundary. WebAssembly builds retain the portable Rust implementation.
+
 ---
 
 ### ceil() / ceiling()
