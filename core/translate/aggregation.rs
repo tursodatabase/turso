@@ -174,6 +174,30 @@ pub fn emit_ungrouped_aggregation<'a>(
                 }
             }
         }
+        for rc in plan
+            .result_columns
+            .iter()
+            .filter(|rc| rc.contains_aggregates)
+        {
+            super::expr::walk_expr(&rc.expr, &mut |expr| -> Result<super::expr::WalkControl> {
+                if let ast::Expr::SubqueryResult { .. } = expr {
+                    if let Some((reg, _, _)) = t_ctx.resolver.resolve_cached_expr_reg(expr) {
+                        translate_expr(
+                            program,
+                            Some(&plan.table_references),
+                            expr,
+                            reg,
+                            &t_ctx.resolver.fork(),
+                        )?;
+                    }
+                    return Ok(super::expr::WalkControl::SkipChildren);
+                }
+                if plan.aggregates.iter().any(|agg| agg.original_expr == *expr) {
+                    return Ok(super::expr::WalkControl::SkipChildren);
+                }
+                Ok(super::expr::WalkControl::Continue)
+            })?;
+        }
         // Evaluate non-aggregate columns now (with cursor in invalid state, columns return NULL)
         // Must use no_constant_opt to prevent constant hoisting which would place the label
         // after the hoisted constants, causing infinite loops in compound selects.
