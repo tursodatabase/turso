@@ -775,7 +775,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         columns: &[hir::InsertTarget],
         upserts: &[(Option<hir::ConflictTarget>, &ast::UpsertDo)],
     ) -> Result<Vec<bool>> {
-        if table.value().btree().is_none() {
+        if !table.value().btree().is_some_and(|btree| btree.has_rowid) {
             return Ok(vec![true; upserts.len()]);
         }
         let source = self.source(target).ok_or_else(|| {
