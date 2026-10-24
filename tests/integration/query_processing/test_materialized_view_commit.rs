@@ -780,6 +780,10 @@ const FAILED_WRITE_SETUP: &[&str] = &[
     "CREATE MATERIALIZED VIEW v_group AS SELECT b % 2 AS parity, count(*) AS n, sum(b) AS s FROM t GROUP BY parity",
     "CREATE MATERIALIZED VIEW v_join AS SELECT t.id, u.n FROM t JOIN u ON t.id = u.k",
     "CREATE MATERIALIZED VIEW v_on_view AS SELECT id, a FROM v WHERE b > 1",
+    // A three-way join with the same table twice: one delta join whose
+    // phases read `t`'s changes for two of its inputs.
+    "CREATE MATERIALIZED VIEW v_multiway AS SELECT x.id, u.n, y.a \
+     FROM t x JOIN u ON x.id = u.k JOIN t y ON y.b = u.k",
 ];
 
 struct FailedWriteCase {

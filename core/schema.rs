@@ -153,6 +153,9 @@ pub const DBSP_ARRANGEMENT_TABLE_PREFIX: &str = "__turso_internal_dbsp_arrangeme
 /// Hidden storage-version marker owned by every materialized view, including
 /// views whose maintenance circuit has no stateful operators.
 pub const DBSP_METADATA_TABLE_PREFIX: &str = "__turso_internal_dbsp_metadata_v";
+/// Index materialized views create on a base table, so that their joins can
+/// look that table up by key.
+pub const DBSP_INDEX_PREFIX: &str = "__turso_internal_dbsp_index_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 pub const SEQ_BACKING_TABLE_PREFIX: &str = "__turso_internal_seq_";
 // Prefix for the hidden sequence *name* owned by an AUTOINCREMENT table.
@@ -654,6 +657,12 @@ pub fn is_materialized_view_state_table(table_name: &str) -> bool {
     ]
     .iter()
     .any(|prefix| table_name.starts_with(prefix))
+}
+
+/// Check if an index is one materialized views create on a base table so that
+/// their joins can look that table up by key.
+pub fn is_materialized_view_join_key_index(index_name: &str) -> bool {
+    index_name.starts_with(DBSP_INDEX_PREFIX)
 }
 
 pub fn allow_user_dml(table_name: &str) -> bool {

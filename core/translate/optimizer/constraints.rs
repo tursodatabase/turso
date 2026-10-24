@@ -1785,7 +1785,7 @@ pub(super) fn can_use_partial_index(
 /// table (`Index::validate_where_expr`), so this minimal binder is enough
 /// to make the expression directly comparable to a bound query expression
 /// via `exprs_are_equivalent` — without threading a full `Resolver`.
-fn bind_partial_index_columns(expr: &mut ast::Expr, table_reference: &JoinedTable) {
+pub(crate) fn bind_partial_index_columns(expr: &mut ast::Expr, table_reference: &JoinedTable) {
     let column_pos = |name: &str| -> Option<usize> {
         table_reference.columns().iter().position(|c| {
             c.name

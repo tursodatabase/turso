@@ -218,17 +218,36 @@ impl Connection {
         self: &Arc<Self>,
         view_name: &str,
     ) -> Result<Vec<Option<String>>> {
+        Ok(self
+            .materialized_view_plan(view_name)?
+            .chosen_value_collations()
+            .into_iter()
+            .map(|collation| collation.map(|collation| collation.name()))
+            .collect())
+    }
+
+    /// Whether which rows materialized view `view_name` holds depends on
+    /// which of several equal values it chose, so that a fresh run of its
+    /// definition may return a different number of rows. Under RTRIM a
+    /// DISTINCT may keep 'X' or 'X  '; a NOCASE UNION with 'x' above it then
+    /// returns one row or two. A tool that checks a view against a fresh run
+    /// of its definition cannot compare such a view.
+    pub fn materialized_view_rows_depend_on_chosen_values(
+        self: &Arc<Self>,
+        view_name: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .materialized_view_plan(view_name)?
+            .rows_depend_on_chosen_values())
+    }
+
+    fn materialized_view_plan(self: &Arc<Self>, view_name: &str) -> Result<MaintenancePlan> {
         let schema = self.schema.read().clone();
         let view = schema.get_materialized_view(view_name).ok_or_else(|| {
             LimboError::InvalidArgument(format!("no such materialized view: {view_name}"))
         })?;
         let select = view.lock().select_stmt.clone();
-        let plan = build_plan_for_connection(view_name, &select, &schema, self)?;
-        Ok(plan
-            .chosen_value_collations()
-            .into_iter()
-            .map(|collation| collation.map(|collation| collation.name()))
-            .collect())
+        build_plan_for_connection(view_name, &select, &schema, self)
     }
 }
 
@@ -359,8 +378,18 @@ fn emit_plan_nodes(
                         ))
                     })
                 };
-                let declared_inputs = [declared_input(inputs[0])?, declared_input(inputs[1])?];
-                let contract = JoinContract::from_outputs(declared_inputs, on)?;
+                let declared_inputs = inputs
+                    .iter()
+                    .map(|input_id| declared_input(*input_id))
+                    .collect::<Result<Vec<_>>>()?;
+                let contract = JoinContract::from_outputs(
+                    program,
+                    view_name,
+                    inputs,
+                    &declared_inputs,
+                    on,
+                    input,
+                )?;
                 match kind {
                     dag::JoinKind::Inner => emit_inner_join(
                         program,

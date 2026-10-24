@@ -71,3 +71,48 @@ fn create_materialized_view_is_rejected_in_mvcc_mode() {
     let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, v FROM t");
     assert_eq!(rows, vec![(1, 10)]);
 }
+
+#[test]
+fn rows_depend_on_chosen_values_when_a_choice_feeds_a_key_under_another_collation() {
+    let tmp_db = TempDatabase::builder().with_views(true).build();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE n (v TEXT COLLATE NOCASE)")
+        .unwrap();
+    conn.execute("CREATE TABLE r (v TEXT COLLATE RTRIM)")
+        .unwrap();
+    conn.execute("INSERT INTO n VALUES ('x')").unwrap();
+    conn.execute("INSERT INTO r VALUES ('X'), ('X  ')").unwrap();
+    let views = [
+        (
+            "nocase_union_over_rtrim_distinct",
+            "SELECT v FROM n UNION SELECT v FROM (SELECT DISTINCT v FROM r)",
+            true,
+        ),
+        (
+            "nocase_group_by_over_rtrim_distinct",
+            "SELECT v COLLATE NOCASE AS k, count(*) AS c \
+             FROM (SELECT DISTINCT v FROM r) GROUP BY v COLLATE NOCASE",
+            true,
+        ),
+        (
+            "nocase_union_over_nocase_distinct",
+            "SELECT v FROM n UNION SELECT v FROM (SELECT DISTINCT v FROM n)",
+            false,
+        ),
+        (
+            "binary_distinct_over_rtrim_distinct",
+            "SELECT DISTINCT v COLLATE BINARY AS k FROM (SELECT DISTINCT v FROM r)",
+            false,
+        ),
+    ];
+    for (name, definition, expected) in views {
+        conn.execute(format!("CREATE MATERIALIZED VIEW {name} AS {definition}"))
+            .unwrap();
+        assert_eq!(
+            conn.materialized_view_rows_depend_on_chosen_values(name)
+                .unwrap(),
+            expected,
+            "{definition}"
+        );
+    }
+}

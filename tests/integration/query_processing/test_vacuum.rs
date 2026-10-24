@@ -4809,6 +4809,14 @@ const MATERIALIZED_VIEW_FIXTURE: &[(&str, &str)] = &[
     ("vj", "SELECT t.a, u.n FROM t JOIN u ON t.a = u.k"),
     ("vv", "SELECT g, n FROM vg WHERE n > 1"),
     ("vd", "SELECT DISTINCT g, b % 3 FROM t"),
+    (
+        "vk",
+        "SELECT t.a, u.n FROM t JOIN u ON t.g = u.k WHERE t.b > 50",
+    ),
+    (
+        "vk2",
+        "SELECT t.b, u.k FROM t JOIN u ON u.k = t.g WHERE t.b > 50",
+    ),
 ];
 
 /// Plain VACUUM keeps materialized views, their internal state tables, and
@@ -4840,6 +4848,37 @@ fn test_plain_vacuum_preserves_materialized_views(tmp_db: TempDatabase) -> anyho
     let (_reopened, conn) = connect_existing_with_opts(&tmp_db.path, tmp_db.db_opts);
     assert_materialized_views_equal_their_queries(&conn);
     assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+/// VACUUM creates user indexes before it replays materialized views, so a
+/// view replaced the index it created for a join key by a user index on the
+/// same column that was created after the view.
+#[turso_macros::test(views)]
+fn test_plain_vacuum_drops_view_join_key_index_a_user_index_replaces(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    create_materialized_view_fixture(&conn)?;
+    let join_key_indexes = |conn: &Arc<Connection>| -> Vec<(String,)> {
+        conn.exec_rows(
+            "SELECT name FROM sqlite_schema \
+             WHERE name LIKE '__turso_internal_dbsp_index%' ORDER BY name",
+        )
+    };
+    assert_eq!(join_key_indexes(&conn).len(), 1);
+    conn.execute("CREATE INDEX t_g ON t(g) WHERE b > 50")?;
+    conn.execute("VACUUM")?;
+    assert!(join_key_indexes(&conn).is_empty());
+    assert_eq!(run_integrity_check(&conn), "ok");
+    conn.execute("INSERT INTO t VALUES (1000, 2, 999)")?;
+    conn.execute("DELETE FROM u WHERE k = 3")?;
+    assert_materialized_views_equal_their_queries(&conn);
+    drop(conn);
+
+    let (_reopened, conn) = connect_existing_with_opts(&tmp_db.path, tmp_db.db_opts);
+    assert!(join_key_indexes(&conn).is_empty());
+    assert_materialized_views_equal_their_queries(&conn);
     Ok(())
 }
 

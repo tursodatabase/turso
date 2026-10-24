@@ -1,4 +1,4 @@
-use crate::{alloc, turso_assert, turso_assert_eq, Result, Value, ValueRef};
+use crate::{alloc, turso_assert, turso_assert_eq, turso_debug_assert, Result, Value, ValueRef};
 
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Range;
@@ -1577,8 +1577,12 @@ impl ProgramBuilder {
         let mut constant = Vec::new();
         let mut span_idx = 0;
 
-        for item in self.insns.drain(..) {
+        for (position, item) in self.insns.drain(..).enumerate() {
             let idx = item.1;
+            turso_debug_assert!(
+                position == idx,
+                "constant instructions must be moved only once per program"
+            );
 
             // Advance past spans we've completely passed
             while span_idx < self.constant_spans.len() && self.constant_spans[span_idx].1 < idx {

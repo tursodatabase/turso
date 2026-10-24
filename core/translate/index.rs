@@ -1224,6 +1224,7 @@ pub fn translate_drop_index(
     resolver: &Resolver,
     if_exists: bool,
     program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
     let idx_name = normalize_ident(qualified_name.name.as_str());
     let opts = ProgramBuilderOpts::new(5, 40, 5);
@@ -1279,6 +1280,17 @@ pub fn translate_drop_index(
                     .to_string(),
             ));
         }
+    }
+    // An index with a reserved name belongs to the engine: indexes that
+    // materialized views create for their joins, for example, are dropped by
+    // DROP VIEW. Users cannot drop one, as CREATE INDEX does not let them
+    // create one; the engine's own nested statements can.
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| idx_name.starts_with(prefix))
+        && !connection.is_nested_stmt()
+    {
+        crate::bail_parse_error!("Object name reserved for internal use: {}", idx_name);
     }
 
     let cdc_table = prepare_cdc_if_necessary(

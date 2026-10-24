@@ -36,7 +36,8 @@ one:
   MATERIALIZED VIEW` statement to fill it again from the current source data.
 
 Every view created before materialized views were compiled to VDBE bytecode
-(storage version 1) is in this state.
+(storage version 1), and every view created before a run of inner joins was
+maintained as one join (storage version 2), is in this state.
 
 In the tables below, ✅ means the feature is implemented and part of the
 intended supported surface. 🚧 identifies an implemented feature with an
@@ -80,6 +81,29 @@ even if the regular query engine does.
 | Self joins | ✅ Yes | |
 | Multi-way and nested joins | ✅ Yes | Covered through five-way joins; there is no fixed shape limit. |
 | Joins over derived, aggregate, distinct, or set-operation results | ✅ Yes | Both join inputs use the same composable stream contract. |
+
+Cost of maintaining a join: a run of inner joins is maintained as one join
+that stores no intermediate join results. A changed row of one table is
+joined with the other tables one at a time, following the `=` terms between
+them. A table whose compared column is its INTEGER PRIMARY KEY or has an index
+is looked up by key, so a small write reads only the matching rows. When the
+compared column has no index, the view creates one, named
+`__turso_internal_dbsp_index_v3_<table>__<hash of the definition>`. When the
+WHERE clause has terms that read only that table, the index only holds the
+rows that pass them (a term that reads the rowid is left out of the index
+and only checked by the join). Views that need the same index share one.
+These indexes cost space and make writes to those tables slower, like any
+index. They are kept up to date by every write to the table, `DROP VIEW`
+removes one once no remaining view needs it, `DROP INDEX` refuses them, and
+`VACUUM` creates them again. A user index on the same columns is used
+instead of creating one, including a partial index whose WHERE is one or
+more of the view's terms on that table. A user index created after the view
+replaces the view's own index at the next `VACUUM`. If the user index is
+dropped later, the view does not create a replacement, and the table is read
+once per write statement. The same happens when an index cannot find every
+matching row, for example when the two compared columns convert values to
+different types before comparing. A table with no `=` term to the tables
+joined before it is paired with every row.
 
 ### Aggregation
 

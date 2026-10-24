@@ -370,7 +370,7 @@ pub fn translate_inner(
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
-        } => translate_drop_index(&idx_name, resolver, if_exists, program)?,
+        } => translate_drop_index(&idx_name, resolver, if_exists, program, connection)?,
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
@@ -382,7 +382,7 @@ pub fn translate_inner(
         ast::Stmt::DropView {
             if_exists,
             view_name,
-        } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+        } => view::translate_drop_view(resolver, &view_name, if_exists, program, connection)?,
         ast::Stmt::CreateType {
             if_not_exists,
             type_name,

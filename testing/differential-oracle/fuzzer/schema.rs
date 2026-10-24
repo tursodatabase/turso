@@ -427,6 +427,7 @@ impl SchemaIntrospector {
             };
             if origin.as_deref().is_some_and(|origin| origin != "c")
                 || name.starts_with("sqlite_autoindex_")
+                || name.starts_with("__turso_internal_")
             {
                 return Ok(());
             }

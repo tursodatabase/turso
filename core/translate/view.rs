@@ -1,4 +1,6 @@
-use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType, RESERVED_TABLE_PREFIXES};
+use crate::schema::{
+    BTreeCharacteristics, BTreeTable, Index, SchemaObjectType, RESERVED_TABLE_PREFIXES,
+};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::sequence::bind_sequence_names_in_select;
@@ -279,6 +281,47 @@ pub fn translate_create_materialized_view(
         }
     }
 
+    // Indexes the view's joins need on its base tables, built from the
+    // tables' current rows the way CREATE INDEX builds them. Loading their
+    // schema rows below makes the table's write path keep them up to date.
+    // An index another view already created is shared: its name is derived
+    // from its definition.
+    for needed in maintenance_plan.join_key_indexes() {
+        let index = &needed.index;
+        if !resolver.with_schema(database_id, |s| s.is_unique_idx_name(&index.name)) {
+            continue;
+        }
+        let index_root_reg = program.alloc_register();
+        program.emit_insn(Insn::CreateBtree {
+            db: database_id,
+            root: index_root_reg,
+            flags: CreateBTreeFlags::new_index(),
+        });
+        emit_schema_entry(
+            program,
+            resolver,
+            sqlite_schema_cursor_id,
+            None,
+            SchemaEntryType::Index,
+            &index.name,
+            &needed.table.name,
+            index_root_reg,
+            Some(needed.create_sql.clone()),
+        )?;
+        let index_cursor_id = program.alloc_cursor_index(None, index)?;
+        crate::translate::index::emit_refill_index(
+            program,
+            resolver,
+            database_id,
+            &needed.table,
+            index,
+            index_cursor_id,
+            RegisterOrLiteral::Register(index_root_reg),
+            None,
+        )?;
+        parse_schema_names.push(escape_sql_string_literal(&index.name));
+    }
+
     // Parse schema to load the new view (and its state table, if any)
     let where_clause = parse_schema_names
         .iter()
@@ -305,7 +348,6 @@ pub fn translate_create_materialized_view(
         cursors: cursor_info,
     });
 
-    program.epilogue(resolver.schema());
     Ok(())
 }
 
@@ -472,6 +514,7 @@ pub fn translate_drop_view(
     view_name: &ast::QualifiedName,
     if_exists: bool,
     program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
 ) -> Result<()> {
     // Unqualified names search the temp schema first, then main, then
     // attached databases, so DROP VIEW finds temp views like SQLite does.
@@ -576,6 +619,29 @@ pub fn translate_drop_view(
         Vec::new()
     };
 
+    let unneeded_indexes = if is_materialized_view {
+        join_key_indexes_no_other_view_needs(
+            resolver,
+            database_id,
+            &normalized_view_name,
+            connection,
+        )?
+    } else {
+        Vec::new()
+    };
+    for index in &unneeded_indexes {
+        program.emit_insn(Insn::Destroy {
+            db: database_id,
+            root: index.root_page,
+            former_root_reg: 0,
+            is_temp: 0,
+        });
+        program.emit_insn(Insn::DropIndex {
+            index: index.clone(),
+            db: database_id,
+        });
+    }
+
     // Destroy the internal tables' btrees and indexes (those that exist).
     for internal_table_name in &internal_table_names {
         let internal_indexes: Vec<_> = resolver.with_schema(database_id, |s| {
@@ -649,6 +715,31 @@ pub fn translate_drop_view(
 
     // Check if this row matches the view, DBSP table, or DBSP index
     let skip_delete_label = program.allocate_label();
+    let delete_label = program.allocate_label();
+
+    // A join-key index no remaining view needs (type='index', its name).
+    if !unneeded_indexes.is_empty() {
+        let index_type_reg = program.emit_string8_new_reg("index".to_string());
+        let other_index = program.allocate_label();
+        program.emit_insn(Insn::Ne {
+            lhs: col0_reg,
+            rhs: index_type_reg,
+            target_pc: other_index,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        for index in &unneeded_indexes {
+            let index_name_reg = program.emit_string8_new_reg(index.name.clone());
+            program.emit_insn(Insn::Eq {
+                lhs: col1_reg,
+                rhs: index_name_reg,
+                target_pc: delete_label,
+                flags: CmpInsFlags::default(),
+                collation: program.curr_collation(),
+            });
+        }
+        program.preassign_label_to_next_insn(other_index);
+    }
 
     // Check if this is the view entry (type='view' and name=view_name)
     program.emit_insn(Insn::Ne {
@@ -665,7 +756,8 @@ pub fn translate_drop_view(
         flags: CmpInsFlags::default(),
         collation: program.curr_collation(),
     });
-    // Matches view - delete it
+    // Matches the view or an unneeded join-key index - delete it
+    program.preassign_label_to_next_insn(delete_label);
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id,
         dest: rowid_reg,
@@ -827,6 +919,173 @@ pub fn translate_drop_view(
         p5: 1, // update version
     });
 
-    program.epilogue(resolver.schema());
     Ok(())
+}
+
+/// The join-key indexes that no materialized view other than `dropped_view`
+/// needs. Which indexes a view needs is decided by planning it again, with
+/// the same code CREATE MATERIALIZED VIEW used to create them, so nothing
+/// on disk records which views share an index.
+fn join_key_indexes_no_other_view_needs(
+    resolver: &Resolver,
+    database_id: usize,
+    dropped_view: &str,
+    connection: &Arc<Connection>,
+) -> Result<Vec<Arc<Index>>> {
+    let (join_key_indexes, views) = resolver.with_schema(database_id, |s| {
+        let join_key_indexes = s
+            .indexes
+            .values()
+            .flatten()
+            .filter(|index| crate::schema::is_materialized_view_join_key_index(&index.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let views = s
+            .materialized_view_names
+            .iter()
+            .filter(|name| {
+                name.as_str() == dropped_view || s.has_compatible_materialized_view_storage(name)
+            })
+            .map(|name| {
+                let view = s
+                    .get_materialized_view(name)
+                    .expect("every materialized view name has a view definition");
+                let select = view.lock().select_stmt.clone();
+                (name.clone(), select)
+            })
+            .collect::<Vec<_>>();
+        (join_key_indexes, views)
+    });
+    if join_key_indexes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (dropped, others): (Vec<_>, Vec<_>) =
+        views.iter().partition(|(name, _)| name == dropped_view);
+    let existing = join_key_indexes
+        .iter()
+        .map(|index| index.name.clone())
+        .collect::<Vec<_>>();
+    let unneeded = unneeded_join_key_indexes(&existing, dropped.first(), &others, |view| {
+        let (view_name, select) = view;
+        let plan = resolver.with_view_scope(database_id, view_name.clone(), || {
+            crate::incremental::vdbe_maintenance::plan_view(view_name, select, resolver, connection)
+        })?;
+        Ok(plan
+            .join_key_indexes()
+            .iter()
+            .map(|index| index.index.name.clone())
+            .collect())
+    });
+    Ok(join_key_indexes
+        .into_iter()
+        .filter(|index| unneeded.contains(&index.name))
+        .collect())
+}
+
+/// Of the `existing` join-key indexes, the ones to drop with `dropped`: those
+/// it needs that no view in `others` needs, as `needs` lists them. When the
+/// dropped view cannot be planned, every index no other view needs is
+/// dropped. When another view cannot be planned, nothing is dropped, so
+/// DROP VIEW never fails because of an unrelated view; an index kept this
+/// way only costs space and write time.
+fn unneeded_join_key_indexes<V>(
+    existing: &[String],
+    dropped: Option<&V>,
+    others: &[V],
+    needs: impl Fn(&V) -> Result<Vec<String>>,
+) -> Vec<String> {
+    let candidates = match dropped.map(&needs) {
+        Some(Ok(needed)) => existing
+            .iter()
+            .filter(|index| needed.contains(index))
+            .cloned()
+            .collect::<Vec<_>>(),
+        Some(Err(_)) | None => existing.to_vec(),
+    };
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let mut needed_by_others = Vec::new();
+    for view in others {
+        match needs(view) {
+            Ok(needed) => needed_by_others.extend(needed),
+            Err(_) => return Vec::new(),
+        }
+    }
+    candidates
+        .into_iter()
+        .filter(|index| !needed_by_others.contains(index))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unneeded_join_key_indexes;
+    use crate::LimboError;
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// Each view is (name, the indexes it needs); a view needing "error"
+    /// cannot be planned.
+    fn needs(view: &(&str, &[&str])) -> crate::Result<Vec<String>> {
+        match view.1 {
+            ["error"] => Err(LimboError::InternalError(format!(
+                "{} does not plan",
+                view.0
+            ))),
+            needed => Ok(names(needed)),
+        }
+    }
+
+    #[test]
+    fn drop_view_drops_only_indexes_no_other_view_needs() {
+        let existing = names(&["i1", "i2", "i3"]);
+        let dropped = ("v1", &["i1", "i2"][..]);
+        let others = [("v2", &["i2"][..]), ("v3", &["i3"][..])];
+        assert_eq!(
+            unneeded_join_key_indexes(&existing, Some(&dropped), &others, needs),
+            names(&["i1"])
+        );
+    }
+
+    #[test]
+    fn drop_view_keeps_every_index_when_another_view_does_not_plan() {
+        let existing = names(&["i1", "i2"]);
+        let dropped = ("v1", &["i1"][..]);
+        let others = [("v2", &["error"][..]), ("v3", &["i2"][..])];
+        assert_eq!(
+            unneeded_join_key_indexes(&existing, Some(&dropped), &others, needs),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn drop_view_without_indexes_does_not_plan_other_views() {
+        let existing = names(&["i1"]);
+        let dropped = ("v1", &[][..]);
+        let others = [("v2", &["error"][..])];
+        let planned = std::cell::Cell::new(0);
+        let counting_needs = |view: &(&str, &[&str])| {
+            planned.set(planned.get() + 1);
+            needs(view)
+        };
+        assert_eq!(
+            unneeded_join_key_indexes(&existing, Some(&dropped), &others, counting_needs),
+            Vec::<String>::new()
+        );
+        assert_eq!(planned.get(), 1);
+    }
+
+    #[test]
+    fn drop_view_that_does_not_plan_drops_indexes_no_other_view_needs() {
+        let existing = names(&["i1", "i2"]);
+        let dropped = ("v1", &["error"][..]);
+        let others = [("v2", &["i2"][..])];
+        assert_eq!(
+            unneeded_join_key_indexes(&existing, Some(&dropped), &others, needs),
+            names(&["i1"])
+        );
+    }
 }

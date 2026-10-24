@@ -5,7 +5,7 @@ use super::output::NodeOutputContract;
 use super::stream::{binding_rowid_metadata_width, DeltaIdentity};
 use crate::function::{AggFunc, Func};
 use crate::incremental::dag;
-use crate::schema::BTreeTable;
+use crate::schema::{BTreeTable, Index, Table};
 use crate::sync::Arc;
 use crate::translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
 use crate::translate::emitter::Resolver;
@@ -17,6 +17,7 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::select::prepare_select_plan;
+use crate::turso_assert;
 use crate::util::walk_expr_with_subqueries;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
@@ -377,39 +378,50 @@ fn build_select_plan_dag(
         }
     }
 
+    // A run of inner joins becomes one join node over all its inputs, so it
+    // keeps no intermediate join results. Outer, semi and anti joins end the
+    // run: they take the run's result as their first input. A filter on the
+    // run's first input joins the run's terms, so that input stays a base
+    // table the join can look up by key instead of a filtered copy.
     let mut node = inputs[0];
+    let mut run = Vec::new();
+    let mut run_terms = Vec::new();
     for step in 0..inputs.len() {
         if step > 0 {
-            let pair = [node, inputs[step]];
             let on = std::mem::take(&mut on_by_step[step]);
-            node = match join_types[step] {
-                JoinType::Inner => builder.push(dag::OpNode::Join {
-                    inputs: pair,
-                    on,
-                    kind: dag::JoinKind::Inner,
-                })?,
-                JoinType::LeftOuter => push_outer_join(builder, pair, on, true, false)?,
-                JoinType::RightOuter => push_outer_join(builder, pair, on, false, true)?,
-                JoinType::FullOuter => push_outer_join(builder, pair, on, true, true)?,
-                JoinType::Semi => builder.push(dag::OpNode::Join {
-                    inputs: pair,
-                    on,
-                    kind: dag::JoinKind::Semi,
-                })?,
-                JoinType::Anti => builder.push(dag::OpNode::Join {
-                    inputs: pair,
-                    on,
-                    kind: dag::JoinKind::Anti,
-                })?,
-            };
+            if join_types[step] == JoinType::Inner {
+                run.push(inputs[step]);
+                run_terms.extend(on);
+            } else {
+                node = push_inner_run(builder, node, &mut run, &mut run_terms)?;
+                let pair = vec![node, inputs[step]];
+                node = match join_types[step] {
+                    JoinType::LeftOuter => push_outer_join(builder, pair, on, true, false)?,
+                    JoinType::RightOuter => push_outer_join(builder, pair, on, false, true)?,
+                    JoinType::FullOuter => push_outer_join(builder, pair, on, true, true)?,
+                    JoinType::Semi => builder.push(dag::OpNode::Join {
+                        inputs: pair,
+                        on,
+                        kind: dag::JoinKind::Semi,
+                    })?,
+                    JoinType::Anti => builder.push(dag::OpNode::Join {
+                        inputs: pair,
+                        on,
+                        kind: dag::JoinKind::Anti,
+                    })?,
+                    JoinType::Inner => unreachable!("inner joins extend the run"),
+                };
+            }
         }
-        if let Some(predicate) = combine_predicates(std::mem::take(&mut filters_by_step[step])) {
-            node = builder.push(dag::OpNode::Filter {
-                input: node,
-                predicate,
-            })?;
-        }
+        // Only the first table and outer joins have filters: the WHERE terms of
+        // an inner join are terms of the run.
+        turso_assert!(
+            run.is_empty() || filters_by_step[step].is_empty(),
+            "a filter inside a run of inner joins must be a join term"
+        );
+        run_terms.append(&mut filters_by_step[step]);
     }
+    node = push_inner_run(builder, node, &mut run, &mut run_terms)?;
 
     if plan.group_by.is_some() || !plan.aggregates.is_empty() {
         let (group_exprs, group_keys, scalar) = if plan
@@ -516,6 +528,32 @@ fn build_select_plan_dag(
     Ok(node)
 }
 
+/// Join `first` with the inputs collected in `run` by one inner join node
+/// checking `terms`, and empty both. Without a run, `terms` are filters on
+/// `first`.
+fn push_inner_run(
+    builder: &mut dag::DagBuilder,
+    first: dag::NodeId,
+    run: &mut Vec<dag::NodeId>,
+    terms: &mut Vec<ast::Expr>,
+) -> Result<dag::NodeId> {
+    if run.is_empty() {
+        return match combine_predicates(std::mem::take(terms)) {
+            Some(predicate) => builder.push(dag::OpNode::Filter {
+                input: first,
+                predicate,
+            }),
+            None => Ok(first),
+        };
+    }
+    let inputs = std::iter::once(first).chain(run.drain(..)).collect();
+    builder.push(dag::OpNode::Join {
+        inputs,
+        on: std::mem::take(terms),
+        kind: dag::JoinKind::Inner,
+    })
+}
+
 /// Build an outer join from simpler operators: the inner join, plus the
 /// NULL-padded anti join of each side whose unmatched rows are kept.
 ///
@@ -526,7 +564,7 @@ fn build_select_plan_dag(
 /// ```
 fn push_outer_join(
     builder: &mut dag::DagBuilder,
-    inputs: [dag::NodeId; 2],
+    inputs: Vec<dag::NodeId>,
     on: Vec<ast::Expr>,
     keep_left_rows: bool,
     keep_right_rows: bool,
@@ -536,7 +574,7 @@ fn push_outer_join(
         bindings: Vec::new(),
     });
     let mut branches = vec![builder.push(dag::OpNode::Join {
-        inputs,
+        inputs: inputs.clone(),
         on: on.clone(),
         kind: dag::JoinKind::Inner,
     })?];
@@ -546,7 +584,7 @@ fn push_outer_join(
         }
         let other = inputs[1 - side];
         let unmatched = builder.push(dag::OpNode::Join {
-            inputs: [inputs[side], other],
+            inputs: vec![inputs[side], other],
             on: on.clone(),
             kind: dag::JoinKind::Anti,
         })?;
@@ -714,6 +752,19 @@ pub(crate) struct HiddenTableDef {
     pub(crate) primary_key_index: bool,
 }
 
+/// An index materialized views create on a base table so that their joins
+/// can look that table up by key. Views that need the same index share it:
+/// DROP VIEW drops it once no remaining view needs it, and its reserved name
+/// keeps users from dropping it. The table's ordinary write path keeps it
+/// up to date.
+#[derive(Debug, Clone)]
+pub(crate) struct JoinKeyIndexDef {
+    /// Not created yet: its root page is 0.
+    pub(crate) index: Arc<Index>,
+    pub(crate) table: Arc<BTreeTable>,
+    pub(crate) create_sql: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuxiliaryStatePurpose {
     AggregateMultiset { aggregate_index: usize },
@@ -845,6 +896,7 @@ pub(crate) struct MaintenancePlan {
     operator_states: OperatorStateCatalog,
     output_arity: usize,
     version_marker: HiddenTableDef,
+    join_key_indexes: Vec<JoinKeyIndexDef>,
 }
 
 impl MaintenancePlan {
@@ -864,6 +916,10 @@ impl MaintenancePlan {
         std::iter::once(&self.version_marker).chain(self.operator_states.hidden_tables())
     }
 
+    pub(crate) fn join_key_indexes(&self) -> &[JoinKeyIndexDef] {
+        &self.join_key_indexes
+    }
+
     /// For each view column: the collation under which the value it shows
     /// was chosen among several values that compare equal, or `None` when
     /// the value is exact. These are the values SQL leaves open, such as
@@ -875,7 +931,33 @@ impl MaintenancePlan {
     /// value is not reported.
     #[cfg(feature = "test_helper")]
     pub(crate) fn chosen_value_collations(&self) -> Vec<Option<CollationSeq>> {
+        self.chosen_values().columns
+    }
+
+    /// Whether which rows the view holds, not only which values they show,
+    /// depends on a value SQL leaves open. That happens when a value chosen
+    /// under one collation is a key under another non-binary collation: a
+    /// DISTINCT under RTRIM may show 'X' or 'X  ', and a UNION under NOCASE
+    /// above it then keeps one row beside 'x' or two.
+    #[cfg(feature = "test_helper")]
+    pub(crate) fn rows_depend_on_chosen_values(&self) -> bool {
+        self.chosen_values().rows_depend_on_choice
+    }
+
+    #[cfg(feature = "test_helper")]
+    fn chosen_values(&self) -> ChosenValues {
         let dag = &self.dag;
+        let mut rows_depend_on_choice = false;
+        // A key compared under `key` can put values that `chosen` keeps apart
+        // into one class.
+        let mut note_key_over_chosen = |key: dag::KeyColumn, chosen: Option<CollationSeq>| {
+            if chosen.is_some_and(|chosen| {
+                chosen != key.collation
+                    && !matches!(key.collation, CollationSeq::Binary | CollationSeq::Unset)
+            }) {
+                rows_depend_on_choice = true;
+            }
+        };
         let mut chosen: Vec<Vec<Option<CollationSeq>>> = Vec::with_capacity(dag.nodes.len());
         // The collation of input column `expr` when it passes on a chosen
         // value unchanged.
@@ -905,10 +987,9 @@ impl MaintenancePlan {
                     inputs,
                     kind: dag::JoinKind::Inner,
                     ..
-                } => [&chosen[inputs[0]], &chosen[inputs[1]]]
-                    .into_iter()
-                    .flatten()
-                    .copied()
+                } => inputs
+                    .iter()
+                    .flat_map(|input| chosen[*input].iter().copied())
                     .collect(),
                 dag::OpNode::Join { inputs, .. } => chosen[inputs[0]].clone(),
                 dag::OpNode::Pad {
@@ -937,6 +1018,13 @@ impl MaintenancePlan {
                             passed_on(&chosen, *input, expr)
                         }
                     };
+                    for (expr, key) in group_exprs.iter().zip(group_keys) {
+                        let compared = match expr {
+                            ast::Expr::Collate(inner, _) => inner,
+                            expr => expr,
+                        };
+                        note_key_over_chosen(*key, passed_on(&chosen, *input, compared));
+                    }
                     group_exprs
                         .iter()
                         .zip(group_keys)
@@ -962,20 +1050,36 @@ impl MaintenancePlan {
                     inputs,
                     key_columns,
                     ..
-                } => (0..width)
-                    .map(|index| {
-                        key_columns
-                            .get(index)
-                            .filter(|key| key.ambiguous)
-                            .map(|key| key.collation)
-                            .or_else(|| inputs.iter().find_map(|input| chosen[*input][index]))
-                    })
-                    .collect(),
+                } => {
+                    for (index, key) in key_columns.iter().enumerate() {
+                        for input in inputs {
+                            note_key_over_chosen(*key, chosen[*input][index]);
+                        }
+                    }
+                    (0..width)
+                        .map(|index| {
+                            key_columns
+                                .get(index)
+                                .filter(|key| key.ambiguous)
+                                .map(|key| key.collation)
+                                .or_else(|| inputs.iter().find_map(|input| chosen[*input][index]))
+                        })
+                        .collect()
+                }
             };
             chosen.push(columns);
         }
-        chosen.swap_remove(dag.root)
+        ChosenValues {
+            columns: chosen.swap_remove(dag.root),
+            rows_depend_on_choice,
+        }
     }
+}
+
+#[cfg(feature = "test_helper")]
+struct ChosenValues {
+    columns: Vec<Option<CollationSeq>>,
+    rows_depend_on_choice: bool,
 }
 
 /// Validate a view and build its executable maintenance plan.
@@ -1008,11 +1112,139 @@ pub(crate) fn plan_view(
     let operator_states = plan_operator_states(view_name, &dag, resolver)?;
     let output_arity = dag.root_schema().len();
     let version_marker = version_marker_table(view_name);
+    let join_key_indexes = plan_join_key_indexes(&dag, &operator_states, resolver)?;
     Ok(MaintenancePlan {
         dag,
         operator_states,
         output_arity,
         version_marker,
+        join_key_indexes,
+    })
+}
+
+/// The indexes the view's inner joins need on base tables that have no user
+/// index for their join keys (see `needed_join_key_indexes`). An index is
+/// named after its table and a hash of its definition, so every view that
+/// needs the same index names the same one and they all share it.
+fn plan_join_key_indexes(
+    dag: &dag::MaintenanceDag,
+    operator_states: &OperatorStateCatalog,
+    resolver: &Resolver,
+) -> Result<Vec<JoinKeyIndexDef>> {
+    let schema = resolver.schema();
+    let mut indexes: Vec<JoinKeyIndexDef> = Vec::new();
+    for node in &dag.nodes {
+        let dag::OpNode::Join {
+            inputs,
+            on,
+            kind: dag::JoinKind::Inner,
+        } = node
+        else {
+            continue;
+        };
+        let outputs = inputs
+            .iter()
+            .map(|input| Ok(&operator_states.for_node(*input)?.output))
+            .collect::<Result<Vec<_>>>()?;
+        let key_inputs = outputs
+            .iter()
+            .map(|output| super::join::KeyInput {
+                schema: &output.schema,
+                binding_rowids: &output.binding_rowids,
+            })
+            .collect::<Vec<_>>();
+        let tables = inputs
+            .iter()
+            .map(|input| match &dag.nodes[*input] {
+                dag::OpNode::Scan { table, .. }
+                    if table.has_rowid && !schema.is_materialized_view(&table.name) =>
+                {
+                    Some(table.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for needed in
+            super::join::needed_join_key_indexes(&key_inputs, &tables, on, schema, resolver)?
+        {
+            let index = join_key_index_def(needed, resolver)?;
+            if !indexes
+                .iter()
+                .any(|planned| planned.index.name == index.index.name)
+            {
+                indexes.push(index);
+            }
+        }
+    }
+    Ok(indexes)
+}
+
+/// The index, and its CREATE INDEX statement, for one needed join key index.
+fn join_key_index_def(
+    needed: super::join::JoinKeyIndex,
+    resolver: &Resolver,
+) -> Result<JoinKeyIndexDef> {
+    use crate::incremental::view::DBSP_CIRCUIT_VERSION;
+
+    let table = needed.table;
+    let columns = needed
+        .columns
+        .iter()
+        .map(|(column, collation)| {
+            let name = table.columns()[*column]
+                .name
+                .clone()
+                .expect("a join key column has a name");
+            ast::SortedColumn {
+                expr: Box::new(ast::Expr::Collate(
+                    Box::new(ast::Expr::Id(ast::Name::exact(name))),
+                    ast::Name::exact(collation.to_string()),
+                )),
+                order: None,
+                nulls: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut index = Index {
+        name: String::new(),
+        table_name: table.name.clone(),
+        root_page: 0,
+        columns: crate::translate::index::resolve_sorted_columns(&table, &columns)?,
+        unique: false,
+        ephemeral: false,
+        has_rowid: true,
+        where_clause: needed.where_clause.map(Box::new),
+        index_method: None,
+        on_conflict: None,
+    };
+    // A WHERE that CREATE INDEX would refuse is left out: the index then
+    // holds every row, and the join still checks the terms.
+    if !index.validate_where_expr(&Table::BTree(table.clone()), resolver) {
+        index.where_clause = None;
+    }
+    let mut stmt = ast::Stmt::CreateIndex {
+        unique: false,
+        if_not_exists: false,
+        idx_name: ast::QualifiedName::single(ast::Name::exact(String::new())),
+        tbl_name: ast::Name::exact(table.name.clone()),
+        using: None,
+        columns,
+        with_clause: Vec::new(),
+        where_clause: index.where_clause.clone(),
+    };
+    index.name = format!(
+        "{}{DBSP_CIRCUIT_VERSION}_{}__{:016x}",
+        crate::schema::DBSP_INDEX_PREFIX,
+        table.name,
+        twox_hash::XxHash3_64::oneshot(stmt.to_string().as_bytes()),
+    );
+    if let ast::Stmt::CreateIndex { idx_name, .. } = &mut stmt {
+        idx_name.name = ast::Name::exact(index.name.clone());
+    }
+    Ok(JoinKeyIndexDef {
+        index: Arc::new(index),
+        table,
+        create_sql: stmt.to_string(),
     })
 }
 
@@ -1132,10 +1364,10 @@ fn validate_planned_node(
                     )));
                 }
             }
-            let input_contracts = [
-                &operator_states.for_node(inputs[0])?.output,
-                &operator_states.for_node(inputs[1])?.output,
-            ];
+            let input_contracts = inputs
+                .iter()
+                .map(|input| Ok(&operator_states.for_node(*input)?.output))
+                .collect::<Result<Vec<_>>>()?;
             if *kind != dag::JoinKind::Inner
                 && !matches!(
                     input_contracts[0].published_identity,
@@ -1345,7 +1577,10 @@ fn plan_node_output(
             kind: dag::JoinKind::Inner,
             ..
         } => {
-            let inputs = [prior_output(inputs[0])?, prior_output(inputs[1])?];
+            let inputs = inputs
+                .iter()
+                .map(|input| prior_output(*input))
+                .collect::<Result<Vec<_>>>()?;
             let identity = if inputs
                 .iter()
                 .all(|input| matches!(input.published_identity, DeltaIdentity::BindingRowids(_)))
@@ -1357,8 +1592,8 @@ fn plan_node_output(
                         .sum(),
                 )
             } else {
-                // Opaque pair for non-binding inputs.
-                DeltaIdentity::OperatorKey(2)
+                // One opaque slot per input, holding that input's identity.
+                DeltaIdentity::OperatorKey(inputs.len())
             };
             let mut provenance = Vec::new();
             for input in &inputs {
