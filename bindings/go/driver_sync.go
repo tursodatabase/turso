@@ -125,8 +125,12 @@ type TursoSyncDb struct {
 	client      *http.Client
 	busyTimeout int // busy timeout in milliseconds (0 = disabled)
 
-	mu sync.Mutex
+	mu        sync.Mutex
+	closed    bool
+	openConns int
 }
+
+var ErrTursoSyncDbClosed = errors.New("turso: sync database closed")
 
 // main constructor to create synced database
 func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb, error) {
@@ -183,6 +187,12 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 	if err != nil {
 		return nil, err
 	}
+	keepDb := false
+	defer func() {
+		if !keepDb {
+			turso_sync_database_deinit(sdb)
+		}
+	}()
 
 	d := &TursoSyncDb{
 		db:          sdb,
@@ -207,10 +217,12 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 	if err != nil {
 		return nil, err
 	}
-	_, _, err = d.driveOpUntilDone(ctx, op)
+	_, opFinal, err := d.driveOpUntilDone(ctx, op)
+	turso_sync_operation_deinit(opFinal)
 	if err != nil {
 		return nil, err
 	}
+	keepDb = true
 	return d, nil
 }
 
@@ -222,6 +234,9 @@ type tursoSyncConnector struct{ db *TursoSyncDb }
 func (c *tursoSyncConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	c.db.mu.Lock()
 	defer c.db.mu.Unlock()
+	if c.db.closed {
+		return nil, ErrTursoSyncDbClosed
+	}
 
 	op, err := turso_sync_database_connect(c.db.db)
 	if err != nil {
@@ -254,6 +269,8 @@ func (c *tursoSyncConnector) Connect(ctx context.Context) (driver.Conn, error) {
 		turso_connection_set_busy_timeout_ms(conn, int64(timeout))
 	}
 	dbConn.busyTimeout = timeout
+	dbConn.onClose = c.db.releaseConnection
+	c.db.openConns++
 
 	return dbConn, nil
 }
@@ -273,6 +290,9 @@ func (d *TursoSyncDb) Connect(ctx context.Context) (*sql.DB, error) {
 func (d *TursoSyncDb) Pull(ctx context.Context) (bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.closed {
+		return false, ErrTursoSyncDbClosed
+	}
 
 	// 1) Wait for remote changes
 	waitOp, err := turso_sync_database_wait_changes(d.db)
@@ -315,6 +335,9 @@ func (d *TursoSyncDb) Pull(ctx context.Context) (bool, error) {
 func (d *TursoSyncDb) Push(ctx context.Context) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.closed {
+		return ErrTursoSyncDbClosed
+	}
 
 	op, err := turso_sync_database_push_changes(d.db)
 	if err != nil {
@@ -332,6 +355,9 @@ func (d *TursoSyncDb) Push(ctx context.Context) error {
 func (d *TursoSyncDb) Stats(ctx context.Context) (TursoSyncDbStats, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.closed {
+		return TursoSyncDbStats{}, ErrTursoSyncDbClosed
+	}
 
 	op, err := turso_sync_database_stats(d.db)
 	if err != nil {
@@ -365,6 +391,9 @@ func (d *TursoSyncDb) Stats(ctx context.Context) (TursoSyncDbStats, error) {
 func (d *TursoSyncDb) Checkpoint(ctx context.Context) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.closed {
+		return ErrTursoSyncDbClosed
+	}
 
 	op, err := turso_sync_database_checkpoint(d.db)
 	if err != nil {
@@ -376,6 +405,31 @@ func (d *TursoSyncDb) Checkpoint(ctx context.Context) error {
 	}
 	turso_sync_operation_deinit(opFinal)
 	return nil
+}
+
+// Close releases the native sync database.
+// Connections opened before Close keep working; the native database is freed when the last of them is closed.
+// After Close, Connect, Pull, Push, Stats and Checkpoint return ErrTursoSyncDbClosed.
+func (d *TursoSyncDb) Close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.closed = true
+	d.deinitIfUnused()
+	return nil
+}
+
+func (d *TursoSyncDb) releaseConnection() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.openConns--
+	d.deinitIfUnused()
+}
+
+func (d *TursoSyncDb) deinitIfUnused() {
+	if d.closed && d.openConns == 0 && d.db != nil {
+		turso_sync_database_deinit(d.db)
+		d.db = nil
+	}
 }
 
 // driveOpUntilDone resumes an async operation until completion, serving IO requests as needed.
