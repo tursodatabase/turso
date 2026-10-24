@@ -69,6 +69,7 @@ scalar_functions! {
     PgGetExpr(FunctionArity::OneOf(&[2, 3]), true),
     ToChar(FunctionArity::Exact(2), true),
     TimestamptzIn(FunctionArity::Exact(1), true),
+    TimestamptzOut(FunctionArity::Exact(1), true),
     TimestampIn(FunctionArity::Exact(1), true),
     DatetimePl(FunctionArity::OneOf(&[2, 4]), true),
     DatetimeMi(FunctionArity::OneOf(&[2, 4]), true),
@@ -131,6 +132,7 @@ impl ScalarCall for PgScalarFunction {
             Self::PgGetExpr => exec_pg_get_expr(args)?,
             Self::ToChar => exec_to_char(args[0].get_value(), &text_arg(args, 1)),
             Self::TimestamptzIn => crate::datetime::exec_timestamptz_in(args[0].get_value())?,
+            Self::TimestamptzOut => crate::datetime::exec_timestamptz_out(args[0].get_value()),
             Self::TimestampIn => crate::datetime::exec_timestamp_in(args[0].get_value())?,
             Self::DatetimePl => crate::datetime::exec_typed_datetime_pl(
                 args[0].get_value(),
@@ -977,7 +979,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             crate::datetime::exec_timestamp_in(&Value::build_text(input.to_string())),
         ),
         "timestamptz" | "timestamp with time zone" => datetime_input_error(
-            crate::datetime::exec_timestamptz_in(&Value::build_text(input.to_string())),
+            crate::datetime::timestamptz_value(&Value::build_text(input.to_string())),
         ),
         "time" | "time without time zone" => datetime_input_error(crate::datetime::exec_time_in(
             &Value::build_text(input.to_string()),

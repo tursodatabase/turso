@@ -227,6 +227,18 @@ pub trait Dialect: Send + Sync + 'static {
     fn cast_to_custom_type_decodes(&self) -> bool {
         false
     }
+
+    /// Whether `+` or `-` between a column of a custom type and any other
+    /// value calls the type's operator function, even when the type's DECODE
+    /// changes the stored value.
+    ///
+    /// PostgreSQL picks the operator from the operand types, so
+    /// `timestamptz_col + interval_col` adds the interval. SQLite calls the
+    /// function only for types whose DECODE returns the stored value
+    /// unchanged and uses the standard `+` otherwise.
+    fn applies_custom_type_arithmetic_to_any_operand(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

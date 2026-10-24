@@ -73,8 +73,9 @@ fn interval_out_of_range() -> LimboError {
     LimboError::InvalidDate("interval out of range".to_string())
 }
 
-/// Converts a value to the stored form of `timestamptz`: UTC text with a `+00`
-/// offset, or `infinity` / `-infinity`.
+/// Converts a value to the stored form of `timestamptz`: UTC text without an
+/// offset, or `infinity` / `-infinity`. This is the form tursopg stored before
+/// it had its own timestamptz type, so older rows compare equal to new ones.
 pub(crate) fn exec_timestamptz_in(value: &Value) -> Result<Value> {
     let input = match value {
         Value::Null => return Ok(Value::Null),
@@ -83,7 +84,22 @@ pub(crate) fn exec_timestamptz_in(value: &Value) -> Result<Value> {
     };
     let ts = parse_timestamp(&input, now_micros(), true)
         .map_err(|err| input_error(err, TIMESTAMPTZ, &input))?;
-    Ok(Value::build_text(format_timestamp(ts, true)))
+    Ok(Value::build_text(format_timestamp(ts, false)))
+}
+
+/// Converts a stored `timestamptz` to the text PostgreSQL shows: the UTC time
+/// with a `+00` offset.
+pub(crate) fn exec_timestamptz_out(value: &Value) -> Value {
+    match value {
+        Value::Null => Value::Null,
+        Value::Text(text) if matches!(text.as_str(), "infinity" | "-infinity") => value.clone(),
+        other => Value::build_text(format!("{other}+00")),
+    }
+}
+
+/// Converts a value to a `timestamptz` the way a cast does.
+pub(crate) fn timestamptz_value(value: &Value) -> Result<Value> {
+    Ok(exec_timestamptz_out(&exec_timestamptz_in(value)?))
 }
 
 /// Converts a value to the stored form of `timestamp`. A time zone in the
@@ -376,15 +392,15 @@ pub(crate) fn to_char_datetime(value: &Value, format: &str) -> Option<Value> {
 }
 
 /// Converts a text-format parameter sent with a date, time, timestamp or
-/// timestamptz type OID to the stored form, as PostgreSQL runs the type's input
-/// function when it binds the parameter. Returns `None` for other OIDs.
+/// timestamptz type OID to a value of that type, as PostgreSQL runs the type's
+/// input function when it binds the parameter. Returns `None` for other OIDs.
 pub fn datetime_param_in(text: &str, oid: u32) -> Option<Result<Value>> {
     let value = Value::build_text(text.to_string());
     match oid {
         DATE_OID => Some(exec_date_in(&value)),
         TIME_OID => Some(exec_time_in(&value)),
         TIMESTAMP_OID => Some(exec_timestamp_in(&value)),
-        TIMESTAMPTZ_OID => Some(exec_timestamptz_in(&value)),
+        TIMESTAMPTZ_OID => Some(timestamptz_value(&value)),
         _ => None,
     }
 }
@@ -3632,7 +3648,7 @@ mod tests {
         for (cases, convert) in [
             (
                 TIMESTAMPTZ_CASES,
-                exec_timestamptz_in as fn(&Value) -> Result<Value>,
+                timestamptz_value as fn(&Value) -> Result<Value>,
             ),
             (TIMESTAMP_CASES, exec_timestamp_in),
             (INTERVAL_CASES, exec_interval_in),
@@ -4440,7 +4456,7 @@ mod tests {
         assert_eq!(since_today("today 1:00 +01"), "00:00:00");
         assert_eq!(since_today("today allballs"), "00:00:00");
         assert_eq!(since_today("yesterday 12:00 z"), "-12:00:00");
-        let today = exec_timestamptz_in(&text("today")).unwrap().to_string();
+        let today = timestamptz_value(&text("today")).unwrap().to_string();
         assert_eq!(today, format!("{} 00:00:00+00", &now_text()[..10]));
         let now = exec_timestamptz_in(&text("now")).unwrap();
         let elapsed = exec_datetime_mi(&text(&now_text()), &now)
@@ -4645,7 +4661,7 @@ mod tests {
         #[test]
         fn timestamptz_output_parses_back_to_itself(micros in micros_range()) {
             let formatted = format_timestamp(Timestamp::Finite(micros), true);
-            let stored = exec_timestamptz_in(&text(&formatted)).unwrap();
+            let stored = timestamptz_value(&text(&formatted)).unwrap();
             prop_assert_eq!(stored.to_string(), formatted.as_str());
             prop_assert_eq!(
                 decode_stored_datetime(&formatted),

@@ -140,12 +140,9 @@ bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
 
 date, time, timestamp and timestamptz follow PostgreSQL input rules (DateStyle
-ISO, MDY; TimeZone UTC). timestamptz values are stored as UTC text in PostgreSQL
-output form, such as `2026-10-08 12:00:00.123456+00`, so they compare and sort by
-instant. Rows written by earlier versions without the `+00` suffix sort correctly
-but do not compare equal to new values, and `::text` and arithmetic on them
-give text without the suffix; `UPDATE t SET ts = ts` rewrites them in the new
-form. Supported: `infinity`, `-infinity`, `epoch`, `now`,
+ISO, MDY; TimeZone UTC). timestamptz values are stored as UTC text without an
+offset, as in earlier versions, so they compare and sort by instant, and are
+read in PostgreSQL output form, such as `2026-10-08 12:00:00.123456+00`. Supported: `infinity`, `-infinity`, `epoch`, `now`,
 `today`, numeric offsets (`+02`, `+05:30`, `-0800`), microseconds, ISO 8601
 forms, `+`/`-` with interval, date `+`/`-` integer, date - date,
 `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP`, `date(x)` and `timestamptz(x)` casts, and

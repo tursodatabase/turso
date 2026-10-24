@@ -865,6 +865,10 @@ fn copy_from_file_not_found_repl() {
 /// for a free ephemeral port and verify our own child is the process that
 /// came up on it, retrying with a fresh port if the child dies on bind.
 fn start_tursopg_server() -> (Child, u16) {
+    start_tursopg_server_on(":memory:")
+}
+
+fn start_tursopg_server_on(database: &str) -> (Child, u16) {
     for _ in 0..10 {
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -873,7 +877,7 @@ fn start_tursopg_server() -> (Child, u16) {
             .port();
         let addr = format!("127.0.0.1:{port}");
         let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-            .arg(":memory:")
+            .arg(database)
             .arg("--server")
             .arg(&addr)
             .stdout(Stdio::piped())
@@ -1648,6 +1652,61 @@ fn wire_untyped_param_compared_with_timestamp_column() {
             Ok("1".to_string())
         );
     });
+}
+
+/// `timestamptz.db` and its `-log` file were written by tursopg before it had
+/// its own timestamptz type: the rows are stored as UTC text without an offset.
+#[test]
+fn timestamptz_rows_written_before_pg_types_match_new_rows() {
+    let dir = std::env::temp_dir().join(format!("tursopg-timestamptz-main-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for file in ["timestamptz-main.db", "timestamptz-main.db-log"] {
+        std::fs::copy(fixtures.join(file), dir.join(file)).unwrap();
+    }
+    let database = dir.join("timestamptz-main.db");
+    let (mut server, port) = start_tursopg_server_on(database.to_str().unwrap());
+    let mut c = PgTestClient::connect(port);
+    for table in ["plain", "indexed"] {
+        let query =
+            |c: &mut PgTestClient, sql: &str| c.query_single_text(&sql.replace("{t}", table));
+        assert_eq!(
+            query(
+                &mut c,
+                "SELECT count(*) FROM {t} WHERE ts = '2026-10-08 14:00:00+02'"
+            ),
+            "1",
+            "{table}"
+        );
+        assert_eq!(
+            query(
+                &mut c,
+                "SELECT (ts + interval '1 hour')::text FROM {t} WHERE id = 2"
+            ),
+            "2026-10-08 13:00:00.5+00",
+            "{table}"
+        );
+        query(
+            &mut c,
+            "INSERT INTO {t} VALUES (3, '2026-10-08 12:00:00+00') RETURNING id",
+        );
+        assert_eq!(
+            query(&mut c, "SELECT count(DISTINCT ts) FROM {t}"),
+            "2",
+            "{table}"
+        );
+        assert_eq!(
+            query(
+                &mut c,
+                "SELECT count(*) FROM {t} WHERE ts = '2026-10-08 12:00:00+00'"
+            ),
+            "2",
+            "{table}"
+        );
+    }
+    server.kill().ok();
+    server.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Direct table-column references take the schema-tagged path: a column

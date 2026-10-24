@@ -194,6 +194,10 @@ impl Dialect for PostgresDialect {
     fn cast_to_custom_type_decodes(&self) -> bool {
         true
     }
+
+    fn applies_custom_type_arithmetic_to_any_operand(&self) -> bool {
+        true
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
@@ -3487,7 +3491,7 @@ fn index_definition(table_schema: &str, table_name: &str, index_name: &str, idx:
 
 const PG_TYPE_SQLS: &[&str] = &[
     "CREATE TYPE timestamp(value text) BASE text ENCODE timestamp_in(value) DECODE value OPERATOR '+' datetime_pl OPERATOR '-' datetime_mi OPERATOR '<'",
-    "CREATE TYPE timestamptz(value text) BASE text ENCODE timestamptz_in(value) DECODE value OPERATOR '+' datetime_pl OPERATOR '-' datetime_mi OPERATOR '<'",
+    "CREATE TYPE timestamptz(value text) BASE text ENCODE timestamptz_in(value) DECODE timestamptz_out(value) OPERATOR '+' datetime_pl OPERATOR '-' datetime_mi OPERATOR '<'",
     "CREATE TYPE date(value text) BASE text ENCODE date_in(value) DECODE value OPERATOR '+' date_pl OPERATOR '-' date_mi OPERATOR '<'",
     "CREATE TYPE time(value text) BASE text ENCODE time_in(value) DECODE value OPERATOR '<'",
     "CREATE TYPE boolean(value any) BASE integer ENCODE bool_in(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'",

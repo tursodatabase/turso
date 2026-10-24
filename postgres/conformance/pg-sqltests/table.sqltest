@@ -232,6 +232,15 @@ expect {
     0
 }
 
+test table-numeric-column-plus-integer-column-keeps-scale {
+    CREATE TABLE prices (val numeric(10,2), qty int);
+    INSERT INTO prices VALUES (1.5, 7);
+    SELECT val + qty, qty + val, val - qty FROM prices;
+}
+expect {
+    8.50|8.50|-5.50
+}
+
 test table-uuid-column-omitted-from-insert-is-null {
     CREATE TABLE t (id int PRIMARY KEY, u uuid);
     INSERT INTO t (id) VALUES (1);
