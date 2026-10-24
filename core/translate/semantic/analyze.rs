@@ -14,13 +14,13 @@ use super::{
     context::SemanticContext,
     expr::{ExprPolicies, ExprPolicy, QueryFunctionState, RowValueChecks},
     hir::{
-        BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, ColumnRef, CompoundArm, Cte,
-        CteId, DatabaseId, Delete, DeleteTargetKind, Expr, FunctionEvaluation, Grouping,
-        HirDocument, HirRoot, IndexCoverage, IndexHint, Insert, InsertTargetKind, Limit, OrderTerm,
-        Output, OutputId, OutputNameKind, OutputOwner, Query, QueryBlock, QueryBlockBody,
-        QueryBlockId, QueryId, QueryRoot, SchemaExpressionRoot, SchemaProgramId, Source,
-        SourceColumn, SourceId, SourceKind, SourceOwner, TriggerBody, TriggerCommand, TypeFact,
-        Update, UpdateTargetKind,
+        BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, ColumnRef, ColumnSlots,
+        CompoundArm, Cte, CteId, DatabaseId, Delete, DeleteTargetKind, Expr, FunctionEvaluation,
+        Grouping, HirDocument, HirRoot, IndexCoverage, IndexHint, Insert, InsertTargetKind, Limit,
+        OrderTerm, Output, OutputId, OutputNameKind, OutputOwner, Query, QueryBlock,
+        QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SchemaExpressionRoot, SchemaProgramId,
+        Source, SourceColumn, SourceId, SourceKind, SourceOwner, TriggerBody, TriggerCommand,
+        TypeFact, Update, UpdateTargetKind,
     },
     query::FromContext,
     scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
@@ -100,6 +100,7 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
     };
     analyzer.finish_column_reads(&root)?;
     let document = analyzer.finish(root)?;
+    #[cfg(debug_assertions)]
     document.validate().map_err(|error| {
         LimboError::InternalError(format!("semantic analysis produced invalid HIR: {error}"))
     })?;
@@ -298,9 +299,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             alias: None,
             kind: SourceKind::SchemaExpression,
             columns: columns.into(),
-            generated_expressions: vec![ColumnReadExpression::Absent; width],
-            default_expressions: vec![ColumnReadExpression::Absent; width],
-            column_type_programs: vec![None; width],
+            generated_expressions: ColumnSlots::empty(width),
+            default_expressions: ColumnSlots::empty(width),
+            column_type_programs: ColumnSlots::empty(width),
             check_constraints: None,
             rowid_available: false,
             index_hint: IndexHint::None,
@@ -765,11 +766,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             })?;
             if let Some(expression) = generated {
                 source.generated_expressions[reference.column] =
-                    ColumnReadExpression::Planned(expression);
+                    ColumnReadExpression::Planned(Box::new(expression));
             }
             if let Some(expression) = default {
                 source.default_expressions[reference.column] =
-                    ColumnReadExpression::Planned(expression);
+                    ColumnReadExpression::Planned(Box::new(expression));
             }
         }
         Ok(())
@@ -1457,7 +1458,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     && self
                         .source(source)
                         .and_then(|source| source.columns.get(column.column))
-                        .is_some_and(|column| column.rowid_alias)
+                        .is_some_and(|column| column.rowid_alias())
             }
             _ => false,
         }
@@ -1687,12 +1688,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         &self,
         block: QueryBlockId,
         outputs: &mut Vec<Output>,
-        expanded: Vec<ExpandedColumn>,
+        expanded: Vec<ExpandedColumn<'_>>,
         scope: &Scope,
     ) -> Result<()> {
         // Like SQLite, with full_column_names on and short_column_names off
         // the column is named after its source.
         let long_names = self.context().long_column_names();
+        outputs.reserve(expanded.len());
         for column in expanded {
             let resolved = self.resolve_atomic_expr(column.resolved.expr, scope)?;
             let name = if long_names {
@@ -2683,31 +2685,89 @@ mod tests {
     }
 
     #[test]
-    fn columns_with_the_same_declared_type_share_one_declaration() {
+    fn table_source_reads_its_columns_from_the_schema_unless_a_column_has_a_collation() {
         let mut schema = Schema::new();
-        let table = BTreeTable::from_sql("CREATE TABLE t(a INTEGER, b INTEGER, c TEXT)", 2)
-            .expect("table schema parses");
-        schema
-            .add_btree_table(Arc::new(table))
-            .expect("table name is unique");
-        let document =
-            analyze_sql_with_schema(&schema, "SELECT a FROM t").expect("SELECT analyzes");
-        let HirRoot::Query(root) = &document.root else {
-            panic!("SELECT produces query root");
-        };
-        let query = document.query(root.query).expect("query exists");
-        let first = query.blocks[0].from.as_ref().expect("query has FROM").first;
-        let source = document.source(first).expect("source exists");
-        let declared = |column: usize| {
-            source.columns[column]
-                .type_fact
-                .declared
+        for sql in [
+            "CREATE TABLE plain(a INTEGER, b TEXT)",
+            "CREATE TABLE collated(a INTEGER, b TEXT COLLATE NOCASE)",
+        ] {
+            let table = BTreeTable::from_sql(sql, 2).expect("table schema parses");
+            schema
+                .add_btree_table(Arc::new(table))
+                .expect("table name is unique");
+        }
+        let source_columns = |sql: &str| {
+            let document = analyze_sql_with_schema(&schema, sql).expect("SELECT analyzes");
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let query = document.query(root.query).expect("query exists");
+            let first = query.blocks[0].from.as_ref().expect("query has FROM").first;
+            document
+                .source(first)
+                .expect("source exists")
+                .columns
                 .clone()
-                .expect("column has a declared type")
         };
 
-        assert!(Arc::ptr_eq(&declared(0), &declared(1)));
-        assert!(!Arc::ptr_eq(&declared(0), &declared(2)));
+        let plain = source_columns("SELECT a FROM plain");
+        assert!(matches!(
+            plain,
+            crate::translate::semantic::hir::SourceColumns::Table(_)
+        ));
+        assert_eq!(plain.column(1).name(), "b");
+        assert_eq!(
+            plain
+                .column(1)
+                .type_fact()
+                .declared
+                .as_ref()
+                .map(|declared| declared.name.as_str()),
+            Some("TEXT")
+        );
+        let collated = source_columns("SELECT a FROM collated");
+        assert!(matches!(
+            collated,
+            crate::translate::semantic::hir::SourceColumns::Owned(_)
+        ));
+        assert_eq!(
+            collated
+                .column(1)
+                .collation()
+                .map(|collation| *collation.value()),
+            Some(crate::translate::collate::CollationSeq::NoCase)
+        );
+    }
+
+    #[test]
+    fn table_source_stores_no_column_lists_unless_a_column_has_a_default() {
+        let mut schema = Schema::new();
+        for sql in [
+            "CREATE TABLE plain(a INTEGER, b TEXT)",
+            "CREATE TABLE defaulted(a INTEGER, b TEXT DEFAULT 'x')",
+        ] {
+            let table = BTreeTable::from_sql(sql, 2).expect("table schema parses");
+            schema
+                .add_btree_table(Arc::new(table))
+                .expect("table name is unique");
+        }
+        let stored = |sql: &str| {
+            let document = analyze_sql_with_schema(&schema, sql).expect("SELECT analyzes");
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let query = document.query(root.query).expect("query exists");
+            let first = query.blocks[0].from.as_ref().expect("query has FROM").first;
+            let source = document.source(first).expect("source exists");
+            (
+                source.generated_expressions.stores_values(),
+                source.default_expressions.stores_values(),
+                source.column_type_programs.stores_values(),
+            )
+        };
+
+        assert_eq!(stored("SELECT a FROM plain"), (false, false, false));
+        assert_eq!(stored("SELECT a FROM defaulted"), (false, true, false));
     }
 
     #[test]
@@ -3347,7 +3407,7 @@ mod tests {
             panic!("transitive base dependency plans its read-time default");
         };
         assert!(matches!(
-            base_default,
+            base_default.as_ref(),
             Expr::Literal(ast::Literal::Numeric(value)) if value == "7"
         ));
 
@@ -3355,7 +3415,7 @@ mod tests {
             panic!("generated dependency is planned");
         };
         assert!(matches!(
-            doubled,
+            doubled.as_ref(),
             Expr::Binary { lhs, .. }
                 if matches!(lhs.as_ref(), Expr::Column(column)
                     if column.source == source.id && column.column == 0)
@@ -3365,7 +3425,7 @@ mod tests {
             panic!("directly read generated column is planned");
         };
         assert!(matches!(
-            combined,
+            combined.as_ref(),
             Expr::Binary { lhs, rhs, .. }
                 if matches!(lhs.as_ref(), Expr::Column(column)
                     if column.source == source.id && column.column == 1)
@@ -3687,17 +3747,21 @@ mod tests {
         assert_eq!(source.alias.as_deref(), Some("derived"));
         assert!(!source.rowid_available);
         assert_eq!(source.columns.len(), 2);
-        assert_eq!(&*source.columns[0].name, "item_text");
-        assert_eq!(source.columns[0].type_fact.storage, Some(Type::Text));
+        assert_eq!(source.columns.column(0).name(), "item_text");
         assert_eq!(
-            source.columns[0]
-                .collation
-                .as_ref()
+            source.columns.column(0).type_fact().storage,
+            Some(Type::Text)
+        );
+        assert_eq!(
+            source
+                .columns
+                .column(0)
+                .collation()
                 .expect("first compound arm supplies source collation")
                 .value(),
             &crate::translate::collate::CollationSeq::NoCase
         );
-        assert_eq!(&*source.columns[1].name, "item_key");
+        assert_eq!(source.columns.column(1).name(), "item_key");
         assert!(matches!(
             outer_block.outputs[0].expr,
             Expr::Column(reference) if reference.source == source.id && reference.column == 0
@@ -5124,7 +5188,7 @@ mod tests {
         assert_eq!(source.owner, SourceOwner::QueryBlock(root_block.id));
         assert_eq!(source.alias.as_deref(), Some("p"));
         assert!(!source.rowid_available);
-        assert_eq!(&*source.columns[1].name, "item_text");
+        assert_eq!(source.columns.column(1).name(), "item_text");
         assert!(matches!(
             root_block.outputs[0].expr,
             Expr::Column(reference) if reference.source == source.id && reference.column == 1
@@ -5758,7 +5822,7 @@ mod tests {
             group_source
                 .columns
                 .iter()
-                .map(|column| column.name.as_ref())
+                .map(|column| column.name())
                 .collect::<Vec<_>>(),
             [
                 "id",
@@ -6409,14 +6473,14 @@ mod tests {
         let source = document.source(source_id).expect("array source exists");
         assert!(source.column_type_programs.iter().all(Option::is_none));
 
-        let values = &source.columns[0].type_fact;
+        let values = &source.columns.column(0).type_fact();
         assert_eq!(values.storage, Some(Type::Blob));
         assert_eq!(values.array_dimensions, 1);
         let value = values.array_element().expect("INTEGER[] has an element");
         assert_eq!(value.storage, Some(Type::Integer));
         assert_eq!(value.array_dimensions, 0);
 
-        let matrix = &source.columns[1].type_fact;
+        let matrix = &source.columns.column(1).type_fact();
         assert_eq!(matrix.storage, Some(Type::Blob));
         assert_eq!(matrix.array_dimensions, 2);
         let row = matrix.array_element().expect("TEXT[][] has array elements");
@@ -6425,7 +6489,7 @@ mod tests {
         let value = row.array_element().expect("TEXT[] has scalar elements");
         assert_eq!(value.storage, Some(Type::Text));
 
-        let anything = &source.columns[2].type_fact;
+        let anything = &source.columns.column(2).type_fact();
         assert!(anything
             .array_element()
             .expect("ANY[] has an element fact")
@@ -6603,7 +6667,7 @@ mod tests {
             .source(block.from.as_ref().expect("query has FROM").first)
             .expect("custom table source exists");
 
-        let scalar = &source.columns[0].type_fact;
+        let scalar = &source.columns.column(0).type_fact();
         assert_eq!(scalar.storage, Some(Type::Integer));
         assert_eq!(scalar.array_dimensions, 0);
         let scalar_chain = &scalar
@@ -6627,7 +6691,7 @@ mod tests {
             ));
         }
 
-        let nested = &source.columns[1].type_fact;
+        let nested = &source.columns.column(1).type_fact();
         let nested_chain = &nested
             .declared
             .as_ref()
@@ -6660,7 +6724,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(operators, [ast::Operator::Add, ast::Operator::Subtract]);
 
-        let array = &source.columns[2].type_fact;
+        let array = &source.columns.column(2).type_fact();
         assert_eq!(array.storage, Some(Type::Blob));
         assert_eq!(array.array_dimensions, 1);
         let element = array
@@ -6689,7 +6753,7 @@ mod tests {
             .outputs
             .iter()
             .zip(source.columns.iter())
-            .all(|(output, column)| output.type_fact == column.type_fact));
+            .all(|(output, column)| output.type_fact == *column.type_fact()));
     }
 
     #[test]
@@ -6715,15 +6779,20 @@ mod tests {
                 .expect("outer source exists");
             assert!(source.column_type_programs[0].is_none());
             assert_eq!(
-                source.columns[0]
-                    .type_fact
+                source
+                    .columns
+                    .column(0)
+                    .type_fact()
                     .declared
                     .as_ref()
                     .and_then(|declared| declared.custom())
                     .map(|definition| definition.value().name.as_str()),
                 Some("scaled")
             );
-            assert_eq!(block.outputs[0].type_fact, source.columns[0].type_fact);
+            assert_eq!(
+                block.outputs[0].type_fact,
+                *source.columns.column(0).type_fact()
+            );
         }
     }
 
@@ -6938,7 +7007,10 @@ mod tests {
                 source.kind,
                 SourceKind::Pseudo { kind: actual, .. } if actual == kind
             ));
-            assert_eq!(source.columns[1].type_fact.storage, Some(Type::Text));
+            assert_eq!(
+                source.columns.column(1).type_fact().storage,
+                Some(Type::Text)
+            );
         }
     }
 
@@ -7612,10 +7684,11 @@ mod tests {
         assert_eq!(child_source.name, "item_notes");
         assert!(matches!(
             &child_source.generated_expressions[1],
-            ColumnReadExpression::Planned(hir::Expr::Binary { lhs, .. })
+            ColumnReadExpression::Planned(expression)
+                if matches!(expression.as_ref(), hir::Expr::Binary { lhs, .. }
                 if matches!(lhs.as_ref(), hir::Expr::Column(column)
                     if column.source == incoming.child_source && column.column == 0)
-        ));
+        )));
     }
 
     #[test]
@@ -7721,17 +7794,19 @@ mod tests {
             IndexCoverage::Complete { ref indexes } if indexes.is_empty()
         ));
         assert!(matches!(
-            source.default_expressions[1],
-            ColumnReadExpression::Planned(Expr::Literal(ast::Literal::String(ref value)))
+            &source.default_expressions[1],
+            ColumnReadExpression::Planned(expression)
+                if matches!(expression.as_ref(), Expr::Literal(ast::Literal::String(value))
                 if value.trim_matches(|ch| ch == '\'' || ch == '"') == "fallback"
-        ));
+        )));
         assert!(matches!(
-            source.generated_expressions[2],
-            ColumnReadExpression::Planned(Expr::Binary {
+            &source.generated_expressions[2],
+            ColumnReadExpression::Planned(expression)
+                if matches!(expression.as_ref(), Expr::Binary {
                 operator: ast::Operator::Multiply,
                 ..
-            })
-        ));
+            }
+        )));
     }
 
     #[test]
@@ -9886,9 +9961,12 @@ mod tests {
         assert!(matches!(input.kind, SourceKind::SchemaExpression));
         assert_eq!(input.owner, SourceOwner::Root);
         assert_eq!(input.columns.len(), 2);
-        assert_eq!(&*input.columns[0].name, "value");
-        assert_eq!(&*input.columns[1].name, "minimum");
-        assert_eq!(input.columns[0].type_fact.storage, Some(Type::Integer));
+        assert_eq!(input.columns.column(0).name(), "value");
+        assert_eq!(input.columns.column(1).name(), "minimum");
+        assert_eq!(
+            input.columns.column(0).type_fact().storage,
+            Some(Type::Integer)
+        );
 
         let Expr::Case { when_then, .. } = &program.body else {
             panic!("stored CASE becomes HIR");
@@ -11373,9 +11451,12 @@ mod tests {
             .source(program.input_source)
             .expect("domain CHECK input exists");
         assert_eq!(input.columns.len(), 1);
-        assert_eq!(&*input.columns[0].name, "value");
-        assert_eq!(input.columns[0].type_fact.storage, target.type_fact.storage);
-        assert!(input.columns[0].type_fact.declared.is_none());
+        assert_eq!(input.columns.column(0).name(), "value");
+        assert_eq!(
+            input.columns.column(0).type_fact().storage,
+            target.type_fact.storage
+        );
+        assert!(input.columns.column(0).type_fact().declared.is_none());
         let Expr::Binary { lhs, .. } = &program.body else {
             panic!("domain CHECK becomes binary HIR");
         };
@@ -11538,13 +11619,14 @@ mod tests {
                 IndexCoverage::Complete { ref indexes } if indexes.is_empty()
             ));
             assert!(matches!(
-                source.generated_expressions[2],
-                ColumnReadExpression::Planned(Expr::Binary {
-                    lhs: ref left,
+                &source.generated_expressions[2],
+                ColumnReadExpression::Planned(expression)
+                    if matches!(expression.as_ref(), Expr::Binary {
+                    lhs: left,
                     operator: ast::Operator::Multiply,
                     ..
-                }) if matches!(left.as_ref(), Expr::Column(reference) if reference.source == source.id && reference.column == 0)
-            ));
+                } if matches!(left.as_ref(), Expr::Column(reference) if reference.source == source.id && reference.column == 0)
+            )));
         }
     }
 
@@ -11656,10 +11738,11 @@ mod tests {
         assert!(matches!(child_source.kind, SourceKind::Table(_)));
         assert!(matches!(
             &child_source.generated_expressions[1],
-            ColumnReadExpression::Planned(Expr::Binary { lhs, .. })
+            ColumnReadExpression::Planned(expression)
+                if matches!(expression.as_ref(), Expr::Binary { lhs, .. }
                 if matches!(lhs.as_ref(), Expr::Column(column)
                     if column.source == incoming.child_source && column.column == 0)
-        ));
+        )));
     }
 
     #[test]
@@ -12275,11 +12358,12 @@ mod tests {
             IndexCoverage::Complete { ref indexes } if indexes.is_empty()
         ));
         assert!(matches!(
-            source.generated_expressions[2],
-            ColumnReadExpression::Planned(Expr::Binary { ref lhs, .. })
+            &source.generated_expressions[2],
+            ColumnReadExpression::Planned(expression)
+                if matches!(expression.as_ref(), Expr::Binary { lhs, .. }
                 if matches!(lhs.as_ref(), Expr::Column(column)
                     if column.source == delete.target && column.column == 0)
-        ));
+        )));
 
         let predicate = delete.predicate.as_ref().expect("WHERE is preserved");
         assert!(matches!(
@@ -12430,10 +12514,11 @@ mod tests {
         assert!(matches!(child_source.kind, SourceKind::Table(_)));
         assert!(matches!(
             &child_source.generated_expressions[1],
-            ColumnReadExpression::Planned(Expr::Binary { lhs, .. })
+            ColumnReadExpression::Planned(expression)
+                if matches!(expression.as_ref(), Expr::Binary { lhs, .. }
                 if matches!(lhs.as_ref(), Expr::Column(column)
                     if column.source == incoming.child_source && column.column == 0)
-        ));
+        )));
     }
 
     #[test]

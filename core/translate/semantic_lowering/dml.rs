@@ -999,7 +999,10 @@ pub(super) fn emit_stored_column(
 /// The custom type of `column` of `source`: its definitions from the
 /// declared type through its ancestors.
 fn custom_chain(source: &hir::Source, column: usize) -> Option<&[hir::ResolvedType]> {
-    source.columns[column]
+    let hir::SourceColumnRef::Owned(column) = source.columns.column(column) else {
+        return None;
+    };
+    column
         .type_fact
         .declared
         .as_ref()
@@ -1022,7 +1025,7 @@ pub(super) fn has_custom_types(source: &hir::Source) -> bool {
         || source
             .columns
             .iter()
-            .any(|column| column.type_fact.is_array())
+            .any(|column| column.type_fact().is_array())
 }
 
 /// STRICT with custom types: check each value in `start..` against the type

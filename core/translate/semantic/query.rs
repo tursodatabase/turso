@@ -102,9 +102,9 @@ pub(crate) fn expr_data_type<'a>(
         hir::Expr::Function(_) | hir::Expr::Parameter(_) => StorageClassMask::all(),
         hir::Expr::Column(reference) => source_of(reference.source)
             .and_then(|source| source.columns.get(reference.column))
-            .filter(|column| column.has_affinity)
+            .filter(|column| column.has_affinity())
             .map_or(StorageClassMask::all(), |column| {
-                from_affinity(column.affinity)
+                from_affinity(column.affinity())
             }),
         hir::Expr::RowId(_) => from_affinity(Affinity::Integer),
         hir::Expr::Cast { target, .. } => from_affinity(target.affinity),
@@ -213,7 +213,7 @@ fn from_syntax_keeps_right_rows(from: &ast::FromClause) -> bool {
 
 pub(super) struct AnalyzedSourceColumn {
     pub(super) column: hir::SourceColumn,
-    pub(super) programs: Option<hir::BoundColumnTypePrograms>,
+    pub(super) programs: Option<Box<hir::BoundColumnTypePrograms>>,
 }
 
 #[derive(Clone, Copy)]
@@ -923,9 +923,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 alias,
                 kind,
                 columns,
-                generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                default_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                column_type_programs: vec![None; width],
+                generated_expressions: hir::ColumnSlots::empty(width),
+                default_expressions: hir::ColumnSlots::empty(width),
+                column_type_programs: hir::ColumnSlots::empty(width),
                 check_constraints: None,
                 rowid_available: false,
                 index_hint: hir::IndexHint::None,
@@ -966,7 +966,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .columns
             .iter()
             .enumerate()
-            .filter_map(|(column, definition)| definition.hidden.then_some(column))
+            .filter_map(|(column, definition)| definition.hidden().then_some(column))
             .take(arguments.len())
             .collect::<Vec<_>>();
         if hidden_columns.len() != arguments.len() {
@@ -1174,9 +1174,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     hir::SourceKind::Cte(cte)
                 },
                 columns: columns.into(),
-                generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                default_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                column_type_programs: vec![None; width],
+                generated_expressions: hir::ColumnSlots::empty(width),
+                default_expressions: hir::ColumnSlots::empty(width),
+                column_type_programs: hir::ColumnSlots::empty(width),
                 check_constraints: None,
                 rowid_available: false,
                 index_hint: hir::IndexHint::None,
@@ -1260,9 +1260,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     .map(crate::util::normalize_ident),
                 kind: hir::SourceKind::Derived(query),
                 columns: columns.into(),
-                generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                default_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                column_type_programs: vec![None; width],
+                generated_expressions: hir::ColumnSlots::empty(width),
+                default_expressions: hir::ColumnSlots::empty(width),
+                column_type_programs: hir::ColumnSlots::empty(width),
                 check_constraints: None,
                 rowid_available: false,
                 index_hint: hir::IndexHint::None,
@@ -1464,9 +1464,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 ),
                 kind: hir::SourceKind::Derived(query),
                 columns: columns.into(),
-                generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                default_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                column_type_programs: vec![None; width],
+                generated_expressions: hir::ColumnSlots::empty(width),
+                default_expressions: hir::ColumnSlots::empty(width),
+                column_type_programs: hir::ColumnSlots::empty(width),
                 check_constraints: None,
                 rowid_available: false,
                 index_hint: hir::IndexHint::None,
@@ -1536,7 +1536,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             hir::Expr::Column(reference) => self
                 .source(reference.source)
                 .and_then(|source| source.columns.get(reference.column))
-                .map(|column| column.name.to_string()),
+                .map(|column| column.name().to_string()),
             hir::Expr::RowId(_) => output
                 .name
                 .rsplit('.')
@@ -1604,40 +1604,58 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let table_id =
             self.catalog_object_id(Some(database), CatalogObjectKind::Table, table_name.clone());
         let table = CatalogObject::new(table_id, self.context().snapshot(), Some(database), table);
-        let analyzed_columns = self.source_columns(&table)?;
-        let mut columns = Vec::with_capacity(analyzed_columns.len());
-        let mut column_type_programs = Vec::with_capacity(analyzed_columns.len());
-        for analyzed in analyzed_columns {
-            columns.push(analyzed.column);
-            column_type_programs.push(analyzed.programs);
-        }
-        let generated_expressions = table
-            .value()
-            .columns()
+        let (columns, column_type_programs) = if self.schema_describes_columns(&table)? {
+            let width = table.value().columns().len();
+            (
+                hir::SourceColumns::Table(hir::TableColumns::new(table.handle())),
+                hir::ColumnSlots::empty(width),
+            )
+        } else {
+            let analyzed_columns = self.source_columns(&table)?;
+            let mut columns = Vec::with_capacity(analyzed_columns.len());
+            let mut column_type_programs = Vec::with_capacity(analyzed_columns.len());
+            for analyzed in analyzed_columns {
+                columns.push(analyzed.column);
+                column_type_programs.push(analyzed.programs);
+            }
+            (columns.into(), column_type_programs.into())
+        };
+        let schema_columns = table.value().columns();
+        let generated_expressions = if schema_columns
             .iter()
-            .map(|column| {
-                if column.generated_expr().is_some() {
-                    hir::ColumnReadExpression::NotRequired
-                } else {
-                    hir::ColumnReadExpression::Absent
-                }
-            })
-            .collect();
+            .any(|column| column.generated_expr().is_some())
+        {
+            schema_columns
+                .iter()
+                .map(|column| {
+                    if column.generated_expr().is_some() {
+                        hir::ColumnReadExpression::NotRequired
+                    } else {
+                        hir::ColumnReadExpression::Absent
+                    }
+                })
+                .collect()
+        } else {
+            hir::ColumnSlots::empty(schema_columns.len())
+        };
         // A DEFAULT fills a column missing from a short B-tree record. A
         // virtual table returns every column itself.
         let reads_defaults = table.value().btree().is_some();
-        let default_expressions = table
-            .value()
-            .columns()
-            .iter()
-            .map(|column| {
-                if reads_defaults && column.default.is_some() {
-                    hir::ColumnReadExpression::NotRequired
-                } else {
-                    hir::ColumnReadExpression::Absent
-                }
-            })
-            .collect();
+        let default_expressions =
+            if reads_defaults && schema_columns.iter().any(|column| column.default.is_some()) {
+                schema_columns
+                    .iter()
+                    .map(|column| {
+                        if column.default.is_some() {
+                            hir::ColumnReadExpression::NotRequired
+                        } else {
+                            hir::ColumnReadExpression::Absent
+                        }
+                    })
+                    .collect()
+            } else {
+                hir::ColumnSlots::empty(schema_columns.len())
+            };
         let index_hint = match indexed {
             None => hir::IndexHint::None,
             Some(ast::Indexed::NotIndexed) => hir::IndexHint::NotIndexed,
@@ -1678,7 +1696,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         argument_predicates: Vec::new(),
                     },
                 },
-                columns: columns.into(),
+                columns,
                 generated_expressions,
                 default_expressions,
                 column_type_programs,
@@ -1724,6 +1742,23 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             )?;
         }
         Ok(source)
+    }
+
+    fn schema_describes_columns(&self, table: &hir::ResolvedTable) -> Result<bool> {
+        let is_strict = matches!(table.value(), Table::BTree(table) if table.is_strict);
+        let database = table.database().ok_or_else(|| {
+            LimboError::InternalError("table source has no owning database".to_string())
+        })?;
+        let schema = self.context().schema(database)?;
+        for column in table.value().columns() {
+            if column.name.is_none()
+                || column.has_explicit_collation()
+                || (is_strict && schema.resolve_type(&column.ty_str, true)?.is_some())
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(super) fn source_columns(
@@ -1793,11 +1828,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         && chain.iter().any(|definition| definition.value().not_null);
                     (
                         type_fact,
-                        Some(hir::BoundColumnTypePrograms {
+                        Some(Box::new(hir::BoundColumnTypePrograms {
                             encode,
                             decode,
                             encode_nulls,
-                        }),
+                        })),
                     )
                 }
                 None if column.ty_str.is_empty() => (TypeFact::known(column.ty()), None),

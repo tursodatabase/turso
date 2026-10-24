@@ -267,7 +267,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
     fn append_returning_star_outputs(
         &self,
         outputs: &mut Vec<hir::Output>,
-        expanded: Vec<ExpandedColumn>,
+        expanded: Vec<ExpandedColumn<'_>>,
         scope: &Scope,
     ) -> Result<()> {
         for column in expanded {

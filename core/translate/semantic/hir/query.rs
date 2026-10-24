@@ -282,12 +282,117 @@ pub struct CheckConstraint {
 /// statement does not need. Every required expression must be `Planned`
 /// before the HIR document is finished.
 #[derive(Clone, Debug)]
-#[allow(clippy::large_enum_variant)]
 pub enum ColumnReadExpression {
     Absent,
     NotRequired,
-    Planned(Expr),
+    Planned(Box<Expr>),
 }
+
+/// One value per column of a source. While every column holds the empty
+/// value, no list is stored; the first write to a column stores one.
+#[derive(Clone, Debug)]
+pub struct ColumnSlots<T: EmptySlot> {
+    width: usize,
+    values: Vec<T>,
+}
+
+pub trait EmptySlot: Clone + 'static {
+    const EMPTY: &'static Self;
+}
+
+impl EmptySlot for ColumnReadExpression {
+    const EMPTY: &'static Self = &ColumnReadExpression::Absent;
+}
+
+impl EmptySlot for Option<Box<BoundColumnTypePrograms>> {
+    const EMPTY: &'static Self = &None;
+}
+
+impl<T: EmptySlot> ColumnSlots<T> {
+    pub fn empty(width: usize) -> Self {
+        Self {
+            width,
+            values: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.width
+    }
+
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.width {
+            return None;
+        }
+        Some(self.values.get(index).unwrap_or(T::EMPTY))
+    }
+
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &T> + Clone + '_ {
+        (0..self.width).map(|index| &self[index])
+    }
+
+    #[cfg(test)]
+    pub fn stores_values(&self) -> bool {
+        !self.values.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn truncate(&mut self, width: usize) {
+        self.width = self.width.min(width);
+        self.values.truncate(self.width);
+    }
+
+    #[cfg(test)]
+    pub fn pop(&mut self) -> Option<T> {
+        let index = self.width.checked_sub(1)?;
+        let value = self.get(index).cloned();
+        self.truncate(index);
+        value
+    }
+}
+
+impl<T: EmptySlot> std::ops::Index<usize> for ColumnSlots<T> {
+    type Output = T;
+
+    #[inline]
+    fn index(&self, index: usize) -> &T {
+        self.get(index)
+            .unwrap_or_else(|| panic!("source has no column {index}"))
+    }
+}
+
+impl<T: EmptySlot> std::ops::IndexMut<usize> for ColumnSlots<T> {
+    fn index_mut(&mut self, index: usize) -> &mut T {
+        assert!(index < self.width, "source has no column {index}");
+        if self.values.is_empty() {
+            self.values = vec![T::EMPTY.clone(); self.width];
+        }
+        &mut self.values[index]
+    }
+}
+
+impl<T: EmptySlot> std::convert::From<Vec<T>> for ColumnSlots<T> {
+    fn from(values: Vec<T>) -> Self {
+        Self {
+            width: values.len(),
+            values,
+        }
+    }
+}
+
+impl<T: EmptySlot> std::iter::FromIterator<T> for ColumnSlots<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(values: I) -> Self {
+        values.into_iter().collect::<Vec<_>>().into()
+    }
+}
+
+const _: () =
+    assert!(std::mem::size_of::<ColumnReadExpression>() == 2 * std::mem::size_of::<usize>());
+const _: () = assert!(
+    std::mem::size_of::<Option<Box<BoundColumnTypePrograms>>>() == std::mem::size_of::<usize>()
+);
 
 #[derive(Clone, Debug)]
 pub struct Source {
@@ -297,16 +402,16 @@ pub struct Source {
     pub name: String,
     pub alias: Option<String>,
     pub kind: SourceKind,
-    pub columns: crate::sync::Arc<[SourceColumn]>,
+    pub columns: SourceColumns,
     /// Virtual generated-column expressions for this exact source occurrence,
     /// aligned with `columns` and materialized when the statement needs them.
-    pub generated_expressions: Vec<ColumnReadExpression>,
+    pub generated_expressions: ColumnSlots<ColumnReadExpression>,
     /// Read-time defaults for short records, aligned with `columns` and
     /// materialized when the statement needs them.
-    pub default_expressions: Vec<ColumnReadExpression>,
+    pub default_expressions: ColumnSlots<ColumnReadExpression>,
     /// Custom-type encode/decode programs aligned with `columns`. Plain and
     /// built-in typed columns contain `None`.
-    pub column_type_programs: Vec<Option<BoundColumnTypePrograms>>,
+    pub column_type_programs: ColumnSlots<Option<Box<BoundColumnTypePrograms>>>,
     /// CHECK constraints selected and instantiated for this exact DML target.
     /// `None` means this source does not enforce CHECKs for the current
     /// statement; `Some([])` means enforcement is active but no catalog CHECK
@@ -369,6 +474,216 @@ pub struct SourceColumn {
     pub collation: Option<super::ResolvedCollation>,
     pub hidden: bool,
     pub rowid_alias: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum SourceColumns {
+    Table(TableColumns),
+    Owned(crate::sync::Arc<[SourceColumn]>),
+}
+
+impl SourceColumns {
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Table(columns) => columns.table.columns().len(),
+            Self::Owned(columns) => columns.len(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<SourceColumnRef<'_>> {
+        match self {
+            Self::Table(columns) => {
+                columns
+                    .table
+                    .columns()
+                    .get(index)
+                    .map(|column| SourceColumnRef::Table {
+                        column,
+                        columns,
+                        index,
+                    })
+            }
+            Self::Owned(columns) => columns.get(index).map(SourceColumnRef::Owned),
+        }
+    }
+
+    #[inline]
+    pub fn column(&self, index: usize) -> SourceColumnRef<'_> {
+        self.get(index)
+            .unwrap_or_else(|| panic!("source has no column {index}"))
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = SourceColumnRef<'_>> + Clone + '_ {
+        (0..self.len()).map(|index| self.column(index))
+    }
+}
+
+impl std::iter::FromIterator<SourceColumn> for SourceColumns {
+    fn from_iter<I: IntoIterator<Item = SourceColumn>>(columns: I) -> Self {
+        Self::Owned(columns.into_iter().collect())
+    }
+}
+
+impl std::convert::From<Vec<SourceColumn>> for SourceColumns {
+    fn from(columns: Vec<SourceColumn>) -> Self {
+        Self::Owned(columns.into())
+    }
+}
+
+impl std::convert::From<crate::sync::Arc<[SourceColumn]>> for SourceColumns {
+    fn from(columns: crate::sync::Arc<[SourceColumn]>) -> Self {
+        Self::Owned(columns)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TableColumns {
+    table: crate::sync::Arc<crate::schema::Table>,
+    type_facts: crate::sync::Arc<crate::sync::OnceLock<Box<[TypeFact]>>>,
+}
+
+impl TableColumns {
+    pub fn new(table: crate::sync::Arc<crate::schema::Table>) -> Self {
+        Self {
+            table,
+            type_facts: crate::sync::Arc::new(crate::sync::OnceLock::new()),
+        }
+    }
+
+    #[inline]
+    fn type_fact(&self, index: usize) -> &TypeFact {
+        &self
+            .type_facts
+            .get_or_init(|| declared_type_facts(&self.table))[index]
+    }
+}
+
+fn declared_type_facts(table: &crate::schema::Table) -> Box<[TypeFact]> {
+    let mut declarations: Vec<crate::sync::Arc<super::DeclaredType>> = Vec::new();
+    table
+        .columns()
+        .iter()
+        .map(|column| {
+            if column.ty_str.is_empty() {
+                return TypeFact::known(column.ty());
+            }
+            let same_type = |declared: &&crate::sync::Arc<super::DeclaredType>| {
+                declared.name == column.ty_str
+                    && declared.storage == column.ty()
+                    && declared.array_dimensions == column.array_dimensions()
+            };
+            let declared = match declarations.iter().find(same_type) {
+                Some(declared) => declared.clone(),
+                None => {
+                    let declared = crate::sync::Arc::new(super::DeclaredType {
+                        name: column.ty_str.clone(),
+                        storage: column.ty(),
+                        custom_chain: Vec::new(),
+                        array_dimensions: column.array_dimensions(),
+                    });
+                    declarations.push(declared.clone());
+                    declared
+                }
+            };
+            TypeFact::shared_declared(declared)
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SourceColumnRef<'a> {
+    Table {
+        column: &'a crate::schema::Column,
+        columns: &'a TableColumns,
+        index: usize,
+    },
+    Owned(&'a SourceColumn),
+}
+
+impl<'a> SourceColumnRef<'a> {
+    #[inline]
+    pub fn name(self) -> &'a str {
+        match self {
+            Self::Table { column, .. } => column
+                .name
+                .as_deref()
+                .expect("a table source only reads named columns from its schema"),
+            Self::Owned(column) => &column.name,
+        }
+    }
+
+    #[inline]
+    pub fn type_fact(self) -> std::borrow::Cow<'a, TypeFact> {
+        match self {
+            Self::Table { columns, index, .. } => {
+                std::borrow::Cow::Borrowed(columns.type_fact(index))
+            }
+            Self::Owned(column) => std::borrow::Cow::Borrowed(&column.type_fact),
+        }
+    }
+
+    #[inline]
+    pub fn affinity(self) -> Affinity {
+        match self {
+            Self::Table { column, .. } => column.affinity(),
+            Self::Owned(column) => column.affinity,
+        }
+    }
+
+    #[inline]
+    pub fn has_affinity(self) -> bool {
+        match self {
+            Self::Table { .. } => true,
+            Self::Owned(column) => column.has_affinity,
+        }
+    }
+
+    #[inline]
+    pub fn collation(self) -> Option<&'a super::ResolvedCollation> {
+        match self {
+            Self::Table { .. } => None,
+            Self::Owned(column) => column.collation.as_ref(),
+        }
+    }
+
+    #[inline]
+    pub fn hidden(self) -> bool {
+        match self {
+            Self::Table { column, .. } => column.hidden(),
+            Self::Owned(column) => column.hidden,
+        }
+    }
+
+    #[inline]
+    pub fn rowid_alias(self) -> bool {
+        match self {
+            Self::Table { column, .. } => column.is_rowid_alias(),
+            Self::Owned(column) => column.rowid_alias,
+        }
+    }
+
+    pub fn to_owned(self) -> SourceColumn {
+        match self {
+            Self::Table { .. } => SourceColumn {
+                name: self.name().into(),
+                type_fact: self.type_fact().into_owned(),
+                affinity: self.affinity(),
+                has_affinity: self.has_affinity(),
+                collation: None,
+                hidden: self.hidden(),
+                rowid_alias: self.rowid_alias(),
+            },
+            Self::Owned(column) => column.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

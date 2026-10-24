@@ -216,10 +216,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     .enumerate()
                     .filter(|(other, (source, other_merged))| {
                         *other != position
-                            && source
-                                .columns
-                                .iter()
-                                .any(|candidate| candidate.name.eq_ignore_ascii_case(&column.name))
+                            && source.columns.iter().any(|candidate| {
+                                candidate.name().eq_ignore_ascii_case(&column.name)
+                            })
                             && !merges(*other_merged, &column.name)
                     })
                     .count();

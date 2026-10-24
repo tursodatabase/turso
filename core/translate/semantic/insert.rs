@@ -775,7 +775,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         columns: &[hir::InsertTarget],
         upserts: &[(Option<hir::ConflictTarget>, &ast::UpsertDo)],
     ) -> Result<Vec<bool>> {
-        if table.value().btree().is_none() {
+        if !table.value().btree().is_some_and(|btree| btree.has_rowid) {
             return Ok(vec![true; upserts.len()]);
         }
         let source = self.source(target).ok_or_else(|| {
@@ -1066,8 +1066,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     table: table.clone(),
                 },
                 columns,
-                generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                default_expressions: vec![hir::ColumnReadExpression::Absent; width],
+                generated_expressions: hir::ColumnSlots::empty(width),
+                default_expressions: hir::ColumnSlots::empty(width),
                 column_type_programs,
                 check_constraints: None,
                 rowid_available,

@@ -1372,6 +1372,13 @@ fn build_in_list_expr(
     rhs_syntax: &[Box<ast::Expr>],
     children: FrameChildren,
 ) -> Result<ResolvedScopeExpr> {
+    if expression_operand_width(lhs_syntax) == 1
+        && rhs_syntax
+            .iter()
+            .all(|value| expression_operand_width(value) == 1)
+    {
+        return build_scalar_in_list_expr(negated, children);
+    }
     let operands = take_expression_operands(
         std::iter::once(lhs_syntax).chain(rhs_syntax.iter().map(Box::as_ref)),
         children,
@@ -1401,6 +1408,34 @@ fn build_in_list_expr(
             lhs: Box::new(lhs),
             negated,
             values: operands.collect(),
+            comparisons,
+        },
+        hir::TypeFact::known(Type::Integer),
+        ExprCollation::Absent,
+    ))
+}
+
+fn build_scalar_in_list_expr(negated: bool, children: FrameChildren) -> Result<ResolvedScopeExpr> {
+    let mut children = children.into_iter();
+    let lhs = children
+        .next()
+        .expect("IN has a left operand")
+        .into_scalar()?;
+    let mut values = Vec::with_capacity(children.len());
+    let mut comparisons = Vec::with_capacity(children.len());
+    for child in children {
+        let value = child.into_scalar()?;
+        comparisons.push(in_operand_comparison(
+            std::slice::from_ref(&lhs),
+            std::slice::from_ref(&value),
+        ));
+        values.push(value.expr);
+    }
+    Ok(computed_expr(
+        hir::Expr::InList {
+            lhs: Box::new(lhs.expr),
+            negated,
+            values,
             comparisons,
         },
         hir::TypeFact::known(Type::Integer),
@@ -1743,12 +1778,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     ) -> Result<ResolvedScopeExpr> {
         let mut frames = vec![ExprFrame::new(syntax, expected_type, 0)?];
         let mut values = Vec::<FrameValue>::new();
+        reserve_in_list_values(&mut values, syntax);
         loop {
             if let Some(child) = frames
                 .last_mut()
                 .expect("root expression frame exists")
                 .next_child(self.context().main_schema())?
             {
+                reserve_in_list_values(&mut values, child.syntax);
                 frames.push(ExprFrame::new(
                     child.syntax,
                     child.expected_type,
@@ -1758,40 +1795,27 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
 
             let frame = frames.pop().expect("completed expression frame exists");
-            let children = values.drain(frame.first_value..).collect::<FrameChildren>();
-            let resolved = match frame.syntax {
-                ast::Expr::Subquery(_)
-                | ast::Expr::Exists(_)
-                | ast::Expr::InSelect { .. }
-                | ast::Expr::InTable { .. } => {
-                    // An aggregate in the subquery of only this block's
-                    // columns belongs to this block, where aggregates are
-                    // allowed here.
-                    let host = match (&functions, policy.aggregates) {
-                        (FunctionContext::Query(state), AggregatePolicy::Allow) => {
-                            Some(state.block)
-                        }
-                        _ => None,
-                    };
-                    self.aggregate_hosts.push(host);
-                    let value = self.build_subquery_expr(
-                        frame.syntax,
-                        children,
-                        scope,
-                        owner,
-                        policy.policies,
-                    );
-                    self.aggregate_hosts.pop();
-                    value?
-                }
-                _ => FrameValue::Scalar(self.build_expr_from_frames(
+            let resolved = if frame.first_value == values.len()
+                && !matches!(
                     frame.syntax,
-                    children,
+                    ast::Expr::Binary(..)
+                        | ast::Expr::Between { .. }
+                        | ast::Expr::InList { .. }
+                        | ast::Expr::Subquery(_)
+                        | ast::Expr::Exists(_)
+                        | ast::Expr::InSelect { .. }
+                        | ast::Expr::InTable { .. }
+                ) {
+                FrameValue::Scalar(self.build_expr(
+                    frame.syntax,
+                    ExprChildren::new(),
                     scope,
                     policy,
                     functions,
                     frame.expected_type.as_ref(),
-                )?),
+                )?)
+            } else {
+                self.build_frame_value(frame, &mut values, scope, policy, owner, functions)?
             };
             match frames.last_mut() {
                 Some(_) => values.push(resolved),
@@ -1801,6 +1825,45 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 None => return resolved.into_scalar(),
             }
         }
+    }
+
+    fn build_frame_value(
+        &mut self,
+        frame: ExprFrame<'ast>,
+        values: &mut Vec<FrameValue>,
+        scope: &Scope,
+        policy: ExprPolicy,
+        owner: ExprOwner,
+        functions: &mut FunctionContext<'_, 'ast>,
+    ) -> Result<FrameValue> {
+        let children = values.drain(frame.first_value..).collect::<FrameChildren>();
+        Ok(match frame.syntax {
+            ast::Expr::Subquery(_)
+            | ast::Expr::Exists(_)
+            | ast::Expr::InSelect { .. }
+            | ast::Expr::InTable { .. } => {
+                // An aggregate in the subquery of only this block's
+                // columns belongs to this block, where aggregates are
+                // allowed here.
+                let host = match (&functions, policy.aggregates) {
+                    (FunctionContext::Query(state), AggregatePolicy::Allow) => Some(state.block),
+                    _ => None,
+                };
+                self.aggregate_hosts.push(host);
+                let value =
+                    self.build_subquery_expr(frame.syntax, children, scope, owner, policy.policies);
+                self.aggregate_hosts.pop();
+                value?
+            }
+            _ => FrameValue::Scalar(self.build_expr_from_frames(
+                frame.syntax,
+                children,
+                scope,
+                policy,
+                functions,
+                frame.expected_type.as_ref(),
+            )?),
+        })
     }
 
     /// Whether an aggregate written in `block` reads columns of other query
@@ -3877,11 +3940,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 })?;
                 Ok(ResolvedScopeExpr {
                     expr: hir::Expr::Column(reference),
-                    type_fact: column.type_fact.clone(),
-                    affinity: column.affinity,
-                    has_affinity: column.has_affinity,
+                    type_fact: column.type_fact().into_owned(),
+                    affinity: column.affinity(),
+                    has_affinity: column.has_affinity(),
                     collation: ExprCollation::column(
-                        column.collation.clone(),
+                        column.collation().cloned(),
                         &self.binary_collation,
                     ),
                 })
@@ -4043,6 +4106,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }),
             affinity,
         )
+    }
+}
+
+fn reserve_in_list_values(values: &mut Vec<FrameValue>, syntax: &ast::Expr) {
+    if let ast::Expr::InList { rhs, .. } = syntax {
+        values.reserve(rhs.len() + 1);
     }
 }
 
@@ -5096,8 +5165,8 @@ mod tests {
         translate::semantic::{
             context::{DoubleQuotedDml, SemanticContext},
             hir::{
-                ColumnReadExpression, DatabaseId, Expr, IndexCoverage, IndexHint, Source,
-                SourceColumn, SourceId, SourceKind, SourceOwner, TypeFact,
+                DatabaseId, Expr, IndexCoverage, IndexHint, Source, SourceColumn, SourceId,
+                SourceKind, SourceOwner, TypeFact,
             },
             scope::Scope,
         },
@@ -5179,7 +5248,7 @@ mod tests {
             name: "items".to_string(),
             alias: None,
             kind: SourceKind::SchemaExpression,
-            columns: crate::sync::Arc::from(vec![SourceColumn {
+            columns: vec![SourceColumn {
                 name: "value".into(),
                 type_fact: TypeFact::known(Type::Text),
                 affinity: Affinity::Text,
@@ -5187,10 +5256,11 @@ mod tests {
                 collation: None,
                 hidden: false,
                 rowid_alias: false,
-            }]),
-            generated_expressions: vec![ColumnReadExpression::Absent],
-            default_expressions: vec![ColumnReadExpression::Absent],
-            column_type_programs: vec![None],
+            }]
+            .into(),
+            generated_expressions: hir::ColumnSlots::empty(1),
+            default_expressions: hir::ColumnSlots::empty(1),
+            column_type_programs: hir::ColumnSlots::empty(1),
             check_constraints: None,
             rowid_available: true,
             index_hint: IndexHint::None,

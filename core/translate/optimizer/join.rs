@@ -1604,7 +1604,7 @@ fn hir_plain_rowid_table(document: &HirDocument, source: &HirPlanSource, schema:
         && definition
             .columns
             .iter()
-            .all(|column| !column.type_fact.is_array())
+            .all(|column| !column.type_fact().is_array())
 }
 
 /// A hash join of HIR sources that builds a hash table from `build` and
@@ -3288,9 +3288,9 @@ mod tests {
             alias: None,
             kind: hir::SourceKind::SchemaExpression,
             columns: Vec::new().into(),
-            generated_expressions: Vec::new(),
-            default_expressions: Vec::new(),
-            column_type_programs: Vec::new(),
+            generated_expressions: hir::ColumnSlots::empty(0),
+            default_expressions: hir::ColumnSlots::empty(0),
+            column_type_programs: hir::ColumnSlots::empty(0),
             check_constraints: None,
             rowid_available: true,
             index_hint: IndexHint::None,

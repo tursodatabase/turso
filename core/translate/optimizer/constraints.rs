@@ -1193,7 +1193,7 @@ pub(crate) fn hir_constraints_for_source(
             let column_collation = source_definition
                 .columns
                 .get(position)
-                .and_then(|column| column.collation.as_ref())
+                .and_then(|column| column.collation())
                 .map(|collation| *collation.value())
                 .unwrap_or_default();
             if constraint.comparison_collation.unwrap_or_default() != column_collation {
@@ -1953,9 +1953,9 @@ mod tests {
                 alias: None,
                 kind: hir::SourceKind::SchemaExpression,
                 columns: Vec::new().into(),
-                generated_expressions: Vec::new(),
-                default_expressions: Vec::new(),
-                column_type_programs: Vec::new(),
+                generated_expressions: hir::ColumnSlots::empty(0),
+                default_expressions: hir::ColumnSlots::empty(0),
+                column_type_programs: hir::ColumnSlots::empty(0),
                 check_constraints: None,
                 rowid_available: true,
                 index_hint: hir::IndexHint::None,
@@ -2045,9 +2045,9 @@ mod tests {
                     rowid_alias: column.is_rowid_alias(),
                 })
                 .collect(),
-            generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
-            default_expressions: vec![hir::ColumnReadExpression::Absent; width],
-            column_type_programs: vec![None; width],
+            generated_expressions: hir::ColumnSlots::empty(width),
+            default_expressions: hir::ColumnSlots::empty(width),
+            column_type_programs: hir::ColumnSlots::empty(width),
             check_constraints: None,
             rowid_available: true,
             index_hint: hir::IndexHint::None,

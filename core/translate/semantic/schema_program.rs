@@ -5,8 +5,8 @@ use super::{
     expr::ExprPolicy,
     hir::{
         self, BoundDomainCheck, BoundDomainConstraints, BoundSchemaCall, BoundSchemaProgram,
-        ColumnReadExpression, DatabaseId, IndexCoverage, IndexHint, ResolvedType, Source,
-        SourceColumn, SourceKind, SourceOwner, TypeFact,
+        ColumnSlots, DatabaseId, IndexCoverage, IndexHint, ResolvedType, Source, SourceColumn,
+        SourceKind, SourceOwner, TypeFact,
     },
     scope::{ResolvedScopeExpr, Scope},
 };
@@ -184,9 +184,9 @@ impl Analyzer<'_, '_, '_> {
             alias: None,
             kind: SourceKind::SchemaExpression,
             columns: columns.into(),
-            generated_expressions: vec![ColumnReadExpression::Absent; width],
-            default_expressions: vec![ColumnReadExpression::Absent; width],
-            column_type_programs: vec![None; width],
+            generated_expressions: ColumnSlots::empty(width),
+            default_expressions: ColumnSlots::empty(width),
+            column_type_programs: ColumnSlots::empty(width),
             check_constraints: None,
             rowid_available: false,
             index_hint: IndexHint::None,

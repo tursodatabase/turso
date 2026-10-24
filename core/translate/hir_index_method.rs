@@ -458,7 +458,7 @@ impl<'a> Matcher<'a> {
                         .get(column.column)
                         .is_some_and(|column| {
                             column
-                                .name
+                                .name()
                                 .eq_ignore_ascii_case(&crate::util::normalize_ident(name.as_str()))
                         })
             }

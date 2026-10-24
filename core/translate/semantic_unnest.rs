@@ -1290,7 +1290,10 @@ fn read_column_pair(
     })
 }
 
-fn source_column(document: &HirDocument, column: hir::ColumnRef) -> Option<&hir::SourceColumn> {
+fn source_column(
+    document: &HirDocument,
+    column: hir::ColumnRef,
+) -> Option<hir::SourceColumnRef<'_>> {
     document.source(column.source)?.columns.get(column.column)
 }
 
@@ -1305,17 +1308,16 @@ fn column_pair_compares_the_same(document: &HirDocument, pair: &ColumnPair) -> b
     ) else {
         return false;
     };
-    let collation = |column: &hir::SourceColumn| match column
-        .collation
-        .as_ref()
+    let collation = |column: hir::SourceColumnRef<'_>| match column
+        .collation()
         .map(|collation| *collation.value())
     {
         None | Some(CollationSeq::Unset) => CollationSeq::Binary,
         Some(collation) => collation,
     };
-    let affinity = |column: &hir::SourceColumn| {
-        if column.has_affinity {
-            column.affinity
+    let affinity = |column: hir::SourceColumnRef<'_>| {
+        if column.has_affinity() {
+            column.affinity()
         } else {
             crate::vdbe::affinity::Affinity::Blob
         }
@@ -1591,7 +1593,7 @@ fn try_aggregate_rewrite(
         .iter()
         .map(|key| {
             source_column(document, *key)
-                .cloned()
+                .map(hir::SourceColumnRef::to_owned)
                 .expect("a link column exists")
         })
         .collect::<Vec<_>>();
@@ -1674,9 +1676,9 @@ fn try_aggregate_rewrite(
         alias: None,
         kind: hir::SourceKind::Derived(query_id),
         columns: columns.into(),
-        generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
-        default_expressions: vec![hir::ColumnReadExpression::Absent; width],
-        column_type_programs: vec![None; width],
+        generated_expressions: hir::ColumnSlots::empty(width),
+        default_expressions: hir::ColumnSlots::empty(width),
+        column_type_programs: hir::ColumnSlots::empty(width),
         check_constraints: None,
         rowid_available: false,
         index_hint: hir::IndexHint::None,
