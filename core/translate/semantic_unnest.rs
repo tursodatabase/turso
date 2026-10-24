@@ -1673,7 +1673,7 @@ fn try_aggregate_rewrite(
         name: format!("scalar_subquery_{}", query_id.index()),
         alias: None,
         kind: hir::SourceKind::Derived(query_id),
-        columns,
+        columns: columns.into(),
         generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
         default_expressions: vec![hir::ColumnReadExpression::Absent; width],
         column_type_programs: vec![None; width],

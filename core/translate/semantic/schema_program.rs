@@ -183,7 +183,7 @@ impl Analyzer<'_, '_, '_> {
             name: "schema expression inputs".to_string(),
             alias: None,
             kind: SourceKind::SchemaExpression,
-            columns,
+            columns: columns.into(),
             generated_expressions: vec![ColumnReadExpression::Absent; width],
             default_expressions: vec![ColumnReadExpression::Absent; width],
             column_type_programs: vec![None; width],

@@ -5526,7 +5526,7 @@ mod tests {
             name: "items".to_string(),
             alias: None,
             kind,
-            columns,
+            columns: columns.into(),
             generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
             default_expressions: vec![hir::ColumnReadExpression::Absent; width],
             column_type_programs: vec![None; width],

@@ -1234,7 +1234,7 @@ impl<'document> HirValidator<'document> {
             }
         }
 
-        for column in &source.columns {
+        for column in source.columns.iter() {
             self.visit_type_fact(&column.type_fact)?;
             self.visit_optional_catalog_object(column.collation.as_ref(), "column collation")?;
         }

@@ -297,7 +297,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             name: "register inputs".to_string(),
             alias: None,
             kind: SourceKind::SchemaExpression,
-            columns,
+            columns: columns.into(),
             generated_expressions: vec![ColumnReadExpression::Absent; width],
             default_expressions: vec![ColumnReadExpression::Absent; width],
             column_type_programs: vec![None; width],
@@ -2659,7 +2659,7 @@ mod tests {
     }
 
     #[test]
-    fn select_star_with_where_copies_no_column_binding() {
+    fn select_star_with_where_makes_no_column_binding() {
         let mut schema = Schema::new();
         let columns: Vec<String> = (0..64).map(|column| format!("c{column} INTEGER")).collect();
         let table = BTreeTable::from_sql(
@@ -2673,14 +2673,13 @@ mod tests {
         schema
             .add_btree_table(Arc::new(table))
             .expect("table name is unique");
-        crate::translate::semantic::scope::tests::COLUMN_BINDINGS_COPIED
-            .with(|copied| copied.set(0));
+        crate::translate::semantic::scope::tests::COLUMN_BINDINGS_MADE.with(|made| made.set(0));
         analyze_sql_with_schema(&schema, "SELECT * FROM wide WHERE id = 1")
             .expect("SELECT analyzes");
-        let copied = crate::translate::semantic::scope::tests::COLUMN_BINDINGS_COPIED
-            .with(|copied| copied.get());
+        let made =
+            crate::translate::semantic::scope::tests::COLUMN_BINDINGS_MADE.with(|made| made.get());
 
-        assert_eq!(copied, 0);
+        assert_eq!(made, 0);
     }
 
     #[test]
@@ -6689,7 +6688,7 @@ mod tests {
         assert!(block
             .outputs
             .iter()
-            .zip(&source.columns)
+            .zip(source.columns.iter())
             .all(|(output, column)| output.type_fact == column.type_fact));
     }
 

@@ -4434,7 +4434,7 @@ pub(crate) mod tests {
             name: "items".to_string(),
             alias: Some("i".to_string()),
             kind: SourceKind::Table(resolved_table("items")),
-            columns: vec![
+            columns: crate::sync::Arc::from(vec![
                 SourceColumn {
                     name: "first".into(),
                     type_fact: TypeFact::known(Type::Integer),
@@ -4453,7 +4453,7 @@ pub(crate) mod tests {
                     hidden: false,
                     rowid_alias: false,
                 },
-            ],
+            ]),
             generated_expressions: vec![ColumnReadExpression::Absent; 2],
             default_expressions: vec![ColumnReadExpression::Absent; 2],
             column_type_programs: vec![None; 2],
@@ -4486,7 +4486,7 @@ pub(crate) mod tests {
                 from: Box::new(from),
                 columns: Vec::new(),
             }),
-            columns: Vec::new(),
+            columns: Vec::new().into(),
             generated_expressions: Vec::new(),
             default_expressions: Vec::new(),
             column_type_programs: Vec::new(),
@@ -5613,7 +5613,7 @@ pub(crate) mod tests {
         derived_source.owner = SourceOwner::QueryBlock(root_block_id);
         derived_source.database = None;
         derived_source.kind = SourceKind::Derived(child_query);
-        derived_source.columns.truncate(1);
+        derived_source.columns = derived_source.columns[..1].into();
         derived_source.generated_expressions.truncate(1);
         derived_source.default_expressions.truncate(1);
         derived_source.column_type_programs.truncate(1);

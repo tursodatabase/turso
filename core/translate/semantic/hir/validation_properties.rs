@@ -442,19 +442,22 @@ fn referenced_array_columns_are_self_describing(tc: hegel::TestCase) {
     };
     let reference = *reference;
     let source = &mut document.sources[reference.source.index()];
-    source.columns[reference.column].type_fact = TypeFact::declared(DeclaredType {
+    let mut columns = source.columns.to_vec();
+    columns[reference.column].type_fact = TypeFact::declared(DeclaredType {
         name: "INTEGER".to_string(),
         storage: Type::Integer,
         custom_chain: Vec::new(),
         array_dimensions: 1,
     });
+    source.columns = columns.into();
     document
         .validate()
         .expect("the referenced array column is described by its type fact");
 
-    document.sources[reference.source.index()].columns[reference.column]
-        .type_fact
-        .storage = Some(Type::Integer);
+    let source = &mut document.sources[reference.source.index()];
+    let mut columns = source.columns.to_vec();
+    columns[reference.column].type_fact.storage = Some(Type::Integer);
+    source.columns = columns.into();
     assert!(document.validate().is_err());
 }
 

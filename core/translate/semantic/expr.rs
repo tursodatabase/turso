@@ -5179,7 +5179,7 @@ mod tests {
             name: "items".to_string(),
             alias: None,
             kind: SourceKind::SchemaExpression,
-            columns: vec![SourceColumn {
+            columns: crate::sync::Arc::from(vec![SourceColumn {
                 name: "value".into(),
                 type_fact: TypeFact::known(Type::Text),
                 affinity: Affinity::Text,
@@ -5187,7 +5187,7 @@ mod tests {
                 collation: None,
                 hidden: false,
                 rowid_alias: false,
-            }],
+            }]),
             generated_expressions: vec![ColumnReadExpression::Absent],
             default_expressions: vec![ColumnReadExpression::Absent],
             column_type_programs: vec![None],

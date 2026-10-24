@@ -1173,7 +1173,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 } else {
                     hir::SourceKind::Cte(cte)
                 },
-                columns,
+                columns: columns.into(),
                 generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
                 default_expressions: vec![hir::ColumnReadExpression::Absent; width],
                 column_type_programs: vec![None; width],
@@ -1259,7 +1259,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     .map(ast::Name::as_str)
                     .map(crate::util::normalize_ident),
                 kind: hir::SourceKind::Derived(query),
-                columns,
+                columns: columns.into(),
                 generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
                 default_expressions: vec![hir::ColumnReadExpression::Absent; width],
                 column_type_programs: vec![None; width],
@@ -1463,7 +1463,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         .unwrap_or(name),
                 ),
                 kind: hir::SourceKind::Derived(query),
-                columns,
+                columns: columns.into(),
                 generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
                 default_expressions: vec![hir::ColumnReadExpression::Absent; width],
                 column_type_programs: vec![None; width],
@@ -1678,7 +1678,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         argument_predicates: Vec::new(),
                     },
                 },
-                columns,
+                columns: columns.into(),
                 generated_expressions,
                 default_expressions,
                 column_type_programs,
