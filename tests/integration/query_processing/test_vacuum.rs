@@ -4192,6 +4192,53 @@ fn test_plain_vacuum_preserves_custom_types() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Plain VACUUM must copy array values as stored. Converting them to display
+/// text and back turned BLOB[] elements into TEXT and changed ANY[] element
+/// types.
+#[test]
+fn test_plain_vacuum_preserves_array_values() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_custom_types(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB[], a ANY[], c cents[]) STRICT")?;
+    conn.execute(
+        "INSERT INTO t VALUES \
+         (1, ARRAY[], ARRAY[1, '1', x'01'], ARRAY[1, 2]), \
+         (2, ARRAY[x'cafe'], NULL, ARRAY[])",
+    )?;
+
+    let query = "SELECT id, hex(b), hex(a), hex(c), c FROM t ORDER BY id";
+    let before_rows: Vec<(i64, String, String, String, String)> = conn.exec_rows(query);
+    assert_eq!(
+        before_rows,
+        vec![
+            (
+                1,
+                "01".to_string(),
+                "04090F0E3101".to_string(),
+                "0301026400C8".to_string(),
+                "{1,2}".to_string()
+            ),
+            (
+                2,
+                "0210CAFE".to_string(),
+                String::new(),
+                "01".to_string(),
+                "{}".to_string()
+            ),
+        ]
+    );
+
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+    let after_rows: Vec<(i64, String, String, String, String)> = conn.exec_rows(query);
+    assert_eq!(after_rows, before_rows);
+
+    Ok(())
+}
+
 /// Plain VACUUM reparses the live schema on the same connection. Custom types
 /// that rely on a comparator-backed index must still order correctly after the
 /// rewrite, and the same connection must remain able to use that type in new
