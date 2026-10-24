@@ -829,9 +829,9 @@ mod tests {
         translate::{
             plan::{ColumnUsedMask, HirPlannedSource},
             semantic::hir::{
-                CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression, DatabaseId,
-                Expr, IndexCoverage, IndexExpressions, IndexHint, Source, SourceColumn, SourceId,
-                SourceKind, SourceOwner, TypeFact,
+                CatalogObject, CatalogObjectId, CatalogSnapshot, DatabaseId, Expr, IndexCoverage,
+                IndexExpressions, IndexHint, Source, SourceColumn, SourceId, SourceKind,
+                SourceOwner, TypeFact,
             },
         },
         vdbe::affinity::Affinity,
@@ -931,9 +931,9 @@ mod tests {
                 rowid_alias: false,
             }]
             .into(),
-            generated_expressions: vec![ColumnReadExpression::Absent],
-            default_expressions: vec![ColumnReadExpression::Absent],
-            column_type_programs: vec![None],
+            generated_expressions: hir::ColumnSlots::empty(1),
+            default_expressions: hir::ColumnSlots::empty(1),
+            column_type_programs: hir::ColumnSlots::empty(1),
             check_constraints: None,
             rowid_available: true,
             index_hint: IndexHint::None,

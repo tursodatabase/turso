@@ -1632,10 +1632,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::translate::collate::CollationSeq;
     use crate::translate::semantic::hir::{
-        CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression, ComparisonComponent,
-        ComparisonSemantics, DatabaseId, Expr, IndexCoverage, IndexHint, MergedColumnValue, Output,
-        OutputNameKind, QueryBlockId, QueryId, Source, SourceColumn, SourceKind, SourceOwner,
-        UsingColumn,
+        CatalogObject, CatalogObjectId, CatalogSnapshot, ComparisonComponent, ComparisonSemantics,
+        DatabaseId, Expr, IndexCoverage, IndexHint, MergedColumnValue, Output, OutputNameKind,
+        QueryBlockId, QueryId, Source, SourceColumn, SourceKind, SourceOwner, UsingColumn,
     };
     use turso_parser::ast::Literal;
 
@@ -1667,9 +1666,9 @@ pub(crate) mod tests {
             alias: alias.map(str::to_string),
             kind: SourceKind::SchemaExpression,
             columns: columns.into(),
-            generated_expressions: vec![ColumnReadExpression::Absent; width],
-            default_expressions: vec![ColumnReadExpression::Absent; width],
-            column_type_programs: vec![None; width],
+            generated_expressions: hir::ColumnSlots::empty(width),
+            default_expressions: hir::ColumnSlots::empty(width),
+            column_type_programs: hir::ColumnSlots::empty(width),
             check_constraints: None,
             rowid_available,
             index_hint: IndexHint::None,

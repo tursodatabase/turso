@@ -1413,9 +1413,9 @@ impl<'document> HirValidator<'document> {
 
     fn visit_column_read_expressions(
         &self,
-        expressions: &[ColumnReadExpression],
+        expressions: &ColumnSlots<ColumnReadExpression>,
     ) -> ValidationResult {
-        for expression in expressions {
+        for expression in expressions.iter() {
             if let ColumnReadExpression::Planned(expression) = expression {
                 self.visit_expr(expression)?;
             }

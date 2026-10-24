@@ -14,13 +14,13 @@ use super::{
     context::SemanticContext,
     expr::{ExprPolicies, ExprPolicy, QueryFunctionState, RowValueChecks},
     hir::{
-        BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, ColumnRef, CompoundArm, Cte,
-        CteId, DatabaseId, Delete, DeleteTargetKind, Expr, FunctionEvaluation, Grouping,
-        HirDocument, HirRoot, IndexCoverage, IndexHint, Insert, InsertTargetKind, Limit, OrderTerm,
-        Output, OutputId, OutputNameKind, OutputOwner, Query, QueryBlock, QueryBlockBody,
-        QueryBlockId, QueryId, QueryRoot, SchemaExpressionRoot, SchemaProgramId, Source,
-        SourceColumn, SourceId, SourceKind, SourceOwner, TriggerBody, TriggerCommand, TypeFact,
-        Update, UpdateTargetKind,
+        BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, ColumnRef, ColumnSlots,
+        CompoundArm, Cte, CteId, DatabaseId, Delete, DeleteTargetKind, Expr, FunctionEvaluation,
+        Grouping, HirDocument, HirRoot, IndexCoverage, IndexHint, Insert, InsertTargetKind, Limit,
+        OrderTerm, Output, OutputId, OutputNameKind, OutputOwner, Query, QueryBlock,
+        QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SchemaExpressionRoot, SchemaProgramId,
+        Source, SourceColumn, SourceId, SourceKind, SourceOwner, TriggerBody, TriggerCommand,
+        TypeFact, Update, UpdateTargetKind,
     },
     query::FromContext,
     scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
@@ -299,9 +299,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             alias: None,
             kind: SourceKind::SchemaExpression,
             columns: columns.into(),
-            generated_expressions: vec![ColumnReadExpression::Absent; width],
-            default_expressions: vec![ColumnReadExpression::Absent; width],
-            column_type_programs: vec![None; width],
+            generated_expressions: ColumnSlots::empty(width),
+            default_expressions: ColumnSlots::empty(width),
+            column_type_programs: ColumnSlots::empty(width),
             check_constraints: None,
             rowid_available: false,
             index_hint: IndexHint::None,
@@ -2736,6 +2736,37 @@ mod tests {
                 .map(|collation| *collation.value()),
             Some(crate::translate::collate::CollationSeq::NoCase)
         );
+    }
+
+    #[test]
+    fn table_source_stores_no_column_lists_unless_a_column_has_a_default() {
+        let mut schema = Schema::new();
+        for sql in [
+            "CREATE TABLE plain(a INTEGER, b TEXT)",
+            "CREATE TABLE defaulted(a INTEGER, b TEXT DEFAULT 'x')",
+        ] {
+            let table = BTreeTable::from_sql(sql, 2).expect("table schema parses");
+            schema
+                .add_btree_table(Arc::new(table))
+                .expect("table name is unique");
+        }
+        let stored = |sql: &str| {
+            let document = analyze_sql_with_schema(&schema, sql).expect("SELECT analyzes");
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let query = document.query(root.query).expect("query exists");
+            let first = query.blocks[0].from.as_ref().expect("query has FROM").first;
+            let source = document.source(first).expect("source exists");
+            (
+                source.generated_expressions.stores_values(),
+                source.default_expressions.stores_values(),
+                source.column_type_programs.stores_values(),
+            )
+        };
+
+        assert_eq!(stored("SELECT a FROM plain"), (false, false, false));
+        assert_eq!(stored("SELECT a FROM defaulted"), (false, true, false));
     }
 
     #[test]

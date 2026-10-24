@@ -479,9 +479,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         column
                     })
                     .collect(),
-                generated_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
-                default_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
-                column_type_programs: column_type_programs.to_vec(),
+                generated_expressions: hir::ColumnSlots::empty(columns.len()),
+                default_expressions: hir::ColumnSlots::empty(columns.len()),
+                column_type_programs: column_type_programs.to_vec().into(),
                 check_constraints: None,
                 rowid_available,
                 index_hint: hir::IndexHint::None,

@@ -923,9 +923,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 alias,
                 kind,
                 columns,
-                generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                default_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                column_type_programs: vec![None; width],
+                generated_expressions: hir::ColumnSlots::empty(width),
+                default_expressions: hir::ColumnSlots::empty(width),
+                column_type_programs: hir::ColumnSlots::empty(width),
                 check_constraints: None,
                 rowid_available: false,
                 index_hint: hir::IndexHint::None,
@@ -1174,9 +1174,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     hir::SourceKind::Cte(cte)
                 },
                 columns: columns.into(),
-                generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                default_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                column_type_programs: vec![None; width],
+                generated_expressions: hir::ColumnSlots::empty(width),
+                default_expressions: hir::ColumnSlots::empty(width),
+                column_type_programs: hir::ColumnSlots::empty(width),
                 check_constraints: None,
                 rowid_available: false,
                 index_hint: hir::IndexHint::None,
@@ -1260,9 +1260,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     .map(crate::util::normalize_ident),
                 kind: hir::SourceKind::Derived(query),
                 columns: columns.into(),
-                generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                default_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                column_type_programs: vec![None; width],
+                generated_expressions: hir::ColumnSlots::empty(width),
+                default_expressions: hir::ColumnSlots::empty(width),
+                column_type_programs: hir::ColumnSlots::empty(width),
                 check_constraints: None,
                 rowid_available: false,
                 index_hint: hir::IndexHint::None,
@@ -1464,9 +1464,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 ),
                 kind: hir::SourceKind::Derived(query),
                 columns: columns.into(),
-                generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                default_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                column_type_programs: vec![None; width],
+                generated_expressions: hir::ColumnSlots::empty(width),
+                default_expressions: hir::ColumnSlots::empty(width),
+                column_type_programs: hir::ColumnSlots::empty(width),
                 check_constraints: None,
                 rowid_available: false,
                 index_hint: hir::IndexHint::None,
@@ -1608,7 +1608,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             let width = table.value().columns().len();
             (
                 hir::SourceColumns::Table(hir::TableColumns::new(table.handle())),
-                std::iter::repeat_with(|| None).take(width).collect(),
+                hir::ColumnSlots::empty(width),
             )
         } else {
             let analyzed_columns = self.source_columns(&table)?;
@@ -1618,35 +1618,44 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 columns.push(analyzed.column);
                 column_type_programs.push(analyzed.programs);
             }
-            (columns.into(), column_type_programs)
+            (columns.into(), column_type_programs.into())
         };
-        let generated_expressions = table
-            .value()
-            .columns()
+        let schema_columns = table.value().columns();
+        let generated_expressions = if schema_columns
             .iter()
-            .map(|column| {
-                if column.generated_expr().is_some() {
-                    hir::ColumnReadExpression::NotRequired
-                } else {
-                    hir::ColumnReadExpression::Absent
-                }
-            })
-            .collect();
+            .any(|column| column.generated_expr().is_some())
+        {
+            schema_columns
+                .iter()
+                .map(|column| {
+                    if column.generated_expr().is_some() {
+                        hir::ColumnReadExpression::NotRequired
+                    } else {
+                        hir::ColumnReadExpression::Absent
+                    }
+                })
+                .collect()
+        } else {
+            hir::ColumnSlots::empty(schema_columns.len())
+        };
         // A DEFAULT fills a column missing from a short B-tree record. A
         // virtual table returns every column itself.
         let reads_defaults = table.value().btree().is_some();
-        let default_expressions = table
-            .value()
-            .columns()
-            .iter()
-            .map(|column| {
-                if reads_defaults && column.default.is_some() {
-                    hir::ColumnReadExpression::NotRequired
-                } else {
-                    hir::ColumnReadExpression::Absent
-                }
-            })
-            .collect();
+        let default_expressions =
+            if reads_defaults && schema_columns.iter().any(|column| column.default.is_some()) {
+                schema_columns
+                    .iter()
+                    .map(|column| {
+                        if column.default.is_some() {
+                            hir::ColumnReadExpression::NotRequired
+                        } else {
+                            hir::ColumnReadExpression::Absent
+                        }
+                    })
+                    .collect()
+            } else {
+                hir::ColumnSlots::empty(schema_columns.len())
+            };
         let index_hint = match indexed {
             None => hir::IndexHint::None,
             Some(ast::Indexed::NotIndexed) => hir::IndexHint::NotIndexed,
@@ -1744,7 +1753,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         for column in table.value().columns() {
             if column.name.is_none()
                 || column.has_explicit_collation()
-                || schema.resolve_type(&column.ty_str, is_strict)?.is_some()
+                || (is_strict && schema.resolve_type(&column.ty_str, true)?.is_some())
             {
                 return Ok(false);
             }

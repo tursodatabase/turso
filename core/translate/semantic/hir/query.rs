@@ -288,6 +288,106 @@ pub enum ColumnReadExpression {
     Planned(Box<Expr>),
 }
 
+/// One value per column of a source. While every column holds the empty
+/// value, no list is stored; the first write to a column stores one.
+#[derive(Clone, Debug)]
+pub struct ColumnSlots<T: EmptySlot> {
+    width: usize,
+    values: Vec<T>,
+}
+
+pub trait EmptySlot: Clone + 'static {
+    const EMPTY: &'static Self;
+}
+
+impl EmptySlot for ColumnReadExpression {
+    const EMPTY: &'static Self = &ColumnReadExpression::Absent;
+}
+
+impl EmptySlot for Option<Box<BoundColumnTypePrograms>> {
+    const EMPTY: &'static Self = &None;
+}
+
+impl<T: EmptySlot> ColumnSlots<T> {
+    pub fn empty(width: usize) -> Self {
+        Self {
+            width,
+            values: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.width
+    }
+
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.width {
+            return None;
+        }
+        Some(self.values.get(index).unwrap_or(T::EMPTY))
+    }
+
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &T> + Clone + '_ {
+        (0..self.width).map(|index| &self[index])
+    }
+
+    #[cfg(test)]
+    pub fn stores_values(&self) -> bool {
+        !self.values.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn truncate(&mut self, width: usize) {
+        self.width = self.width.min(width);
+        self.values.truncate(self.width);
+    }
+
+    #[cfg(test)]
+    pub fn pop(&mut self) -> Option<T> {
+        let index = self.width.checked_sub(1)?;
+        let value = self.get(index).cloned();
+        self.truncate(index);
+        value
+    }
+}
+
+impl<T: EmptySlot> std::ops::Index<usize> for ColumnSlots<T> {
+    type Output = T;
+
+    #[inline]
+    fn index(&self, index: usize) -> &T {
+        self.get(index)
+            .unwrap_or_else(|| panic!("source has no column {index}"))
+    }
+}
+
+impl<T: EmptySlot> std::ops::IndexMut<usize> for ColumnSlots<T> {
+    fn index_mut(&mut self, index: usize) -> &mut T {
+        assert!(index < self.width, "source has no column {index}");
+        if self.values.is_empty() {
+            self.values = vec![T::EMPTY.clone(); self.width];
+        }
+        &mut self.values[index]
+    }
+}
+
+impl<T: EmptySlot> std::convert::From<Vec<T>> for ColumnSlots<T> {
+    fn from(values: Vec<T>) -> Self {
+        Self {
+            width: values.len(),
+            values,
+        }
+    }
+}
+
+impl<T: EmptySlot> std::iter::FromIterator<T> for ColumnSlots<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(values: I) -> Self {
+        values.into_iter().collect::<Vec<_>>().into()
+    }
+}
+
 const _: () =
     assert!(std::mem::size_of::<ColumnReadExpression>() == 2 * std::mem::size_of::<usize>());
 const _: () = assert!(
@@ -305,13 +405,13 @@ pub struct Source {
     pub columns: SourceColumns,
     /// Virtual generated-column expressions for this exact source occurrence,
     /// aligned with `columns` and materialized when the statement needs them.
-    pub generated_expressions: Vec<ColumnReadExpression>,
+    pub generated_expressions: ColumnSlots<ColumnReadExpression>,
     /// Read-time defaults for short records, aligned with `columns` and
     /// materialized when the statement needs them.
-    pub default_expressions: Vec<ColumnReadExpression>,
+    pub default_expressions: ColumnSlots<ColumnReadExpression>,
     /// Custom-type encode/decode programs aligned with `columns`. Plain and
     /// built-in typed columns contain `None`.
-    pub column_type_programs: Vec<Option<Box<BoundColumnTypePrograms>>>,
+    pub column_type_programs: ColumnSlots<Option<Box<BoundColumnTypePrograms>>>,
     /// CHECK constraints selected and instantiated for this exact DML target.
     /// `None` means this source does not enforce CHECKs for the current
     /// statement; `Some([])` means enforcement is active but no catalog CHECK
