@@ -7967,8 +7967,7 @@ const SPARE_AGG_PAYLOADS: usize = 8;
 ///   Returns NULL if no non-NULL values were seen (unless float arithmetic was used).
 /// - **Total**: Like Sum but always returns Float, defaulting to 0.0 for empty groups
 /// - **Min/Max**: Returns the tracked extreme value directly
-/// - **GroupConcat/StringAgg**: Returns the accumulated string, or an empty string when the
-///   accumulator is NULL but the frame still holds values (only empty strings are left)
+/// - **GroupConcat/StringAgg**: Returns the accumulated string
 /// - **JsonGroup***: Parses accumulated raw JSONB bytes into proper JSON output
 pub fn op_agg_context_load(
     _program: &Program,
@@ -9331,21 +9330,20 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
                 0
             };
             let remove_len = value_len.checked_add(separator_len).or_overflow()?;
-            match acc {
-                Value::Text(text) if remove_len < text.as_str().len() => {
-                    if !text.as_str().is_char_boundary(remove_len) {
-                        return Err(LimboError::InternalError(format!(
-                            "GroupConcat xInverse removes {remove_len} bytes from {}",
-                            text.as_str().len()
-                        )));
-                    }
-                    text.value.to_mut().drain(..remove_len);
-                }
-                Value::Text(_) | Value::Null => {
-                    *acc = Value::Null;
-                    separator_lengths.clear();
-                }
-                _ => unreachable!("GroupConcat accumulator is Text or NULL"),
+            let Value::Text(text) = acc else {
+                return Ok(());
+            };
+            let accumulated_len = text.as_str().len();
+            if remove_len < accumulated_len && !text.as_str().is_char_boundary(remove_len) {
+                return Err(LimboError::InternalError(format!(
+                    "GroupConcat xInverse removes {remove_len} bytes from {accumulated_len}"
+                )));
+            }
+            if remove_len >= accumulated_len {
+                *acc = Value::Null;
+                separator_lengths.clear();
+            } else {
+                text.value.to_mut().drain(..remove_len);
             }
         }
         AggFunc::Min
