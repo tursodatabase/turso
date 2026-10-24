@@ -18,7 +18,7 @@ use crate::{
         },
         fkeys::{
             build_index_affinity_string, emit_guarded_fk_decrement, open_read_index,
-            open_read_table, ForeignKeyActions,
+            open_read_table, table_scan_match_any, ForeignKeyActions,
         },
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
@@ -35,7 +35,7 @@ use crate::{
     CaptureDataChangesExt, Connection,
 };
 use tracing::{instrument, Level};
-use turso_parser::ast::TriggerEvent;
+use turso_parser::ast::{RefAct, TriggerEvent};
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_delete(
@@ -367,12 +367,16 @@ pub fn emit_fk_child_decrement_on_delete(
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_for_child(child_table_name, None)
     })? {
-        // Both immediate and deferred child FKs maintain a counter: when the
-        // parent delete finds this child and bumps the violation counter, the
-        // cascade that then removes the child must give that count back, or an
-        // unrelated statement/transaction-end check fails (issue #9290). Each
-        // FK decrements its own counter via `fk_ref.fk.deferred` below.
-        //
+        // An immediate FK only has a count to give back if the parent-side
+        // delete check counted it, which happens for ON DELETE NO ACTION only
+        // (RESTRICT halts at once; CASCADE/SET NULL/SET DEFAULT never count).
+        // Decrementing for any other action would cancel some other FK's
+        // pending violation. This lets a cascade through one FK clear the
+        // NO ACTION violation of another FK on the same child (issue #9290).
+        let immediate = !fk_ref.fk.deferred;
+        if immediate && !matches!(fk_ref.fk.on_delete, RefAct::NoAction) {
+            continue;
+        }
         // Fast path: if any FK column is NULL can't be a violation
         let null_skip = program.allocate_label();
         for cname in &fk_ref.fk.child_columns {
@@ -443,6 +447,17 @@ pub fn emit_fk_child_decrement_on_delete(
             // Parent MISSING, decrement is guarded by FkIfZero to avoid underflow
             program.preassign_label_to_next_insn(missing);
             program.emit_insn(Insn::Close { cursor_id: pcur });
+            if immediate {
+                emit_skip_if_another_child_refs_key(
+                    program,
+                    &fk_ref,
+                    child_tbl,
+                    child_cursor_id,
+                    child_rowid_reg,
+                    database_id,
+                    done,
+                )?;
+            }
             emit_guarded_fk_decrement(program, done, fk_ref.fk.deferred);
             program.preassign_label_to_next_insn(done);
         } else {
@@ -490,12 +505,84 @@ pub fn emit_fk_child_decrement_on_delete(
                 num_regs: n,
             });
             program.emit_insn(Insn::Close { cursor_id: icur });
+            if immediate {
+                emit_skip_if_another_child_refs_key(
+                    program,
+                    &fk_ref,
+                    child_tbl,
+                    child_cursor_id,
+                    child_rowid_reg,
+                    database_id,
+                    ok,
+                )?;
+            }
             emit_guarded_fk_decrement(program, ok, fk_ref.fk.deferred);
             program.preassign_label_to_next_insn(ok);
             program.emit_insn(Insn::Close { cursor_id: icur });
         }
         program.preassign_label_to_next_insn(null_skip);
     }
+    Ok(())
+}
+
+/// The parent-side delete check counts one immediate violation per deleted
+/// parent key and FK, not one per child row. So only the last child row that
+/// still references the missing key may give that count back; while another
+/// child row (other than the one being deleted) references it, jump to `skip`.
+#[allow(clippy::too_many_arguments)]
+fn emit_skip_if_another_child_refs_key(
+    program: &mut ProgramBuilder,
+    fk_ref: &crate::schema::ResolvedFkRef,
+    child_tbl: &BTreeTable,
+    child_cursor_id: usize,
+    child_rowid_reg: usize,
+    database_id: usize,
+    skip: crate::vdbe::BranchOffset,
+) -> crate::Result<()> {
+    let n = fk_ref.fk.child_columns.len();
+    let key_start = program.alloc_registers(n);
+    for (i, cname) in fk_ref.fk.child_columns.iter().enumerate() {
+        let (pos, col) = child_tbl.get_column(cname).unwrap();
+        if col.is_rowid_alias() {
+            program.emit_insn(Insn::Copy {
+                src_reg: child_rowid_reg,
+                dst_reg: key_start + i,
+                extra_amount: 0,
+            });
+        } else {
+            program.emit_insn(Insn::Column {
+                cursor_id: child_cursor_id,
+                column: pos,
+                dest: key_start + i,
+                default: None,
+            });
+        }
+    }
+    let found_other = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: found_other,
+    });
+    table_scan_match_any(
+        program,
+        &fk_ref.child_table,
+        &fk_ref.fk.child_columns,
+        key_start,
+        Some(child_rowid_reg),
+        database_id,
+        |p| {
+            p.emit_insn(Insn::Integer {
+                value: 1,
+                dest: found_other,
+            });
+            Ok(())
+        },
+    )?;
+    program.emit_insn(Insn::If {
+        reg: found_other,
+        target_pc: skip,
+        jump_if_null: false,
+    });
     Ok(())
 }
 
