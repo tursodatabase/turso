@@ -61,7 +61,6 @@ use turso_parser::ast;
 pub(crate) fn capture_catalog(
     schema: &Arc<Schema>,
     connection: &Connection,
-    dialect: &dyn crate::dialect::Dialect,
     search_path: Option<&[String]>,
 ) -> Result<semantic::catalog::SemanticCatalog> {
     semantic::catalog::SemanticCatalog::capture(
@@ -71,7 +70,6 @@ pub(crate) fn capture_catalog(
         connection.attached_databases(),
         connection.namespaces(),
         connection.experimental_custom_types_enabled(),
-        dialect,
         search_path,
     )
 }
@@ -161,12 +159,7 @@ pub fn translate(
     } else {
         connection.search_path()
     };
-    let captured = capture_catalog(
-        schema,
-        &connection,
-        dialect.as_ref(),
-        search_path.as_deref(),
-    )?;
+    let captured = capture_catalog(schema, &connection, search_path.as_deref())?;
     let catalog = semantic_context(&captured, syms, &connection, dialect)?;
 
     walk_stmt_expressions(&stmt, &mut |expr| {

@@ -1597,7 +1597,7 @@ fn try_aggregate_rewrite(
         .collect::<Vec<_>>();
     let result_name = output.name.clone();
     let result_column = hir::SourceColumn {
-        name: result_name,
+        name: result_name.into(),
         type_fact: output.type_fact.clone(),
         affinity: output.schema_affinity,
         has_affinity: output.has_affinity,
@@ -1656,7 +1656,7 @@ fn try_aggregate_rewrite(
             .iter()
             .enumerate()
             .map(|(index, column)| hir::SourceColumn {
-                name: format!("correlation_key_{index}"),
+                name: format!("correlation_key_{index}").into(),
                 type_fact: column.type_fact.clone(),
                 affinity: column.affinity,
                 has_affinity: column.has_affinity,
@@ -1673,7 +1673,7 @@ fn try_aggregate_rewrite(
         name: format!("scalar_subquery_{}", query_id.index()),
         alias: None,
         kind: hir::SourceKind::Derived(query_id),
-        columns,
+        columns: columns.into(),
         generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
         default_expressions: vec![hir::ColumnReadExpression::Absent; width],
         column_type_programs: vec![None; width],

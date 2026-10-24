@@ -703,7 +703,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     .columns
                     .get(index)
                     .map(|column| crate::util::normalize_ident(column.col_name.as_str()))
-                    .unwrap_or(column.name),
+                    .unwrap_or_else(|| column.name.to_string()),
                 type_fact: column.type_fact,
                 affinity: column.affinity,
                 has_affinity: column.has_affinity,
@@ -759,7 +759,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     .columns
                     .get(index)
                     .map(|column| crate::util::normalize_ident(column.col_name.as_str()))
-                    .unwrap_or(column.name),
+                    .unwrap_or_else(|| column.name.to_string()),
                 type_fact: column.type_fact,
                 affinity: column.affinity,
                 has_affinity: column.has_affinity,

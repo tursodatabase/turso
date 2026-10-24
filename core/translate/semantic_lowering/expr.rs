@@ -5313,6 +5313,7 @@ mod tests {
                 schema: Arc::new(schema),
             }],
             unqualified_database_search_path: vec![hir::DatabaseId::new(MAIN_DB_ID)],
+            empty_temp_schema: None,
             has_temp_database: false,
             search_path_configured: false,
         };
@@ -5501,7 +5502,7 @@ mod tests {
         rowid_alias: bool,
     ) -> hir::SourceColumn {
         hir::SourceColumn {
-            name: name.to_string(),
+            name: name.into(),
             type_fact: TypeFact::known(storage),
             affinity,
             has_affinity: true,
@@ -5525,7 +5526,7 @@ mod tests {
             name: "items".to_string(),
             alias: None,
             kind,
-            columns,
+            columns: columns.into(),
             generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
             default_expressions: vec![hir::ColumnReadExpression::Absent; width],
             column_type_programs: vec![None; width],

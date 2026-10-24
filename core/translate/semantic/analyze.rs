@@ -176,6 +176,7 @@ pub(super) struct Analyzer<'context, 'catalog, 'ast> {
     /// standard operators even on custom-typed columns, so the values an
     /// index on the column stores are the ones a read computes.
     pub(super) standard_operators_only: bool,
+    pub(super) built_in_declared_types: Vec<Arc<super::hir::DeclaredType>>,
     /// Stored view SELECTs live in the catalog and are analyzed like the
     /// statement's own AST, so the catalog must outlive the AST borrow.
     _catalog_outlives_ast: std::marker::PhantomData<&'ast &'catalog ()>,
@@ -247,6 +248,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             cte_scopes: Vec::new(),
             views_in_progress: Vec::new(),
             standard_operators_only: false,
+            built_in_declared_types: Vec::new(),
             aggregate_counts: HashMap::default(),
             aggregate_hosts: Vec::new(),
             register_source: None,
@@ -278,7 +280,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let columns = inputs
             .iter()
             .map(|name| SourceColumn {
-                name: name.clone(),
+                name: name.as_str().into(),
                 type_fact: TypeFact::dynamic(),
                 affinity: Affinity::Blob,
                 has_affinity: false,
@@ -295,7 +297,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             name: "register inputs".to_string(),
             alias: None,
             kind: SourceKind::SchemaExpression,
-            columns,
+            columns: columns.into(),
             generated_expressions: vec![ColumnReadExpression::Absent; width],
             default_expressions: vec![ColumnReadExpression::Absent; width],
             column_type_programs: vec![None; width],
@@ -323,7 +325,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }))
     }
 
-    pub(super) const fn context(&self) -> &SemanticContext<'catalog> {
+    pub(super) const fn context(&self) -> &'context SemanticContext<'catalog> {
         self.context
     }
 
@@ -2657,7 +2659,7 @@ mod tests {
     }
 
     #[test]
-    fn select_star_with_where_copies_each_column_binding_once() {
+    fn select_star_with_where_makes_no_column_binding() {
         let mut schema = Schema::new();
         let columns: Vec<String> = (0..64).map(|column| format!("c{column} INTEGER")).collect();
         let table = BTreeTable::from_sql(
@@ -2671,15 +2673,41 @@ mod tests {
         schema
             .add_btree_table(Arc::new(table))
             .expect("table name is unique");
-        crate::translate::semantic::scope::tests::COLUMN_BINDINGS_COPIED
-            .with(|copied| copied.set(0));
+        crate::translate::semantic::scope::tests::COLUMN_BINDINGS_MADE.with(|made| made.set(0));
         analyze_sql_with_schema(&schema, "SELECT * FROM wide WHERE id = 1")
             .expect("SELECT analyzes");
-        let copied = crate::translate::semantic::scope::tests::COLUMN_BINDINGS_COPIED
-            .with(|copied| copied.get());
+        let made =
+            crate::translate::semantic::scope::tests::COLUMN_BINDINGS_MADE.with(|made| made.get());
 
-        // Adding the table makes its columns visible by copying each one.
-        assert_eq!(copied, 65);
+        assert_eq!(made, 0);
+    }
+
+    #[test]
+    fn columns_with_the_same_declared_type_share_one_declaration() {
+        let mut schema = Schema::new();
+        let table = BTreeTable::from_sql("CREATE TABLE t(a INTEGER, b INTEGER, c TEXT)", 2)
+            .expect("table schema parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("table name is unique");
+        let document =
+            analyze_sql_with_schema(&schema, "SELECT a FROM t").expect("SELECT analyzes");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let query = document.query(root.query).expect("query exists");
+        let first = query.blocks[0].from.as_ref().expect("query has FROM").first;
+        let source = document.source(first).expect("source exists");
+        let declared = |column: usize| {
+            source.columns[column]
+                .type_fact
+                .declared
+                .clone()
+                .expect("column has a declared type")
+        };
+
+        assert!(Arc::ptr_eq(&declared(0), &declared(1)));
+        assert!(!Arc::ptr_eq(&declared(0), &declared(2)));
     }
 
     #[test]
@@ -2726,6 +2754,40 @@ mod tests {
             output_lists_set("SELECT * FROM t WHERE id = 1 ORDER BY a"),
             2
         );
+    }
+
+    #[test]
+    fn planning_without_expression_indexes_searches_no_expressions() {
+        let symbols = SymbolTable::new();
+        let walks = |index_sql: &str| {
+            let mut schema = Schema::new();
+            let table = Arc::new(
+                BTreeTable::from_sql("CREATE TABLE t(a INTEGER, b INTEGER)", 2)
+                    .expect("table schema parses"),
+            );
+            schema
+                .add_btree_table(table.clone())
+                .expect("table name is unique");
+            let index = Index::from_sql(&symbols, index_sql, 3, &table).expect("index parses");
+            schema
+                .add_index(Arc::new(index))
+                .expect("index name is unique");
+            let document = analyze_sql_with_schema(&schema, "SELECT a FROM t WHERE b IN (1, 2, 3)")
+                .expect("SELECT analyzes");
+            crate::translate::semantic_to_plan::tests::EXPRESSION_INDEX_WALKS
+                .with(|walks| walks.set(0));
+            crate::translate::semantic_to_plan::HirPlan::build(
+                Arc::new(document),
+                &schema,
+                &crate::translate::optimizer::CostModelParams::default(),
+            )
+            .expect("SELECT plans");
+            crate::translate::semantic_to_plan::tests::EXPRESSION_INDEX_WALKS
+                .with(|walks| walks.get())
+        };
+
+        assert_eq!(walks("CREATE INDEX i ON t(a)"), 0);
+        assert!(walks("CREATE INDEX i ON t(a + b)") > 0);
     }
 
     fn schema_with_custom_columns() -> Schema {
@@ -3625,7 +3687,7 @@ mod tests {
         assert_eq!(source.alias.as_deref(), Some("derived"));
         assert!(!source.rowid_available);
         assert_eq!(source.columns.len(), 2);
-        assert_eq!(source.columns[0].name, "item_text");
+        assert_eq!(&*source.columns[0].name, "item_text");
         assert_eq!(source.columns[0].type_fact.storage, Some(Type::Text));
         assert_eq!(
             source.columns[0]
@@ -3635,7 +3697,7 @@ mod tests {
                 .value(),
             &crate::translate::collate::CollationSeq::NoCase
         );
-        assert_eq!(source.columns[1].name, "item_key");
+        assert_eq!(&*source.columns[1].name, "item_key");
         assert!(matches!(
             outer_block.outputs[0].expr,
             Expr::Column(reference) if reference.source == source.id && reference.column == 0
@@ -5062,7 +5124,7 @@ mod tests {
         assert_eq!(source.owner, SourceOwner::QueryBlock(root_block.id));
         assert_eq!(source.alias.as_deref(), Some("p"));
         assert!(!source.rowid_available);
-        assert_eq!(source.columns[1].name, "item_text");
+        assert_eq!(&*source.columns[1].name, "item_text");
         assert!(matches!(
             root_block.outputs[0].expr,
             Expr::Column(reference) if reference.source == source.id && reference.column == 1
@@ -5696,7 +5758,7 @@ mod tests {
             group_source
                 .columns
                 .iter()
-                .map(|column| column.name.as_str())
+                .map(|column| column.name.as_ref())
                 .collect::<Vec<_>>(),
             [
                 "id",
@@ -6626,7 +6688,7 @@ mod tests {
         assert!(block
             .outputs
             .iter()
-            .zip(&source.columns)
+            .zip(source.columns.iter())
             .all(|(output, column)| output.type_fact == column.type_fact));
     }
 
@@ -9825,8 +9887,8 @@ mod tests {
         assert!(matches!(input.kind, SourceKind::SchemaExpression));
         assert_eq!(input.owner, SourceOwner::Root);
         assert_eq!(input.columns.len(), 2);
-        assert_eq!(input.columns[0].name, "value");
-        assert_eq!(input.columns[1].name, "minimum");
+        assert_eq!(&*input.columns[0].name, "value");
+        assert_eq!(&*input.columns[1].name, "minimum");
         assert_eq!(input.columns[0].type_fact.storage, Some(Type::Integer));
 
         let Expr::Case { when_then, .. } = &program.body else {
@@ -11312,7 +11374,7 @@ mod tests {
             .source(program.input_source)
             .expect("domain CHECK input exists");
         assert_eq!(input.columns.len(), 1);
-        assert_eq!(input.columns[0].name, "value");
+        assert_eq!(&*input.columns[0].name, "value");
         assert_eq!(input.columns[0].type_fact.storage, target.type_fact.storage);
         assert!(input.columns[0].type_fact.declared.is_none());
         let Expr::Binary { lhs, .. } = &program.body else {

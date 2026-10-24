@@ -903,7 +903,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let columns = defs
             .iter()
             .map(|def| hir::SourceColumn {
-                name: def.name.clone(),
+                name: def.name.as_str().into(),
                 type_fact: def.value.type_fact.clone(),
                 affinity: def.value.affinity,
                 has_affinity: def.value.has_affinity,
@@ -1145,7 +1145,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let columns = cte_columns
             .iter()
             .map(|column| hir::SourceColumn {
-                name: column.name.clone(),
+                name: column.name.as_str().into(),
                 type_fact: column.type_fact.clone(),
                 affinity: if recursive {
                     Affinity::Blob
@@ -1173,7 +1173,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 } else {
                     hir::SourceKind::Cte(cte)
                 },
-                columns,
+                columns: columns.into(),
                 generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
                 default_expressions: vec![hir::ColumnReadExpression::Absent; width],
                 column_type_programs: vec![None; width],
@@ -1259,7 +1259,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     .map(ast::Name::as_str)
                     .map(crate::util::normalize_ident),
                 kind: hir::SourceKind::Derived(query),
-                columns,
+                columns: columns.into(),
                 generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
                 default_expressions: vec![hir::ColumnReadExpression::Absent; width],
                 column_type_programs: vec![None; width],
@@ -1443,7 +1443,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
         for (column, view_column) in columns.iter_mut().zip(&view.columns) {
             if let Some(view_name) = &view_column.name {
-                column.name.clone_from(view_name);
+                column.name = view_name.as_str().into();
             }
         }
         let width = columns.len();
@@ -1463,7 +1463,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         .unwrap_or(name),
                 ),
                 kind: hir::SourceKind::Derived(query),
-                columns,
+                columns: columns.into(),
                 generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
                 default_expressions: vec![hir::ColumnReadExpression::Absent; width],
                 column_type_programs: vec![None; width],
@@ -1502,7 +1502,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let name = unique_subquery_column_name(self.subquery_column_name(output), &names);
                 names.push(name.clone());
                 hir::SourceColumn {
-                    name,
+                    name: name.into(),
                     type_fact: output.type_fact.clone(),
                     affinity,
                     has_affinity,
@@ -1536,7 +1536,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             hir::Expr::Column(reference) => self
                 .source(reference.source)
                 .and_then(|source| source.columns.get(reference.column))
-                .map(|column| column.name.clone()),
+                .map(|column| column.name.to_string()),
             hir::Expr::RowId(_) => output
                 .name
                 .rsplit('.')
@@ -1678,7 +1678,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         argument_predicates: Vec::new(),
                     },
                 },
-                columns,
+                columns: columns.into(),
                 generated_expressions,
                 default_expressions,
                 column_type_programs,
@@ -1744,12 +1744,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let database = table.database().ok_or_else(|| {
             LimboError::InternalError("table source has no owning database".to_string())
         })?;
+        let schema = self.context().schema(database)?;
         let mut columns = Vec::with_capacity(table.value().columns().len());
         for (index, column) in table.value().columns().iter().enumerate() {
-            let resolved_type = self
-                .context()
-                .schema(database)?
-                .resolve_type(&column.ty_str, is_strict)?;
+            let resolved_type = schema.resolve_type(&column.ty_str, is_strict)?;
             let (type_fact, programs) = match resolved_type {
                 Some(resolved) if !type_programs => {
                     let (type_fact, _) =
@@ -1803,15 +1801,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     )
                 }
                 None if column.ty_str.is_empty() => (TypeFact::known(column.ty()), None),
-                None => (
-                    TypeFact::declared(DeclaredType {
-                        name: column.ty_str.clone(),
-                        storage: column.ty(),
-                        custom_chain: Vec::new(),
-                        array_dimensions: column.array_dimensions(),
-                    }),
-                    None,
-                ),
+                None => (self.built_in_declared_type(column), None),
             };
             let collation = column.collation_opt().map(|collation| {
                 let name = collation.to_string();
@@ -1820,10 +1810,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             });
             columns.push(AnalyzedSourceColumn {
                 column: hir::SourceColumn {
-                    name: column
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("column{}", index + 1)),
+                    name: match &column.name {
+                        Some(name) => name.as_str().into(),
+                        None => format!("column{}", index + 1).into(),
+                    },
                     type_fact,
                     affinity: column.affinity(),
                     has_affinity: true,
@@ -1835,6 +1825,25 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             });
         }
         Ok(columns)
+    }
+
+    fn built_in_declared_type(&mut self, column: &crate::schema::Column) -> TypeFact {
+        let same_type = |declared: &&Arc<DeclaredType>| {
+            declared.name == column.ty_str
+                && declared.storage == column.ty()
+                && declared.array_dimensions == column.array_dimensions()
+        };
+        if let Some(declared) = self.built_in_declared_types.iter().find(same_type) {
+            return TypeFact::shared_declared(declared.clone());
+        }
+        let declared = Arc::new(DeclaredType {
+            name: column.ty_str.clone(),
+            storage: column.ty(),
+            custom_chain: Vec::new(),
+            array_dimensions: column.array_dimensions(),
+        });
+        self.built_in_declared_types.push(declared.clone());
+        TypeFact::shared_declared(declared)
     }
 }
 

@@ -297,7 +297,7 @@ pub struct Source {
     pub name: String,
     pub alias: Option<String>,
     pub kind: SourceKind,
-    pub columns: Vec<SourceColumn>,
+    pub columns: crate::sync::Arc<[SourceColumn]>,
     /// Virtual generated-column expressions for this exact source occurrence,
     /// aligned with `columns` and materialized when the statement needs them.
     pub generated_expressions: Vec<ColumnReadExpression>,
@@ -362,7 +362,7 @@ pub enum PseudoSource {
 
 #[derive(Clone, Debug)]
 pub struct SourceColumn {
-    pub name: String,
+    pub name: crate::sync::Arc<str>,
     pub type_fact: TypeFact,
     pub affinity: Affinity,
     pub has_affinity: bool,

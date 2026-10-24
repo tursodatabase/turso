@@ -4132,6 +4132,15 @@ impl<'a> HirPlanContext<'a> {
         sources: &mut [HirPlanSource],
         expression: &hir::Expr,
     ) -> Result<()> {
+        let reads_expression_index = sources.iter().any(|planned| {
+            matches!(planned, HirPlanSource::BTree(_))
+                && self.has_expression_index_key(planned.source())
+        });
+        if !reads_expression_index {
+            return Ok(());
+        }
+        #[cfg(test)]
+        tests::EXPRESSION_INDEX_WALKS.with(|walks| walks.set(walks.get() + 1));
         let mut result = Ok(());
         expression.for_each(&mut |part| {
             // A column read on its own is never an index expression.
@@ -4158,12 +4167,7 @@ impl<'a> HirPlanContext<'a> {
             // Outer-query reads are planned by their owning query.
             return Ok(());
         };
-        let has_expression_key = self
-            .definition(source)
-            .index_expressions
-            .iter()
-            .any(|index| index.columns.iter().any(Option::is_some) || index.predicate.is_some());
-        if !has_expression_key {
+        if !self.has_expression_index_key(source) {
             return Ok(());
         }
 
@@ -4173,6 +4177,13 @@ impl<'a> HirPlanContext<'a> {
         }
         planned.register_expression_index_usage(expression.clone(), columns_mask);
         Ok(())
+    }
+
+    fn has_expression_index_key(&self, source: SourceId) -> bool {
+        self.definition(source)
+            .index_expressions
+            .iter()
+            .any(|index| index.columns.iter().any(Option::is_some) || index.predicate.is_some())
     }
 }
 
@@ -4349,7 +4360,12 @@ fn column_usage(source: SourceId, usage: &[ColumnUsage]) -> Result<(ColumnUsedMa
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    thread_local! {
+        /// How many expressions planning searched for expression index reads on this thread.
+        pub(crate) static EXPRESSION_INDEX_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     use super::*;
     use crate::{
         schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, Index, Schema, Table, Type},
@@ -4418,9 +4434,9 @@ mod tests {
             name: "items".to_string(),
             alias: Some("i".to_string()),
             kind: SourceKind::Table(resolved_table("items")),
-            columns: vec![
+            columns: crate::sync::Arc::from(vec![
                 SourceColumn {
-                    name: "first".to_string(),
+                    name: "first".into(),
                     type_fact: TypeFact::known(Type::Integer),
                     affinity: Affinity::Integer,
                     has_affinity: true,
@@ -4429,7 +4445,7 @@ mod tests {
                     rowid_alias: false,
                 },
                 SourceColumn {
-                    name: "second".to_string(),
+                    name: "second".into(),
                     type_fact: TypeFact::known(Type::Text),
                     affinity: Affinity::Text,
                     has_affinity: true,
@@ -4437,7 +4453,7 @@ mod tests {
                     hidden: false,
                     rowid_alias: false,
                 },
-            ],
+            ]),
             generated_expressions: vec![ColumnReadExpression::Absent; 2],
             default_expressions: vec![ColumnReadExpression::Absent; 2],
             column_type_programs: vec![None; 2],
@@ -4470,7 +4486,7 @@ mod tests {
                 from: Box::new(from),
                 columns: Vec::new(),
             }),
-            columns: Vec::new(),
+            columns: Vec::new().into(),
             generated_expressions: Vec::new(),
             default_expressions: Vec::new(),
             column_type_programs: Vec::new(),
@@ -5597,7 +5613,7 @@ mod tests {
         derived_source.owner = SourceOwner::QueryBlock(root_block_id);
         derived_source.database = None;
         derived_source.kind = SourceKind::Derived(child_query);
-        derived_source.columns.truncate(1);
+        derived_source.columns = derived_source.columns[..1].into();
         derived_source.generated_expressions.truncate(1);
         derived_source.default_expressions.truncate(1);
         derived_source.column_type_programs.truncate(1);
@@ -5672,7 +5688,7 @@ mod tests {
             id: cte_id,
             name: "numbers".to_string(),
             columns: vec![CteColumn {
-                name: source_column.name.clone(),
+                name: source_column.name.to_string(),
                 type_fact: source_column.type_fact.clone(),
                 affinity: source_column.affinity,
                 has_affinity: source_column.has_affinity,

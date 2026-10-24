@@ -1054,7 +1054,13 @@ impl Expr {
             let frame = frames.last_mut().expect("root expression frame exists");
             if let Some((index, child)) = frame.next_child(visitor) {
                 match visitor.pre_order(frame.expression, &mut frame.context, index, child)? {
+                    ControlFlow::Continue(context) if visitor.child(child, 0).is_none() => {
+                        let value = visitor.post_order(child, context, &[])?;
+                        frame.child_values.push(value);
+                    }
                     ControlFlow::Continue(context) => {
+                        #[cfg(test)]
+                        tests::CHILD_FRAMES_CREATED.with(|created| created.set(created.get() + 1));
                         frames.push(ExprFrame::new(child, context));
                     }
                     ControlFlow::Break(()) => {}
@@ -1322,9 +1328,32 @@ mod tests {
     thread_local! {
         /// How many expression walks on this thread allocated a stack of frames.
         pub(super) static FRAME_STACKS_CREATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// How many frames expression walks on this thread pushed for children.
+        pub(super) static CHILD_FRAMES_CREATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     use super::*;
+
+    #[test]
+    fn walking_children_without_children_pushes_no_frames() {
+        let row = Expr::Row(vec![
+            Expr::column(SourceId::new(0), 1),
+            Expr::Unary {
+                operator: UnaryOperator::Negative,
+                expr: Box::new(Expr::column(SourceId::new(0), 2)),
+            },
+            Expr::column(SourceId::new(0), 3),
+        ]);
+        CHILD_FRAMES_CREATED.with(|created| created.set(0));
+
+        let mut visited = Vec::new();
+        row.for_each(&mut |expression| {
+            visited.push(matches!(expression, Expr::Column(_)));
+        });
+
+        assert_eq!(visited, [false, true, false, true, true]);
+        assert_eq!(CHILD_FRAMES_CREATED.with(|created| created.get()), 1);
+    }
 
     #[test]
     fn walking_an_expression_without_children_creates_no_frame_stack() {

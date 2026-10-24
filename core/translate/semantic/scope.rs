@@ -2,6 +2,8 @@
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
+use std::borrow::Cow;
+
 use super::hir::{self, ColumnRef, OutputId, SourceId, TypeFact};
 use crate::{schema::Type, sync::Arc, vdbe::affinity::Affinity, Result};
 
@@ -102,8 +104,8 @@ pub(crate) struct ExpandedColumn {
 #[derive(Debug)]
 struct ColumnBinding {
     source: SourceId,
-    display_name: String,
-    lookup_name: String,
+    display_name: Arc<str>,
+    lookup_name: ColumnName,
     resolved: ResolvedScopeExpr,
     hidden: bool,
     /// The implicit rowid a parenthesized join group saved for one of its
@@ -112,13 +114,26 @@ struct ColumnBinding {
     /// The name a USING or NATURAL join compares: the column's own name,
     /// or for a column of a join group the unique name the group gave it,
     /// since SQLite looks the group's subquery up by column name.
-    using_name: String,
+    using_name: ColumnName,
+}
+
+#[derive(Clone, Debug)]
+struct ColumnName(Arc<str>);
+
+impl ColumnName {
+    fn matches(&self, name: &str) -> bool {
+        self.0.eq_ignore_ascii_case(name)
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl Clone for ColumnBinding {
     fn clone(&self) -> Self {
         #[cfg(test)]
-        tests::COLUMN_BINDINGS_COPIED.with(|copied| copied.set(copied.get() + 1));
+        tests::COLUMN_BINDINGS_MADE.with(|made| made.set(made.get() + 1));
         Self {
             source: self.source,
             display_name: self.display_name.clone(),
@@ -140,10 +155,16 @@ impl ColumnBinding {
                 column: index,
             }),
         };
+        Self::new(source.id, expr, column)
+    }
+
+    fn new(source: SourceId, expr: hir::Expr, column: &hir::SourceColumn) -> Self {
+        #[cfg(test)]
+        tests::COLUMN_BINDINGS_MADE.with(|made| made.set(made.get() + 1));
         Self {
-            source: source.id,
+            source,
             display_name: column.name.clone(),
-            lookup_name: crate::util::normalize_ident(&column.name),
+            lookup_name: ColumnName(column.name.clone()),
             resolved: ResolvedScopeExpr {
                 expr,
                 type_fact: column.type_fact.clone(),
@@ -153,7 +174,7 @@ impl ColumnBinding {
             },
             hidden: column.hidden,
             rowid_names: false,
-            using_name: crate::util::normalize_ident(&column.name),
+            using_name: ColumnName(column.name.clone()),
         }
     }
 
@@ -168,13 +189,120 @@ pub(crate) fn resolve_source_column(source: &hir::Source, name: &str) -> Result<
         .columns
         .iter()
         .enumerate()
-        .find(|(_, column)| crate::util::normalize_ident(&column.name) == normalized)
+        .find(|(_, column)| column.name.eq_ignore_ascii_case(&normalized))
         .map(|(index, column)| ColumnBinding::from_source(source, index, column).resolved())
         .ok_or_else(|| {
             crate::LimboError::ParseError(format!(
                 "cannot join using column {name} - column not present in both tables"
             ))
         })
+}
+
+/// A column as the scope's names find it: a column of a source, read in
+/// place, or a binding that a join group or a USING join changed.
+#[derive(Clone, Copy)]
+enum ColumnView<'a> {
+    Source {
+        source: &'a ScopeSource,
+        index: usize,
+    },
+    Binding(&'a ColumnBinding),
+}
+
+impl<'a> ColumnView<'a> {
+    fn source(self) -> SourceId {
+        match self {
+            Self::Source { source, .. } => source.id,
+            Self::Binding(binding) => binding.source,
+        }
+    }
+
+    fn display_name(self) -> &'a str {
+        match self {
+            Self::Source { source, index } => &source.columns[index].name,
+            Self::Binding(binding) => &binding.display_name,
+        }
+    }
+
+    fn lookup_name(self) -> &'a str {
+        match self {
+            Self::Source { source, index } => &source.columns[index].name,
+            Self::Binding(binding) => binding.lookup_name.as_str(),
+        }
+    }
+
+    fn lookup_matches(self, name: &str) -> bool {
+        self.lookup_name().eq_ignore_ascii_case(name)
+    }
+
+    fn using_name(self) -> &'a str {
+        match self {
+            Self::Source { source, index } => &source.columns[index].name,
+            Self::Binding(binding) => binding.using_name.as_str(),
+        }
+    }
+
+    fn using_matches(self, name: &str) -> bool {
+        self.using_name().eq_ignore_ascii_case(name)
+    }
+
+    fn hidden(self) -> bool {
+        match self {
+            Self::Source { source, index } => source.columns[index].hidden,
+            Self::Binding(binding) => binding.hidden,
+        }
+    }
+
+    fn rowid_names(self) -> bool {
+        match self {
+            Self::Source { .. } => false,
+            Self::Binding(binding) => binding.rowid_names,
+        }
+    }
+
+    fn expr(self) -> Cow<'a, hir::Expr> {
+        match self {
+            Self::Source { source, index } => match &source.group_values {
+                Some(values) => Cow::Borrowed(&values[index]),
+                None => Cow::Owned(hir::Expr::Column(ColumnRef {
+                    source: source.id,
+                    column: index,
+                })),
+            },
+            Self::Binding(binding) => Cow::Borrowed(&binding.resolved.expr),
+        }
+    }
+
+    fn resolved(self) -> ResolvedScopeExpr {
+        match self {
+            Self::Source { source, index } => {
+                let column = &source.columns[index];
+                ResolvedScopeExpr {
+                    expr: self.expr().into_owned(),
+                    type_fact: column.type_fact.clone(),
+                    affinity: column.affinity,
+                    has_affinity: column.has_affinity,
+                    collation: ExprCollation::inherited(column.collation.clone()),
+                }
+            }
+            Self::Binding(binding) => binding.resolved(),
+        }
+    }
+
+    fn to_binding(self) -> ColumnBinding {
+        match self {
+            Self::Source { source, index } => {
+                ColumnBinding::new(source.id, self.expr().into_owned(), &source.columns[index])
+            }
+            Self::Binding(binding) => binding.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum VisibleColumn {
+    AllOfSource(usize),
+    Binding(ColumnBinding),
 }
 
 #[derive(Clone, Debug)]
@@ -184,7 +312,9 @@ struct ScopeSource {
     table_name: String,
     database: Option<hir::DatabaseId>,
     database_qualified: bool,
-    columns: Vec<ColumnBinding>,
+    columns: Arc<[hir::SourceColumn]>,
+    /// For a parenthesized join group: the value each column reads.
+    group_values: Option<Vec<hir::Expr>>,
     rowid_available: bool,
     unqualified: bool,
     /// Lookup names of this source's columns that `table.*` reads as the
@@ -200,6 +330,19 @@ struct ScopeSource {
     /// qualified name finds the copy on the left instead, unless the join
     /// is a RIGHT JOIN.
     using_merged: Vec<(String, hir::MergedColumnValue)>,
+}
+
+impl ScopeSource {
+    fn column(&self, index: usize) -> ColumnView<'_> {
+        ColumnView::Source {
+            source: self,
+            index,
+        }
+    }
+
+    fn column_views(&self) -> impl Iterator<Item = ColumnView<'_>> + '_ {
+        (0..self.columns.len()).map(|index| self.column(index))
+    }
 }
 
 /// How a name of the outer query can reach a column of a parenthesized
@@ -302,7 +445,7 @@ struct ScopeOutput {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Scope {
     sources: Arc<Vec<ScopeSource>>,
-    visible_columns: Arc<Vec<ColumnBinding>>,
+    visible: Arc<Vec<VisibleColumn>>,
     outputs: Vec<ScopeOutput>,
     outer: Option<Arc<Scope>>,
     outer_resolution_blocked: bool,
@@ -349,14 +492,12 @@ impl Scope {
     pub(crate) fn add_source(&mut self, source: &hir::Source, unqualified: bool) {
         #[cfg(test)]
         tests::SOURCES_ADDED.with(|added| added.set(added.get() + 1));
-        let columns: Vec<_> = source
-            .columns
-            .iter()
-            .enumerate()
-            .map(|(index, column)| ColumnBinding::from_source(source, index, column))
-            .collect();
+        let group_values = match &source.kind {
+            hir::SourceKind::FromGroup(group) => Some(group.columns.clone()),
+            _ => None,
+        };
         if unqualified {
-            Arc::make_mut(&mut self.visible_columns).extend(columns.iter().cloned());
+            Arc::make_mut(&mut self.visible).push(VisibleColumn::AllOfSource(self.sources.len()));
         }
         Arc::make_mut(&mut self.sources).push(ScopeSource {
             id: source.id,
@@ -366,7 +507,8 @@ impl Scope {
             table_name: crate::util::normalize_ident(&source.name),
             database: source.database,
             database_qualified: source.alias.is_none(),
-            columns,
+            columns: source.columns.clone(),
+            group_values,
             rowid_available: source.rowid_available,
             unqualified,
             star_merged: Vec::new(),
@@ -390,15 +532,15 @@ impl Scope {
             .last_mut()
             .expect("source was just added");
         added.unqualified = true;
-        for (column, saved) in added.columns.iter().zip(&saved) {
+        for (column, saved) in added.column_views().zip(&saved) {
             if saved.visibility == GroupColumnVisibility::QualifiedOnly {
                 continue;
             }
-            let mut visible = column.clone();
+            let mut visible = column.to_binding();
             visible.hidden = saved.visibility == GroupColumnVisibility::HiddenFromStar;
             match &saved.kind {
                 SavedGroupColumnKind::Using { name } | SavedGroupColumnKind::Table { name, .. } => {
-                    visible.lookup_name.clone_from(name);
+                    visible.lookup_name = ColumnName(name.as_str().into());
                 }
                 // `*` never lists a saved rowid.
                 SavedGroupColumnKind::RowId { .. } => {
@@ -406,7 +548,7 @@ impl Scope {
                     visible.hidden = true;
                 }
             }
-            Arc::make_mut(&mut self.visible_columns).push(visible);
+            Arc::make_mut(&mut self.visible).push(VisibleColumn::Binding(visible));
         }
         added.saved = Some(saved);
     }
@@ -456,7 +598,7 @@ impl Scope {
                     },
                 });
             }
-            for (index, column) in source.columns.iter().enumerate() {
+            for (index, column) in source.column_views().enumerate() {
                 let mut saved = match &source.saved {
                     // A rowid entry is not copied through a second group.
                     Some(saved)
@@ -465,23 +607,23 @@ impl Scope {
                         continue
                     }
                     Some(saved) => saved[index].clone(),
-                    None if column.hidden => continue,
+                    None if column.hidden() => continue,
                     None => SavedGroupColumn {
                         kind: SavedGroupColumnKind::Table {
                             table: source.qualifier.clone(),
                             database: source.database,
-                            name: column.lookup_name.clone(),
+                            name: crate::util::normalize_ident(column.lookup_name()),
                         },
                         visibility: GroupColumnVisibility::Visible,
                     },
                 };
-                if own_using.contains(&column.lookup_name)
-                    || next_using.contains(&column.lookup_name)
+                if own_using.iter().any(|name| column.lookup_matches(name))
+                    || next_using.iter().any(|name| column.lookup_matches(name))
                 {
                     saved.visibility = GroupColumnVisibility::QualifiedOnly;
                 }
                 defs.push(GroupColumnDef {
-                    name: column.display_name.clone(),
+                    name: column.display_name().to_string(),
                     value: column.resolved(),
                     saved,
                 });
@@ -490,9 +632,8 @@ impl Scope {
                 // The first rowid name that is not a declared column.
                 if let Some(name) = ["_ROWID_", "ROWID", "OID"].into_iter().find(|name| {
                     !source
-                        .columns
-                        .iter()
-                        .any(|column| column.lookup_name.eq_ignore_ascii_case(name))
+                        .column_views()
+                        .any(|column| column.lookup_matches(name))
                 }) {
                     defs.push(GroupColumnDef {
                         name: name.to_string(),
@@ -584,9 +725,18 @@ impl Scope {
             !self.outer_resolution_blocked && !other.outer_resolution_blocked,
             "root-level source scopes must allow ordinary resolution"
         );
+        let first_appended_source = self.sources.len();
         Arc::make_mut(&mut self.sources).extend(Arc::unwrap_or_clone(other.sources));
-        Arc::make_mut(&mut self.visible_columns)
-            .extend(Arc::unwrap_or_clone(other.visible_columns));
+        Arc::make_mut(&mut self.visible).extend(
+            Arc::unwrap_or_clone(other.visible)
+                .into_iter()
+                .map(|visible| match visible {
+                    VisibleColumn::AllOfSource(source) => {
+                        VisibleColumn::AllOfSource(first_appended_source + source)
+                    }
+                    VisibleColumn::Binding(binding) => VisibleColumn::Binding(binding),
+                }),
+        );
     }
 
     pub(crate) fn without_outer(mut self) -> Self {
@@ -780,7 +930,7 @@ impl Scope {
             source
                 .using_merged
                 .iter()
-                .find(|(merged, _)| merged == name)
+                .find(|(merged, _)| merged.eq_ignore_ascii_case(name))
                 .map(|(_, value)| *value)
         };
         for source in self.sources.iter() {
@@ -814,9 +964,8 @@ impl Scope {
                     // the group's own name to be checked.
                     if matches.is_empty() && database.is_none() && source.qualifier == table {
                         if let Some(candidate) = source
-                            .columns
-                            .iter()
-                            .find(|candidate| candidate.lookup_name == column)
+                            .column_views()
+                            .find(|candidate| candidate.lookup_matches(column))
                         {
                             add(candidate.resolved(), None)?;
                         }
@@ -829,8 +978,8 @@ impl Scope {
                             SavedGroupColumnKind::RowId { .. } => column,
                         };
                         add(
-                            source.columns[index].resolved(),
-                            merged_value(source, &source.columns[index].using_name)
+                            source.column(index).resolved(),
+                            merged_value(source, source.column(index).using_name())
                                 .or_else(|| merged_value(source, name)),
                         )?;
                     }
@@ -848,9 +997,8 @@ impl Scope {
             }
             table_seen = true;
             let declared = source
-                .columns
-                .iter()
-                .find(|candidate| candidate.lookup_name == column);
+                .column_views()
+                .find(|candidate| candidate.lookup_matches(column));
             match declared {
                 Some(candidate) => add(candidate.resolved(), merged_value(source, column))?,
                 None if source.rowid_available && is_rowid_name(column) => {
@@ -938,8 +1086,8 @@ impl Scope {
         // an unmerged visible column makes an unqualified star ambiguous.
         let mut visible_sources = HashSet::default();
         let mut visible_identities = HashMap::default();
-        for column in self.visible_columns.iter().filter(|column| !column.hidden) {
-            visible_sources.insert(column.source);
+        for column in self.visible_columns().filter(|column| !column.hidden()) {
+            visible_sources.insert(column.source());
         }
         for source in self
             .sources
@@ -949,14 +1097,13 @@ impl Scope {
             let identity = (source.database, source.qualifier.as_str());
             if visible_identities.insert(identity, source.id).is_some() {
                 let column = self
-                    .visible_columns
-                    .iter()
-                    .find(|column| !column.hidden && column.source == source.id)
+                    .visible_columns()
+                    .find(|column| !column.hidden() && column.source() == source.id)
                     .expect("visible source must own a visible column");
                 crate::bail_parse_error!(
                     "ambiguous column name: {}.{}",
                     source.qualifier,
-                    column.display_name
+                    column.display_name()
                 );
             }
         }
@@ -968,35 +1115,34 @@ impl Scope {
         // `database.table.column`, which a source of the same name inside a
         // join group can make ambiguous.
         let several = self.sources.len() > 1;
-        self.visible_columns
-            .iter()
-            .filter(|column| !column.hidden)
+        self.visible_columns()
+            .filter(|column| !column.hidden())
             .map(|column| {
                 if bare_group {
-                    self.resolve_source_column(&column.lookup_name)?;
+                    self.resolve_source_column(&crate::util::normalize_ident(column.lookup_name()))?;
                 }
                 let source = self
                     .sources
                     .iter()
-                    .find(|source| source.id == column.source);
+                    .find(|source| source.id == column.source());
                 if let Some(source) = source.filter(|source| several && source.saved.is_none()) {
                     let collides = self
                         .saved_group_matches(&source.qualifier, source.database)
                         .into_iter()
                         .any(|(group, index)| {
                             let saved = group.saved.as_ref().expect("group");
-                            matches!(&saved[index].kind, SavedGroupColumnKind::Table { name, .. } if *name == column.lookup_name)
+                            matches!(&saved[index].kind, SavedGroupColumnKind::Table { name, .. } if column.lookup_matches(name))
                                 && !group
                                     .using_merged
                                     .iter()
-                                    .any(|(merged, _)| *merged == column.lookup_name)
+                                    .any(|(merged, _)| column.lookup_matches(merged))
                         });
                     if collides {
                         let written = match self.database_name(source.database) {
                             Some(database) => {
-                                format!("{database}.{}.{}", source.qualifier, column.display_name)
+                                format!("{database}.{}.{}", source.qualifier, column.display_name())
                             }
-                            None => format!("{}.{}", source.qualifier, column.display_name),
+                            None => format!("{}.{}", source.qualifier, column.display_name()),
                         };
                         crate::bail_parse_error!("ambiguous column name: {written}");
                     }
@@ -1004,16 +1150,16 @@ impl Scope {
                 let qualifier = self
                     .sources
                     .iter()
-                    .find(|source| source.id == column.source)
+                    .find(|source| source.id == column.source())
                     .map(|source| source.qualifier.clone())
                     .ok_or_else(|| {
                         crate::LimboError::InternalError(format!(
                             "visible column {} has no source in scope",
-                            column.display_name
+                            column.display_name()
                         ))
                     })?;
                 Ok(ExpandedColumn {
-                    name: column.display_name.clone(),
+                    name: column.display_name().to_string(),
                     qualifier,
                     resolved: column.resolved(),
                 })
@@ -1054,44 +1200,51 @@ impl Scope {
             let bare = self.sources.len() == 1;
             let mut expanded = Vec::new();
             for source in &matching {
-                for column in source.columns.iter().filter(|column| !column.hidden) {
+                for column in source.column_views().filter(|column| !column.hidden()) {
                     // With several sources, the column expands as
                     // `database.table.column`, which a source of the same
                     // name in another database does not make ambiguous.
-                    let resolved = if source.star_merged.contains(&column.lookup_name) {
+                    let resolved = if source
+                        .star_merged
+                        .iter()
+                        .any(|name| column.lookup_matches(name))
+                    {
                         self.merged_star_column(column)?
                     } else {
                         match source.database {
                             Some(database) => self.resolve_database_qualified(
                                 database,
                                 qualifier,
-                                &column.display_name,
+                                &column.display_name(),
                             )?,
-                            None => self.resolve_qualified(qualifier, &column.display_name)?,
+                            None => self.resolve_qualified(qualifier, &column.display_name())?,
                         }
                         .unwrap_or_else(|| column.resolved())
                     };
                     expanded.push(ExpandedColumn {
-                        name: column.display_name.clone(),
+                        name: column.display_name().to_string(),
                         qualifier: source.qualifier.clone(),
                         resolved,
                     });
                 }
             }
             for (source, index) in saved_matches {
-                let column = &source.columns[index];
+                let column = source.column(index);
                 let saved_name = self.saved_column_name(column);
                 // The group's subquery expands these under the group's
                 // own name, so a direct source cannot make them ambiguous.
                 // The one source of a FROM clause expands them as bare
                 // names, by the unique names the group gave them.
                 let resolved = if bare {
-                    let Some(resolved) = self.resolve_source_column(&column.using_name)? else {
-                        crate::bail_parse_error!("no such column: {}", column.display_name);
+                    let Some(resolved) = self.resolve_source_column(
+                        &crate::util::normalize_ident(column.using_name()),
+                    )?
+                    else {
+                        crate::bail_parse_error!("no such column: {}", column.display_name());
                     };
                     resolved
                 } else if source.star_merged.contains(&saved_name) {
-                    self.merged_star_column_named(&saved_name, &column.display_name)?
+                    self.merged_star_column_named(&saved_name, &column.display_name())?
                 } else {
                     column.resolved()
                 };
@@ -1099,7 +1252,7 @@ impl Scope {
                 // which it treats as a subquery, unless the group is the
                 // one source of the FROM clause.
                 expanded.push(ExpandedColumn {
-                    name: column.display_name.clone(),
+                    name: column.display_name().to_string(),
                     qualifier: if bare {
                         normalized.clone()
                     } else {
@@ -1112,17 +1265,20 @@ impl Scope {
         }
         let source = matching[0];
         source
-            .columns
-            .iter()
-            .filter(|column| !column.hidden)
+            .column_views()
+            .filter(|column| !column.hidden())
             .map(|column| {
-                let resolved = if source.star_merged.contains(&column.lookup_name) {
+                let resolved = if source
+                    .star_merged
+                    .iter()
+                    .any(|name| column.lookup_matches(name))
+                {
                     self.merged_star_column(column)?
                 } else {
                     column.resolved()
                 };
                 Ok(ExpandedColumn {
-                    name: column.display_name.clone(),
+                    name: column.display_name().to_string(),
                     qualifier: source.qualifier.clone(),
                     resolved,
                 })
@@ -1131,29 +1287,28 @@ impl Scope {
     }
 
     /// The name a column had before its join group made it unique.
-    fn saved_column_name(&self, column: &ColumnBinding) -> String {
+    fn saved_column_name(&self, column: ColumnView<'_>) -> String {
         self.sources
             .iter()
-            .find(|source| source.id == column.source)
+            .find(|source| source.id == column.source())
             .and_then(|source| {
                 let saved = source.saved.as_ref()?;
                 let index = source
-                    .columns
-                    .iter()
-                    .position(|candidate| candidate.display_name == column.display_name)?;
+                    .column_views()
+                    .position(|candidate| candidate.display_name() == column.display_name())?;
                 match &saved[index].kind {
                     SavedGroupColumnKind::Using { name }
                     | SavedGroupColumnKind::Table { name, .. } => Some(name.clone()),
                     SavedGroupColumnKind::RowId { .. } => None,
                 }
             })
-            .unwrap_or_else(|| column.lookup_name.clone())
+            .unwrap_or_else(|| crate::util::normalize_ident(column.lookup_name()))
     }
 
     /// The value `table.*` reads for a column a later USING merged: the one
     /// visible column of that name, as an unqualified reference would find.
-    fn merged_star_column(&self, column: &ColumnBinding) -> Result<ResolvedScopeExpr> {
-        self.merged_star_column_named(&column.lookup_name, &column.display_name)
+    fn merged_star_column(&self, column: ColumnView<'_>) -> Result<ResolvedScopeExpr> {
+        self.merged_star_column_named(column.lookup_name(), column.display_name())
     }
 
     fn merged_star_column_named(
@@ -1162,9 +1317,8 @@ impl Scope {
         display_name: &str,
     ) -> Result<ResolvedScopeExpr> {
         let mut matches = self
-            .visible_columns
-            .iter()
-            .filter(|visible| visible.lookup_name == lookup_name);
+            .visible_columns()
+            .filter(|visible| visible.lookup_matches(lookup_name));
         let Some(first) = matches.next() else {
             crate::bail_parse_error!("no such column: {display_name}");
         };
@@ -1197,10 +1351,10 @@ impl Scope {
         // One copy per source: a join group is one source with one column
         // of each name.
         let mut matches = self.sources.iter().filter_map(|source| {
-            self.visible_columns.iter().find(|column| {
-                column.source == source.id
-                    && (!natural || !column.hidden)
-                    && column.using_name == normalized
+            self.visible_columns().find(|column| {
+                column.source() == source.id
+                    && (!natural || !column.hidden())
+                    && column.using_matches(&normalized)
             })
         });
         let Some(column) = matches.next() else {
@@ -1226,19 +1380,18 @@ impl Scope {
             .filter(|column| !column.hidden)
             .filter_map(|right_column| {
                 let lookup = crate::util::normalize_ident(&right_column.name);
-                self.visible_columns
-                    .iter()
-                    .find(|left_column| !left_column.hidden && left_column.using_name == lookup)
-                    .map(|_| right_column.name.clone())
+                self.visible_columns()
+                    .find(|left_column| !left_column.hidden() && left_column.using_matches(&lookup))
+                    .map(|_| right_column.name.to_string())
             })
             .collect()
     }
 
     pub(crate) fn apply_using(&mut self, columns: &[hir::UsingColumn]) -> Result<()> {
         for using in columns {
-            let right_position = self.visible_columns.iter().position(|column| {
+            let right_position = self.visible_columns().position(|column| {
                 matches!(
-                    &column.resolved.expr,
+                    column.expr().as_ref(),
                     hir::Expr::Column(reference) if *reference == using.right
                 )
             });
@@ -1258,13 +1411,12 @@ impl Scope {
                     .push((lookup_name.clone(), using.value));
             }
             let left_position = self
-                .visible_columns
-                .iter()
+                .visible_columns()
                 .enumerate()
                 .find(|(position, column)| {
                     *position != right_position
-                        && column.using_name == lookup_name
-                        && same_join_column(&column.resolved.expr, &using.left)
+                        && column.using_matches(&lookup_name)
+                        && same_join_column(&column.expr(), &using.left)
                 })
                 .map(|(position, _)| position);
             let Some(left_position) = left_position else {
@@ -1284,7 +1436,10 @@ impl Scope {
                 collation: using.collation.clone(),
             }));
 
-            let left = &mut Arc::make_mut(&mut self.visible_columns)[left_position];
+            let visible = self.owned_visible_columns();
+            let VisibleColumn::Binding(left) = &mut visible[left_position] else {
+                unreachable!("owned visible columns are bindings");
+            };
             left.resolved = ResolvedScopeExpr {
                 expr: merged,
                 type_fact: using.type_fact.clone(),
@@ -1294,15 +1449,18 @@ impl Scope {
             };
             let left_source = left.source;
             let merged_expr = left.resolved.expr.clone();
-            Arc::make_mut(&mut self.visible_columns).remove(right_position);
+            visible.remove(right_position);
             // Every column of the right source with the merged name gives
             // way to the merged value: a join group can hold several
             // columns the name finds. Under a RIGHT JOIN the merged value
             // also replaces every other copy on the left, as SQLite's
             // `lookupName` lets the right-most table win.
             let right_join = using.value == hir::MergedColumnValue::Right;
-            Arc::make_mut(&mut self.visible_columns).retain(|column| {
-                if column.lookup_name != lookup_name {
+            visible.retain(|column| {
+                let VisibleColumn::Binding(column) = column else {
+                    unreachable!("owned visible columns are bindings");
+                };
+                if !column.lookup_name.matches(&lookup_name) {
                     return true;
                 }
                 if same_join_column(&column.resolved.expr, &merged_expr) {
@@ -1320,9 +1478,8 @@ impl Scope {
     fn resolve_source_column(&self, name: &str) -> Result<Option<ResolvedScopeExpr>> {
         let mut found = None;
         for column in self
-            .visible_columns
-            .iter()
-            .filter(|column| !column.rowid_names && column.lookup_name == name)
+            .visible_columns()
+            .filter(|column| !column.rowid_names() && column.lookup_matches(name))
         {
             if found.is_some() {
                 crate::bail_parse_error!("ambiguous column name: {}", name);
@@ -1338,11 +1495,7 @@ impl Scope {
         if !is_rowid_name(name) {
             return Ok(None);
         }
-        for column in self
-            .visible_columns
-            .iter()
-            .filter(|column| column.rowid_names)
-        {
+        for column in self.visible_columns().filter(|column| column.rowid_names()) {
             if found.is_some() {
                 crate::bail_parse_error!("ambiguous column name: {}", name);
             }
@@ -1386,6 +1539,34 @@ impl Scope {
                 .outer
                 .as_deref()
                 .is_some_and(|outer| outer.has_qualifier(qualifier))
+    }
+
+    fn visible_columns(&self) -> impl Iterator<Item = ColumnView<'_>> + '_ {
+        self.visible.iter().flat_map(|visible| {
+            let (source, binding) = match visible {
+                VisibleColumn::AllOfSource(source) => (Some(&self.sources[*source]), None),
+                VisibleColumn::Binding(binding) => (None, Some(ColumnView::Binding(binding))),
+            };
+            source
+                .into_iter()
+                .flat_map(ScopeSource::column_views)
+                .chain(binding)
+        })
+    }
+
+    fn owned_visible_columns(&mut self) -> &mut Vec<VisibleColumn> {
+        if self
+            .visible
+            .iter()
+            .any(|visible| matches!(visible, VisibleColumn::AllOfSource(_)))
+        {
+            let owned = self
+                .visible_columns()
+                .map(|column| VisibleColumn::Binding(column.to_binding()))
+                .collect();
+            self.visible = Arc::new(owned);
+        }
+        Arc::make_mut(&mut self.visible)
     }
 }
 
@@ -1436,8 +1617,8 @@ pub(crate) mod tests {
     thread_local! {
         /// How many sources were added to scopes on this thread.
         pub(crate) static SOURCES_ADDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-        /// How many column bindings were copied on this thread.
-        pub(crate) static COLUMN_BINDINGS_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// How many column bindings were made or copied on this thread.
+        pub(crate) static COLUMN_BINDINGS_MADE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// How many times a scope was given a block's outputs on this thread.
         pub(crate) static OUTPUT_LISTS_SET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
@@ -1454,7 +1635,7 @@ pub(crate) mod tests {
 
     fn column(name: &str, hidden: bool) -> SourceColumn {
         SourceColumn {
-            name: name.to_string(),
+            name: name.into(),
             type_fact: TypeFact::known(Type::Text),
             affinity: Affinity::Text,
             has_affinity: true,
@@ -1479,7 +1660,7 @@ pub(crate) mod tests {
             name: name.to_string(),
             alias: alias.map(str::to_string),
             kind: SourceKind::SchemaExpression,
-            columns,
+            columns: columns.into(),
             generated_expressions: vec![ColumnReadExpression::Absent; width],
             default_expressions: vec![ColumnReadExpression::Absent; width],
             column_type_programs: vec![None; width],

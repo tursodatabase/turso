@@ -155,7 +155,7 @@ pub(crate) fn hir_planning_conjuncts(
         }
     }
     let mut conjuncts = Vec::with_capacity(lifted.len());
-    for conjunct in &lifted {
+    for conjunct in lifted {
         split_column_between(conjunct, &mut conjuncts);
     }
     conjuncts
@@ -397,7 +397,7 @@ fn hir_literal_can_be_copied(expression: &crate::translate::semantic::hir::Expr)
 }
 
 fn split_column_between(
-    conjunct: &crate::translate::semantic::hir::Expr,
+    conjunct: crate::translate::semantic::hir::Expr,
     conjuncts: &mut Vec<crate::translate::semantic::hir::Expr>,
 ) {
     use crate::translate::semantic::hir::Expr;
@@ -411,21 +411,26 @@ fn split_column_between(
                 start_comparison,
                 end_comparison,
             } if matches!(expr.as_ref(), Expr::Column(_) | Expr::RowId(_)) => {
-                for (operator, bound, comparison) in [
-                    (ast::Operator::GreaterEquals, start, start_comparison),
-                    (ast::Operator::LessEquals, end, end_comparison),
+                for (operator, bound, comparison, lhs) in [
+                    (
+                        ast::Operator::GreaterEquals,
+                        start,
+                        start_comparison,
+                        expr.clone(),
+                    ),
+                    (ast::Operator::LessEquals, end, end_comparison, expr),
                 ] {
                     conjuncts.push(Expr::Binary {
-                        lhs: expr.clone(),
+                        lhs,
                         operator,
-                        rhs: bound.clone(),
+                        rhs: bound,
                         array_concat: false,
                         custom: None,
-                        comparison: Some(comparison.clone()),
+                        comparison: Some(comparison),
                     });
                 }
             }
-            conjunct => conjuncts.push(conjunct.clone()),
+            conjunct => conjuncts.push(conjunct),
         }
     }
 }

@@ -166,7 +166,7 @@ impl Analyzer<'_, '_, '_> {
         let columns = inputs
             .iter()
             .map(|input| SourceColumn {
-                name: input.name.clone(),
+                name: input.name.as_str().into(),
                 affinity: input_affinity(&input.type_fact),
                 has_affinity: true,
                 type_fact: input.type_fact.clone(),
@@ -183,7 +183,7 @@ impl Analyzer<'_, '_, '_> {
             name: "schema expression inputs".to_string(),
             alias: None,
             kind: SourceKind::SchemaExpression,
-            columns,
+            columns: columns.into(),
             generated_expressions: vec![ColumnReadExpression::Absent; width],
             default_expressions: vec![ColumnReadExpression::Absent; width],
             column_type_programs: vec![None; width],

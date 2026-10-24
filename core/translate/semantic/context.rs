@@ -13,7 +13,7 @@ use crate::{
     LimboError, Result, SymbolTable, MAIN_DB_ID, TEMP_DB_ID,
 };
 
-use super::catalog::SemanticCatalog;
+use super::catalog::{EmptyTempSchema, SemanticCatalog};
 use super::hir::{CatalogSnapshot, DatabaseId, DatabaseSnapshot};
 
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
@@ -106,6 +106,7 @@ impl<'catalog> SemanticContext<'catalog> {
         .map(|context| {
             context
                 .with_catalog(catalog)
+                .with_empty_temp_database_name(catalog)
                 .with_dqs_dml(dqs_dml)
                 .with_foreign_keys(foreign_keys_enabled)
                 .with_temp_database(catalog.has_temp_database)
@@ -115,6 +116,14 @@ impl<'catalog> SemanticContext<'catalog> {
 
     fn with_catalog(mut self, catalog: &'catalog SemanticCatalog) -> Self {
         self.catalog = Some(catalog);
+        self
+    }
+
+    fn with_empty_temp_database_name(mut self, catalog: &SemanticCatalog) -> Self {
+        if catalog.empty_temp_schema.is_some() {
+            self.database_names
+                .insert("temp".to_string(), DatabaseId::new(TEMP_DB_ID));
+        }
         self
     }
 
@@ -301,9 +310,7 @@ impl<'catalog> SemanticContext<'catalog> {
     /// an earlier lookup resolved against this catalog.
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         let schema = self
-            .database_schemas
-            .get(&DatabaseId::new(database_id))
-            .copied()
+            .database_schema(DatabaseId::new(database_id))
             .unwrap_or_else(|| panic!("database {database_id} is not in the catalog"));
         f(schema)
     }
@@ -532,18 +539,19 @@ impl<'catalog> SemanticContext<'catalog> {
     }
 
     pub(crate) fn schema(&self, database: DatabaseId) -> Result<&Schema> {
-        self.database_schemas
-            .get(&database)
-            .copied()
-            .ok_or_else(|| {
-                LimboError::InternalError(format!(
-                    "semantic catalog has no database {}",
-                    database.index()
-                ))
-            })
+        self.database_schema(database).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "semantic catalog has no database {}",
+                database.index()
+            ))
+        })
     }
 
     pub(crate) fn database_snapshots(&self) -> Vec<DatabaseSnapshot> {
+        let empty_temp_snapshot = self.empty_temp_schema().map(|empty_temp| DatabaseSnapshot {
+            database: DatabaseId::new(TEMP_DB_ID),
+            schema_version: empty_temp.schema_version(),
+        });
         let mut snapshots = self
             .database_schemas
             .iter()
@@ -551,6 +559,7 @@ impl<'catalog> SemanticContext<'catalog> {
                 database: *database,
                 schema_version: schema.schema_version,
             })
+            .chain(empty_temp_snapshot)
             .collect::<Vec<_>>();
         snapshots.sort_unstable_by_key(|snapshot| snapshot.database.index());
         snapshots
@@ -600,8 +609,7 @@ impl<'catalog> SemanticContext<'catalog> {
                 .unqualified_databases(&table_name, view_database)
                 .iter()
                 .any(|database| {
-                    self.database_schemas
-                        .get(database)
+                    self.database_schema(*database)
                         .is_some_and(|schema| schema.get_table(&table_name).is_some())
                 }),
         })
@@ -617,8 +625,7 @@ impl<'catalog> SemanticContext<'catalog> {
     ) -> Result<Option<(DatabaseId, &'catalog crate::schema::View)>> {
         let view_name = normalize_ident(name.name.as_str());
         let has_view = |database: &DatabaseId| {
-            self.database_schemas
-                .get(database)
+            self.database_schema(*database)
                 .is_some_and(|schema| schema.views.contains_key(&view_name))
         };
         let database = match &name.namespace {
@@ -637,9 +644,7 @@ impl<'catalog> SemanticContext<'catalog> {
             return Ok(None);
         };
         Ok(self
-            .database_schemas
-            .get(&database)
-            .copied()
+            .database_schema(database)
             .and_then(|schema| schema.views.get(&view_name))
             .map(|view| (database, view.as_ref())))
     }
@@ -670,8 +675,7 @@ impl<'catalog> SemanticContext<'catalog> {
                 .unqualified_databases(&table_name, view_database)
                 .into_iter()
                 .find(|database| {
-                    self.database_schemas
-                        .get(database)
+                    self.database_schema(*database)
                         .is_some_and(|schema| schema.get_table(&table_name).is_some())
                 })
                 .ok_or_else(|| no_such_table(name))?,
@@ -695,8 +699,7 @@ impl<'catalog> SemanticContext<'catalog> {
     pub(crate) fn is_broken_view(&self, name: &turso_parser::ast::QualifiedName) -> bool {
         let view_name = normalize_ident(name.name.as_str());
         let broken = |database: &DatabaseId| {
-            self.database_schemas
-                .get(database)
+            self.database_schema(*database)
                 .is_some_and(|schema| schema.broken_views.contains(&view_name))
         };
         match &name.namespace {
@@ -713,8 +716,7 @@ impl<'catalog> SemanticContext<'catalog> {
     pub(crate) fn is_incompatible_view(&self, name: &turso_parser::ast::QualifiedName) -> bool {
         let view_name = normalize_ident(name.name.as_str());
         let incompatible = |database: &DatabaseId| {
-            self.database_schemas
-                .get(database)
+            self.database_schema(*database)
                 .is_some_and(|schema| schema.incompatible_views.contains(&view_name))
         };
         match &name.namespace {
@@ -756,6 +758,21 @@ impl<'catalog> SemanticContext<'catalog> {
 
     pub(crate) const fn snapshot(&self) -> CatalogSnapshot {
         self.snapshot
+    }
+
+    fn database_schema(&self, database: DatabaseId) -> Option<&'catalog Schema> {
+        if let Some(schema) = self.database_schemas.get(&database) {
+            return Some(schema);
+        }
+        if database.index() != TEMP_DB_ID {
+            return None;
+        }
+        self.empty_temp_schema()
+            .map(|empty_temp| empty_temp.schema(self.dialect.as_ref()))
+    }
+
+    fn empty_temp_schema(&self) -> Option<&'catalog EmptyTempSchema> {
+        self.catalog?.empty_temp_schema.as_ref()
     }
 }
 

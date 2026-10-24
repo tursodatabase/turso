@@ -3287,7 +3287,7 @@ mod tests {
             name: name.to_string(),
             alias: None,
             kind: hir::SourceKind::SchemaExpression,
-            columns: Vec::new(),
+            columns: Vec::new().into(),
             generated_expressions: Vec::new(),
             default_expressions: Vec::new(),
             column_type_programs: Vec::new(),

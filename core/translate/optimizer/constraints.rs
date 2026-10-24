@@ -1952,7 +1952,7 @@ mod tests {
                 name: format!("source_{index}"),
                 alias: None,
                 kind: hir::SourceKind::SchemaExpression,
-                columns: Vec::new(),
+                columns: Vec::new().into(),
                 generated_expressions: Vec::new(),
                 default_expressions: Vec::new(),
                 column_type_programs: Vec::new(),
@@ -2036,7 +2036,7 @@ mod tests {
                 .columns()
                 .iter()
                 .map(|column| hir::SourceColumn {
-                    name: column.name.clone().expect("test column has a name"),
+                    name: column.name.clone().expect("test column has a name").into(),
                     type_fact: hir::TypeFact::known(crate::schema::Type::Integer),
                     affinity: Affinity::Integer,
                     has_affinity: true,

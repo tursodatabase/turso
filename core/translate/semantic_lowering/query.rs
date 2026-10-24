@@ -8623,7 +8623,7 @@ fn hir_materialized_table(source: &hir::Source) -> Arc<BTreeTable> {
                 Affinity::None => "",
             };
             Column::new(
-                Some(column.name.clone()),
+                Some(column.name.to_string()),
                 ty_str.to_string(),
                 None,
                 None,
@@ -10502,7 +10502,7 @@ fn check_hir_window_key_is_orderable(
     let name = document
         .source(column.source)
         .and_then(|source| source.columns.get(column.column))
-        .map(|column| column.name.as_str())
+        .map(|column| column.name.as_ref())
         .ok_or_else(|| {
             LimboError::InternalError(format!(
                 "HIR window key references missing column {column:?}"
@@ -10847,6 +10847,7 @@ pub(super) mod tests {
                 schema: schema.clone(),
             }],
             unqualified_database_search_path: vec![hir::DatabaseId::new(MAIN_DB_ID)],
+            empty_temp_schema: None,
             has_temp_database: false,
             search_path_configured: false,
         };
