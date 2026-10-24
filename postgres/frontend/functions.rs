@@ -201,11 +201,17 @@ impl ScalarCall for PgScalarFunction {
             Self::PgLimitValue => exec_pg_limit_value(args)?,
             Self::Now | Self::TransactionTimestamp => {
                 Value::build_text(crate::datetime::timestamptz_text(
-                    crate::session::session_state(connection)?.transaction_start(),
+                    connection
+                        .context::<crate::settings::PgSessionState>()
+                        .map_or_else(crate::datetime::now_micros, |state| {
+                            state.transaction_start()
+                        }),
                 ))
             }
             Self::StatementTimestamp => Value::build_text(crate::datetime::timestamptz_text(
-                crate::session::session_state(connection)?.statement_start(),
+                connection
+                    .context::<crate::settings::PgSessionState>()
+                    .map_or_else(crate::datetime::now_micros, |state| state.statement_start()),
             )),
             Self::ClockTimestamp => Value::build_text(crate::datetime::now_text()),
         };
