@@ -2699,6 +2699,8 @@ impl Database {
             temp_store: AtomicTempStore::new(TempStore::Default),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
+            autocommit_conflict_retry_enabled: AtomicBool::new(true),
+            conflict_retry_timeout_override: RwLock::new(None),
             progress_handler: ProgressHandler::new(),
             query_timeout_ms: AtomicU64::new(0),
             interrupt_requested: AtomicBool::new(false),
@@ -2715,6 +2717,7 @@ impl Database {
             n_active_writes: AtomicI32::new(0),
             n_active_root_statements: AtomicI32::new(0),
             n_active_blob_statements: AtomicI32::new(0),
+            n_statements_waiting_to_retry: AtomicI32::new(0),
             statement_activity: Arc::new(Mutex::new(
                 crate::connection::StatementActivity::default(),
             )),
