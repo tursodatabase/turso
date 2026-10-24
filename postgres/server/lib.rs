@@ -204,7 +204,7 @@ impl SimpleQueryHandler for TursoPgHandler {
                     let conn = self.conn.lock().unwrap().clone();
                     if conn
                         .prepare(first)
-                        .and_then(|mut s| s.run_ignore_rows().map_err(Into::into))
+                        .and_then(|mut s| s.run_ignore_rows())
                         .is_ok()
                     {
                         client.set_transaction_status(TransactionStatus::Transaction);
@@ -247,7 +247,7 @@ impl SimpleQueryHandler for TursoPgHandler {
                     // Ignore errors: the core may have already auto-rolled back the transaction.
                     let _ = conn
                         .prepare("ROLLBACK")
-                        .and_then(|mut s| s.run_ignore_rows().map_err(Into::into));
+                        .and_then(|mut s| s.run_ignore_rows());
                     responses.push(Response::TransactionEnd(Tag::new("ROLLBACK")));
                     start_idx = 1;
                 }
@@ -318,7 +318,7 @@ where
 {
     let _ = conn
         .prepare("ROLLBACK")
-        .and_then(|mut s| s.run_ignore_rows().map_err(Into::into));
+        .and_then(|mut s| s.run_ignore_rows());
     client.set_transaction_status(TransactionStatus::Idle);
     err
 }
@@ -334,7 +334,7 @@ fn pg_error_to_response(err: PgWireError) -> PgWireResult<Response> {
                 pg_err.sqlstate.to_owned(),
                 pg_err.message.clone(),
             );
-            info.detail = pg_err.detail.clone();
+            info.detail.clone_from(&pg_err.detail);
             Ok(Response::Error(Box::new(info)))
         }
         Err(e) => Err(PgWireError::ApiError(e)),
@@ -363,7 +363,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
                     let conn = self.conn.lock().unwrap().clone();
                     if conn
                         .prepare(query)
-                        .and_then(|mut s| s.run_ignore_rows().map_err(Into::into))
+                        .and_then(|mut s| s.run_ignore_rows())
                         .is_ok()
                     {
                         client.set_transaction_status(TransactionStatus::Transaction);
@@ -419,7 +419,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
                     // Ignore errors: the core may have already auto-rolled back the transaction.
                     let _ = conn
                         .prepare("ROLLBACK")
-                        .and_then(|mut s| s.run_ignore_rows().map_err(Into::into));
+                        .and_then(|mut s| s.run_ignore_rows());
                     return Ok(Response::TransactionEnd(Tag::new("ROLLBACK")));
                 }
                 _ => {

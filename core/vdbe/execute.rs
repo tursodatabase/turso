@@ -5568,7 +5568,8 @@ pub fn op_auto_commit(
     } else {
         return match &tx_op {
             TxOp::Begin => Err(LimboError::TransactionAlreadyActive.into()),
-            TxOp::Commit | TxOp::Rollback => Err(LimboError::NoActiveTransaction.into()),
+            TxOp::Commit => Err(LimboError::NoActiveTransaction { op: "commit" }.into()),
+            TxOp::Rollback => Err(LimboError::NoActiveTransaction { op: "rollback" }.into()),
         };
     }
 

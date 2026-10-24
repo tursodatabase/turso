@@ -180,7 +180,7 @@ fn test_txn_error_doesnt_rollback_txn(tmp_db: TempDatabase) -> Result<()> {
     // should fail
     assert!(conn
         .execute("begin")
-        .inspect_err(|e| assert!(matches!(e, LimboError::TxError(_))))
+        .inspect_err(|e| assert!(matches!(e, LimboError::TransactionAlreadyActive)))
         .is_err());
     conn.execute("insert into t values (1)")?;
     conn.execute("commit")?;

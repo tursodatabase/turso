@@ -202,8 +202,12 @@ pub fn translate_inner(
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
-    if (is_vacuum || is_write) && connection.get_query_only() {
-        return Err(crate::LimboError::ReadOnly);
+    if is_vacuum && connection.get_query_only() {
+        bail_parse_error!("Cannot execute VACUUM in query_only mode")
+    }
+
+    if is_write && connection.get_query_only() {
+        bail_parse_error!("Cannot execute write statement in query_only mode")
     }
 
     if is_write && connection.is_tx_read_only() {

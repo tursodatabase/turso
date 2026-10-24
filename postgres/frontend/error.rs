@@ -283,7 +283,7 @@ fn sqlstate(error: &LimboError) -> &'static str {
         }
         LimboError::SequenceExhausted { .. } => SQLSTATE_SEQUENCE_LIMIT_EXCEEDED,
         LimboError::TxError(msg) => tx_error_sqlstate(msg),
-        LimboError::NoActiveTransaction => SQLSTATE_NO_ACTIVE_SQL_TRANSACTION,
+        LimboError::NoActiveTransaction { .. } => SQLSTATE_NO_ACTIVE_SQL_TRANSACTION,
         LimboError::TransactionAlreadyActive => SQLSTATE_ACTIVE_SQL_TRANSACTION,
         LimboError::ReadOnly => SQLSTATE_READ_ONLY_SQL_TRANSACTION,
         LimboError::TxTerminated | LimboError::StatementsInProgress(_) => {
@@ -315,6 +315,8 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.contains("already exists") {
         SQLSTATE_DUPLICATE_TABLE
+    } else if msg.contains("query_only mode") {
+        SQLSTATE_READ_ONLY_SQL_TRANSACTION
     } else {
         SQLSTATE_SYNTAX_ERROR
     }
@@ -350,6 +352,14 @@ mod tests {
             (LimboError::OutOfMemory, SQLSTATE_OUT_OF_MEMORY),
             (LimboError::Busy, SQLSTATE_LOCK_NOT_AVAILABLE),
             (LimboError::ReadOnly, SQLSTATE_READ_ONLY_SQL_TRANSACTION),
+            (
+                LimboError::NoActiveTransaction { op: "commit" },
+                SQLSTATE_NO_ACTIVE_SQL_TRANSACTION,
+            ),
+            (
+                LimboError::TransactionAlreadyActive,
+                SQLSTATE_ACTIVE_SQL_TRANSACTION,
+            ),
             (
                 LimboError::Corrupt("page 3".to_string()),
                 SQLSTATE_DATA_CORRUPTED,
@@ -393,10 +403,6 @@ mod tests {
                 "Cannot execute write statement in query_only mode",
                 SQLSTATE_READ_ONLY_SQL_TRANSACTION,
             ),
-            (
-                "cannot execute write statement in a read-only transaction",
-                SQLSTATE_READ_ONLY_SQL_TRANSACTION,
-            ),
         ] {
             let e = LimboError::ParseError(msg.to_string());
             assert_eq!(
@@ -410,14 +416,6 @@ mod tests {
     #[test]
     fn transaction_errors_classify_by_message() {
         for (msg, code) in [
-            (
-                "cannot start a transaction within a transaction",
-                SQLSTATE_ACTIVE_SQL_TRANSACTION,
-            ),
-            (
-                "cannot commit - no transaction is active",
-                SQLSTATE_NO_ACTIVE_SQL_TRANSACTION,
-            ),
             (
                 "no such savepoint: sp",
                 SQLSTATE_INVALID_SAVEPOINT_SPECIFICATION,

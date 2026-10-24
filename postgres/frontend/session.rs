@@ -265,7 +265,7 @@ fn apply_tx_access_mode(conn: &Arc<Connection>, read_only: bool) -> crate::Resul
 }
 
 fn is_no_active_tx_error(e: &crate::Error) -> bool {
-    matches!(e.core_error(), LimboError::NoActiveTransaction)
+    matches!(e.core_error(), LimboError::NoActiveTransaction { .. })
 }
 
 fn is_nested_begin_error(e: &crate::Error) -> bool {

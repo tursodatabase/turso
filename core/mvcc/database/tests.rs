@@ -9516,7 +9516,7 @@ fn test_commit_without_tx() {
     // expect error on trying to commit a non-existent interactive transaction
     let err = conn.execute("COMMIT").unwrap_err();
     assert!(
-        matches!(err, LimboError::NoActiveTransaction),
+        matches!(err, LimboError::NoActiveTransaction { .. }),
         "expected NoActiveTransaction, got: {err:?}"
     );
 }
@@ -21481,7 +21481,7 @@ fn abandoned_exclusive_commit_should_not_block_subsequent_concurrent_writer() {
 
     assert!(matches!(
         conn_a.prepare("COMMIT").unwrap().step().err().unwrap(),
-        LimboError::NoActiveTransaction
+        LimboError::NoActiveTransaction { .. }
     ));
 
     conn_b.execute("BEGIN CONCURRENT").unwrap();
@@ -22161,7 +22161,7 @@ fn test_sequence_write_conflict_rolls_back_outer_tx_and_rejects_commit() {
 
     let commit = nextval_conn.execute("COMMIT");
     assert!(
-        matches!(commit, Err(LimboError::NoActiveTransaction)),
+        matches!(commit, Err(LimboError::NoActiveTransaction { .. })),
         "COMMIT after conflict rollback must report no active transaction, got {commit:?}"
     );
 
