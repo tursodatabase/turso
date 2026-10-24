@@ -181,6 +181,39 @@ expect {
     1
 }
 
+# The hash build inside the materialized build input for a1 must not look up
+# the WHERE subquery that reads a3, because that subquery is left out of the
+# materialization.
+setup subquery-reads-table-after-materialized-build-input {
+    CREATE TABLE t0(a);
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t3(a);
+    INSERT INTO t0 VALUES (1), (2);
+    INSERT INTO t1 VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6);
+    INSERT INTO t3 VALUES (1);
+    ANALYZE;
+}
+
+@setup subquery-reads-table-after-materialized-build-input
+test where-subquery-reads-table-after-materialized-build-input {
+    SELECT count(*) FROM t0 AS a0 CROSS JOIN t1 AS a1 CROSS JOIN t3 AS a2 CROSS JOIN t0 AS a3
+    WHERE a2.a = a1.b AND a1.a = a0.a AND (SELECT a3.a) > 0;
+}
+expect {
+    2
+}
+
+@setup subquery-reads-table-after-materialized-build-input
+@skip-if sqlite "SQLite does not use hash joins"
+test where-subquery-reads-table-after-materialized-build-input-uses-a-hash-join {
+    EXPLAIN QUERY PLAN
+    SELECT count(*) FROM t0 AS a0 CROSS JOIN t1 AS a1 CROSS JOIN t3 AS a2 CROSS JOIN t0 AS a3
+    WHERE a2.a = a1.b AND a1.a = a0.a AND (SELECT a3.a) > 0;
+}
+expect pattern {
+    (?s)MATERIALIZE hash build input for t1 AS a1.*HASH JOIN t3 AS a2
+}
+
 setup large-tables {
     CREATE TABLE o(id INTEGER PRIMARY KEY, a INT);
     CREATE TABLE p(id INTEGER PRIMARY KEY, x INT, y INT);
