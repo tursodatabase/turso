@@ -400,37 +400,30 @@ impl Future for Execute {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        match self.stmt.step(None, cx)? {
-            Poll::Ready(_) => {
-                let n_change = self.stmt.inner.lock().unwrap().n_change();
-                Poll::Ready(Ok(n_change as u64))
+        loop {
+            match self.stmt.step(0, cx)? {
+                Poll::Ready(Some(_)) => continue,
+                Poll::Ready(None) => {
+                    let n_change = self.stmt.inner.lock().unwrap().n_change();
+                    return Poll::Ready(Ok(n_change as u64));
+                }
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 impl Statement {
-    fn step(
-        &self,
-        columns: Option<usize>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Result<Option<Row>>> {
+    fn step(&self, columns: usize, cx: &mut std::task::Context<'_>) -> Poll<Result<Option<Row>>> {
         let mut stmt = self.inner.lock().unwrap();
         match stmt.step(Some(cx.waker()))? {
             turso_sdk_kit::rsapi::TursoStatusCode::Row => {
-                if let Some(columns) = columns {
-                    let mut values = Vec::with_capacity(columns);
-                    for i in 0..columns {
-                        let value = stmt.row_value(i)?;
-                        values.push(value);
-                    }
-                    Poll::Ready(Ok(Some(Row { values })))
-                } else {
-                    Poll::Ready(Err(Error::Misuse(
-                        "unexpected row during execution".to_string(),
-                    )))
+                let mut values = Vec::with_capacity(columns);
+                for i in 0..columns {
+                    let value = stmt.row_value(i)?;
+                    values.push(value);
                 }
+                Poll::Ready(Ok(Some(Row { values })))
             }
             turso_sdk_kit::rsapi::TursoStatusCode::Done => Poll::Ready(Ok(None)),
             turso_sdk_kit::rsapi::TursoStatusCode::Io => {

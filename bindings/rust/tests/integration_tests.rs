@@ -442,6 +442,53 @@ pub async fn test_execute_batch() {
 }
 
 #[tokio::test]
+async fn test_execute_discards_rows_and_runs_statement_to_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let db = Builder::new_local(path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+
+    for sql in [
+        "PRAGMA journal_mode=WAL",
+        "PRAGMA table_info(sqlite_schema)",
+        "PRAGMA user_version",
+        "SELECT 1",
+    ] {
+        conn.execute(sql, ()).await.unwrap();
+    }
+
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; CREATE TABLE t(x); PRAGMA user_version; PRAGMA user_version=3;",
+    )
+    .await
+    .unwrap();
+
+    let rows_changed = conn
+        .execute("INSERT INTO t VALUES (1), (2), (3) RETURNING x", ())
+        .await
+        .unwrap();
+    assert_eq!(rows_changed, 3);
+
+    for (sql, expected) in [
+        ("SELECT COUNT(*) FROM t", Value::Integer(3)),
+        ("PRAGMA user_version", Value::Integer(3)),
+        ("PRAGMA journal_mode", Value::Text("wal".to_string())),
+    ] {
+        let row = conn
+            .prepare(sql)
+            .await
+            .unwrap()
+            .query_row(())
+            .await
+            .unwrap();
+        assert_eq!(row.get_value(0).unwrap(), expected, "{sql}");
+    }
+}
+
+#[tokio::test]
 async fn test_query_row_returns_first_row() {
     let db = Builder::new_local(":memory:").build().await.unwrap();
     let conn = db.connect().unwrap();
