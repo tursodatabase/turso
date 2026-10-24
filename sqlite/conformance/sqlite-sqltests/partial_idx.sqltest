@@ -1301,6 +1301,49 @@ expect {
     -3
 }
 
+# FALSE is the integer 0, so `x = FALSE` proves an index WHERE of `x = 0`.
+@skip-if sqlite "sqlite does not match FALSE against 0 in a partial index WHERE"
+test partial-index-where-zero-matches-query-false {
+    CREATE TABLE receipts(queue TEXT, job_id TEXT, _deleted INTEGER DEFAULT 0);
+    CREATE UNIQUE INDEX active_receipts ON receipts(queue, job_id) WHERE _deleted = 0;
+    INSERT INTO receipts VALUES ('work', 'id', 0), ('work', 'id', 1), ('work', 'other', 0);
+    EXPLAIN QUERY PLAN SELECT job_id FROM receipts WHERE queue = 'work' AND job_id = 'id' AND _deleted = false;
+    SELECT job_id, _deleted FROM receipts WHERE queue = 'work' AND job_id = 'id' AND _deleted = false;
+}
+expect {
+    1|0|0|SEARCH receipts USING COVERING INDEX active_receipts (queue=? AND job_id=?)
+    id|0
+}
+
+@skip-if sqlite "sqlite does not match TRUE against 1 in a partial index WHERE"
+test partial-index-where-true-matches-query-one {
+    CREATE TABLE t(a, flag INTEGER);
+    CREATE INDEX idx ON t(a) WHERE flag = TRUE;
+    INSERT INTO t VALUES (1, 1), (1, 0), (2, 1);
+    EXPLAIN QUERY PLAN SELECT a FROM t WHERE 1 = flag AND a = 1;
+    SELECT a, flag FROM t WHERE 1 = flag AND a = 1;
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX idx (a=?)
+    1|1
+}
+
+# `b IS FALSE` tests whether b is false, which is not the same as `b IS 0`:
+# 'abc' IS FALSE is true, but 'abc' IS 0 is false.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test partial-index-where-is-zero-does-not-match-query-is-false {
+    CREATE TABLE t(a, b);
+    CREATE INDEX idx ON t(a) WHERE b IS 0;
+    INSERT INTO t VALUES (1, 0), (1, 'abc'), (1, 1);
+    EXPLAIN QUERY PLAN SELECT a FROM t WHERE b IS FALSE AND a = 1;
+    SELECT a, b FROM t WHERE b IS FALSE AND a = 1 ORDER BY b;
+}
+expect {
+    1|0|0|SCAN t
+    1|0
+    1|abc
+}
+
 # Use the partial index when it provides the requested order.
 @skip-if sqlite "query plan explanation output is different in sqlite"
 test partial-index-or-term-with-order {
