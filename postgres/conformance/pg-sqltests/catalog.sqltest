@@ -1007,3 +1007,12 @@ test pg-policy-dump-discovery-is-empty {
     JOIN pg_catalog.pg_policy pol ON src.tbloid = pol.polrelid;
 }
 expect {}
+
+test pg-publication-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT p.tableoid, p.oid, p.pubname, p.pubowner, p.puballtables,
+           p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate, p.pubviaroot,
+           'n' AS pubgencols
+    FROM pg_publication p;
+}
+expect {}
