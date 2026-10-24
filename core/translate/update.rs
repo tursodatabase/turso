@@ -285,6 +285,7 @@ fn prepare_update_plan(
     let target_table = JoinedTable {
         table: table.as_ref().clone(),
         identifier: body.tbl_name.identifier(),
+        has_alias: body.tbl_name.alias.is_some(),
         internal_id: program.table_reference_counter.next(),
         op: Operation::default_scan_for(&table),
         unmatched_right_rows_plan: None,
@@ -398,6 +399,7 @@ fn prepare_update_plan(
         // under its schema name so `RETURNING t.col` works while `RETURNING alias.col`
         // still fails.
         returning_target.identifier = table_name.to_string();
+        returning_target.has_alias = false;
         let mut returning_table_references = TableReferences::new(
             vec![returning_target],
             read_scope_tables.outer_query_refs().to_vec(),
