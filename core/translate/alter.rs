@@ -440,6 +440,13 @@ pub(crate) fn eval_constant_default_value(expr: &ast::Expr) -> Result<Value> {
         ast::Expr::Literal(literal) => literal_default_value(literal),
         ast::Expr::Id(name) => Ok(Value::from_text(name.as_str().to_string())),
         ast::Expr::Unary(op, inner) => {
+            if let (ast::UnaryOperator::Negative, ast::Expr::Literal(ast::Literal::Numeric(text))) =
+                (op, inner.as_ref())
+            {
+                if !text.starts_with("0x") && !text.starts_with("0X") {
+                    return parse_numeric_literal(&format!("-{text}"));
+                }
+            }
             let value = eval_constant_default_value(inner)?;
             match (op, value) {
                 (ast::UnaryOperator::Positive, value) => Ok(value),
