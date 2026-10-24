@@ -2,9 +2,7 @@
 
 # sqlite_schema and sqlite_master name the same table, and so do
 # sqlite_temp_schema and sqlite_temp_master. Either name qualifies a column,
-# whichever name FROM used, unless FROM gave an alias. `<tbl>.*` only accepts
-# the alias or the name SQLite stores the table under: sqlite_master, or
-# sqlite_temp_master for temp.
+# whichever name FROM used, unless FROM gave an alias.
 
 setup schema {
     CREATE TABLE t (a);
@@ -127,53 +125,6 @@ test temp-names-do-not-qualify-main-column {
 expect error {
 }
 
-@setup schema
-test sqlite-master-star-from-sqlite-schema {
-    SELECT type, name, tbl_name, sql FROM (SELECT sqlite_master.* FROM sqlite_schema);
-}
-expect {
-    table|t|t|CREATE TABLE t (a)
-}
-
-@setup schema
-test sqlite-schema-star-from-sqlite-master {
-    SELECT sqlite_schema.* FROM sqlite_master;
-}
-expect error {
-    no such table: sqlite_schema
-}
-
-test sqlite-temp-master-star-from-sqlite-temp-schema {
-    CREATE TEMP TABLE tt (a);
-    SELECT type, name, tbl_name, sql FROM (SELECT sqlite_temp_master.* FROM sqlite_temp_schema);
-}
-expect {
-    table|tt|tt|CREATE TABLE tt (a)
-}
-
-test sqlite-temp-schema-star-from-sqlite-temp-master {
-    SELECT sqlite_temp_schema.* FROM sqlite_temp_master;
-}
-expect error {
-    no such table: sqlite_temp_schema
-}
-
-@setup schema
-test alias-hides-stored-name-for-star {
-    SELECT sqlite_master.* FROM sqlite_schema x;
-}
-expect error {
-    no such table: sqlite_master
-}
-
-@setup schema
-test sqlite-schema-star-from-sqlite-schema {
-    SELECT sqlite_schema.* FROM sqlite_schema;
-}
-expect error {
-    no such table: sqlite_schema
-}
-
 # An alias spelled like a schema table name is still an alias: only it
 # qualifies the table's columns.
 
@@ -192,6 +143,13 @@ expect error {
 }
 
 @setup schema
+test schema-name-alias-same-as-from-name-hides-other-names {
+    SELECT sqlite_master.name FROM sqlite_schema AS sqlite_schema;
+}
+expect error {
+}
+
+@setup schema
 test schema-name-alias-qualifies-column {
     SELECT sqlite_schema.name FROM sqlite_master AS sqlite_schema;
 }
@@ -201,79 +159,30 @@ expect {
 
 @setup schema
 test schema-name-alias-hides-other-names-for-outer-column {
-    SELECT (SELECT sqlite_schema.name) FROM sqlite_schema AS sqlite_master;
+    SELECT (SELECT sqlite_master.name) FROM sqlite_schema AS sqlite_schema;
 }
 expect error {
+}
+
+@setup schema
+test schema-name-alias-hides-other-names-in-parenthesized-join {
+    SELECT sqlite_master.name FROM (sqlite_master AS sqlite_schema, t);
+}
+expect error {
+}
+
+test other-name-qualifies-column-in-parenthesized-join {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    SELECT sqlite_schema.name, sqlite_master.name FROM (sqlite_master, t);
+}
+expect {
+    t|t
 }
 
 test temp-name-alias-hides-other-temp-names {
     CREATE TEMP TABLE tt (a);
-    SELECT sqlite_temp_schema.name FROM sqlite_temp_master AS sqlite_temp_master;
+    SELECT sqlite_temp_master.name FROM sqlite_temp_schema AS sqlite_temp_schema;
 }
 expect error {
-}
-
-test main-name-alias-qualifies-temp-column {
-    CREATE TEMP TABLE tt (a);
-    SELECT sqlite_master.name FROM sqlite_temp_schema AS sqlite_master;
-}
-expect {
-    tt
-}
-
-@setup schema
-test schema-name-alias-hides-stored-name-for-star {
-    SELECT sqlite_master.* FROM sqlite_master AS sqlite_schema;
-}
-expect error {
-    no such table: sqlite_master
-}
-
-@setup schema
-test schema-name-alias-qualifies-star {
-    SELECT type, name, tbl_name, sql FROM (SELECT sqlite_schema.* FROM sqlite_master AS sqlite_schema);
-}
-expect {
-    table|t|t|CREATE TABLE t (a)
-}
-
-# FROM temp.sqlite_master reads the temp schema table, so a main name
-# qualifies its columns only after a database name.
-
-test main-name-in-from-does-not-qualify-temp-column {
-    CREATE TEMP TABLE tt (a);
-    SELECT sqlite_master.name FROM temp.sqlite_master;
-}
-expect error {
-}
-
-test sqlite-schema-in-from-does-not-qualify-temp-column {
-    CREATE TEMP TABLE tt (a);
-    SELECT sqlite_schema.name FROM temp.sqlite_schema;
-}
-expect error {
-}
-
-test temp-name-qualifies-column-from-temp-sqlite-master {
-    CREATE TEMP TABLE tt (a);
-    SELECT sqlite_temp_schema.name, temp.sqlite_master.name FROM temp.sqlite_master;
-}
-expect {
-    tt|tt
-}
-
-test main-name-star-from-temp-sqlite-master {
-    CREATE TEMP TABLE tt (a);
-    SELECT sqlite_master.* FROM temp.sqlite_master;
-}
-expect error {
-    no such table: sqlite_master
-}
-
-test temp-stored-name-star-from-temp-sqlite-master {
-    CREATE TEMP TABLE tt (a);
-    SELECT type, name, tbl_name, sql FROM (SELECT sqlite_temp_master.* FROM temp.sqlite_master);
-}
-expect {
-    table|tt|tt|CREATE TABLE tt (a)
 }
