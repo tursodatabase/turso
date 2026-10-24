@@ -1123,6 +1123,7 @@ pub fn translate_insert(
             program,
             resolver,
             &mut upsert_actions,
+            &constraints,
             &ctx,
             &insertion,
             &table,
@@ -1610,6 +1611,7 @@ fn resolve_upserts(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
     upsert_actions: &mut [(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
+    constraints: &ConstraintsToCheck,
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
     table: &Table,
@@ -1618,7 +1620,16 @@ fn resolve_upserts(
     table_references: &mut TableReferences,
     table_alias: Option<&str>,
 ) -> Result<()> {
-    for (_, label, upsert) in upsert_actions {
+    for (position, (_, label, upsert)) in upsert_actions.iter_mut().enumerate() {
+        // Like SQLite, only compile an action that some constraint check can
+        // jump to, so its SET clause and UPDATE triggers are never resolved
+        // when the INSERT cannot conflict.
+        let reachable = constraints.constraints_to_check.iter().any(|(_, handler)| {
+            handler.or(constraints.upsert_catch_all_position) == Some(position)
+        });
+        if !reachable {
+            continue;
+        }
         program.preassign_label_to_next_insn(*label);
 
         if let UpsertDo::Set {
