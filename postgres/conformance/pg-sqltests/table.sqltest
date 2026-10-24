@@ -316,6 +316,52 @@ expect {
     3|4
 }
 
+test table-int-primary-key-default-used-when-omitted {
+    CREATE TABLE p (id int PRIMARY KEY DEFAULT 5, v int);
+    INSERT INTO p (v) VALUES (2);
+    SELECT id, v FROM p;
+}
+expect {
+    5|2
+}
+
+test table-int-primary-key-default-used-for-default-keyword {
+    CREATE TABLE p (id int PRIMARY KEY DEFAULT 5, v int);
+    INSERT INTO p (id, v) VALUES (DEFAULT, 2);
+    SELECT id, v FROM p;
+}
+expect {
+    5|2
+}
+
+test table-int-primary-key-default-used-by-insert-select {
+    CREATE TABLE p (id int PRIMARY KEY DEFAULT 5, v int);
+    INSERT INTO p (v) SELECT 2;
+    SELECT id, v FROM p;
+}
+expect {
+    5|2
+}
+
+test table-int-primary-key-default-null-rejected {
+    CREATE TABLE p (id int PRIMARY KEY DEFAULT NULL, v int);
+    INSERT INTO p (v) VALUES (2);
+}
+expect error {null value in column "id" of relation "p" violates not-null constraint}
+
+test table-int-primary-key-update-to-null-rejected {
+    CREATE TABLE p (id int PRIMARY KEY, v int);
+    INSERT INTO p VALUES (1, 1);
+    UPDATE p SET id = NULL;
+}
+expect error {null value in column "id" of relation "p" violates not-null constraint}
+
+test table-bigint-primary-key-omitted-rejected {
+    CREATE TABLE p (id bigint PRIMARY KEY, v int);
+    INSERT INTO p (v) VALUES (2);
+}
+expect error {null value in column "id" of relation "p" violates not-null constraint}
+
 @setup users
 test table-insert-returning-table-star {
     INSERT INTO users VALUES (4, 'dave', 40, false) RETURNING users.*;

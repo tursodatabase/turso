@@ -868,6 +868,19 @@ fn emit_update_column_values<'a>(
                         &t_ctx.resolver,
                     )?;
 
+                    if t_ctx.resolver.dialect.rejects_null_integer_primary_key() {
+                        emit_notnull_constraint_check(
+                            program,
+                            table_references,
+                            rowid_set_clause_reg,
+                            table_column,
+                            column_ctx.table_name(),
+                            or_conflict,
+                            skip_row_label,
+                            &t_ctx.resolver,
+                        )?;
+                    }
+
                     program.emit_insn(Insn::MustBeInt {
                         reg: rowid_set_clause_reg,
                         target_pc: None,
