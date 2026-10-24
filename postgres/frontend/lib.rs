@@ -10,7 +10,7 @@ mod statement;
 mod unnest;
 
 pub use catalog::PostgresDialect;
-pub use datetime::{datetime_param_in, datetime_wire_binary};
+pub use datetime::{cast_datetime_parameters, datetime_param_in, datetime_wire_binary};
 pub use error::{Error, ErrorReport, Result};
 pub use session::PgConnection as Connection;
 pub use session::{

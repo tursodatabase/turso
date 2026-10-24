@@ -239,6 +239,16 @@ pub trait Dialect: Send + Sync + 'static {
     fn applies_custom_type_arithmetic_to_any_operand(&self) -> bool {
         false
     }
+
+    /// The custom type that both sides of a comparison are cast to when one
+    /// side has custom type `lhs_type` and the other has the different custom
+    /// type `rhs_type`. None compares the values as they are.
+    ///
+    /// PostgreSQL converts a `date` to `timestamp` before comparing it with a
+    /// `timestamp`. SQLite has no such conversions.
+    fn comparison_type(&self, _lhs_type: &str, _rhs_type: &str) -> Option<&'static str> {
+        None
+    }
 }
 
 #[cfg(test)]

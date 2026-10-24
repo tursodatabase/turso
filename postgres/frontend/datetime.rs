@@ -169,7 +169,11 @@ pub(crate) fn error_sqlstate(message: &str) -> &'static str {
 }
 
 pub(crate) fn now_text() -> String {
-    format_timestamp(Timestamp::Finite(now_micros()), true)
+    timestamptz_text(now_micros())
+}
+
+pub(crate) fn timestamptz_text(micros: i64) -> String {
+    format_timestamp(Timestamp::Finite(micros), true)
 }
 
 /// `+` written in SQL. `lhs_type` and `rhs_type` are the operand types the
@@ -215,6 +219,97 @@ pub(crate) fn exec_typed_datetime_mi(
         classify_declared(lhs, lhs_type)?,
         classify_declared(rhs, rhs_type)?,
     )
+}
+
+/// `*` written in SQL with an operand that is an interval or a datetime: an
+/// interval times a number, in either order. See [exec_typed_datetime_pl] for
+/// the type arguments.
+pub(crate) fn exec_typed_interval_mul(
+    lhs: &Value,
+    rhs: &Value,
+    lhs_type: &str,
+    rhs_type: &str,
+) -> Result<Value> {
+    if matches!(lhs, Value::Null) || matches!(rhs, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let result = match (
+        classify_factor(lhs, lhs_type)?,
+        classify_factor(rhs, rhs_type)?,
+    ) {
+        (Factor::Interval(span), Factor::Number(factor, _))
+        | (Factor::Number(factor, _), Factor::Interval(span)) => interval_mul(span, factor)?,
+        (a, b) => return Err(factor_operator_does_not_exist(&a, "*", &b)),
+    };
+    Ok(Value::build_text(format_interval(result)))
+}
+
+/// `/` written in SQL with an operand that is an interval or a datetime: an
+/// interval divided by a number.
+pub(crate) fn exec_typed_interval_div(
+    lhs: &Value,
+    rhs: &Value,
+    lhs_type: &str,
+    rhs_type: &str,
+) -> Result<Value> {
+    if matches!(lhs, Value::Null) || matches!(rhs, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let result = match (
+        classify_factor(lhs, lhs_type)?,
+        classify_factor(rhs, rhs_type)?,
+    ) {
+        (Factor::Interval(span), Factor::Number(factor, _)) => interval_div(span, factor)?,
+        (a, b) => return Err(factor_operator_does_not_exist(&a, "/", &b)),
+    };
+    Ok(Value::build_text(format_interval(result)))
+}
+
+/// An operand of `*` or `/`. A quoted string without a type, such as the
+/// `'1.5'` in `interval '1 day' * '1.5'`, is a number when it reads as one,
+/// as PostgreSQL resolves it to `double precision`.
+enum Factor {
+    Interval(Interval),
+    Number(f64, &'static str),
+    Other(Operand),
+}
+
+fn classify_factor(value: &Value, declared: &str) -> Result<Factor> {
+    match value {
+        Value::Numeric(turso_core::Numeric::Integer(n)) => {
+            return Ok(Factor::Number(*n as f64, "integer"))
+        }
+        Value::Numeric(_) => {
+            let number = value.as_float();
+            return Ok(Factor::Number(number, "double precision"));
+        }
+        Value::Text(text) if declared.is_empty() => {
+            if let Ok(number) = text.as_str().trim().parse::<f64>() {
+                return Ok(Factor::Number(number, "double precision"));
+            }
+        }
+        _ => {}
+    }
+    Ok(match classify_declared(value, declared)? {
+        Operand::Interval(span) => Factor::Interval(span),
+        Operand::Infinite(positive) if declared.is_empty() => {
+            Factor::Interval(infinite_interval(positive))
+        }
+        other => Factor::Other(other),
+    })
+}
+
+fn factor_operator_does_not_exist(lhs: &Factor, op: &str, rhs: &Factor) -> LimboError {
+    let type_name = |factor: &Factor| match factor {
+        Factor::Interval(_) => "interval",
+        Factor::Number(_, name) => name,
+        Factor::Other(operand) => operand_type_name(operand),
+    };
+    LimboError::InvalidDate(format!(
+        "operator does not exist: {} {op} {}",
+        type_name(lhs),
+        type_name(rhs)
+    ))
 }
 
 /// `+` for timestamps, dates and intervals stored as text.
@@ -405,6 +500,24 @@ pub fn datetime_param_in(text: &str, oid: u32) -> Option<Result<Value>> {
     }
 }
 
+/// Adds a cast to every `$N` parameter the client declared as date, time,
+/// timestamp or timestamptz (`param_oids[N - 1]`), so `$1 + 1` adds a day to
+/// a date parameter instead of adding numbers.
+pub fn cast_datetime_parameters(sql: &str, param_oids: &[Option<u32>]) -> Result<String> {
+    let type_of = |param_number: usize| match param_oids.get(param_number.checked_sub(1)?)? {
+        Some(DATE_OID) => Some("date"),
+        Some(TIME_OID) => Some("time"),
+        Some(TIMESTAMP_OID) => Some("timestamp"),
+        Some(TIMESTAMPTZ_OID) => Some("timestamptz"),
+        _ => None,
+    };
+    if !(1..=param_oids.len()).any(|n| type_of(n).is_some()) {
+        return Ok(sql.to_string());
+    }
+    turso_pg_parser::cast_parameters(sql, type_of)
+        .map_err(|err| LimboError::ParseError(err.to_string()))
+}
+
 /// Converts a stored date, time, timestamp or timestamptz text to the value
 /// PostgreSQL sends in binary format: days since 2000-01-01 for `date`,
 /// microseconds since 2000-01-01 for timestamps and microseconds since
@@ -480,7 +593,7 @@ fn stored_time_micros(text: &str) -> Option<i64> {
     (micros <= USECS_PER_DAY).then_some(micros)
 }
 
-fn now_micros() -> i64 {
+pub(crate) fn now_micros() -> i64 {
     Utc::now().timestamp_micros()
 }
 
@@ -3144,6 +3257,124 @@ fn interval_um(iv: Interval) -> Result<Interval> {
             micros.checked_neg(),
         ),
     }
+}
+
+/// PostgreSQL's `interval_mul`. The whole part of each field is multiplied;
+/// a fraction of a month moves to days (30 per month) and a fraction of a
+/// day moves to the time part. Fractions never move up to larger units.
+fn interval_mul(span: Interval, factor: f64) -> Result<Interval> {
+    if factor.is_nan() {
+        return Err(interval_out_of_range());
+    }
+    let Interval::Finite {
+        months,
+        days,
+        micros,
+    } = span
+    else {
+        if factor == 0.0 {
+            return Err(interval_out_of_range());
+        }
+        return if factor < 0.0 {
+            interval_um(span)
+        } else {
+            Ok(span)
+        };
+    };
+    if factor.is_infinite() {
+        let sign = finite_interval_sign(months, days, micros);
+        if sign == 0 {
+            return Err(interval_out_of_range());
+        }
+        return Ok(infinite_interval(factor * sign as f64 > 0.0));
+    }
+    scale_interval(months, days, micros, |field| field * factor)
+}
+
+/// PostgreSQL's `interval_div`, with the same moving of fractions as
+/// [interval_mul].
+fn interval_div(span: Interval, factor: f64) -> Result<Interval> {
+    if factor.is_nan() {
+        return Err(interval_out_of_range());
+    }
+    if factor == 0.0 {
+        return Err(LimboError::DivisionByZero);
+    }
+    let Interval::Finite {
+        months,
+        days,
+        micros,
+    } = span
+    else {
+        if factor.is_infinite() {
+            return Err(interval_out_of_range());
+        }
+        return if factor < 0.0 {
+            interval_um(span)
+        } else {
+            Ok(span)
+        };
+    };
+    if factor.is_infinite() {
+        return Ok(Interval::Finite {
+            months: 0,
+            days: 0,
+            micros: 0,
+        });
+    }
+    scale_interval(months, days, micros, |field| field / factor)
+}
+
+fn scale_interval(
+    months: i32,
+    days: i32,
+    micros: i64,
+    scale: impl Fn(f64) -> f64,
+) -> Result<Interval> {
+    const SECS_PER_DAY: f64 = 86_400.0;
+    let ts_round = |value: f64| (value * 1_000_000.0).round_ties_even() / 1_000_000.0;
+    let fits_i32 = |value: f64| value >= i32::MIN as f64 && value < -(i32::MIN as f64);
+    let scaled_months = scale(months as f64);
+    let scaled_days = scale(days as f64);
+    if !fits_i32(scaled_months) || !fits_i32(scaled_days) {
+        return Err(interval_out_of_range());
+    }
+    let result_months = scaled_months as i32;
+    let mut result_days = scaled_days as i32;
+    let month_remainder_days =
+        ts_round((scaled_months - result_months as f64) * DAYS_PER_MONTH as f64);
+    let mut sec_remainder = ts_round(
+        (scaled_days - result_days as f64 + month_remainder_days
+            - (month_remainder_days as i32) as f64)
+            * SECS_PER_DAY,
+    );
+    if sec_remainder.abs() >= SECS_PER_DAY {
+        let whole_days = (sec_remainder / SECS_PER_DAY) as i32;
+        result_days = result_days
+            .checked_add(whole_days)
+            .ok_or_else(interval_out_of_range)?;
+        sec_remainder -= whole_days as f64 * SECS_PER_DAY;
+    }
+    result_days = result_days
+        .checked_add(month_remainder_days as i32)
+        .ok_or_else(interval_out_of_range)?;
+    let result_micros =
+        (scale(micros as f64) + sec_remainder * USECS_PER_SEC as f64).round_ties_even();
+    if !(result_micros >= i64::MIN as f64 && result_micros < -(i64::MIN as f64)) {
+        return Err(interval_out_of_range());
+    }
+    finite_interval(
+        Some(result_months),
+        Some(result_days),
+        Some(result_micros as i64),
+    )
+}
+
+fn finite_interval_sign(months: i32, days: i32, micros: i64) -> i32 {
+    let span = micros as i128
+        + days as i128 * USECS_PER_DAY as i128
+        + months as i128 * DAYS_PER_MONTH as i128 * USECS_PER_DAY as i128;
+    span.signum() as i32
 }
 
 fn finite_interval(

@@ -28,6 +28,35 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
         .collect())
 }
 
+/// Appends `::type_name` to every `$N` parameter for which `type_of(N)`
+/// returns a type name, so the statement treats the parameter as that type.
+pub fn cast_parameters(
+    sql: &str,
+    type_of: impl Fn(usize) -> Option<&'static str>,
+) -> Result<String, ParseError> {
+    let scan = pg_query::scan(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+    let mut rewritten = String::with_capacity(sql.len());
+    let mut copied_up_to = 0;
+    for token in scan.tokens {
+        if token.token != pg_query::protobuf::Token::Param as i32 {
+            continue;
+        }
+        let end = token.end as usize;
+        let type_name = sql[token.start as usize + 1..end]
+            .parse()
+            .ok()
+            .and_then(&type_of);
+        if let Some(type_name) = type_name {
+            rewritten.push_str(&sql[copied_up_to..end]);
+            rewritten.push_str("::");
+            rewritten.push_str(type_name);
+            copied_up_to = end;
+        }
+    }
+    rewritten.push_str(&sql[copied_up_to..]);
+    Ok(rewritten)
+}
+
 /// Get tables referenced in a query
 pub fn get_tables(sql: &str) -> Result<Vec<String>, ParseError> {
     let result = parse(sql)?;

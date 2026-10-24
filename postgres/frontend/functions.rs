@@ -73,6 +73,7 @@ scalar_functions! {
     TimestampIn(FunctionArity::Exact(1), true),
     DatetimePl(FunctionArity::OneOf(&[2, 4]), true),
     DatetimeMi(FunctionArity::OneOf(&[2, 4]), true),
+    IntervalMul | IntervalDiv(FunctionArity::Exact(4), true),
     DateIn(FunctionArity::Exact(1), true),
     BoolIn(FunctionArity::Exact(1), true),
     VarcharIn(FunctionArity::Exact(2), true),
@@ -146,6 +147,18 @@ impl ScalarCall for PgScalarFunction {
                 &text_arg(args, 2),
                 &text_arg(args, 3),
             )?,
+            Self::IntervalMul => crate::datetime::exec_typed_interval_mul(
+                args[0].get_value(),
+                args[1].get_value(),
+                &text_arg(args, 2),
+                &text_arg(args, 3),
+            )?,
+            Self::IntervalDiv => crate::datetime::exec_typed_interval_div(
+                args[0].get_value(),
+                args[1].get_value(),
+                &text_arg(args, 2),
+                &text_arg(args, 3),
+            )?,
             Self::DateIn => crate::datetime::exec_date_in(args[0].get_value())?,
             Self::BoolIn => exec_bool_in(args[0].get_value())?,
             Self::VarcharIn => exec_varchar_in(args[0].get_value(), int_arg(args, 1, 0))?,
@@ -186,10 +199,15 @@ impl ScalarCall for PgScalarFunction {
                 Value::from_i64(0)
             }
             Self::PgLimitValue => exec_pg_limit_value(args)?,
-            Self::Now
-            | Self::ClockTimestamp
-            | Self::TransactionTimestamp
-            | Self::StatementTimestamp => Value::build_text(crate::datetime::now_text()),
+            Self::Now | Self::TransactionTimestamp => {
+                Value::build_text(crate::datetime::timestamptz_text(
+                    crate::session::session_state(connection)?.transaction_start(),
+                ))
+            }
+            Self::StatementTimestamp => Value::build_text(crate::datetime::timestamptz_text(
+                crate::session::session_state(connection)?.statement_start(),
+            )),
+            Self::ClockTimestamp => Value::build_text(crate::datetime::now_text()),
         };
         Ok(IOResult::Done(value))
     }

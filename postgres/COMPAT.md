@@ -156,12 +156,17 @@ compared with a column of these types (or uuid, boolean and other built-in
 types) is converted to the column's type first, so `ts = '2026-10-08 14:00+02'`
 and `ts IN (SELECT '2026-10-08 14:00+02')` match `2026-10-08 12:00:00+00` with
 or without an index. PostgreSQL rejects the subquery and text column forms
-(`timestamptz = text`). Comparing values of two different datetime types, such
-as a timestamptz column with a date column, compares their text instead of
-converting one to the other.
-A parameter sent with a date or timestamp type is not treated as a date in
-arithmetic (`$1 + 1` adds to the year number). `date + '1 day'` is accepted (PostgreSQL rejects
-it as ambiguous).
+(`timestamptz = text`).
+Comparing two different datetime types converts a date to timestamp and a
+timestamp to timestamptz first, as PostgreSQL does, when each side is a column
+or a cast. A parameter sent with a date, time, timestamp or timestamptz type
+OID is treated as that type, so `$1 + 1` adds a day to a date. `now()`,
+`CURRENT_TIMESTAMP`, `CURRENT_DATE` and `transaction_timestamp()` return the
+start time of the transaction, `statement_timestamp()` the start time of the
+statement and `clock_timestamp()` the current time; the `now` and `today`
+input strings still read the current time. Result columns of `date - date`
+report int4, but the same expression on two date columns reports a numeric
+type. `date + '1 day'` is accepted (PostgreSQL rejects it as ambiguous).
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -236,7 +241,7 @@ it as ambiguous).
 | Row-wise comparison | ❌ Not supported | Row constructors `(a,b) < (c,d)` fail to translate |
 | SELECT ... FOR UPDATE/SHARE | ❌ Not supported | Rejected |
 | SELECT FOR NO KEY UPDATE/SELECT FOR KEY SHARE lock modes | ❌ Not supported | Rejected |
-| SQL standard interval handling | 🟡 Partial | interval is stored as TEXT as written (`'P1D'::interval` stays `P1D`); results of interval arithmetic use PostgreSQL output form. `+` and `-` work between timestamp, timestamptz and interval values when an operand is a cast to one of these types or to date, a date, timestamp or timestamptz column, `now()`, `CURRENT_DATE`, `CURRENT_TIMESTAMP` or `LOCALTIMESTAMP`. Interval comparison and multiplication are not supported |
+| SQL standard interval handling | 🟡 Partial | interval is stored as TEXT as written (`'P1D'::interval` stays `P1D`); results of interval arithmetic use PostgreSQL output form. `+` and `-` work between timestamp, timestamptz and interval values when an operand is a cast to one of these types or to date, a date, timestamp or timestamptz column, `now()`, `CURRENT_DATE`, `CURRENT_TIMESTAMP` or `LOCALTIMESTAMP`. An interval can be multiplied or divided by a number. Interval comparison is not supported |
 | SYSTEM_USER | ❌ Not supported | current_user/current_role return stub values |
 | TABLE statement | ✅ Supported | |
 | Underscores (_) for thousands separators | ✅ Supported | |
