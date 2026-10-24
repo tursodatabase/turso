@@ -370,6 +370,15 @@ impl TypeDef {
         }
     }
 
+    /// Returns the function of the operator `op`, if the type declares one
+    /// with a function.
+    pub fn operator_func(&self, op: &str) -> Option<&String> {
+        self.operators()
+            .iter()
+            .find(|o| o.op == op)
+            .and_then(|o| o.func_name.as_ref())
+    }
+
     /// Returns the default expression (Custom types only).
     pub fn default_expr(&self) -> Option<&ast::Expr> {
         match &self.kind {

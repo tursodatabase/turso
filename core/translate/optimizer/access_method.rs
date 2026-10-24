@@ -9,7 +9,10 @@ use turso_parser::ast::{self, SortOrder, TableInternalId};
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
-use crate::translate::expr::{as_binary_components, comparison_affinity, walk_expr, WalkControl};
+use crate::translate::expr::{
+    as_binary_components, comparison_affinity, custom_type_eq_func_for_column_pair, walk_expr,
+    WalkControl,
+};
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, expr_uses_custom_collation, ordered_ephemeral_key_columns,
     partial_index, partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
@@ -1241,12 +1244,24 @@ fn one_table_in_expr(expr: &ast::Expr) -> Option<TableInternalId> {
     (!has_more_than_one).then_some(table).flatten()
 }
 
-/// Return the two tables used by one equal test.
-pub(super) fn tables_in_equal_test(expr: &ast::Expr) -> Option<(TableInternalId, TableInternalId)> {
+/// Return the two tables used by one equal test that a hash join can use.
+///
+/// A hash join compares keys byte for byte, so it cannot use a test between
+/// columns whose equal values can have different bytes.
+pub(super) fn tables_in_equal_test(
+    expr: &ast::Expr,
+    table_references: &TableReferences,
+    schema: &Schema,
+) -> Option<(TableInternalId, TableInternalId)> {
     let Ok(Some((left, operator, right))) = as_binary_components(expr) else {
         return None;
     };
     if !matches!(operator.as_ast_operator(), Some(ast::Operator::Equals)) {
+        return None;
+    }
+    if custom_type_eq_func_for_column_pair(left, table_references, right, table_references, schema)
+        .is_some()
+    {
         return None;
     }
     Some((one_table_in_expr(left)?, one_table_in_expr(right)?))
