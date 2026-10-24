@@ -1824,6 +1824,38 @@ fn test_savepoint_rollback_across_wal_restart() {
 }
 
 #[turso_macros::test]
+fn test_insert_after_database_full_in_transaction(tmp_db: TempDatabase) {
+    insert_after_database_full(&tmp_db, "BEGIN", "COMMIT");
+}
+
+#[turso_macros::test]
+fn test_insert_after_database_full_in_savepoint(tmp_db: TempDatabase) {
+    insert_after_database_full(&tmp_db, "SAVEPOINT s1", "RELEASE s1");
+}
+
+fn insert_after_database_full(tmp_db: &TempDatabase, begin: &str, end: &str) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t1(a)").unwrap();
+    conn.execute("PRAGMA max_page_count = 3").unwrap();
+    conn.execute(begin).unwrap();
+    let result =
+        conn.execute("INSERT INTO t1(rowid, a) VALUES (2, zeroblob(3000)), (1, zeroblob(3000))");
+    assert!(
+        matches!(result, Err(LimboError::DatabaseFull)),
+        "expected database full, got: {result:?}"
+    );
+    conn.execute("PRAGMA max_page_count = 10").unwrap();
+    conn.execute("INSERT INTO t1(rowid, a) VALUES (3, zeroblob(3000)), (4, zeroblob(3000))")
+        .unwrap();
+    conn.execute(end).unwrap();
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t1");
+    assert_eq!(rows, vec![(2,)]);
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+}
+
+#[turso_macros::test]
 /// INSERT OR FAIL should keep changes made by the statement before the error.
 /// Unlike ABORT (the default), FAIL does not roll back successful inserts within the same statement.
 fn test_insert_or_fail_keeps_prior_changes(tmp_db: TempDatabase) {
