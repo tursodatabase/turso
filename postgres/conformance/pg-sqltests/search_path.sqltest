@@ -628,3 +628,20 @@ expect {
     3
     6
 }
+
+test drop-view-ignores-relations-outside-the-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_drop_view;
+    DROP VIEW IF EXISTS sp_drop_view.t;
+    DROP VIEW IF EXISTS sp_drop_view.v;
+    DROP VIEW IF EXISTS public.v;
+    DROP TABLE IF EXISTS public.t;
+    CREATE TABLE t (a int);
+    CREATE VIEW v AS SELECT a FROM t;
+    SET search_path TO sp_drop_view;
+    DROP VIEW IF EXISTS t;
+    DROP MATERIALIZED VIEW IF EXISTS v;
+    SELECT count(*) FROM public.v;
+}
+expect {
+    0
+}
