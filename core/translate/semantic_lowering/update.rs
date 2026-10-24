@@ -1762,7 +1762,12 @@ impl UpdateRow<'_, '_> {
                 )?;
             }
         }
-        super::fkey::emit_update_repairs(program, &pending_repairs, self.target.database)?;
+        super::fkey::emit_update_repairs(
+            program,
+            self.target.document,
+            &pending_repairs,
+            self.target.database,
+        )?;
         if let (Some(sequence), Some(_)) = (layout.sequence, self.new_rowid) {
             sequence.emit_moved_row(program, self.written_rowid())?;
         }

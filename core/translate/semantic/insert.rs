@@ -204,7 +204,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     }
                 };
                 let (upserts, excluded_source) =
-                    self.analyze_upserts(upsert, target, table, expressions.policies)?;
+                    self.analyze_upserts(upsert, target, table, &columns, expressions.policies)?;
                 (columns, source, upserts, excluded_source)
             }
         };
@@ -684,6 +684,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         mut syntax: Option<&'ast ast::Upsert>,
         target: hir::SourceId,
         table: &hir::ResolvedTable,
+        columns: &[hir::InsertTarget],
         policies: ExprPolicies,
     ) -> Result<(Vec<hir::Upsert>, Option<hir::SourceId>)> {
         let scope = {
@@ -695,8 +696,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             scope
         };
         let policy = policies.schema_expression().with_self_source(target);
-        let mut upserts = Vec::new();
-        let mut excluded_source = None;
+        let mut targets = Vec::new();
         while let Some(upsert) = syntax {
             let conflict_target = upsert
                 .index
@@ -738,8 +738,18 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     })
                 })
                 .transpose()?;
+            targets.push((conflict_target, &upsert.do_clause));
+            syntax = upsert.next.as_deref();
+        }
+        let reachable = self.reachable_upserts(target, table, columns, &targets)?;
+        let mut upserts = Vec::new();
+        let mut excluded_source = None;
+        for ((conflict_target, do_clause), reachable) in targets.into_iter().zip(reachable) {
+            if !reachable {
+                continue;
+            }
             let action = self.analyze_upsert_action(
-                &upsert.do_clause,
+                do_clause,
                 target,
                 table,
                 &mut excluded_source,
@@ -749,9 +759,68 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 target: conflict_target,
                 action,
             });
-            syntax = upsert.next.as_deref();
         }
         Ok((upserts, excluded_source))
+    }
+
+    /// Like SQLite, which UPSERTs some constraint check can jump to: the
+    /// first one naming the rowid when the INSERT sets the rowid, the first
+    /// one naming each UNIQUE index, and the last one without a target for
+    /// the other constraints. The others are never compiled, so errors in
+    /// their DO UPDATE and in UPDATE triggers do not fail the INSERT.
+    fn reachable_upserts(
+        &self,
+        target: hir::SourceId,
+        table: &hir::ResolvedTable,
+        columns: &[hir::InsertTarget],
+        upserts: &[(Option<hir::ConflictTarget>, &ast::UpsertDo)],
+    ) -> Result<Vec<bool>> {
+        if table.value().btree().is_none() {
+            return Ok(vec![true; upserts.len()]);
+        }
+        let source = self.source(target).ok_or_else(|| {
+            LimboError::InternalError(format!("missing INSERT target source {target}"))
+        })?;
+        let sets_rowid = columns.iter().any(|column| {
+            column.uses_value
+                && match column.column {
+                    hir::TargetColumn::RowId => true,
+                    hir::TargetColumn::Column(position) => table
+                        .value()
+                        .columns()
+                        .get(position)
+                        .is_some_and(|column| column.is_rowid_alias()),
+                }
+        });
+        let constraints = sets_rowid
+            .then_some(None)
+            .into_iter()
+            .chain(
+                source
+                    .index_expressions
+                    .iter()
+                    .filter(|expressions| expressions.index.value().unique)
+                    .map(|expressions| Some(&expressions.index)),
+            )
+            .collect::<Vec<_>>();
+        let named = |constraint: Option<&hir::ResolvedIndex>| {
+            upserts.iter().position(|(conflict_target, _)| {
+                conflict_target.as_ref().is_some_and(|conflict_target| {
+                    conflict_target.matched_index.as_ref() == constraint
+                })
+            })
+        };
+        let catch_all = upserts
+            .last()
+            .filter(|(conflict_target, _)| conflict_target.is_none())
+            .map(|_| upserts.len() - 1);
+        let mut reachable = vec![false; upserts.len()];
+        for constraint in constraints {
+            if let Some(position) = named(constraint).or(catch_all) {
+                reachable[position] = true;
+            }
+        }
+        Ok(reachable)
     }
 
     /// The constraint an ON CONFLICT target names, matched as SQLite does:

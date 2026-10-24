@@ -15,7 +15,6 @@ use turso_parser::ast::RefAct;
 use super::emit::{
     copy_with_affinity, emit_fk_restrict_halt, emit_fk_violation, emit_guarded_fk_decrement,
     emit_skip_if_any_null, index_probe, index_scan_match_any, open_read_index, open_read_table,
-    table_scan_match_any,
 };
 use crate::{
     schema::BTreeTable,
@@ -25,7 +24,7 @@ use crate::{
         semantic::hir::{self, HirDocument, SourceId},
     },
     vdbe::{
-        builder::ProgramBuilder,
+        builder::{ProgramBuilder, SourceBinding},
         insn::{CmpInsFlags, ConstraintInfo, Insn},
         BranchOffset,
     },
@@ -137,8 +136,8 @@ fn emit_children_still_point_here(
         }
         None => table_scan_match_any(
             program,
-            &child_table,
-            &foreign_key.child_positions,
+            document,
+            foreign_key,
             key,
             self_reference.then_some(rowid),
             database,
@@ -354,15 +353,9 @@ pub(super) fn emit_insert_parent_repairs(
                 let probe = copy_with_affinity(program, key, width, index.value(), &child_table);
                 index_scan_match_any(program, cursor, probe, width, None, repair)?;
             }
-            None => table_scan_match_any(
-                program,
-                &child_table,
-                &foreign_key.child_positions,
-                key,
-                None,
-                database,
-                repair,
-            )?,
+            None => {
+                table_scan_match_any(program, document, foreign_key, key, None, database, repair)?
+            }
         }
         program.preassign_label_to_next_insn(skip);
     }
@@ -442,6 +435,7 @@ pub(super) fn emit_update_checks<'a>(
         let declaration = foreign_key.declaration.clone();
         emit_child_probe(
             program,
+            document,
             foreign_key,
             old_key,
             exclude,
@@ -455,7 +449,7 @@ pub(super) fn emit_update_checks<'a>(
             },
         )?;
         if deferred && !replaces {
-            emit_new_parent_key_repairs(program, foreign_key, new_key, database)?;
+            emit_new_parent_key_repairs(program, document, foreign_key, new_key, database)?;
         }
         program.preassign_label_to_next_insn(unchanged);
     }
@@ -587,6 +581,7 @@ pub(super) struct PendingRepair<'a> {
 /// back their violations.
 pub(super) fn emit_update_repairs(
     program: &mut ProgramBuilder,
+    document: &HirDocument,
     pending: &[PendingRepair<'_>],
     database: usize,
 ) -> Result<()> {
@@ -605,7 +600,13 @@ pub(super) fn emit_update_repairs(
             target_pc: skip,
             jump_if_null: true,
         });
-        emit_new_parent_key_repairs(program, repair.foreign_key, repair.new_key, database)?;
+        emit_new_parent_key_repairs(
+            program,
+            document,
+            repair.foreign_key,
+            repair.new_key,
+            database,
+        )?;
         program.preassign_label_to_next_insn(skip);
     }
     program.preassign_label_to_next_insn(done);
@@ -616,12 +617,14 @@ pub(super) fn emit_update_repairs(
 /// one violation for each.
 fn emit_new_parent_key_repairs(
     program: &mut ProgramBuilder,
+    document: &HirDocument,
     foreign_key: &hir::ResolvedForeignKey,
     new_key: usize,
     database: usize,
 ) -> Result<()> {
     emit_child_probe(
         program,
+        document,
         foreign_key,
         new_key,
         None,
@@ -671,6 +674,7 @@ pub(super) fn emit_skip_if_same_key(
 /// scanned.
 fn emit_child_probe(
     program: &mut ProgramBuilder,
+    document: &HirDocument,
     foreign_key: &hir::ResolvedForeignKey,
     key: usize,
     exclude: Option<usize>,
@@ -693,8 +697,8 @@ fn emit_child_probe(
         }
         None => table_scan_match_any(
             program,
-            &child_table,
-            &foreign_key.child_positions,
+            document,
+            foreign_key,
             key,
             exclude,
             database,
@@ -702,6 +706,78 @@ fn emit_child_probe(
         )?,
     }
     program.preassign_label_to_next_insn(skip);
+    Ok(())
+}
+
+/// Scan the child table and run `on_match` for every row whose child key
+/// equals the non-NULL parent key at `key`. Rows with a NULL key column are
+/// skipped, and so is the row `skip_rowid` when given. The child key is read
+/// through the foreign key's child source, so an INTEGER PRIMARY KEY column
+/// reads the rowid and a virtual generated column is computed.
+fn table_scan_match_any(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_key: &hir::ResolvedForeignKey,
+    key: usize,
+    skip_rowid: Option<usize>,
+    database: usize,
+    mut on_match: impl FnMut(&mut ProgramBuilder) -> Result<()>,
+) -> Result<()> {
+    let child_table = btree(&foreign_key.child_table)?;
+    let cursor = open_read_table(program, &child_table, database);
+    program.bind_source(
+        foreign_key.child_source,
+        SourceBinding::BTree {
+            scan_cursor: cursor,
+            table_cursor: None,
+        },
+    );
+    let done = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: cursor,
+        pc_if_empty: done,
+    });
+    let loop_top = program.allocate_label();
+    program.preassign_label_to_next_insn(loop_top);
+    let next_row = program.allocate_label();
+    let child_key = emit_child_key(program, document, foreign_key, foreign_key.child_source)?;
+    for offset in 0..foreign_key.child_positions.len() {
+        program.emit_insn(Insn::IsNull {
+            reg: child_key + offset,
+            target_pc: next_row,
+        });
+        program.emit_insn(Insn::Ne {
+            lhs: child_key + offset,
+            rhs: key + offset,
+            target_pc: next_row,
+            flags: CmpInsFlags::default(),
+            collation: Some(CollationSeq::Binary),
+        });
+    }
+    if let Some(skip_rowid) = skip_rowid {
+        let rowid = program.alloc_register();
+        program.emit_insn(Insn::RowId {
+            cursor_id: cursor,
+            dest: rowid,
+        });
+        program.emit_insn(Insn::Eq {
+            lhs: rowid,
+            rhs: skip_rowid,
+            target_pc: next_row,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+    }
+    on_match(program)?;
+    program.preassign_label_to_next_insn(next_row);
+    program.emit_insn(Insn::Next {
+        cursor_id: cursor,
+        is_index: false,
+        pc_if_next: loop_top,
+        fullscan: false,
+    });
+    program.preassign_label_to_next_insn(done);
+    program.emit_insn(Insn::Close { cursor_id: cursor });
     Ok(())
 }
 

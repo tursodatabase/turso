@@ -474,9 +474,13 @@ fn translate_statement(
             savepoint_name,
         } => translate_rollback(program, tx_name, savepoint_name)?,
         ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
-        ast::Stmt::Vacuum { name, into } => {
-            vacuum::translate_vacuum(program, name.as_ref(), into.as_deref(), connection.clone())?
-        }
+        ast::Stmt::Vacuum { name, into } => vacuum::translate_vacuum(
+            program,
+            catalog,
+            name.as_ref(),
+            into.as_deref(),
+            connection.clone(),
+        )?,
         ast::Stmt::CreateSequence {
             if_not_exists,
             seq_name,

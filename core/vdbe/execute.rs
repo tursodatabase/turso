@@ -74,7 +74,6 @@ use crate::{
     CaptureDataChangesInfo, CdcVersion, CheckpointMode, Clock, Completion, ConnectOpts, Connection,
     Database, DatabaseStorage, IOExt, MonotonicInstant, MvCursor, NonNan, OpenFlags, QueryMode,
     Statement, TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
-    TEMP_DB_ID,
 };
 use crate::{
     error::{
@@ -8316,7 +8315,12 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
             }
         }
         AggFunc::Min | AggFunc::Max => payload[0].clone(),
-        AggFunc::GroupConcat | AggFunc::StringAgg => payload[0].clone(),
+        AggFunc::GroupConcat | AggFunc::StringAgg => match payload {
+            [Value::Null, Value::Numeric(Numeric::Integer(count)), ..] if *count > 0 => {
+                Value::build_text(String::new())
+            }
+            _ => payload[0].clone(),
+        },
         AggFunc::ArrayAgg => {
             // payload[0] = count, payload[1..] = accumulated values.
             // Serialize to a record blob only once at finalization.
@@ -9329,7 +9333,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             };
             let remove_len = value_len.checked_add(separator_len).or_overflow()?;
             let Value::Text(text) = acc else {
-                unreachable!("GroupConcat accumulator is Text after a non-NULL xStep");
+                return Ok(());
             };
             let accumulated_len = text.as_str().len();
             if remove_len < accumulated_len && !text.as_str().is_char_boundary(remove_len) {
@@ -18152,6 +18156,14 @@ pub fn op_alter_column(
                 .is_some_and(|column| column.is_rowid_alias())
             && !new_column.is_rowid_alias();
 
+        // Rename the key column before columns_mut(), whose drop rebuilds the
+        // WITHOUT ROWID key order from primary_key_columns by name.
+        for (pk_name, _ord) in &mut btree.primary_key_columns {
+            if pk_name.eq_ignore_ascii_case(&old_column_name) {
+                pk_name.clone_from(&new_name);
+            }
+        }
+
         if *rename {
             btree.columns_mut()[*column_index].name = Some(new_name.clone());
 
@@ -18202,13 +18214,6 @@ pub fn op_alter_column(
                 if let Some(ref mut wc) = idx.where_clause {
                     rename_identifiers(wc, &old_column_name, &new_name);
                 }
-            }
-        }
-
-        // Keep primary_key_columns consistent (names may change on rename)
-        for (pk_name, _ord) in &mut btree.primary_key_columns {
-            if pk_name.eq_ignore_ascii_case(&old_column_name) {
-                pk_name.clone_from(&new_name);
             }
         }
 
@@ -19058,15 +19063,15 @@ pub fn op_hash_clear(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub fn op_hash_reset_matched(
+pub fn op_hash_probe_init(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(HashResetMatched { hash_table_id }, insn);
+    load_insn!(HashProbeInit { hash_table_id }, insn);
     if let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) {
-        hash_table.reset_matched_bits();
+        hash_table.begin_probe_pass();
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -20256,19 +20261,13 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
     load_insn!(
         VacuumInto {
             schema_name,
-            dest_path
+            dest_reg
         },
         insn
     );
 
     if matches!(state.op_vacuum_state, VacuumOpState::None) {
         let source_db_id = program.connection.get_database_id_by_name(schema_name)?;
-
-        // Matches sqlite that treats VACUUM temp INTO as a no-op (no file created)
-        if source_db_id == TEMP_DB_ID {
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
-        }
 
         state.op_vacuum_state = VacuumOpState::IntoFile(Box::new(VacuumIntoOpContext {
             escaped_schema_name: schema_name.replace('"', "\"\""),
@@ -20314,7 +20313,11 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     .into());
                 }
 
-                let target = crate::util::OpenOptions::parse(dest_path)?;
+                let Value::Text(dest_path) = state.registers[*dest_reg].get_value() else {
+                    return Err(LimboError::InvalidArgument("non-text filename".to_string()).into());
+                };
+                let dest_path = dest_path.as_str().to_string();
+                let target = crate::util::OpenOptions::parse(&dest_path)?;
                 if target.cipher.is_some() || target.hexkey.is_some() {
                     return Err(LimboError::InvalidArgument(
                         "VACUUM INTO does not support the cipher and hexkey URI parameters"

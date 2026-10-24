@@ -990,6 +990,77 @@ expect {
     1|50
 }
 
+# The child FK column is the rowid alias, so it is not stored in the record.
+@cross-check-integrity
+test fk-deferred-insert-parent-fixes-rowid-alias-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER PRIMARY KEY REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c(pid) VALUES(1);
+    INSERT INTO p(id) VALUES(1);
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test fk-deferred-update-parent-fixes-rowid-alias-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER PRIMARY KEY REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(5);
+    BEGIN;
+    INSERT INTO c(pid) VALUES(2);
+    UPDATE p SET id=2 WHERE id=5;
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test fk-update-parent-referenced-by-rowid-alias-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER PRIMARY KEY REFERENCES p(id));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    UPDATE p SET id=3;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-delete-parent-referenced-by-rowid-alias-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER PRIMARY KEY REFERENCES p(id));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-drop-parent-referenced-by-rowid-alias-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER PRIMARY KEY REFERENCES p(id));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    DROP TABLE p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
 # Self-referential: row referencing itself should succeed
 @cross-check-integrity
 test fk-deferred-self-ref-succeeds {

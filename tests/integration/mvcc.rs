@@ -410,6 +410,28 @@ fn test_mvcc_read_to_write_upgrade_does_not_block_checkpoint(
     Ok(())
 }
 
+#[test]
+fn test_mvcc_blob_open_reports_unsupported() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_blob_open_reports_unsupported.db");
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, data BLOB)")?;
+    conn.execute("INSERT INTO files VALUES (1, zeroblob(8))")?;
+
+    for read_write in [false, true] {
+        let Err(err) = conn.blob_open("files", "data", 1, read_write) else {
+            panic!("blob_open must fail in MVCC mode");
+        };
+        assert_eq!(
+            err.to_string(),
+            "Internal error: incremental blob I/O is not supported in MVCC mode"
+        );
+    }
+
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT hex(data) FROM files WHERE id = 1");
+    assert_eq!(rows, vec![("0000000000000000".to_string(),)]);
+    Ok(())
+}
+
 /// DETACH must clean up any active MVCC transaction on the attached database.
 /// An uncommitted insert followed by ROLLBACK + DETACH + re-ATTACH must not
 /// show the uncommitted data.

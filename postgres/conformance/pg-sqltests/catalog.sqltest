@@ -945,3 +945,96 @@ test pg-trigger-parent-discovery-is-empty {
     ORDER BY t.tgrelid, t.tgname;
 }
 expect {}
+
+test pg-trigger-tableoid-discovery-is-empty {
+    SET search_path TO '';
+    SELECT t.tableoid, t.oid, t.tgrelid, t.tgname, t.tgenabled,
+           t.tgparentid <> 0 AS tgispartition
+    FROM unnest('{}'::pg_catalog.oid[]) AS src(tbloid)
+    JOIN pg_catalog.pg_trigger t ON src.tbloid = t.tgrelid
+    LEFT JOIN pg_catalog.pg_trigger u ON u.oid = t.tgparentid
+    WHERE (NOT t.tgisinternal AND t.tgparentid = 0)
+       OR t.tgenabled != u.tgenabled
+    ORDER BY t.tgrelid, t.tgname;
+}
+expect {}
+
+test pg-get-triggerdef-missing-trigger {
+    SET search_path TO '';
+    SELECT CASE WHEN pg_catalog.pg_get_triggerdef(0) IS NULL THEN 1 ELSE 0 END,
+           CASE WHEN pg_catalog.pg_get_triggerdef(0, false) IS NULL THEN 1 ELSE 0 END,
+           CASE WHEN pg_catalog.pg_get_triggerdef(0, true) IS NULL THEN 1 ELSE 0 END,
+           CASE WHEN pg_catalog.pg_get_triggerdef(NULL) IS NULL THEN 1 ELSE 0 END,
+           CASE WHEN pg_catalog.pg_get_triggerdef(0, NULL) IS NULL THEN 1 ELSE 0 END;
+}
+expect {1|1|1|1|1}
+
+test pg-trigger-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT t.tgrelid, t.tgname, pg_catalog.pg_get_triggerdef(t.oid, false) AS tgdef,
+           t.tgenabled, t.tableoid, t.oid, t.tgparentid <> 0 AS tgispartition
+    FROM unnest('{}'::pg_catalog.oid[]) AS src(tbloid)
+    JOIN pg_catalog.pg_trigger t ON src.tbloid = t.tgrelid
+    LEFT JOIN pg_catalog.pg_trigger u ON u.oid = t.tgparentid
+    WHERE (NOT t.tgisinternal AND t.tgparentid = 0)
+       OR t.tgenabled != u.tgenabled
+    ORDER BY t.tgrelid, t.tgname;
+}
+expect {}
+
+test pg-rewrite-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT tableoid, oid, rulename, ev_class AS ruletable, ev_type, is_instead, ev_enabled
+    FROM pg_rewrite
+    WHERE ev_class IN (
+        SELECT oid FROM pg_class
+        WHERE relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+    )
+    ORDER BY oid;
+}
+expect {}
+
+test pg-policy-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT pol.oid, pol.tableoid, pol.polrelid, pol.polname, pol.polcmd, pol.polpermissive,
+           CASE WHEN pol.polroles = '{0}' THEN NULL ELSE
+               pg_catalog.array_to_string(ARRAY(SELECT pg_catalog.quote_ident(rolname)
+                   FROM pg_catalog.pg_roles WHERE oid = ANY(pol.polroles)), ', ')
+           END AS polroles,
+           pg_catalog.pg_get_expr(pol.polqual, pol.polrelid) AS polqual,
+           pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid) AS polwithcheck
+    FROM unnest('{16384,16385}'::pg_catalog.oid[]) AS src(tbloid)
+    JOIN pg_catalog.pg_policy pol ON src.tbloid = pol.polrelid;
+}
+expect {}
+
+test pg-publication-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT p.tableoid, p.oid, p.pubname, p.pubowner, p.puballtables,
+           p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate, p.pubviaroot,
+           'n' AS pubgencols
+    FROM pg_publication p;
+}
+expect {}
+
+test pg-publication-rel-tableoid-is-selectable {
+    SET search_path TO '';
+    SELECT tableoid, oid, prpubid, prrelid,
+           pg_catalog.pg_get_expr(prqual, prrelid) AS prrelqual, prattrs
+    FROM pg_catalog.pg_publication_rel;
+}
+expect {}
+
+test pg-publication-rel-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT tableoid, oid, prpubid, prrelid,
+           pg_catalog.pg_get_expr(prqual, prrelid) AS prrelqual,
+           CASE WHEN pr.prattrs IS NOT NULL THEN
+               (SELECT array_agg(attname)
+                FROM pg_catalog.generate_series(0, pg_catalog.array_upper(pr.prattrs::pg_catalog.int2[], 1)) s,
+                     pg_catalog.pg_attribute
+                WHERE attrelid = pr.prrelid AND attnum = prattrs[s])
+           ELSE NULL END AS prattrs
+    FROM pg_catalog.pg_publication_rel pr;
+}
+expect {}

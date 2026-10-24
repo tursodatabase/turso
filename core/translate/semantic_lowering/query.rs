@@ -1744,6 +1744,7 @@ fn emit_hir_simple_count(
             "HIR count(*) shortcut needs exactly one output".to_string(),
         ));
     };
+    let bound = program.expression_register_count();
     program.bind_expression_register(&count_output.expr, count);
     let start = query_output_registers(program, &block.outputs, output.needs_values())?;
     emit_query_row(
@@ -1755,7 +1756,7 @@ fn emit_hir_simple_count(
         start,
         block_done,
     )?;
-    program.clear_expression_registers();
+    program.truncate_expression_registers(bound);
     Ok(true)
 }
 
@@ -1767,6 +1768,7 @@ fn emit_hir_grouped_aggregate<'a>(
     block_plan: &HirQueryBlockPlan,
     output: &HirRowOutput<'_>,
 ) -> Result<()> {
+    let bound = program.expression_register_count();
     let runtime = initialize_hir_group_runtime(program, plan, query, block, block_plan)?;
     emit_btree_loops(
         program,
@@ -1778,7 +1780,9 @@ fn emit_hir_grouped_aggregate<'a>(
     if matches!(runtime.rows, HirGroupRows::Sorter(_)) {
         emit_hir_group_sorter_rows(program, &plan.document, &runtime)?;
     }
-    emit_hir_group_result(program, &plan.document, query, block, output, &runtime)
+    emit_hir_group_result(program, &plan.document, query, block, output, &runtime)?;
+    program.truncate_expression_registers(bound);
+    Ok(())
 }
 
 /// The expressions a grouped loop's index stores that the block reads from
@@ -2653,7 +2657,6 @@ fn emit_hir_group_result(
         start,
         runtime.state.output_done,
     )?;
-    program.clear_expression_registers();
     program.emit_insn(Insn::Return {
         return_reg: runtime.state.output_return,
         can_fallthrough: false,
@@ -6783,6 +6786,7 @@ fn prepare_hir_coroutine_loop<'a>(
     let destination = QueryDestination::CoroutineYield {
         yield_reg,
         stored_outputs: crate::alloc::vec![],
+        decode_arrays: false,
     };
     let row = match &planned_loop.access {
         HirSourceAccess::Derived { query, .. } | HirSourceAccess::Cte { query, .. } => {
@@ -9758,7 +9762,9 @@ fn emit_hir_sorter_rows(
     for (output, column) in output_columns.iter().enumerate() {
         program.emit_column_or_rowid(pseudo_cursor, *column, outputs + output);
     }
-    emit_array_results(program, document, output_definitions, outputs, &[])?;
+    if decodes_arrays(destination) {
+        emit_array_results(program, document, output_definitions, outputs, &[])?;
+    }
     emit_hir_row_to_destination(program, destination, outputs, output_definitions.len())?;
     emit_after_row(
         program,
@@ -10115,7 +10121,9 @@ fn emit_query_row_with_inputs<'expr>(
         }
     }
 
-    if output.needs_values() && matches!(&output.target, HirRowTarget::Direct { .. }) {
+    if output.needs_values()
+        && matches!(&output.target, HirRowTarget::Direct { destination, .. } if decodes_arrays(destination))
+    {
         emit_array_results(program, document, outputs, start, stored_outputs)?;
     }
 
@@ -10668,6 +10676,16 @@ fn emit_hir_window_output_subroutine(
         can_fallthrough: false,
     });
     Ok(())
+}
+
+fn decodes_arrays(destination: &QueryDestination) -> bool {
+    !matches!(
+        destination,
+        QueryDestination::CoroutineYield {
+            decode_arrays: false,
+            ..
+        }
+    )
 }
 
 /// Decode each array output for display, except the outputs in

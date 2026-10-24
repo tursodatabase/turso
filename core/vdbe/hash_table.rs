@@ -2110,6 +2110,35 @@ impl HashTable {
         }
     }
 
+    /// Start a new probe pass over the same build side. The build is done once,
+    /// but a join inside an outer loop or a correlated subquery probes it once
+    /// per outer row, so everything the previous pass left behind must go:
+    /// buffered and spilled probe rows, grace progress, build partitions loaded
+    /// back from disk, the probe cursor and the matched marks. Build partitions
+    /// that never spilled stay resident, since there is no copy on disk to
+    /// reload them from.
+    pub fn begin_probe_pass(&mut self) {
+        turso_assert!(
+            matches!(
+                self.state,
+                HashTableState::Probing | HashTableState::GraceProcessing
+            ),
+            "begin_probe_pass called before the build was finalized",
+            { "state": format!("{:?}", self.state) }
+        );
+        self.evict_all_loaded_partitions();
+        self.probe_spill_state = None;
+        self.grace_state = None;
+        self.current_probe_keys = None;
+        self.current_probe_hash = None;
+        self.probe_bucket_idx = 0;
+        self.probe_entry_idx = 0;
+        self.current_spill_partition_idx = 0;
+        self.reset_matched_bits();
+        self.begin_unmatched_scan();
+        self.state = HashTableState::Probing;
+    }
+
     /// Reset the unmatched scan state to the beginning.
     pub fn begin_unmatched_scan(&mut self) {
         self.unmatched_scan_bucket = 0;

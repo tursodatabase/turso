@@ -12,7 +12,6 @@ use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ForeignKey, Index},
     sync::Arc,
-    translate::collate::CollationSeq,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{CmpInsFlags, ConstraintInfo, Insn},
@@ -187,86 +186,6 @@ pub(super) fn emit_skip_if_any_null(
             target_pc,
         });
     }
-}
-
-/// Scan `table` and run `on_match` for every row whose columns at
-/// `positions` all equal the non-NULL key at `key_start`. Rows with a NULL
-/// key column are skipped, and so is the row `skip_rowid` when given.
-pub(super) fn table_scan_match_any<F>(
-    program: &mut ProgramBuilder,
-    table: &Arc<BTreeTable>,
-    positions: &[usize],
-    key_start: usize,
-    skip_rowid: Option<usize>,
-    database: usize,
-    mut on_match: F,
-) -> Result<()>
-where
-    F: FnMut(&mut ProgramBuilder) -> Result<()>,
-{
-    let cursor = open_read_table(program, table, database);
-    let done = program.allocate_label();
-    program.emit_insn(Insn::Rewind {
-        cursor_id: cursor,
-        pc_if_empty: done,
-    });
-    let loop_top = program.allocate_label();
-    program.preassign_label_to_next_insn(loop_top);
-    let next_row = program.allocate_label();
-    for (i, &position) in positions.iter().enumerate() {
-        let value = program.alloc_register();
-        program.emit_insn(Insn::Column {
-            cursor_id: cursor,
-            column: position,
-            dest: value,
-            default: None,
-        });
-        program.emit_insn(Insn::IsNull {
-            reg: value,
-            target_pc: next_row,
-        });
-        let equal = program.allocate_label();
-        program.emit_insn(Insn::Eq {
-            lhs: value,
-            rhs: key_start + i,
-            target_pc: equal,
-            flags: CmpInsFlags::default(),
-            collation: Some(CollationSeq::Binary),
-        });
-        program.emit_insn(Insn::Goto {
-            target_pc: next_row,
-        });
-        program.preassign_label_to_next_insn(equal);
-    }
-    if let Some(skip_rowid) = skip_rowid {
-        let rowid = program.alloc_register();
-        let skip = program.allocate_label();
-        program.emit_insn(Insn::RowId {
-            cursor_id: cursor,
-            dest: rowid,
-        });
-        program.emit_insn(Insn::Eq {
-            lhs: rowid,
-            rhs: skip_rowid,
-            target_pc: skip,
-            flags: CmpInsFlags::default(),
-            collation: None,
-        });
-        on_match(program)?;
-        program.preassign_label_to_next_insn(skip);
-    } else {
-        on_match(program)?;
-    }
-    program.preassign_label_to_next_insn(next_row);
-    program.emit_insn(Insn::Next {
-        cursor_id: cursor,
-        is_index: program.cursor_is_index(cursor),
-        pc_if_next: loop_top,
-        fullscan: false,
-    });
-    program.preassign_label_to_next_insn(done);
-    program.emit_insn(Insn::Close { cursor_id: cursor });
-    Ok(())
 }
 
 /// Count one foreign-key violation: on the connection for a deferred
