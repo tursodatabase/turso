@@ -16181,7 +16181,13 @@ pub struct OpInitCdcVersionInner {
 pub type OpInitCdcVersionState = Option<Box<OpInitCdcVersionInner>>;
 
 fn prepare_cdc_internal(conn: &Arc<Connection>, sql: String) -> Result<crate::Statement> {
-    let stmt = conn.prepare_internal(sql)?;
+    // CDC must not capture the creation of its own tables, also when switching
+    // from one capture table to another while capture is on.
+    let cdc_info = conn.get_capture_data_changes_info().clone();
+    conn.set_capture_data_changes_info(None);
+    let stmt = conn.prepare_internal(sql);
+    conn.set_capture_data_changes_info(cdc_info);
+    let stmt = stmt?;
     stmt.program
         .prepared
         .needs_stmt_subtransactions
@@ -16217,10 +16223,13 @@ pub fn op_init_cdc_version(
             return Ok(InsnFunctionStepResult::Step);
         }
 
-        // If CDC is already enabled, re-parse with current version and exit
-        // early. Idempotent; avoids CDC capturing its own table creation when
-        // the pragma is called multiple times.
-        if let Some(info) = conn.get_capture_data_changes_info().as_ref() {
+        // If CDC is already enabled for the same table, only the mode can
+        // change: re-parse with the current version and skip the table setup.
+        if let Some(info) = conn
+            .get_capture_data_changes_info()
+            .as_ref()
+            .filter(|info| info.table.eq_ignore_ascii_case(cdc_table_name))
+        {
             let opts = CaptureDataChangesInfo::parse(cdc_mode, info.version)?;
             state.pending_cdc_info = Some(opts);
             state.pc += 1;
