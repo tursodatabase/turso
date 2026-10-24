@@ -186,6 +186,16 @@ impl Dialect for PostgresDialect {
     fn errors_on_zero_divisor(&self) -> bool {
         true
     }
+
+    fn comparison_type(&self, lhs_type: &str, rhs_type: &str) -> Option<&'static str> {
+        match (lhs_type, rhs_type) {
+            ("date", "timestamp") | ("timestamp", "date") => Some("timestamp"),
+            ("date" | "timestamp", "timestamptz") | ("timestamptz", "date" | "timestamp") => {
+                Some("timestamptz")
+            }
+            _ => None,
+        }
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {

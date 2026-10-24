@@ -72,6 +72,7 @@ scalar_functions! {
     TimestampIn(FunctionArity::Exact(1), true),
     DatetimePl(FunctionArity::OneOf(&[2, 4]), true),
     DatetimeMi(FunctionArity::OneOf(&[2, 4]), true),
+    IntervalMul | IntervalDiv(FunctionArity::Exact(4), true),
     DateIn(FunctionArity::Exact(1), true),
     TimeIn(FunctionArity::Exact(1), true),
     DatePl(FunctionArity::Exact(2), true),
@@ -142,6 +143,18 @@ impl ScalarCall for PgScalarFunction {
                 &text_arg(args, 2),
                 &text_arg(args, 3),
             )?,
+            Self::IntervalMul => crate::datetime::exec_typed_interval_mul(
+                args[0].get_value(),
+                args[1].get_value(),
+                &text_arg(args, 2),
+                &text_arg(args, 3),
+            )?,
+            Self::IntervalDiv => crate::datetime::exec_typed_interval_div(
+                args[0].get_value(),
+                args[1].get_value(),
+                &text_arg(args, 2),
+                &text_arg(args, 3),
+            )?,
             Self::DateIn => crate::datetime::exec_date_in(args[0].get_value())?,
             Self::TimeIn => crate::datetime::exec_time_in(args[0].get_value())?,
             Self::DatePl => {
@@ -180,10 +193,15 @@ impl ScalarCall for PgScalarFunction {
                 Value::from_i64(0)
             }
             Self::PgLimitValue => exec_pg_limit_value(args)?,
-            Self::Now
-            | Self::ClockTimestamp
-            | Self::TransactionTimestamp
-            | Self::StatementTimestamp => Value::build_text(crate::datetime::now_text()),
+            Self::Now | Self::TransactionTimestamp => {
+                Value::build_text(crate::datetime::timestamptz_text(
+                    crate::session::session_state(connection)?.transaction_start(),
+                ))
+            }
+            Self::StatementTimestamp => Value::build_text(crate::datetime::timestamptz_text(
+                crate::session::session_state(connection)?.statement_start(),
+            )),
+            Self::ClockTimestamp => Value::build_text(crate::datetime::now_text()),
         };
         Ok(IOResult::Done(value))
     }

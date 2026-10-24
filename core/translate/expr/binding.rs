@@ -591,7 +591,7 @@ pub fn bind_and_rewrite_expr<'a>(
             Ok(WalkControl::Continue)
         },
     )?;
-    Ok(())
+    cast_compared_custom_types(top_level_expr, referenced_tables.as_deref(), resolver)
 }
 
 pub(crate) fn validate_function_tail(

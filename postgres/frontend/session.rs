@@ -558,7 +558,7 @@ pub(crate) fn custom_parameter(conn: &Connection, name: &str) -> Option<String> 
         .then(|| state.setting(&name).unwrap_or_default())
 }
 
-fn session_state(conn: &Connection) -> Result<&PgSessionState> {
+pub(crate) fn session_state(conn: &Connection) -> Result<&PgSessionState> {
     conn.context::<PgSessionState>().ok_or_else(|| {
         LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
     })

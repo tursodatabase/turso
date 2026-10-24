@@ -117,6 +117,77 @@ pub(super) fn emit_custom_type_operator(
     Ok(result_reg)
 }
 
+/// Wraps one side of each comparison between two different custom types in a
+/// CAST to the type the dialect compares them as (see
+/// `Dialect::comparison_type`). This runs before the optimizer, so an index
+/// seek uses the converted value.
+pub(super) fn cast_compared_custom_types(
+    expr: &mut ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<()> {
+    walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
+        let ast::Expr::Binary(lhs, op, rhs) = expr else {
+            return Ok(WalkControl::Continue);
+        };
+        if !op.is_comparison() {
+            return Ok(WalkControl::Continue);
+        }
+        let (Some(lhs_type), Some(rhs_type)) = (
+            custom_type_name_of(lhs, referenced_tables, resolver),
+            custom_type_name_of(rhs, referenced_tables, resolver),
+        ) else {
+            return Ok(WalkControl::Continue);
+        };
+        if lhs_type == rhs_type {
+            return Ok(WalkControl::Continue);
+        }
+        let Some(common_type) = resolver.dialect.comparison_type(&lhs_type, &rhs_type) else {
+            return Ok(WalkControl::Continue);
+        };
+        for (side, side_type) in [(lhs, lhs_type), (rhs, rhs_type)] {
+            if side_type != common_type {
+                let value =
+                    std::mem::replace(side.as_mut(), ast::Expr::Literal(ast::Literal::Null));
+                **side = ast::Expr::Cast {
+                    expr: Box::new(value),
+                    type_name: Some(ast::Type {
+                        name: common_type.to_string(),
+                        size: None,
+                        array_dimensions: 0,
+                    }),
+                };
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+/// The lowercase custom type name of a column of a custom type or of a CAST
+/// to a custom type.
+fn custom_type_name_of(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Option<String> {
+    match expr {
+        ast::Expr::Column { .. } => {
+            let info = expr_custom_type_info(expr, referenced_tables, resolver)?;
+            (!info.column.is_array()).then_some(info.type_name)
+        }
+        ast::Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } if type_name.array_dimensions == 0 => {
+            let name = crate::util::dequote(&type_name.name).to_lowercase();
+            resolver.schema().get_type_def_unchecked(&name)?;
+            Some(name)
+        }
+        _ => None,
+    }
+}
+
 /// Info about a column with a custom type, extracted from an expression.
 pub(super) struct ExprCustomTypeInfo {
     type_name: String,

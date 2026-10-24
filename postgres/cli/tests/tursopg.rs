@@ -1634,6 +1634,58 @@ fn wire_datetime_typed_params() {
     });
 }
 
+/// A parameter sent with a datetime type has that type in the query, so
+/// arithmetic and comparisons treat it as a date or timestamp. Expected
+/// values come from PostgreSQL 18.
+#[test]
+fn wire_datetime_typed_params_in_expressions() {
+    with_pg_client(|c| {
+        for (sql, oid, param, expected) in [
+            ("SELECT $1 + 1", 1082, "2026-10-08", "2026-10-09"),
+            ("SELECT $1 - 1", 1082, "2026-10-08", "2026-10-07"),
+            ("SELECT $1 - '2026-10-01'::date", 1082, "2026-10-08", "7"),
+            (
+                "SELECT $1 + interval '1 day'",
+                1114,
+                "2026-10-08 12:00",
+                "2026-10-09 12:00:00",
+            ),
+            (
+                "SELECT CASE WHEN $1 = '2026-10-08 00:00'::timestamp THEN 'eq' ELSE 'ne' END",
+                1082,
+                "2026-10-08",
+                "eq",
+            ),
+            (
+                "SELECT CASE WHEN $1 = '2026-10-08 12:00'::timestamp THEN 'eq' ELSE 'ne' END",
+                1184,
+                "2026-10-08 14:00+02",
+                "eq",
+            ),
+        ] {
+            assert_eq!(
+                c.query_with_typed_param(sql, oid, param),
+                Ok(expected.to_string()),
+                "{sql} {oid} {param}"
+            );
+        }
+    });
+}
+
+/// Datetime functions and date arithmetic report the types PostgreSQL 18
+/// reports.
+#[test]
+fn wire_datetime_functions_report_datetime_types() {
+    with_pg_client(|c| {
+        assert_eq!(
+            c.query_column_oids(
+                "SELECT '2026-10-08'::date - '2026-10-01'::date, now(), CURRENT_DATE, CURRENT_TIMESTAMP, transaction_timestamp(), statement_timestamp(), clock_timestamp(), LOCALTIMESTAMP, CURRENT_DATE + 1"
+            ),
+            vec![OID_INT4, 1184, 1082, 1184, 1184, 1184, 1184, 1114, 1082]
+        );
+    });
+}
+
 /// Direct table-column references take the schema-tagged path: a column
 /// declared INTEGER reports INT4, TEXT reports TEXT, and so on. The wire
 /// layer must not regress to TEXT here.

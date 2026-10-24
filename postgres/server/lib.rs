@@ -19,7 +19,7 @@ use pgwire::api::results::{
     DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
     QueryResponse, Response, Tag,
 };
-use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
+use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
     ClientInfo, ClientPortalStore, NoopHandler, PgWireConnectionState, PgWireServerHandlers, Type,
@@ -72,7 +72,7 @@ impl TursoPgServer {
             handler: Arc::new(TursoPgHandler {
                 conn: self.conn.clone(),
                 db_file: self.db_file.clone(),
-                query_parser: Arc::new(NoopQueryParser::new()),
+                query_parser: Arc::new(DatetimeParameterParser),
             }),
         });
 
@@ -113,7 +113,31 @@ impl TursoPgServer {
 struct TursoPgHandler {
     conn: Arc<Mutex<PgConnection>>,
     db_file: String,
-    query_parser: Arc<NoopQueryParser>,
+    query_parser: Arc<DatetimeParameterParser>,
+}
+
+/// Keeps the SQL of a Parse message as the statement, with a cast added to
+/// each parameter the client declared as a date, time or timestamp type.
+/// The cast is part of the stored SQL, so every later prepare of the
+/// statement sees the parameter types.
+struct DatetimeParameterParser;
+
+#[async_trait]
+impl QueryParser for DatetimeParameterParser {
+    type Statement = String;
+
+    async fn parse_sql<C>(
+        &self,
+        _client: &C,
+        sql: &str,
+        types: &[Option<Type>],
+    ) -> PgWireResult<Self::Statement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let oids: Vec<Option<u32>> = types.iter().map(|t| t.as_ref().map(Type::oid)).collect();
+        turso_pg::cast_datetime_parameters(sql, &oids).map_err(|err| pg_error(err.into()))
+    }
 }
 
 impl TursoPgHandler {
@@ -223,7 +247,7 @@ impl SimpleQueryHandler for TursoPgHandler {
 #[async_trait]
 impl ExtendedQueryHandler for TursoPgHandler {
     type Statement = String;
-    type QueryParser = NoopQueryParser;
+    type QueryParser = DatetimeParameterParser;
 
     async fn on_execute<C>(&self, client: &mut C, message: Execute) -> PgWireResult<()>
     where
