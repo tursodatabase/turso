@@ -208,6 +208,24 @@ fn index_key_matches_at_most_one_row(key: &[ValueRef<'_>], index_info: &IndexInf
         && !key.iter().any(|value| matches!(value, ValueRef::Null))
 }
 
+/// Byte-addressable value of column `column` in a materialized MVCC row record, for
+/// incremental blob I/O. TEXT and BLOB are addressable; every other type — and a
+/// column past the end of the record — errors with the same `cannot open value of
+/// type ...` wording the b-tree path uses, so the two cursors behave identically.
+fn mvcc_blob_column_bytes(record: &ImmutableRecord, column: usize) -> Result<&[u8]> {
+    match record.get_value_opt(column) {
+        Some(ValueRef::Text(text)) => Ok(text.value.as_bytes()),
+        Some(ValueRef::Blob(blob)) => Ok(blob),
+        Some(ValueRef::Numeric(crate::numeric::Numeric::Float(_))) => Err(blob_type_error("real")),
+        Some(ValueRef::Numeric(_)) => Err(blob_type_error("integer")),
+        Some(ValueRef::Null) | None => Err(blob_type_error("null")),
+    }
+}
+
+fn blob_type_error(type_name: &str) -> LimboError {
+    LimboError::InternalError(format!("cannot open value of type {type_name}"))
+}
+
 #[cfg(any(test, injected_yields))]
 fn cursor_yield_key(tx_id: u64, table_id: MVTableId) -> u64 {
     // ASCII-ish "CURSORCR"
@@ -1625,6 +1643,48 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
     fn record(&mut self) -> IOResultOr<Option<&crate::types::ImmutableRecord>> {
         self.current_row()
+    }
+
+    /// Incremental blob I/O, read side, for MVCC rows.
+    ///
+    /// The b-tree cursor addresses the value's bytes in place on its page; MVCC has no
+    /// such page, but it has already materialized the visible row version into an
+    /// in-memory record, so the length and the requested byte range are served from the
+    /// column value there. Only TEXT and BLOB are byte-addressable — every other type
+    /// errors with the same wording as the b-tree path. The write side stays unsupported
+    /// in MVCC (`Connection::blob_open` rejects a read-write handle), so a mutating
+    /// counterpart is deliberately not provided and the trait default — which errors —
+    /// stands. See #10623 / #10642.
+    fn blob_column_len(&mut self, column: usize) -> IOResultOr<usize> {
+        let record = return_if_io!(self.current_row());
+        let record = record.ok_or_else(|| {
+            LimboError::InternalError("incremental blob I/O: cursor is not on a row".to_string())
+        })?;
+        let len = mvcc_blob_column_bytes(record, column)?.len();
+        Ok(IOResult::Done(len))
+    }
+
+    fn blob_read_column(
+        &mut self,
+        column: usize,
+        off: usize,
+        len: usize,
+        out: &mut crate::ValueBlob,
+    ) -> IOResultOr<()> {
+        let record = return_if_io!(self.current_row());
+        let record = record.ok_or_else(|| {
+            LimboError::InternalError("incremental blob I/O: cursor is not on a row".to_string())
+        })?;
+        let bytes = mvcc_blob_column_bytes(record, column)?;
+        if off.saturating_add(len) > bytes.len() {
+            return Err(LimboError::InternalError(
+                "blob access past end of column value".to_string(),
+            )
+            .into());
+        }
+        out.clear();
+        out.extend_from_slice(&bytes[off..off + len]);
+        Ok(IOResult::Done(()))
     }
 
     fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> IOResultOr<SeekResult> {

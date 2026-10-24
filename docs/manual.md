@@ -114,7 +114,7 @@ MVCC is a supported journal mode. It has the following limitations:
 
 * `PRAGMA wal_checkpoint(TRUNCATE)` blocks both readers and writers. Passive checkpointing, which does not block them, is still behind the `--experimental-mvcc-passive-checkpoint` flag.
 * Indexes on `WITHOUT ROWID` tables are not supported.
-* Incremental blob I/O (`blob_open`, `sqlite3_blob_open`) is not supported.
+* Incremental blob I/O (`blob_open`, `sqlite3_blob_open`) is read-only: opening a handle for writing is not supported (a write cannot patch an MVCC row version in place).
 * If a database is written to using MVCC and then opened again without MVCC, the changes are not visible unless first checkpointed
 
 ## The SQL shell
