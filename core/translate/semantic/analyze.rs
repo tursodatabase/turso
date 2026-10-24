@@ -1458,7 +1458,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     && self
                         .source(source)
                         .and_then(|source| source.columns.get(column.column))
-                        .is_some_and(|column| column.rowid_alias)
+                        .is_some_and(|column| column.rowid_alias())
             }
             _ => false,
         }
@@ -2684,31 +2684,58 @@ mod tests {
     }
 
     #[test]
-    fn columns_with_the_same_declared_type_share_one_declaration() {
+    fn table_source_reads_its_columns_from_the_schema_unless_a_column_has_a_collation() {
         let mut schema = Schema::new();
-        let table = BTreeTable::from_sql("CREATE TABLE t(a INTEGER, b INTEGER, c TEXT)", 2)
-            .expect("table schema parses");
-        schema
-            .add_btree_table(Arc::new(table))
-            .expect("table name is unique");
-        let document =
-            analyze_sql_with_schema(&schema, "SELECT a FROM t").expect("SELECT analyzes");
-        let HirRoot::Query(root) = &document.root else {
-            panic!("SELECT produces query root");
-        };
-        let query = document.query(root.query).expect("query exists");
-        let first = query.blocks[0].from.as_ref().expect("query has FROM").first;
-        let source = document.source(first).expect("source exists");
-        let declared = |column: usize| {
-            source.columns[column]
-                .type_fact
-                .declared
+        for sql in [
+            "CREATE TABLE plain(a INTEGER, b TEXT)",
+            "CREATE TABLE collated(a INTEGER, b TEXT COLLATE NOCASE)",
+        ] {
+            let table = BTreeTable::from_sql(sql, 2).expect("table schema parses");
+            schema
+                .add_btree_table(Arc::new(table))
+                .expect("table name is unique");
+        }
+        let source_columns = |sql: &str| {
+            let document = analyze_sql_with_schema(&schema, sql).expect("SELECT analyzes");
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let query = document.query(root.query).expect("query exists");
+            let first = query.blocks[0].from.as_ref().expect("query has FROM").first;
+            document
+                .source(first)
+                .expect("source exists")
+                .columns
                 .clone()
-                .expect("column has a declared type")
         };
 
-        assert!(Arc::ptr_eq(&declared(0), &declared(1)));
-        assert!(!Arc::ptr_eq(&declared(0), &declared(2)));
+        let plain = source_columns("SELECT a FROM plain");
+        assert!(matches!(
+            plain,
+            crate::translate::semantic::hir::SourceColumns::Table(_)
+        ));
+        assert_eq!(plain.column(1).name(), "b");
+        assert_eq!(
+            plain
+                .column(1)
+                .type_fact()
+                .declared
+                .as_ref()
+                .map(|declared| declared.name.as_str()),
+            Some("TEXT")
+        );
+        let collated = source_columns("SELECT a FROM collated");
+        assert!(matches!(
+            collated,
+            crate::translate::semantic::hir::SourceColumns::Owned(_)
+        ));
+        assert_eq!(
+            collated
+                .column(1)
+                .collation()
+                .map(|collation| *collation.value()),
+            Some(crate::translate::collate::CollationSeq::NoCase)
+        );
     }
 
     #[test]
@@ -3688,17 +3715,21 @@ mod tests {
         assert_eq!(source.alias.as_deref(), Some("derived"));
         assert!(!source.rowid_available);
         assert_eq!(source.columns.len(), 2);
-        assert_eq!(&*source.columns[0].name, "item_text");
-        assert_eq!(source.columns[0].type_fact.storage, Some(Type::Text));
+        assert_eq!(source.columns.column(0).name(), "item_text");
         assert_eq!(
-            source.columns[0]
-                .collation
-                .as_ref()
+            source.columns.column(0).type_fact().storage,
+            Some(Type::Text)
+        );
+        assert_eq!(
+            source
+                .columns
+                .column(0)
+                .collation()
                 .expect("first compound arm supplies source collation")
                 .value(),
             &crate::translate::collate::CollationSeq::NoCase
         );
-        assert_eq!(&*source.columns[1].name, "item_key");
+        assert_eq!(source.columns.column(1).name(), "item_key");
         assert!(matches!(
             outer_block.outputs[0].expr,
             Expr::Column(reference) if reference.source == source.id && reference.column == 0
@@ -5125,7 +5156,7 @@ mod tests {
         assert_eq!(source.owner, SourceOwner::QueryBlock(root_block.id));
         assert_eq!(source.alias.as_deref(), Some("p"));
         assert!(!source.rowid_available);
-        assert_eq!(&*source.columns[1].name, "item_text");
+        assert_eq!(source.columns.column(1).name(), "item_text");
         assert!(matches!(
             root_block.outputs[0].expr,
             Expr::Column(reference) if reference.source == source.id && reference.column == 1
@@ -5759,7 +5790,7 @@ mod tests {
             group_source
                 .columns
                 .iter()
-                .map(|column| column.name.as_ref())
+                .map(|column| column.name())
                 .collect::<Vec<_>>(),
             [
                 "id",
@@ -6410,14 +6441,14 @@ mod tests {
         let source = document.source(source_id).expect("array source exists");
         assert!(source.column_type_programs.iter().all(Option::is_none));
 
-        let values = &source.columns[0].type_fact;
+        let values = &source.columns.column(0).type_fact();
         assert_eq!(values.storage, Some(Type::Blob));
         assert_eq!(values.array_dimensions, 1);
         let value = values.array_element().expect("INTEGER[] has an element");
         assert_eq!(value.storage, Some(Type::Integer));
         assert_eq!(value.array_dimensions, 0);
 
-        let matrix = &source.columns[1].type_fact;
+        let matrix = &source.columns.column(1).type_fact();
         assert_eq!(matrix.storage, Some(Type::Blob));
         assert_eq!(matrix.array_dimensions, 2);
         let row = matrix.array_element().expect("TEXT[][] has array elements");
@@ -6426,7 +6457,7 @@ mod tests {
         let value = row.array_element().expect("TEXT[] has scalar elements");
         assert_eq!(value.storage, Some(Type::Text));
 
-        let anything = &source.columns[2].type_fact;
+        let anything = &source.columns.column(2).type_fact();
         assert!(anything
             .array_element()
             .expect("ANY[] has an element fact")
@@ -6604,7 +6635,7 @@ mod tests {
             .source(block.from.as_ref().expect("query has FROM").first)
             .expect("custom table source exists");
 
-        let scalar = &source.columns[0].type_fact;
+        let scalar = &source.columns.column(0).type_fact();
         assert_eq!(scalar.storage, Some(Type::Integer));
         assert_eq!(scalar.array_dimensions, 0);
         let scalar_chain = &scalar
@@ -6628,7 +6659,7 @@ mod tests {
             ));
         }
 
-        let nested = &source.columns[1].type_fact;
+        let nested = &source.columns.column(1).type_fact();
         let nested_chain = &nested
             .declared
             .as_ref()
@@ -6661,7 +6692,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(operators, [ast::Operator::Add, ast::Operator::Subtract]);
 
-        let array = &source.columns[2].type_fact;
+        let array = &source.columns.column(2).type_fact();
         assert_eq!(array.storage, Some(Type::Blob));
         assert_eq!(array.array_dimensions, 1);
         let element = array
@@ -6690,7 +6721,7 @@ mod tests {
             .outputs
             .iter()
             .zip(source.columns.iter())
-            .all(|(output, column)| output.type_fact == column.type_fact));
+            .all(|(output, column)| output.type_fact == *column.type_fact()));
     }
 
     #[test]
@@ -6716,15 +6747,20 @@ mod tests {
                 .expect("outer source exists");
             assert!(source.column_type_programs[0].is_none());
             assert_eq!(
-                source.columns[0]
-                    .type_fact
+                source
+                    .columns
+                    .column(0)
+                    .type_fact()
                     .declared
                     .as_ref()
                     .and_then(|declared| declared.custom())
                     .map(|definition| definition.value().name.as_str()),
                 Some("scaled")
             );
-            assert_eq!(block.outputs[0].type_fact, source.columns[0].type_fact);
+            assert_eq!(
+                block.outputs[0].type_fact,
+                *source.columns.column(0).type_fact()
+            );
         }
     }
 
@@ -6939,7 +6975,10 @@ mod tests {
                 source.kind,
                 SourceKind::Pseudo { kind: actual, .. } if actual == kind
             ));
-            assert_eq!(source.columns[1].type_fact.storage, Some(Type::Text));
+            assert_eq!(
+                source.columns.column(1).type_fact().storage,
+                Some(Type::Text)
+            );
         }
     }
 
@@ -9890,9 +9929,12 @@ mod tests {
         assert!(matches!(input.kind, SourceKind::SchemaExpression));
         assert_eq!(input.owner, SourceOwner::Root);
         assert_eq!(input.columns.len(), 2);
-        assert_eq!(&*input.columns[0].name, "value");
-        assert_eq!(&*input.columns[1].name, "minimum");
-        assert_eq!(input.columns[0].type_fact.storage, Some(Type::Integer));
+        assert_eq!(input.columns.column(0).name(), "value");
+        assert_eq!(input.columns.column(1).name(), "minimum");
+        assert_eq!(
+            input.columns.column(0).type_fact().storage,
+            Some(Type::Integer)
+        );
 
         let Expr::Case { when_then, .. } = &program.body else {
             panic!("stored CASE becomes HIR");
@@ -11377,9 +11419,12 @@ mod tests {
             .source(program.input_source)
             .expect("domain CHECK input exists");
         assert_eq!(input.columns.len(), 1);
-        assert_eq!(&*input.columns[0].name, "value");
-        assert_eq!(input.columns[0].type_fact.storage, target.type_fact.storage);
-        assert!(input.columns[0].type_fact.declared.is_none());
+        assert_eq!(input.columns.column(0).name(), "value");
+        assert_eq!(
+            input.columns.column(0).type_fact().storage,
+            target.type_fact.storage
+        );
+        assert!(input.columns.column(0).type_fact().declared.is_none());
         let Expr::Binary { lhs, .. } = &program.body else {
             panic!("domain CHECK becomes binary HIR");
         };

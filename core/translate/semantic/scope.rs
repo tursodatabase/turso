@@ -147,7 +147,7 @@ impl Clone for ColumnBinding {
 }
 
 impl ColumnBinding {
-    fn from_source(source: &hir::Source, index: usize, column: &hir::SourceColumn) -> Self {
+    fn from_source(source: &hir::Source, index: usize, column: hir::SourceColumnRef<'_>) -> Self {
         let expr = match &source.kind {
             hir::SourceKind::FromGroup(group) => group.columns[index].clone(),
             _ => hir::Expr::Column(ColumnRef {
@@ -158,23 +158,27 @@ impl ColumnBinding {
         Self::new(source.id, expr, column)
     }
 
-    fn new(source: SourceId, expr: hir::Expr, column: &hir::SourceColumn) -> Self {
+    fn new(source: SourceId, expr: hir::Expr, column: hir::SourceColumnRef<'_>) -> Self {
         #[cfg(test)]
         tests::COLUMN_BINDINGS_MADE.with(|made| made.set(made.get() + 1));
+        let name: Arc<str> = match column {
+            hir::SourceColumnRef::Owned(column) => column.name.clone(),
+            hir::SourceColumnRef::Table { .. } => column.name().into(),
+        };
         Self {
             source,
-            display_name: column.name.clone(),
-            lookup_name: ColumnName(column.name.clone()),
+            display_name: name.clone(),
+            lookup_name: ColumnName(name.clone()),
             resolved: ResolvedScopeExpr {
                 expr,
-                type_fact: column.type_fact.clone(),
-                affinity: column.affinity,
-                has_affinity: column.has_affinity,
-                collation: ExprCollation::inherited(column.collation.clone()),
+                type_fact: column.type_fact().into_owned(),
+                affinity: column.affinity(),
+                has_affinity: column.has_affinity(),
+                collation: ExprCollation::inherited(column.collation().cloned()),
             },
-            hidden: column.hidden,
+            hidden: column.hidden(),
             rowid_names: false,
-            using_name: ColumnName(column.name.clone()),
+            using_name: ColumnName(name),
         }
     }
 
@@ -189,7 +193,7 @@ pub(crate) fn resolve_source_column(source: &hir::Source, name: &str) -> Result<
         .columns
         .iter()
         .enumerate()
-        .find(|(_, column)| column.name.eq_ignore_ascii_case(&normalized))
+        .find(|(_, column)| column.name().eq_ignore_ascii_case(&normalized))
         .map(|(index, column)| ColumnBinding::from_source(source, index, column).resolved())
         .ok_or_else(|| {
             crate::LimboError::ParseError(format!(
@@ -219,14 +223,14 @@ impl<'a> ColumnView<'a> {
 
     fn display_name(self) -> &'a str {
         match self {
-            Self::Source { source, index } => &source.columns[index].name,
+            Self::Source { source, index } => source.columns.column(index).name(),
             Self::Binding(binding) => &binding.display_name,
         }
     }
 
     fn lookup_name(self) -> &'a str {
         match self {
-            Self::Source { source, index } => &source.columns[index].name,
+            Self::Source { source, index } => source.columns.column(index).name(),
             Self::Binding(binding) => binding.lookup_name.as_str(),
         }
     }
@@ -237,7 +241,7 @@ impl<'a> ColumnView<'a> {
 
     fn using_name(self) -> &'a str {
         match self {
-            Self::Source { source, index } => &source.columns[index].name,
+            Self::Source { source, index } => source.columns.column(index).name(),
             Self::Binding(binding) => binding.using_name.as_str(),
         }
     }
@@ -248,7 +252,7 @@ impl<'a> ColumnView<'a> {
 
     fn hidden(self) -> bool {
         match self {
-            Self::Source { source, index } => source.columns[index].hidden,
+            Self::Source { source, index } => source.columns.column(index).hidden(),
             Self::Binding(binding) => binding.hidden,
         }
     }
@@ -276,13 +280,13 @@ impl<'a> ColumnView<'a> {
     fn resolved(self) -> ResolvedScopeExpr {
         match self {
             Self::Source { source, index } => {
-                let column = &source.columns[index];
+                let column = source.columns.column(index);
                 ResolvedScopeExpr {
                     expr: self.expr().into_owned(),
-                    type_fact: column.type_fact.clone(),
-                    affinity: column.affinity,
-                    has_affinity: column.has_affinity,
-                    collation: ExprCollation::inherited(column.collation.clone()),
+                    type_fact: column.type_fact().into_owned(),
+                    affinity: column.affinity(),
+                    has_affinity: column.has_affinity(),
+                    collation: ExprCollation::inherited(column.collation().cloned()),
                 }
             }
             Self::Binding(binding) => binding.resolved(),
@@ -291,9 +295,11 @@ impl<'a> ColumnView<'a> {
 
     fn to_binding(self) -> ColumnBinding {
         match self {
-            Self::Source { source, index } => {
-                ColumnBinding::new(source.id, self.expr().into_owned(), &source.columns[index])
-            }
+            Self::Source { source, index } => ColumnBinding::new(
+                source.id,
+                self.expr().into_owned(),
+                source.columns.column(index),
+            ),
             Self::Binding(binding) => binding.clone(),
         }
     }
@@ -312,7 +318,7 @@ struct ScopeSource {
     table_name: String,
     database: Option<hir::DatabaseId>,
     database_qualified: bool,
-    columns: Arc<[hir::SourceColumn]>,
+    columns: hir::SourceColumns,
     /// For a parenthesized join group: the value each column reads.
     group_values: Option<Vec<hir::Expr>>,
     rowid_available: bool,
@@ -1377,12 +1383,12 @@ impl Scope {
         right
             .columns
             .iter()
-            .filter(|column| !column.hidden)
+            .filter(|column| !column.hidden())
             .filter_map(|right_column| {
-                let lookup = crate::util::normalize_ident(&right_column.name);
+                let lookup = crate::util::normalize_ident(right_column.name());
                 self.visible_columns()
                     .find(|left_column| !left_column.hidden() && left_column.using_matches(&lookup))
-                    .map(|_| right_column.name.to_string())
+                    .map(|_| right_column.name().to_string())
             })
             .collect()
     }

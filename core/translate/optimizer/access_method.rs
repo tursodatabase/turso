@@ -1351,10 +1351,9 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
                 )
             ) && constraint.usable
                 && constraint.table_col_pos.is_some_and(|position| {
-                    definition
-                        .columns
-                        .get(position)
-                        .is_some_and(|column| constraint.satisfies_index_affinity(column.affinity))
+                    definition.columns.get(position).is_some_and(|column| {
+                        constraint.satisfies_index_affinity(column.affinity())
+                    })
                 })
         })
         .collect();
@@ -1542,16 +1541,13 @@ fn hir_materialized_subquery_ephemeral_index(
     key_col_positions: &[usize],
 ) -> Result<Arc<Index>> {
     let index_column = |position: usize| {
-        let column = &source.columns[position];
+        let column = source.columns.column(position);
         IndexColumn {
-            name: column.name.to_string(),
+            name: column.name().to_string(),
             order: SortOrder::Asc,
             nulls_order: None,
             pos_in_table: position,
-            collation: column
-                .collation
-                .as_ref()
-                .map(|collation| *collation.value()),
+            collation: column.collation().map(|collation| *collation.value()),
             default: None,
             expr: None,
         }

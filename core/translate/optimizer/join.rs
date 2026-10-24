@@ -1604,7 +1604,7 @@ fn hir_plain_rowid_table(document: &HirDocument, source: &HirPlanSource, schema:
         && definition
             .columns
             .iter()
-            .all(|column| !column.type_fact.is_array())
+            .all(|column| !column.type_fact().is_array())
 }
 
 /// A hash join of HIR sources that builds a hash table from `build` and

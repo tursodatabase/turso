@@ -244,7 +244,7 @@ fn synthesized_derived_table(source: &hir::Source) -> Result<BTreeTable> {
         .iter()
         .map(|column| {
             crate::schema::Column::new_default_text(
-                Some(column.name.to_string()),
+                Some(column.name().to_string()),
                 String::new(),
                 None,
             )

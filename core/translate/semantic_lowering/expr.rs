@@ -564,7 +564,7 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
             }
         }
         if !self.program.flags.suppress_custom_type_decode()
-            && column.type_fact.array_dimensions == 0
+            && column.type_fact().array_dimensions == 0
         {
             return self
                 .schema_call_child(&programs.decode, index)
@@ -3217,7 +3217,7 @@ impl ExprLowerer<'_, '_, '_> {
         let suppress_custom_type_decode = self.program.flags.suppress_custom_type_decode();
         // See `column_child`: a virtual column's value is not decoded.
         let decode_children =
-            if column.type_fact.array_dimensions > 0 || suppress_custom_type_decode || computed {
+            if column.type_fact().array_dimensions > 0 || suppress_custom_type_decode || computed {
                 0
             } else {
                 type_program.as_ref().map_or(0, |programs| {
@@ -3255,8 +3255,8 @@ impl ExprLowerer<'_, '_, '_> {
         match generated {
             hir::ColumnReadExpression::Planned(_) => {
                 debug_assert_eq!(children[0], target);
-                if decode_children == 0 && column.has_affinity {
-                    self.program.emit_column_affinity(target, column.affinity);
+                if decode_children == 0 && column.has_affinity() {
+                    self.program.emit_column_affinity(target, column.affinity());
                 }
             }
             hir::ColumnReadExpression::Absent => {}
@@ -3308,7 +3308,7 @@ impl ExprLowerer<'_, '_, '_> {
                 reference.source, reference.column
             ))
         })?;
-        if column.rowid_alias {
+        if column.rowid_alias() {
             return Err(LimboError::InternalError(
                 "HIR custom-type default cannot be read from a rowid alias".to_string(),
             ));
@@ -3392,9 +3392,9 @@ impl ExprLowerer<'_, '_, '_> {
         if matches!(context.registers, ExprRegisters::None) {
             match generated {
                 hir::ColumnReadExpression::Planned(_) => {
-                    if column.has_affinity {
+                    if column.has_affinity() {
                         self.program
-                            .emit_column_affinity(context.target, column.affinity);
+                            .emit_column_affinity(context.target, column.affinity());
                     }
                 }
                 hir::ColumnReadExpression::Absent => {
@@ -3436,7 +3436,7 @@ impl ExprLowerer<'_, '_, '_> {
     fn emit_stored_column(
         &mut self,
         reference: hir::ColumnRef,
-        column: &hir::SourceColumn,
+        column: hir::SourceColumnRef<'_>,
         target: usize,
         apply_storage_affinity: bool,
     ) -> Result<()> {
@@ -3452,7 +3452,7 @@ impl ExprLowerer<'_, '_, '_> {
                 // A row image keeps NULL in an INTEGER PRIMARY KEY column's
                 // register; the value is the rowid.
                 let src_reg = match rowid {
-                    Some(rowid) if column.rowid_alias => rowid,
+                    Some(rowid) if column.rowid_alias() => rowid,
                     _ => start + reference.column,
                 };
                 self.program.emit_insn(Insn::Copy {
@@ -3484,7 +3484,7 @@ impl ExprLowerer<'_, '_, '_> {
                 });
             }
             SourceBinding::BTree { scan_cursor, .. } => {
-                if column.rowid_alias {
+                if column.rowid_alias() {
                     self.emit_btree_rowid(scan_cursor, target)?;
                 } else {
                     let read = self.resolve_btree_column(reference)?;
@@ -3496,8 +3496,8 @@ impl ExprLowerer<'_, '_, '_> {
                 // computed from a literal, gives values back as stored; a
                 // compound subquery column follows its combined affinity.
                 if apply_storage_affinity
-                    && column.has_affinity
-                    && column.affinity == crate::vdbe::affinity::Affinity::Real
+                    && column.has_affinity()
+                    && column.affinity() == crate::vdbe::affinity::Affinity::Real
                 {
                     expr::maybe_apply_affinity(crate::schema::Type::Real, target, self.program);
                 }
@@ -3552,11 +3552,10 @@ impl ExprLowerer<'_, '_, '_> {
         }
     }
 
-    fn set_column_collation(&mut self, column: &hir::SourceColumn) {
+    fn set_column_collation(&mut self, column: hir::SourceColumnRef<'_>) {
         self.program.set_collation(
             column
-                .collation
-                .as_ref()
+                .collation()
                 .map(|collation| (*collation.value(), false)),
         );
     }

@@ -1037,7 +1037,7 @@ fn expression_affinity(document: &HirDocument, expression: &hir::Expr) -> Affini
         hir::Expr::Column(reference) => document
             .source(reference.source)
             .and_then(|source| source.columns.get(reference.column))
-            .map_or(Affinity::Blob, |column| column.affinity),
+            .map_or(Affinity::Blob, |column| column.affinity()),
         hir::Expr::RowId(_) => Affinity::Integer,
         hir::Expr::Output(id) => document
             .output(*id)
@@ -1082,7 +1082,8 @@ fn resolved_result_value(
                     "HIR result references missing column {reference:?}"
                 ))
             })?;
-            let declared = column.type_fact.declared.as_ref();
+            let type_fact = column.type_fact();
+            let declared = type_fact.declared.as_ref();
             // A subquery column that reads a rowid is declared INTEGER.
             let reads_rowid = declared.is_none()
                 && matches!(
@@ -1103,7 +1104,7 @@ fn resolved_result_value(
                         .unwrap_or_default(),
                     declared
                         .map(|declared| declared.storage)
-                        .or(column.type_fact.storage)
+                        .or(column.type_fact().storage)
                         .unwrap_or(Type::Null),
                 )
             };
@@ -1116,7 +1117,7 @@ fn resolved_result_value(
                     }
                     _ => source.name.clone(),
                 },
-                column_name: column.name.to_string(),
+                column_name: column.name().to_string(),
                 declared_type,
                 ty,
                 array_dimensions: declared.map_or(0, |declared| declared.array_dimensions),

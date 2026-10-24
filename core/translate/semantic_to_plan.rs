@@ -4434,7 +4434,7 @@ pub(crate) mod tests {
             name: "items".to_string(),
             alias: Some("i".to_string()),
             kind: SourceKind::Table(resolved_table("items")),
-            columns: crate::sync::Arc::from(vec![
+            columns: vec![
                 SourceColumn {
                     name: "first".into(),
                     type_fact: TypeFact::known(Type::Integer),
@@ -4453,7 +4453,8 @@ pub(crate) mod tests {
                     hidden: false,
                     rowid_alias: false,
                 },
-            ]),
+            ]
+            .into(),
             generated_expressions: vec![ColumnReadExpression::Absent; 2],
             default_expressions: vec![ColumnReadExpression::Absent; 2],
             column_type_programs: vec![None; 2],
@@ -5613,7 +5614,12 @@ pub(crate) mod tests {
         derived_source.owner = SourceOwner::QueryBlock(root_block_id);
         derived_source.database = None;
         derived_source.kind = SourceKind::Derived(child_query);
-        derived_source.columns = derived_source.columns[..1].into();
+        derived_source.columns = derived_source
+            .columns
+            .iter()
+            .take(1)
+            .map(|column| column.to_owned())
+            .collect();
         derived_source.generated_expressions.truncate(1);
         derived_source.default_expressions.truncate(1);
         derived_source.column_type_programs.truncate(1);
@@ -5683,16 +5689,16 @@ pub(crate) mod tests {
         let mut cte_document = plan.document.as_ref().clone();
         cte_document.sources[source_id.index()].kind = SourceKind::Cte(cte_id);
         cte_document.queries[root_query.index()].reachable_ctes = vec![cte_id];
-        let source_column = &cte_document.sources[source_id.index()].columns[0];
+        let source_column = cte_document.sources[source_id.index()].columns.column(0);
         cte_document.ctes.push(Cte {
             id: cte_id,
             name: "numbers".to_string(),
             columns: vec![CteColumn {
-                name: source_column.name.to_string(),
-                type_fact: source_column.type_fact.clone(),
-                affinity: source_column.affinity,
-                has_affinity: source_column.has_affinity,
-                collation: source_column.collation.clone(),
+                name: source_column.name().to_string(),
+                type_fact: source_column.type_fact().into_owned(),
+                affinity: source_column.affinity(),
+                has_affinity: source_column.has_affinity(),
+                collation: source_column.collation().cloned(),
             }],
             materialized: Materialized::Yes,
             body: CteBody::Query(child_query),

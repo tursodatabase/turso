@@ -664,7 +664,7 @@ impl SeekExpressionLowering<hir::Expr> for HirSeekExpressionLowering<'_> {
                 let rowid_alias = source
                     .columns
                     .get(column.column)
-                    .is_some_and(|column| column.rowid_alias);
+                    .is_some_and(|column| column.rowid_alias());
                 let not_null = match &source.kind {
                     hir::SourceKind::Table(table) => table
                         .value()
@@ -702,7 +702,7 @@ impl SeekExpressionLowering<hir::Expr> for HirSeekExpressionLowering<'_> {
                         .document
                         .source(column.source)
                         .and_then(|source| source.columns.get(column.column))
-                        .is_some_and(|column| column.rowid_alias)
+                        .is_some_and(|column| column.rowid_alias())
             }
             _ => false,
         };
@@ -765,8 +765,8 @@ impl SeekExpressionLowering<hir::Expr> for HirSeekExpressionLowering<'_> {
         self.source
             .columns
             .iter()
-            .find(|column| column.rowid_alias)
-            .map_or(Affinity::Numeric, |column| column.affinity)
+            .find(|column| column.rowid_alias())
+            .map_or(Affinity::Numeric, |column| column.affinity())
     }
 }
 
@@ -8617,8 +8617,8 @@ fn hir_materialized_table(source: &hir::Source) -> Arc<BTreeTable> {
         .columns
         .iter()
         .map(|column| {
-            let storage = column.type_fact.storage.unwrap_or(Type::Null);
-            let ty_str = match column.affinity {
+            let storage = column.type_fact().storage.unwrap_or(Type::Null);
+            let ty_str = match column.affinity() {
                 Affinity::Blob => "BLOB",
                 Affinity::Text => "TEXT",
                 Affinity::Numeric => "NUMERIC",
@@ -8627,17 +8627,14 @@ fn hir_materialized_table(source: &hir::Source) -> Arc<BTreeTable> {
                 Affinity::None => "",
             };
             Column::new(
-                Some(column.name.to_string()),
+                Some(column.name().to_string()),
                 ty_str.to_string(),
                 None,
                 None,
                 storage,
-                column
-                    .collation
-                    .as_ref()
-                    .map(|collation| *collation.value()),
+                column.collation().map(|collation| *collation.value()),
                 ColDef {
-                    flags: if column.hidden {
+                    flags: if column.hidden() {
                         crate::schema::ColDefFlags::Hidden
                     } else {
                         crate::schema::ColDefFlags::empty()
@@ -8903,8 +8900,8 @@ fn build_hir_autoindex(
                     // has the column's affinity, as a read of the column
                     // does.
                     if let Some(definition) = prepared.source.columns.get(column) {
-                        if definition.has_affinity {
-                            program.emit_column_affinity(target, definition.affinity);
+                        if definition.has_affinity() {
+                            program.emit_column_affinity(target, definition.affinity());
                         }
                     }
                     Ok(())
@@ -10510,7 +10507,7 @@ fn check_hir_window_key_is_orderable(
     let name = document
         .source(column.source)
         .and_then(|source| source.columns.get(column.column))
-        .map(|column| column.name.as_ref())
+        .map(|column| column.name())
         .ok_or_else(|| {
             LimboError::InternalError(format!(
                 "HIR window key references missing column {column:?}"
@@ -10731,7 +10728,7 @@ fn array_column_decode<'a>(
         return None;
     };
     let source = document.source(reference.source)?;
-    if !source.columns.get(reference.column)?.type_fact.is_array() {
+    if !source.columns.get(reference.column)?.type_fact().is_array() {
         return None;
     }
     source
@@ -10752,7 +10749,7 @@ fn hir_expr_passes_array(document: &HirDocument, expression: &hir::Expr) -> bool
         hir::Expr::Column(reference) => document
             .source(reference.source)
             .and_then(|source| source.columns.get(reference.column))
-            .is_some_and(|column| column.type_fact.is_array()),
+            .is_some_and(|column| column.type_fact().is_array()),
         hir::Expr::Output(output) => document
             .output(*output)
             .is_some_and(|output| output.type_fact.is_array() || is_array(&output.expr)),

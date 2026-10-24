@@ -3877,11 +3877,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 })?;
                 Ok(ResolvedScopeExpr {
                     expr: hir::Expr::Column(reference),
-                    type_fact: column.type_fact.clone(),
-                    affinity: column.affinity,
-                    has_affinity: column.has_affinity,
+                    type_fact: column.type_fact().into_owned(),
+                    affinity: column.affinity(),
+                    has_affinity: column.has_affinity(),
                     collation: ExprCollation::column(
-                        column.collation.clone(),
+                        column.collation().cloned(),
                         &self.binary_collation,
                     ),
                 })
@@ -5179,7 +5179,7 @@ mod tests {
             name: "items".to_string(),
             alias: None,
             kind: SourceKind::SchemaExpression,
-            columns: crate::sync::Arc::from(vec![SourceColumn {
+            columns: vec![SourceColumn {
                 name: "value".into(),
                 type_fact: TypeFact::known(Type::Text),
                 affinity: Affinity::Text,
@@ -5187,7 +5187,8 @@ mod tests {
                 collation: None,
                 hidden: false,
                 rowid_alias: false,
-            }]),
+            }]
+            .into(),
             generated_expressions: vec![ColumnReadExpression::Absent],
             default_expressions: vec![ColumnReadExpression::Absent],
             column_type_programs: vec![None],

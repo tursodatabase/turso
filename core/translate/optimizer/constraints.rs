@@ -1193,7 +1193,7 @@ pub(crate) fn hir_constraints_for_source(
             let column_collation = source_definition
                 .columns
                 .get(position)
-                .and_then(|column| column.collation.as_ref())
+                .and_then(|column| column.collation())
                 .map(|collation| *collation.value())
                 .unwrap_or_default();
             if constraint.comparison_collation.unwrap_or_default() != column_collation {

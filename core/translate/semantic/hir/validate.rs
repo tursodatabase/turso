@@ -1235,8 +1235,8 @@ impl<'document> HirValidator<'document> {
         }
 
         for column in source.columns.iter() {
-            self.visit_type_fact(&column.type_fact)?;
-            self.visit_optional_catalog_object(column.collation.as_ref(), "column collation")?;
+            self.visit_type_fact(&column.type_fact())?;
+            self.visit_optional_catalog_object(column.collation(), "column collation")?;
         }
         match &source.index_hint {
             IndexHint::None | IndexHint::NotIndexed => {}
@@ -2523,7 +2523,7 @@ impl<'document> HirValidator<'document> {
                 || format!("source {source} column {column} requires an unplanned {description}"),
             )?;
         }
-        let type_fact = &source_definition.columns[column].type_fact;
+        let type_fact = &source_definition.columns.column(column).type_fact();
         let reads_catalog_storage = matches!(
             &source_definition.kind,
             SourceKind::Table(_) | SourceKind::TableFunction { .. }

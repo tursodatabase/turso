@@ -102,9 +102,9 @@ pub(crate) fn expr_data_type<'a>(
         hir::Expr::Function(_) | hir::Expr::Parameter(_) => StorageClassMask::all(),
         hir::Expr::Column(reference) => source_of(reference.source)
             .and_then(|source| source.columns.get(reference.column))
-            .filter(|column| column.has_affinity)
+            .filter(|column| column.has_affinity())
             .map_or(StorageClassMask::all(), |column| {
-                from_affinity(column.affinity)
+                from_affinity(column.affinity())
             }),
         hir::Expr::RowId(_) => from_affinity(Affinity::Integer),
         hir::Expr::Cast { target, .. } => from_affinity(target.affinity),
@@ -966,7 +966,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .columns
             .iter()
             .enumerate()
-            .filter_map(|(column, definition)| definition.hidden.then_some(column))
+            .filter_map(|(column, definition)| definition.hidden().then_some(column))
             .take(arguments.len())
             .collect::<Vec<_>>();
         if hidden_columns.len() != arguments.len() {
@@ -1536,7 +1536,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             hir::Expr::Column(reference) => self
                 .source(reference.source)
                 .and_then(|source| source.columns.get(reference.column))
-                .map(|column| column.name.to_string()),
+                .map(|column| column.name().to_string()),
             hir::Expr::RowId(_) => output
                 .name
                 .rsplit('.')
@@ -1604,13 +1604,22 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let table_id =
             self.catalog_object_id(Some(database), CatalogObjectKind::Table, table_name.clone());
         let table = CatalogObject::new(table_id, self.context().snapshot(), Some(database), table);
-        let analyzed_columns = self.source_columns(&table)?;
-        let mut columns = Vec::with_capacity(analyzed_columns.len());
-        let mut column_type_programs = Vec::with_capacity(analyzed_columns.len());
-        for analyzed in analyzed_columns {
-            columns.push(analyzed.column);
-            column_type_programs.push(analyzed.programs);
-        }
+        let (columns, column_type_programs) = if self.schema_describes_columns(&table)? {
+            let width = table.value().columns().len();
+            (
+                hir::SourceColumns::Table(hir::TableColumns::new(table.handle())),
+                std::iter::repeat_with(|| None).take(width).collect(),
+            )
+        } else {
+            let analyzed_columns = self.source_columns(&table)?;
+            let mut columns = Vec::with_capacity(analyzed_columns.len());
+            let mut column_type_programs = Vec::with_capacity(analyzed_columns.len());
+            for analyzed in analyzed_columns {
+                columns.push(analyzed.column);
+                column_type_programs.push(analyzed.programs);
+            }
+            (columns.into(), column_type_programs)
+        };
         let generated_expressions = table
             .value()
             .columns()
@@ -1678,7 +1687,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         argument_predicates: Vec::new(),
                     },
                 },
-                columns: columns.into(),
+                columns,
                 generated_expressions,
                 default_expressions,
                 column_type_programs,
@@ -1724,6 +1733,23 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             )?;
         }
         Ok(source)
+    }
+
+    fn schema_describes_columns(&self, table: &hir::ResolvedTable) -> Result<bool> {
+        let is_strict = matches!(table.value(), Table::BTree(table) if table.is_strict);
+        let database = table.database().ok_or_else(|| {
+            LimboError::InternalError("table source has no owning database".to_string())
+        })?;
+        let schema = self.context().schema(database)?;
+        for column in table.value().columns() {
+            if column.name.is_none()
+                || column.has_explicit_collation()
+                || schema.resolve_type(&column.ty_str, is_strict)?.is_some()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(super) fn source_columns(
