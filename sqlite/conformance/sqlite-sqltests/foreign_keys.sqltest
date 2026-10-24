@@ -4831,3 +4831,38 @@ expect {
     2
     2
 }
+
+# The parent delete counts the NO ACTION child as a violation. Deleting the
+# rows of a different, CASCADE child table must not give that count back:
+# that FK was never counted, so the NO ACTION violation still stands.
+@cross-check-integrity
+test fk-delete-cascade-child-does-not-cancel-other-noaction-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE nc(id INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    CREATE TABLE cc(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE CASCADE);
+    INSERT INTO p VALUES(1);
+    INSERT INTO nc VALUES(1,1);
+    INSERT INTO cc VALUES(1,1),(2,1);
+    DELETE FROM p WHERE id=1;
+}
+expect error {
+}
+
+# Two children reference the same deleted parent through the NO ACTION FK
+# and are both removed by the CASCADE FK, while another table keeps a real
+# violation on a second deleted parent. Only the last of the two cascaded
+# children gives the count back, so the other violation still fails.
+@cross-check-integrity
+test fk-delete-cascade-siblings-do-not-cancel-unrelated-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE CASCADE, pname REFERENCES p(name));
+    CREATE TABLE d(id INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    INSERT INTO p VALUES(1,'a'),(2,'b');
+    INSERT INTO c VALUES(1,1,'a'),(2,1,'a');
+    INSERT INTO d VALUES(1,2);
+    DELETE FROM p WHERE id IN (1,2);
+}
+expect error {
+}

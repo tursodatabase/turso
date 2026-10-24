@@ -3941,7 +3941,12 @@ pub fn halt(
 
     // Check for immediate foreign key violations.
     // Any immediate violation causes the statement subtransaction to roll back.
+    // Subprograms (triggers, FK actions) share the parent statement's
+    // immediate counter (see op_program), so only the top-level statement
+    // judges it, as SQLite does: a count a subprogram sees may belong to a
+    // violation the parent resolves later in the same statement.
     if program.connection.foreign_keys_enabled()
+        && !program.is_trigger_subprogram()
         && state.get_fk_immediate_violations_during_stmt() > 0
     {
         return Err(state.immediate_foreign_key_error().into());
@@ -6263,9 +6268,10 @@ pub fn op_program(
                 }
                 // Copy the subprogram's final immediate FK violation count back
                 // into the parent statement (see the seeding comment above).
-                // Only on clean completion: an aborted/ignored subprogram leaves
-                // dirty state that must not perturb the parent's counter.
-                if !subprogram_aborted {
+                // On clean completion, and on RAISE(IGNORE), whose writes before
+                // the RAISE are kept. Other aborts leave dirty state that must
+                // not perturb the parent's counter.
+                if !subprogram_aborted || raise_ignore {
                     state.set_fk_immediate_violations_during_stmt(
                         statement.fk_immediate_violations_during_stmt(),
                     );
