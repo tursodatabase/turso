@@ -256,6 +256,8 @@ FROM quarterly_sales s,
 
 Groups rows that share the same values in the specified columns. Typically used with aggregate functions.
 
+An aggregate that reads only columns from enclosing queries belongs to the nearest query that supplies one of those columns. That query computes the aggregate once per group, even when the aggregate appears inside nested scalar or FROM subqueries. An aggregate that reads a column from its own query stays in that query.
+
 ```sql
 SELECT department, COUNT(*) AS employee_count, AVG(salary) AS avg_salary
 FROM employees

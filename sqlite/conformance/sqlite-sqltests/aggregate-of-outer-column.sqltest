@@ -126,3 +126,103 @@ test outer-aggregate-in-a-table-function-argument-is-an-error {
 expect error {
     misuse of aggregate: json_group_array()
 }
+
+@cross-check-integrity
+test nested-aggregate-uses-nearest-referenced-query {
+    CREATE TABLE t(a);
+    CREATE TABLE u(b);
+    INSERT INTO t VALUES (1),(2);
+    INSERT INTO u VALUES (10),(20);
+    SELECT a, (SELECT (SELECT sum(u.b + t.a)) FROM u) FROM t ORDER BY a;
+}
+expect {
+    1|32
+    2|34
+}
+
+@cross-check-integrity
+test nested-aggregate-skips-unrelated-from {
+    CREATE TABLE t(a);
+    CREATE TABLE u(b);
+    INSERT INTO t VALUES (1),(2),(3);
+    INSERT INTO u VALUES (10),(20);
+    SELECT (SELECT (SELECT sum(t.a)) FROM u) FROM t;
+}
+expect {
+    6
+}
+
+@cross-check-integrity
+test nested-identical-local-aggregates-stay-independent {
+    CREATE TABLE t(a);
+    CREATE TABLE u(b);
+    INSERT INTO t VALUES (1),(2),(3);
+    INSERT INTO u VALUES (10),(20);
+    SELECT sum(1), (SELECT (SELECT sum(1) FROM u)) FROM t;
+}
+expect {
+    3|2
+}
+
+@cross-check-integrity
+test outer-aggregate-inside-derived-table-per-group {
+    CREATE TABLE t(a INT, b INT);
+    INSERT INTO t VALUES (3,1),(1,2),(2,3),(1,4),(3,5);
+    SELECT a, (SELECT w FROM (SELECT sum(t.b) w)) FROM t GROUP BY a ORDER BY a;
+}
+expect {
+    1|6
+    2|3
+    3|6
+}
+
+@cross-check-integrity
+test outer-aggregate-inside-derived-table-with-filter {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1),(2),(3),(NULL);
+    SELECT (SELECT w FROM (SELECT sum(t.a) w)) FROM t WHERE a > 1;
+}
+expect {
+    5
+}
+
+@cross-check-integrity
+test outer-aggregate-inside-derived-table-empty-input {
+    CREATE TABLE t(a);
+    SELECT coalesce((SELECT w FROM (SELECT sum(t.a) w)), -1) FROM t;
+}
+expect {
+    -1
+}
+
+@cross-check-integrity
+test nested-scalar-aggregate-belongs-to-outer-table {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1),(2),(NULL);
+    SELECT (SELECT (SELECT sum(t.a))) FROM t;
+}
+expect {
+    3
+}
+
+@cross-check-integrity
+test derived-table-local-aggregate-stays-local {
+    CREATE TABLE t(a);
+    CREATE TABLE u(b);
+    INSERT INTO t VALUES (1),(2);
+    INSERT INTO u VALUES (10),(20);
+    SELECT a, (SELECT w FROM (SELECT sum(b) w FROM u)) FROM t ORDER BY a;
+}
+expect {
+    1|30
+    2|30
+}
+
+test outer-aggregate-inside-derived-table-in-where-is-an-error {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1),(2),(3);
+    SELECT * FROM t WHERE (SELECT w FROM (SELECT max(t.a) w)) > 1;
+}
+expect error {
+    misuse of aggregate: max()
+}

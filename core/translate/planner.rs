@@ -1952,7 +1952,13 @@ fn prepare_lateral_subquery_plan(
     outer_query_refs: &[OuterQueryReference],
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
-    resolver.begin_collecting_aggregates_from_subqueries();
+    resolver.begin_collecting_aggregates_from_subqueries(
+        outer_query_refs
+            .iter()
+            .filter(|table| table.scope_depth == 0)
+            .map(|table| table.internal_id)
+            .collect(),
+    );
     let plan = prepare_select_plan(
         select,
         resolver,

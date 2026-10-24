@@ -133,6 +133,11 @@ impl From<bool> for DoubleQuotedDml {
     }
 }
 
+struct QueryAggregateCollection {
+    tables: Vec<TableInternalId>,
+    aggregates: Vec<Aggregate>,
+}
+
 pub struct Resolver<'a> {
     schema: &'a Schema,
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
@@ -169,12 +174,12 @@ pub struct Resolver<'a> {
     /// (resolve.c `resolveExprStep`). An aggregate whose argument columns
     /// belong to an enclosing query is computed by that query, not by the
     /// subquery it is written in. When a subquery resolves such an aggregate it
-    /// adds it to the enclosing query's list here (the last entry) instead of
+    /// adds it to the owning query's list here instead of
     /// keeping it, so the outer query never has to reach in and take it out
     /// later. Each query adds an empty list before planning its subqueries and
     /// removes it — folding the collected aggregates into its own aggregate
     /// list — afterwards.
-    enclosing_query_aggregates: RefCell<Vec<Vec<Aggregate>>>,
+    enclosing_query_aggregates: RefCell<Vec<QueryAggregateCollection>>,
     pub enable_custom_types: bool,
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
@@ -642,10 +647,13 @@ impl<'a> Resolver<'a> {
     /// Start collecting aggregates that this query's subqueries find to belong
     /// to this query, before planning those subqueries.
     /// [`Self::take_aggregates_from_subqueries`] retrieves them afterwards.
-    pub(crate) fn begin_collecting_aggregates_from_subqueries(&self) {
+    pub(crate) fn begin_collecting_aggregates_from_subqueries(&self, tables: Vec<TableInternalId>) {
         self.enclosing_query_aggregates
             .borrow_mut()
-            .push(Vec::new());
+            .push(QueryAggregateCollection {
+                tables,
+                aggregates: Vec::new(),
+            });
     }
 
     /// Stop collecting and return the aggregates this query's subqueries moved
@@ -654,7 +662,8 @@ impl<'a> Resolver<'a> {
         self.enclosing_query_aggregates
             .borrow_mut()
             .pop()
-            .unwrap_or_default()
+            .expect("query aggregate collection must have started")
+            .aggregates
     }
 
     /// Number of aggregates moved up so far to the innermost collecting query.
@@ -662,7 +671,7 @@ impl<'a> Resolver<'a> {
         self.enclosing_query_aggregates
             .borrow()
             .last()
-            .map_or(0, Vec::len)
+            .map_or(0, |collected| collected.aggregates.len())
     }
 
     /// The function name of the aggregate at `index` among those moved up to
@@ -671,17 +680,26 @@ impl<'a> Resolver<'a> {
         self.enclosing_query_aggregates
             .borrow()
             .last()
-            .and_then(|collected| collected.get(index))
+            .and_then(|collected| collected.aggregates.get(index))
             .map(|agg| agg.func.to_string())
     }
 
-    /// Move an aggregate up to the innermost enclosing query that is
-    /// collecting. Returns false when there is none — the aggregate then stays
-    /// with the query that resolved it.
-    pub(crate) fn move_aggregate_to_enclosing_query(&self, agg: Aggregate) -> bool {
-        match self.enclosing_query_aggregates.borrow_mut().last_mut() {
+    /// Move an aggregate up to the enclosing query that owns its nearest
+    /// referenced table. Returns false when that query is not collecting.
+    pub(crate) fn move_aggregate_to_enclosing_query(
+        &self,
+        agg: Aggregate,
+        owner_table: TableInternalId,
+    ) -> bool {
+        match self
+            .enclosing_query_aggregates
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|collected| collected.tables.contains(&owner_table))
+        {
             Some(collected) => {
-                collected.push(agg);
+                collected.aggregates.push(agg);
                 true
             }
             None => false,
