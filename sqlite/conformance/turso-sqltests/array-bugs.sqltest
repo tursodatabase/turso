@@ -184,3 +184,64 @@ test array-custom-type-decode-next-to-literal {
 expect {
     l|{1,2,3}
 }
+
+setup indexed-smallint-array {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a smallint[]) STRICT;
+    CREATE INDEX i ON t(a);
+    INSERT INTO t VALUES (1, '{1,2}'), (2, '{3}'), (3, NULL);
+}
+
+@setup indexed-smallint-array
+test array-index-text-key-matches-scan {
+    SELECT (SELECT count(*) FROM t INDEXED BY i WHERE a = '{3}'),
+           (SELECT count(*) FROM t NOT INDEXED WHERE a = '{3}');
+}
+expect {
+    0|0
+}
+
+@setup indexed-smallint-array
+test array-index-array-key-matches-scan {
+    SELECT (SELECT id FROM t INDEXED BY i WHERE a = ARRAY[3]),
+           (SELECT id FROM t NOT INDEXED WHERE a = ARRAY[3]);
+}
+expect {
+    2|2
+}
+
+@setup indexed-smallint-array
+test array-index-in-array-keys {
+    SELECT id FROM t INDEXED BY i WHERE a IN (ARRAY[1,2], ARRAY[3]) ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup indexed-smallint-array
+test array-index-null-key {
+    SELECT id FROM t INDEXED BY i WHERE a IS NULL;
+}
+expect {
+    3
+}
+
+test array-composite-index-array-key {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, category INTEGER, a smallint[]) STRICT;
+    CREATE INDEX i ON t(category, a);
+    INSERT INTO t VALUES (1, 1, '{1,2}'), (2, 1, '{3}'), (3, 2, '{3}');
+    SELECT id FROM t INDEXED BY i WHERE category = 1 AND a = ARRAY[3];
+}
+expect {
+    2
+}
+
+test array-index-scalar-element-encode-remains-checked {
+    CREATE TABLE t(a smallint) STRICT;
+    CREATE INDEX i ON t(a);
+    INSERT INTO t VALUES (1);
+    SELECT * FROM t WHERE a = 40000;
+}
+expect error {
+    integer out of range for smallint
+}
