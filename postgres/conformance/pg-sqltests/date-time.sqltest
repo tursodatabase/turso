@@ -1,0 +1,108 @@
+# date and time input, output and arithmetic through the PostgreSQL frontend.
+
+@database :memory:
+
+test date-cast-forms {
+    SELECT '2026-10-08'::date, '20261008'::date, 'October 8, 2026'::date, '2026-10-08 23:30-02'::date, 'epoch'::date, 'infinity'::date;
+}
+expect {
+    2026-10-08|2026-10-08|2026-10-08|2026-10-08|1970-01-01|infinity
+}
+
+test date-cast-invalid {
+    SELECT '2026-02-30'::date;
+}
+expect error {date/time field value out of range: "2026-02-30"}
+
+test date-plus-and-minus-integer {
+    SELECT '2026-10-08'::date + 1, 1 + '2026-10-08'::date, '2026-10-08'::date - 1, '2026-10-08'::date + 1 + 1;
+}
+expect {
+    2026-10-09|2026-10-09|2026-10-07|2026-10-10
+}
+
+test date-minus-date-is-days {
+    SELECT '2026-10-08'::date - '2026-10-01'::date, ('2026-10-08'::date + 1) - '2026-10-08'::date, (CURRENT_DATE + 1) - CURRENT_DATE;
+}
+expect {
+    7|1|1
+}
+
+test date-plus-interval-is-timestamp {
+    SELECT '2026-10-08'::date + interval '1 hour', '2026-10-08'::date - interval '1 day';
+}
+expect {
+    2026-10-08 01:00:00|2026-10-07 00:00:00
+}
+
+test date-minus-timestamptz {
+    SELECT '2026-10-08'::date - '2026-10-07 12:00+00'::timestamptz, '2026-10-08 12:00+00'::timestamptz - '2026-10-08'::date;
+}
+expect {
+    12:00:00|12:00:00
+}
+
+test date-infinity-arithmetic {
+    SELECT 'infinity'::date + 1, 'infinity'::date - interval '1 day', '-infinity'::date - '2026-10-08 12:00+00'::timestamptz;
+}
+expect {
+    infinity|infinity|-infinity
+}
+
+test date-minus-infinite-date {
+    SELECT 'infinity'::date - '2026-10-08'::date;
+}
+expect error {cannot subtract infinite dates}
+
+test date-plus-integer-out-of-range {
+    SELECT '2026-10-08'::date + 2147483647;
+}
+expect error {date out of range}
+
+test date-column-arithmetic-and-order {
+    CREATE TABLE t (id int, d date);
+    INSERT INTO t VALUES (1, '2026-10-08'), (2, 'infinity'), (3, '-infinity'), (4, '0999-01-01');
+    SELECT id, d + 1 FROM t ORDER BY d;
+}
+expect {
+    3|-infinity
+    4|0999-01-02
+    1|2026-10-09
+    2|infinity
+}
+
+test time-cast-forms {
+    SELECT '12:00'::time, '12:00:00.5'::time, '24:00:00'::time, '12:00 +02'::time, '1:02:03 PM'::time, '2026-10-08 13:45'::time;
+}
+expect {
+    12:00:00|12:00:00.5|24:00:00|12:00:00|13:02:03|13:45:00
+}
+
+test time-cast-invalid {
+    SELECT '25:00'::time;
+}
+expect error {date/time field value out of range: "25:00"}
+
+test time-column-order {
+    CREATE TABLE t (id int, tm time);
+    INSERT INTO t VALUES (1, '12:00:00.5'), (2, '9:00'), (3, '12:00'), (4, '24:00');
+    SELECT id, tm FROM t ORDER BY tm;
+}
+expect {
+    2|09:00:00
+    3|12:00:00
+    1|12:00:00.5
+    4|24:00:00
+}
+
+test date-plus-date-has-no-operator {
+    SELECT '2026-10-08'::date + '2026-10-08'::date;
+}
+expect error {operator does not exist: date \+ date}
+
+test to-char-time-zone-of-date-and-timestamp {
+    SELECT to_char('2026-01-05'::date, 'tz TZ OF'), to_char('2026-01-05 10:00'::timestamp, '[tz][TZ] OF');
+}
+expect {
+    utc UTC +00|[][] +00
+}

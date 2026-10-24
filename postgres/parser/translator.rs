@@ -3092,10 +3092,19 @@ impl PostgreSQLTranslator {
                     ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTime)),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTimestamp
-                        | SqlValueFunctionOp::SvfopCurrentTimestampN
-                        | SqlValueFunctionOp::SvfopLocaltimestamp
+                        | SqlValueFunctionOp::SvfopCurrentTimestampN,
+                    ) => Ok(now_call()),
+                    Ok(
+                        SqlValueFunctionOp::SvfopLocaltimestamp
                         | SqlValueFunctionOp::SvfopLocaltimestampN,
-                    ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp)),
+                    ) => Ok(ast::Expr::Cast {
+                        expr: Box::new(now_call()),
+                        type_name: Some(ast::Type {
+                            name: "timestamp".to_string(),
+                            size: None,
+                            array_dimensions: 0,
+                        }),
+                    }),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentUser
                         | SqlValueFunctionOp::SvfopSessionUser
@@ -3533,6 +3542,31 @@ impl PostgreSQLTranslator {
             _ => {}
         }
 
+        if matches!(op_name, "+" | "-")
+            && (is_datetime_operand(a_expr.lexpr.as_deref())
+                || is_datetime_operand(a_expr.rexpr.as_deref()))
+        {
+            let has_date_operand = is_date_operand(a_expr.lexpr.as_deref())
+                || is_date_operand(a_expr.rexpr.as_deref());
+            let func_name = match (op_name, has_date_operand) {
+                ("+", true) => "date_pl",
+                ("+", false) => "datetime_pl",
+                (_, true) => "date_mi",
+                (_, false) => "datetime_mi",
+            };
+            return Ok(ast::Expr::FunctionCall {
+                name: ast::Name::from_string(func_name),
+                distinctness: None,
+                args: vec![left, right],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            });
+        }
+
         // Map PostgreSQL operators to Turso operators
         let binary_op = match op_name {
             "=" => ast::Operator::Equals,
@@ -3905,6 +3939,8 @@ impl PostgreSQLTranslator {
             "INT4" | "INT2" | "INT8" => Some("INTEGER"),
             "BOOL" => Some("BOOLEAN"),
             "TEXT" => Some("TEXT"),
+            "DATE" => Some("date"),
+            "TIMESTAMPTZ" => Some("timestamptz"),
             _ => None,
         };
         if let Some(type_name) = cast_type {
@@ -5433,6 +5469,75 @@ fn is_star_qualified_by(node: &pg_query::protobuf::Node, target_qualifiers: &[&s
     qualifier.iter().rev().zip(target_qualifiers).all(
         |(field, expected)| matches!(&field.node, Some(Node::String(s)) if s.sval == *expected),
     )
+}
+
+fn now_call() -> ast::Expr {
+    ast::Expr::FunctionCall {
+        name: ast::Name::from_string("now"),
+        distinctness: None,
+        args: vec![],
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }
+}
+
+fn is_datetime_operand(node: Option<&pg_query::protobuf::Node>) -> bool {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::SqlValueFunctionOp as Op;
+    match node.and_then(|n| n.node.as_ref()) {
+        Some(Node::TypeCast(type_cast)) => type_cast
+            .type_name
+            .as_ref()
+            .and_then(|type_name| last_string(&type_name.names))
+            .is_some_and(|name| {
+                matches!(
+                    name.as_str(),
+                    "interval" | "timestamptz" | "timestamp" | "date"
+                )
+            }),
+        Some(Node::FuncCall(func_call)) => last_string(&func_call.funcname).is_some_and(|name| {
+            matches!(
+                name.as_str(),
+                "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp"
+            )
+        }),
+        Some(Node::SqlvalueFunction(svf)) => matches!(
+            Op::try_from(svf.op),
+            Ok(Op::SvfopCurrentDate
+                | Op::SvfopCurrentTimestamp
+                | Op::SvfopCurrentTimestampN
+                | Op::SvfopLocaltimestamp
+                | Op::SvfopLocaltimestampN)
+        ),
+        Some(Node::AExpr(a_expr))
+            if a_expr.kind == pg_query::protobuf::AExprKind::AexprOp as i32 =>
+        {
+            last_string(&a_expr.name).is_some_and(|op| matches!(op.as_str(), "+" | "-"))
+                && (is_datetime_operand(a_expr.lexpr.as_deref())
+                    || is_datetime_operand(a_expr.rexpr.as_deref()))
+        }
+        _ => false,
+    }
+}
+
+fn is_date_operand(node: Option<&pg_query::protobuf::Node>) -> bool {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::SqlValueFunctionOp as Op;
+    match node.and_then(|n| n.node.as_ref()) {
+        Some(Node::TypeCast(type_cast)) => type_cast
+            .type_name
+            .as_ref()
+            .and_then(|type_name| last_string(&type_name.names))
+            .is_some_and(|name| name == "date"),
+        Some(Node::SqlvalueFunction(svf)) => {
+            matches!(Op::try_from(svf.op), Ok(Op::SvfopCurrentDate))
+        }
+        _ => false,
+    }
 }
 
 fn last_string(names: &[pg_query::protobuf::Node]) -> Option<String> {

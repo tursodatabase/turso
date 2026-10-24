@@ -60,7 +60,10 @@ impl From<&LimboError> for ErrorReport {
     fn from(error: &LimboError) -> Self {
         let mut report = Self {
             sqlstate: sqlstate(error),
-            message: error.to_string(),
+            message: match error {
+                LimboError::InvalidDate(_) => crate::datetime::error_message(error),
+                _ => error.to_string(),
+            },
             detail: None,
             table_name: None,
             constraint_name: None,
@@ -235,9 +238,10 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::InvalidTextRepresentation(_) => SQLSTATE_INVALID_TEXT_REPRESENTATION,
         LimboError::IntegerOverflow => SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
         LimboError::TooBig => SQLSTATE_STRING_DATA_RIGHT_TRUNCATION,
-        LimboError::InvalidDate(_)
-        | LimboError::InvalidTime(_)
-        | LimboError::InvalidModifier(_) => SQLSTATE_INVALID_DATETIME_FORMAT,
+        LimboError::InvalidDate(msg) => crate::datetime::error_sqlstate(msg),
+        LimboError::InvalidTime(_) | LimboError::InvalidModifier(_) => {
+            SQLSTATE_INVALID_DATETIME_FORMAT
+        }
         LimboError::ConversionError(_)
         | LimboError::InvalidArgument(_)
         | LimboError::InvalidFormatter(_) => SQLSTATE_DATA_EXCEPTION,

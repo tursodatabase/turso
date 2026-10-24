@@ -1,0 +1,271 @@
+# timestamptz input, output, comparison and arithmetic through the PostgreSQL
+# frontend. The session time zone is UTC in both turso-pg and the stock
+# PostgreSQL container, so every value prints with a +00 offset.
+
+@database :memory:
+
+test timestamptz-cast-short-offset {
+    SELECT '2026-10-08 14:00:00+02'::timestamptz;
+}
+expect {
+    2026-10-08 12:00:00+00
+}
+
+test timestamptz-cast-zulu {
+    SELECT '2026-10-08T12:00:00Z'::timestamptz;
+}
+expect {
+    2026-10-08 12:00:00+00
+}
+
+test timestamptz-cast-keeps-microseconds {
+    SELECT '2026-10-08T12:00:00.123456+05:30'::timestamptz;
+}
+expect {
+    2026-10-08 06:30:00.123456+00
+}
+
+test timestamptz-cast-rounds-to-microseconds {
+    SELECT '2026-10-08 12:00:00.1234565'::timestamptz, '2026-10-08 12:00:00.1234575'::timestamptz;
+}
+expect {
+    2026-10-08 12:00:00.123456+00|2026-10-08 12:00:00.123458+00
+}
+
+test timestamptz-cast-offset-forms {
+    SELECT '2026-10-08 12:00:00+0230'::timestamptz, '2026-10-08 12:00:00 -2'::timestamptz, '2026-10-08 12:00:00-15:59:59'::timestamptz;
+}
+expect {
+    2026-10-08 09:30:00+00|2026-10-08 14:00:00+00|2026-10-09 03:59:59+00
+}
+
+test timestamptz-cast-date-only {
+    SELECT '2026-10-08'::timestamptz, '2026-10-08 +02'::timestamptz;
+}
+expect {
+    2026-10-08 00:00:00+00|2026-10-07 22:00:00+00
+}
+
+test timestamptz-cast-leap-second-and-midnight {
+    SELECT '2026-10-08 12:00:60'::timestamptz, '2026-10-08 24:00:00'::timestamptz;
+}
+expect {
+    2026-10-08 12:01:00+00|2026-10-09 00:00:00+00
+}
+
+test timestamptz-cast-special-values {
+    SELECT 'infinity'::timestamptz, '-infinity'::timestamptz, 'epoch'::timestamptz;
+}
+expect {
+    infinity|-infinity|1970-01-01 00:00:00+00
+}
+
+test timestamptz-cast-invalid-syntax {
+    SELECT 'nope'::timestamptz;
+}
+expect error {invalid input syntax for type timestamp with time zone: "nope"}
+
+test timestamptz-cast-field-out-of-range {
+    SELECT '2026-02-30 12:00:00'::timestamptz;
+}
+expect error {date/time field value out of range: "2026-02-30 12:00:00"}
+
+test timestamptz-cast-offset-out-of-range {
+    SELECT '2026-10-08 12:00:00+16'::timestamptz;
+}
+expect error {time zone displacement out of range}
+
+test timestamptz-equal-across-offsets {
+    SELECT CASE WHEN '2026-10-08 14:00:00+02'::timestamptz = '2026-10-08 12:00:00Z'::timestamptz THEN 'equal' ELSE 'different' END;
+}
+expect {
+    equal
+}
+
+test timestamptz-column-insert-and-text-cast {
+    CREATE TABLE t (id int, ts timestamptz);
+    INSERT INTO t VALUES (1, '2026-10-08 14:00:00+02'), (2, '2026-10-08T12:00:00.123456Z'), (3, 'infinity');
+    SELECT id, ts, ts::text FROM t ORDER BY id;
+}
+expect {
+    1|2026-10-08 12:00:00+00|2026-10-08 12:00:00+00
+    2|2026-10-08 12:00:00.123456+00|2026-10-08 12:00:00.123456+00
+    3|infinity|infinity
+}
+
+test timestamptz-column-insert-returning {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00+00') RETURNING ts;
+}
+expect {
+    2026-10-08 12:00:00+00
+}
+
+test timestamptz-column-insert-invalid {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-10-08 25:00:00');
+}
+expect error {date/time field value out of range: "2026-10-08 25:00:00"}
+
+test timestamptz-column-order-across-offsets {
+    CREATE TABLE t (id int, ts timestamptz);
+    INSERT INTO t VALUES (1, '2026-10-08T12:00:00Z'), (2, '2026-10-08T13:00:00+02:00'), (3, '-infinity'), (4, 'infinity');
+    SELECT id FROM t ORDER BY ts;
+}
+expect {
+    3
+    2
+    1
+    4
+}
+
+test timestamptz-column-compare-with-cast {
+    CREATE TABLE t (id int, ts timestamptz);
+    INSERT INTO t VALUES (1, '2026-10-08T12:00:00Z'), (2, '2026-10-08T14:00:00Z');
+    SELECT id FROM t WHERE ts > '2026-10-08 13:00:00+02'::timestamptz ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test timestamptz-column-indexed-compare-with-cast {
+    CREATE TABLE t (id int, ts timestamptz);
+    CREATE INDEX t_ts ON t (ts);
+    INSERT INTO t VALUES (1, '2026-10-08T12:00:00Z'), (2, '2026-10-08T14:00:00Z');
+    SELECT id FROM t WHERE ts = '2026-10-08 16:00:00+02'::timestamptz;
+}
+expect {
+    2
+}
+
+test timestamptz-plus-interval {
+    SELECT '2026-10-08 12:00:00+00'::timestamptz + interval '1 day 1 hour';
+}
+expect {
+    2026-10-09 13:00:00+00
+}
+
+test timestamptz-minus-interval-clamps-month-end {
+    SELECT '2026-03-31 00:00:00+00'::timestamptz - interval '1 month', interval '1 year' + '2024-02-29 00:00:00+00'::timestamptz;
+}
+expect {
+    2026-02-28 00:00:00+00|2025-02-28 00:00:00+00
+}
+
+test timestamptz-minus-timestamptz {
+    SELECT '2026-10-08 12:00:00+00'::timestamptz - '2026-10-01 00:00:00+00'::timestamptz, '2026-10-01 00:00:00+00'::timestamptz - '2026-10-08 12:00:00+00'::timestamptz;
+}
+expect {
+    7 days 12:00:00|-7 days -12:00:00
+}
+
+test timestamptz-infinity-arithmetic {
+    SELECT 'infinity'::timestamptz + interval '1 day', 'infinity'::timestamptz - '2026-10-08 00:00:00+00'::timestamptz;
+}
+expect {
+    infinity|infinity
+}
+
+test timestamptz-infinity-minus-infinity {
+    SELECT 'infinity'::timestamptz - 'infinity'::timestamptz;
+}
+expect error {interval out of range}
+
+test timestamptz-column-plus-interval-column {
+    CREATE TABLE t (ts timestamptz, i interval);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00+00', '1 day');
+    SELECT ts + i, ts - interval '90 minutes' FROM t;
+}
+expect {
+    2026-10-09 12:00:00+00|2026-10-08 10:30:00+00
+}
+
+test timestamptz-now-minus-interval-before-now {
+    SELECT CASE WHEN now() - interval '1 day' < now() THEN 'before' ELSE 'after' END;
+}
+expect {
+    before
+}
+
+test timestamptz-now-text-has-microseconds-and-offset {
+    SELECT CASE WHEN now()::text ~ '^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(\.\d{1,6})?\+00$' THEN 'ok' ELSE now()::text END;
+}
+expect {
+    ok
+}
+
+test timestamptz-to-char {
+    SELECT to_char('2026-10-08 14:05:09.123456+00'::timestamptz, 'YYYY-MM-DD HH24:MI:SS.US TZ'), to_char('2026-10-08 14:05:09+00'::timestamptz, 'FMDay, FMDDth FMMonth YYYY HH12 AM');
+}
+expect {
+    2026-10-08 14:05:09.123456 UTC|Thursday, 8th October 2026 02 PM
+}
+
+test timestamptz-to-char-infinity-is-null {
+    SELECT coalesce(to_char('infinity'::timestamptz, 'YYYY'), 'null');
+}
+expect {
+    null
+}
+
+test timestamp-cast-ignores-offset {
+    SELECT '2026-10-08 14:00:00+02'::timestamp;
+}
+expect {
+    2026-10-08 14:00:00
+}
+
+test timestamp-plus-interval {
+    SELECT '2026-10-08 12:00:00'::timestamp + interval '1 hour', '2026-10-08 12:00:00'::timestamp - '2026-10-08 11:59:59.5'::timestamp;
+}
+expect {
+    2026-10-08 13:00:00|00:00:00.5
+}
+
+test timestamptz-current-timestamp-has-microseconds-and-offset {
+    SELECT CASE WHEN CURRENT_TIMESTAMP::text ~ '^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(\.\d{1,6})?\+00$' THEN 'ok' ELSE CURRENT_TIMESTAMP::text END;
+}
+expect {
+    ok
+}
+
+test timestamptz-localtimestamp-has-no-offset {
+    SELECT CASE WHEN LOCALTIMESTAMP::text ~ '^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(\.\d{1,6})?$' THEN 'ok' ELSE LOCALTIMESTAMP::text END;
+}
+expect {
+    ok
+}
+
+test timestamptz-current-timestamp-arithmetic {
+    SELECT CASE WHEN CURRENT_TIMESTAMP - interval '1 day' < CURRENT_TIMESTAMP AND LOCALTIMESTAMP + interval '1 hour' > LOCALTIMESTAMP THEN 'ok' ELSE 'wrong' END;
+}
+expect {
+    ok
+}
+
+test timestamptz-function-call-cast {
+    SELECT timestamptz('2026-10-08 14:00+02'), date('2026-10-08 23:30-02'::timestamptz), date('2026-10-08');
+}
+expect {
+    2026-10-08 12:00:00+00|2026-10-09|2026-10-08
+}
+
+test timestamptz-cast-to-date-time-timestamp {
+    SELECT '2026-10-08 23:30-02'::timestamptz::date, '2026-10-08 23:30:00.5+00'::timestamptz::time, '2026-10-08 23:30-02'::timestamptz::timestamp;
+}
+expect {
+    2026-10-09|23:30:00.5|2026-10-09 01:30:00
+}
+
+test timestamptz-now-cast-to-date-is-current-date {
+    SELECT CASE WHEN now()::date = CURRENT_DATE THEN 'ok' ELSE 'wrong' END;
+}
+expect {
+    ok
+}
+
+test date-function-call-invalid {
+    SELECT date('garbage');
+}
+expect error {invalid input syntax for type date: "garbage"}

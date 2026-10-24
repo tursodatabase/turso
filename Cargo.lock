@@ -7278,6 +7278,7 @@ dependencies = [
  "chrono",
  "chumsky",
  "parking_lot",
+ "proptest",
  "rustc-hash 2.1.1",
  "strum",
  "tempfile",

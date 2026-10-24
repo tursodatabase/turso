@@ -155,7 +155,8 @@ impl Dialect for PostgresDialect {
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)
+        turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)?;
+        register_pg_types(schema)
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
@@ -3474,6 +3475,39 @@ fn index_definition(table_schema: &str, table_name: &str, index_name: &str, idx:
         def.push_str(&format!(" WHERE {where_clause}"));
     }
     def
+}
+
+const PG_TYPE_SQLS: &[&str] = &[
+    "CREATE TYPE timestamp(value text) BASE text ENCODE timestamp_in(value) DECODE value OPERATOR '+' datetime_pl OPERATOR '-' datetime_mi OPERATOR '<'",
+    "CREATE TYPE timestamptz(value text) BASE text ENCODE timestamptz_in(value) DECODE value OPERATOR '+' datetime_pl OPERATOR '-' datetime_mi OPERATOR '<'",
+    "CREATE TYPE date(value text) BASE text ENCODE date_in(value) DECODE value OPERATOR '+' date_pl OPERATOR '-' date_mi OPERATOR '<'",
+    "CREATE TYPE time(value text) BASE text ENCODE time_in(value) DECODE value OPERATOR '<'",
+];
+
+fn register_pg_types(schema: &mut Schema) -> Result<()> {
+    for sql in PG_TYPE_SQLS {
+        let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+        let Ok(Some(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateType {
+            type_name,
+            body,
+            ..
+        }))) = parser.next_cmd()
+        else {
+            return Err(LimboError::InternalError(format!(
+                "failed to parse built-in type SQL: {sql}"
+            )));
+        };
+        let type_def = turso_core::schema::TypeDef::from_create_type(
+            &type_name,
+            &body,
+            true,
+            sql.to_string(),
+        )?;
+        schema
+            .type_registry
+            .insert(type_name.to_lowercase(), Arc::new(type_def));
+    }
+    Ok(())
 }
 
 // TODO: Fix tests to use correct API
