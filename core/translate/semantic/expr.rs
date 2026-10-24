@@ -337,21 +337,45 @@ impl FrameValue {
 
     fn into_operand(self) -> ExprOperand {
         match self {
-            Self::Scalar(value) => ExprOperand {
-                expr: value.expr.clone(),
-                components: smallvec::smallvec![value],
-            },
-            Self::RowSubquery { query, components } => ExprOperand {
-                expr: hir::Expr::Subquery(hir::SubqueryExpr::Row { query }),
-                components: *components,
-            },
+            Self::Scalar(value) => ExprOperand::Scalar(value),
+            Self::RowSubquery { query, components } => {
+                ExprOperand::RowSubquery { query, components }
+            }
         }
     }
 }
 
-struct ExprOperand {
-    expr: hir::Expr,
-    components: ExprChildren,
+enum ExprOperand {
+    Scalar(ResolvedScopeExpr),
+    RowSubquery {
+        query: hir::QueryId,
+        components: Box<ExprChildren>,
+    },
+    RowValue(Box<ExprChildren>),
+}
+
+impl ExprOperand {
+    fn components(&self) -> &[ResolvedScopeExpr] {
+        match self {
+            Self::Scalar(value) => std::slice::from_ref(value),
+            Self::RowSubquery { components, .. } | Self::RowValue(components) => components,
+        }
+    }
+
+    fn into_expr(self) -> hir::Expr {
+        match self {
+            Self::Scalar(value) => value.expr,
+            Self::RowSubquery { query, .. } => {
+                hir::Expr::Subquery(hir::SubqueryExpr::Row { query })
+            }
+            Self::RowValue(components) => hir::Expr::Row(
+                components
+                    .into_iter()
+                    .map(|component| component.expr)
+                    .collect(),
+            ),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1020,7 +1044,7 @@ struct ExprFrame<'a> {
     syntax: &'a ast::Expr,
     expected_type: Option<Arc<TypeDef>>,
     next_child: usize,
-    resolved_children: FrameChildren,
+    first_value: usize,
     /// For an IN list: the operand the next child is in, and the child's
     /// position in it. Finding the child by counting operand widths from
     /// the start would read the whole list for every child.
@@ -1039,13 +1063,17 @@ struct ExprChild<'a> {
 }
 
 impl<'a> ExprFrame<'a> {
-    fn new(syntax: &'a ast::Expr, expected_type: Option<Arc<TypeDef>>) -> Result<Self> {
+    fn new(
+        syntax: &'a ast::Expr,
+        expected_type: Option<Arc<TypeDef>>,
+        first_value: usize,
+    ) -> Result<Self> {
         validate_special_function_syntax(syntax)?;
         Ok(Self {
             syntax,
             expected_type,
             next_child: 0,
-            resolved_children: SmallVec::new(),
+            first_value,
             in_list: OperandCursor::default(),
         })
     }
@@ -1320,43 +1348,93 @@ fn take_expression_operands<'a>(
     }
 
     let mut children = children.into_iter();
-    syntaxes
-        .into_iter()
-        .map(|syntax| {
-            let values = children
-                .by_ref()
-                .take(expression_operand_width(syntax))
-                .collect::<FrameChildren>();
-            if values.len() == 1 {
-                return Ok(values
-                    .into_iter()
-                    .next()
-                    .expect("operand contains one frame value")
-                    .into_operand());
-            }
-            let components = values
-                .into_iter()
-                .map(FrameValue::into_scalar)
-                .collect::<Result<ExprChildren>>()?;
-            let expr = hir::Expr::Row(
-                components
-                    .iter()
-                    .map(|component| component.expr.clone())
-                    .collect(),
-            );
-            Ok(ExprOperand { expr, components })
-        })
-        .collect::<Result<_>>()
+    let mut operands = SmallVec::with_capacity(syntaxes.len());
+    for syntax in syntaxes {
+        let width = expression_operand_width(syntax);
+        if width == 1 {
+            let child = children.next().expect("operand contains one frame value");
+            operands.push(child.into_operand());
+            continue;
+        }
+        let components = children
+            .by_ref()
+            .take(width)
+            .map(FrameValue::into_scalar)
+            .collect::<Result<ExprChildren>>()?;
+        operands.push(ExprOperand::RowValue(Box::new(components)));
+    }
+    Ok(operands)
 }
 
-fn take_scalar_operand(mut operand: ExprOperand) -> Result<ResolvedScopeExpr> {
-    if operand.components.len() != 1 {
-        crate::bail_parse_error!("row value misused");
+fn build_in_list_expr(
+    lhs_syntax: &ast::Expr,
+    negated: bool,
+    rhs_syntax: &[Box<ast::Expr>],
+    children: FrameChildren,
+) -> Result<ResolvedScopeExpr> {
+    let operands = take_expression_operands(
+        std::iter::once(lhs_syntax).chain(rhs_syntax.iter().map(Box::as_ref)),
+        children,
+    )?;
+    let (lhs, values) = operands.split_first().expect("IN has a left operand");
+    let lhs_width = lhs.components().len();
+    for value in values {
+        let width = value.components().len();
+        if lhs_width != width {
+            if lhs_width == 1 {
+                crate::bail_parse_error!("row value misused");
+            }
+            crate::bail_parse_error!(
+                "IN(...) element has {width} term{} - expected {lhs_width}",
+                if width == 1 { "" } else { "s" },
+            );
+        }
     }
-    Ok(operand
-        .components
-        .pop()
-        .expect("scalar operand contains one value"))
+    let comparisons = values
+        .iter()
+        .map(|value| in_operand_comparison(lhs.components(), value.components()))
+        .collect();
+    let mut operands = operands.into_iter().map(ExprOperand::into_expr);
+    let lhs = operands.next().expect("IN has a left operand");
+    Ok(computed_expr(
+        hir::Expr::InList {
+            lhs: Box::new(lhs),
+            negated,
+            values: operands.collect(),
+            comparisons,
+        },
+        hir::TypeFact::known(Type::Integer),
+        ExprCollation::Absent,
+    ))
+}
+
+fn scalarize_frame_values(children: &mut FrameChildren, row_values: RowValueChecks) -> Result<()> {
+    for child in children.iter_mut() {
+        let FrameValue::RowSubquery { components, .. } = child else {
+            continue;
+        };
+        if row_values != RowValueChecks::None {
+            crate::bail_parse_error!(
+                "sub-select returns {} columns - expected 1",
+                components.len()
+            );
+        }
+        let value = components.swap_remove(0);
+        *child = FrameValue::Scalar(value);
+    }
+    Ok(())
+}
+
+fn take_scalar_operand(operand: ExprOperand) -> Result<ResolvedScopeExpr> {
+    match operand {
+        ExprOperand::Scalar(value) => Ok(value),
+        ExprOperand::RowSubquery { mut components, .. } | ExprOperand::RowValue(mut components)
+            if components.len() == 1 =>
+        {
+            Ok(components.pop().expect("scalar operand contains one value"))
+        }
+        _ => crate::bail_parse_error!("row value misused"),
+    }
 }
 
 /// The first explicit COLLATE among `facts`, if any: the collation an
@@ -1376,7 +1454,7 @@ fn expression_operands_collation<'a>(
 ) -> ExprCollation {
     operands
         .into_iter()
-        .flat_map(|operand| &operand.components)
+        .flat_map(|operand| operand.components())
         .fold(ExprCollation::Absent, |current, value| {
             expression_collation(&current, &value.collation)
         })
@@ -1663,18 +1741,24 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         functions: &mut FunctionContext<'_, 'ast>,
         expected_type: Option<Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
-        let mut frames = vec![ExprFrame::new(syntax, expected_type)?];
+        let mut frames = vec![ExprFrame::new(syntax, expected_type, 0)?];
+        let mut values = Vec::<FrameValue>::new();
         loop {
             if let Some(child) = frames
                 .last_mut()
                 .expect("root expression frame exists")
                 .next_child(self.context().main_schema())?
             {
-                frames.push(ExprFrame::new(child.syntax, child.expected_type)?);
+                frames.push(ExprFrame::new(
+                    child.syntax,
+                    child.expected_type,
+                    values.len(),
+                )?);
                 continue;
             }
 
             let frame = frames.pop().expect("completed expression frame exists");
+            let children = values.drain(frame.first_value..).collect::<FrameChildren>();
             let resolved = match frame.syntax {
                 ast::Expr::Subquery(_)
                 | ast::Expr::Exists(_)
@@ -1692,7 +1776,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     self.aggregate_hosts.push(host);
                     let value = self.build_subquery_expr(
                         frame.syntax,
-                        frame.resolved_children,
+                        children,
                         scope,
                         owner,
                         policy.policies,
@@ -1702,7 +1786,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 }
                 _ => FrameValue::Scalar(self.build_expr_from_frames(
                     frame.syntax,
-                    frame.resolved_children,
+                    children,
                     scope,
                     policy,
                     functions,
@@ -1710,7 +1794,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 )?),
             };
             match frames.last_mut() {
-                Some(parent) => parent.resolved_children.push(resolved),
+                Some(_) => values.push(resolved),
                 None if policy.policies.row_values == RowValueChecks::None => {
                     return Ok(resolved.into_any_value());
                 }
@@ -2146,28 +2230,34 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         functions: &mut FunctionContext<'_, 'ast>,
         expected_type: Option<Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
-        let mut frames = vec![ExprFrame::new(syntax, expected_type)?];
+        let mut frames = vec![ExprFrame::new(syntax, expected_type, 0)?];
+        let mut values = Vec::<FrameValue>::new();
         loop {
             if let Some(child) = frames
                 .last_mut()
                 .expect("root expression frame exists")
                 .next_child(self.context().main_schema())?
             {
-                frames.push(ExprFrame::new(child.syntax, child.expected_type)?);
+                frames.push(ExprFrame::new(
+                    child.syntax,
+                    child.expected_type,
+                    values.len(),
+                )?);
                 continue;
             }
 
             let frame = frames.pop().expect("completed expression frame exists");
+            let children = values.drain(frame.first_value..).collect::<FrameChildren>();
             let resolved = self.build_expr_from_frames(
                 frame.syntax,
-                frame.resolved_children,
+                children,
                 scope,
                 policy,
                 functions,
                 frame.expected_type.as_ref(),
             )?;
             match frames.last_mut() {
-                Some(parent) => parent.resolved_children.push(FrameValue::Scalar(resolved)),
+                Some(_) => values.push(FrameValue::Scalar(resolved)),
                 None => return Ok(resolved),
             }
         }
@@ -2210,6 +2300,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 not,
                 ..
             } => self.build_between_expr(lhs, start, end, *not, children),
+            ast::Expr::InList { lhs, not, rhs, .. } => {
+                let mut children = children;
+                scalarize_frame_values(&mut children, policy.policies.row_values)?;
+                build_in_list_expr(lhs, *not, rhs, children)
+            }
             _ => {
                 let children = if policy.policies.row_values == RowValueChecks::None {
                     children
@@ -2265,19 +2360,19 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 ));
             }
         }
-        if lhs.components.len() != rhs.components.len()
-            || lhs.components.len() > 1 && !supports_row_value_binary_comparison(operator)
+        if lhs.components().len() != rhs.components().len()
+            || lhs.components().len() > 1 && !supports_row_value_binary_comparison(operator)
         {
             crate::bail_parse_error!("row value misused");
         }
-        if lhs.components.len() > 1 {
-            let comparison = expression_operand_comparison(&lhs.components, &rhs.components);
+        if lhs.components().len() > 1 {
+            let comparison = expression_operand_comparison(lhs.components(), rhs.components());
             let collation = expression_operands_collation([&lhs, &rhs]);
             return Ok(computed_expr(
                 hir::Expr::Binary {
-                    lhs: Box::new(lhs.expr),
+                    lhs: Box::new(lhs.into_expr()),
                     operator,
-                    rhs: Box::new(rhs.expr),
+                    rhs: Box::new(rhs.into_expr()),
                     array_concat: false,
                     custom: None,
                     comparison: Some(comparison),
@@ -2375,18 +2470,18 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let expr = operands.next().expect("BETWEEN has a tested operand");
         let start = operands.next().expect("BETWEEN has a lower bound");
         let end = operands.next().expect("BETWEEN has an upper bound");
-        if expr.components.len() != start.components.len()
-            || expr.components.len() != end.components.len()
+        if expr.components().len() != start.components().len()
+            || expr.components().len() != end.components().len()
         {
             crate::bail_parse_error!("row value misused");
         }
         // BETWEEN on a custom type is `x >= a AND x <= b` with
         // the type's own comparison operators.
-        if expr.components.len() == 1 {
+        if expr.components().len() == 1 {
             let (tested, low, high) = (
-                &expr.components[0],
-                &start.components[0],
-                &end.components[0],
+                &expr.components()[0],
+                &start.components()[0],
+                &end.components()[0],
             );
             let custom = self
                 .resolve_custom_binary_operator(
@@ -2429,15 +2524,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 ));
             }
         }
-        let start_comparison = expression_operand_comparison(&expr.components, &start.components);
-        let end_comparison = expression_operand_comparison(&expr.components, &end.components);
+        let start_comparison = expression_operand_comparison(expr.components(), start.components());
+        let end_comparison = expression_operand_comparison(expr.components(), end.components());
         let collation = ExprCollation::Absent;
         Ok(computed_expr(
             hir::Expr::Between {
-                expr: Box::new(expr.expr),
+                expr: Box::new(expr.into_expr()),
                 negated,
-                start: Box::new(start.expr),
-                end: Box::new(end.expr),
+                start: Box::new(start.into_expr()),
+                end: Box::new(end.into_expr()),
                 start_comparison,
                 end_comparison,
             },
@@ -2682,45 +2777,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     inner.collation,
                 ))
             }
-            ast::Expr::Binary(..) | ast::Expr::Between { .. } => {
+            ast::Expr::Binary(..) | ast::Expr::Between { .. } | ast::Expr::InList { .. } => {
                 unreachable!("operand expressions are built from shaped frame values")
-            }
-            ast::Expr::InList { lhs, not, rhs, .. } => {
-                let mut operands = take_expression_operands(
-                    std::iter::once(lhs.as_ref()).chain(rhs.iter().map(Box::as_ref)),
-                    scalar_frame_values(children),
-                )?
-                .into_iter();
-                let lhs = operands.next().expect("IN has a left operand");
-                let values = operands.collect::<Vec<_>>();
-                for value in &values {
-                    if lhs.components.len() != value.components.len() {
-                        if lhs.components.len() == 1 {
-                            crate::bail_parse_error!("row value misused");
-                        }
-                        crate::bail_parse_error!(
-                            "IN(...) element has {} term{} - expected {}",
-                            value.components.len(),
-                            if value.components.len() == 1 { "" } else { "s" },
-                            lhs.components.len()
-                        );
-                    }
-                }
-                let comparisons = values
-                    .iter()
-                    .map(|value| in_operand_comparison(&lhs.components, &value.components))
-                    .collect();
-                let collation = ExprCollation::Absent;
-                Ok(computed_expr(
-                    hir::Expr::InList {
-                        lhs: Box::new(lhs.expr),
-                        negated: *not,
-                        values: values.into_iter().map(|value| value.expr).collect(),
-                        comparisons,
-                    },
-                    hir::TypeFact::known(Type::Integer),
-                    collation,
-                ))
             }
             ast::Expr::Like {
                 lhs,
@@ -4277,11 +4335,11 @@ fn expect_no_frame_children(children: FrameChildren) -> Result<()> {
 }
 
 fn scalar_frame_children(children: FrameChildren) -> Result<ExprChildren> {
-    children.into_iter().map(FrameValue::into_scalar).collect()
-}
-
-fn scalar_frame_values(children: ExprChildren) -> FrameChildren {
-    children.into_iter().map(FrameValue::Scalar).collect()
+    let mut scalars = ExprChildren::with_capacity(children.len());
+    for child in children {
+        scalars.push(child.into_scalar()?);
+    }
+    Ok(scalars)
 }
 
 fn expect_expr_children<const N: usize>(children: ExprChildren) -> Result<[ResolvedScopeExpr; N]> {
@@ -5076,7 +5134,7 @@ mod tests {
             rhs: (1..=elements).map(literal).collect(),
         };
         let schema = Schema::new();
-        let mut frame = ExprFrame::new(&syntax, None).expect("IN list frame");
+        let mut frame = ExprFrame::new(&syntax, None, 0).expect("IN list frame");
         OPERAND_WIDTH_CALLS.with(|calls| calls.set(0));
         let mut children = Vec::new();
         while let Some(child) = frame.next_child(&schema).expect("IN list children") {
