@@ -6075,6 +6075,17 @@ pub fn op_program(
                     statement.bind_at(param_index, value)?;
                 }
 
+                // Share the parent statement's immediate FK violation counter
+                // with the subprogram. The subprogram runs with its own
+                // ProgramState, so without this a cascade that resolves a
+                // violation (e.g. deletes the child whose parent is gone) would
+                // decrement a fresh zero counter instead of the parent's, and
+                // the parent's immediate check would still fail (issue #9290).
+                // The final value is copied back when the subprogram completes.
+                statement.set_fk_immediate_violations_during_stmt(
+                    state.get_fk_immediate_violations_during_stmt(),
+                );
+
                 *state.active_op_state.program() = OpProgramState::Step {
                     is_trigger,
                     statement,
@@ -6160,6 +6171,16 @@ pub fn op_program(
                         }
                     }
                 }
+                // Copy the subprogram's final immediate FK violation count back
+                // into the parent statement (see the seeding comment above).
+                // Only on clean completion: an aborted/ignored subprogram leaves
+                // dirty state that must not perturb the parent's counter.
+                if !subprogram_aborted {
+                    state.set_fk_immediate_violations_during_stmt(
+                        statement.fk_immediate_violations_during_stmt(),
+                    );
+                }
+
                 finish_subprogram(
                     program,
                     &statement,
