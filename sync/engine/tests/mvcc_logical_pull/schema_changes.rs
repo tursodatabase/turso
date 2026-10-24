@@ -86,7 +86,6 @@ fn drop_table_with_primary_key() -> Result<()> {
 }
 
 #[test]
-#[ignore = "https://github.com/tursodatabase/turso/issues/9529"]
 fn rename_indexed_table() -> Result<()> {
     let remote = Remote::new(&[
         "CREATE TABLE t (x, y)",
@@ -96,6 +95,118 @@ fn rename_indexed_table() -> Result<()> {
     let replica = remote.bootstrap_replica()?;
 
     remote.execute_transaction(&["ALTER TABLE t RENAME TO u"])?;
+    replica.pull()?;
+
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
+#[test]
+fn rename_table_referenced_by_foreign_key_and_change_it_in_one_transaction() -> Result<()> {
+    let remote = Remote::new(&[
+        "CREATE TABLE t (x PRIMARY KEY, y)",
+        "CREATE TABLE child (r REFERENCES t (x))",
+        "INSERT INTO t VALUES (1, 2)",
+        "INSERT INTO child VALUES (1)",
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(&[
+        "ALTER TABLE t RENAME TO u",
+        "ALTER TABLE u ADD COLUMN z",
+        "UPDATE u SET z = 3 WHERE x = 1",
+        "INSERT INTO u VALUES (4, 5, 6)",
+    ])?;
+    replica.pull()?;
+
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
+#[test]
+fn rename_table_to_the_old_name_of_another_renamed_table() -> Result<()> {
+    let remote = Remote::new(&[
+        "CREATE TABLE a (x)",
+        "CREATE TABLE b (y)",
+        "INSERT INTO a VALUES (1)",
+        "INSERT INTO b VALUES (2)",
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(&["ALTER TABLE b RENAME TO c", "ALTER TABLE a RENAME TO b"])?;
+    replica.pull()?;
+
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
+#[test]
+fn swap_table_names() -> Result<()> {
+    let remote = Remote::new(&[
+        "CREATE TABLE a (x)",
+        "CREATE TABLE b (y)",
+        "INSERT INTO a VALUES (1)",
+        "INSERT INTO b VALUES (2)",
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(&[
+        "ALTER TABLE a RENAME TO tmp",
+        "ALTER TABLE b RENAME TO a",
+        "ALTER TABLE tmp RENAME TO b",
+    ])?;
+    replica.pull()?;
+
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
+#[test]
+fn swap_table_names_and_change_a_table_named_like_the_temporary_name() -> Result<()> {
+    let remote = Remote::new(&[
+        "CREATE TABLE a (x)",
+        "CREATE TABLE b (y)",
+        "CREATE TABLE turso_sync_rename_1 (z)",
+        "INSERT INTO a VALUES (1)",
+        "INSERT INTO b VALUES (2)",
+        "INSERT INTO turso_sync_rename_1 VALUES (3)",
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(&[
+        "ALTER TABLE a RENAME TO tmp",
+        "ALTER TABLE b RENAME TO a",
+        "ALTER TABLE tmp RENAME TO b",
+        "ALTER TABLE turso_sync_rename_1 ADD COLUMN w",
+    ])?;
+    replica.pull()?;
+
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
+#[test]
+fn rename_table_next_to_a_table_named_like_a_temporary_name() -> Result<()> {
+    let remote = Remote::new(&[
+        "CREATE TABLE a (x)",
+        "CREATE TABLE turso_sync_rename_2 (q)",
+        "INSERT INTO a VALUES (1)",
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(&["ALTER TABLE a RENAME TO b"])?;
+    replica.pull()?;
+
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
+#[test]
+fn rename_table_to_a_name_like_a_temporary_name() -> Result<()> {
+    let remote = Remote::new(&["CREATE TABLE a (x)", "INSERT INTO a VALUES (1)"])?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(&["ALTER TABLE a RENAME TO turso_sync_rename_2"])?;
     replica.pull()?;
 
     assert_eq!(replica.snapshot()?, remote.snapshot()?);

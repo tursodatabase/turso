@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     ops::Deref,
     sync::{Arc, Mutex},
 };
@@ -22,9 +22,9 @@ use crate::{
     database_sync_engine::{DataStats, DatabaseSyncEngineOpts},
     database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
     database_tape::{
-        run_stmt_expect_one_row, run_stmt_ignore_rows, run_stmt_once, DatabaseChangesIteratorMode,
-        DatabaseChangesIteratorOpts, DatabaseReplaySession, DatabaseReplaySessionOpts,
-        DatabaseTape, DatabaseWalSession,
+        quote_ident, run_stmt_expect_one_row, run_stmt_ignore_rows, run_stmt_once,
+        DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts, DatabaseReplaySession,
+        DatabaseReplaySessionOpts, DatabaseTape, DatabaseWalSession,
     },
     errors::Error,
     io_operations::IoOperations,
@@ -1253,8 +1253,14 @@ fn append_schema_ops(
     ops: &mut Vec<LogicalOp>,
 ) -> Result<()> {
     let mut drops = Vec::new();
+    let mut table_renames = Vec::new();
     let mut table_refreshes_and_creates = Vec::new();
     let mut non_table_creates = Vec::new();
+    let names_in_txn: HashSet<String> = deltas
+        .values()
+        .flat_map(|delta| delta.old.iter().chain(delta.new.iter()))
+        .map(|row| row.name.to_lowercase())
+        .collect();
     for delta in deltas.into_values() {
         let old = delta
             .old
@@ -1276,8 +1282,13 @@ fn append_schema_ops(
                     new.name, old.row_type, new.row_type
                 )));
             }
-            (Some(_), Some(new)) if is_table(&new) => table_refreshes_and_creates
-                .push(schema_logical_op(&new, LogicalSchemaAction::Refresh)?),
+            (Some(old), Some(new)) if is_table(&new) => {
+                if old.name != new.name {
+                    table_renames.push((old.name, new.clone()));
+                }
+                table_refreshes_and_creates
+                    .push(schema_logical_op(&new, LogicalSchemaAction::Refresh)?);
+            }
             (Some(old), Some(new)) => {
                 drops.push(schema_logical_op(&old, LogicalSchemaAction::Drop)?);
                 non_table_creates.push(schema_logical_op(&new, LogicalSchemaAction::Create)?);
@@ -1285,10 +1296,52 @@ fn append_schema_ops(
         }
     }
     ops.extend(drops);
+    append_table_rename_ops(table_renames, &names_in_txn, ops)?;
     ops.extend(table_refreshes_and_creates);
     // these may depend on new or altered tables, so we emit them after all tables have been updated
     ops.extend(non_table_creates);
     Ok(())
+}
+
+fn append_table_rename_ops(
+    mut renames: Vec<(String, DecodedSchemaRow)>,
+    names_in_txn: &HashSet<String>,
+    ops: &mut Vec<LogicalOp>,
+) -> Result<()> {
+    let mut temporary_names = (1..)
+        .map(|n| format!("turso_sync_rename_{n}"))
+        .filter(|name| !names_in_txn.contains(name));
+    while !renames.is_empty() {
+        let next_with_free_name = renames.iter().position(|(_, row)| {
+            !renames
+                .iter()
+                .any(|(from, _)| from.eq_ignore_ascii_case(&row.name))
+        });
+        match next_with_free_name {
+            Some(i) => {
+                let (from, row) = renames.remove(i);
+                ops.push(table_rename_op(&row, &from, &row.name)?);
+            }
+            None => {
+                let temporary_name = temporary_names.next().unwrap();
+                let (from, row) = &mut renames[0];
+                ops.push(table_rename_op(row, from, &temporary_name)?);
+                *from = temporary_name;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn table_rename_op(row: &DecodedSchemaRow, from: &str, to: &str) -> Result<LogicalOp> {
+    Ok(LogicalOp {
+        sql: format!(
+            "ALTER TABLE {} RENAME TO {}",
+            quote_ident(from),
+            quote_ident(to)
+        ),
+        ..schema_logical_op(row, LogicalSchemaAction::Alter)?
+    })
 }
 
 fn is_table(row: &DecodedSchemaRow) -> bool {
