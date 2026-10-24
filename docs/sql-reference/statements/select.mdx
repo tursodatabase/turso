@@ -623,6 +623,9 @@ it is not included in `SELECT *`.
 system column `tableoid` for publication discovery. These catalogs currently
 return no rows. Select `tableoid` explicitly; it is not included in `SELECT *`.
 
+In the PostgreSQL frontend, `generate_series(...)` and
+`pg_catalog.generate_series(...)` are available even when `search_path` is empty.
+
 ## See Also
 
 - [INSERT](/docs/sql-reference/statements/insert) for adding rows to a table
