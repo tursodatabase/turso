@@ -190,6 +190,15 @@ expect {
     3|0
 }
 
+test smallint-array-null-element {
+    CREATE TABLE t1(val smallint[]) STRICT;
+    INSERT INTO t1 VALUES ('{5,NULL,7}');
+    SELECT val FROM t1;
+}
+expect {
+    {5,NULL,7}
+}
+
 @requires strict "uses STRICT tables"
 test smallint-overflow {
     CREATE TABLE t1(val smallint) STRICT;
