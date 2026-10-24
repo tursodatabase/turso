@@ -1215,9 +1215,9 @@ impl Scope {
                             Some(database) => self.resolve_database_qualified(
                                 database,
                                 qualifier,
-                                &column.display_name(),
+                                column.display_name(),
                             )?,
-                            None => self.resolve_qualified(qualifier, &column.display_name())?,
+                            None => self.resolve_qualified(qualifier, column.display_name())?,
                         }
                         .unwrap_or_else(|| column.resolved())
                     };
@@ -1244,7 +1244,7 @@ impl Scope {
                     };
                     resolved
                 } else if source.star_merged.contains(&saved_name) {
-                    self.merged_star_column_named(&saved_name, &column.display_name())?
+                    self.merged_star_column_named(&saved_name, column.display_name())?
                 } else {
                     column.resolved()
                 };
