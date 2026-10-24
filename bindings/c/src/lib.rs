@@ -1262,14 +1262,31 @@ pub unsafe extern "C" fn sqlite3_exec(
     if !err.is_null() {
         *err = std::ptr::null_mut();
     }
-    let statements = split_sql_statements(sql_str);
-    for stmt_sql in statements {
+    let mut offset = 0;
+    while offset < sql_str.len() {
+        let remaining = &sql_str[offset..];
+        let (statement_len, is_dql) = {
+            let db_inner = db_ref.inner.lock().unwrap();
+            match db_inner.conn.prepare(remaining) {
+                Ok(stmt) => (
+                    stmt.tail_offset().max(1).min(remaining.len()),
+                    stmt.get_program().is_readonly() || stmt.num_columns() > 0,
+                ),
+                Err(LimboError::InvalidArgument(ref msg))
+                    if msg == "The supplied SQL string contains no statements" =>
+                {
+                    break;
+                }
+                Err(_) => (remaining.len(), false),
+            }
+        };
+        let stmt_sql = &remaining[..statement_len];
+        offset += statement_len;
         let trimmed = stmt_sql.trim();
         if trimmed.is_empty() {
             continue;
         }
 
-        let is_dql = is_query_statement(trimmed);
         if !is_dql {
             // For DML/DDL, use normal execute path
             let db_inner = db_ref.inner.lock().unwrap();
@@ -1321,54 +1338,6 @@ pub unsafe extern "C" fn sqlite3_exec(
         }
     }
     SQLITE_OK
-}
-
-/// Detect if a SQL statement is DQL
-fn is_query_statement(sql: &str) -> bool {
-    let trimmed = sql.trim_start();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let bytes = trimmed.as_bytes();
-
-    let starts_with_ignore_case = |keyword: &[u8]| -> bool {
-        if bytes.len() < keyword.len() {
-            return false;
-        }
-        // Check keyword matches
-        if !bytes[..keyword.len()].eq_ignore_ascii_case(keyword) {
-            return false;
-        }
-        // Ensure keyword is followed by whitespace or EOF
-        bytes.len() == keyword.len() || bytes[keyword.len()].is_ascii_whitespace()
-    };
-
-    // Check DQL keywords
-    if starts_with_ignore_case(b"SELECT")
-        || starts_with_ignore_case(b"VALUES")
-        || starts_with_ignore_case(b"WITH")
-        || starts_with_ignore_case(b"PRAGMA")
-        || starts_with_ignore_case(b"EXPLAIN")
-    {
-        return true;
-    }
-
-    // Look for RETURNING as a whole word, that's not part of another identifier
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 9 <= bytes.len() && bytes[i..i + 9].eq_ignore_ascii_case(b"RETURNING") {
-            // Check it's a word boundary before and after
-            let is_word_start =
-                i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
-            let is_word_end = i + 9 == bytes.len()
-                || !bytes[i + 9].is_ascii_alphanumeric() && bytes[i + 9] != b'_';
-            if is_word_start && is_word_end {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
 }
 
 /// Execute a query statement with callback for each row
@@ -1472,50 +1441,6 @@ unsafe fn execute_query_with_callback(
     }
 
     sqlite3_finalize(stmt_ptr)
-}
-
-/// Split SQL string into individual statements
-/// Handles quoted strings properly and skips comments
-fn split_sql_statements(sql: &str) -> Vec<&str> {
-    let mut statements = Vec::new();
-    let mut current_start = 0;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let bytes = sql.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            // Check for escaped quotes first
-            b'\'' if !in_double_quote => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2;
-                    continue;
-                }
-                in_single_quote = !in_single_quote;
-            }
-            b'"' if !in_single_quote => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                    i += 2;
-                    continue;
-                }
-                in_double_quote = !in_double_quote;
-            }
-            b';' if !in_single_quote && !in_double_quote => {
-                // we found the statement boundary
-                statements.push(&sql[current_start..i]);
-                current_start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-
-    if current_start < sql.len() {
-        statements.push(&sql[current_start..]);
-    }
-
-    statements
 }
 
 #[no_mangle]
@@ -3944,6 +3869,56 @@ mod tests {
             assert_eq!(msg, "UNIQUE constraint failed: u.a");
             sqlite3_finalize(stmt);
             sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_exec_preserves_trigger_and_comment_boundaries() {
+        unsafe extern "C" fn count_rows(
+            context: *mut ffi::c_void,
+            _n_column: ffi::c_int,
+            _values: *mut *mut ffi::c_char,
+            _columns: *mut *mut ffi::c_char,
+        ) -> ffi::c_int {
+            *(context as *mut usize) += 1;
+            0
+        }
+
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let script = c"-- leading comment; this semicolon is ignored\n;;CREATE TABLE source(value); CREATE TABLE log(value); -- comment with ; semicolon\nCREATE TRIGGER source_log AFTER INSERT ON source BEGIN INSERT INTO log VALUES (new.value); END; INSERT INTO source VALUES (42);";
+            assert_eq!(
+                sqlite3_exec(db, script.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_OK
+            );
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT value FROM log".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(stmt, 0), 42);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            let mut rows = 0usize;
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"-- leading comment\nSELECT 1".as_ptr(),
+                    Some(count_rows),
+                    &mut rows as *mut usize as *mut ffi::c_void,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(rows, 1);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
 
