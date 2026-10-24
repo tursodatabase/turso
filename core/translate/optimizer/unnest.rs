@@ -594,6 +594,7 @@ fn try_rewrite_single_value_aggregate(
             expr: column.clone(),
             alias: Some(format!("correlation_key_{index}")),
             implicit_column_name: None,
+            written_column_name: None,
             contains_aggregates: false,
         });
     }

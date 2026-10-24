@@ -518,6 +518,14 @@ fn prepare_one_select_plan(
                             )?;
                         }
                         ResultColumn::Expr(mut expr, maybe_alias) => {
+                            let written_column_name = match expr.as_ref() {
+                                ast::Expr::Id(name)
+                                | ast::Expr::Qualified(_, name)
+                                | ast::Expr::DoublyQualified(_, _, name) => {
+                                    Some(name.as_str().to_string())
+                                }
+                                _ => None,
+                            };
                             bind_and_rewrite_expr(
                                 &mut expr,
                                 Some(&mut plan.table_references),
@@ -544,6 +552,7 @@ fn prepare_one_select_plan(
                             plan.result_columns.push(ResultSetColumn {
                                 alias,
                                 implicit_column_name,
+                                written_column_name,
                                 expr: *expr,
                                 contains_aggregates,
                             });
@@ -849,6 +858,7 @@ fn prepare_one_select_plan(
                     expr: ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
                     alias: Some(format!("column{}", i + 1)),
                     implicit_column_name: None,
+                    written_column_name: None,
                     contains_aggregates: false,
                 });
             }

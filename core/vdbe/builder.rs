@@ -1276,6 +1276,7 @@ impl ProgramBuilder {
             expr,
             alias: Some(col_name),
             implicit_column_name: None,
+            written_column_name: None,
             contains_aggregates: false,
         });
     }

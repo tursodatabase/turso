@@ -1321,6 +1321,7 @@ fn plan_cte(
                 explicit_columns,
                 Some(cte_definition.cte_id),
                 cte_definition.materialize_hint,
+                false,
             )
         }
         Plan::Delete(_) | Plan::Update(_) => {
@@ -1697,6 +1698,7 @@ fn parse_from_clause_table(
                 None,  // No explicit columns for regular subqueries
                 None,  // Regular inline subqueries don't have a CTE identity
                 false, // No materialize hint for inline subqueries
+                false, // Inline subqueries are not views
             )?);
             Ok(())
         }
@@ -1897,7 +1899,7 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
             .mark_column_used(table_id, column_index);
     }
 
-    subquery.columns = query_output_columns(&subquery.plan, None)?;
+    subquery.columns = query_output_columns(&subquery.plan, None, false)?;
     assert_eq!(subquery.columns.len(), join_columns.len());
     for column_index in 0..subquery.columns.len() {
         let original_name = subquery.columns[column_index]
@@ -1944,6 +1946,7 @@ fn parenthesized_join_result_column(expr: Expr, column_name: &str) -> ResultSetC
         expr,
         alias: Some(column_name.to_string()),
         implicit_column_name: None,
+        written_column_name: None,
         contains_aggregates: false,
     }
 }
@@ -2097,6 +2100,7 @@ fn parse_table(
                     explicit_columns,
                     cte_id,
                     materialize_hint,
+                    false,
                 )?;
                 if let Some(alias) = alias {
                     joined_table.identifier = alias;
@@ -2200,6 +2204,7 @@ fn parse_table(
             (!view.explicit_columns.is_empty()).then_some(view.explicit_columns.as_slice()),
             None,
             false,
+            true,
         )?);
         return Ok(());
     }

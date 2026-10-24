@@ -113,6 +113,9 @@ pub struct ResultSetColumn {
     /// a simple column reference. This preserves the verbatim SQL text
     /// (e.g. "f1+F2") as the column name, matching SQLite behavior.
     pub implicit_column_name: Option<String>,
+    /// `c` in `SELECT t.c FROM t`: the column name as written, without its
+    /// table qualifier.
+    pub written_column_name: Option<String>,
     // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
     pub contains_aggregates: bool,
 }
@@ -157,6 +160,23 @@ impl ResultSetColumn {
                 Some("rowid")
             }
             _ => self.implicit_column_name.as_deref(),
+        }
+    }
+
+    /// SQLite names a FROM-clause subquery or CTE column after the column
+    /// name as written, not after the column it resolves to: `t.C` gives `C`,
+    /// and `x.c` gives `c` even when it reads the `c:1` column of a
+    /// parenthesized join. A view column keeps the resolved name, because
+    /// SQLite names view columns after resolving the view's SELECT.
+    pub(super) fn subquery_column_name<'a>(
+        &'a self,
+        tables: &'a TableReferences,
+    ) -> Option<&'a str> {
+        match (&self.alias, &self.written_column_name, &self.expr) {
+            (None, Some(written_name), ast::Expr::Column { .. } | ast::Expr::RowId { .. }) => {
+                Some(written_name)
+            }
+            _ => self.name(tables),
         }
     }
 
@@ -1358,6 +1378,7 @@ fn star_result_column(
     ResultSetColumn {
         alias,
         implicit_column_name: None,
+        written_column_name: None,
         expr,
         contains_aggregates: false,
     }
@@ -3017,6 +3038,7 @@ impl Operation {
 pub(super) fn query_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
+    is_view: bool,
 ) -> Result<alloc::Vec<Column>> {
     let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
         Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
@@ -3055,7 +3077,14 @@ pub(super) fn query_output_columns(
         .map(|(column_index, result_column)| {
             let name = explicit_columns
                 .and_then(|names| names.get(column_index).cloned())
-                .or_else(|| result_column.name(table_references).map(String::from));
+                .or_else(|| {
+                    if is_view {
+                        result_column.name(table_references)
+                    } else {
+                        result_column.subquery_column_name(table_references)
+                    }
+                    .map(String::from)
+                });
             let affinity = compound_arms
                 .as_ref()
                 .map(|arms| compound_column_affinity(arms, column_index))
@@ -3090,8 +3119,9 @@ pub(super) fn query_output_columns(
 fn subquery_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
+    is_view: bool,
 ) -> Result<alloc::Vec<Column>> {
-    let mut columns = query_output_columns(plan, explicit_columns)?;
+    let mut columns = query_output_columns(plan, explicit_columns, is_view)?;
     make_column_names_unique(&mut columns);
     Ok(columns)
 }
@@ -3150,7 +3180,7 @@ impl JoinedTable {
         internal_id: TableInternalId,
     ) -> Result<Self> {
         let plan = Plan::Select(Box::new(plan));
-        let columns = subquery_output_columns(&plan, None)?;
+        let columns = subquery_output_columns(&plan, None, false)?;
 
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
@@ -3182,6 +3212,8 @@ impl JoinedTable {
     /// If `cte_id` is provided, this subquery is a CTE reference that can share materialized data.
     /// If `materialize_hint` is true, the CTE was declared with AS MATERIALIZED and should always
     /// be materialized regardless of reference count.
+    /// If `is_view` is true, the subquery is an expanded view.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_subquery_from_plan(
         identifier: String,
         plan: Plan,
@@ -3190,8 +3222,9 @@ impl JoinedTable {
         explicit_columns: Option<&[String]>,
         cte_id: Option<usize>,
         materialize_hint: bool,
+        is_view: bool,
     ) -> Result<Self> {
-        let columns = subquery_output_columns(&plan, explicit_columns)?;
+        let columns = subquery_output_columns(&plan, explicit_columns, is_view)?;
         // Get result columns and table references from the plan
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
@@ -3232,7 +3265,7 @@ impl JoinedTable {
         internal_id: TableInternalId,
         explicit_columns: Option<&[String]>,
     ) -> Result<Self> {
-        let mut columns = subquery_output_columns(query, explicit_columns)?;
+        let mut columns = subquery_output_columns(query, explicit_columns, false)?;
         // The recursive self-reference reads SQLite's queue table, whose
         // columns have no declared type: comparisons in the recursive term
         // see the stored value without the anchor query's affinity. Only the

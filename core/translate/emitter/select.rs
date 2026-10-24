@@ -1042,6 +1042,7 @@ fn build_materialized_build_input_plan(
             },
             alias: None,
             implicit_column_name: None,
+            written_column_name: None,
             contains_aggregates: false,
         }],
         MaterializedBuildInputMode::KeyPayload { num_keys, .. } => {
@@ -1055,6 +1056,7 @@ fn build_materialized_build_input_plan(
                     expr: expr.clone(),
                     alias: None,
                     implicit_column_name: None,
+                    written_column_name: None,
                     contains_aggregates: false,
                 });
             }
@@ -1079,6 +1081,7 @@ fn build_materialized_build_input_plan(
                     expr,
                     alias: None,
                     implicit_column_name: None,
+                    written_column_name: None,
                     contains_aggregates: false,
                 });
             }
