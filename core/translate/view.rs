@@ -101,7 +101,7 @@ pub fn translate_create_materialized_view(
             view_column_schema.columns.len()
         );
     }
-    view_column_schema.rename_columns(columns);
+    view_column_schema.rename_columns(columns.iter().map(|column| column.col_name.as_str()));
     let view_columns = view_column_schema.flat_columns()?;
 
     // One plan owns validation, the executable operator DAG, and the hidden
