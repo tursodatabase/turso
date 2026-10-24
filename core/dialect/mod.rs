@@ -205,6 +205,17 @@ pub trait Dialect: Send + Sync + 'static {
     fn errors_on_zero_divisor(&self) -> bool {
         false
     }
+
+    /// Whether an INTEGER PRIMARY KEY column behaves like a normal NOT NULL
+    /// column: an INSERT that leaves it out uses its DEFAULT, and an INSERT
+    /// or UPDATE that makes it NULL fails with a NOT NULL error.
+    ///
+    /// PostgreSQL has no rowid, so a primary key without a value is an
+    /// error. SQLite ignores the DEFAULT and gives the row a new rowid, and
+    /// an UPDATE to NULL fails with "datatype mismatch".
+    fn rejects_null_integer_primary_key(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
