@@ -1,0 +1,99 @@
+@database :memory:
+@requires-file trigger "trigger tests require trigger support"
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/7975
+#
+# When REPLACE deletes a conflicting row and an ON DELETE CASCADE trigger on a
+# child table inserts a new conflicting row into the target table, uniqueness
+# must be re-checked with ABORT semantics before writing the index and table
+# entries.
+
+@cross-check-integrity
+test replace-fk-cascade-trigger-reinsert-unique-aborts {
+    PRAGMA foreign_keys = 1;
+    CREATE TABLE p1 (a, b UNIQUE);
+    CREATE TABLE c1 (c, d REFERENCES p1(b) ON DELETE CASCADE);
+    CREATE TRIGGER tr6 AFTER DELETE ON c1 BEGIN INSERT INTO p1 VALUES(4, 1); END;
+    INSERT INTO p1 VALUES(1, 1);
+    INSERT INTO c1 VALUES(2, 1);
+    REPLACE INTO p1 VALUES(3, 1);
+}
+expect error {
+}
+
+@cross-check-integrity
+test replace-fk-cascade-trigger-reinsert-rowid-aborts {
+    PRAGMA foreign_keys = 1;
+    CREATE TABLE p1 (a, b UNIQUE);
+    CREATE TABLE c1 (c, d REFERENCES p1(b) ON DELETE CASCADE);
+    CREATE TRIGGER tr6 AFTER DELETE ON c1 BEGIN INSERT INTO p1(rowid, a, b) VALUES(2, 4, 99); END;
+    INSERT INTO p1 VALUES(1, 1);
+    INSERT INTO c1 VALUES(2, 1);
+    REPLACE INTO p1 VALUES(3, 1);
+}
+expect error {
+}
+
+@cross-check-integrity
+test replace-fk-cascade-trigger-nonconflicting-succeeds {
+    PRAGMA foreign_keys = 1;
+    CREATE TABLE p1 (a, b UNIQUE);
+    CREATE TABLE c1 (c, d REFERENCES p1(b) ON DELETE CASCADE);
+    CREATE TRIGGER tr6 AFTER DELETE ON c1 BEGIN INSERT INTO p1 VALUES(4, 99); END;
+    INSERT INTO p1 VALUES(1, 1);
+    INSERT INTO c1 VALUES(2, 1);
+    REPLACE INTO p1 VALUES(3, 1);
+    SELECT a, b FROM p1 ORDER BY b;
+    PRAGMA integrity_check;
+}
+expect {
+    3|1
+    4|99
+    ok
+}
+
+@cross-check-integrity
+test update-or-replace-fk-cascade-trigger-reinsert-unique-aborts {
+    PRAGMA foreign_keys = 1;
+    CREATE TABLE p1 (a, b UNIQUE);
+    CREATE TABLE c1 (c, d REFERENCES p1(b) ON DELETE CASCADE);
+    CREATE TRIGGER tr6 AFTER DELETE ON c1 BEGIN INSERT INTO p1 VALUES(4, 1); END;
+    INSERT INTO p1 VALUES(1, 1);
+    INSERT INTO p1 VALUES(3, 2);
+    INSERT INTO c1 VALUES(2, 1);
+    UPDATE OR REPLACE p1 SET b = 1 WHERE a = 3;
+}
+expect error {
+}
+
+@cross-check-integrity
+test update-or-replace-fk-cascade-trigger-reinsert-rowid-aborts {
+    PRAGMA foreign_keys = 1;
+    CREATE TABLE p1 (id INTEGER PRIMARY KEY, b INT UNIQUE);
+    CREATE TABLE c1 (c, d REFERENCES p1(id) ON DELETE CASCADE);
+    CREATE TRIGGER tr6 AFTER DELETE ON c1 BEGIN INSERT INTO p1 VALUES(1, 99); END;
+    INSERT INTO p1 VALUES(1, 10);
+    INSERT INTO p1 VALUES(3, 20);
+    INSERT INTO c1 VALUES(2, 1);
+    UPDATE OR REPLACE p1 SET id = 1 WHERE id = 3;
+}
+expect error {
+}
+
+@cross-check-integrity
+test update-or-replace-fk-cascade-trigger-deletes-updated-row {
+    PRAGMA foreign_keys = 1;
+    CREATE TABLE p1 (a, b UNIQUE);
+    CREATE TABLE c1 (c, d REFERENCES p1(b) ON DELETE CASCADE);
+    CREATE TRIGGER tr6 AFTER DELETE ON c1 BEGIN DELETE FROM p1 WHERE a = 3; END;
+    INSERT INTO p1 VALUES(1, 1);
+    INSERT INTO p1 VALUES(3, 2);
+    INSERT INTO c1 VALUES(2, 1);
+    UPDATE OR REPLACE p1 SET b = 1 WHERE a = 3;
+    SELECT count(*) FROM p1;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    ok
+}
