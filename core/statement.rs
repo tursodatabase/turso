@@ -1088,7 +1088,7 @@ impl Statement {
         }
         if let Some(column) = self.resolved_result_column(idx) {
             return match &column.value {
-                ResolvedResultValue::Column(source) => Some(Cow::Borrowed(&source.table_name)),
+                ResolvedResultValue::Column(source) => Some(Cow::Borrowed(source.table_name())),
                 ResolvedResultValue::Expression | ResolvedResultValue::RowId { .. } => None,
             };
         }
@@ -1122,8 +1122,8 @@ impl Statement {
         }
         if let Some(column) = self.resolved_result_column(idx) {
             return match &column.value {
-                ResolvedResultValue::Column(source) if !source.declared_type.is_empty() => {
-                    Some(source.declared_type.clone())
+                ResolvedResultValue::Column(source) if !source.declared_type().is_empty() => {
+                    Some(source.declared_type().to_string())
                 }
                 ResolvedResultValue::RowId { declared_type, .. } => declared_type.clone(),
                 _ => None,
@@ -1195,7 +1195,7 @@ impl Statement {
         }
         if let Some(column) = self.resolved_result_column(idx) {
             return match &column.value {
-                ResolvedResultValue::Column(source) => type_name(source.ty).map(str::to_string),
+                ResolvedResultValue::Column(source) => type_name(source.ty()).map(str::to_string),
                 ResolvedResultValue::Expression | ResolvedResultValue::RowId { .. } => None,
             };
         }
@@ -1239,9 +1239,9 @@ impl Statement {
                 let full = self.program.connection.get_full_column_names();
                 let short = self.program.connection.get_short_column_names();
                 if full {
-                    Cow::Owned(format!("{}.{}", source.table_name, source.column_name))
+                    Cow::Owned(format!("{}.{}", source.table_name(), source.column_name()))
                 } else if short {
-                    Cow::Borrowed(&source.column_name)
+                    Cow::Borrowed(source.column_name())
                 } else {
                     Cow::Borrowed(&column.name)
                 }
@@ -1266,7 +1266,7 @@ impl Statement {
         };
         let schema = self.program.connection.schema.read();
         let resolved = schema
-            .resolve_type(&source.declared_type, source.table_is_strict)
+            .resolve_type(source.declared_type(), source.table_is_strict())
             .ok()
             .flatten();
         let (base_type, kind) = match resolved {
@@ -1286,8 +1286,8 @@ impl Statement {
             None => (None, ColumnTypeKind::Builtin),
         };
         Some(ColumnTypeInfo {
-            declared_name: source.declared_type.clone(),
-            array_dimensions: source.array_dimensions,
+            declared_name: source.declared_type().to_string(),
+            array_dimensions: source.array_dimensions(),
             base_type,
             kind,
         })

@@ -94,10 +94,10 @@ pub(crate) struct ResolvedScopeExpr {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ExpandedColumn {
+pub(crate) struct ExpandedColumn<'scope> {
     pub(crate) name: String,
     /// The source's alias, or its table name or `(subquery-N)` without one.
-    pub(crate) qualifier: String,
+    pub(crate) qualifier: Cow<'scope, str>,
     pub(crate) resolved: ResolvedScopeExpr,
 }
 
@@ -1087,13 +1087,15 @@ impl Scope {
         }
     }
 
-    pub(crate) fn expand_star(&self) -> Result<Vec<ExpandedColumn>> {
+    pub(crate) fn expand_star(&self) -> Result<Vec<ExpandedColumn<'_>>> {
         // Repeated qualifiers are legal across databases. Within one database,
         // an unmerged visible column makes an unqualified star ambiguous.
         let mut visible_sources = HashSet::default();
         let mut visible_identities = HashMap::default();
-        for column in self.visible_columns().filter(|column| !column.hidden()) {
-            visible_sources.insert(column.source());
+        if self.sources.len() > 1 {
+            for column in self.visible_columns().filter(|column| !column.hidden()) {
+                visible_sources.insert(column.source());
+            }
         }
         for source in self
             .sources
@@ -1157,7 +1159,7 @@ impl Scope {
                     .sources
                     .iter()
                     .find(|source| source.id == column.source())
-                    .map(|source| source.qualifier.clone())
+                    .map(|source| Cow::Borrowed(source.qualifier.as_str()))
                     .ok_or_else(|| {
                         crate::LimboError::InternalError(format!(
                             "visible column {} has no source in scope",
@@ -1173,7 +1175,7 @@ impl Scope {
             .collect()
     }
 
-    pub(crate) fn expand_table_star(&self, qualifier: &str) -> Result<Vec<ExpandedColumn>> {
+    pub(crate) fn expand_table_star(&self, qualifier: &str) -> Result<Vec<ExpandedColumn<'_>>> {
         let normalized = crate::util::normalize_ident(qualifier);
         // The name of a join group does not qualify `*`; the names of the
         // sources inside it do.
@@ -1229,7 +1231,7 @@ impl Scope {
                     };
                     expanded.push(ExpandedColumn {
                         name: column.display_name().to_string(),
-                        qualifier: source.qualifier.clone(),
+                        qualifier: Cow::Borrowed(source.qualifier.as_str()),
                         resolved,
                     });
                 }
@@ -1260,9 +1262,9 @@ impl Scope {
                 expanded.push(ExpandedColumn {
                     name: column.display_name().to_string(),
                     qualifier: if bare {
-                        normalized.clone()
+                        Cow::Owned(normalized.clone())
                     } else {
-                        source.qualifier.clone()
+                        Cow::Borrowed(source.qualifier.as_str())
                     },
                     resolved,
                 });
@@ -1285,7 +1287,7 @@ impl Scope {
                 };
                 Ok(ExpandedColumn {
                     name: column.display_name().to_string(),
-                    qualifier: source.qualifier.clone(),
+                    qualifier: Cow::Borrowed(source.qualifier.as_str()),
                     resolved,
                 })
             })

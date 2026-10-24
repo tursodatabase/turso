@@ -1688,12 +1688,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         &self,
         block: QueryBlockId,
         outputs: &mut Vec<Output>,
-        expanded: Vec<ExpandedColumn>,
+        expanded: Vec<ExpandedColumn<'_>>,
         scope: &Scope,
     ) -> Result<()> {
         // Like SQLite, with full_column_names on and short_column_names off
         // the column is named after its source.
         let long_names = self.context().long_column_names();
+        outputs.reserve(expanded.len());
         for column in expanded {
             let resolved = self.resolve_atomic_expr(column.resolved.expr, scope)?;
             let name = if long_names {

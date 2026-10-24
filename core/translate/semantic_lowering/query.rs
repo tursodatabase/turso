@@ -10842,6 +10842,75 @@ pub(super) mod tests {
     };
     use turso_parser::parser::Parser;
 
+    #[test]
+    fn table_result_column_reads_its_metadata_from_the_schema_table() {
+        let columns = |sql: &str| {
+            let mut schema = Schema::new();
+            schema
+                .add_btree_table(Arc::new(
+                    BTreeTable::from_sql("CREATE TABLE items(id INTEGER, label TEXT)", 2)
+                        .expect("table schema parses"),
+                ))
+                .expect("table name is unique");
+            let (document, schema) = analyze_sql_with_schema(schema, sql);
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let columns =
+                crate::translate::semantic_lowering::resolved_result_columns(&document, root.query)
+                    .expect("result columns resolve");
+            (columns, schema)
+        };
+
+        let (table_columns, schema_after) = columns("SELECT label FROM items");
+        let crate::translate::semantic_lowering::ResolvedResultValue::Column(
+            crate::translate::semantic_lowering::ResolvedResultSourceColumn::Table {
+                table,
+                column,
+            },
+        ) = &table_columns[0].value
+        else {
+            panic!("table column result keeps its schema table");
+        };
+        assert!(Arc::ptr_eq(
+            table,
+            &schema_after.get_table("items").expect("table exists")
+        ));
+        assert_eq!(*column, 1);
+        let crate::translate::semantic_lowering::ResolvedResultValue::Column(source) =
+            &table_columns[0].value
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            (
+                source.table_name(),
+                source.column_name(),
+                source.declared_type()
+            ),
+            ("items", "label", "TEXT")
+        );
+
+        let (query_columns, _) = columns("SELECT label FROM (SELECT label FROM items) AS sub");
+        let crate::translate::semantic_lowering::ResolvedResultValue::Column(source) =
+            &query_columns[0].value
+        else {
+            panic!("subquery column result is a column");
+        };
+        assert!(matches!(
+            source,
+            crate::translate::semantic_lowering::ResolvedResultSourceColumn::Query { .. }
+        ));
+        assert_eq!(
+            (
+                source.table_name(),
+                source.column_name(),
+                source.declared_type()
+            ),
+            ("sub", "label", "TEXT")
+        );
+    }
+
     pub(in crate::translate::semantic_lowering) fn program() -> ProgramBuilder {
         program_with_mode(QueryMode::Normal)
     }
