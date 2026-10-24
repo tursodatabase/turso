@@ -287,6 +287,31 @@ fn emit_loop_source<'a>(
                 return Ok(());
             }
 
+            // Bare columns follow the row that changes a built-in min/max.
+            // Reading its value leaves the accumulator intact and also works
+            // with FILTER, DISTINCT and the numeric AggStep fast path.
+            let extremum = t_ctx
+                .reg_nonagg_emit_once_flag
+                .and_then(|_| {
+                    plan.aggregates.iter().enumerate().rfind(|(_, agg)| {
+                        matches!(
+                            agg.func,
+                            crate::function::AggFunc::Min | crate::function::AggFunc::Max
+                        )
+                    })
+                })
+                .map(|(i, agg)| {
+                    let before = program.alloc_register();
+                    let after = program.alloc_register();
+                    let func = crate::function::AccumulatorFunc::Agg(agg.func.clone());
+                    program.emit_insn(Insn::AggValue {
+                        acc_reg: start_reg + i,
+                        dest_reg: before,
+                        func: func.clone(),
+                    });
+                    (start_reg + i, before, after, func)
+                });
+
             // In planner.rs, we have collected all aggregates from the SELECT clause, including ones where the aggregate is embedded inside
             // a more complex expression. Some examples: length(sum(x)), sum(x) + avg(y), sum(x) + 1, etc.
             // The result of those more complex expressions depends on the final result of the aggregate, so we don't translate the complete expressions here.
@@ -337,11 +362,33 @@ fn emit_loop_source<'a>(
 
             let label_emit_nonagg_only_once = if let Some(flag) = t_ctx.reg_nonagg_emit_once_flag {
                 let if_label = program.allocate_label();
-                program.emit_insn(Insn::If {
-                    reg: flag,
-                    target_pc: if_label,
-                    jump_if_null: false,
-                });
+                if let Some((acc_reg, before, after, func)) = extremum {
+                    program.emit_insn(Insn::AggValue {
+                        acc_reg,
+                        dest_reg: after,
+                        func,
+                    });
+                    let capture = program.allocate_label();
+                    program.emit_insn(Insn::IfNot {
+                        reg: flag,
+                        target_pc: capture,
+                        jump_if_null: false,
+                    });
+                    program.emit_insn(Insn::Eq {
+                        lhs: before,
+                        rhs: after,
+                        target_pc: if_label,
+                        flags: crate::vdbe::insn::CmpInsFlags::default().null_eq(),
+                        collation: None,
+                    });
+                    program.preassign_label_to_next_insn(capture);
+                } else {
+                    program.emit_insn(Insn::If {
+                        reg: flag,
+                        target_pc: if_label,
+                        jump_if_null: false,
+                    });
+                }
                 Some(if_label)
             } else {
                 None
@@ -381,12 +428,18 @@ fn emit_loop_source<'a>(
             // Columns of an outer query are not pre-read: the outer cursor does
             // not move while this loop runs, and a value read here would be stale
             // for an outer row where this loop finds no rows.
-            for rc in plan
+            for expr in plan
                 .result_columns
                 .iter()
                 .filter(|rc| rc.contains_aggregates)
+                .map(|rc| &rc.expr)
+                .chain(
+                    plan.group_by
+                        .iter()
+                        .flat_map(|gb| gb.having.iter().flatten()),
+                )
             {
-                walk_expr(&rc.expr, &mut |expr: &Expr| -> Result<WalkControl> {
+                walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
                     match expr {
                         Expr::Column { table, .. } | Expr::RowId { table, .. }
                             if plan
