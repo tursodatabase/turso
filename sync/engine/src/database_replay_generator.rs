@@ -363,7 +363,11 @@ impl DatabaseReplayGenerator {
                             before.get(1)
                         );
                     };
-                    let query = format!("DROP {} {}", entity_type.as_str(), entity_name.as_str());
+                    let query = format!(
+                        "DROP {} {}",
+                        entity_type.as_str(),
+                        quote_ident(entity_name.as_str())
+                    );
                     let delete = ReplayInfo {
                         change_type: DatabaseChangeType::Delete,
                         query,
@@ -835,6 +839,33 @@ impl DatabaseReplayGenerator {
                 }
                 Ok(())
             }
+            turso_parser::ast::Stmt::AlterTable(turso_parser::ast::AlterTable {
+                name: tbl_name,
+                body: turso_parser::ast::AlterTableBody::DropColumn(col_name),
+            }) => {
+                let table_name = tbl_name.name.as_str();
+                let local_columns = self
+                    .local_column_definitions(coro, table_name)
+                    .await?
+                    .unwrap_or_default();
+                let col_name = col_name.as_str();
+
+                if has_column(&local_columns, col_name) {
+                    self.execute_ddl(ddl)?;
+                } else {
+                    tracing::debug!(
+                        "execute_ddl_idempotent: column {col_name} is already missing from {table_name}, skipping"
+                    );
+                }
+                Ok(())
+            }
+            turso_parser::ast::Stmt::DropTable { if_exists, .. }
+            | turso_parser::ast::Stmt::DropIndex { if_exists, .. }
+            | turso_parser::ast::Stmt::DropTrigger { if_exists, .. }
+            | turso_parser::ast::Stmt::DropView { if_exists, .. } => {
+                *if_exists = true;
+                self.execute_ddl(&stmt.to_string())
+            }
             _ => {
                 self.conn.execute(ddl)?;
                 Ok(())
@@ -976,7 +1007,7 @@ fn generated_column_changed_between_local_and_remote(
     local_column: &turso_parser::ast::ColumnDefinition,
     remote_columns: &[turso_parser::ast::ColumnDefinition],
 ) -> bool {
-    if !is_generated(local_column) {
+    if !is_generated_column(local_column) {
         return false;
     }
     let local_name = local_column.col_name.as_str();
@@ -989,16 +1020,16 @@ fn generated_column_changed_between_local_and_remote(
         // remote has removed the gencol
         return true;
     };
-    return is_generated(remote_column) && remote_column.to_string() != local_column.to_string();
+    is_generated_column(remote_column) && remote_column.to_string() != local_column.to_string()
+}
 
-    fn is_generated(column: &turso_parser::ast::ColumnDefinition) -> bool {
-        column.constraints.iter().any(|constraint| {
-            matches!(
-                constraint.constraint,
-                turso_parser::ast::ColumnConstraint::Generated { .. }
-            )
-        })
-    }
+pub(crate) fn is_generated_column(column: &turso_parser::ast::ColumnDefinition) -> bool {
+    column.constraints.iter().any(|constraint| {
+        matches!(
+            constraint.constraint,
+            turso_parser::ast::ColumnConstraint::Generated { .. }
+        )
+    })
 }
 
 fn has_column(columns: &[turso_parser::ast::ColumnDefinition], name: &str) -> bool {
