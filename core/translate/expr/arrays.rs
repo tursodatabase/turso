@@ -190,14 +190,25 @@ pub(crate) fn emit_array_decode(
     col: &Column,
     resolver: &Resolver,
 ) -> Result<()> {
+    emit_array_element_decode(program, reg, col, resolver)?;
+    // Convert record blob to JSON text for display
+    program.emit_insn(Insn::ArrayDecode { reg });
+    Ok(())
+}
+
+/// Decode custom elements while retaining the native array representation.
+/// Trigger expressions need a blob for subscripts and array functions.
+pub(super) fn emit_array_element_decode(
+    program: &mut ProgramBuilder,
+    reg: usize,
+    col: &Column,
+    resolver: &Resolver,
+) -> Result<()> {
     if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
         if let Some(decode_expr) = type_def.decode() {
             emit_array_element_loop(program, reg, decode_expr, col, type_def, resolver)?;
         }
     }
-
-    // Convert record blob to JSON text for display
-    program.emit_insn(Insn::ArrayDecode { reg });
     Ok(())
 }
 

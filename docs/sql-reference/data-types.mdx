@@ -223,6 +223,8 @@ INSERT INTO sensors VALUES (1, ARRAY[1.5, 2.5, 3.5], '["a","b"]', '[0, 1, 1]');
 
 Arrays are displayed as JSON arrays on output. Element types are validated against the declared base type — for example, an `INTEGER[]` column rejects non-numeric text elements.
 
+Trigger `OLD` references and `AFTER`-trigger `NEW` references expose decoded custom-array elements. Copying those arrays into another column applies the destination encoding once; array functions and subscripts continue to operate on native array values.
+
 For the full set of array functions, operators, and subscript syntax, see [Array Functions](/docs/sql-reference/functions/array).
 
 ### Inspecting Types
