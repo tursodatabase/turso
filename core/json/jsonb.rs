@@ -2366,7 +2366,30 @@ impl Jsonb {
         Ok(pos)
     }
 
+    fn validate_keyword_boundary(input: &[u8], token_start: usize, end: usize) -> PResult<()> {
+        let is_boundary = if end >= input.len() {
+            true
+        } else {
+            let next = input[end];
+            (WS_TABLE[next as usize] & 3) != 0
+                || matches!(next, b',' | b']' | b'}')
+                || (next == b'/'
+                    && input
+                        .get(end + 1)
+                        .is_some_and(|next| matches!(next, b'/' | b'*')))
+        };
+        if is_boundary {
+            Ok(())
+        } else {
+            Err(PError::Message {
+                msg: "Invalid character after JSON keyword".to_string(),
+                location: Some(token_start),
+            })
+        }
+    }
+
     fn deserialize_true(&mut self, input: &[u8], mut pos: usize) -> PResult<usize> {
+        let token_start = pos;
         let true_lit = b"true";
         for i in 0..true_lit.len() {
             if pos + i >= input.len() || input[pos + i] != true_lit[i] {
@@ -2378,12 +2401,14 @@ impl Jsonb {
         }
 
         pos += true_lit.len();
+        Self::validate_keyword_boundary(input, token_start, pos)?;
         self.data.push(ElementType::TRUE as u8);
 
         Ok(pos)
     }
 
     fn deserialize_false(&mut self, input: &[u8], mut pos: usize) -> PResult<usize> {
+        let token_start = pos;
         let false_lit = b"false";
         for i in 0..false_lit.len() {
             if pos + i >= input.len() || input[pos + i] != false_lit[i] {
@@ -2395,6 +2420,7 @@ impl Jsonb {
         }
 
         pos += false_lit.len();
+        Self::validate_keyword_boundary(input, token_start, pos)?;
         self.data.push(ElementType::FALSE as u8);
 
         Ok(pos)
@@ -2406,6 +2432,7 @@ impl Jsonb {
         mut pos: usize,
         info: &mut ParseInfo,
     ) -> PResult<usize> {
+        let token_start = pos;
         // First check if we have enough bytes remaining for "nan" (minimum 3 bytes)
         if pos + 3 > input.len() {
             return Err(PError::Message {
@@ -2422,6 +2449,7 @@ impl Jsonb {
             && input[pos + 3] == b'l'
         {
             pos += 4;
+            Self::validate_keyword_boundary(input, token_start, pos)?;
             self.data.push(ElementType::NULL as u8);
             return Ok(pos);
         }
@@ -2433,6 +2461,7 @@ impl Jsonb {
             && (input[pos + 2] == b'n' || input[pos + 2] == b'N')
         {
             pos += 3;
+            Self::validate_keyword_boundary(input, token_start, pos)?;
             info.has_json5 = true;
             self.data.push(ElementType::NULL as u8);
             return Ok(pos);
