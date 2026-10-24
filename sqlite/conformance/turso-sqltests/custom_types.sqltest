@@ -1,6 +1,16 @@
 @database :memory:
 @requires-file custom_types "uses custom types"
 
+test virtual-generated-custom-type-is-not-decoded {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE g(id INTEGER PRIMARY KEY, x INT, w cents GENERATED ALWAYS AS (7) VIRTUAL) STRICT;
+    INSERT INTO g(id, x) VALUES (1, 1);
+    SELECT * FROM g;
+}
+expect {
+    1|1|7
+}
+
 @requires strict "uses STRICT tables"
 test create-type-basic {
     CREATE TYPE test_uint(value any) BASE text
