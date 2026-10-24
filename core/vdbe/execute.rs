@@ -18150,6 +18150,14 @@ pub fn op_alter_column(
                 .is_some_and(|column| column.is_rowid_alias())
             && !new_column.is_rowid_alias();
 
+        // Rename the key column before columns_mut(), whose drop rebuilds the
+        // WITHOUT ROWID key order from primary_key_columns by name.
+        for (pk_name, _ord) in &mut btree.primary_key_columns {
+            if pk_name.eq_ignore_ascii_case(&old_column_name) {
+                pk_name.clone_from(&new_name);
+            }
+        }
+
         if *rename {
             btree.columns_mut()[*column_index].name = Some(new_name.clone());
 
@@ -18200,13 +18208,6 @@ pub fn op_alter_column(
                 if let Some(ref mut wc) = idx.where_clause {
                     rename_identifiers(wc, &old_column_name, &new_name);
                 }
-            }
-        }
-
-        // Keep primary_key_columns consistent (names may change on rename)
-        for (pk_name, _ord) in &mut btree.primary_key_columns {
-            if pk_name.eq_ignore_ascii_case(&old_column_name) {
-                pk_name.clone_from(&new_name);
             }
         }
 
