@@ -74,7 +74,6 @@ use crate::{
     CaptureDataChangesInfo, CdcVersion, CheckpointMode, Clock, Completion, ConnectOpts, Connection,
     Database, DatabaseStorage, IOExt, MonotonicInstant, MvCursor, NonNan, OpenFlags, QueryMode,
     Statement, TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
-    TEMP_DB_ID,
 };
 use crate::{
     error::{
@@ -20251,19 +20250,13 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
     load_insn!(
         VacuumInto {
             schema_name,
-            dest_path
+            dest_reg
         },
         insn
     );
 
     if matches!(state.op_vacuum_state, VacuumOpState::None) {
         let source_db_id = program.connection.get_database_id_by_name(schema_name)?;
-
-        // Matches sqlite that treats VACUUM temp INTO as a no-op (no file created)
-        if source_db_id == TEMP_DB_ID {
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
-        }
 
         state.op_vacuum_state = VacuumOpState::IntoFile(Box::new(VacuumIntoOpContext {
             escaped_schema_name: schema_name.replace('"', "\"\""),
@@ -20309,7 +20302,11 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     .into());
                 }
 
-                let target = crate::util::OpenOptions::parse(dest_path)?;
+                let Value::Text(dest_path) = state.registers[*dest_reg].get_value() else {
+                    return Err(LimboError::InvalidArgument("non-text filename".to_string()).into());
+                };
+                let dest_path = dest_path.as_str().to_string();
+                let target = crate::util::OpenOptions::parse(&dest_path)?;
                 if target.cipher.is_some() || target.hexkey.is_some() {
                     return Err(LimboError::InvalidArgument(
                         "VACUUM INTO does not support the cipher and hexkey URI parameters"

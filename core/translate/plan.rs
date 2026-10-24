@@ -398,7 +398,7 @@ pub enum SubqueryOrigin {
     DmlWhere,
     DmlSet,
     DmlReturning,
-    TriggerWhen,
+    ExprWithoutFromClause,
 }
 
 impl SubqueryOrigin {
@@ -410,7 +410,7 @@ impl SubqueryOrigin {
             | SubqueryOrigin::SelectHaving
             | SubqueryOrigin::SelectOrderBy
             | SubqueryOrigin::SelectLimitOffset
-            | SubqueryOrigin::TriggerWhen => SubqueryEvalPhase::BeforeLoop,
+            | SubqueryOrigin::ExprWithoutFromClause => SubqueryEvalPhase::BeforeLoop,
             SubqueryOrigin::DmlWhere => SubqueryEvalPhase::BeforeLoop,
             SubqueryOrigin::DmlSet => SubqueryEvalPhase::PreWrite,
             SubqueryOrigin::DmlReturning => SubqueryEvalPhase::PostWriteReturning,
