@@ -611,6 +611,10 @@ currently returns no rows.
 missing trigger OIDs and NULL arguments. PostgreSQL triggers are not currently
 supported, so no trigger definitions are available.
 
+`pg_catalog.pg_rewrite` exposes the hidden system column `tableoid` for rule
+discovery. The catalog currently returns no rows. Select `tableoid` explicitly;
+it is not included in `SELECT *`.
+
 ## See Also
 
 - [INSERT](/docs/sql-reference/statements/insert) for adding rows to a table

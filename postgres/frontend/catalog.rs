@@ -2154,7 +2154,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_rewrite",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead INTEGER, ev_qual TEXT, ev_action TEXT)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead INTEGER, ev_qual TEXT, ev_action TEXT, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_foreign_table",

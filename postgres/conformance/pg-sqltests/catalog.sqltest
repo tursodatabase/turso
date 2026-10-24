@@ -981,3 +981,15 @@ test pg-trigger-dump-discovery-is-empty {
     ORDER BY t.tgrelid, t.tgname;
 }
 expect {}
+
+test pg-rewrite-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT tableoid, oid, rulename, ev_class AS ruletable, ev_type, is_instead, ev_enabled
+    FROM pg_rewrite
+    WHERE ev_class IN (
+        SELECT oid FROM pg_class
+        WHERE relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+    )
+    ORDER BY oid;
+}
+expect {}
