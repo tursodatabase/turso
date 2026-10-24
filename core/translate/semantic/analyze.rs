@@ -100,6 +100,7 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
     };
     analyzer.finish_column_reads(&root)?;
     let document = analyzer.finish(root)?;
+    #[cfg(debug_assertions)]
     document.validate().map_err(|error| {
         LimboError::InternalError(format!("semantic analysis produced invalid HIR: {error}"))
     })?;
