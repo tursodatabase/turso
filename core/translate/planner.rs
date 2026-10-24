@@ -1243,6 +1243,7 @@ fn plan_cte(
             )?;
             outer_query_refs.push(OuterQueryReference {
                 identifier: referenced_cte_table.identifier.clone(),
+                has_alias: referenced_cte_table.has_alias,
                 internal_id: referenced_cte_table.internal_id,
                 table: referenced_cte_table.table.clone(),
                 database_id: referenced_cte_table.database_id,
@@ -1446,6 +1447,7 @@ fn prepare_recursive_cte_plan(
     let mut recursive_query_outer_refs = outer_query_refs.to_vec();
     recursive_query_outer_refs.push(OuterQueryReference {
         identifier: cte_definition.name.clone(),
+        has_alias: false,
         internal_id: input_table.internal_id,
         table: input_table.table,
         database_id: input_table.database_id,
@@ -1643,6 +1645,7 @@ fn parse_from_clause_table(
                 )?;
                 outer_query_refs_for_subquery.push(OuterQueryReference {
                     identifier: cte_definition.name.clone(),
+                    has_alias: false,
                     internal_id: cte_table.internal_id,
                     database_id: cte_table.database_id,
                     table: cte_table.table,
@@ -1687,9 +1690,10 @@ fn parse_from_clause_table(
             }
             let cur_table_index = table_references.joined_tables().len();
             let identifier = maybe_alias
+                .as_ref()
                 .map(|a| normalize_ident(a.name().as_str()))
                 .unwrap_or_else(|| format!("(subquery-{cur_table_index})"));
-            table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
+            let mut joined_table = JoinedTable::new_subquery_from_plan(
                 identifier,
                 subplan,
                 None,
@@ -1697,7 +1701,9 @@ fn parse_from_clause_table(
                 None,  // No explicit columns for regular subqueries
                 None,  // Regular inline subqueries don't have a CTE identity
                 false, // No materialize hint for inline subqueries
-            )?);
+            )?;
+            joined_table.has_alias = maybe_alias.is_some();
+            table_references.add_joined_table(joined_table);
             Ok(())
         }
         ast::SelectTable::TableCall(qualified_name, args, maybe_alias) => parse_table(
@@ -2017,6 +2023,7 @@ fn parse_table(
             // If there's an alias provided, update the identifier to use that alias
             if let Some(a) = maybe_alias {
                 cte_table.identifier = normalize_ident(a.name().as_str());
+                cte_table.has_alias = true;
             }
 
             // Mark the pre-planned outer_query_ref as "CTE definition only" so it is
@@ -2100,6 +2107,7 @@ fn parse_table(
                 )?;
                 if let Some(alias) = alias {
                     joined_table.identifier = alias;
+                    joined_table.has_alias = true;
                 }
                 table_references.add_joined_table(joined_table);
             } else {
@@ -2113,6 +2121,7 @@ fn parse_table(
                     op: Operation::default_scan_for(&outer_table),
                     unmatched_right_rows_plan: None,
                     table: outer_table,
+                    has_alias: alias.is_some(),
                     identifier: alias.unwrap_or(normalized_qualified_name),
                     internal_id,
                     join_info: None,
@@ -2152,6 +2161,7 @@ fn parse_table(
             op: Operation::default_scan_for(&tbl_ref),
             unmatched_right_rows_plan: None,
             table: tbl_ref,
+            has_alias: alias.is_some(),
             identifier: alias.unwrap_or(normalized_qualified_name),
             internal_id,
             join_info: None,
@@ -2169,6 +2179,7 @@ fn parse_table(
         resolver.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
     if let Some(view) = regular_view {
         // Views are essentially query aliases, so just Expand the view as a subquery.
+        let has_alias = maybe_alias.is_some();
         let view_alias = maybe_alias
             .map(|a| normalize_ident(a.name().as_str()))
             .unwrap_or_else(|| normalize_ident(table_name.as_str()));
@@ -2192,7 +2203,7 @@ fn parse_table(
                 )
             })
         })?;
-        table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
+        let mut joined_table = JoinedTable::new_subquery_from_plan(
             view_alias,
             view_plan,
             None,
@@ -2200,7 +2211,9 @@ fn parse_table(
             (!view.explicit_columns.is_empty()).then_some(view.explicit_columns.as_slice()),
             None,
             false,
-        )?);
+        )?;
+        joined_table.has_alias = has_alias;
+        table_references.add_joined_table(joined_table);
         return Ok(());
     }
 
@@ -2259,6 +2272,7 @@ fn parse_table(
             }),
             unmatched_right_rows_plan: None,
             table: Table::BTree(btree_table),
+            has_alias: alias.is_some(),
             identifier: alias.unwrap_or(normalized_qualified_name),
             internal_id: program.table_reference_counter.next(),
             join_info: None,
@@ -2286,6 +2300,7 @@ fn parse_table(
                     unmatched_right_rows_plan: None,
                     table: outer_ref.table.clone(),
                     identifier: outer_ref.identifier.clone(),
+                    has_alias: outer_ref.has_alias,
                     internal_id: program.table_reference_counter.next(),
                     join_info: None,
                     col_used_mask: ColumnUsedMask::default(),
@@ -2510,6 +2525,7 @@ fn add_ctes_read_by_subqueries_as_outer_refs(
         )?;
         table_references.add_outer_query_reference(OuterQueryReference {
             identifier: cte_definition.name.clone(),
+            has_alias: false,
             internal_id: joined_table.internal_id,
             database_id: joined_table.database_id,
             table: joined_table.table,

@@ -213,6 +213,7 @@ pub fn prepare_delete_plan(
         unmatched_right_rows_plan: None,
         table,
         identifier: qualified_name.identifier(),
+        has_alias: qualified_name.alias.is_some(),
         internal_id: program.table_reference_counter.next(),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),

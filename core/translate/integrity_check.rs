@@ -276,6 +276,7 @@ fn translate_integrity_check_for_schema(
                 unmatched_right_rows_plan: None,
                 table: Table::BTree(btree_table.clone()),
                 identifier: btree_table.name.clone(),
+                has_alias: false,
                 internal_id: table_ref_id,
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
