@@ -1038,3 +1038,10 @@ test pg-publication-rel-dump-discovery-is-empty {
     FROM pg_catalog.pg_publication_rel pr;
 }
 expect {}
+
+test pg-publication-namespace-pgdump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT tableoid, oid, pnpubid, pnnspid
+    FROM pg_catalog.pg_publication_namespace;
+}
+expect {}

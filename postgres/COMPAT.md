@@ -80,8 +80,8 @@ plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 `tableoid` for pg_dump discovery. `pg_trigger` exposes `tgparentid` for
 parent-trigger lookup and hidden `tableoid` during dump discovery.
 `pg_rewrite` also exposes hidden `tableoid` for rule discovery, and `pg_policy`
-exposes it for policy discovery. `pg_publication` and `pg_publication_rel`
-expose hidden `tableoid` for publication discovery.
+exposes it for policy discovery. `pg_publication`, `pg_publication_rel`, and
+`pg_publication_namespace` expose hidden `tableoid` for publication discovery.
 `pg_get_triggerdef(oid)` and `pg_get_triggerdef(oid, pretty)` return NULL:
 PostgreSQL triggers are not supported and `pg_trigger` is empty.
 Catalog introspection functions: `format_type`,

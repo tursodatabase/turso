@@ -619,9 +619,9 @@ it is not included in `SELECT *`.
 discovery. The catalog currently returns no rows. Select `tableoid` explicitly;
 it is not included in `SELECT *`.
 
-`pg_catalog.pg_publication` and `pg_catalog.pg_publication_rel` expose the hidden
-system column `tableoid` for publication discovery. These catalogs currently
-return no rows. Select `tableoid` explicitly; it is not included in `SELECT *`.
+`pg_catalog.pg_publication`, `pg_catalog.pg_publication_rel`, and
+`pg_catalog.pg_publication_namespace` expose the hidden system column `tableoid`
+for publication discovery. These catalogs currently return no rows. Select `tableoid` explicitly; it is not included in `SELECT *`.
 
 In the PostgreSQL frontend, `generate_series(...)` and
 `pg_catalog.generate_series(...)` are available even when `search_path` is empty.
