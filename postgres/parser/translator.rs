@@ -3546,18 +3546,26 @@ impl PostgreSQLTranslator {
             && (is_datetime_operand(a_expr.lexpr.as_deref())
                 || is_datetime_operand(a_expr.rexpr.as_deref()))
         {
-            let has_date_operand = is_date_operand(a_expr.lexpr.as_deref())
-                || is_date_operand(a_expr.rexpr.as_deref());
-            let func_name = match (op_name, has_date_operand) {
-                ("+", true) => "date_pl",
-                ("+", false) => "datetime_pl",
-                (_, true) => "date_mi",
-                (_, false) => "datetime_mi",
+            let func_name = if op_name == "+" {
+                "datetime_pl"
+            } else {
+                "datetime_mi"
+            };
+            let type_name = |node: Option<&pg_query::protobuf::Node>| {
+                Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+                    "'{}'",
+                    declared_datetime_type(node)
+                ))))
             };
             return Ok(ast::Expr::FunctionCall {
                 name: ast::Name::from_string(func_name),
                 distinctness: None,
-                args: vec![left, right],
+                args: vec![
+                    left,
+                    right,
+                    type_name(a_expr.lexpr.as_deref()),
+                    type_name(a_expr.rexpr.as_deref()),
+                ],
                 order_by: vec![],
                 within_group: vec![],
                 filter_over: ast::FunctionTail {
@@ -5486,34 +5494,11 @@ fn now_call() -> ast::Expr {
 }
 
 fn is_datetime_operand(node: Option<&pg_query::protobuf::Node>) -> bool {
-    use pg_query::protobuf::node::Node;
-    use pg_query::protobuf::SqlValueFunctionOp as Op;
+    if !declared_datetime_type(node).is_empty() {
+        return true;
+    }
     match node.and_then(|n| n.node.as_ref()) {
-        Some(Node::TypeCast(type_cast)) => type_cast
-            .type_name
-            .as_ref()
-            .and_then(|type_name| last_string(&type_name.names))
-            .is_some_and(|name| {
-                matches!(
-                    name.as_str(),
-                    "interval" | "timestamptz" | "timestamp" | "date"
-                )
-            }),
-        Some(Node::FuncCall(func_call)) => last_string(&func_call.funcname).is_some_and(|name| {
-            matches!(
-                name.as_str(),
-                "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp"
-            )
-        }),
-        Some(Node::SqlvalueFunction(svf)) => matches!(
-            Op::try_from(svf.op),
-            Ok(Op::SvfopCurrentDate
-                | Op::SvfopCurrentTimestamp
-                | Op::SvfopCurrentTimestampN
-                | Op::SvfopLocaltimestamp
-                | Op::SvfopLocaltimestampN)
-        ),
-        Some(Node::AExpr(a_expr))
+        Some(pg_query::protobuf::node::Node::AExpr(a_expr))
             if a_expr.kind == pg_query::protobuf::AExprKind::AexprOp as i32 =>
         {
             last_string(&a_expr.name).is_some_and(|op| matches!(op.as_str(), "+" | "-"))
@@ -5524,19 +5509,41 @@ fn is_datetime_operand(node: Option<&pg_query::protobuf::Node>) -> bool {
     }
 }
 
-fn is_date_operand(node: Option<&pg_query::protobuf::Node>) -> bool {
+/// The type of a datetime operand when the expression itself names it (a cast,
+/// `now()`, `CURRENT_DATE`, ...), or "" when only the value can tell. The
+/// runtime needs this because `'infinity'` is a valid date, timestamp and
+/// interval.
+fn declared_datetime_type(node: Option<&pg_query::protobuf::Node>) -> &'static str {
     use pg_query::protobuf::node::Node;
     use pg_query::protobuf::SqlValueFunctionOp as Op;
     match node.and_then(|n| n.node.as_ref()) {
-        Some(Node::TypeCast(type_cast)) => type_cast
-            .type_name
-            .as_ref()
-            .and_then(|type_name| last_string(&type_name.names))
-            .is_some_and(|name| name == "date"),
-        Some(Node::SqlvalueFunction(svf)) => {
-            matches!(Op::try_from(svf.op), Ok(Op::SvfopCurrentDate))
+        Some(Node::TypeCast(type_cast)) => {
+            match type_cast
+                .type_name
+                .as_ref()
+                .and_then(|type_name| last_string(&type_name.names))
+                .as_deref()
+            {
+                Some("interval") => "interval",
+                Some("timestamptz") => "timestamptz",
+                Some("timestamp") => "timestamp",
+                Some("date") => "date",
+                _ => "",
+            }
         }
-        _ => false,
+        Some(Node::FuncCall(func_call)) => match last_string(&func_call.funcname).as_deref() {
+            Some("now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp") => {
+                "timestamptz"
+            }
+            _ => "",
+        },
+        Some(Node::SqlvalueFunction(svf)) => match Op::try_from(svf.op) {
+            Ok(Op::SvfopCurrentDate) => "date",
+            Ok(Op::SvfopCurrentTimestamp | Op::SvfopCurrentTimestampN) => "timestamptz",
+            Ok(Op::SvfopLocaltimestamp | Op::SvfopLocaltimestampN) => "timestamp",
+            _ => "",
+        },
+        _ => "",
     }
 }
 

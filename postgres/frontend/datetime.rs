@@ -11,6 +11,10 @@ const UNIX_EPOCH_DAYS_FROM_CE: i64 = 719_163;
 const JULIAN_DAYS_FROM_CE: i64 = 1_721_425;
 const MIN_YEAR: i64 = 1;
 const MAX_YEAR: i64 = 9999;
+/// 4714-11-24 BC, the earliest timestamp PostgreSQL can represent. Stored
+/// values stay within years 1 to 9999, but interval arithmetic may pass
+/// through earlier dates, as it does in PostgreSQL.
+const PG_MIN_MICROS: i64 = -2_440_588 * USECS_PER_DAY;
 
 const TIMESTAMPTZ: &str = "timestamp with time zone";
 const TIMESTAMP: &str = "timestamp without time zone";
@@ -152,15 +156,62 @@ pub(crate) fn now_text() -> String {
     format_timestamp(Timestamp::Finite(now_micros()), true)
 }
 
-/// `+` for timestamps, dates and intervals stored as text.
-pub(crate) fn exec_datetime_pl(lhs: &Value, rhs: &Value) -> Result<Value> {
+/// `+` written in SQL. `lhs_type` and `rhs_type` are the operand types the
+/// query names (`date`, `timestamp`, `timestamptz`, `interval`), or "" when
+/// only the stored value can tell.
+pub(crate) fn exec_typed_datetime_pl(
+    lhs: &Value,
+    rhs: &Value,
+    lhs_type: &str,
+    rhs_type: &str,
+) -> Result<Value> {
     if matches!(lhs, Value::Null) || matches!(rhs, Value::Null) {
         return Ok(Value::Null);
     }
-    if let Some(result) = date_pl_integer(lhs, rhs, false) {
+    let has_date = lhs_type == "date" || rhs_type == "date";
+    if let Some(result) = date_pl_integer(lhs, rhs, has_date) {
         return result;
     }
-    let (a, b) = (classify(lhs)?, classify(rhs)?);
+    datetime_pl(
+        classify_declared(lhs, lhs_type)?,
+        classify_declared(rhs, rhs_type)?,
+    )
+}
+
+/// `-` written in SQL. See [exec_typed_datetime_pl].
+pub(crate) fn exec_typed_datetime_mi(
+    lhs: &Value,
+    rhs: &Value,
+    lhs_type: &str,
+    rhs_type: &str,
+) -> Result<Value> {
+    if lhs_type == "date" && rhs_type == "date" {
+        return exec_date_mi(lhs, rhs);
+    }
+    if matches!(lhs, Value::Null) || matches!(rhs, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let has_date = lhs_type == "date" || rhs_type == "date";
+    if let Some(result) = date_mi_integer(lhs, rhs, has_date) {
+        return result;
+    }
+    datetime_mi(
+        classify_declared(lhs, lhs_type)?,
+        classify_declared(rhs, rhs_type)?,
+    )
+}
+
+/// `+` for timestamps, dates and intervals stored as text.
+pub(crate) fn exec_datetime_pl(lhs: &Value, rhs: &Value) -> Result<Value> {
+    exec_typed_datetime_pl(lhs, rhs, "", "")
+}
+
+/// `-` for timestamps, dates and intervals stored as text.
+pub(crate) fn exec_datetime_mi(lhs: &Value, rhs: &Value) -> Result<Value> {
+    exec_typed_datetime_mi(lhs, rhs, "", "")
+}
+
+fn datetime_pl(a: Operand, b: Operand) -> Result<Value> {
     let result = match (a, b) {
         (Operand::Datetime(ts, kind), Operand::Interval(iv))
         | (Operand::Interval(iv), Operand::Datetime(ts, kind)) => {
@@ -185,15 +236,7 @@ pub(crate) fn exec_datetime_pl(lhs: &Value, rhs: &Value) -> Result<Value> {
     Ok(Value::build_text(result))
 }
 
-/// `-` for timestamps, dates and intervals stored as text.
-pub(crate) fn exec_datetime_mi(lhs: &Value, rhs: &Value) -> Result<Value> {
-    if matches!(lhs, Value::Null) || matches!(rhs, Value::Null) {
-        return Ok(Value::Null);
-    }
-    if let Some(result) = date_mi_integer(lhs, rhs, false) {
-        return result;
-    }
-    let (a, b) = (classify(lhs)?, classify(rhs)?);
+fn datetime_mi(a: Operand, b: Operand) -> Result<Value> {
     let result = match (a, b) {
         (
             Operand::Datetime(Timestamp::Finite(a), DatetimeKind::Date),
@@ -448,6 +491,30 @@ fn classify(value: &Value) -> Result<Operand> {
     parse_interval(text)
         .map(Operand::Interval)
         .map_err(|err| input_error(err, "interval", text))
+}
+
+/// Like [classify], but an operand whose type the query names is read as that
+/// type, so `interval 'infinity'` is an interval and `'infinity'::date` a date.
+fn classify_declared(value: &Value, declared: &str) -> Result<Operand> {
+    let Value::Text(text) = value else {
+        return classify(value);
+    };
+    let text = text.as_str();
+    let kind = match declared {
+        "interval" => {
+            return parse_interval(text)
+                .map(Operand::Interval)
+                .map_err(|err| input_error(err, "interval", text))
+        }
+        "date" => DatetimeKind::Date,
+        "timestamp" => DatetimeKind::Timestamp,
+        "timestamptz" => DatetimeKind::TimestampTz,
+        _ => return classify(value),
+    };
+    match infinity_sign(text) {
+        Some(positive) => Ok(Operand::Datetime(infinite_timestamp(positive), kind)),
+        None => classify(value),
+    }
 }
 
 fn infinity_sign(text: &str) -> Option<bool> {
@@ -2938,20 +3005,23 @@ fn timestamp_pl_interval(ts: Timestamp, iv: Interval) -> Result<Timestamp> {
                 let total = f.year * 12 + f.month - 1 + i64::from(months);
                 let year = total.div_euclid(12);
                 let month = total.rem_euclid(12) + 1;
-                if !(MIN_YEAR..=MAX_YEAR).contains(&year) {
-                    return Err(timestamp_out_of_range());
-                }
                 let day = f.day.min(days_in_month(year, month));
-                let date = NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32)
+                let date = i32::try_from(year)
+                    .ok()
+                    .and_then(|year| NaiveDate::from_ymd_opt(year, month as u32, day as u32))
                     .ok_or_else(timestamp_out_of_range)?;
                 let time = micros.rem_euclid(USECS_PER_DAY);
                 micros = (i64::from(date.num_days_from_ce()) - UNIX_EPOCH_DAYS_FROM_CE)
                     * USECS_PER_DAY
                     + time;
+                if micros < PG_MIN_MICROS {
+                    return Err(timestamp_out_of_range());
+                }
             }
             micros = i64::from(days)
                 .checked_mul(USECS_PER_DAY)
                 .and_then(|d| micros.checked_add(d))
+                .filter(|m| *m >= PG_MIN_MICROS)
                 .and_then(|m| m.checked_add(delta))
                 .ok_or_else(timestamp_out_of_range)?;
             if !micros_in_range(micros) {

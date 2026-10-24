@@ -70,8 +70,8 @@ scalar_functions! {
     ToChar(FunctionArity::Exact(2), true),
     TimestamptzIn(FunctionArity::Exact(1), true),
     TimestampIn(FunctionArity::Exact(1), true),
-    DatetimePl(FunctionArity::Exact(2), true),
-    DatetimeMi(FunctionArity::Exact(2), true),
+    DatetimePl(FunctionArity::OneOf(&[2, 4]), true),
+    DatetimeMi(FunctionArity::OneOf(&[2, 4]), true),
     DateIn(FunctionArity::Exact(1), true),
     TimeIn(FunctionArity::Exact(1), true),
     DatePl(FunctionArity::Exact(2), true),
@@ -130,12 +130,18 @@ impl ScalarCall for PgScalarFunction {
             Self::ToChar => exec_to_char(args[0].get_value(), &text_arg(args, 1)),
             Self::TimestamptzIn => crate::datetime::exec_timestamptz_in(args[0].get_value())?,
             Self::TimestampIn => crate::datetime::exec_timestamp_in(args[0].get_value())?,
-            Self::DatetimePl => {
-                crate::datetime::exec_datetime_pl(args[0].get_value(), args[1].get_value())?
-            }
-            Self::DatetimeMi => {
-                crate::datetime::exec_datetime_mi(args[0].get_value(), args[1].get_value())?
-            }
+            Self::DatetimePl => crate::datetime::exec_typed_datetime_pl(
+                args[0].get_value(),
+                args[1].get_value(),
+                &text_arg(args, 2),
+                &text_arg(args, 3),
+            )?,
+            Self::DatetimeMi => crate::datetime::exec_typed_datetime_mi(
+                args[0].get_value(),
+                args[1].get_value(),
+                &text_arg(args, 2),
+                &text_arg(args, 3),
+            )?,
             Self::DateIn => crate::datetime::exec_date_in(args[0].get_value())?,
             Self::TimeIn => crate::datetime::exec_time_in(args[0].get_value())?,
             Self::DatePl => {

@@ -106,3 +106,32 @@ test to-char-time-zone-of-date-and-timestamp {
 expect {
     utc UTC +00|[][] +00
 }
+
+test date-plus-and-minus-infinite-interval {
+    SELECT '2024-03-06'::date - interval 'infinity', '2024-03-06'::date + interval '-infinity', '2024-03-06'::date - interval '-infinity', 'infinity'::date + interval '1 day';
+}
+expect {
+    -infinity|-infinity|infinity|infinity
+}
+
+test infinite-date-plus-date-has-no-operator {
+    SELECT 'infinity'::date + '2014-11-29'::date;
+}
+expect error {operator does not exist: date \+ date}
+
+test infinite-date-plus-timestamptz-has-no-operator {
+    SELECT '-infinity'::date + now();
+}
+expect error {operator does not exist: date \+ timestamp with time zone}
+
+test interval-month-step-may-pass-through-bc {
+    SELECT '1324-10-30'::timestamp + interval '-26.34 century 91983.1973 weeks', '0010-01-31 00:00+00'::timestamptz + interval '-120 months 3653 days';
+}
+expect {
+    0453-09-19 09:08:47.04|0010-01-31 00:00:00+00
+}
+
+test interval-month-step-before-4714-bc-is-out-of-range {
+    SELECT '0001-01-01'::timestamp - interval '4714 years';
+}
+expect error {timestamp out of range}
