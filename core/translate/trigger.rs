@@ -167,6 +167,7 @@ pub fn translate_create_trigger(
         );
     }
 
+    validate_trigger_variables(commands, when_clause)?;
     if time
         .as_ref()
         .is_some_and(|t| *t == ast::TriggerTime::InsteadOf)
@@ -284,6 +285,76 @@ fn resolve_create_trigger_database_id(
         crate::TEMP_DB_ID => Ok(crate::TEMP_DB_ID),
         _ => Ok(crate::MAIN_DB_ID),
     }
+}
+
+fn validate_trigger_variables(
+    commands: &[ast::TriggerCmd],
+    when_clause: Option<&ast::Expr>,
+) -> Result<()> {
+    let check_expr = |expr: &ast::Expr| {
+        crate::util::walk_expr_with_subqueries(expr, &mut reject_trigger_variable)
+    };
+    if let Some(expr) = when_clause {
+        check_expr(expr)?;
+    }
+    for command in commands {
+        match command {
+            ast::TriggerCmd::Select(select) => {
+                crate::util::walk_select_expressions(select, &mut reject_trigger_variable)?;
+            }
+            ast::TriggerCmd::Insert {
+                or_conflict,
+                tbl_name,
+                col_names,
+                select,
+                upsert,
+                returning,
+            } => {
+                let stmt = ast::Stmt::Insert {
+                    with: None,
+                    or_conflict: *or_conflict,
+                    tbl_name: QualifiedName {
+                        namespace: None,
+                        name: tbl_name.clone(),
+                        alias: None,
+                    },
+                    columns: col_names.clone(),
+                    body: ast::InsertBody::Select(select.clone(), upsert.clone()),
+                    returning: returning.clone(),
+                };
+                crate::util::walk_stmt_expressions(&stmt, &mut reject_trigger_variable)?;
+            }
+            ast::TriggerCmd::Update {
+                sets,
+                from,
+                where_clause,
+                ..
+            } => {
+                for set in sets {
+                    check_expr(&set.expr)?;
+                }
+                if let Some(from) = from {
+                    check_from_clause_refs(from, &|_| Ok(()), &check_expr)?;
+                }
+                if let Some(expr) = where_clause {
+                    check_expr(expr)?;
+                }
+            }
+            ast::TriggerCmd::Delete { where_clause, .. } => {
+                if let Some(expr) = where_clause {
+                    check_expr(expr)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_trigger_variable(expr: &ast::Expr) -> Result<crate::translate::expr::WalkControl> {
+    if matches!(expr, ast::Expr::Variable(_)) {
+        bail_parse_error!("trigger cannot use variables");
+    }
+    Ok(crate::translate::expr::WalkControl::Continue)
 }
 
 /// Validate that no table or expression reference in a trigger body points to a

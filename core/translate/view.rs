@@ -346,6 +346,12 @@ pub fn translate_create_view(
     if_not_exists: bool,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
+    crate::util::walk_select_expressions(select_stmt, &mut |expr| {
+        if matches!(expr, ast::Expr::Variable(_)) {
+            bail_parse_error!("parameters are not allowed in views");
+        }
+        Ok(crate::translate::expr::WalkControl::Continue)
+    })?;
     // TEMP views always live in the temp schema. The parser rejects
     // CREATE TEMP VIEW with a database name other than "temp".
     let database_id = if temporary {
