@@ -202,6 +202,164 @@ test select-cast-invalid-text-to-timestamp {
 }
 expect error {}
 
+test select-cast-int8-accepts-its-smallest-and-largest-values {
+    SELECT 9223372036854775807::int8, (-9223372036854775808)::bigint, int8(-9223372036854775808);
+}
+expect {
+    9223372036854775807|-9223372036854775808|-9223372036854775808
+}
+
+test select-cast-int8-rejects-literal-above-its-range {
+    SELECT 9223372036854775808::int8;
+}
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rejects-literal-below-its-range {
+    SELECT (-9223372036854775809)::int8;
+}
+expect error {
+    bigint out of range
+}
+
+test select-int8-function-rejects-literal-above-its-range {
+    SELECT int8(9223372036854775808);
+}
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rounds-decimal-literals-before-checking-the-range {
+    SELECT 9223372036854775807.4::int8, (-9223372036854775808.4)::int8, 9.223372036854775807e18::int8;
+}
+expect {
+    9223372036854775807|-9223372036854775808|9223372036854775807
+}
+
+test select-cast-int8-rejects-decimal-literal-that-rounds-above-its-range {
+    SELECT 9223372036854775807.5::int8;
+}
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rejects-decimal-literal-that-rounds-below-its-range {
+    SELECT (-9223372036854775808.5)::int8;
+}
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rejects-exponent-literal-above-its-range {
+    SELECT 1e19::int8;
+}
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rejects-literal-with-underscores-above-its-range {
+    SELECT 9_223_372_036_854_775_808::int8;
+}
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-accepts-zero-with-a-large-exponent {
+    SELECT 0e100::int8, 0.0e25::int8;
+}
+expect {
+    0|0
+}
+
+test select-cast-int8-accepts-largest-hex-literal {
+    SELECT 0x7fffffffffffffff::int8;
+}
+expect {
+    9223372036854775807
+}
+
+test select-cast-int8-rejects-hex-literal-above-its-range {
+    SELECT 0x8000000000000000::int8;
+}
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-accepts-smallest-negative-hex-literal {
+    SELECT (-0x8000000000000000)::int8;
+}
+expect {
+    -9223372036854775808
+}
+
+test select-binary-and-octal-literals-above-int4-range {
+    SELECT 0b11111111111111111111111111111111, -0b1_0000_0000_0000_0000_0000_0000_0000_0000, 0o77777777777;
+}
+expect {
+    4294967295|-4294967296|8589934591
+}
+
+test select-hex-literals-above-float8-range-do-not-crash {
+    SELECT CASE WHEN 0x10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 > 0 THEN 'positive' ELSE 'negative' END, CASE WHEN -0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff < 0 THEN 'negative' ELSE 'positive' END;
+}
+expect {
+    positive|negative
+}
+
+test select-cast-int8-rejects-hex-literal-above-float8-range {
+    SELECT 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff::int8;
+}
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-out-of-range-literal-in-unused-column-default {
+    CREATE TABLE int8_default(a int8 DEFAULT 9223372036854775808::int8, b int);
+    INSERT INTO int8_default VALUES (5, 1);
+    SELECT * FROM int8_default;
+}
+expect {
+    5|1
+}
+
+test select-cast-int8-out-of-range-literal-in-used-column-default {
+    CREATE TABLE int8_default_used(a int8 DEFAULT CAST(9223372036854775808 AS bigint), b int);
+    INSERT INTO int8_default_used(b) VALUES (1);
+}
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-out-of-range-literal-in-check-constraint {
+    CREATE TABLE int8_check(a int8 CHECK (a < int8(9223372036854775808)));
+    INSERT INTO int8_check VALUES (5);
+}
+expect error {
+    bigint out of range
+}
+
+test select-hex-literal-above-int8-range-stays-positive {
+    SELECT CASE WHEN 0xffffffffffffffff > 0 THEN 'positive' ELSE 'negative' END, CASE WHEN 0x10000000000000000 > 0 THEN 'positive' ELSE 'negative' END;
+}
+expect {
+    positive|positive
+}
+
+test select-cast-as-bigint-rejects-literal-above-its-range {
+    SELECT CAST(9223372036854775808 AS bigint);
+}
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-out-of-range-literal-in-branch-that-never-runs {
+    SELECT coalesce(CASE WHEN false THEN 9223372036854775808::int8 END, 7);
+}
+expect {
+    7
+}
+
 test select-case-expression {
     SELECT CASE WHEN 1 < 2 THEN 'lt' ELSE 'ge' END;
 }

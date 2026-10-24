@@ -2958,6 +2958,11 @@ impl PostgreSQLTranslator {
                 if !pg_type_name.typmods.is_empty() {
                     return Err(not_supported("a type modifier in a cast"));
                 }
+                if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8")
+                    && literal_exceeds_int8(arg)
+                {
+                    return Ok(raise_bigint_out_of_range());
+                }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
                     expr,
@@ -3265,9 +3270,9 @@ impl PostgreSQLTranslator {
                     let quoted = format!("'{}'", s.sval.replace('\'', "''"));
                     Ok(ast::Expr::Literal(ast::Literal::String(quoted)))
                 }
-                pg_query::protobuf::a_const::Val::Fval(f) => {
-                    Ok(ast::Expr::Literal(ast::Literal::Numeric(f.fval.clone())))
-                }
+                pg_query::protobuf::a_const::Val::Fval(f) => Ok(ast::Expr::Literal(
+                    ast::Literal::Numeric(non_decimal_literal_to_decimal(&f.fval)),
+                )),
                 pg_query::protobuf::a_const::Val::Boolval(b) => {
                     // SQLite uses 0/1 for booleans
                     Ok(ast::Expr::Literal(ast::Literal::Numeric(
@@ -3915,6 +3920,11 @@ impl PostgreSQLTranslator {
                     return Err(not_supported(format!(
                         "DISTINCT, ORDER BY, FILTER or OVER on {func_name}()"
                     )));
+                }
+                if func_name.eq_ignore_ascii_case("int8")
+                    && literal_exceeds_int8(&func_call.args[0])
+                {
+                    return Ok(raise_bigint_out_of_range());
                 }
                 return Ok(ast::Expr::Cast {
                     expr: args.into_iter().next().unwrap(),
@@ -5709,6 +5719,116 @@ fn json_type_or_raise(
             .collect(),
         else_expr: Some(raise(error)),
     }
+}
+
+fn literal_exceeds_int8(node: &pg_query::protobuf::Node) -> bool {
+    use pg_query::protobuf::{a_const::Val, node::Node, AConst};
+    match &node.node {
+        Some(Node::AConst(AConst {
+            val: Some(Val::Fval(f)),
+            ..
+        })) => numeric_literal_exceeds_int8(&f.fval),
+        _ => false,
+    }
+}
+
+fn raise_bigint_out_of_range() -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(function_call("int8_out_of_range", vec![])),
+        type_name: Some(ast::Type {
+            name: "INTEGER".to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    }
+}
+
+/// Rounds half away from zero before the range check, like PostgreSQL's
+/// numeric to int8 cast.
+fn numeric_literal_exceeds_int8(literal: &str) -> bool {
+    let literal = non_decimal_literal_to_decimal(literal).replace('_', "");
+    let (negative, unsigned) = match literal.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, literal.as_str()),
+    };
+    let limit = if negative {
+        i64::MIN.unsigned_abs() as u128
+    } else {
+        i64::MAX as u128
+    };
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => match exponent.parse::<i64>() {
+            Ok(exponent) => (mantissa, exponent),
+            Err(_) => return false,
+        },
+        None => (unsigned, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    let all_digits = format!("{int_part}{frac_part}");
+    let digits = all_digits.trim_start_matches('0').as_bytes();
+    if digits.is_empty() {
+        return false;
+    }
+    let int_len = (digits.len() as i64)
+        .saturating_sub(frac_part.len() as i64)
+        .saturating_add(exponent);
+    if int_len > 19 {
+        return true;
+    }
+    if int_len < 0 {
+        return false;
+    }
+    let int_len = int_len as usize;
+    let mut magnitude: u128 = 0;
+    for i in 0..int_len {
+        let digit = digits.get(i).map_or(0, |d| d - b'0');
+        magnitude = magnitude * 10 + digit as u128;
+    }
+    if digits.get(int_len).is_some_and(|&d| d >= b'5') {
+        magnitude += 1;
+    }
+    magnitude > limit
+}
+
+fn non_decimal_literal_to_decimal(literal: &str) -> String {
+    let (sign, unsigned) = match literal.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", literal),
+    };
+    let radix = match unsigned.get(..2) {
+        Some("0x" | "0X") => 16,
+        Some("0o" | "0O") => 8,
+        Some("0b" | "0B") => 2,
+        _ => return literal.to_string(),
+    };
+    let mut decimal_digits = vec![0u8];
+    for digit in unsigned[2..].chars().filter(|&c| c != '_') {
+        let mut carry = digit
+            .to_digit(radix)
+            .expect("PostgreSQL's lexer only accepts digits of the literal's radix");
+        for decimal_digit in decimal_digits.iter_mut() {
+            let value = *decimal_digit as u32 * radix + carry;
+            *decimal_digit = (value % 10) as u8;
+            carry = value / 10;
+        }
+        while carry > 0 {
+            decimal_digits.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    let magnitude: String = decimal_digits
+        .iter()
+        .rev()
+        .map(|&d| char::from(b'0' + d))
+        .collect();
+    format!("{sign}{magnitude}")
 }
 
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
