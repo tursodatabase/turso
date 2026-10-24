@@ -429,6 +429,8 @@ fn test_mvcc_blob_read_works_and_write_is_unsupported() -> anyhow::Result<()> {
     let mut mid = [0u8; 4];
     blob.read(2, &mut mid)?;
     assert_eq!(mid, [0x22, 0x33, 0x44, 0x55]);
+    let mut past_end = [0u8; 4];
+    assert!(blob.read(8, &mut past_end).is_err());
     blob.close()?;
 
     let Err(err) = conn.blob_open("files", "data", 1, true) else {
@@ -441,6 +443,25 @@ fn test_mvcc_blob_read_works_and_write_is_unsupported() -> anyhow::Result<()> {
 
     let rows: Vec<(String,)> = conn.exec_rows("SELECT hex(data) FROM files WHERE id = 1");
     assert_eq!(rows, vec![("00112233445566778899".to_string(),)]);
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_blob_reads_a_large_value_by_range() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_blob_reads_a_large_value_by_range.db");
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, data BLOB)")?;
+    conn.execute("INSERT INTO files VALUES (1, randomblob(100000))")?;
+    let expected: Vec<(String,)> =
+        conn.exec_rows("SELECT hex(substr(data, 50001, 16)) FROM files WHERE id = 1");
+
+    let mut blob = conn.blob_open("files", "data", 1, false)?;
+    assert_eq!(blob.bytes(), 100000);
+    let mut buf = [0u8; 16];
+    blob.read(50000, &mut buf)?;
+    let hex: String = buf.iter().map(|b| format!("{b:02X}")).collect();
+    assert_eq!(hex, expected[0].0);
+    blob.close()?;
     Ok(())
 }
 
