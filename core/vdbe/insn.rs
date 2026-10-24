@@ -368,6 +368,11 @@ pub struct AggStepData {
     /// Collation for comparison-based aggregates (MIN/MAX), resolved at
     /// translation time from the argument expression.
     pub collation: Option<CollationSeq>,
+    /// For MIN/MAX: register set to 1 when this step stores a new value or the
+    /// aggregate has no value yet, and to 0 otherwise. Like SQLite, an aggregate
+    /// query reads its columns outside aggregate functions only from rows where
+    /// it is not 0, so that they come from the row holding the MIN/MAX value.
+    pub changed_reg: Option<usize>,
 }
 
 /// Which of SUM, TOTAL, or AVG an `IvmSumFinalize` instruction computes. The

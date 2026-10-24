@@ -1190,6 +1190,15 @@ pub struct TranslateCtx<'a> {
     // we want to emit the non-aggregate columns (foo and bar) only once.
     // This register is a flag that tracks whether we have already done that.
     pub reg_nonagg_emit_once_flag: Option<usize>,
+    // In non-group-by statements with MIN/MAX and non-aggregate columns, the register
+    // that the MIN/MAX steps set when the row holds a new MIN/MAX value. The
+    // non-aggregate columns are then read from each such row instead of only once.
+    pub reg_min_max_changed: Option<usize>,
+    /// In non-group-by statements with aggregations, the table columns read outside
+    /// an aggregate function by a result column that contains aggregates or by HAVING
+    /// (e.g. `a` in `SELECT CASE WHEN sum(b) > 0 THEN a END FROM t HAVING a > 0`),
+    /// each with the register the main loop copies its value into.
+    pub ungrouped_column_regs: Vec<(Expr, usize)>,
     // First register of the result columns of the query
     pub reg_result_cols_start: Option<usize>,
     pub limit_ctx: Option<LimitCtx>,
@@ -1262,6 +1271,8 @@ impl<'a> TranslateCtx<'a> {
             label_main_loop_end: None,
             reg_agg_start: None,
             reg_nonagg_emit_once_flag: None,
+            reg_min_max_changed: None,
+            ungrouped_column_regs: Vec::new(),
             limit_ctx: None,
             reg_offset: None,
             reg_limit_offset_sum: None,
