@@ -631,11 +631,12 @@ impl PostgreSQLTranslator {
             );
             serial_sequences.push(seq_name.clone());
             let namespace = serial_sequence_namespace(tbl_name);
+            let seq_arg = format!("{namespace}.{seq_name}").replace('\'', "''");
             default_expr = Some(ast::Expr::FunctionCall {
                 name: ast::Name::from_string("nextval"),
                 distinctness: None,
                 args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                    "'{namespace}.{seq_name}'"
+                    "'{seq_arg}'"
                 ))))],
                 order_by: vec![],
                 within_group: vec![],

@@ -955,7 +955,13 @@ fn bind_qualified_name(
 /// validated as `Expr::Literal(Literal::String(_))` during bind-time checks.
 pub(super) fn extract_string_literal(expr: &ast::Expr) -> crate::Result<String> {
     match expr {
-        ast::Expr::Literal(ast::Literal::String(s)) => Ok(s.trim_matches('\'').to_string()),
+        ast::Expr::Literal(ast::Literal::String(s)) => {
+            if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+                Ok(crate::translate::expr::sanitize_string(s))
+            } else {
+                Ok(s.clone())
+            }
+        }
         _ => crate::bail_parse_error!("expected a string literal argument"),
     }
 }

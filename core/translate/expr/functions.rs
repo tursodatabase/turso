@@ -192,7 +192,7 @@ pub(super) fn translate_sequence_function(
     let is_nextval = matches!(&func_ctx.func, Func::Scalar(ScalarFunc::NextVal));
 
     let seq_name_raw = extract_string_literal(&args[0])?;
-    let (database_id, normalized_name) = if let Some((schema, name)) = seq_name_raw.split_once('.')
+    let (database_id, normalized_name) = if let Some((schema, name)) = seq_name_raw.rsplit_once('.')
     {
         let schema_norm = normalize_ident(schema);
         let db_id = resolver
