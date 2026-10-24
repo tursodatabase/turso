@@ -806,7 +806,7 @@ impl ProgramBuilder {
     }
 
     /// Read `expression` from `register` instead of evaluating it, until
-    /// [Self::clear_expression_registers].
+    /// [Self::truncate_expression_registers].
     pub(crate) fn bind_expression_register(
         &mut self,
         expression: &crate::translate::semantic::hir::Expr,
@@ -850,10 +850,6 @@ impl ProgramBuilder {
             .iter()
             .find(|(bound, _)| *bound == address)
             .map(|(_, register)| *register)
-    }
-
-    pub(crate) fn clear_expression_registers(&mut self) {
-        self.expression_registers.clear();
     }
 
     pub(crate) fn bind_subquery(&mut self, query: QueryId, binding: SubqueryBinding) {

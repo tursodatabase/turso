@@ -601,6 +601,21 @@ fn hir_displays_arrays_passed_through_expressions() {
 }
 
 #[test]
+fn hir_aggregate_subquery_in_a_grouped_query_keeps_the_group_keys() {
+    let db = setup();
+    let (sqlite, hir) = connections(&db);
+    for sql in [
+        "SELECT extra FROM items GROUP BY extra HAVING 1 <> (SELECT count(*) FROM tags) ORDER BY 1",
+        "SELECT extra, sum(value) FROM items GROUP BY extra \
+         HAVING max(value) <> (SELECT count(*) FROM tags GROUP BY tag ORDER BY 1 LIMIT 1) ORDER BY 1",
+        "SELECT (SELECT count(*) FROM tags GROUP BY tag ORDER BY 1 LIMIT 1), extra FROM items \
+         GROUP BY extra ORDER BY 2",
+    ] {
+        assert_same_rows(&hir, &sqlite, sql);
+    }
+}
+
+#[test]
 fn hir_subquery_outputs_stay_arrays_for_the_outer_query() {
     let db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
