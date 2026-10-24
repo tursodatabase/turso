@@ -920,6 +920,66 @@ mod tests {
     }
 
     #[test]
+    fn test_bigint_expression_results_are_int8_on_wire() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        conn.execute("CREATE TABLE t(id int PRIMARY KEY, b bigint)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 5000000000)")
+            .unwrap();
+        for sql in [
+            "SELECT b * 2 FROM t",
+            "SELECT coalesce(b, 1) FROM t",
+            "SELECT coalesce(1, b) FROM t",
+            "SELECT coalesce(NULL, b) FROM t",
+            "SELECT abs(b) FROM t",
+            "SELECT CASE WHEN id = 1 THEN b ELSE 1 END FROM t",
+            "SELECT -b FROM t",
+            "SELECT (b + 1) * 2 FROM t",
+            "SELECT CAST(id AS bigint) + 1 FROM t",
+            "SELECT int8(id) + 1 FROM t",
+            "SELECT b & 1 FROM t",
+            "SELECT b | 1 FROM t",
+            "SELECT b >> 1 FROM t",
+            "SELECT ~b FROM t",
+        ] {
+            let stmt = conn.prepare(sql).unwrap();
+            let fields = build_field_info(&stmt, &Format::UnifiedText);
+            assert_eq!(*fields[0].datatype(), Type::INT8, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_bigint_expression_binary_result_keeps_eight_bytes() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        conn.execute("CREATE TABLE t(b bigint)").unwrap();
+        conn.execute("INSERT INTO t VALUES (5000000000)").unwrap();
+        let mut stmt = conn.prepare("SELECT b * 2 FROM t").unwrap();
+        let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedBinary));
+        assert_eq!(*fields[0].datatype(), Type::INT8);
+        let rows = stmt.run_collect_rows().unwrap();
+        let mut encoder = DataRowEncoder::new(fields.clone());
+        encode_value(&mut encoder, &rows[0][0], fields[0].datatype()).unwrap();
+        let row = encoder.finish().unwrap();
+        let mut expected = 8i32.to_be_bytes().to_vec();
+        expected.extend_from_slice(&10_000_000_000i64.to_be_bytes());
+        assert_eq!(&row.data[..], expected.as_slice());
+    }
+
+    #[test]
     fn test_set_transaction_is_non_query() {
         assert!(is_pg_non_query(
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"

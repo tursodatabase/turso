@@ -168,7 +168,7 @@ pub enum ColumnTypeKind {
 }
 
 /// Recursively infer the result primitive of a non-table-column expression
-/// and return its uppercase name (`"INTEGER"`, `"REAL"`, `"TEXT"`,
+/// and return its uppercase name (`"INTEGER"`, `"BIGINT"`, `"REAL"`, `"TEXT"`,
 /// `"NUMERIC"`, `"BLOB"`) or `None` when no determination can be made.
 ///
 /// Used by [`Statement::get_column_type_info`] to give wire-protocol layers
@@ -201,7 +201,14 @@ fn infer_expression_primitive(
         }
         Expr::Collate(inner, _) => infer_expression_primitive(inner, referenced_tables),
         Expr::Unary(op, inner) => match op {
-            UnaryOperator::Not | UnaryOperator::BitwiseNot => Some("INTEGER"),
+            UnaryOperator::Not => Some("INTEGER"),
+            UnaryOperator::BitwiseNot => Some(
+                if infer_expression_primitive(inner, referenced_tables) == Some("BIGINT") {
+                    "BIGINT"
+                } else {
+                    "INTEGER"
+                },
+            ),
             UnaryOperator::Negative => Some(combine_arithmetic_primitive(
                 Some("INTEGER"),
                 infer_expression_primitive(inner, referenced_tables),
@@ -209,8 +216,7 @@ fn infer_expression_primitive(
             UnaryOperator::Positive => infer_expression_primitive(inner, referenced_tables),
         },
         Expr::Binary(left, op, right) => match op {
-            // Arithmetic: widen INTEGER × INTEGER to INTEGER, anything mixed
-            // with REAL becomes REAL, fall through to NUMERIC otherwise.
+            // Arithmetic retains BIGINT width; mixing with REAL widens to REAL.
             Operator::Add
             | Operator::Subtract
             | Operator::Multiply
@@ -220,12 +226,23 @@ fn infer_expression_primitive(
                 let r = infer_expression_primitive(right, referenced_tables);
                 Some(combine_arithmetic_primitive(l, r))
             }
-            // Bitwise: result is always INTEGER in both SQLite and PG.
-            Operator::BitwiseAnd
-            | Operator::BitwiseOr
-            | Operator::BitwiseNot
-            | Operator::LeftShift
-            | Operator::RightShift => Some("INTEGER"),
+            // Bitwise results retain integer width; shifts use the left operand.
+            Operator::BitwiseAnd | Operator::BitwiseOr | Operator::BitwiseNot => Some(
+                if infer_expression_primitive(left, referenced_tables) == Some("BIGINT")
+                    || infer_expression_primitive(right, referenced_tables) == Some("BIGINT")
+                {
+                    "BIGINT"
+                } else {
+                    "INTEGER"
+                },
+            ),
+            Operator::LeftShift | Operator::RightShift => Some(
+                if infer_expression_primitive(left, referenced_tables) == Some("BIGINT") {
+                    "BIGINT"
+                } else {
+                    "INTEGER"
+                },
+            ),
             // Comparison and logical: SQLite returns 0/1 INTEGER; tursopg
             // maps INTEGER to BOOL at the wire layer for boolean columns,
             // but the type the wire layer reports is still INTEGER here.
@@ -279,8 +296,24 @@ fn infer_expression_primitive(
                 _ => None,
             }
         }
-        // CAST, column references, and anything else: defer to the affinity
-        // machinery, which handles these shapes correctly.
+        Expr::Column { table, column, .. } => {
+            let (_, table_ref) = referenced_tables?.find_table_by_internal_id(*table)?;
+            let col = table_ref.get_column_at(*column)?;
+            if !col.is_array() && is_bigint_name(&col.ty_str) {
+                Some("BIGINT")
+            } else {
+                affinity_to_primitive(translate::expr::get_expr_affinity(
+                    expr,
+                    referenced_tables,
+                    None,
+                ))
+            }
+        }
+        Expr::Cast {
+            type_name: Some(ty),
+            ..
+        } if ty.array_dimensions == 0 && is_bigint_name(&ty.name) => Some("BIGINT"),
+        // Other expressions use affinity when it carries enough information.
         _ => affinity_to_primitive(translate::expr::get_expr_affinity(
             expr,
             referenced_tables,
@@ -298,7 +331,7 @@ fn common_primitive<'a>(
 ) -> Option<&'static str> {
     use turso_parser::ast::{Expr, Literal};
 
-    let is_numeric = |primitive| matches!(primitive, "INTEGER" | "REAL" | "NUMERIC");
+    let is_numeric = |primitive| matches!(primitive, "INTEGER" | "BIGINT" | "REAL" | "NUMERIC");
     let mut common = None;
     for expr in exprs.filter(|expr| !matches!(expr, Expr::Literal(Literal::Null))) {
         let primitive = infer_expression_primitive(expr, referenced_tables)?;
@@ -312,6 +345,12 @@ fn common_primitive<'a>(
         };
     }
     common
+}
+
+fn is_bigint_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("BIGINT")
+        || name.eq_ignore_ascii_case("INT8")
+        || name.eq_ignore_ascii_case("BIGSERIAL")
 }
 
 /// Map [`crate::vdbe::affinity::Affinity`] to the uppercase primitive name
@@ -328,8 +367,8 @@ fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'
 }
 
 /// Pick the widening primitive for an arithmetic binary op given each
-/// operand's inferred primitive. `INTEGER + INTEGER -> INTEGER`,
-/// `INTEGER + REAL -> REAL`, everything else collapses to `NUMERIC` (the
+/// operand's inferred primitive. Integer operands retain BIGINT width,
+/// mixing with REAL gives REAL, and other combinations become NUMERIC (the
 /// safe wire default for a mixed-affinity numeric result).
 fn combine_arithmetic_primitive(
     left: Option<&'static str>,
@@ -337,9 +376,11 @@ fn combine_arithmetic_primitive(
 ) -> &'static str {
     match (left, right) {
         (Some("INTEGER"), Some("INTEGER")) => "INTEGER",
-        (Some("INTEGER"), Some("REAL"))
-        | (Some("REAL"), Some("INTEGER"))
-        | (Some("REAL"), Some("REAL")) => "REAL",
+        (Some("BIGINT"), Some("INTEGER" | "BIGINT")) | (Some("INTEGER"), Some("BIGINT")) => {
+            "BIGINT"
+        }
+        (Some("INTEGER" | "BIGINT"), Some("REAL"))
+        | (Some("REAL"), Some("INTEGER" | "BIGINT" | "REAL")) => "REAL",
         _ => "NUMERIC",
     }
 }
