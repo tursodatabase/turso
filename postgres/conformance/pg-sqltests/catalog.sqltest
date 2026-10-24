@@ -993,3 +993,17 @@ test pg-rewrite-dump-discovery-is-empty {
     ORDER BY oid;
 }
 expect {}
+
+test pg-policy-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT pol.oid, pol.tableoid, pol.polrelid, pol.polname, pol.polcmd, pol.polpermissive,
+           CASE WHEN pol.polroles = '{0}' THEN NULL ELSE
+               pg_catalog.array_to_string(ARRAY(SELECT pg_catalog.quote_ident(rolname)
+                   FROM pg_catalog.pg_roles WHERE oid = ANY(pol.polroles)), ', ')
+           END AS polroles,
+           pg_catalog.pg_get_expr(pol.polqual, pol.polrelid) AS polqual,
+           pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid) AS polwithcheck
+    FROM unnest('{16384,16385}'::pg_catalog.oid[]) AS src(tbloid)
+    JOIN pg_catalog.pg_policy pol ON src.tbloid = pol.polrelid;
+}
+expect {}
