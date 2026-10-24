@@ -212,6 +212,83 @@ expect {
     1
 }
 
+# https://github.com/tursodatabase/turso/issues/5809
+# sqlite_sequence stores the table name with the case used in CREATE TABLE.
+@cross-check-integrity
+test autoinc-mixed-case-table-name-kept-in-sequence {
+    CREATE TABLE "MiXeD Name"(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO "MiXeD Name"(v) VALUES('x');
+    UPDATE sqlite_sequence SET seq=100 WHERE name='MiXeD Name';
+    INSERT INTO "MiXeD Name"(v) VALUES('y');
+    SELECT id,v FROM "MiXeD Name" ORDER BY id;
+    SELECT name,seq FROM sqlite_sequence;
+}
+expect {
+    1|x
+    101|y
+    MiXeD Name|101
+}
+
+# A sqlite_sequence row whose name differs from the table's only in case belongs
+# to no table: INSERT does not use it and DROP TABLE does not delete it.
+@cross-check-integrity
+test autoinc-insert-and-drop-ignore-sequence-row-that-differs-in-case {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO sqlite_sequence VALUES('T', 7);
+    INSERT INTO t(v) VALUES(1);
+    SELECT id FROM t;
+    SELECT name, seq FROM sqlite_sequence ORDER BY rowid;
+    DROP TABLE t;
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    1
+    T|7
+    t|1
+    T|7
+}
+
+# Renaming a mixed-case AUTOINCREMENT table stores the new name as written.
+@cross-check-integrity
+test autoinc-rename-mixed-case-table-updates-sequence-entry {
+    CREATE TABLE "MiXeD"(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO "MiXeD"(v) VALUES('x');
+    ALTER TABLE mixed RENAME TO "NeW Name";
+    SELECT name,seq FROM sqlite_sequence;
+    INSERT INTO "new name"(v) VALUES('y');
+    SELECT name,seq FROM sqlite_sequence;
+}
+expect {
+    NeW Name|1
+    NeW Name|2
+}
+
+# A row whose name differs from the table's only in case belongs to no table.
+@cross-check-integrity
+test autoinc-rename-keeps-sequence-row-that-differs-in-case {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(v) VALUES(1);
+    INSERT INTO sqlite_sequence VALUES('T', 7);
+    ALTER TABLE t RENAME TO u;
+    SELECT name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+    u|1
+    T|7
+}
+
+# Older versions of Turso stored the lowercased table name. RENAME must still find that row.
+@skip-if sqlite "SQLite never wrote lowercased names"
+test autoinc-rename-updates-lowercased-sequence-row {
+    CREATE TABLE "MiXeD"(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO sqlite_sequence VALUES('mixed', 7);
+    ALTER TABLE mixed RENAME TO u;
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    u|7
+}
+
 # Test: Renaming an AUTOINCREMENT table updates sqlite_sequence in place.
 @cross-check-integrity
 test autoinc-rename-table-updates-sequence-entry {
@@ -246,6 +323,29 @@ expect {
     1|x
     2|y
     |z
+}
+
+@skip-if sqlite "ALTER COLUMN is a Turso extension"
+test autoinc-alter-column-clears-mixed-case-sequence-row {
+    CREATE TABLE "MiXeD"(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT);
+    INSERT INTO "MiXeD"(b) VALUES('x');
+    ALTER TABLE mixed ALTER COLUMN a TO a2 TEXT;
+    SELECT COUNT(*) FROM sqlite_sequence;
+}
+expect {
+    0
+}
+
+@skip-if sqlite "ALTER COLUMN is a Turso extension"
+test autoinc-alter-column-keeps-sequence-row-that-differs-in-case {
+    CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT);
+    INSERT INTO t(b) VALUES('x');
+    INSERT INTO sqlite_sequence VALUES('T', 7);
+    ALTER TABLE t ALTER COLUMN a TO a2 TEXT;
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    T|7
 }
 
 # Test: AUTOINCREMENT fails if the maximum rowid is reached. (Assumes 64-bit rowid)
