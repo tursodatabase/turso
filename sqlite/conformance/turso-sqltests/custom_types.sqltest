@@ -581,6 +581,37 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test add-column-default-rejected-by-encode-fails-alter {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO t1 VALUES (1);
+    ALTER TABLE t1 ADD COLUMN x varchar(3) DEFAULT 'toolong';
+}
+expect error {
+    value too long for varchar
+}
+
+@requires strict "uses STRICT tables"
+test add-column-default-accepted-by-encode {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO t1 VALUES (1);
+    ALTER TABLE t1 ADD COLUMN y varchar(3) DEFAULT 'ok';
+    SELECT * FROM t1;
+}
+expect {
+    1|ok
+}
+
+@requires strict "uses STRICT tables"
+test add-column-default-rejected-by-encode-empty-table {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
+    ALTER TABLE t1 ADD COLUMN x varchar(3) DEFAULT 'toolong';
+    SELECT count(*) FROM t1;
+}
+expect {
+    0
+}
+
+@requires strict "uses STRICT tables"
 test add-column-numeric-default-preexisting {
     CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
     INSERT INTO t1 VALUES (1);
