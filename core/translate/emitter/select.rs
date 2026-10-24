@@ -36,7 +36,7 @@ use crate::{
 };
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
-use turso_parser::ast::Expr;
+use turso_parser::ast::{self, Expr};
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_select(
@@ -897,6 +897,12 @@ fn build_materialized_build_input_plan(
         // because those tables are available during probe loops. Use the broader "included"
         // set when deciding which WHERE terms can be evaluated inside the materialization.
         term.consumed = !included_tables.contains_all_set_bits_of(&mask);
+        // A literal true replaces each term that the subplan cannot evaluate. Such a term
+        // can use a subquery that is left out of the subplan below, and looking it up
+        // there would fail.
+        if term.consumed {
+            term.expr = Expr::Literal(ast::Literal::Numeric("1".to_string()));
+        }
     }
 
     // Clone table references and then "sanitize" each access method so that
@@ -1081,7 +1087,7 @@ fn build_materialized_build_input_plan(
     };
 
     // The WHERE terms that use a subquery reading tables outside the prefix are
-    // consumed above, so the subquery must not be emitted in this subplan either.
+    // replaced above, so the subquery must not be emitted in this subplan either.
     let non_from_clause_subqueries = plan
         .non_from_clause_subqueries
         .iter()
