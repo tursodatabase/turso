@@ -379,11 +379,14 @@ impl TypeDef {
     }
 
     /// The ENCODE expression to run on a value that a column of this type is
-    /// compared with. None for a type with parameters such as `varchar(3)`:
-    /// its ENCODE checks the parameter, and `col = 'abcd'` must be false, not
-    /// an error.
+    /// compared with. None for a type with parameters whose stored value reads
+    /// back unchanged, such as `varchar(3)`: its ENCODE only checks the
+    /// parameter, and `col = 'abcd'` must be false, not an error.
     pub fn encode_for_comparison_value(&self) -> Option<&ast::Expr> {
-        if self.compares_with_standard_operator() && self.user_params().next().is_some() {
+        if self.compares_with_standard_operator()
+            && self.user_params().next().is_some()
+            && self.decode_returns_value_unchanged()
+        {
             return None;
         }
         self.encode()
