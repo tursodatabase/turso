@@ -1905,6 +1905,9 @@ impl Jsonb {
                     });
                 }
 
+                // SQLite reports a bad escape at the character after the
+                // backslash.
+                let esc_pos = pos;
                 let esc = input[pos];
                 pos += 1;
 
@@ -1968,7 +1971,7 @@ impl Jsonb {
                         if pos + 4 > input.len() {
                             return Err(PError::Message {
                                 msg: "Incomplete unicode escape sequence".to_string(),
-                                location: Some(pos),
+                                location: Some(esc_pos),
                             });
                         }
 
@@ -1980,7 +1983,7 @@ impl Jsonb {
                             if !is_hex_digit(h) {
                                 return Err(PError::Message {
                                     msg: "Invalid unicode escape sequence".to_string(),
-                                    location: Some(pos),
+                                    location: Some(esc_pos),
                                 });
                             }
                             escape_buffer[2 + i] = h;
@@ -2042,7 +2045,7 @@ impl Jsonb {
                         if pos + 2 > input.len() {
                             return Err(PError::Message {
                                 msg: "Incopmlete hex escape sequence".to_string(),
-                                location: Some(pos),
+                                location: Some(esc_pos),
                             });
                         }
 
@@ -2054,7 +2057,7 @@ impl Jsonb {
                             if !is_hex_digit(h) {
                                 return Err(PError::Message {
                                     msg: "Invalid hex escape sequence".to_string(),
-                                    location: Some(pos),
+                                    location: Some(esc_pos),
                                 });
                             }
                             escape_buffer[2 + i] = h;
@@ -2069,7 +2072,7 @@ impl Jsonb {
                     _ => {
                         return Err(PError::Message {
                             msg: "Invalid escape sequence".to_string(),
-                            location: Some(pos),
+                            location: Some(esc_pos),
                         });
                     }
                 }
@@ -2180,25 +2183,20 @@ impl Jsonb {
             len += 1;
             has_digit = true;
 
-            if pos < input.len() && (input[pos] == b'x' || input[pos] == b'X') {
-                // Hexadecimal number
+            // Like SQLite, '0x' starts a hex number only when a hex digit
+            // follows; otherwise the number is just '0'.
+            if pos + 1 < input.len()
+                && (input[pos] == b'x' || input[pos] == b'X')
+                && is_hex_digit(input[pos + 1])
+            {
                 self.data.push(input[pos]);
                 pos += 1;
                 len += 1;
 
-                let mut has_digit = false;
                 while pos < input.len() && is_hex_digit(input[pos]) {
                     self.data.push(input[pos]);
                     pos += 1;
                     len += 1;
-                    has_digit = true;
-                }
-
-                if !has_digit {
-                    return Err(PError::Message {
-                        msg: "Invalid hex digit".to_string(),
-                        location: Some(pos),
-                    });
                 }
 
                 info.has_json5 = true;
@@ -2318,11 +2316,12 @@ impl Jsonb {
                         len += 1;
                     }
 
-                    // Exponent must have at least one digit
+                    // Exponent must have at least one digit. SQLite reports
+                    // the 'e', or the sign after it.
                     if pos >= input.len() || !input[pos].is_ascii_digit() {
                         return Err(PError::Message {
                             msg: "malformed JSON".to_string(),
-                            location: Some(pos),
+                            location: Some(pos - 1),
                         });
                     }
                 }
