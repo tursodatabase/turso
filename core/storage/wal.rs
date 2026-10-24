@@ -3929,6 +3929,12 @@ impl Wal for WalFile {
     // this method involves IO and cross "async" boundary - so juggling with references is bad and dangerous
     fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion> {
         tracing::debug!("read_frame_raw({})", frame_id);
+        let max_frame = self.get_max_frame();
+        if frame_id == 0 || frame_id > max_frame {
+            return Err(LimboError::InvalidArgument(format!(
+                "frame_id is out of range: frame_id={frame_id}, max_frame={max_frame}"
+            )));
+        }
         let offset = self.frame_offset(frame_id);
         let expected_frame_len = WAL_FRAME_HEADER_SIZE + self.page_size() as usize;
         if frame.len() != expected_frame_len {

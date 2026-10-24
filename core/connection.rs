@@ -2203,8 +2203,18 @@ impl Connection {
     pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<WalFrameInfo> {
         use crate::storage::sqlite3_ondisk::parse_wal_frame_header;
 
-        let c = self.pager.load().wal_get_frame(frame_no, frame)?;
-        self.db.io.wait_for_completion(c)?;
+        let pager = self.pager.load();
+        let started_read_tx = !pager.holds_read_lock();
+        if started_read_tx {
+            pager.begin_read_tx()?;
+        }
+        let result = pager
+            .wal_get_frame(frame_no, frame)
+            .and_then(|c| self.db.io.wait_for_completion(c));
+        if started_read_tx {
+            pager.end_read_tx();
+        }
+        result?;
         let (header, _) = parse_wal_frame_header(frame);
         Ok(WalFrameInfo {
             page_no: header.page_number,
