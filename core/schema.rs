@@ -2018,6 +2018,8 @@ impl Schema {
         automatic_indices: HashMap<String, Vec<(String, i64)>>,
         mvcc_enabled: bool,
     ) -> Result<()> {
+        self.recover_quoted_integer_rowid_aliases(&automatic_indices);
+
         for unparsed_sql_from_index in from_sql_indexes {
             let table = self
                 .get_btree_table(&unparsed_sql_from_index.table_name)
@@ -2152,6 +2154,77 @@ impl Schema {
             }
         }
         Ok(())
+    }
+
+    fn recover_quoted_integer_rowid_aliases(
+        &mut self,
+        automatic_indices: &HashMap<String, Vec<(String, i64)>>,
+    ) {
+        for schema_table in self.tables.values_mut() {
+            let Table::BTree(btree) = Arc::make_mut(schema_table) else {
+                continue;
+            };
+            let btree = Arc::make_mut(btree);
+            let Some(primary_key_index) = btree
+                .unique_sets
+                .iter()
+                .position(|set| set.is_primary_key && set.columns.len() == 1)
+            else {
+                continue;
+            };
+            if btree
+                .unique_sets
+                .iter()
+                .filter(|set| set.is_primary_key)
+                .count()
+                != 1
+                || btree.primary_key_columns.len() != 1
+                || !btree.has_rowid
+            {
+                continue;
+            }
+
+            let autoindex_count = automatic_indices
+                .iter()
+                .find(|(table_name, _)| table_name.eq_ignore_ascii_case(&btree.name))
+                .map_or(0, |(_, indices)| indices.len());
+            if btree.unique_sets.len() != autoindex_count + 1 {
+                continue;
+            }
+
+            let (column_name, order) = btree.primary_key_columns[0].clone();
+            if order == SortOrder::Desc {
+                continue;
+            }
+            let Some(column) = btree
+                .columns()
+                .iter()
+                .find(|column| column.name.as_deref() == Some(column_name.as_str()))
+            else {
+                continue;
+            };
+            if !column.primary_key()
+                || column.is_rowid_alias()
+                || !column.ty_str.eq_ignore_ascii_case("INTEGER")
+                || !column.ty_params.is_empty()
+                || !column
+                    .written_ty_str
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("\"INTEGER\""))
+            {
+                continue;
+            }
+
+            let primary_key_set = btree.unique_sets.remove(primary_key_index);
+            btree.rowid_alias_conflict_clause = primary_key_set.conflict_clause;
+            if let Some(column) = btree
+                .columns_mut()
+                .iter_mut()
+                .find(|column| column.name.as_deref() == Some(column_name.as_str()))
+            {
+                column.set_rowid_alias(true);
+            }
+        }
     }
 
     fn order_persisted_materialized_views(
