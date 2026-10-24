@@ -213,7 +213,7 @@ fn from_syntax_keeps_right_rows(from: &ast::FromClause) -> bool {
 
 pub(super) struct AnalyzedSourceColumn {
     pub(super) column: hir::SourceColumn,
-    pub(super) programs: Option<hir::BoundColumnTypePrograms>,
+    pub(super) programs: Option<Box<hir::BoundColumnTypePrograms>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1793,11 +1793,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         && chain.iter().any(|definition| definition.value().not_null);
                     (
                         type_fact,
-                        Some(hir::BoundColumnTypePrograms {
+                        Some(Box::new(hir::BoundColumnTypePrograms {
                             encode,
                             decode,
                             encode_nulls,
-                        }),
+                        })),
                     )
                 }
                 None if column.ty_str.is_empty() => (TypeFact::known(column.ty()), None),

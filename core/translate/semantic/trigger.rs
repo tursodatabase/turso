@@ -450,7 +450,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         row: TriggerRow,
         table: &hir::ResolvedTable,
         columns: &[hir::SourceColumn],
-        column_type_programs: &[Option<hir::BoundColumnTypePrograms>],
+        column_type_programs: &[Option<Box<hir::BoundColumnTypePrograms>>],
         rowid_available: bool,
     ) -> Result<hir::SourceId> {
         let source = self.reserve_source();

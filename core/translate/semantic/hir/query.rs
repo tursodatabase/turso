@@ -282,12 +282,14 @@ pub struct CheckConstraint {
 /// statement does not need. Every required expression must be `Planned`
 /// before the HIR document is finished.
 #[derive(Clone, Debug)]
-#[allow(clippy::large_enum_variant)]
 pub enum ColumnReadExpression {
     Absent,
     NotRequired,
-    Planned(Expr),
+    Planned(Box<Expr>),
 }
+
+const _: () = assert!(std::mem::size_of::<ColumnReadExpression>() == 16);
+const _: () = assert!(std::mem::size_of::<Option<Box<BoundColumnTypePrograms>>>() == 8);
 
 #[derive(Clone, Debug)]
 pub struct Source {
@@ -306,7 +308,7 @@ pub struct Source {
     pub default_expressions: Vec<ColumnReadExpression>,
     /// Custom-type encode/decode programs aligned with `columns`. Plain and
     /// built-in typed columns contain `None`.
-    pub column_type_programs: Vec<Option<BoundColumnTypePrograms>>,
+    pub column_type_programs: Vec<Option<Box<BoundColumnTypePrograms>>>,
     /// CHECK constraints selected and instantiated for this exact DML target.
     /// `None` means this source does not enforce CHECKs for the current
     /// statement; `Some([])` means enforcement is active but no catalog CHECK

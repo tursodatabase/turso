@@ -5993,7 +5993,7 @@ mod tests {
             false,
         );
         definition.generated_expressions[1] =
-            hir::ColumnReadExpression::Planned(hir::Expr::column(source_id, 0));
+            hir::ColumnReadExpression::Planned(Box::new(hir::Expr::column(source_id, 0)));
         let mut document = document(Vec::new());
         document.sources.push(definition);
         let mut program = program();
@@ -6353,8 +6353,8 @@ mod tests {
             vec![source_column("value", Type::Text, Affinity::Text, false)],
             true,
         );
-        definition.default_expressions[0] = hir::ColumnReadExpression::Planned(hir::Expr::Literal(
-            Literal::Numeric("7".to_string()),
+        definition.default_expressions[0] = hir::ColumnReadExpression::Planned(Box::new(
+            hir::Expr::Literal(Literal::Numeric("7".to_string())),
         ));
         let mut document = document(Vec::new());
         document.sources.push(definition);
@@ -6403,8 +6403,9 @@ mod tests {
         }
         let mut definition = source(source_id, hir::SourceKind::SchemaExpression, columns, false);
         for index in 1..WIDTH {
-            definition.generated_expressions[index] =
-                hir::ColumnReadExpression::Planned(hir::Expr::column(source_id, index - 1));
+            definition.generated_expressions[index] = hir::ColumnReadExpression::Planned(Box::new(
+                hir::Expr::column(source_id, index - 1),
+            ));
         }
         let mut document = document(Vec::new());
         document.sources.push(definition);

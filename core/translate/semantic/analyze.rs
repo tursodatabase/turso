@@ -766,11 +766,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             })?;
             if let Some(expression) = generated {
                 source.generated_expressions[reference.column] =
-                    ColumnReadExpression::Planned(expression);
+                    ColumnReadExpression::Planned(Box::new(expression));
             }
             if let Some(expression) = default {
                 source.default_expressions[reference.column] =
-                    ColumnReadExpression::Planned(expression);
+                    ColumnReadExpression::Planned(Box::new(expression));
             }
         }
         Ok(())
@@ -3348,7 +3348,7 @@ mod tests {
             panic!("transitive base dependency plans its read-time default");
         };
         assert!(matches!(
-            base_default,
+            base_default.as_ref(),
             Expr::Literal(ast::Literal::Numeric(value)) if value == "7"
         ));
 
@@ -3356,7 +3356,7 @@ mod tests {
             panic!("generated dependency is planned");
         };
         assert!(matches!(
-            doubled,
+            doubled.as_ref(),
             Expr::Binary { lhs, .. }
                 if matches!(lhs.as_ref(), Expr::Column(column)
                     if column.source == source.id && column.column == 0)
@@ -3366,7 +3366,7 @@ mod tests {
             panic!("directly read generated column is planned");
         };
         assert!(matches!(
-            combined,
+            combined.as_ref(),
             Expr::Binary { lhs, rhs, .. }
                 if matches!(lhs.as_ref(), Expr::Column(column)
                     if column.source == source.id && column.column == 1)
@@ -7613,10 +7613,11 @@ mod tests {
         assert_eq!(child_source.name, "item_notes");
         assert!(matches!(
             &child_source.generated_expressions[1],
-            ColumnReadExpression::Planned(hir::Expr::Binary { lhs, .. })
+            ColumnReadExpression::Planned(expression)
+                if matches!(expression.as_ref(), hir::Expr::Binary { lhs, .. }
                 if matches!(lhs.as_ref(), hir::Expr::Column(column)
                     if column.source == incoming.child_source && column.column == 0)
-        ));
+        )));
     }
 
     #[test]
@@ -7722,17 +7723,19 @@ mod tests {
             IndexCoverage::Complete { ref indexes } if indexes.is_empty()
         ));
         assert!(matches!(
-            source.default_expressions[1],
-            ColumnReadExpression::Planned(Expr::Literal(ast::Literal::String(ref value)))
+            &source.default_expressions[1],
+            ColumnReadExpression::Planned(expression)
+                if matches!(expression.as_ref(), Expr::Literal(ast::Literal::String(value))
                 if value.trim_matches(|ch| ch == '\'' || ch == '"') == "fallback"
-        ));
+        )));
         assert!(matches!(
-            source.generated_expressions[2],
-            ColumnReadExpression::Planned(Expr::Binary {
+            &source.generated_expressions[2],
+            ColumnReadExpression::Planned(expression)
+                if matches!(expression.as_ref(), Expr::Binary {
                 operator: ast::Operator::Multiply,
                 ..
-            })
-        ));
+            }
+        )));
     }
 
     #[test]
@@ -11539,13 +11542,14 @@ mod tests {
                 IndexCoverage::Complete { ref indexes } if indexes.is_empty()
             ));
             assert!(matches!(
-                source.generated_expressions[2],
-                ColumnReadExpression::Planned(Expr::Binary {
-                    lhs: ref left,
+                &source.generated_expressions[2],
+                ColumnReadExpression::Planned(expression)
+                    if matches!(expression.as_ref(), Expr::Binary {
+                    lhs: left,
                     operator: ast::Operator::Multiply,
                     ..
-                }) if matches!(left.as_ref(), Expr::Column(reference) if reference.source == source.id && reference.column == 0)
-            ));
+                } if matches!(left.as_ref(), Expr::Column(reference) if reference.source == source.id && reference.column == 0)
+            )));
         }
     }
 
@@ -11657,10 +11661,11 @@ mod tests {
         assert!(matches!(child_source.kind, SourceKind::Table(_)));
         assert!(matches!(
             &child_source.generated_expressions[1],
-            ColumnReadExpression::Planned(Expr::Binary { lhs, .. })
+            ColumnReadExpression::Planned(expression)
+                if matches!(expression.as_ref(), Expr::Binary { lhs, .. }
                 if matches!(lhs.as_ref(), Expr::Column(column)
                     if column.source == incoming.child_source && column.column == 0)
-        ));
+        )));
     }
 
     #[test]
@@ -12276,11 +12281,12 @@ mod tests {
             IndexCoverage::Complete { ref indexes } if indexes.is_empty()
         ));
         assert!(matches!(
-            source.generated_expressions[2],
-            ColumnReadExpression::Planned(Expr::Binary { ref lhs, .. })
+            &source.generated_expressions[2],
+            ColumnReadExpression::Planned(expression)
+                if matches!(expression.as_ref(), Expr::Binary { lhs, .. }
                 if matches!(lhs.as_ref(), Expr::Column(column)
                     if column.source == delete.target && column.column == 0)
-        ));
+        )));
 
         let predicate = delete.predicate.as_ref().expect("WHERE is preserved");
         assert!(matches!(
@@ -12431,10 +12437,11 @@ mod tests {
         assert!(matches!(child_source.kind, SourceKind::Table(_)));
         assert!(matches!(
             &child_source.generated_expressions[1],
-            ColumnReadExpression::Planned(Expr::Binary { lhs, .. })
+            ColumnReadExpression::Planned(expression)
+                if matches!(expression.as_ref(), Expr::Binary { lhs, .. }
                 if matches!(lhs.as_ref(), Expr::Column(column)
                     if column.source == incoming.child_source && column.column == 0)
-        ));
+        )));
     }
 
     #[test]
