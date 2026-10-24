@@ -1736,6 +1736,19 @@ expect {
     {"a":{"b":{"d":{}}},"c":{}}
 }
 
+test json-patch-applies-duplicate-patch-keys-in-order {
+    select json_patch('{}', '{"a":{"x":1},"a":5,"a":{"y":2}}');
+    select json_patch('{}', '{"a":{"x":1},"a":null,"a":{"y":2}}');
+    select json_patch('{"a":{"b":1}}', '{"a":{"c":2},"a":{"b":null}}');
+    select json_patch('{"a":{"b":{"c":1}},"z":0}', '{"a":{"b":{"d":{"e":{"f":2}}}},"z":{"q":null}}');
+}
+expect {
+    {"a":{"y":2}}
+    {"a":{"y":2}}
+    {"a":{"c":2}}
+    {"a":{"b":{"c":1,"d":{"e":{"f":2}}}},"z":{}}
+}
+
 test json-patch-does-not-decode-textraw-keys {
     select json_patch('{"a\nb":0}', x'7C4A615C6E621331');
 }

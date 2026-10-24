@@ -6,12 +6,7 @@ use crate::json::error::{Error as PError, Result as PResult};
 use crate::json::Conv;
 use crate::types::{value_blob_from_slice, ValueBlob};
 use crate::{bail_parse_error, LimboError, Result};
-use std::{
-    borrow::Cow,
-    collections::{HashMap, VecDeque},
-    fmt::Write,
-    str::from_utf8,
-};
+use std::{borrow::Cow, collections::HashMap, fmt::Write, str::from_utf8};
 
 use super::path::{JsonPath, PathElement};
 
@@ -3240,154 +3235,111 @@ impl Jsonb {
             .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))
     }
 
-    // TODO Primitive implementation could be optimized.
     pub fn patch(&mut self, patch: &Jsonb) -> Result<()> {
-        let (patch_header, _) = patch.read_header(0)?;
+        self.merge_patch_at(0, patch, 0)?;
+        Ok(())
+    }
+
+    fn merge_patch_at(&mut self, target: usize, patch: &Jsonb, patch_idx: usize) -> Result<isize> {
+        let target_end = self.skip_element(target)?;
+        let patch_end = patch.skip_element(patch_idx)?;
+        let (patch_header, patch_header_size) = patch.read_header(patch_idx)?;
 
         if patch_header.0 != ElementType::OBJECT {
-            self.data.clear();
-            self.data.extend_from_slice(&patch.data);
-            return Ok(());
+            self.data.splice(
+                target..target_end,
+                patch.data[patch_idx..patch_end].iter().copied(),
+            );
+            return Ok((patch_end - patch_idx) as isize - (target_end - target) as isize);
         }
 
-        let result = self;
+        let (target_header, _) = self.read_header(target)?;
+        let target_was_object = target_header.0 == ElementType::OBJECT;
+        if !target_was_object {
+            let empty_obj = JsonbHeader::make_obj().into_bytes();
+            self.data
+                .splice(target..target_end, empty_obj.as_bytes().iter().copied());
+        }
 
-        let mut work_stack = VecDeque::with_capacity(10);
-        work_stack.push_back((
-            JsonPath {
-                elements: vec![PathElement::Root()],
-            },
-            0,
-        ));
+        let (target_header, target_header_size) = self.read_header(target)?;
+        let members_start = target + target_header_size;
+        let mut members_end = members_start + target_header.1;
+        let mut patch_cursor = patch_idx + patch_header_size;
 
-        while let Some((path, patch_cursor)) = work_stack.pop_front() {
-            let (patch_obj_header, patch_obj_header_size) = patch.read_header(patch_cursor)?;
-
-            if patch_obj_header.0 != ElementType::OBJECT {
-                continue;
+        while patch_cursor < patch_end {
+            let (key_header, key_header_size) = patch.read_header(patch_cursor)?;
+            if !key_header.0.is_valid_key() {
+                bail_parse_error!("Invalid key type");
             }
+            let key_text =
+                decoded_key_text(&patch.data, patch_cursor, key_header, key_header_size)?;
+            let value_idx = patch_cursor + key_header_size + key_header.1;
+            let value_end = patch.skip_element(value_idx)?;
+            let value_type = patch.read_header(value_idx)?.0 .0;
 
-            let target_is_object = result
-                .navigate_path(&path, PathOperationMode::ReplaceExisting)
-                .is_ok_and(|stack| {
-                    stack.last().is_some_and(|target| {
-                        result
-                            .element_type_at(target.field_value_index)
-                            .is_ok_and(|element_type| element_type == ElementType::OBJECT)
-                    })
-                });
-            if !target_is_object {
-                continue;
-            }
-
-            let patch_end = patch_cursor + patch_obj_header_size + patch_obj_header.1;
-            let mut patch_key_cursor = patch_cursor + patch_obj_header_size;
-
-            let mut key_values = Vec::new();
-
-            while patch_key_cursor < patch_end {
-                let (key_header, key_header_size) = patch.read_header(patch_key_cursor)?;
-                if !key_header.0.is_valid_key() {
-                    return Err(LimboError::ParseError("Invalid key type".to_string()));
+            match self.find_object_member(members_start, members_end, &key_text)? {
+                Some((member_start, member_value, member_end)) => {
+                    if value_type == ElementType::NULL {
+                        self.data.drain(member_start..member_end);
+                        members_end -= member_end - member_start;
+                    } else {
+                        let delta = self.merge_patch_at(member_value, patch, value_idx)?;
+                        members_end = (members_end as isize + delta) as usize;
+                    }
                 }
-
-                let key_start = patch_key_cursor + key_header_size;
-                let key_text = read_text_payload(&patch.data, key_start, key_header.1)?;
-
-                // Read the value
-                let value_cursor = key_start + key_header.1;
-                let (value_header, value_header_size) = patch.read_header(value_cursor)?;
-                let key_text = if matches!(key_header.0, ElementType::TEXT5 | ElementType::TEXTJ) {
-                    Cow::Owned(unescape_string(key_text))
-                } else {
-                    Cow::Borrowed(key_text)
-                };
-
-                key_values.push((
-                    patch_key_cursor..value_cursor,
-                    key_text,
-                    value_header.0,
-                    value_cursor..value_cursor + value_header_size + value_header.1,
-                ));
-
-                patch_key_cursor = value_cursor + value_header_size + value_header.1;
-            }
-
-            for (key_range, key_text, value_type, value_range) in key_values {
-                let mut key_path = path.clone();
-                key_path.elements.push(PathElement::Key(key_text, false));
-
-                let Ok(target_stack) =
-                    result.navigate_path(&key_path, PathOperationMode::ReplaceExisting)
-                else {
+                None if value_type == ElementType::NULL => {}
+                None => {
+                    let key_data = &patch.data[patch_cursor..value_idx];
                     let empty_obj = JsonbHeader::make_obj().into_bytes();
-                    let value_data = match value_type {
-                        ElementType::NULL => continue,
-                        ElementType::OBJECT => empty_obj.as_bytes(),
-                        _ => &patch.data[value_range.clone()],
+                    let value_data = if value_type == ElementType::OBJECT {
+                        empty_obj.as_bytes()
+                    } else {
+                        &patch.data[value_idx..value_end]
                     };
-                    let key_data = &patch.data[key_range];
-                    let object_stack =
-                        result.navigate_path(&path, PathOperationMode::ReplaceExisting)?;
-                    let object_idx = object_stack
-                        .last()
-                        .ok_or_else(|| {
-                            LimboError::InternalError("object path should not be empty".to_string())
-                        })?
-                        .field_value_index;
-                    let object_end = result.skip_element(object_idx)?;
-                    result.data.splice(
-                        object_end..object_end,
+                    self.data.splice(
+                        members_end..members_end,
                         key_data.iter().chain(value_data).copied(),
                     );
-                    result.update_parent_references(
-                        object_stack,
-                        (key_data.len() + value_data.len()) as isize,
-                    )?;
+                    let new_value = members_end + key_data.len();
+                    members_end = new_value + value_data.len();
                     if value_type == ElementType::OBJECT {
-                        work_stack.push_back((key_path, value_range.start));
-                    }
-                    continue;
-                };
-
-                match value_type {
-                    ElementType::NULL => {
-                        let mut op = DeleteOperation::new();
-
-                        let _ = result.operate_on_path(&key_path, &mut op);
-                    }
-                    ElementType::OBJECT => {
-                        let target_value_idx = target_stack
-                            .last()
-                            .ok_or_else(|| {
-                                LimboError::InternalError(
-                                    "target stack should not be empty".to_string(),
-                                )
-                            })?
-                            .field_value_index;
-                        let (target_header, _) = result.read_header(target_value_idx)?;
-
-                        if target_header.0 != ElementType::OBJECT {
-                            let empty_obj = Jsonb::from_raw_data(
-                                JsonbHeader::make_obj().into_bytes().as_bytes(),
-                            )?;
-                            let mut op = ReplaceOperation::new(empty_obj);
-                            result.operate_on_path(&key_path, &mut op)?;
-                        }
-                        work_stack.push_back((key_path, value_range.start));
-                    }
-                    _ => {
-                        let patch_value = Jsonb::from_raw_data(&patch.data[value_range])?;
-
-                        let mut op = SetOperation::new(patch_value);
-
-                        let _ = result.operate_on_path(&key_path, &mut op);
+                        let delta = self.merge_patch_at(new_value, patch, value_idx)?;
+                        members_end = (members_end as isize + delta) as usize;
                     }
                 }
             }
+            patch_cursor = value_end;
         }
 
-        Ok(())
+        let payload_size = members_end - members_start;
+        if !target_was_object || payload_size != target_header.1 {
+            let header = JsonbHeader::new(ElementType::OBJECT, payload_size).into_bytes();
+            self.data
+                .splice(target..members_start, header.as_bytes().iter().copied());
+        }
+        Ok(self.skip_element(target)? as isize - target_end as isize)
+    }
+
+    fn find_object_member(
+        &self,
+        members_start: usize,
+        members_end: usize,
+        key_text: &str,
+    ) -> Result<Option<(usize, usize, usize)>> {
+        let mut cursor = members_start;
+        while cursor < members_end {
+            let (key_header, key_header_size) = self.read_header(cursor)?;
+            if !key_header.0.is_valid_key() {
+                bail_parse_error!("Invalid key type");
+            }
+            let value_idx = cursor + key_header_size + key_header.1;
+            let member_end = self.skip_element(value_idx)?;
+            if decoded_key_text(&self.data, cursor, key_header, key_header_size)? == key_text {
+                return Ok(Some((cursor, value_idx, member_end)));
+            }
+            cursor = member_end;
+        }
+        Ok(None)
     }
 
     pub fn array_iterator(&self) -> Result<ArrayIteratorState> {
@@ -3586,6 +3538,19 @@ fn read_text_payload(data: &[u8], start: usize, len: usize) -> Result<&str> {
         bail_parse_error!("malformed JSON: text payload extends beyond data");
     };
     from_utf8(bytes).map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
+}
+
+fn decoded_key_text(
+    data: &[u8],
+    key_idx: usize,
+    key_header: JsonbHeader,
+    key_header_size: usize,
+) -> Result<Cow<'_, str>> {
+    let key_text = read_text_payload(data, key_idx + key_header_size, key_header.1)?;
+    Ok(match key_header.0 {
+        ElementType::TEXT5 | ElementType::TEXTJ => Cow::Owned(unescape_string(key_text)),
+        _ => Cow::Borrowed(key_text),
+    })
 }
 
 /// Picks the element type for an object key created from a path label.
