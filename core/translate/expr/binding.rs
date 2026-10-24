@@ -746,13 +746,7 @@ fn resolve_qualified_name(
             &joined_table.table,
             joined_table.internal_id,
             &joined_table.identifier,
-            if database_id == Some(joined_table.database_id)
-                && matches!(joined_table.table, Table::BTree(_) | Table::Virtual(_))
-            {
-                None
-            } else {
-                database_id
-            },
+            database_id_to_match(&joined_table.table, joined_table.database_id, database_id),
             table_name,
             column_name,
         )?;
@@ -797,7 +791,7 @@ fn resolve_qualified_name(
             &outer_ref.table,
             outer_ref.internal_id,
             &outer_ref.identifier,
-            database_id,
+            database_id_to_match(&outer_ref.table, outer_ref.database_id, database_id),
             table_name,
             column_name,
         )?;
@@ -838,6 +832,22 @@ fn resolve_qualified_name(
         Ok(QualifiedNameMatch::NoColumn)
     } else {
         Ok(QualifiedNameMatch::NoTable)
+    }
+}
+
+/// A schema name that matches the table's own database is already satisfied,
+/// so the table can then be matched by its alias.
+fn database_id_to_match(
+    table: &Table,
+    table_database_id: usize,
+    database_id: Option<usize>,
+) -> Option<usize> {
+    if database_id == Some(table_database_id)
+        && matches!(table, Table::BTree(_) | Table::Virtual(_))
+    {
+        None
+    } else {
+        database_id
     }
 }
 
