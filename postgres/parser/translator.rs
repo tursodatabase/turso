@@ -2973,7 +2973,7 @@ impl PostgreSQLTranslator {
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("TypeCast missing type name".into()))?;
                 if !pg_type_name.typmods.is_empty() {
-                    return Err(not_supported("a type modifier in a cast"));
+                    return cast_with_type_modifier(expr, pg_type_name);
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
@@ -3107,10 +3107,19 @@ impl PostgreSQLTranslator {
                     ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTime)),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTimestamp
-                        | SqlValueFunctionOp::SvfopCurrentTimestampN
-                        | SqlValueFunctionOp::SvfopLocaltimestamp
+                        | SqlValueFunctionOp::SvfopCurrentTimestampN,
+                    ) => Ok(now_call()),
+                    Ok(
+                        SqlValueFunctionOp::SvfopLocaltimestamp
                         | SqlValueFunctionOp::SvfopLocaltimestampN,
-                    ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp)),
+                    ) => Ok(ast::Expr::Cast {
+                        expr: Box::new(now_call()),
+                        type_name: Some(ast::Type {
+                            name: "timestamp".to_string(),
+                            size: None,
+                            array_dimensions: 0,
+                        }),
+                    }),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentUser
                         | SqlValueFunctionOp::SvfopSessionUser
@@ -3548,6 +3557,39 @@ impl PostgreSQLTranslator {
             _ => {}
         }
 
+        if matches!(op_name, "+" | "-")
+            && (is_datetime_operand(a_expr.lexpr.as_deref())
+                || is_datetime_operand(a_expr.rexpr.as_deref()))
+        {
+            let func_name = if op_name == "+" {
+                "datetime_pl"
+            } else {
+                "datetime_mi"
+            };
+            let type_name = |node: Option<&pg_query::protobuf::Node>| {
+                Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+                    "'{}'",
+                    declared_datetime_type(node)
+                ))))
+            };
+            return Ok(ast::Expr::FunctionCall {
+                name: ast::Name::from_string(func_name),
+                distinctness: None,
+                args: vec![
+                    left,
+                    right,
+                    type_name(a_expr.lexpr.as_deref()),
+                    type_name(a_expr.rexpr.as_deref()),
+                ],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            });
+        }
+
         // Map PostgreSQL operators to Turso operators
         let binary_op = match op_name {
             "=" => ast::Operator::Equals,
@@ -3920,6 +3962,8 @@ impl PostgreSQLTranslator {
             "INT4" | "INT2" | "INT8" => Some("INTEGER"),
             "BOOL" => Some("BOOLEAN"),
             "TEXT" => Some("TEXT"),
+            "DATE" => Some("date"),
+            "TIMESTAMPTZ" => Some("timestamptz"),
             _ => None,
         };
         if let Some(type_name) = cast_type {
@@ -5491,6 +5535,74 @@ fn is_star_qualified_by(node: &pg_query::protobuf::Node, target_qualifiers: &[&s
     )
 }
 
+fn now_call() -> ast::Expr {
+    ast::Expr::FunctionCall {
+        name: ast::Name::from_string("now"),
+        distinctness: None,
+        args: vec![],
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }
+}
+
+fn is_datetime_operand(node: Option<&pg_query::protobuf::Node>) -> bool {
+    if !declared_datetime_type(node).is_empty() {
+        return true;
+    }
+    match node.and_then(|n| n.node.as_ref()) {
+        Some(pg_query::protobuf::node::Node::AExpr(a_expr))
+            if a_expr.kind == pg_query::protobuf::AExprKind::AexprOp as i32 =>
+        {
+            last_string(&a_expr.name).is_some_and(|op| matches!(op.as_str(), "+" | "-"))
+                && (is_datetime_operand(a_expr.lexpr.as_deref())
+                    || is_datetime_operand(a_expr.rexpr.as_deref()))
+        }
+        _ => false,
+    }
+}
+
+/// The type of a datetime operand when the expression itself names it (a cast,
+/// `now()`, `CURRENT_DATE`, ...), or "" when only the value can tell. The
+/// runtime needs this because `'infinity'` is a valid date, timestamp and
+/// interval.
+fn declared_datetime_type(node: Option<&pg_query::protobuf::Node>) -> &'static str {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::SqlValueFunctionOp as Op;
+    match node.and_then(|n| n.node.as_ref()) {
+        Some(Node::TypeCast(type_cast)) => {
+            match type_cast
+                .type_name
+                .as_ref()
+                .and_then(|type_name| last_string(&type_name.names))
+                .as_deref()
+            {
+                Some("interval") => "interval",
+                Some("timestamptz") => "timestamptz",
+                Some("timestamp") => "timestamp",
+                Some("date") => "date",
+                _ => "",
+            }
+        }
+        Some(Node::FuncCall(func_call)) => match last_string(&func_call.funcname).as_deref() {
+            Some("now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp") => {
+                "timestamptz"
+            }
+            _ => "",
+        },
+        Some(Node::SqlvalueFunction(svf)) => match Op::try_from(svf.op) {
+            Ok(Op::SvfopCurrentDate) => "date",
+            Ok(Op::SvfopCurrentTimestamp | Op::SvfopCurrentTimestampN) => "timestamptz",
+            Ok(Op::SvfopLocaltimestamp | Op::SvfopLocaltimestampN) => "timestamp",
+            _ => "",
+        },
+        _ => "",
+    }
+}
+
 fn last_string(names: &[pg_query::protobuf::Node]) -> Option<String> {
     names
         .iter()
@@ -5772,6 +5884,41 @@ fn json_type_or_raise(
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types. Other names are kept as
 /// written so that enums and domains resolve to their custom type.
+/// `CAST(x AS varchar(n))`. Unlike an INSERT, an explicit cast cuts longer
+/// text to `n` characters instead of failing, so it becomes
+/// `substr(CAST(x AS TEXT), 1, n)`.
+fn cast_with_type_modifier(
+    expr: Box<ast::Expr>,
+    pg_type_name: &pg_query::protobuf::TypeName,
+) -> Result<ast::Expr, ParseError> {
+    let pg_type = object_name(&pg_type_name.names, is_default_schema, "type")?;
+    let typmods = integer_typmods(pg_type_name)?;
+    let max_len = match (pg_type.to_uppercase().as_str(), typmods.as_slice()) {
+        ("VARCHAR", [max_len]) if *max_len >= 1 && pg_type_name.array_bounds.is_empty() => *max_len,
+        _ => return Err(not_supported("a type modifier in a cast")),
+    };
+    let text = ast::Expr::Cast {
+        expr,
+        type_name: Some(ast::Type {
+            name: "TEXT".to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    };
+    let number = |n: i64| Box::new(ast::Expr::Literal(ast::Literal::Numeric(n.to_string())));
+    Ok(ast::Expr::FunctionCall {
+        name: ast::Name::from_string("substr"),
+        distinctness: None,
+        args: vec![Box::new(text), number(1), number(max_len)],
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    })
+}
+
 fn pg_type_name_to_ast_type(
     type_name: &pg_query::protobuf::TypeName,
 ) -> Result<ast::Type, ParseError> {
@@ -5783,14 +5930,13 @@ fn pg_type_name_to_ast_type(
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
             "REAL"
         }
-        // For CAST expressions, map all text-like PG types to TEXT and
-        // boolean to INTEGER for SQLite VDBE compatibility
-        "BOOLEAN" | "BOOL" => "INTEGER",
+        "BOOLEAN" | "BOOL" => "boolean",
+        "UUID" => "uuid",
         "DATE" => "date",
         "TIME" | "TIMETZ" => "time",
         "TIMESTAMP" => "timestamp",
         "TIMESTAMPTZ" => "timestamptz",
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INTERVAL" | "INET" | "JSON"
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "INTERVAL" | "INET" | "JSON"
         | "JSONB" | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => {
             "TEXT"
         }
@@ -5849,12 +5995,16 @@ fn extract_type_name(col_def: &pg_query::protobuf::ColumnDef) -> Result<String, 
 fn extract_integer_typmods(
     col_def: &pg_query::protobuf::ColumnDef,
 ) -> Result<Vec<i64>, ParseError> {
+    match &col_def.type_name {
+        Some(type_name) => integer_typmods(type_name),
+        None => Ok(vec![]),
+    }
+}
+
+fn integer_typmods(type_name: &pg_query::protobuf::TypeName) -> Result<Vec<i64>, ParseError> {
     use pg_query::protobuf::a_const::Val;
     use pg_query::protobuf::node::Node;
 
-    let Some(type_name) = &col_def.type_name else {
-        return Ok(vec![]);
-    };
     type_name
         .typmods
         .iter()
@@ -8727,7 +8877,7 @@ mod tests {
         };
 
         let expected = [
-            ast::Expr::Literal(ast::Literal::CurrentTimestamp),
+            now_call(),
             ast::Expr::Literal(ast::Literal::CurrentDate),
             ast::Expr::Literal(ast::Literal::CurrentTime),
         ];
@@ -10680,12 +10830,10 @@ mod tests {
     #[test]
     fn fail_closed_cast_type_modifiers() {
         assert_not_supported("SELECT '1.239'::numeric(5, 2)", "a type modifier in a cast");
-        assert_not_supported(
-            "SELECT CAST('abcdef' AS varchar(3))",
-            "a type modifier in a cast",
-        );
+        assert_not_supported("SELECT 'a'::varchar(3)[]", "a type modifier in a cast");
         assert_not_supported("SELECT now()::timestamp(0)", "a type modifier in a cast");
         assert_translates("SELECT '1.5'::numeric, 'a'::varchar, 1::int[]");
+        assert_translates("SELECT CAST('abcdef' AS varchar(3))");
     }
 
     #[test]

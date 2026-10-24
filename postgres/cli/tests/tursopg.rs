@@ -865,6 +865,10 @@ fn copy_from_file_not_found_repl() {
 /// for a free ephemeral port and verify our own child is the process that
 /// came up on it, retrying with a fresh port if the child dies on bind.
 fn start_tursopg_server() -> (Child, u16) {
+    start_tursopg_server_on(":memory:")
+}
+
+fn start_tursopg_server_on(database: &str) -> (Child, u16) {
     for _ in 0..10 {
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -873,7 +877,7 @@ fn start_tursopg_server() -> (Child, u16) {
             .port();
         let addr = format!("127.0.0.1:{port}");
         let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-            .arg(":memory:")
+            .arg(database)
             .arg("--server")
             .arg(&addr)
             .stdout(Stdio::piped())
@@ -1029,6 +1033,52 @@ impl PgTestClient {
         extract_first_data_row_text(&response).expect("query returned no rows")
     }
 
+    /// Run the query with the extended protocol, asking for binary results,
+    /// and return the raw bytes of the first column of the first DataRow.
+    fn query_single_binary(&mut self, sql: &str) -> Vec<u8> {
+        let mut parse = vec![0];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        self.send_message(b'P', &parse);
+        self.send_message(b'B', &[0, 0, 0, 0, 0, 0, 0, 1, 0, 1]);
+        self.send_message(b'E', &[0; 5]);
+        self.send_message(b'S', &[]);
+        let response = self.read_until_ready();
+        if let Some(fields) = extract_error_fields(&response) {
+            panic!("{sql}: {fields:?}");
+        }
+        extract_first_data_row_bytes(&response).expect("query returned no rows")
+    }
+
+    /// Run the query with the extended protocol and one text-format
+    /// parameter declared with the given type OID. Returns the first column
+    /// of the first DataRow, or the ErrorResponse fields.
+    fn query_with_typed_param(
+        &mut self,
+        sql: &str,
+        param_oid: u32,
+        param: &str,
+    ) -> Result<String, HashMap<u8, String>> {
+        let mut parse = vec![0];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.push(0);
+        parse.extend_from_slice(&1i16.to_be_bytes());
+        parse.extend_from_slice(&param_oid.to_be_bytes());
+        self.send_message(b'P', &parse);
+        let mut bind = vec![0, 0, 0, 0, 0, 1];
+        bind.extend_from_slice(&(param.len() as i32).to_be_bytes());
+        bind.extend_from_slice(param.as_bytes());
+        bind.extend_from_slice(&[0, 0]);
+        self.send_message(b'B', &bind);
+        self.send_message(b'E', &[0; 5]);
+        self.send_message(b'S', &[]);
+        let response = self.read_until_ready();
+        match extract_error_fields(&response) {
+            Some(fields) => Err(fields),
+            None => Ok(extract_first_data_row_text(&response).expect("query returned no rows")),
+        }
+    }
+
     /// Send query and return the fields from the first ErrorResponse ('E') message.
     /// Returns an empty map if the response contains no error.
     fn query_error_fields(&mut self, sql: &str) -> HashMap<u8, String> {
@@ -1081,6 +1131,10 @@ fn extract_parameter_status(data: &[u8], name: &str) -> Option<String> {
 /// column count, then per column an `int32` value length (-1 for NULL) and
 /// that many bytes.
 fn extract_first_data_row_text(data: &[u8]) -> Option<String> {
+    extract_first_data_row_bytes(data).map(|value| String::from_utf8(value).unwrap())
+}
+
+fn extract_first_data_row_bytes(data: &[u8]) -> Option<Vec<u8>> {
     let mut pos = 0;
     while pos < data.len() {
         let tag = data[pos];
@@ -1101,8 +1155,7 @@ fn extract_first_data_row_text(data: &[u8]) -> Option<String> {
             if value_len < 0 {
                 return None;
             }
-            let value = &body[6..6 + value_len as usize];
-            return Some(String::from_utf8(value.to_vec()).unwrap());
+            return Some(body[6..6 + value_len as usize].to_vec());
         }
         pos = body_end;
     }
@@ -1507,6 +1560,192 @@ fn wire_cast_reports_target_type() {
             c.query_column_oids("SELECT CAST(1 AS REAL)"),
             vec![OID_FLOAT8]
         );
+    });
+}
+
+/// Casts to the datetime types report their PostgreSQL OIDs, so clients
+/// decode the values as dates and times instead of strings.
+#[test]
+fn wire_datetime_casts_report_datetime_types() {
+    with_pg_client(|c| {
+        assert_eq!(
+            c.query_column_oids(
+                "SELECT '2026-10-08 12:00+02'::timestamptz, '2026-10-08 12:00'::timestamp, '2026-10-08'::date, '12:00'::time"
+            ),
+            vec![1184, 1114, 1082, 1083]
+        );
+    });
+}
+
+/// Binary results use PostgreSQL's binary layout: microseconds (or days
+/// for date) since 2000-01-01, with the largest and smallest integers for
+/// infinity and -infinity. Expected bytes come from PostgreSQL 18.
+#[test]
+fn wire_datetime_binary_results() {
+    with_pg_client(|c| {
+        for (sql, expected) in [
+            ("SELECT '2000-01-02'::date", "00000001"),
+            ("SELECT '-infinity'::date", "80000000"),
+            (
+                "SELECT '1999-12-31 23:00:00-02'::timestamptz",
+                "00000000d693a400",
+            ),
+            ("SELECT 'infinity'::timestamptz", "7fffffffffffffff"),
+            (
+                "SELECT '2000-01-01 00:00:01.5'::timestamp",
+                "000000000016e360",
+            ),
+            (
+                "SELECT '1999-12-31 23:59:59'::timestamp",
+                "fffffffffff0bdc0",
+            ),
+            ("SELECT '01:02:03.000004'::time", "00000000dde878c4"),
+        ] {
+            let bytes = c.query_single_binary(sql);
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(hex, expected, "{sql}");
+        }
+    });
+}
+
+/// A text parameter declared as a datetime type goes through that type's
+/// input rules when it is bound, as in PostgreSQL. Expected values come from
+/// PostgreSQL 18.
+#[test]
+fn wire_datetime_typed_params() {
+    with_pg_client(|c| {
+        for (oid, param, expected) in [
+            (1184, "2026-10-08 14:00+02", "2026-10-08 12:00:00+00"),
+            (1184, "infinity", "infinity"),
+            (1082, "20261008", "2026-10-08"),
+            (1083, "1:02 PM", "13:02:00"),
+            (1114, "2026-10-08T14:00:00.5+02", "2026-10-08 14:00:00.5"),
+        ] {
+            assert_eq!(
+                c.query_with_typed_param("SELECT $1", oid, param),
+                Ok(expected.to_string()),
+                "{oid} {param}"
+            );
+        }
+        let error = c
+            .query_with_typed_param("SELECT $1", 1184, "garbage")
+            .unwrap_err();
+        assert_eq!(error.get(&b'C').map(String::as_str), Some("22007"));
+        assert_eq!(
+            error.get(&b'M').map(String::as_str),
+            Some("invalid input syntax for type timestamp with time zone: \"garbage\"")
+        );
+    });
+}
+
+#[test]
+fn wire_untyped_param_compared_with_timestamp_column() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE t(ts timestamp)");
+        c.query_command_tags("INSERT INTO t VALUES ('2026-10-08 12:00:00')");
+        assert_eq!(
+            c.query_with_typed_param(
+                "SELECT count(*) FROM t WHERE ts = $1 AND ts >= $1",
+                0,
+                "2026-10-08T12:00:00"
+            ),
+            Ok("1".to_string())
+        );
+    });
+}
+
+/// `timestamptz.db` and its `-log` file were written by tursopg before it had
+/// its own timestamptz type: the rows are stored as UTC text without an offset.
+#[test]
+fn timestamptz_rows_written_before_pg_types_match_new_rows() {
+    let dir = std::env::temp_dir().join(format!("tursopg-timestamptz-main-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for file in ["timestamptz-main.db", "timestamptz-main.db-log"] {
+        std::fs::copy(fixtures.join(file), dir.join(file)).unwrap();
+    }
+    let database = dir.join("timestamptz-main.db");
+    let (mut server, port) = start_tursopg_server_on(database.to_str().unwrap());
+    let mut c = PgTestClient::connect(port);
+    for table in ["plain", "indexed"] {
+        let query =
+            |c: &mut PgTestClient, sql: &str| c.query_single_text(&sql.replace("{t}", table));
+        assert_eq!(
+            query(
+                &mut c,
+                "SELECT count(*) FROM {t} WHERE ts = '2026-10-08 14:00:00+02'"
+            ),
+            "1",
+            "{table}"
+        );
+        assert_eq!(
+            query(
+                &mut c,
+                "SELECT (ts + interval '1 hour')::text FROM {t} WHERE id = 2"
+            ),
+            "2026-10-08 13:00:00.5+00",
+            "{table}"
+        );
+        query(
+            &mut c,
+            "INSERT INTO {t} VALUES (3, '2026-10-08 12:00:00+00') RETURNING id",
+        );
+        assert_eq!(
+            query(&mut c, "SELECT count(DISTINCT ts) FROM {t}"),
+            "2",
+            "{table}"
+        );
+        assert_eq!(
+            query(
+                &mut c,
+                "SELECT count(*) FROM {t} WHERE ts = '2026-10-08 12:00:00+00'"
+            ),
+            "2",
+            "{table}"
+        );
+    }
+    server.kill().ok();
+    server.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn timestamptz_compared_with_subquery_text_matches_with_and_without_index() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE plain (id int, ts timestamptz)");
+        c.query_command_tags("CREATE TABLE indexed (id int, ts timestamptz)");
+        c.query_command_tags("CREATE INDEX indexed_ts ON indexed (ts)");
+        c.query_command_tags("CREATE TABLE spellings (s text)");
+        c.query_command_tags("INSERT INTO spellings VALUES ('2026-10-08 14:00+02')");
+        for table in ["plain", "indexed"] {
+            c.query_command_tags(&format!(
+                "INSERT INTO {table} VALUES (1, '2026-10-08 12:00+00'), (2, '2026-10-08 12:00:00.5+00')"
+            ));
+            for condition in [
+                "ts IN (SELECT '2026-10-08 14:00+02')",
+                "ts IN (SELECT '2026-10-08 14:00+02' UNION ALL SELECT '2026-10-08 13:00+02' WHERE false)",
+                "ts IN (SELECT s FROM spellings)",
+                "ts = (SELECT s FROM spellings)",
+                "ts = (SELECT '2026-10-08 14:00+02')",
+            ] {
+                assert_eq!(
+                    c.query_single_text(&format!(
+                        "SELECT string_agg(id::text, ',') FROM {table} WHERE {condition}"
+                    )),
+                    "1",
+                    "{table}: {condition}"
+                );
+            }
+            assert_eq!(
+                c.query_error_fields(&format!(
+                    "SELECT id FROM {table} WHERE ts IN (-1, '2026-10-08 12:00+00')"
+                ))
+                .get(&b'C')
+                .map(String::as_str),
+                Some("22007"),
+                "{table}"
+            );
+        }
     });
 }
 

@@ -88,8 +88,10 @@ Catalog introspection functions: `format_type`,
 `pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_expr` (returns TursoPG's
 stored SQL; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
-`pg_input_is_valid`, `to_char` (numeric), `now`/`clock_timestamp`/
-`transaction_timestamp`/`statement_timestamp`.
+`pg_input_is_valid`, `to_char` (numeric, date, timestamp, timestamptz),
+`now`/`clock_timestamp`/`transaction_timestamp`/`statement_timestamp` (all
+read the clock at each call; PostgreSQL returns the transaction start time for
+`now`, `transaction_timestamp` and `CURRENT_TIMESTAMP`).
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
 forms; the first schema of `search_path` that exists), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
@@ -137,6 +139,30 @@ including char(n), timestamp(p) and bit(n), are rejected. interval, xml, tsvecto
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
 
+date, time, timestamp and timestamptz follow PostgreSQL input rules (DateStyle
+ISO, MDY; TimeZone UTC). timestamptz values are stored as UTC text without an
+offset, as in earlier versions, so they compare and sort by instant, and are
+read in PostgreSQL output form, such as `2026-10-08 12:00:00.123456+00`. Supported: `infinity`, `-infinity`, `epoch`, `now`,
+`today`, numeric offsets (`+02`, `+05:30`, `-0800`), microseconds, ISO 8601
+forms, `+`/`-` with interval, date `+`/`-` integer, date - date,
+`CURRENT_TIMESTAMP`, `LOCALTIMESTAMP`, `date(x)` and `timestamptz(x)` casts, and
+binary-format results. Not supported: years before 0001 or after 9999
+(including BC), named time zones and time zone abbreviations other than UTC,
+session time zones other than UTC, POSIX time zone specs, and fractional-second
+precision such as `timestamptz(3)`. SQLite date functions (`strftime`,
+`datetime`, `julianday`, `unixepoch`) do not read the `+00` suffix and return
+NULL for timestamptz values. A string, parameter, text column or subquery result
+compared with a column of these types (or uuid, boolean and other built-in
+types) is converted to the column's type first, so `ts = '2026-10-08 14:00+02'`
+and `ts IN (SELECT '2026-10-08 14:00+02')` match `2026-10-08 12:00:00+00` with
+or without an index. PostgreSQL rejects the subquery and text column forms
+(`timestamptz = text`). Comparing values of two different datetime types, such
+as a timestamptz column with a date column, compares their text instead of
+converting one to the other.
+A parameter sent with a date or timestamp type is not treated as a date in
+arithmetic (`$1 + 1` adds to the year number). `date + '1 day'` is accepted (PostgreSQL rejects
+it as ambiguous).
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |
@@ -149,7 +175,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Phrase search | ❌ Not supported | tsvector/tsquery degrade to TEXT; no full-text search |
 | Range types | ❌ Not supported | |
 | smallserial type | ✅ Supported | serial2/serial4/serial8 aliases too; serial implies NOT NULL + implicit sequence, not PRIMARY KEY |
-| Type modifier support | 🟡 Partial | varchar(n) length enforced ("value too long for varchar"); numeric(p,s) scale applied; modifiers on other types and in casts (`x::varchar(3)`) rejected |
+| Type modifier support | 🟡 Partial | varchar(n) length enforced ("value too long for type character varying(n)", trailing spaces past the limit are cut); `x::varchar(n)` cuts text to n characters; numeric(p,s) scale applied; modifiers on other types and in other casts (`x::numeric(5,2)`) rejected |
 | UUIDv7 | ❌ Not supported | |
 | XML data type | ❌ Not supported | xml columns degrade to TEXT; no XML functions |
 
@@ -210,7 +236,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Row-wise comparison | ❌ Not supported | Row constructors `(a,b) < (c,d)` fail to translate |
 | SELECT ... FOR UPDATE/SHARE | ❌ Not supported | Rejected |
 | SELECT FOR NO KEY UPDATE/SELECT FOR KEY SHARE lock modes | ❌ Not supported | Rejected |
-| SQL standard interval handling | ❌ Not supported | interval degrades to TEXT; no interval arithmetic |
+| SQL standard interval handling | 🟡 Partial | interval is stored as TEXT as written (`'P1D'::interval` stays `P1D`); results of interval arithmetic use PostgreSQL output form. `+` and `-` work between timestamp, timestamptz and interval values when an operand is a cast to one of these types or to date, a date, timestamp or timestamptz column, `now()`, `CURRENT_DATE`, `CURRENT_TIMESTAMP` or `LOCALTIMESTAMP`. Interval comparison and multiplication are not supported |
 | SYSTEM_USER | ❌ Not supported | current_user/current_role return stub values |
 | TABLE statement | ✅ Supported | |
 | Underscores (_) for thousands separators | ✅ Supported | |

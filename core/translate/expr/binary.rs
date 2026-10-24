@@ -148,6 +148,29 @@ pub(super) fn emit_binary_expr_scalar(
         translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
         let right_collation_ctx = program.curr_collation_ctx();
 
+        let (e1_reg, e2_reg) = if op.is_comparison() {
+            (
+                emit_comparison_value_as_column_type(
+                    program,
+                    referenced_tables,
+                    e1,
+                    e1_reg,
+                    e2,
+                    resolver,
+                )?,
+                emit_comparison_value_as_column_type(
+                    program,
+                    referenced_tables,
+                    e2,
+                    e2_reg,
+                    e1,
+                    resolver,
+                )?,
+            )
+        } else {
+            (e1_reg, e2_reg)
+        };
+
         /*
          * The rules for determining which collating function to use for a binary comparison
          * operator (=, <, >, <=, >=, !=, IS, and IS NOT) are as follows:

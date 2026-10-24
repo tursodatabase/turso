@@ -1,5 +1,4 @@
 use crate::settings::SettingScope;
-use chrono::Utc;
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
@@ -69,6 +68,17 @@ scalar_functions! {
     ObjDescription(FunctionArity::OneOf(&[1, 2]), true),
     PgGetExpr(FunctionArity::OneOf(&[2, 3]), true),
     ToChar(FunctionArity::Exact(2), true),
+    TimestamptzIn(FunctionArity::Exact(1), true),
+    TimestamptzOut(FunctionArity::Exact(1), true),
+    TimestampIn(FunctionArity::Exact(1), true),
+    DatetimePl(FunctionArity::OneOf(&[2, 4]), true),
+    DatetimeMi(FunctionArity::OneOf(&[2, 4]), true),
+    DateIn(FunctionArity::Exact(1), true),
+    BoolIn(FunctionArity::Exact(1), true),
+    VarcharIn(FunctionArity::Exact(2), true),
+    TimeIn(FunctionArity::Exact(1), true),
+    DatePl(FunctionArity::Exact(2), true),
+    DateMi(FunctionArity::Exact(2), true),
     PgInputIsValid(FunctionArity::Exact(2), true),
     Textlike(FunctionArity::Exact(2), true),
     LikeEscape(FunctionArity::Exact(2), true),
@@ -121,6 +131,31 @@ impl ScalarCall for PgScalarFunction {
             Self::PgGetIndexdef => exec_pg_get_indexdef(connection, int_arg(args, 0, 0)),
             Self::PgGetExpr => exec_pg_get_expr(args)?,
             Self::ToChar => exec_to_char(args[0].get_value(), &text_arg(args, 1)),
+            Self::TimestamptzIn => crate::datetime::exec_timestamptz_in(args[0].get_value())?,
+            Self::TimestamptzOut => crate::datetime::exec_timestamptz_out(args[0].get_value()),
+            Self::TimestampIn => crate::datetime::exec_timestamp_in(args[0].get_value())?,
+            Self::DatetimePl => crate::datetime::exec_typed_datetime_pl(
+                args[0].get_value(),
+                args[1].get_value(),
+                &text_arg(args, 2),
+                &text_arg(args, 3),
+            )?,
+            Self::DatetimeMi => crate::datetime::exec_typed_datetime_mi(
+                args[0].get_value(),
+                args[1].get_value(),
+                &text_arg(args, 2),
+                &text_arg(args, 3),
+            )?,
+            Self::DateIn => crate::datetime::exec_date_in(args[0].get_value())?,
+            Self::BoolIn => exec_bool_in(args[0].get_value())?,
+            Self::VarcharIn => exec_varchar_in(args[0].get_value(), int_arg(args, 1, 0))?,
+            Self::TimeIn => crate::datetime::exec_time_in(args[0].get_value())?,
+            Self::DatePl => {
+                crate::datetime::exec_date_pl(args[0].get_value(), args[1].get_value())?
+            }
+            Self::DateMi => {
+                crate::datetime::exec_date_mi(args[0].get_value(), args[1].get_value())?
+            }
             Self::PgInputIsValid => exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1)),
             Self::Textlike => exec_textlike(args)?,
             Self::LikeEscape => exec_like_escape(args)?,
@@ -154,11 +189,72 @@ impl ScalarCall for PgScalarFunction {
             Self::Now
             | Self::ClockTimestamp
             | Self::TransactionTimestamp
-            | Self::StatementTimestamp => {
-                Value::build_text(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string())
-            }
+            | Self::StatementTimestamp => Value::build_text(crate::datetime::now_text()),
         };
         Ok(IOResult::Done(value))
+    }
+}
+
+/// Converts a value to the stored form of `boolean`: 1 or 0. An integer is
+/// true when it is not 0, as in a PostgreSQL cast from integer.
+fn exec_bool_in(value: &Value) -> Result<Value> {
+    let input = match value {
+        Value::Null => return Ok(Value::Null),
+        Value::Numeric(Numeric::Integer(i)) => return Ok(Value::from_i64((*i != 0) as i64)),
+        Value::Text(text) => text.as_str().to_string(),
+        other => other.to_string(),
+    };
+    match parse_bool(&input) {
+        Some(b) => Ok(Value::from_i64(b as i64)),
+        None => Err(LimboError::InvalidTextRepresentation {
+            type_name: "boolean",
+            input,
+        }),
+    }
+}
+
+/// Reads a boolean the way PostgreSQL does: surrounding whitespace is
+/// ignored, and any prefix of true, false, yes or no is accepted in any case.
+/// on and off need at least two letters, and 1 and 0 must be the whole input.
+pub(crate) fn parse_bool(input: &str) -> Option<bool> {
+    let word = input
+        .trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'))
+        .to_ascii_lowercase();
+    let is_prefix_of =
+        |full: &str, min_len: usize| word.len() >= min_len && full.starts_with(word.as_str());
+    if is_prefix_of("true", 1) || is_prefix_of("yes", 1) || is_prefix_of("on", 2) || word == "1" {
+        Some(true)
+    } else if is_prefix_of("false", 1)
+        || is_prefix_of("no", 1)
+        || is_prefix_of("off", 2)
+        || word == "0"
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Converts a value to the stored form of `varchar(max_len)`. As in
+/// PostgreSQL, longer text is cut to `max_len` characters when only spaces
+/// are cut off, and is an error otherwise.
+fn exec_varchar_in(value: &Value, max_len: i64) -> Result<Value> {
+    let text = match value {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(text) => text.as_str().to_string(),
+        other => other.to_string(),
+    };
+    let max_len = usize::try_from(max_len)
+        .map_err(|_| LimboError::InternalError(format!("invalid varchar length {max_len}")))?;
+    let Some((cut_at, _)) = text.char_indices().nth(max_len) else {
+        return Ok(Value::build_text(text));
+    };
+    if text[cut_at..].chars().all(|c| c == ' ') {
+        Ok(Value::build_text(text[..cut_at].to_string()))
+    } else {
+        Err(LimboError::ValueTooLong(format!(
+            "character varying({max_len})"
+        )))
     }
 }
 
@@ -689,9 +785,13 @@ fn exec_pg_format_type(type_oid: i64, typemod: i64) -> Value {
     Value::build_text(type_name)
 }
 
-/// Simplified to_char: formats a number with the given format pattern.
-/// Supports basic PG numeric format patterns (9, 0, S, MI, FM, D, G, PR, TH, L).
+/// Simplified to_char: formats a date or timestamp, or a number with the given
+/// format pattern. Supports basic PG numeric format patterns (9, 0, S, MI, FM,
+/// D, G, PR, TH, L).
 fn exec_to_char(value: &Value, format: &str) -> Value {
+    if let Some(formatted) = crate::datetime::to_char_datetime(value, format) {
+        return formatted;
+    }
     let num = match value {
         Value::Null => return Value::Null,
         Value::Numeric(_) => value.as_float(),
@@ -758,12 +858,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
 
     match base_type.as_str() {
         "bool" | "boolean" => {
-            let lower = trimmed.to_lowercase();
-            let valid = matches!(
-                lower.as_str(),
-                "t" | "true" | "y" | "yes" | "on" | "1" | "f" | "false" | "n" | "no" | "off" | "0"
-            );
-            if valid {
+            if parse_bool(input).is_some() {
                 None
             } else {
                 Some((
@@ -877,69 +972,18 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 None
             }
         }
-        "date" => {
-            // Accept YYYY-MM-DD
-            let parts: Vec<&str> = trimmed.split('-').collect();
-            if parts.len() == 3
-                && parts[0].parse::<i32>().is_ok()
-                && parts[1].parse::<u32>().is_ok_and(|m| (1..=12).contains(&m))
-                && parts[2].parse::<u32>().is_ok_and(|d| (1..=31).contains(&d))
-            {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type date: \"{input}\""),
-                    "22007".to_string(),
-                ))
-            }
-        }
-        "timestamp" | "timestamp without time zone" => {
-            // Accept YYYY-MM-DD HH:MM:SS[.fff]
-            if parse_timestamp_prefix(trimmed).is_some() {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type timestamp: \"{input}\""),
-                    "22007".to_string(),
-                ))
-            }
-        }
-        "timestamptz" | "timestamp with time zone" => {
-            // Accept YYYY-MM-DD HH:MM:SS[.fff][+/-HH[:MM]]
-            let (base, _tz) = match trimmed.rfind('+') {
-                Some(pos) if pos > 10 => (&trimmed[..pos], Some(&trimmed[pos..])),
-                _ => match trimmed.rfind('-') {
-                    Some(pos) if pos > 10 => (&trimmed[..pos], Some(&trimmed[pos..])),
-                    _ => (trimmed, None),
-                },
-            };
-            if parse_timestamp_prefix(base).is_some() {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type timestamp with time zone: \"{input}\""),
-                    "22007".to_string(),
-                ))
-            }
-        }
-        "time" | "time without time zone" => {
-            // Accept HH:MM:SS[.fff]
-            let time_part = trimmed.split('.').next().unwrap_or(trimmed);
-            let parts: Vec<&str> = time_part.split(':').collect();
-            if parts.len() >= 2
-                && parts.len() <= 3
-                && parts[0].parse::<u32>().is_ok_and(|h| (0..=23).contains(&h))
-                && parts[1].parse::<u32>().is_ok_and(|m| (0..=59).contains(&m))
-                && (parts.len() < 3 || parts[2].parse::<u32>().is_ok_and(|s| (0..=59).contains(&s)))
-            {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type time: \"{input}\""),
-                    "22007".to_string(),
-                ))
-            }
-        }
+        "date" => datetime_input_error(crate::datetime::exec_date_in(&Value::build_text(
+            input.to_string(),
+        ))),
+        "timestamp" | "timestamp without time zone" => datetime_input_error(
+            crate::datetime::exec_timestamp_in(&Value::build_text(input.to_string())),
+        ),
+        "timestamptz" | "timestamp with time zone" => datetime_input_error(
+            crate::datetime::timestamptz_value(&Value::build_text(input.to_string())),
+        ),
+        "time" | "time without time zone" => datetime_input_error(crate::datetime::exec_time_in(
+            &Value::build_text(input.to_string()),
+        )),
         "json" | "jsonb" => {
             if is_valid_json(trimmed) {
                 None
@@ -1024,47 +1068,12 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
     }
 }
 
-/// Parse a YYYY-MM-DD HH:MM:SS[.fff] prefix, returning Some(()) if valid.
-fn parse_timestamp_prefix(s: &str) -> Option<()> {
-    let parts: Vec<&str> = s.splitn(2, [' ', 'T']).collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    // Validate date part
-    let date_parts: Vec<&str> = parts[0].split('-').collect();
-    if date_parts.len() != 3
-        || date_parts[0].parse::<i32>().is_err()
-        || !date_parts[1]
-            .parse::<u32>()
-            .is_ok_and(|m| (1..=12).contains(&m))
-        || !date_parts[2]
-            .parse::<u32>()
-            .is_ok_and(|d| (1..=31).contains(&d))
-    {
-        return None;
-    }
-    // Validate time part (strip fractional seconds)
-    let time_str = parts[1].split('.').next().unwrap_or(parts[1]);
-    let time_parts: Vec<&str> = time_str.split(':').collect();
-    if time_parts.len() < 2
-        || time_parts.len() > 3
-        || !time_parts[0]
-            .parse::<u32>()
-            .is_ok_and(|h| (0..=23).contains(&h))
-        || !time_parts[1]
-            .parse::<u32>()
-            .is_ok_and(|m| (0..=59).contains(&m))
-    {
-        return None;
-    }
-    if time_parts.len() == 3
-        && !time_parts[2]
-            .parse::<u32>()
-            .is_ok_and(|s| (0..=59).contains(&s))
-    {
-        return None;
-    }
-    Some(())
+fn datetime_input_error(result: turso_core::Result<Value>) -> Option<(String, String)> {
+    result.err().map(|err| {
+        let message = crate::datetime::error_message(&err);
+        let sqlstate = crate::datetime::error_sqlstate(&message);
+        (message, sqlstate.to_string())
+    })
 }
 
 /// Minimal JSON validation without requiring serde_json.

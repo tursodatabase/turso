@@ -1419,25 +1419,14 @@ impl Statement {
                 .resolve_type(&declared_name, table_ref.is_strict())
                 .ok()
                 .flatten();
-            // `kind` is computed from the leaf TypeDef in the resolution chain:
-            // STRUCT and UNION are tagged on `TypeDefKind`, DOMAIN is tagged
-            // separately on `TypeDef.is_domain`, and anything else registered
-            // through CREATE TYPE is a Custom. A column whose declared name
-            // does not appear in the type registry is a Builtin.
+            // `kind` is computed from the leaf TypeDef in the resolution chain.
+            // A column whose declared name does not appear in the type
+            // registry is a Builtin.
             let (base_type, kind) = match resolved {
-                Some(resolved) => {
-                    let leaf = resolved.leaf();
-                    let kind = if leaf.is_struct() {
-                        ColumnTypeKind::Struct
-                    } else if leaf.is_union() {
-                        ColumnTypeKind::Union
-                    } else if leaf.is_domain {
-                        ColumnTypeKind::Domain
-                    } else {
-                        ColumnTypeKind::Custom
-                    };
-                    (Some(resolved.primitive.to_uppercase()), kind)
-                }
+                Some(resolved) => (
+                    Some(resolved.primitive.to_uppercase()),
+                    resolved_type_kind(&resolved),
+                ),
                 None => (None, ColumnTypeKind::Builtin),
             };
             drop(schema);
@@ -1447,6 +1436,28 @@ impl Statement {
                 base_type,
                 kind,
             }));
+        }
+        if let turso_parser::ast::Expr::Cast {
+            type_name: Some(ty),
+            ..
+        } = &column.expr
+        {
+            let resolved = self
+                .program
+                .connection
+                .schema
+                .read()
+                .resolve_type_unchecked(&ty.name)
+                .ok()
+                .flatten();
+            if let Some(resolved) = resolved {
+                return Ok(Some(ColumnTypeInfo {
+                    declared_name: ty.name.clone(),
+                    array_dimensions: ty.array_dimensions,
+                    base_type: Some(resolved.primitive.to_uppercase()),
+                    kind: resolved_type_kind(&resolved),
+                }));
+            }
         }
         // Not a table column: infer the result primitive from the
         // expression's shape (literal value type, operand types of a binary
@@ -1927,6 +1938,19 @@ impl Drop for Statement {
             self.program.connection.end_nested();
             self.nested_guard_active = false;
         }
+    }
+}
+
+fn resolved_type_kind(resolved: &crate::schema::ResolvedType) -> ColumnTypeKind {
+    let leaf = resolved.leaf();
+    if leaf.is_struct() {
+        ColumnTypeKind::Struct
+    } else if leaf.is_union() {
+        ColumnTypeKind::Union
+    } else if leaf.is_domain {
+        ColumnTypeKind::Domain
+    } else {
+        ColumnTypeKind::Custom
     }
 }
 

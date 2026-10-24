@@ -370,6 +370,28 @@ impl TypeDef {
         }
     }
 
+    /// True when the type declares `<` or `=` without a function, so values of
+    /// the type are compared with the standard comparison.
+    pub fn compares_with_standard_operator(&self) -> bool {
+        self.operators()
+            .iter()
+            .any(|o| (o.op == "<" || o.op == "=") && o.func_name.is_none())
+    }
+
+    /// The ENCODE expression to run on a value that a column of this type is
+    /// compared with. None for a type with parameters whose stored value reads
+    /// back unchanged, such as `varchar(3)`: its ENCODE only checks the
+    /// parameter, and `col = 'abcd'` must be false, not an error.
+    pub fn encode_for_comparison_value(&self) -> Option<&ast::Expr> {
+        if self.compares_with_standard_operator()
+            && self.user_params().next().is_some()
+            && self.decode_returns_value_unchanged()
+        {
+            return None;
+        }
+        self.encode()
+    }
+
     /// Returns the default expression (Custom types only).
     pub fn default_expr(&self) -> Option<&ast::Expr> {
         match &self.kind {

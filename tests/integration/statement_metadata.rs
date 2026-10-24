@@ -225,6 +225,35 @@ mod tests {
         assert_eq!(rowid_col.kind, ColumnTypeKind::Builtin);
     }
 
+    #[test]
+    fn type_info_for_casts_to_custom_types() {
+        let db = fresh_db_with_custom_types("type_info_custom_casts.db");
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+            .unwrap();
+        conn.execute("CREATE DOMAIN positive_int AS integer CHECK (VALUE > 0)")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT CAST(? AS cents), CAST(? AS positive_int), CAST(? AS cents[])")
+            .unwrap();
+
+        let cents = expect_info(&stmt, 0);
+        assert_eq!(cents.declared_name, "cents");
+        assert_eq!(cents.base_type, Some("INTEGER".to_string()));
+        assert_eq!(cents.kind, ColumnTypeKind::Custom);
+        assert_eq!(cents.array_dimensions, 0);
+
+        let domain = expect_info(&stmt, 1);
+        assert_eq!(domain.declared_name, "positive_int");
+        assert_eq!(domain.base_type, Some("INTEGER".to_string()));
+        assert_eq!(domain.kind, ColumnTypeKind::Domain);
+
+        let cents_array = expect_info(&stmt, 2);
+        assert_eq!(cents_array.declared_name, "cents");
+        assert_eq!(cents_array.array_dimensions, 1);
+    }
+
     /// Bare literals carry a concrete primitive that the wire-protocol layer
     /// must report (a PostgreSQL client running `SELECT 42` expects INT4,
     /// not TEXT). The API deliberately departs from SQLite's "literals have

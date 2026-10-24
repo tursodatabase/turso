@@ -205,6 +205,40 @@ pub trait Dialect: Send + Sync + 'static {
     fn errors_on_zero_divisor(&self) -> bool {
         false
     }
+
+    /// Whether a quoted string or a bound parameter compared with a value of
+    /// a custom type is first converted to that type, the way it would be
+    /// when stored.
+    ///
+    /// PostgreSQL converts it, so `date_col = '20261008'` matches and
+    /// `date_col < '2027'` is an invalid date. SQLite compares the string as
+    /// it is.
+    fn converts_strings_compared_with_custom_types(&self) -> bool {
+        false
+    }
+
+    /// Whether `CAST(x AS t)` to a custom type gives the value the way a
+    /// column of type `t` shows it (ENCODE then DECODE) instead of the
+    /// stored value (ENCODE only).
+    ///
+    /// PostgreSQL has no stored form: `CAST('A0EEBC99-...' AS uuid)` is the
+    /// uuid text in lowercase. With SQLite, `CAST(42 AS cents)` is the
+    /// stored value 4200.
+    fn cast_to_custom_type_decodes(&self) -> bool {
+        false
+    }
+
+    /// Whether `+` or `-` between a column of a custom type and any other
+    /// value calls the type's operator function, even when the type's DECODE
+    /// changes the stored value.
+    ///
+    /// PostgreSQL picks the operator from the operand types, so
+    /// `timestamptz_col + interval_col` adds the interval. SQLite calls the
+    /// function only for types whose DECODE returns the stored value
+    /// unchanged and uses the standard `+` otherwise.
+    fn applies_custom_type_arithmetic_to_any_operand(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

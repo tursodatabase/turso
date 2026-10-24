@@ -537,6 +537,22 @@ impl Plan {
         }
     }
 
+    /// Returns every SELECT of a SELECT or compound SELECT plan, and none for
+    /// other plans.
+    pub fn select_plans_mut(&mut self) -> Vec<&mut SelectPlan> {
+        match self {
+            Plan::Select(select_plan) => vec![select_plan],
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => left
+                .iter_mut()
+                .map(|(select_plan, _)| select_plan)
+                .chain(core::iter::once(right_most.as_mut()))
+                .collect(),
+            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => Vec::new(),
+        }
+    }
+
     /// Returns the result columns of a SELECT or compound SELECT plan. For a
     /// compound SELECT the columns of the right-most component are returned,
     /// since every component must agree on column count and naming.
