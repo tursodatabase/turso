@@ -171,6 +171,12 @@ When COMMIT is issued, Turso checks whether any other transaction has modified t
 
 This provides **snapshot isolation**: each transaction sees a consistent view of the database as of its first statement, without blocking other writers.
 
+Allocating an `AUTOINCREMENT` id temporarily needs the writer lock. If another
+exclusive writer holds it, the insert may return `SQLITE_BUSY` while waiting.
+The outer `BEGIN CONCURRENT` transaction and its earlier writes remain active.
+Conflicts between writes to ordinary user rows still require retrying the
+transaction.
+
 ### Example
 
 ```sql
