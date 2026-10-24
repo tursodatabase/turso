@@ -186,6 +186,10 @@ impl Dialect for PostgresDialect {
     fn errors_on_zero_divisor(&self) -> bool {
         true
     }
+
+    fn cast_to_custom_type_decodes(&self) -> bool {
+        true
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
@@ -3482,7 +3486,11 @@ const PG_TYPE_SQLS: &[&str] = &[
     "CREATE TYPE timestamptz(value text) BASE text ENCODE timestamptz_in(value) DECODE value OPERATOR '+' datetime_pl OPERATOR '-' datetime_mi OPERATOR '<'",
     "CREATE TYPE date(value text) BASE text ENCODE date_in(value) DECODE value OPERATOR '+' date_pl OPERATOR '-' date_mi OPERATOR '<'",
     "CREATE TYPE time(value text) BASE text ENCODE time_in(value) DECODE value OPERATOR '<'",
+    "CREATE TYPE boolean(value any) BASE integer ENCODE bool_in(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'",
+    "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE varchar_in(value, maxlen) DECODE value OPERATOR '<'",
 ];
+
+const PG_TYPE_ALIASES: &[(&str, &str)] = &[("bool", "boolean")];
 
 fn register_pg_types(schema: &mut Schema) -> Result<()> {
     for sql in PG_TYPE_SQLS {
@@ -3506,6 +3514,10 @@ fn register_pg_types(schema: &mut Schema) -> Result<()> {
         schema
             .type_registry
             .insert(type_name.to_lowercase(), Arc::new(type_def));
+    }
+    for (alias, target) in PG_TYPE_ALIASES {
+        let type_def = schema.type_registry[*target].clone();
+        schema.type_registry.insert(alias.to_string(), type_def);
     }
     Ok(())
 }

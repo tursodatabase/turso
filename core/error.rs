@@ -112,10 +112,15 @@ pub enum LimboError {
     IntegerOverflow,
     #[error("division by zero")]
     DivisionByZero,
-    #[error("invalid input syntax for type numeric: \"{0}\"")]
-    InvalidTextRepresentation(String),
+    #[error("invalid input syntax for type {type_name}: \"{input}\"")]
+    InvalidTextRepresentation {
+        type_name: &'static str,
+        input: String,
+    },
     #[error("string or blob too big")]
     TooBig,
+    #[error("value too long for type {0}")]
+    ValueTooLong(String),
     #[error("database table is locked")]
     TableLocked,
     #[error("attempt to write a readonly database")]
