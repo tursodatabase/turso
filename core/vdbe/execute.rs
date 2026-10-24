@@ -9693,6 +9693,7 @@ pub fn op_agg_final(
             state,
             ext_func.finalize_aggregate(&mut state.registers[acc_reg])
         );
+        value.check_length_limit()?;
         state.registers[dest_reg].set_value(value);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -9714,6 +9715,7 @@ pub fn op_agg_final(
                     _ => finalize_agg_payload(func, payload)?,
                 },
             };
+            value.check_length_limit()?;
             if acc_reg == dest_reg {
                 let accumulator =
                     std::mem::replace(&mut state.registers[acc_reg], Register::Value(value));
@@ -12616,6 +12618,7 @@ pub fn op_function(
             unreachable!("Window functions should not be handled here")
         }
     }
+    state.registers[*dest].get_value().check_length_limit()?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
