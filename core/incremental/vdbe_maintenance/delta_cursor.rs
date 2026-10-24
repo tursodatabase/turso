@@ -11,6 +11,8 @@ struct PendingDeltaRead {
     buffer: Arc<Buffer>,
 }
 
+type DeltaRow = (i64, crate::alloc::Vec<Value>, isize, usize);
+
 /// Read-only cursor over a transaction's captured changes for one base table.
 /// Spill segments are loaded asynchronously one bounded batch at a time,
 /// followed by the in-memory tail. Exposes base columns at their table
@@ -29,7 +31,7 @@ pub struct DeltaCursor {
     tail_loaded: bool,
     reading_tail: bool,
     /// Current spill batch, or the in-memory tail.
-    rows: Vec<(i64, crate::alloc::Vec<Value>, isize)>,
+    rows: Vec<DeltaRow>,
     /// Number of base-table columns; the weight is column `num_columns`.
     num_columns: usize,
     /// Position of the current row; `rows.len()` means exhausted.
@@ -206,7 +208,7 @@ impl DeltaCursor {
             let event = &self.tail[self.tail_positions[self.pos]];
             (&event.values, event.weight)
         } else {
-            let (_, values, weight) = &self.rows[self.pos];
+            let (_, values, weight, _) = &self.rows[self.pos];
             (values, *weight)
         };
         if idx == self.num_columns {
@@ -224,13 +226,23 @@ impl DeltaCursor {
         );
         values[idx].clone()
     }
+
+    pub fn has_field(&self, physical_column: usize) -> bool {
+        self.assert_current();
+        let physical_width = if self.reading_tail {
+            self.tail[self.tail_positions[self.pos]].physical_width
+        } else {
+            self.rows[self.pos].3
+        };
+        physical_column < physical_width
+    }
 }
 
 fn parse_spilled_delta(
     bytes: &[u8],
     segment: &SpillSegment,
     table_id: Option<&TableChangeId>,
-) -> Result<Vec<(i64, crate::alloc::Vec<Value>, isize)>> {
+) -> Result<Vec<DeltaRow>> {
     let mut rows = Vec::new();
     let mut offset = 0;
     for _ in 0..segment.rows {
@@ -249,9 +261,10 @@ fn parse_spilled_delta(
         let mut record = ImmutableRecord::new(payload_len)?;
         record.start_serialization(payload)?;
         let mut values = record.get_values_owned()?;
-        if values.len() < 3 {
+        if values.len() < 4 {
             return Err(LimboError::Corrupt(
-                "materialized-view delta record lacks table identity, rowid, or weight".to_string(),
+                "materialized-view delta record lacks table identity, rowid, weight, or physical width"
+                    .to_string(),
             ));
         }
         let event_table_id = match values.remove(0) {
@@ -282,8 +295,21 @@ fn parse_spilled_delta(
                 ));
             }
         };
+        let physical_width = match values.remove(0) {
+            Value::Numeric(crate::numeric::Numeric::Integer(value)) => usize::try_from(value)
+                .map_err(|_| {
+                    LimboError::Corrupt(
+                        "materialized-view delta physical width is invalid".to_string(),
+                    )
+                })?,
+            _ => {
+                return Err(LimboError::Corrupt(
+                    "materialized-view delta physical width is not an integer".to_string(),
+                ));
+            }
+        };
         if Some(&event_table_id) == table_id {
-            rows.push((rowid, values, weight));
+            rows.push((rowid, values, weight, physical_width));
         }
     }
     Ok(rows)

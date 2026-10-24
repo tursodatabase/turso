@@ -93,24 +93,43 @@ pub fn emit_stored_column(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    let table = program.btree_table_from_cursor(cursor_id).map(Arc::clone);
-    let encoded_default = table.as_ref().and_then(|table| {
-        let column = &table.columns()[column_index];
-        let default_expr = column.default.as_ref()?;
-        let resolved = resolver
-            .schema()
-            .resolve_type(&column.ty_str, table.is_strict)
-            .ok()??;
-        resolved
-            .chain
-            .iter()
-            .any(|td| td.encode().is_some())
-            .then_some((table, column, default_expr))
-    });
-    let Some((table, column, default_expr)) = encoded_default else {
+    let Some(table) = program.btree_table_from_cursor(cursor_id).map(Arc::clone) else {
         program.emit_column_or_rowid(cursor_id, column_index, target_register);
         return Ok(());
     };
+    emit_stored_column_from_table(
+        program,
+        cursor_id,
+        &table,
+        column_index,
+        target_register,
+        resolver,
+    )
+}
+
+pub fn emit_stored_column_from_table(
+    program: &mut ProgramBuilder,
+    cursor_id: CursorID,
+    table: &BTreeTable,
+    column_index: usize,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let column = &table.columns()[column_index];
+    let Some(default_expr) = column.default.as_ref() else {
+        program.emit_column_or_rowid(cursor_id, column_index, target_register);
+        return Ok(());
+    };
+    let has_encode = resolver
+        .schema()
+        .resolve_type(&column.ty_str, table.is_strict)
+        .ok()
+        .flatten()
+        .is_some_and(|resolved| resolved.chain.iter().any(|td| td.encode().is_some()));
+    if !has_encode {
+        program.emit_column_or_rowid(cursor_id, column_index, target_register);
+        return Ok(());
+    }
     program.flags.set_suppress_column_default(true);
     program.emit_column_or_rowid(cursor_id, column_index, target_register);
     let has_field_label = program.allocate_label();

@@ -75,6 +75,7 @@ pub(super) fn emit_filter(
         &binding_remap,
         &table_references,
         &mut resolver,
+        false,
     )?;
     let bound_predicate = remap_bound_expr(predicate, &binding_remap)?;
     translate_condition_expr(
@@ -357,6 +358,7 @@ pub(super) fn emit_project(
     input: &EphemeralDelta,
     projections: &[ast::Expr],
     output_contract: &NodeOutputContract,
+    decode_custom_type_columns: bool,
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<EmittedNodeOutput> {
@@ -367,7 +369,15 @@ pub(super) fn emit_project(
         output_contract.emitted_identity,
         output_contract.binding_rowids.clone(),
     )?;
-    emit_project_rows(program, input, projections, &output, schema, connection)?;
+    emit_project_rows(
+        program,
+        input,
+        projections,
+        &output,
+        decode_custom_type_columns,
+        schema,
+        connection,
+    )?;
     EmittedNodeOutput::from_ephemeral(node_id, output, output_contract)
 }
 
@@ -377,6 +387,7 @@ fn emit_project_rows(
     input: &EphemeralDelta,
     projections: &[ast::Expr],
     output: &EphemeralDelta,
+    decode_custom_type_columns: bool,
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<()> {
@@ -414,6 +425,7 @@ fn emit_project_rows(
         &binding_remap,
         &table_references,
         &mut resolver,
+        decode_custom_type_columns,
     )?;
 
     turso_assert!(

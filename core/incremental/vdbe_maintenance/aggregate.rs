@@ -333,6 +333,7 @@ fn emit_group_aggregate_rows(
         &binding_remap,
         &table_references,
         &mut resolver,
+        false,
     )?;
 
     for (i, group_expr) in group_exprs.iter().enumerate() {
