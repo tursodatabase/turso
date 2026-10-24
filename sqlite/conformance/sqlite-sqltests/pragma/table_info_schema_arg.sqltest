@@ -1,0 +1,10 @@
+@database :memory:
+
+test pragma-table-info-attached-schema-argument {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t(a);
+    SELECT name, type FROM pragma_table_info('t', 'aux');
+}
+expect {
+    a|
+}
