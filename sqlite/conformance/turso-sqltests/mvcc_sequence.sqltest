@@ -325,6 +325,46 @@ expect {
     2|b
 }
 
+test mvcc-autoincrement-mixed-case-table-name-kept-in-sequence {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE "MiXeD Name" (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO "MiXeD Name"(v) VALUES ('a');
+    INSERT INTO "MiXeD Name"(v) VALUES ('b');
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    mvcc
+    MiXeD Name|2
+}
+
+# Older versions stored the lowercased name. That row must be replaced, not kept next to the new one.
+test mvcc-autoincrement-replaces-lowercase-sequence-row {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE "MiXeD Name" (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO sqlite_sequence VALUES ('mixed name', 0);
+    INSERT INTO "MiXeD Name"(v) VALUES ('a');
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    mvcc
+    MiXeD Name|1
+}
+
+# A row whose name differs from the table's only in case belongs to no table.
+test mvcc-autoincrement-keeps-sequence-row-that-differs-in-case {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO t(v) VALUES ('a');
+    INSERT INTO sqlite_sequence VALUES ('T', 7);
+    INSERT INTO t(v) VALUES ('b');
+    SELECT name, seq FROM sqlite_sequence ORDER BY name;
+}
+expect {
+    mvcc
+    T|7
+    t|2
+}
+
 test mvcc-autoincrement-checkpoint-compaction-many-tables {
     PRAGMA journal_mode = 'mvcc';
     CREATE TABLE stress_00(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);

@@ -2,6 +2,7 @@ use crate::schema::ColumnLayout;
 use crate::translate::emitter::{
     emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
 };
+use crate::translate::sequence::emit_skip_sqlite_sequence_row_of_other_table;
 use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -753,7 +754,7 @@ pub fn translate_insert(
         .autoincrement_meta
         .filter(|_| any_trigger_inserts_into(resolver, database_id, &ctx.table.name))
     {
-        emit_write_sqlite_sequence(program, resolver, ctx.database_id, meta)?;
+        emit_write_sqlite_sequence(program, resolver, ctx.database_id, ctx.table, meta)?;
     }
 
     // We need to emit NOT NULL constraints (and their actions) a first time for stored columns,
@@ -1268,7 +1269,7 @@ fn emit_epilogue(
     }
     program.preassign_label_to_next_insn(ctx.loop_labels.stmt_epilogue);
     if let Some(meta) = ctx.autoincrement_meta {
-        emit_write_sqlite_sequence(program, resolver, ctx.database_id, meta)?;
+        emit_write_sqlite_sequence(program, resolver, ctx.database_id, ctx.table, meta)?;
         program.emit_insn(Insn::Close {
             cursor_id: meta.seq_cursor_id,
         });
@@ -1314,9 +1315,10 @@ fn emit_write_sqlite_sequence(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     database_id: usize,
+    table: &BTreeTable,
     meta: AutoincMeta,
 ) -> Result<()> {
-    reload_autoincrement_state(program, meta);
+    reload_autoincrement_state(program, table, meta);
     let write_label = program.allocate_label();
     let done_label = program.allocate_label();
     program.emit_insn(Insn::IsNull {
@@ -1538,7 +1540,7 @@ fn emit_rowid_generation(
             insertion.key_register(),
         )?;
     } else if let Some(meta) = ctx.autoincrement_meta {
-        reload_autoincrement_state(program, meta);
+        reload_autoincrement_state(program, ctx.table, meta);
         let r_max = program.alloc_register();
 
         let dummy_reg = program.alloc_register();
@@ -1709,7 +1711,7 @@ fn init_autoincrement(
     let meta = ctx
         .autoincrement_meta
         .expect("AUTOINCREMENT metadata should be initialized");
-    reload_autoincrement_state(program, meta);
+    reload_autoincrement_state(program, ctx.table, meta);
     program.emit_insn(Insn::Copy {
         src_reg: meta.r_seq,
         dst_reg: meta.r_max_rowid,
@@ -1731,7 +1733,7 @@ fn open_autoincrement_state(
         db: ctx.database_id,
     });
 
-    let table_name_reg = program.emit_string8_new_reg(ctx.table.name.clone());
+    let table_name_reg = program.emit_string8_new_reg(ctx.table.original_name.clone());
     let r_seq = program.alloc_register();
     let r_seq_rowid = program.alloc_register();
 
@@ -1754,12 +1756,11 @@ fn open_autoincrement_state(
     Ok(())
 }
 
-fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
+fn reload_autoincrement_state(program: &mut ProgramBuilder, table: &BTreeTable, meta: AutoincMeta) {
     let AutoincMeta {
         seq_cursor_id,
         r_seq,
         r_seq_rowid,
-        table_name_reg,
         ..
     } = meta;
 
@@ -1784,18 +1785,7 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
 
     let name_col_reg = program.alloc_register();
     program.emit_column_or_rowid(seq_cursor_id, 0, name_col_reg);
-    program.emit_insn(Insn::Ne {
-        lhs: table_name_reg,
-        rhs: name_col_reg,
-        target_pc: found_label,
-        flags: Default::default(),
-        collation: Some(super::collate::CollationSeq::NoCase),
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: name_col_reg,
-        dst_reg: table_name_reg,
-        extra_amount: 0,
-    });
+    emit_skip_sqlite_sequence_row_of_other_table(program, name_col_reg, table, found_label);
 
     program.emit_column_or_rowid(seq_cursor_id, 1, r_seq);
     // SQLite emits AddImm r[seq], 0 here. OP_AddImm always leaves an integer.

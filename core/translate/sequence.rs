@@ -29,6 +29,7 @@ use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
     to_u32, AddSequenceData, CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral,
 };
+use crate::vdbe::BranchOffset;
 use crate::Result;
 use turso_parser::ast;
 
@@ -702,7 +703,7 @@ pub(crate) fn emit_sqlite_sequence_sync(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     database_id: usize,
-    autoinc_table_name: &str,
+    autoinc_table: &BTreeTable,
     value_reg: usize,
 ) -> Result<bool> {
     let Some(sseq_table) = resolver.with_schema(database_id, |s| {
@@ -719,9 +720,9 @@ pub(crate) fn emit_sqlite_sequence_sync(
         db: database_id,
     });
 
-    let name_reg = program.emit_string8_new_reg(autoinc_table_name.to_string());
+    let name_reg = program.emit_string8_new_reg(autoinc_table.original_name.clone());
 
-    // Delete every existing row matching `name = autoinc_table_name`.
+    // Delete every existing row for `autoinc_table`.
     let insert_label = program.allocate_label();
     let loop_top_label = program.allocate_label();
     let skip_delete_label = program.allocate_label();
@@ -732,13 +733,12 @@ pub(crate) fn emit_sqlite_sequence_sync(
     program.preassign_label_to_next_insn(loop_top_label);
     let col_name_reg = program.alloc_register();
     program.emit_column_or_rowid(sseq_cursor, 0, col_name_reg);
-    program.emit_insn(Insn::Ne {
-        lhs: col_name_reg,
-        rhs: name_reg,
-        target_pc: skip_delete_label,
-        flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
-    });
+    emit_skip_sqlite_sequence_row_of_other_table(
+        program,
+        col_name_reg,
+        autoinc_table,
+        skip_delete_label,
+    );
     program.emit_insn(Insn::Delete {
         cursor_id: sseq_cursor,
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
@@ -796,6 +796,34 @@ pub(crate) fn emit_sqlite_sequence_sync(
     Ok(true)
 }
 
+/// Jump to `skip_label` unless the `sqlite_sequence` name in `row_name_reg`
+/// belongs to `table`. Like SQLite, the name must equal the name written in
+/// CREATE TABLE exactly. Older versions of Turso wrote the lowercased name,
+/// so an exact match on that also counts.
+pub(crate) fn emit_skip_sqlite_sequence_row_of_other_table(
+    program: &mut ProgramBuilder,
+    row_name_reg: usize,
+    table: &BTreeTable,
+    skip_label: BranchOffset,
+) {
+    let matched_label = program.allocate_label();
+    let lowercased_name = (table.name != table.original_name).then_some(&table.name);
+    for name in std::iter::once(&table.original_name).chain(lowercased_name) {
+        let name_reg = program.emit_string8_new_reg(name.clone());
+        program.emit_insn(Insn::Eq {
+            lhs: row_name_reg,
+            rhs: name_reg,
+            target_pc: matched_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+    }
+    program.emit_insn(Insn::Goto {
+        target_pc: skip_label,
+    });
+    program.preassign_label_to_next_insn(matched_label);
+}
+
 /// If `seq` is an AUTOINCREMENT-backing sequence (its name begins with
 /// `__turso_internal_autoincrement_`), emit `sqlite_sequence` sync
 /// bytecode for the underlying table. No-op for user-defined
@@ -812,7 +840,14 @@ pub(crate) fn emit_autoincrement_sqlite_sequence_sync(
     let Some(table_name) = seq_name.strip_prefix(AUTOINCREMENT_SEQ_PREFIX) else {
         return Ok(());
     };
-    emit_sqlite_sequence_sync(program, resolver, database_id, table_name, value_reg)?;
+    let table = resolver
+        .with_schema(database_id, |s| s.get_btree_table(table_name))
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "missing AUTOINCREMENT table \"{table_name}\" for sequence \"{seq_name}\""
+            ))
+        })?;
+    emit_sqlite_sequence_sync(program, resolver, database_id, &table, value_reg)?;
     Ok(())
 }
 
