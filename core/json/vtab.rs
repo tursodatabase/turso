@@ -191,6 +191,7 @@ impl std::fmt::Debug for JsonVirtualTable {
 pub struct JsonEachCursor {
     rowid: i64,
     id: i64,
+    root_offset: i64,
     json: Jsonb,
     path_to_current_value: InPlaceJsonPath,
     traversal_states: Vec<TraversalState>,
@@ -201,7 +202,6 @@ pub struct JsonEachCursor {
 struct TraversalState {
     iterator_state: IteratorState,
     parent_id: Option<i64>,
-    innermost_container_id: Option<i64>,
     innermost_container_cursor: InPlaceJsonPathCursor,
 }
 
@@ -210,6 +210,7 @@ impl JsonEachCursor {
         Self {
             rowid: 0,
             id: 0,
+            root_offset: 0,
             json: Jsonb::empty(),
             traversal_states: Vec::new(),
             path_to_current_value: InPlaceJsonPath::new_root(),
@@ -221,23 +222,12 @@ impl JsonEachCursor {
     fn push_state(
         &mut self,
         iterator_state: IteratorState,
+        parent_id: Option<i64>,
         innermost_container_cursor: InPlaceJsonPathCursor,
     ) {
-        let parent_id = self
-            .traversal_states
-            .last()
-            .and_then(|state| state.innermost_container_id)
-            .or(Some(0));
-
-        let innermost_container = match iterator_state {
-            IteratorState::Object(_) | IteratorState::Array(_) => Some(self.id),
-            _ => parent_id,
-        };
-
         self.traversal_states.push(TraversalState {
             iterator_state,
             parent_id,
-            innermost_container_id: innermost_container,
             innermost_container_cursor,
         });
     }
@@ -256,7 +246,6 @@ impl InternalVirtualTableCursor for JsonEachCursor {
     ) -> Result<bool, LimboError> {
         self.traversal_states.clear();
         self.rowid = 0;
-        self.id = 0;
 
         if args.is_empty() || args[0] == Value::Null {
             return Ok(false);
@@ -277,15 +266,17 @@ impl InternalVirtualTableCursor for JsonEachCursor {
 
         let mut jsonb = convert_dbtype_to_jsonb(&args[0], Conv::Strict)?;
 
-        let root_json = if args.len() == 1 {
-            jsonb
-        } else if let Some(json) = navigate_to_path(&mut jsonb, &args[1])? {
-            json
+        let (root_json, root_offset, root_id) = if args.len() == 1 {
+            (jsonb, 0, 0)
+        } else if let Some(found) = navigate_to_path(&mut jsonb, &args[1])? {
+            found
         } else {
             return Ok(false);
         };
 
         self.json = root_json;
+        self.root_offset = root_offset;
+        self.id = root_id;
         self.path_to_current_value =
             InPlaceJsonPath::from_json_path(root_path.to_string(), json_path(&root_path)?);
         let iterator_state = json_iterator_from(&self.json)?;
@@ -296,7 +287,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         } else {
             self.path_to_current_value.cursor()
         };
-        self.push_state(iterator_state, innermost_container_path);
+        self.push_state(iterator_state, Some(root_id), innermost_container_path);
 
         let key = self.path_to_current_value.key().to_owned();
         match self.traversal_mode {
@@ -349,15 +340,9 @@ impl InternalVirtualTableCursor for JsonEachCursor {
 
 impl JsonEachCursor {
     fn advance(&mut self) -> Result<bool, LimboError> {
-        self.id += 1;
-        if self.traversal_states.is_empty() {
+        let Some(traversal_state) = self.traversal_states.pop() else {
             return Ok(false);
-        }
-
-        let traversal_state = self
-            .traversal_states
-            .pop()
-            .expect("traversal state stack is empty");
+        };
 
         let parent_id = if matches!(self.traversal_mode, JsonTraversalMode::Tree) {
             traversal_state.parent_id
@@ -370,6 +355,7 @@ impl JsonEachCursor {
                     self.path_to_current_value.pop();
                     return self.advance();
                 };
+                self.id = self.root_offset + state.position() as i64;
 
                 let recursing_iterator = if matches!(self.traversal_mode, JsonTraversalMode::Tree) {
                     self.json
@@ -379,12 +365,13 @@ impl JsonEachCursor {
                 };
                 self.push_state(
                     IteratorState::Array(new_state),
+                    traversal_state.parent_id,
                     self.path_to_current_value.cursor(),
                 );
                 let recurses = recursing_iterator.is_some();
                 self.path_to_current_value.push_array_index(&idx);
                 if let Some(it) = recursing_iterator {
-                    self.push_state(it, self.path_to_current_value.cursor());
+                    self.push_state(it, Some(self.id), self.path_to_current_value.cursor());
                 }
 
                 let key = self.path_to_current_value.key().to_owned();
@@ -409,9 +396,11 @@ impl JsonEachCursor {
                     self.path_to_current_value.pop();
                     return self.advance();
                 };
+                self.id = self.root_offset + state.position() as i64;
 
                 self.push_state(
                     IteratorState::Object(new_state),
+                    traversal_state.parent_id,
                     self.path_to_current_value.cursor(),
                 );
                 self.path_to_current_value
@@ -421,7 +410,7 @@ impl JsonEachCursor {
                         .json
                         .container_property_iterator(&IteratorState::Object(state))
                         .is_some_and(|it| {
-                            self.push_state(it, self.path_to_current_value.cursor());
+                            self.push_state(it, Some(self.id), self.path_to_current_value.cursor());
                             true
                         });
 
@@ -490,7 +479,10 @@ fn json_iterator_from(json: &Jsonb) -> crate::Result<IteratorState> {
         }
     }
 }
-fn navigate_to_path(jsonb: &mut Jsonb, path: &Value) -> Result<Option<Jsonb>, LimboError> {
+fn navigate_to_path(
+    jsonb: &mut Jsonb,
+    path: &Value,
+) -> Result<Option<(Jsonb, i64, i64)>, LimboError> {
     let json_path = json_path_from_db_value(path, true)?.ok_or_else(|| {
         LimboError::InvalidArgument(format!("path '{path}' is not a valid json path"))
     })?;
@@ -501,7 +493,11 @@ fn navigate_to_path(jsonb: &mut Jsonb, path: &Value) -> Result<Option<Jsonb>, Li
     {
         return Ok(None);
     }
-    Ok(Some(search_operation.result()))
+    let value_offset = search_operation.value_offset() as i64;
+    let root_id = search_operation
+        .label_offset()
+        .map_or(value_offset, |offset| offset as i64);
+    Ok(Some((search_operation.result(), value_offset, root_id)))
 }
 
 mod columns {

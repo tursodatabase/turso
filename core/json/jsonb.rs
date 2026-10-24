@@ -660,6 +660,8 @@ impl PathOperation for InsertOperation {
 pub struct SearchOperation {
     value: Jsonb,
     mode: PathOperationMode,
+    value_offset: usize,
+    label_offset: Option<usize>,
 }
 
 impl SearchOperation {
@@ -667,7 +669,17 @@ impl SearchOperation {
         Ok(Self {
             mode: PathOperationMode::ReplaceExisting,
             value: Jsonb::new(capacity)?,
+            value_offset: 0,
+            label_offset: None,
         })
+    }
+
+    pub fn value_offset(&self) -> usize {
+        self.value_offset
+    }
+
+    pub fn label_offset(&self) -> Option<usize> {
+        self.label_offset
     }
 
     pub fn result(self) -> Jsonb {
@@ -684,14 +696,18 @@ impl PathOperation for SearchOperation {
         let target = stack.pop().ok_or_else(|| {
             LimboError::InternalError("stack should not be empty after check".to_string())
         })?;
-        let idx = if let Some(idx) = target.get_array_index() {
-            idx
-        } else {
-            target.field_value_index
+        let (idx, label_idx) = match (target.get_array_index(), target.field_key_index) {
+            (Some(idx), _) => (idx, None),
+            (None, JsonLocationKind::ObjectProperty(key_idx)) => {
+                (target.field_value_index, Some(key_idx))
+            }
+            (None, _) => (target.field_value_index, None),
         };
         let (JsonbHeader(_, size), header_size) = json.read_header(idx)?;
         let end = json.element_end(idx, &[header_size, size])?;
         self.value.data.extend_from_slice(&json.data[idx..end]);
+        self.value_offset = idx;
+        self.label_offset = label_idx;
 
         Ok(())
     }
@@ -923,6 +939,18 @@ pub struct ObjectIteratorState {
     cursor: usize,
     end: usize,
     index: usize,
+}
+
+impl ArrayIteratorState {
+    pub fn position(&self) -> usize {
+        self.cursor
+    }
+}
+
+impl ObjectIteratorState {
+    pub fn position(&self) -> usize {
+        self.cursor
+    }
 }
 
 pub type ArrayIteratorItem = ((usize, Jsonb), ArrayIteratorState);

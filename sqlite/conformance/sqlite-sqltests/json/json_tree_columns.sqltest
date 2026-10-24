@@ -207,3 +207,59 @@ expect {
     json||1
     root||1
 }
+
+# id is the byte offset of the element in the JSONB form of the input, and
+# for an object member it is the offset of its key. parent is the id of the
+# containing element, and json_each always returns NULL for it.
+
+test json-tree-id-and-parent-are-jsonb-offsets {
+    SELECT id, parent, fullkey FROM json_tree('{"a":[1,2],"b":{"c":3}}');
+}
+expect {
+    0||$
+    2|0|$.a
+    5|2|$.a[0]
+    7|2|$.a[1]
+    9|0|$.b
+    12|9|$.b.c
+}
+
+test json-each-id-is-jsonb-offset {
+    SELECT id, typeof(parent) FROM json_each('[1,[2,3],{"x":4},5]');
+}
+expect {
+    2|null
+    4|null
+    9|null
+    14|null
+}
+
+test json-tree-id-and-parent-with-root-path {
+    SELECT id, parent, fullkey FROM json_tree('{"a":[1,2],"b":{"c":3}}', '$.b');
+}
+expect {
+    9||$.b
+    12|9|$.b.c
+}
+
+test json-each-id-with-root-path-to-array-element {
+    SELECT id, fullkey FROM json_each('[1,[2,[3,4]]]', '$[1][1]');
+}
+expect {
+    7|$[1][1][0]
+    9|$[1][1][1]
+}
+
+test json-each-id-of-primitive-under-object-key {
+    SELECT id, value FROM json_each('{"a":[1,2],"b":{"c":3}}', '$.b.c');
+}
+expect {
+    12|3
+}
+
+test json-tree-id-with-two-byte-container-header {
+    SELECT max(id), count(*) FROM json_tree((SELECT json_group_array(value) FROM generate_series(1, 500)));
+}
+expect {
+    1891|501
+}
