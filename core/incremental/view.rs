@@ -716,7 +716,7 @@ impl IncrementalView {
                 select,
             }) => {
                 let mut column_schema = extract_view_columns(&select, schema)?;
-                column_schema.rename_columns(&columns);
+                column_schema.rename_columns(columns.iter().map(|column| column.col_name.as_str()));
                 Ok(Self {
                     name: view_name.name.as_str().to_string(),
                     select_stmt: select,

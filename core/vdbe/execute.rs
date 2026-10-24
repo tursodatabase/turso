@@ -18091,6 +18091,7 @@ pub fn op_alter_column(
                     if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                         &view.sql,
                         schema,
+                        *db,
                         table_name.as_str(),
                         &target_db_name,
                         &old_column_name,
@@ -18112,6 +18113,7 @@ pub fn op_alter_column(
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                             &view.sql,
                             schema,
+                            crate::TEMP_DB_ID,
                             table_name.as_str(),
                             &target_db_name,
                             &old_column_name,
@@ -18316,7 +18318,6 @@ pub fn op_alter_column(
                     let view = Arc::make_mut(view_arc);
                     view.sql = rewritten.sql;
                     view.select_stmt = rewritten.select_stmt;
-                    view.columns = rewritten.columns;
                 }
                 Ok(())
             })??;

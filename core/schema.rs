@@ -30,7 +30,6 @@ pub struct View {
     pub name: String,
     pub sql: String,
     pub select_stmt: ast::Select,
-    pub columns: Vec<Column>,
     pub explicit_columns: Vec<String>,
 }
 
@@ -39,14 +38,12 @@ impl View {
         name: String,
         sql: String,
         select_stmt: ast::Select,
-        columns: Vec<Column>,
         explicit_columns: Vec<String>,
     ) -> Self {
         Self {
             name,
             sql,
             select_stmt,
-            columns,
             explicit_columns,
         }
     }
@@ -2732,14 +2729,10 @@ impl Schema {
                             select,
                             ..
                         } => {
-                            let mut view_column_schema =
-                                crate::util::extract_view_columns(&select, self)?;
-                            view_column_schema.rename_columns(&column_names);
                             let view = View::new(
                                 name.to_string(),
                                 sql.to_string(),
                                 select,
-                                view_column_schema.flat_columns()?,
                                 column_names
                                     .iter()
                                     .map(|column| column.col_name.as_str().to_string())
@@ -3126,7 +3119,6 @@ impl TryClone for View {
             name: self.name.clone(),
             sql: self.sql.clone(),
             select_stmt: self.select_stmt.clone(),
-            columns: self.columns.try_clone()?,
             explicit_columns: self.explicit_columns.try_clone()?,
         })
     }

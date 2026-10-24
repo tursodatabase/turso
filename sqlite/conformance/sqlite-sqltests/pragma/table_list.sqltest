@@ -29,6 +29,196 @@ expect {
 }
 
 @cross-check-integrity
+test pragma-table-list-view-columns-follow-alter-and-drop-table {
+    CREATE TABLE t(a, b);
+    CREATE VIEW v AS SELECT * FROM t;
+    CREATE VIEW w AS SELECT 1 FROM t;
+    ALTER TABLE t ADD COLUMN c;
+    SELECT name FROM pragma_table_info('v');
+    SELECT name, ncol FROM pragma_table_list WHERE type = 'view' ORDER BY name;
+    DROP TABLE t;
+    SELECT name, ncol FROM pragma_table_list WHERE type = 'view' ORDER BY name;
+}
+expect {
+    a
+    b
+    c
+    v|3
+    w|1
+    v|0
+    w|0
+}
+
+@cross-check-integrity
+test pragma-table-list-named-view-columns-follow-alter-and-drop-table {
+    CREATE TABLE t(a, b);
+    CREATE VIEW v AS SELECT * FROM t;
+    ALTER TABLE t ADD COLUMN c;
+    SELECT name FROM pragma_table_xinfo('v');
+    PRAGMA table_list('v');
+    DROP TABLE t;
+    PRAGMA table_list('v');
+}
+expect {
+    a
+    b
+    c
+    main|v|view|3|0|0
+    main|v|view|0|0|0
+}
+
+@cross-check-integrity
+test pragma-table-list-view-over-view-columns-follow-alter-and-drop-table {
+    CREATE TABLE t(a, b);
+    CREATE VIEW v AS SELECT * FROM t;
+    CREATE VIEW vv AS SELECT * FROM v;
+    CREATE VIEW vw AS SELECT 1 FROM v;
+    ALTER TABLE t ADD COLUMN c;
+    SELECT name FROM pragma_table_info('vv');
+    PRAGMA table_list('vv');
+    DROP TABLE t;
+    PRAGMA table_list('vv');
+    PRAGMA table_list('vw');
+}
+expect {
+    a
+    b
+    c
+    main|vv|view|3|0|0
+    main|vv|view|0|0|0
+    main|vw|view|0|0|0
+}
+
+@cross-check-integrity
+test pragma-table-list-view-column-list-decides-column-count {
+    CREATE TABLE t(a INT, b TEXT);
+    CREATE VIEW v3(p, q) AS SELECT * FROM t;
+    CREATE TABLE u(a, b, c);
+    CREATE VIEW v4(p, q, r) AS SELECT * FROM u;
+    ALTER TABLE t ADD COLUMN c;
+    ALTER TABLE u DROP COLUMN c;
+    PRAGMA table_list('v3');
+    PRAGMA table_info('v3');
+    PRAGMA table_list('v4');
+    PRAGMA table_info('v4');
+    DROP TABLE t;
+    PRAGMA table_list('v3');
+}
+expect {
+    main|v3|view|2|0|0
+    0|p||0||0
+    1|q||0||0
+    main|v4|view|3|0|0
+    0|p||0||0
+    1|q||0||0
+    2|r||0||0
+    main|v3|view|0|0|0
+}
+
+@cross-check-integrity
+test pragma-table-list-join-using-view-over-dropped-table {
+    CREATE TABLE t(a);
+    CREATE TABLE t2(a);
+    CREATE VIEW v AS SELECT * FROM t;
+    CREATE VIEW j AS SELECT * FROM t2 JOIN t USING(a);
+    CREATE VIEW n AS SELECT * FROM t2 NATURAL JOIN t;
+    CREATE VIEW jv AS SELECT * FROM t2 JOIN v USING(a);
+    DROP TABLE t;
+    SELECT name, ncol FROM pragma_table_list WHERE type = 'view' ORDER BY name;
+}
+expect {
+    j|0
+    jv|0
+    n|0
+    v|0
+}
+
+@cross-check-integrity
+test pragma-table-list-lists-every-view-when-one-view-has-a-bad-join {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS SELECT * FROM t;
+    CREATE TABLE t2(a);
+    CREATE VIEW jv AS SELECT * FROM t2 JOIN v USING(a);
+    CREATE VIEW ok AS SELECT 1;
+    DROP TABLE t;
+    CREATE TABLE t(x);
+    SELECT name, ncol FROM pragma_table_list WHERE type = 'view' ORDER BY name;
+}
+expect {
+    jv|0
+    ok|1
+    v|1
+}
+
+@cross-check-integrity
+test pragma-table-list-views-that-read-a-view-twice-many-levels-deep {
+    CREATE TABLE t(a);
+    CREATE VIEW v0 AS SELECT * FROM t;
+    CREATE VIEW v1 AS SELECT x.* FROM v0 x, v0 y;
+    CREATE VIEW v2 AS SELECT x.* FROM v1 x, v1 y;
+    CREATE VIEW v3 AS SELECT x.* FROM v2 x, v2 y;
+    CREATE VIEW v4 AS SELECT x.* FROM v3 x, v3 y;
+    CREATE VIEW v5 AS SELECT x.* FROM v4 x, v4 y;
+    CREATE VIEW v6 AS SELECT x.* FROM v5 x, v5 y;
+    CREATE VIEW v7 AS SELECT x.* FROM v6 x, v6 y;
+    CREATE VIEW v8 AS SELECT x.* FROM v7 x, v7 y;
+    CREATE VIEW v9 AS SELECT x.* FROM v8 x, v8 y;
+    CREATE VIEW v10 AS SELECT x.* FROM v9 x, v9 y;
+    CREATE VIEW v11 AS SELECT x.* FROM v10 x, v10 y;
+    CREATE VIEW v12 AS SELECT x.* FROM v11 x, v11 y;
+    CREATE VIEW v13 AS SELECT x.* FROM v12 x, v12 y;
+    CREATE VIEW v14 AS SELECT x.* FROM v13 x, v13 y;
+    CREATE VIEW v15 AS SELECT x.* FROM v14 x, v14 y;
+    CREATE VIEW v16 AS SELECT x.* FROM v15 x, v15 y;
+    CREATE VIEW v17 AS SELECT x.* FROM v16 x, v16 y;
+    CREATE VIEW v18 AS SELECT x.* FROM v17 x, v17 y;
+    CREATE VIEW v19 AS SELECT x.* FROM v18 x, v18 y;
+    CREATE VIEW v20 AS SELECT x.* FROM v19 x, v19 y;
+    CREATE VIEW v21 AS SELECT x.* FROM v20 x, v20 y;
+    CREATE VIEW v22 AS SELECT x.* FROM v21 x, v21 y;
+    CREATE VIEW v23 AS SELECT x.* FROM v22 x, v22 y;
+    CREATE VIEW v24 AS SELECT x.* FROM v23 x, v23 y;
+    SELECT count(*) FROM pragma_table_list WHERE type = 'view';
+}
+expect {
+    25
+}
+
+@skip-if sqlite "sqlite stops at 65535 references to one view"
+test pragma-table-info-view-that-reads-a-view-twice-many-levels-deep {
+    CREATE TABLE t(a);
+    CREATE VIEW v0 AS SELECT * FROM t;
+    CREATE VIEW v1 AS SELECT x.* FROM v0 x, v0 y;
+    CREATE VIEW v2 AS SELECT x.* FROM v1 x, v1 y;
+    CREATE VIEW v3 AS SELECT x.* FROM v2 x, v2 y;
+    CREATE VIEW v4 AS SELECT x.* FROM v3 x, v3 y;
+    CREATE VIEW v5 AS SELECT x.* FROM v4 x, v4 y;
+    CREATE VIEW v6 AS SELECT x.* FROM v5 x, v5 y;
+    CREATE VIEW v7 AS SELECT x.* FROM v6 x, v6 y;
+    CREATE VIEW v8 AS SELECT x.* FROM v7 x, v7 y;
+    CREATE VIEW v9 AS SELECT x.* FROM v8 x, v8 y;
+    CREATE VIEW v10 AS SELECT x.* FROM v9 x, v9 y;
+    CREATE VIEW v11 AS SELECT x.* FROM v10 x, v10 y;
+    CREATE VIEW v12 AS SELECT x.* FROM v11 x, v11 y;
+    CREATE VIEW v13 AS SELECT x.* FROM v12 x, v12 y;
+    CREATE VIEW v14 AS SELECT x.* FROM v13 x, v13 y;
+    CREATE VIEW v15 AS SELECT x.* FROM v14 x, v14 y;
+    CREATE VIEW v16 AS SELECT x.* FROM v15 x, v15 y;
+    CREATE VIEW v17 AS SELECT x.* FROM v16 x, v16 y;
+    CREATE VIEW v18 AS SELECT x.* FROM v17 x, v17 y;
+    CREATE VIEW v19 AS SELECT x.* FROM v18 x, v18 y;
+    CREATE VIEW v20 AS SELECT x.* FROM v19 x, v19 y;
+    CREATE VIEW v21 AS SELECT x.* FROM v20 x, v20 y;
+    CREATE VIEW v22 AS SELECT x.* FROM v21 x, v21 y;
+    CREATE VIEW v23 AS SELECT x.* FROM v22 x, v22 y;
+    CREATE VIEW v24 AS SELECT x.* FROM v23 x, v23 y;
+    SELECT name FROM pragma_table_info('v24');
+}
+expect {
+    a
+}
+
+@cross-check-integrity
 test pragma-table-list-strict {
     CREATE TABLE strict_t(a INTEGER, b TEXT) STRICT;
     PRAGMA table_list('strict_t');
@@ -99,6 +289,31 @@ test pragma-table-xinfo-prefers-temp-shadow {
 }
 expect {
     0|b|0
+}
+
+@cross-check-integrity
+test pragma-table-list-view-with-unread-cte-over-dropped-table {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS WITH q AS (SELECT * FROM t) SELECT 1 AS one;
+    DROP TABLE t;
+    PRAGMA table_list('v');
+    SELECT name FROM pragma_table_info('v');
+}
+expect {
+    main|v|view|1|0|0
+    one
+}
+
+@cross-check-integrity
+test pragma-table-list-temp-view-over-main-table {
+    CREATE TABLE s(a, b);
+    CREATE TEMP VIEW tv AS SELECT a FROM s;
+    PRAGMA table_list('tv');
+    SELECT name FROM pragma_table_info('tv');
+}
+expect {
+    temp|tv|view|1|0|0
+    a
 }
 
 @cross-check-integrity

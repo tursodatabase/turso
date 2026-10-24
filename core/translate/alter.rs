@@ -1951,6 +1951,7 @@ pub fn translate_alter_table(
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                             &view.sql,
                             s,
+                            database_id,
                             table_name,
                             &target_db_name,
                             from,
@@ -1971,6 +1972,7 @@ pub fn translate_alter_table(
                                 if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                                     &view.sql,
                                     s,
+                                    crate::TEMP_DB_ID,
                                     table_name,
                                     &target_db_name,
                                     from,
@@ -3142,7 +3144,7 @@ impl TargetQualifiers {
                     if !is_cte =>
                 {
                     other_table_has_column |=
-                        trigger_from_table_has_column(resolver, database_id, name, old_col_norm);
+                        trigger_from_table_has_column(resolver, database_id, name, old_col_norm)?;
                 }
                 _ => {
                     other_table_has_column |= resolver
@@ -3168,7 +3170,7 @@ fn trigger_from_table_has_column(
     trigger_database_id: usize,
     table_name: &ast::QualifiedName,
     col_norm: &str,
-) -> bool {
+) -> Result<bool> {
     let table_name_norm = normalize_ident(table_name.name.as_str());
     let Some(database_id) = trigger_table_database_id(
         resolver,
@@ -3176,20 +3178,24 @@ fn trigger_from_table_has_column(
         &table_name_norm,
         table_name.namespace.as_ref().map(|db| db.as_str()),
     ) else {
-        return false;
+        return Ok(false);
     };
     resolver.with_schema(database_id, |schema| {
         if let Some(table) = schema.get_table(&table_name_norm) {
-            return table.get_column_by_name(col_norm).is_some();
+            return Ok(table.get_column_by_name(col_norm).is_some());
         }
-        schema.get_view(&table_name_norm).is_some_and(|view| {
-            view.columns.iter().any(|column| {
+        let Some(view) = schema.get_view(&table_name_norm) else {
+            return Ok(false);
+        };
+        Ok(crate::util::ViewResolution::new(database_id)
+            .readable_view_columns(&view, schema)?
+            .iter()
+            .any(|column| {
                 column
                     .name
                     .as_deref()
                     .is_some_and(|name| name.eq_ignore_ascii_case(col_norm))
-            })
-        })
+            }))
     })
 }
 
@@ -3608,7 +3614,12 @@ fn apply_select_for_column_rename(
 ) -> Result<()> {
     let outer_target_qualifiers = &TargetQualifiers {
         ctes: resolver.with_schema(database_id, |schema| {
-            crate::util::extract_cte_columns(&select.with, schema, &outer_target_qualifiers.ctes)
+            crate::util::extract_cte_columns(
+                &select.with,
+                schema,
+                &outer_target_qualifiers.ctes,
+                &mut crate::util::ViewResolution::new(database_id),
+            )
         })?,
         ..outer_target_qualifiers.clone()
     };

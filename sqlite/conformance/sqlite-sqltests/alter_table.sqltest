@@ -120,6 +120,94 @@ expect {
 }
 
 @skip-if mvcc "views not supported in MVCC mode"
+@skip-if sqlite "sqlite does not rewrite dependent views on RENAME COLUMN"
+test alter-table-rename-added-column-read-through-star-view {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v AS SELECT * FROM t;
+    ALTER TABLE t ADD COLUMN c;
+    CREATE VIEW w AS SELECT c FROM v;
+    INSERT INTO t VALUES (1, 2, 3);
+    ALTER TABLE t RENAME COLUMN c TO d;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'w';
+    SELECT * FROM w;
+}
+expect {
+    CREATE VIEW w AS SELECT d FROM v
+    3
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+@cross-check-integrity
+test alter-table-rename-column-keeps-trigger-column-of-view-after-add-column {
+    CREATE TABLE t (a, b);
+    CREATE TABLE s (x);
+    CREATE VIEW v AS SELECT * FROM s;
+    CREATE TABLE log (y);
+    ALTER TABLE s ADD COLUMN a;
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log SELECT a FROM v; END;
+    ALTER TABLE t RENAME COLUMN a TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'tr';
+}
+expect {
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log SELECT a FROM v; END
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+@skip-if sqlite "sqlite does not rewrite dependent views on RENAME COLUMN"
+test alter-table-rename-column-view-reads-view-twice {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v1 AS SELECT a, b FROM t;
+    CREATE VIEW v2 AS SELECT x.b, y.b AS yb FROM v1 x, v1 y;
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' ORDER BY name;
+}
+expect {
+    CREATE VIEW v1 AS SELECT a, c FROM t
+    CREATE VIEW v2 AS SELECT x.c, y.c AS yb FROM v1 x, v1 y
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+@skip-if sqlite "sqlite stops at 65535 references to one view"
+test alter-table-rename-column-under-views-that-read-a-view-twice-many-levels-deep {
+    CREATE TABLE t(a);
+    CREATE TABLE u(a, b);
+    CREATE VIEW v0 AS SELECT * FROM t;
+    CREATE VIEW v1 AS SELECT x.* FROM v0 x, v0 y;
+    CREATE VIEW v2 AS SELECT x.* FROM v1 x, v1 y;
+    CREATE VIEW v3 AS SELECT x.* FROM v2 x, v2 y;
+    CREATE VIEW v4 AS SELECT x.* FROM v3 x, v3 y;
+    CREATE VIEW v5 AS SELECT x.* FROM v4 x, v4 y;
+    CREATE VIEW v6 AS SELECT x.* FROM v5 x, v5 y;
+    CREATE VIEW v7 AS SELECT x.* FROM v6 x, v6 y;
+    CREATE VIEW v8 AS SELECT x.* FROM v7 x, v7 y;
+    CREATE VIEW v9 AS SELECT x.* FROM v8 x, v8 y;
+    CREATE VIEW v10 AS SELECT x.* FROM v9 x, v9 y;
+    CREATE VIEW v11 AS SELECT x.* FROM v10 x, v10 y;
+    CREATE VIEW v12 AS SELECT x.* FROM v11 x, v11 y;
+    CREATE VIEW v13 AS SELECT x.* FROM v12 x, v12 y;
+    CREATE VIEW v14 AS SELECT x.* FROM v13 x, v13 y;
+    CREATE VIEW v15 AS SELECT x.* FROM v14 x, v14 y;
+    CREATE VIEW v16 AS SELECT x.* FROM v15 x, v15 y;
+    CREATE VIEW v17 AS SELECT x.* FROM v16 x, v16 y;
+    CREATE VIEW v18 AS SELECT x.* FROM v17 x, v17 y;
+    CREATE VIEW v19 AS SELECT x.* FROM v18 x, v18 y;
+    CREATE VIEW v20 AS SELECT x.* FROM v19 x, v19 y;
+    CREATE VIEW v21 AS SELECT x.* FROM v20 x, v20 y;
+    CREATE VIEW v22 AS SELECT x.* FROM v21 x, v21 y;
+    CREATE VIEW v23 AS SELECT x.* FROM v22 x, v22 y;
+    CREATE VIEW v24 AS SELECT x.* FROM v23 x, v23 y;
+    CREATE TRIGGER tr AFTER INSERT ON u BEGIN SELECT a FROM v24; END;
+    ALTER TABLE u RENAME COLUMN a TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'tr';
+    ALTER TABLE t RENAME COLUMN a TO c;
+    SELECT name FROM pragma_table_info('v24');
+}
+expect {
+    CREATE TRIGGER tr AFTER INSERT ON u BEGIN SELECT a FROM v24; END
+    c
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-subquery {
     CREATE TABLE t (a, b);
     CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t WHERE t.b = 1);
@@ -208,6 +296,46 @@ test alter-table-rename-column-view-mutual-cycle {
     ALTER TABLE t RENAME COLUMN b TO c;
 }
 expect error {
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-trigger-reads-view-over-dropped-table {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS SELECT * FROM t;
+    CREATE TABLE u(a, b);
+    CREATE TABLE log(y);
+    CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO log SELECT a FROM v; END;
+    DROP TABLE t;
+    ALTER TABLE u RENAME COLUMN a TO c;
+}
+expect error {
+    error in view v: no such table
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-with-temp-views-over-main-table {
+    CREATE TABLE m(a, b);
+    CREATE TEMP VIEW tv AS SELECT a FROM m;
+    CREATE TEMP VIEW tw AS SELECT a FROM tv;
+    ALTER TABLE m RENAME COLUMN b TO z;
+    SELECT sql FROM sqlite_temp_schema ORDER BY name;
+}
+expect {
+    CREATE VIEW tv AS SELECT a FROM m
+    CREATE VIEW tw AS SELECT a FROM tv
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-view-subquery-reads-view-over-dropped-table {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS SELECT * FROM t;
+    CREATE TABLE u(a, b);
+    CREATE VIEW w AS SELECT b FROM u WHERE EXISTS (SELECT a FROM v);
+    DROP TABLE t;
+    ALTER TABLE u RENAME COLUMN a TO c;
+}
+expect error {
+    error in view v: no such table
 }
 
 test alter-table-rename-column-view-attached-db-qualified {

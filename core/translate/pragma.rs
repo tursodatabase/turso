@@ -14,7 +14,7 @@ use super::integrity_check::{
 };
 use crate::function::Func;
 use crate::pragma::pragma_for;
-use crate::schema::{BTreeTable, Index, Schema, Table};
+use crate::schema::{BTreeTable, Index, Schema, Table, View};
 use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
@@ -23,7 +23,7 @@ use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::plan::BitSet;
 use crate::util::{
-    normalize_ident, parse_signed_number, parse_string, IOExt as _,
+    normalize_ident, parse_signed_number, parse_string, IOExt as _, ViewResolution,
     PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
@@ -166,6 +166,7 @@ fn emit_table_list_rows_for_schema(
         program.emit_int(strict as i64, base_reg + 5);
         program.emit_result_row(base_reg, 6);
     };
+    let mut resolution = ViewResolution::new(database_id);
 
     if let Some(filter_name) = filter_name {
         let lookup_name = normalize_table_pragma_lookup_name(database_id, filter_name);
@@ -187,7 +188,7 @@ fn emit_table_list_rows_for_schema(
                 program,
                 &view.name,
                 "view",
-                view.columns.len(),
+                table_list_view_column_count(&view, schema, &mut resolution),
                 false,
                 false,
             );
@@ -213,11 +214,21 @@ fn emit_table_list_rows_for_schema(
             program,
             &view.name,
             "view",
-            view.columns.len(),
+            table_list_view_column_count(view, schema, &mut resolution),
             false,
             false,
         );
     }
+}
+
+fn table_list_view_column_count(
+    view: &View,
+    schema: &Schema,
+    resolution: &mut ViewResolution,
+) -> usize {
+    resolution
+        .view_columns(view, schema)
+        .map_or(0, |columns| columns.len())
 }
 
 /// SQLite matches PRAGMA names without regard to case.
@@ -1425,7 +1436,8 @@ fn query_pragma(
                     } else if let Some(view) = db_schema.get_view(&lookup_name) {
                         emit_columns_for_table_info(
                             program,
-                            &view.columns,
+                            &ViewResolution::new(table_database_id)
+                                .view_columns(&view, db_schema)?,
                             // Views are query definitions, not tables; pk is always 0.
                             None,
                             base_reg,
@@ -1486,7 +1498,8 @@ fn query_pragma(
                     } else if let Some(view) = db_schema.get_view(&lookup_name) {
                         emit_columns_for_table_info(
                             program,
-                            &view.columns,
+                            &ViewResolution::new(table_database_id)
+                                .view_columns(&view, db_schema)?,
                             // Views are query definitions, not tables; pk is always 0.
                             None,
                             base_reg,

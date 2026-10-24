@@ -71,3 +71,26 @@ fn create_materialized_view_is_rejected_in_mvcc_mode() {
     let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, v FROM t");
     assert_eq!(rows, vec![(1, 10)]);
 }
+
+#[test]
+fn database_opens_when_a_view_joins_using_a_view_over_a_dropped_table() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("view_over_dropped_table.db");
+    let opts = turso_core::DatabaseOpts::new();
+    {
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(a)").unwrap();
+        conn.execute("CREATE TABLE t2(a)").unwrap();
+        conn.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
+        conn.execute("CREATE VIEW jv AS SELECT * FROM t2 JOIN v USING(a)")
+            .unwrap();
+        conn.execute("DROP TABLE t").unwrap();
+        conn.close().unwrap();
+    }
+    let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+    let conn = db.connect_limbo();
+    let rows: Vec<(String, i64)> = conn
+        .exec_rows("SELECT name, ncol FROM pragma_table_list WHERE type = 'view' ORDER BY name");
+    assert_eq!(rows, vec![("jv".to_string(), 0), ("v".to_string(), 0)]);
+}
