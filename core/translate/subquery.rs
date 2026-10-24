@@ -18,7 +18,7 @@ use crate::{
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
-        collate::in_subquery_side_collation,
+        collate::get_expr_collation_ctx_with_symbols,
         compound_select::emit_program_for_compound_select,
         emitter::select::{
             emit_materialized_build_inputs, emit_program_for_select_with_resolver, emit_query,
@@ -1014,7 +1014,11 @@ fn get_subquery_parser<'a>(
                         )
                         .aff_mask(),
                     );
-                    lhs_collations.push(in_subquery_side_collation(lhs_expr, referenced_tables)?);
+                    lhs_collations.push(get_expr_collation_ctx_with_symbols(
+                        lhs_expr,
+                        referenced_tables,
+                        Some(resolver.symbol_table),
+                    )?);
                 }
                 let in_affinity_str: Arc<String> = Arc::new(affinity_chars);
 
@@ -1022,13 +1026,23 @@ fn get_subquery_parser<'a>(
                     .iter()
                     .enumerate()
                     .map(|(i, c)| {
-                        let rhs_collation = in_subquery_side_collation(&c.expr, table_references)?;
+                        let lhs_collation = lhs_collations[i];
+                        let rhs_collation = get_expr_collation_ctx_with_symbols(
+                            &c.expr,
+                            table_references,
+                            Some(resolver.symbol_table),
+                        )?;
                         Ok::<_, crate::LimboError>(IndexColumn {
                             name: c.name(table_references).unwrap_or("").to_string(),
                             order: SortOrder::Asc,
                             nulls_order: None,
                             pos_in_table: i,
-                            collation: lhs_collations[i].or(rhs_collation),
+                            collation: lhs_collation
+                                .filter(|(_, explicit)| *explicit)
+                                .or_else(|| rhs_collation.filter(|(_, explicit)| *explicit))
+                                .or(lhs_collation)
+                                .or(rhs_collation)
+                                .map(|(collation, _)| collation),
                             default: None,
                             expr: None,
                         })

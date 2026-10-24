@@ -39,7 +39,7 @@ addr  opcode             p1  p2  p3  p4                 p5  comment
   22      MakeRecord     12   2   4                      0  r[4]=mkrec(r[12..13]); for sqlite_autoindex_parent_1
   23      NoConflict      2  27  12  1                   0  key=r[12..12]
   24      IdxRowId        2  14   0                      0  r[14]=cursor 2.rowid
-  25      Eq              5  14  27  Binary              0  if r[5]==r[14] goto 27
+  25      Eq              5  14  27                      0  if r[5]==r[14] goto 27
   26      Halt         2067   0   0  parent.k            0
   27      Column          1   1  15                      0  r[15]=parent.k
   28      Copy            7  16   0                      0  r[16]=r[7]

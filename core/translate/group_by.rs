@@ -1093,12 +1093,12 @@ pub fn group_by_emit_row_phase<'a>(
             agg_result_reg,
             &t_ctx.resolver,
         )?;
-        t_ctx.resolver.cache_expr_reg(
+        t_ctx.resolver.cache_scalar_expr_reg(
             std::borrow::Cow::Owned(agg.original_expr.clone()),
             agg_result_reg,
             false,
-            None,
-        );
+            &plan.table_references,
+        )?;
     }
 
     t_ctx.resolver.enable_expr_to_reg_cache();

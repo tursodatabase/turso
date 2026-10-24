@@ -57,9 +57,11 @@ pub(super) fn translate_in_list(
     // dest if null should be in ConditionMetadata
     resolver: &Resolver,
 ) -> Result<()> {
+    program.reset_collation();
     let lhs_arity = expr_vector_size(lhs)?;
     let lhs_reg = program.alloc_registers(lhs_arity);
     let _ = translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
+    let lhs_collation = program.curr_collation_ctx();
     let mut check_null_reg = 0;
     let mut check_null_in_row_values_reg = 0;
     let label_ok = program.allocate_label();
@@ -100,7 +102,18 @@ pub(super) fn translate_in_list(
     for (i, expr) in rhs.iter().enumerate() {
         let last_condition = i == rhs.len() - 1;
         let rhs_reg = program.alloc_registers(lhs_arity);
+        program.reset_collation();
         let _ = translate_expr(program, referenced_tables, expr, rhs_reg, resolver)?;
+        let rhs_collation = program.curr_collation_ctx();
+        let collation = lhs_collation
+            .filter(|(_, explicit)| *explicit)
+            .or_else(|| {
+                rhs_collation.filter(|(_, explicit)| {
+                    rhs.len() == 1 && expr.is_constant(resolver) && *explicit
+                })
+            })
+            .or(lhs_collation)
+            .map(|(collation, _)| collation);
 
         if lhs_arity == 1 {
             // Scalar comparison path
@@ -119,12 +132,7 @@ pub(super) fn translate_in_list(
                         rhs: rhs_reg,
                         target_pc: label_ok,
                         flags: cmp_flags,
-                        collation: comparison_collation(
-                            lhs,
-                            expr,
-                            referenced_tables,
-                            Some(resolver),
-                        )?,
+                        collation,
                     });
                 } else {
                     program.emit_insn(Insn::NotNull {
@@ -138,7 +146,7 @@ pub(super) fn translate_in_list(
                     rhs: rhs_reg,
                     target_pc: condition_metadata.jump_target_when_false,
                     flags: cmp_flags.jump_if_null(),
-                    collation: comparison_collation(lhs, expr, referenced_tables, Some(resolver))?,
+                    collation,
                 });
             } else {
                 program.emit_insn(Insn::IsNull {

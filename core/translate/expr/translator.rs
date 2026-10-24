@@ -146,7 +146,7 @@ fn translate_expr_by_kind(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    match expr {
+    let register = match expr {
         ast::Expr::SubqueryResult { .. } => translate_subquery_result_expr(
             program,
             referenced_tables,
@@ -254,7 +254,30 @@ fn translate_expr_by_kind(
         ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
             unreachable!("Array and Subscript are desugared into function calls by the parser")
         }
+    }?;
+    if matches!(
+        expr,
+        ast::Expr::FunctionCall { .. }
+            | ast::Expr::Case { .. }
+            | ast::Expr::Between { .. }
+            | ast::Expr::InList { .. }
+            | ast::Expr::Like { .. }
+            | ast::Expr::IsNull(_)
+            | ast::Expr::NotNull(_)
+    ) {
+        let collation = crate::translate::collate::get_explicit_collseq_from_expr(
+            expr,
+            Some(resolver.symbol_table),
+        )?;
+        program.set_collation(collation.map(|collation| (collation, true)));
+    } else if matches!(expr, ast::Expr::Unary(op, _) if *op != UnaryOperator::Positive) {
+        program.set_collation(
+            program
+                .curr_collation_ctx()
+                .filter(|(_, explicit)| *explicit),
+        );
     }
+    Ok(register)
 }
 
 #[inline(never)]
@@ -540,7 +563,7 @@ fn translate_binary_expr(
     // These use truth semantics (only non-zero numbers are truthy) rather than equality.
     if matches!(op, ast::Operator::Is | ast::Operator::IsNot) {
         if let Some(is_true_literal) = truth_test_rhs(e2) {
-            return translate_truth_test_expr(
+            translate_truth_test_expr(
                 program,
                 referenced_tables,
                 e1,
@@ -548,7 +571,13 @@ fn translate_binary_expr(
                 is_true_literal,
                 target_register,
                 resolver,
+            )?;
+            program.set_collation(
+                program
+                    .curr_collation_ctx()
+                    .filter(|(_, explicit)| *explicit),
             );
+            return Ok(target_register);
         }
     }
 
@@ -657,6 +686,7 @@ fn translate_case_expr(
     // case statement we're processing.
     let base_reg = base.as_ref().map(|_| program.alloc_register());
     let expr_reg = program.alloc_register();
+    program.reset_collation();
     if let Some(base_expr) = base {
         translate_expr(
             program,
@@ -666,7 +696,9 @@ fn translate_case_expr(
             resolver,
         )?;
     };
+    let base_collation = program.curr_collation_ctx();
     for (when_expr, then_expr) in when_then_pairs {
+        program.reset_collation();
         translate_expr_no_constant_opt(
             program,
             referenced_tables,
@@ -675,6 +707,13 @@ fn translate_case_expr(
             resolver,
             NoConstantOptReason::RegisterReuse,
         )?;
+        let when_collation = program.curr_collation_ctx();
+        let collation = base_collation
+            .filter(|(_, explicit)| *explicit)
+            .or_else(|| when_collation.filter(|(_, explicit)| *explicit))
+            .or(base_collation)
+            .or(when_collation)
+            .map(|(collation, _)| collation);
         match base_reg {
             // CASE 1 WHEN 0 THEN 0 ELSE 1 becomes 1==0, Ne branch to next clause
             Some(base_reg) => program.emit_insn(Insn::Ne {
@@ -683,7 +722,7 @@ fn translate_case_expr(
                 target_pc: next_case_label,
                 // A NULL result is considered untrue when evaluating WHEN terms.
                 flags: CmpInsFlags::default().jump_if_null(),
-                collation: program.curr_collation(),
+                collation,
             }),
             // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
             None => program.emit_insn(Insn::IfNot {
