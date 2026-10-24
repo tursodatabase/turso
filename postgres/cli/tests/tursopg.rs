@@ -1709,6 +1709,46 @@ fn timestamptz_rows_written_before_pg_types_match_new_rows() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn timestamptz_compared_with_subquery_text_matches_with_and_without_index() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE plain (id int, ts timestamptz)");
+        c.query_command_tags("CREATE TABLE indexed (id int, ts timestamptz)");
+        c.query_command_tags("CREATE INDEX indexed_ts ON indexed (ts)");
+        c.query_command_tags("CREATE TABLE spellings (s text)");
+        c.query_command_tags("INSERT INTO spellings VALUES ('2026-10-08 14:00+02')");
+        for table in ["plain", "indexed"] {
+            c.query_command_tags(&format!(
+                "INSERT INTO {table} VALUES (1, '2026-10-08 12:00+00'), (2, '2026-10-08 12:00:00.5+00')"
+            ));
+            for condition in [
+                "ts IN (SELECT '2026-10-08 14:00+02')",
+                "ts IN (SELECT '2026-10-08 14:00+02' UNION ALL SELECT '2026-10-08 13:00+02' WHERE false)",
+                "ts IN (SELECT s FROM spellings)",
+                "ts = (SELECT s FROM spellings)",
+                "ts = (SELECT '2026-10-08 14:00+02')",
+            ] {
+                assert_eq!(
+                    c.query_single_text(&format!(
+                        "SELECT string_agg(id::text, ',') FROM {table} WHERE {condition}"
+                    )),
+                    "1",
+                    "{table}: {condition}"
+                );
+            }
+            assert_eq!(
+                c.query_error_fields(&format!(
+                    "SELECT id FROM {table} WHERE ts IN (-1, '2026-10-08 12:00+00')"
+                ))
+                .get(&b'C')
+                .map(String::as_str),
+                Some("22007"),
+                "{table}"
+            );
+        }
+    });
+}
+
 /// Direct table-column references take the schema-tagged path: a column
 /// declared INTEGER reports INT4, TEXT reports TEXT, and so on. The wire
 /// layer must not regress to TEXT here.

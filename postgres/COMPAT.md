@@ -151,13 +151,14 @@ binary-format results. Not supported: years before 0001 or after 9999
 session time zones other than UTC, POSIX time zone specs, and fractional-second
 precision such as `timestamptz(3)`. SQLite date functions (`strftime`,
 `datetime`, `julianday`, `unixepoch`) do not read the `+00` suffix and return
-NULL for timestamptz values. A quoted string or parameter compared with a
-column of these types (or uuid, boolean and other built-in types) is converted
-to the column's type first, so `ts = '2026-10-08 14:00+02'` matches
-`2026-10-08 12:00:00+00` with or without an index. Text produced by a subquery,
-as in `d IN (SELECT '2026-10-08')`, is compared as text without conversion
-(PostgreSQL rejects `date = text`); cast it, as in `SELECT '2026-10-08'::date`. Comparing values of two different datetime types, such as a timestamptz column
-with a date column, compares their text instead of converting one to the other.
+NULL for timestamptz values. A string, parameter, text column or subquery result
+compared with a column of these types (or uuid, boolean and other built-in
+types) is converted to the column's type first, so `ts = '2026-10-08 14:00+02'`
+and `ts IN (SELECT '2026-10-08 14:00+02')` match `2026-10-08 12:00:00+00` with
+or without an index. PostgreSQL rejects the subquery and text column forms
+(`timestamptz = text`). Comparing values of two different datetime types, such
+as a timestamptz column with a date column, compares their text instead of
+converting one to the other.
 A parameter sent with a date or timestamp type is not treated as a date in
 arithmetic (`$1 + 1` adds to the year number). `date + '1 day'` is accepted (PostgreSQL rejects
 it as ambiguous).

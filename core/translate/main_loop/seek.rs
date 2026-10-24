@@ -23,11 +23,12 @@ fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
 /// `key_exprs[i]` is the expression of key `i`, or None when the key does not
 /// come from an expression of its own (e.g. an `IN (subquery)` value).
 ///
-/// A quoted string or a bound parameter is converted to the column's type,
-/// as the scan does. Any other key is compared by the scan with the decoded
-/// column value as it is, so it is used as it is when stored and decoded
-/// values look the same, and encoded otherwise (uuid, boolean), which maps a
-/// decoded value of the type back to its stored form.
+/// When the dialect converts values compared with custom types, a key that
+/// has no custom type of its own is converted to the column's type, as the
+/// scan does. Any other key is compared by the scan with the decoded column
+/// value as it is, so it is used as it is when stored and decoded values look
+/// the same, and encoded otherwise (uuid, boolean), which maps a decoded value
+/// of the type back to its stored form.
 pub(super) fn encode_seek_keys_for_custom_types(
     program: &mut ProgramBuilder,
     tables: &TableReferences,
@@ -65,7 +66,9 @@ pub(super) fn encode_seek_keys_for_custom_types(
         if let Some(key_expr) = key_expr {
             if let Some(converted_reg) = crate::translate::expr::emit_untyped_value_as_type(
                 program,
+                Some(tables),
                 key_expr,
+                reg,
                 table_col,
                 &resolved.chain,
                 crate::translate::expr::ValueForm::Stored,
