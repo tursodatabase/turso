@@ -8768,7 +8768,7 @@ mod tests {
         };
 
         let expected = [
-            ast::Expr::Literal(ast::Literal::CurrentTimestamp),
+            now_call(),
             ast::Expr::Literal(ast::Literal::CurrentDate),
             ast::Expr::Literal(ast::Literal::CurrentTime),
         ];

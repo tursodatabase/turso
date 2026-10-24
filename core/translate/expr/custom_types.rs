@@ -373,7 +373,7 @@ pub(super) fn emit_comparison_value_as_column_type(
 
 struct ComparisonType {
     column: Column,
-    chain: Vec<Arc<TypeDef>>,
+    chain: crate::alloc::Vec<Arc<TypeDef>>,
     form: ValueForm,
 }
 
