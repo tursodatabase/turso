@@ -248,6 +248,111 @@ expect {
     ABC|def|4
 }
 
+test select-substring-negative-start {
+    SELECT substring('abc' from -1 for 3);
+}
+expect {
+    a
+}
+
+test select-substring-negative-length {
+    SELECT substring('abcdef' from 2 for -1);
+}
+expect error {}
+
+test select-substring-basic {
+    SELECT substring('abcdef' from 2 for 3);
+}
+expect {
+    bcd
+}
+
+test select-substring-start-zero {
+    SELECT substring('abc' from 0 for 3);
+}
+expect {
+    ab
+}
+
+test select-substring-negative-start-longer-length {
+    SELECT substring('abc' from -1 for 4);
+}
+expect {
+    ab
+}
+
+test select-substring-negative-length-zero-start {
+    SELECT substring('abc' from 0 for -1);
+}
+expect error {}
+
+test select-substring-zero-length {
+    SELECT substring('abcdef' from 2 for 0);
+}
+expect {}
+
+test select-substring-start-beyond-end {
+    SELECT substring('abc' from 5 for 2);
+}
+expect {}
+
+test select-substring-start-at-end {
+    SELECT substring('abc' from 3 for 1);
+}
+expect {
+    c
+}
+
+test select-substring-no-length {
+    SELECT substring('abcdef' from 3);
+}
+expect {
+    cdef
+}
+
+test select-substring-no-start {
+    SELECT substring('abcdef' for 3);
+}
+expect {
+    abc
+}
+
+test select-substring-empty-string {
+    SELECT substring('' from 1 for 3);
+}
+expect {}
+
+test select-substring-length-exceeds-string {
+    SELECT substring('abc' from 2 for 10);
+}
+expect {
+    bc
+}
+
+test select-substring-negative-start-exact-boundary {
+    SELECT substring('abc' from -1 for 2);
+}
+expect {}
+
+test select-substring-negative-start-zero-length {
+    SELECT substring('abc' from -1 for 0);
+}
+expect {}
+
+test select-substring-negative-start-large-length {
+    SELECT substring('abc' from -2 for 5);
+}
+expect {
+    ab
+}
+
+test select-substring-unicode {
+    SELECT substring('你好世界' from 2 for 2);
+}
+expect {
+    好世
+}
+
 test select-abs {
     SELECT abs(-7);
 }
