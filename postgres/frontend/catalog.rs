@@ -159,7 +159,10 @@ impl Dialect for PostgresDialect {
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
-        register_catalog_modules(crate::functions::register_functions(options))
+        let options = crate::functions::register_functions(options);
+        #[cfg(feature = "test_helper")]
+        let options = crate::auth_functions::register_functions(options);
+        register_catalog_modules(options)
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {

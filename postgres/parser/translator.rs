@@ -3832,7 +3832,7 @@ impl PostgreSQLTranslator {
         &self,
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
-        let func_name = object_name(&func_call.funcname, is_pg_catalog, "function")?;
+        let func_name = function_name(&func_call.funcname)?;
         if func_name.eq_ignore_ascii_case("substring")
             && func_call.args.get(1).is_some_and(is_text_pattern)
         {
@@ -7000,6 +7000,13 @@ fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
             .iter()
             .any(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "||")),
         _ => false,
+    }
+}
+
+fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
+    match extract_key_columns(names)?.as_slice() {
+        [schema, name] if !is_default_schema(schema) => Ok(format!("{schema}.{name}")),
+        _ => object_name(names, is_pg_catalog, "function"),
     }
 }
 
@@ -10550,13 +10557,40 @@ mod tests {
 
     #[test]
     fn fail_closed_schema_qualified_functions() {
-        assert_not_supported("SELECT myschema.f(1)", "schema-qualified function");
+        assert_not_supported("SELECT public.lower('A')", "schema-qualified function");
         assert_not_supported(
             "SELECT * FROM myschema.generate_series(1, 3)",
             "schema-qualified function",
         );
         assert_translates("SELECT pg_catalog.lower('A')");
         assert_translates("SELECT * FROM pg_catalog.generate_series(1, 3)");
+    }
+
+    #[test]
+    fn function_of_a_schema_is_called_by_its_schema_and_its_name() {
+        for (sql, expected_name) in [
+            ("SELECT auth.uid()", "auth.uid"),
+            ("SELECT AUTH.UID()", "auth.uid"),
+            ("SELECT \"Auth\".uid()", "Auth.uid"),
+            ("SELECT myschema.f(1)", "myschema.f"),
+            ("SELECT pg_catalog.lower('A')", "lower"),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let ast::Stmt::Select(select) = PostgreSQLTranslator::new().translate(&parsed).unwrap()
+            else {
+                panic!("{sql}: expected a SELECT");
+            };
+            let ast::OneSelect::Select { columns, .. } = &select.body.select else {
+                panic!("{sql}: expected a simple SELECT");
+            };
+            let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
+                panic!("{sql}: expected an expression");
+            };
+            let ast::Expr::FunctionCall { name, .. } = &**expr else {
+                panic!("{sql}: expected a function call, got {expr:?}");
+            };
+            assert_eq!(name.as_str(), expected_name, "{sql}");
+        }
     }
 
     #[test]

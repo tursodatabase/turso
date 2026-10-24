@@ -36,7 +36,7 @@ build: build-tursopg build-runner
 
 # Build the tursopg server binary
 build-tursopg:
-	cd $(ROOT_DIR) && cargo build $(CARGO_PROFILE) --package tursopg
+	cd $(ROOT_DIR) && cargo build $(CARGO_PROFILE) --package tursopg --features test_helper
 
 # Build the sqltest runner
 build-runner:
