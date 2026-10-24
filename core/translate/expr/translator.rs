@@ -311,17 +311,23 @@ fn try_emit_expression_index_value_if_any(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<bool> {
-    let has_expression_indexes = !program.flags.skip_expression_index_values()
+    if !has_expression_index_values(program, referenced_tables) {
+        return Ok(false);
+    }
+    try_emit_expression_index_value(program, referenced_tables, expr, target_register, resolver)
+}
+
+pub(super) fn has_expression_index_values(
+    program: &ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+) -> bool {
+    !program.flags.skip_expression_index_values()
         && referenced_tables.is_some_and(|tables| {
             tables
                 .joined_tables()
                 .iter()
                 .any(|t| !t.expression_index_usages.is_empty())
-        });
-    if !has_expression_indexes {
-        return Ok(false);
-    }
-    try_emit_expression_index_value(program, referenced_tables, expr, target_register, resolver)
+        })
 }
 
 #[inline(never)]
