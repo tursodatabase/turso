@@ -246,17 +246,12 @@ impl Value {
 
     /// Generates the Soundex code for a given word
     pub fn exec_soundex(&self) -> Value {
-        let s = match self {
-            Value::Text(s) => s.as_str(),
-            Value::Null => return Value::build_text("?000"),
-            _ => return Value::build_text("?000"),
-        };
-
-        if s.bytes().any(|b| !b.is_ascii_alphabetic()) {
-            return Value::build_text("?000");
-        }
-
-        let mut bytes = s.bytes();
+        let value_bytes = self.byte_view().unwrap_or_default();
+        let text = &value_bytes[..first_nul(&value_bytes).unwrap_or(value_bytes.len())];
+        let mut bytes = text
+            .iter()
+            .copied()
+            .skip_while(|b| !b.is_ascii_alphabetic());
         let Some(first_char) = bytes.next() else {
             return Value::build_text("?000");
         };
@@ -265,7 +260,7 @@ impl Value {
         let mut result = String::with_capacity(4);
         result.push(first_upper as char);
         let get_code = |b: u8| -> Option<char> {
-            match b.to_ascii_lowercase() {
+            match (b & 0x7f).to_ascii_lowercase() {
                 b'b' | b'f' | b'p' | b'v' => Some('1'),
                 b'c' | b'g' | b'j' | b'k' | b'q' | b's' | b'x' | b'z' => Some('2'),
                 b'd' | b't' => Some('3'),
@@ -281,12 +276,6 @@ impl Value {
         for b in bytes {
             if result.len() >= 4 {
                 break;
-            }
-
-            // H and W are ignored completely in this step for continuity checks
-            let lower = b.to_ascii_lowercase();
-            if lower == b'h' || lower == b'w' {
-                continue;
             }
 
             let code = get_code(b);
@@ -731,7 +720,7 @@ impl Value {
     }
 
     /// Returns the raw bytes backing this value for the byte-manipulation
-    /// functions (`get_byte`/`set_byte`). Blobs are used verbatim; text is
+    /// functions (`get_byte`/`set_byte`) and `soundex()`. Blobs are used verbatim; text is
     /// interpreted as its UTF-8 bytes; numbers use their textual form (matching
     /// how `hex()` coerces). `NULL` has no byte view.
     fn byte_view(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
@@ -2712,7 +2701,7 @@ mod tests {
         assert_eq!(input_str.exec_soundex(), expected_str);
 
         let input_str = Value::build_text("Ashcraft");
-        let expected_str = Value::build_text("A261");
+        let expected_str = Value::build_text("A226");
         assert_eq!(input_str.exec_soundex(), expected_str);
 
         let input_str = Value::build_text("Robert");

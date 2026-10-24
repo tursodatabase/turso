@@ -153,10 +153,6 @@ pub fn translate_analyze(
     // Resolve the target database and collect analyze targets.
     let (database_id, analyze_targets) = resolve_analyze_targets(&target_opt, catalog)?;
 
-    if analyze_targets.is_empty() {
-        return Ok(());
-    }
-
     // Register a write transaction for the target database so that the
     // epilogue emits a Transaction instruction (which starts the MVCC
     // exclusive transaction required by OpenWrite on sqlite_schema).

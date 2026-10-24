@@ -1876,7 +1876,7 @@ impl InsertRow<'_> {
                 )?,
             }
         }
-        super::fkey::emit_update_repairs(program, &pending_repairs, database)?;
+        super::fkey::emit_update_repairs(program, document, &pending_repairs, database)?;
         if let (Some(sequence), Some(_)) = (self.sequence, new_rowid) {
             sequence.emit_moved_row(program, written)?;
         }
@@ -2964,7 +2964,7 @@ mod tests {
             "INSERT INTO counted VALUES (1, 'x') ON CONFLICT DO UPDATE SET id = 5",
             "INSERT INTO counted VALUES (1, 'x') ON CONFLICT DO UPDATE SET rowid = 5",
             // `items` has no INTEGER PRIMARY KEY.
-            "INSERT INTO items VALUES (1, 'x') ON CONFLICT DO UPDATE SET oid = 5",
+            "INSERT INTO items(rowid, value) VALUES (1, 'x') ON CONFLICT DO UPDATE SET oid = 5",
         ] {
             let program = emit(sql);
             assert_eq!(

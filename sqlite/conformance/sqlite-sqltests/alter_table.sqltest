@@ -69,6 +69,40 @@ expect {
     a|x
 }
 
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@cross-check-integrity
+test alter-table-rename-column-without-rowid-first-key-column {
+    CREATE TABLE t (a, b, c, PRIMARY KEY (a, b, c)) WITHOUT ROWID;
+    INSERT INTO t VALUES (1, 2, 3);
+    ALTER TABLE t RENAME COLUMN a TO x;
+    SELECT * FROM t;
+    SELECT count(*) FROM t WHERE x = 1;
+    INSERT INTO t VALUES (4, 5, 6);
+    SELECT * FROM t;
+    SELECT count(*) FROM t WHERE x = 4 AND b = 5 AND c = 6;
+}
+expect {
+    1|2|3
+    1
+    1|2|3
+    4|5|6
+    1
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@cross-check-integrity
+test alter-table-rename-column-without-rowid-two-column-key {
+    CREATE TABLE t (a, b, PRIMARY KEY (a, b)) WITHOUT ROWID;
+    INSERT INTO t VALUES (1, 2);
+    ALTER TABLE t RENAME COLUMN a TO x;
+    SELECT * FROM t;
+    SELECT count(*) FROM t WHERE x = 1;
+}
+expect {
+    1|2
+    1
+}
+
 @skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view {
     CREATE TABLE t (a, b);

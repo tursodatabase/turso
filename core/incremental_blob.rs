@@ -279,6 +279,11 @@ impl Connection {
         rowid: i64,
         read_write: bool,
     ) -> Result<Blob> {
+        if self.mvcc_enabled() {
+            return Err(LimboError::InternalError(
+                "incremental blob I/O is not supported in MVCC mode".to_string(),
+            ));
+        }
         let fk_enforced = self.foreign_keys_enabled();
         let (table_ref, record_column) = self.with_schema_mut(|schema| {
             if schema.is_materialized_view(table) || schema.get_view(table).is_some() {

@@ -4654,6 +4654,47 @@ expect error {
 }
 
 @cross-check-integrity
+test fk-deferred-insert-parent-fixes-virtual-col-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER, g INTEGER GENERATED ALWAYS AS (x * 2) VIRTUAL REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c(x) VALUES(7);
+    INSERT INTO p VALUES(14);
+    COMMIT;
+    SELECT x, g FROM c;
+}
+expect {
+    7|14
+}
+
+@cross-check-integrity
+test fk-delete-parent-referenced-by-virtual-col-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER, g INTEGER GENERATED ALWAYS AS (x * 2) VIRTUAL REFERENCES p(id), y INTEGER);
+    INSERT INTO p VALUES(14);
+    INSERT INTO c(x, y) VALUES(7, 1);
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-drop-parent-referenced-by-virtual-col-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER, g INTEGER GENERATED ALWAYS AS (x * 2) VIRTUAL REFERENCES p(id));
+    INSERT INTO p VALUES(14);
+    INSERT INTO c(x) VALUES(7);
+    DROP TABLE p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
 test fk-child-references-parent-virtual-col {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY, a INTEGER, v AS (a * 2) VIRTUAL UNIQUE);

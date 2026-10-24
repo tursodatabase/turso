@@ -94,6 +94,47 @@ expect {
     4|'y'|'y'
 }
 
+setup empty_concat_suffix_values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, w TEXT);
+    INSERT INTO t VALUES (1,'a','a'),(2,'',''),(3,NULL,'');
+}
+
+@setup empty_concat_suffix_values
+@cross-check-integrity
+test moving-group-concat-only-empty-strings-left {
+    SELECT id,
+           quote(group_concat(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING)),
+           quote(string_agg(v, '--') OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING)),
+           quote(group_concat(w) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING))
+    FROM t ORDER BY id;
+}
+expect {
+    1|'a,'|'a--'|'a,,'
+    2|''|''|','
+    3|NULL|NULL|''
+}
+
+setup empty_concat_middle_values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1,'a'),(2,''),(3,'b'),(4,''),(5,'c');
+}
+
+@setup empty_concat_middle_values
+@cross-check-integrity
+test moving-group-concat-step-after-text-emptied {
+    SELECT id,
+           quote(group_concat(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING)),
+           quote(group_concat(v, '--') OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW))
+    FROM t ORDER BY id;
+}
+expect {
+    1|'a,'|'a'
+    2|'b'|'a--'
+    3|''|'b'
+    4|'c'|''
+    5|''|'c'
+}
+
 setup peer_values {
     CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v TEXT, sep TEXT);
     INSERT INTO t VALUES

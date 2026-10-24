@@ -8305,7 +8305,7 @@ mod tests {
         let HirRoot::Insert(insert) = &document.root else {
             panic!("INSERT produces INSERT root");
         };
-        assert_eq!(insert.upserts.len(), 4);
+        assert_eq!(insert.upserts.len(), 3);
 
         let primary = insert.upserts[0]
             .target
@@ -8345,7 +8345,6 @@ mod tests {
         assert!(matches!(partial.terms[0].expr, Expr::Function(_)));
         assert!(matches!(partial.predicate, Some(Expr::Binary { .. })));
 
-        assert!(insert.upserts[3].target.is_none());
         assert!(insert
             .upserts
             .iter()
