@@ -248,3 +248,86 @@ expect {
     9|7|0|SEARCH q USING INDEX q_x (x=?)
     10|7|0|SEARCH p USING COVERING INDEX ephemeral_p_t3 (y=?)
 }
+
+# A materialized hash build input removes t1 from the join loops and keeps its
+# columns in the hash payload. A subquery in the SELECT list that reads t1 must
+# read the payload of the current row, including null-extended rows.
+setup materialized-build-input-left-join {
+    CREATE TABLE t(a, b, c);
+    CREATE TABLE u(b);
+    INSERT INTO t VALUES (1, NULL, 10), (2, 1, 20);
+    INSERT INTO u VALUES (2);
+    ANALYZE;
+}
+
+@setup materialized-build-input-left-join
+test select-list-subquery-reads-materialized-build-input-left-join {
+    SELECT t1.c, (SELECT t1.c), EXISTS (SELECT 1 WHERE t1.c = 10)
+    FROM t AS t1 JOIN t AS t2 ON t2.b = t1.a LEFT JOIN u ON u.b = t2.a;
+}
+expect {
+    10|10|1
+}
+
+@setup materialized-build-input-left-join
+test select-list-subquery-reads-materialized-build-input-inner-join {
+    SELECT t1.c, (SELECT t1.c), EXISTS (SELECT 1 WHERE t1.c = 10)
+    FROM t AS t1 JOIN t AS t2 ON t2.b = t1.a JOIN u ON u.b = t2.a;
+}
+expect {
+    10|10|1
+}
+
+@setup materialized-build-input-left-join
+@skip-if sqlite "SQLite does not use hash joins"
+test select-list-subquery-reads-materialized-build-input-uses-a-hash-join {
+    EXPLAIN QUERY PLAN
+    SELECT t1.c, (SELECT t1.c), EXISTS (SELECT 1 WHERE t1.c = 10)
+    FROM t AS t1 JOIN t AS t2 ON t2.b = t1.a LEFT JOIN u ON u.b = t2.a;
+}
+expect pattern {
+    (?s)MATERIALIZE hash build input.*HASH JOIN u
+}
+
+setup materialized-build-input-unmatched-rows {
+    CREATE TABLE t(a, b, c, d);
+    CREATE TABLE u(b);
+    INSERT INTO t VALUES (1, NULL, 10, 100), (2, 1, 20, 200), (3, 2, 30, 300), (4, 3, 40, 400);
+    INSERT INTO u VALUES (2);
+    ANALYZE;
+}
+
+@setup materialized-build-input-unmatched-rows
+test select-list-subquery-reads-materialized-build-input-unmatched-rows {
+    SELECT t1.c, (SELECT t1.d), EXISTS (SELECT 1 WHERE t1.c = 10), u.b
+    FROM t AS t1 JOIN t AS t2 ON t2.b = t1.a LEFT JOIN u ON u.b = t2.a
+    ORDER BY t1.c;
+}
+expect {
+    10|100|1|2
+    20|200|0|
+    30|300|0|
+}
+
+@setup materialized-build-input-unmatched-rows
+test where-subquery-reads-materialized-build-input-unmatched-rows {
+    SELECT t1.c, u.b
+    FROM t AS t1 JOIN t AS t2 ON t2.b = t1.a LEFT JOIN u ON u.b = t2.a
+    WHERE (SELECT t1.d) > coalesce(u.b, 0) * 100 + 250
+    ORDER BY t1.c;
+}
+expect {
+    30|
+}
+
+@setup materialized-build-input-unmatched-rows
+@skip-if sqlite "SQLite does not use hash joins"
+test select-list-subquery-reads-materialized-build-input-unmatched-rows-uses-a-hash-join {
+    EXPLAIN QUERY PLAN
+    SELECT t1.c, (SELECT t1.d), EXISTS (SELECT 1 WHERE t1.c = 10), u.b
+    FROM t AS t1 JOIN t AS t2 ON t2.b = t1.a LEFT JOIN u ON u.b = t2.a
+    ORDER BY t1.c;
+}
+expect pattern {
+    (?s)MATERIALIZE hash build input.*HASH JOIN u
+}

@@ -4292,7 +4292,8 @@ pub struct NonFromClauseSubquery {
     pub correlated: bool,
     pub origin: SubqueryOrigin,
     pub eval_phase: SubqueryEvalPhase,
-    /// Run after this table when a later loop needs fewer calls.
+    /// Run after this table, either because a later loop needs fewer calls or
+    /// because this table's hash join loads columns the subquery reads.
     pub preferred_eval_after_table: Option<TableInternalId>,
 }
 

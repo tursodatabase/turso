@@ -10,6 +10,7 @@ use crate::{
             MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
             OperationMode, ResultSetColumn, TableMask, TranslateCtx,
         },
+        expr::expr_references_subquery_id,
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
         optimizer::{constraints::partial_index, mark_partial_index_predicate_terms_consumed},
@@ -669,6 +670,57 @@ fn prune_join_order_for_materialized_inputs(
     }
     plan.join_order
         .retain(|member| !tables_to_remove.get(member.original_idx));
+
+    // The columns of the removed tables are read from the hash payload, so a
+    // correlated subquery that reads one of them must run in the probe loop.
+    // A WHERE subquery whose terms the build input already applied is not
+    // needed by the probe loop.
+    let payload_loop = plan
+        .join_order
+        .iter()
+        .position(|member| {
+            matches!(
+                &plan.table_references.joined_tables()[member.original_idx].op,
+                Operation::HashJoin(hash_join_op)
+                    if build_inputs
+                        .get(&hash_join_op.build_table_idx)
+                        .is_some_and(|input| !input.requires_build_table())
+            )
+        })
+        .expect("a materialized build input removed tables, so its probe loop remains");
+    let payload_probe_table_id = plan.join_order[payload_loop].table_id;
+    for subquery in plan.non_from_clause_subqueries.iter_mut() {
+        let SubqueryState::Unevaluated {
+            plan: Some(subquery_plan),
+        } = &subquery.state
+        else {
+            continue;
+        };
+        let reads_removed_table =
+            subquery_plan
+                .used_outer_query_ref_ids()
+                .iter()
+                .any(|outer_ref_id| {
+                    plan.table_references
+                        .joined_tables()
+                        .iter()
+                        .position(|table| table.internal_id == *outer_ref_id)
+                        .is_some_and(|table_idx| tables_to_remove.get(table_idx))
+                });
+        let only_used_by_applied_where_terms = subquery.origin == SubqueryOrigin::SelectWhere
+            && plan
+                .where_clause
+                .iter()
+                .filter(|term| expr_references_subquery_id(&term.expr, subquery.internal_id))
+                .all(|term| term.consumed);
+        if reads_removed_table
+            && !only_used_by_applied_where_terms
+            && subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?
+                < EvalAt::Loop(payload_loop)
+        {
+            subquery.preferred_eval_after_table = Some(payload_probe_table_id);
+        }
+    }
     Ok(())
 }
 
