@@ -6,7 +6,7 @@ use crate::types::IOResultOr;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     create_seek_range, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey, RowVersions,
-    SortableIndexKey,
+    SeenRowVersion, SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -577,6 +577,9 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     /// [`MvStore::index_rows_epoch`] read before the MVCC index peek was taken.
     /// See [`Self::reseek_index_if_index_rows_changed`].
     index_peek_epoch: u64,
+    /// The row a blob handle was opened on and the version of it the handle saw.
+    blob_row_version: Option<(RowID, SeenRowVersion)>,
+    blob_expired: bool,
 }
 
 pub enum NextRowidResult {
@@ -646,6 +649,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
             index_peek_epoch: 0,
+            blob_row_version: None,
+            blob_expired: false,
         })
     }
 
@@ -1631,6 +1636,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     /// already in memory. Writes are not supported in MVCC, so `blob_write_column`
     /// keeps the default that errors.
     fn blob_column_len(&mut self, column: usize) -> IOResultOr<usize> {
+        self.check_blob_row_unchanged()?;
         let record = return_if_io!(self.current_row());
         let record = record.ok_or_else(|| {
             LimboError::InternalError("incremental blob I/O: cursor is not on a row".to_string())
@@ -1646,6 +1652,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         len: usize,
         out: &mut crate::ValueBlob,
     ) -> IOResultOr<()> {
+        self.check_blob_row_unchanged()?;
         let record = return_if_io!(self.current_row());
         let record = record.ok_or_else(|| {
             LimboError::InternalError("incremental blob I/O: cursor is not on a row".to_string())
@@ -2395,6 +2402,32 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     /// Returns true if this cursor operates in MVCC mode.
     fn is_mvcc(&self) -> bool {
         true
+    }
+}
+
+impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock, A> {
+    /// Like the b-tree cursor, a blob handle expires for good once its row is updated
+    /// or deleted. The first call records which version of the row the handle sees;
+    /// a later call that sees another version, or none, expires the handle.
+    fn check_blob_row_unchanged(&mut self) -> Result<()> {
+        if self.blob_expired {
+            return Err(LimboError::BlobHandleExpired);
+        }
+        let CursorPosition::Loaded { row_id, .. } = &self.current_pos else {
+            return Err(LimboError::InternalError(
+                "incremental blob I/O: cursor is not on a row".to_string(),
+            ));
+        };
+        let seen = self.db.seen_row_version(self.snapshot, row_id)?;
+        match &self.blob_row_version {
+            None => self.blob_row_version = Some((row_id.clone(), seen)),
+            Some((pinned_row, pinned_seen)) if pinned_row == row_id && *pinned_seen == seen => {}
+            Some(_) => {
+                self.blob_expired = true;
+                return Err(LimboError::BlobHandleExpired);
+            }
+        }
+        Ok(())
     }
 }
 

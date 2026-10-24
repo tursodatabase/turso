@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use turso_core::{
     mvcc::persistent_storage::logical_log::LogTxFrameInfo, Clock, Completion, ConnectOpts,
-    Database, DatabaseOpts, EncryptionKey, EncryptionOpts, File, MonotonicInstant, OpenFlags,
-    OpenOptions, SqliteDialect, StepResult, WallClockInstant, IO,
+    Database, DatabaseOpts, EncryptionKey, EncryptionOpts, File, LimboError, MonotonicInstant,
+    OpenFlags, OpenOptions, SqliteDialect, StepResult, WallClockInstant, IO,
 };
 
 /// Create a new database file at `path` with MVCC journal mode enabled.
@@ -441,6 +441,80 @@ fn test_mvcc_blob_read_works_and_write_is_unsupported() -> anyhow::Result<()> {
 
     let rows: Vec<(String,)> = conn.exec_rows("SELECT hex(data) FROM files WHERE id = 1");
     assert_eq!(rows, vec![("00112233445566778899".to_string(),)]);
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_blob_expires_when_its_row_changes() -> anyhow::Result<()> {
+    for (case, change) in [
+        ("other_column", "UPDATE t SET x = 1 WHERE id = 1"),
+        (
+            "blob_column",
+            "UPDATE t SET data = x'FFFFFFFF' WHERE id = 1",
+        ),
+        ("delete", "DELETE FROM t WHERE id = 1"),
+    ] {
+        let tmp_db = TempDatabase::new_with_mvcc(&format!("test_mvcc_blob_expires_{case}.db"));
+        let conn = tmp_db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x, data BLOB)")?;
+        conn.execute("INSERT INTO t VALUES (1, 0, x'00112233')")?;
+
+        let mut blob = conn.blob_open("t", "data", 1, false)?;
+        let mut buf = [0u8; 4];
+        blob.read(0, &mut buf)?;
+        conn.execute(change)?;
+        for _ in 0..2 {
+            assert!(
+                matches!(blob.read(0, &mut buf), Err(LimboError::BlobHandleExpired)),
+                "{case}: the handle must expire, and stay expired"
+            );
+        }
+        blob.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_blob_opened_after_its_row_changed_in_the_same_transaction() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_blob_opened_after_its_row_changed.db");
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x, data BLOB)")?;
+    conn.execute("INSERT INTO t VALUES (1, 0, x'00112233')")?;
+    conn.execute("BEGIN")?;
+    conn.execute("UPDATE t SET data = x'44556677' WHERE id = 1")?;
+
+    let mut blob = conn.blob_open("t", "data", 1, false)?;
+    let mut buf = [0u8; 4];
+    blob.read(0, &mut buf)?;
+    assert_eq!(buf, [0x44, 0x55, 0x66, 0x77]);
+    conn.execute("UPDATE t SET x = 1 WHERE id = 1")?;
+    assert!(matches!(
+        blob.read(0, &mut buf),
+        Err(LimboError::BlobHandleExpired)
+    ));
+    blob.close()?;
+    conn.execute("COMMIT")?;
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_blob_on_a_checkpointed_row_expires_when_the_row_changes() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_blob_on_a_checkpointed_row.db");
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x, data BLOB)")?;
+    conn.execute("INSERT INTO t VALUES (1, 0, x'00112233')")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    let mut blob = conn.blob_open("t", "data", 1, false)?;
+    let mut buf = [0u8; 4];
+    blob.read(0, &mut buf)?;
+    assert_eq!(buf, [0x00, 0x11, 0x22, 0x33]);
+    conn.execute("UPDATE t SET x = 1 WHERE id = 1")?;
+    assert!(matches!(
+        blob.read(0, &mut buf),
+        Err(LimboError::BlobHandleExpired)
+    ));
+    blob.close()?;
     Ok(())
 }
 

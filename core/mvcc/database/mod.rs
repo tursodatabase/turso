@@ -4299,6 +4299,17 @@ pub struct WalPos {
     pub frame: u64,
 }
 
+/// Which version of a row a snapshot sees, as returned by [`MvStore::seen_row_version`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeenRowVersion {
+    /// The row has no in-memory versions; it lives only in the b-tree.
+    BtreeOnly,
+    /// The snapshot sees the version with this id.
+    Visible(u64),
+    /// The row has versions but the snapshot sees none of them.
+    Gone,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MvccReadSnapshot {
     pub(crate) tx_id: TxID,
@@ -5913,6 +5924,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Which version of `row_id` the snapshot sees.
+    pub(crate) fn seen_row_version(
+        &self,
+        snapshot: MvccReadSnapshot,
+        row_id: &RowID,
+    ) -> Result<SeenRowVersion> {
+        let Some(entry) = self.rows.get(row_id) else {
+            return Ok(SeenRowVersion::BtreeOnly);
+        };
+        let versions = entry.value().read();
+        Ok(match self.find_visible_version(snapshot, &versions)? {
+            Some(version) => SeenRowVersion::Visible(version.id),
+            None => SeenRowVersion::Gone,
+        })
     }
 
     /// Gets all row ids in the database.
