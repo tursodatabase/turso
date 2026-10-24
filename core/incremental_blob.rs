@@ -282,9 +282,7 @@ impl Connection {
         rowid: i64,
         read_write: bool,
     ) -> Result<Blob> {
-        // Reads work on MVCC (the cursor serves the value out of the materialized row
-        // version — see MvccLazyCursor's blob_read_column/blob_column_len), but writes
-        // cannot patch a page in place there, so a read-write handle is still rejected.
+        // MVCC cannot patch a row in place, so only read-only handles are allowed there.
         if self.mvcc_enabled() && read_write {
             return Err(LimboError::InternalError(
                 "incremental blob I/O writes are not supported in MVCC mode".to_string(),
@@ -333,6 +331,9 @@ impl Connection {
             if read_write {
                 check_column_writable(schema, &tbl, idx, col, fk_enforced)?;
             }
+            // Virtual generated columns are not stored, so the schema position and
+            // the record position diverge on tables that have them; the map gives
+            // the on-disk position the b-tree layer must address.
             let record_column = tbl
                 .logical_to_physical_map
                 .get(idx)
@@ -525,11 +526,7 @@ fn build_blob_program(
     b.emit_halt_err(1, format!("no such rowid: {rowid}"));
     b.preassign_label_to_next_insn(l_end);
 
-    // Read-only schema access here too: going through `with_schema_mut` would clone
-    // the connection's schema copy-on-write, and in MVCC mode that divergent copy makes
-    // the blob program's first step adopt the shared schema and bump the prepare-context
-    // generation, repreparing it from its non-SQL label (see blob_open above, #10623).
-    b.epilogue(&conn.schema.read());
+    conn.with_schema(crate::MAIN_DB_ID, |schema| b.epilogue(schema));
     b.build(conn.clone(), false, "incremental blob io")
         .map_err(|e| LimboError::InternalError(format!("blob program build failed: {e}")))
 }

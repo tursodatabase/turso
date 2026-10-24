@@ -410,9 +410,6 @@ fn test_mvcc_read_to_write_upgrade_does_not_block_checkpoint(
     Ok(())
 }
 
-/// Read-only incremental blob I/O works on MVCC: the cursor serves the bytes out of
-/// the materialized row version. Read-write handles are still rejected (writes cannot
-/// patch an MVCC row in place), and the row is left unchanged either way. See #10642.
 #[test]
 fn test_mvcc_blob_read_works_and_write_is_unsupported() -> anyhow::Result<()> {
     let tmp_db =
@@ -421,7 +418,6 @@ fn test_mvcc_blob_read_works_and_write_is_unsupported() -> anyhow::Result<()> {
     conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, data BLOB)")?;
     conn.execute("INSERT INTO files VALUES (1, x'00112233445566778899')")?;
 
-    // Read-only open succeeds and reads the value, whole and by range.
     let mut blob = conn.blob_open("files", "data", 1, false)?;
     assert_eq!(blob.bytes(), 10);
     let mut whole = [0u8; 10];
@@ -435,7 +431,6 @@ fn test_mvcc_blob_read_works_and_write_is_unsupported() -> anyhow::Result<()> {
     assert_eq!(mid, [0x22, 0x33, 0x44, 0x55]);
     blob.close()?;
 
-    // Read-write open is still rejected up front with a clear error.
     let Err(err) = conn.blob_open("files", "data", 1, true) else {
         panic!("read-write blob_open must fail in MVCC mode");
     };
@@ -444,7 +439,6 @@ fn test_mvcc_blob_read_works_and_write_is_unsupported() -> anyhow::Result<()> {
         "Internal error: incremental blob I/O writes are not supported in MVCC mode"
     );
 
-    // The row is untouched.
     let rows: Vec<(String,)> = conn.exec_rows("SELECT hex(data) FROM files WHERE id = 1");
     assert_eq!(rows, vec![("00112233445566778899".to_string(),)]);
     Ok(())
