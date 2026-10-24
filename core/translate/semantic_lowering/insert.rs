@@ -604,6 +604,7 @@ fn emit_select_rows(
         &QueryDestination::CoroutineYield {
             yield_reg,
             stored_outputs: crate::alloc::vec![],
+            decode_arrays: true,
         },
     )?;
     program.emit_insn(Insn::EndCoroutine { yield_reg });

@@ -6783,6 +6783,7 @@ fn prepare_hir_coroutine_loop<'a>(
     let destination = QueryDestination::CoroutineYield {
         yield_reg,
         stored_outputs: crate::alloc::vec![],
+        decode_arrays: false,
     };
     let row = match &planned_loop.access {
         HirSourceAccess::Derived { query, .. } | HirSourceAccess::Cte { query, .. } => {
@@ -9758,7 +9759,9 @@ fn emit_hir_sorter_rows(
     for (output, column) in output_columns.iter().enumerate() {
         program.emit_column_or_rowid(pseudo_cursor, *column, outputs + output);
     }
-    emit_array_results(program, document, output_definitions, outputs, &[])?;
+    if decodes_arrays(destination) {
+        emit_array_results(program, document, output_definitions, outputs, &[])?;
+    }
     emit_hir_row_to_destination(program, destination, outputs, output_definitions.len())?;
     emit_after_row(
         program,
@@ -10115,7 +10118,9 @@ fn emit_query_row_with_inputs<'expr>(
         }
     }
 
-    if output.needs_values() && matches!(&output.target, HirRowTarget::Direct { .. }) {
+    if output.needs_values()
+        && matches!(&output.target, HirRowTarget::Direct { destination, .. } if decodes_arrays(destination))
+    {
         emit_array_results(program, document, outputs, start, stored_outputs)?;
     }
 
@@ -10668,6 +10673,16 @@ fn emit_hir_window_output_subroutine(
         can_fallthrough: false,
     });
     Ok(())
+}
+
+fn decodes_arrays(destination: &QueryDestination) -> bool {
+    !matches!(
+        destination,
+        QueryDestination::CoroutineYield {
+            decode_arrays: false,
+            ..
+        }
+    )
 }
 
 /// Decode each array output for display, except the outputs in

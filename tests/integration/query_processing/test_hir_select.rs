@@ -601,6 +601,44 @@ fn hir_displays_arrays_passed_through_expressions() {
 }
 
 #[test]
+fn hir_subquery_outputs_stay_arrays_for_the_outer_query() {
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+        .build();
+    let hir = db.connect_limbo();
+    hir.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, vals integer[]) STRICT")
+        .unwrap();
+    hir.execute("INSERT INTO a VALUES (1, '{4,5,6}'), (2, '{7}')")
+        .unwrap();
+    let integer = rusqlite::types::Value::Integer;
+    let text = |value: &str| rusqlite::types::Value::Text(value.to_string());
+    for (sql, expected) in [
+        (
+            "SELECT array_element(e, 2), e FROM (SELECT ARRAY[10, 20, 30] AS e)",
+            vec![vec![integer(20), text("{10,20,30}")]],
+        ),
+        (
+            "SELECT array_element(e, 3) FROM (SELECT column1 AS e FROM (VALUES (ARRAY[10, 20, 30])))",
+            vec![vec![integer(30)]],
+        ),
+        (
+            "WITH c AS (SELECT ARRAY[10, 20, 30] AS e) SELECT array_element(e, 1) FROM c",
+            vec![vec![integer(10)]],
+        ),
+        (
+            "SELECT array_element(e, 1) FROM (SELECT ARRAY[id * 10] AS e FROM a ORDER BY id DESC)",
+            vec![vec![integer(20)], vec![integer(10)]],
+        ),
+        (
+            "SELECT array_element(vals, 1), vals FROM (SELECT vals FROM a WHERE id = 1)",
+            vec![vec![integer(4), text("{4,5,6}")]],
+        ),
+    ] {
+        assert_eq!(limbo_exec_rows(&hir, sql), expected, "{sql}");
+    }
+}
+
+#[test]
 fn hir_real_column_comparisons_keep_large_integers_exact() {
     let db = setup();
     let (sqlite, hir) = connections(&db);

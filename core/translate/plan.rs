@@ -474,6 +474,10 @@ pub enum QueryDestination {
         /// the values a schema statement compares with an index entry or a
         /// CHECK constraint, which DML computes the same way.
         stored_outputs: alloc::Vec<usize>,
+        /// Whether array outputs are turned into text. A FROM subquery or
+        /// CTE keeps them as arrays, so the outer query can still read their
+        /// elements; the outer query turns the arrays it returns into text.
+        decode_arrays: bool,
     },
     /// The results of the query are stored in an ephemeral index,
     /// later used by the parent query.

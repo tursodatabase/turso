@@ -330,6 +330,7 @@ impl PlannedSelect {
                 &QueryDestination::CoroutineYield {
                     yield_reg,
                     stored_outputs: self.stored_outputs.clone(),
+                    decode_arrays: true,
                 },
             )
         })?;
