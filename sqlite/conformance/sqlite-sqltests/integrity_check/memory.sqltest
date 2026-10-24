@@ -44,6 +44,20 @@ expect {
     ok
 }
 
+# The table-valued forms name their column after the pragma, like PRAGMA does
+test pragma-functions-column-names {
+    SELECT quick_check FROM pragma_quick_check;
+    SELECT integrity_check FROM pragma_integrity_check;
+    SELECT name FROM pragma_table_info('pragma_quick_check');
+    SELECT name FROM pragma_table_info('pragma_integrity_check');
+}
+expect {
+    ok
+    ok
+    quick_check
+    integrity_check
+}
+
 # Test integrity_check with a simple table
 @cross-check-integrity
 test integrity-check-simple-table {
