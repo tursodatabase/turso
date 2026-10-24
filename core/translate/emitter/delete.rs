@@ -376,9 +376,11 @@ pub fn emit_fk_child_decrement_on_delete(
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_for_child(namespace.id, child_table_name, None)
     })? {
-        if !fk_ref.fk.deferred {
-            continue;
-        }
+        // Both immediate and deferred child FKs maintain a counter: when the
+        // parent delete finds this child and bumps the violation counter, the
+        // cascade that then removes the child must give that count back, or an
+        // unrelated statement/transaction-end check fails (issue #9290). Each
+        // FK decrements its own counter via `fk_ref.fk.deferred` below.
         let child_positions: Vec<usize> = fk_ref
             .fk
             .child_columns
@@ -440,7 +442,7 @@ pub fn emit_fk_child_decrement_on_delete(
             // Parent MISSING, decrement is guarded by FkIfZero to avoid underflow
             program.preassign_label_to_next_insn(missing);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            emit_guarded_fk_decrement(program, done, true);
+            emit_guarded_fk_decrement(program, done, fk_ref.fk.deferred);
             program.preassign_label_to_next_insn(done);
         } else {
             // Probe parent unique index
@@ -476,7 +478,7 @@ pub fn emit_fk_child_decrement_on_delete(
                 num_regs: n,
             });
             program.emit_insn(Insn::Close { cursor_id: icur });
-            emit_guarded_fk_decrement(program, ok, true);
+            emit_guarded_fk_decrement(program, ok, fk_ref.fk.deferred);
             program.preassign_label_to_next_insn(ok);
             program.emit_insn(Insn::Close { cursor_id: icur });
         }
