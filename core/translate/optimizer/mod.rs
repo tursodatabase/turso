@@ -1114,7 +1114,7 @@ fn find_select_plan_form(
     }
 
     plan.simple_aggregate = detect_simple_aggregate(plan);
-    let table_plan = find_table_access_plan(
+    let mut table_plan = find_table_access_plan(
         schema,
         resolver,
         &mut plan.result_columns,
@@ -1186,6 +1186,20 @@ fn find_select_plan_form(
     }
 
     plan_correlated_subqueries(plan, resolver, &subquery_calls, cache, save_subquery_plans)?;
+    // The unmatched-right-row plans copied the WHERE subqueries before the
+    // correlated ones were planned. Copy the planned subqueries instead.
+    if let Some(table_plan) = table_plan.as_mut() {
+        for unmatched_plan in table_plan.unmatched_right_rows_plans.iter_mut().flatten() {
+            for copied_subquery in &mut unmatched_plan.subqueries {
+                *copied_subquery = plan
+                    .non_from_clause_subqueries
+                    .iter()
+                    .find(|subquery| subquery.internal_id == copied_subquery.internal_id)
+                    .expect("a copied WHERE subquery must still be in the query")
+                    .clone();
+            }
+        }
+    }
 
     let table_cost = table_cost.or_else(|| {
         plan.table_references
