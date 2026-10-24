@@ -232,7 +232,7 @@ int sqlite3_extended_result_codes(sqlite3 *db, int onoff);
 
 sqlite3 *sqlite3_db_handle(sqlite3_stmt *_stmt);
 
-void sqlite3_sleep(int _ms);
+int sqlite3_sleep(int _ms);
 
 int sqlite3_limit(sqlite3 *_db, int _id, int _new_value);
 

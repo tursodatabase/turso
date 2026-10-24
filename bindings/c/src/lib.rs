@@ -1885,8 +1885,10 @@ pub unsafe extern "C" fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqli
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_sleep(_ms: ffi::c_int) {
-    stub!();
+pub unsafe extern "C" fn sqlite3_sleep(ms: ffi::c_int) -> ffi::c_int {
+    let ms = ms.max(0);
+    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    ms
 }
 
 #[no_mangle]
@@ -3908,6 +3910,28 @@ mod tests {
     }
     use super::*;
     use std::ptr;
+
+    #[test]
+    fn test_sqlite3_sleep() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::test_sqlite3_sleep_child", "--nocapture"])
+            .env("TURSO_TEST_SQLITE3_SLEEP_CHILD", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn test_sqlite3_sleep_child() {
+        if std::env::var_os("TURSO_TEST_SQLITE3_SLEEP_CHILD").is_none() {
+            return;
+        }
+
+        let start = std::time::Instant::now();
+        assert_eq!(unsafe { sqlite3_sleep(5) }, 5);
+        assert!(start.elapsed() >= std::time::Duration::from_millis(5));
+        assert_eq!(unsafe { sqlite3_sleep(-1) }, 0);
+    }
 
     /// sqlite3_errmsg must return the bare message SQLite produces — no
     /// "Runtime error:" prefix and no "(19)" suffix; those are sqlite3
