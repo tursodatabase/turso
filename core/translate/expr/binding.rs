@@ -3,8 +3,8 @@ use crate::schema::{
     SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME, TEMP_SCHEMA_TABLE_NAME_ALT,
 };
 use crate::translate::plan::{
-    merge_columns, resolve_unqualified_column, unqualified_column_sources, ColumnLookup,
-    OuterQueryReference, ResolvedColumn,
+    is_schema_table, merge_columns, resolve_unqualified_column, unqualified_column_sources,
+    ColumnLookup, OuterQueryReference, ResolvedColumn,
 };
 
 /// The precedence of binding identifiers to columns.
@@ -867,8 +867,7 @@ fn qualifier_names_table(
     table_name: &str,
     has_database_qualifier: bool,
 ) -> bool {
-    let is_schema_table = matches!(table, Table::BTree(btree) if btree.root_page == 1);
-    if has_alias || !is_schema_table {
+    if has_alias || !is_schema_table(table) {
         return table_reference_name.eq_ignore_ascii_case(table_name);
     }
     let main_names = [SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT];

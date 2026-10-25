@@ -5,11 +5,11 @@ use super::plan::NamedWindowBound;
 use super::{
     expr::{walk_expr, walk_expr_mut},
     plan::{
-        left_using_column_sources, merge_columns, query_output_columns, resolve_unqualified_column,
-        Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
-        JoinOrderMember, JoinOrigin, JoinType as PlanJoinType, JoinedTable, Operation,
-        OuterQueryReference, Plan, QueryDestination, ResolvedColumn, ResultSetColumn, Scan,
-        TableReferences, WhereTerm, WhereTermOrigin,
+        alias_or_stored_name, left_using_column_sources, merge_columns, query_output_columns,
+        resolve_unqualified_column, Aggregate, ColumnUsedMask, Distinctness, EvalAt,
+        IterationDirection, JoinInfo, JoinOrderMember, JoinOrigin, JoinType as PlanJoinType,
+        JoinedTable, Operation, OuterQueryReference, Plan, QueryDestination, ResolvedColumn,
+        ResultSetColumn, Scan, TableReferences, WhereTerm, WhereTermOrigin,
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
 };
@@ -1845,7 +1845,7 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
                 None => ParenthesizedJoinColumn {
                     source: ParenthesizedJoinColumnSource::Table {
                         database_id,
-                        table_name: source_table.identifier.clone(),
+                        table_name: alias_or_stored_name(source_table).to_string(),
                         column_name: column_name.to_string(),
                     },
                     visibility: ParenthesizedJoinColumnVisibility::Visible,
@@ -1890,7 +1890,7 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
             join_columns.push(ParenthesizedJoinColumn {
                 source: ParenthesizedJoinColumnSource::RowId {
                     database_id,
-                    table_name: source_table.identifier.clone(),
+                    table_name: alias_or_stored_name(source_table).to_string(),
                 },
                 visibility: ParenthesizedJoinColumnVisibility::Visible,
             });

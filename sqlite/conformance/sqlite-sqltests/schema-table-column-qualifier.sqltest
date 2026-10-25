@@ -2,7 +2,9 @@
 
 # sqlite_schema and sqlite_master name the same table, and so do
 # sqlite_temp_schema and sqlite_temp_master. Either name qualifies a column,
-# whichever name FROM used, unless FROM gave an alias.
+# whichever name FROM used, unless FROM gave an alias. `<tbl>.*` only accepts
+# the alias or the name SQLite stores the table under: sqlite_master, or
+# sqlite_temp_master for temp.
 
 setup schema {
     CREATE TABLE t (a);
@@ -125,6 +127,100 @@ test temp-names-do-not-qualify-main-column {
 expect error {
 }
 
+@setup schema
+test sqlite-master-star-from-sqlite-schema {
+    SELECT type, name, tbl_name FROM (SELECT sqlite_master.* FROM sqlite_schema);
+}
+expect {
+    table|t|t
+}
+
+@setup schema
+test sqlite-schema-star-from-sqlite-master {
+    SELECT sqlite_schema.* FROM sqlite_master;
+}
+expect error {
+    no such table: sqlite_schema
+}
+
+@setup schema
+test sqlite-schema-star-from-sqlite-schema {
+    SELECT sqlite_schema.* FROM sqlite_schema;
+}
+expect error {
+    no such table: sqlite_schema
+}
+
+test sqlite-temp-master-star-from-sqlite-temp-schema {
+    CREATE TEMP TABLE tt (a);
+    SELECT type, name, tbl_name FROM (SELECT sqlite_temp_master.* FROM sqlite_temp_schema);
+}
+expect {
+    table|tt|tt
+}
+
+test sqlite-temp-master-star-from-temp-sqlite-master {
+    CREATE TEMP TABLE tt (a);
+    SELECT type, name, tbl_name FROM (SELECT sqlite_temp_master.* FROM temp.sqlite_master);
+}
+expect {
+    table|tt|tt
+}
+
+test sqlite-master-star-from-temp-sqlite-master {
+    SELECT sqlite_master.* FROM temp.sqlite_master;
+}
+expect error {
+    no such table: sqlite_master
+}
+
+test sqlite-temp-schema-star-from-sqlite-temp-schema {
+    SELECT sqlite_temp_schema.* FROM sqlite_temp_schema;
+}
+expect error {
+    no such table: sqlite_temp_schema
+}
+
+@setup schema
+test alias-hides-stored-name-for-star {
+    SELECT sqlite_master.* FROM sqlite_schema x;
+}
+expect error {
+    no such table: sqlite_master
+}
+
+@setup schema
+test schema-name-alias-hides-stored-name-for-star {
+    SELECT sqlite_master.* FROM sqlite_master AS sqlite_schema;
+}
+expect error {
+    no such table: sqlite_master
+}
+
+@setup schema
+test schema-name-alias-qualifies-star {
+    SELECT type, name, tbl_name FROM (SELECT sqlite_schema.* FROM sqlite_master AS sqlite_schema);
+}
+expect {
+    table|t|t
+}
+
+test sqlite-master-star-from-parenthesized-join {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    SELECT type, name, tbl_name FROM (SELECT sqlite_master.* FROM (sqlite_schema, t));
+}
+expect {
+    table|t|t
+}
+
+@setup schema
+test sqlite-master-star-from-both-names-is-ambiguous {
+    SELECT sqlite_master.* FROM sqlite_schema, sqlite_master;
+}
+expect error {
+}
+
 # An alias spelled like a schema table name is still an alias: only it
 # qualifies the table's columns.
 
@@ -185,4 +281,107 @@ test temp-name-alias-hides-other-temp-names {
     SELECT sqlite_temp_master.name FROM sqlite_temp_schema AS sqlite_temp_schema;
 }
 expect error {
+}
+
+# Inside a parenthesized join with an alias, SQLite saves each column under the
+# table's alias or stored name, so only that name qualifies it, for both
+# `<tbl>.<col>` and `<tbl>.*`.
+
+test sqlite-master-qualifies-column-in-aliased-join {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    SELECT sqlite_master.name, main.sqlite_master.name, sqlite_master.rowid FROM (sqlite_schema, t) AS g;
+}
+expect {
+    t|t|1
+}
+
+test sqlite-schema-does-not-qualify-column-in-aliased-join {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    SELECT sqlite_schema.name FROM (sqlite_schema, t) AS g;
+}
+expect error {
+}
+
+test sqlite-master-star-from-aliased-join {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    SELECT type, name, tbl_name, a FROM (SELECT sqlite_master.*, t.* FROM (sqlite_schema, t) AS g);
+}
+expect {
+    table|t|t|1
+}
+
+test sqlite-schema-star-from-aliased-join {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    SELECT sqlite_schema.* FROM (sqlite_schema, t) AS g;
+}
+expect error {
+    no such table: sqlite_schema
+}
+
+test sqlite-master-qualifies-column-in-nested-aliased-join {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    SELECT sqlite_master.name FROM ((sqlite_schema, t) AS g, t AS t3);
+}
+expect {
+    t
+}
+
+test sqlite-master-star-from-nested-aliased-join {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    SELECT type, name, tbl_name FROM (SELECT sqlite_master.* FROM ((sqlite_schema, t) AS g, t AS t3));
+}
+expect {
+    table|t|t
+}
+
+test sqlite-temp-master-qualifies-column-in-aliased-join {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    CREATE TEMP TABLE tt (b);
+    SELECT sqlite_temp_master.name FROM (temp.sqlite_master, t) AS g;
+}
+expect {
+    tt
+}
+
+test main-names-do-not-qualify-temp-column-in-aliased-join {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    CREATE TEMP TABLE tt (b);
+    SELECT temp.sqlite_master.name FROM (sqlite_temp_schema, t) AS g;
+}
+expect error {
+}
+
+test sqlite-temp-master-star-from-aliased-join {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    CREATE TEMP TABLE tt (b);
+    SELECT type, name, tbl_name FROM (SELECT sqlite_temp_master.* FROM (sqlite_temp_schema, t) AS g);
+}
+expect {
+    table|tt|tt
+}
+
+test alias-hides-stored-name-in-aliased-join {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    SELECT sqlite_master.name FROM (sqlite_master AS sqlite_schema, t) AS g;
+}
+expect error {
+}
+
+test schema-name-alias-qualifies-column-in-aliased-join {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    SELECT sqlite_schema.name FROM (sqlite_master AS sqlite_schema, t) AS g;
+}
+expect {
+    t
 }
