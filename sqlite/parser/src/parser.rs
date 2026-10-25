@@ -1976,6 +1976,9 @@ impl<'a> Parser<'a> {
         // Bracket-quoted identifier: [name] or [multi word name],
         // optionally qualified: [tbl].[col] or [db].[tbl].[col]
         let name = self.parse_bracket_quoted_name()?;
+        if self.peek()?.is_some_and(|t| t.token_type == TK_LP) {
+            return self.parse_function_call(name);
+        }
         let second_name = if self.peek()?.is_some_and(|t| t.token_type == TK_DOT) {
             eat_assert!(self, TK_DOT);
             Some(self.parse_nm()?)
@@ -1993,6 +1996,47 @@ impl<'a> Parser<'a> {
             (Some(second), Some(third)) => Ok(Box::new(Expr::DoublyQualified(name, second, third))),
             (Some(second), None) => Ok(Box::new(Expr::Qualified(name, second))),
             _ => Ok(Box::new(Expr::Id(name))),
+        }
+    }
+
+    fn parse_function_call(&mut self, name: Name) -> Result<Box<Expr>> {
+        eat_assert!(self, TK_LP);
+        let tok = self.peek_no_eof()?;
+        match tok.token_type {
+            TK_STAR => {
+                eat_assert!(self, TK_STAR);
+                eat_expect!(self, TK_RP);
+                let filter_over = self.parse_filter_over()?;
+                // No arguments, but later passes still walk any
+                // FILTER/OVER sub-expressions, so fold their
+                // height into this node's height.
+                self.last_expr_height += 1;
+                Ok(Box::new(Expr::FunctionCallStar { name, filter_over }))
+            }
+            _ => {
+                let distinct = self.parse_distinct()?;
+                let exprs = self.parse_expr_list()?;
+                // Height is the tallest sub-expression later
+                // passes can descend into: the arguments plus the
+                // ORDER BY / WITHIN GROUP / FILTER / OVER clauses.
+                let mut clause_height = self.last_expr_height;
+                let order_by = self.parse_order_by()?;
+                clause_height = clause_height.max(self.last_expr_height);
+                eat_expect!(self, TK_RP);
+                let within_group = self.parse_within_group()?;
+                clause_height = clause_height.max(self.last_expr_height);
+                let filter_over = self.parse_filter_over()?;
+                clause_height = clause_height.max(self.last_expr_height);
+                self.last_expr_height = 1 + clause_height;
+                Ok(Box::new(Expr::FunctionCall {
+                    name,
+                    distinctness: distinct,
+                    args: exprs,
+                    order_by,
+                    within_group,
+                    filter_over,
+                }))
+            }
         }
     }
 
@@ -2050,47 +2094,7 @@ impl<'a> Parser<'a> {
                     });
                 } // can not be literal string in function name
 
-                eat_assert!(self, TK_LP);
-                let tok = self.peek_no_eof()?;
-                match tok.token_type {
-                    TK_STAR => {
-                        eat_assert!(self, TK_STAR);
-                        eat_expect!(self, TK_RP);
-                        let filter_over = self.parse_filter_over()?;
-                        // No arguments, but later passes still walk any
-                        // FILTER/OVER sub-expressions, so fold their
-                        // height into this node's height.
-                        self.last_expr_height += 1;
-                        return Ok(Box::new(Expr::FunctionCallStar {
-                            name: Name::from_bytes(name),
-                            filter_over,
-                        }));
-                    }
-                    _ => {
-                        let distinct = self.parse_distinct()?;
-                        let exprs = self.parse_expr_list()?;
-                        // Height is the tallest sub-expression later
-                        // passes can descend into: the arguments plus the
-                        // ORDER BY / WITHIN GROUP / FILTER / OVER clauses.
-                        let mut clause_height = self.last_expr_height;
-                        let order_by = self.parse_order_by()?;
-                        clause_height = clause_height.max(self.last_expr_height);
-                        eat_expect!(self, TK_RP);
-                        let within_group = self.parse_within_group()?;
-                        clause_height = clause_height.max(self.last_expr_height);
-                        let filter_over = self.parse_filter_over()?;
-                        clause_height = clause_height.max(self.last_expr_height);
-                        self.last_expr_height = 1 + clause_height;
-                        return Ok(Box::new(Expr::FunctionCall {
-                            name: Name::from_bytes(name),
-                            distinctness: distinct,
-                            args: exprs,
-                            order_by,
-                            within_group,
-                            filter_over,
-                        }));
-                    }
-                }
+                return self.parse_function_call(Name::from_bytes(name));
             } else {
                 None
             }
@@ -13558,6 +13562,50 @@ mod tests {
                         assert_eq!(name.to_string(), "nextval");
                     } else {
                         panic!("expected FunctionCall");
+                    }
+                } else {
+                    panic!("expected Expr");
+                }
+            } else {
+                panic!("expected Select");
+            }
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_bracket_quoted_function_call() {
+        let sql = b"SELECT [upper]('a'), [count](*), [random]()";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        if let Cmd::Stmt(Stmt::Select(sel)) = cmd {
+            if let OneSelect::Select { columns, .. } = &sel.body.select {
+                assert_eq!(columns.len(), 3);
+                if let ResultColumn::Expr(expr, _) = &columns[0] {
+                    if let Expr::FunctionCall { name, args, .. } = expr.as_ref() {
+                        assert_eq!(name.as_str(), "upper");
+                        assert_eq!(args.len(), 1);
+                    } else {
+                        panic!("expected FunctionCall for [upper]");
+                    }
+                } else {
+                    panic!("expected Expr");
+                }
+                if let ResultColumn::Expr(expr, _) = &columns[1] {
+                    if let Expr::FunctionCallStar { name, .. } = expr.as_ref() {
+                        assert_eq!(name.as_str(), "count");
+                    } else {
+                        panic!("expected FunctionCallStar for [count]");
+                    }
+                } else {
+                    panic!("expected Expr");
+                }
+                if let ResultColumn::Expr(expr, _) = &columns[2] {
+                    if let Expr::FunctionCall { name, args, .. } = expr.as_ref() {
+                        assert_eq!(name.as_str(), "random");
+                        assert_eq!(args.len(), 0);
+                    } else {
+                        panic!("expected FunctionCall for [random]");
                     }
                 } else {
                     panic!("expected Expr");
