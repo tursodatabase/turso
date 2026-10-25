@@ -319,7 +319,7 @@ fn non_numeric_string_divisor_raises_22p02() {
     ] {
         let e = exec_err(&conn, sql);
         assert!(
-            matches!(e.core_error(), LimboError::InvalidTextRepresentation { .. }),
+            matches!(e.core_error(), LimboError::InvalidTextRepresentation(_)),
             "expected InvalidTextRepresentation for {sql}, got: {e:?}"
         );
         assert_eq!(e.sqlstate, "22P02", "{sql}: {e:?}");

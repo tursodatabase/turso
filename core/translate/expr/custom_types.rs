@@ -134,8 +134,8 @@ pub(super) fn cast_compared_custom_types(
             return Ok(WalkControl::Continue);
         }
         let (Some(lhs_type), Some(rhs_type)) = (
-            custom_type_name_of(lhs, referenced_tables, resolver),
-            custom_type_name_of(rhs, referenced_tables, resolver),
+            compared_type_name(lhs, referenced_tables, resolver)?,
+            compared_type_name(rhs, referenced_tables, resolver)?,
         ) else {
             return Ok(WalkControl::Continue);
         };
@@ -164,28 +164,22 @@ pub(super) fn cast_compared_custom_types(
     Ok(())
 }
 
-/// The lowercase custom type name of a column of a custom type or of a CAST
-/// to a custom type.
-fn custom_type_name_of(
+/// The lowercase name of the custom type an expression is compared as: the
+/// type of a column (also of a subquery, view or CTE), a CAST, or `min`,
+/// `max` or `coalesce` of one of these. A domain is compared as its base type.
+fn compared_type_name(
     expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
-) -> Option<String> {
-    match expr {
-        ast::Expr::Column { .. } => {
-            let info = expr_custom_type_info(expr, referenced_tables, resolver)?;
-            (!info.column.is_array()).then_some(info.type_name)
-        }
-        ast::Expr::Cast {
-            type_name: Some(type_name),
-            ..
-        } if type_name.array_dimensions == 0 => {
-            let name = crate::util::dequote(&type_name.name).to_lowercase();
-            resolver.schema().get_type_def_unchecked(&name)?;
-            Some(name)
-        }
-        _ => None,
-    }
+) -> Result<Option<String>> {
+    let Some(typed) = comparison_type_of(expr, referenced_tables, resolver)? else {
+        return Ok(None);
+    };
+    Ok(typed
+        .chain
+        .iter()
+        .find(|td| !td.is_domain)
+        .map(|td| td.name.to_lowercase()))
 }
 
 /// Info about a column with a custom type, extracted from an expression.
@@ -307,10 +301,9 @@ pub(super) struct ResolvedOperator {
 ///    and the other is anything except a column of a different custom type. This lets `date + 1`, `date + int_col`
 ///    and `date + ?` add days, while a comparison such as `int_col = '10'` still
 ///    uses the standard operator.
-/// 4. The operator is arithmetic and the operands are columns of two different
-///    types that both read stored values back unchanged (or the dialect applies
-///    custom type arithmetic to any operand) and both declare a function for the
-///    operator. The left type's function is used. This lets
+/// 4. The operator is arithmetic, the dialect applies custom type arithmetic
+///    to any operand, and the operands are columns of two different types that
+///    both declare a function for the operator. The left type's function is used. This lets
 ///    `timestamptz_col - date_col` subtract.
 ///
 /// When case 2 applies, the literal is encoded before being passed to the operator
@@ -340,13 +333,7 @@ pub(super) fn find_custom_type_operator(
         }
 
         // Derive missing operators from < and =
-        let find_op = |sym: &str| -> Option<String> {
-            type_def
-                .operators()
-                .iter()
-                .find(|o| o.op == sym)
-                .and_then(|o| o.func_name.clone())
-        };
+        let find_op = |sym: &str| operator_function(type_def, sym);
 
         match *op {
             // a > b  →  lt(b, a)
@@ -375,17 +362,15 @@ pub(super) fn find_custom_type_operator(
             return None;
         }
         // Case 4: Different custom types with an arithmetic operator.
-        let both_decode_unchanged = lhs.type_def.decode_returns_value_unchanged()
-            && rhs.type_def.decode_returns_value_unchanged();
-        let applies_to_any_operand = both_decode_unchanged
-            || resolver
+        if op.is_comparison()
+            || !resolver
                 .dialect
-                .applies_custom_type_arithmetic_to_any_operand();
-        if op.is_comparison() || !applies_to_any_operand {
+                .applies_custom_type_arithmetic_to_any_operand()
+        {
             return None;
         }
-        arithmetic_function(&rhs.type_def, op_str)?;
-        let func_name = arithmetic_function(&lhs.type_def, op_str)?;
+        operator_function(&rhs.type_def, op_str)?;
+        let func_name = operator_function(&lhs.type_def, op_str)?;
         return Some(ResolvedOperator {
             func_name,
             swap_args: false,
@@ -434,7 +419,7 @@ pub(super) fn find_custom_type_operator(
     }
 }
 
-fn arithmetic_function(type_def: &TypeDef, op_str: &str) -> Option<String> {
+fn operator_function(type_def: &TypeDef, op_str: &str) -> Option<String> {
     type_def
         .operators()
         .iter()
@@ -806,19 +791,7 @@ pub(crate) fn emit_untyped_value_as_type(
         }
     }
     if form == ValueForm::Decoded {
-        for td in chain.iter().rev() {
-            if let Some(decode_expr) = td.decode() {
-                emit_type_expr(
-                    program,
-                    decode_expr,
-                    converted_reg,
-                    converted_reg,
-                    column,
-                    td,
-                    resolver,
-                )?;
-            }
-        }
+        emit_decodes(program, chain, converted_reg, column, resolver)?;
     }
     program.preassign_label_to_next_insn(skip_label);
 
@@ -961,23 +934,25 @@ pub(crate) fn emit_user_facing_column_value(
             reg: dest_reg,
             target_pc: skip_label,
         });
-
-        // Apply decode in reverse order (parent/ancestor first, then child)
-        for td in resolved.chain.iter().rev() {
-            if let Some(decode_expr) = td.decode() {
-                emit_type_expr(
-                    program,
-                    decode_expr,
-                    dest_reg,
-                    dest_reg,
-                    column,
-                    td,
-                    resolver,
-                )?;
-            }
-        }
-
+        emit_decodes(program, &resolved.chain, dest_reg, column, resolver)?;
         program.preassign_label_to_next_insn(skip_label);
+    }
+    Ok(())
+}
+
+/// Applies the DECODE of each type in `chain` to the value in `reg`, the
+/// ancestor type's first.
+pub(crate) fn emit_decodes(
+    program: &mut ProgramBuilder,
+    chain: &[Arc<TypeDef>],
+    reg: usize,
+    column: &Column,
+    resolver: &Resolver,
+) -> Result<()> {
+    for td in chain.iter().rev() {
+        if let Some(decode_expr) = td.decode() {
+            emit_type_expr(program, decode_expr, reg, reg, column, td, resolver)?;
+        }
     }
     Ok(())
 }

@@ -905,12 +905,7 @@ fn emit_cast_decodes(
     if !resolver.dialect.cast_to_custom_type_decodes() {
         return Ok(());
     }
-    for td in chain.iter().rev() {
-        if let Some(decode_expr) = td.decode() {
-            emit_type_expr(program, decode_expr, reg, reg, cast_col, td, resolver)?;
-        }
-    }
-    Ok(())
+    emit_decodes(program, chain, reg, cast_col, resolver)
 }
 
 #[inline(never)]

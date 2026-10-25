@@ -77,3 +77,184 @@ test smallint-literal-compare {
 expect {
     1|1|1
 }
+
+test uuid-in-subquery-of-cast {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT count(*) FROM t WHERE u IN (SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid);
+}
+expect {
+    1
+}
+
+test uuid-in-subquery-of-cast-indexed {
+    CREATE TABLE t (u uuid);
+    CREATE INDEX t_u ON t (u);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT count(*) FROM t WHERE u IN (SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid);
+}
+expect {
+    1
+}
+
+test uuid-view-and-cte-column-compared-with-literal {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    CREATE VIEW v AS SELECT u FROM t;
+    SELECT
+        (SELECT count(*) FROM v WHERE u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'),
+        (WITH c AS (SELECT u FROM t) SELECT count(*) FROM c WHERE u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'),
+        (SELECT count(*) FROM (SELECT u FROM t) s WHERE s.u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11');
+}
+expect {
+    1|1|1
+}
+
+test uuid-view-and-cte-column-compared-with-literal-indexed {
+    CREATE TABLE t (u uuid);
+    CREATE INDEX t_u ON t (u);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    CREATE VIEW v AS SELECT u FROM t;
+    SELECT
+        (SELECT count(*) FROM v WHERE u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'),
+        (WITH c AS (SELECT u FROM t) SELECT count(*) FROM c WHERE u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'),
+        (SELECT count(*) FROM (SELECT u FROM t) s WHERE s.u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11');
+}
+expect {
+    1|1|1
+}
+
+test uuid-union-with-literal-removes-duplicate {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT count(*) FROM (SELECT u FROM t UNION SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11') s;
+}
+expect {
+    1
+}
+
+test uuid-case-compared-with-literal {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT CASE u WHEN 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11' THEN 1 ELSE 0 END, CASE WHEN u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11' THEN 1 ELSE 0 END FROM t;
+}
+expect {
+    1|1
+}
+
+test timestamp-min-max-coalesce-compared-with-literal {
+    CREATE TABLE e (ts timestamp);
+    INSERT INTO e VALUES ('2026-10-08 12:00:00');
+    SELECT
+        (SELECT CASE WHEN max(ts) = '2026-10-08T12:00:00' THEN 1 ELSE 0 END FROM e),
+        (SELECT CASE WHEN min(ts) = '2026-10-08T12:00:00' THEN 1 ELSE 0 END FROM e),
+        (SELECT count(*) FROM e WHERE coalesce(ts, '2000-01-01') = '2026-10-08T12:00:00');
+}
+expect {
+    1|1|1
+}
+
+test timestamp-min-max-coalesce-compared-with-literal-indexed {
+    CREATE TABLE e (ts timestamp);
+    CREATE INDEX e_ts ON e (ts);
+    INSERT INTO e VALUES ('2026-10-08 12:00:00');
+    SELECT
+        (SELECT CASE WHEN max(ts) = '2026-10-08T12:00:00' THEN 1 ELSE 0 END FROM e),
+        (SELECT CASE WHEN min(ts) = '2026-10-08T12:00:00' THEN 1 ELSE 0 END FROM e),
+        (SELECT count(*) FROM e WHERE coalesce(ts, '2000-01-01') = '2026-10-08T12:00:00');
+}
+expect {
+    1|1|1
+}
+
+test numeric-check-compares-decoded-value {
+    CREATE TABLE c (v numeric(10,2) CHECK (v > '1.10'));
+    INSERT INTO c VALUES (1.5);
+    SELECT v FROM c;
+}
+expect {
+    1.50
+}
+
+test numeric-check-rejects-value-below-literal {
+    CREATE TABLE c (v numeric(10,2) CHECK (v > '1.10'));
+    INSERT INTO c VALUES (1.05);
+}
+expect error {
+    violates check constraint
+}
+
+test date-column-compared-with-timestamp-column {
+    CREATE TABLE d (dt date, ts timestamp);
+    INSERT INTO d VALUES ('2026-10-08', '2026-10-08 00:00:00');
+    SELECT count(*) FROM d WHERE dt = ts;
+}
+expect {
+    1
+}
+
+test date-column-compared-with-timestamp-column-indexed {
+    CREATE TABLE d (dt date, ts timestamp);
+    CREATE INDEX d_ts ON d (ts);
+    INSERT INTO d VALUES ('2026-10-08', '2026-10-08 00:00:00');
+    SELECT count(*) FROM d WHERE dt = ts;
+}
+expect {
+    1
+}
+
+test domain-date-joined-with-timestamp {
+    CREATE DOMAIN dd AS date;
+    CREATE TABLE a (r dd);
+    CREATE TABLE b (ts timestamp);
+    INSERT INTO a VALUES ('2026-10-08');
+    INSERT INTO b VALUES ('2026-10-08 00:00:00');
+    SELECT count(*) FROM a JOIN b ON a.r = b.ts;
+}
+expect {
+    1
+}
+
+test domain-date-joined-with-timestamp-indexed {
+    CREATE DOMAIN dd AS date;
+    CREATE TABLE a (r dd);
+    CREATE TABLE b (ts timestamp);
+    CREATE INDEX b_ts ON b (ts);
+    INSERT INTO a VALUES ('2026-10-08');
+    INSERT INTO b VALUES ('2026-10-08 00:00:00');
+    SELECT count(*) FROM a JOIN b ON a.r = b.ts;
+}
+expect {
+    1
+}
+
+test subquery-date-joined-with-timestamp {
+    CREATE TABLE t1 (ts timestamp, d date);
+    INSERT INTO t1 VALUES ('2026-10-08 00:00:00', '2026-10-08');
+    SELECT count(*) FROM (SELECT d AS m FROM t1) s JOIN t1 ON s.m = t1.ts;
+}
+expect {
+    1
+}
+
+test subquery-date-joined-with-timestamp-indexed {
+    CREATE TABLE t1 (ts timestamp, d date);
+    CREATE INDEX t1_ts ON t1 (ts);
+    INSERT INTO t1 VALUES ('2026-10-08 00:00:00', '2026-10-08');
+    SELECT count(*) FROM (SELECT d AS m FROM t1) s JOIN t1 ON s.m = t1.ts;
+}
+expect {
+    1
+}
+
+test date-column-joined-with-timestamp-indexed {
+    CREATE TABLE a (d date);
+    CREATE TABLE b (ts timestamp);
+    CREATE INDEX b_ts ON b (ts);
+    INSERT INTO a VALUES ('2026-10-08');
+    INSERT INTO b VALUES ('2026-10-08 00:00:00');
+    SELECT count(*) FROM a JOIN b ON a.d = b.ts;
+}
+expect {
+    1
+}

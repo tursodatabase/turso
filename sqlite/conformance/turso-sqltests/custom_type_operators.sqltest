@@ -829,3 +829,15 @@ test op-index-seek-encodes-key-of-type-with-parameters {
 expect {
     1|1|1|1
 }
+
+@requires strict "uses STRICT tables"
+test op-different-types-use-standard-arithmetic {
+    CREATE TYPE ta(value any) BASE integer ENCODE value DECODE value OPERATOR '+' min;
+    CREATE TYPE tb(value any) BASE integer ENCODE value DECODE value OPERATOR '+' max;
+    CREATE TABLE t(a ta, b tb) STRICT;
+    INSERT INTO t VALUES (1, 2);
+    SELECT a + b, b + a FROM t;
+}
+expect {
+    3|3
+}
