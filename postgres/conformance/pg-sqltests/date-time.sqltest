@@ -312,3 +312,25 @@ test time-plus-infinite-interval-is-an-error {
     SELECT '12:00'::time + interval 'infinity';
 }
 expect error {cannot add infinite interval to time}
+
+test date-time-columns-compared-with-special-and-short-spellings {
+    CREATE TABLE t (ts timestamp, d date, tz timestamptz);
+    CREATE INDEX t_ts ON t (ts);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00', '2026-10-08', '2026-10-08 12:00:00+00');
+    SELECT count(*) FROM t WHERE ts = '2026-10-08 12:00:00.0001';
+    SELECT count(*) FROM t WHERE ts < 'infinity';
+    SELECT count(*) FROM t WHERE ts > 'epoch';
+    SELECT count(*) FROM t WHERE d > '-infinity';
+    SELECT count(*) FROM t WHERE d = '2026-10-8';
+    SELECT count(*) FROM t WHERE d = ' 2026-10-08 ';
+    SELECT count(*) FROM t WHERE tz = '2026-10-08 14:00:00+02';
+}
+expect {
+    0
+    1
+    1
+    1
+    1
+    1
+    1
+}
