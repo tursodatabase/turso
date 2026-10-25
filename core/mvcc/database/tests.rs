@@ -24480,6 +24480,7 @@ fn mvcc_count_matches_the_rows_with_and_without_version_chains() {
 }
 
 use crate::types::{SeekKey, SeekOp, SeekResult};
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 
 const READER_KEY_SPACE: i64 = 90;
@@ -24584,18 +24585,22 @@ fn write_random_row(
         rng.random_range(0..40)
     };
     let value = format!("{tag}-{key}-{}", "x".repeat(padding));
-    if !rows.contains_key(&key) {
-        conn.execute(format!("INSERT INTO t VALUES ({key}, '{value}')"))
-            .unwrap();
-        rows.insert(key, value);
-    } else if rng.random_bool(0.5) {
-        conn.execute(format!("UPDATE t SET v = '{value}' WHERE id = {key}"))
-            .unwrap();
-        rows.insert(key, value);
-    } else {
-        conn.execute(format!("DELETE FROM t WHERE id = {key}"))
-            .unwrap();
-        rows.remove(&key);
+    match rows.entry(key) {
+        Entry::Vacant(entry) => {
+            conn.execute(format!("INSERT INTO t VALUES ({key}, '{value}')"))
+                .unwrap();
+            entry.insert(value);
+        }
+        Entry::Occupied(mut entry) if rng.random_bool(0.5) => {
+            conn.execute(format!("UPDATE t SET v = '{value}' WHERE id = {key}"))
+                .unwrap();
+            entry.insert(value);
+        }
+        Entry::Occupied(entry) => {
+            conn.execute(format!("DELETE FROM t WHERE id = {key}"))
+                .unwrap();
+            entry.remove();
+        }
     }
 }
 

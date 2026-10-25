@@ -498,10 +498,10 @@ pub enum RowVersionState {
     Deleted,
 }
 
-pub(crate) enum CellAndChain {
-    CellVisible,
-    VersionVisible(crate::alloc::ArcSlice<u8>),
-    NothingVisible,
+pub(crate) enum VisibleRow {
+    Cell,
+    Version(crate::alloc::ArcSlice<u8>),
+    NoRow,
 }
 
 pub type TxID = u64;
@@ -5939,14 +5939,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         snapshot: MvccReadSnapshot,
         versions: &RowVersions<A>,
-    ) -> Result<CellAndChain> {
+    ) -> Result<VisibleRow> {
         let versions = versions.read();
         if !self.chain_hides_btree_row(snapshot, &versions)? {
-            return Ok(CellAndChain::CellVisible);
+            return Ok(VisibleRow::Cell);
         }
         Ok(match self.find_visible_version(snapshot, &versions)? {
-            Some(version) => CellAndChain::VersionVisible(table_row_payload(version)),
-            None => CellAndChain::NothingVisible,
+            Some(version) => VisibleRow::Version(table_row_payload(version)),
+            None => VisibleRow::NoRow,
         })
     }
 

@@ -4,7 +4,7 @@ use crate::alloc::{ArcSlice, DynAllocator};
 use crate::mvcc::cursor::CursorYieldPoint;
 use crate::mvcc::cursor::{static_iterator_hack, MvccEntry, MvccIterator};
 use crate::mvcc::database::{
-    CellAndChain, MVTableId, MvccReadSnapshot, RowID, RowKey, RowVersions, TxID,
+    MVTableId, MvccReadSnapshot, RowID, RowKey, RowVersions, TxID, VisibleRow,
 };
 use crate::mvcc::yield_points::inject_io_yield;
 use crate::sync::Arc;
@@ -569,17 +569,17 @@ impl BTreeCursor {
                         .store
                         .resolve_cell_with_chain(reader.snapshot, reader.chain.versions())?
                     {
-                        CellAndChain::CellVisible => {
+                        VisibleRow::Cell => {
                             reader.row = Row::Cell(rowid);
                             reader.step = Step::Idle;
                             self.settle_mvcc_row(true, false);
                         }
-                        CellAndChain::VersionVisible(payload) => {
+                        VisibleRow::Version(payload) => {
                             reader.row = Row::Chain { rowid, payload };
                             reader.step = Step::Idle;
                             self.settle_mvcc_row(false, true);
                         }
-                        CellAndChain::NothingVisible => {
+                        VisibleRow::NoRow => {
                             reader.step = Step::SkipHiddenCell;
                             self.has_record = true;
                             return Ok(false);
