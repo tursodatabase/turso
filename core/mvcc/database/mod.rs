@@ -61,6 +61,8 @@ use tracing::instrument;
 use tracing::Level;
 
 pub mod checkpoint_state_machine;
+#[cfg(not(nightly))]
+mod version_chain;
 pub use checkpoint_state_machine::{
     sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
 };
@@ -133,14 +135,16 @@ pub struct MVTableId(i64);
 /// This associated type keeps `RowVersionChain<A>` allocator-shaped in MVCC
 /// code without scattering `cfg(nightly)` branches. Stable Rust cannot define
 /// a `Vec<T, A>` type alias that ignores `A`, so the stable implementation
-/// maps every allocator to the allocator-free `Vec<RowVersion>`.
+/// maps every allocator to the allocator-free `VersionChain`, which keeps a
+/// single version inline. The nightly build keeps a `Vec<RowVersion, A>`, so
+/// that each chain allocates from its allocator.
 pub trait RowVersionAllocator: ConcurrentAllocator {
     type RowVersionChain: std::fmt::Debug;
 }
 
 #[cfg(not(nightly))]
 impl<A: ConcurrentAllocator> RowVersionAllocator for A {
-    type RowVersionChain = crate::alloc::Vec<RowVersion>;
+    type RowVersionChain = version_chain::VersionChain;
 }
 
 #[cfg(nightly)]
@@ -8858,8 +8862,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     const CHAIN_EXACT_GROWTH_MAX_LEN: usize = 4;
 
     /// Most chains hold one or two versions. Amortized `Vec` growth gives an
-    /// empty chain four slots of about 100 bytes each, so a short chain grows
-    /// by one slot at a time and a long chain doubles as before.
+    /// empty chain four slots, so a short chain grows by one slot at a time and
+    /// a long chain doubles as before.
     fn reserve_space_for_one_version(
         versions: &mut RowVersionChain<A>,
     ) -> Result<(), TryReserveError> {
