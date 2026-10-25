@@ -25519,6 +25519,154 @@ fn a_write_to_one_table_leaves_the_write_count_of_another_table_unchanged() {
 }
 
 #[test]
+fn mvcc_table_scan_sees_a_write_of_its_transaction_made_in_the_middle_of_a_step() {
+    let forward = "SELECT id, v FROM t";
+    let backward = "SELECT id, v FROM t ORDER BY id DESC";
+    let forward_without_4 = vec![
+        (1, "v"),
+        (2, "w"),
+        (3, "v"),
+        (6, "v"),
+        (7, "v"),
+        (8, "v"),
+        (9, "w"),
+        (10, "v"),
+    ];
+    let cases = [
+        (
+            forward,
+            3,
+            CursorYieldPoint::NextBtreeAdvance,
+            "DELETE FROM t WHERE id = 4",
+            forward_without_4.clone(),
+        ),
+        (
+            forward,
+            2,
+            CursorYieldPoint::NextBtreeAdvance,
+            "DELETE FROM t WHERE id = 4",
+            forward_without_4,
+        ),
+        (
+            backward,
+            3,
+            CursorYieldPoint::PrevBtreeAdvance,
+            "DELETE FROM t WHERE id = 3",
+            vec![
+                (10, "v"),
+                (9, "w"),
+                (8, "v"),
+                (7, "v"),
+                (6, "v"),
+                (4, "v"),
+                (2, "w"),
+                (1, "v"),
+            ],
+        ),
+    ];
+    let mut wrong_scans = Vec::new();
+    for (query, rows_before_yield, yield_point, write, expected) in cases {
+        let db = MvccTestDb::new();
+        let conn = &db.conn;
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO t VALUES (1, 'v'), (2, 'v'), (3, 'v'), (4, 'v'), (6, 'v'), \
+             (7, 'v'), (8, 'v'), (9, 'v'), (10, 'v')",
+        )
+        .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("UPDATE t SET v = 'w' WHERE id IN (2, 9)")
+            .unwrap();
+
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.set_yield_injector(Some(NthHitYieldInjector::new(
+            yield_point.point(),
+            rows_before_yield - 1,
+        )));
+        let mut scan = conn.prepare(query).unwrap();
+        let mut rows = Vec::new();
+        let mut written = false;
+        loop {
+            match scan.step().unwrap() {
+                StepResult::Row => {
+                    let row = scan.row().unwrap();
+                    rows.push((
+                        row.get::<i64>(0).unwrap(),
+                        row.get_value(1).to_text().unwrap().to_string(),
+                    ));
+                }
+                StepResult::Yield => {
+                    assert!(!written, "{query}: the scan yielded twice");
+                    assert_eq!(rows.len(), rows_before_yield);
+                    conn.set_yield_injector(None);
+                    conn.execute(write).unwrap();
+                    written = true;
+                }
+                StepResult::IO => scan.get_pager().io.step().unwrap(),
+                StepResult::Done => break,
+                other => panic!("unexpected step result {other:?}"),
+            }
+        }
+        drop(scan);
+        conn.execute("COMMIT").unwrap();
+        assert!(
+            written,
+            "{query}: the scan never yielded at {yield_point:?}"
+        );
+
+        let expected = expected
+            .iter()
+            .map(|(id, v)| (*id, v.to_string()))
+            .collect::<Vec<_>>();
+        if rows != expected {
+            wrong_scans.push(format!(
+                "{query} with `{write}` at {yield_point:?} after {rows_before_yield} rows: \
+                 got {rows:?}, expected {expected:?}"
+            ));
+        }
+    }
+    assert!(wrong_scans.is_empty(), "{wrong_scans:#?}");
+}
+
+#[derive(Debug)]
+struct NthHitYieldInjector {
+    point: YieldPoint,
+    hits_before_yield: Mutex<Option<usize>>,
+}
+
+impl NthHitYieldInjector {
+    fn new(point: YieldPoint, hits_before_yield: usize) -> Arc<Self> {
+        Arc::new(Self {
+            point,
+            hits_before_yield: Mutex::new(Some(hits_before_yield)),
+        })
+    }
+}
+
+impl YieldInjector for NthHitYieldInjector {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        if point != self.point {
+            return false;
+        }
+        let mut hits_before_yield = self.hits_before_yield.lock();
+        match *hits_before_yield {
+            Some(0) => {
+                *hits_before_yield = None;
+                true
+            }
+            Some(hits) => {
+                *hits_before_yield = Some(hits - 1);
+                false
+            }
+            None => false,
+        }
+    }
+}
+
+#[test]
 fn mvcc_table_reader_returns_the_same_rows_after_an_injected_yield() {
     for checkpoint in [true, false] {
         let (db, unfinished, rows) = reader_yield_fixture(checkpoint);
