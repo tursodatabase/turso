@@ -6597,10 +6597,10 @@ impl BTreeCursor {
         }
     }
 
-    /// A range seek op comes from a cursor that sat between two entries with
-    /// no record (see try_save_position_for_external_balance). The seek put
-    /// the cursor on the entry after that gap, so put it back in the gap: no
-    /// record, and the next next() returns this entry.
+    /// A range seek op comes from a cursor saved with skip_advance (see
+    /// try_save_position_for_external_balance): it sat in the gap before an
+    /// entry. The seek put the cursor on the entry after that gap, so put it
+    /// back in the gap: no record, and the next next() returns this entry.
     fn stay_before_entry_if_saved_in_gap(&mut self, seek_op: SeekOp) {
         if !seek_op.eq_only() {
             self.set_has_record(false);
