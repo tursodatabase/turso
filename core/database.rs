@@ -350,6 +350,9 @@ pub enum OpenDbAsyncPhase {
     /// Drives `Database::header_validation` (header validation + WAL recovery)
     /// as a sub state machine so WAL recovery on open does not block.
     ValidatingHeader,
+    /// Loads page 1, which the WAL attach dropped from the cache, before
+    /// `_connect` reads the default cache size from it.
+    Connecting,
     ReadingHeader,
     LoadingSchema,
     BootstrapMvStore,
@@ -540,11 +543,21 @@ pub struct ConnectAsyncState {
     conn: Option<Arc<Connection>>,
     /// The in-flight `sqlite_stat1` scan.
     refresh: RefreshAnalyzeStatsState,
+    /// The pager init (DB header and page 1 reads) of the new connection.
+    init: InitState,
 }
 
 impl ConnectAsyncState {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+impl Drop for ConnectAsyncState {
+    fn drop(&mut self) {
+        if let InitState::ReadPage1 { pager } = &self.init {
+            pager.end_read_tx();
+        }
     }
 }
 
@@ -1616,7 +1629,21 @@ impl Database {
                     let _ = &mut db;
 
                     // Wrap db in Arc before connecting
-                    let db = Arc::new(db);
+                    state.db = Some(Arc::new(db));
+                    state.pager = Some(pager);
+                    state.phase = OpenDbAsyncPhase::Connecting;
+                }
+
+                OpenDbAsyncPhase::Connecting => {
+                    let db = state
+                        .db
+                        .as_ref()
+                        .expect("db must be set in ValidatingHeader phase");
+                    let pager = state
+                        .pager
+                        .as_ref()
+                        .expect("pager must be set in ValidatingHeader phase");
+                    return_if_io!(pager.with_header(|_| ()));
 
                     // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
                     let conn = db._connect(
@@ -1632,8 +1659,6 @@ impl Database {
                     // to ensure schema_version and make_from_btree are atomic
                     let guard = db.schema.lock_arc();
 
-                    state.db = Some(db);
-                    state.pager = Some(pager);
                     state.conn = Some(conn);
                     state.schema_guard = Some(guard);
 
@@ -2509,7 +2534,7 @@ impl Database {
 
     /// Non-blocking [`Self::connect`].
     ///
-    /// Creating the connection itself never waits, but the connect-time
+    /// Creating the connection can wait on reading page 1. The connect-time
     /// ANALYZE stats refresh runs a `SELECT` over `sqlite_stat1`, and that
     /// statement can have to wait: on page I/O, or on another transaction
     /// (a read that speculatively saw a version whose writer is still
@@ -2527,7 +2552,7 @@ impl Database {
     /// stays best-effort: a failure to prepare or scan `sqlite_stat1` is
     /// logged and the connection is returned without stats.
     ///
-    /// Only the first call, which creates the connection, uses `opts`; later
+    /// Only the calls until the connection is created use `opts`; later
     /// calls with the same `state` only resume the stats refresh.
     pub fn connect_async(
         self: &Arc<Database>,
@@ -2537,9 +2562,15 @@ impl Database {
         let conn = match &state.conn {
             Some(conn) => conn.clone(),
             None => {
+                self.validate_connect_page_codec(opts.page_codec.as_ref())?;
+                let pager = return_if_io!(self._init_nonblock(
+                    &mut state.init,
+                    opts.encryption_key.as_ref(),
+                    opts.page_codec.as_ref(),
+                ));
                 let conn = self._connect(
                     false,
-                    None,
+                    Some(Arc::new(pager)),
                     opts.encryption_key,
                     opts.page_codec,
                     ConnectionContext::default(),
