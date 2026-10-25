@@ -833,7 +833,7 @@ struct SpillState {
     /// DISTINCT only, empty otherwise: where the key with each hash is. Equal keys
     /// have equal hashes, so a new key needs no disk read and a duplicate of a key
     /// on disk needs to read only that one key, not its whole partition.
-    distinct_key_places: HashMap<u64, DistinctKeyPlace>,
+    distinct_key_places: HashMap<u64, PackedDistinctKeyPlace>,
     distinct_key_read: Option<DistinctKeyRead>,
 }
 
@@ -841,7 +841,47 @@ struct SpillState {
 enum DistinctKeyPlace {
     InBuffer,
     OnDisk { offset: u64, len: usize },
+    OnDiskWithoutOffset,
     SharedByDifferentKeys,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PackedDistinctKeyPlace(u64);
+
+impl PackedDistinctKeyPlace {
+    const LEN_BITS: u32 = 24;
+    const IN_BUFFER: u64 = u64::MAX;
+    const SHARED_BY_DIFFERENT_KEYS: u64 = u64::MAX - 1;
+    const ON_DISK_WITHOUT_OFFSET: u64 = u64::MAX - 2;
+
+    fn new(place: DistinctKeyPlace) -> Self {
+        match place {
+            DistinctKeyPlace::InBuffer => Self(Self::IN_BUFFER),
+            DistinctKeyPlace::SharedByDifferentKeys => Self(Self::SHARED_BY_DIFFERENT_KEYS),
+            DistinctKeyPlace::OnDiskWithoutOffset => Self(Self::ON_DISK_WITHOUT_OFFSET),
+            DistinctKeyPlace::OnDisk { offset, len } => {
+                let offset_limit = (1u64 << (u64::BITS - Self::LEN_BITS)) - 1;
+                let len_limit = 1u64 << Self::LEN_BITS;
+                if offset < offset_limit && (len as u64) < len_limit {
+                    Self((offset << Self::LEN_BITS) | len as u64)
+                } else {
+                    Self(Self::ON_DISK_WITHOUT_OFFSET)
+                }
+            }
+        }
+    }
+
+    fn get(self) -> DistinctKeyPlace {
+        match self.0 {
+            Self::IN_BUFFER => DistinctKeyPlace::InBuffer,
+            Self::SHARED_BY_DIFFERENT_KEYS => DistinctKeyPlace::SharedByDifferentKeys,
+            Self::ON_DISK_WITHOUT_OFFSET => DistinctKeyPlace::OnDiskWithoutOffset,
+            packed => DistinctKeyPlace::OnDisk {
+                offset: packed >> Self::LEN_BITS,
+                len: (packed & ((1u64 << Self::LEN_BITS) - 1)) as usize,
+            },
+        }
+    }
 }
 
 struct DistinctKeyRead {
@@ -1330,7 +1370,7 @@ impl HashTable {
                 .expect("spill state exists")
                 .distinct_key_places
                 .get(&hash)
-                .copied();
+                .map(|place| place.get());
             let has_spilled_dup = match place {
                 None | Some(DistinctKeyPlace::InBuffer) => false,
                 Some(DistinctKeyPlace::OnDisk { offset, len }) => {
@@ -1341,7 +1381,9 @@ impl HashTable {
                         metrics.as_deref_mut()
                     ))
                 }
-                Some(DistinctKeyPlace::SharedByDifferentKeys) => {
+                Some(
+                    DistinctKeyPlace::OnDiskWithoutOffset | DistinctKeyPlace::SharedByDifferentKeys,
+                ) => {
                     return_if_io!(self.spilled_partition_has_key(
                         partition_idx,
                         hash,
@@ -1374,7 +1416,7 @@ impl HashTable {
                 };
                 spill_state
                     .distinct_key_places
-                    .try_insert(hash, new_place)?;
+                    .try_insert(hash, PackedDistinctKeyPlace::new(new_place))?;
             }
             self.num_entries += 1;
             self.mem_used += entry_size;
@@ -1524,7 +1566,7 @@ impl HashTable {
                 };
                 spill_state
                     .distinct_key_places
-                    .try_insert(entry.hash, place)?;
+                    .try_insert(entry.hash, PackedDistinctKeyPlace::new(place))?;
             }
         }
         Ok(())
@@ -3450,7 +3492,7 @@ impl HashTable {
 }
 
 fn record_distinct_key_on_disk(
-    places: &mut HashMap<u64, DistinctKeyPlace>,
+    places: &mut HashMap<u64, PackedDistinctKeyPlace>,
     hash: u64,
     offset: u64,
     len: usize,
@@ -3459,11 +3501,14 @@ fn record_distinct_key_on_disk(
         return;
     };
     turso_assert!(
-        !matches!(place, DistinctKeyPlace::OnDisk { .. }),
+        !matches!(
+            place.get(),
+            DistinctKeyPlace::OnDisk { .. } | DistinctKeyPlace::OnDiskWithoutOffset
+        ),
         "a buffered DISTINCT key cannot share its hash with a key already on disk"
     );
-    if *place == DistinctKeyPlace::InBuffer {
-        *place = DistinctKeyPlace::OnDisk { offset, len };
+    if place.get() == DistinctKeyPlace::InBuffer {
+        *place = PackedDistinctKeyPlace::new(DistinctKeyPlace::OnDisk { offset, len });
     }
 }
 
@@ -4342,6 +4387,15 @@ mod hashtests {
 
     #[test]
     fn test_insert_distinct_finds_duplicates_when_different_keys_share_a_hash() {
+        assert_duplicates_found_when_every_spilled_key_is(DistinctKeyPlace::SharedByDifferentKeys);
+    }
+
+    #[test]
+    fn test_insert_distinct_finds_duplicates_of_keys_on_disk_without_offset() {
+        assert_duplicates_found_when_every_spilled_key_is(DistinctKeyPlace::OnDiskWithoutOffset);
+    }
+
+    fn assert_duplicates_found_when_every_spilled_key_is(place: DistinctKeyPlace) {
         let io = Arc::new(MemoryIO::new());
         let config = HashTableConfig {
             initial_buckets: 4,
@@ -4362,14 +4416,14 @@ mod hashtests {
                 &mut metrics
             ));
         }
-        for place in ht
+        for stored_place in ht
             .spill_state
             .as_mut()
             .unwrap()
             .distinct_key_places
             .values_mut()
         {
-            *place = DistinctKeyPlace::SharedByDifferentKeys;
+            *stored_place = PackedDistinctKeyPlace::new(place);
         }
 
         for key in (0..2048).rev() {
@@ -4379,6 +4433,59 @@ mod hashtests {
             );
         }
         assert!(insert_distinct_text(&mut ht, "new key", &mut metrics));
+    }
+
+    #[test]
+    fn test_distinct_key_place_map_entry_takes_two_u64s() {
+        assert_eq!(
+            std::mem::size_of::<(u64, PackedDistinctKeyPlace)>(),
+            2 * std::mem::size_of::<u64>()
+        );
+    }
+
+    #[test]
+    fn test_packed_distinct_key_place_keeps_every_place() {
+        let largest_offset = (1u64 << 40) - 2;
+        let largest_len = (1usize << 24) - 1;
+        for place in [
+            DistinctKeyPlace::InBuffer,
+            DistinctKeyPlace::SharedByDifferentKeys,
+            DistinctKeyPlace::OnDiskWithoutOffset,
+            DistinctKeyPlace::OnDisk { offset: 0, len: 0 },
+            DistinctKeyPlace::OnDisk {
+                offset: 12345,
+                len: 678,
+            },
+            DistinctKeyPlace::OnDisk {
+                offset: largest_offset,
+                len: largest_len,
+            },
+        ] {
+            assert_eq!(PackedDistinctKeyPlace::new(place).get(), place);
+        }
+    }
+
+    #[test]
+    fn test_packed_distinct_key_place_without_room_for_offset_or_len() {
+        for place in [
+            DistinctKeyPlace::OnDisk {
+                offset: (1u64 << 40) - 1,
+                len: 0,
+            },
+            DistinctKeyPlace::OnDisk {
+                offset: 0,
+                len: 1usize << 24,
+            },
+            DistinctKeyPlace::OnDisk {
+                offset: u64::MAX,
+                len: usize::MAX,
+            },
+        ] {
+            assert_eq!(
+                PackedDistinctKeyPlace::new(place).get(),
+                DistinctKeyPlace::OnDiskWithoutOffset
+            );
+        }
     }
 
     #[test]
