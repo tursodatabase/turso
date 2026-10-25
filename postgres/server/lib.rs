@@ -147,18 +147,19 @@ impl TursoPgHandler {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
         let schema_file = parent.join(format!("turso-postgres-schema-{name}.db"));
+        let wal = schema_file.with_extension("db-wal");
+        let shm = schema_file.with_extension("db-shm");
+        let log = schema_file.with_extension("db-log");
         if schema_file.exists() {
             if let Err(e) = std::fs::remove_file(&schema_file) {
                 tracing::warn!("Failed to delete schema file {:?}: {}", schema_file, e);
             } else {
                 tracing::info!("Deleted schema file {:?}", schema_file);
             }
-            // Also clean up WAL and SHM files
-            let wal = schema_file.with_extension("db-wal");
-            let shm = schema_file.with_extension("db-shm");
-            let _ = std::fs::remove_file(wal);
-            let _ = std::fs::remove_file(shm);
         }
+        let _ = std::fs::remove_file(wal);
+        let _ = std::fs::remove_file(shm);
+        let _ = std::fs::remove_file(log);
     }
 }
 
@@ -1135,5 +1136,41 @@ mod tests {
 
         assert!(!ends_with_with_no_data("CREATE TABLE T AS SELECT 1"));
         assert!(!ends_with_with_no_data("SELECT 'WITH NO DATA'"));
+    }
+
+    #[test]
+    fn test_cleanup_dropped_schema_file_removes_log_wal_shm() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_file = temp_dir.path().join("main.db");
+        let (_io, db) = turso_pg::open_database(
+            &db_file.to_string_lossy(),
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        let handler = TursoPgHandler {
+            conn: Arc::new(Mutex::new(conn)),
+            db_file: db_file.to_string_lossy().to_string(),
+            query_parser: Arc::new(NoopQueryParser),
+        };
+
+        let schema_db = temp_dir.path().join("turso-postgres-schema-es.db");
+        let schema_wal = temp_dir.path().join("turso-postgres-schema-es.db-wal");
+        let schema_shm = temp_dir.path().join("turso-postgres-schema-es.db-shm");
+        let schema_log = temp_dir.path().join("turso-postgres-schema-es.db-log");
+
+        std::fs::write(&schema_db, b"db").unwrap();
+        std::fs::write(&schema_wal, b"wal").unwrap();
+        std::fs::write(&schema_shm, b"shm").unwrap();
+        std::fs::write(&schema_log, b"log").unwrap();
+
+        handler.cleanup_dropped_schema_file("DROP SCHEMA es CASCADE");
+
+        assert!(!schema_db.exists());
+        assert!(!schema_wal.exists());
+        assert!(!schema_shm.exists());
+        assert!(!schema_log.exists());
     }
 }
