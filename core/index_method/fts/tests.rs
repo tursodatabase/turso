@@ -841,7 +841,7 @@ fn single_term_prefixes_match_and_keep_bm25_scores() {
     ] {
         let hits = query_hits(&mut cursor, FTS_PATTERN_COMBINED_ORDERED, query, -1);
         let mut ids = hits.iter().map(|hit| hit.0).collect::<Vec<_>>();
-        ids.sort();
+        ids.sort_unstable();
         assert_eq!(ids, expected, "{query}");
         assert!(hits.iter().all(|hit| hit.1.as_float() > 0.0));
     }
