@@ -61,7 +61,7 @@ impl HirFromScope for hir::From {
 pub(crate) fn table_mask_from_hir_scope(
     document: &HirDocument,
     from: &impl HirFromScope,
-    expression: &hir::Expr,
+    expression: hir::ExprId,
 ) -> Result<TableMask> {
     table_mask_from_hir_positions(document, expression, |source| from.source_position(source))
 }
@@ -72,7 +72,7 @@ pub(crate) fn table_mask_from_hir_scope(
 pub(crate) fn table_mask_from_hir_expr(
     document: &HirDocument,
     from: Option<&hir::From>,
-    expression: &hir::Expr,
+    expression: hir::ExprId,
 ) -> Result<TableMask> {
     table_mask_from_hir_positions(document, expression, |source| {
         from.and_then(|from| from.source_position(source))
@@ -81,7 +81,7 @@ pub(crate) fn table_mask_from_hir_expr(
 
 fn table_mask_from_hir_positions(
     document: &HirDocument,
-    expression: &hir::Expr,
+    expression: hir::ExprId,
     position: impl Fn(hir::SourceId) -> Option<usize>,
 ) -> Result<TableMask> {
     let mut mask = TableMask::default();

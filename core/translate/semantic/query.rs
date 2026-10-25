@@ -24,6 +24,7 @@ pub(crate) fn compound_column_affinity<'a>(
     query: &hir::Query,
     position: usize,
     source_of: &dyn Fn(hir::SourceId) -> Option<&'a hir::Source>,
+    exprs: &hir::ExprArena,
 ) -> (Affinity, bool) {
     let outputs = query
         .blocks
@@ -45,13 +46,13 @@ pub(crate) fn compound_column_affinity<'a>(
         if affinity != Affinity::None {
             break;
         }
-        data_types |= expr_data_type(&output.expr, source_of);
+        data_types |= expr_data_type(exprs.at(output.expr), source_of);
     }
     if affinity == Affinity::None {
         return (Affinity::Blob, false);
     }
     for output in arms {
-        data_types |= expr_data_type(&output.expr, source_of);
+        data_types |= expr_data_type(exprs.at(output.expr), source_of);
     }
     let conflicts = match affinity {
         Affinity::Text => data_types.has_numeric(),
@@ -67,7 +68,7 @@ pub(crate) fn compound_column_affinity<'a>(
 /// The storage classes an expression can give, like SQLite's
 /// `sqlite3ExprDataType`.
 pub(crate) fn expr_data_type<'a>(
-    expression: &hir::Expr,
+    expression: hir::ExprRef<'_>,
     source_of: &dyn Fn(hir::SourceId) -> Option<&'a hir::Source>,
 ) -> StorageClassMask {
     let from_affinity = |affinity: Affinity| {
@@ -79,12 +80,12 @@ pub(crate) fn expr_data_type<'a>(
             StorageClassMask::all()
         }
     };
-    match expression {
+    match expression.node() {
         hir::Expr::Collate { expr, .. }
         | hir::Expr::Unary {
             operator: ast::UnaryOperator::Positive,
             expr,
-        } => expr_data_type(expr, source_of),
+        } => expr_data_type(expression.at(*expr), source_of),
         hir::Expr::Literal(literal) => {
             match crate::translate::alter::literal_default_value(literal)
                 .map(|value| value.value_type())
@@ -116,10 +117,10 @@ pub(crate) fn expr_data_type<'a>(
         } => {
             let mut types = StorageClassMask::from_null();
             for (_, then) in when_then {
-                types |= expr_data_type(then, source_of);
+                types |= expr_data_type(expression.at(*then), source_of);
             }
             if let Some(else_expr) = else_expr {
-                types |= expr_data_type(else_expr, source_of);
+                types |= expr_data_type(expression.at(*else_expr), source_of);
             }
             types
         }
@@ -321,6 +322,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 column.name,
                 hir::OutputNameKind::StarExpansion,
                 resolved,
+                &mut self.exprs,
             ));
         }
 
@@ -351,7 +353,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             limit: None,
             output,
         };
-        query.captures = query.direct_captures(|source| self.source(source));
+        query.captures = query.direct_captures(|source| self.source(source), &self.exprs);
         let id = query.id;
         self.insert_query(id, query)?;
         Ok(id)
@@ -392,7 +394,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             crate::LimboError::InternalError(format!("missing semantic source {source}"))
         })?;
         match first.saved {
-            Some(saved) => scope.add_group_source(definition, saved),
+            Some(saved) => scope.add_group_source(definition, saved, &self.exprs),
             None => scope.add_source(definition, true),
         }
 
@@ -445,7 +447,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                             // The right column is checked first: a missing
                             // right column is reported before an ambiguous
                             // left copy.
-                            let right = resolve_source_column(definition, &name)?;
+                            let right = resolve_source_column(definition, &name, &self.exprs)?;
                             let left =
                                 scope.resolve_using_left(&name, natural, has_right_or_full_join)?;
                             // The columns compare as `left = right` written
@@ -454,8 +456,24 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                             // as BINARY, like any column decides it.
                             let right = self.using_operand(right, &scope)?;
                             let left = self.using_operand(left, &scope)?;
-                            let value = merged_column_value(kind);
-                            let mut column = build_using_column(name, left.clone(), right, value)?;
+                            Ok((name, left, right))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?;
+            let value = merged_column_value(kind);
+            let using_columns = using_columns
+                .map(|columns| {
+                    columns
+                        .into_iter()
+                        .map(|(name, left, right)| {
+                            let mut column = build_using_column(
+                                name,
+                                left.clone(),
+                                right,
+                                value,
+                                &mut self.exprs,
+                            )?;
                             if value == hir::MergedColumnValue::Coalesce {
                                 // The merged column of a FULL JOIN keeps the
                                 // left column's affinity and collation, so
@@ -470,13 +488,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         .collect::<Result<Vec<_>>>()
                 })
                 .transpose()?;
+            let definition = self.source(right).expect("join source was just added");
 
             match analyzed.saved {
-                Some(saved) => scope.add_group_source(definition, saved),
+                Some(saved) => scope.add_group_source(definition, saved, &self.exprs),
                 None => scope.add_source(definition, true),
             }
             if let Some(columns) = &using_columns {
-                scope.apply_using(columns)?;
+                scope.apply_using(columns, &mut self.exprs)?;
             }
             let constraint = match using_columns {
                 Some(columns) if natural => hir::JoinConstraint::Natural(columns),
@@ -583,7 +602,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 .map(|join| join.right)
                 .filter(|right| lateral_sources.contains(right))
                 .collect();
-            if let Some(read) = self.expr_reads_any_source(&constraint, &later_laterals) {
+            if let Some(read) = self.expr_reads_any_source(constraint, &later_laterals) {
                 let read = self.source(read).expect("FROM source exists");
                 crate::bail_parse_error!(
                     "no such table: {}",
@@ -836,7 +855,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             GroupMode::Flatten => {
                 let (from, inner_scope) = self.analyze_from_clause(syntax, context)?;
                 let defs = inner_scope.saved_group_columns(&from)?;
-                let values = defs.iter().map(|def| def.value.expr.clone()).collect();
+                let values = defs
+                    .iter()
+                    .map(|def| self.exprs.push(def.value.expr.clone()))
+                    .collect();
                 (
                     hir::SourceKind::FromGroup(hir::FromGroup {
                         from: Box::new(from),
@@ -866,6 +888,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                             def.name.clone(),
                             hir::OutputNameKind::ExplicitAlias,
                             def.value.clone(),
+                            &mut self.exprs,
                         )
                     })
                     .collect();
@@ -894,7 +917,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     limit: None,
                     output,
                 };
-                query.captures = query.direct_captures(|source| self.source(source));
+                query.captures = query.direct_captures(|source| self.source(source), &self.exprs);
                 self.insert_query(query_id, query)?;
                 (hir::SourceKind::Derived(query_id), defs)
             }
@@ -983,7 +1006,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             let argument = ResolvedScopeExpr {
                 expr: hir::Expr::Unary {
                     operator: ast::UnaryOperator::Positive,
-                    expr: Box::new(argument.expr),
+                    expr: self.exprs.push(argument.expr),
                 },
                 has_affinity: false,
                 ..argument
@@ -1002,7 +1025,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     component.array = false;
                 }
             }
-            argument_predicates.push(predicate);
+            argument_predicates.push(self.exprs.push(predicate));
         }
         let source = self.source_mut(source).ok_or_else(|| {
             crate::LimboError::InternalError(format!(
@@ -1038,15 +1061,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     pub(super) fn reduce_full_joins_rejected_by_where(
         &self,
         from: &mut hir::From,
-        filter: &hir::Expr,
+        filter: hir::ExprId,
     ) {
         let mut terms = Vec::new();
-        where_conjuncts(filter, &mut terms);
+        where_conjuncts(self.exprs.at(filter), &mut terms);
         let rejects = |sources: &[hir::SourceId]| {
             sources.iter().any(|source| {
-                terms
-                    .iter()
-                    .any(|term| crate::translate::semantic_to_plan::rejects_null_row(term, *source))
+                terms.iter().any(|term| {
+                    crate::translate::semantic_to_plan::rejects_null_row(*term, *source)
+                })
             })
         };
         let mut left = Vec::new();
@@ -1106,9 +1129,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         scope: &Scope,
         policy: ExprPolicy,
         parent: Option<hir::QueryId>,
-    ) -> Result<hir::Expr> {
-        self.analyze_source_scalar_expr_with_facts(syntax, scope, policy, parent)
-            .map(|resolved| resolved.expr)
+    ) -> Result<hir::ExprId> {
+        let expression = self
+            .analyze_source_scalar_expr_with_facts(syntax, scope, policy, parent)?
+            .expr;
+        Ok(self.exprs.push(expression))
     }
 
     fn analyze_source_scalar_expr_with_facts(
@@ -1279,18 +1304,18 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     /// through a subquery written in it.
     fn expr_reads_any_source(
         &self,
-        expression: &hir::Expr,
+        expression: hir::ExprId,
         candidates: &[hir::SourceId],
     ) -> Option<hir::SourceId> {
         if candidates.is_empty() {
             return None;
         }
         let mut found = None;
-        expression.for_each(&mut |expression| {
+        self.exprs.at(expression).for_each(&mut |expression| {
             if found.is_some() {
                 return;
             }
-            found = match expression {
+            found = match expression.node() {
                 hir::Expr::Column(reference) if candidates.contains(&reference.source) => {
                     Some(reference.source)
                 }
@@ -1347,9 +1372,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             return false;
         };
         let mut found = false;
-        let mut check = |expression: &hir::Expr| {
-            expression.for_each(&mut |expression| {
-                if let hir::Expr::Function(call) = expression {
+        let mut check = |expression: &hir::ExprId| {
+            self.exprs.at(*expression).for_each(&mut |expression| {
+                if let hir::Expr::Function(call) = expression.node() {
                     if matches!(
                         &call.evaluation,
                         hir::FunctionEvaluation::Aggregate { id, .. } if id.block == block
@@ -1520,7 +1545,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     /// a value of the other class (text against numeric) removes it, so the
     /// column compares by storage class.
     fn compound_column_affinity(&self, query: &hir::Query, position: usize) -> (Affinity, bool) {
-        compound_column_affinity(query, position, &|source| self.source(source))
+        compound_column_affinity(query, position, &|source| self.source(source), &self.exprs)
     }
 
     /// Like SQLite, a subquery column without an alias is named after the
@@ -1532,7 +1557,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         if output.name_kind != hir::OutputNameKind::Inferred {
             return output.name.clone();
         }
-        let column_name = match &output.expr {
+        let column_name = match &self.exprs[output.expr] {
             hir::Expr::Column(reference) => self
                 .source(reference.source)
                 .and_then(|source| source.columns.get(reference.column))
@@ -1937,16 +1962,16 @@ fn is_full_join(kind: ast::JoinType) -> bool {
 }
 
 /// The terms a WHERE clause ANDs together.
-fn where_conjuncts<'e>(expression: &'e hir::Expr, terms: &mut Vec<&'e hir::Expr>) {
-    match expression {
+fn where_conjuncts<'e>(expression: hir::ExprRef<'e>, terms: &mut Vec<hir::ExprRef<'e>>) {
+    match expression.node() {
         hir::Expr::Binary {
             lhs,
             operator: ast::Operator::And,
             rhs,
             ..
         } => {
-            where_conjuncts(lhs, terms);
-            where_conjuncts(rhs, terms);
+            where_conjuncts(expression.at(*lhs), terms);
+            where_conjuncts(expression.at(*rhs), terms);
         }
         _ => terms.push(expression),
     }

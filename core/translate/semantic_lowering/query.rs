@@ -123,8 +123,8 @@ struct HirRowOutput<'a> {
 /// custom ORDER BY keys can need encoded values while SELECT needs decoded ones.
 #[derive(Default)]
 struct HirRowInputs<'a> {
-    values: &'a [super::expr::ExprRegisterInput<'a>],
-    sort_keys: &'a [super::expr::ExprRegisterInput<'a>],
+    values: &'a [super::expr::ExprRegisterInput],
+    sort_keys: &'a [super::expr::ExprRegisterInput],
 }
 
 /// Each terminal keeps its exact HIR node identity, even when equivalent nodes
@@ -133,26 +133,27 @@ struct HirRowInputs<'a> {
 #[derive(Default)]
 struct HirWindowOutputPlan<'a> {
     columns: Vec<usize>,
-    values: Vec<(&'a hir::Expr, usize)>,
-    sort_keys: Vec<(&'a hir::Expr, usize)>,
+    values: Vec<(hir::ExprId, usize)>,
+    sort_keys: Vec<(hir::ExprId, usize)>,
+    marker: std::marker::PhantomData<&'a hir::ExprArena>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-struct HirWindowOutputRegisters<'a> {
+struct HirWindowOutputRegisters {
     start: usize,
-    values: Vec<super::expr::ExprRegisterInput<'a>>,
-    sort_keys: Vec<super::expr::ExprRegisterInput<'a>>,
+    values: Vec<super::expr::ExprRegisterInput>,
+    sort_keys: Vec<super::expr::ExprRegisterInput>,
 }
 
 impl<'a> HirWindowOutputPlan<'a> {
     /// Row-result preparation reads `columns` into this contiguous register range.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn prepare_registers(&self, program: &mut ProgramBuilder) -> HirWindowOutputRegisters<'a> {
+    fn prepare_registers(&self, program: &mut ProgramBuilder) -> HirWindowOutputRegisters {
         let start = program.alloc_registers(self.columns.len());
-        let bind = |entries: &[(&'a hir::Expr, usize)]| {
+        let bind = |entries: &[(hir::ExprId, usize)]| {
             entries
                 .iter()
-                .map(|(expr, slot)| super::expr::ExprRegisterInput::new(expr, start + slot))
+                .map(|(expr, slot)| super::expr::ExprRegisterInput::new(*expr, start + slot))
                 .collect()
         };
         HirWindowOutputRegisters {
@@ -163,7 +164,7 @@ impl<'a> HirWindowOutputPlan<'a> {
     }
 }
 
-impl HirWindowOutputRegisters<'_> {
+impl HirWindowOutputRegisters {
     #[cfg_attr(not(test), allow(dead_code))]
     fn row_inputs(&self) -> HirRowInputs<'_> {
         HirRowInputs {
@@ -176,7 +177,7 @@ impl HirWindowOutputRegisters<'_> {
 struct HirWindowOutputCollector<'plan, 'expr> {
     buffer: &'plan mut super::window::HirWindowBufferPlan<'expr>,
     columns: &'plan mut Vec<usize>,
-    inputs: &'plan mut Vec<(&'expr hir::Expr, usize)>,
+    inputs: &'plan mut Vec<(hir::ExprId, usize)>,
     encoded: bool,
 }
 
@@ -202,8 +203,12 @@ impl<'expr> hir::ExprVisitor<'expr> for HirWindowOutputCollector<'_, 'expr> {
     type Output = ();
     type Error = LimboError;
 
-    fn child(&mut self, expression: &'expr hir::Expr, index: usize) -> Option<&'expr hir::Expr> {
-        if Self::is_terminal(expression) {
+    fn child(
+        &mut self,
+        expression: hir::ExprRef<'expr>,
+        index: usize,
+    ) -> Option<hir::ExprRef<'expr>> {
+        if Self::is_terminal(expression.node()) {
             None
         } else {
             expression.child(index)
@@ -212,24 +217,25 @@ impl<'expr> hir::ExprVisitor<'expr> for HirWindowOutputCollector<'_, 'expr> {
 
     fn pre_order(
         &mut self,
-        _parent: &'expr hir::Expr,
+        _parent: hir::ExprRef<'expr>,
         _context: &mut (),
         _index: usize,
-        _child: &'expr hir::Expr,
+        _child: hir::ExprRef<'expr>,
     ) -> Result<std::ops::ControlFlow<(), ()>> {
         Ok(std::ops::ControlFlow::Continue(()))
     }
 
     fn post_order(
         &mut self,
-        expression: &'expr hir::Expr,
+        expression_ref: hir::ExprRef<'expr>,
         _context: (),
         _children: &[()],
     ) -> Result<()> {
-        if !Self::is_terminal(expression) {
+        let expression = expression_ref.id();
+        if !Self::is_terminal(expression_ref.node()) {
             return Ok(());
         }
-        if let hir::Expr::Function(call) = expression {
+        if let hir::Expr::Function(call) = expression_ref.node() {
             if let hir::FunctionEvaluation::Window { window, .. } = &call.evaluation {
                 if *window == self.buffer.window.id {
                     return Ok(());
@@ -263,9 +269,10 @@ fn plan_hir_window_output_inputs<'a>(
             "HIR window output belongs to a different query block".into(),
         ));
     }
+    let exprs = buffer.exprs;
     let mut plan = HirWindowOutputPlan::default();
     for output in &block.outputs {
-        output.expr.walk(
+        exprs.at(output.expr).walk(
             (),
             &mut HirWindowOutputCollector {
                 buffer,
@@ -282,12 +289,12 @@ fn plan_hir_window_output_inputs<'a>(
             .as_ref()
             .and_then(|declared| declared.custom())
             .is_some_and(|custom| custom.value().decode().is_some());
-        let expression = match hir_order_output_position(block, &term.expr) {
-            Some(output) if encoded => &block.outputs[output].expr,
+        let expression = match hir_order_output_position(exprs, block, term.expr) {
+            Some(output) if encoded => block.outputs[output].expr,
             Some(_) => continue, // The sorter copies an already evaluated SELECT output.
-            None => &term.expr,
+            None => term.expr,
         };
-        expression.walk(
+        exprs.at(expression).walk(
             (),
             &mut HirWindowOutputCollector {
                 buffer,
@@ -307,13 +314,14 @@ fn plan_hir_window_layer_inputs<'a>(
     outer_keys: &[super::window::HirWindowInputKey<'a>],
     buffer: &mut super::window::HirWindowBufferPlan<'a>,
 ) -> Result<HirWindowOutputPlan<'a>> {
+    let exprs = buffer.exprs;
     let mut plan = HirWindowOutputPlan::default();
     let encoded_keys = outer_keys
         .iter()
         .filter(|key| key.is_encoded())
         .map(|key| (key.expression, true));
     for (expression, encoded) in outer.column_expressions().chain(encoded_keys) {
-        expression.walk(
+        exprs.at(expression).walk(
             (),
             &mut HirWindowOutputCollector {
                 buffer,
@@ -450,7 +458,7 @@ struct HirGroupRuntime<'a> {
     grouping: &'a hir::Grouping,
     aggregates: HirAggregateState<'a>,
     rows: HirGroupRows,
-    inputs: Vec<HirGroupInput<'a>>,
+    inputs: Vec<HirGroupInput>,
     sources: Vec<HirGroupSource>,
     state: HirGroupState,
 }
@@ -480,7 +488,7 @@ struct HirGroupState {
     current_keys: usize,
 }
 
-enum HirGroupInput<'a> {
+enum HirGroupInput {
     Key(usize),
     Column {
         reference: hir::ColumnRef,
@@ -497,7 +505,7 @@ enum HirGroupInput<'a> {
     /// row keeps the stored value once, as SQLite does, instead of the
     /// columns the expression reads.
     Expression {
-        expressions: Vec<&'a hir::Expr>,
+        expressions: Vec<hir::ExprId>,
         row_register: usize,
         group_register: usize,
     },
@@ -547,8 +555,11 @@ fn open_hir_in_seek_source_cursor(
             // subquery, so it is filled again each time the loop starts.
             let mut reads_sources = false;
             for value in values {
-                value.for_each(&mut |expression| {
-                    if matches!(expression, hir::Expr::Column(_) | hir::Expr::RowId(_)) {
+                document.exprs.at(*value).for_each(&mut |expression| {
+                    if matches!(
+                        expression.node(),
+                        hir::Expr::Column(_) | hir::Expr::RowId(_)
+                    ) {
                         reads_sources = true;
                     }
                 });
@@ -561,7 +572,10 @@ fn open_hir_in_seek_source_cursor(
                 !reads_sources,
                 |program, expression, target| {
                     super::expr::translate_expr_no_constant_opt(
-                        program, document, expression, target,
+                        program,
+                        document,
+                        *expression,
+                        target,
                     )
                     .map(|_| ())
                 },
@@ -636,19 +650,19 @@ struct HirSeekExpressionLowering<'a> {
     source: &'a hir::Source,
 }
 
-impl SeekExpressionLowering<hir::Expr> for HirSeekExpressionLowering<'_> {
+impl SeekExpressionLowering<hir::ExprId> for HirSeekExpressionLowering<'_> {
     fn emit_expression(
         &mut self,
         program: &mut ProgramBuilder,
-        expression: &hir::Expr,
+        expression: &hir::ExprId,
         target: usize,
     ) -> Result<()> {
-        super::expr::translate_expr_no_constant_opt(program, self.document, expression, target)?;
+        super::expr::translate_expr_no_constant_opt(program, self.document, *expression, target)?;
         Ok(())
     }
 
-    fn is_nonnull(&self, expression: &hir::Expr) -> bool {
-        match expression {
+    fn is_nonnull(&self, expression: &hir::ExprId) -> bool {
+        match &self.document.exprs[*expression] {
             hir::Expr::Literal(
                 Literal::Numeric(_)
                 | Literal::String(_)
@@ -683,15 +697,15 @@ impl SeekExpressionLowering<hir::Expr> for HirSeekExpressionLowering<'_> {
     fn is_null_matching(
         &self,
         operator: turso_parser::ast::Operator,
-        expression: &hir::Expr,
+        expression: &hir::ExprId,
     ) -> bool {
         operator == turso_parser::ast::Operator::Is && !self.is_nonnull(expression)
     }
 
-    fn affinity(&self, affinity: Affinity, expression: &hir::Expr) -> Affinity {
+    fn affinity(&self, affinity: Affinity, expression: &hir::ExprId) -> Affinity {
         // Skip the affinity a key value already has: a number under numeric
         // affinity, text under TEXT, any blob, and a rowid.
-        let unchanged = match expression {
+        let unchanged = match &self.document.exprs[*expression] {
             hir::Expr::Literal(Literal::Numeric(_)) => affinity.is_numeric(),
             hir::Expr::Literal(Literal::String(_)) => affinity == Affinity::Text,
             hir::Expr::Literal(Literal::Blob(_)) => true,
@@ -1087,7 +1101,7 @@ fn emit_cached_subquery(
     let record_start = program.alloc_registers(key_width + width);
     for (position, key) in keys.iter().enumerate() {
         let value = record_start + position * 2;
-        super::expr::translate_expr_no_constant_opt(program, &plan.document, key, value)?;
+        super::expr::translate_detached_expr_no_constant_opt(program, &plan.document, key, value)?;
         program.emit_insn(Insn::Function {
             constant_mask: 0,
             start_reg: value,
@@ -1224,7 +1238,7 @@ pub(crate) fn emit_query_body(
     let done = program.allocate_label();
     let distinct = initialize_hir_distinct(program, block)?;
     let sorter = (!query.order_by.is_empty())
-        .then(|| initialize_hir_sorter(program, query, block))
+        .then(|| initialize_hir_sorter(program, &document.exprs, query, block))
         .transpose()?;
     let limit = initialize_limit(
         program,
@@ -1275,7 +1289,7 @@ fn emit_query_block_without_from(
                 super::expr::translate_condition_expr(
                     program,
                     document,
-                    filter,
+                    *filter,
                     ConditionMetadata {
                         jump_if_condition_is_true: false,
                         jump_target_when_true: emit_row,
@@ -1289,7 +1303,7 @@ fn emit_query_block_without_from(
                 document,
                 output,
                 &block.outputs,
-                block.outputs.iter().map(|output| &output.expr),
+                block.outputs.iter().map(|output| output.expr),
                 start,
                 block_done,
             )?;
@@ -1307,7 +1321,7 @@ fn emit_query_block_without_from(
                     document,
                     output,
                     &block.outputs,
-                    row.iter(),
+                    row.iter().copied(),
                     start,
                     next_row,
                 )?;
@@ -1384,7 +1398,7 @@ pub(crate) fn emit_planned_query_body(
         || hir_window_rows_follow_order_by(document, query, block)?
         || hir_group_rows_follow_order_by(document, query, block, &planned_query.blocks[0]);
     let sorter = (!query.order_by.is_empty() && !sort_elided)
-        .then(|| initialize_hir_sorter(program, query, block))
+        .then(|| initialize_hir_sorter(program, &document.exprs, query, block))
         .transpose()?;
     // An index method may apply LIMIT and OFFSET while it scans.
     let limit = query
@@ -1467,7 +1481,7 @@ fn hir_window_rows_follow_order_by(
     if query.order_by.is_empty() {
         return Ok(false);
     }
-    let plan = super::window::plan_hir_window_buffer(query, block, window.id)?;
+    let plan = super::window::plan_hir_window_buffer(&document.exprs, query, block, window.id)?;
     let keys = plan.input_sort_keys();
     if keys.len() < query.order_by.len() {
         return Ok(false);
@@ -1478,14 +1492,17 @@ fn hir_window_rows_follow_order_by(
         None => order == SortOrder::Asc,
     };
     Ok(query.order_by.iter().zip(&keys).all(|(term, key)| {
-        let mut expression = &term.expr;
-        while let hir::Expr::Output(id) = expression {
+        let mut expression = term.expr;
+        while let hir::Expr::Output(id) = &document.exprs[expression] {
             match document.output(*id) {
-                Some(output) => expression = &output.expr,
+                Some(output) => expression = output.expr,
                 None => return false,
             }
         }
-        expression.equivalent(key.expression)
+        document
+            .exprs
+            .at(expression)
+            .equivalent(document.exprs.at(key.expression))
             && term.order == key.order
             && nulls_first(term.order, term.nulls) == nulls_first(key.order, key.nulls)
             && term
@@ -1633,7 +1650,7 @@ fn emit_hir_ungrouped_without_from(
         super::expr::translate_condition_expr(
             program,
             document,
-            filter,
+            *filter,
             ConditionMetadata {
                 jump_if_condition_is_true: false,
                 jump_target_when_true: emit_step,
@@ -1745,14 +1762,14 @@ fn emit_hir_simple_count(
         ));
     };
     let bound = program.expression_register_count();
-    program.bind_expression_register(&count_output.expr, count);
+    program.bind_expression_register(count_output.expr, count);
     let start = query_output_registers(program, &block.outputs, output.needs_values())?;
     emit_query_row(
         program,
         document,
         output,
         &block.outputs,
-        block.outputs.iter().map(|output| &output.expr),
+        block.outputs.iter().map(|output| output.expr),
         start,
         block_done,
     )?;
@@ -1787,10 +1804,10 @@ fn emit_hir_grouped_aggregate<'a>(
 
 /// The expressions a grouped loop's index stores that the block reads from
 /// it. Each is kept in the group row as the index stores it.
-fn hir_group_loop_index_expressions<'a>(
-    plan: &'a HirPlan,
+fn hir_group_loop_index_expressions(
+    plan: &HirPlan,
     planned_loop: &HirPlannedLoop,
-) -> Result<Vec<(SourceId, &'a hir::Expr, usize)>> {
+) -> Result<Vec<(SourceId, hir::ExprId, usize)>> {
     let HirSourceAccess::BTree { operation, .. } = &planned_loop.access else {
         return Ok(Vec::new());
     };
@@ -1832,19 +1849,18 @@ fn hir_group_key_orders(
         return vec![(SortOrder::Asc, None); grouping.keys.len()];
     };
     let terms = query.order_by.iter().map(|term| {
-        let mut expression = &term.expr;
-        while let hir::Expr::Output(output) = expression {
+        let mut expression = term.expr;
+        while let hir::Expr::Output(output) = &document.exprs[expression] {
             match document.output(*output) {
-                Some(output) => expression = &output.expr,
+                Some(output) => expression = output.expr,
                 None => break,
             }
         }
-        (expression, term.order, term.nulls)
+        (document.exprs.at(expression), term.order, term.nulls)
     });
-    if terms
-        .clone()
-        .all(|(expression, ..)| is_hir_aggregate_call(expression) || is_hir_constant(expression))
-    {
+    if terms.clone().all(|(expression, ..)| {
+        is_hir_aggregate_call(expression.node()) || is_hir_constant(expression)
+    }) {
         return vec![(first.order, first.nulls); grouping.keys.len()];
     }
     grouping
@@ -1853,7 +1869,7 @@ fn hir_group_key_orders(
         .map(|key| {
             terms
                 .clone()
-                .find(|(expression, ..)| expression.equivalent(key))
+                .find(|(expression, ..)| expression.equivalent(document.exprs.at(*key)))
                 .map_or((SortOrder::Asc, None), |(_, order, nulls)| (order, nulls))
         })
         .collect()
@@ -1868,9 +1884,9 @@ fn is_hir_aggregate_call(expression: &hir::Expr) -> bool {
 }
 
 /// Whether the expression reads no row and always gives the same value.
-fn is_hir_constant(expression: &hir::Expr) -> bool {
+fn is_hir_constant(expression: hir::ExprRef<'_>) -> bool {
     let mut constant = true;
-    expression.for_each(&mut |expression| match expression {
+    expression.for_each(&mut |expression| match expression.node() {
         hir::Expr::Column(_)
         | hir::Expr::RowId(_)
         | hir::Expr::MergedColumn(_)
@@ -1926,15 +1942,18 @@ fn initialize_hir_group_runtime<'a>(
         else {
             continue;
         };
-        expression.for_each(&mut |expression| {
-            if let hir::Expr::Column(dependency) = expression {
-                if !usage.contains(dependency) {
-                    usage.push(*dependency);
+        plan.document
+            .exprs
+            .at(*expression)
+            .for_each(&mut |expression| {
+                if let hir::Expr::Column(dependency) = expression.node() {
+                    if !usage.contains(dependency) {
+                        usage.push(*dependency);
+                    }
                 }
-            }
-        });
+            });
     }
-    let rowids = hir_group_rowids(query, block);
+    let rowids = hir_group_rowids(&plan.document.exprs, query, block);
     let key_order = hir_group_key_order(&plan.document, query, grouping)
         .unwrap_or_else(|| (0..grouping.keys.len()).collect());
     let mut inputs = key_order
@@ -2112,12 +2131,12 @@ fn hir_group_row_columns(
     query: &hir::Query,
     block: &hir::QueryBlock,
     grouping: &hir::Grouping,
-    covered: &[(SourceId, &hir::Expr, usize)],
+    covered: &[(SourceId, hir::ExprId, usize)],
 ) -> Vec<hir::ColumnRef> {
     struct Visitor<'a> {
         document: &'a HirDocument,
-        keys: &'a [hir::Expr],
-        covered: &'a [(SourceId, &'a hir::Expr, usize)],
+        keys: &'a [hir::ExprId],
+        covered: &'a [(SourceId, hir::ExprId, usize)],
         columns: Vec<hir::ColumnRef>,
     }
     impl Visitor<'_> {
@@ -2126,18 +2145,18 @@ fn hir_group_row_columns(
                 self.columns.push(reference);
             }
         }
-        fn is_covered(&self, expression: &hir::Expr) -> bool {
+        fn is_covered(&self, expression: hir::ExprId) -> bool {
             self.covered
                 .iter()
-                .any(|(_, covered, _)| std::ptr::eq(*covered, expression))
+                .any(|(_, covered, _)| *covered == expression)
         }
-        fn visit(&mut self, expression: &hir::Expr) {
+        fn visit(&mut self, expression: hir::ExprId) {
             if hir_group_key_is_reused(self.document, self.keys, expression)
                 || self.is_covered(expression)
             {
                 return;
             }
-            match expression {
+            match &self.document.exprs[expression] {
                 hir::Expr::Column(reference) => self.add(*reference),
                 hir::Expr::Function(call)
                     if matches!(call.evaluation, hir::FunctionEvaluation::Aggregate { .. }) =>
@@ -2146,32 +2165,32 @@ fn hir_group_row_columns(
                 }
                 hir::Expr::Output(output) => {
                     if let Some(output) = self.document.output(*output) {
-                        self.visit(&output.expr);
+                        self.visit(output.expr);
                     }
                 }
-                _ => {
+                node => {
                     let mut index = 0;
-                    while let Some(child) = expression.child(index) {
+                    while let Some(child) = node.child(index) {
                         self.visit(child);
                         index += 1;
                     }
                 }
             }
         }
-        fn add_row_columns(&mut self, expression: &hir::Expr) {
+        fn add_row_columns(&mut self, expression: hir::ExprId) {
             if self.is_covered(expression) {
                 return;
             }
-            match expression {
+            match &self.document.exprs[expression] {
                 hir::Expr::Column(reference) => self.add(*reference),
                 hir::Expr::Output(output) => {
                     if let Some(output) = self.document.output(*output) {
-                        self.add_row_columns(&output.expr);
+                        self.add_row_columns(output.expr);
                     }
                 }
-                _ => {
+                node => {
                     let mut index = 0;
-                    while let Some(child) = expression.child(index) {
+                    while let Some(child) = node.child(index) {
                         self.add_row_columns(child);
                         index += 1;
                     }
@@ -2186,13 +2205,13 @@ fn hir_group_row_columns(
         columns: Vec::new(),
     };
     for output in &block.outputs {
-        visitor.visit(&output.expr);
+        visitor.visit(output.expr);
     }
-    if let Some(having) = &grouping.having {
+    if let Some(having) = grouping.having {
         visitor.visit(having);
     }
     for term in &query.order_by {
-        visitor.visit(&term.expr);
+        visitor.visit(term.expr);
     }
     for window in &block.windows {
         for expression in hir_window_expressions(window) {
@@ -2208,11 +2227,11 @@ fn hir_group_row_columns(
 /// can carry one is computed again from its columns.
 fn hir_group_key_is_reused(
     document: &HirDocument,
-    keys: &[hir::Expr],
-    expression: &hir::Expr,
+    keys: &[hir::ExprId],
+    expression: hir::ExprId,
 ) -> bool {
     hir_group_key_position(document, keys, expression).is_some()
-        && !hir_expr_can_return_json(expression)
+        && !hir_expr_can_return_json(document.exprs.at(expression))
 }
 
 /// The GROUP BY key equal to `expression`. `GROUP BY alias` names an output
@@ -2220,27 +2239,28 @@ fn hir_group_key_is_reused(
 /// is the key.
 fn hir_group_key_position(
     document: &HirDocument,
-    keys: &[hir::Expr],
-    expression: &hir::Expr,
+    keys: &[hir::ExprId],
+    expression: hir::ExprId,
 ) -> Option<usize> {
-    keys.iter().position(|key| {
-        if key.equivalent(expression) {
+    let exprs = &document.exprs;
+    keys.iter().position(|&key| {
+        if exprs.at(key).equivalent(exprs.at(expression)) {
             return true;
         }
-        let hir::Expr::Output(output) = key else {
+        let hir::Expr::Output(output) = &exprs[key] else {
             return false;
         };
         document
             .output(*output)
-            .is_some_and(|output| output.expr.equivalent(expression))
+            .is_some_and(|output| exprs.at(output.expr).equivalent(exprs.at(expression)))
     })
 }
 
 /// Whether `expression` can produce a value with the JSON subtype.
-fn hir_expr_can_return_json(expression: &hir::Expr) -> bool {
+fn hir_expr_can_return_json(expression: hir::ExprRef<'_>) -> bool {
     let mut json = false;
     expression.for_each(&mut |expression| {
-        json |= match expression {
+        json |= match expression.node() {
             #[cfg(feature = "json")]
             hir::Expr::Function(call) => {
                 matches!(call.function.value(), crate::function::Func::Json(_))
@@ -2255,11 +2275,15 @@ fn hir_expr_can_return_json(expression: &hir::Expr) -> bool {
     json
 }
 
-fn hir_group_rowids(query: &hir::Query, block: &hir::QueryBlock) -> Vec<SourceId> {
+fn hir_group_rowids(
+    exprs: &hir::ExprArena,
+    query: &hir::Query,
+    block: &hir::QueryBlock,
+) -> Vec<SourceId> {
     let mut rowids = Vec::new();
-    let mut collect = |expression: &hir::Expr| {
-        expression.for_each(&mut |expression| {
-            if let hir::Expr::RowId(source) = expression {
+    let mut collect = |expression: hir::ExprId| {
+        exprs.at(expression).for_each(&mut |expression| {
+            if let hir::Expr::RowId(source) = expression.node() {
                 if !rowids.contains(source) {
                     rowids.push(*source);
                 }
@@ -2267,7 +2291,7 @@ fn hir_group_rowids(query: &hir::Query, block: &hir::QueryBlock) -> Vec<SourceId
         });
     };
     for output in &block.outputs {
-        collect(&output.expr);
+        collect(output.expr);
     }
     if let hir::QueryBlockBody::Select {
         grouping: Some(grouping),
@@ -2275,14 +2299,14 @@ fn hir_group_rowids(query: &hir::Query, block: &hir::QueryBlock) -> Vec<SourceId
     } = &block.body
     {
         for key in &grouping.keys {
-            collect(key);
+            collect(*key);
         }
-        if let Some(having) = &grouping.having {
+        if let Some(having) = grouping.having {
             collect(having);
         }
     }
     for term in &query.order_by {
-        collect(&term.expr);
+        collect(term.expr);
     }
     for window in &block.windows {
         for expression in hir_window_expressions(window) {
@@ -2304,7 +2328,7 @@ fn emit_hir_group_input(
                 HirGroupInput::Key(index) => super::expr::translate_expr(
                     program,
                     document,
-                    &runtime.grouping.keys[*index],
+                    runtime.grouping.keys[*index],
                     runtime.state.current_keys + index,
                 )?,
                 // The group's row registers hold columns as stored; reading
@@ -2314,7 +2338,7 @@ fn emit_hir_group_input(
                     row_register,
                     ..
                 } => super::dml::with_stored_values(program, |program| {
-                    super::expr::translate_expr(
+                    super::expr::translate_detached_expr(
                         program,
                         document,
                         &hir::Expr::Column(*reference),
@@ -2325,7 +2349,7 @@ fn emit_hir_group_input(
                     source,
                     row_register,
                     ..
-                } => super::expr::translate_expr(
+                } => super::expr::translate_detached_expr(
                     program,
                     document,
                     &hir::Expr::RowId(*source),
@@ -2343,10 +2367,10 @@ fn emit_hir_group_input(
     for (position, input) in runtime.inputs.iter().enumerate() {
         let target = sorter.inputs_start + position;
         let expression = match input {
-            HirGroupInput::Key(index) => &runtime.grouping.keys[*index],
+            HirGroupInput::Key(index) => runtime.grouping.keys[*index],
             HirGroupInput::Column { reference, .. } => {
                 super::dml::with_stored_values(program, |program| {
-                    super::expr::translate_expr(
+                    super::expr::translate_detached_expr(
                         program,
                         document,
                         &hir::Expr::Column(*reference),
@@ -2356,7 +2380,12 @@ fn emit_hir_group_input(
                 continue;
             }
             HirGroupInput::RowId { source, .. } => {
-                super::expr::translate_expr(program, document, &hir::Expr::RowId(*source), target)?;
+                super::expr::translate_detached_expr(
+                    program,
+                    document,
+                    &hir::Expr::RowId(*source),
+                    target,
+                )?;
                 continue;
             }
             HirGroupInput::Expression { expressions, .. } => expressions[0],
@@ -2404,7 +2433,7 @@ fn bind_hir_group_sources(
             HirGroupSourceValues::Row => *row_register,
             HirGroupSourceValues::Group => *group_register,
         };
-        for expression in expressions {
+        for &expression in expressions {
             program.unbind_expression_register(expression);
             program.bind_expression_register(expression, register);
         }
@@ -2575,8 +2604,9 @@ fn bind_hir_group_key_registers(
     runtime: &HirGroupRuntime<'_>,
 ) {
     let keys = &runtime.grouping.keys;
-    let mut bind = |root: &hir::Expr| {
-        root.for_each(&mut |expression| {
+    let mut bind = |root: hir::ExprId| {
+        document.exprs.at(root).for_each(&mut |expression| {
+            let expression = expression.id();
             if !hir_group_key_is_reused(document, keys, expression) {
                 return;
             }
@@ -2586,13 +2616,13 @@ fn bind_hir_group_key_registers(
         });
     };
     for output in &block.outputs {
-        bind(&output.expr);
+        bind(output.expr);
     }
-    if let Some(having) = &runtime.grouping.having {
+    if let Some(having) = runtime.grouping.having {
         bind(having);
     }
     for term in &query.order_by {
-        bind(&term.expr);
+        bind(term.expr);
     }
     for window in &block.windows {
         for expression in hir_window_expressions(window) {
@@ -2638,7 +2668,7 @@ fn emit_hir_group_result(
         super::expr::translate_condition_expr(
             program,
             document,
-            having,
+            *having,
             ConditionMetadata {
                 jump_if_condition_is_true: false,
                 jump_target_when_true: emit_row,
@@ -2653,7 +2683,7 @@ fn emit_hir_group_result(
         document,
         output,
         &block.outputs,
-        block.outputs.iter().map(|output| &output.expr),
+        block.outputs.iter().map(|output| output.expr),
         start,
         runtime.state.output_done,
     )?;
@@ -2696,7 +2726,7 @@ fn emit_hir_aggregate_result(
         super::expr::translate_condition_expr(
             program,
             document,
-            having,
+            *having,
             ConditionMetadata {
                 jump_if_condition_is_true: false,
                 jump_target_when_true: emit_row,
@@ -2711,7 +2741,7 @@ fn emit_hir_aggregate_result(
         document,
         output,
         &block.outputs,
-        block.outputs.iter().map(|output| &output.expr),
+        block.outputs.iter().map(|output| output.expr),
         start,
         block_done,
     )
@@ -3126,7 +3156,7 @@ fn emit_hir_compound_order_by(
     let mut order_collations_nulls = crate::alloc::vec![];
     let mut comparators = crate::alloc::vec![];
     for term in &query.order_by {
-        let position = hir_compound_order_position(query, &term.expr)?;
+        let position = hir_compound_order_position(&document.exprs, query, term.expr)?;
         order_positions.push(position);
         order_collations_nulls.push((
             term.order,
@@ -3259,10 +3289,14 @@ fn emit_hir_compound_order_by(
     Ok(())
 }
 
-fn hir_compound_order_position(query: &hir::Query, expression: &hir::Expr) -> Result<usize> {
-    let mut expression = expression;
+fn hir_compound_order_position(
+    exprs: &hir::ExprArena,
+    query: &hir::Query,
+    expression: hir::ExprId,
+) -> Result<usize> {
+    let mut expression = &exprs[expression];
     while let hir::Expr::Collate { expr, .. } = expression {
-        expression = expr;
+        expression = &exprs[*expr];
     }
     let hir::Expr::Output(output) = expression else {
         return Err(LimboError::InternalError(format!(
@@ -3320,7 +3354,7 @@ pub(super) struct PreparedHirBtreeLoop<'a> {
     pub(super) table_has_rowid: bool,
     /// Expressions of the query block the index supplies, each with the
     /// index column holding it.
-    pub(super) index_keys: Vec<(&'a hir::Expr, usize)>,
+    pub(super) index_keys: Vec<(hir::ExprId, usize)>,
 }
 
 pub(super) struct PreparedHirMaterializedLoop<'a> {
@@ -3346,7 +3380,7 @@ pub(super) struct PreparedHirOrUnionLoop<'a> {
     table_cursor: CursorID,
     branches: Vec<PreparedHirBtreeLoop<'a>>,
     /// For each branch, the conditions checked before its seek.
-    branch_filters: &'a [Vec<hir::Expr>],
+    branch_filters: &'a [Vec<hir::ExprId>],
 }
 
 /// A scan through a query pattern of an index method, such as FTS: the
@@ -3358,7 +3392,7 @@ pub(super) struct PreparedHirIndexMethodLoop<'a> {
     database: usize,
     /// Expressions of the query block the index returns, each with the
     /// index column that holds it.
-    covered: Vec<(&'a hir::Expr, usize)>,
+    covered: Vec<(hir::ExprId, usize)>,
 }
 
 pub(super) struct PreparedHirRegistersLoop<'a> {
@@ -3721,7 +3755,7 @@ fn hir_nested_outer_column_reads(
         if !nested.captures.iter().any(|source| owned_by_query(*source)) {
             continue;
         }
-        for usage in nested.direct_column_usage(|source| document.source(source)) {
+        for usage in nested.direct_column_usage(|source| document.source(source), &document.exprs) {
             if owned_by_query(usage.reference.source) && !reads.contains(&usage.reference) {
                 reads.push(usage.reference);
             }
@@ -3741,14 +3775,18 @@ impl<'expr> hir::ExprVisitor<'expr> for HirBareAggregateColumnCollector<'expr> {
     type Output = ();
     type Error = LimboError;
 
-    fn child(&mut self, expression: &'expr hir::Expr, index: usize) -> Option<&'expr hir::Expr> {
-        if let hir::Expr::Output(output) = expression {
+    fn child(
+        &mut self,
+        expression: hir::ExprRef<'expr>,
+        index: usize,
+    ) -> Option<hir::ExprRef<'expr>> {
+        if let hir::Expr::Output(output) = expression.node() {
             return (index == 0).then(|| {
-                &self
+                expression.at(self
                     .document
                     .output(*output)
                     .expect("validated HIR output reference exists")
-                    .expr
+                    .expr)
             });
         }
         expression.child(index)
@@ -3756,13 +3794,13 @@ impl<'expr> hir::ExprVisitor<'expr> for HirBareAggregateColumnCollector<'expr> {
 
     fn pre_order(
         &mut self,
-        _parent: &'expr hir::Expr,
+        _parent: hir::ExprRef<'expr>,
         _context: &mut (),
         _child_index: usize,
-        child: &'expr hir::Expr,
+        child: hir::ExprRef<'expr>,
     ) -> Result<ControlFlow<(), ()>> {
         if matches!(
-            child,
+            child.node(),
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Aggregate { .. })
         ) {
@@ -3773,11 +3811,11 @@ impl<'expr> hir::ExprVisitor<'expr> for HirBareAggregateColumnCollector<'expr> {
 
     fn post_order(
         &mut self,
-        expression: &'expr hir::Expr,
+        expression: hir::ExprRef<'expr>,
         _context: (),
         _children: &[()],
     ) -> Result<()> {
-        match expression {
+        match expression.node() {
             hir::Expr::Column(reference) if !self.columns.contains(reference) => {
                 self.columns.push(*reference);
             }
@@ -3791,9 +3829,10 @@ impl<'expr> hir::ExprVisitor<'expr> for HirBareAggregateColumnCollector<'expr> {
 }
 
 impl<'expr> HirBareAggregateColumnCollector<'expr> {
-    fn collect(&mut self, expression: &'expr hir::Expr) -> Result<()> {
+    fn collect(&mut self, expression: hir::ExprId) -> Result<()> {
+        let expression = self.document.exprs.at(expression);
         if matches!(
-            expression,
+            expression.node(),
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Aggregate { .. })
         ) {
@@ -3810,21 +3849,21 @@ impl<'expr> hir::ExprVisitor<'expr> for HirAggregateCollector<'expr> {
 
     fn pre_order(
         &mut self,
-        _parent: &'expr hir::Expr,
+        _parent: hir::ExprRef<'expr>,
         _context: &mut (),
         _child_index: usize,
-        _child: &'expr hir::Expr,
+        _child: hir::ExprRef<'expr>,
     ) -> Result<ControlFlow<(), ()>> {
         Ok(ControlFlow::Continue(()))
     }
 
     fn post_order(
         &mut self,
-        expression: &'expr hir::Expr,
+        expression: hir::ExprRef<'expr>,
         _context: (),
         _children: &[()],
     ) -> Result<()> {
-        let hir::Expr::Function(call) = expression else {
+        let hir::Expr::Function(call) = expression.node() else {
             return Ok(());
         };
         let hir::FunctionEvaluation::Aggregate { id, .. } = call.evaluation else {
@@ -3859,7 +3898,8 @@ fn collect_hir_aggregates<'a>(
         block: block.id,
         aggregates: (0..block.aggregate_count).map(|_| None).collect(),
     };
-    let mut collect = |expression: &'a hir::Expr| expression.walk((), &mut collector);
+    let mut collect =
+        |expression: hir::ExprId| document.exprs.at(expression).walk((), &mut collector);
     // Like SQLite, an aggregate of this block's columns may be written in a
     // subquery of the block.
     for subquery in document
@@ -3869,50 +3909,50 @@ fn collect_hir_aggregates<'a>(
     {
         for subquery_block in &subquery.blocks {
             for output in &subquery_block.outputs {
-                collect(&output.expr)?;
+                collect(output.expr)?;
             }
             if let hir::QueryBlockBody::Select {
                 filter, grouping, ..
             } = &subquery_block.body
             {
                 if let Some(filter) = filter {
-                    collect(filter)?;
+                    collect(*filter)?;
                 }
                 if let Some(grouping) = grouping {
                     for key in &grouping.keys {
-                        collect(key)?;
+                        collect(*key)?;
                     }
-                    if let Some(having) = &grouping.having {
+                    if let Some(having) = grouping.having {
                         collect(having)?;
                     }
                 }
             }
         }
         for term in &subquery.order_by {
-            collect(&term.expr)?;
+            collect(term.expr)?;
         }
     }
     for output in &block.outputs {
-        collect(&output.expr)?;
+        collect(output.expr)?;
     }
     if let hir::QueryBlockBody::Select {
         filter, grouping, ..
     } = &block.body
     {
         if let Some(filter) = filter {
-            collect(filter)?;
+            collect(*filter)?;
         }
         if let Some(grouping) = grouping {
             for key in &grouping.keys {
-                collect(key)?;
+                collect(*key)?;
             }
-            if let Some(having) = &grouping.having {
+            if let Some(having) = grouping.having {
                 collect(having)?;
             }
         }
     }
     for term in &query.order_by {
-        collect(&term.expr)?;
+        collect(term.expr)?;
     }
     for window in &block.windows {
         for expression in hir_window_expressions(window) {
@@ -3935,13 +3975,13 @@ fn collect_hir_aggregates<'a>(
 }
 
 /// Expressions owned by a window definition rather than by a window call.
-fn hir_window_expressions(window: &hir::ResolvedWindow) -> impl Iterator<Item = &hir::Expr> {
+fn hir_window_expressions(window: &hir::ResolvedWindow) -> impl Iterator<Item = hir::ExprId> + '_ {
     let bounds = [Some(&window.frame.start), window.frame.end.as_ref()]
         .into_iter()
         .flatten()
         .filter_map(|bound| match bound {
             hir::WindowFrameBound::Preceding(expression)
-            | hir::WindowFrameBound::Following(expression) => Some(expression.as_ref()),
+            | hir::WindowFrameBound::Following(expression) => Some(*expression),
             hir::WindowFrameBound::CurrentRow
             | hir::WindowFrameBound::UnboundedPreceding
             | hir::WindowFrameBound::UnboundedFollowing => None,
@@ -3949,8 +3989,8 @@ fn hir_window_expressions(window: &hir::ResolvedWindow) -> impl Iterator<Item = 
     window
         .partition_by
         .iter()
-        .map(|term| &term.expr)
-        .chain(window.order_by.iter().map(|term| &term.expr))
+        .map(|term| term.expr)
+        .chain(window.order_by.iter().map(|term| term.expr))
         .chain(bounds)
 }
 
@@ -3984,9 +4024,9 @@ fn initialize_hir_aggregates<'a>(
                         "HIR percentile aggregate {id:?} does not have one direct argument"
                     )));
                 };
-                validate_hir_percentile_fraction(document, block, fraction, &func)?;
+                validate_hir_percentile_fraction(document, block, *fraction, &func)?;
                 let register = program.alloc_register();
-                super::expr::translate_expr(program, document, fraction, register)?;
+                super::expr::translate_expr(program, document, *fraction, register)?;
                 crate::translate::aggregation::emit_percentile_fraction_range_check(
                     program, register,
                 );
@@ -4039,6 +4079,7 @@ fn initialize_hir_aggregates<'a>(
                 values, order_by, ..
             } if !order_by.is_empty() => Some(open_hir_ordered_arguments(
                 program,
+                &document.exprs,
                 index,
                 values,
                 order_by,
@@ -4060,19 +4101,19 @@ fn initialize_hir_aggregates<'a>(
         rowids: Vec::new(),
     };
     for output in &block.outputs {
-        bare.collect(&output.expr)?;
+        bare.collect(output.expr)?;
     }
     if let hir::QueryBlockBody::Select {
         grouping: Some(grouping),
         ..
     } = &block.body
     {
-        if let Some(having) = &grouping.having {
+        if let Some(having) = grouping.having {
             bare.collect(having)?;
         }
     }
     for term in &query.order_by {
-        bare.collect(&term.expr)?;
+        bare.collect(term.expr)?;
     }
     for window in &block.windows {
         for expression in hir_window_expressions(window) {
@@ -4204,13 +4245,15 @@ fn emit_hir_bare_row_test(
 
 fn open_hir_ordered_arguments(
     program: &mut ProgramBuilder,
+    exprs: &hir::ExprArena,
     aggregate: usize,
-    values: &[hir::Expr],
+    values: &[hir::ExprId],
     order_by: &[hir::OrderTerm],
     distinct: bool,
 ) -> Result<HirOrderedArguments> {
-    let distinct_on_order_key =
-        distinct && matches!((values, order_by), ([value], [term]) if value.equivalent(&term.expr));
+    let distinct_on_order_key = distinct
+        && matches!((values, order_by), ([value], [term])
+            if exprs.at(*value).equivalent(exprs.at(term.expr)));
     let values = values.len();
     // An index orders by collation only, not by a custom type's order.
     if order_by.iter().any(|term| {
@@ -4298,7 +4341,7 @@ fn emit_hir_ordered_argument_row(
     let width = ordered.terms + 1 + 2 * ordered.values;
     let start = program.alloc_registers(width);
     for (position, term) in order_by.iter().enumerate() {
-        super::expr::translate_expr(program, document, &term.expr, start + position)?;
+        super::expr::translate_expr(program, document, term.expr, start + position)?;
     }
     program.emit_insn(Insn::AddImm {
         register: ordered.sequence,
@@ -4318,7 +4361,7 @@ fn emit_hir_ordered_argument_row(
                 extra_amount: 0,
             });
         } else {
-            super::expr::translate_expr(program, document, value, arguments + position)?;
+            super::expr::translate_expr(program, document, *value, arguments + position)?;
         }
     }
     for position in 0..ordered.values {
@@ -4404,7 +4447,7 @@ fn emit_hir_ordered_aggregate_steps(
             subtype_reg: subtype,
             dest_reg: start + position,
         });
-        program.bind_expression_register(value, start + position);
+        program.bind_expression_register(*value, start + position);
     }
     let distinct = aggregate
         .distinct
@@ -4439,12 +4482,12 @@ fn emit_hir_ordered_aggregate_steps(
 fn validate_hir_percentile_fraction(
     document: &HirDocument,
     block: &hir::QueryBlock,
-    fraction: &hir::Expr,
+    fraction: hir::ExprId,
     function: &AggFunc,
 ) -> Result<()> {
     let mut invalid = false;
-    fraction.for_each(&mut |expression| {
-        invalid |= matches!(expression, hir::Expr::Subquery(_));
+    document.exprs.at(fraction).for_each(&mut |expression| {
+        invalid |= matches!(expression.node(), hir::Expr::Subquery(_));
     });
     document.visit_expr_sources(fraction, &mut |source| {
         invalid |= matches!(
@@ -4631,7 +4674,7 @@ fn emit_hir_aggregate_capture(
             ))
         })?;
         for column in &capture.columns {
-            super::expr::translate_expr(
+            super::expr::translate_detached_expr(
                 program,
                 document,
                 &hir::Expr::column(source.id, *column),
@@ -4639,7 +4682,12 @@ fn emit_hir_aggregate_capture(
             )?;
         }
         if let Some(rowid) = capture.rowid {
-            super::expr::translate_expr(program, document, &hir::Expr::rowid(source.id), rowid)?;
+            super::expr::translate_detached_expr(
+                program,
+                document,
+                &hir::Expr::rowid(source.id),
+                rowid,
+            )?;
         }
     }
     program.preassign_label_to_next_insn(captured);
@@ -5138,7 +5186,7 @@ impl HirLoopNest<'_, '_> {
                     self.document,
                     output,
                     outputs,
-                    outputs.iter().map(|output| &output.expr),
+                    outputs.iter().map(|output| output.expr),
                     start,
                     innermost_next,
                 )?;
@@ -5157,7 +5205,7 @@ impl HirLoopNest<'_, '_> {
                         ));
                     };
                     let value = program.alloc_register();
-                    super::expr::translate_expr(program, self.document, argument, value)?;
+                    super::expr::translate_expr(program, self.document, *argument, value)?;
                     program.emit_insn(Insn::IsNull {
                         reg: value,
                         target_pc: innermost_next,
@@ -5273,7 +5321,7 @@ impl HirLoopNest<'_, '_> {
                 continue;
             };
             for (expression, _) in &prepared.index_keys {
-                if let Some(register) = program.unbind_expression_register(expression) {
+                if let Some(register) = program.unbind_expression_register(*expression) {
                     index_key_bindings.push((*expression, register));
                 }
             }
@@ -5363,7 +5411,7 @@ impl HirLoopNest<'_, '_> {
             close_hir_btree_loop(program, &hir_loop, &[]);
             if let PreparedHirLoop::BTree(prepared) = &prepared {
                 for (expression, _) in &prepared.index_keys {
-                    program.unbind_expression_register(expression);
+                    program.unbind_expression_register(*expression);
                 }
             }
             restore_unmatched_pass_bindings(
@@ -5470,7 +5518,7 @@ impl HirLoopNest<'_, '_> {
             // became NULL rows: an argument that reads one is NULL now.
             let args_reg = program.alloc_registers(operation.arguments.len());
             for (index, argument) in operation.arguments.iter().enumerate() {
-                super::expr::translate_expr(program, self.document, argument, args_reg + index)?;
+                super::expr::translate_expr(program, self.document, *argument, args_reg + index)?;
             }
             let idx_str = operation.idx_str.as_ref().map(|value| {
                 let register = program.alloc_register();
@@ -5535,7 +5583,7 @@ impl HirLoopNest<'_, '_> {
                 // source's rowid comes through its current binding. A
                 // register-backed row has the constant key it was marked by.
                 if self.loops_plan.loops[right].unmatched_right_rows.is_some() {
-                    super::expr::translate_expr(
+                    super::expr::translate_detached_expr(
                         program,
                         self.document,
                         &hir::Expr::RowId(right_outer.source),
@@ -5609,7 +5657,7 @@ impl HirLoopNest<'_, '_> {
             if right_outer.kind == hir::JoinKind::Anti {
                 let mut reads_probe = false;
                 self.document
-                    .visit_expr_sources(&predicate.expr, &mut |source| {
+                    .visit_expr_sources(predicate.expr, &mut |source| {
                         reads_probe |= source == right_outer.owner;
                     });
                 if reads_probe {
@@ -5631,7 +5679,7 @@ impl HirLoopNest<'_, '_> {
             super::expr::translate_condition_expr(
                 program,
                 self.document,
-                &predicate.expr,
+                predicate.expr,
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
                     jump_target_when_true: passed,
@@ -5869,7 +5917,7 @@ impl HirRightOuterJoin {
     ) -> Result<usize> {
         let start = program.alloc_registers(positions.len());
         for (offset, position) in positions.iter().enumerate() {
-            super::expr::translate_expr(
+            super::expr::translate_detached_expr(
                 program,
                 document,
                 &hir::Expr::Column(hir::ColumnRef {
@@ -5920,7 +5968,12 @@ impl HirRightOuterJoin {
                 dest: rowid,
             });
         } else {
-            super::expr::translate_expr(program, document, &hir::Expr::RowId(self.source), rowid)?;
+            super::expr::translate_detached_expr(
+                program,
+                document,
+                &hir::Expr::RowId(self.source),
+                rowid,
+            )?;
         }
         program.emit_insn(Insn::Insert {
             cursor: self.matched,
@@ -5944,7 +5997,7 @@ fn restore_unmatched_pass_bindings(
     program: &mut ProgramBuilder,
     right_source: Option<(SourceId, SourceBinding)>,
     register_bindings: Vec<(SourceId, Option<SourceBinding>)>,
-    index_key_bindings: Vec<(&hir::Expr, usize)>,
+    index_key_bindings: Vec<(hir::ExprId, usize)>,
 ) {
     if let Some((source, original)) = right_source {
         program.bind_source(source, original);
@@ -7027,8 +7080,8 @@ fn hir_hash_kept_columns(
         if let Some(hir::ColumnReadExpression::Planned(expression)) =
             source.generated_expressions.get(column)
         {
-            expression.for_each(&mut |expression| {
-                if let hir::Expr::Column(dependency) = expression {
+            document.exprs.at(*expression).for_each(&mut |expression| {
+                if let hir::Expr::Column(dependency) = expression.node() {
                     if dependency.source == source.id && !columns.contains(&dependency.column) {
                         columns.push(dependency.column);
                     }
@@ -7169,14 +7222,14 @@ fn emit_hir_hash_build_input(
             super::expr::translate_expr_no_constant_opt(
                 program,
                 document,
-                &key.build,
+                key.build,
                 input.record + position,
             )?;
         }
         let slot = |register: usize| input.record + keys.len() + (register - prepared.payload);
         for source in &input.sources {
             for column in &source.columns {
-                super::expr::translate_expr_no_constant_opt(
+                super::expr::translate_detached_expr_no_constant_opt(
                     program,
                     document,
                     &hir::Expr::column(source.source, *column),
@@ -7184,7 +7237,7 @@ fn emit_hir_hash_build_input(
                 )?;
             }
             if let Some(rowid) = source.rowid {
-                super::expr::translate_expr_no_constant_opt(
+                super::expr::translate_detached_expr_no_constant_opt(
                     program,
                     document,
                     &hir::Expr::rowid(source.source),
@@ -7323,7 +7376,7 @@ fn start_hir_hash_loop(
                 super::expr::translate_expr_no_constant_opt(
                     program,
                     document,
-                    &key.build,
+                    key.build,
                     prepared.build_keys + position,
                 )?;
             }
@@ -7338,7 +7391,7 @@ fn start_hir_hash_loop(
         Some(_) => emit_hir_hash_input_payload(program, prepared),
         None => {
             for column in &prepared.columns {
-                super::expr::translate_expr_no_constant_opt(
+                super::expr::translate_detached_expr_no_constant_opt(
                     program,
                     document,
                     &hir::Expr::Column(hir::ColumnRef {
@@ -7403,12 +7456,7 @@ fn start_hir_hash_loop(
     }
 
     for (position, key) in keys.iter().enumerate() {
-        super::expr::translate_expr(
-            program,
-            document,
-            &key.value,
-            prepared.probe_keys + position,
-        )?;
+        super::expr::translate_expr(program, document, key.value, prepared.probe_keys + position)?;
     }
     program.emit_insn(Insn::Affinity {
         start_reg: prepared.probe_keys,
@@ -7771,7 +7819,7 @@ fn start_hir_or_union_loop(
             super::expr::translate_condition_expr(
                 program,
                 document,
-                filter,
+                *filter,
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
                     jump_target_when_true: passed,
@@ -7879,7 +7927,7 @@ fn prepare_hir_index_method_loop<'a>(
         access
             .covered
             .iter()
-            .find(|(covered, _)| covered.equivalent(expression))
+            .find(|(covered, _)| document.exprs.at(*covered).equivalent(expression))
             .map(|(_, column)| *column)
     })?;
     Ok(PreparedHirIndexMethodLoop {
@@ -7894,10 +7942,7 @@ fn prepare_hir_index_method_loop<'a>(
 /// Every expression the query block owning `source` evaluates per row: its
 /// outputs, grouping keys and HAVING, its query's ORDER BY, and the WHERE
 /// terms its plan left to check.
-fn hir_block_expressions<'a>(
-    plan: &'a HirPlan,
-    source: &hir::Source,
-) -> Result<Vec<&'a hir::Expr>> {
+fn hir_block_expressions(plan: &HirPlan, source: &hir::Source) -> Result<Vec<hir::ExprId>> {
     let document = &plan.document;
     let hir::SourceOwner::QueryBlock(block_id) = source.owner else {
         return Ok(Vec::new());
@@ -7911,13 +7956,13 @@ fn hir_block_expressions<'a>(
     let mut roots = block
         .outputs
         .iter()
-        .map(|output| &output.expr)
+        .map(|output| output.expr)
         .collect::<Vec<_>>();
     if let Some(grouping) = hir_grouping(block) {
         roots.extend(&grouping.keys);
-        roots.extend(&grouping.having);
+        roots.extend(grouping.having);
     }
-    roots.extend(query.order_by.iter().map(|term| &term.expr));
+    roots.extend(query.order_by.iter().map(|term| term.expr));
     if let Some(planned) = plan.planned_query(block_id.query).and_then(|planned| {
         planned
             .blocks
@@ -7929,7 +7974,7 @@ fn hir_block_expressions<'a>(
                 .predicates
                 .iter()
                 .filter(|term| !term.consumed)
-                .map(|term| &term.expr),
+                .map(|term| term.expr),
         );
     }
     Ok(roots)
@@ -7937,19 +7982,20 @@ fn hir_block_expressions<'a>(
 
 /// The largest parts of the block's expressions for which `matches` names a
 /// column of a cursor, with that column.
-fn find_block_subexpressions<'a>(
-    plan: &'a HirPlan,
+fn find_block_subexpressions(
+    plan: &HirPlan,
     source: &hir::Source,
-    matches: impl Fn(&hir::Expr) -> Option<usize>,
-) -> Result<Vec<(&'a hir::Expr, usize)>> {
+    matches: impl Fn(hir::ExprRef<'_>) -> Option<usize>,
+) -> Result<Vec<(hir::ExprId, usize)>> {
+    let exprs = &plan.document.exprs;
     let mut found = Vec::new();
     let mut pending = hir_block_expressions(plan, source)?;
     while let Some(expression) = pending.pop() {
-        if let Some(column) = matches(expression) {
+        if let Some(column) = matches(exprs.at(expression)) {
             found.push((expression, column));
             continue;
         }
-        pending.extend((0..).map_while(|position| expression.child(position)));
+        pending.extend((0..).map_while(|position| exprs[expression].child(position)));
     }
     Ok(found)
 }
@@ -7979,7 +8025,7 @@ fn start_hir_index_method_loop(
     for (expression, column) in &prepared.covered {
         let register = program.alloc_register();
         program.emit_column_or_rowid(prepared.index_cursor, *column, register);
-        program.bind_expression_register(expression, register);
+        program.bind_expression_register(*expression, register);
     }
     Ok(HirBtreeLoop {
         cursor: Some(prepared.index_cursor),
@@ -8011,7 +8057,7 @@ fn emit_index_method_query(
     let start = program.alloc_registers(count);
     program.emit_int(access.pattern as i64, start);
     for (position, argument) in arguments.iter().enumerate() {
-        super::expr::translate_expr(program, document, argument, start + 1 + position)?;
+        super::expr::translate_expr(program, document, *argument, start + 1 + position)?;
     }
     if let Some(fields) = fields {
         program.emit_string8(fields.clone(), start + 1 + arguments.len());
@@ -8045,7 +8091,7 @@ pub(super) fn emit_hir_predicate(
         super::expr::translate_condition_expr(
             program,
             document,
-            &predicate.expr,
+            predicate.expr,
             ConditionMetadata {
                 jump_if_condition_is_true: false,
                 jump_target_when_true: passed,
@@ -8067,7 +8113,7 @@ fn index_method_predicate(
     crate::translate::hir_index_method::HirIndexMethodAccess,
 )> {
     let mut sources = Vec::new();
-    document.visit_expr_sources(&predicate.expr, &mut |source| {
+    document.visit_expr_sources(predicate.expr, &mut |source| {
         if !sources.contains(&source) {
             sources.push(source);
         }
@@ -8132,7 +8178,7 @@ fn emit_index_method_predicate(
     });
     program.preassign_label_to_next_insn(opened);
     let rowid = program.alloc_register();
-    super::expr::translate_expr(program, document, &hir::Expr::RowId(source_id), rowid)?;
+    super::expr::translate_detached_expr(program, document, &hir::Expr::RowId(source_id), rowid)?;
     program.emit_insn(Insn::IsNull {
         reg: rowid,
         target_pc: fail,
@@ -8807,11 +8853,11 @@ pub(super) fn prepare_hir_btree_loop<'a>(
 
 /// The block's subexpressions `index` stores, with the index column each is
 /// read from. An automatic index stores no expressions.
-fn hir_index_key_expressions<'a>(
-    plan: &'a HirPlan,
+fn hir_index_key_expressions(
+    plan: &HirPlan,
     source: &hir::Source,
     index: &Index,
-) -> Result<Vec<(&'a hir::Expr, usize)>> {
+) -> Result<Vec<(hir::ExprId, usize)>> {
     if index.ephemeral {
         return Ok(Vec::new());
     }
@@ -8822,10 +8868,9 @@ fn hir_index_key_expressions<'a>(
     match expressions {
         Some(expressions) if expressions.columns.iter().any(Option::is_some) => {
             find_block_subexpressions(plan, source, |expression| {
-                expressions
-                    .columns
-                    .iter()
-                    .position(|key| key.as_ref().is_some_and(|key| key.equivalent(expression)))
+                expressions.columns.iter().position(|key| {
+                    key.is_some_and(|key| plan.document.exprs.at(key).equivalent(expression))
+                })
             })
         }
         _ => Ok(Vec::new()),
@@ -8894,7 +8939,10 @@ fn build_hir_autoindex(
                 }
                 hir::ColumnReadExpression::Planned(expression) => {
                     super::expr::translate_expr_no_constant_opt(
-                        program, document, expression, target,
+                        program,
+                        document,
+                        *expression,
+                        target,
                     )?;
                     // The index stores the value the column gives, which
                     // has the column's affinity, as a read of the column
@@ -9056,7 +9104,7 @@ fn start_hir_virtual_loop(
     let exhausted = program.allocate_label();
     let args_reg = program.alloc_registers(prepared.operation.arguments.len());
     for (index, argument) in prepared.operation.arguments.iter().enumerate() {
-        super::expr::translate_expr(program, document, argument, args_reg + index)?;
+        super::expr::translate_expr(program, document, *argument, args_reg + index)?;
     }
     let idx_str = prepared.operation.idx_str.as_ref().map(|value| {
         let register = program.alloc_register();
@@ -9114,7 +9162,7 @@ pub(super) fn start_hir_btree_loop(
         }
         HirBtreeOperation::RowidEq { cmp_expr } => {
             let key = program.alloc_register();
-            super::expr::translate_expr(program, document, cmp_expr, key)?;
+            super::expr::translate_expr(program, document, *cmp_expr, key)?;
             program.emit_insn(Insn::SeekRowid {
                 cursor_id: prepared.cursor,
                 src_reg: key,
@@ -9186,7 +9234,7 @@ pub(super) fn start_hir_btree_loop(
                 register
             }
         };
-        program.bind_expression_register(expression, register);
+        program.bind_expression_register(*expression, register);
     }
     Ok(HirBtreeLoop {
         cursor: Some(prepared.cursor),
@@ -9295,7 +9343,7 @@ pub(super) fn predicate_ready_loop(
     predicates: &[crate::translate::plan::HirWhereTerm],
     index: usize,
 ) -> Result<Option<usize>> {
-    let ready = predicate_loop(program, document, &predicates[index].expr, loops)?;
+    let ready = predicate_loop(program, document, predicates[index].expr, loops)?;
     let deferred = deferred_predicates
         .iter()
         .find(|(_, predicate)| *predicate == index)
@@ -9309,7 +9357,7 @@ pub(super) fn predicate_ready_loop(
 pub(super) fn predicate_loop(
     program: &ProgramBuilder,
     document: &HirDocument,
-    expression: &hir::Expr,
+    expression: hir::ExprId,
     loops: &[HirPlannedLoop],
 ) -> Result<Option<usize>> {
     let mut eval_at = None;
@@ -9488,6 +9536,7 @@ fn initialize_hir_distinct(
 
 fn initialize_hir_sorter<'a>(
     program: &mut ProgramBuilder,
+    exprs: &hir::ExprArena,
     query: &'a hir::Query,
     block: &hir::QueryBlock,
 ) -> Result<HirSorterOutput<'a>> {
@@ -9502,7 +9551,7 @@ fn initialize_hir_sorter<'a>(
     let mut order_collations_nulls = crate::alloc::vec![];
     let mut comparators = crate::alloc::vec![];
     for term in &query.order_by {
-        let output = hir_order_output_position(block, &term.expr);
+        let output = hir_order_output_position(exprs, block, term.expr);
         let custom = term
             .type_fact
             .declared
@@ -9576,12 +9625,16 @@ fn initialize_hir_sorter<'a>(
     })
 }
 
-fn hir_order_output_position(block: &hir::QueryBlock, expression: &hir::Expr) -> Option<usize> {
+fn hir_order_output_position(
+    exprs: &hir::ExprArena,
+    block: &hir::QueryBlock,
+    expression: hir::ExprId,
+) -> Option<usize> {
     let mut expression = expression;
-    while let hir::Expr::Collate { expr, .. } = expression {
-        expression = expr;
+    while let hir::Expr::Collate { expr, .. } = &exprs[expression] {
+        expression = *expr;
     }
-    if let hir::Expr::Output(output) = expression {
+    if let hir::Expr::Output(output) = &exprs[expression] {
         return block
             .outputs
             .iter()
@@ -9590,7 +9643,7 @@ fn hir_order_output_position(block: &hir::QueryBlock, expression: &hir::Expr) ->
     block
         .outputs
         .iter()
-        .position(|output| expression.equivalent(&output.expr))
+        .position(|output| exprs.at(expression).equivalent(exprs.at(output.expr)))
 }
 
 /// Insert one row into the ORDER BY sorter. `outputs_start` holds the
@@ -9602,7 +9655,7 @@ fn emit_hir_sorter_insert(
     outputs: &[hir::Output],
     outputs_start: Option<usize>,
     sorter: &HirSorterOutput<'_>,
-    inputs: &[super::expr::ExprRegisterInput<'_>],
+    inputs: &[super::expr::ExprRegisterInput],
 ) -> Result<()> {
     let output_register = |output: usize| match outputs_start {
         Some(start) => start + output,
@@ -9623,7 +9676,7 @@ fn emit_hir_sorter_insert(
             HirSortKeySource::EncodedOutput(output) => emit_hir_sort_key(
                 program,
                 document,
-                &outputs[*output].expr,
+                outputs[*output].expr,
                 &term.type_fact,
                 target,
                 inputs,
@@ -9631,7 +9684,7 @@ fn emit_hir_sorter_insert(
             HirSortKeySource::Expression => emit_hir_sort_key(
                 program,
                 document,
-                &term.expr,
+                term.expr,
                 &term.type_fact,
                 target,
                 inputs,
@@ -9661,10 +9714,10 @@ fn emit_hir_sorter_insert(
 fn emit_hir_sort_key(
     program: &mut ProgramBuilder,
     document: &HirDocument,
-    expression: &hir::Expr,
+    expression: hir::ExprId,
     type_fact: &hir::TypeFact,
     target: usize,
-    inputs: &[super::expr::ExprRegisterInput<'_>],
+    inputs: &[super::expr::ExprRegisterInput],
 ) -> Result<()> {
     let suppress_decode = type_fact
         .declared
@@ -9792,12 +9845,12 @@ fn initialize_limit(
     };
     let limit_register = program.alloc_register();
     if first_row_only {
-        emit_first_row_limit_value(program, document, &limit.limit, limit_register)?;
+        emit_first_row_limit_value(program, document, limit.limit, limit_register)?;
     } else {
-        emit_limit_value(program, document, &limit.limit, limit_register)?;
+        emit_limit_value(program, document, limit.limit, limit_register)?;
     }
 
-    let offset = if let Some(offset) = &limit.offset {
+    let offset = if let Some(offset) = limit.offset {
         let offset_register = program.alloc_register();
         emit_offset_value(program, document, offset, offset_register)?;
         program.emit_insn(Insn::MustBeInt {
@@ -9828,10 +9881,10 @@ fn initialize_limit(
 fn emit_limit_value(
     program: &mut ProgramBuilder,
     document: &HirDocument,
-    expression: &hir::Expr,
+    expression: hir::ExprId,
     target: usize,
 ) -> Result<()> {
-    match expression {
+    match &document.exprs[expression] {
         hir::Expr::Literal(Literal::Numeric(value)) => match parse_numeric_literal(value)? {
             Value::Numeric(Numeric::Integer(value)) => {
                 program.emit_insn(Insn::Integer {
@@ -9868,10 +9921,10 @@ fn emit_limit_value(
 fn emit_first_row_limit_value(
     program: &mut ProgramBuilder,
     document: &HirDocument,
-    expression: &hir::Expr,
+    expression: hir::ExprId,
     target: usize,
 ) -> Result<()> {
-    if let hir::Expr::Literal(Literal::Numeric(value)) = expression {
+    if let hir::Expr::Literal(Literal::Numeric(value)) = &document.exprs[expression] {
         if let Value::Numeric(Numeric::Integer(value)) = parse_numeric_literal(value)? {
             program.emit_insn(Insn::Integer {
                 value: i64::from(value != 0),
@@ -9917,10 +9970,10 @@ fn emit_first_row_limit_value(
 fn emit_offset_value(
     program: &mut ProgramBuilder,
     document: &HirDocument,
-    expression: &hir::Expr,
+    expression: hir::ExprId,
     target: usize,
 ) -> Result<()> {
-    match expression {
+    match &document.exprs[expression] {
         hir::Expr::Literal(Literal::Numeric(value)) => match parse_numeric_literal(value)? {
             Value::Numeric(Numeric::Integer(value)) => {
                 program.emit_insn(Insn::Integer {
@@ -10004,12 +10057,12 @@ fn destination_stops_after_first_row(destination: &QueryDestination) -> bool {
     )
 }
 
-fn emit_query_row<'expr>(
+fn emit_query_row(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     output: &HirRowOutput<'_>,
     outputs: &[hir::Output],
-    expressions: impl ExactSizeIterator<Item = &'expr hir::Expr>,
+    expressions: impl ExactSizeIterator<Item = hir::ExprId>,
     start: usize,
     skip_row: BranchOffset,
 ) -> Result<()> {
@@ -10026,12 +10079,12 @@ fn emit_query_row<'expr>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_query_row_with_inputs<'expr>(
+fn emit_query_row_with_inputs(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     output: &HirRowOutput<'_>,
     outputs: &[hir::Output],
-    expressions: impl ExactSizeIterator<Item = &'expr hir::Expr>,
+    expressions: impl ExactSizeIterator<Item = hir::ExprId>,
     start: usize,
     skip_row: BranchOffset,
     inputs: &HirRowInputs<'_>,
@@ -10082,7 +10135,7 @@ fn emit_query_row_with_inputs<'expr>(
         );
     if !output.needs_values() {
         for expression in expressions {
-            super::expr::register_parameters(program, expression);
+            super::expr::register_parameters(program, document, expression);
         }
     } else {
         for (position, expression) in expressions.enumerate() {
@@ -10208,7 +10261,7 @@ struct HirWindowLayer<'a> {
     plan: super::window::HirWindowBufferPlan<'a>,
     keys: Vec<super::window::HirWindowInputKey<'a>>,
     sorter: Option<HirWindowInputSorter>,
-    functions: Vec<WindowFunctionRuntime<&'a hir::Expr>>,
+    functions: Vec<WindowFunctionRuntime<hir::ExprId>>,
     accumulators: usize,
     buffer: WindowBufferRuntime,
     input: WindowBufferInput,
@@ -10219,7 +10272,7 @@ struct HirWindowLayer<'a> {
     labels: WindowLabels,
     /// Buffer columns the consumer reads, loaded into `outputs` per row.
     output_columns: Vec<usize>,
-    outputs: HirWindowOutputRegisters<'a>,
+    outputs: HirWindowOutputRegisters,
     output_return: usize,
 }
 
@@ -10235,7 +10288,8 @@ impl<'a> HirWindowLayer<'a> {
         grouped_rows: bool,
         sorted_input: bool,
     ) -> Result<Self> {
-        let mut plan = super::window::plan_hir_window_buffer(query, block, window)?;
+        let mut plan =
+            super::window::plan_hir_window_buffer(&document.exprs, query, block, window)?;
         let output_plan = match consumer {
             HirWindowConsumer::Select => plan_hir_window_output_inputs(query, block, &mut plan)?,
             HirWindowConsumer::Layer { plan: outer, keys } => {
@@ -10484,7 +10538,7 @@ fn check_hir_window_key_is_orderable(
     document: &HirDocument,
     key: &super::window::HirWindowInputKey<'_>,
 ) -> Result<()> {
-    let hir::Expr::Column(column) = key.expression else {
+    let hir::Expr::Column(column) = &document.exprs[key.expression] else {
         return Ok(());
     };
     let Some(custom) = key
@@ -10662,7 +10716,7 @@ fn emit_hir_window_output_subroutine(
         document,
         output,
         &block.outputs,
-        block.outputs.iter().map(|output| &output.expr),
+        block.outputs.iter().map(|output| output.expr),
         start,
         skip_row,
         inputs,
@@ -10698,7 +10752,7 @@ pub(super) fn emit_array_results(
         if stored_outputs.contains(&position) {
             continue;
         }
-        if !output.type_fact.is_array() && !hir_expr_passes_array(document, &output.expr) {
+        if !output.type_fact.is_array() && !hir_expr_passes_array(document, output.expr) {
             continue;
         }
         let register = start + position;
@@ -10709,7 +10763,7 @@ pub(super) fn emit_array_results(
         });
         // An array column of a custom type has its elements decoded for
         // display.
-        if let Some(decode) = array_column_decode(document, &output.expr) {
+        if let Some(decode) = array_column_decode(document, &document.exprs[output.expr]) {
             super::expr::translate_schema_calls_on_elements(program, document, decode, register)?;
         }
         program.emit_insn(Insn::ArrayDecode { reg: register });
@@ -10742,9 +10796,9 @@ fn array_column_decode<'a>(
 /// An expression that can pass an array value through is decoded for
 /// display too: COALESCE, IFNULL, scalar MIN and MAX, IIF,
 /// NULLIF, CASE and `||` over array operands, and array functions.
-fn hir_expr_passes_array(document: &HirDocument, expression: &hir::Expr) -> bool {
-    let is_array = |expression| hir_expr_passes_array(document, expression);
-    match expression {
+fn hir_expr_passes_array(document: &HirDocument, expression: hir::ExprId) -> bool {
+    let is_array = |expression: &hir::ExprId| hir_expr_passes_array(document, *expression);
+    match &document.exprs[expression] {
         hir::Expr::Array(_) => true,
         hir::Expr::Column(reference) => document
             .source(reference.source)
@@ -10778,7 +10832,7 @@ fn hir_expr_passes_array(document: &HirDocument, expression: &hir::Expr) -> bool
             ..
         } => {
             when_then.iter().any(|(_, then)| is_array(then))
-                || else_expr.as_deref().is_some_and(is_array)
+                || else_expr.as_ref().is_some_and(is_array)
         }
         _ => false,
     }
@@ -11074,7 +11128,7 @@ pub(super) mod tests {
         let HirRoot::Query(root) = &document.root else {
             panic!("SELECT produces a query root");
         };
-        &document.queries[root.query.index()].blocks[0].outputs[0].expr
+        &document.exprs[document.queries[root.query.index()].blocks[0].outputs[0].expr]
     }
 
     fn root_query(document: &HirDocument) -> QueryId {
@@ -11088,7 +11142,7 @@ pub(super) mod tests {
         match root_expression(document) {
             Expr::Subquery(subquery) => subquery,
             Expr::Binary { rhs, .. } => {
-                let Expr::Subquery(subquery) = rhs.as_ref() else {
+                let Expr::Subquery(subquery) = &document.exprs[*rhs] else {
                     panic!("binary RHS is a subquery");
                 };
                 subquery
@@ -11102,10 +11156,13 @@ pub(super) mod tests {
             .query(root_query(document))
             .expect("root query exists");
         let hir::QueryBlockBody::Select {
-            filter: Some(Expr::Subquery(subquery)),
+            filter: Some(filter),
             ..
         } = &query.blocks[0].body
         else {
+            panic!("root filter is a subquery expression");
+        };
+        let Expr::Subquery(subquery) = &document.exprs[*filter] else {
             panic!("root filter is a subquery expression");
         };
         subquery
@@ -11541,7 +11598,8 @@ pub(super) mod tests {
             Some(CollationSeq::NoCase)
         );
 
-        let Expr::Function(call) = &mut document.queries[0].blocks[0].outputs[0].expr else {
+        let output = document.queries[0].blocks[0].outputs[0].expr;
+        let Expr::Function(call) = document.exprs.get_mut(output) else {
             panic!("root expression is aggregate call");
         };
         let hir::FunctionArguments::Expressions { facts, .. } = &mut call.arguments else {
@@ -11566,7 +11624,8 @@ pub(super) mod tests {
         );
         let query = document.query(root_query(&document)).unwrap();
         let block = &query.blocks[0];
-        let mut buffer = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+        let mut buffer =
+            plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id).unwrap();
         let inputs = plan_hir_window_output_inputs(query, block, &mut buffer).unwrap();
         assert_eq!(
             buffer.columns.len(),
@@ -11577,7 +11636,7 @@ pub(super) mod tests {
         assert_eq!(inputs.values.len(), 2);
         assert_eq!(inputs.values[0].1, inputs.values[1].1);
         assert!(
-            !std::ptr::eq(inputs.values[0].0, inputs.values[1].0),
+            inputs.values[0].0 != inputs.values[1].0,
             "each occurrence keeps its own substitution"
         );
         let mut program = program();
@@ -11585,7 +11644,7 @@ pub(super) mod tests {
         let registers = inputs.prepare_registers(&mut program);
         let result = program.alloc_register();
         program.bind_window_result(hir::WindowFunctionId::new(block.id, 0), result);
-        let sorter = initialize_hir_sorter(&mut program, query, block).unwrap();
+        let sorter = initialize_hir_sorter(&mut program, &document.exprs, query, block).unwrap();
         let distinct = initialize_hir_distinct(&mut program, block).unwrap();
         let done = program.allocate_label();
         let output_label = program.allocate_label();
@@ -11651,16 +11710,17 @@ pub(super) mod tests {
             let document = analyze_sql(rowid_items_schema(), sql);
             let query = document.query(root_query(&document)).unwrap();
             let block = &query.blocks[0];
-            let mut buffer = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+            let mut buffer =
+                plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id).unwrap();
             let inputs = plan_hir_window_output_inputs(query, block, &mut buffer).unwrap();
             let expected = if block.windows.len() == 1 { 2 } else { 1 };
             assert_eq!(inputs.values.len(), expected);
             assert_eq!(buffer.columns.len(), expected);
-            assert!(std::ptr::eq(inputs.values[0].0, &block.outputs[1].expr));
+            assert_eq!(inputs.values[0].0, block.outputs[1].expr);
             assert!(inputs
                 .values
                 .iter()
-                .all(|(expr, _)| !matches!(expr, hir::Expr::Column(_))));
+                .all(|(expr, _)| !matches!(document.exprs[*expr], hir::Expr::Column(_))));
         }
         let document = analyze_sql(
             rowid_items_schema(),
@@ -11668,7 +11728,8 @@ pub(super) mod tests {
         );
         let query = document.query(root_query(&document)).unwrap();
         let block = &query.blocks[0];
-        let mut buffer = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+        let mut buffer =
+            plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id).unwrap();
         let inputs = plan_hir_window_output_inputs(query, block, &mut buffer).unwrap();
         assert!(
             inputs.columns.is_empty(),
@@ -11687,7 +11748,8 @@ pub(super) mod tests {
         );
         let query = document.query(root_query(&document)).unwrap();
         let block = &query.blocks[0];
-        let mut buffer = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+        let mut buffer =
+            plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id).unwrap();
         let inputs = plan_hir_window_output_inputs(query, block, &mut buffer).unwrap();
         assert_eq!(buffer.columns.len(), 2);
         assert_ne!(inputs.values[0].1, inputs.sort_keys[0].1);
@@ -11695,7 +11757,7 @@ pub(super) mod tests {
             buffer.columns[1],
             HirWindowBufferColumn::Encoded(_)
         ));
-        let hir::Expr::Column(reference) = block.outputs[0].expr else {
+        let hir::Expr::Column(reference) = document.exprs[block.outputs[0].expr] else {
             panic!("column output");
         };
         let mut program = program();
@@ -11747,8 +11809,9 @@ pub(super) mod tests {
             let key = program.alloc_register();
             program.bind_window_result(hir::WindowFunctionId::new(block.id, 0), result);
             let distinct = initialize_hir_distinct(&mut program, block).unwrap();
-            let sorter =
-                ordered.then(|| initialize_hir_sorter(&mut program, query, block).unwrap());
+            let sorter = ordered.then(|| {
+                initialize_hir_sorter(&mut program, &document.exprs, query, block).unwrap()
+            });
             let limit =
                 initialize_limit(&mut program, &document, query.limit.as_ref(), done, false)
                     .unwrap();
@@ -11764,13 +11827,13 @@ pub(super) mod tests {
                 distinct: distinct.as_ref(),
             };
             let values = [super::super::expr::ExprRegisterInput::new(
-                &block.outputs[1].expr,
+                block.outputs[1].expr,
                 buffered,
             )];
             let keys: Vec<_> = query
                 .order_by
                 .iter()
-                .map(|term| super::super::expr::ExprRegisterInput::new(&term.expr, key))
+                .map(|term| super::super::expr::ExprRegisterInput::new(term.expr, key))
                 .collect();
             program.emit_insn(Insn::Gosub {
                 target_pc: label,
@@ -11876,7 +11939,7 @@ pub(super) mod tests {
         let query = document.query(root_query(&document)).unwrap();
         let block = &query.blocks[0];
         let mut program = program();
-        let sorter = initialize_hir_sorter(&mut program, query, block).unwrap();
+        let sorter = initialize_hir_sorter(&mut program, &document.exprs, query, block).unwrap();
         assert!(matches!(
             sorter.key_sources[0],
             HirSortKeySource::EncodedOutput(0)
@@ -11886,11 +11949,11 @@ pub(super) mod tests {
         let window_result = program.alloc_register();
         program.bind_window_result(hir::WindowFunctionId::new(block.id, 0), window_result);
         let values = [super::super::expr::ExprRegisterInput::new(
-            &block.outputs[0].expr,
+            block.outputs[0].expr,
             decoded,
         )];
         let keys = [super::super::expr::ExprRegisterInput::new(
-            &block.outputs[0].expr,
+            block.outputs[0].expr,
             encoded,
         )];
         let label = program.allocate_label();
@@ -13538,10 +13601,13 @@ pub(super) mod tests {
         // virtual table receives the argument as written.
         assert!(matches!(
             operation.arguments.as_slice(),
-            [Expr::Unary {
-                operator: turso_parser::ast::UnaryOperator::Positive,
-                expr
-            }] if matches!(expr.as_ref(), Expr::Literal(Literal::String(_)))
+            [argument] if matches!(
+                &plan.document.exprs[*argument],
+                Expr::Unary {
+                    operator: turso_parser::ast::UnaryOperator::Positive,
+                    expr
+                } if matches!(&plan.document.exprs[*expr], Expr::Literal(Literal::String(_)))
+            )
         ));
         let mut program = program();
 
@@ -14779,9 +14845,12 @@ pub(super) mod tests {
                 .body
             {
                 hir::QueryBlockBody::Select {
-                    filter: Some(Expr::InList { values, .. }),
+                    filter: Some(filter),
                     ..
-                } => values.clone(),
+                } => match &plan.document.exprs[*filter] {
+                    Expr::InList { values, .. } => values.clone(),
+                    _ => panic!("indexed test has an IN-list filter"),
+                },
                 _ => panic!("indexed test has an IN-list filter"),
             };
             let planned_query = plan
@@ -14943,21 +15012,23 @@ pub(super) mod tests {
             types::SeekOp,
         };
 
-        let document = analyze_sql(rowid_items_schema(), "SELECT value FROM items");
+        let mut document = analyze_sql(rowid_items_schema(), "SELECT value FROM items");
+        let five = document
+            .exprs
+            .push(Expr::Literal(Literal::Numeric("5".to_string())));
+        let two = document
+            .exprs
+            .push(Expr::Literal(Literal::Numeric("2".to_string())));
         let source = &document.sources[0];
         let seek_def = SeekDef {
             prefix: Vec::new(),
             start: SeekKey {
-                last_component: SeekKeyComponent::Expr(Expr::Literal(Literal::Numeric(
-                    "5".to_string(),
-                ))),
+                last_component: SeekKeyComponent::Expr(five),
                 op: SeekOp::LE { eq_only: false },
                 affinity: Affinity::Integer,
             },
             end: SeekKey {
-                last_component: SeekKeyComponent::Expr(Expr::Literal(Literal::Numeric(
-                    "2".to_string(),
-                ))),
+                last_component: SeekKeyComponent::Expr(two),
                 op: SeekOp::LE { eq_only: false },
                 affinity: Affinity::Integer,
             },

@@ -249,6 +249,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         name,
                         name_kind,
                         resolved,
+                        &mut self.exprs,
                     ));
                 }
                 ast::ResultColumn::Star => {
@@ -265,7 +266,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
     }
 
     fn append_returning_star_outputs(
-        &self,
+        &mut self,
         outputs: &mut Vec<hir::Output>,
         expanded: Vec<ExpandedColumn<'_>>,
         scope: &Scope,
@@ -277,6 +278,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 column.name,
                 hir::OutputNameKind::StarExpansion,
                 resolved,
+                &mut self.exprs,
             ));
         }
         Ok(())

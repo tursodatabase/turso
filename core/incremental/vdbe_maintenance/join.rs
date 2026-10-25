@@ -33,13 +33,13 @@ struct JoinInputContract {
 /// The complete physical contract of one binary join node.
 pub(super) struct JoinContract {
     inputs: [JoinInputContract; JOIN_ARITY],
-    on: Vec<hir::Expr>,
+    on: Vec<hir::ExprId>,
 }
 
 impl JoinContract {
     pub(super) fn from_outputs(
         outputs: [&NodeOutput; JOIN_ARITY],
-        on: &[hir::Expr],
+        on: &[hir::ExprId],
     ) -> Result<Self> {
         let input = |position: usize| -> Result<JoinInputContract> {
             let output = outputs[position];
@@ -371,7 +371,7 @@ fn emit_join_phase(
                 }
                 _ => program.emit_column_or_rowid(cursor_ids[pos], physical_column, value_reg),
             }
-            row.add_column(Some(expr), value_reg);
+            row.add_column(Some(*expr), value_reg);
         }
         for (binding_index, binding) in input.schema.bindings.iter().enumerate() {
             let rowid_reg = program.alloc_register();
@@ -395,11 +395,11 @@ fn emit_join_phase(
     let innermost_next = next_labels[JOIN_ARITY - 1];
     for condition in &contract.on {
         let pred_true = program.allocate_label();
-        row.bind(program, document, condition);
+        row.bind(program, document, *condition);
         translate_condition_expr(
             program,
             document,
-            condition,
+            *condition,
             ConditionMetadata {
                 jump_if_condition_is_true: false,
                 jump_target_when_true: pred_true,

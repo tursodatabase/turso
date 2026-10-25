@@ -149,9 +149,14 @@ pub(super) fn emit_delete(
     }
     // A DELETE that fires triggers or foreign-key actions first collects
     // its rowids, since they can change the table.
-    let uses_rowset =
-        uses_rowset(delete) || !triggers.is_empty() || !actions.is_empty() || operation.is_none();
-    if !uses_rowset && !has_foreign_keys && operation.is_some_and(touches_at_most_one_row) {
+    let uses_rowset = uses_rowset(document, delete)
+        || !triggers.is_empty()
+        || !actions.is_empty()
+        || operation.is_none();
+    if !uses_rowset
+        && !has_foreign_keys
+        && operation.is_some_and(|operation| touches_at_most_one_row(document, operation))
+    {
         program.set_multi_write(false);
     }
 
@@ -215,8 +220,10 @@ fn emit_clear_btrees(program: &mut ProgramBuilder, target: &DmlTarget<'_>) {
 /// Whether the DELETE first collects the rowids of the rows to delete, then
 /// deletes them. A WHERE clause with a subquery does this, so the subquery
 /// never reads a table that is changing under it.
-fn uses_rowset(delete: &hir::Delete) -> bool {
-    delete.predicate.as_ref().is_some_and(has_subquery)
+fn uses_rowset(document: &hir::HirDocument, delete: &hir::Delete) -> bool {
+    delete
+        .predicate
+        .is_some_and(|predicate| has_subquery(document, predicate))
 }
 
 /// Delete each row as the loop reaches it.
@@ -361,7 +368,7 @@ fn emit_rowset_delete(
             // given them as stored.
             super::dml::with_stored_values(program, |program| {
                 for column in 0..columns {
-                    super::expr::translate_expr_no_constant_opt(
+                    super::expr::translate_detached_expr_no_constant_opt(
                         program,
                         document,
                         &hir::Expr::Column(hir::ColumnRef {
@@ -452,7 +459,7 @@ fn emit_virtual_delete(
         super::query::HirLoopsPlan::of_access(access),
         &|program, _next| {
             let start = program.alloc_registers(2);
-            super::expr::translate_expr(
+            super::expr::translate_detached_expr(
                 program,
                 document,
                 &hir::Expr::RowId(delete.target),
@@ -535,7 +542,7 @@ fn emit_delete_row(
             returning
                 .outputs
                 .iter()
-                .any(|output| has_subquery(&output.expr))
+                .any(|output| has_subquery(document, output.expr))
         })
         .map(|_| -> Result<usize> {
             // A virtual column is not stored; reading it through the copy
@@ -569,7 +576,7 @@ fn emit_delete_row(
                 let skip = program.allocate_label();
                 let register = program.alloc_register();
                 super::expr::translate_expr_no_constant_opt(
-                    program, document, predicate, register,
+                    program, document, *predicate, register,
                 )?;
                 program.emit_insn(Insn::IfNot {
                     reg: register,

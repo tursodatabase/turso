@@ -15,12 +15,12 @@ use super::{
     expr::{ExprPolicies, ExprPolicy, QueryFunctionState, RowValueChecks},
     hir::{
         BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, ColumnRef, ColumnSlots,
-        CompoundArm, Cte, CteId, DatabaseId, Delete, DeleteTargetKind, Expr, FunctionEvaluation,
-        Grouping, HirDocument, HirRoot, IndexCoverage, IndexHint, Insert, InsertTargetKind, Limit,
-        OrderTerm, Output, OutputId, OutputNameKind, OutputOwner, Query, QueryBlock,
-        QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SchemaExpressionRoot, SchemaProgramId,
-        Source, SourceColumn, SourceId, SourceKind, SourceOwner, TriggerBody, TriggerCommand,
-        TypeFact, Update, UpdateTargetKind,
+        CompoundArm, Cte, CteId, DatabaseId, Delete, DeleteTargetKind, Expr, ExprArena, ExprId,
+        ExprRef, FunctionEvaluation, Grouping, HirDocument, HirRoot, IndexCoverage, IndexHint,
+        Insert, InsertTargetKind, Limit, OrderTerm, Output, OutputId, OutputNameKind, OutputOwner,
+        Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SchemaExpressionRoot,
+        SchemaProgramId, Source, SourceColumn, SourceId, SourceKind, SourceOwner, TriggerBody,
+        TriggerCommand, TypeFact, Update, UpdateTargetKind,
     },
     query::FromContext,
     scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
@@ -99,7 +99,8 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
         } => analyzer.analyze_register_expressions(inputs, expressions)?,
     };
     analyzer.finish_column_reads(&root)?;
-    let document = analyzer.finish(root)?;
+    let mut document = analyzer.finish(root)?;
+    crate::translate::plan::prepare_planning_terms(&mut document);
     #[cfg(debug_assertions)]
     document.validate().map_err(|error| {
         LimboError::InternalError(format!("semantic analysis produced invalid HIR: {error}"))
@@ -154,6 +155,7 @@ pub(super) struct Analyzer<'context, 'catalog, 'ast> {
     sources: Vec<Option<Source>>,
     ctes: Vec<Option<Cte>>,
     schema_programs: Vec<Option<BoundSchemaProgram>>,
+    pub(super) exprs: super::hir::ExprArena,
     schema_programs_in_progress: HashSet<CatalogObjectId>,
     catalog_ids: HashMap<CatalogIdentity, CatalogObjectId>,
     pub(super) cte_scopes: Vec<super::cte::CteScope<'ast>>,
@@ -190,6 +192,7 @@ struct AnalyzerState<'ast> {
     sources: Vec<Option<Source>>,
     ctes: Vec<Option<Cte>>,
     schema_programs: Vec<Option<BoundSchemaProgram>>,
+    expr_count: usize,
     schema_programs_in_progress: HashSet<CatalogObjectId>,
     catalog_ids: HashMap<CatalogIdentity, CatalogObjectId>,
     cte_scopes: Vec<super::cte::CteScope<'ast>>,
@@ -244,6 +247,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             sources: Vec::new(),
             ctes: Vec::new(),
             schema_programs: Vec::new(),
+            exprs: super::hir::ExprArena::default(),
             schema_programs_in_progress: HashSet::default(),
             catalog_ids: HashMap::default(),
             cte_scopes: Vec::new(),
@@ -544,21 +548,23 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             ctes: Self::finish_arena(self.ctes, "CTE")?,
             schema_programs: Self::finish_arena(self.schema_programs, "schema program")?,
             cdc: None,
+            exprs: self.exprs,
+            planning: Default::default(),
         })
     }
 
     fn finish_column_reads(&mut self, root: &HirRoot) -> Result<()> {
         let mut pending = Vec::new();
         for query in self.queries.iter().flatten() {
-            query.direct_column_reads(|source| self.source(source), &mut pending);
+            query.direct_column_reads(|source| self.source(source), &self.exprs, &mut pending);
         }
         // An index expression can read a generated column, which then needs
         // its generation expression when the index is used.
         for source in self.sources.iter().flatten() {
             for index in &source.index_expressions {
                 for expression in index.columns.iter().flatten().chain(&index.predicate) {
-                    expression.for_each(&mut |expression| {
-                        if let Expr::Column(reference) = expression {
+                    self.exprs.at(*expression).for_each(&mut |expression| {
+                        if let Expr::Column(reference) = expression.node() {
                             pending.push(*reference);
                         }
                     });
@@ -603,7 +609,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
         }
         for update in updates {
-            pending.extend(update.direct_column_reads(|source| self.source(source)));
+            pending.extend(update.direct_column_reads(|source| self.source(source), &self.exprs));
             if let UpdateTargetKind::BTree { foreign_keys, .. } = &update.target_kind {
                 for source in [update.target, update.new_source] {
                     let width = self
@@ -628,7 +634,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
         }
         for delete in deletes {
-            pending.extend(delete.direct_column_reads());
+            pending.extend(delete.direct_column_reads(&self.exprs));
             if let DeleteTargetKind::BTree { foreign_keys, .. } = &delete.target_kind {
                 let width = self
                     .source(delete.target)
@@ -751,8 +757,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 .transpose()?;
 
             for expression in generated.iter().chain(default.iter()) {
-                expression.for_each(&mut |expression| {
-                    if let Expr::Column(dependency) = expression {
+                self.exprs.at(*expression).for_each(&mut |expression| {
+                    if let Expr::Column(dependency) = expression.node() {
                         pending.push(*dependency);
                     }
                 });
@@ -766,11 +772,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             })?;
             if let Some(expression) = generated {
                 source.generated_expressions[reference.column] =
-                    ColumnReadExpression::Planned(Box::new(expression));
+                    ColumnReadExpression::Planned(expression);
             }
             if let Some(expression) = default {
                 source.default_expressions[reference.column] =
-                    ColumnReadExpression::Planned(Box::new(expression));
+                    ColumnReadExpression::Planned(expression);
             }
         }
         Ok(())
@@ -951,7 +957,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             limit,
             output,
         };
-        query.captures = query.direct_captures(|source| self.source(source));
+        query.captures = query.direct_captures(|source| self.source(source), &self.exprs);
         self.insert_query(query_id, query)?;
 
         Ok(query_id)
@@ -1101,8 +1107,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     policies.where_clause(),
                     &mut functions,
                 )?;
-                reject_clause_alias_functions(&resolved.expr, block_id, &outputs, false)?;
-                Some(resolved.expr)
+                let filter = self.exprs.push(resolved.expr);
+                reject_clause_alias_functions(self.exprs.at(filter), block_id, &outputs, false)?;
+                Some(filter)
             }
             None => None,
         };
@@ -1124,11 +1131,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         // SQLite's havingToWhere(). Aggregate errors of those groups never
         // happen.
         let filter = match grouping.as_mut() {
-            Some(grouping) => move_having_terms_to_where(grouping, &outputs, filter),
+            Some(grouping) => {
+                move_having_terms_to_where(grouping, &outputs, filter, &mut self.exprs)
+            }
             None => filter,
         };
         let mut from = from;
-        if let (Some(from), Some(filter)) = (from.as_mut(), filter.as_ref()) {
+        if let (Some(from), Some(filter)) = (from.as_mut(), filter) {
             self.reduce_full_joins_rejected_by_where(from, filter);
         }
         let aggregate_query = grouping.is_some() || self.aggregate_count(functions.block()) > 0;
@@ -1240,12 +1249,17 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     format!("column{}", index + 1),
                     OutputNameKind::Inferred,
                     descriptor,
+                    &mut self.exprs,
                 )
             })
             .collect();
         let rows = resolved_rows
             .into_iter()
-            .map(|row| row.into_iter().map(|resolved| resolved.expr).collect())
+            .map(|row| {
+                row.into_iter()
+                    .map(|resolved| self.exprs.push(resolved.expr))
+                    .collect()
+            })
             .collect();
         let aggregate_count = self.aggregate_count(functions.block());
         let window_function_count = functions.window_function_count();
@@ -1287,10 +1301,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         functions,
                     )?,
                 };
-            reject_clause_alias_functions(&resolved.expr, block, outputs, false)?;
-            key_type_facts.push(resolved.type_fact.clone());
+            let key = self.exprs.push(resolved.expr);
+            reject_clause_alias_functions(self.exprs.at(key), block, outputs, false)?;
+            key_type_facts.push(resolved.type_fact);
             key_collations.push(resolved.collation.value().cloned());
-            keys.push(resolved.expr);
+            keys.push(key);
         }
 
         let having = match syntax.having.as_deref() {
@@ -1299,9 +1314,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 having_scope.set_outputs(outputs);
                 let resolved =
                     self.analyze_query_expr(syntax, &having_scope, policies.having(), functions)?;
-                reject_clause_alias_functions(&resolved.expr, block, outputs, true)?;
-                reject_aliased_aggregates(&resolved.expr, block, outputs)?;
-                Some(resolved.expr)
+                let having = self.exprs.push(resolved.expr);
+                reject_clause_alias_functions(self.exprs.at(having), block, outputs, true)?;
+                reject_aliased_aggregates(self.exprs.at(having), block, outputs)?;
+                Some(having)
             }
             None => None,
         };
@@ -1352,7 +1368,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 DroppedOrderTerms::AfterRowidOf(source) => {
                     if terms
                         .first()
-                        .is_some_and(|first| self.is_rowid_of(&first.expr, source, outputs))
+                        .is_some_and(|first| self.is_rowid_of(first.expr, source, outputs))
                     {
                         RowValueChecks::ScalarSubqueries
                     } else {
@@ -1383,7 +1399,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                             functions,
                         )
                         .and_then(|resolved| {
-                            reject_aliased_aggregates(&resolved.expr, block, outputs)
+                            let term = self.exprs.push(resolved.expr);
+                            reject_aliased_aggregates(self.exprs.at(term), block, outputs)
                         })
                         .and_then(|()| {
                             // SQLite moves window functions out of the ORDER
@@ -1419,8 +1436,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     functions,
                 )?,
             };
-            reject_aliased_aggregates(&resolved.expr, block, outputs)?;
-            terms.push(order_term(syntax, resolved));
+            let term = order_term(syntax, resolved, &mut self.exprs);
+            reject_aliased_aggregates(self.exprs.at(term.expr), block, outputs)?;
+            terms.push(term);
         }
         Ok(terms)
     }
@@ -1443,10 +1461,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
 
     /// Whether `expr`, or the result column it names, is the rowid of
     /// `source`.
-    fn is_rowid_of(&self, expr: &Expr, source: SourceId, outputs: &[Output]) -> bool {
-        let expr = match expr {
+    fn is_rowid_of(&self, expr: ExprId, source: SourceId, outputs: &[Output]) -> bool {
+        let expr = match &self.exprs[expr] {
             Expr::Output(id) => match outputs.iter().find(|output| output.id == *id) {
-                Some(output) => &output.expr,
+                Some(output) => &self.exprs[output.expr],
                 None => return false,
             },
             expr => expr,
@@ -1470,6 +1488,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             sources: self.sources.clone(),
             ctes: self.ctes.clone(),
             schema_programs: self.schema_programs.clone(),
+            expr_count: self.exprs.len(),
             schema_programs_in_progress: self.schema_programs_in_progress.clone(),
             catalog_ids: self.catalog_ids.clone(),
             cte_scopes: self.cte_scopes.clone(),
@@ -1484,6 +1503,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         self.sources = state.sources;
         self.ctes = state.ctes;
         self.schema_programs = state.schema_programs;
+        self.exprs.truncate(state.expr_count);
         self.schema_programs_in_progress = state.schema_programs_in_progress;
         self.catalog_ids = state.catalog_ids;
         self.cte_scopes = state.cte_scopes;
@@ -1507,8 +1527,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .map(|offset| self.analyze_query_scalar_expr(offset, &scope, policy, parent))
             .transpose()?;
         Ok(Limit {
-            limit: limit.expr,
-            offset: offset.map(|offset| offset.expr),
+            limit: self.exprs.push(limit.expr),
+            offset: offset.map(|offset| self.exprs.push(offset.expr)),
         })
     }
 
@@ -1542,7 +1562,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 )?;
                 let resolved =
                     self.compound_order_by_output(output_arms[0], position, &collations)?;
-                Ok(order_term(syntax, resolved))
+                Ok(order_term(syntax, resolved, &mut self.exprs))
             })
             .collect()
     }
@@ -1570,10 +1590,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         else {
             return Ok(None);
         };
-        Ok(block
-            .outputs
-            .iter()
-            .position(|output| output.expr.equivalent(&resolved.expr)))
+        let candidate = self.exprs.push(resolved.expr);
+        Ok(block.outputs.iter().position(|output| {
+            self.exprs
+                .at(output.expr)
+                .equivalent(self.exprs.at(candidate))
+        }))
     }
 
     /// The first arm's output at `position`, under the term's collations.
@@ -1587,7 +1609,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         for name in collations.iter().rev() {
             let collation = self.resolve_collation(name)?;
             resolved.expr = Expr::Collate {
-                expr: Box::new(resolved.expr),
+                expr: self.exprs.push(resolved.expr),
                 collation: collation.clone(),
             };
             resolved.collation = ExprCollation::Explicit(collation);
@@ -1633,7 +1655,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 Wrapper::Collate(name) => {
                     let collation = self.resolve_collation(name)?;
                     resolved.expr = Expr::Collate {
-                        expr: Box::new(resolved.expr),
+                        expr: self.exprs.push(resolved.expr),
                         collation: collation.clone(),
                     };
                     resolved.collation = ExprCollation::Explicit(collation);
@@ -1685,7 +1707,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     }
 
     fn append_star_outputs(
-        &self,
+        &mut self,
         block: QueryBlockId,
         outputs: &mut Vec<Output>,
         expanded: Vec<ExpandedColumn<'_>>,
@@ -1695,6 +1717,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         // the column is named after its source.
         let long_names = self.context().long_column_names();
         outputs.reserve(expanded.len());
+        self.exprs.reserve(expanded.len());
         for column in expanded {
             let resolved = self.resolve_atomic_expr(column.resolved.expr, scope)?;
             let name = if long_names {
@@ -1707,6 +1730,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 name,
                 OutputNameKind::StarExpansion,
                 resolved,
+                &mut self.exprs,
             ));
         }
         Ok(())
@@ -1751,6 +1775,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             name,
             name_kind,
             resolved,
+            &mut self.exprs,
         ))
     }
 }
@@ -1760,12 +1785,13 @@ pub(super) fn output_from_resolved(
     name: String,
     name_kind: OutputNameKind,
     resolved: ResolvedScopeExpr,
+    exprs: &mut ExprArena,
 ) -> Output {
     let (collation, collation_is_explicit) = resolved.collation.into_output();
     Output {
         id,
         name,
-        expr: resolved.expr,
+        expr: exprs.push(resolved.expr),
         type_fact: resolved.type_fact,
         affinity: resolved.affinity,
         schema_affinity: resolved.affinity,
@@ -1777,7 +1803,7 @@ pub(super) fn output_from_resolved(
 }
 
 fn reject_clause_alias_functions(
-    expression: &Expr,
+    expression: ExprRef<'_>,
     block: QueryBlockId,
     outputs: &[Output],
     allow_aggregates: bool,
@@ -1787,7 +1813,7 @@ fn reject_clause_alias_functions(
         if error.is_some() {
             return;
         }
-        let Expr::Output(id) = expression else {
+        let Expr::Output(id) = expression.node() else {
             return;
         };
         let OutputOwner::QueryBlock(owner) = id.owner else {
@@ -1803,11 +1829,11 @@ fn reject_clause_alias_functions(
             )));
             return;
         };
-        output.expr.for_each(&mut |expression| {
+        expression.at(output.expr).for_each(&mut |expression| {
             if error.is_some() {
                 return;
             }
-            let Expr::Function(call) = expression else {
+            let Expr::Function(call) = expression.node() else {
                 return;
             };
             error = match call.evaluation {
@@ -1835,8 +1861,9 @@ fn reject_clause_alias_functions(
 fn move_having_terms_to_where(
     grouping: &mut Grouping,
     outputs: &[Output],
-    filter: Option<Expr>,
-) -> Option<Expr> {
+    filter: Option<ExprId>,
+    exprs: &mut ExprArena,
+) -> Option<ExprId> {
     if grouping.keys.is_empty() {
         return filter;
     }
@@ -1844,21 +1871,24 @@ fn move_having_terms_to_where(
         return filter;
     };
     let mut conjuncts = Vec::new();
-    collect_conjuncts(having, &mut conjuncts);
-    let (moved, kept): (Vec<Expr>, Vec<Expr>) = conjuncts.into_iter().partition(|term| {
-        !is_literal_false(term) && reads_only_group_keys(term, grouping, outputs)
+    collect_conjuncts(having, exprs, &mut conjuncts);
+    let (moved, kept): (Vec<ExprId>, Vec<ExprId>) = conjuncts.into_iter().partition(|term| {
+        !is_literal_false(&exprs[*term])
+            && reads_only_group_keys(exprs.at(*term), grouping, outputs)
     });
-    grouping.having = kept.into_iter().reduce(and_exprs);
+    grouping.having = kept
+        .into_iter()
+        .reduce(|lhs, rhs| and_exprs(lhs, rhs, exprs));
     moved.into_iter().fold(filter, |filter, term| {
         Some(match filter {
-            Some(filter) => and_exprs(filter, term),
+            Some(filter) => and_exprs(filter, term, exprs),
             None => term,
         })
     })
 }
 
-fn collect_conjuncts(expression: Expr, conjuncts: &mut Vec<Expr>) {
-    match expression {
+fn collect_conjuncts(expression: ExprId, exprs: &ExprArena, conjuncts: &mut Vec<ExprId>) {
+    match &exprs[expression] {
         Expr::Binary {
             lhs,
             operator: ast::Operator::And,
@@ -1866,22 +1896,22 @@ fn collect_conjuncts(expression: Expr, conjuncts: &mut Vec<Expr>) {
             custom: None,
             ..
         } => {
-            collect_conjuncts(*lhs, conjuncts);
-            collect_conjuncts(*rhs, conjuncts);
+            collect_conjuncts(*lhs, exprs, conjuncts);
+            collect_conjuncts(*rhs, exprs, conjuncts);
         }
-        expression => conjuncts.push(expression),
+        _ => conjuncts.push(expression),
     }
 }
 
-fn and_exprs(lhs: Expr, rhs: Expr) -> Expr {
-    Expr::Binary {
-        lhs: Box::new(lhs),
+fn and_exprs(lhs: ExprId, rhs: ExprId, exprs: &mut ExprArena) -> ExprId {
+    exprs.push(Expr::Binary {
+        lhs,
         operator: ast::Operator::And,
-        rhs: Box::new(rhs),
+        rhs,
         array_concat: false,
         custom: None,
         comparison: None,
-    }
+    })
 }
 
 /// The terms SQLite keeps in HAVING as always false: `0`, `FALSE` and
@@ -1909,10 +1939,10 @@ fn is_literal_false(expression: &Expr) -> bool {
 /// only when it groups with BINARY collation: rows another collation puts
 /// in one group can differ under BINARY, so a term over such a key does not
 /// decide the same for every row of the group.
-fn reads_only_group_keys(term: &Expr, grouping: &Grouping, outputs: &[Output]) -> bool {
-    fn is_binary_key(grouping: &Grouping, expression: &Expr) -> bool {
+fn reads_only_group_keys(term: ExprRef<'_>, grouping: &Grouping, outputs: &[Output]) -> bool {
+    fn is_binary_key(grouping: &Grouping, expression: ExprRef<'_>) -> bool {
         grouping.keys.iter().enumerate().any(|(index, key)| {
-            key.equivalent(expression)
+            expression.at(*key).equivalent(expression)
                 && grouping.key_collations[index]
                     .as_ref()
                     .is_none_or(|collation| {
@@ -1923,16 +1953,16 @@ fn reads_only_group_keys(term: &Expr, grouping: &Grouping, outputs: &[Output]) -
                     })
         })
     }
-    fn check(expression: &Expr, grouping: &Grouping, outputs: &[Output]) -> bool {
+    fn check(expression: ExprRef<'_>, grouping: &Grouping, outputs: &[Output]) -> bool {
         expression.fold(&mut |expression, children: &[bool]| {
             if is_binary_key(grouping, expression) {
                 return true;
             }
-            match expression {
+            match expression.node() {
                 Expr::Output(id) => outputs
                     .iter()
                     .find(|output| output.id == *id)
-                    .is_some_and(|output| check(&output.expr, grouping, outputs)),
+                    .is_some_and(|output| check(expression.at(output.expr), grouping, outputs)),
                 Expr::Column(_) | Expr::RowId(_) | Expr::MergedColumn(_) | Expr::Subquery(_) => {
                     false
                 }
@@ -1947,24 +1977,28 @@ fn reads_only_group_keys(term: &Expr, grouping: &Grouping, outputs: &[Output]) -
     check(term, grouping, outputs)
 }
 
-fn reject_aliased_aggregates(having: &Expr, block: QueryBlockId, outputs: &[Output]) -> Result<()> {
+fn reject_aliased_aggregates(
+    having: ExprRef<'_>,
+    block: QueryBlockId,
+    outputs: &[Output],
+) -> Result<()> {
     let mut error = None;
     having.for_each(&mut |expression| {
         if error.is_some() {
             return;
         }
-        let Expr::Function(call) = expression else {
+        let Expr::Function(call) = expression.node() else {
             return;
         };
         if !matches!(call.evaluation, FunctionEvaluation::Aggregate { .. }) {
             return;
         }
         for argument in call.arguments.expressions() {
-            argument.for_each(&mut |expression| {
+            expression.at(*argument).for_each(&mut |expression| {
                 if error.is_some() {
                     return;
                 }
-                let Expr::Output(id) = expression else {
+                let Expr::Output(id) = expression.node() else {
                     return;
                 };
                 let OutputOwner::QueryBlock(owner) = id.owner else {
@@ -1980,7 +2014,7 @@ fn reject_aliased_aggregates(having: &Expr, block: QueryBlockId, outputs: &[Outp
                     )));
                     return;
                 };
-                if expression_contains_aggregate(&output.expr) {
+                if expression_contains_aggregate(expression.at(output.expr)) {
                     error = Some(LimboError::ParseError(format!(
                         "misuse of aliased aggregate {}",
                         crate::util::normalize_ident(&output.name)
@@ -2002,9 +2036,13 @@ fn resolved_output(output: &Output) -> ResolvedScopeExpr {
     }
 }
 
-fn order_term(syntax: &ast::SortedColumn, resolved: ResolvedScopeExpr) -> OrderTerm {
+fn order_term(
+    syntax: &ast::SortedColumn,
+    resolved: ResolvedScopeExpr,
+    exprs: &mut ExprArena,
+) -> OrderTerm {
     OrderTerm {
-        expr: resolved.expr,
+        expr: exprs.push(resolved.expr),
         order: syntax.order.unwrap_or(ast::SortOrder::Asc),
         nulls: syntax.nulls,
         type_fact: resolved.type_fact,
@@ -2176,10 +2214,10 @@ fn ordinal(number: usize) -> String {
     format!("{number}{suffix}")
 }
 
-fn expression_contains_aggregate(expression: &Expr) -> bool {
+fn expression_contains_aggregate(expression: ExprRef<'_>) -> bool {
     let mut found = false;
     expression.for_each(&mut |expression| {
-        if let Expr::Function(call) = expression {
+        if let Expr::Function(call) = expression.node() {
             found |= matches!(call.evaluation, FunctionEvaluation::Aggregate { .. });
         }
     });
@@ -3278,7 +3316,7 @@ mod tests {
         ];
 
         for (output, (index, spelling)) in outputs.iter().zip(expected) {
-            let Expr::Parameter(parameter) = &output.expr else {
+            let Expr::Parameter(parameter) = &document.exprs[output.expr] else {
                 panic!("parser variable becomes HIR parameter");
             };
             assert_eq!(parameter.index.get(), index);
@@ -3310,7 +3348,7 @@ mod tests {
         };
         let output = &document.query(root.query).expect("query exists").blocks[0].outputs[0];
         assert!(matches!(
-            &output.expr,
+            &document.exprs[output.expr],
             Expr::Literal(ast::Literal::String(value)) if value == "'missing name'"
         ));
         assert_eq!(output.type_fact.storage, Some(Type::Text));
@@ -3356,7 +3394,7 @@ mod tests {
         assert_eq!(source.columns.len(), 3);
 
         assert!(matches!(
-            &block.outputs[0].expr,
+            &document.exprs[block.outputs[0].expr],
             Expr::Column(reference) if reference.source == source.id && reference.column == 1
         ));
         assert_eq!(block.outputs[0].type_fact.storage, Some(Type::Text));
@@ -3375,14 +3413,16 @@ mod tests {
         );
         assert!(!block.outputs[0].collation_is_explicit);
         assert!(matches!(
-            &block.outputs[1].expr,
+            &document.exprs[block.outputs[1].expr],
             Expr::Column(reference) if reference.source == source.id && reference.column == 2
         ));
         assert!(matches!(
-            &block.outputs[2].expr,
+            &document.exprs[block.outputs[2].expr],
             Expr::Column(reference) if reference.source == source.id && reference.column == 0
         ));
-        assert!(matches!(&block.outputs[3].expr, Expr::RowId(id) if *id == source.id));
+        assert!(
+            matches!(&document.exprs[block.outputs[3].expr], Expr::RowId(id) if *id == source.id)
+        );
         assert_eq!(block.outputs[3].type_fact.storage, Some(Type::Integer));
     }
 
@@ -3407,7 +3447,7 @@ mod tests {
             panic!("transitive base dependency plans its read-time default");
         };
         assert!(matches!(
-            base_default.as_ref(),
+            &document.exprs[*base_default],
             Expr::Literal(ast::Literal::Numeric(value)) if value == "7"
         ));
 
@@ -3415,9 +3455,9 @@ mod tests {
             panic!("generated dependency is planned");
         };
         assert!(matches!(
-            doubled.as_ref(),
+            &document.exprs[*doubled],
             Expr::Binary { lhs, .. }
-                if matches!(lhs.as_ref(), Expr::Column(column)
+                if matches!(&document.exprs[*lhs], Expr::Column(column)
                     if column.source == source.id && column.column == 0)
         ));
 
@@ -3425,11 +3465,11 @@ mod tests {
             panic!("directly read generated column is planned");
         };
         assert!(matches!(
-            combined.as_ref(),
+            &document.exprs[*combined],
             Expr::Binary { lhs, rhs, .. }
-                if matches!(lhs.as_ref(), Expr::Column(column)
+                if matches!(&document.exprs[*lhs], Expr::Column(column)
                     if column.source == source.id && column.column == 1)
-                && matches!(rhs.as_ref(), Expr::Column(column)
+                && matches!(&document.exprs[*rhs], Expr::Column(column)
                     if column.source == source.id && column.column == 0)
         ));
         assert!(matches!(
@@ -3653,8 +3693,8 @@ mod tests {
             .chain(expression_index.predicate.iter())
             .all(|expression| {
                 let mut reads_only_source = true;
-                expression.for_each(&mut |part| {
-                    if let Expr::Column(column) = part {
+                document.expr(*expression).for_each(&mut |part| {
+                    if let Expr::Column(column) = part.node() {
                         reads_only_source &= column.source == source.id;
                     }
                 });
@@ -3763,11 +3803,11 @@ mod tests {
         );
         assert_eq!(source.columns.column(1).name(), "item_key");
         assert!(matches!(
-            outer_block.outputs[0].expr,
+            &document.exprs[outer_block.outputs[0].expr],
             Expr::Column(reference) if reference.source == source.id && reference.column == 0
         ));
         assert!(matches!(
-            outer_block.outputs[1].expr,
+            &document.exprs[outer_block.outputs[1].expr],
             Expr::Column(reference) if reference.source == source.id && reference.column == 1
         ));
     }
@@ -3841,7 +3881,7 @@ mod tests {
         let Expr::Subquery(SubqueryExpr::Scalar {
             query: scalar_id,
             output,
-        }) = &outer_block.outputs[0].expr
+        }) = &document.exprs[outer_block.outputs[0].expr]
         else {
             panic!("scalar subquery remains explicit in HIR");
         };
@@ -3850,7 +3890,7 @@ mod tests {
         assert_eq!(scalar.parent, Some(outer.id));
         assert_eq!(scalar.captures, vec![outer_source]);
         assert!(matches!(
-            scalar.blocks[0].outputs[0].expr,
+            &document.exprs[scalar.blocks[0].outputs[0].expr],
             Expr::Column(reference)
                 if reference.source == outer_source && reference.column == 1
         ));
@@ -3869,7 +3909,9 @@ mod tests {
             &crate::translate::collate::CollationSeq::NoCase
         );
 
-        let Expr::Subquery(SubqueryExpr::Exists(exists_id)) = &outer_block.outputs[1].expr else {
+        let Expr::Subquery(SubqueryExpr::Exists(exists_id)) =
+            &document.exprs[outer_block.outputs[1].expr]
+        else {
             panic!("EXISTS subquery remains explicit in HIR");
         };
         let exists = document.query(*exists_id).expect("EXISTS query exists");
@@ -3907,7 +3949,7 @@ mod tests {
             .first;
         let Expr::Subquery(SubqueryExpr::Scalar {
             query: middle_id, ..
-        }) = &outer.blocks[0].outputs[0].expr
+        }) = &document.exprs[outer.blocks[0].outputs[0].expr]
         else {
             panic!("outer expression contains middle query");
         };
@@ -3915,7 +3957,7 @@ mod tests {
         assert!(middle.captures.is_empty());
         let Expr::Subquery(SubqueryExpr::Scalar {
             query: inner_id, ..
-        }) = &middle.blocks[0].outputs[0].expr
+        }) = &document.exprs[middle.blocks[0].outputs[0].expr]
         else {
             panic!("middle expression contains inner query");
         };
@@ -3943,9 +3985,10 @@ mod tests {
         };
         let outer = document.query(root.query).expect("outer query exists");
         let from = outer.blocks[0].from.as_ref().expect("query has FROM");
-        let JoinConstraint::On(Expr::Subquery(SubqueryExpr::Exists(inner_id))) =
-            &from.joins[0].constraint
-        else {
+        let JoinConstraint::On(constraint) = from.joins[0].constraint else {
+            panic!("JOIN keeps its EXISTS subquery");
+        };
+        let Expr::Subquery(SubqueryExpr::Exists(inner_id)) = &document.exprs[constraint] else {
             panic!("JOIN keeps its EXISTS subquery");
         };
         let inner = document.query(*inner_id).expect("inner query exists");
@@ -3982,11 +4025,13 @@ mod tests {
         let source = block.from.as_ref().expect("query has FROM").first;
         let mut columns = Vec::new();
         let mut outputs = Vec::new();
-        filter.for_each(&mut |expression| match expression {
-            Expr::Column(reference) => columns.push(*reference),
-            Expr::Output(output) => outputs.push(*output),
-            _ => {}
-        });
+        document
+            .expr(*filter)
+            .for_each(&mut |expression| match expression.node() {
+                Expr::Column(reference) => columns.push(*reference),
+                Expr::Output(output) => outputs.push(*output),
+                _ => {}
+            });
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].source, source);
         assert_eq!(columns[0].column, 2);
@@ -4017,10 +4062,13 @@ mod tests {
             .expect("outer query has FROM")
             .first;
         let QueryBlockBody::Select {
-            filter: Some(Expr::Subquery(SubqueryExpr::Exists(inner))),
+            filter: Some(filter),
             ..
         } = &outer.blocks[0].body
         else {
+            panic!("WHERE keeps its EXISTS subquery");
+        };
+        let Expr::Subquery(SubqueryExpr::Exists(inner)) = &document.exprs[*filter] else {
             panic!("WHERE keeps its EXISTS subquery");
         };
         let inner = document.query(*inner).expect("inner query exists");
@@ -4034,9 +4082,9 @@ mod tests {
             panic!("inner WHERE becomes a filter");
         };
         assert!(matches!(
-            filter,
+            &document.exprs[*filter],
             Expr::Binary { lhs, .. }
-                if matches!(lhs.as_ref(), Expr::Column(reference)
+                if matches!(&document.exprs[*lhs], Expr::Column(reference)
                     if reference.source == outer_source && reference.column == 0)
         ));
     }
@@ -4094,15 +4142,15 @@ mod tests {
         let source = block.from.as_ref().expect("query has FROM").first;
         assert_eq!(grouping.keys.len(), 3);
         assert!(matches!(
-            grouping.keys[0],
+            &document.exprs[grouping.keys[0]],
             Expr::Column(reference) if reference.source == source && reference.column == 2
         ));
         assert!(matches!(
-            grouping.keys[1],
+            document.exprs[grouping.keys[1]],
             Expr::Output(id) if id == OutputId::query(block.id, 1)
         ));
         assert!(matches!(
-            grouping.keys[2],
+            document.exprs[grouping.keys[2]],
             Expr::Output(id) if id == OutputId::query(block.id, 0)
         ));
         assert_eq!(grouping.key_type_facts[0].storage, Some(Type::Real));
@@ -4161,13 +4209,7 @@ mod tests {
         let QueryBlockBody::Select {
             grouping:
                 Some(super::super::hir::Grouping {
-                    having:
-                        Some(Expr::Binary {
-                            lhs,
-                            rhs,
-                            operator: ast::Operator::Greater,
-                            ..
-                        }),
+                    having: Some(having),
                     ..
                 }),
             ..
@@ -4175,14 +4217,23 @@ mod tests {
         else {
             panic!("HAVING becomes grouping predicate");
         };
+        let Expr::Binary {
+            lhs,
+            rhs,
+            operator: ast::Operator::Greater,
+            ..
+        } = &document.exprs[*having]
+        else {
+            panic!("HAVING becomes grouping predicate");
+        };
         assert!(matches!(
-            lhs.as_ref(),
+            &document.exprs[*lhs],
             Expr::Function(call)
                 if matches!(call.evaluation, FunctionEvaluation::Aggregate { id, .. }
                     if id.index == 1 && id.block == block.id)
         ));
         assert!(matches!(
-            rhs.as_ref(),
+            &document.exprs[*rhs],
             Expr::Output(id) if *id == OutputId::query(block.id, 0)
         ));
     }
@@ -4281,7 +4332,7 @@ mod tests {
         let block = &query.blocks[0];
         assert_eq!(query.order_by.len(), 3);
         assert!(matches!(
-            query.order_by[0].expr,
+            document.exprs[query.order_by[0].expr],
             Expr::Output(id) if id == OutputId::query(block.id, 0)
         ));
         assert_eq!(query.order_by[0].order, ast::SortOrder::Desc);
@@ -4296,13 +4347,13 @@ mod tests {
             &crate::translate::collate::CollationSeq::NoCase
         );
         assert!(matches!(
-            query.order_by[1].expr,
+            document.exprs[query.order_by[1].expr],
             Expr::Output(id) if id == OutputId::query(block.id, 1)
         ));
         assert!(matches!(
-            &query.order_by[2].expr,
+            &document.exprs[query.order_by[2].expr],
             Expr::Collate { expr, collation }
-                if matches!(expr.as_ref(), Expr::Output(id)
+                if matches!(&document.exprs[*expr], Expr::Output(id)
                     if *id == OutputId::query(block.id, 0))
                 && collation.value() == &crate::translate::collate::CollationSeq::Binary
         ));
@@ -4339,13 +4390,13 @@ mod tests {
         assert_eq!(block.window_function_count, 1);
         assert_eq!(block.windows.len(), 1);
         assert!(matches!(
-            &query.order_by[0].expr,
+            &document.exprs[query.order_by[0].expr],
             Expr::Function(call)
                 if matches!(call.evaluation, FunctionEvaluation::Aggregate { id, .. }
                     if id.block == block.id && id.index == 1)
         ));
         assert!(matches!(
-            &query.order_by[1].expr,
+            &document.exprs[query.order_by[1].expr],
             Expr::Function(call)
                 if matches!(call.evaluation, FunctionEvaluation::Window { id, .. }
                     if id.block == block.id && id.index == 0)
@@ -4388,7 +4439,8 @@ mod tests {
             .as_ref()
             .expect("outer query has FROM")
             .first;
-        let Expr::Subquery(SubqueryExpr::Scalar { query: inner, .. }) = &outer.order_by[0].expr
+        let Expr::Subquery(SubqueryExpr::Scalar { query: inner, .. }) =
+            &document.exprs[outer.order_by[0].expr]
         else {
             panic!("ORDER BY keeps its scalar subquery");
         };
@@ -4445,13 +4497,15 @@ mod tests {
         let query = document.query(root.query).expect("query exists");
         let first_output = OutputId::query(query.blocks[0].id, 0);
         assert_eq!(query.order_by.len(), 2);
-        assert!(matches!(query.order_by[0].expr, Expr::Output(id) if id == first_output));
+        assert!(
+            matches!(document.exprs[query.order_by[0].expr], Expr::Output(id) if id == first_output)
+        );
         assert_eq!(query.order_by[0].order, ast::SortOrder::Desc);
         assert_eq!(query.order_by[0].nulls, Some(ast::NullsOrder::First));
         assert!(matches!(
-            &query.order_by[1].expr,
+            &document.exprs[query.order_by[1].expr],
             Expr::Collate { expr, collation }
-                if matches!(expr.as_ref(), Expr::Output(id) if *id == first_output)
+                if matches!(&document.exprs[*expr], Expr::Output(id) if *id == first_output)
                     && collation.value() == &crate::translate::collate::CollationSeq::NoCase
         ));
 
@@ -4503,7 +4557,7 @@ mod tests {
             let query = document.query(root.query).expect("query exists");
             let expected = OutputId::query(query.blocks[0].id, position);
             assert!(
-                matches!(query.order_by[0].expr, Expr::Output(id) if id == expected),
+                matches!(document.exprs[query.order_by[0].expr], Expr::Output(id) if id == expected),
                 "{sql}"
             );
         }
@@ -4528,19 +4582,19 @@ mod tests {
         let query = document.query(root.query).expect("query exists");
         let limit = query.limit.as_ref().expect("LIMIT is preserved");
         assert!(matches!(
-            &limit.limit,
+            &document.exprs[limit.limit],
             Expr::Binary {
                 lhs,
                 operator: ast::Operator::Add,
                 rhs,
                 ..
-            } if matches!(lhs.as_ref(), Expr::Function(call)
+            } if matches!(&document.exprs[*lhs], Expr::Function(call)
                 if matches!(call.evaluation, FunctionEvaluation::Scalar))
-                && matches!(rhs.as_ref(), Expr::Literal(ast::Literal::Numeric(value))
+                && matches!(&document.exprs[*rhs], Expr::Literal(ast::Literal::Numeric(value))
                     if value == "2")
         ));
         assert!(matches!(
-            limit.offset.as_ref(),
+            limit.offset.map(|offset| &document.exprs[offset]),
             Some(Expr::Literal(ast::Literal::String(value))) if value == "'3'"
         ));
 
@@ -4553,11 +4607,11 @@ mod tests {
         assert_eq!(query.blocks.len(), 2);
         let limit = query.limit.as_ref().expect("compound LIMIT is preserved");
         assert!(matches!(
-            &limit.limit,
+            &comma.exprs[limit.limit],
             Expr::Literal(ast::Literal::Numeric(value)) if value == "2"
         ));
         assert!(matches!(
-            limit.offset.as_ref(),
+            limit.offset.map(|offset| &comma.exprs[offset]),
             Some(Expr::Literal(ast::Literal::Numeric(value))) if value == "4"
         ));
     }
@@ -4580,7 +4634,7 @@ mod tests {
         };
         let outer = document.query(root.query).expect("outer query exists");
         let Expr::Subquery(SubqueryExpr::Scalar { query: inner, .. }) =
-            &outer.limit.as_ref().expect("LIMIT is preserved").limit
+            &document.exprs[outer.limit.as_ref().expect("LIMIT is preserved").limit]
         else {
             panic!("LIMIT keeps its scalar subquery");
         };
@@ -4656,12 +4710,12 @@ mod tests {
         };
         assert_eq!(rows.len(), 2);
         assert!(matches!(
-            &rows[0][0],
+            &document.exprs[rows[0][0]],
             Expr::Collate { expr, .. }
-                if matches!(expr.as_ref(), Expr::Literal(ast::Literal::Numeric(value)) if value == "1")
+                if matches!(&document.exprs[*expr], Expr::Literal(ast::Literal::Numeric(value)) if value == "1")
         ));
         assert!(matches!(
-            &rows[1][1],
+            &document.exprs[rows[1][1]],
             Expr::Literal(ast::Literal::String(value)) if value == "'right'"
         ));
     }
@@ -4685,7 +4739,8 @@ mod tests {
             .as_ref()
             .expect("outer query has FROM")
             .first;
-        let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = &outer.blocks[0].outputs[0].expr
+        let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) =
+            &document.exprs[outer.blocks[0].outputs[0].expr]
         else {
             panic!("VALUES stays a scalar subquery");
         };
@@ -4696,7 +4751,7 @@ mod tests {
             panic!("child query owns VALUES rows");
         };
         assert!(matches!(
-            rows[0][0],
+            &document.exprs[rows[0][0]],
             Expr::Column(reference)
                 if reference.source == outer_source && reference.column == 1
         ));
@@ -4717,12 +4772,12 @@ mod tests {
             panic!("query owns VALUES rows");
         };
         assert!(matches!(
-            &rows[0][0],
+            &document.exprs[rows[0][0]],
             Expr::Function(call)
                 if matches!(call.evaluation, FunctionEvaluation::Aggregate { .. })
         ));
         assert!(matches!(
-            &rows[0][1],
+            &document.exprs[rows[0][1]],
             Expr::Function(call)
                 if matches!(call.evaluation, FunctionEvaluation::Window { .. })
         ));
@@ -4739,7 +4794,7 @@ mod tests {
             panic!("query owns VALUES rows");
         };
         assert!(matches!(
-            &rows[0][0],
+            &document.exprs[rows[0][0]],
             Expr::Literal(ast::Literal::String(value)) if value == "'missing'"
         ));
     }
@@ -4789,13 +4844,13 @@ mod tests {
             query,
             negated,
             comparison,
-        }) = &outer.blocks[0].outputs[0].expr
+        }) = &document.exprs[outer.blocks[0].outputs[0].expr]
         else {
             panic!("IN query remains explicit in HIR");
         };
         assert!(!negated);
         assert!(matches!(
-            lhs.as_ref(),
+            &document.exprs[*lhs],
             Expr::Column(reference)
                 if reference.source == outer_source && reference.column == 1
         ));
@@ -4821,7 +4876,7 @@ mod tests {
             negated,
             comparison,
             ..
-        }) = &outer.blocks[0].outputs[1].expr
+        }) = &document.exprs[outer.blocks[0].outputs[1].expr]
         else {
             panic!("NOT IN query remains explicit in HIR");
         };
@@ -4874,7 +4929,7 @@ mod tests {
                 negated,
                 comparison,
                 ..
-            }) = &output.expr
+            }) = &document.exprs[output.expr]
             else {
                 panic!("named relation uses IN-query HIR");
             };
@@ -4896,7 +4951,7 @@ mod tests {
             let block = &relation.blocks[0];
             let source = block.from.as_ref().expect("relation query has FROM").first;
             assert!(matches!(
-                block.outputs[0].expr,
+                &document.exprs[block.outputs[0].expr],
                 Expr::Column(reference)
                     if reference.source == source && reference.column == 0
             ));
@@ -4941,11 +4996,11 @@ mod tests {
             query,
             comparison,
             ..
-        }) = &outer.blocks[0].outputs[0].expr
+        }) = &document.exprs[outer.blocks[0].outputs[0].expr]
         else {
             panic!("table function uses IN-query HIR");
         };
-        assert!(matches!(lhs.as_ref(), Expr::Row(values) if values.len() == 8));
+        assert!(matches!(&document.exprs[*lhs], Expr::Row(values) if values.len() == 8));
         assert_eq!(comparison.components.len(), 8);
 
         let relation = document.query(*query).expect("relation query exists");
@@ -5007,11 +5062,11 @@ mod tests {
         let outer = document.query(root.query).expect("outer query exists");
         let Expr::Subquery(SubqueryExpr::In {
             lhs, comparison, ..
-        }) = &outer.blocks[0].outputs[0].expr
+        }) = &document.exprs[outer.blocks[0].outputs[0].expr]
         else {
             panic!("row IN query remains explicit in HIR");
         };
-        let Expr::Row(values) = lhs.as_ref() else {
+        let Expr::Row(values) = &document.exprs[*lhs] else {
             panic!("row left side remains explicit in HIR");
         };
         assert_eq!(values.len(), 2);
@@ -5117,7 +5172,7 @@ mod tests {
         let query = document.query(root.query).expect("query exists");
         for block in &query.blocks {
             assert_eq!(block.aggregate_count, 1);
-            let Expr::Function(function) = &block.outputs[0].expr else {
+            let Expr::Function(function) = &document.exprs[block.outputs[0].expr] else {
                 panic!("count becomes a resolved function");
             };
             assert!(matches!(
@@ -5190,7 +5245,7 @@ mod tests {
         assert!(!source.rowid_available);
         assert_eq!(source.columns.column(1).name(), "item_text");
         assert!(matches!(
-            root_block.outputs[0].expr,
+            &document.exprs[root_block.outputs[0].expr],
             Expr::Column(reference) if reference.source == source.id && reference.column == 1
         ));
     }
@@ -5310,7 +5365,8 @@ mod tests {
         );
 
         let limit = recursive.limit.as_ref().expect("recursive LIMIT binds");
-        let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = &limit.limit else {
+        let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = &document.exprs[limit.limit]
+        else {
             panic!("LIMIT subquery remains explicit HIR");
         };
         assert_eq!(
@@ -5318,8 +5374,8 @@ mod tests {
             Some(recursive.seed)
         );
         assert!(matches!(
-            limit.offset,
-            Some(Expr::Parameter(ref parameter)) if parameter.index.get() == 1
+            limit.offset.map(|offset| &document.exprs[offset]),
+            Some(Expr::Parameter(parameter)) if parameter.index.get() == 1
         ));
     }
 
@@ -5370,7 +5426,7 @@ mod tests {
         };
         let b_output = &document.query(b_body).expect("b body exists").blocks[0].outputs[0];
         assert!(
-            matches!(&b_output.expr, Expr::Literal(ast::Literal::Numeric(value)) if value == "1"),
+            matches!(&document.exprs[b_output.expr], Expr::Literal(ast::Literal::Numeric(value)) if value == "1"),
             "a reads the b from its own WITH clause: {:?}",
             b_output.expr
         );
@@ -5496,7 +5552,7 @@ mod tests {
             .first;
         let Expr::Subquery(SubqueryExpr::Scalar {
             query: owner_id, ..
-        }) = outer.blocks[0].outputs[0].expr
+        }) = document.exprs[outer.blocks[0].outputs[0].expr]
         else {
             panic!("outer output contains the CTE-owning query");
         };
@@ -5672,12 +5728,12 @@ mod tests {
             panic!("ordinary CTE owns query body");
         };
         assert!(matches!(
-            &document
+            &document.exprs[document
                 .query(shadow_body)
                 .expect("shadow body exists")
                 .blocks[0]
                 .outputs[0]
-                .expr,
+                .expr],
             Expr::Literal(ast::Literal::Numeric(value)) if value == "2"
         ));
     }
@@ -5744,21 +5800,24 @@ mod tests {
             .collect();
         assert_eq!(aliases, [Some("i"), Some("c"), Some("t"), Some("e")]);
 
-        let JoinConstraint::On(Expr::Binary { lhs, rhs, .. }) = &from.joins[1].constraint else {
+        let JoinConstraint::On(constraint) = from.joins[1].constraint else {
+            panic!("JOIN ON becomes a resolved HIR expression");
+        };
+        let Expr::Binary { lhs, rhs, .. } = &document.exprs[constraint] else {
             panic!("JOIN ON becomes a resolved HIR expression");
         };
         assert!(matches!(
-            lhs.as_ref(),
+            &document.exprs[*lhs],
             Expr::Column(reference) if reference.source == sources[3] && reference.column == 0
         ));
         assert!(matches!(
-            rhs.as_ref(),
+            &document.exprs[*rhs],
             Expr::Column(reference) if reference.source == sources[0] && reference.column == 0
         ));
 
         for (output, source) in block.outputs.iter().zip(sources) {
             assert!(matches!(
-                output.expr,
+                &document.exprs[output.expr],
                 Expr::Column(reference) if reference.source == source && reference.column == 1
             ));
         }
@@ -5817,7 +5876,10 @@ mod tests {
         assert_eq!(group.from.joins.len(), 1);
         // The one value of the USING column comes first, then each
         // source's columns and implicit rowid, as SQLite lists them.
-        assert!(matches!(group.columns[0], Expr::MergedColumn(_)));
+        assert!(matches!(
+            &document.exprs[group.columns[0]],
+            Expr::MergedColumn(_)
+        ));
         assert_eq!(
             group_source
                 .columns
@@ -5836,11 +5898,14 @@ mod tests {
             ]
         );
         assert_eq!(block.outputs.len(), 4);
-        assert!(matches!(block.outputs[0].expr, Expr::MergedColumn(_)));
+        assert!(matches!(
+            &document.exprs[block.outputs[0].expr],
+            Expr::MergedColumn(_)
+        ));
         for output in &block.outputs {
-            output.expr.for_each(&mut |expression| {
+            document.expr(output.expr).for_each(&mut |expression| {
                 assert!(!matches!(
-                    expression,
+                    expression.node(),
                     Expr::Column(reference) if reference.source == group_source.id
                 ));
             });
@@ -5884,14 +5949,17 @@ mod tests {
             SourceKind::Table(_)
         ));
         assert!(matches!(
-            block.outputs[0].expr,
+            &document.exprs[block.outputs[0].expr],
             Expr::Column(reference) if reference.source == items && reference.column == 1
         ));
         assert!(matches!(
-            block.outputs[1].expr,
+            &document.exprs[block.outputs[1].expr],
             Expr::Column(reference) if reference.source == categories && reference.column == 1
         ));
-        assert!(matches!(block.outputs[2].expr, Expr::MergedColumn(_)));
+        assert!(matches!(
+            &document.exprs[block.outputs[2].expr],
+            Expr::MergedColumn(_)
+        ));
     }
 
     #[test]
@@ -5995,13 +6063,13 @@ mod tests {
             // argument keeps its written value and the planner never folds the
             // predicate into an index lookup on the outer table.
             assert!(matches!(
-                &argument_predicates[0],
+                &document.exprs[argument_predicates[0]],
                 Expr::Binary { lhs, operator: ast::Operator::Equals, rhs, comparison: Some(_), .. }
-                    if matches!(lhs.as_ref(), Expr::Column(reference) if reference.source == function_id)
+                    if matches!(&document.exprs[*lhs], Expr::Column(reference) if reference.source == function_id)
                         && matches!(
-                            rhs.as_ref(),
+                            &document.exprs[*rhs],
                             Expr::Unary { operator: ast::UnaryOperator::Positive, expr }
-                                if matches!(expr.as_ref(), Expr::Column(reference) if reference.source == items_id && reference.column == 1)
+                                if matches!(&document.exprs[*expr], Expr::Column(reference) if reference.source == items_id && reference.column == 1)
                         )
             ));
         }
@@ -6034,13 +6102,16 @@ mod tests {
         };
         assert!(matches!(
             argument_predicates.as_slice(),
-            [Expr::Binary { lhs, operator: ast::Operator::Equals, rhs, comparison: Some(_), .. }]
-                if matches!(lhs.as_ref(), Expr::Column(reference) if reference.source == source)
-                    && matches!(
-                        rhs.as_ref(),
-                        Expr::Unary { operator: ast::UnaryOperator::Positive, expr }
-                            if matches!(expr.as_ref(), Expr::Literal(ast::Literal::Null))
-                    )
+            [predicate] if matches!(
+                &document.exprs[*predicate],
+                Expr::Binary { lhs, operator: ast::Operator::Equals, rhs, comparison: Some(_), .. }
+                    if matches!(&document.exprs[*lhs], Expr::Column(reference) if reference.source == source)
+                        && matches!(
+                            &document.exprs[*rhs],
+                            Expr::Unary { operator: ast::UnaryOperator::Positive, expr }
+                                if matches!(&document.exprs[*expr], Expr::Literal(ast::Literal::Null))
+                        )
+            )
         ));
 
         let query = root.query;
@@ -6068,8 +6139,11 @@ mod tests {
         };
         assert!(matches!(
             operation.arguments.as_slice(),
-            [Expr::Unary { operator: ast::UnaryOperator::Positive, expr }]
-                if matches!(expr.as_ref(), Expr::Literal(ast::Literal::Null))
+            [argument] if matches!(
+                &plan.document.exprs[*argument],
+                Expr::Unary { operator: ast::UnaryOperator::Positive, expr }
+                    if matches!(&plan.document.exprs[*expr], Expr::Literal(ast::Literal::Null))
+            )
         ));
         assert!(matches!(
             block.predicates.as_slice(),
@@ -6111,8 +6185,11 @@ mod tests {
         };
         assert!(matches!(
             operation.arguments.as_slice(),
-            [Expr::Unary { operator: ast::UnaryOperator::Positive, expr }]
-                if matches!(expr.as_ref(), Expr::Literal(ast::Literal::String(_)))
+            [argument] if matches!(
+                &plan.document.exprs[*argument],
+                Expr::Unary { operator: ast::UnaryOperator::Positive, expr }
+                    if matches!(&plan.document.exprs[*expr], Expr::Literal(ast::Literal::String(_)))
+            )
         ));
         assert!(block.predicates[0].consumed);
     }
@@ -6139,7 +6216,8 @@ mod tests {
             .as_ref()
             .expect("outer query has FROM")
             .first;
-        let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = &outer.blocks[0].outputs[0].expr
+        let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) =
+            &document.exprs[outer.blocks[0].outputs[0].expr]
         else {
             panic!("output contains scalar query");
         };
@@ -6162,12 +6240,15 @@ mod tests {
         };
         assert!(matches!(
             argument_predicates.as_slice(),
-            [Expr::Binary { rhs, comparison: Some(_), .. }]
-                if matches!(
-                    rhs.as_ref(),
-                    Expr::Unary { operator: ast::UnaryOperator::Positive, expr }
-                        if matches!(expr.as_ref(), Expr::Column(reference) if reference.source == outer_source && reference.column == 1)
-                )
+            [predicate] if matches!(
+                &document.exprs[*predicate],
+                Expr::Binary { rhs, comparison: Some(_), .. }
+                    if matches!(
+                        &document.exprs[*rhs],
+                        Expr::Unary { operator: ast::UnaryOperator::Positive, expr }
+                            if matches!(&document.exprs[*expr], Expr::Column(reference) if reference.source == outer_source && reference.column == 1)
+                    )
+            )
         ));
     }
 
@@ -6237,24 +6318,30 @@ mod tests {
         assert_eq!(column.name, "id");
         assert_eq!(column.value, MergedColumnValue::Left);
         assert!(matches!(
-            column.left.as_ref(),
+            &document.exprs[column.left],
             Expr::Column(reference) if reference.source == from.first && reference.column == 0
         ));
         assert_eq!(column.right.source, from.joins[0].right);
         assert_eq!(column.right.column, 0);
 
-        assert!(matches!(block.outputs[0].expr, Expr::MergedColumn(_)));
         assert!(matches!(
-            block.outputs[1].expr,
+            &document.exprs[block.outputs[0].expr],
+            Expr::MergedColumn(_)
+        ));
+        assert!(matches!(
+            &document.exprs[block.outputs[1].expr],
             Expr::Column(reference) if reference.source == from.first && reference.column == 0
         ));
         assert!(matches!(
-            block.outputs[2].expr,
+            &document.exprs[block.outputs[2].expr],
             Expr::Column(reference)
                 if reference.source == from.joins[0].right && reference.column == 0
         ));
         assert_eq!(block.outputs.len(), 7);
-        assert!(matches!(block.outputs[3].expr, Expr::MergedColumn(_)));
+        assert!(matches!(
+            &document.exprs[block.outputs[3].expr],
+            Expr::MergedColumn(_)
+        ));
     }
 
     #[test]
@@ -6308,10 +6395,19 @@ mod tests {
                 .value(),
             &crate::translate::collate::CollationSeq::NoCase
         );
-        assert!(matches!(block.outputs[0].expr, Expr::MergedColumn(_)));
+        assert!(matches!(
+            &document.exprs[block.outputs[0].expr],
+            Expr::MergedColumn(_)
+        ));
         assert_eq!(block.outputs.len(), 7);
-        assert!(matches!(block.outputs[3].expr, Expr::Column(_)));
-        assert!(matches!(block.outputs[4].expr, Expr::MergedColumn(_)));
+        assert!(matches!(
+            &document.exprs[block.outputs[3].expr],
+            Expr::Column(_)
+        ));
+        assert!(matches!(
+            &document.exprs[block.outputs[4].expr],
+            Expr::MergedColumn(_)
+        ));
     }
 
     #[test]
@@ -6383,7 +6479,7 @@ mod tests {
             };
             let column = &columns[0];
             assert_eq!(column.value, value);
-            let Expr::MergedColumn(merged) = &block.outputs[1].expr else {
+            let Expr::MergedColumn(merged) = &document.exprs[block.outputs[1].expr] else {
                 panic!("star emits one merged USING column");
             };
             assert_eq!(merged.value, value);
@@ -6497,7 +6593,7 @@ mod tests {
             .is_none());
         assert!(block.outputs.iter().enumerate().all(|(column, output)| {
             matches!(
-                output.expr,
+                &document.exprs[output.expr],
                 Expr::Column(reference)
                     if reference.source == source_id && reference.column == column
             )
@@ -6523,34 +6619,36 @@ mod tests {
         };
         let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
 
-        assert!(matches!(&outputs[0].expr, Expr::Array(elements) if elements.len() == 2));
+        assert!(
+            matches!(&document.exprs[outputs[0].expr], Expr::Array(elements) if elements.len() == 2)
+        );
         assert_eq!(outputs[0].type_fact.storage, Some(Type::Blob));
         assert_eq!(outputs[0].type_fact.array_dimensions, 1);
 
-        let Expr::Array(rows) = &outputs[1].expr else {
+        let Expr::Array(rows) = &document.exprs[outputs[1].expr] else {
             panic!("array() becomes array HIR");
         };
-        assert!(rows
-            .iter()
-            .all(|row| matches!(row, Expr::Array(elements) if elements.len() == 1)));
+        assert!(rows.iter().all(
+            |row| matches!(&document.exprs[*row], Expr::Array(elements) if elements.len() == 1)
+        ));
         assert_eq!(outputs[1].type_fact.storage, Some(Type::Blob));
         assert_eq!(outputs[1].type_fact.array_dimensions, 2);
 
-        let Expr::Subscript { base, index } = &outputs[2].expr else {
+        let Expr::Subscript { base, index } = &document.exprs[outputs[2].expr] else {
             panic!("bracket syntax becomes subscript HIR");
         };
-        assert!(matches!(base.as_ref(), Expr::Column(column) if column.column == 0));
+        assert!(matches!(&document.exprs[*base], Expr::Column(column) if column.column == 0));
         assert!(matches!(
-            index.as_ref(),
+            &document.exprs[*index],
             Expr::Literal(ast::Literal::Numeric(value)) if value == "1"
         ));
         assert_eq!(outputs[2].type_fact.storage, Some(Type::Integer));
         assert_eq!(outputs[2].type_fact.array_dimensions, 0);
 
-        let Expr::Subscript { base, .. } = &outputs[3].expr else {
+        let Expr::Subscript { base, .. } = &document.exprs[outputs[3].expr] else {
             panic!("array_element() becomes subscript HIR");
         };
-        assert!(matches!(base.as_ref(), Expr::Column(column) if column.column == 1));
+        assert!(matches!(&document.exprs[*base], Expr::Column(column) if column.column == 1));
         assert_eq!(outputs[3].type_fact.storage, Some(Type::Blob));
         assert_eq!(outputs[3].type_fact.array_dimensions, 1);
         assert_eq!(
@@ -6590,7 +6688,7 @@ mod tests {
         let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
 
         for output in &outputs[..13] {
-            let Expr::Function(call) = &output.expr else {
+            let Expr::Function(call) = &document.exprs[output.expr] else {
                 panic!("array utility remains a resolved function call");
             };
             assert!(matches!(call.operation, FunctionOperation::Ordinary));
@@ -6629,17 +6727,17 @@ mod tests {
             .all(|output| output.type_fact == TypeFact::known(Type::Integer)));
         assert_eq!(outputs[12].type_fact, TypeFact::known(Type::Text));
 
-        let Expr::Subscript { base, .. } = &outputs[13].expr else {
+        let Expr::Subscript { base, .. } = &document.exprs[outputs[13].expr] else {
             panic!("array_element() remains dedicated subscript HIR");
         };
-        let Expr::Function(append) = base.as_ref() else {
+        let Expr::Function(append) = &document.exprs[*base] else {
             panic!("subscript keeps its typed array-producing call");
         };
         assert_eq!(append.result_type.array_dimensions, 1);
         assert_eq!(outputs[13].type_fact.storage, Some(Type::Integer));
         assert_eq!(outputs[13].type_fact.array_dimensions, 0);
 
-        let Expr::Function(dynamic_remove) = &outputs[14].expr else {
+        let Expr::Function(dynamic_remove) = &document.exprs[outputs[14].expr] else {
             panic!("array_remove() remains a resolved function call");
         };
         assert_eq!(dynamic_remove.result_type.storage, Some(Type::Blob));
@@ -6687,7 +6785,10 @@ mod tests {
         for call in scalar_programs.encode.iter().chain(&scalar_programs.decode) {
             assert!(matches!(
                 call.arguments.as_slice(),
-                [Expr::Literal(ast::Literal::Numeric(value))] if value == "4"
+                [argument] if matches!(
+                    &document.exprs[*argument],
+                    Expr::Literal(ast::Literal::Numeric(value)) if value == "4"
+                )
             ));
         }
 
@@ -6716,7 +6817,7 @@ mod tests {
                 let program = document
                     .schema_program(call.program)
                     .expect("transform program exists");
-                let Expr::Binary { operator, .. } = program.body else {
+                let Expr::Binary { operator, .. } = document.exprs[program.body] else {
                     panic!("fixed transform is binary");
                 };
                 operator
@@ -6746,7 +6847,10 @@ mod tests {
         assert!(!array_programs.encode_nulls);
         assert!(matches!(
             array_programs.encode[0].arguments.as_slice(),
-            [Expr::Literal(ast::Literal::Numeric(value))] if value == "5"
+            [argument] if matches!(
+                &document.exprs[*argument],
+                Expr::Literal(ast::Literal::Numeric(value)) if value == "5"
+            )
         ));
 
         assert!(block
@@ -6816,7 +6920,7 @@ mod tests {
         let custom = outputs
             .iter()
             .map(|output| {
-                let Expr::Binary { custom, .. } = &output.expr else {
+                let Expr::Binary { custom, .. } = &document.exprs[output.expr] else {
                     panic!("output remains binary HIR");
                 };
                 custom.as_ref()
@@ -6855,7 +6959,10 @@ mod tests {
                 .expect("amount has an encoder")
                 .arguments
                 .as_slice(),
-            [Expr::Literal(ast::Literal::Numeric(value))] if value == "4"
+            [argument] if matches!(
+                &document.exprs[*argument],
+                Expr::Literal(ast::Literal::Numeric(value)) if value == "4"
+            )
         ));
 
         let reversed = custom[3].expect("left literal uses right custom column");
@@ -6996,7 +7103,7 @@ mod tests {
             }
             .expect("event exposes requested row");
             assert!(matches!(
-                expression,
+                &document.exprs[*expression],
                 Expr::Column(column)
                     if column.source == expected_source && column.column == 1
             ));
@@ -7061,7 +7168,7 @@ mod tests {
             panic!("trigger root contains predicate");
         };
         assert!(matches!(
-            expression,
+            &document.exprs[*expression],
             Expr::RowId(source) if Some(*source) == root.environment.new_source
         ));
 
@@ -7126,7 +7233,7 @@ mod tests {
         assert!(query.captures.contains(&new_source));
         assert!(query.captures.contains(&old_source));
         assert!(matches!(
-            query.limit.as_ref().map(|limit| &limit.limit),
+            query.limit.as_ref().map(|limit| &document.exprs[limit.limit]),
             Some(Expr::Column(column)) if column.source == new_source && column.column == 0
         ));
     }
@@ -7148,7 +7255,7 @@ mod tests {
         let new_source = root.environment.new_source.expect("INSERT has NEW");
         let query = document.query(*query_id).expect("trigger query exists");
         assert!(matches!(
-            query.blocks[0].outputs[0].expr,
+            &document.exprs[query.blocks[0].outputs[0].expr],
             Expr::Column(column) if column.source == new_source && column.column == 1
         ));
 
@@ -7219,8 +7326,12 @@ mod tests {
         let InsertSource::Values(rows) = &insert.source else {
             panic!("trigger INSERT uses VALUES");
         };
-        assert!(matches!(rows[0][0], Expr::Column(column) if column.source == new_source));
-        assert!(matches!(rows[0][1], Expr::Column(column) if column.source == old_source));
+        assert!(
+            matches!(&document.exprs[rows[0][0]], Expr::Column(column) if column.source == new_source)
+        );
+        assert!(
+            matches!(&document.exprs[rows[0][1]], Expr::Column(column) if column.source == old_source)
+        );
         let hir::UpsertAction::Update {
             assignments,
             predicate,
@@ -7229,10 +7340,10 @@ mod tests {
             panic!("UPSERT updates");
         };
         assert!(
-            matches!(assignments[0].value, Expr::Column(column) if column.source == new_source)
+            matches!(&document.exprs[assignments[0].value], Expr::Column(column) if column.source == new_source)
         );
         assert!(
-            matches!(predicate, Some(Expr::Binary { lhs, .. }) if matches!(lhs.as_ref(), Expr::Column(column) if column.source == old_source))
+            matches!(predicate.map(|predicate| &document.exprs[predicate]), Some(Expr::Binary { lhs, .. }) if matches!(&document.exprs[*lhs], Expr::Column(column) if column.source == old_source))
         );
 
         let invalid = first_trigger_command(
@@ -7274,13 +7385,13 @@ mod tests {
         assert_ne!(update.target, outer_old);
         assert_ne!(update.new_source, outer_new);
         assert!(matches!(
-            update.assignments[0].value,
+            &document.exprs[update.assignments[0].value],
             Expr::Column(column) if column.source == outer_new
         ));
         let predicate = update.predicate.as_ref().expect("UPDATE has predicate");
         let mut reads = Vec::new();
-        predicate.for_each(&mut |expression| {
-            if let Expr::Column(column) = expression {
+        document.expr(*predicate).for_each(&mut |expression| {
+            if let Expr::Column(column) = expression.node() {
                 reads.push(column.source);
             }
         });
@@ -7312,7 +7423,8 @@ mod tests {
         let environment = &root.environment;
         let outer_new = environment.new_source.expect("UPDATE has NEW");
         let outer_old = environment.old_source.expect("UPDATE has OLD");
-        let Expr::Subquery(hir::SubqueryExpr::Scalar { query, .. }) = &update.assignments[0].value
+        let Expr::Subquery(hir::SubqueryExpr::Scalar { query, .. }) =
+            &document.exprs[update.assignments[0].value]
         else {
             panic!("assignment is scalar subquery");
         };
@@ -7368,12 +7480,10 @@ mod tests {
         let outer_old = environment.old_source.expect("outer UPDATE has OLD");
         assert_ne!(delete.target, outer_old);
         let mut reads = Vec::new();
-        delete
-            .predicate
-            .as_ref()
-            .expect("DELETE has predicate")
+        document
+            .expr(*delete.predicate.as_ref().expect("DELETE has predicate"))
             .for_each(&mut |expression| {
-                if let Expr::Column(column) = expression {
+                if let Expr::Column(column) = expression.node() {
                     reads.push(column.source);
                 }
             });
@@ -7402,12 +7512,10 @@ mod tests {
         };
         let outer_old = root.environment.old_source.expect("DELETE trigger has OLD");
         let mut queries = Vec::new();
-        delete
-            .predicate
-            .as_ref()
-            .expect("DELETE has predicate")
+        document
+            .expr(*delete.predicate.as_ref().expect("DELETE has predicate"))
             .for_each(&mut |expression| {
-                if let Expr::Subquery(hir::SubqueryExpr::In { query, .. }) = expression {
+                if let Expr::Subquery(hir::SubqueryExpr::In { query, .. }) = expression.node() {
                     queries.push(*query);
                 }
             });
@@ -7458,12 +7566,15 @@ mod tests {
         let old_source = root.environment.old_source.expect("UPDATE has OLD");
 
         let mut predicate_reads = Vec::new();
-        program
-            .predicate
-            .as_ref()
-            .expect("trigger has WHEN predicate")
+        document
+            .expr(
+                *program
+                    .predicate
+                    .as_ref()
+                    .expect("trigger has WHEN predicate"),
+            )
             .for_each(&mut |expression| {
-                if let Expr::Column(column) = expression {
+                if let Expr::Column(column) = expression.node() {
                     predicate_reads.push(column.source);
                 }
             });
@@ -7478,7 +7589,7 @@ mod tests {
 
         let query = document.query(*query_id).expect("SELECT query exists");
         assert!(matches!(
-            query.blocks[0].outputs[0].expr,
+            &document.exprs[query.blocks[0].outputs[0].expr],
             Expr::Column(column) if column.source == new_source
         ));
 
@@ -7486,24 +7597,26 @@ mod tests {
         let InsertSource::Values(rows) = &insert.source else {
             panic!("INSERT command uses VALUES");
         };
-        assert!(matches!(rows[0][0], Expr::Column(column) if column.source == new_source));
-        assert!(matches!(rows[0][1], Expr::Column(column) if column.source == old_source));
+        assert!(
+            matches!(&document.exprs[rows[0][0]], Expr::Column(column) if column.source == new_source)
+        );
+        assert!(
+            matches!(&document.exprs[rows[0][1]], Expr::Column(column) if column.source == old_source)
+        );
 
         assert_eq!(update.conflict, Some(ast::ResolveType::Replace));
         assert!(matches!(
-            update.assignments[0].value,
+            &document.exprs[update.assignments[0].value],
             Expr::Column(column) if column.source == new_source
         ));
         assert_ne!(update.target, old_source);
 
         assert_ne!(delete.target, old_source);
         let mut delete_reads = Vec::new();
-        delete
-            .predicate
-            .as_ref()
-            .expect("DELETE has predicate")
+        document
+            .expr(*delete.predicate.as_ref().expect("DELETE has predicate"))
             .for_each(&mut |expression| {
-                if let Expr::Column(column) = expression {
+                if let Expr::Column(column) = expression.node() {
                     delete_reads.push(column.source);
                 }
             });
@@ -7685,8 +7798,8 @@ mod tests {
         assert!(matches!(
             &child_source.generated_expressions[1],
             ColumnReadExpression::Planned(expression)
-                if matches!(expression.as_ref(), hir::Expr::Binary { lhs, .. }
-                if matches!(lhs.as_ref(), hir::Expr::Column(column)
+                if matches!(&document.exprs[*expression], hir::Expr::Binary { lhs, .. }
+                if matches!(&document.exprs[*lhs], hir::Expr::Column(column)
                     if column.source == incoming.child_source && column.column == 0)
         )));
     }
@@ -7781,8 +7894,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(matches!(
             rows[1].as_slice(),
-            [Expr::Literal(ast::Literal::String(value)), Expr::Literal(ast::Literal::Numeric(id))]
-                if value.trim_matches(|ch| ch == '\'' || ch == '"') == "second" && id == "8"
+            [value, id] if matches!(
+                (&document.exprs[*value], &document.exprs[*id]),
+                (Expr::Literal(ast::Literal::String(value)), Expr::Literal(ast::Literal::Numeric(id)))
+                    if value.trim_matches(|ch| ch == '\'' || ch == '"') == "second" && id == "8"
+            )
         ));
 
         let source = document
@@ -7796,13 +7912,13 @@ mod tests {
         assert!(matches!(
             &source.default_expressions[1],
             ColumnReadExpression::Planned(expression)
-                if matches!(expression.as_ref(), Expr::Literal(ast::Literal::String(value))
+                if matches!(&document.exprs[*expression], Expr::Literal(ast::Literal::String(value))
                 if value.trim_matches(|ch| ch == '\'' || ch == '"') == "fallback"
         )));
         assert!(matches!(
             &source.generated_expressions[2],
             ColumnReadExpression::Planned(expression)
-                if matches!(expression.as_ref(), Expr::Binary {
+                if matches!(&document.exprs[*expression], Expr::Binary {
                 operator: ast::Operator::Multiply,
                 ..
             }
@@ -7832,15 +7948,15 @@ mod tests {
             panic!("VALUES stays inline HIR");
         };
         let queries = [
-            match rows[0][0] {
+            match document.exprs[rows[0][0]] {
                 Expr::Subquery(SubqueryExpr::Scalar { query, output: 0 }) => query,
                 _ => panic!("first value is scalar query"),
             },
-            match rows[0][1] {
+            match document.exprs[rows[0][1]] {
                 Expr::Subquery(SubqueryExpr::Exists(query)) => query,
                 _ => panic!("second value is EXISTS query"),
             },
-            match rows[0][2] {
+            match document.exprs[rows[0][2]] {
                 Expr::Subquery(SubqueryExpr::In { query, .. }) => query,
                 _ => panic!("third value is IN query"),
             },
@@ -7945,7 +8061,7 @@ mod tests {
             panic!("first arm remains VALUES");
         };
         assert!(matches!(
-            &rows[0][0],
+            &document.exprs[rows[0][0]],
             Expr::Function(function) if matches!(
                 &function.operation,
                 FunctionOperation::CustomType(CustomTypeOperation::UnionValue {
@@ -7955,7 +8071,7 @@ mod tests {
             )
         ));
         assert!(matches!(
-            &query.blocks[1].outputs[0].expr,
+            &document.exprs[query.blocks[1].outputs[0].expr],
             Expr::Function(function) if matches!(
                 &function.operation,
                 FunctionOperation::CustomType(CustomTypeOperation::UnionValue {
@@ -8012,14 +8128,16 @@ mod tests {
         assert_eq!(constraints[1].catalog_position, 1);
         for constraint in constraints {
             let mut reads_target = false;
-            constraint.expression.for_each(&mut |expression| {
-                if matches!(
-                    expression,
-                    Expr::Column(column) if column.source == insert.target
-                ) {
-                    reads_target = true;
-                }
-            });
+            document
+                .expr(constraint.expression)
+                .for_each(&mut |expression| {
+                    if matches!(
+                        expression.node(),
+                        Expr::Column(column) if column.source == insert.target
+                    ) {
+                        reads_target = true;
+                    }
+                });
             assert!(reads_target, "CHECK reads the INSERT row image");
         }
 
@@ -8077,7 +8195,8 @@ mod tests {
         assert_eq!(query.output.len(), 2);
         let block = &query.blocks[0];
         let input = block.from.as_ref().expect("SELECT has FROM").first;
-        let Expr::Subquery(SubqueryExpr::Scalar { query: inner, .. }) = &block.outputs[1].expr
+        let Expr::Subquery(SubqueryExpr::Scalar { query: inner, .. }) =
+            &document.exprs[block.outputs[1].expr]
         else {
             panic!("second output remains a scalar subquery");
         };
@@ -8154,11 +8273,12 @@ mod tests {
         assert!(matches!(
             &target_loop.access,
             HirSourceAccess::BTree {
-                operation: SelectedBtreeOperation::RowidEq {
-                    cmp_expr: hir::Expr::Literal(ast::Literal::Numeric(value))
-                },
+                operation: SelectedBtreeOperation::RowidEq { cmp_expr },
                 ..
-            } if value == "1"
+            } if matches!(
+                &plan.document.exprs[*cmp_expr],
+                hir::Expr::Literal(ast::Literal::Numeric(value)) if value == "1"
+            )
         ));
 
         let schema = schema_with_join_tables();
@@ -8231,11 +8351,12 @@ mod tests {
         assert!(matches!(
             &target_loop.access,
             HirSourceAccess::BTree {
-                operation: SelectedBtreeOperation::RowidEq {
-                    cmp_expr: hir::Expr::Literal(ast::Literal::Numeric(value))
-                },
+                operation: SelectedBtreeOperation::RowidEq { cmp_expr },
                 ..
-            } if value == "1"
+            } if matches!(
+                &plan.document.exprs[*cmp_expr],
+                hir::Expr::Literal(ast::Literal::Numeric(value)) if value == "1"
+            )
         ));
         assert_eq!(access.predicates.len(), 1);
         assert!(access.predicates[0].consumed);
@@ -8389,10 +8510,10 @@ mod tests {
         assert!(primary.matched_index.is_none());
         assert!(matches!(
             primary.terms.as_slice(),
-            [hir::ConflictTerm {
-                expr: Expr::Column(column),
-                ..
-            }] if column.source == insert.target && column.column == 0
+            [hir::ConflictTerm { expr, .. }] if matches!(
+                &document.exprs[*expr],
+                Expr::Column(column) if column.source == insert.target && column.column == 0
+            )
         ));
 
         let ordinary = insert.upserts[1]
@@ -8417,8 +8538,16 @@ mod tests {
             .as_ref()
             .expect("partial expression index is frozen");
         assert_eq!(partial_index.value().name, "guarded_expression");
-        assert!(matches!(partial.terms[0].expr, Expr::Function(_)));
-        assert!(matches!(partial.predicate, Some(Expr::Binary { .. })));
+        assert!(matches!(
+            &document.exprs[partial.terms[0].expr],
+            Expr::Function(_)
+        ));
+        assert!(matches!(
+            partial
+                .predicate
+                .map(|predicate| &document.exprs[predicate]),
+            Some(Expr::Binary { .. })
+        ));
 
         assert!(insert
             .upserts
@@ -8512,24 +8641,24 @@ mod tests {
         assert_eq!(assignments.len(), 2, "duplicate score keeps one assignment");
         assert_eq!(assignments[0].columns, [TargetColumn::Column(1)]);
         assert!(matches!(
-            assignments[0].value,
+            &document.exprs[assignments[0].value],
             Expr::Column(column) if column.source == excluded && column.column == 1
         ));
         assert_eq!(assignments[1].columns, [TargetColumn::Column(2)]);
         assert!(matches!(
-            &assignments[1].value,
+            &document.exprs[assignments[1].value],
             Expr::Binary { lhs, rhs, .. }
-                if matches!(lhs.as_ref(), Expr::Column(column)
+                if matches!(&document.exprs[*lhs], Expr::Column(column)
                     if column.source == excluded && column.column == 2)
-                    && matches!(rhs.as_ref(), Expr::Literal(ast::Literal::Numeric(value))
+                    && matches!(&document.exprs[*rhs], Expr::Literal(ast::Literal::Numeric(value))
                         if value == "2")
         ));
         assert!(matches!(
-            predicate,
+            predicate.map(|predicate| &document.exprs[predicate]),
             Some(Expr::Binary { lhs, rhs, .. })
-                if matches!(lhs.as_ref(), Expr::Column(column)
+                if matches!(&document.exprs[*lhs], Expr::Column(column)
                     if column.source == insert.target && column.column == 0)
-                    && matches!(rhs.as_ref(), Expr::Column(column)
+                    && matches!(&document.exprs[*rhs], Expr::Column(column)
                         if column.source == excluded && column.column == 0)
         ));
         assert!(matches!(
@@ -8562,7 +8691,7 @@ mod tests {
             panic!("UPSERT action is UPDATE");
         };
         assert!(matches!(
-            &assignments[0].value,
+            &document.exprs[assignments[0].value],
             Expr::Function(function) if matches!(
                 &function.operation,
                 FunctionOperation::CustomType(CustomTypeOperation::UnionValue {
@@ -8601,7 +8730,7 @@ mod tests {
             panic!("UPSERT action is UPDATE");
         };
         assert!(matches!(
-            assignments[0].value,
+            &document.exprs[assignments[0].value],
             Expr::Column(column) if column.source == insert.target && column.column == 1
         ));
     }
@@ -8663,7 +8792,7 @@ mod tests {
         let InsertSource::Values(rows) = &insert.source else {
             panic!("INSERT keeps VALUES rows");
         };
-        let Expr::Function(outer) = &rows[0][1] else {
+        let Expr::Function(outer) = &document.exprs[rows[0][1]] else {
             panic!("outer union value is a function");
         };
         let FunctionOperation::CustomType(CustomTypeOperation::UnionValue {
@@ -8687,7 +8816,7 @@ mod tests {
         let FunctionArguments::Expressions { values, .. } = &outer.arguments else {
             panic!("union value has ordinary arguments");
         };
-        let Expr::Function(inner) = &values[1] else {
+        let Expr::Function(inner) = &document.exprs[values[1]] else {
             panic!("selected variant contains nested union value");
         };
         assert!(matches!(
@@ -8698,7 +8827,7 @@ mod tests {
             }) if union_type.value().name == "inner_u"
         ));
 
-        let Expr::Function(color) = &rows[0][2] else {
+        let Expr::Function(color) = &document.exprs[rows[0][2]] else {
             panic!("color union value is a function");
         };
         assert!(matches!(
@@ -8735,7 +8864,7 @@ mod tests {
         let query = document.query(query).expect("INSERT source query exists");
         assert_eq!(query.blocks.len(), 2);
 
-        let Expr::Function(outer) = &query.blocks[0].outputs[0].expr else {
+        let Expr::Function(outer) = &document.exprs[query.blocks[0].outputs[0].expr] else {
             panic!("first arm resolves outer union value");
         };
         assert!(matches!(
@@ -8749,7 +8878,7 @@ mod tests {
             panic!("union value has ordinary arguments");
         };
         assert!(matches!(
-            &values[1],
+            &document.exprs[values[1]],
             Expr::Function(function) if matches!(
                 &function.operation,
                 FunctionOperation::CustomType(CustomTypeOperation::UnionValue {
@@ -8763,7 +8892,7 @@ mod tests {
             panic!("second arm remains VALUES");
         };
         assert!(matches!(
-            &rows[0][0],
+            &document.exprs[rows[0][0]],
             Expr::Function(function) if matches!(
                 &function.operation,
                 FunctionOperation::CustomType(CustomTypeOperation::UnionValue {
@@ -8773,7 +8902,7 @@ mod tests {
             )
         ));
         assert!(matches!(
-            &rows[0][1],
+            &document.exprs[rows[0][1]],
             Expr::Function(function) if matches!(
                 &function.operation,
                 FunctionOperation::CustomType(CustomTypeOperation::UnionValue {
@@ -8842,13 +8971,13 @@ mod tests {
             ]
         );
         assert!(matches!(
-            &returning.outputs[0].expr,
+            &document.exprs[returning.outputs[0].expr],
             Expr::Column(column) if column.source == insert.target && column.column == 0
         ));
         assert!(matches!(
-            &returning.outputs[3].expr,
+            &document.exprs[returning.outputs[3].expr],
             Expr::Collate { expr, .. }
-                if matches!(expr.as_ref(), Expr::Column(column)
+                if matches!(&document.exprs[*expr], Expr::Column(column)
                     if column.source == insert.target && column.column == 1)
         ));
         assert_eq!(returning.outputs[0].type_fact.storage, Some(Type::Integer));
@@ -8899,15 +9028,15 @@ mod tests {
             .expect("RETURNING is preserved")
             .outputs;
         let query_ids = [
-            match outputs[0].expr {
+            match document.exprs[outputs[0].expr] {
                 Expr::Subquery(SubqueryExpr::Scalar { query, output: 0 }) => query,
                 _ => panic!("first output is scalar subquery"),
             },
-            match outputs[1].expr {
+            match document.exprs[outputs[1].expr] {
                 Expr::Subquery(SubqueryExpr::Exists(query)) => query,
                 _ => panic!("second output is EXISTS subquery"),
             },
-            match outputs[2].expr {
+            match document.exprs[outputs[2].expr] {
                 Expr::Subquery(SubqueryExpr::In { query, .. }) => query,
                 _ => panic!("third output is IN subquery"),
             },
@@ -8936,12 +9065,12 @@ mod tests {
         let HirRoot::Insert(insert) = &document.root else {
             panic!("INSERT produces INSERT root");
         };
-        let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = insert
+        let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = document.exprs[insert
             .returning
             .as_ref()
             .expect("RETURNING is preserved")
             .outputs[0]
-            .expr
+            .expr]
         else {
             panic!("RETURNING output is a scalar subquery");
         };
@@ -8976,19 +9105,19 @@ mod tests {
         let Expr::Subquery(SubqueryExpr::Scalar {
             query: values_query,
             ..
-        }) = rows[0][1]
+        }) = document.exprs[rows[0][1]]
         else {
             panic!("VALUES expression is a scalar subquery");
         };
         let Expr::Subquery(SubqueryExpr::Scalar {
             query: returning_query,
             ..
-        }) = insert
+        }) = document.exprs[insert
             .returning
             .as_ref()
             .expect("RETURNING is preserved")
             .outputs[0]
-            .expr
+            .expr]
         else {
             panic!("RETURNING expression is a scalar subquery");
         };
@@ -9137,15 +9266,16 @@ mod tests {
         };
         assert!(matches!(
             rows[0].as_slice(),
-            [Expr::Literal(ast::Literal::String(value))]
-                if value.trim_matches(|ch| ch == '\'' || ch == '"') == "fallback"
+            [value] if matches!(
+                &explicit_default.exprs[*value],
+                Expr::Literal(ast::Literal::String(value))
+                    if value.trim_matches(|ch| ch == '\'' || ch == '"') == "fallback"
+            )
         ));
         assert!(matches!(
             defaults.as_slice(),
-            [ResolvedDefault {
-                column: 0,
-                value: Expr::Literal(ast::Literal::Null),
-            }]
+            [ResolvedDefault { column: 0, value }]
+                if matches!(explicit_default.exprs[*value], Expr::Literal(ast::Literal::Null))
         ));
 
         let default_values =
@@ -9296,7 +9426,7 @@ mod tests {
         let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
         assert_eq!(outputs.len(), 7);
         assert!(matches!(
-            outputs[0].expr,
+            &document.exprs[outputs[0].expr],
             Expr::Unary {
                 operator: ast::UnaryOperator::Negative,
                 ..
@@ -9304,7 +9434,7 @@ mod tests {
         ));
         assert_eq!(outputs[0].type_fact.storage, Some(Type::Integer));
         assert!(matches!(
-            outputs[1].expr,
+            &document.exprs[outputs[1].expr],
             Expr::Unary {
                 operator: ast::UnaryOperator::Not,
                 ..
@@ -9319,7 +9449,7 @@ mod tests {
             operator: ast::Operator::Equals,
             comparison: Some(comparison),
             ..
-        } = &outputs[4].expr
+        } = &document.exprs[outputs[4].expr]
         else {
             panic!("comparison becomes binary HIR with frozen rules");
         };
@@ -9336,8 +9466,8 @@ mod tests {
                 .value(),
             &crate::translate::collate::CollationSeq::NoCase
         );
-        assert!(matches!(outputs[5].expr, Expr::IsNull(_)));
-        assert!(matches!(outputs[6].expr, Expr::NotNull(_)));
+        assert!(matches!(&document.exprs[outputs[5].expr], Expr::IsNull(_)));
+        assert!(matches!(&document.exprs[outputs[6].expr], Expr::NotNull(_)));
         assert_eq!(outputs[5].type_fact.storage, Some(Type::Integer));
         assert_eq!(outputs[6].type_fact.storage, Some(Type::Integer));
     }
@@ -9370,7 +9500,7 @@ mod tests {
             start_comparison,
             end_comparison,
             ..
-        } = &outputs[0].expr
+        } = &document.exprs[outputs[0].expr]
         else {
             panic!("BETWEEN becomes HIR with two comparisons");
         };
@@ -9394,7 +9524,7 @@ mod tests {
             start_comparison,
             end_comparison,
             ..
-        } = &outputs[1].expr
+        } = &document.exprs[outputs[1].expr]
         else {
             panic!("NOT BETWEEN preserves negation");
         };
@@ -9420,7 +9550,7 @@ mod tests {
             values,
             comparisons,
             ..
-        } = &outputs[2].expr
+        } = &document.exprs[outputs[2].expr]
         else {
             panic!("list IN becomes HIR");
         };
@@ -9436,7 +9566,7 @@ mod tests {
                     })
         }));
 
-        let Expr::InList { comparisons, .. } = &outputs[3].expr else {
+        let Expr::InList { comparisons, .. } = &document.exprs[outputs[3].expr] else {
             panic!("reversed list IN becomes HIR");
         };
         assert_eq!(comparisons.len(), 1);
@@ -9483,12 +9613,12 @@ mod tests {
             rhs,
             comparison: Some(comparison),
             ..
-        } = &outputs[0].expr
+        } = &document.exprs[outputs[0].expr]
         else {
             panic!("row equality becomes binary HIR");
         };
-        assert!(matches!(lhs.as_ref(), Expr::Row(values) if values.len() == 2));
-        assert!(matches!(rhs.as_ref(), Expr::Row(values) if values.len() == 2));
+        assert!(matches!(&document.exprs[*lhs], Expr::Row(values) if values.len() == 2));
+        assert!(matches!(&document.exprs[*rhs], Expr::Row(values) if values.len() == 2));
         assert_row_comparison_facts(comparison);
 
         let Expr::Between {
@@ -9498,13 +9628,13 @@ mod tests {
             start_comparison,
             end_comparison,
             ..
-        } = &outputs[1].expr
+        } = &document.exprs[outputs[1].expr]
         else {
             panic!("row BETWEEN becomes HIR");
         };
-        assert!(matches!(expr.as_ref(), Expr::Row(values) if values.len() == 2));
-        assert!(matches!(start.as_ref(), Expr::Row(values) if values.len() == 2));
-        assert!(matches!(end.as_ref(), Expr::Row(values) if values.len() == 2));
+        assert!(matches!(&document.exprs[*expr], Expr::Row(values) if values.len() == 2));
+        assert!(matches!(&document.exprs[*start], Expr::Row(values) if values.len() == 2));
+        assert!(matches!(&document.exprs[*end], Expr::Row(values) if values.len() == 2));
         assert_row_comparison_facts(start_comparison);
         assert_row_comparison_facts(end_comparison);
 
@@ -9513,14 +9643,14 @@ mod tests {
             values,
             comparisons,
             ..
-        } = &outputs[2].expr
+        } = &document.exprs[outputs[2].expr]
         else {
             panic!("row list IN becomes HIR");
         };
-        assert!(matches!(lhs.as_ref(), Expr::Row(values) if values.len() == 2));
-        assert!(values
-            .iter()
-            .all(|value| matches!(value, Expr::Row(values) if values.len() == 2)));
+        assert!(matches!(&document.exprs[*lhs], Expr::Row(values) if values.len() == 2));
+        assert!(values.iter().all(
+            |value| matches!(&document.exprs[*value], Expr::Row(values) if values.len() == 2)
+        ));
         assert_eq!(comparisons.len(), 2);
         for comparison in comparisons {
             assert_row_in_comparison_facts(comparison);
@@ -9611,11 +9741,11 @@ mod tests {
             rhs,
             comparison: Some(comparison),
             ..
-        } = &outputs[0].expr
+        } = &document.exprs[outputs[0].expr]
         else {
             panic!("row-subquery equality becomes binary HIR");
         };
-        let Expr::Subquery(SubqueryExpr::Row { query }) = rhs.as_ref() else {
+        let Expr::Subquery(SubqueryExpr::Row { query }) = &document.exprs[*rhs] else {
             panic!("binary operand keeps one row-subquery node");
         };
         assert_eq!(
@@ -9633,11 +9763,11 @@ mod tests {
             start_comparison,
             end_comparison,
             ..
-        } = &outputs[1].expr
+        } = &document.exprs[outputs[1].expr]
         else {
             panic!("row-subquery BETWEEN becomes HIR");
         };
-        let Expr::Subquery(SubqueryExpr::Row { query }) = expr.as_ref() else {
+        let Expr::Subquery(SubqueryExpr::Row { query }) = &document.exprs[*expr] else {
             panic!("BETWEEN operand keeps one row-subquery node");
         };
         assert_eq!(
@@ -9720,7 +9850,7 @@ mod tests {
             when_then,
             else_expr: Some(_),
             base_comparisons,
-        } = &outputs[0].expr
+        } = &document.exprs[outputs[0].expr]
         else {
             panic!("simple CASE keeps base, branches, and ELSE");
         };
@@ -9755,7 +9885,7 @@ mod tests {
             when_then,
             else_expr: Some(_),
             base_comparisons,
-        } = &outputs[1].expr
+        } = &document.exprs[outputs[1].expr]
         else {
             panic!("searched CASE has branches and ELSE without base");
         };
@@ -9768,7 +9898,7 @@ mod tests {
             when_then,
             else_expr: None,
             base_comparisons,
-        } = &outputs[2].expr
+        } = &document.exprs[outputs[2].expr]
         else {
             panic!("searched CASE can omit ELSE");
         };
@@ -9845,7 +9975,7 @@ mod tests {
         for (output, (name, storage, affinity, parameters, dimensions)) in
             outputs.iter().zip(expected)
         {
-            let Expr::Cast { target, .. } = &output.expr else {
+            let Expr::Cast { target, .. } = &document.exprs[output.expr] else {
                 panic!("CAST becomes resolved HIR");
             };
             assert_eq!(target.name, name);
@@ -9886,7 +10016,7 @@ mod tests {
             panic!("SELECT produces query root");
         };
         let output = &document.query(root.query).expect("query exists").blocks[0].outputs[0];
-        let Expr::Cast { target, .. } = &output.expr else {
+        let Expr::Cast { target, .. } = &document.exprs[output.expr] else {
             panic!("custom CAST becomes resolved HIR");
         };
         assert_eq!(target.name, "BIGINT");
@@ -9941,7 +10071,7 @@ mod tests {
             panic!("SELECT produces query root");
         };
         let output = &document.query(root.query).expect("query exists").blocks[0].outputs[0];
-        let Expr::Cast { target, .. } = &output.expr else {
+        let Expr::Cast { target, .. } = &document.exprs[output.expr] else {
             panic!("custom CAST becomes resolved HIR");
         };
         assert_eq!(target.programs.encode.len(), 1);
@@ -9949,7 +10079,10 @@ mod tests {
         let call = &target.programs.encode[0];
         assert!(matches!(
             call.arguments.as_slice(),
-            [Expr::Literal(ast::Literal::Numeric(value))] if value == "0"
+            [argument] if matches!(
+                &document.exprs[*argument],
+                Expr::Literal(ast::Literal::Numeric(value)) if value == "0"
+            )
         ));
 
         let program = document
@@ -9968,24 +10101,24 @@ mod tests {
             Some(Type::Integer)
         );
 
-        let Expr::Case { when_then, .. } = &program.body else {
+        let Expr::Case { when_then, .. } = &document.exprs[program.body] else {
             panic!("stored CASE becomes HIR");
         };
-        let Expr::Binary { lhs, rhs, .. } = &when_then[0].0 else {
+        let Expr::Binary { lhs, rhs, .. } = &document.exprs[when_then[0].0] else {
             panic!("stored condition becomes binary HIR");
         };
         assert!(matches!(
-            lhs.as_ref(),
+            &document.exprs[*lhs],
             Expr::Column(column)
                 if column.source == program.input_source && column.column == 0
         ));
         assert!(matches!(
-            rhs.as_ref(),
+            &document.exprs[*rhs],
             Expr::Column(column)
                 if column.source == program.input_source && column.column == 1
         ));
         assert!(matches!(
-            &when_then[0].1,
+            &document.exprs[when_then[0].1],
             Expr::Column(column)
                 if column.source == program.input_source && column.column == 0
         ));
@@ -10014,7 +10147,7 @@ mod tests {
         };
         let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
         for (output, parameter_count) in outputs.iter().zip([0, 2]) {
-            let Expr::Cast { target, .. } = &output.expr else {
+            let Expr::Cast { target, .. } = &document.exprs[output.expr] else {
                 panic!("CAST becomes resolved HIR");
             };
             assert_eq!(target.name, "positive");
@@ -10054,7 +10187,7 @@ mod tests {
             panic!("SELECT produces query root");
         };
         let output = &document.query(root.query).expect("query exists").blocks[0].outputs[0];
-        let Expr::Cast { target, .. } = &output.expr else {
+        let Expr::Cast { target, .. } = &document.exprs[output.expr] else {
             panic!("CAST becomes resolved HIR");
         };
         assert_eq!(target.name, "positive");
@@ -10110,7 +10243,7 @@ mod tests {
         let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
         assert_eq!(outputs.len(), 2);
         for output in outputs {
-            let Expr::Function(call) = &output.expr else {
+            let Expr::Function(call) = &document.exprs[output.expr] else {
                 panic!("function call becomes resolved HIR");
             };
             assert!(matches!(call.evaluation, FunctionEvaluation::Scalar));
@@ -10125,7 +10258,7 @@ mod tests {
                 } if values.len() == 1 && order_by.is_empty()
             ));
         }
-        let Expr::Function(length) = &outputs[0].expr else {
+        let Expr::Function(length) = &document.exprs[outputs[0].expr] else {
             unreachable!();
         };
         assert!(matches!(
@@ -10134,7 +10267,7 @@ mod tests {
         ));
         assert_eq!(length.result_type.storage, Some(Type::Integer));
         assert_eq!(outputs[0].type_fact, length.result_type);
-        let Expr::Function(abs) = &outputs[1].expr else {
+        let Expr::Function(abs) = &document.exprs[outputs[1].expr] else {
             unreachable!();
         };
         assert!(matches!(
@@ -10167,7 +10300,7 @@ mod tests {
         let block = &document.query(root.query).expect("query exists").blocks[0];
         assert_eq!(block.aggregate_count, 0);
         for output in &block.outputs[..1] {
-            let Expr::Function(call) = &output.expr else {
+            let Expr::Function(call) = &document.exprs[output.expr] else {
                 panic!("scalar output becomes a function call");
             };
             assert!(matches!(call.evaluation, FunctionEvaluation::Scalar));
@@ -10181,7 +10314,7 @@ mod tests {
                 } if values.len() == 1 && order_by.is_empty()
             ));
         }
-        let Expr::Function(random) = &block.outputs[1].expr else {
+        let Expr::Function(random) = &document.exprs[block.outputs[1].expr] else {
             panic!("random(*) becomes a function call");
         };
         assert!(matches!(
@@ -10238,7 +10371,7 @@ mod tests {
         };
         let block = &document.query(root.query).expect("query exists").blocks[0];
         let source = block.from.as_ref().expect("query has FROM").first;
-        let Expr::Function(call) = &block.outputs[0].expr else {
+        let Expr::Function(call) = &document.exprs[block.outputs[0].expr] else {
             panic!("json_object becomes a function call");
         };
         let crate::translate::semantic::hir::FunctionArguments::Expressions {
@@ -10257,11 +10390,11 @@ mod tests {
             .zip(values.chunks_exact(2))
         {
             assert!(matches!(
-                &pair[0],
+                &document.exprs[pair[0]],
                 Expr::Literal(ast::Literal::String(name)) if name == &format!("'{column}'")
             ));
             assert!(matches!(
-                pair[1],
+                &document.exprs[pair[1]],
                 Expr::Column(reference) if reference.source == source
             ));
         }
@@ -10301,7 +10434,7 @@ mod tests {
         };
         let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
 
-        let Expr::Function(tag) = &outputs[0].expr else {
+        let Expr::Function(tag) = &document.exprs[outputs[0].expr] else {
             panic!("union_tag becomes a function call");
         };
         let FunctionOperation::CustomType(CustomTypeOperation::UnionTag {
@@ -10315,7 +10448,7 @@ mod tests {
         assert_eq!(tag_names.as_ref(), ["telegram", "slack"]);
         assert_eq!(tag.result_type.storage, Some(Type::Text));
 
-        let Expr::Function(field) = &outputs[1].expr else {
+        let Expr::Function(field) = &document.exprs[outputs[1].expr] else {
             panic!("struct_extract becomes a function call");
         };
         let FunctionOperation::CustomType(CustomTypeOperation::StructExtract {
@@ -10329,13 +10462,14 @@ mod tests {
         assert_eq!(*field_index, 0);
         assert_eq!(field.result_type.storage, Some(Type::Integer));
 
-        let [union, Expr::Literal(ast::Literal::String(field_name))] =
-            field.arguments.expressions()
-        else {
+        let [union, field_name] = field.arguments.expressions() else {
+            panic!("struct_extract keeps its input and member name");
+        };
+        let Expr::Literal(ast::Literal::String(field_name)) = &document.exprs[*field_name] else {
             panic!("struct_extract keeps its input and member name");
         };
         assert_eq!(field_name, "'chat_id'");
-        let Expr::Function(union) = union else {
+        let Expr::Function(union) = &document.exprs[*union] else {
             panic!("struct input comes from union_extract");
         };
         let FunctionOperation::CustomType(CustomTypeOperation::UnionExtract {
@@ -10408,7 +10542,7 @@ mod tests {
         };
         let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
 
-        let Expr::FieldAccess(point_x) = &outputs[0].expr else {
+        let Expr::FieldAccess(point_x) = &document.exprs[outputs[0].expr] else {
             panic!("struct field becomes field-access HIR");
         };
         assert_eq!(point_x.field_name, "x");
@@ -10417,18 +10551,18 @@ mod tests {
         assert_eq!(point_x.result_type.storage, Some(Type::Integer));
         assert_eq!(outputs[0].type_fact, point_x.result_type);
         assert!(matches!(
-            point_x.base.as_ref(),
+            &document.exprs[point_x.base],
             Expr::Column(column) if column.column == 1
         ));
 
-        let Expr::FieldAccess(nested_x) = &outputs[1].expr else {
+        let Expr::FieldAccess(nested_x) = &document.exprs[outputs[1].expr] else {
             panic!("nested struct field becomes field-access HIR");
         };
         assert_eq!(nested_x.kind, FieldAccessKind::Struct { field_index: 0 });
         assert_eq!(nested_x.container_type.value().name, "point");
         assert_eq!(nested_x.result_type.storage, Some(Type::Integer));
         assert_eq!(outputs[1].type_fact, nested_x.result_type);
-        let Expr::FieldAccess(shape_point) = nested_x.base.as_ref() else {
+        let Expr::FieldAccess(shape_point) = &document.exprs[nested_x.base] else {
             panic!("nested access keeps the union access as its base");
         };
         assert_eq!(shape_point.field_name, "point");
@@ -10443,7 +10577,7 @@ mod tests {
             Some("point")
         );
         assert!(matches!(
-            shape_point.base.as_ref(),
+            &document.exprs[shape_point.base],
             Expr::Column(column) if column.column == 2
         ));
     }
@@ -10460,7 +10594,7 @@ mod tests {
             panic!("SELECT produces query root");
         };
         assert!(matches!(
-            &document.query(root.query).expect("query exists").blocks[0].outputs[0].expr,
+            &document.exprs[document.query(root.query).expect("query exists").blocks[0].outputs[0].expr],
             Expr::Column(column) if column.column == 0
         ));
 
@@ -10516,7 +10650,7 @@ mod tests {
                 crate::translate::semantic::hir::SequenceOperationKind::SetValue,
             ),
         ] {
-            let Expr::Function(call) = &outputs[index].expr else {
+            let Expr::Function(call) = &document.exprs[outputs[index].expr] else {
                 panic!("sequence call becomes a function expression");
             };
             let FunctionOperation::Sequence(operation) = &call.operation else {
@@ -10538,7 +10672,7 @@ mod tests {
             assert_eq!(call.result_type, TypeFact::known(Type::Integer));
         }
 
-        let Expr::Function(currval) = &outputs[3].expr else {
+        let Expr::Function(currval) = &document.exprs[outputs[3].expr] else {
             panic!("currval becomes a function expression");
         };
         assert!(matches!(currval.operation, FunctionOperation::Ordinary));
@@ -10588,8 +10722,8 @@ mod tests {
         let HirRoot::Query(root) = &document.root else {
             panic!("SELECT produces query root");
         };
-        let Expr::Function(call) =
-            &document.query(root.query).expect("query exists").blocks[0].outputs[0].expr
+        let Expr::Function(call) = &document.exprs
+            [document.query(root.query).expect("query exists").blocks[0].outputs[0].expr]
         else {
             panic!("nextval becomes a function expression");
         };
@@ -10624,7 +10758,7 @@ mod tests {
         let block = &document.query(root.query).expect("query exists").blocks[0];
         assert_eq!(block.aggregate_count, 6);
         for (index, output) in block.outputs.iter().enumerate() {
-            let Expr::Function(call) = &output.expr else {
+            let Expr::Function(call) = &document.exprs[output.expr] else {
                 panic!("aggregate output becomes a function call");
             };
             assert!(matches!(
@@ -10635,7 +10769,7 @@ mod tests {
         }
         assert!(block.outputs[..3].iter().all(|output| {
             matches!(
-                &output.expr,
+                &document.exprs[output.expr],
                 Expr::Function(call)
                     if matches!(
                         &call.arguments,
@@ -10648,14 +10782,14 @@ mod tests {
                     )
             )
         }));
-        let Expr::Function(count_star) = &block.outputs[3].expr else {
+        let Expr::Function(count_star) = &document.exprs[block.outputs[3].expr] else {
             unreachable!();
         };
         assert!(matches!(
             &count_star.arguments,
             crate::translate::semantic::hir::FunctionArguments::Star
         ));
-        let Expr::Function(distinct_sum) = &block.outputs[4].expr else {
+        let Expr::Function(distinct_sum) = &document.exprs[block.outputs[4].expr] else {
             unreachable!();
         };
         assert!(matches!(
@@ -10667,7 +10801,7 @@ mod tests {
                 ..
             } if values.len() == 1 && order_by.is_empty()
         ));
-        let Expr::Function(ordered_concat) = &block.outputs[5].expr else {
+        let Expr::Function(ordered_concat) = &document.exprs[block.outputs[5].expr] else {
             unreachable!();
         };
         let crate::translate::semantic::hir::FunctionArguments::Expressions {
@@ -10683,7 +10817,7 @@ mod tests {
         assert!(distinctness.is_none());
         assert_eq!(order_by.len(), 1);
         assert!(matches!(
-            order_by[0].expr,
+            &document.exprs[order_by[0].expr],
             Expr::Column(crate::translate::semantic::hir::ColumnRef { column: 2, .. })
         ));
         assert_eq!(order_by[0].order, ast::SortOrder::Desc);
@@ -10717,7 +10851,7 @@ mod tests {
         let block = &document.query(root.query).expect("query exists").blocks[0];
         assert_eq!(block.aggregate_count, 2);
 
-        let Expr::Function(sum) = &block.outputs[0].expr else {
+        let Expr::Function(sum) = &document.exprs[block.outputs[0].expr] else {
             panic!("filtered aggregate becomes a function call");
         };
         assert!(matches!(
@@ -10726,10 +10860,10 @@ mod tests {
                 id,
                 filter: Some(filter),
             } if *id == crate::translate::semantic::hir::AggregateId::new(block.id, 0)
-                && matches!(filter.as_ref(), Expr::Binary { .. })
+                && matches!(&document.exprs[*filter], Expr::Binary { .. })
         ));
 
-        let Expr::Function(count) = &block.outputs[1].expr else {
+        let Expr::Function(count) = &document.exprs[block.outputs[1].expr] else {
             panic!("filtered COUNT becomes a function call");
         };
         assert!(matches!(
@@ -10742,7 +10876,7 @@ mod tests {
                 id,
                 filter: Some(filter),
             } if *id == crate::translate::semantic::hir::AggregateId::new(block.id, 1)
-                && matches!(filter.as_ref(), Expr::NotNull(_))
+                && matches!(&document.exprs[*filter], Expr::NotNull(_))
         ));
     }
 
@@ -10774,7 +10908,7 @@ mod tests {
         assert_eq!(block.aggregate_count, 0);
         assert_eq!(block.window_function_count, 3);
 
-        let Expr::Function(row_number) = &block.outputs[0].expr else {
+        let Expr::Function(row_number) = &document.exprs[block.outputs[0].expr] else {
             panic!("row_number becomes a function call");
         };
         let FunctionEvaluation::Window {
@@ -10808,7 +10942,7 @@ mod tests {
         assert!(matches!(frame.end, Some(WindowFrameBound::CurrentRow)));
         assert_eq!(block.outputs[0].type_fact.storage, Some(Type::Integer));
 
-        let Expr::Function(sum) = &block.outputs[1].expr else {
+        let Expr::Function(sum) = &document.exprs[block.outputs[1].expr] else {
             panic!("window sum becomes a function call");
         };
         let FunctionEvaluation::Window {
@@ -10823,14 +10957,14 @@ mod tests {
             *id,
             crate::translate::semantic::hir::WindowFunctionId::new(block.id, 1)
         );
-        assert!(matches!(filter.as_ref(), Expr::Binary { .. }));
+        assert!(matches!(&document.exprs[*filter], Expr::Binary { .. }));
         let frame = &block.windows[window.index].frame;
         assert_eq!(frame.mode, ast::FrameMode::Rows);
         assert!(matches!(frame.start, WindowFrameBound::Preceding(_)));
         assert!(matches!(frame.end, Some(WindowFrameBound::Following(_))));
         assert_eq!(block.outputs[1].type_fact.storage, Some(Type::Numeric));
 
-        let Expr::Function(first_value) = &block.outputs[2].expr else {
+        let Expr::Function(first_value) = &document.exprs[block.outputs[2].expr] else {
             panic!("first_value becomes a function call");
         };
         let FunctionEvaluation::Window { window, .. } = &first_value.evaluation else {
@@ -10995,7 +11129,7 @@ mod tests {
         assert_eq!(block.window_function_count, 3);
         assert_eq!(block.windows.len(), 3);
         for (index, output) in block.outputs.iter().enumerate() {
-            let Expr::Function(function) = &output.expr else {
+            let Expr::Function(function) = &document.exprs[output.expr] else {
                 panic!("window output becomes a function call");
             };
             let FunctionEvaluation::Window { window, .. } = function.evaluation else {
@@ -11197,7 +11331,7 @@ mod tests {
         let block = &document.query(root.query).expect("query exists").blocks[0];
         assert_eq!(block.aggregate_count, 3);
 
-        let Expr::Function(mode) = &block.outputs[0].expr else {
+        let Expr::Function(mode) = &document.exprs[block.outputs[0].expr] else {
             panic!("mode becomes a function call");
         };
         let crate::translate::semantic::hir::FunctionArguments::OrderedSet { direct, order_by } =
@@ -11206,12 +11340,12 @@ mod tests {
             panic!("mode keeps ordered-set arguments");
         };
         assert!(direct.is_empty());
-        assert!(matches!(order_by.expr, Expr::Column(_)));
+        assert!(matches!(&document.exprs[order_by.expr], Expr::Column(_)));
         assert_eq!(order_by.type_fact.storage, Some(Type::Text));
         assert!(order_by.collation.is_some());
         assert_eq!(block.outputs[0].type_fact.storage, Some(Type::Text));
 
-        let Expr::Function(percentile_cont) = &block.outputs[1].expr else {
+        let Expr::Function(percentile_cont) = &document.exprs[block.outputs[1].expr] else {
             panic!("percentile_cont becomes a function call");
         };
         let crate::translate::semantic::hir::FunctionArguments::OrderedSet { direct, order_by } =
@@ -11220,11 +11354,11 @@ mod tests {
             panic!("percentile_cont keeps ordered-set arguments");
         };
         assert_eq!(direct.len(), 1);
-        assert!(matches!(order_by.expr, Expr::Column(_)));
+        assert!(matches!(&document.exprs[order_by.expr], Expr::Column(_)));
         assert_eq!(order_by.type_fact.storage, Some(Type::Real));
         assert_eq!(block.outputs[1].type_fact.storage, Some(Type::Real));
 
-        let Expr::Function(percentile_disc) = &block.outputs[2].expr else {
+        let Expr::Function(percentile_disc) = &document.exprs[block.outputs[2].expr] else {
             panic!("percentile_disc becomes a function call");
         };
         let crate::translate::semantic::hir::FunctionArguments::OrderedSet { direct, order_by } =
@@ -11233,7 +11367,10 @@ mod tests {
             panic!("percentile_disc keeps ordered-set arguments");
         };
         assert_eq!(direct.len(), 1);
-        assert!(matches!(order_by.expr, Expr::Collate { .. }));
+        assert!(matches!(
+            &document.exprs[order_by.expr],
+            Expr::Collate { .. }
+        ));
         assert_eq!(order_by.order, ast::SortOrder::Asc);
         assert!(order_by.nulls.is_none());
         assert!(order_by.collation.is_some());
@@ -11243,7 +11380,7 @@ mod tests {
             FunctionEvaluation::Aggregate {
                 filter: Some(filter),
                 ..
-            } if matches!(filter.as_ref(), Expr::Binary { .. })
+            } if matches!(&document.exprs[*filter], Expr::Binary { .. })
         ));
     }
 
@@ -11314,19 +11451,19 @@ mod tests {
             panic!("SELECT produces query root");
         };
         let output = &document.query(root.query).expect("query exists").blocks[0].outputs[0];
-        let Expr::Cast { target, .. } = &output.expr else {
+        let Expr::Cast { target, .. } = &document.exprs[output.expr] else {
             panic!("custom CAST becomes resolved HIR");
         };
         let program = document
             .schema_program(target.programs.encode[0].program)
             .expect("encoder program exists");
-        let Expr::Case { when_then, .. } = &program.body else {
+        let Expr::Case { when_then, .. } = &document.exprs[program.body] else {
             panic!("encoder keeps CASE body");
         };
-        let Expr::Binary { lhs, .. } = &when_then[0].0 else {
+        let Expr::Binary { lhs, .. } = &document.exprs[when_then[0].0] else {
             panic!("encoder condition is a comparison");
         };
-        let Expr::Function(length) = lhs.as_ref() else {
+        let Expr::Function(length) = &document.exprs[*lhs] else {
             panic!("comparison contains resolved function");
         };
         assert!(matches!(
@@ -11337,8 +11474,11 @@ mod tests {
         assert_eq!(length.result_type.storage, Some(Type::Integer));
         assert!(matches!(
             length.arguments.expressions(),
-            [Expr::Column(column)]
-                if column.source == program.input_source && column.column == 0
+            [argument] if matches!(
+                &document.exprs[*argument],
+                Expr::Column(column)
+                    if column.source == program.input_source && column.column == 0
+            )
         ));
     }
 
@@ -11356,7 +11496,7 @@ mod tests {
             panic!("SELECT produces query root");
         };
         let output = &document.query(root.query).expect("query exists").blocks[0].outputs[0];
-        let Expr::Cast { target, .. } = &output.expr else {
+        let Expr::Cast { target, .. } = &document.exprs[output.expr] else {
             panic!("VARCHAR CAST becomes resolved HIR");
         };
         assert_eq!(target.programs.encode.len(), 1);
@@ -11366,19 +11506,19 @@ mod tests {
         let Expr::Case {
             else_expr: Some(else_expr),
             ..
-        } = &program.body
+        } = &document.exprs[program.body]
         else {
             panic!("VARCHAR encoder keeps failure branch");
         };
         let Expr::Raise {
             action: ast::ResolveType::Abort,
             message: Some(message),
-        } = else_expr.as_ref()
+        } = &document.exprs[*else_expr]
         else {
             panic!("VARCHAR failure branch becomes RAISE(ABORT)");
         };
         assert!(matches!(
-            message.as_ref(),
+            &document.exprs[*message],
             Expr::Literal(ast::Literal::String(value))
                 if value == "'value too long for varchar'"
         ));
@@ -11425,7 +11565,7 @@ mod tests {
             panic!("SELECT produces query root");
         };
         let output = &document.query(root.query).expect("query exists").blocks[0].outputs[0];
-        let Expr::Cast { target, .. } = &output.expr else {
+        let Expr::Cast { target, .. } = &document.exprs[output.expr] else {
             panic!("domain CAST becomes resolved HIR");
         };
         let domain = target
@@ -11457,11 +11597,11 @@ mod tests {
             target.type_fact.storage
         );
         assert!(input.columns.column(0).type_fact().declared.is_none());
-        let Expr::Binary { lhs, .. } = &program.body else {
+        let Expr::Binary { lhs, .. } = &document.exprs[program.body] else {
             panic!("domain CHECK becomes binary HIR");
         };
         assert!(matches!(
-            lhs.as_ref(),
+            &document.exprs[*lhs],
             Expr::Column(column)
                 if column.source == program.input_source && column.column == 0
         ));
@@ -11486,7 +11626,7 @@ mod tests {
         };
         let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
 
-        let Expr::Collate { collation, .. } = &outputs[0].expr else {
+        let Expr::Collate { collation, .. } = &document.exprs[outputs[0].expr] else {
             panic!("COLLATE becomes resolved HIR");
         };
         assert_eq!(
@@ -11501,7 +11641,7 @@ mod tests {
             let Expr::Binary {
                 comparison: Some(comparison),
                 ..
-            } = &output.expr
+            } = &document.exprs[output.expr]
             else {
                 panic!("comparison rules are frozen in binary HIR");
             };
@@ -11586,17 +11726,17 @@ mod tests {
         assert_eq!(update.assignments[0].columns, [TargetColumn::Column(1)]);
         assert_eq!(update.assignments[1].columns, [TargetColumn::Column(0)]);
         assert!(matches!(
-            update.assignments[0].value,
+            &document.exprs[update.assignments[0].value],
             Expr::Binary {
                 lhs: ref left,
                 operator: ast::Operator::Concat,
                 ..
-            } if matches!(left.as_ref(), Expr::Column(reference) if reference.source == update.target && reference.column == 1)
+            } if matches!(&document.exprs[*left], Expr::Column(reference) if reference.source == update.target && reference.column == 1)
         ));
         assert!(matches!(
-            update.predicate,
-            Some(Expr::Binary { lhs: ref left, .. })
-                if matches!(left.as_ref(), Expr::Column(reference) if reference.source == update.target && reference.column == 0)
+            update.predicate.map(|predicate| &document.exprs[predicate]),
+            Some(Expr::Binary { lhs: left, .. })
+                if matches!(&document.exprs[*left], Expr::Column(reference) if reference.source == update.target && reference.column == 0)
         ));
 
         let old = document.source(update.target).expect("OLD source exists");
@@ -11621,11 +11761,11 @@ mod tests {
             assert!(matches!(
                 &source.generated_expressions[2],
                 ColumnReadExpression::Planned(expression)
-                    if matches!(expression.as_ref(), Expr::Binary {
+                    if matches!(&document.exprs[*expression], Expr::Binary {
                     lhs: left,
                     operator: ast::Operator::Multiply,
                     ..
-                } if matches!(left.as_ref(), Expr::Column(reference) if reference.source == source.id && reference.column == 0)
+                } if matches!(&document.exprs[*left], Expr::Column(reference) if reference.source == source.id && reference.column == 0)
             )));
         }
     }
@@ -11739,8 +11879,8 @@ mod tests {
         assert!(matches!(
             &child_source.generated_expressions[1],
             ColumnReadExpression::Planned(expression)
-                if matches!(expression.as_ref(), Expr::Binary { lhs, .. }
-                if matches!(lhs.as_ref(), Expr::Column(column)
+                if matches!(&document.exprs[*expression], Expr::Binary { lhs, .. }
+                if matches!(&document.exprs[*lhs], Expr::Column(column)
                     if column.source == incoming.child_source && column.column == 0)
         )));
     }
@@ -11759,12 +11899,12 @@ mod tests {
         assert_eq!(update.assignments.len(), 2);
         assert_eq!(update.assignments[0].columns, [TargetColumn::Column(1)]);
         assert!(matches!(
-            update.assignments[0].value,
+            &document.exprs[update.assignments[0].value],
             Expr::Literal(ast::Literal::String(ref value)) if value.contains("last")
         ));
         assert_eq!(update.assignments[1].columns, [TargetColumn::Column(0)]);
         assert!(matches!(
-            update.assignments[1].value,
+            &document.exprs[update.assignments[1].value],
             Expr::Literal(ast::Literal::Numeric(ref value)) if value == "9"
         ));
 
@@ -11780,11 +11920,11 @@ mod tests {
 
         let default = analyze_sql_with_schema(&schema, "UPDATE writable SET value = DEFAULT")
             .expect("SET DEFAULT binds the target default");
-        let HirRoot::Update(default) = &default.root else {
+        let HirRoot::Update(default_update) = &default.root else {
             panic!("UPDATE produces UPDATE root");
         };
         assert!(matches!(
-            default.assignments[0].value,
+            &default.exprs[default_update.assignments[0].value],
             Expr::Literal(ast::Literal::String(ref value)) if value.contains("fallback")
         ));
     }
@@ -11809,10 +11949,12 @@ mod tests {
             update.assignments[0].columns,
             [TargetColumn::Column(1), TargetColumn::Column(0)]
         );
-        let Expr::Subquery(SubqueryExpr::Row { query }) = update.assignments[0].value else {
+        let Expr::Subquery(SubqueryExpr::Row { query }) =
+            &document.exprs[update.assignments[0].value]
+        else {
             panic!("multi-column SET keeps one row subquery");
         };
-        let query = document.query(query).expect("assignment query exists");
+        let query = document.query(*query).expect("assignment query exists");
         assert_eq!(query.output.len(), 2);
         assert_eq!(query.captures, [update.target]);
         assert_eq!(
@@ -11850,11 +11992,11 @@ mod tests {
         };
         assert_eq!(update.assignments.len(), 2);
         assert!(matches!(
-            update.assignments[0].value,
+            &document.exprs[update.assignments[0].value],
             Expr::Literal(ast::Literal::String(ref value)) if value.contains("last")
         ));
         assert!(matches!(
-            update.assignments[1].value,
+            &document.exprs[update.assignments[1].value],
             Expr::Subquery(SubqueryExpr::Scalar { output: 1, .. })
         ));
 
@@ -11868,7 +12010,7 @@ mod tests {
         };
         assert_eq!(update.assignments.len(), 1);
         assert!(matches!(
-            update.assignments[0].value,
+            &duplicate.exprs[update.assignments[0].value],
             Expr::Subquery(SubqueryExpr::Scalar { output: 1, .. })
         ));
     }
@@ -11886,13 +12028,13 @@ mod tests {
         let HirRoot::Update(update) = &document.root else {
             panic!("UPDATE produces UPDATE root");
         };
-        let Expr::Function(outer) = &update.assignments[0].value else {
+        let Expr::Function(outer) = &document.exprs[update.assignments[0].value] else {
             panic!("last array setter remains the assignment");
         };
         let FunctionArguments::Expressions { values, .. } = &outer.arguments else {
             panic!("array setter has expression arguments");
         };
-        assert!(matches!(values[0], Expr::Function(_)));
+        assert!(matches!(&document.exprs[values[0]], Expr::Function(_)));
 
         let schema = schema_with_writable_table();
         let document = analyze_sql_with_schema(
@@ -11903,7 +12045,8 @@ mod tests {
         let HirRoot::Update(update) = &document.root else {
             panic!("UPDATE produces UPDATE root");
         };
-        let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = &update.assignments[0].value
+        let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) =
+            &document.exprs[update.assignments[0].value]
         else {
             panic!("SET subquery remains explicit");
         };
@@ -11911,7 +12054,9 @@ mod tests {
             document.query(*query).expect("SET query exists").captures,
             [update.target]
         );
-        let Some(Expr::Subquery(SubqueryExpr::Exists(query))) = update.predicate.as_ref() else {
+        let Some(Expr::Subquery(SubqueryExpr::Exists(query))) =
+            update.predicate.map(|predicate| &document.exprs[predicate])
+        else {
             panic!("WHERE subquery remains explicit");
         };
         assert_eq!(
@@ -11952,8 +12097,8 @@ mod tests {
         );
         assert!(returning.outputs.iter().all(|output| {
             let mut uses_other_source = false;
-            output.expr.for_each(&mut |expression| {
-                if matches!(expression, Expr::Column(column) if column.source != update.new_source)
+            document.expr(output.expr).for_each(&mut |expression| {
+                if matches!(expression.node(), Expr::Column(column) if column.source != update.new_source)
                 {
                     uses_other_source = true;
                 }
@@ -11989,11 +12134,11 @@ mod tests {
             .expect("RETURNING is preserved")
             .outputs;
         let query_ids = [
-            match outputs[0].expr {
+            match document.exprs[outputs[0].expr] {
                 Expr::Subquery(SubqueryExpr::Scalar { query, output: 0 }) => query,
                 _ => panic!("first output is scalar subquery"),
             },
-            match outputs[1].expr {
+            match document.exprs[outputs[1].expr] {
                 Expr::Subquery(SubqueryExpr::Exists(query)) => query,
                 _ => panic!("second output is EXISTS subquery"),
             },
@@ -12026,28 +12171,31 @@ mod tests {
             panic!("UPDATE produces UPDATE root");
         };
         let mut query_ids = Vec::new();
-        update.assignments[0].value.for_each(&mut |expression| {
-            if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression {
-                query_ids.push(*query);
-            }
-        });
-        update
-            .predicate
-            .as_ref()
-            .expect("WHERE is preserved")
+        document
+            .expr(update.assignments[0].value)
             .for_each(&mut |expression| {
-                if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression {
+                if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression.node() {
                     query_ids.push(*query);
                 }
             });
-        update
-            .returning
-            .as_ref()
-            .expect("RETURNING is preserved")
-            .outputs[0]
-            .expr
+        document
+            .expr(*update.predicate.as_ref().expect("WHERE is preserved"))
             .for_each(&mut |expression| {
-                if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression {
+                if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression.node() {
+                    query_ids.push(*query);
+                }
+            });
+        document
+            .expr(
+                update
+                    .returning
+                    .as_ref()
+                    .expect("RETURNING is preserved")
+                    .outputs[0]
+                    .expr,
+            )
+            .for_each(&mut |expression| {
+                if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression.node() {
                     query_ids.push(*query);
                 }
             });
@@ -12119,14 +12267,14 @@ mod tests {
         assert_eq!(source.owner, SourceOwner::Root);
         assert_eq!(source.alias.as_deref(), Some("source"));
         assert!(matches!(
-            update.assignments[0].value,
+            &document.exprs[update.assignments[0].value],
             Expr::Column(column) if column.source == source.id && column.column == 1
         ));
         assert!(matches!(
-            update.predicate,
-            Some(Expr::Binary { ref lhs, ref rhs, .. })
-                if matches!(lhs.as_ref(), Expr::Column(column) if column.source == update.target && column.column == 0)
-                    && matches!(rhs.as_ref(), Expr::Column(column) if column.source == source.id && column.column == 0)
+            update.predicate.map(|predicate| &document.exprs[predicate]),
+            Some(Expr::Binary { lhs, rhs, .. })
+                if matches!(&document.exprs[*lhs], Expr::Column(column) if column.source == update.target && column.column == 0)
+                    && matches!(&document.exprs[*rhs], Expr::Column(column) if column.source == source.id && column.column == 0)
         ));
     }
 
@@ -12152,7 +12300,8 @@ mod tests {
         assert_eq!(from.joins.len(), 1);
         assert!(matches!(
             from.joins[0].constraint,
-            hir::JoinConstraint::On(Expr::Binary { .. })
+            hir::JoinConstraint::On(constraint)
+                if matches!(document.exprs[constraint], Expr::Binary { .. })
         ));
 
         let error = analyze_sql_with_schema(
@@ -12258,22 +12407,22 @@ mod tests {
         assert_eq!(update.assignments[1].columns, [TargetColumn::Column(0)]);
         let from = update.from.as_ref().expect("FROM is preserved");
         assert!(matches!(
-            update.assignments[1].value,
+            &document.exprs[update.assignments[1].value],
             Expr::Column(column) if column.source == from.first && column.column == 0
         ));
         assert!(matches!(
-            update.predicate,
-            Some(Expr::Binary { ref lhs, ref rhs, .. })
-                if matches!(lhs.as_ref(), Expr::RowId(source) if *source == update.target)
-                    && matches!(rhs.as_ref(), Expr::RowId(source) if *source == from.first)
+            update.predicate.map(|predicate| &document.exprs[predicate]),
+            Some(Expr::Binary { lhs, rhs, .. })
+                if matches!(&document.exprs[*lhs], Expr::RowId(source) if *source == update.target)
+                    && matches!(&document.exprs[*rhs], Expr::RowId(source) if *source == from.first)
         ));
         let returning = update.returning.as_ref().expect("RETURNING is preserved");
         assert!(matches!(
-            returning.outputs[0].expr,
+            document.exprs[returning.outputs[0].expr],
             Expr::RowId(source) if source == update.new_source
         ));
         assert!(matches!(
-            returning.outputs[1].expr,
+            &document.exprs[returning.outputs[1].expr],
             Expr::Column(column) if column.source == update.new_source && column.column == 0
         ));
         for source in [update.target, update.new_source] {
@@ -12360,21 +12509,21 @@ mod tests {
         assert!(matches!(
             &source.generated_expressions[2],
             ColumnReadExpression::Planned(expression)
-                if matches!(expression.as_ref(), Expr::Binary { lhs, .. }
-                if matches!(lhs.as_ref(), Expr::Column(column)
+                if matches!(&document.exprs[*expression], Expr::Binary { lhs, .. }
+                if matches!(&document.exprs[*lhs], Expr::Column(column)
                     if column.source == delete.target && column.column == 0)
         )));
 
         let predicate = delete.predicate.as_ref().expect("WHERE is preserved");
         assert!(matches!(
-            predicate,
+            &document.exprs[*predicate],
             Expr::Binary { lhs, .. }
-                if matches!(lhs.as_ref(), Expr::Binary { lhs, .. }
-                    if matches!(lhs.as_ref(), Expr::RowId(source) if *source == delete.target))
+                if matches!(&document.exprs[*lhs], Expr::Binary { lhs, .. }
+                    if matches!(&document.exprs[*lhs], Expr::RowId(source) if *source == delete.target))
         ));
         let mut query = None;
-        predicate.for_each(&mut |expression| {
-            if let Expr::Subquery(SubqueryExpr::Exists(id)) = expression {
+        document.expr(*predicate).for_each(&mut |expression| {
+            if let Expr::Subquery(SubqueryExpr::Exists(id)) = expression.node() {
                 query = Some(*id);
             }
         });
@@ -12515,8 +12664,8 @@ mod tests {
         assert!(matches!(
             &child_source.generated_expressions[1],
             ColumnReadExpression::Planned(expression)
-                if matches!(expression.as_ref(), Expr::Binary { lhs, .. }
-                if matches!(lhs.as_ref(), Expr::Column(column)
+                if matches!(&document.exprs[*expression], Expr::Binary { lhs, .. }
+                if matches!(&document.exprs[*lhs], Expr::Column(column)
                     if column.source == incoming.child_source && column.column == 0)
         )));
     }
@@ -12554,17 +12703,19 @@ mod tests {
         );
         assert!(returning.outputs.iter().all(|output| {
             let mut uses_other_source = false;
-            output.expr.for_each(&mut |expression| match expression {
-                Expr::Column(column) if column.source != delete.target => {
-                    uses_other_source = true;
-                }
-                Expr::RowId(source) if *source != delete.target => uses_other_source = true,
-                _ => {}
-            });
+            document
+                .expr(output.expr)
+                .for_each(&mut |expression| match expression.node() {
+                    Expr::Column(column) if column.source != delete.target => {
+                        uses_other_source = true;
+                    }
+                    Expr::RowId(source) if *source != delete.target => uses_other_source = true,
+                    _ => {}
+                });
             !uses_other_source
         }));
         assert!(matches!(
-            returning.outputs[3].expr,
+            document.exprs[returning.outputs[3].expr],
             Expr::RowId(source) if source == delete.target
         ));
         assert!(returning.outputs[4].collation_is_explicit);
@@ -12601,11 +12752,11 @@ mod tests {
             .expect("RETURNING is preserved")
             .outputs;
         let query_ids = [
-            match outputs[0].expr {
+            match document.exprs[outputs[0].expr] {
                 Expr::Subquery(SubqueryExpr::Scalar { query, output: 0 }) => query,
                 _ => panic!("first output is scalar subquery"),
             },
-            match outputs[1].expr {
+            match document.exprs[outputs[1].expr] {
                 Expr::Subquery(SubqueryExpr::Exists(query)) => query,
                 _ => panic!("second output is EXISTS subquery"),
             },
@@ -12637,23 +12788,24 @@ mod tests {
             panic!("DELETE produces DELETE root");
         };
         let mut query_ids = Vec::new();
-        delete
-            .predicate
-            .as_ref()
-            .expect("WHERE is preserved")
+        document
+            .expr(*delete.predicate.as_ref().expect("WHERE is preserved"))
             .for_each(&mut |expression| {
-                if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression {
+                if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression.node() {
                     query_ids.push(*query);
                 }
             });
-        delete
-            .returning
-            .as_ref()
-            .expect("RETURNING is preserved")
-            .outputs[0]
-            .expr
+        document
+            .expr(
+                delete
+                    .returning
+                    .as_ref()
+                    .expect("RETURNING is preserved")
+                    .outputs[0]
+                    .expr,
+            )
             .for_each(&mut |expression| {
-                if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression {
+                if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression.node() {
                     query_ids.push(*query);
                 }
             });
@@ -12722,18 +12874,18 @@ mod tests {
         };
         assert!(matches!(delete.target_kind, hir::DeleteTargetKind::Virtual));
         assert!(matches!(
-            delete.predicate,
-            Some(Expr::Binary { ref lhs, ref rhs, .. })
-                if matches!(lhs.as_ref(), Expr::RowId(source) if *source == delete.target)
-                    && matches!(rhs.as_ref(), Expr::Subquery(SubqueryExpr::Scalar { .. }))
+            delete.predicate.map(|predicate| &document.exprs[predicate]),
+            Some(Expr::Binary { lhs, rhs, .. })
+                if matches!(&document.exprs[*lhs], Expr::RowId(source) if *source == delete.target)
+                    && matches!(&document.exprs[*rhs], Expr::Subquery(SubqueryExpr::Scalar { .. }))
         ));
         let returning = delete.returning.as_ref().expect("RETURNING is preserved");
         assert!(matches!(
-            returning.outputs[0].expr,
+            document.exprs[returning.outputs[0].expr],
             Expr::RowId(source) if source == delete.target
         ));
         assert!(matches!(
-            returning.outputs[1].expr,
+            &document.exprs[returning.outputs[1].expr],
             Expr::Column(column) if column.source == delete.target && column.column == 0
         ));
         let source = document

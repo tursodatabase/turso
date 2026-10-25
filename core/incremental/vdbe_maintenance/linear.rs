@@ -20,7 +20,7 @@ pub(super) fn emit_filter(
     node_id: dag::NodeId,
     input: &EphemeralDelta,
     output_contract: &NodeOutputContract,
-    predicate: &hir::Expr,
+    predicate: hir::ExprId,
 ) -> Result<EmittedNodeOutput> {
     let output = open_ephemeral_delta(
         program,
@@ -330,7 +330,7 @@ pub(super) fn emit_project(
     view_name: &str,
     node_id: dag::NodeId,
     input: &EphemeralDelta,
-    projections: &[hir::Expr],
+    projections: &[hir::ExprId],
     output_contract: &NodeOutputContract,
 ) -> Result<EmittedNodeOutput> {
     let output = open_ephemeral_delta(
@@ -348,7 +348,7 @@ fn emit_project_rows(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     input: &EphemeralDelta,
-    projections: &[hir::Expr],
+    projections: &[hir::ExprId],
     output: &EphemeralDelta,
 ) -> Result<()> {
     let num_output_columns = output.width;
@@ -386,8 +386,8 @@ fn emit_project_rows(
     let out_start = program.alloc_registers(num_output_columns + 1);
     let new_weight_reg = out_start + num_output_columns;
     for (index, expr) in projections.iter().enumerate() {
-        row.bind(program, document, expr);
-        translate_expr_no_constant_opt(program, document, expr, out_start + index)?;
+        row.bind(program, document, *expr);
+        translate_expr_no_constant_opt(program, document, *expr, out_start + index)?;
     }
     program.truncate_expression_registers(bound_registers);
     let weight_reg = program.alloc_register();

@@ -35,7 +35,7 @@ pub(super) fn emit_group_aggregate(
     view_name: &str,
     node_id: dag::NodeId,
     channel: &EphemeralDelta,
-    group_exprs: &[hir::Expr],
+    group_exprs: &[hir::ExprId],
     group_keys: &[dag::KeyColumn],
     aggregates: &[Aggregate],
     multiset_keys: &[Option<dag::KeyColumn>],
@@ -101,7 +101,7 @@ fn emit_group_aggregate_rows(
     document: &HirDocument,
     view_name: &str,
     channel: &ConsolidatedDelta,
-    group_exprs: &[hir::Expr],
+    group_exprs: &[hir::ExprId],
     group_keys: &[dag::KeyColumn],
     aggregates: &[Aggregate],
     multiset_keys: &[Option<dag::KeyColumn>],
@@ -315,8 +315,8 @@ fn emit_group_aggregate_rows(
     let row = StreamRow::load(program, channel);
 
     for (i, group_expr) in group_exprs.iter().enumerate() {
-        row.bind(program, document, group_expr);
-        translate_expr_no_constant_opt(program, document, group_expr, incoming_group_start + i)?;
+        row.bind(program, document, *group_expr);
+        translate_expr_no_constant_opt(program, document, *group_expr, incoming_group_start + i)?;
     }
     program.emit_insn(Insn::Copy {
         src_reg: incoming_group_start,
@@ -486,11 +486,11 @@ fn emit_group_aggregate_rows(
         let aggregate_done_label = program.allocate_label();
         if let Some(filter_expr) = &agg.filter {
             let apply_aggregate_label = program.allocate_label();
-            row.bind(program, document, filter_expr);
+            row.bind(program, document, *filter_expr);
             translate_condition_expr(
                 program,
                 document,
-                filter_expr,
+                *filter_expr,
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
                     jump_target_when_true: apply_aggregate_label,
@@ -501,8 +501,8 @@ fn emit_group_aggregate_rows(
         }
         let col_reg = match agg.args.first() {
             Some(arg_expr) => {
-                row.bind(program, document, arg_expr);
-                translate_expr_no_constant_opt(program, document, arg_expr, arg_reg)?;
+                row.bind(program, document, *arg_expr);
+                translate_expr_no_constant_opt(program, document, *arg_expr, arg_reg)?;
                 Some(arg_reg)
             }
             None => None,

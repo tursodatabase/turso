@@ -132,6 +132,7 @@ fn constraint_output_multipliers_for(
 /// Return the row count after one table and its ready filters.
 #[allow(clippy::too_many_arguments)]
 fn rows_after_join(
+    exprs: &hir::ExprArena,
     input_cardinality: f64,
     method: &AccessMethod,
     rhs_constraints: &HirTableConstraints,
@@ -193,9 +194,9 @@ fn rows_after_join(
         {
             return false;
         }
-        let (_, constraining_expr, _) = constraint.get_hir_constraining_expr(where_clause);
+        let (_, constraining_expr, _) = constraint.get_hir_constraining_expr(exprs, where_clause);
         matches!(
-            constraining_expr,
+            exprs[constraining_expr],
             hir::Expr::Literal(turso_parser::ast::Literal::Null)
         ) && constraint.table_col_pos.is_some_and(|column_pos| {
             rhs.btree().is_some_and(|source| {
@@ -243,6 +244,7 @@ fn rows_after_join(
 /// so it is not chosen.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hir_subquery_calls_for_plan(
+    exprs: &hir::ExprArena,
     plan: &JoinN,
     access_methods: &[AccessMethod],
     constraints: &[HirTableConstraints],
@@ -302,6 +304,7 @@ pub(crate) fn hir_subquery_calls_for_plan(
             calls.push((*query, subquery_calls, runs_after));
         }
         input_cardinality = rows_after_join(
+            exprs,
             input_cardinality,
             method,
             &constraints[*source_position],
@@ -682,7 +685,7 @@ pub(crate) fn compute_hir_join_order(
     where_clause: &[HirWhereTerm],
     base_table_rows: &[RowCountEstimate],
     source_costs: &[Cost],
-    order_target: Option<&HirOrderTarget<'_>>,
+    order_target: Option<&HirOrderTarget>,
     initial_input_cardinality: f64,
     access_methods_arena: &mut Vec<AccessMethod>,
     schema: &Schema,
@@ -783,6 +786,7 @@ pub(crate) fn compute_hir_join_order(
         let mut mask = TableMask::default();
         mask.set(position)?;
         let output_cardinality = rows_after_join(
+            &document.exprs,
             initial_input_cardinality,
             &first.access_method,
             source_constraints,
@@ -828,6 +832,7 @@ pub(crate) fn compute_hir_join_order(
         let mut rhs_mask = TableMask::default();
         rhs_mask.set(rhs)?;
         let output_cardinality = rows_after_join(
+            &document.exprs,
             lhs.output_cardinality,
             &method,
             &constraints[rhs],
@@ -1034,7 +1039,7 @@ pub(crate) fn compute_hir_greedy_join_order(
     where_clause: &[HirWhereTerm],
     base_table_rows: &[RowCountEstimate],
     source_costs: &[Cost],
-    order_target: Option<&HirOrderTarget<'_>>,
+    order_target: Option<&HirOrderTarget>,
     initial_input_cardinality: f64,
     access_methods_arena: &mut Vec<AccessMethod>,
     schema: &Schema,
@@ -1120,6 +1125,7 @@ pub(crate) fn compute_hir_greedy_join_order(
     let mut first_mask = TableMask::default();
     first_mask.set(first_position)?;
     let mut output_cardinality = rows_after_join(
+        &document.exprs,
         initial_input_cardinality,
         &first.access_method,
         &constraints[first_position],
@@ -1219,6 +1225,7 @@ pub(crate) fn compute_hir_greedy_join_order(
             let mut rhs_mask = TableMask::default();
             rhs_mask.set(position)?;
             let candidate_cardinality = rows_after_join(
+                &document.exprs,
                 output_cardinality,
                 &method,
                 &constraints[position],
@@ -1276,7 +1283,7 @@ fn hir_join_step(
     predicate_work: &[PredicateWorkInfo],
     base_table_rows: &[RowCountEstimate],
     source_costs: &[Cost],
-    order_target: Option<&HirOrderTarget<'_>>,
+    order_target: Option<&HirOrderTarget>,
     source_position: usize,
     lhs_mask: &TableMask,
     lhs_steps: &[(usize, &AccessMethod)],
@@ -1313,6 +1320,7 @@ fn hir_join_step(
                         document
                             .source(source.internal_id)
                             .expect("validated HIR contains referenced source"),
+                        &document.exprs,
                     ),
                     &constraints[source_position],
                     lhs_mask,
@@ -1533,11 +1541,11 @@ impl HirHashJoins<'_> {
 }
 
 /// The one source an expression's columns and rowids read, if exactly one.
-fn hir_one_source(expression: &hir::Expr) -> Option<hir::SourceId> {
+fn hir_one_source(expression: hir::ExprRef<'_>) -> Option<hir::SourceId> {
     let mut found = None;
     let mut more = false;
     expression.for_each(&mut |expression| {
-        let source = match expression {
+        let source = match expression.node() {
             hir::Expr::Column(column) => column.source,
             hir::Expr::RowId(source) => *source,
             _ => return,
@@ -1550,10 +1558,10 @@ fn hir_one_source(expression: &hir::Expr) -> Option<hir::SourceId> {
     (!more).then_some(found).flatten()
 }
 
-fn hir_runs_subquery(expression: &hir::Expr) -> bool {
+fn hir_runs_subquery(expression: hir::ExprRef<'_>) -> bool {
     let mut runs = false;
     expression.for_each(&mut |expression| {
-        runs |= matches!(expression, hir::Expr::Subquery(_));
+        runs |= matches!(expression.node(), hir::Expr::Subquery(_));
     });
     runs
 }
@@ -1711,11 +1719,14 @@ fn hir_try_hash_join_access_method(
             operator: Operator::Equals,
             rhs,
             ..
-        } = &term.expr
+        } = &document.exprs[term.expr]
         else {
             continue;
         };
-        let (Some(left), Some(right)) = (hir_one_source(lhs), hir_one_source(rhs)) else {
+        let (Some(left), Some(right)) = (
+            hir_one_source(document.exprs.at(*lhs)),
+            hir_one_source(document.exprs.at(*rhs)),
+        ) else {
             continue;
         };
         let build_side = if left == build_source.internal_id && right == probe_source.internal_id {
@@ -1742,14 +1753,16 @@ fn hir_try_hash_join_access_method(
             comparison,
             custom,
             ..
-        } = &where_clause[key.where_clause_idx].expr
+        } = &document.exprs[where_clause[key.where_clause_idx].expr]
         else {
             unreachable!("a hash join key is a binary `=`");
         };
         let (build_expr, probe_expr) = match key.build_side {
-            super::constraints::BinaryExprSide::Lhs => (lhs.as_ref(), rhs.as_ref()),
-            super::constraints::BinaryExprSide::Rhs => (rhs.as_ref(), lhs.as_ref()),
+            super::constraints::BinaryExprSide::Lhs => (*lhs, *rhs),
+            super::constraints::BinaryExprSide::Rhs => (*rhs, *lhs),
         };
+        let (build_expr, probe_expr) =
+            (document.exprs.at(build_expr), document.exprs.at(probe_expr));
         (build_expr, probe_expr, comparison, custom)
     };
     for key in &join_keys {
@@ -1758,7 +1771,7 @@ fn hir_try_hash_join_access_method(
         // built-in collation.
         if custom.is_some()
             || hir_runs_subquery(build_expr)
-            || matches!(build_expr, hir::Expr::Row(_))
+            || matches!(build_expr.node(), hir::Expr::Row(_))
             || comparison
                 .as_ref()
                 .is_some_and(|comparison| comparison.components.len() != 1)
@@ -1790,10 +1803,11 @@ fn hir_try_hash_join_access_method(
             .iter()
             .position(|constraint| constraint.where_clause_pos.0 == key.where_clause_idx)
     };
-    let simple_column = |expr: &hir::Expr, source: &crate::translate::plan::HirPlannedSource| {
-        hir_one_source(expr) == Some(source.internal_id)
-            && matches!(expr, hir::Expr::Column(_) | hir::Expr::RowId(_))
-    };
+    let simple_column =
+        |expr: hir::ExprRef<'_>, source: &crate::translate::plan::HirPlannedSource| {
+            hir_one_source(expr) == Some(source.internal_id)
+                && matches!(expr.node(), hir::Expr::Column(_) | hir::Expr::RowId(_))
+        };
     let probe_index_can_seek_join_key = |key: &HashJoinKey| {
         let Some(constraint_position) = key_constraint(probe, key) else {
             return false;
@@ -1865,7 +1879,7 @@ fn hir_try_hash_join_access_method(
     // probe row to one build row.
     let keys_cover_unique_build_key = join_keys.iter().any(|key| {
         let (build_expr, ..) = sides(key);
-        match build_expr {
+        match build_expr.node() {
             hir::Expr::RowId(source) => *source == build_source.internal_id,
             hir::Expr::Column(column) => {
                 column.source == build_source.internal_id
@@ -1883,7 +1897,7 @@ fn hir_try_hash_join_access_method(
             .iter()
             .filter(|key| {
                 let (build_expr, ..) = sides(key);
-                matches!(build_expr, hir::Expr::Column(column) if column.source == build_source.internal_id)
+                matches!(build_expr.node(), hir::Expr::Column(column) if column.source == build_source.internal_id)
             })
             .map(|key| key.where_clause_idx)
             .collect();
@@ -2168,7 +2182,7 @@ fn hir_hash_join_candidate(
         && where_clause.iter().any(|term| {
             let mut inside = true;
             let mut reads_outer = false;
-            document.visit_expr_sources(&term.expr, &mut |source| match sources
+            document.visit_expr_sources(term.expr, &mut |source| match sources
                 .iter()
                 .position(|planned| planned.source() == source)
             {
@@ -2266,6 +2280,7 @@ fn hir_starting_sources_by_score(
                 document
                     .source(source.internal_id)
                     .expect("validated HIR contains referenced source"),
+                &document.exprs,
             ))
         },
     )?;
@@ -2501,8 +2516,8 @@ fn build_hir_predicate_work(
         .iter()
         .map(|term| {
             Ok(PredicateWorkInfo {
-                table_mask: table_mask_from_hir_scope(document, from, &term.expr)?,
-                extra_steps: hir_where_expr_steps(&term.expr).saturating_sub(1),
+                table_mask: table_mask_from_hir_scope(document, from, term.expr)?,
+                extra_steps: hir_where_expr_steps(document.exprs.at(term.expr)).saturating_sub(1),
             })
         })
         .collect()
@@ -2674,8 +2689,9 @@ mod tests {
             },
         ];
         let layout = HirFromLayout::new(&sources, &groups);
+        let mut exprs = hir::ExprArena::default();
         let terms = [HirWhereTerm {
-            expr: hir::Expr::Literal(ast::Literal::Numeric("1".into())),
+            expr: exprs.push(hir::Expr::Literal(ast::Literal::Numeric("1".into()))),
             from_outer_join: Some(outer_group),
             consumed: false,
         }];
@@ -2726,7 +2742,7 @@ mod tests {
             .into_iter()
             .map(HirPlanSource::BTree)
             .collect::<Vec<_>>();
-        let document = HirDocument {
+        let mut document = HirDocument {
             snapshot: hir::CatalogSnapshot::from_id(0),
             databases: Vec::new(),
             root: hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
@@ -2741,6 +2757,8 @@ mod tests {
             ctes: Vec::new(),
             schema_programs: Vec::new(),
             cdc: None,
+            exprs: hir::ExprArena::default(),
+            planning: hir::PlanningTerms::default(),
         };
         let from = hir::From {
             first,
@@ -2750,18 +2768,21 @@ mod tests {
                 constraint: hir::JoinConstraint::None,
             }],
         };
+        let lhs = document.exprs.push(hir::Expr::column(second, 0));
+        let rhs = document.exprs.push(hir::Expr::column(first, 0));
         let where_clause = vec![HirWhereTerm {
-            expr: hir::Expr::Binary {
-                lhs: Box::new(hir::Expr::column(second, 0)),
+            expr: document.exprs.push(hir::Expr::Binary {
+                lhs,
                 operator: Operator::Equals,
-                rhs: Box::new(hir::Expr::column(first, 0)),
+                rhs,
                 array_concat: false,
                 custom: None,
                 comparison: None,
-            },
+            }),
             from_outer_join: None,
             consumed: false,
         }];
+        crate::translate::plan::prepare_planning_terms(&mut document);
         let constraints = vec![_hir_empty_constraints(), _hir_auto_index_constraints(0, 0)?];
         let mut lhs_mask = TableMask::default();
         lhs_mask.set(0)?;
@@ -2839,7 +2860,7 @@ mod tests {
         .into_iter()
         .map(HirPlanSource::BTree)
         .collect::<Vec<_>>();
-        let document = HirDocument {
+        let mut document = HirDocument {
             snapshot: hir::CatalogSnapshot::from_id(0),
             databases: Vec::new(),
             root: hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
@@ -2855,18 +2876,26 @@ mod tests {
             ctes: Vec::new(),
             schema_programs: Vec::new(),
             cdc: None,
+            exprs: hir::ExprArena::default(),
+            planning: hir::PlanningTerms::default(),
         };
-        let equality = |lhs, rhs| {
-            HirWhereTerm::from(hir::Expr::Binary {
-                lhs: Box::new(hir::Expr::column(lhs, 0)),
+        let equality = |exprs: &mut hir::ExprArena, lhs, rhs| {
+            let lhs = exprs.push(hir::Expr::column(lhs, 0));
+            let rhs = exprs.push(hir::Expr::column(rhs, 0));
+            HirWhereTerm::from(exprs.push(hir::Expr::Binary {
+                lhs,
                 operator: Operator::Equals,
-                rhs: Box::new(hir::Expr::column(rhs, 0)),
+                rhs,
                 array_concat: false,
                 custom: None,
                 comparison: None,
-            })
+            }))
         };
-        let where_clause = vec![equality(second, first), equality(third, second)];
+        let where_clause = vec![
+            equality(&mut document.exprs, second, first),
+            equality(&mut document.exprs, third, second),
+        ];
+        crate::translate::plan::prepare_planning_terms(&mut document);
         let constraints = vec![
             _hir_empty_constraints(),
             _hir_auto_index_constraints(0, 0)?,
@@ -2958,6 +2987,8 @@ mod tests {
             ctes: Vec::new(),
             schema_programs: Vec::new(),
             cdc: None,
+            exprs: hir::ExprArena::default(),
+            planning: hir::PlanningTerms::default(),
         };
         let mut access_methods = Vec::new();
         STARTING_SOURCE_SCORINGS.with(|scorings| scorings.set(0));
@@ -3006,7 +3037,7 @@ mod tests {
                 Ok(HirPlanSource::BTree(source))
             })
             .collect::<Result<Vec<_>>>()?;
-        let document = HirDocument {
+        let mut document = HirDocument {
             snapshot: hir::CatalogSnapshot::from_id(0),
             databases: Vec::new(),
             root: hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
@@ -3022,21 +3053,26 @@ mod tests {
             ctes: Vec::new(),
             schema_programs: Vec::new(),
             cdc: None,
+            exprs: hir::ExprArena::default(),
+            planning: hir::PlanningTerms::default(),
         };
         // Each table joins the one before it, so an order that puts a
         // table before the one it joins to pays for a cross product.
         let where_clause = (1..names.len())
             .map(|position| {
-                HirWhereTerm::from(hir::Expr::Binary {
-                    lhs: Box::new(hir::Expr::column(ids[position], 0)),
+                let lhs = document.exprs.push(hir::Expr::column(ids[position], 0));
+                let rhs = document.exprs.push(hir::Expr::column(ids[position - 1], 0));
+                HirWhereTerm::from(document.exprs.push(hir::Expr::Binary {
+                    lhs,
                     operator: Operator::Equals,
-                    rhs: Box::new(hir::Expr::column(ids[position - 1], 0)),
+                    rhs,
                     array_concat: false,
                     custom: None,
                     comparison: None,
-                })
+                }))
             })
             .collect::<Vec<_>>();
+        crate::translate::plan::prepare_planning_terms(&mut document);
         let constraints = std::iter::once(Ok(_hir_empty_constraints()))
             .chain(
                 (1..names.len())

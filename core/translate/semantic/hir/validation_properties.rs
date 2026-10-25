@@ -47,7 +47,7 @@ fn source(id: SourceId, owner: SourceOwner, width: usize, kind: SourceKind) -> S
     }
 }
 
-fn output(block: QueryBlockId, index: usize, expression: Expr) -> Output {
+fn output(block: QueryBlockId, index: usize, expression: ExprId) -> Output {
     Output {
         id: OutputId::query(block, index),
         name: format!("output_{index}"),
@@ -68,13 +68,14 @@ fn generated_query_document(tc: &hegel::TestCase) -> HirDocument {
     let source_id = SourceId::new(0);
     let column_count = generated_count(tc);
     let output_count = generated_count(tc);
+    let mut exprs = ExprArena::default();
     let outputs = (0..output_count)
         .map(|index| {
-            output(
-                block_id,
-                index,
-                Expr::column(source_id, generated_position(tc, column_count)),
-            )
+            let column = exprs.push(Expr::column(
+                source_id,
+                generated_position(tc, column_count),
+            ));
+            output(block_id, index, column)
         })
         .collect::<Vec<_>>();
     let query_outputs = outputs.iter().map(|output| output.id).collect();
@@ -119,19 +120,23 @@ fn generated_query_document(tc: &hegel::TestCase) -> HirDocument {
         ctes: Vec::new(),
         schema_programs: Vec::new(),
         cdc: None,
+        exprs,
+        planning: PlanningTerms::default(),
     }
 }
 
-fn schema_call(program: SchemaProgramId) -> BoundSchemaCall {
+fn schema_call(exprs: &mut ExprArena, program: SchemaProgramId) -> BoundSchemaCall {
     BoundSchemaCall {
         program,
-        arguments: vec![Expr::Literal(Literal::Null)],
+        arguments: vec![exprs.push(Expr::Literal(Literal::Null))],
     }
 }
 
-fn expression_with_schema_call(program: SchemaProgramId) -> Expr {
-    Expr::Cast {
-        expr: Box::new(Expr::Literal(Literal::Null)),
+fn expression_with_schema_call(exprs: &mut ExprArena, program: SchemaProgramId) -> ExprId {
+    let expr = exprs.push(Expr::Literal(Literal::Null));
+    let call = schema_call(exprs, program);
+    exprs.push(Expr::Cast {
+        expr,
         target: Box::new(TypeName {
             name: "domain_value".to_string(),
             parameters: Vec::new(),
@@ -139,12 +144,12 @@ fn expression_with_schema_call(program: SchemaProgramId) -> Expr {
             type_fact: TypeFact::known(Type::Integer),
             affinity: Affinity::Integer,
             programs: BoundCastPrograms {
-                encode: vec![schema_call(program)],
+                encode: vec![call],
                 domain: None,
                 apply_builtin_affinity: false,
             },
         }),
-    }
+    })
 }
 
 fn generated_schema_program_document(tc: &hegel::TestCase) -> HirDocument {
@@ -159,11 +164,14 @@ fn generated_schema_program_document(tc: &hegel::TestCase) -> HirDocument {
         input_width,
         SourceKind::SchemaExpression,
     ));
-    document.schema_programs.push(BoundSchemaProgram {
-        input_source,
-        body: Expr::column(input_source, input_position),
-    });
-    document.queries[0].blocks[0].outputs[0].expr = expression_with_schema_call(program_id);
+    let body = document
+        .exprs
+        .push(Expr::column(input_source, input_position));
+    document
+        .schema_programs
+        .push(BoundSchemaProgram { input_source, body });
+    document.queries[0].blocks[0].outputs[0].expr =
+        expression_with_schema_call(&mut document.exprs, program_id);
     document
 }
 
@@ -175,16 +183,17 @@ fn generated_cte_document(tc: &hegel::TestCase) -> HirDocument {
     let cte_id = CteId::new(0);
     let source_id = SourceId::new(0);
     let width = generated_count(tc);
+    let mut exprs = ExprArena::default();
     let root_outputs = (0..width)
-        .map(|position| output(root_block, position, Expr::column(source_id, position)))
+        .map(|position| {
+            let column = exprs.push(Expr::column(source_id, position));
+            output(root_block, position, column)
+        })
         .collect::<Vec<_>>();
     let body_outputs = (0..width)
         .map(|position| {
-            output(
-                body_block,
-                position,
-                Expr::Literal(Literal::Numeric(position.to_string())),
-            )
+            let literal = exprs.push(Expr::Literal(Literal::Numeric(position.to_string())));
+            output(body_block, position, literal)
         })
         .collect::<Vec<_>>();
     let root_output_ids = root_outputs.iter().map(|output| output.id).collect();
@@ -267,6 +276,8 @@ fn generated_cte_document(tc: &hegel::TestCase) -> HirDocument {
         }],
         schema_programs: Vec::new(),
         cdc: None,
+        exprs,
+        planning: PlanningTerms::default(),
     }
 }
 
@@ -315,12 +326,15 @@ fn out_of_range_references_are_rejected(tc: hegel::TestCase) {
                 OutputId::query(block, document.queries[0].blocks[0].outputs.len());
         }
         MissingReference::ExpressionSource => {
-            first_output_mut(&mut document).expr =
-                Expr::column(SourceId::new(document.sources.len()), 0);
+            let column = document
+                .exprs
+                .push(Expr::column(SourceId::new(document.sources.len()), 0));
+            first_output_mut(&mut document).expr = column;
         }
         MissingReference::ExpressionColumn => {
             let width = document.sources[0].columns.len();
-            first_output_mut(&mut document).expr = Expr::column(SourceId::new(0), width);
+            let column = document.exprs.push(Expr::column(SourceId::new(0), width));
+            first_output_mut(&mut document).expr = column;
         }
     }
 
@@ -417,7 +431,8 @@ fn source_column_state_widths_must_stay_aligned(tc: hegel::TestCase) {
 #[hegel::test]
 fn referenced_columns_require_their_stored_read_programs(tc: hegel::TestCase) {
     let mut document = generated_query_document(&tc);
-    let Expr::Column(reference) = &first_output_mut(&mut document).expr else {
+    let expression = first_output_mut(&mut document).expr;
+    let Expr::Column(reference) = &document.exprs[expression] else {
         unreachable!("the generator emits a column output");
     };
     let reference = *reference;
@@ -437,7 +452,8 @@ fn referenced_columns_require_their_stored_read_programs(tc: hegel::TestCase) {
 #[hegel::test]
 fn referenced_array_columns_are_self_describing(tc: hegel::TestCase) {
     let mut document = generated_query_document(&tc);
-    let Expr::Column(reference) = &first_output_mut(&mut document).expr else {
+    let expression = first_output_mut(&mut document).expr;
+    let Expr::Column(reference) = &document.exprs[expression] else {
         unreachable!("the generator emits a column output");
     };
     let reference = *reference;
@@ -550,17 +566,20 @@ fn unfinished_schema_program_state_is_rejected(tc: hegel::TestCase) {
     ]));
     match corruption {
         BrokenSchemaProgram::MissingProgram => {
-            first_output_mut(&mut document).expr =
-                expression_with_schema_call(SchemaProgramId::new(1));
+            let expression =
+                expression_with_schema_call(&mut document.exprs, SchemaProgramId::new(1));
+            first_output_mut(&mut document).expr = expression;
         }
         BrokenSchemaProgram::MissingInputSource => {
             document.schema_programs[0].input_source = SourceId::new(document.sources.len());
         }
         BrokenSchemaProgram::RecursiveProgram => {
-            document.schema_programs[0].body = expression_with_schema_call(SchemaProgramId::new(0));
+            document.schema_programs[0].body =
+                expression_with_schema_call(&mut document.exprs, SchemaProgramId::new(0));
         }
         BrokenSchemaProgram::UnreachableProgram => {
-            first_output_mut(&mut document).expr = Expr::Literal(Literal::Null);
+            let null = document.exprs.push(Expr::Literal(Literal::Null));
+            first_output_mut(&mut document).expr = null;
         }
     }
 

@@ -232,7 +232,7 @@ pub struct ProgramBuilder {
     rerun_subqueries: Vec<QueryId>,
     /// Registers already holding the value of exact HIR expression nodes,
     /// keyed by node address, such as GROUP BY keys while a group is output.
-    expression_registers: Vec<(usize, usize)>,
+    expression_registers: Vec<(crate::translate::semantic::hir::ExprId, usize)>,
     /// The mode in which the query is being executed.
     mode: BuilderQueryMode,
     pub flags: ProgramBuilderFlags,
@@ -809,11 +809,10 @@ impl ProgramBuilder {
     /// [Self::truncate_expression_registers].
     pub(crate) fn bind_expression_register(
         &mut self,
-        expression: &crate::translate::semantic::hir::Expr,
+        expression: crate::translate::semantic::hir::ExprId,
         register: usize,
     ) {
-        self.expression_registers
-            .push((std::ptr::from_ref(expression) as usize, register));
+        self.expression_registers.push((expression, register));
     }
 
     /// How many expression registers are bound, to drop the ones bound
@@ -827,13 +826,12 @@ impl ProgramBuilder {
     /// [Self::bind_expression_register] to restore.
     pub(crate) fn unbind_expression_register(
         &mut self,
-        expression: &crate::translate::semantic::hir::Expr,
+        expression: crate::translate::semantic::hir::ExprId,
     ) -> Option<usize> {
-        let address = std::ptr::from_ref(expression) as usize;
         let position = self
             .expression_registers
             .iter()
-            .position(|(bound, _)| *bound == address)?;
+            .position(|(bound, _)| *bound == expression)?;
         Some(self.expression_registers.remove(position).1)
     }
 
@@ -843,12 +841,11 @@ impl ProgramBuilder {
 
     pub(crate) fn expression_register(
         &self,
-        expression: &crate::translate::semantic::hir::Expr,
+        expression: crate::translate::semantic::hir::ExprId,
     ) -> Option<usize> {
-        let address = std::ptr::from_ref(expression) as usize;
         self.expression_registers
             .iter()
-            .find(|(bound, _)| *bound == address)
+            .find(|(bound, _)| *bound == expression)
             .map(|(_, register)| *register)
     }
 

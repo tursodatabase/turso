@@ -193,7 +193,7 @@ fn compile_trigger(
         super::expr::translate_condition_expr(
             &mut builder,
             &plan.document,
-            predicate,
+            *predicate,
             ConditionMetadata {
                 jump_if_condition_is_true: false,
                 jump_target_when_true: passed,

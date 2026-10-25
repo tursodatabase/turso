@@ -61,22 +61,22 @@ use crate::translate::window::{
 /// producing argument must be recomputed after the row leaves the buffer.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
-pub(super) enum HirWindowBufferColumn<'a> {
-    Evaluate(&'a hir::Expr),
+pub(super) enum HirWindowBufferColumn {
+    Evaluate(hir::ExprId),
     /// ORDER BY can need the stored custom value instead of its decoded form.
-    Encoded(&'a hir::Expr),
+    Encoded(hir::ExprId),
     Source {
-        expression: &'a hir::Expr,
+        expression: hir::ExprId,
         reference: hir::ColumnRef,
     },
 }
 
-impl<'a> HirWindowBufferColumn<'a> {
-    fn expression(&self) -> &'a hir::Expr {
+impl HirWindowBufferColumn {
+    fn expression(&self) -> hir::ExprId {
         match self {
             Self::Evaluate(expression)
             | Self::Encoded(expression)
-            | Self::Source { expression, .. } => expression,
+            | Self::Source { expression, .. } => *expression,
         }
     }
 }
@@ -84,9 +84,9 @@ impl<'a> HirWindowBufferColumn<'a> {
 /// One exact HIR leaf and the window-buffer column holding its value.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
-struct HirWindowLateInput<'a> {
-    owner: &'a hir::Expr,
-    expression: &'a hir::Expr,
+struct HirWindowLateInput {
+    owner: hir::ExprId,
+    expression: hir::ExprId,
     column: usize,
 }
 
@@ -95,8 +95,8 @@ struct HirWindowLateInput<'a> {
 pub(super) struct HirWindowFunction<'a> {
     pub(super) id: hir::WindowFunctionId,
     pub(super) function: AccumulatorFunc,
-    pub(super) arguments: Vec<BufferedWindowValue<&'a hir::Expr>>,
-    pub(super) filter: Option<BufferedWindowValue<&'a hir::Expr>>,
+    pub(super) arguments: Vec<BufferedWindowValue<hir::ExprId>>,
+    pub(super) filter: Option<BufferedWindowValue<hir::ExprId>>,
     pub(super) argument_facts: &'a [hir::FunctionArgumentFacts],
 }
 
@@ -109,11 +109,12 @@ pub(super) struct HirWindowFunction<'a> {
 #[derive(Debug)]
 pub(super) struct HirWindowBufferPlan<'a> {
     pub(super) window: &'a hir::ResolvedWindow,
-    pub(super) columns: Vec<HirWindowBufferColumn<'a>>,
+    pub(super) columns: Vec<HirWindowBufferColumn>,
     pub(super) partition_slots: Vec<usize>,
     pub(super) order_slots: Vec<usize>,
     pub(super) functions: Vec<HirWindowFunction<'a>>,
-    late_inputs: Vec<HirWindowLateInput<'a>>,
+    late_inputs: Vec<HirWindowLateInput>,
+    pub(super) exprs: &'a hir::ExprArena,
 }
 
 impl HirWindowBufferPlan<'_> {
@@ -199,21 +200,21 @@ impl<'expr> ExprVisitor<'expr> for WindowCallCollector<'expr> {
 
     fn pre_order(
         &mut self,
-        _parent: &'expr hir::Expr,
+        _parent: hir::ExprRef<'expr>,
         _context: &mut (),
         _child_index: usize,
-        _child: &'expr hir::Expr,
+        _child: hir::ExprRef<'expr>,
     ) -> Result<ControlFlow<(), ()>> {
         Ok(ControlFlow::Continue(()))
     }
 
     fn post_order(
         &mut self,
-        expression: &'expr hir::Expr,
+        expression: hir::ExprRef<'expr>,
         _context: (),
         _children: &[()],
     ) -> Result<()> {
-        let hir::Expr::Function(call) = expression else {
+        let hir::Expr::Function(call) = expression.node() else {
             return Ok(());
         };
         let hir::FunctionEvaluation::Window { id, .. } = call.evaluation else {
@@ -234,21 +235,25 @@ impl<'expr> ExprVisitor<'expr> for WindowCallCollector<'expr> {
     }
 }
 
-struct LateArgumentCollector<'columns, 'expr> {
-    owner: &'expr hir::Expr,
-    columns: &'columns mut Vec<HirWindowBufferColumn<'expr>>,
-    inputs: &'columns mut Vec<HirWindowLateInput<'expr>>,
+struct LateArgumentCollector<'columns> {
+    owner: hir::ExprId,
+    columns: &'columns mut Vec<HirWindowBufferColumn>,
+    inputs: &'columns mut Vec<HirWindowLateInput>,
 }
 
-impl<'expr> ExprVisitor<'expr> for LateArgumentCollector<'_, 'expr> {
+impl<'expr> ExprVisitor<'expr> for LateArgumentCollector<'_> {
     type Context = ();
     type Output = ();
     type Error = LimboError;
 
-    fn child(&mut self, expression: &'expr hir::Expr, index: usize) -> Option<&'expr hir::Expr> {
-        if matches!(expression, hir::Expr::Subquery(_))
+    fn child(
+        &mut self,
+        expression: hir::ExprRef<'expr>,
+        index: usize,
+    ) -> Option<hir::ExprRef<'expr>> {
+        if matches!(expression.node(), hir::Expr::Subquery(_))
             || matches!(
-                expression,
+                expression.node(),
                 hir::Expr::Function(call)
                     if matches!(call.evaluation, hir::FunctionEvaluation::Aggregate { .. })
             )
@@ -260,21 +265,22 @@ impl<'expr> ExprVisitor<'expr> for LateArgumentCollector<'_, 'expr> {
 
     fn pre_order(
         &mut self,
-        _parent: &'expr hir::Expr,
+        _parent: hir::ExprRef<'expr>,
         _context: &mut (),
         _child_index: usize,
-        _child: &'expr hir::Expr,
+        _child: hir::ExprRef<'expr>,
     ) -> Result<ControlFlow<(), ()>> {
         Ok(ControlFlow::Continue(()))
     }
 
     fn post_order(
         &mut self,
-        expression: &'expr hir::Expr,
+        expression_ref: hir::ExprRef<'expr>,
         _context: (),
         _children: &[()],
     ) -> Result<()> {
-        let column = match expression {
+        let expression = expression_ref.id();
+        let column = match expression_ref.node() {
             hir::Expr::Column(reference) => HirWindowBufferColumn::Source {
                 expression,
                 reference: *reference,
@@ -289,7 +295,7 @@ impl<'expr> ExprVisitor<'expr> for LateArgumentCollector<'_, 'expr> {
             }
             _ => return Ok(()),
         };
-        let column = push_reused_column(self.columns, column);
+        let column = push_reused_column(expression_ref.arena(), self.columns, column);
         self.inputs.push(HirWindowLateInput {
             owner: self.owner,
             expression,
@@ -300,12 +306,13 @@ impl<'expr> ExprVisitor<'expr> for LateArgumentCollector<'_, 'expr> {
 }
 
 fn columns_are_equivalent(
-    left: &HirWindowBufferColumn<'_>,
-    right: &HirWindowBufferColumn<'_>,
+    exprs: &hir::ExprArena,
+    left: &HirWindowBufferColumn,
+    right: &HirWindowBufferColumn,
 ) -> bool {
     match (left, right) {
         (HirWindowBufferColumn::Encoded(left), HirWindowBufferColumn::Encoded(right)) => {
-            left.equivalent(right)
+            exprs.at(*left).equivalent(exprs.at(*right))
         }
         (HirWindowBufferColumn::Encoded(_), _) | (_, HirWindowBufferColumn::Encoded(_)) => false,
         (
@@ -317,7 +324,7 @@ fn columns_are_equivalent(
             },
         ) => left == right,
         (HirWindowBufferColumn::Evaluate(left), HirWindowBufferColumn::Evaluate(right)) => {
-            left.equivalent(right)
+            exprs.at(*left).equivalent(exprs.at(*right))
         }
         (
             HirWindowBufferColumn::Source { reference, .. },
@@ -327,18 +334,19 @@ fn columns_are_equivalent(
             HirWindowBufferColumn::Evaluate(expression),
             HirWindowBufferColumn::Source { reference, .. },
         ) => {
-            matches!(expression, hir::Expr::Column(other) if other == reference)
+            matches!(&exprs[*expression], hir::Expr::Column(other) if other == reference)
         }
     }
 }
 
-fn push_reused_column<'a>(
-    columns: &mut Vec<HirWindowBufferColumn<'a>>,
-    column: HirWindowBufferColumn<'a>,
+fn push_reused_column(
+    exprs: &hir::ExprArena,
+    columns: &mut Vec<HirWindowBufferColumn>,
+    column: HirWindowBufferColumn,
 ) -> usize {
     if let Some(index) = columns
         .iter()
-        .position(|existing| columns_are_equivalent(existing, &column))
+        .position(|existing| columns_are_equivalent(exprs, existing, &column))
     {
         return index;
     }
@@ -349,21 +357,21 @@ fn push_reused_column<'a>(
 
 /// Append a terminal value needed after the source cursor has advanced.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn push_hir_window_output_column<'a>(
-    plan: &mut HirWindowBufferPlan<'a>,
-    expression: &'a hir::Expr,
+pub(super) fn push_hir_window_output_column(
+    plan: &mut HirWindowBufferPlan<'_>,
+    expression: hir::ExprId,
     encoded: bool,
 ) -> usize {
     let column = if encoded {
         HirWindowBufferColumn::Encoded(expression)
     } else {
-        expression_column(expression)
+        expression_column(plan.exprs, expression)
     };
-    push_reused_column(&mut plan.columns, column)
+    push_reused_column(plan.exprs, &mut plan.columns, column)
 }
 
-fn expression_column(expression: &hir::Expr) -> HirWindowBufferColumn<'_> {
-    match expression {
+fn expression_column(exprs: &hir::ExprArena, expression: hir::ExprId) -> HirWindowBufferColumn {
+    match &exprs[expression] {
         hir::Expr::Column(reference) => HirWindowBufferColumn::Source {
             expression,
             reference: *reference,
@@ -373,6 +381,7 @@ fn expression_column(expression: &hir::Expr) -> HirWindowBufferColumn<'_> {
 }
 
 fn collect_window_calls<'a>(
+    exprs: &'a hir::ExprArena,
     query: &'a hir::Query,
     block: &'a hir::QueryBlock,
 ) -> Result<Vec<&'a hir::FunctionCall>> {
@@ -380,28 +389,28 @@ fn collect_window_calls<'a>(
         block: block.id,
         calls: (0..block.window_function_count).map(|_| None).collect(),
     };
-    let mut collect = |expression: &'a hir::Expr| expression.walk((), &mut collector);
+    let mut collect = |expression: hir::ExprId| exprs.at(expression).walk((), &mut collector);
     for output in &block.outputs {
-        collect(&output.expr)?;
+        collect(output.expr)?;
     }
     if let hir::QueryBlockBody::Select {
         filter, grouping, ..
     } = &block.body
     {
         if let Some(filter) = filter {
-            collect(filter)?;
+            collect(*filter)?;
         }
         if let Some(grouping) = grouping {
             for key in &grouping.keys {
-                collect(key)?;
+                collect(*key)?;
             }
-            if let Some(having) = &grouping.having {
+            if let Some(having) = grouping.having {
                 collect(having)?;
             }
         }
     }
     for term in &query.order_by {
-        collect(&term.expr)?;
+        collect(term.expr)?;
     }
     collector
         .calls
@@ -427,6 +436,7 @@ fn accumulator_function(call: &hir::FunctionCall) -> Result<AccumulatorFunc> {
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn plan_hir_window_buffer<'a>(
+    exprs: &'a hir::ExprArena,
     query: &'a hir::Query,
     block: &'a hir::QueryBlock,
     window_id: hir::WindowId,
@@ -453,15 +463,15 @@ pub(super) fn plan_hir_window_buffer<'a>(
     let partition_slots = window
         .partition_by
         .iter()
-        .map(|term| push_reused_column(&mut columns, expression_column(&term.expr)))
+        .map(|term| push_reused_column(exprs, &mut columns, expression_column(exprs, term.expr)))
         .collect();
     let order_slots = window
         .order_by
         .iter()
-        .map(|term| push_reused_column(&mut columns, expression_column(&term.expr)))
+        .map(|term| push_reused_column(exprs, &mut columns, expression_column(exprs, term.expr)))
         .collect();
 
-    let calls = collect_window_calls(query, block)?;
+    let calls = collect_window_calls(exprs, query, block)?;
     let mut functions = Vec::new();
     let mut late_inputs = Vec::new();
     for call in calls {
@@ -477,7 +487,7 @@ pub(super) fn plan_hir_window_buffer<'a>(
             continue;
         }
         let function = accumulator_function(call)?;
-        let (values, argument_facts): (&[hir::Expr], &[hir::FunctionArgumentFacts]) =
+        let (values, argument_facts): (&[hir::ExprId], &[hir::FunctionArgumentFacts]) =
             match &call.arguments {
                 hir::FunctionArguments::Star => (&[], &[]),
                 hir::FunctionArguments::Expressions { values, facts, .. } => (values, facts),
@@ -494,8 +504,8 @@ pub(super) fn plan_hir_window_buffer<'a>(
         }
 
         let arguments = if window_function_uses_subtypes(&function) {
-            for value in values {
-                value.walk(
+            for &value in values {
+                exprs.at(value).walk(
                     (),
                     &mut LateArgumentCollector {
                         owner: value,
@@ -504,20 +514,24 @@ pub(super) fn plan_hir_window_buffer<'a>(
                     },
                 )?;
             }
-            values.iter().map(BufferedWindowValue::Recompute).collect()
+            values
+                .iter()
+                .copied()
+                .map(BufferedWindowValue::Recompute)
+                .collect()
         } else {
             values
                 .iter()
                 .map(|value| {
                     let index = columns.len();
-                    columns.push(expression_column(value));
+                    columns.push(expression_column(exprs, *value));
                     BufferedWindowValue::Column(index)
                 })
                 .collect()
         };
-        let filter = filter.as_deref().map(|filter| {
+        let filter = filter.map(|filter| {
             let index = columns.len();
-            columns.push(expression_column(filter));
+            columns.push(expression_column(exprs, filter));
             BufferedWindowValue::Column(index)
         });
         functions.push(HirWindowFunction {
@@ -536,6 +550,7 @@ pub(super) fn plan_hir_window_buffer<'a>(
         order_slots,
         functions,
         late_inputs,
+        exprs,
     })
 }
 
@@ -565,7 +580,7 @@ pub(super) fn emit_hir_window_input_column<'a>(
     plan: &HirWindowBufferPlan<'a>,
     column: usize,
     target: usize,
-    inputs: &[ExprRegisterInput<'a>],
+    inputs: &[ExprRegisterInput],
 ) -> Result<()> {
     let column = &plan.columns[column];
     emit_hir_window_value(
@@ -578,13 +593,13 @@ pub(super) fn emit_hir_window_input_column<'a>(
     )
 }
 
-fn emit_hir_window_value<'a>(
+fn emit_hir_window_value(
     program: &mut ProgramBuilder,
-    document: &'a hir::HirDocument,
-    expression: &'a hir::Expr,
+    document: &hir::HirDocument,
+    expression: hir::ExprId,
     encoded: bool,
     target: usize,
-    inputs: &[ExprRegisterInput<'a>],
+    inputs: &[ExprRegisterInput],
 ) -> Result<()> {
     let previous = program.flags.suppress_custom_type_decode();
     if encoded {
@@ -602,7 +617,7 @@ fn emit_hir_window_value<'a>(
 /// One key that orders source rows before they enter the window buffer.
 #[derive(Debug)]
 pub(super) struct HirWindowInputKey<'a> {
-    pub(super) expression: &'a hir::Expr,
+    pub(super) expression: hir::ExprId,
     /// Buffer column holding the decoded value of `expression`.
     pub(super) slot: usize,
     pub(super) order: SortOrder,
@@ -627,7 +642,7 @@ impl<'a> HirWindowInputKey<'a> {
         program: &mut ProgramBuilder,
         document: &'a hir::HirDocument,
         target: usize,
-        inputs: &[ExprRegisterInput<'a>],
+        inputs: &[ExprRegisterInput],
     ) -> Result<()> {
         emit_hir_window_value(program, document, self.expression, true, target, inputs)
     }
@@ -636,7 +651,7 @@ impl<'a> HirWindowInputKey<'a> {
 impl<'a> HirWindowBufferPlan<'a> {
     /// Values this layer stores per row, with whether each is a stored
     /// (encoded) custom-type value.
-    pub(super) fn column_expressions(&self) -> impl Iterator<Item = (&'a hir::Expr, bool)> + '_ {
+    pub(super) fn column_expressions(&self) -> impl Iterator<Item = (hir::ExprId, bool)> + '_ {
         self.columns.iter().map(|column| {
             (
                 column.expression(),
@@ -659,7 +674,7 @@ impl<'a> HirWindowBufferPlan<'a> {
                 .iter()
                 .zip(&self.partition_slots)
                 .map(|(term, slot)| HirWindowInputKey {
-                    expression: &term.expr,
+                    expression: term.expr,
                     slot: *slot,
                     order: SortOrder::Asc,
                     nulls: None,
@@ -671,7 +686,7 @@ impl<'a> HirWindowBufferPlan<'a> {
             .iter()
             .zip(&self.order_slots)
             .map(|(term, slot)| HirWindowInputKey {
-                expression: &term.expr,
+                expression: term.expr,
                 slot: *slot,
                 order: term.order,
                 nulls: term.nulls,
@@ -829,7 +844,7 @@ pub(super) fn open_hir_window_buffer(
 pub(super) fn prepare_hir_window_runtime<'a>(
     program: &mut ProgramBuilder,
     plan: &HirWindowBufferPlan<'a>,
-) -> Result<Vec<WindowFunctionRuntime<&'a hir::Expr>>> {
+) -> Result<Vec<WindowFunctionRuntime<hir::ExprId>>> {
     if plan.functions.is_empty() {
         return Err(LimboError::InternalError(format!(
             "HIR window {:?} has no functions",
@@ -890,7 +905,7 @@ pub(super) fn prepare_hir_window_runtime<'a>(
 pub(super) fn emit_hir_window_partition_reset(
     program: &mut ProgramBuilder,
     accumulator_start: usize,
-    functions: &[WindowFunctionRuntime<&hir::Expr>],
+    functions: &[WindowFunctionRuntime<hir::ExprId>],
     frame_tracking: WindowFrameTracking,
 ) {
     emit_window_partition_reset(program, accumulator_start, functions, frame_tracking);
@@ -950,8 +965,8 @@ pub(super) fn hir_window_frame_shape(frame: &hir::WindowFrame) -> WindowFrameSha
     }
 }
 
-fn hir_frame_offset_is_constant(expression: &hir::Expr) -> bool {
-    expression.fold(&mut |expression, children| match expression {
+fn hir_frame_offset_is_constant(expression: hir::ExprRef<'_>) -> bool {
+    expression.fold(&mut |expression, children| match expression.node() {
         hir::Expr::Literal(
             turso_parser::ast::Literal::CurrentDate
             | turso_parser::ast::Literal::CurrentTime
@@ -997,7 +1012,7 @@ fn hir_frame_offset_is_constant(expression: &hir::Expr) -> bool {
 pub(super) fn emit_hir_window_frame_offset(
     program: &mut ProgramBuilder,
     document: &hir::HirDocument,
-    expression: &hir::Expr,
+    expression: hir::ExprId,
     register: usize,
     mode: turso_parser::ast::FrameMode,
     side: WindowFrameBoundSide,
@@ -1007,7 +1022,7 @@ pub(super) fn emit_hir_window_frame_offset(
         register,
         mode,
         side,
-        hir_frame_offset_is_constant(expression),
+        hir_frame_offset_is_constant(document.exprs.at(expression)),
         |program, register| {
             translate_expr_no_constant_opt(program, document, expression, register).map(|_| ())
         },
@@ -1029,7 +1044,7 @@ pub(super) fn emit_hir_window_frame_offsets(
     if let Some(register) = offsets.start() {
         let expression = match &plan.window.frame.start {
             hir::WindowFrameBound::Preceding(expression)
-            | hir::WindowFrameBound::Following(expression) => expression,
+            | hir::WindowFrameBound::Following(expression) => *expression,
             _ => unreachable!("a start offset is only allocated for a bounded frame start"),
         };
         emit_hir_window_frame_offset(
@@ -1047,7 +1062,7 @@ pub(super) fn emit_hir_window_frame_offsets(
             Some(
                 hir::WindowFrameBound::Preceding(expression)
                 | hir::WindowFrameBound::Following(expression),
-            ) => expression,
+            ) => *expression,
             _ => unreachable!("an end offset is only allocated for a bounded frame end"),
         };
         emit_hir_window_frame_offset(
@@ -1071,7 +1086,7 @@ fn hir_window_delete_op(
 ) -> Option<crate::translate::window::WindowOp> {
     let positive = |bound: &hir::WindowFrameBound| match bound {
         hir::WindowFrameBound::Preceding(expr) | hir::WindowFrameBound::Following(expr) => {
-            matches!(expr.as_ref(), hir::Expr::Literal(turso_parser::ast::Literal::Numeric(value))
+            matches!(&plan.exprs[*expr], hir::Expr::Literal(turso_parser::ast::Literal::Numeric(value))
                 if crate::translate::window::window_numeric_offset_gt_zero(value))
         }
         _ => false,
@@ -1092,7 +1107,7 @@ pub(super) fn emit_hir_window_operation<'a>(
     program: &mut ProgramBuilder,
     document: &'a hir::HirDocument,
     plan: &HirWindowBufferPlan<'a>,
-    functions: &[WindowFunctionRuntime<&'a hir::Expr>],
+    functions: &[WindowFunctionRuntime<hir::ExprId>],
     accumulator_start: usize,
     cursors: crate::translate::window::WindowCursors,
     peers: WindowPeerState,
@@ -1186,7 +1201,7 @@ pub(super) fn emit_hir_window_buffer_step<'a>(
     program: &mut ProgramBuilder,
     document: &'a hir::HirDocument,
     plan: &HirWindowBufferPlan<'a>,
-    functions: &[WindowFunctionRuntime<&'a hir::Expr>],
+    functions: &[WindowFunctionRuntime<hir::ExprId>],
     accumulator_start: usize,
     buffer: &WindowBufferRuntime,
     input: WindowBufferInput,
@@ -1274,7 +1289,7 @@ pub(super) fn emit_hir_window_partition_flush<'a>(
     program: &mut ProgramBuilder,
     document: &'a hir::HirDocument,
     plan: &HirWindowBufferPlan<'a>,
-    functions: &[WindowFunctionRuntime<&'a hir::Expr>],
+    functions: &[WindowFunctionRuntime<hir::ExprId>],
     accumulator_start: usize,
     buffer: &WindowBufferRuntime,
     state: WindowInputState,
@@ -1331,7 +1346,7 @@ pub(super) fn emit_hir_window_row_results<'a>(
     program: &mut ProgramBuilder,
     document: &'a hir::HirDocument,
     plan: &HirWindowBufferPlan<'a>,
-    functions: &[WindowFunctionRuntime<&'a hir::Expr>],
+    functions: &[WindowFunctionRuntime<hir::ExprId>],
     cursors: crate::translate::window::WindowCursors,
     tracking: WindowFrameTracking,
     accumulator_start: usize,
@@ -1547,7 +1562,7 @@ pub(super) fn emit_hir_window_first_row(
     peers: WindowPeerState,
     frame_tracking: WindowFrameTracking,
     accumulator_start: usize,
-    functions: &[WindowFunctionRuntime<&hir::Expr>],
+    functions: &[WindowFunctionRuntime<hir::ExprId>],
     emit_row: impl FnMut(&mut ProgramBuilder) -> Result<()>,
 ) -> Result<()> {
     emit_window_peer_seed(program, peers);
@@ -1572,7 +1587,7 @@ pub(super) fn emit_hir_window_first_row_frame(
     plan: &HirWindowBufferPlan<'_>,
     state: WindowFirstRowFrame<'_>,
     accumulator_start: usize,
-    functions: &[WindowFunctionRuntime<&hir::Expr>],
+    functions: &[WindowFunctionRuntime<hir::ExprId>],
     mut emit_row: impl FnMut(&mut ProgramBuilder) -> Result<()>,
 ) -> Result<()> {
     let frame = hir_window_frame_shape(&plan.window.frame);
@@ -1600,15 +1615,15 @@ pub(super) fn emit_hir_window_first_row_frame(
 
 struct HirWindowValueEmitter<'document, 'inputs> {
     document: &'document hir::HirDocument,
-    late_inputs: &'inputs [HirWindowLateInput<'document>],
+    late_inputs: &'inputs [HirWindowLateInput],
 }
 
-impl<'a> WindowValueEmitter<&'a hir::Expr> for HirWindowValueEmitter<'a, '_> {
+impl WindowValueEmitter<hir::ExprId> for HirWindowValueEmitter<'_, '_> {
     fn emit_buffered_value(
         &mut self,
         program: &mut ProgramBuilder,
         cursor: CursorID,
-        value: &BufferedWindowValue<&'a hir::Expr>,
+        value: &BufferedWindowValue<hir::ExprId>,
         target: usize,
     ) -> Result<()> {
         match value {
@@ -1619,11 +1634,11 @@ impl<'a> WindowValueEmitter<&'a hir::Expr> for HirWindowValueEmitter<'a, '_> {
                 default: None,
             }),
             BufferedWindowValue::Recompute(expression) => {
-                let mut inputs: SmallVec<[ExprRegisterInput<'a>; 4]> = SmallVec::new();
+                let mut inputs: SmallVec<[ExprRegisterInput; 4]> = SmallVec::new();
                 for input in self
                     .late_inputs
                     .iter()
-                    .filter(|input| std::ptr::eq(input.owner, *expression))
+                    .filter(|input| input.owner == *expression)
                 {
                     let register = program.alloc_register();
                     program.emit_insn(Insn::Column {
@@ -1634,7 +1649,7 @@ impl<'a> WindowValueEmitter<&'a hir::Expr> for HirWindowValueEmitter<'a, '_> {
                     });
                     inputs.push(ExprRegisterInput::new(input.expression, register));
                 }
-                translate_expr_with_inputs(program, self.document, expression, target, &inputs)?;
+                translate_expr_with_inputs(program, self.document, *expression, target, &inputs)?;
             }
         }
         Ok(())
@@ -1647,7 +1662,7 @@ pub(super) fn emit_hir_window_step<'a>(
     program: &mut ProgramBuilder,
     document: &'a hir::HirDocument,
     plan: &HirWindowBufferPlan<'a>,
-    functions: &[WindowFunctionRuntime<&'a hir::Expr>],
+    functions: &[WindowFunctionRuntime<hir::ExprId>],
     context: WindowStepContext,
 ) -> Result<()> {
     emit_function_step_runtime(
@@ -1667,7 +1682,7 @@ pub(super) fn emit_hir_window_inverse<'a>(
     program: &mut ProgramBuilder,
     document: &'a hir::HirDocument,
     plan: &HirWindowBufferPlan<'a>,
-    functions: &[WindowFunctionRuntime<&'a hir::Expr>],
+    functions: &[WindowFunctionRuntime<hir::ExprId>],
     accumulator_registers_start: usize,
     start_cursor: CursorID,
 ) -> Result<()> {
@@ -1768,11 +1783,17 @@ mod tests {
         }))
     }
 
-    fn column_reference(column: &HirWindowBufferColumn<'_>) -> Option<hir::ColumnRef> {
+    fn column_reference(
+        exprs: &hir::ExprArena,
+        column: &HirWindowBufferColumn,
+    ) -> Option<hir::ColumnRef> {
         match column {
-            HirWindowBufferColumn::Source { reference, .. }
-            | HirWindowBufferColumn::Evaluate(hir::Expr::Column(reference)) => Some(*reference),
-            HirWindowBufferColumn::Evaluate(_) | HirWindowBufferColumn::Encoded(_) => None,
+            HirWindowBufferColumn::Source { reference, .. } => Some(*reference),
+            HirWindowBufferColumn::Evaluate(expression) => match &exprs[*expression] {
+                hir::Expr::Column(reference) => Some(*reference),
+                _ => None,
+            },
+            HirWindowBufferColumn::Encoded(_) => None,
         }
     }
 
@@ -1783,18 +1804,22 @@ mod tests {
              OVER (PARTITION BY group_id ORDER BY sort_key) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
 
         assert_eq!(plan.window.id, block.windows[0].id);
         assert_eq!(plan.columns.len(), 4);
-        let source = column_reference(&plan.columns[0]).expect("partition column is buffered");
+        let source = column_reference(&document.exprs, &plan.columns[0])
+            .expect("partition column is buffered");
         assert_eq!(source.column, 2);
-        let source = column_reference(&plan.columns[1]).expect("order column is buffered");
+        let source =
+            column_reference(&document.exprs, &plan.columns[1]).expect("order column is buffered");
         assert_eq!(source.column, 3);
-        let source = column_reference(&plan.columns[2]).expect("argument column is buffered");
+        let source = column_reference(&document.exprs, &plan.columns[2])
+            .expect("argument column is buffered");
         assert_eq!(source.column, 0);
-        let source = column_reference(&plan.columns[3]).expect("filter column is buffered");
+        let source =
+            column_reference(&document.exprs, &plan.columns[3]).expect("filter column is buffered");
         assert_eq!(source.column, 1);
 
         let [function] = plan.functions.as_slice() else {
@@ -1821,26 +1846,26 @@ mod tests {
              ) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
 
         assert_eq!(plan.partition_slots, [0, 0]);
         assert_eq!(plan.order_slots, [1, 0]);
         assert_eq!(plan.columns.len(), 3);
         assert_eq!(
-            column_reference(&plan.columns[0])
+            column_reference(&document.exprs, &plan.columns[0])
                 .expect("partition column is buffered")
                 .column,
             2
         );
         assert_eq!(
-            column_reference(&plan.columns[1])
+            column_reference(&document.exprs, &plan.columns[1])
                 .expect("order column is buffered")
                 .column,
             3
         );
         assert_eq!(
-            column_reference(&plan.columns[2])
+            column_reference(&document.exprs, &plan.columns[2])
                 .expect("argument column is buffered")
                 .column,
             0
@@ -1856,8 +1881,8 @@ mod tests {
              ) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         let mut program = program();
         let input = WindowBufferInput {
             start: program.alloc_registers(plan.columns.len()),
@@ -1898,8 +1923,8 @@ mod tests {
              ) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         assert_eq!(plan.order_slots, [1, 1, 0]);
 
         let mut program = program();
@@ -1942,8 +1967,8 @@ mod tests {
              ) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         let mut range_program = program();
         let state = prepare_hir_window_peer_state(&mut range_program, &plan);
 
@@ -1984,8 +2009,8 @@ mod tests {
              ) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         let mut rows_program = program();
         let state = prepare_hir_window_peer_state(&mut rows_program, &plan);
         assert!(state.current.is_some());
@@ -2005,8 +2030,8 @@ mod tests {
              ) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         let mut keyed_program = program();
         let state = prepare_hir_window_peer_state(&mut keyed_program, &plan);
         let current = state.current.expect("ORDER BY keys are allocated");
@@ -2051,8 +2076,8 @@ mod tests {
              ) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         let mut unordered_program = program();
         let state = prepare_hir_window_peer_state(&mut unordered_program, &plan);
         let peer = unordered_program.allocate_label();
@@ -2075,8 +2100,8 @@ mod tests {
              ) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         let mut program = program();
         let left = program.alloc_registers(2);
         let right = program.alloc_registers(2);
@@ -2132,8 +2157,8 @@ mod tests {
         let document =
             analyze_sql("SELECT sum(value) OVER (PARTITION BY group_id COLLATE nocase) FROM items");
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         let mut program = program();
         let current_keys = program.alloc_register();
         let state = prepare_hir_window_input_state(&mut program, &plan);
@@ -2205,8 +2230,8 @@ mod tests {
     fn hir_window_without_partition_skips_partition_change() {
         let document = analyze_sql("SELECT sum(value) OVER () FROM items");
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         let mut program = program();
         let input = WindowBufferInput {
             start: program.alloc_registers(plan.columns.len()),
@@ -2230,9 +2255,10 @@ mod tests {
              OVER (PARTITION BY group_id ORDER BY sort_key) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
-        let source = column_reference(&plan.columns[0]).expect("partition column is buffered");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
+        let source = column_reference(&document.exprs, &plan.columns[0])
+            .expect("partition column is buffered");
         let mut program = program();
         let source_start = program.alloc_registers(4);
         program.bind_source(
@@ -2263,8 +2289,8 @@ mod tests {
     fn empty_window_input_row_allocates_no_registers() {
         let document = analyze_sql("SELECT row_number() OVER () FROM items");
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         assert!(plan.columns.is_empty());
         let mut program = program();
         let expected_start = program.alloc_registers(0);
@@ -2290,8 +2316,8 @@ mod tests {
     ) {
         let document = analyze_sql(sql);
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         let mut program = program();
 
         let runtime = open_hir_window_buffer(&mut program, &plan);
@@ -2332,7 +2358,7 @@ mod tests {
         fn rewind_cursors(sql: &str) -> (WindowCursors, Vec<CursorID>) {
             let document = analyze_sql(sql);
             let (query, block) = root_query(&document);
-            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+            let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
                 .expect("window buffer plans");
             let mut program = program();
             let runtime = open_hir_window_buffer(&mut program, &plan);
@@ -2375,9 +2401,10 @@ mod tests {
     fn hir_window_row_uses_shared_buffer_insertion() {
         let document = analyze_sql("SELECT sum(value) OVER () FROM items");
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
-        let source = column_reference(&plan.columns[0]).expect("argument column is buffered");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
+        let source = column_reference(&document.exprs, &plan.columns[0])
+            .expect("argument column is buffered");
         let mut program = program();
         let runtime = open_hir_window_buffer(&mut program, &plan);
         let source_start = program.alloc_register();
@@ -2450,8 +2477,8 @@ mod tests {
         assert_eq!(block.windows.len(), 2);
 
         for window in &block.windows {
-            let plan =
-                plan_hir_window_buffer(query, block, window.id).expect("window buffer plans");
+            let plan = plan_hir_window_buffer(&document.exprs, query, block, window.id)
+                .expect("window buffer plans");
             let [function] = plan.functions.as_slice() else {
                 panic!("one function belongs to each effective window");
             };
@@ -2459,7 +2486,7 @@ mod tests {
             let hir::FunctionEvaluation::Window {
                 window: function_window,
                 ..
-            } = collect_window_calls(query, block).expect("window calls collect")
+            } = collect_window_calls(&document.exprs, query, block).expect("window calls collect")
                 [function.id.index]
                 .evaluation
             else {
@@ -2480,7 +2507,7 @@ mod tests {
         block.window_function_count += 1;
 
         let (query, block) = root_query(&document);
-        let error = plan_hir_window_buffer(query, block, block.windows[0].id)
+        let error = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
             .expect_err("missing identity is rejected");
         assert!(error
             .to_string()
@@ -2502,8 +2529,8 @@ mod tests {
             1,
             "calls naming the same window and frame share it"
         );
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         let runtimes =
             prepare_hir_window_runtime(&mut program, &plan).expect("window runtime prepares");
         assert_eq!(runtimes.len(), 2);
@@ -2530,8 +2557,8 @@ mod tests {
     fn hir_window_runtime_uses_shared_aggregate_results() {
         let document = analyze_sql("SELECT sum(value) OVER () FROM items");
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         let mut program = program();
         let functions =
             prepare_hir_window_runtime(&mut program, &plan).expect("window runtime prepares");
@@ -2588,8 +2615,8 @@ mod tests {
              ) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         let mut program = program();
         let functions =
             prepare_hir_window_runtime(&mut program, &plan).expect("window runtime prepares");
@@ -2636,7 +2663,7 @@ mod tests {
         fn tracking(sql: &str) -> WindowFrameTracking {
             let document = analyze_sql(sql);
             let (query, block) = root_query(&document);
-            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+            let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
                 .expect("window buffer plans");
             let mut program = program();
             prepare_hir_window_frame_tracking(&mut program, &plan)
@@ -2701,7 +2728,7 @@ mod tests {
                 "SELECT sum(value) OVER (ROWS BETWEEN {frame}) FROM items"
             ));
             let (query, block) = root_query(&document);
-            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+            let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
                 .expect("window buffer plans");
             let mut program = program();
             let offsets = prepare_hir_window_frame_offsets(&mut program, &plan);
@@ -2745,8 +2772,9 @@ mod tests {
                     "SELECT sum(value) OVER (ORDER BY sort_key {mode} BETWEEN {bounds}) FROM items"
                 ));
                 let (query, block) = root_query(&document);
-                let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
-                    .expect("window buffer plans");
+                let plan =
+                    plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+                        .expect("window buffer plans");
                 for op in [WindowOp::AggStep, WindowOp::AggInverse, WindowOp::ReturnRow] {
                     for in_flush in [false, true] {
                         for has_offset in [false, true] {
@@ -2828,7 +2856,7 @@ mod tests {
                  BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM items"
             ));
             let (query, block) = root_query(&document);
-            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+            let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
                 .expect("window buffer plans");
             for op in [WindowOp::AggStep, WindowOp::AggInverse, WindowOp::ReturnRow] {
                 let mut program = program();
@@ -2899,7 +2927,7 @@ mod tests {
                 "SELECT sum(value) OVER (ORDER BY sort_key RANGE BETWEEN {frame}) FROM items"
             ));
             let (query, block) = root_query(&document);
-            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+            let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
                 .expect("window buffer plans");
             let mut program = program();
             let current = buffer_cursor(&mut program, plan.columns.len());
@@ -2965,8 +2993,9 @@ mod tests {
                      RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM items"
                 ));
                 let (query, block) = root_query(&document);
-                let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
-                    .expect("window buffer plans");
+                let plan =
+                    plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+                        .expect("window buffer plans");
                 assert_eq!(
                     plan.order_slots,
                     [1],
@@ -3119,8 +3148,9 @@ mod tests {
                      BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM items"
                 ));
                 let (query, block) = root_query(&document);
-                let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
-                    .expect("window buffer plans");
+                let plan =
+                    plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+                        .expect("window buffer plans");
                 let mut program = program();
                 let buffer = open_hir_window_buffer(&mut program, &plan);
                 let peers = prepare_hir_window_peer_state(&mut program, &plan);
@@ -3191,7 +3221,7 @@ mod tests {
                  GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM items"
             ));
             let (query, block) = root_query(&document);
-            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+            let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
                 .expect("window buffer plans");
             let mut program = program();
             let runtime = open_hir_window_buffer(&mut program, &plan);
@@ -3324,7 +3354,7 @@ mod tests {
                 "SELECT sum(value) OVER (ORDER BY sort_key {frame}) FROM items"
             ));
             let (query, block) = root_query(&document);
-            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+            let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
                 .expect("window buffer plans");
             let mut program = program();
             let runtime = open_hir_window_buffer(&mut program, &plan);
@@ -3456,8 +3486,8 @@ mod tests {
             "SELECT sum(value) OVER (ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         let mut program = program();
         let offsets = prepare_hir_window_frame_offsets(&mut program, &plan);
         let check = window_frame_order_check(hir_window_frame_shape(&plan.window.frame), offsets)
@@ -3516,7 +3546,7 @@ mod tests {
         fn delay(sql: &str) -> (WindowFrameOffsets, ProgramBuilder) {
             let document = analyze_sql(sql);
             let (query, block) = root_query(&document);
-            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+            let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
                 .expect("window buffer plans");
             let mut program = program();
             let offsets = prepare_hir_window_frame_offsets(&mut program, &plan);
@@ -3560,7 +3590,7 @@ mod tests {
                 "SELECT sum(value) OVER (ROWS BETWEEN {frame}) FROM items"
             ));
             let (query, block) = root_query(&document);
-            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+            let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
                 .expect("window buffer plans");
             let mut program = program();
             prepare_hir_window_frame_offsets(&mut program, &plan)
@@ -3597,7 +3627,7 @@ mod tests {
             let hir::WindowFrameBound::Preceding(expression) = &block.windows[0].frame.start else {
                 panic!("test window has a PRECEDING start");
             };
-            hir_frame_offset_is_constant(expression)
+            hir_frame_offset_is_constant(document.expr(*expression))
         }
 
         assert!(constant("1 + 1"));
@@ -3626,7 +3656,7 @@ mod tests {
         emit_hir_window_frame_offset(
             &mut program,
             &document,
-            expression,
+            *expression,
             register,
             window.frame.mode,
             WindowFrameBoundSide::Start,
@@ -3655,8 +3685,8 @@ mod tests {
              ) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         let mut program = program();
         let offsets = prepare_hir_window_frame_offsets(&mut program, &plan);
         let WindowFrameOffsets::Both { start, end } = offsets else {
@@ -3698,20 +3728,22 @@ mod tests {
     fn json_window_arguments_recompute_from_buffered_source_columns() {
         let document = analyze_sql("SELECT json_group_array(json_array(value)) OVER () FROM items");
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
 
         assert!(matches!(
             plan.columns.as_slice(),
-            [HirWindowBufferColumn::Source { expression: hir::Expr::Column(expression_reference), reference }]
-                if reference.column == 0 && expression_reference == reference
+            [HirWindowBufferColumn::Source { expression, reference }]
+                if reference.column == 0
+                    && matches!(&document.exprs[*expression], hir::Expr::Column(expression_reference) if expression_reference == reference)
         ));
         let [function] = plan.functions.as_slice() else {
             panic!("one JSON window function is planned");
         };
         assert!(matches!(
             function.arguments.as_slice(),
-            [BufferedWindowValue::Recompute(hir::Expr::Function(_))]
+            [BufferedWindowValue::Recompute(argument)]
+                if matches!(&document.exprs[*argument], hir::Expr::Function(_))
         ));
     }
 
@@ -3736,7 +3768,9 @@ mod tests {
                     "SELECT sum(value) OVER (ORDER BY sort_key {mode} BETWEEN {bounds}) FROM items"
                 ));
                 let (query, block) = root_query(&document);
-                let plan = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+                let plan =
+                    plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+                        .unwrap();
                 let frame = hir_window_frame_shape(&plan.window.frame);
                 let mut program = program();
                 let buffer = open_hir_window_buffer(&mut program, &plan);
@@ -3969,7 +4003,9 @@ mod tests {
                     "SELECT {function} OVER (PARTITION BY group_id ORDER BY sort_key {frame}) FROM items"
                 ));
                 let (query, block) = root_query(&document);
-                let plan = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+                let plan =
+                    plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+                        .unwrap();
                 let mut program = program();
                 let buffer = open_hir_window_buffer(&mut program, &plan);
                 let functions = prepare_hir_window_runtime(&mut program, &plan).unwrap();
@@ -4104,7 +4140,8 @@ mod tests {
         use crate::translate::window::WindowOp;
         let document = analyze_sql(sql);
         let (query, block) = root_query(&document);
-        let plan = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+        let plan =
+            plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id).unwrap();
         let mut program = program();
         let functions = prepare_hir_window_runtime(&mut program, &plan).unwrap();
         let results = functions
@@ -4518,7 +4555,8 @@ mod tests {
                 "SELECT {function} OVER (ORDER BY sort_key {frame}) FROM items"
             ));
             let (query, block) = root_query(&document);
-            let plan = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+            let plan =
+                plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id).unwrap();
             assert_eq!(hir_window_delete_op(&plan), expected, "{function} {frame}");
         }
     }
@@ -4544,7 +4582,9 @@ mod tests {
                         "SELECT sum(value) OVER ({order} {mode} BETWEEN {bounds} {exclusion}) FROM items"
                     ));
                     let (query, block) = root_query(&document);
-                    let plan = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+                    let plan =
+                        plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+                            .unwrap();
                     for op in [WindowOp::AggStep, WindowOp::AggInverse, WindowOp::ReturnRow] {
                         for flush in [false, true] {
                             let mut program = program();
@@ -4721,7 +4761,8 @@ mod tests {
         use crate::translate::window::WindowOp;
         let document = analyze_sql("SELECT sum(value) OVER () FROM items");
         let (query, block) = root_query(&document);
-        let plan = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+        let plan =
+            plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id).unwrap();
         let mut program = program();
         let functions = prepare_hir_window_runtime(&mut program, &plan).unwrap();
         let accumulators = program.alloc_registers(functions.len());
@@ -4764,8 +4805,8 @@ mod tests {
             "SELECT sum(value) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         for op in [WindowOp::AggStep, WindowOp::AggInverse] {
             for kind in 0..3 {
                 let mut program = program();
@@ -4847,8 +4888,8 @@ mod tests {
              WINDOW window_frame AS (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
         );
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         let mut program = program();
         let functions =
             prepare_hir_window_runtime(&mut program, &plan).expect("window runtime prepares");
@@ -4893,8 +4934,8 @@ mod tests {
              WINDOW window_frame AS (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
         );
         let (query, block) = root_query(&document);
-        let plan =
-            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let plan = plan_hir_window_buffer(&document.exprs, query, block, block.windows[0].id)
+            .expect("window buffer plans");
         let mut program = program();
         let functions =
             prepare_hir_window_runtime(&mut program, &plan).expect("window runtime prepares");

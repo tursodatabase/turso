@@ -80,12 +80,15 @@ pub(super) fn check(plan: &HirPlan, update: &hir::Update, access: &HirAccessPlan
         let reads_from = update.returning.as_ref().is_some_and(|returning| {
             returning.outputs.iter().any(|output| {
                 let mut other = false;
-                output.expr.for_each(&mut |expression| match expression {
-                    hir::Expr::Column(hir::ColumnRef { source, .. }) | hir::Expr::RowId(source) => {
-                        other |= *source != update.target && *source != update.new_source;
-                    }
-                    _ => {}
-                });
+                document.exprs.at(output.expr).for_each(
+                    &mut |expression| match expression.node() {
+                        hir::Expr::Column(hir::ColumnRef { source, .. })
+                        | hir::Expr::RowId(source) => {
+                            other |= *source != update.target && *source != update.new_source;
+                        }
+                        _ => {}
+                    },
+                );
                 other
             })
         });
@@ -210,9 +213,9 @@ pub(super) fn emit_update(
         let width = assignment.columns.len();
         for (part, target_column) in assignment.columns.iter().enumerate() {
             let value = match width {
-                1 => NewValue::Expr(&assignment.value),
+                1 => NewValue::Expr(assignment.value),
                 _ => NewValue::RowPart {
-                    row: &assignment.value,
+                    row: assignment.value,
                     part,
                     width,
                 },
@@ -229,7 +232,9 @@ pub(super) fn emit_update(
     let mut changed_indexes = Vec::new();
     // Every index entry holds the rowid, so a new rowid changes them all.
     for old in &target.source.index_expressions {
-        if rowid_value.is_none() && !index_reads_assigned_column(update.target, old, &assigned) {
+        if rowid_value.is_none()
+            && !index_reads_assigned_column(document, update.target, old, &assigned)
+        {
             continue;
         }
         let new = new_source
@@ -264,7 +269,9 @@ pub(super) fn emit_update(
         && triggers.is_empty()
         && !has_foreign_keys
         && !replaces
-        && single_loop.is_some_and(|(_, operation)| operation.is_some_and(touches_at_most_one_row))
+        && single_loop.is_some_and(|(_, operation)| {
+            operation.is_some_and(|operation| touches_at_most_one_row(document, operation))
+        })
     {
         program.set_multi_write(false);
     }
@@ -330,17 +337,20 @@ pub(super) fn emit_update(
             .iter()
             .filter(|constraint| {
                 let mut reads_changed = false;
-                constraint.expression.for_each(&mut |expression| {
-                    reads_changed |= match expression {
-                        hir::Expr::Column(hir::ColumnRef { source, column }) => {
-                            *source == new_source.id && assigned.contains(column)
-                        }
-                        hir::Expr::RowId(source) => {
-                            *source == new_source.id && rowid_value.is_some()
-                        }
-                        _ => false,
-                    };
-                });
+                document
+                    .exprs
+                    .at(constraint.expression)
+                    .for_each(&mut |expression| {
+                        reads_changed |= match expression.node() {
+                            hir::Expr::Column(hir::ColumnRef { source, column }) => {
+                                *source == new_source.id && assigned.contains(column)
+                            }
+                            hir::Expr::RowId(source) => {
+                                *source == new_source.id && rowid_value.is_some()
+                            }
+                            _ => false,
+                        };
+                    });
                 reads_changed
             })
             .collect()
@@ -433,7 +443,9 @@ pub(super) fn emit_update(
     // clause first collects its rowids, since a trigger or a REPLACE
     // can change the table, and the subquery must not see changed rows.
     let statement_replace = has_statement_conflict && or_conflict == ResolveType::Replace;
-    let where_subquery = update.predicate.as_ref().is_some_and(has_subquery);
+    let where_subquery = update
+        .predicate
+        .is_some_and(|predicate| has_subquery(document, predicate));
     // An UPDATE that moves rows, changes the key of the index its loop
     // reads, or may REPLACE rows while reading an index collects its rows
     // first, so the loop never reaches a changed row again.
@@ -506,9 +518,9 @@ fn emit_virtual_update(
         let width = assignment.columns.len();
         for (part, target_column) in assignment.columns.iter().enumerate() {
             let value = match width {
-                1 => NewValue::Expr(&assignment.value),
+                1 => NewValue::Expr(assignment.value),
                 _ => NewValue::RowPart {
-                    row: &assignment.value,
+                    row: assignment.value,
                     part,
                     width,
                 },
@@ -577,7 +589,7 @@ fn emit_virtual_update(
                 ));
             };
             let start = program.alloc_registers(columns + 2);
-            super::expr::translate_expr(
+            super::expr::translate_detached_expr(
                 program,
                 document,
                 &hir::Expr::RowId(update.target),
@@ -688,11 +700,11 @@ fn emit_virtual_update(
 
 /// The new value of one column an UPDATE sets.
 #[derive(Clone, Copy)]
-enum NewValue<'a> {
-    Expr(&'a hir::Expr),
+enum NewValue {
+    Expr(hir::ExprId),
     /// `SET (a, b) = (SELECT ...)`: value `part` of a row of `width` values.
     RowPart {
-        row: &'a hir::Expr,
+        row: hir::ExprId,
         part: usize,
         width: usize,
     },
@@ -701,20 +713,20 @@ enum NewValue<'a> {
 /// The rows of `SET (a, b) = (SELECT ...)` already computed for the current
 /// row, each in consecutive registers, so that each runs once.
 #[derive(Default)]
-struct RowValues<'a> {
-    computed: Vec<(&'a hir::Expr, usize)>,
+struct RowValues {
+    computed: Vec<(hir::ExprId, usize)>,
 }
 
 /// Lowers one HIR expression into a register.
-type Translate = fn(&mut ProgramBuilder, &hir::HirDocument, &hir::Expr, usize) -> Result<usize>;
+type Translate = fn(&mut ProgramBuilder, &hir::HirDocument, hir::ExprId, usize) -> Result<usize>;
 
-impl<'a> NewValue<'a> {
+impl NewValue {
     fn emit(
         self,
         program: &mut ProgramBuilder,
         document: &hir::HirDocument,
         register: usize,
-        rows: &mut RowValues<'a>,
+        rows: &mut RowValues,
         translate: Translate,
     ) -> Result<()> {
         match self {
@@ -722,11 +734,7 @@ impl<'a> NewValue<'a> {
                 translate(program, document, value, register)?;
             }
             NewValue::RowPart { row, part, width } => {
-                let start = match rows
-                    .computed
-                    .iter()
-                    .find(|(computed, _)| std::ptr::eq(*computed, row))
-                {
+                let start = match rows.computed.iter().find(|(computed, _)| *computed == row) {
                     Some((_, start)) => *start,
                     None => {
                         let start = program.alloc_registers(width);
@@ -749,7 +757,7 @@ impl<'a> NewValue<'a> {
 /// What every row of an UPDATE computes, shared by both loops.
 struct UpdateRowLayout<'a> {
     /// Each column's assigned value, if any.
-    values: &'a [Option<NewValue<'a>>],
+    values: &'a [Option<NewValue>],
     /// UPDATE ... FROM: the scratch table the join filled, and for each
     /// assigned column the scratch column holding its value.
     scratch: Option<(CursorID, &'a [Option<usize>])>,
@@ -764,7 +772,7 @@ struct UpdateRowLayout<'a> {
     /// The CHECK constraints the new row must pass.
     checks: &'a [&'a hir::CheckConstraint],
     /// The new rowid, when the UPDATE sets it.
-    rowid_value: Option<NewValue<'a>>,
+    rowid_value: Option<NewValue>,
     new_source: hir::SourceId,
     foreign_keys: &'a hir::DmlForeignKeys,
     returning: Option<ReturningBuffer<'a>>,
@@ -961,7 +969,7 @@ fn emit_from_update(
             )?;
         }
         let rowid = program.alloc_register();
-        super::expr::translate_expr(
+        super::expr::translate_detached_expr(
             program,
             document,
             &hir::Expr::RowId(target.source.id),
@@ -1236,15 +1244,16 @@ fn assigned_columns(update: &hir::Update) -> Result<Vec<hir::TargetColumn>> {
 
 /// Whether an index's key or WHERE term reads a column the UPDATE assigns.
 pub(super) fn index_reads_assigned_column(
+    document: &hir::HirDocument,
     target: hir::SourceId,
     index: &hir::IndexExpressions,
     assigned: &[hir::TargetColumn],
 ) -> bool {
     let is_assigned = |column: usize| assigned.contains(&hir::TargetColumn::Column(column));
-    let reads_assigned = |expression: &hir::Expr| {
+    let reads_assigned = |expression: hir::ExprId| {
         let mut reads = false;
-        expression.for_each(&mut |expression| {
-            if let hir::Expr::Column(column) = expression {
+        document.exprs.at(expression).for_each(&mut |expression| {
+            if let hir::Expr::Column(column) = expression.node() {
                 reads |= column.source == target && is_assigned(column.column);
             }
         });
@@ -1258,10 +1267,10 @@ pub(super) fn index_reads_assigned_column(
             .iter()
             .zip(&index.columns)
             .any(|(column, expression)| match expression {
-                Some(expression) => reads_assigned(expression),
+                Some(expression) => reads_assigned(*expression),
                 None => is_assigned(column.pos_in_table),
             });
-    key_reads || index.predicate.as_ref().is_some_and(reads_assigned)
+    key_reads || index.predicate.is_some_and(reads_assigned)
 }
 
 /// The registers of the row an UPDATE rewrites: the rowid, then one
@@ -1481,7 +1490,7 @@ impl UpdateRow<'_, '_> {
                 // given them as stored.
                 super::dml::with_stored_values(program, |program| {
                     for column in 0..columns {
-                        super::expr::translate_expr_no_constant_opt(
+                        super::expr::translate_detached_expr_no_constant_opt(
                             program,
                             document,
                             &hir::Expr::Column(hir::ColumnRef {
@@ -1984,7 +1993,7 @@ impl UpdateRow<'_, '_> {
                 super::expr::translate_expr_no_constant_opt(
                     program,
                     self.target.document,
-                    &default.value,
+                    default.value,
                     register,
                 )?;
                 program.preassign_label_to_next_insn(not_null);
@@ -2030,14 +2039,14 @@ impl UpdateRow<'_, '_> {
                 super::expr::translate_expr_no_constant_opt(
                     program,
                     document,
-                    old_predicate,
+                    *old_predicate,
                     old_in_index,
                 )?;
                 let new_in_index = program.alloc_register();
                 super::expr::translate_expr_no_constant_opt(
                     program,
                     document,
-                    new_predicate,
+                    *new_predicate,
                     new_in_index,
                 )?;
                 (Some(old_in_index), Some(new_in_index))
@@ -2058,7 +2067,10 @@ impl UpdateRow<'_, '_> {
             match expression {
                 Some(expression) if !super::dml::is_virtual_key_column(table, column) => {
                     super::expr::translate_expr_no_constant_opt(
-                        program, document, expression, register,
+                        program,
+                        document,
+                        *expression,
+                        register,
                     )?
                 }
                 _ => {

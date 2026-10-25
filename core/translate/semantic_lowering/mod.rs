@@ -298,7 +298,13 @@ impl PlannedSelect {
                 // its arms agree on; arms of different classes leave it
                 // without a declared type.
                 let affinity = if query.blocks.len() > 1 {
-                    compound_column_affinity(query, position, &|source| document.source(source)).0
+                    compound_column_affinity(
+                        query,
+                        position,
+                        &|source| document.source(source),
+                        &document.exprs,
+                    )
+                    .0
                 } else {
                     output.schema_affinity
                 };
@@ -366,10 +372,10 @@ impl PlannedSelect {
             let target = start + position;
             if self.stored_outputs.contains(&position) {
                 dml::with_stored_values(program, |program| {
-                    expr::translate_expr_no_constant_opt(program, document, &output.expr, target)
+                    expr::translate_expr_no_constant_opt(program, document, output.expr, target)
                 })?;
             } else {
-                expr::translate_expr_no_constant_opt(program, document, &output.expr, target)?;
+                expr::translate_expr_no_constant_opt(program, document, output.expr, target)?;
             }
         }
         Ok(())
@@ -731,7 +737,7 @@ fn rewrite_rowid_outputs(document: &mut HirDocument, positions: &[usize]) -> Res
         ));
     };
     let query = root.query;
-    let [block] = document.queries[query.index()].blocks.as_mut_slice() else {
+    let [block] = document.queries[query.index()].blocks.as_slice() else {
         return Err(LimboError::InternalError(
             "HIR scan has more than one query block".into(),
         ));
@@ -742,10 +748,14 @@ fn rewrite_rowid_outputs(document: &mut HirDocument, positions: &[usize]) -> Res
         .map(|from| from.first)
         .ok_or_else(|| LimboError::InternalError("HIR scan reads no table".into()))?;
     for &position in positions {
-        let output = block.outputs.get_mut(position).ok_or_else(|| {
-            LimboError::InternalError(format!("HIR scan has no output {position}"))
-        })?;
-        output.expr = hir::Expr::rowid(source);
+        let rowid = document.exprs.push(hir::Expr::rowid(source));
+        let output = document.queries[query.index()].blocks[0]
+            .outputs
+            .get_mut(position)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!("HIR scan has no output {position}"))
+            })?;
+        output.expr = rowid;
         output.type_fact = hir::TypeFact::known(Type::Integer);
         output.affinity = Affinity::Integer;
         output.schema_affinity = Affinity::Integer;
@@ -836,9 +846,9 @@ fn resolved_output_columns_from(
     outputs
         .iter()
         .map(|output| {
-            let value = match group_column_of(document, from, &output.expr) {
-                Some(column) => resolved_result_value(document, &column)?,
-                None => resolved_result_value(document, &output.expr)?,
+            let value = match group_column_of(document, from, output.expr) {
+                Some(column) => resolved_result_value(document, &hir::Expr::Column(column))?,
+                None => resolved_result_value(document, &document.exprs[output.expr])?,
             };
             Ok(ResolvedResultColumn {
                 name: output.name.clone(),
@@ -848,7 +858,7 @@ fn resolved_output_columns_from(
                 ),
                 value,
                 affinity: output.affinity,
-                primitive: expression_primitive(document, &output.expr),
+                primitive: expression_primitive(document, &document.exprs[output.expr]),
             })
         })
         .collect()
@@ -862,16 +872,18 @@ fn resolved_output_columns_from(
 fn group_column_of(
     document: &HirDocument,
     from: Option<&hir::From>,
-    expression: &hir::Expr,
-) -> Option<hir::Expr> {
+    expression: hir::ExprId,
+) -> Option<hir::ColumnRef> {
     let bare = |group: &hir::Source| {
         from.is_some_and(|from| from.first == group.id && from.joins.is_empty())
     };
-    let mut found = None;
-    let mut expression = match expression {
-        hir::Expr::Column(_) | hir::Expr::MergedColumn(_) => expression.clone(),
-        _ => return None,
-    };
+    if !matches!(
+        document.exprs[expression],
+        hir::Expr::Column(_) | hir::Expr::MergedColumn(_)
+    ) {
+        return None;
+    }
+    let mut found: Option<hir::ColumnRef> = None;
     loop {
         let outer = document.sources.iter().find_map(|source| {
             let hir::SourceKind::FromGroup(group) = &source.kind else {
@@ -880,20 +892,22 @@ fn group_column_of(
             if bare(source) {
                 return None;
             }
-            let column = group
-                .columns
-                .iter()
-                .position(|value| value.equivalent(&expression))?;
-            Some(hir::Expr::Column(hir::ColumnRef {
+            let column = group.columns.iter().position(|value| match found {
+                Some(inner) => {
+                    matches!(document.exprs[*value], hir::Expr::Column(column) if column == inner)
+                }
+                None => document
+                    .exprs
+                    .at(*value)
+                    .equivalent(document.exprs.at(expression)),
+            })?;
+            Some(hir::ColumnRef {
                 source: source.id,
                 column,
-            }))
+            })
         });
         match outer {
-            Some(outer) => {
-                expression = outer.clone();
-                found = Some(outer);
-            }
+            Some(outer) => found = Some(outer),
             None => return found,
         }
     }
@@ -917,14 +931,14 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
                 _ => None,
             }
         }
-        hir::Expr::Collate { expr, .. } => expression_primitive(document, expr),
+        hir::Expr::Collate { expr, .. } => expression_primitive(document, &document.exprs[*expr]),
         hir::Expr::Unary { operator, expr } => match operator {
             UnaryOperator::Not | UnaryOperator::BitwiseNot => Some("INTEGER"),
             UnaryOperator::Negative => Some(arithmetic_primitive(
                 Some("INTEGER"),
-                expression_primitive(document, expr),
+                expression_primitive(document, &document.exprs[*expr]),
             )),
-            UnaryOperator::Positive => expression_primitive(document, expr),
+            UnaryOperator::Positive => expression_primitive(document, &document.exprs[*expr]),
         },
         hir::Expr::Binary {
             lhs, operator, rhs, ..
@@ -934,8 +948,8 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
             | Operator::Multiply
             | Operator::Divide
             | Operator::Modulus => Some(arithmetic_primitive(
-                expression_primitive(document, lhs),
-                expression_primitive(document, rhs),
+                expression_primitive(document, &document.exprs[*lhs]),
+                expression_primitive(document, &document.exprs[*rhs]),
             )),
             Operator::BitwiseAnd
             | Operator::BitwiseOr
@@ -964,10 +978,7 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
             ..
         } => common_primitive(
             document,
-            when_then
-                .iter()
-                .map(|(_, then)| then)
-                .chain(else_expr.as_deref()),
+            when_then.iter().map(|(_, then)| *then).chain(*else_expr),
         ),
         hir::Expr::Function(call) => {
             let hir::FunctionArguments::Expressions { values, .. } = &call.arguments else {
@@ -976,11 +987,13 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
             match call.function.value() {
                 Func::Scalar(
                     ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Max | ScalarFunc::Min,
-                ) => common_primitive(document, values.iter()),
-                Func::Scalar(ScalarFunc::Nullif) => expression_primitive(document, values.first()?),
+                ) => common_primitive(document, values.iter().copied()),
+                Func::Scalar(ScalarFunc::Nullif) => {
+                    expression_primitive(document, &document.exprs[*values.first()?])
+                }
                 Func::Scalar(ScalarFunc::Abs) => Some(arithmetic_primitive(
                     Some("INTEGER"),
-                    expression_primitive(document, values.first()?),
+                    expression_primitive(document, &document.exprs[*values.first()?]),
                 )),
                 _ => None,
             }
@@ -998,13 +1011,14 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
 /// The type every non-NULL expression converts to, as PostgreSQL types
 /// CASE branches and COALESCE arguments: mixed numeric types widen the way
 /// arithmetic does, and any other mix has no common type.
-fn common_primitive<'a>(
+fn common_primitive(
     document: &HirDocument,
-    expressions: impl Iterator<Item = &'a hir::Expr>,
+    expressions: impl Iterator<Item = hir::ExprId>,
 ) -> Option<&'static str> {
     let is_numeric = |primitive| matches!(primitive, "INTEGER" | "REAL" | "NUMERIC");
     let mut common = None;
     for expression in expressions
+        .map(|expression| &document.exprs[expression])
         .filter(|expression| !matches!(expression, hir::Expr::Literal(ast::Literal::Null)))
     {
         let primitive = expression_primitive(document, expression)?;
@@ -1043,7 +1057,7 @@ fn expression_affinity(document: &HirDocument, expression: &hir::Expr) -> Affini
             .output(*id)
             .map_or(Affinity::Blob, |output| output.affinity),
         hir::Expr::Cast { target, .. } => target.affinity,
-        hir::Expr::Collate { expr, .. } => expression_affinity(document, expr),
+        hir::Expr::Collate { expr, .. } => expression_affinity(document, &document.exprs[*expr]),
         _ => Affinity::Blob,
     }
 }
@@ -1059,7 +1073,9 @@ fn resolved_result_value(
     };
     match expression {
         // SQLite names a USING column after the left table's column.
-        hir::Expr::MergedColumn(merged) => resolved_result_value(document, &merged.left),
+        hir::Expr::MergedColumn(merged) => {
+            resolved_result_value(document, &document.exprs[merged.left])
+        }
         hir::Expr::Column(reference) => {
             let source = source_of(reference.source)?;
             if let Some(table) = catalog_table(source) {
@@ -1093,7 +1109,9 @@ fn resolved_result_value(
                             .query(*query)
                             .and_then(|query| query.blocks.first())
                             .and_then(|block| block.outputs.get(reference.column))
-                            .is_some_and(|output| matches!(output.expr, hir::Expr::RowId(_)))
+                            .is_some_and(|output| {
+                                matches!(document.exprs[output.expr], hir::Expr::RowId(_))
+                            })
                 );
             let (declared_type, ty) = if reads_rowid {
                 ("INTEGER".to_string(), Type::Integer)

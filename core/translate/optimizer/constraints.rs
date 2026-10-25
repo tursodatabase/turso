@@ -222,8 +222,8 @@ pub struct TableConstraints<E = ast::Expr> {
     pub temporary_index_terms: SmallVec<[ConstraintRef; 4]>,
 }
 
-pub(crate) type HirConstraint = Constraint<hir::Expr>;
-pub(crate) type HirTableConstraints = TableConstraints<hir::Expr>;
+pub(crate) type HirConstraint = Constraint<hir::ExprId>;
+pub(crate) type HirTableConstraints = TableConstraints<hir::ExprId>;
 
 /// Resolved source facts needed while collecting HIR constraints.
 ///
@@ -297,12 +297,12 @@ impl HirConstraintTarget {
 }
 
 #[derive(Debug)]
-pub(crate) struct HirBinaryConstraintPart<'a> {
+pub(crate) struct HirBinaryConstraintPart {
     pub(crate) target: HirConstraintTarget,
     pub(crate) operator: ConstraintOperator,
     pub(crate) side: BinaryExprSide,
-    pub(crate) constrained_expr: &'a hir::Expr,
-    pub(crate) constraining_expr: &'a hir::Expr,
+    pub(crate) constrained_expr: hir::ExprId,
+    pub(crate) constraining_expr: hir::ExprId,
     pub(crate) comparison_affinity: Option<Affinity>,
     pub(crate) comparison_collation: Option<CollationSeq>,
 }
@@ -312,10 +312,10 @@ pub(crate) struct HirBinaryConstraintPart<'a> {
 /// The side points at the constraining expression. For example,
 /// `1 > items.value` returns `Lhs` and normalizes the operator to `<`. Both
 /// sides are returned when both directly reference the source.
-pub(crate) fn hir_binary_constraint_parts<'a>(
-    expr: &'a hir::Expr,
+pub(crate) fn hir_binary_constraint_parts(
+    expr: hir::ExprRef<'_>,
     source: hir::SourceId,
-) -> SmallVec<[HirBinaryConstraintPart<'a>; 2]> {
+) -> SmallVec<[HirBinaryConstraintPart; 2]> {
     let mut parts = SmallVec::new();
     let hir::Expr::Binary {
         lhs,
@@ -323,12 +323,13 @@ pub(crate) fn hir_binary_constraint_parts<'a>(
         rhs,
         comparison: Some(comparison),
         ..
-    } = expr
+    } = expr.node()
     else {
         return parts;
     };
+    let (lhs, rhs) = (*lhs, *rhs);
 
-    let target = |expr: &hir::Expr| match expr {
+    let target = |child: hir::ExprId| match expr.at(child).node() {
         hir::Expr::Column(column) if column.source == source => {
             Some(HirConstraintTarget::Column(*column))
         }
@@ -377,11 +378,11 @@ pub(crate) fn hir_binary_constraint_parts<'a>(
     parts
 }
 
-fn hir_truth_test_rhs(expr: &hir::Expr) -> Option<bool> {
-    match expr {
+fn hir_truth_test_rhs(expr: hir::ExprRef<'_>) -> Option<bool> {
+    match expr.node() {
         hir::Expr::Literal(ast::Literal::True) => Some(true),
         hir::Expr::Literal(ast::Literal::False) => Some(false),
-        hir::Expr::Collate { expr, .. } => hir_truth_test_rhs(expr),
+        hir::Expr::Collate { expr: inner, .. } => hir_truth_test_rhs(expr.at(*inner)),
         _ => None,
     }
 }
@@ -412,13 +413,14 @@ fn hir_binary_constraints_for_term(
 ) -> Result<SmallVec<[HirConstraint; 2]>> {
     let source = source_definition.id;
     let mut constraints = SmallVec::new();
-    if let hir::Expr::IsNull(constrained_expr) = &term.expr {
+    let term_expr = document.expr(term.expr);
+    if let hir::Expr::IsNull(constrained_expr) = term_expr.node() {
         if let Some(constraint) = hir_is_null_constraint_for_term(
             document,
             from,
             term_position,
             term,
-            constrained_expr,
+            *constrained_expr,
             source_definition,
             constraint_source,
             schema,
@@ -428,10 +430,10 @@ fn hir_binary_constraints_for_term(
         }
         return Ok(constraints);
     }
-    let hir::Expr::Binary { operator, rhs, .. } = &term.expr else {
+    let hir::Expr::Binary { operator, rhs, .. } = term_expr.node() else {
         return Ok(constraints);
     };
-    if *operator == ast::Operator::Is && hir_truth_test_rhs(rhs).is_some() {
+    if *operator == ast::Operator::Is && hir_truth_test_rhs(term_expr.at(*rhs)).is_some() {
         return Ok(constraints);
     }
     if term
@@ -441,7 +443,7 @@ fn hir_binary_constraints_for_term(
         return Ok(constraints);
     }
 
-    for part in hir_binary_constraint_parts(&term.expr, source) {
+    for part in hir_binary_constraint_parts(term_expr, source) {
         if matches!(part.target, HirConstraintTarget::Expression(_)) {
             let target_mask = table_mask_from_hir_scope(document, from, part.constrained_expr)?;
             let target_position = from.source_position(part.target.source()).ok_or_else(|| {
@@ -455,7 +457,8 @@ fn hir_binary_constraints_for_term(
             }
         }
         let is_op = part.operator.as_ast_operator() == Some(ast::Operator::Is);
-        let null_matching = is_op && !hir_is_non_null_literal(part.constraining_expr);
+        let null_matching =
+            is_op && !hir_is_non_null_literal(&document.exprs[part.constraining_expr]);
         let usable = term.from_outer_join == Some(source)
             || if is_op {
                 !from.outer_join_may_null_extend(source)
@@ -525,7 +528,7 @@ fn hir_is_null_constraint_for_term(
     from: &impl HirFromScope,
     term_position: usize,
     term: &HirWhereTerm,
-    constrained_expr: &hir::Expr,
+    constrained_expr: hir::ExprId,
     source_definition: &hir::Source,
     constraint_source: HirConstraintSource<'_>,
     schema: &Schema,
@@ -538,7 +541,7 @@ fn hir_is_null_constraint_for_term(
     {
         return Ok(None);
     }
-    let table_col_pos = match constrained_expr {
+    let table_col_pos = match &document.exprs[constrained_expr] {
         hir::Expr::Column(column) if column.source == source => Some(column.column),
         hir::Expr::Literal(_)
         | hir::Expr::Parameter(_)
@@ -579,11 +582,7 @@ fn hir_is_null_constraint_for_term(
         where_clause_pos: (term_position, BinaryExprSide::Rhs),
         operator,
         table_col_pos,
-        constraining_expr: Some((
-            ast::Operator::Is,
-            hir::Expr::Literal(ast::Literal::Null),
-            Affinity::Blob,
-        )),
+        constraining_expr: Some((ast::Operator::Is, document.planning.null(), Affinity::Blob)),
         lhs_mask: TableMask::default(),
         selectivity,
         usable: term.from_outer_join == Some(source) || !from.outer_join_may_null_extend(source),
@@ -705,14 +704,14 @@ fn hir_selectivity_index_for_column<'a>(
 }
 
 fn hir_partial_index_selectivity(
-    predicate: &hir::Expr,
+    predicate: hir::ExprRef<'_>,
     table: &HirPlannedSource,
     source: &hir::Source,
     schema: &Schema,
     params: &CostModelParams,
 ) -> f64 {
-    let resolve_side = |expression: &hir::Expr| {
-        let (column, is_rowid) = match expression {
+    let resolve_side = |expression: hir::ExprRef<'_>| {
+        let (column, is_rowid) = match expression.node() {
             hir::Expr::Column(column) if column.source == source.id => (Some(column.column), false),
             hir::Expr::RowId(row_source) if *row_source == source.id => (None, true),
             _ => return None,
@@ -720,14 +719,14 @@ fn hir_partial_index_selectivity(
         let physical_column = column.map(|position| &table.table.columns()[position]);
         Some((physical_column, column, is_rowid))
     };
-    let leaf = |lhs: &hir::Expr, rhs: &hir::Expr, operator: ConstraintOperator| {
+    let leaf = |lhs: hir::ExprRef<'_>, rhs: hir::ExprRef<'_>, operator: ConstraintOperator| {
         let (column, column_position, is_rowid) = resolve_side(lhs)
             .or_else(|| resolve_side(rhs))
             .unwrap_or((None, None, false));
         let index = column_position
             .and_then(|position| hir_selectivity_index_for_column(schema, table, source, position));
         let null_matching = operator.as_ast_operator() == Some(ast::Operator::Is)
-            && !(hir_is_non_null_literal(lhs) || hir_is_non_null_literal(rhs));
+            && !(hir_is_non_null_literal(lhs.node()) || hir_is_non_null_literal(rhs.node()));
         hir_estimate_constraint_selectivity(
             schema,
             table,
@@ -740,106 +739,119 @@ fn hir_partial_index_selectivity(
         )
     };
 
-    predicate.fold(&mut |expression, children: &[f64]| match expression {
-        hir::Expr::Binary {
-            operator: ast::Operator::And,
-            ..
-        } => {
-            let [left, right] = children else {
-                unreachable!("binary AND has two children")
-            };
-            left * right
-        }
-        hir::Expr::Binary {
-            operator: ast::Operator::Or,
-            ..
-        } => {
-            let [left, right] = children else {
-                unreachable!("binary OR has two children")
-            };
-            (left + right - left * right).min(1.0)
-        }
-        hir::Expr::Binary {
-            operator: ast::Operator::Is,
-            rhs,
-            ..
-        } if matches!(rhs.as_ref(), hir::Expr::Literal(ast::Literal::Null)) => params.sel_is_null,
-        hir::Expr::Binary {
-            operator: ast::Operator::IsNot,
-            rhs,
-            ..
-        } if matches!(rhs.as_ref(), hir::Expr::Literal(ast::Literal::Null)) => {
-            params.sel_is_not_null
-        }
-        hir::Expr::Binary {
-            lhs, operator, rhs, ..
-        } => leaf(lhs, rhs, (*operator).into()),
-        hir::Expr::IsNull(_) => params.sel_is_null,
-        hir::Expr::NotNull(_) => params.sel_is_not_null,
-        hir::Expr::Between { negated, .. } => {
-            if *negated {
-                1.0 - params.sel_range
-            } else {
-                params.sel_range
+    predicate.fold(
+        &mut |expression, children: &[f64]| match expression.node() {
+            hir::Expr::Binary {
+                operator: ast::Operator::And,
+                ..
+            } => {
+                let [left, right] = children else {
+                    unreachable!("binary AND has two children")
+                };
+                left * right
             }
-        }
-        hir::Expr::InList {
-            lhs,
-            negated,
-            values,
-            ..
-        } => leaf(
-            lhs,
-            lhs,
-            ConstraintOperator::In {
-                not: *negated,
-                estimated_values: values.len() as f64,
-            },
-        ),
-        hir::Expr::Like { negated, .. } => {
-            if *negated {
-                params.sel_not_like
-            } else {
-                params.sel_like
+            hir::Expr::Binary {
+                operator: ast::Operator::Or,
+                ..
+            } => {
+                let [left, right] = children else {
+                    unreachable!("binary OR has two children")
+                };
+                (left + right - left * right).min(1.0)
             }
-        }
-        hir::Expr::Unary {
-            operator: ast::UnaryOperator::Not,
-            ..
-        } => {
-            let [value] = children else {
-                unreachable!("unary NOT has one child")
-            };
-            1.0 - value
-        }
-        _ => params.sel_other,
-    })
+            hir::Expr::Binary {
+                operator: ast::Operator::Is,
+                rhs,
+                ..
+            } if matches!(
+                expression.arena()[*rhs],
+                hir::Expr::Literal(ast::Literal::Null)
+            ) =>
+            {
+                params.sel_is_null
+            }
+            hir::Expr::Binary {
+                operator: ast::Operator::IsNot,
+                rhs,
+                ..
+            } if matches!(
+                expression.arena()[*rhs],
+                hir::Expr::Literal(ast::Literal::Null)
+            ) =>
+            {
+                params.sel_is_not_null
+            }
+            hir::Expr::Binary {
+                lhs, operator, rhs, ..
+            } => leaf(expression.at(*lhs), expression.at(*rhs), (*operator).into()),
+            hir::Expr::IsNull(_) => params.sel_is_null,
+            hir::Expr::NotNull(_) => params.sel_is_not_null,
+            hir::Expr::Between { negated, .. } => {
+                if *negated {
+                    1.0 - params.sel_range
+                } else {
+                    params.sel_range
+                }
+            }
+            hir::Expr::InList {
+                lhs,
+                negated,
+                values,
+                ..
+            } => leaf(
+                expression.at(*lhs),
+                expression.at(*lhs),
+                ConstraintOperator::In {
+                    not: *negated,
+                    estimated_values: values.len() as f64,
+                },
+            ),
+            hir::Expr::Like { negated, .. } => {
+                if *negated {
+                    params.sel_not_like
+                } else {
+                    params.sel_like
+                }
+            }
+            hir::Expr::Unary {
+                operator: ast::UnaryOperator::Not,
+                ..
+            } => {
+                let [value] = children else {
+                    unreachable!("unary NOT has one child")
+                };
+                1.0 - value
+            }
+            _ => params.sel_other,
+        },
+    )
 }
 
 fn hir_constrained_expr<'a>(
+    document: &'a hir::HirDocument,
     constraint: &HirConstraint,
-    where_clause: &'a [HirWhereTerm],
-) -> Result<&'a hir::Expr> {
+    where_clause: &[HirWhereTerm],
+) -> Result<hir::ExprRef<'a>> {
     let (term_position, constraining_side) = constraint.where_clause_pos;
     let term = where_clause.get(term_position).ok_or_else(|| {
         crate::LimboError::InternalError(format!(
             "HIR constraint WHERE position {term_position} is out of bounds"
         ))
     })?;
-    let (lhs, rhs) = match &term.expr {
-        hir::Expr::Binary { lhs, rhs, .. } => (lhs, rhs),
+    let (lhs, rhs) = match &document.exprs[term.expr] {
+        hir::Expr::Binary { lhs, rhs, .. } => (*lhs, *rhs),
         // `x IS NULL` constrains x; see `hir_is_null_constraint_for_term`.
-        hir::Expr::IsNull(constrained) => return Ok(constrained),
+        hir::Expr::IsNull(constrained) => return Ok(document.exprs.at(*constrained)),
         _ => {
             return Err(crate::LimboError::InternalError(format!(
                 "HIR constraint WHERE position {term_position} is not binary"
             )))
         }
     };
-    Ok(match constraining_side {
+    Ok(document.exprs.at(match constraining_side {
         BinaryExprSide::Lhs => rhs,
         BinaryExprSide::Rhs => lhs,
-    })
+    }))
 }
 
 fn hir_index_expressions<'a>(
@@ -862,11 +874,11 @@ fn hir_index_expressions<'a>(
 
 /// Whether a query WHERE term proves an index predicate conjunct: the term
 /// is the conjunct, or the conjunct is an OR with a branch the term proves.
-fn hir_query_term_implies_predicate(query: &hir::Expr, predicate: &hir::Expr) -> bool {
+fn hir_query_term_implies_predicate(query: hir::ExprRef<'_>, predicate: hir::ExprRef<'_>) -> bool {
     if query.equivalent(predicate) {
         return true;
     }
-    match predicate {
+    match predicate.node() {
         hir::Expr::Binary {
             lhs,
             operator: ast::Operator::Or,
@@ -874,17 +886,18 @@ fn hir_query_term_implies_predicate(query: &hir::Expr, predicate: &hir::Expr) ->
             custom: None,
             ..
         } => {
-            hir_query_term_implies_predicate(query, lhs)
-                || hir_query_term_implies_predicate(query, rhs)
+            hir_query_term_implies_predicate(query, predicate.at(*lhs))
+                || hir_query_term_implies_predicate(query, predicate.at(*rhs))
         }
         _ => false,
     }
 }
 
 fn hir_partial_index_predicate_terms(
+    document: &hir::HirDocument,
     from: &impl HirFromScope,
     source: hir::SourceId,
-    predicate: &hir::Expr,
+    predicate: hir::ExprId,
     query_where_clause: &[HirWhereTerm],
 ) -> Option<SmallVec<[usize; 4]>> {
     let full_join = from.full_join_may_null_extend(source);
@@ -900,14 +913,18 @@ fn hir_partial_index_predicate_terms(
             }
     };
     let mut matched_terms = SmallVec::new();
-    for index_conjunct in &crate::translate::plan::hir_planning_conjuncts(predicate) {
+    for &index_conjunct in document.planning.conjuncts(predicate) {
+        let index_conjunct = document.exprs.at(index_conjunct);
         let (term_position, term) = query_where_clause.iter().enumerate().find(|(_, term)| {
-            can_use_query_term(term) && hir_query_term_implies_predicate(&term.expr, index_conjunct)
+            can_use_query_term(term)
+                && hir_query_term_implies_predicate(document.exprs.at(term.expr), index_conjunct)
         })?;
         // A query term that proves one branch of an OR makes the partial
         // index usable, but the index also holds rows of the other branch,
         // so the term stays a filter unless it is the whole conjunct.
-        if index_conjunct.equivalent(&term.expr) && !matched_terms.contains(&term_position) {
+        if index_conjunct.equivalent(document.exprs.at(term.expr))
+            && !matched_terms.contains(&term_position)
+        {
             matched_terms.push(term_position);
         }
     }
@@ -965,7 +982,7 @@ fn hir_scalar_comparison(
 }
 
 fn hir_in_list_comparison(
-    values: &[hir::Expr],
+    values: &[hir::ExprId],
     comparisons: &[hir::ComparisonSemantics],
 ) -> Result<Option<(Affinity, Option<CollationSeq>)>> {
     if comparisons.len() != values.len() {
@@ -1006,7 +1023,7 @@ fn hir_in_list_constraint_for_term(
         negated,
         values,
         comparisons,
-    } = &term.expr
+    } = &document.exprs[term.expr]
     else {
         return Ok(None);
     };
@@ -1017,7 +1034,7 @@ fn hir_in_list_constraint_for_term(
     };
 
     let rowid_alias_column = constraint_source.rowid_alias_column();
-    let (table_col_pos, is_rowid) = match lhs.as_ref() {
+    let (table_col_pos, is_rowid) = match &document.exprs[*lhs] {
         hir::Expr::Column(column) if column.source == source => (
             Some(column.column),
             rowid_alias_column == Some(column.column),
@@ -1027,7 +1044,7 @@ fn hir_in_list_constraint_for_term(
     };
 
     let mut rhs_mask = TableMask::default();
-    for value in values {
+    for &value in values {
         rhs_mask.union_with(&table_mask_from_hir_scope(document, from, value)?)?;
     }
     let estimated_values = values.len() as f64;
@@ -1076,7 +1093,7 @@ fn hir_in_query_constraint_for_term(
         query,
         negated,
         comparison,
-    }) = &term.expr
+    }) = &document.exprs[term.expr]
     else {
         return Ok(None);
     };
@@ -1097,7 +1114,7 @@ fn hir_in_query_constraint_for_term(
     };
 
     let rowid_alias_column = constraint_source.rowid_alias_column();
-    let (table_col_pos, is_rowid) = match lhs.as_ref() {
+    let (table_col_pos, is_rowid) = match &document.exprs[*lhs] {
         hir::Expr::Column(column) if column.source == source => (
             Some(column.column),
             rowid_alias_column == Some(column.column),
@@ -1221,20 +1238,20 @@ pub(crate) fn hir_constraints_for_source(
             continue;
         }
         let partial_index = if index.where_clause.is_some() {
-            let predicate = expressions.predicate.as_ref().ok_or_else(|| {
+            let predicate = expressions.predicate.ok_or_else(|| {
                 crate::LimboError::InternalError(format!(
                     "HIR metadata for partial index {} has no predicate",
                     index.name
                 ))
             })?;
             let Some(predicate_terms) =
-                hir_partial_index_predicate_terms(from, source, predicate, where_clause)
+                hir_partial_index_predicate_terms(document, from, source, predicate, where_clause)
             else {
                 continue;
             };
             Some(PartialIndexCandidate {
                 selectivity: hir_partial_index_selectivity(
-                    predicate,
+                    document.exprs.at(predicate),
                     table,
                     source_definition,
                     schema,
@@ -1324,11 +1341,12 @@ pub(crate) fn hir_constraints_for_source(
                     else {
                         continue;
                     };
-                    let constrained_expr = hir_constrained_expr(constraint, where_clause)?;
+                    let constrained_expr =
+                        hir_constrained_expr(document, constraint, where_clause)?;
                     expressions.columns.iter().position(|indexed_expr| {
-                        indexed_expr
-                            .as_ref()
-                            .is_some_and(|indexed_expr| constrained_expr.equivalent(indexed_expr))
+                        indexed_expr.is_some_and(|indexed_expr| {
+                            constrained_expr.equivalent(document.exprs.at(indexed_expr))
+                        })
                     })
                 }
                 None => None,
@@ -1637,11 +1655,12 @@ impl RangeConstraintRef {
 
     pub(crate) fn as_hir_seek_range_constraint(
         &self,
+        exprs: &hir::ExprArena,
         constraints: &[HirConstraint],
         where_clause: &[HirWhereTerm],
-    ) -> SeekRangeConstraint<hir::Expr> {
+    ) -> SeekRangeConstraint<hir::ExprId> {
         self.map_seek_range(|position| {
-            constraints[position].get_hir_constraining_expr(where_clause)
+            constraints[position].get_hir_constraining_expr(exprs, where_clause)
         })
     }
 }
@@ -1649,29 +1668,30 @@ impl RangeConstraintRef {
 impl HirConstraint {
     pub(super) fn get_hir_constraining_expr(
         &self,
+        exprs: &hir::ExprArena,
         where_clause: &[HirWhereTerm],
-    ) -> (ast::Operator, hir::Expr, Affinity) {
-        if let Some(constraining) = &self.constraining_expr {
-            return constraining.clone();
+    ) -> (ast::Operator, hir::ExprId, Affinity) {
+        if let Some(constraining) = self.constraining_expr {
+            return constraining;
         }
 
         let (term_position, side) = self.where_clause_pos;
-        let hir::Expr::Binary { lhs, rhs, .. } = &where_clause[term_position].expr else {
+        let hir::Expr::Binary { lhs, rhs, .. } = &exprs[where_clause[term_position].expr] else {
             panic!("expected HIR seek constraint to reference a binary expression");
         };
         let expression = match side {
-            BinaryExprSide::Lhs => lhs.as_ref(),
-            BinaryExprSide::Rhs => rhs.as_ref(),
+            BinaryExprSide::Lhs => *lhs,
+            BinaryExprSide::Rhs => *rhs,
         };
         let mut affinity = self.comparison_affinity.unwrap_or(Affinity::Blob);
-        if hir_expr_needs_no_affinity_change(affinity, expression) {
+        if hir_expr_needs_no_affinity_change(affinity, &exprs[expression]) {
             affinity = Affinity::Blob;
         }
         (
             self.operator
                 .as_ast_operator()
                 .expect("HIR seek constraints use comparison operators"),
-            expression.clone(),
+            expression,
             affinity,
         )
     }
@@ -1976,6 +1996,8 @@ mod tests {
             ctes: Vec::new(),
             schema_programs: Vec::new(),
             cdc: None,
+            exprs: hir::ExprArena::default(),
+            planning: hir::PlanningTerms::default(),
         }
     }
 
@@ -2004,8 +2026,9 @@ mod tests {
         source: hir::SourceId,
         table: &Table,
         index: Arc<Index>,
-        columns: Vec<Option<hir::Expr>>,
-        predicate: Option<hir::Expr>,
+        exprs: hir::ExprArena,
+        columns: Vec<Option<hir::ExprId>>,
+        predicate: Option<hir::ExprId>,
     ) -> hir::HirDocument {
         let index_id = hir::CatalogObjectId::new(2);
         let resolved_index = hir::CatalogObject::new(
@@ -2022,6 +2045,7 @@ mod tests {
         );
         let width = table.columns().len();
         let mut document = empty_hir_document(source);
+        document.exprs = exprs;
         *document
             .sources
             .get_mut(source.index())
@@ -2095,19 +2119,25 @@ mod tests {
     }
 
     fn hir_comparison(
+        exprs: &mut hir::ExprArena,
         lhs: hir::Expr,
         operator: ast::Operator,
         rhs: hir::Expr,
         affinity: Affinity,
-    ) -> hir::Expr {
-        hir_comparison_with_collation(lhs, operator, rhs, affinity, None)
+    ) -> hir::ExprId {
+        hir_comparison_with_collation(exprs, lhs, operator, rhs, affinity, None)
     }
 
-    fn hir_binary(lhs: hir::Expr, operator: ast::Operator, rhs: hir::Expr) -> hir::Expr {
+    fn hir_binary(
+        exprs: &mut hir::ExprArena,
+        lhs: hir::Expr,
+        operator: ast::Operator,
+        rhs: hir::Expr,
+    ) -> hir::Expr {
         hir::Expr::Binary {
-            lhs: Box::new(lhs),
+            lhs: exprs.push(lhs),
             operator,
-            rhs: Box::new(rhs),
+            rhs: exprs.push(rhs),
             array_concat: false,
             custom: None,
             comparison: None,
@@ -2115,16 +2145,19 @@ mod tests {
     }
 
     fn hir_comparison_with_collation(
+        exprs: &mut hir::ExprArena,
         lhs: hir::Expr,
         operator: ast::Operator,
         rhs: hir::Expr,
         affinity: Affinity,
         collation: Option<hir::ResolvedCollation>,
-    ) -> hir::Expr {
-        hir::Expr::Binary {
-            lhs: Box::new(lhs),
+    ) -> hir::ExprId {
+        let lhs = exprs.push(lhs);
+        let rhs = exprs.push(rhs);
+        exprs.push(hir::Expr::Binary {
+            lhs,
             operator,
-            rhs: Box::new(rhs),
+            rhs,
             array_concat: false,
             custom: None,
             comparison: Some(hir::ComparisonSemantics {
@@ -2134,7 +2167,7 @@ mod tests {
                     array: false,
                 }],
             }),
-        }
+        })
     }
 
     fn resolved_collation(value: CollationSeq) -> hir::ResolvedCollation {
@@ -2147,12 +2180,13 @@ mod tests {
     }
 
     fn hir_in_list(
+        exprs: &mut hir::ExprArena,
         lhs: hir::Expr,
         negated: bool,
         values: Vec<hir::Expr>,
         affinity: Affinity,
         collation: Option<CollationSeq>,
-    ) -> hir::Expr {
+    ) -> hir::ExprId {
         let comparisons = values
             .iter()
             .map(|_| hir::ComparisonSemantics {
@@ -2163,12 +2197,14 @@ mod tests {
                 }],
             })
             .collect();
-        hir::Expr::InList {
-            lhs: Box::new(lhs),
+        let lhs = exprs.push(lhs);
+        let values = values.into_iter().map(|value| exprs.push(value)).collect();
+        exprs.push(hir::Expr::InList {
+            lhs,
             negated,
             values,
             comparisons,
-        }
+        })
     }
 
     #[test]
@@ -2235,6 +2271,7 @@ mod tests {
             document
                 .source(source)
                 .expect("test document contains HIR source"),
+            &document.exprs,
         );
 
         let access_method =
@@ -2315,6 +2352,7 @@ mod tests {
             document
                 .source(source)
                 .expect("test document contains HIR source"),
+            &document.exprs,
         );
         let params = CostModelParams::default();
 
@@ -2353,13 +2391,15 @@ mod tests {
     #[test]
     fn hir_binary_constraint_parts_follow_the_constrained_source() {
         let source = hir::SourceId::new(7);
+        let mut exprs = hir::ExprArena::default();
         let left = hir_comparison(
+            &mut exprs,
             hir::Expr::column(source, 2),
             ast::Operator::GreaterEquals,
             hir::Expr::Literal(ast::Literal::Numeric("10".into())),
             Affinity::Integer,
         );
-        let left_parts = hir_binary_constraint_parts(&left, source);
+        let left_parts = hir_binary_constraint_parts(exprs.at(left), source);
         let [left_part] = left_parts.as_slice() else {
             panic!("left column produces one constraint part");
         };
@@ -2373,18 +2413,19 @@ mod tests {
         );
         assert_eq!(left_part.side, BinaryExprSide::Rhs);
         assert!(matches!(
-            left_part.constraining_expr,
+            &exprs[left_part.constraining_expr],
             hir::Expr::Literal(ast::Literal::Numeric(value)) if value == "10"
         ));
         assert_eq!(left_part.comparison_affinity, Some(Affinity::Integer));
 
         let right = hir_comparison(
+            &mut exprs,
             hir::Expr::Literal(ast::Literal::Numeric("1".into())),
             ast::Operator::Greater,
             hir::Expr::rowid(source),
             Affinity::Integer,
         );
-        let right_parts = hir_binary_constraint_parts(&right, source);
+        let right_parts = hir_binary_constraint_parts(exprs.at(right), source);
         let [right_part] = right_parts.as_slice() else {
             panic!("right rowid produces one constraint part");
         };
@@ -2395,7 +2436,7 @@ mod tests {
         );
         assert_eq!(right_part.side, BinaryExprSide::Lhs);
         assert!(matches!(
-            right_part.constraining_expr,
+            &exprs[right_part.constraining_expr],
             hir::Expr::Literal(ast::Literal::Numeric(value)) if value == "1"
         ));
         assert_eq!(right_part.comparison_affinity, Some(Affinity::Integer));
@@ -2413,8 +2454,10 @@ mod tests {
                 constraint: hir::JoinConstraint::None,
             }],
         };
+        let mut document = empty_hir_document(source);
         let term = HirWhereTerm {
             expr: hir_comparison_with_collation(
+                &mut document.exprs,
                 hir::Expr::rowid(source),
                 ast::Operator::Is,
                 hir::Expr::column(left_source, 0),
@@ -2426,8 +2469,9 @@ mod tests {
         };
         let table = rowid_table();
         let table = hir_planned_source(source, &table);
+        crate::translate::plan::prepare_planning_terms(&mut document);
         let constraints = hir_binary_constraints_for_source(
-            &empty_hir_document(source),
+            &document,
             &from,
             &[term],
             HirConstraintSource::BTree(&table),
@@ -2457,8 +2501,10 @@ mod tests {
             first: source,
             joins: Vec::new(),
         };
+        let mut document = empty_hir_document(source);
         let range = HirWhereTerm {
             expr: hir_comparison(
+                &mut document.exprs,
                 hir::Expr::column(source, 0),
                 ast::Operator::Greater,
                 hir::Expr::Literal(ast::Literal::Numeric("1".into())),
@@ -2469,6 +2515,7 @@ mod tests {
         };
         let equality = HirWhereTerm {
             expr: hir_comparison(
+                &mut document.exprs,
                 hir::Expr::column(source, 0),
                 ast::Operator::Equals,
                 hir::Expr::column(source, 1),
@@ -2482,9 +2529,10 @@ mod tests {
             Column::new_default_integer(Some("b".into()), "INTEGER".into(), None),
         ]);
         let table = hir_planned_source(source, &table);
+        crate::translate::plan::prepare_planning_terms(&mut document);
 
         let constraints = hir_binary_constraints_for_source(
-            &empty_hir_document(source),
+            &document,
             &from,
             &[range, equality],
             HirConstraintSource::BTree(&table),
@@ -2509,8 +2557,10 @@ mod tests {
             first: source,
             joins: Vec::new(),
         };
+        let mut document = empty_hir_document(source);
         let equality = HirWhereTerm {
             expr: hir_comparison(
+                &mut document.exprs,
                 hir::Expr::column(source, 0),
                 ast::Operator::Equals,
                 hir::Expr::Literal(ast::Literal::Numeric("1".into())),
@@ -2521,6 +2571,7 @@ mod tests {
         };
         let in_list = HirWhereTerm {
             expr: hir_in_list(
+                &mut document.exprs,
                 hir::Expr::column(source, 0),
                 false,
                 vec![
@@ -2534,8 +2585,9 @@ mod tests {
             consumed: false,
         };
         let params = CostModelParams::default();
+        crate::translate::plan::prepare_planning_terms(&mut document);
         let constraints = hir_constraints_for_source(
-            &empty_hir_document(source),
+            &document,
             &from,
             &[equality, in_list],
             HirConstraintSource::Derived {
@@ -2569,8 +2621,10 @@ mod tests {
                 constraint: hir::JoinConstraint::None,
             }],
         };
+        let mut document = empty_hir_document(source);
         let term = HirWhereTerm {
             expr: hir_in_list(
+                &mut document.exprs,
                 hir::Expr::column(source, 0),
                 false,
                 vec![
@@ -2589,9 +2643,10 @@ mod tests {
             None,
         )]);
         let table = hir_planned_source(source, &table);
+        crate::translate::plan::prepare_planning_terms(&mut document);
 
         let constraints = hir_constraints_for_source(
-            &empty_hir_document(source),
+            &document,
             &from,
             &[term],
             HirConstraintSource::BTree(&table),
@@ -2628,7 +2683,9 @@ mod tests {
             first: source,
             joins: Vec::new(),
         };
-        let mut expression = hir_in_list(
+        let mut document = empty_hir_document(source);
+        let expression = hir_in_list(
+            &mut document.exprs,
             hir::Expr::column(source, 0),
             true,
             vec![
@@ -2649,11 +2706,12 @@ mod tests {
             consumed: false,
         };
 
+        crate::translate::plan::prepare_planning_terms(&mut document);
         let constraint = hir_in_list_constraint_for_term(
-            &empty_hir_document(source),
+            &document,
             &from,
             0,
-            &term(expression.clone()),
+            &term(expression),
             HirConstraintSource::BTree(&table),
             &Schema::new(),
             &CostModelParams::default(),
@@ -2666,12 +2724,12 @@ mod tests {
             ConstraintOperator::In { not: true, .. }
         ));
 
-        let hir::Expr::InList { comparisons, .. } = &mut expression else {
+        let hir::Expr::InList { comparisons, .. } = document.exprs.get_mut(expression) else {
             unreachable!();
         };
         comparisons[1].components[0].collation = Some(resolved_collation(CollationSeq::NoCase));
         assert!(hir_in_list_constraint_for_term(
-            &empty_hir_document(source),
+            &document,
             &from,
             0,
             &term(expression),
@@ -2692,20 +2750,24 @@ mod tests {
             first: source,
             joins: Vec::new(),
         };
-        let expression = hir::Expr::Subquery(hir::SubqueryExpr::In {
-            lhs: Box::new(hir::Expr::column(source, 0)),
-            query,
-            negated: false,
-            comparison: hir::ComparisonSemantics {
-                components: vec![hir::ComparisonComponent {
-                    affinity: Affinity::Text,
-                    collation: Some(resolved_collation(CollationSeq::NoCase)),
-                    array: false,
-                }],
-            },
-        });
+        let in_query = |exprs: &mut hir::ExprArena| {
+            let lhs = exprs.push(hir::Expr::column(source, 0));
+            exprs.push(hir::Expr::Subquery(hir::SubqueryExpr::In {
+                lhs,
+                query,
+                negated: false,
+                comparison: hir::ComparisonSemantics {
+                    components: vec![hir::ComparisonComponent {
+                        affinity: Affinity::Text,
+                        collation: Some(resolved_collation(CollationSeq::NoCase)),
+                        array: false,
+                    }],
+                },
+            }))
+        };
+        let mut document = hir_document_with_query(source, query, Vec::new());
         let term = HirWhereTerm {
-            expr: expression.clone(),
+            expr: in_query(&mut document.exprs),
             from_outer_join: None,
             consumed: false,
         };
@@ -2717,7 +2779,7 @@ mod tests {
         let table = hir_planned_source(source, &table);
         let params = CostModelParams::default();
         let row_count = params.rows_per_table_fallback;
-        let document = hir_document_with_query(source, query, Vec::new());
+        crate::translate::plan::prepare_planning_terms(&mut document);
 
         let constraints = hir_constraints_for_source(
             &document,
@@ -2764,7 +2826,9 @@ mod tests {
             }
         );
 
-        let correlated = hir_document_with_query(source, query, vec![captured]);
+        let mut correlated = hir_document_with_query(source, query, vec![captured]);
+        let expression = in_query(&mut correlated.exprs);
+        crate::translate::plan::prepare_planning_terms(&mut correlated);
         assert!(hir_in_query_constraint_for_term(
             &correlated,
             &from,
@@ -2790,8 +2854,10 @@ mod tests {
             first: source,
             joins: Vec::new(),
         };
+        let mut exprs = hir::ExprArena::default();
         let compatible = HirWhereTerm {
             expr: hir_comparison(
+                &mut exprs,
                 hir::Expr::column(source, 0),
                 ast::Operator::Equals,
                 hir::Expr::Literal(ast::Literal::Numeric("1".into())),
@@ -2802,6 +2868,7 @@ mod tests {
         };
         let incompatible = HirWhereTerm {
             expr: hir_comparison_with_collation(
+                &mut exprs,
                 hir::Expr::column(source, 0),
                 ast::Operator::Equals,
                 hir::Expr::Literal(ast::Literal::Numeric("2".into())),
@@ -2829,7 +2896,9 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        let document = hir_document_with_index(source, &table, index.clone(), vec![None], None);
+        let mut document =
+            hir_document_with_index(source, &table, index.clone(), exprs, vec![None], None);
+        crate::translate::plan::prepare_planning_terms(&mut document);
         let table = hir_planned_source(source, &table);
 
         let constraints = hir_constraints_for_source(
@@ -2868,13 +2937,17 @@ mod tests {
             first: source,
             joins: Vec::new(),
         };
+        let mut exprs = hir::ExprArena::default();
+        let sum = hir_binary(
+            &mut exprs,
+            hir::Expr::column(source, 0),
+            ast::Operator::Add,
+            hir::Expr::column(source, 1),
+        );
         let term = HirWhereTerm {
             expr: hir_comparison(
-                hir_binary(
-                    hir::Expr::column(source, 0),
-                    ast::Operator::Add,
-                    hir::Expr::column(source, 1),
-                ),
+                &mut exprs,
+                sum,
                 ast::Operator::Equals,
                 hir::Expr::Literal(ast::Literal::Numeric("10".into())),
                 Affinity::Integer,
@@ -2907,17 +2980,29 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        let document = hir_document_with_index(
+        let index_sum = hir_binary(
+            &mut exprs,
+            hir::Expr::column(source, 1),
+            ast::Operator::Add,
+            hir::Expr::column(source, 0),
+        );
+        let index_sum = exprs.push(index_sum);
+        let target_expression = hir_binary(
+            &mut exprs,
+            hir::Expr::column(source, 0),
+            ast::Operator::Add,
+            hir::Expr::column(source, 1),
+        );
+        let target_expression = exprs.push(target_expression);
+        let mut document = hir_document_with_index(
             source,
             &table,
             index.clone(),
-            vec![Some(hir_binary(
-                hir::Expr::column(source, 1),
-                ast::Operator::Add,
-                hir::Expr::column(source, 0),
-            ))],
+            exprs,
+            vec![Some(index_sum)],
             None,
         );
+        crate::translate::plan::prepare_planning_terms(&mut document);
         let table = hir_planned_source(source, &table);
 
         let params = CostModelParams::default();
@@ -2954,17 +3039,12 @@ mod tests {
             &params,
             &|_| None,
         )?;
-        let target_expression = hir_binary(
-            hir::Expr::column(source, 0),
-            ast::Operator::Add,
-            hir::Expr::column(source, 1),
-        );
-        let order_target: crate::translate::optimizer::order::HirOrderTarget<'_> =
+        let order_target: crate::translate::optimizer::order::HirOrderTarget =
             crate::translate::optimizer::order::OrderTarget {
                 columns: vec![crate::translate::optimizer::order::ColumnOrder {
                     source,
                     target: crate::translate::optimizer::order::ColumnTarget::Expr(
-                        &target_expression,
+                        target_expression,
                     ),
                     order: SortOrder::Desc,
                     collation: CollationSeq::Binary,
@@ -2979,6 +3059,7 @@ mod tests {
             document
                 .source(source)
                 .expect("test document contains HIR source"),
+            &document.exprs,
         );
         let chosen = crate::translate::optimizer::access_method::choose_best_btree_candidate(
             &access_source,
@@ -3011,8 +3092,10 @@ mod tests {
             first: source,
             joins: Vec::new(),
         };
+        let mut exprs = hir::ExprArena::default();
         let seek = HirWhereTerm {
             expr: hir_comparison(
+                &mut exprs,
                 hir::Expr::column(source, 0),
                 ast::Operator::Equals,
                 hir::Expr::Literal(ast::Literal::Numeric("10".into())),
@@ -3023,6 +3106,7 @@ mod tests {
         };
         let lower = HirWhereTerm {
             expr: hir_comparison(
+                &mut exprs,
                 hir::Expr::column(source, 1),
                 ast::Operator::Greater,
                 hir::Expr::Literal(ast::Literal::Numeric("0".into())),
@@ -3033,6 +3117,7 @@ mod tests {
         };
         let upper = HirWhereTerm {
             expr: hir_comparison(
+                &mut exprs,
                 hir::Expr::column(source, 1),
                 ast::Operator::Less,
                 hir::Expr::Literal(ast::Literal::Numeric("100".into())),
@@ -3041,7 +3126,16 @@ mod tests {
             from_outer_join: None,
             consumed: false,
         };
-        let predicate = hir_binary(lower.expr.clone(), ast::Operator::And, upper.expr.clone());
+        let predicate_lower = exprs.deep_copy(lower.expr);
+        let predicate_upper = exprs.deep_copy(upper.expr);
+        let predicate = exprs.push(hir::Expr::Binary {
+            lhs: predicate_lower,
+            operator: ast::Operator::And,
+            rhs: predicate_upper,
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        });
         let table = table_with_columns(vec![
             Column::new_default_integer(Some("a".into()), "INTEGER".into(), None),
             Column::new_default_integer(Some("b".into()), "INTEGER".into(), None),
@@ -3059,8 +3153,15 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        let document =
-            hir_document_with_index(source, &table, index.clone(), vec![None], Some(predicate));
+        let mut document = hir_document_with_index(
+            source,
+            &table,
+            index.clone(),
+            exprs,
+            vec![None],
+            Some(predicate),
+        );
+        crate::translate::plan::prepare_planning_terms(&mut document);
         let table = hir_planned_source(source, &table);
         let params = CostModelParams::default();
 
@@ -3105,6 +3206,7 @@ mod tests {
             document
                 .source(source)
                 .expect("test document contains HIR source"),
+            &document.exprs,
         );
         let base_row_count =
             crate::translate::optimizer::cost::RowCountEstimate::AnalyzeStats(10_000.0);
@@ -3189,14 +3291,38 @@ mod tests {
     fn hir_partial_index_respects_outer_join_predicate_origin() {
         let left = hir::SourceId::new(0);
         let source = hir::SourceId::new(1);
+        let mut exprs = hir::ExprArena::default();
         let predicate = hir_comparison(
+            &mut exprs,
             hir::Expr::column(source, 0),
             ast::Operator::Greater,
             hir::Expr::Literal(ast::Literal::Numeric("0".into())),
             Affinity::Integer,
         );
+        let query_term = exprs.deep_copy(predicate);
+        let table = table_with_columns(vec![Column::new_default_integer(
+            Some("a".into()),
+            "INTEGER".into(),
+            None,
+        )]);
+        let index = Arc::new(Index {
+            constraint_name: None,
+            name: "items_a_partial".into(),
+            table_name: "items".into(),
+            root_page: 2,
+            columns: crate::alloc::vec![crate::schema::IndexColumn::new("a", 0)],
+            unique: false,
+            ephemeral: false,
+            has_rowid: true,
+            where_clause: Some(Box::new(ast::Expr::Literal(ast::Literal::True))),
+            index_method: None,
+            on_conflict: None,
+        });
+        let mut document =
+            hir_document_with_index(source, &table, index, exprs, vec![None], Some(predicate));
+        crate::translate::plan::prepare_planning_terms(&mut document);
         let mut term = HirWhereTerm {
-            expr: predicate.clone(),
+            expr: query_term,
             from_outer_join: None,
             consumed: false,
         };
@@ -3210,17 +3336,19 @@ mod tests {
         };
 
         assert!(hir_partial_index_predicate_terms(
+            &document,
             &from,
             source,
-            &predicate,
+            predicate,
             std::slice::from_ref(&term),
         )
         .is_none());
         term.from_outer_join = Some(source);
         let matched = hir_partial_index_predicate_terms(
+            &document,
             &from,
             source,
-            &predicate,
+            predicate,
             std::slice::from_ref(&term),
         )
         .expect("matching LEFT JOIN predicate proves partial index");
@@ -3228,9 +3356,10 @@ mod tests {
 
         from.joins[0].kind = hir::JoinKind::Full;
         assert!(hir_partial_index_predicate_terms(
+            &document,
             &from,
             source,
-            &predicate,
+            predicate,
             std::slice::from_ref(&term),
         )
         .is_none());

@@ -58,28 +58,28 @@ impl<'expr> ExprVisitor<'expr> for ExprValidationVisitor<'_, '_> {
     type Output = ();
     type Error = HirValidationError;
 
-    fn child(&mut self, expression: &'expr Expr, index: usize) -> Option<&'expr Expr> {
-        if let Expr::MergedColumn(column) = expression {
-            return [column.left.as_ref(), column.right.as_ref()]
+    fn child(&mut self, expression: ExprRef<'expr>, index: usize) -> Option<ExprRef<'expr>> {
+        if let Expr::MergedColumn(column) = expression.node() {
+            return [column.left, column.right]
                 .get(index)
-                .copied();
+                .map(|child| expression.at(*child));
         }
         expression.child(index)
     }
 
     fn pre_order(
         &mut self,
-        _parent: &Expr,
+        _parent: ExprRef<'expr>,
         _context: &mut (),
         _child_index: usize,
-        _child: &Expr,
+        _child: ExprRef<'expr>,
     ) -> ValidationResult<ControlFlow<(), ()>> {
         Ok(ControlFlow::Continue(()))
     }
 
     fn post_order(
         &mut self,
-        expression: &Expr,
+        expression: ExprRef<'expr>,
         _context: (),
         _children: &[()],
     ) -> ValidationResult {
@@ -242,12 +242,12 @@ impl<'document> HirValidator<'document> {
                 self.visit_trigger_environment(&root.environment)?;
                 match &root.body {
                     #[cfg(test)]
-                    TriggerBody::Predicate(expression) => self.visit_expr(expression),
+                    TriggerBody::Predicate(expression) => self.visit_expr(*expression),
                     #[cfg(test)]
                     TriggerBody::Command(command) => self.visit_trigger_command(command),
                     TriggerBody::Program(program) => {
                         if let Some(predicate) = &program.predicate {
-                            self.visit_expr(predicate)?;
+                            self.visit_expr(*predicate)?;
                         }
                         for command in &program.commands {
                             self.visit_trigger_command(command)?;
@@ -259,7 +259,7 @@ impl<'document> HirValidator<'document> {
             HirRoot::SchemaExpressions(root) => {
                 self.visit_source(root.source, Some(SourceOwner::Root))?;
                 for expression in &root.expressions {
-                    self.visit_expr(expression)?;
+                    self.visit_expr(*expression)?;
                 }
                 Ok(())
             }
@@ -324,7 +324,7 @@ impl<'document> HirValidator<'document> {
                 self.validate_autoincrement(target_table, autoincrement.as_ref())?;
                 for default in defaults.iter().chain(replace_defaults) {
                     self.validate_column_position(insert.target, default.column)?;
-                    self.visit_expr(&default.value)?;
+                    self.visit_expr(default.value)?;
                 }
             }
             InsertTargetKind::Virtual => {
@@ -379,13 +379,13 @@ impl<'document> HirValidator<'document> {
         for upsert in &insert.upserts {
             if let Some(target) = &upsert.target {
                 for term in &target.terms {
-                    self.visit_expr(&term.expr)?;
+                    self.visit_expr(term.expr)?;
                     self.visit_optional_catalog_object(
                         term.collation.as_ref(),
                         "conflict-target collation",
                     )?;
                 }
-                self.visit_optional_expr(target.predicate.as_ref())?;
+                self.visit_optional_expr(target.predicate.as_ref().copied())?;
                 self.visit_optional_catalog_object(
                     target.matched_index.as_ref(),
                     "conflict-target index",
@@ -397,7 +397,7 @@ impl<'document> HirValidator<'document> {
             } = &upsert.action
             {
                 self.visit_assignments(insert.target, assignments)?;
-                self.visit_optional_expr(predicate.as_ref())?;
+                self.visit_optional_expr(predicate.as_ref().copied())?;
             }
         }
         if let Some(excluded) = insert.excluded_source {
@@ -458,7 +458,7 @@ impl<'document> HirValidator<'document> {
                 self.validate_autoincrement(target_table, autoincrement.as_ref())?;
                 for default in defaults {
                     self.validate_column_position(update.new_source, default.column)?;
-                    self.visit_expr(&default.value)?;
+                    self.visit_expr(default.value)?;
                 }
             }
             UpdateTargetKind::Virtual => {
@@ -482,7 +482,7 @@ impl<'document> HirValidator<'document> {
             self.visit_from(from, SourceOwner::Root)?;
         }
         self.visit_assignments(update.target, &update.assignments)?;
-        self.visit_optional_expr(update.predicate.as_ref())?;
+        self.visit_optional_expr(update.predicate.as_ref().copied())?;
         self.visit_order_terms(&update.order_by)?;
         self.visit_optional_limit(update.limit.as_ref())?;
         self.visit_optional_returning(update.returning.as_ref())
@@ -529,7 +529,7 @@ impl<'document> HirValidator<'document> {
                 })?;
             }
         }
-        self.visit_optional_expr(delete.predicate.as_ref())?;
+        self.visit_optional_expr(delete.predicate.as_ref().copied())?;
         self.visit_order_terms(&delete.order_by)?;
         self.visit_optional_limit(delete.limit.as_ref())?;
         self.visit_optional_returning(delete.returning.as_ref())
@@ -540,8 +540,8 @@ impl<'document> HirValidator<'document> {
             for column in &assignment.columns {
                 self.validate_target_column(target, *column)?;
             }
-            self.visit_expr(&assignment.value)?;
-            let value_width = self.expression_width(&assignment.value)?;
+            self.visit_expr(assignment.value)?;
+            let value_width = self.expression_width(assignment.value)?;
             self.require(assignment.columns.len() == value_width, || {
                 format!(
                     "assignment has {} target columns but value width {value_width}",
@@ -1058,7 +1058,7 @@ impl<'document> HirValidator<'document> {
             QueryBlockBody::Select {
                 filter, grouping, ..
             } => {
-                self.visit_optional_expr(filter.as_ref())?;
+                self.visit_optional_expr(filter.as_ref().copied())?;
                 if let Some(grouping) = grouping {
                     self.visit_exprs(&grouping.keys)?;
                     self.require(grouping.key_type_facts.len() == grouping.keys.len(), || {
@@ -1076,7 +1076,7 @@ impl<'document> HirValidator<'document> {
                             "GROUP BY key collation",
                         )?;
                     }
-                    self.visit_optional_expr(grouping.having.as_ref())?;
+                    self.visit_optional_expr(grouping.having.as_ref().copied())?;
                 }
             }
             QueryBlockBody::Values { rows } => {
@@ -1108,7 +1108,7 @@ impl<'document> HirValidator<'document> {
             self.visit_source(join.right, Some(owner))?;
             match &join.constraint {
                 JoinConstraint::None => {}
-                JoinConstraint::On(expression) => self.visit_expr(expression)?,
+                JoinConstraint::On(expression) => self.visit_expr(*expression)?,
                 JoinConstraint::Using(columns) | JoinConstraint::Natural(columns) => {
                     let expected_value = match join.kind {
                         JoinKind::Right => MergedColumnValue::Right,
@@ -1133,7 +1133,7 @@ impl<'document> HirValidator<'document> {
                                 join.right, column.right.source
                             )
                         })?;
-                        self.visit_expr(&column.left)?;
+                        self.visit_expr(column.left)?;
                         self.visit_column_ref(column.right)?;
                         self.visit_type_fact(&column.type_fact)?;
                         self.visit_optional_catalog_object(
@@ -1258,7 +1258,7 @@ impl<'document> HirValidator<'document> {
         }
         if let Some(constraints) = &source.check_constraints {
             for constraint in constraints {
-                self.visit_expr(&constraint.expression)?;
+                self.visit_expr(constraint.expression)?;
             }
         }
         // An UPDATE's NEW row is a pseudo source with its own index
@@ -1316,9 +1316,9 @@ impl<'document> HirValidator<'document> {
                 || format!("source {id} has incomplete partial-index metadata"),
             )?;
             for expression in expressions.columns.iter().flatten() {
-                self.visit_expr(expression)?;
+                self.visit_expr(*expression)?;
             }
-            self.visit_optional_expr(expressions.predicate.as_ref())?;
+            self.visit_optional_expr(expressions.predicate.as_ref().copied())?;
         }
         if let IndexCoverage::Complete { indexes } = &source.index_coverage {
             self.require(indexes == &resolved_index_ids, || {
@@ -1351,7 +1351,7 @@ impl<'document> HirValidator<'document> {
                     OutputId::index_method_pattern(pattern.id, output_index),
                 )?;
             }
-            self.visit_optional_expr(pattern.predicate.as_ref())?;
+            self.visit_optional_expr(pattern.predicate.as_ref().copied())?;
             self.visit_order_terms(&pattern.order_by)?;
             self.visit_optional_limit(pattern.limit.as_ref())?;
         }
@@ -1417,7 +1417,7 @@ impl<'document> HirValidator<'document> {
     ) -> ValidationResult {
         for expression in expressions.iter() {
             if let ColumnReadExpression::Planned(expression) = expression {
-                self.visit_expr(expression)?;
+                self.visit_expr(*expression)?;
             }
         }
         Ok(())
@@ -1497,7 +1497,7 @@ impl<'document> HirValidator<'document> {
             || format!("output {expected:?} marks an absent collation as explicit"),
         )?;
         self.visit_optional_catalog_object(output.collation.as_ref(), "output collation")?;
-        self.visit_expr(&output.expr)
+        self.visit_expr(output.expr)
     }
 
     fn visit_output_reference(&self, id: OutputId) -> ValidationResult {
@@ -1531,7 +1531,7 @@ impl<'document> HirValidator<'document> {
             ),
             || format!("schema program {id} input is not a schema-expression source"),
         )?;
-        self.visit_expr(&program.body)?;
+        self.visit_expr(program.body)?;
         state.set(2);
         Ok(())
     }
@@ -1560,16 +1560,21 @@ impl<'document> HirValidator<'document> {
         Ok(())
     }
 
-    fn visit_expr(&self, expression: &Expr) -> ValidationResult {
-        expression.walk((), &mut ExprValidationVisitor { validator: self })
+    fn visit_expr(&self, expression: ExprId) -> ValidationResult {
+        self.require(expression.index() < self.document.exprs.len(), || {
+            format!("expression {expression:?} is outside the expression arena")
+        })?;
+        self.document
+            .expr(expression)
+            .walk((), &mut ExprValidationVisitor { validator: self })
     }
 
-    fn validate_expr_node(&self, expression: &Expr) -> ValidationResult {
-        match expression {
+    fn validate_expr_node(&self, expression: ExprRef<'_>) -> ValidationResult {
+        match expression.node() {
             Expr::Literal(_) | Expr::Parameter(_) => Ok(()),
             Expr::Column(reference) => self.visit_column_ref(*reference),
             Expr::MergedColumn(column) => {
-                let Expr::Column(right) = column.right.as_ref() else {
+                let Expr::Column(right) = &self.document.exprs[column.right] else {
                     return self.invalid("merged-column right side is not a source column");
                 };
                 self.visit_column_ref(*right)?;
@@ -1605,7 +1610,7 @@ impl<'document> HirValidator<'document> {
                     || "non-concatenation expression is marked as array concatenation",
                 )?;
                 if let Some(comparison) = comparison {
-                    self.visit_expression_comparison(comparison, lhs, rhs, "binary comparison")?;
+                    self.visit_expression_comparison(comparison, *lhs, *rhs, "binary comparison")?;
                 }
                 if let Some(custom) = custom {
                     self.require(
@@ -1630,9 +1635,10 @@ impl<'document> HirValidator<'document> {
                             BinaryOperand::Left => lhs,
                             BinaryOperand::Right => rhs,
                         };
-                        self.require(matches!(literal.as_ref(), Expr::Literal(_)), || {
-                            "custom operator literal encoding refers to a non-literal operand"
-                        })?;
+                        self.require(
+                            matches!(self.document.exprs[*literal], Expr::Literal(_)),
+                            || "custom operator literal encoding refers to a non-literal operand",
+                        )?;
                         if let Some(encoder) = &encoding.encoder {
                             self.visit_schema_program(encoder.program)?;
                         }
@@ -1651,14 +1657,14 @@ impl<'document> HirValidator<'document> {
             } => {
                 self.visit_expression_comparison(
                     start_comparison,
-                    expr,
-                    start,
+                    *expr,
+                    *start,
                     "BETWEEN lower-bound comparison",
                 )?;
                 self.visit_expression_comparison(
                     end_comparison,
-                    expr,
-                    end,
+                    *expr,
+                    *end,
                     "BETWEEN upper-bound comparison",
                 )
             }
@@ -1667,7 +1673,7 @@ impl<'document> HirValidator<'document> {
                 when_then,
                 base_comparisons,
                 ..
-            } => match base.as_deref() {
+            } => match *base {
                 None => self.require(base_comparisons.is_empty(), || {
                     "searched CASE contains base-comparison metadata"
                 }),
@@ -1679,7 +1685,7 @@ impl<'document> HirValidator<'document> {
                         self.visit_expression_comparison(
                             comparison,
                             base,
-                            when,
+                            *when,
                             "simple CASE comparison",
                         )?;
                     }
@@ -1718,7 +1724,12 @@ impl<'document> HirValidator<'document> {
                     "IN-list comparison count does not match its value count"
                 })?;
                 for (value, comparison) in values.iter().zip(comparisons) {
-                    self.visit_expression_comparison(comparison, lhs, value, "IN-list comparison")?;
+                    self.visit_expression_comparison(
+                        comparison,
+                        *lhs,
+                        *value,
+                        "IN-list comparison",
+                    )?;
                 }
                 Ok(())
             }
@@ -1732,7 +1743,7 @@ impl<'document> HirValidator<'document> {
                 ..
             } => {
                 self.visit_catalog_object(function, "LIKE function")?;
-                let lhs_width = self.expression_width(lhs)?;
+                let lhs_width = self.expression_width(*lhs)?;
                 self.require(
                     lhs_width == 1 || *operator == turso_parser::ast::LikeOperator::Match,
                     || "only MATCH accepts a row-valued left expression",
@@ -1870,7 +1881,7 @@ impl<'document> HirValidator<'document> {
                 ..
             } => {
                 self.visit_query(*query)?;
-                let lhs_width = self.expression_width(lhs)?;
+                let lhs_width = self.expression_width(*lhs)?;
                 let output_width = self.query(*query)?.output.len();
                 self.require(output_width == lhs_width, || {
                     format!("IN subquery {query} has {output_width} outputs, expected {lhs_width}")
@@ -1883,8 +1894,8 @@ impl<'document> HirValidator<'document> {
     fn visit_expression_comparison(
         &self,
         comparison: &ComparisonSemantics,
-        lhs: &Expr,
-        rhs: &Expr,
+        lhs: ExprId,
+        rhs: ExprId,
         context: &str,
     ) -> ValidationResult {
         let lhs_width = self.expression_width(lhs)?;
@@ -1895,8 +1906,8 @@ impl<'document> HirValidator<'document> {
         self.visit_comparison(comparison, lhs_width, context)
     }
 
-    fn expression_width(&self, expression: &Expr) -> ValidationResult<usize> {
-        match expression {
+    fn expression_width(&self, expression: ExprId) -> ValidationResult<usize> {
+        match &self.document.exprs[expression] {
             Expr::Row(values) => Ok(values.len()),
             Expr::Subquery(SubqueryExpr::Row { query }) => Ok(self.query(*query)?.output.len()),
             _ => Ok(1),
@@ -1926,7 +1937,7 @@ impl<'document> HirValidator<'document> {
 
     fn visit_resolved_window(&self, window: &ResolvedWindow) -> ValidationResult {
         for term in &window.partition_by {
-            self.visit_expr(&term.expr)?;
+            self.visit_expr(term.expr)?;
             self.visit_type_fact(&term.type_fact)?;
             if let Some(collation) = &term.collation {
                 self.visit_catalog_object(collation, "PARTITION BY collation")?;
@@ -1944,7 +1955,7 @@ impl<'document> HirValidator<'document> {
     fn visit_window_bound(&self, bound: &WindowFrameBound) -> ValidationResult {
         match bound {
             WindowFrameBound::Following(expr) | WindowFrameBound::Preceding(expr) => {
-                self.visit_expr(expr)
+                self.visit_expr(*expr)
             }
             WindowFrameBound::CurrentRow
             | WindowFrameBound::UnboundedFollowing
@@ -1954,7 +1965,7 @@ impl<'document> HirValidator<'document> {
 
     fn visit_order_terms(&self, terms: &[OrderTerm]) -> ValidationResult {
         for term in terms {
-            self.visit_expr(&term.expr)?;
+            self.visit_expr(term.expr)?;
         }
         self.validate_order_term_metadata(terms)
     }
@@ -1973,18 +1984,18 @@ impl<'document> HirValidator<'document> {
         let Some(limit) = limit else {
             return Ok(());
         };
-        self.visit_expr(&limit.limit)?;
-        self.visit_optional_expr(limit.offset.as_ref())
+        self.visit_expr(limit.limit)?;
+        self.visit_optional_expr(limit.offset.as_ref().copied())
     }
 
-    fn visit_exprs(&self, expressions: &[Expr]) -> ValidationResult {
+    fn visit_exprs(&self, expressions: &[ExprId]) -> ValidationResult {
         for expression in expressions {
-            self.visit_expr(expression)?;
+            self.visit_expr(*expression)?;
         }
         Ok(())
     }
 
-    fn visit_optional_expr(&self, expression: Option<&Expr>) -> ValidationResult {
+    fn visit_optional_expr(&self, expression: Option<ExprId>) -> ValidationResult {
         expression.map_or(Ok(()), |expression| self.visit_expr(expression))
     }
 
@@ -2641,6 +2652,8 @@ mod tests {
             ctes: Vec::new(),
             schema_programs: Vec::new(),
             cdc: None,
+            exprs: ExprArena::default(),
+            planning: PlanningTerms::default(),
         }
     }
 
@@ -2663,23 +2676,21 @@ mod tests {
 
     #[test]
     fn expression_validation_does_not_use_the_call_stack() {
-        let document = empty_document(Vec::new());
-        let validator = HirValidator::new(&document);
-        let mut expression = Expr::Literal(turso_parser::ast::Literal::Null);
+        let mut document = empty_document(Vec::new());
+        let mut expression = document
+            .exprs
+            .push(Expr::Literal(turso_parser::ast::Literal::Null));
         for _ in 0..10_000 {
-            expression = Expr::Unary {
+            expression = document.exprs.push(Expr::Unary {
                 operator: turso_parser::ast::UnaryOperator::Negative,
-                expr: Box::new(expression),
-            };
+                expr: expression,
+            });
         }
+        let validator = HirValidator::new(&document);
 
         validator
-            .visit_expr(&expression)
+            .visit_expr(expression)
             .expect("deep expression validates iteratively");
-
-        // Dropping this synthetic tree recursively would test Rust's drop
-        // stack instead of the HIR walker.
-        std::mem::forget(expression);
     }
 
     #[test]

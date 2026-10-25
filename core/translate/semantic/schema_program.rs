@@ -91,7 +91,7 @@ impl Analyzer<'_, '_, '_> {
             program,
             arguments: arguments
                 .iter()
-                .map(|argument| argument.expr.clone())
+                .map(|argument| self.exprs.push(argument.expr.clone()))
                 .collect(),
         }))
     }
