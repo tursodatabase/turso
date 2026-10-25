@@ -161,7 +161,6 @@ impl Dialect for PostgresDialect {
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
         let options = crate::functions::register_functions(options);
-        #[cfg(feature = "test_helper")]
         let options = crate::auth_functions::register_functions(options);
         register_catalog_modules(options)
     }

@@ -44,7 +44,7 @@ turso_macros.workspace = true
 [features]
 default = ["test_helper", "fts", "io_uring"]
 checksum = ["turso_core/checksum"]
-test_helper = ["turso_core/test_helper", "turso_pg/test_helper"]
+test_helper = ["turso_core/test_helper"]
 fts = ["turso_core/fts"]
 io_memory_yield = ["turso_core/io_memory_yield"]
 io_uring = ["turso_core/io_uring"]

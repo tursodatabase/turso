@@ -1,4 +1,3 @@
-#[cfg(feature = "test_helper")]
 mod auth_functions;
 mod catalog;
 mod copy;
