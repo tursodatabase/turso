@@ -1,7 +1,7 @@
 use super::{BTreeCursor, NotedPayload};
 use crate::alloc::{ArcSlice, DynAllocator};
 #[cfg(any(test, injected_yields))]
-use crate::mvcc::cursor::CursorYieldPoint;
+use crate::mvcc::cursor::{cursor_yield_key, CursorYieldPoint};
 use crate::mvcc::cursor::{static_iterator_hack, MvccEntry, MvccIterator};
 use crate::mvcc::database::{
     MVTableId, MvccReadSnapshot, RowID, RowKey, RowVersions, TxID, VisibleRow,
@@ -21,7 +21,7 @@ pub(crate) struct MvccReader {
     btree: BtreeAccess,
     chain: Chain,
     direction: IterationDirection,
-    chains_stop_at_seek_key: bool,
+    exact_seek_key: Option<i64>,
     cell: Option<i64>,
     row: Row,
     step: Step,
@@ -123,7 +123,7 @@ impl MvccReader {
             btree: BtreeAccess::Undecided,
             chain: Chain::Exhausted,
             direction: IterationDirection::Forwards,
-            chains_stop_at_seek_key: false,
+            exact_seek_key: None,
             cell: None,
             row: Row::Unpositioned,
             step: Step::Idle,
@@ -186,7 +186,13 @@ impl BTreeCursor {
         }
         return_if_io!(self.drive_mvcc_step());
         let found = match self.mvcc().row.rowid() {
-            Some(found_rowid) => !op.eq_only() || found_rowid == rowid,
+            Some(found_rowid) => {
+                turso_assert!(
+                    !op.eq_only() || found_rowid == rowid,
+                    "an exact seek must stop on its key or on no row"
+                );
+                true
+            }
             None => false,
         };
         Ok(IOResult::Done(if found {
@@ -285,13 +291,31 @@ impl BTreeCursor {
         Ok(self.reusable_immutable_record.as_ref())
     }
 
+    pub(super) fn forget_mvcc_position(&mut self) {
+        self.row_is_from_version_chain = false;
+        let Some(reader) = self.mvcc_reader.as_deref_mut() else {
+            return;
+        };
+        reader.chains = None;
+        reader.chain = Chain::Exhausted;
+        reader.exact_seek_key = None;
+        reader.cell = None;
+        reader.row = Row::Unpositioned;
+        reader.step = Step::Idle;
+        reader.count_step = CountStep::Idle;
+    }
+
+    #[cfg(any(test, injected_yields))]
+    pub(super) fn mvcc_yield_key(&self) -> Option<u64> {
+        self.mvcc_reader
+            .as_deref()
+            .map(|reader| cursor_yield_key(reader.snapshot.tx_id, reader.table_id))
+    }
+
     fn plan_mvcc_step(&mut self, direction: IterationDirection) -> bool {
         let reader = self.mvcc();
         let rowid = match reader.row {
-            Row::Unpositioned => {
-                self.start_mvcc_scan(direction);
-                return true;
-            }
+            Row::Unpositioned => return false,
             Row::BeforeFirst => {
                 if direction == IterationDirection::Backwards {
                     return false;
@@ -308,7 +332,7 @@ impl BTreeCursor {
             }
             Row::Cell(rowid) | Row::Chain { rowid, .. } => rowid,
         };
-        if reader.direction != direction || reader.chains_stop_at_seek_key {
+        if reader.direction != direction || reader.exact_seek_key.is_some() {
             let op = match direction {
                 IterationDirection::Forwards => SeekOp::GT,
                 IterationDirection::Backwards => SeekOp::LT,
@@ -512,31 +536,9 @@ impl BTreeCursor {
     fn resolve_mvcc_row(&mut self) -> Result<bool> {
         loop {
             let reader = self.mvcc_mut();
-            let pick = match (reader.cell, reader.chain.rowid()) {
-                (None, None) => Pick::End,
-                (Some(cell), None) => Pick::Cell(cell),
-                (None, Some(chain)) => Pick::Chain(chain),
-                (Some(cell), Some(chain)) if cell == chain => Pick::CellAndChain(cell),
-                (Some(cell), Some(chain)) => {
-                    let cell_first = match reader.direction {
-                        IterationDirection::Forwards => cell < chain,
-                        IterationDirection::Backwards => cell > chain,
-                    };
-                    if cell_first {
-                        Pick::Cell(cell)
-                    } else {
-                        Pick::Chain(chain)
-                    }
-                }
-            };
-            match pick {
+            match reader.pick() {
                 Pick::End => {
-                    reader.row = match reader.direction {
-                        IterationDirection::Forwards => Row::AfterLast,
-                        IterationDirection::Backwards => Row::BeforeFirst,
-                    };
-                    reader.step = Step::Idle;
-                    self.settle_mvcc_row(false, false);
+                    self.end_mvcc_row();
                     return Ok(true);
                 }
                 Pick::Cell(rowid) => {
@@ -579,6 +581,9 @@ impl BTreeCursor {
                             reader.step = Step::Idle;
                             self.settle_mvcc_row(false, true);
                         }
+                        VisibleRow::NoRow if reader.exact_seek_key.is_some() => {
+                            self.end_mvcc_row();
+                        }
                         VisibleRow::NoRow => {
                             reader.step = Step::SkipHiddenCell;
                             self.has_record = true;
@@ -589,6 +594,17 @@ impl BTreeCursor {
                 }
             }
         }
+    }
+
+    fn end_mvcc_row(&mut self) {
+        let reader = self.mvcc_mut();
+        reader.row = match (reader.exact_seek_key, reader.direction) {
+            (Some(_), _) => Row::Unpositioned,
+            (None, IterationDirection::Forwards) => Row::AfterLast,
+            (None, IterationDirection::Backwards) => Row::BeforeFirst,
+        };
+        reader.step = Step::Idle;
+        self.settle_mvcc_row(false, false);
     }
 
     fn settle_mvcc_row(&mut self, cell_row: bool, chain_row: bool) {
@@ -628,12 +644,41 @@ impl BTreeCursor {
 }
 
 impl MvccReader {
+    fn pick(&self) -> Pick {
+        if let Some(key) = self.exact_seek_key {
+            return match (self.cell == Some(key), self.chain.rowid() == Some(key)) {
+                (true, true) => Pick::CellAndChain(key),
+                (true, false) => Pick::Cell(key),
+                (false, true) => Pick::Chain(key),
+                (false, false) => Pick::End,
+            };
+        }
+        match (self.cell, self.chain.rowid()) {
+            (None, None) => Pick::End,
+            (Some(cell), None) => Pick::Cell(cell),
+            (None, Some(chain)) => Pick::Chain(chain),
+            (Some(cell), Some(chain)) if cell == chain => Pick::CellAndChain(cell),
+            (Some(cell), Some(chain)) => {
+                let cell_first = match self.direction {
+                    IterationDirection::Forwards => cell < chain,
+                    IterationDirection::Backwards => cell > chain,
+                };
+                if cell_first {
+                    Pick::Cell(cell)
+                } else {
+                    Pick::Chain(chain)
+                }
+            }
+        }
+    }
+
     fn restart_chains(&mut self, range: ChainRange) {
-        self.chains_stop_at_seek_key = range.one_key;
+        self.exact_seek_key = None;
         if range.one_key {
             let Bound::Included(rowid) = range.start else {
                 unreachable!("a one-key chain range must include its key");
             };
+            self.exact_seek_key = Some(rowid);
             self.chains = None;
             let row_id = RowID::new(self.table_id, RowKey::Int(rowid));
             self.chain = match self.store.rows.get(&row_id) {
@@ -671,7 +716,7 @@ impl MvccReader {
     fn advance_chain(&mut self) {
         let Some(chains) = self.chains.as_mut() else {
             turso_assert!(
-                self.chains_stop_at_seek_key,
+                self.exact_seek_key.is_some(),
                 "only a one-key chain range has no iterator"
             );
             self.chain = Chain::Exhausted;

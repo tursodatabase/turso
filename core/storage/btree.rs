@@ -5928,6 +5928,10 @@ impl BTreeCursor {
     /// and BtCursor.aOverflow, which accessPayload (btree.c) uses for both
     /// column reads and incremental blob I/O.
     fn ensure_payload_layout(&mut self) -> Result<()> {
+        turso_assert!(
+            !self.row_is_from_version_chain,
+            "a row from a version chain has no cell to read"
+        );
         let usable = self.usable_space();
         turso_assert!(usable > 4, "usable space must exceed overflow header");
         let cell_idx = self.stack.current_cell_index();
@@ -6623,7 +6627,8 @@ impl ProvidesYieldContext for BTreeCursor {
             self.yield_injector.clone(),
             None,
             self.yield_instance_id,
-            BTREE_WRITE_YIELD_FAMILY ^ self.root_page as u64,
+            self.mvcc_yield_key()
+                .unwrap_or(BTREE_WRITE_YIELD_FAMILY ^ self.root_page as u64),
         )
     }
 }
@@ -7484,6 +7489,7 @@ impl CursorTrait for BTreeCursor {
     fn invalidate_btree_cache(&mut self) {
         self.stack.clear();
         self.has_record = false;
+        self.forget_mvcc_position();
         self.noted_payload = NotedPayload::NONE;
         self.move_to_right_state.1 = None;
         self.invalidate_count_cache();
