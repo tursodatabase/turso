@@ -515,7 +515,7 @@ mod tests {
                 let opts = profile
                     .options(enable_mvcc)
                     .with_seed(8940 + profile as u64)
-                    .with_max_steps(6000);
+                    .with_max_steps(12000);
                 let mut whopper = Whopper::new(opts).unwrap();
                 whopper.run().unwrap();
                 let connection = &whopper.context.fibers[0].connection;
