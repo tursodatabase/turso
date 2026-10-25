@@ -160,6 +160,7 @@ test txn-begin-read-only-rejects-write {
     BEGIN READ ONLY;
     UPDATE counter SET n = 99;
 }
+@sqlstate 25006
 expect error {
 }
 
@@ -168,6 +169,7 @@ test txn-begin-read-only-rejects-insert {
     BEGIN READ ONLY;
     INSERT INTO counter VALUES (1);
 }
+@sqlstate 25006
 expect error {
 }
 
@@ -176,6 +178,7 @@ test txn-begin-read-only-rejects-delete {
     BEGIN READ ONLY;
     DELETE FROM counter;
 }
+@sqlstate 25006
 expect error {
 }
 
@@ -272,6 +275,7 @@ test txn-begin-read-only-rollback-to-savepoint-stays-read-only {
     ROLLBACK TO sp;
     UPDATE counter SET n = 1;
 }
+@sqlstate 25006
 expect error {
 }
 
@@ -287,13 +291,13 @@ expect {
     1
 }
 
-@skip-if postgres "Turso transactions are snapshot isolation, so only REPEATABLE READ is accepted"
 test txn-start-transaction-read-only-rejects-write {
     CREATE TABLE w (v int);
     INSERT INTO w VALUES (0);
     START TRANSACTION READ ONLY;
     INSERT INTO w VALUES (1);
 }
+@sqlstate 25006
 expect error {
 }
 
@@ -308,6 +312,7 @@ test txn-aborted-state-error-in-transaction-aborts-batch {
     SELECT 1/0;
     SELECT n FROM counter;
 }
+@sqlstate 22012
 expect error {
 }
 
@@ -317,6 +322,7 @@ test txn-aborted-state-commit-after-error-in-same-batch {
     SELECT 1/0;
     COMMIT;
 }
+@sqlstate 22012
 expect error {
 }
 
@@ -326,6 +332,7 @@ test txn-aborted-state-rollback-after-error-in-same-batch {
     SELECT 1/0;
     ROLLBACK;
 }
+@sqlstate 22012
 expect error {
 }
 
@@ -335,6 +342,7 @@ test txn-aborted-state-ddl-error-causes-abort {
     CREATE TABLE counter (n int);
     SELECT n FROM counter;
 }
+@sqlstate 42P07
 expect error {
 }
 
@@ -344,6 +352,7 @@ test txn-aborted-state-begin-after-error-rejected {
     SELECT 1/0;
     BEGIN;
 }
+@sqlstate 22012
 expect error {
 }
 
@@ -395,17 +404,17 @@ expect {
     3
 }
 
-@skip-if postgres "AND CHAIN is not supported in Turso; PostgreSQL would accept it"
 test txn-and-chain-unsupported-outside-transaction {
     COMMIT AND CHAIN;
 }
+@sqlstate 25P01
 expect error {
 }
 
-@skip-if postgres "AND CHAIN is not supported in Turso; PostgreSQL would accept it"
 test txn-rollback-and-chain-unsupported-outside-transaction {
     ROLLBACK AND CHAIN;
 }
+@sqlstate 25P01
 expect error {
 }
 
@@ -415,6 +424,7 @@ test txn-set-transaction-read-only-rejects-write {
     SET TRANSACTION READ ONLY;
     UPDATE counter SET n = 1;
 }
+@sqlstate 25006
 expect error {
 }
 
@@ -424,6 +434,7 @@ test txn-set-transaction-last-access-mode-wins {
     SET TRANSACTION READ WRITE, READ ONLY;
     UPDATE counter SET n = 1;
 }
+@sqlstate 25006
 expect error {
 }
 
@@ -433,6 +444,7 @@ test txn-set-read-write-after-query-rejected {
     SELECT n FROM counter;
     SET TRANSACTION READ WRITE;
 }
+@sqlstate 25001
 expect error {
     transaction read-write mode must be set before any query
 }
@@ -444,6 +456,7 @@ test txn-set-read-only-after-query-takes-effect {
     SET TRANSACTION READ ONLY;
     UPDATE counter SET n = 1;
 }
+@sqlstate 25006
 expect error {
 }
 
@@ -479,6 +492,7 @@ test txn-nested-begin-read-write-after-query-rejected {
     SELECT n FROM counter;
     BEGIN READ WRITE;
 }
+@sqlstate 25001
 expect error {
     transaction read-write mode must be set before any query
 }
@@ -530,6 +544,7 @@ test txn-nested-begin-read-only-applies-access-mode {
     BEGIN READ ONLY;
     UPDATE counter SET n = 1;
 }
+@sqlstate 25006
 expect error {
 }
 
@@ -543,4 +558,64 @@ test txn-nested-begin-read-write-applies-access-mode {
 }
 expect {
     6
+}
+
+# SQLSTATE cases that the Rust tests of the transaction semantics also cover.
+# The runner stops at the first error of a test. Thus a test cannot show the
+# 25P02 that a later statement of an aborted transaction gets.
+
+@setup counter
+test txn-set-read-write-after-read-only-downgrade-rejected {
+    BEGIN;
+    SELECT n FROM counter;
+    SET TRANSACTION READ ONLY;
+    SET TRANSACTION READ WRITE;
+}
+@sqlstate 25001
+expect error {
+    transaction read-write mode must be set before any query
+}
+
+@setup counter
+test txn-nested-begin-read-write-after-read-only-downgrade-rejected {
+    BEGIN;
+    INSERT INTO counter VALUES (1);
+    BEGIN READ ONLY;
+    BEGIN READ WRITE;
+}
+@sqlstate 25001
+expect error {
+    transaction read-write mode must be set before any query
+}
+
+@setup counter
+test txn-error-inside-read-only-transaction {
+    BEGIN READ ONLY;
+    SELECT 1/0;
+}
+@sqlstate 22012
+expect error {
+}
+
+@setup counter
+test txn-runtime-error-after-savepoint {
+    BEGIN;
+    INSERT INTO counter VALUES (1);
+    SAVEPOINT s;
+    INSERT INTO counter VALUES (2);
+    SELECT 1/0;
+}
+@sqlstate 22012
+expect error {
+}
+
+@setup counter
+test txn-unknown-table-after-savepoint {
+    BEGIN;
+    INSERT INTO counter VALUES (1);
+    SAVEPOINT s;
+    SELECT * FROM no_such_table;
+}
+@sqlstate 42P01
+expect error {
 }
