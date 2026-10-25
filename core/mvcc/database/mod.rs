@@ -4075,6 +4075,19 @@ pub struct RowidAllocator {
     max_rowid: AtomicI64,
     /// True after the first btree-max scan. Never reset to false.
     initialized: AtomicBool,
+    btree_last: Mutex<Option<BtreeLast>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BtreeLast {
+    pub(crate) read_mark: WalPos,
+    pub(crate) rowid: Option<i64>,
+}
+
+impl BtreeLast {
+    pub(crate) fn may_hold(&self, rowid: i64) -> bool {
+        self.rowid.is_some_and(|last| rowid <= last)
+    }
 }
 
 /// Sub state machine for [`MvStore::bootstrap_nonblock`]. Carried by the
@@ -10485,6 +10498,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     lock: TursoRwLock::new(),
                     max_rowid: AtomicI64::new(0),
                     initialized: AtomicBool::new(false),
+                    btree_last: Mutex::new(None),
                 })
             })
             .clone()
@@ -10611,6 +10625,17 @@ impl RowidAllocator {
             {
                 return;
             }
+        }
+    }
+
+    pub(crate) fn btree_last(&self, read_mark: WalPos) -> Option<BtreeLast> {
+        (*self.btree_last.lock()).filter(|last| last.read_mark == read_mark)
+    }
+
+    pub(crate) fn record_btree_last(&self, last: BtreeLast) {
+        let mut stored = self.btree_last.lock();
+        if stored.is_none_or(|stored| stored.read_mark <= last.read_mark) {
+            *stored = Some(last);
         }
     }
 
