@@ -4275,7 +4275,10 @@ pub struct RecoverCtx {
 }
 
 /// WAL position `(checkpoint_seq, frame)`. Ordered lexicographically for physical reachability.
+/// Each row version stores one, so the fields are packed into 12 bytes instead of the 16 bytes
+/// that the alignment of `frame` gives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(C, packed(4))]
 pub struct WalPos {
     pub checkpoint_seq: u32,
     pub frame: u64,

@@ -870,9 +870,9 @@ fn debug_gc_metrics_truncate_vs_passive() {
             snap.logical_log_size,
             snap.active_txs,
             snap.min_reader_mark.checkpoint_seq,
-            snap.min_reader_mark.frame,
+            { snap.min_reader_mark.frame },
             snap.backfill_floor.checkpoint_seq,
-            snap.backfill_floor.frame,
+            { snap.backfill_floor.frame },
         );
     }
 
@@ -948,9 +948,9 @@ fn debug_gc_metrics_truncate_vs_passive() {
                 snap.logical_log_size,
                 snap.active_txs,
                 snap.min_reader_mark.checkpoint_seq,
-                snap.min_reader_mark.frame,
+                { snap.min_reader_mark.frame },
                 snap.backfill_floor.checkpoint_seq,
-                snap.backfill_floor.frame,
+                { snap.backfill_floor.frame },
             );
         }
 
@@ -1033,9 +1033,9 @@ fn debug_gc_metrics_truncate_vs_passive() {
                 snap.logical_log_size,
                 snap.active_txs,
                 snap.min_reader_mark.checkpoint_seq,
-                snap.min_reader_mark.frame,
+                { snap.min_reader_mark.frame },
                 snap.backfill_floor.checkpoint_seq,
-                snap.backfill_floor.frame,
+                { snap.backfill_floor.frame },
             );
         }
     }
@@ -1095,7 +1095,8 @@ fn mvcc_passive_checkpoint_publishes_backfill_and_reclaims_versions() {
         "passive Finalize must drain empty SkipMap slots: {snap:?}"
     );
     assert_eq!(
-        snap.backfill_floor.frame, wal_bf,
+        { snap.backfill_floor.frame },
+        wal_bf,
         "backfill_floor must track published nbackfills: {snap:?}"
     );
 
@@ -12190,6 +12191,16 @@ fn test_short_version_chain_has_no_unused_capacity() {
         assert!(db.mvcc_store.update(tx, row).unwrap());
         assert_eq!(chain_len_and_capacity(), (version + 1, version + 1));
     }
+}
+
+/// A version chain stores its versions inline, so the size of `RowVersion` is a
+/// large part of the heap that MVCC uses for each row. The nightly build stores
+/// an allocator in each payload, so its sizes are different.
+#[cfg(not(nightly))]
+#[test]
+fn test_row_version_size() {
+    assert_eq!(std::mem::size_of::<WalPos>(), 12);
+    assert_eq!(std::mem::size_of::<RowVersion>(), 88);
 }
 
 /// A tombstone over a B-tree row keeps a copy of the deleted row only for the
