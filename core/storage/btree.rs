@@ -6429,10 +6429,7 @@ impl BTreeCursor {
     /// be >= the rowid being inserted — in which case the caller must re-seek
     /// from the root.
     pub fn is_positioned_past_page_start(&self) -> bool {
-        self.valid_state == CursorValidState::Valid
-            && self.stack.current_page >= 0
-            && self.has_record()
-            && self.stack.current_cell_index() > 0
+        self.has_record() && self.stack.current_cell_index() > 0
     }
 
     /// True iff the cursor has run off the last cell of the table's rightmost
@@ -7093,8 +7090,16 @@ impl CursorTrait for BTreeCursor {
 
                 DeleteState::DeterminePostBalancingSeekKey => {
                     let page = self.stack.top_ref();
-                    let is_index = page.is_index()?;
-                    let target_key = if is_index {
+                    let cell_idx = self.stack.current_cell_index() as usize;
+                    if cell_idx > 0
+                        && !delete_may_need_balancing(page.get_contents(), cell_idx, usable_space)?
+                    {
+                        self.state = CursorState::Delete(DeleteState::LoadPage {
+                            post_balancing_seek_key: None,
+                        });
+                        continue;
+                    }
+                    let target_key = if page.is_index()? {
                         let record = match return_if_io!(self.record()) {
                             Some(record) => record.clone(),
                             None => unreachable!("there should've been a record"),
@@ -10833,7 +10838,6 @@ pub fn payload_overflow_threshold_min(_page_type: PageType, usable_space: usize)
 
 /// Same rule as `sqlite3BtreeDelete`: an interior delete may always need balancing, and a leaf
 /// delete needs it when the freed cell and its 2-byte cell pointer leave more than 2/3 of the page free.
-#[cfg(test)]
 fn delete_may_need_balancing(
     page: &PageContent,
     cell_idx: usize,
