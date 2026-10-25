@@ -1174,8 +1174,6 @@ pub struct ProgramState {
     pub(crate) is_active_write: bool,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
-    /// Whether this write opened an MVCC statement savepoint because it joined
-    /// an autocommit transaction a sibling statement holds open.
     shared_auto_txn_savepoint: bool,
     pub n_change: AtomicI64,
     pub n_total_change: AtomicI64,
@@ -1494,8 +1492,7 @@ impl ProgramState {
         connection: &Connection,
         self_counted: bool,
     ) -> bool {
-        let is_already_committing = !matches!(self.commit_state, CommitState::Ready);
-        if is_already_committing {
+        if self.is_committing() {
             return true;
         }
         let active_writers = connection.n_active_writes.load(Ordering::SeqCst);
@@ -1552,6 +1549,10 @@ impl ProgramState {
         }
         self.auto_txn_cleanup == TxnCleanup::RollbackTxn
             || (connection.get_auto_commit() && attached_txn_open())
+    }
+
+    pub(crate) fn is_committing(&self) -> bool {
+        !matches!(self.commit_state, CommitState::Ready)
     }
 
     /// The MvStore this statement runs against: the same answer as
@@ -1722,10 +1723,6 @@ impl ProgramState {
         write: bool,
     ) -> IOResultOr<()> {
         let in_explicit_txn = !connection.auto_commit.load(Ordering::SeqCst);
-        // Like SQLite's OP_Transaction, which opens a statement journal when
-        // `db->nVdbeRead > 1` even in autocommit: earlier statements in the
-        // shared transaction already returned, so a failing write must only
-        // undo its own changes.
         let joins_shared_mvcc_auto_txn = !in_explicit_txn
             && connection.mv_store().is_some()
             && connection.n_active_root_statements.load(Ordering::SeqCst) > 1;
@@ -3640,7 +3637,12 @@ impl Program {
 
             let can_autocommit_now = state.can_autocommit_now(&self.connection, self_counted);
             let is_mvcc = state.mv_store(&self.connection).is_some();
-            let changed_shared_mvcc_auto_txn = !can_autocommit_now
+            let statement_savepoint_covers_shared_txn = state.shared_auto_txn_savepoint
+                && !can_autocommit_now
+                && state.auto_txn_cleanup == TxnCleanup::RollbackTxn
+                && state.sequence_inner_tx_pending.is_none();
+            let changed_shared_mvcc_auto_txn = !statement_savepoint_covers_shared_txn
+                && !can_autocommit_now
                 && state.auto_txn_cleanup == TxnCleanup::RollbackTxn
                 && state.n_change.load(Ordering::SeqCst) > 0;
             if changed_shared_mvcc_auto_txn {
@@ -3654,7 +3656,8 @@ impl Program {
                 // is rolling back the whole MVCC transaction.
             }
             let must_rollback_tx_if_needed = can_autocommit_now || changed_shared_mvcc_auto_txn;
-            if err.is_some() && !pager.is_checkpointing() {
+            if (err.is_some() || statement_savepoint_covers_shared_txn) && !pager.is_checkpointing()
+            {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
                 // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
@@ -3698,18 +3701,7 @@ impl Program {
                 // Schema updated errors do not cause a rollback; the statement will be reprepared and retried,
                 // and the caller is expected to handle transaction cleanup explicitly if needed.
                 Some(LimboError::SchemaUpdated) => {}
-                // A write that joined an autocommit transaction a sibling
-                // statement still holds open cannot be the one committing, so
-                // its conflict came from the write-time check, which fails
-                // before the row is touched. Its statement savepoint was rolled
-                // back above, and the statements that already returned keep
-                // their changes, as they would in SQLite.
-                Some(LimboError::WriteWriteConflict)
-                    if state.shared_auto_txn_savepoint
-                        && !can_autocommit_now
-                        && state.auto_txn_cleanup == TxnCleanup::RollbackTxn
-                        && state.sequence_inner_tx_pending.is_none() =>
-                {
+                Some(LimboError::WriteWriteConflict) if statement_savepoint_covers_shared_txn => {
                     self.connection.set_changes(0);
                 }
                 Some(LimboError::WriteWriteConflict | LimboError::SchemaConflict) => {

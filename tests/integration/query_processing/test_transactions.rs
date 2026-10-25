@@ -748,6 +748,81 @@ fn test_mvcc_conflict_mid_statement_undoes_only_that_statement_in_shared_autocom
     assert_eq!(balances, vec![(1, 100), (2, 250)]);
 }
 
+// Dropping the reader before it finishes ends the transaction, so the
+// earlier INSERT commits, as it would in SQLite.
+#[test]
+fn test_mvcc_dropping_unfinished_reader_commits_shared_autocommit_txn() {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_drop_reader_shared_autocommit.db");
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+    let observer = tmp_db.connect_limbo();
+    conn1
+        .execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)")
+        .unwrap();
+    conn1
+        .execute("CREATE TABLE audit (id INTEGER PRIMARY KEY, note TEXT)")
+        .unwrap();
+    conn1
+        .execute("INSERT INTO accounts VALUES (1, 100), (2, 200)")
+        .unwrap();
+
+    let mut reader = conn2
+        .prepare("SELECT id FROM accounts ORDER BY id")
+        .unwrap();
+    step_to_row(&tmp_db, &mut reader);
+    conn2
+        .execute("INSERT INTO audit VALUES (1, 'payment recorded')")
+        .unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("UPDATE accounts SET balance = 150 WHERE id = 1")
+        .unwrap();
+    let conflict = conn2.execute("UPDATE accounts SET balance = 90 WHERE id = 1");
+    assert!(matches!(conflict, Err(LimboError::WriteWriteConflict)));
+
+    drop(reader);
+    conn1.execute("COMMIT").unwrap();
+
+    let audit: Vec<(i64,)> = observer.exec_rows("SELECT count(*) FROM audit");
+    assert_eq!(audit, vec![(1,)]);
+    let balances: Vec<(i64, i64)> =
+        observer.exec_rows("SELECT id, balance FROM accounts ORDER BY id");
+    assert_eq!(balances, vec![(1, 150), (2, 200)]);
+}
+
+// A constraint error in a write that joined the shared transaction undoes
+// that write's own rows and keeps the earlier INSERT.
+#[test]
+fn test_mvcc_constraint_error_undoes_only_that_statement_in_shared_autocommit_txn() {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_constraint_shared_autocommit.db");
+    let conn = tmp_db.connect_limbo();
+    let observer = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit (id INTEGER PRIMARY KEY, note TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO accounts VALUES (1, 100), (2, 200)")
+        .unwrap();
+
+    let mut reader = conn.prepare("SELECT id FROM accounts ORDER BY id").unwrap();
+    step_to_row(&tmp_db, &mut reader);
+    conn.execute("INSERT INTO audit VALUES (1, 'account opened')")
+        .unwrap();
+    // Inserts row 3, then fails on row 1.
+    let err = conn.execute("INSERT INTO accounts VALUES (3, 0), (1, 0)");
+    assert!(matches!(err, Err(LimboError::Constraint(_))));
+
+    reader.run_ignore_rows().unwrap();
+    drop(reader);
+
+    let audit: Vec<(i64,)> = observer.exec_rows("SELECT count(*) FROM audit");
+    assert_eq!(audit, vec![(1,)]);
+    let balances: Vec<(i64, i64)> =
+        observer.exec_rows("SELECT id, balance FROM accounts ORDER BY id");
+    assert_eq!(balances, vec![(1, 100), (2, 200)]);
+}
+
 #[test]
 fn test_mvcc_checkpoint_works() {
     let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_checkpoint_works.db");

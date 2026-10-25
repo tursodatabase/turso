@@ -1721,10 +1721,10 @@ impl Statement {
 
         let mut statement_failed = false;
         if self.state.execution_state.is_running() {
-            if self.query_mode == QueryMode::Normal
+            let returning_rows_already_written = self.query_mode == QueryMode::Normal
                 && self.program.change_cnt_on
-                && self.has_returned_row
-            {
+                && self.has_returned_row;
+            if returning_rows_already_written || self.finishes_shared_mvcc_auto_txn() {
                 // Write statement with RETURNING, user got at least one Row.
                 // With ephemeral-buffered RETURNING, ALL DML completed before any
                 // rows were yielded. The remaining work is just the scan-back
@@ -1858,6 +1858,23 @@ impl Statement {
             return Err(err);
         }
         Ok(())
+    }
+
+    fn finishes_shared_mvcc_auto_txn(&mut self) -> bool {
+        let connection = self.program.connection.clone();
+        let mv_store = connection.mv_store();
+        let Some(mv_store) = mv_store.as_ref() else {
+            return false;
+        };
+        self.query_mode == QueryMode::Normal
+            && self.program.is_readonly()
+            && self.counted_as_active_root
+            && connection.get_auto_commit()
+            && !self.state.is_committing()
+            && self.state.can_autocommit_now(&connection, true)
+            && connection
+                .get_mv_tx_id()
+                .is_some_and(|tx_id| mv_store.tx_has_writes(tx_id))
     }
 
     pub fn row(&self) -> Option<&Row> {
