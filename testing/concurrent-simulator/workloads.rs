@@ -947,6 +947,35 @@ impl Workload for FtsMatchWorkload {
     }
 }
 
+pub const UPSERT_SIM_TABLE: &str = "upsert_unique_sim";
+
+pub fn upsert_sim_schema() -> Vec<(String, String)> {
+    vec![(
+        UPSERT_SIM_TABLE.to_string(),
+        format!(
+            "CREATE TABLE IF NOT EXISTS {UPSERT_SIM_TABLE} (id INTEGER PRIMARY KEY, v TEXT UNIQUE)"
+        ),
+    )]
+}
+
+/// Insert or update rows in `UPSERT_SIM_TABLE` via `ON CONFLICT(v) DO UPDATE SET id = excluded.id`.
+/// Each slot `s` in `0..16` only uses rowids congruent to `s (mod 16)` so `id` can move both
+/// upward and downward across checkpoints without colliding with another slot's primary key.
+pub struct UpsertRowidWorkload;
+
+impl Workload for UpsertRowidWorkload {
+    fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        let slot = rng.random_range(0..16_i64);
+        let bucket = rng.random_range(0..10_000_i64);
+        let id = bucket * 16 + slot;
+        let sql = format!(
+            "INSERT INTO {UPSERT_SIM_TABLE} VALUES ({id}, 'k_{slot}') \
+             ON CONFLICT(v) DO UPDATE SET id = excluded.id"
+        );
+        Some(Operation::Execute { sql })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

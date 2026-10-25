@@ -1,5 +1,6 @@
 //! INSERT conversion into closed semantic HIR.
 
+use crate::namespace::NamespaceId;
 use turso_parser::ast;
 
 use super::{
@@ -282,10 +283,12 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let (sqlite_sequence, sequence, backing_table) = {
             let schema = self.context().schema(database)?;
             let sqlite_sequence = schema
-                .get_table(SQLITE_SEQUENCE_TABLE_NAME)
+                .get_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
                 .ok_or_else(|| LimboError::Corrupt("missing sqlite_sequence table".to_string()))?;
-            let sequence = schema.get_sequence(&sequence_name).cloned();
-            let backing_table = schema.get_table(&backing_table_name);
+            let sequence = schema
+                .get_sequence(NamespaceId::ROOT, &sequence_name)
+                .cloned();
+            let backing_table = schema.get_table(NamespaceId::ROOT, &backing_table_name);
             (sqlite_sequence, sequence, backing_table)
         };
         let sqlite_sequence_id = self.catalog_object_id(
@@ -336,9 +339,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let table_name = table.value().get_name();
         let inserts_into_table = |schema: &crate::schema::Schema| {
             schema
-                .triggers
-                .values()
-                .flatten()
+                .triggers(NamespaceId::ROOT)
                 .flat_map(|trigger| trigger.commands.iter())
                 .any(|command| {
                     matches!(command, ast::TriggerCmd::Insert { tbl_name, .. }

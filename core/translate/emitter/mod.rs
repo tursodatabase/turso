@@ -1,5 +1,6 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
+use crate::namespace::NamespaceId;
 use crate::schema::{BTreeTable, Column, Schema};
 use crate::translate::semantic::context::SemanticContext;
 use crate::vdbe::{
@@ -64,7 +65,7 @@ pub fn prepare_cdc_if_necessary(
             return Ok(None);
         }
     }
-    let Some(turso_cdc_table) = schema.get_table(cdc_table) else {
+    let Some(turso_cdc_table) = schema.get_table(NamespaceId::ROOT, cdc_table) else {
         crate::bail_parse_error!("no such table: {}", cdc_table);
     };
     let Some(cdc_btree) = turso_cdc_table.btree() else {
@@ -166,7 +167,9 @@ fn with_cdc_change_ids<T>(
     };
     let seq_name = crate::schema::autoincrement_sequence_name(&cdc_table);
     let seq = catalog
-        .with_schema(crate::MAIN_DB_ID, |s| s.get_sequence(&seq_name).cloned())
+        .with_schema(crate::MAIN_DB_ID, |s| {
+            s.get_sequence(NamespaceId::ROOT, &seq_name).cloned()
+        })
         .ok_or_else(|| {
             crate::LimboError::InternalError(format!(
                 "missing implicit AUTOINCREMENT sequence for CDC table \"{cdc_table}\""

@@ -1038,3 +1038,25 @@ test pg-publication-rel-dump-discovery-is-empty {
     FROM pg_catalog.pg_publication_rel pr;
 }
 expect {}
+
+test pg-publication-namespace-pgdump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT tableoid, oid, pnpubid, pnnspid
+    FROM pg_catalog.pg_publication_namespace;
+}
+expect {}
+
+test pg-seclabels-pgdump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT label, provider, classoid, objoid, objsubid
+    FROM pg_catalog.pg_seclabels
+    ORDER BY classoid, objoid, objsubid;
+}
+expect {}
+
+test pg-seclabels-columns-are-selectable {
+    SET search_path TO '';
+    SELECT objoid, classoid, objsubid, objtype, objnamespace, objname, provider, label
+    FROM pg_seclabels;
+}
+expect {}

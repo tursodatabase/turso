@@ -830,6 +830,11 @@ struct SpillState {
     temp_file: TempFile,
     /// Partitioning strategy for this spill.
     partitioning: Partitioning,
+    /// DISTINCT only, empty otherwise: for each partition, the hash of every key
+    /// it holds, in its buffer or on disk. Equal keys have equal hashes, so a key
+    /// whose hash is missing here cannot be a duplicate of anything on disk, and
+    /// `insert_distinct` does not need to load the partition to find that out.
+    distinct_key_hashes: Vec<HashSet<u64>>,
 }
 
 impl SpillState {
@@ -846,6 +851,7 @@ impl SpillState {
             next_spill_offset: 0,
             temp_file: TempFile::with_temp_store(io, temp_store)?,
             partitioning,
+            distinct_key_hashes: vec![],
         })
     }
 
@@ -1304,12 +1310,19 @@ impl HashTable {
                 return Ok(IOResult::Done(false));
             }
 
-            // Ensure spilled partition is loaded before checking
-            let has_partition = {
+            // Load the spilled partition only if a key with this hash went to disk;
+            // otherwise nothing there can equal this key.
+            let may_be_on_disk = {
                 let spill_state = self.spill_state.as_ref().expect("spill state exists");
+                turso_assert_eq!(
+                    spill_state.distinct_key_hashes.len(),
+                    spill_state.partitioning.count,
+                    "DISTINCT spill state must track key hashes for every partition"
+                );
                 spill_state.find_partition(partition_idx).is_some()
+                    && spill_state.distinct_key_hashes[partition_idx].contains(&hash)
             };
-            if has_partition && !self.is_partition_loaded(partition_idx) {
+            if may_be_on_disk && !self.is_partition_loaded(partition_idx) {
                 return_if_io!(self.load_spilled_partition(partition_idx, metrics.as_deref_mut()));
             }
 
@@ -1347,6 +1360,7 @@ impl HashTable {
                     key_values.iter().cloned().try_collect()?,
                     0,
                 ))?;
+                spill_state.distinct_key_hashes[partition_idx].try_insert(hash)?;
             }
             self.num_entries += 1;
             self.mem_used += entry_size;
@@ -1371,6 +1385,7 @@ impl HashTable {
                 let partitioning = Partitioning::new(partition_count);
                 self.spill_state = Some(SpillState::new(&self.io, self.temp_store, partitioning)?);
                 self.redistribute_to_partitions()?;
+                self.record_distinct_key_hashes()?;
                 self.state = HashTableState::Spilled;
             }
             return self.insert_distinct(key_values, key_refs, metrics);
@@ -1387,6 +1402,23 @@ impl HashTable {
         self.num_entries += 1;
         self.mem_used += entry_size;
         Ok(IOResult::Done(true))
+    }
+
+    /// Called once, when a DISTINCT table first spills and its entries have just
+    /// been moved into the partition buffers: records each entry's hash in the
+    /// set of the partition it belongs to.
+    fn record_distinct_key_hashes(&mut self) -> Result<()> {
+        let spill_state = self.spill_state.as_mut().expect("spill state must exist");
+        let mut hashes = Vec::try_with_capacity_ext(spill_state.partitioning.count)?;
+        for buffer in &spill_state.partition_buffers {
+            let mut set = HashSet::try_with_capacity_ext(buffer.entries.len())?;
+            for entry in &buffer.entries {
+                set.try_insert(entry.hash)?;
+            }
+            hashes.try_push(set)?;
+        }
+        spill_state.distinct_key_hashes = hashes;
+        Ok(())
     }
 
     /// Clear all entries and reset spill state.
@@ -3811,6 +3843,7 @@ mod hashtests {
             next_spill_offset: 0,
             temp_file,
             partitioning,
+            distinct_key_hashes: vec![],
         };
         ht.spill_state = Some(spill_state);
         ht.state = HashTableState::Probing;
@@ -3861,6 +3894,7 @@ mod hashtests {
             next_spill_offset: truncated.len() as u64,
             temp_file,
             partitioning,
+            distinct_key_hashes: vec![],
         };
         ht.spill_state = Some(spill_state);
         ht.state = HashTableState::Probing;
@@ -4100,6 +4134,58 @@ mod hashtests {
         loop {
             if let IOResult::Done(inserted) =
                 ht.insert_distinct(&key_values, &key_refs, None).unwrap()
+            {
+                return inserted;
+            }
+        }
+    }
+
+    /// A spilled DISTINCT used to reload a partition from disk for every new key,
+    /// which made a large DISTINCT quadratic (#8223). New keys must not read the
+    /// disk at all; duplicates of keys on disk must still be found, including
+    /// under NOCASE where the duplicate differs in case.
+    #[test]
+    fn test_insert_distinct_new_keys_do_not_reload_spilled_partitions() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 4 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::NoCase],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: Some(4),
+        };
+        let mut ht = HashTable::new(config, io).unwrap();
+        let mut metrics = HashJoinMetrics::default();
+
+        for key in 0..2048 {
+            assert!(insert_distinct_text(
+                &mut ht,
+                &format!("key{key}"),
+                &mut metrics
+            ));
+        }
+        assert!(ht.has_spilled());
+        assert!(metrics.spill_chunks > 0, "{metrics:?}");
+        assert_eq!(metrics.load_bytes_read, 0, "{metrics:?}");
+
+        for key in 0..2048 {
+            assert!(
+                !insert_distinct_text(&mut ht, &format!("KEY{key}"), &mut metrics),
+                "KEY{key} is a NOCASE duplicate of key{key}"
+            );
+        }
+        assert!(metrics.load_bytes_read > 0, "{metrics:?}");
+    }
+
+    fn insert_distinct_text(ht: &mut HashTable, key: &str, metrics: &mut HashJoinMetrics) -> bool {
+        let key_values = [Value::build_text(key.to_string())];
+        let key_refs = [key_values[0].as_ref()];
+        loop {
+            if let IOResult::Done(inserted) = ht
+                .insert_distinct(&key_values, &key_refs, Some(metrics))
+                .unwrap()
             {
                 return inserted;
             }

@@ -5305,6 +5305,7 @@ pub(crate) fn emit_parameter(
 
 #[cfg(test)]
 mod tests {
+    use crate::namespace::NamespaceId;
     use std::num::NonZeroU32;
 
     use super::*;
@@ -5416,13 +5417,16 @@ mod tests {
             )
             .expect("custom operator type parses");
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql(
-                    "CREATE TABLE custom_values(a amount(4), b amount(4)) STRICT",
-                    2,
-                )
-                .expect("custom operator table parses"),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql(
+                        "CREATE TABLE custom_values(a amount(4), b amount(4)) STRICT",
+                        2,
+                    )
+                    .expect("custom operator table parses"),
+                ),
+            )
             .expect("custom operator table name is unique");
         schema
     }
@@ -5434,9 +5438,10 @@ mod tests {
             ("CREATE TABLE right_values(id INTEGER)", 3),
         ] {
             schema
-                .add_btree_table(Arc::new(
-                    BTreeTable::from_sql(sql, root_page).expect("join table parses"),
-                ))
+                .add_btree_table(
+                    NamespaceId::ROOT,
+                    Arc::new(BTreeTable::from_sql(sql, root_page).expect("join table parses")),
+                )
                 .expect("join table name is unique");
         }
         schema
@@ -6118,13 +6123,16 @@ mod tests {
             )
             .expect("custom type parses");
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql(
-                    "CREATE TABLE typed_values(value scaled(4) DEFAULT 3) STRICT",
-                    2,
-                )
-                .expect("custom table parses"),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql(
+                        "CREATE TABLE typed_values(value scaled(4) DEFAULT 3) STRICT",
+                        2,
+                    )
+                    .expect("custom table parses"),
+                ),
+            )
             .expect("table name is unique");
         let document = analyze_sql(schema, "SELECT value FROM typed_values");
         let hir::HirRoot::Query(root) = &document.root else {

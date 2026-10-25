@@ -9,6 +9,7 @@ use super::stream::{
 };
 use super::MaintenanceInput;
 use crate::incremental::dag;
+use crate::namespace::NamespaceId;
 use crate::schema::Schema;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -55,14 +56,14 @@ fn emit_output_arrangement(
     );
 
     let table = schema
-        .get_btree_table(arrangement_table_name)
+        .get_btree_table(NamespaceId::ROOT, arrangement_table_name)
         .ok_or_else(|| {
             LimboError::InternalError(format!(
                 "output arrangement {arrangement_table_name} of materialized view {view_name} not found"
             ))
         })?;
     let index = schema
-        .get_indices(arrangement_table_name)
+        .get_indices(NamespaceId::ROOT, arrangement_table_name)
         .next()
         .cloned()
         .ok_or_else(|| {

@@ -1,5 +1,6 @@
 //! Query-source conversion into HIR arenas and scopes.
 
+use crate::namespace::NamespaceId;
 use turso_parser::ast;
 
 use super::{
@@ -1595,7 +1596,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let table = self
             .context()
             .schema(database)?
-            .get_table(&table_name)
+            .get_table(NamespaceId::ROOT, &table_name)
             .ok_or_else(|| LimboError::ParseError(format!("no such table: {table_name}")))?;
         self.analyze_catalog_table_source(
             name,

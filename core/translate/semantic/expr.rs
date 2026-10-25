@@ -1,5 +1,6 @@
 //! Parser-expression conversion into resolved HIR expressions.
 
+use crate::namespace::NamespaceId;
 use smallvec::SmallVec;
 use turso_parser::ast;
 
@@ -3928,8 +3929,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let name = normalize_ident(&user_name);
                 let database = self
                     .context()
-                    .resolve_existing_sequence_database_id(&name)
-                    .unwrap_or(crate::MAIN_DB_ID);
+                    .find_existing_sequence(&name)
+                    .map_or(crate::MAIN_DB_ID, |namespace| namespace.database_id);
                 (hir::DatabaseId::new(database), name)
             }
         };
@@ -3937,18 +3938,20 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             crate::translate::sequence::sequence_backing_table_name(&normalized_name);
         let (backing_table, sequence, sqlite_sequence) = {
             let schema = self.context().schema(database)?;
-            let backing_table = schema.get_table(&backing_table_name).ok_or_else(|| {
-                LimboError::ParseError(format!("sequence \"{user_name}\" does not exist"))
-            })?;
+            let backing_table = schema
+                .get_table(NamespaceId::ROOT, &backing_table_name)
+                .ok_or_else(|| {
+                    LimboError::ParseError(format!("sequence \"{user_name}\" does not exist"))
+                })?;
             let sequence = schema
-                .get_sequence(&normalized_name)
+                .get_sequence(NamespaceId::ROOT, &normalized_name)
                 .cloned()
                 .ok_or_else(|| {
                     LimboError::ParseError(format!("sequence \"{user_name}\" does not exist"))
                 })?;
             let sqlite_sequence = normalized_name
                 .starts_with(AUTOINCREMENT_SEQ_PREFIX)
-                .then(|| schema.get_table(SQLITE_SEQUENCE_TABLE_NAME))
+                .then(|| schema.get_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME))
                 .flatten();
             (backing_table, sequence, sqlite_sequence)
         };

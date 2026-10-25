@@ -1,6 +1,7 @@
 //! Lowering shared by HIR DELETE and UPDATE.
 
 use crate::alloc::TursoIteratorExt;
+use crate::namespace::NamespaceId;
 use turso_parser::ast;
 
 use crate::{
@@ -117,7 +118,7 @@ fn may_clear_btrees(session: &HirSession<'_>, document: &HirDocument, target: So
     let table_name = table.value().get_name();
     session.context.with_schema(database.index(), |schema| {
         schema
-            .get_dependent_materialized_views(table_name)
+            .get_dependent_materialized_views(NamespaceId::ROOT, table_name)
             .is_empty()
     })
 }

@@ -218,9 +218,11 @@ impl Connection {
         view_name: &str,
     ) -> Result<Vec<Option<String>>> {
         let schema = self.schema.read().clone();
-        let view = schema.get_materialized_view(view_name).ok_or_else(|| {
-            LimboError::InvalidArgument(format!("no such materialized view: {view_name}"))
-        })?;
+        let view = schema
+            .get_materialized_view(crate::namespace::NamespaceId::ROOT, view_name)
+            .ok_or_else(|| {
+                LimboError::InvalidArgument(format!("no such materialized view: {view_name}"))
+            })?;
         let select = view.lock().select_stmt.clone();
         let plan = build_plan_for_connection(view_name, &select, &schema, self)?;
         Ok(plan

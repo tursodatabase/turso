@@ -957,6 +957,25 @@ impl InsertRow<'_> {
             }),
         }
         program.preassign_label_to_next_insn(ready);
+        let types_checked_first = table.has_virtual_columns()
+            || self
+                .triggers
+                .iter()
+                .any(|trigger| trigger.time == TriggerTime::Before);
+        let checks_not_null_first = |position: usize, column: &Column| {
+            table.is_strict
+                && column.notnull()
+                && !column.is_rowid_alias()
+                && !column.is_virtual_generated()
+                && !types_checked_first
+                && !column.is_array()
+                && self.target.source.column_type_programs[position].is_none()
+        };
+        for (position, column) in table.columns().iter().enumerate() {
+            if checks_not_null_first(position, column) {
+                self.emit_notnull_check(program, position, column, row_done)?;
+            }
+        }
         if super::dml::has_custom_types(self.target.source) {
             super::dml::emit_custom_type_writes(
                 program,
@@ -983,7 +1002,11 @@ impl InsertRow<'_> {
         // becomes the column's DEFAULT, which the generated columns, the
         // CHECK constraints and the index keys must see.
         for (position, column) in table.columns().iter().enumerate() {
-            if column.notnull() && !column.is_rowid_alias() && !column.is_virtual_generated() {
+            if column.notnull()
+                && !column.is_rowid_alias()
+                && !column.is_virtual_generated()
+                && !checks_not_null_first(position, column)
+            {
                 self.emit_notnull_check(program, position, column, row_done)?;
             }
         }
@@ -2474,6 +2497,7 @@ struct IndexKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::namespace::NamespaceId;
     use crate::{
         sync::Arc,
         translate::semantic_lowering::query::tests::{analyze_plan, indexed_items_schema, program},
@@ -2501,9 +2525,10 @@ mod tests {
             ),
         ] {
             schema
-                .add_btree_table(Arc::new(
-                    crate::schema::BTreeTable::from_sql(sql, root).unwrap(),
-                ))
+                .add_btree_table(
+                    NamespaceId::ROOT,
+                    Arc::new(crate::schema::BTreeTable::from_sql(sql, root).unwrap()),
+                )
                 .unwrap();
         }
         schema
@@ -2513,13 +2538,16 @@ mod tests {
     fn strict_table_with_virtual_columns_checks_only_stored_columns() {
         let mut schema = schema();
         schema
-            .add_btree_table(Arc::new(
-                crate::schema::BTreeTable::from_sql(
-                    "CREATE TABLE sv(a INT, b INT AS (a || 'x'), c TEXT) STRICT",
-                    120,
-                )
-                .unwrap(),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    crate::schema::BTreeTable::from_sql(
+                        "CREATE TABLE sv(a INT, b INT AS (a || 'x'), c TEXT) STRICT",
+                        120,
+                    )
+                    .unwrap(),
+                ),
+            )
             .unwrap();
         let plan = Arc::new(analyze_plan(schema, "INSERT INTO sv(a, c) VALUES (1, 'q')"));
         let insert = insert_root(&plan).unwrap();
@@ -2561,7 +2589,9 @@ mod tests {
         let mut table =
             crate::schema::BTreeTable::from_sql("CREATE TABLE hc(a, b DEFAULT 5, c)", 121).unwrap();
         table.columns_mut()[1].set_hidden(true);
-        schema.add_btree_table(Arc::new(table)).unwrap();
+        schema
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
+            .unwrap();
         let plan = analyze_plan(schema, "INSERT INTO hc VALUES (1, 2)");
         let insert = insert_root(&plan).unwrap();
         check(&plan, insert, &program()).unwrap();
@@ -2591,13 +2621,16 @@ mod tests {
             )
             .unwrap();
         schema
-            .add_btree_table(Arc::new(
-                crate::schema::BTreeTable::from_sql(
-                    "CREATE TABLE priced(id INTEGER PRIMARY KEY, amount cents NOT NULL) STRICT",
-                    140,
-                )
-                .unwrap(),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    crate::schema::BTreeTable::from_sql(
+                        "CREATE TABLE priced(id INTEGER PRIMARY KEY, amount cents NOT NULL) STRICT",
+                        140,
+                    )
+                    .unwrap(),
+                ),
+            )
             .unwrap();
         let plan = Arc::new(analyze_plan(schema, sql));
         let insert = insert_root(&plan).unwrap();
@@ -2677,15 +2710,18 @@ mod tests {
             let name = crate::schema::autoincrement_sequence_name("counted");
             let sequence =
                 crate::schema::Sequence::new(name.clone(), None, None, None, None, false).unwrap();
-            schema.sequences.insert(name.clone(), Arc::new(sequence));
+            schema.add_sequence(NamespaceId::ROOT, sequence);
             schema
-                .add_btree_table(Arc::new(
-                    crate::schema::BTreeTable::from_sql(
-                        &crate::translate::sequence::sequence_backing_table_sql(&name),
-                        130,
-                    )
-                    .unwrap(),
-                ))
+                .add_btree_table(
+                    NamespaceId::ROOT,
+                    Arc::new(
+                        crate::schema::BTreeTable::from_sql(
+                            &crate::translate::sequence::sequence_backing_table_sql(&name),
+                            130,
+                        )
+                        .unwrap(),
+                    ),
+                )
                 .unwrap();
             schema
         };
@@ -2725,7 +2761,7 @@ mod tests {
                 ),
             ] {
                 schema
-                    .add_btree_table(Arc::new(
+                    .add_btree_table(NamespaceId::ROOT, Arc::new(
                         crate::schema::BTreeTable::from_sql(sql, root).unwrap(),
                     ))
                     .unwrap();
@@ -2906,7 +2942,7 @@ mod tests {
     fn array_values_are_encoded_as_records() {
         let mut schema = schema();
         schema
-            .add_btree_table(Arc::new(
+            .add_btree_table(NamespaceId::ROOT, Arc::new(
                 crate::schema::BTreeTable::from_sql(
                     "CREATE TABLE tagged(id INTEGER PRIMARY KEY, tags TEXT[], grid INTEGER[][]) STRICT",
                     150,

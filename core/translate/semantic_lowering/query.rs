@@ -10768,7 +10768,9 @@ pub(super) fn emit_array_results(
         if let Some(decode) = array_column_decode(document, &document.exprs[output.expr]) {
             super::expr::translate_schema_calls_on_elements(program, document, decode, register)?;
         }
-        program.emit_insn(Insn::ArrayDecode { reg: register });
+        if !program.flags.keep_array_results_as_blobs() {
+            program.emit_insn(Insn::ArrayDecode { reg: register });
+        }
         program.preassign_label_to_next_insn(skip);
     }
     Ok(())
@@ -10880,6 +10882,7 @@ fn row_value_destination(program: &mut ProgramBuilder, width: usize) -> Destinat
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::namespace::NamespaceId;
     use crate::{
         dialect::SqliteDialect,
         schema::{BTreeTable, Schema},
@@ -10965,33 +10968,39 @@ pub(super) mod tests {
     pub(in crate::translate::semantic_lowering) fn indexed_items_schema() -> Schema {
         let mut schema = Schema::new();
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql("CREATE TABLE items(value INTEGER, extra TEXT)", 2)
-                    .expect("fixed table schema parses"),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql("CREATE TABLE items(value INTEGER, extra TEXT)", 2)
+                        .expect("fixed table schema parses"),
+                ),
+            )
             .expect("fixed table name is unique");
         schema
-            .add_index(Arc::new(Index {
-                constraint_name: None,
-                name: "items_value".to_string(),
-                table_name: "items".to_string(),
-                root_page: 3,
-                columns: crate::alloc::vec![IndexColumn {
-                    name: "value".to_string(),
-                    order: SortOrder::Asc,
-                    nulls_order: None,
-                    pos_in_table: 0,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                }],
-                unique: false,
-                ephemeral: false,
-                has_rowid: true,
-                where_clause: None,
-                index_method: None,
-                on_conflict: None,
-            }))
+            .add_index(
+                NamespaceId::ROOT,
+                Arc::new(Index {
+                    constraint_name: None,
+                    name: "items_value".to_string(),
+                    table_name: "items".to_string(),
+                    root_page: 3,
+                    columns: crate::alloc::vec![IndexColumn {
+                        name: "value".to_string(),
+                        order: SortOrder::Asc,
+                        nulls_order: None,
+                        pos_in_table: 0,
+                        collation: None,
+                        default: None,
+                        expr: None,
+                    }],
+                    unique: false,
+                    ephemeral: false,
+                    has_rowid: true,
+                    where_clause: None,
+                    index_method: None,
+                    on_conflict: None,
+                }),
+            )
             .expect("fixed index name is unique");
         schema
     }
@@ -10999,10 +11008,16 @@ pub(super) mod tests {
     fn rowid_items_schema() -> Schema {
         let mut schema = Schema::new();
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)", 2)
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql(
+                        "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)",
+                        2,
+                    )
                     .expect("fixed table schema parses"),
-            ))
+                ),
+            )
             .expect("fixed table name is unique");
         schema
     }
@@ -11016,10 +11031,16 @@ pub(super) mod tests {
             )
             .expect("custom ordered type parses");
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql("CREATE TABLE items(value amount(4), extra TEXT) STRICT", 2)
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql(
+                        "CREATE TABLE items(value amount(4), extra TEXT) STRICT",
+                        2,
+                    )
                     .expect("custom ordered table parses"),
-            ))
+                ),
+            )
             .expect("custom ordered table name is unique");
         schema
     }
@@ -11027,39 +11048,48 @@ pub(super) mod tests {
     fn joined_items_schema() -> Schema {
         let mut schema = Schema::new();
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql("CREATE TABLE left_items(value INTEGER)", 2)
-                    .expect("left table schema parses"),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql("CREATE TABLE left_items(value INTEGER)", 2)
+                        .expect("left table schema parses"),
+                ),
+            )
             .expect("left table name is unique");
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql("CREATE TABLE right_items(value INTEGER, extra TEXT)", 3)
-                    .expect("right table schema parses"),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql("CREATE TABLE right_items(value INTEGER, extra TEXT)", 3)
+                        .expect("right table schema parses"),
+                ),
+            )
             .expect("right table name is unique");
         schema
-            .add_index(Arc::new(Index {
-                constraint_name: None,
-                name: "right_items_value".to_string(),
-                table_name: "right_items".to_string(),
-                root_page: 4,
-                columns: crate::alloc::vec![IndexColumn {
-                    name: "value".to_string(),
-                    order: SortOrder::Asc,
-                    nulls_order: None,
-                    pos_in_table: 0,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                }],
-                unique: false,
-                ephemeral: false,
-                has_rowid: true,
-                where_clause: None,
-                index_method: None,
-                on_conflict: None,
-            }))
+            .add_index(
+                NamespaceId::ROOT,
+                Arc::new(Index {
+                    constraint_name: None,
+                    name: "right_items_value".to_string(),
+                    table_name: "right_items".to_string(),
+                    root_page: 4,
+                    columns: crate::alloc::vec![IndexColumn {
+                        name: "value".to_string(),
+                        order: SortOrder::Asc,
+                        nulls_order: None,
+                        pos_in_table: 0,
+                        collation: None,
+                        default: None,
+                        expr: None,
+                    }],
+                    unique: false,
+                    ephemeral: false,
+                    has_rowid: true,
+                    where_clause: None,
+                    index_method: None,
+                    on_conflict: None,
+                }),
+            )
             .expect("right index name is unique");
         schema
     }
@@ -11067,16 +11097,22 @@ pub(super) mod tests {
     fn automatic_join_schema() -> Schema {
         let mut schema = Schema::new();
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql("CREATE TABLE left_items(value INTEGER)", 2)
-                    .expect("left table schema parses"),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql("CREATE TABLE left_items(value INTEGER)", 2)
+                        .expect("left table schema parses"),
+                ),
+            )
             .expect("left table name is unique");
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql("CREATE TABLE right_items(value INTEGER, extra TEXT)", 3)
-                    .expect("right table schema parses"),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql("CREATE TABLE right_items(value INTEGER, extra TEXT)", 3)
+                        .expect("right table schema parses"),
+                ),
+            )
             .expect("right table name is unique");
         schema.analyze_stats.table_stats_mut("left_items").row_count = Some(1_000);
         schema
@@ -11089,23 +11125,29 @@ pub(super) mod tests {
     fn automatic_generated_join_schema() -> Schema {
         let mut schema = Schema::new();
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql("CREATE TABLE left_items(value INTEGER)", 2)
-                    .expect("left table schema parses"),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql("CREATE TABLE left_items(value INTEGER)", 2)
+                        .expect("left table schema parses"),
+                ),
+            )
             .expect("left table name is unique");
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql(
-                    "CREATE TABLE right_items(\
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql(
+                        "CREATE TABLE right_items(\
                          value INTEGER, \
                          generated INTEGER AS (value + 1) VIRTUAL, \
                          extra TEXT\
                      )",
-                    3,
-                )
-                .expect("generated table schema parses"),
-            ))
+                        3,
+                    )
+                    .expect("generated table schema parses"),
+                ),
+            )
             .expect("right table name is unique");
         schema.analyze_stats.table_stats_mut("left_items").row_count = Some(1_000);
         schema
@@ -11118,10 +11160,13 @@ pub(super) mod tests {
     fn left_join_with_tail_schema() -> Schema {
         let mut schema = automatic_join_schema();
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql("CREATE TABLE tail_items(value INTEGER, extra TEXT)", 4)
-                    .expect("tail table schema parses"),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql("CREATE TABLE tail_items(value INTEGER, extra TEXT)", 4)
+                        .expect("tail table schema parses"),
+                ),
+            )
             .expect("tail table name is unique");
         schema
     }
@@ -11764,7 +11809,7 @@ pub(super) mod tests {
         };
         let mut program = program();
         let cursor = program.alloc_cursor_id(CursorType::BTreeTable(
-            schema.get_btree_table("items").unwrap(),
+            schema.get_btree_table(NamespaceId::ROOT, "items").unwrap(),
         ));
         program.bind_source(
             reference.source,
@@ -12545,10 +12590,13 @@ pub(super) mod tests {
     fn correlation_comes_from_the_resolved_query_capture_set() {
         let mut schema = Schema::new();
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql("CREATE TABLE items(value TEXT)", 2)
-                    .expect("fixed table schema parses"),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql("CREATE TABLE items(value TEXT)", 2)
+                        .expect("fixed table schema parses"),
+                ),
+            )
             .expect("fixed table name is unique");
         let document = analyze_sql(schema, "SELECT (SELECT value) FROM items");
         let subquery = root_subquery(&document);
@@ -12653,10 +12701,13 @@ pub(super) mod tests {
     fn correlated_subquery_wrapper_does_not_emit_once() {
         let mut schema = Schema::new();
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql("CREATE TABLE items(value TEXT)", 2)
-                    .expect("fixed table schema parses"),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql("CREATE TABLE items(value TEXT)", 2)
+                        .expect("fixed table schema parses"),
+                ),
+            )
             .expect("fixed table name is unique");
         let document = analyze_sql(schema, "SELECT (SELECT value) FROM items");
         let mut program = program();
@@ -13097,10 +13148,13 @@ pub(super) mod tests {
     fn planned_full_scan_binds_its_source_and_emits_residual_filter() {
         let mut schema = Schema::new();
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql("CREATE TABLE items(value INTEGER)", 2)
-                    .expect("fixed table schema parses"),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql("CREATE TABLE items(value INTEGER)", 2)
+                        .expect("fixed table schema parses"),
+                ),
+            )
             .expect("fixed table name is unique");
         let plan = analyze_plan(
             schema,
@@ -15087,18 +15141,21 @@ pub(super) mod tests {
             .expect("items table schema parses"),
         );
         schema
-            .add_btree_table(table.clone())
+            .add_btree_table(NamespaceId::ROOT, table.clone())
             .expect("items table name is unique");
         schema
-            .add_index(Arc::new(
-                Index::from_sql(
-                    &SymbolTable::new(),
-                    "CREATE INDEX items_idx ON items(d, a, lower(b), c)",
-                    3,
-                    &table,
-                )
-                .expect("expression index parses"),
-            ))
+            .add_index(
+                NamespaceId::ROOT,
+                Arc::new(
+                    Index::from_sql(
+                        &SymbolTable::new(),
+                        "CREATE INDEX items_idx ON items(d, a, lower(b), c)",
+                        3,
+                        &table,
+                    )
+                    .expect("expression index parses"),
+                ),
+            )
             .expect("items index name is unique");
         schema
     }
@@ -15150,28 +15207,34 @@ pub(super) mod tests {
     fn left_join_null_row_computes_the_indexed_expression_from_its_columns() {
         let mut schema = Schema::new();
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql("CREATE TABLE left_items(value INTEGER)", 2)
-                    .expect("left table schema parses"),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql("CREATE TABLE left_items(value INTEGER)", 2)
+                        .expect("left table schema parses"),
+                ),
+            )
             .expect("left table name is unique");
         let right = Arc::new(
             BTreeTable::from_sql("CREATE TABLE right_items(k INTEGER, v INTEGER)", 3)
                 .expect("right table schema parses"),
         );
         schema
-            .add_btree_table(right.clone())
+            .add_btree_table(NamespaceId::ROOT, right.clone())
             .expect("right table name is unique");
         schema
-            .add_index(Arc::new(
-                Index::from_sql(
-                    &SymbolTable::new(),
-                    "CREATE INDEX right_items_idx ON right_items(k, v, coalesce(v, -1))",
-                    4,
-                    &right,
-                )
-                .expect("expression index parses"),
-            ))
+            .add_index(
+                NamespaceId::ROOT,
+                Arc::new(
+                    Index::from_sql(
+                        &SymbolTable::new(),
+                        "CREATE INDEX right_items_idx ON right_items(k, v, coalesce(v, -1))",
+                        4,
+                        &right,
+                    )
+                    .expect("expression index parses"),
+                ),
+            )
             .expect("right index name is unique");
         let plan = analyze_plan(
             schema,

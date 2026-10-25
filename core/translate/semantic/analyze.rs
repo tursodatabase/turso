@@ -2277,6 +2277,7 @@ pub(super) fn unsupported_select<T>() -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    use crate::namespace::NamespaceId;
     use turso_parser::{ast, parser::Parser};
 
     use crate::{
@@ -2362,7 +2363,9 @@ mod tests {
             AnalyzeInput::TriggerPredicate {
                 context: TriggerAnalysis {
                     database: DatabaseId::new(MAIN_DB_ID),
-                    table: schema.get_table("writable").expect("writable table exists"),
+                    table: schema
+                        .get_table(NamespaceId::ROOT, "writable")
+                        .expect("writable table exists"),
                     event,
                     new_is_decoded: false,
                 },
@@ -2388,7 +2391,9 @@ mod tests {
             AnalyzeInput::TriggerSelect {
                 context: TriggerAnalysis {
                     database: DatabaseId::new(MAIN_DB_ID),
-                    table: schema.get_table("writable").expect("writable table exists"),
+                    table: schema
+                        .get_table(NamespaceId::ROOT, "writable")
+                        .expect("writable table exists"),
                     event,
                     new_is_decoded: false,
                 },
@@ -2426,7 +2431,9 @@ mod tests {
             AnalyzeInput::TriggerInsert {
                 context: TriggerAnalysis {
                     database: DatabaseId::new(MAIN_DB_ID),
-                    table: schema.get_table("writable").expect("writable table exists"),
+                    table: schema
+                        .get_table(NamespaceId::ROOT, "writable")
+                        .expect("writable table exists"),
                     event,
                     new_is_decoded: false,
                 },
@@ -2471,7 +2478,9 @@ mod tests {
             AnalyzeInput::TriggerUpdate {
                 context: TriggerAnalysis {
                     database: DatabaseId::new(MAIN_DB_ID),
-                    table: schema.get_table("writable").expect("writable table exists"),
+                    table: schema
+                        .get_table(NamespaceId::ROOT, "writable")
+                        .expect("writable table exists"),
                     event,
                     new_is_decoded: false,
                 },
@@ -2511,7 +2520,9 @@ mod tests {
             AnalyzeInput::TriggerDelete {
                 context: TriggerAnalysis {
                     database: DatabaseId::new(MAIN_DB_ID),
-                    table: schema.get_table("writable").expect("writable table exists"),
+                    table: schema
+                        .get_table(NamespaceId::ROOT, "writable")
+                        .expect("writable table exists"),
                     event,
                     new_is_decoded: false,
                 },
@@ -2557,7 +2568,9 @@ mod tests {
             AnalyzeInput::TriggerProgram(crate::translate::semantic::TriggerProgramInput {
                 context: TriggerAnalysis {
                     database: DatabaseId::new(MAIN_DB_ID),
-                    table: schema.get_table("writable").expect("writable table exists"),
+                    table: schema
+                        .get_table(NamespaceId::ROOT, "writable")
+                        .expect("writable table exists"),
                     event,
                     new_is_decoded: false,
                 },
@@ -2606,7 +2619,7 @@ mod tests {
             .expect("fixed table schema parses"),
         );
         schema
-            .add_btree_table(table)
+            .add_btree_table(NamespaceId::ROOT, table)
             .expect("fixed table name is unique");
         schema
     }
@@ -2626,7 +2639,7 @@ mod tests {
                 BTreeTable::from_sql(sql, root_page).expect("fixed join table schema parses"),
             );
             schema
-                .add_btree_table(table)
+                .add_btree_table(NamespaceId::ROOT, table)
                 .expect("fixed join table name is unique");
         }
         schema
@@ -2706,12 +2719,12 @@ mod tests {
             ),
         ] {
             let table = schema
-                .get_btree_table(table_name)
+                .get_btree_table(NamespaceId::ROOT, table_name)
                 .expect("indexed table exists");
             let index = Index::from_sql(&symbols, sql, root_page, &table)
                 .expect("fixed index schema parses");
             schema
-                .add_index(Arc::new(index))
+                .add_index(NamespaceId::ROOT, Arc::new(index))
                 .expect("fixed index name is unique");
         }
         schema
@@ -2727,11 +2740,11 @@ mod tests {
                     .expect("table schema parses"),
             );
             schema
-                .add_btree_table(table.clone())
+                .add_btree_table(NamespaceId::ROOT, table.clone())
                 .expect("table name is unique");
             let index = Index::from_sql(&symbols, index_sql, 3, &table).expect("index parses");
             schema
-                .add_index(Arc::new(index))
+                .add_index(NamespaceId::ROOT, Arc::new(index))
                 .expect("index name is unique");
             crate::translate::semantic::scope::tests::SOURCES_ADDED.with(|added| added.set(0));
             analyze_sql_with_schema(&schema, "SELECT a FROM t WHERE b = 1")
@@ -2759,7 +2772,7 @@ mod tests {
         )
         .expect("table schema parses");
         schema
-            .add_btree_table(Arc::new(table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
             .expect("table name is unique");
         crate::translate::semantic::scope::tests::COLUMN_BINDINGS_MADE.with(|made| made.set(0));
         analyze_sql_with_schema(&schema, "SELECT * FROM wide WHERE id = 1")
@@ -2779,7 +2792,7 @@ mod tests {
         ] {
             let table = BTreeTable::from_sql(sql, 2).expect("table schema parses");
             schema
-                .add_btree_table(Arc::new(table))
+                .add_btree_table(NamespaceId::ROOT, Arc::new(table))
                 .expect("table name is unique");
         }
         let source_columns = |sql: &str| {
@@ -2834,7 +2847,7 @@ mod tests {
         ] {
             let table = BTreeTable::from_sql(sql, 2).expect("table schema parses");
             schema
-                .add_btree_table(Arc::new(table))
+                .add_btree_table(NamespaceId::ROOT, Arc::new(table))
                 .expect("table name is unique");
         }
         let stored = |sql: &str| {
@@ -2869,7 +2882,7 @@ mod tests {
         )
         .expect("table schema parses");
         schema
-            .add_btree_table(Arc::new(table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
             .expect("table name is unique");
         crate::translate::semantic::hir::tests::DECLARED_TYPES_COPIED.with(|copied| copied.set(0));
         analyze_sql_with_schema(&schema, "SELECT * FROM wide WHERE id = 1")
@@ -2886,7 +2899,7 @@ mod tests {
         let table = BTreeTable::from_sql("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)", 2)
             .expect("table schema parses");
         schema
-            .add_btree_table(Arc::new(table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
             .expect("table name is unique");
         let output_lists_set = |sql: &str| {
             crate::translate::semantic::scope::tests::OUTPUT_LISTS_SET.with(|set| set.set(0));
@@ -2912,11 +2925,11 @@ mod tests {
                     .expect("table schema parses"),
             );
             schema
-                .add_btree_table(table.clone())
+                .add_btree_table(NamespaceId::ROOT, table.clone())
                 .expect("table name is unique");
             let index = Index::from_sql(&symbols, index_sql, 3, &table).expect("index parses");
             schema
-                .add_index(Arc::new(index))
+                .add_index(NamespaceId::ROOT, Arc::new(index))
                 .expect("index name is unique");
             let document = analyze_sql_with_schema(&schema, "SELECT a FROM t WHERE b IN (1, 2, 3)")
                 .expect("SELECT analyzes");
@@ -2957,7 +2970,7 @@ mod tests {
         )
         .expect("custom column table parses");
         schema
-            .add_btree_table(Arc::new(table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
             .expect("custom column table name is unique");
         schema
             .resolve_all_custom_type_affinities()
@@ -2986,7 +2999,7 @@ mod tests {
         )
         .expect("custom operator table parses");
         schema
-            .add_btree_table(Arc::new(table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
             .expect("custom operator table name is unique");
         schema
             .resolve_all_custom_type_affinities()
@@ -3006,7 +3019,7 @@ mod tests {
         )
         .expect("writable table parses");
         schema
-            .add_btree_table(Arc::new(table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
             .expect("writable table name is unique");
         schema
     }
@@ -3027,7 +3040,7 @@ mod tests {
             .expect("guarded table parses"),
         );
         schema
-            .add_btree_table(table.clone())
+            .add_btree_table(NamespaceId::ROOT, table.clone())
             .expect("guarded table name is unique");
         let symbols = SymbolTable::new();
         for (sql, root_page) in [
@@ -3040,7 +3053,7 @@ mod tests {
             let index = Index::from_sql(&symbols, sql, root_page, &table)
                 .expect("guarded index schema parses");
             schema
-                .add_index(Arc::new(index))
+                .add_index(NamespaceId::ROOT, Arc::new(index))
                 .expect("guarded index name is unique");
         }
         schema
@@ -3051,7 +3064,7 @@ mod tests {
         let table = BTreeTable::from_sql("CREATE TABLE insert_source(id INTEGER, value TEXT)", 3)
             .expect("INSERT source table parses");
         schema
-            .add_btree_table(Arc::new(table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
             .expect("INSERT source table name is unique");
         schema
     }
@@ -3116,6 +3129,7 @@ mod tests {
         ] {
             schema
                 .add_trigger(
+                    NamespaceId::ROOT,
                     Trigger::new(
                         name.to_string(),
                         String::new(),
@@ -3142,7 +3156,7 @@ mod tests {
                 .expect("foreign-key parent table parses"),
         );
         schema
-            .add_btree_table(parent.clone())
+            .add_btree_table(NamespaceId::ROOT, parent.clone())
             .expect("foreign-key parent table name is unique");
         let symbols = SymbolTable::new();
         let parent_code = Index::from_sql(
@@ -3153,7 +3167,7 @@ mod tests {
         )
         .expect("foreign-key parent index parses");
         schema
-            .add_index(Arc::new(parent_code))
+            .add_index(NamespaceId::ROOT, Arc::new(parent_code))
             .expect("foreign-key parent index name is unique");
 
         for (sql, root_page) in [
@@ -3178,7 +3192,7 @@ mod tests {
             let table =
                 BTreeTable::from_sql(sql, root_page).expect("foreign-key child table parses");
             schema
-                .add_btree_table(Arc::new(table))
+                .add_btree_table(NamespaceId::ROOT, Arc::new(table))
                 .expect("foreign-key child table name is unique");
         }
         schema
@@ -3210,7 +3224,7 @@ mod tests {
         )
         .expect("INSERT union table parses");
         schema
-            .add_btree_table(Arc::new(table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
             .expect("INSERT union table name is unique");
         schema
             .resolve_all_custom_type_affinities()
@@ -3228,7 +3242,7 @@ mod tests {
         )
         .expect("array table schema parses");
         schema
-            .add_btree_table(Arc::new(table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
             .expect("array table name is unique");
         schema
     }
@@ -3249,7 +3263,7 @@ mod tests {
         )
         .expect("custom field table parses");
         schema
-            .add_btree_table(Arc::new(table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
             .expect("custom field table name is unique");
         schema
             .resolve_all_custom_type_affinities()
@@ -3270,7 +3284,7 @@ mod tests {
         )
         .expect("stored column expressions parse");
         schema
-            .add_btree_table(Arc::new(table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
             .expect("stored-expression table name is unique");
         schema
     }
@@ -3280,16 +3294,14 @@ mod tests {
         let normalized = crate::util::normalize_ident(name);
         let sequence = Sequence::new(normalized.clone(), None, None, None, None, false)
             .expect("fixed sequence descriptor is valid");
-        schema
-            .sequences
-            .insert(normalized.clone(), Arc::new(sequence));
+        schema.add_sequence(NamespaceId::ROOT, sequence);
         let table = BTreeTable::from_sql(
             &crate::translate::sequence::sequence_backing_table_sql(&normalized),
             2,
         )
         .expect("sequence backing table parses");
         schema
-            .add_btree_table(Arc::new(table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
             .expect("sequence backing table name is unique");
         schema
     }
@@ -3311,9 +3323,12 @@ mod tests {
             ("CREATE TABLE sqlite_sequence(name, seq)", 4),
         ] {
             schema
-                .add_btree_table(Arc::new(
-                    BTreeTable::from_sql(sql, root_page).expect("AUTOINCREMENT schema parses"),
-                ))
+                .add_btree_table(
+                    NamespaceId::ROOT,
+                    Arc::new(
+                        BTreeTable::from_sql(sql, root_page).expect("AUTOINCREMENT schema parses"),
+                    ),
+                )
                 .expect("AUTOINCREMENT schema names are unique");
         }
         schema
@@ -3570,7 +3585,7 @@ mod tests {
                     .expect("catalog table parses"),
             );
             schema
-                .add_btree_table(table.clone())
+                .add_btree_table(NamespaceId::ROOT, table.clone())
                 .expect("catalog table name is unique");
             if with_index {
                 let symbols = SymbolTable::new();
@@ -3582,7 +3597,7 @@ mod tests {
                 )
                 .expect("catalog index parses");
                 schema
-                    .add_index(Arc::new(index))
+                    .add_index(NamespaceId::ROOT, Arc::new(index))
                     .expect("catalog index name is unique");
             }
             schema
@@ -4947,10 +4962,13 @@ mod tests {
     fn in_named_relations_reuse_query_membership_hir() {
         let mut schema = schema_with_items();
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql("CREATE TABLE candidates(value TEXT COLLATE RTRIM)", 3)
-                    .expect("fixed membership table schema parses"),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql("CREATE TABLE candidates(value TEXT COLLATE RTRIM)", 3)
+                        .expect("fixed membership table schema parses"),
+                ),
+            )
             .expect("fixed membership table name is unique");
         let document = analyze_sql_with_schema(
             &schema,
@@ -7109,13 +7127,16 @@ mod tests {
     fn insert_autoincrement_requires_sqlite_sequence() {
         let mut schema = Schema::new();
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql(
-                    "CREATE TABLE auto_items(id INTEGER PRIMARY KEY AUTOINCREMENT)",
-                    2,
-                )
-                .expect("AUTOINCREMENT table parses"),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql(
+                        "CREATE TABLE auto_items(id INTEGER PRIMARY KEY AUTOINCREMENT)",
+                        2,
+                    )
+                    .expect("AUTOINCREMENT table parses"),
+                ),
+            )
             .expect("AUTOINCREMENT table name is unique");
         let error = analyze_sql_with_schema(&schema, "INSERT INTO auto_items DEFAULT VALUES")
             .expect_err("missing sqlite_sequence is corrupt catalog state");
@@ -8759,7 +8780,7 @@ mod tests {
         )
         .expect("table named excluded parses");
         schema
-            .add_btree_table(Arc::new(table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
             .expect("table named excluded is unique");
         let document = analyze_sql_with_schema(
             &schema,
@@ -10755,10 +10776,13 @@ mod tests {
         let sequence_name = crate::schema::autoincrement_sequence_name("items");
         let mut schema = schema_with_sequence(&sequence_name);
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name, seq)", 3)
-                    .expect("sqlite_sequence schema parses"),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name, seq)", 3)
+                        .expect("sqlite_sequence schema parses"),
+                ),
+            )
             .expect("sqlite_sequence name is unique");
         let document =
             analyze_sql_with_schema(&schema, &format!("SELECT nextval('{sequence_name}')"))
@@ -12508,7 +12532,7 @@ mod tests {
         )
         .expect("WITHOUT ROWID table parses");
         schema
-            .add_btree_table(Arc::new(table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
             .expect("WITHOUT ROWID table name is unique");
 
         let error = analyze_sql_with_schema(&schema, "UPDATE no_rowid SET value = 'changed'")
@@ -12972,7 +12996,7 @@ mod tests {
         )
         .expect("WITHOUT ROWID table parses");
         without_rowid_schema
-            .add_btree_table(Arc::new(table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
             .expect("WITHOUT ROWID table name is unique");
         let without_rowid_error =
             analyze_sql_with_schema(&without_rowid_schema, "DELETE FROM no_rowid")

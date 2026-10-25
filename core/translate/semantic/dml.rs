@@ -1,5 +1,6 @@
 //! Shared semantic helpers for data-changing statements.
 
+use crate::namespace::NamespaceId;
 use turso_parser::ast;
 
 use super::{
@@ -40,7 +41,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let mut triggers = self
             .context()
             .schema(database)?
-            .get_triggers_for_table(name)
+            .get_triggers_for_table(NamespaceId::ROOT, name)
             .filter(|trigger| trigger_targets_database(trigger, database) && selected(trigger))
             .cloned()
             .map(|trigger| (database, trigger))
@@ -52,12 +53,14 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             // found is put in front, so they end up in the reverse of
             // the order the temp schema lists them.
             let mut temp_triggers = temp_schema
-                .get_triggers_for_table(name)
+                .get_triggers_for_table(NamespaceId::ROOT, name)
                 .filter(|trigger| {
                     selected(trigger)
                         && match trigger.target_database_id {
                             Some(target) => target == database.index(),
-                            None => temp_schema.get_table(&trigger.table_name).is_none(),
+                            None => temp_schema
+                                .get_table(NamespaceId::ROOT, &trigger.table_name)
+                                .is_none(),
                         }
                 })
                 .cloned()
@@ -91,7 +94,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let table = self
             .context()
             .schema(database)?
-            .get_table(&name)
+            .get_table(NamespaceId::ROOT, &name)
             .filter(|table| table.btree().is_some());
         let Some(table) = table else {
             crate::bail_parse_error!("no such table: {}", name);
@@ -127,8 +130,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let (outgoing, incoming, table_has_foreign_keys) = {
             let schema = self.context().schema(database)?;
             let name = target.value().get_name();
-            let incoming = schema.resolved_fks_referencing(name)?;
-            let table_has_foreign_keys = schema.has_child_fks(name) || !incoming.is_empty();
+            let incoming = schema.resolved_fks_referencing(NamespaceId::ROOT, name)?;
+            let table_has_foreign_keys =
+                schema.has_child_fks(NamespaceId::ROOT, name) || !incoming.is_empty();
             // Like SQLite, an UPDATE resolves the constraints the table
             // declares only when it changes a key: one of their child keys,
             // or a parent key another table points at. `updated` covers the
@@ -148,12 +152,12 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         }
                     }
                     if child_key_changed || parent_key_changed {
-                        schema.resolved_fks_for_child(name, Some(updated))?
+                        schema.resolved_fks_for_child(NamespaceId::ROOT, name, Some(updated))?
                     } else {
                         crate::alloc::vec![]
                     }
                 }
-                None => schema.resolved_fks_for_child(name, None)?,
+                None => schema.resolved_fks_for_child(NamespaceId::ROOT, name, None)?,
             };
             (outgoing, incoming, table_has_foreign_keys)
         };
@@ -292,7 +296,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let table = self
             .context()
             .schema(database)?
-            .get_table(&normalized)
+            .get_table(NamespaceId::ROOT, &normalized)
             .ok_or_else(|| {
                 LimboError::InternalError(format!(
                     "resolved foreign-key {role} table {normalized} is missing"

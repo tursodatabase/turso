@@ -1527,7 +1527,25 @@ impl BTreeCursor {
                             break;
                         }
                         if self.stack.has_parent() {
+                            let child_page_id = self.stack.top_ref().get().id();
                             self.pop_upwards();
+                            // A forward seek, such as the one in restore_context, leaves an
+                            // index interior page at the cell whose left child we came from.
+                            // That cell sorts after the child, so step back to the one before it.
+                            let came_from_left_child_of_current_cell = {
+                                let contents = self.stack.top_ref().get_contents();
+                                let cell_idx = self.stack.current_cell_index();
+                                contents.page_type()? == PageType::IndexInterior
+                                    && cell_idx >= 0
+                                    && (cell_idx as usize) < contents.cell_count()
+                                    && contents
+                                        .cell_interior_read_left_child_page(cell_idx as usize)?
+                                        as usize
+                                        == child_page_id
+                            };
+                            if came_from_left_child_of_current_cell {
+                                self.stack.retreat();
+                            }
                         } else {
                             // moved to begin of btree
                             return Ok(IOResult::Done(false));

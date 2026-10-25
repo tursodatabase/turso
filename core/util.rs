@@ -1,4 +1,5 @@
 use crate::alloc::TursoIteratorExt;
+use crate::namespace::NamespaceId;
 use crate::numeric::StrToF64;
 use crate::schema::{ColDef, FromDefinitionFlags};
 use crate::translate::emitter::TransactionMode;
@@ -1915,10 +1916,10 @@ fn view_source_from_select_table(
                     .map(|db| normalize_ident(db.as_str())),
                 alias: table_alias,
             });
-            let table = schema.get_table(&table_name);
+            let table = schema.get_table(NamespaceId::ROOT, &table_name);
             let view = table
                 .is_none()
-                .then(|| schema.get_view(&table_name))
+                .then(|| schema.get_view(NamespaceId::ROOT, &table_name))
                 .flatten();
             let source_columns: &[Column] = match (&table, &view) {
                 (Some(table), _) => table.columns(),
@@ -1990,7 +1991,7 @@ fn view_source_from_select_table(
                 alias: table_alias,
             });
             let columns = schema
-                .get_table(&table_name)
+                .get_table(NamespaceId::ROOT, &table_name)
                 .map(|table| {
                     table
                         .columns()
@@ -3069,7 +3070,7 @@ mod rename_column_view {
                     .is_none_or(|db| db == ctx.target_db_norm);
 
                 if is_local {
-                    if let Some(view) = ctx.schema.views.get(&table_name_norm) {
+                    if let Some(view) = ctx.schema.get_view(NamespaceId::ROOT, &table_name_norm) {
                         let columns_before = view
                             .columns
                             .iter()
@@ -3570,7 +3571,7 @@ mod rename_column_view {
     }
 
     fn table_source_columns(schema: &Schema, table_name: &str) -> Option<Vec<String>> {
-        if let Some(table) = schema.get_table(table_name) {
+        if let Some(table) = schema.get_table(NamespaceId::ROOT, table_name) {
             return Some(
                 table
                     .columns()
@@ -3580,7 +3581,7 @@ mod rename_column_view {
             );
         }
         let table_norm = normalize_ident(table_name);
-        if let Some(view) = schema.views.get(&table_norm) {
+        if let Some(view) = schema.get_view(NamespaceId::ROOT, &table_norm) {
             return Some(
                 view.columns
                     .iter()
@@ -4137,7 +4138,7 @@ pub mod tests {
             let table = BTreeTable::from_sql(create_table_sql, root_page)
                 .expect("test CREATE TABLE should parse");
             schema
-                .add_btree_table(std::sync::Arc::new(table))
+                .add_btree_table(NamespaceId::ROOT, std::sync::Arc::new(table))
                 .expect("test table should be added to schema");
         }
 

@@ -15,6 +15,7 @@ use crate::{
 
 use super::catalog::{EmptyTempSchema, SemanticCatalog};
 use super::hir::{CatalogSnapshot, DatabaseId, DatabaseSnapshot};
+use crate::namespace::{NamespaceId, NamespaceRef};
 
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -281,7 +282,7 @@ impl<'catalog> SemanticContext<'catalog> {
         }
         Ok(self
             .schema(database)?
-            .get_indices(table_name)
+            .get_indices(NamespaceId::ROOT, table_name)
             .cloned()
             .collect())
     }
@@ -343,32 +344,33 @@ impl<'catalog> SemanticContext<'catalog> {
 
     /// The database a schema statement names: the qualifier when there is
     /// one, else main.
-    pub(crate) fn resolve_database_id(
+    pub(crate) fn resolve_namespace(
         &self,
         qualified_name: &turso_parser::ast::QualifiedName,
-    ) -> Result<usize> {
+    ) -> Result<NamespaceRef> {
         let Some(db_name) = &qualified_name.namespace else {
-            return Ok(MAIN_DB_ID);
+            return Ok(NamespaceRef::root_of(MAIN_DB_ID));
         };
         let db_name = normalize_ident(db_name.as_str());
         self.database(&db_name)
-            .map(|database| database.index())
+            .map(|database| NamespaceRef::root_of(database.index()))
             .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {db_name}")))
     }
 
     /// The database a CREATE puts an object whose name has no qualifier
     /// in: the first database of the search path.
-    pub(crate) fn resolve_database_id_for_create(
+    pub(crate) fn resolve_namespace_for_create(
         &self,
         qualified_name: &turso_parser::ast::QualifiedName,
-    ) -> Result<usize> {
+    ) -> Result<NamespaceRef> {
         if qualified_name.namespace.is_some() {
-            return self.resolve_database_id(qualified_name);
+            return self.resolve_namespace(qualified_name);
         }
         self.unqualified_database_search_path
             .iter()
             .map(|database| database.index())
             .find(|database| *database != crate::TEMP_DB_ID)
+            .map(NamespaceRef::root_of)
             .ok_or_else(|| {
                 LimboError::ParseError("no schema has been selected to create in".to_string())
             })
@@ -376,74 +378,74 @@ impl<'catalog> SemanticContext<'catalog> {
 
     /// The database of a sequence named without a qualifier: the first
     /// database of the search path that has it.
-    pub(crate) fn resolve_existing_sequence_database_id(&self, seq_name: &str) -> Option<usize> {
+    pub(crate) fn find_existing_sequence(&self, seq_name: &str) -> Option<NamespaceRef> {
         self.unqualified_database_search_path
             .iter()
-            .map(|database| database.index())
-            .find(|&database| {
-                self.with_schema(database, |schema| schema.get_sequence(seq_name).is_some())
+            .map(|database| NamespaceRef::root_of(database.index()))
+            .find(|namespace| {
+                self.with_schema(namespace.database_id, |schema| {
+                    schema.get_sequence(namespace.id, seq_name).is_some()
+                })
             })
     }
 
     /// The database holding the table, view or materialized view
     /// `qualified_name` names.
-    pub(crate) fn resolve_existing_table_database_id_qualified(
+    pub(crate) fn resolve_existing_table(
         &self,
         qualified_name: &turso_parser::ast::QualifiedName,
-    ) -> Result<usize> {
+    ) -> Result<NamespaceRef> {
         if qualified_name.namespace.is_some() {
-            return self.resolve_database_id(qualified_name);
+            return self.resolve_namespace(qualified_name);
         }
-        self.resolve_existing_table_database_id(qualified_name.name.as_str())
+        self.resolve_existing_table_named(qualified_name.name.as_str())
     }
 
     /// The database holding the table, view or materialized view named
     /// `table_name`, looked up along the unqualified search path.
-    pub(crate) fn resolve_existing_table_database_id(&self, table_name: &str) -> Result<usize> {
+    pub(crate) fn resolve_existing_table_named(&self, table_name: &str) -> Result<NamespaceRef> {
         if table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME)
             || table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT)
         {
-            return Ok(TEMP_DB_ID);
+            return Ok(NamespaceRef::root_of(TEMP_DB_ID));
         }
         if table_name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME)
             || table_name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME_ALT)
         {
-            return Ok(MAIN_DB_ID);
+            return Ok(NamespaceRef::root_of(MAIN_DB_ID));
         }
-        self.resolve_unqualified_existing_database_id(table_name, |schema, name| {
-            schema.get_table(name).is_some()
-                || schema.get_view(name).is_some()
-                || schema.get_materialized_view(name).is_some()
+        self.resolve_unqualified_existing(table_name, |schema, namespace, name| {
+            schema.get_table(namespace, name).is_some()
+                || schema.get_view(namespace, name).is_some()
+                || schema.get_materialized_view(namespace, name).is_some()
         })
     }
 
-    pub(crate) fn resolve_existing_index_database_id(
+    pub(crate) fn resolve_existing_index(
         &self,
         qualified_name: &turso_parser::ast::QualifiedName,
-    ) -> Result<usize> {
+    ) -> Result<NamespaceRef> {
         if qualified_name.namespace.is_some() {
-            return self.resolve_database_id(qualified_name);
+            return self.resolve_namespace(qualified_name);
         }
         let index_name = normalize_ident(qualified_name.name.as_str());
-        self.resolve_unqualified_existing_database_id(&index_name, |schema, name| {
+        self.resolve_unqualified_existing(&index_name, |schema, namespace, name| {
             schema
-                .indexes
-                .values()
-                .flat_map(|indexes| indexes.iter())
+                .indexes(namespace)
                 .any(|index| index.name.eq_ignore_ascii_case(name))
         })
     }
 
-    pub(crate) fn resolve_existing_trigger_database_id(
+    pub(crate) fn resolve_existing_trigger(
         &self,
         qualified_name: &turso_parser::ast::QualifiedName,
-    ) -> Result<usize> {
+    ) -> Result<NamespaceRef> {
         if qualified_name.namespace.is_some() {
-            return self.resolve_database_id(qualified_name);
+            return self.resolve_namespace(qualified_name);
         }
-        self.resolve_unqualified_existing_database_id(
+        self.resolve_unqualified_existing(
             qualified_name.name.as_str(),
-            |schema, name| schema.get_trigger(name).is_some(),
+            |schema, namespace, name| schema.get_trigger(namespace, name).is_some(),
         )
     }
 
@@ -451,14 +453,14 @@ impl<'catalog> SemanticContext<'catalog> {
     /// `schema_has` finds. Without a configured search path an object that
     /// is nowhere is taken to be in main, so the caller reports it missing
     /// there; with one it is an error.
-    fn resolve_unqualified_existing_database_id(
+    pub(crate) fn resolve_unqualified_existing(
         &self,
         object_name: &str,
-        schema_has: impl Fn(&Schema, &str) -> bool,
-    ) -> Result<usize> {
+        namespace_has: impl Fn(&Schema, NamespaceId, &str) -> bool,
+    ) -> Result<NamespaceRef> {
         for database in &self.unqualified_database_search_path {
-            if schema_has(self.schema(*database)?, object_name) {
-                return Ok(database.index());
+            if namespace_has(self.schema(*database)?, NamespaceId::ROOT, object_name) {
+                return Ok(NamespaceRef::root_of(database.index()));
             }
         }
         if self.search_path_configured {
@@ -466,7 +468,7 @@ impl<'catalog> SemanticContext<'catalog> {
                 "no such object: {object_name}"
             )));
         }
-        Ok(MAIN_DB_ID)
+        Ok(NamespaceRef::root_of(MAIN_DB_ID))
     }
 
     pub(crate) fn resolve_collation(&self, name: &str) -> Result<CollationSeq> {
@@ -603,14 +605,17 @@ impl<'catalog> SemanticContext<'catalog> {
                         normalize_ident(database.as_str())
                     ))
                 })?;
-                self.schema(database)?.get_table(&table_name).is_some()
+                self.schema(database)?
+                    .get_table(NamespaceId::ROOT, &table_name)
+                    .is_some()
             }
             None => self
                 .unqualified_databases(&table_name, view_database)
                 .iter()
                 .any(|database| {
-                    self.database_schema(*database)
-                        .is_some_and(|schema| schema.get_table(&table_name).is_some())
+                    self.database_schema(*database).is_some_and(|schema| {
+                        schema.get_table(NamespaceId::ROOT, &table_name).is_some()
+                    })
                 }),
         })
     }
@@ -626,7 +631,7 @@ impl<'catalog> SemanticContext<'catalog> {
         let view_name = normalize_ident(name.name.as_str());
         let has_view = |database: &DatabaseId| {
             self.database_schema(*database)
-                .is_some_and(|schema| schema.views.contains_key(&view_name))
+                .is_some_and(|schema| schema.get_view(NamespaceId::ROOT, &view_name).is_some())
         };
         let database = match &name.namespace {
             Some(database) => Some(self.database(database.as_str()).ok_or_else(|| {
@@ -645,8 +650,12 @@ impl<'catalog> SemanticContext<'catalog> {
         };
         Ok(self
             .database_schema(database)
-            .and_then(|schema| schema.views.get(&view_name))
-            .map(|view| (database, view.as_ref())))
+            .and_then(|schema| {
+                schema
+                    .views(NamespaceId::ROOT)
+                    .find(|(name, _)| *name == view_name)
+            })
+            .map(|(_, view)| (database, view.as_ref())))
     }
 
     pub(crate) fn resolve_table(
@@ -675,8 +684,9 @@ impl<'catalog> SemanticContext<'catalog> {
                 .unqualified_databases(&table_name, view_database)
                 .into_iter()
                 .find(|database| {
-                    self.database_schema(*database)
-                        .is_some_and(|schema| schema.get_table(&table_name).is_some())
+                    self.database_schema(*database).is_some_and(|schema| {
+                        schema.get_table(NamespaceId::ROOT, &table_name).is_some()
+                    })
                 })
                 .ok_or_else(|| no_such_table(name))?,
         };
@@ -689,7 +699,7 @@ impl<'catalog> SemanticContext<'catalog> {
         }
         let table = self
             .schema(database)?
-            .get_table(&table_name)
+            .get_table(NamespaceId::ROOT, &table_name)
             .ok_or_else(|| no_such_table(name))?;
         Ok((database, table))
     }
@@ -700,7 +710,7 @@ impl<'catalog> SemanticContext<'catalog> {
         let view_name = normalize_ident(name.name.as_str());
         let broken = |database: &DatabaseId| {
             self.database_schema(*database)
-                .is_some_and(|schema| schema.broken_views.contains(&view_name))
+                .is_some_and(|schema| schema.is_broken_view(NamespaceId::ROOT, &view_name))
         };
         match &name.namespace {
             Some(database) => self
@@ -717,7 +727,7 @@ impl<'catalog> SemanticContext<'catalog> {
         let view_name = normalize_ident(name.name.as_str());
         let incompatible = |database: &DatabaseId| {
             self.database_schema(*database)
-                .is_some_and(|schema| schema.incompatible_views.contains(&view_name))
+                .is_some_and(|schema| schema.is_incompatible_view(NamespaceId::ROOT, &view_name))
         };
         match &name.namespace {
             Some(database) => self
@@ -738,7 +748,7 @@ impl<'catalog> SemanticContext<'catalog> {
     ) -> Result<Arc<Index>> {
         let normalized_name = normalize_ident(index_name);
         self.schema(database)?
-            .get_index(table_name, &normalized_name)
+            .get_index(NamespaceId::ROOT, table_name, &normalized_name)
             .cloned()
             .ok_or_else(|| LimboError::ParseError(format!("no such index: {index_name}")))
     }

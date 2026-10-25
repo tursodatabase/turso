@@ -18,6 +18,7 @@ use super::{
     },
     semantic::hir::{self, ColumnUsage, HirDocument, QueryBlockId, QueryId, SourceId},
 };
+use crate::namespace::NamespaceId;
 use crate::{
     incremental::view::IncrementalView,
     schema::{Index, Schema, Table},
@@ -1956,7 +1957,7 @@ impl<'a> HirPlanContext<'a> {
             .index_stats
             .iter()
             .filter_map(|(index_name, index_stats)| {
-                let index = schema.get_index(&btree.name, index_name)?;
+                let index = schema.get_index(NamespaceId::ROOT, &btree.name, index_name)?;
                 if index.where_clause.is_some() || index.columns.len() < columns.len() {
                     return None;
                 }
@@ -4251,10 +4252,10 @@ fn materialized_view_sources(
             continue;
         }
         let name = table.value().get_name();
-        let Some(view) = schema.get_materialized_view(name) else {
+        let Some(view) = schema.get_materialized_view(NamespaceId::ROOT, name) else {
             continue;
         };
-        if !schema.has_compatible_materialized_view_storage(name) {
+        if !schema.has_compatible_materialized_view_storage(NamespaceId::ROOT, name) {
             use crate::incremental::view::DBSP_CIRCUIT_VERSION;
             return Err(LimboError::InternalError(format!(
                 "Materialized view '{name}' has an incompatible version. \n\

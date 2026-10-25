@@ -1701,6 +1701,7 @@ pub(super) fn emit_hir_window_inverse<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::namespace::NamespaceId;
     use crate::{
         dialect::SqliteDialect,
         schema::{BTreeTable, PseudoCursorType, Schema},
@@ -1720,10 +1721,13 @@ mod tests {
     fn analyze_sql(sql: &str) -> HirDocument {
         let mut schema = Schema::new();
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql("CREATE TABLE items(value, keep, group_id, sort_key)", 2)
-                    .expect("fixed table schema parses"),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql("CREATE TABLE items(value, keep, group_id, sort_key)", 2)
+                        .expect("fixed table schema parses"),
+                ),
+            )
             .expect("fixed table name is unique");
         let catalog = SemanticCatalog {
             databases: vec![SemanticCatalogDatabase {

@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use crate::bail_parse_error;
 use crate::function::FuncCtx;
+use crate::namespace::NamespaceId;
 use crate::schema::{
     BTreeTable, Sequence, AUTOINCREMENT_SEQ_PREFIX, SEQ_BACKING_TABLE_PREFIX,
     SQLITE_SEQUENCE_TABLE_NAME,
@@ -45,7 +46,7 @@ pub(crate) fn resolve_sequence_backing_table(
     let backing_table_name = sequence_backing_table_name(seq_name);
     catalog
         .with_schema(database_id, |schema| {
-            schema.get_btree_table(&backing_table_name)
+            schema.get_btree_table(NamespaceId::ROOT, &backing_table_name)
         })
         .ok_or_else(|| {
             crate::LimboError::InternalError(format!(
@@ -64,7 +65,7 @@ pub(crate) fn resolve_autoincrement_sqlite_sequence(
 ) -> Option<Arc<BTreeTable>> {
     seq_name.strip_prefix(AUTOINCREMENT_SEQ_PREFIX)?;
     catalog.with_schema(database_id, |schema| {
-        schema.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+        schema.get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
     })
 }
 
@@ -998,7 +999,8 @@ pub fn translate_create_sequence(
     catalog: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = catalog.resolve_database_id_for_create(seq_name)?;
+    let namespace = catalog.resolve_namespace_for_create(seq_name)?;
+    let database_id = namespace.database_id;
     let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
@@ -1024,7 +1026,9 @@ pub fn translate_create_sequence(
     }
 
     // Check if sequence already exists
-    let exists = catalog.with_schema(database_id, |s| s.get_sequence(&normalized_name).is_some());
+    let exists = catalog.with_schema(database_id, |s| {
+        s.get_sequence(namespace.id, &normalized_name).is_some()
+    });
     if exists {
         if if_not_exists {
             return Ok(());
@@ -1043,7 +1047,10 @@ pub fn translate_create_sequence(
     )?;
 
     // Open cursor to sqlite_schema (in the target database)
-    let table = catalog.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let table = catalog.with_schema(database_id, |s| {
+        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+            .unwrap()
+    });
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -1106,16 +1113,21 @@ pub(crate) fn emit_drop_sequence_cleanup(
 ) -> Result<bool> {
     let backing_table_name = sequence_backing_table_name(seq_name);
     let root_page = catalog.with_schema(database_id, |s| {
-        s.get_sequence(seq_name)?;
-        Some(s.get_btree_table(&backing_table_name)?.root_page)
+        s.get_sequence(NamespaceId::ROOT, seq_name)?;
+        Some(
+            s.get_btree_table(NamespaceId::ROOT, &backing_table_name)?
+                .root_page,
+        )
     });
     let Some(root_page) = root_page else {
         return Ok(false);
     };
 
     // Open sqlite_schema for writing (in the target database)
-    let schema_table =
-        catalog.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let schema_table = catalog.with_schema(database_id, |s| {
+        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+            .unwrap()
+    });
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -1200,15 +1212,16 @@ pub fn translate_drop_sequence(
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let normalized_name = normalize_ident(seq_name.name.as_str());
-    let database_id = if seq_name.namespace.is_some() {
-        catalog.resolve_database_id(seq_name)?
+    let namespace = if seq_name.namespace.is_some() {
+        catalog.resolve_namespace(seq_name)?
     } else {
-        match catalog.resolve_existing_sequence_database_id(&normalized_name) {
-            Some(database_id) => database_id,
+        match catalog.find_existing_sequence(&normalized_name) {
+            Some(namespace) => namespace,
             None if if_exists => return Ok(()),
             None => bail_parse_error!("sequence \"{}\" does not exist", normalized_name),
         }
     };
+    let database_id = namespace.database_id;
     let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
@@ -1294,7 +1307,7 @@ fn qualify_sequence_argument(
         return None;
     }
     let name = crate::util::normalize_ident(seq_name_raw);
-    let database_id = catalog.resolve_existing_sequence_database_id(&name)?;
+    let database_id = catalog.find_existing_sequence(&name)?.database_id;
     let database_name = catalog.namespace_name(database_id)?;
     let runtime_name = format!("{database_name}.{name}");
     let mut args = args.to_vec();

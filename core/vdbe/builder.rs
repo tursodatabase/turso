@@ -1,3 +1,4 @@
+use crate::namespace::NamespaceId;
 use crate::{alloc, turso_assert, turso_assert_eq, Result, Value, ValueRef};
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -275,6 +276,7 @@ impl ProgramBuilderFlags {
     const HAS_STATEMENT_CONFLICT: u16 = 1 << 5;
     const SUPPRESS_CUSTOM_TYPE_DECODE: u16 = 1 << 6;
     const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
+    const KEEP_ARRAY_RESULTS_AS_BLOBS: u16 = 1 << 9;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -376,6 +378,19 @@ impl ProgramBuilderFlags {
     #[inline]
     pub const fn set_suppress_custom_type_decode(&mut self, v: bool) {
         self.set(Self::SUPPRESS_CUSTOM_TYPE_DECODE, v)
+    }
+
+    #[inline]
+    /// When set, array result columns are returned as their stored record
+    /// blobs instead of being converted to display text. Engine-internal
+    /// statements (e.g. VACUUM's table copy) write these values back to
+    /// storage, and the text form does not keep element types.
+    pub const fn keep_array_results_as_blobs(self) -> bool {
+        self.get(Self::KEEP_ARRAY_RESULTS_AS_BLOBS)
+    }
+    #[inline]
+    pub const fn set_keep_array_results_as_blobs(&mut self, v: bool) {
+        self.set(Self::KEEP_ARRAY_RESULTS_AS_BLOBS, v)
     }
 
     #[inline]
@@ -1845,7 +1860,7 @@ impl ProgramBuilder {
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
     pub fn epilogue(&mut self, schema: &Schema) {
-        self.has_materialized_views = !schema.table_to_materialized_views.is_empty();
+        self.has_materialized_views = schema.has_materialized_views(NamespaceId::ROOT);
         if self.flags.is_subprogram() {
             // Subprograms (triggers, FK actions) just emit Halt without Transaction
             let description = if self.trigger.is_some() {
