@@ -583,7 +583,7 @@ mod tests {
     use super::*;
     use crate::alloc::TryClone;
     use crate::io::MemoryIO;
-    use crate::namespace::NamespaceId;
+    use crate::namespace::{NamespaceId, NamespaceRef};
     use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
     use crate::vdbe::insn::{ClearBtreeCount, Insn};
     use crate::ConnectOpts;
@@ -596,20 +596,27 @@ mod tests {
             ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 0, 0));
         program.push_cte_being_defined("caller".into());
 
-        let result = program.with_view_expansion(0, "v", |program| {
+        let main = NamespaceRef::root_of(0);
+        let aux = NamespaceRef::root_of(1);
+        let app = NamespaceRef {
+            database_id: 0,
+            id: NamespaceId::new(1),
+        };
+        let result = program.with_view_expansion(main, "v", |program| {
             assert!(!program.is_cte_being_defined("caller"));
             program.push_cte_being_defined("outer_view".into());
 
-            // The same view name in another schema is not a circular reference.
-            program.with_view_expansion(1, "v", |program| {
+            // The same view name in another database or in another namespace
+            // of the same database is not a circular reference.
+            program.with_view_expansion(aux, "v", |program| {
                 assert!(!program.is_cte_being_defined("outer_view"));
-                Ok(())
+                program.with_view_expansion(app, "v", |_| Ok(()))
             })?;
             assert!(program.is_cte_being_defined("outer_view"));
 
             // An indirect circular reference must unwind both expansion scopes.
-            program.with_view_expansion(0, "nested", |program| {
-                program.with_view_expansion(0, "v", |_| -> crate::Result<()> {
+            program.with_view_expansion(main, "nested", |program| {
+                program.with_view_expansion(main, "v", |_| -> crate::Result<()> {
                     panic!("a circular view must not be expanded")
                 })?;
                 Ok(())
@@ -625,8 +632,8 @@ mod tests {
 
         // Both names can be expanded again after the failed expansion.
         program
-            .with_view_expansion(0, "v", |program| {
-                program.with_view_expansion(0, "nested", |_| Ok(()))
+            .with_view_expansion(main, "v", |program| {
+                program.with_view_expansion(main, "nested", |_| Ok(()))
             })
             .unwrap();
         assert!(program.is_cte_being_defined("caller"));
