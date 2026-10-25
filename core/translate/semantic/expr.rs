@@ -796,6 +796,7 @@ impl FunctionInput {
 }
 
 fn normalize_scalar_input(
+    analyzer: &Analyzer<'_, '_, '_>,
     name: &ast::Name,
     function: &Func,
     input: FunctionInput,
@@ -829,7 +830,7 @@ fn normalize_scalar_input(
                     hir::TypeFact::known(Type::Text),
                     ExprCollation::Absent,
                 ));
-                values.push(column.resolved);
+                values.push(analyzer.resolve_atomic_expr(column.expr, scope)?);
             }
             Ok(FunctionInput::Expressions {
                 distinctness: None,
@@ -3368,7 +3369,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             );
         }
         let (input, filter) = if matches!(binding, FunctionBinding::Scalar) {
-            (normalize_scalar_input(name, &function, input, scope)?, None)
+            (
+                normalize_scalar_input(self, name, &function, input, scope)?,
+                None,
+            )
         } else {
             (input, filter)
         };

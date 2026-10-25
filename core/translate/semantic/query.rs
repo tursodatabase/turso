@@ -316,7 +316,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let expanded = scope.expand_star()?;
         let mut outputs = Vec::with_capacity(expanded.len());
         for column in expanded {
-            let resolved = self.resolve_atomic_expr(column.resolved.expr, &scope)?;
+            let resolved = self.resolve_atomic_expr(column.expr, &scope)?;
             outputs.push(output_from_resolved(
                 hir::OutputId::query(block_id, outputs.len()),
                 column.name,

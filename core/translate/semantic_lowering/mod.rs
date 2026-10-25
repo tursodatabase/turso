@@ -289,7 +289,7 @@ impl PlannedSelect {
                 // qualifies it, unless it has an alias.
                 let name = match column.value {
                     ResolvedResultValue::Column(source) if !column.name_is_alias => {
-                        source.column_name
+                        source.column_name().to_string()
                     }
                     ResolvedResultValue::RowId { name, .. } if !column.name_is_alias => name,
                     _ => column.name,
@@ -807,13 +807,60 @@ pub(crate) enum ResolvedResultValue {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedResultSourceColumn {
-    pub(crate) table_name: String,
-    pub(crate) column_name: String,
-    /// Declared type text, empty when the column has none.
-    pub(crate) declared_type: String,
+    origin: ResultColumnOrigin,
     pub(crate) ty: Type,
     pub(crate) array_dimensions: u32,
     pub(crate) table_is_strict: bool,
+}
+
+/// Where a result column's names come from. A catalog table keeps the
+/// table itself, so preparing a statement copies no names.
+#[derive(Debug, Clone)]
+enum ResultColumnOrigin {
+    Table {
+        table: crate::schema::Table,
+        column: usize,
+    },
+    Named {
+        table_name: String,
+        column_name: String,
+        declared_type: String,
+    },
+}
+
+impl ResolvedResultSourceColumn {
+    pub(crate) fn table_name(&self) -> &str {
+        match &self.origin {
+            ResultColumnOrigin::Table { table, .. } => table.get_name(),
+            ResultColumnOrigin::Named { table_name, .. } => table_name,
+        }
+    }
+
+    pub(crate) fn column_name(&self) -> &str {
+        match &self.origin {
+            ResultColumnOrigin::Table { .. } => {
+                self.table_column().name.as_deref().unwrap_or_default()
+            }
+            ResultColumnOrigin::Named { column_name, .. } => column_name,
+        }
+    }
+
+    /// Declared type text, empty when the column has none.
+    pub(crate) fn declared_type(&self) -> &str {
+        match &self.origin {
+            ResultColumnOrigin::Table { .. } => &self.table_column().ty_str,
+            ResultColumnOrigin::Named { declared_type, .. } => declared_type,
+        }
+    }
+
+    fn table_column(&self) -> &crate::schema::Column {
+        let ResultColumnOrigin::Table { table, column } = &self.origin else {
+            unreachable!("only a catalog table column has a schema column")
+        };
+        table
+            .get_column_at(*column)
+            .expect("a result column reads an existing table column")
+    }
 }
 
 fn resolved_result_columns(
@@ -843,25 +890,24 @@ fn resolved_output_columns_from(
     outputs: &[hir::Output],
     from: Option<&hir::From>,
 ) -> Result<Vec<ResolvedResultColumn>> {
-    outputs
-        .iter()
-        .map(|output| {
-            let value = match group_column_of(document, from, output.expr) {
-                Some(column) => resolved_result_value(document, &hir::Expr::Column(column))?,
-                None => resolved_result_value(document, &document.exprs[output.expr])?,
-            };
-            Ok(ResolvedResultColumn {
-                name: output.name.clone(),
-                name_is_alias: matches!(
-                    output.name_kind,
-                    OutputNameKind::ExplicitAlias | OutputNameKind::StarExpansion
-                ),
-                value,
-                affinity: output.affinity,
-                primitive: expression_primitive(document, &document.exprs[output.expr]),
-            })
-        })
-        .collect()
+    let mut columns = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let value = match group_column_of(document, from, output.expr) {
+            Some(column) => resolved_result_value(document, &hir::Expr::Column(column))?,
+            None => resolved_result_value(document, &document.exprs[output.expr])?,
+        };
+        columns.push(ResolvedResultColumn {
+            name: output.name.clone(),
+            name_is_alias: matches!(
+                output.name_kind,
+                OutputNameKind::ExplicitAlias | OutputNameKind::StarExpansion
+            ),
+            value,
+            affinity: output.affinity,
+            primitive: expression_primitive(document, &document.exprs[output.expr]),
+        });
+    }
+    Ok(columns)
 }
 
 /// SQLite reads a parenthesized join as a subquery, and names a column
@@ -1085,9 +1131,10 @@ fn resolved_result_value(
                     ))
                 })?;
                 return Ok(ResolvedResultValue::Column(ResolvedResultSourceColumn {
-                    table_name: table.get_name().to_string(),
-                    column_name: column.name.clone().unwrap_or_default(),
-                    declared_type: column.ty_str.clone(),
+                    origin: ResultColumnOrigin::Table {
+                        table: table.clone(),
+                        column: reference.column,
+                    },
                     ty: column.ty(),
                     array_dimensions: column.array_dimensions(),
                     table_is_strict: table.is_strict(),
@@ -1127,16 +1174,19 @@ fn resolved_result_value(
                 )
             };
             Ok(ResolvedResultValue::Column(ResolvedResultSourceColumn {
-                // A FROM subquery is reported by its alias and a CTE by its
-                // name.
-                table_name: match (&source.kind, &source.alias) {
-                    (hir::SourceKind::Derived(_) | hir::SourceKind::FromGroup(_), Some(alias)) => {
-                        alias.clone()
-                    }
-                    _ => source.name.clone(),
+                origin: ResultColumnOrigin::Named {
+                    // A FROM subquery is reported by its alias and a CTE by
+                    // its name.
+                    table_name: match (&source.kind, &source.alias) {
+                        (
+                            hir::SourceKind::Derived(_) | hir::SourceKind::FromGroup(_),
+                            Some(alias),
+                        ) => alias.clone(),
+                        _ => source.name.clone(),
+                    },
+                    column_name: column.name().to_string(),
+                    declared_type,
                 },
-                column_name: column.name().to_string(),
-                declared_type,
                 ty,
                 array_dimensions: declared.map_or(0, |declared| declared.array_dimensions),
                 table_is_strict: false,

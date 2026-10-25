@@ -662,15 +662,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 }));
             }
         }
-        let mut finished = HashSet::default();
         // A column's generated or default expression names columns of its
         // own table, so every column of one source shares one scope.
         let mut scopes: HashMap<SourceId, Scope> = HashMap::default();
 
         while let Some(reference) = pending.pop() {
-            if !finished.insert(reference) {
-                continue;
-            }
             let (generated_syntax, default_syntax) = {
                 let source = self.source(reference.source).ok_or_else(|| {
                     LimboError::InternalError(format!(
@@ -1719,7 +1715,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         outputs.reserve(expanded.len());
         self.exprs.reserve(expanded.len());
         for column in expanded {
-            let resolved = self.resolve_atomic_expr(column.resolved.expr, scope)?;
+            let resolved = self.resolve_atomic_expr(column.expr, scope)?;
             let name = if long_names {
                 format!("{}.{}", column.qualifier, column.name)
             } else {

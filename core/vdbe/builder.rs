@@ -774,6 +774,10 @@ impl ProgramBuilder {
             .insert(output, OutputBinding { register });
     }
 
+    pub(crate) fn reserve_output_bindings(&mut self, additional: usize) {
+        self.output_bindings.reserve(additional);
+    }
+
     pub(crate) fn output_binding(&self, output: OutputId) -> Option<OutputBinding> {
         self.output_bindings.get(&output).copied()
     }

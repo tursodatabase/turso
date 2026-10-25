@@ -98,7 +98,7 @@ pub(crate) struct ExpandedColumn<'scope> {
     pub(crate) name: String,
     /// The source's alias, or its table name or `(subquery-N)` without one.
     pub(crate) qualifier: Cow<'scope, str>,
-    pub(crate) resolved: ResolvedScopeExpr,
+    pub(crate) expr: hir::Expr,
 }
 
 #[derive(Debug)]
@@ -1182,7 +1182,7 @@ impl Scope {
                 ExpandedColumn {
                     name: column.display_name().to_string(),
                     qualifier,
-                    resolved: column.resolved(),
+                    expr: column.expr().into_owned(),
                 }
             });
         }
@@ -1226,12 +1226,12 @@ impl Scope {
                     // With several sources, the column expands as
                     // `database.table.column`, which a source of the same
                     // name in another database does not make ambiguous.
-                    let resolved = if source
+                    let expr = if source
                         .star_merged
                         .iter()
                         .any(|name| column.lookup_matches(name))
                     {
-                        self.merged_star_column(column)?
+                        self.merged_star_column(column)?.expr
                     } else {
                         match source.database {
                             Some(database) => self.resolve_database_qualified(
@@ -1241,12 +1241,12 @@ impl Scope {
                             )?,
                             None => self.resolve_qualified(qualifier, column.display_name())?,
                         }
-                        .unwrap_or_else(|| column.resolved())
+                        .map_or_else(|| column.expr().into_owned(), |resolved| resolved.expr)
                     };
                     expanded.push(ExpandedColumn {
                         name: column.display_name().to_string(),
                         qualifier: Cow::Borrowed(source.qualifier.as_str()),
-                        resolved,
+                        expr,
                     });
                 }
             }
@@ -1257,18 +1257,19 @@ impl Scope {
                 // own name, so a direct source cannot make them ambiguous.
                 // The one source of a FROM clause expands them as bare
                 // names, by the unique names the group gave them.
-                let resolved = if bare {
+                let expr = if bare {
                     let Some(resolved) = self.resolve_source_column(
                         &crate::util::normalize_ident(column.using_name()),
                     )?
                     else {
                         crate::bail_parse_error!("no such column: {}", column.display_name());
                     };
-                    resolved
+                    resolved.expr
                 } else if source.star_merged.contains(&saved_name) {
                     self.merged_star_column_named(&saved_name, column.display_name())?
+                        .expr
                 } else {
-                    column.resolved()
+                    column.expr().into_owned()
                 };
                 // SQLite names a column of a join group after the group,
                 // which it treats as a subquery, unless the group is the
@@ -1280,7 +1281,7 @@ impl Scope {
                     } else {
                         Cow::Borrowed(source.qualifier.as_str())
                     },
-                    resolved,
+                    expr,
                 });
             }
             return Ok(expanded);
@@ -1290,19 +1291,19 @@ impl Scope {
             .column_views()
             .filter(|column| !column.hidden())
             .map(|column| {
-                let resolved = if source
+                let expr = if source
                     .star_merged
                     .iter()
                     .any(|name| column.lookup_matches(name))
                 {
-                    self.merged_star_column(column)?
+                    self.merged_star_column(column)?.expr
                 } else {
-                    column.resolved()
+                    column.expr().into_owned()
                 };
                 Ok(ExpandedColumn {
                     name: column.display_name().to_string(),
                     qualifier: Cow::Borrowed(source.qualifier.as_str()),
-                    resolved,
+                    expr,
                 })
             })
             .collect()
@@ -2325,14 +2326,13 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             ["left_value", "id", "right_value"]
         );
-        assert!(matches!(&expanded[1].resolved.expr, Expr::MergedColumn(_)));
-        assert_eq!(expanded[1].resolved.type_fact.storage, Some(Type::Text));
-        assert_eq!(expanded[1].resolved.affinity, Affinity::Text);
-        assert!(expanded[1].resolved.has_affinity);
-        assert!(matches!(
-            expanded[1].resolved.collation,
-            ExprCollation::Absent
-        ));
+        let Expr::MergedColumn(merged) = &expanded[1].expr else {
+            panic!("a USING column expands as its merged value");
+        };
+        assert_eq!(merged.type_fact.storage, Some(Type::Text));
+        assert_eq!(merged.affinity, Affinity::Text);
+        assert!(merged.has_affinity);
+        assert!(merged.collation.is_none());
 
         let qualified = scope
             .expand_table_star("right")
@@ -2345,7 +2345,7 @@ pub(crate) mod tests {
             ["id", "right_value"]
         );
         assert!(matches!(
-            &qualified[0].resolved.expr,
+            &qualified[0].expr,
             Expr::Column(ColumnRef { source, column: 0 }) if *source == right.id
         ));
     }
@@ -2430,7 +2430,7 @@ pub(crate) mod tests {
 
         assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0].name, "id");
-        assert!(matches!(&expanded[0].resolved.expr, Expr::MergedColumn(_)));
+        assert!(matches!(&expanded[0].expr, Expr::MergedColumn(_)));
     }
 
     #[test]

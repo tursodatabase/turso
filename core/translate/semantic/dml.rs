@@ -272,7 +272,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         scope: &Scope,
     ) -> Result<()> {
         for column in expanded {
-            let resolved = self.resolve_atomic_expr(column.resolved.expr, scope)?;
+            let resolved = self.resolve_atomic_expr(column.expr, scope)?;
             outputs.push(output_from_resolved(
                 hir::OutputId::root(outputs.len()),
                 column.name,

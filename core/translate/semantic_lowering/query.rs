@@ -10138,6 +10138,7 @@ fn emit_query_row_with_inputs(
             super::expr::register_parameters(program, document, expression);
         }
     } else {
+        program.reserve_output_bindings(outputs.len());
         for (position, expression) in expressions.enumerate() {
             let register = match sorter_in_place {
                 Some(sorter) => sorter.row + sorter.output_columns[position],
