@@ -1061,6 +1061,7 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// Table and index ids this transaction allocated with `CreateBtree`. No other
     /// transaction can see these objects, so rollback drops their row maps whole.
     created_table_ids: Mutex<Vec<MVTableId>>,
+    table_writes: Arc<[AtomicU64; TABLE_WRITE_COUNTS]>,
 }
 
 impl<A: RowVersionAllocator> Transaction<A> {
@@ -1088,6 +1089,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             commit_dep_set: Mutex::new(HashSet::default()),
             holds_blocking_checkpoint_read: AtomicBool::new(false),
             created_table_ids: Mutex::new(Vec::new()),
+            table_writes: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
         }
     }
 
@@ -1097,6 +1099,9 @@ impl<A: RowVersionAllocator> Transaction<A> {
             TransactionState::Active,
             "write set cannot be modified unless transaction is active"
         );
+        if matches!(id.row_id, RowKey::Int(_)) {
+            self.table_writes[table_write_index(id.table_id)].fetch_add(1, Ordering::Release);
+        }
         // Always record in the current savepoint's `newly_added_to_write_set`.
         // Duplicates here are harmless: `rollback_savepoint_changes` collects
         // touched rowids into a BTreeSet (dedup), and the actual write_set
@@ -1324,6 +1329,23 @@ impl<A: RowVersionAllocator> Transaction<A> {
             );
             savepoint.deleted_index_versions.push((key, version_id));
         }
+    }
+}
+
+const TABLE_WRITE_COUNTS: usize = 16;
+
+fn table_write_index(table_id: MVTableId) -> usize {
+    i64::from(table_id).rem_euclid(TABLE_WRITE_COUNTS as i64) as usize
+}
+
+pub(crate) struct TableWriteCount {
+    counts: Arc<[AtomicU64; TABLE_WRITE_COUNTS]>,
+    index: usize,
+}
+
+impl TableWriteCount {
+    pub(crate) fn get(&self) -> u64 {
+        self.counts[self.index].load(Ordering::Acquire)
     }
 }
 
@@ -4778,6 +4800,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             tx_id,
             begin_ts: tx.begin_ts,
             read_mark: tx.read_mark,
+        })
+    }
+
+    pub(crate) fn table_write_count(
+        &self,
+        tx_id: TxID,
+        table_id: MVTableId,
+    ) -> Result<TableWriteCount> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        Ok(TableWriteCount {
+            counts: tx.value().table_writes.clone(),
+            index: table_write_index(table_id),
         })
     }
 

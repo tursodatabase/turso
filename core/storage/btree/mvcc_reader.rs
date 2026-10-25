@@ -4,7 +4,7 @@ use crate::alloc::{ArcSlice, DynAllocator};
 use crate::mvcc::cursor::{cursor_yield_key, CursorYieldPoint};
 use crate::mvcc::cursor::{static_iterator_hack, MvccEntry, MvccIterator};
 use crate::mvcc::database::{
-    MVTableId, MvccReadSnapshot, RowID, RowKey, RowVersions, TxID, VisibleRow,
+    MVTableId, MvccReadSnapshot, RowID, RowKey, RowVersions, TableWriteCount, TxID, VisibleRow,
 };
 use crate::mvcc::yield_points::inject_io_yield;
 use crate::sync::Arc;
@@ -20,6 +20,9 @@ pub(crate) struct MvccReader {
     table_id: MVTableId,
     btree: BtreeAccess,
     chain: Chain,
+    chain_range: ChainRange,
+    own_table_writes: TableWriteCount,
+    own_table_writes_seen: u64,
     direction: IterationDirection,
     exact_seek_key: Option<i64>,
     cell: Option<i64>,
@@ -115,6 +118,7 @@ impl MvccReader {
         } else {
             store.get_table_id_from_root_page_at(root_page, snapshot.begin_ts)
         };
+        let own_table_writes = store.table_write_count(tx_id, table_id)?;
         Ok(Self {
             chains: None,
             store,
@@ -122,6 +126,9 @@ impl MvccReader {
             table_id,
             btree: BtreeAccess::Undecided,
             chain: Chain::Exhausted,
+            chain_range: ChainRange::whole_table(IterationDirection::Forwards),
+            own_table_writes,
+            own_table_writes_seen: 0,
             direction: IterationDirection::Forwards,
             exact_seek_key: None,
             cell: None,
@@ -343,6 +350,7 @@ impl BTreeCursor {
         let move_cell = reader.cell == Some(rowid);
         let advance_chain = reader.chain.rowid() == Some(rowid);
         let reader = self.mvcc_mut();
+        reader.chain_range = reader.chain_range.after(rowid);
         if move_cell {
             let motion = match direction {
                 IterationDirection::Forwards => Motion::Next,
@@ -369,13 +377,10 @@ impl BTreeCursor {
             IterationDirection::Forwards => Motion::Rewind,
             IterationDirection::Backwards => Motion::Last,
         };
-        let range = ChainRange {
-            start: Bound::Included(i64::MIN),
-            end: Bound::Included(i64::MAX),
-            direction,
-            one_key: false,
+        self.mvcc_mut().step = Step::Start {
+            motion,
+            range: ChainRange::whole_table(direction),
         };
-        self.mvcc_mut().step = Step::Start { motion, range };
     }
 
     fn start_mvcc_seek(&mut self, rowid: i64, op: SeekOp) {
@@ -534,6 +539,11 @@ impl BTreeCursor {
     }
 
     fn resolve_mvcc_row(&mut self) -> Result<bool> {
+        let reader = self.mvcc_mut();
+        if reader.own_table_writes_seen != reader.own_table_writes.get() {
+            let range = reader.chain_range;
+            reader.restart_chains(range);
+        }
         loop {
             let reader = self.mvcc_mut();
             match reader.pick() {
@@ -673,6 +683,8 @@ impl MvccReader {
     }
 
     fn restart_chains(&mut self, range: ChainRange) {
+        self.chain_range = range;
+        self.own_table_writes_seen = self.own_table_writes.get();
         self.exact_seek_key = None;
         if range.one_key {
             let Bound::Included(rowid) = range.start else {
@@ -734,6 +746,34 @@ impl MvccReader {
             }
             None => Chain::Exhausted,
         };
+    }
+}
+
+impl ChainRange {
+    fn whole_table(direction: IterationDirection) -> Self {
+        Self {
+            start: Bound::Included(i64::MIN),
+            end: Bound::Included(i64::MAX),
+            direction,
+            one_key: false,
+        }
+    }
+
+    fn after(self, rowid: i64) -> Self {
+        turso_assert!(
+            !self.one_key,
+            "a one-key chain range has no rows after its key"
+        );
+        match self.direction {
+            IterationDirection::Forwards => Self {
+                start: Bound::Excluded(rowid),
+                ..self
+            },
+            IterationDirection::Backwards => Self {
+                end: Bound::Excluded(rowid),
+                ..self
+            },
+        }
     }
 }
 

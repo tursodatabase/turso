@@ -8010,6 +8010,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
+        table_writes: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
     }
 }
 
@@ -9802,6 +9803,7 @@ fn transaction_display() {
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
+        table_writes: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
     };
 
     let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }] }";
@@ -25216,6 +25218,304 @@ fn mvcc_reader_has_no_row_after_its_btree_cache_is_dropped() {
     assert_cursor_row(&mut cursor, &pager, ModelPosition::At(2), &rows, &keys);
     drop(cursor);
     reader.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn mvcc_table_scan_sees_the_writes_of_its_transaction_ahead_of_its_position() {
+    let forward = "SELECT id, v FROM t";
+    let backward = "SELECT id, v FROM t ORDER BY id DESC";
+    let cases = [
+        (
+            forward,
+            3,
+            "DELETE FROM t WHERE id = 4",
+            vec![
+                (1, "v"),
+                (2, "w"),
+                (3, "v"),
+                (6, "v"),
+                (7, "v"),
+                (8, "v"),
+                (9, "w"),
+                (10, "v"),
+            ],
+        ),
+        (
+            forward,
+            3,
+            "UPDATE t SET v = 'changed' WHERE id = 4",
+            vec![
+                (1, "v"),
+                (2, "w"),
+                (3, "v"),
+                (4, "changed"),
+                (6, "v"),
+                (7, "v"),
+                (8, "v"),
+                (9, "w"),
+                (10, "v"),
+            ],
+        ),
+        (
+            forward,
+            3,
+            "INSERT INTO t VALUES (5, 'new')",
+            vec![
+                (1, "v"),
+                (2, "w"),
+                (3, "v"),
+                (4, "v"),
+                (5, "new"),
+                (6, "v"),
+                (7, "v"),
+                (8, "v"),
+                (9, "w"),
+                (10, "v"),
+            ],
+        ),
+        (
+            forward,
+            9,
+            "INSERT INTO t VALUES (11, 'new')",
+            vec![
+                (1, "v"),
+                (2, "w"),
+                (3, "v"),
+                (4, "v"),
+                (6, "v"),
+                (7, "v"),
+                (8, "v"),
+                (9, "w"),
+                (10, "v"),
+                (11, "new"),
+            ],
+        ),
+        (
+            backward,
+            3,
+            "DELETE FROM t WHERE id = 3",
+            vec![
+                (10, "v"),
+                (9, "w"),
+                (8, "v"),
+                (7, "v"),
+                (6, "v"),
+                (4, "v"),
+                (2, "w"),
+                (1, "v"),
+            ],
+        ),
+        (
+            backward,
+            3,
+            "UPDATE t SET v = 'changed' WHERE id = 3",
+            vec![
+                (10, "v"),
+                (9, "w"),
+                (8, "v"),
+                (7, "v"),
+                (6, "v"),
+                (4, "v"),
+                (3, "changed"),
+                (2, "w"),
+                (1, "v"),
+            ],
+        ),
+        (
+            backward,
+            3,
+            "INSERT INTO t VALUES (5, 'new')",
+            vec![
+                (10, "v"),
+                (9, "w"),
+                (8, "v"),
+                (7, "v"),
+                (6, "v"),
+                (5, "new"),
+                (4, "v"),
+                (3, "v"),
+                (2, "w"),
+                (1, "v"),
+            ],
+        ),
+        (
+            backward,
+            9,
+            "INSERT INTO t VALUES (0, 'new')",
+            vec![
+                (10, "v"),
+                (9, "w"),
+                (8, "v"),
+                (7, "v"),
+                (6, "v"),
+                (4, "v"),
+                (3, "v"),
+                (2, "w"),
+                (1, "v"),
+                (0, "new"),
+            ],
+        ),
+    ];
+    let mut wrong_scans = Vec::new();
+    for (query, rows_before_write, write, expected) in cases {
+        let db = MvccTestDb::new();
+        let conn = &db.conn;
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO t VALUES (1, 'v'), (2, 'v'), (3, 'v'), (4, 'v'), (6, 'v'), \
+             (7, 'v'), (8, 'v'), (9, 'v'), (10, 'v')",
+        )
+        .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("UPDATE t SET v = 'w' WHERE id IN (2, 9)")
+            .unwrap();
+
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut scan = conn.prepare(query).unwrap();
+        let mut rows = Vec::new();
+        let mut written = false;
+        loop {
+            if !written && rows.len() == rows_before_write {
+                conn.execute(write).unwrap();
+                written = true;
+            }
+            match scan.step().unwrap() {
+                StepResult::Row => {
+                    let row = scan.row().unwrap();
+                    rows.push((
+                        row.get::<i64>(0).unwrap(),
+                        row.get_value(1).to_text().unwrap().to_string(),
+                    ));
+                }
+                StepResult::IO => scan.get_pager().io.step().unwrap(),
+                StepResult::Done => break,
+                other => panic!("unexpected step result {other:?}"),
+            }
+        }
+        drop(scan);
+        conn.execute("COMMIT").unwrap();
+
+        let expected = expected
+            .iter()
+            .map(|(id, v)| (*id, v.to_string()))
+            .collect::<Vec<_>>();
+        if rows != expected {
+            wrong_scans.push(format!(
+                "{query} with `{write}` after {rows_before_write} rows: \
+                 got {rows:?}, expected {expected:?}"
+            ));
+        }
+    }
+    assert!(wrong_scans.is_empty(), "{wrong_scans:#?}");
+}
+
+#[test]
+fn mvcc_table_scan_sees_its_own_write_to_a_chain_entry_that_it_has_not_seen() {
+    let db = MvccTestDb::new();
+    let conn = &db.conn;
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO t VALUES (1, 'v'), (2, 'v'), (3, 'v'), (4, 'v'), (6, 'v'), \
+         (7, 'v'), (8, 'v'), (9, 'v'), (10, 'v')",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("UPDATE t SET v = 'w' WHERE id = 9").unwrap();
+    let root_page = get_rows(conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut scan = conn.prepare("SELECT id, v FROM t").unwrap();
+    let mut rows = Vec::new();
+    let mut written = false;
+    loop {
+        if !written && rows.len() == 3 {
+            let empty_chain =
+                <RowVersionChain<crate::alloc::DynAllocator> as crate::alloc::TursoVecInExt<
+                    RowVersion,
+                    crate::alloc::DynAllocator,
+                >>::new_in(crate::alloc::DynAllocator::default());
+            db.mvcc_store.rows.insert(
+                RowID::new(table_id, RowKey::Int(5)),
+                Arc::new(RwLock::new(empty_chain)),
+            );
+            conn.execute("INSERT INTO t VALUES (5, 'own')").unwrap();
+            written = true;
+        }
+        match scan.step().unwrap() {
+            StepResult::Row => {
+                let row = scan.row().unwrap();
+                rows.push((
+                    row.get::<i64>(0).unwrap(),
+                    row.get_value(1).to_text().unwrap().to_string(),
+                ));
+            }
+            StepResult::IO => scan.get_pager().io.step().unwrap(),
+            StepResult::Done => break,
+            other => panic!("unexpected step result {other:?}"),
+        }
+    }
+    drop(scan);
+    conn.execute("COMMIT").unwrap();
+
+    let expected = [
+        (1, "v"),
+        (2, "v"),
+        (3, "v"),
+        (4, "v"),
+        (5, "own"),
+        (6, "v"),
+        (7, "v"),
+        (8, "v"),
+        (9, "w"),
+        (10, "v"),
+    ]
+    .map(|(id, v)| (id, v.to_string()));
+    assert_eq!(rows, expected);
+}
+
+#[test]
+fn a_write_to_one_table_leaves_the_write_count_of_another_table_unchanged() {
+    let db = MvccTestDb::new();
+    let conn = &db.conn;
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let table_id = |name: &str| {
+        let query = format!("SELECT rootpage FROM sqlite_schema WHERE name = '{name}'");
+        let root_page = get_rows(conn, &query)[0][0].as_int().unwrap();
+        db.mvcc_store.get_table_id_from_root_page(root_page)
+    };
+    let (a, b) = (table_id("a"), table_id("b"));
+    assert_ne!(table_write_index(a), table_write_index(b));
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO b VALUES (1, 'x')").unwrap();
+    let tx_id = conn.get_mv_tx_id().unwrap();
+    let writes_to_a = db.mvcc_store.table_write_count(tx_id, a).unwrap();
+    let writes_to_b = db.mvcc_store.table_write_count(tx_id, b).unwrap();
+    let (a_before, b_before) = (writes_to_a.get(), writes_to_b.get());
+
+    conn.execute("INSERT INTO b VALUES (2, 'x')").unwrap();
+    assert_eq!(writes_to_a.get(), a_before);
+    assert_eq!(writes_to_b.get(), b_before + 1);
+
+    conn.execute("INSERT INTO a VALUES (1, 'x')").unwrap();
+    assert_eq!(writes_to_a.get(), a_before + 1);
+    assert_eq!(writes_to_b.get(), b_before + 1);
+    conn.execute("COMMIT").unwrap();
 }
 
 #[test]
