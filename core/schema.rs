@@ -2858,6 +2858,35 @@ impl Schema {
         Ok(out)
     }
 
+    /// Parent-side validation allows a UNIQUE key in a different column order.
+    pub fn validate_fk_parent_key(&self, fk: &ResolvedFkRef) -> Result<()> {
+        if fk.parent_uses_rowid {
+            return Ok(());
+        }
+        let parent = self
+            .get_btree_table(&fk.fk.parent_table)
+            .expect("resolved FK parent table");
+        let has_unique_key = self.get_indices(&parent.name).any(|index| {
+            index.unique
+                && index.where_clause.is_none()
+                && index.index_method.is_none()
+                && index.columns.len() == fk.parent_cols.len()
+                && index.columns.iter().all(|column| {
+                    column.pos_in_table != EXPR_INDEX_SENTINEL
+                        && fk
+                            .parent_cols
+                            .iter()
+                            .any(|name| column.name.eq_ignore_ascii_case(name))
+                        && column.collation.unwrap_or(CollationSeq::Binary)
+                            == parent.columns()[column.pos_in_table].collation()
+                })
+        });
+        if !has_unique_key {
+            return Err(fk_mismatch_err(&fk.child_table.name, &parent.name));
+        }
+        Ok(())
+    }
+
     /// Compute all resolved FKs *declared by* `child_table`.
     /// Unlike `resolved_fks_referencing`, this requires every non-rowid parent key
     /// to be backed by a non-partial UNIQUE index on exactly those columns.
