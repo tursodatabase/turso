@@ -1151,3 +1151,130 @@ expect {
     B
     a
 }
+
+# ===== ORDER BY with different spellings of IS NULL / IS NOT NULL =====
+
+setup nullable {
+    CREATE TABLE tn (a);
+    INSERT INTO tn VALUES (1), (NULL);
+}
+
+@setup nullable
+test union-all-order-by-isnull-matches-is-null {
+    SELECT a IS NULL FROM tn UNION ALL SELECT 2 ORDER BY a ISNULL;
+}
+expect {
+    0
+    1
+    2
+}
+
+@setup nullable
+test union-all-order-by-is-null-matches-isnull {
+    SELECT a ISNULL FROM tn UNION ALL SELECT 2 ORDER BY a IS NULL;
+}
+expect {
+    0
+    1
+    2
+}
+
+@setup nullable
+test union-all-order-by-notnull-matches-is-not-null {
+    SELECT a IS NOT NULL FROM tn UNION ALL SELECT 2 ORDER BY a NOTNULL;
+}
+expect {
+    0
+    1
+    2
+}
+
+@setup nullable
+test union-all-order-by-not-null-matches-is-not-null {
+    SELECT a IS NOT NULL FROM tn UNION ALL SELECT 2 ORDER BY a NOT NULL;
+}
+expect {
+    0
+    1
+    2
+}
+
+@setup nullable
+test union-all-order-by-is-not-null-matches-notnull {
+    SELECT a NOTNULL FROM tn UNION ALL SELECT 2 ORDER BY a IS NOT NULL;
+}
+expect {
+    0
+    1
+    2
+}
+
+@setup nullable
+test union-all-order-by-is-not-null-matches-not-null {
+    SELECT a NOT NULL FROM tn UNION ALL SELECT 2 ORDER BY a IS NOT NULL;
+}
+expect {
+    0
+    1
+    2
+}
+
+@setup nullable
+test union-all-order-by-is-parenthesized-null-matches-isnull {
+    SELECT a ISNULL FROM tn UNION ALL SELECT 2 ORDER BY a IS (NULL);
+}
+expect {
+    0
+    1
+    2
+}
+
+@setup nullable
+test union-all-order-by-function-arg-isnull-matches-is-null {
+    SELECT abs(a IS NULL) FROM tn UNION ALL SELECT 2 ORDER BY abs(a ISNULL);
+}
+expect {
+    0
+    1
+    2
+}
+
+@setup nullable
+test union-all-order-by-function-arg-notnull-matches-is-not-null {
+    SELECT coalesce(a NOTNULL, 5) FROM tn UNION ALL SELECT 2 ORDER BY coalesce(a IS NOT NULL, 5);
+}
+expect {
+    0
+    1
+    2
+}
+
+@setup nullable
+test union-all-order-by-aggregate-arg-is-null-matches-isnull {
+    SELECT max(a ISNULL) FROM tn UNION ALL SELECT min(a IS NOT NULL) FROM tn UNION ALL SELECT 2 ORDER BY max(a IS NULL);
+}
+expect {
+    0
+    1
+    2
+}
+
+@setup nullable
+test union-all-order-by-case-base-isnull-matches-is-null {
+    SELECT CASE a IS NULL WHEN 1 THEN 1 ELSE 0 END FROM tn UNION ALL SELECT 2 ORDER BY CASE a ISNULL WHEN 1 THEN 1 ELSE 0 END;
+}
+expect {
+    0
+    1
+    2
+}
+
+@setup nullable
+test union-all-order-by-case-else-not-null-matches-is-not-null {
+    SELECT CASE WHEN 0 THEN 9 ELSE a IS NOT NULL END FROM tn UNION ALL SELECT 2 ORDER BY CASE WHEN 0 THEN 9 ELSE a NOT NULL END;
+}
+expect {
+    0
+    1
+    2
+}
