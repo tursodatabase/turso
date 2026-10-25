@@ -596,7 +596,17 @@ fn emit_column_constraints_validation(
         check_constraints.extend(domain_checks);
     }
 
-    if !has_notnull && check_constraints.is_empty() {
+    let has_custom_default = table.is_strict
+        && column.default.is_some()
+        && (column.is_array()
+            || resolver
+                .schema()
+                .resolve_type(&column.ty_str, table.is_strict)
+                .ok()
+                .flatten()
+                .is_some_and(|resolved| resolved.chain.iter().any(|td| td.encode().is_some())));
+
+    if !has_notnull && check_constraints.is_empty() && !has_custom_default {
         return Ok(());
     }
 
@@ -645,8 +655,12 @@ fn emit_column_constraints_validation(
         program.emit_column_or_rowid(cursor_id, idx, layout.to_register(base_dest_reg, idx));
     }
 
-    let dml_ctx =
-        DmlColumnContext::layout(resolved_table.columns(), base_dest_reg, rowid_reg, layout);
+    let dml_ctx = DmlColumnContext::layout(
+        resolved_table.columns(),
+        base_dest_reg,
+        rowid_reg,
+        layout.clone(),
+    );
     compute_virtual_columns(
         program,
         &resolved_table.columns_topo_sort()?,
@@ -655,6 +669,39 @@ fn emit_column_constraints_validation(
         &resolved_table_arc,
     )?;
     let result_reg = dml_ctx.to_column_reg(new_column_idx);
+
+    if has_custom_default {
+        let mut column_mask = ColumnMask::default();
+        column_mask.set(new_column_idx)?;
+        program.emit_insn(Insn::TypeCheck {
+            start_reg: base_dest_reg,
+            count: layout.num_non_virtual_cols(),
+            check_generated: false,
+            table_reference: BTreeTable::input_type_check_table_ref(
+                &resolved_table_arc,
+                resolver.schema(),
+                Some(&column_mask),
+            )?,
+        });
+        crate::translate::expr::emit_custom_type_encode_columns(
+            program,
+            resolver,
+            resolved_table.columns(),
+            base_dest_reg,
+            Some(&column_mask),
+            &resolved_table.name,
+            &layout,
+        )?;
+        program.emit_insn(Insn::TypeCheck {
+            start_reg: base_dest_reg,
+            count: layout.num_non_virtual_cols(),
+            check_generated: false,
+            table_reference: BTreeTable::type_check_table_ref(
+                &resolved_table_arc,
+                resolver.schema(),
+            ),
+        });
+    }
 
     if !check_constraints.is_empty() {
         let table = Table::BTree(resolved_table_arc.clone());
