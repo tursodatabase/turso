@@ -324,6 +324,25 @@ fn test_wal_frame_far_away_write(db: TempDatabase) {
     assert!(conn2.wal_insert_frame(5, &frame).is_err());
 }
 
+#[test]
+fn test_wal_insert_frame_without_session_does_not_overwrite_committed_frames() {
+    let db = TempDatabase::new_empty();
+    let stale = db.connect_limbo();
+    let writer = db.connect_limbo();
+    writer.execute("CREATE TABLE t(x)").unwrap();
+    writer.execute("INSERT INTO t VALUES (1)").unwrap();
+    let _: Vec<(i64,)> = stale.exec_rows("SELECT count(*) FROM t");
+    let max_frame = stale.wal_state().unwrap().max_frame;
+    let mut frame = [0u8; 24 + 4096];
+    stale.wal_get_frame(max_frame, &mut frame).unwrap();
+    writer.execute("INSERT INTO t VALUES (2)").unwrap();
+    writer.execute("INSERT INTO t VALUES (3)").unwrap();
+    let insert = stale.wal_insert_frame(max_frame + 1, &frame);
+    assert!(matches!(insert, Err(LimboError::TxError(_))), "{insert:?}");
+    let rows: Vec<(i64,)> = db.connect_limbo().exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, [(3,)]);
+}
+
 // TODO: mvcc
 #[turso_macros::test()]
 fn test_wal_frame_api_no_schema_changes_fuzz(db: TempDatabase) {
