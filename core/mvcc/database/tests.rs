@@ -24616,6 +24616,18 @@ fn check_reader_against_model(
         let mut cursor = open_mvcc_table_reader(db, reader, 2);
         walk_mvcc_table_reader(&mut cursor, &pager, rows, &keys, rng);
     }
+    let forward: Vec<(i64, String)> = rows.iter().map(|(id, v)| (*id, v.clone())).collect();
+    let backward: Vec<(i64, String)> = forward.iter().rev().cloned().collect();
+    assert_eq!(
+        scan_with_mvcc_lazy_cursor(db, reader, IterationDirection::Forwards),
+        forward,
+        "MvccLazyCursor, which write cursors still use, must see the rows of the reader"
+    );
+    assert_eq!(
+        scan_with_mvcc_lazy_cursor(db, reader, IterationDirection::Backwards),
+        backward,
+        "MvccLazyCursor, which write cursors still use, must see the rows of the reader"
+    );
 
     let expected: Vec<Vec<Value>> = rows
         .iter()
@@ -24697,6 +24709,62 @@ fn open_mvcc_table_reader(
     cursor.read_mvcc_table(MvccReader::new(mv_store, reader, tx_id, root_page).unwrap());
     assert!(cursor.is_mvcc());
     cursor
+}
+
+fn scan_with_mvcc_lazy_cursor(
+    db: &MvccTestDbNoConn,
+    reader: &Arc<Connection>,
+    direction: IterationDirection,
+) -> Vec<(i64, String)> {
+    use crate::storage::btree::CursorTrait;
+
+    let mv_store = db.get_mvcc_store();
+    let root_page = get_rows(
+        reader,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let btree_root_page = if root_page < 0 {
+        mv_store.get_real_table_id(root_page)
+    } else {
+        root_page
+    };
+    let pager = reader.pager.load().clone();
+    let mut cursor = MvccLazyCursor::new(
+        mv_store,
+        reader,
+        reader.get_mv_tx_id().unwrap(),
+        root_page,
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new_table(pager.clone(), btree_root_page, 2)),
+    )
+    .unwrap();
+    match direction {
+        IterationDirection::Forwards => drive_cursor_io(&pager, || cursor.rewind()),
+        IterationDirection::Backwards => drive_cursor_io(&pager, || cursor.last()),
+    }
+    let mut rows = Vec::new();
+    while let Some(rowid) = drive_cursor_io(&pager, || cursor.rowid()) {
+        let value = loop {
+            match cursor.record().unwrap() {
+                IOResult::Done(record) => {
+                    break record
+                        .expect("a positioned cursor must have a record")
+                        .get_value_opt(1)
+                        .and_then(|value| value.to_text().map(str::to_string))
+                        .expect("column v must be text");
+                }
+                IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
+            }
+        };
+        rows.push((rowid, value));
+        match direction {
+            IterationDirection::Forwards => drive_cursor_io(&pager, || cursor.next()),
+            IterationDirection::Backwards => drive_cursor_io(&pager, || cursor.prev()),
+        }
+    }
+    rows
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24904,6 +24972,103 @@ fn assert_cursor_row(
             assert_eq!(drive_cursor_io(pager, || cursor.rowid()), None);
         }
     }
+}
+
+#[test]
+fn mvcc_reader_and_mvcc_lazy_cursor_see_the_same_rows_when_the_btree_covers_a_chain() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mv_store = db.get_mvcc_store();
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    let mut rows = BTreeMap::new();
+    for id in 1..=6 {
+        writer
+            .execute(format!("INSERT INTO t VALUES ({id}, 'v{id}')"))
+            .unwrap();
+        rows.insert(id, format!("v{id}"));
+    }
+    writer.set_failure_injector(Some(FixedFailureInjector::new([(
+        CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
+        LimboError::TxError("checkpoint fails after it wrote the B-tree".to_string()),
+    )])));
+    assert!(writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").is_err());
+    writer.set_failure_injector(None);
+    writer
+        .execute("UPDATE t SET v = 'u2' WHERE id = 2")
+        .unwrap();
+    writer.execute("DELETE FROM t WHERE id = 4").unwrap();
+    writer.execute("INSERT INTO t VALUES (7, 'v7')").unwrap();
+    rows.insert(2, "u2".to_string());
+    rows.remove(&4);
+    rows.insert(7, "v7".to_string());
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    get_rows(&reader, "SELECT count(*) FROM t");
+    let snapshot = mv_store
+        .read_snapshot(reader.get_mv_tx_id().unwrap())
+        .unwrap();
+    let root_page = get_rows(
+        &reader,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = mv_store.get_table_id_from_root_page(root_page);
+    for id in [1, 3, 5, 6] {
+        let entry = mv_store
+            .rows
+            .get(&RowID::new(table_id, RowKey::Int(id)))
+            .expect("the failed checkpoint keeps the chain");
+        let mut versions = entry.value().write();
+        assert_eq!(versions.len(), 1, "key {id} has one version");
+        versions[0].set_materialized_at(snapshot.read_mark);
+    }
+    let covered_keys: Vec<i64> = (1..=7)
+        .filter(|id| {
+            mv_store
+                .rows
+                .get(&RowID::new(table_id, RowKey::Int(*id)))
+                .is_some_and(|entry| {
+                    let versions = entry.value().read();
+                    mv_store.btree_covers_chain_for_snapshot(snapshot, table_id, &versions)
+                })
+        })
+        .collect();
+    assert_eq!(covered_keys, vec![1, 3, 5, 6]);
+
+    let forward: Vec<(i64, String)> = rows.iter().map(|(id, v)| (*id, v.clone())).collect();
+    let backward: Vec<(i64, String)> = forward.iter().rev().cloned().collect();
+    assert_eq!(
+        scan_with_mvcc_lazy_cursor(&db, &reader, IterationDirection::Forwards),
+        forward
+    );
+    assert_eq!(
+        scan_with_mvcc_lazy_cursor(&db, &reader, IterationDirection::Backwards),
+        backward
+    );
+    let pager = reader.pager.load().clone();
+    let keys: Vec<i64> = rows.keys().copied().collect();
+    let mut rng = ChaCha8Rng::seed_from_u64(7);
+    for _ in 0..4 {
+        let mut cursor = open_mvcc_table_reader(&db, &reader, 2);
+        walk_mvcc_table_reader(&mut cursor, &pager, &rows, &keys, &mut rng);
+    }
+    let expected: Vec<Vec<Value>> = rows
+        .iter()
+        .map(|(id, v)| vec![Value::from_i64(*id), Value::from_text(v.clone())])
+        .collect();
+    assert_eq!(get_rows(&reader, "SELECT id, v FROM t"), expected);
+    assert_eq!(
+        get_rows(&reader, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(rows.len() as i64)]]
+    );
+    reader.execute("ROLLBACK").unwrap();
 }
 
 #[test]
