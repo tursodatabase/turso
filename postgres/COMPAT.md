@@ -155,7 +155,7 @@ floating-point value gives a floating-point result, as in PostgreSQL.
 | Phrase search | ❌ Not supported | tsvector/tsquery degrade to TEXT; no full-text search |
 | Range types | ❌ Not supported | |
 | smallserial type | ✅ Supported | serial2/serial4/serial8 aliases too; serial implies NOT NULL + implicit sequence, not PRIMARY KEY |
-| Type modifier support | 🟡 Partial | varchar(n) length enforced ("value too long for varchar"); numeric(p,s) scale applied; modifiers on other types and in casts (`x::varchar(3)`) rejected |
+| Type modifier support | 🟡 Partial | varchar(n) length enforced ("value too long for type character varying(n)", trailing spaces past the limit are cut); `x::varchar(n)` cuts text to n characters; numeric(p,s) scale applied; modifiers on other types and in other casts (`x::numeric(5,2)`) rejected |
 | UUIDv7 | ❌ Not supported | |
 | XML data type | ❌ Not supported | xml columns degrade to TEXT; no XML functions |
 

@@ -245,6 +245,8 @@ fn errors_report_postgres_sqlstates() {
     conn.execute("CREATE SEQUENCE s_exhaust START 2 INCREMENT 1 MINVALUE 1 MAXVALUE 2")
         .unwrap();
     conn.execute("SELECT nextval('s_exhaust')").unwrap();
+    conn.execute("CREATE TABLE t_short (v varchar(2), b boolean)")
+        .unwrap();
     for (sql, code) in [
         ("SELECTT 1", "42601"),
         ("SELECT * FROM no_such_table_xyz", "42P01"),
@@ -254,6 +256,9 @@ fn errors_report_postgres_sqlstates() {
         ("SELECT abs(-9223372036854775808)", "22003"),
         ("SELECT zeroblob(1000000001)", "22001"),
         ("SELECT nextval('s_exhaust')", "2200H"),
+        ("SELECT 'maybe'::boolean", "22P02"),
+        ("INSERT INTO t_short (b) VALUES ('maybe')", "22P02"),
+        ("INSERT INTO t_short (v) VALUES ('abc')", "22001"),
     ] {
         let e = exec_err(&conn, sql);
         assert_eq!(e.sqlstate, code, "wrong SQLSTATE for: {sql}, got {e:?}");

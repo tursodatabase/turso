@@ -238,7 +238,7 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::DivisionByZero => SQLSTATE_DIVISION_BY_ZERO,
         LimboError::InvalidTextRepresentation(_) => SQLSTATE_INVALID_TEXT_REPRESENTATION,
         LimboError::IntegerOverflow => SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-        LimboError::TooBig => SQLSTATE_STRING_DATA_RIGHT_TRUNCATION,
+        LimboError::TooBig | LimboError::ValueTooLong(_) => SQLSTATE_STRING_DATA_RIGHT_TRUNCATION,
         LimboError::InvalidDate(_)
         | LimboError::InvalidTime(_)
         | LimboError::InvalidModifier(_) => SQLSTATE_INVALID_DATETIME_FORMAT,

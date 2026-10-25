@@ -156,7 +156,8 @@ impl Dialect for PostgresDialect {
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)
+        turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)?;
+        register_pg_types(schema)
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
@@ -3526,6 +3527,21 @@ fn index_definition(table_schema: &str, table_name: &str, index_name: &str, idx:
         def.push_str(&format!(" WHERE {where_clause}"));
     }
     def
+}
+
+const PG_TYPE_SQLS: &[&str] = &[
+    "CREATE TYPE boolean(value any) BASE integer ENCODE bool_in(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'",
+    "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE varchar_in(value, maxlen) DECODE value OPERATOR '<'",
+];
+
+const PG_TYPE_ALIASES: &[(&str, &str)] = &[("bool", "boolean")];
+
+fn register_pg_types(schema: &mut Schema) -> Result<()> {
+    turso_core::schema::register_builtin_types(
+        &mut schema.type_registry,
+        PG_TYPE_SQLS,
+        PG_TYPE_ALIASES,
+    )
 }
 
 // TODO: Fix tests to use correct API
