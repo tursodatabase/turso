@@ -245,6 +245,17 @@ expect {
     2|3|7|4|2|3|4|3|3|4|0
 }
 
+# A sign with no digits after it is reported at the sign, even when an
+# exponent follows.
+test json_error_position_reports_sign_without_digits_before_exponent {
+    SELECT json_error_position('[-e]'), json_error_position('-e'),
+           json_error_position('{a:-e}'), json_error_position('+e1'),
+           json_error_position('[-E+]');
+}
+expect {
+    2|1|4|1|2
+}
+
 # A bad escape is reported at the character after the backslash.
 test json_error_position_reports_bad_escape_after_backslash {
     SELECT json_error_position('"\q"'), json_error_position('"ab\q"'),

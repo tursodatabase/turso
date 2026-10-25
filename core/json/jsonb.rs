@@ -2266,6 +2266,7 @@ impl Jsonb {
                         is_json5 = true;
                     }
                 }
+                b'e' | b'E' if !has_digit => break,
                 b'e' | b'E' => {
                     // A second exponent marker is reported like a
                     // repeated dot.
