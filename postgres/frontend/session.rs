@@ -11,10 +11,10 @@ use crate::settings::{PgSessionState, SettingScope};
 use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    check_set_transaction, is_comment_on, is_refresh_matview, try_extract_copy_from,
-    try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-    unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
+    check_set_transaction, is_comment_on, is_drop_matview, is_refresh_matview,
+    try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
+    try_extract_show, unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt,
+    PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -209,6 +209,9 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
+    if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
+        reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
+    }
 
     for prereq in translated.prereqs {
         let input = prereq.to_string();
@@ -242,37 +245,17 @@ fn create_table_schema_from_search_path(
 
 /// Whether the schema of table `table` already has a table, index, view or
 /// sequence named `name`, which makes PostgreSQL choose another name for a
-/// new index on the table. A table named with a schema is in that schema.
-/// Otherwise the table is looked up in the same order as core does: temp
-/// first, then the databases of the search path. Main when no database has
-/// the table.
+/// new index on the table. Main when no database has the table.
 fn relation_name_is_taken(
     conn: &Arc<Connection>,
     schema: Option<&str>,
     table: &str,
     name: &str,
 ) -> Result<bool> {
-    let database_names: HashMap<usize, String> = conn
-        .list_all_databases()
-        .into_iter()
-        .map(|(id, database, _)| (id, database))
-        .collect();
-    let databases: Vec<String> = match schema {
-        Some(schema) if schema.eq_ignore_ascii_case("public") => vec!["main".to_string()],
-        Some(schema) => database_names
-            .values()
-            .filter(|database| database.eq_ignore_ascii_case(schema))
-            .cloned()
-            .collect(),
-        None => database_names
-            .contains_key(&turso_core::TEMP_DB_ID)
-            .then_some(turso_core::TEMP_DB_ID)
-            .into_iter()
-            .chain(conn.search_order())
-            .chain(std::iter::once(turso_core::MAIN_DB_ID))
-            .map(|id| database_names[&id].clone())
-            .collect(),
-    };
+    let mut databases = relation_lookup_databases(conn, schema);
+    if schema.is_none() {
+        databases.push("main".to_string());
+    }
     let mut taken = false;
     for database in databases {
         let mut stmt = conn.prepare_sqlite(format!(
@@ -298,6 +281,74 @@ fn relation_name_is_taken(
         }
     }
     Ok(taken)
+}
+
+/// PostgreSQL refuses DROP VIEW and DROP MATERIALIZED VIEW on a relation of
+/// another kind, but core's DROP VIEW drops both kinds of view. The relation
+/// is the first table or view named `view_name` in the databases that core
+/// looks it up in. A view is materialized when it has a root page.
+fn reject_drop_of_other_view_kind(
+    conn: &Arc<Connection>,
+    view_name: &ast::QualifiedName,
+    materialized: bool,
+) -> Result<()> {
+    let expected_kind = if materialized {
+        "materialized view"
+    } else {
+        "view"
+    };
+    let schema = view_name.namespace.as_ref().map(|name| name.as_str());
+    for database in relation_lookup_databases(conn, schema) {
+        let mut stmt = conn.prepare_sqlite(format!(
+            "SELECT CASE WHEN type = 'table' THEN 'table' \
+                         WHEN rootpage = 0 THEN 'view' \
+                         ELSE 'materialized view' END \
+             FROM \"{database}\".sqlite_schema \
+             WHERE type IN ('table', 'view') AND name COLLATE NOCASE = ?1"
+        ))?;
+        stmt.bind_at(
+            NonZero::new(1).unwrap(),
+            Value::build_text(view_name.name.as_str().to_string()),
+        )?;
+        let Some(row) = stmt.run_collect_rows()?.into_iter().next() else {
+            continue;
+        };
+        if row[0] != Value::build_text(expected_kind) {
+            return Err(LimboError::ParseError(format!(
+                "\"{}\" is not a {expected_kind}",
+                view_name.name.as_str()
+            )));
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
+/// The databases that a relation is looked up in, in order. A relation
+/// named with a schema is in that schema. Otherwise it is looked up in the
+/// same order as core does: temp first, then the databases of the search
+/// path.
+fn relation_lookup_databases(conn: &Arc<Connection>, schema: Option<&str>) -> Vec<String> {
+    let database_names: HashMap<usize, String> = conn
+        .list_all_databases()
+        .into_iter()
+        .map(|(id, database, _)| (id, database))
+        .collect();
+    match schema {
+        Some(schema) if schema.eq_ignore_ascii_case("public") => vec!["main".to_string()],
+        Some(schema) => database_names
+            .values()
+            .filter(|database| database.eq_ignore_ascii_case(schema))
+            .cloned()
+            .collect(),
+        None => database_names
+            .contains_key(&turso_core::TEMP_DB_ID)
+            .then_some(turso_core::TEMP_DB_ID)
+            .into_iter()
+            .chain(conn.search_order())
+            .map(|id| database_names[&id].clone())
+            .collect(),
+    }
 }
 
 /// The first schema of `search_path` that exists, which is what PostgreSQL's
@@ -908,8 +959,59 @@ fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::search_path_parser;
+    use super::{search_path_parser, PgConnection};
+    use crate::PostgresDialect;
     use chumsky::Parser;
+    use std::sync::Arc;
+    use turso_core::{Database, DatabaseOpts, MemoryIO, OpenOptions};
+
+    #[test]
+    fn drop_view_refuses_a_relation_of_another_kind() {
+        let db = Database::open(
+            Arc::new(MemoryIO::new()),
+            ":memory:",
+            OpenOptions::new(Arc::new(PostgresDialect))
+                .db_opts(DatabaseOpts::new().with_views(true)),
+        )
+        .unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE t (a int); \
+             CREATE VIEW v AS SELECT * FROM t; \
+             CREATE MATERIALIZED VIEW m AS SELECT * FROM t;",
+        )
+        .unwrap();
+        for (sql, error) in [
+            (
+                "DROP MATERIALIZED VIEW v",
+                "\"v\" is not a materialized view",
+            ),
+            (
+                "DROP MATERIALIZED VIEW IF EXISTS public.v",
+                "\"v\" is not a materialized view",
+            ),
+            (
+                "DROP MATERIALIZED VIEW t",
+                "\"t\" is not a materialized view",
+            ),
+            ("DROP VIEW m", "\"m\" is not a view"),
+            ("DROP VIEW IF EXISTS public.m", "\"m\" is not a view"),
+            ("DROP VIEW t", "\"t\" is not a view"),
+        ] {
+            assert_eq!(
+                conn.execute(sql).unwrap_err().to_string(),
+                format!("Parse error: {error}"),
+                "{sql}"
+            );
+        }
+        conn.execute("SELECT * FROM v; SELECT * FROM m; SELECT * FROM t;")
+            .unwrap();
+        conn.execute("DROP VIEW v; DROP MATERIALIZED VIEW m;")
+            .unwrap();
+        for sql in ["SELECT * FROM v", "SELECT * FROM m"] {
+            assert!(conn.execute(sql).is_err(), "{sql}");
+        }
+    }
 
     #[test]
     fn search_path_parser_accepts_identifier_lists() {
