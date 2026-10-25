@@ -1693,6 +1693,7 @@ impl Jsonb {
 
             pos = skip_whitespace_tracking(input, pos, info);
             if pos >= input.len() || input[pos] != b':' {
+                self.deserialize_value(input, pos, pos, depth + 1, info)?;
                 return Err(PError::Message {
                     msg: "Expected : after object key".to_string(),
                     location: Some(pos),
@@ -1914,11 +1915,9 @@ impl Jsonb {
             if quoted && c == quote {
                 closed = true;
                 break; // End of string
-            } else if !quoted && (c == b'"' || c == b'\'') {
-                return Err(PError::Message {
-                    msg: "Unexpected input".to_string(),
-                    location: Some(pos),
-                });
+            } else if !quoted && !is_unquoted_key_char(input, pos - 1) {
+                pos -= 1;
+                break;
             } else if c == b'\\' {
                 // Handle escape sequences
                 if pos >= input.len() {
@@ -1928,16 +1927,9 @@ impl Jsonb {
                     });
                 }
 
+                let esc_pos = pos;
                 let esc = input[pos];
                 pos += 1;
-
-                // SQLite allows only \uXXXX escapes in unquoted keys.
-                if !quoted && esc != b'u' {
-                    return Err(PError::Message {
-                        msg: "Invalid character in unquoted object key".to_string(),
-                        location: Some(pos),
-                    });
-                }
 
                 // A standard escape upgrades plain TEXT to TEXTJ but
                 // never demotes TEXT5: earlier JSON5 syntax keeps the
@@ -1991,7 +1983,7 @@ impl Jsonb {
                         if pos + 4 > input.len() {
                             return Err(PError::Message {
                                 msg: "Incomplete unicode escape sequence".to_string(),
-                                location: Some(pos),
+                                location: Some(esc_pos),
                             });
                         }
 
@@ -2003,7 +1995,7 @@ impl Jsonb {
                             if !is_hex_digit(h) {
                                 return Err(PError::Message {
                                     msg: "Invalid unicode escape sequence".to_string(),
-                                    location: Some(pos),
+                                    location: Some(esc_pos),
                                 });
                             }
                             escape_buffer[2 + i] = h;
@@ -2050,7 +2042,7 @@ impl Jsonb {
                         len += 2;
                         element_type = ElementType::TEXT5;
                     }
-                    b'0' => {
+                    b'0' if !input.get(pos).is_some_and(u8::is_ascii_digit) => {
                         self.data.extend_from_slice(b"\\0");
                         len += 2;
                         element_type = ElementType::TEXT5;
@@ -2065,7 +2057,7 @@ impl Jsonb {
                         if pos + 2 > input.len() {
                             return Err(PError::Message {
                                 msg: "Incopmlete hex escape sequence".to_string(),
-                                location: Some(pos),
+                                location: Some(esc_pos),
                             });
                         }
 
@@ -2077,7 +2069,7 @@ impl Jsonb {
                             if !is_hex_digit(h) {
                                 return Err(PError::Message {
                                     msg: "Invalid hex escape sequence".to_string(),
-                                    location: Some(pos),
+                                    location: Some(esc_pos),
                                 });
                             }
                             escape_buffer[2 + i] = h;
@@ -2092,26 +2084,10 @@ impl Jsonb {
                     _ => {
                         return Err(PError::Message {
                             msg: "Invalid escape sequence".to_string(),
-                            location: Some(pos),
+                            location: Some(esc_pos),
                         });
                     }
                 }
-            } else if !quoted
-                && (c == b':'
-                    || c.is_ascii_whitespace()
-                    || json5_whitespace_len(&input[pos - 1..]) != 0
-                    || (c == b'/' && matches!(input.get(pos), Some(b'/' | b'*'))))
-            {
-                // End of unquoted identifier. A comment right after the
-                // key acts as whitespace, so its opening '/' ends the
-                // key and the whitespace skipping before ':' eats it.
-                pos -= 1; // Put back the terminating character
-                break;
-            } else if !quoted && !is_json5_id_char(c, false) {
-                return Err(PError::Message {
-                    msg: "Invalid character in unquoted object key".to_string(),
-                    location: Some(pos),
-                });
             } else if c <= 0x1F {
                 // Control character
                 element_type = ElementType::TEXT5;
@@ -2203,25 +2179,19 @@ impl Jsonb {
             len += 1;
             has_digit = true;
 
-            if pos < input.len() && (input[pos] == b'x' || input[pos] == b'X') {
+            if pos + 1 < input.len()
+                && (input[pos] == b'x' || input[pos] == b'X')
+                && is_hex_digit(input[pos + 1])
+            {
                 // Hexadecimal number
                 self.data.push(input[pos]);
                 pos += 1;
                 len += 1;
 
-                let mut has_digit = false;
                 while pos < input.len() && is_hex_digit(input[pos]) {
                     self.data.push(input[pos]);
                     pos += 1;
                     len += 1;
-                    has_digit = true;
-                }
-
-                if !has_digit {
-                    return Err(PError::Message {
-                        msg: "Invalid hex digit".to_string(),
-                        location: Some(pos),
-                    });
                 }
 
                 info.has_json5 = true;
@@ -2319,6 +2289,7 @@ impl Jsonb {
                         is_json5 = true;
                     }
                 }
+                b'e' | b'E' if !has_digit => break,
                 b'e' | b'E' => {
                     // A second exponent marker is reported like a
                     // repeated dot.
@@ -2345,7 +2316,7 @@ impl Jsonb {
                     if pos >= input.len() || !input[pos].is_ascii_digit() {
                         return Err(PError::Message {
                             msg: "malformed JSON".to_string(),
-                            location: Some(pos),
+                            location: Some(pos - 1),
                         });
                     }
                 }
@@ -4240,6 +4211,15 @@ pub fn unescape_string(input: &str) -> String {
 #[derive(Debug, Default)]
 pub struct ParseInfo {
     pub has_json5: bool,
+}
+
+fn is_unquoted_key_char(input: &[u8], pos: usize) -> bool {
+    if input[pos] == b'\\' {
+        return input.get(pos + 1) == Some(&b'u')
+            && input.len() >= pos + 6
+            && input[pos + 2..pos + 6].iter().all(|&h| is_hex_digit(h));
+    }
+    is_json5_id_char(input[pos], false) && json5_whitespace_len(&input[pos..]) == 0
 }
 
 /// Whether `b` may appear in an unquoted JSON5 object key. Like
