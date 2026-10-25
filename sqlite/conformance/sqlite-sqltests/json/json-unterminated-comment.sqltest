@@ -1,0 +1,83 @@
+# Regression test for https://github.com/tursodatabase/turso/issues/10743
+# Unterminated /* block comments must be rejected as malformed JSON,
+# matching SQLite behavior.
+
+@database :memory:
+
+test block-comment-unterminated-simple {
+    SELECT json('/*1');
+}
+expect error {
+    malformed JSON
+}
+
+test block-comment-unterminated-in-array {
+    SELECT json('[1/*]');
+}
+expect error {
+    malformed JSON
+}
+
+test block-comment-unterminated-in-object {
+    SELECT json('{/*a:1}');
+}
+expect error {
+    malformed JSON
+}
+
+test block-comment-unterminated-bare {
+    SELECT json('/*');
+}
+expect error {
+    malformed JSON
+}
+
+test line-comment-consumes-value-no-newline {
+    SELECT json('//1');
+}
+expect error {
+    malformed JSON
+}
+
+test line-comment-in-array-consumes-bracket {
+    SELECT json('[1//]');
+}
+expect error {
+    malformed JSON
+}
+
+test line-comment-bare {
+    SELECT json('//');
+}
+expect error {
+    malformed JSON
+}
+
+test block-comment-closed-is-valid {
+    SELECT json('/* comment */ 1');
+}
+expect {
+    1
+}
+
+test block-comment-nested-value-valid {
+    SELECT json('[/* comment */1, 2]');
+}
+expect {
+    [1,2]
+}
+
+test line-comment-with-newline_value_valid {
+    SELECT json('// comment
+1');
+}
+expect {
+    1
+}
+
+test json-error-position-unterminated-comment {
+    SELECT json_error_position('[1/*]'), json_error_position('/*1'), json_error_position('{/*a:1}');
+}
+expect {
+    3|1|2
+}

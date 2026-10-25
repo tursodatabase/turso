@@ -1662,7 +1662,7 @@ impl Jsonb {
 
         loop {
             let key_start = pos;
-            pos = skip_whitespace_tracking(input, pos, info);
+            pos = skip_whitespace_tracking(input, pos, info)?;
             if pos >= input.len() {
                 return Err(PError::Message {
                     msg: "Unexpected end of input".to_string(),
@@ -1691,7 +1691,7 @@ impl Jsonb {
                 });
             }
 
-            pos = skip_whitespace_tracking(input, pos, info);
+            pos = skip_whitespace_tracking(input, pos, info)?;
             if pos >= input.len() || input[pos] != b':' {
                 self.deserialize_value(input, pos, pos, depth + 1, info)?;
                 return Err(PError::Message {
@@ -1702,11 +1702,11 @@ impl Jsonb {
             pos += 1; // consume ':'
 
             let value_start = pos;
-            pos = skip_whitespace_tracking(input, pos, info);
+            pos = skip_whitespace_tracking(input, pos, info)?;
             pos = self.deserialize_value(input, value_start, pos, depth + 1, info)?;
             first = false;
 
-            pos = skip_whitespace_tracking(input, pos, info);
+            pos = skip_whitespace_tracking(input, pos, info)?;
             if pos >= input.len() {
                 return Err(PError::Message {
                     msg: "Unexpected end of input".to_string(),
@@ -1760,7 +1760,7 @@ impl Jsonb {
 
         loop {
             let element_start = pos;
-            pos = skip_whitespace_tracking(input, pos, info);
+            pos = skip_whitespace_tracking(input, pos, info)?;
             if pos < input.len() && input[pos] == b']' {
                 if !first {
                     info.has_json5 = true;
@@ -1770,7 +1770,7 @@ impl Jsonb {
             pos = self.deserialize_value(input, element_start, pos, depth + 1, info)?;
             first = false;
 
-            pos = skip_whitespace_tracking(input, pos, info);
+            pos = skip_whitespace_tracking(input, pos, info)?;
             if pos >= input.len() {
                 return Err(PError::Message {
                     msg: "Unexpected end of input".to_string(),
@@ -2504,11 +2504,11 @@ impl Jsonb {
         let mut info = ParseInfo::default();
 
         // Parse the first complete JSON value
-        let pos = skip_whitespace_tracking(input, 0, &mut info);
+        let pos = skip_whitespace_tracking(input, 0, &mut info)?;
         let mut pos = result.deserialize_value(input, 0, pos, 0, &mut info)?;
 
         // Skip any trailing whitespace
-        pos = skip_whitespace_tracking(input, pos, &mut info);
+        pos = skip_whitespace_tracking(input, pos, &mut info)?;
 
         // Check for any non-whitespace characters after the JSON value
         if pos < input.len() {
@@ -4255,15 +4255,19 @@ fn json5_whitespace_len(input: &[u8]) -> usize {
 /// implementation did: an outlined call here costs more than the
 /// check itself and showed up as a double-digit parser regression.
 #[inline(always)]
-pub fn skip_whitespace_tracking(input: &[u8], pos: usize, info: &mut ParseInfo) -> usize {
+pub fn skip_whitespace_tracking(input: &[u8], pos: usize, info: &mut ParseInfo) -> PResult<usize> {
     // Fast path for non-whitespace, non-comment
     if pos >= input.len() || ((WS_TABLE[input[pos] as usize] & 3) == 0 && input[pos] != b'/') {
-        return pos;
+        return Ok(pos);
     }
     skip_whitespace_and_comments(input, pos, info)
 }
 
-fn skip_whitespace_and_comments(input: &[u8], mut pos: usize, info: &mut ParseInfo) -> usize {
+fn skip_whitespace_and_comments(
+    input: &[u8],
+    mut pos: usize,
+    info: &mut ParseInfo,
+) -> PResult<usize> {
     let len = input.len();
 
     // Process whitespace and comments
@@ -4299,15 +4303,27 @@ fn skip_whitespace_and_comments(input: &[u8], mut pos: usize, info: &mut ParseIn
                     }
                 }
                 b'*' => {
-                    // Block comment - skip until "*/"
+                    // Block comment - skip until "*/". If EOF is reached
+                    // before the closing "*/" the comment is unterminated
+                    // and the input is malformed JSON.
                     info.has_json5 = true;
+                    let comment_start = pos;
                     pos += 2;
-                    while pos + 1 < len {
-                        if input[pos] == b'*' && input[pos + 1] == b'/' {
-                            pos += 2;
-                            break;
+                    let closed = 'block: {
+                        while pos + 1 < len {
+                            if input[pos] == b'*' && input[pos + 1] == b'/' {
+                                pos += 2;
+                                break 'block true;
+                            }
+                            pos += 1;
                         }
-                        pos += 1;
+                        false
+                    };
+                    if !closed {
+                        return Err(PError::Message {
+                            msg: "malformed JSON".to_string(),
+                            location: Some(comment_start),
+                        });
                     }
                 }
                 _ => {
@@ -4321,7 +4337,7 @@ fn skip_whitespace_and_comments(input: &[u8], mut pos: usize, info: &mut ParseIn
         }
     }
 
-    pos
+    Ok(pos)
 }
 
 #[inline]
