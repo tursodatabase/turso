@@ -160,28 +160,20 @@ pub fn bind_and_rewrite_expr<'a>(
                     }
 
                     // No real column matched. SQLite now tries rowid names before outer scopes.
-                    for joined_table in joined_tables.iter() {
-                        if let Table::BTree(btree) = &joined_table.table {
-                            if let Some(row_id_expr) =
-                                parse_row_id(&normalized_id, joined_tables[0].internal_id, || {
-                                    joined_tables.len() != 1
-                                })?
-                            {
-                                if !btree.has_rowid {
-                                    crate::bail_parse_error!("no such column: {}", id.as_str());
-                                }
-                                *expr = row_id_expr;
-                                return Ok(WalkControl::Continue);
-                            }
-                        } else if let Table::Virtual(_) = &joined_table.table {
-                            if let Some(row_id_expr) =
-                                parse_row_id(&normalized_id, joined_tables[0].internal_id, || {
-                                    joined_tables.len() != 1
-                                })?
-                            {
-                                *expr = row_id_expr;
-                                return Ok(WalkControl::Continue);
-                            }
+                    let mut rowid_tables =
+                        joined_tables.iter().filter(|table| match &table.table {
+                            Table::BTree(btree) => btree.has_rowid,
+                            Table::Virtual(_) => true,
+                            _ => false,
+                        });
+                    if let Some(table) = rowid_tables.next() {
+                        if let Some(row_id_expr) =
+                            parse_row_id(&normalized_id, table.internal_id, || {
+                                rowid_tables.next().is_some()
+                            })?
+                        {
+                            *expr = row_id_expr;
+                            return Ok(WalkControl::Continue);
                         }
                     }
 
