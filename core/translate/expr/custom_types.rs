@@ -217,16 +217,19 @@ pub(super) struct ResolvedOperator {
 /// 1. Both operands are columns of the same custom type, OR
 /// 2. One operand is a custom type column and the other is a literal whose type
 ///    is compatible with the custom type's `value` input type, OR
-/// 3. The operator is arithmetic, the type reads stored values back unchanged,
-///    one operand is a column of that type and the other is anything except a
-///    column of a different custom type. This lets `date + 1`, `date + int_col`
-///    and `date + ?` add days, while a comparison such as `int_col = '10'` still
-///    uses the standard operator.
+/// 3. One operand is a column of the type, the other is anything except a column
+///    of a different custom type, and either the operator is arithmetic and the
+///    type reads stored values back unchanged, or the operator is a comparison and
+///    the type's `value` input type is `any`. This lets `date + 1`,
+///    `date + int_col` and `date + ?` add days, and `numeric_col = 1.5 + 0`
+///    compare as numeric, while `int_col = '10'` still uses the standard operator.
 ///
 /// When case 2 applies, the literal is encoded before being passed to the operator
 /// function so both arguments are in the same (encoded) representation. In case 3
-/// the other operand is passed as is, which is only safe when encoded and decoded
-/// values look the same. The operator function checks its type.
+/// the other operand is passed as is. For arithmetic that is only safe when encoded
+/// and decoded values look the same. For a comparison the column is passed decoded,
+/// so both arguments are values as the user sees them, and the value is not rounded
+/// to the column's type parameters. The operator function checks its type.
 pub(super) fn find_custom_type_operator(
     e1: &ast::Expr,
     e2: &ast::Expr,
@@ -292,8 +295,11 @@ pub(super) fn find_custom_type_operator(
             let encode_other = literal_type_name(other).is_some_and(|lit_type| {
                 literal_compatible_with_value_type(lit_type, info.type_def.value_input_type())
             });
-            let pass_other_unencoded =
-                !op.is_comparison() && info.type_def.decode_returns_value_unchanged();
+            let pass_other_unencoded = if op.is_comparison() {
+                info.type_def.value_input_type().eq_ignore_ascii_case("any")
+            } else {
+                info.type_def.decode_returns_value_unchanged()
+            };
             if !encode_other && !pass_other_unencoded {
                 return None;
             }
