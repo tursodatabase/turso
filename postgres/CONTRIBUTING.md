@@ -16,7 +16,8 @@ Three things keep that work honest:
 - **[`conformance/pg-sqltests/`](conformance/pg-sqltests/)** — `.sqltest` tests
   that CI runs against the front-end and against a real PostgreSQL server
   (`make -C postgres/conformance run-postgres`). Tests of Turso-specific
-  behavior have `@skip-if postgres "reason"`.
+  behavior have `@skip-if postgres "reason"`. To require the SQLSTATE of an
+  error, put `@sqlstate <code>` on the line before its `expect error` block.
 
 ## Verification workflow
 
