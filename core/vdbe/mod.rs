@@ -18,6 +18,7 @@
 //! <https://www.sqlite.org/opcode.html>
 
 use crate::alloc::{TryReserveError, TursoFromIterator};
+use crate::namespace::NamespaceId;
 use crate::translate::plan::BitSet;
 use crate::types::IOResultOr;
 use crate::types::{Extendable, Text, ValueBlob};
@@ -160,10 +161,13 @@ pub(crate) fn step_view_delta_batch(
 
                 let schema = connection.schema.read();
                 let views = schema.materialized_view_maintenance_order(
+                    NamespaceId::ROOT,
                     connection.transaction_changes.get_view_names()?,
                 )?;
                 for view_name in &views {
-                    if let Some(view_mutex) = schema.get_materialized_view(view_name) {
+                    if let Some(view_mutex) =
+                        schema.get_materialized_view(NamespaceId::ROOT, view_name)
+                    {
                         let view = view_mutex.lock();
                         turso_assert_ne!(
                             view.get_root_page(),
@@ -206,7 +210,9 @@ pub(crate) fn step_view_delta_batch(
                     }
 
                     let schema = connection.schema.read();
-                    let Some(view_mutex) = schema.get_materialized_view(view_name) else {
+                    let Some(view_mutex) =
+                        schema.get_materialized_view(NamespaceId::ROOT, view_name)
+                    else {
                         *current_index += 1;
                         continue;
                     };

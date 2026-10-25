@@ -35,5 +35,3 @@ QUERY PLAN
    |--SCAN ordered_points AS p1
    `--CORRELATED SCALAR SUBQUERY 1
       `--SEARCH p2 USING INDEX ephemeral_subquery_s2 (point_key<?)
-         |--USE HASH TABLE FOR DISTINCT
-         `--USE SORTER FOR ORDER BY

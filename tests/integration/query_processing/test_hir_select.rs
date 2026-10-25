@@ -1852,7 +1852,7 @@ fn hir_full_join_runs_as_nested_loops_with_an_unmatched_pass() {
 /// Like legacy, HIR plans a correlated subquery for the number of times the
 /// outer plan runs it, estimates a grouped query by its groups rather than
 /// the rows it reads, and treats a lone MIN or MAX over a FROM subquery or
-/// CTE like one over a table. The plans then make the same choices.
+/// CTE like one over a table, seeking its bound instead of walking past it.
 #[test]
 fn hir_subquery_estimates_drive_the_plan() {
     let db = setup();
@@ -1885,12 +1885,13 @@ fn hir_subquery_estimates_drive_the_plan() {
             ["SCAN cust AS c", "SEARCH t USING INDEX ephemeral_subquery_"].as_slice(),
         ),
         (
-            // The CTE reads prod through its price index, so it returns rows
-            // in price order and MAX scans it instead of seeking an index.
+            // Walking the CTE's price order from the end would step over
+            // every row above the bound for each outer row, so MAX seeks a
+            // temporary index on the bound instead.
             "WITH p(price) AS MATERIALIZED (SELECT price FROM prod) \
              SELECT p1.price, (SELECT max(p2.price) FROM p p2 WHERE p2.price < p1.price) \
              FROM p p1 WHERE p1.price < 100",
-            ["SCAN p AS p2"].as_slice(),
+            ["SEARCH p2 USING INDEX ephemeral_subquery_"].as_slice(),
         ),
     ] {
         let plan = query_plan(&hir, sql);
@@ -3600,3 +3601,35 @@ const EXPECTED_PLANS: &[(&str, &[&str])] = &[
         &["SCAN o", "SCAN items USING INDEX items_value"],
     ),
 ];
+
+#[test]
+fn cte_read_by_a_correlated_max_is_filled_once_and_searched() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE days(day INT)").unwrap();
+    conn.execute("INSERT INTO days VALUES (4), (1), (2), (2)")
+        .unwrap();
+    let sql = "WITH dates AS (SELECT DISTINCT day FROM days ORDER BY day) \
+         SELECT d1.day, (SELECT max(d2.day) FROM dates d2 WHERE d2.day < d1.day) \
+         FROM dates d1";
+    let table_reads = limbo_exec_rows(&conn, &format!("EXPLAIN {sql}"))
+        .into_iter()
+        .filter(|row| row[1] == rusqlite::types::Value::Text("OpenRead".into()))
+        .count();
+    assert_eq!(table_reads, 1);
+    let plan = query_plan(&conn, sql);
+    assert!(
+        plan.iter()
+            .any(|line| line.starts_with("SEARCH d2 USING INDEX")),
+        "{plan:?}"
+    );
+    use rusqlite::types::Value::{Integer, Null};
+    assert_eq!(
+        limbo_exec_rows(&conn, sql),
+        vec![
+            vec![Integer(1), Null],
+            vec![Integer(2), Integer(1)],
+            vec![Integer(4), Integer(2)],
+        ]
+    );
+}

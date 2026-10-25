@@ -5,6 +5,7 @@ use crate::LimboError;
 
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
     BTreeTable, ColDef, Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES,
@@ -1122,11 +1123,12 @@ pub fn translate_create_table(
         other => (other, None),
     };
 
-    let database_id = if temporary {
-        crate::TEMP_DB_ID
+    let namespace = if temporary {
+        NamespaceRef::root_of(crate::TEMP_DB_ID)
     } else {
-        catalog.resolve_database_id_for_create(&tbl_name)?
+        catalog.resolve_namespace_for_create(&tbl_name)?
     };
+    let database_id = namespace.database_id;
     let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
@@ -1173,9 +1175,9 @@ pub fn translate_create_table(
     }
 
     // Check for name conflicts with existing schema objects
-    if let Some(object_type) =
-        catalog.with_schema(database_id, |s| s.get_object_type(&normalized_tbl_name))
-    {
+    if let Some(object_type) = catalog.with_schema(database_id, |s| {
+        s.get_object_type(namespace.id, &normalized_tbl_name)
+    }) {
         match object_type {
             // IF NOT EXISTS suppresses errors for table/view conflicts
             SchemaObjectType::Table | SchemaObjectType::View if if_not_exists => {
@@ -1273,11 +1275,12 @@ pub fn translate_create_table(
 
     let created_sequence_table = if has_autoincrement
         && catalog.with_schema(database_id, |s| {
-            s.get_table(SQLITE_SEQUENCE_TABLE_NAME).is_none()
+            s.get_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
+                .is_none()
         }) {
         let schema_master_table = catalog
             .main_schema()
-            .get_btree_table(SQLITE_TABLEID)
+            .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
             .unwrap();
         let sqlite_schema_cursor_id =
             program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table));
@@ -1389,7 +1392,7 @@ pub fn translate_create_table(
 
     let table = catalog
         .main_schema()
-        .get_btree_table(SQLITE_TABLEID)
+        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
         .unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
@@ -1448,7 +1451,8 @@ pub fn translate_create_table(
         let backing_table_name =
             crate::translate::sequence::sequence_backing_table_name(&autoinc_seq_name);
         let already_exists = catalog.with_schema(database_id, |s| {
-            s.get_btree_table(&backing_table_name).is_some()
+            s.get_btree_table(namespace.id, &backing_table_name)
+                .is_some()
         });
         if !already_exists {
             crate::translate::sequence::emit_sequence_backing_table(
@@ -1761,7 +1765,11 @@ pub fn translate_create_virtual_table(
     if !vtab_module.module_kind.eq(&VTabKind::VirtualTable) {
         bail_parse_error!("module {} is not a virtual table", module_name_str);
     };
-    if catalog.main_schema().get_table(&table_name).is_some() {
+    if catalog
+        .main_schema()
+        .get_table(NamespaceId::ROOT, &table_name)
+        .is_some()
+    {
         if *if_not_exists {
             return Ok(());
         }
@@ -1804,7 +1812,7 @@ pub fn translate_create_virtual_table(
     });
     let table = catalog
         .main_schema()
-        .get_btree_table(SQLITE_TABLEID)
+        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
         .unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
@@ -1853,7 +1861,7 @@ pub fn translate_create_virtual_table(
 /// Validates whether a DROP TABLE operation is allowed on the given table name.
 fn validate_drop_table(
     catalog: &SemanticContext<'_>,
-    database_id: usize,
+    namespace: NamespaceRef,
     tbl_name: &str,
     connection: &Arc<Connection>,
 ) -> Result<()> {
@@ -1865,13 +1873,15 @@ fn validate_drop_table(
         bail_parse_error!("Cannot drop system table {}", tbl_name);
     }
     // Check if this is a materialized view - if so, refuse to drop it with DROP TABLE
-    if catalog.with_schema(database_id, |schema| schema.is_materialized_view(tbl_name)) {
+    if catalog.with_schema(namespace.database_id, |schema| {
+        schema.is_materialized_view(namespace.id, tbl_name)
+    }) {
         bail_parse_error!(
             "Cannot DROP TABLE on materialized view {tbl_name}. Use DROP VIEW instead.",
         );
     }
-    let dependent_views = catalog.with_schema(database_id, |schema| {
-        schema.get_dependent_materialized_views(tbl_name)
+    let dependent_views = catalog.with_schema(namespace.database_id, |schema| {
+        schema.get_dependent_materialized_views(namespace.id, tbl_name)
     });
     if !dependent_views.is_empty() {
         bail_parse_error!(
@@ -1895,19 +1905,20 @@ pub fn translate_drop_table(
 
     // With no such table in any database the name can name, IF EXISTS
     // does nothing.
-    let database_id = match catalog.resolve_existing_table_database_id_qualified(&tbl_name) {
-        Ok(database_id) => database_id,
+    let namespace = match catalog.resolve_existing_table(&tbl_name) {
+        Ok(namespace) => namespace,
         Err(_) if if_exists => return Ok(()),
         Err(_) => bail_parse_error!(
             "no such table: {}",
             crate::util::table_name_for_error(&tbl_name)
         ),
     };
+    let database_id = namespace.database_id;
 
     let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
-    let Some(table) = catalog.with_schema(database_id, |s| s.get_table(name)) else {
+    let Some(table) = catalog.with_schema(database_id, |s| s.get_table(namespace.id, name)) else {
         if if_exists {
             return Ok(());
         }
@@ -1916,13 +1927,15 @@ pub fn translate_drop_table(
             crate::util::table_name_for_error(&tbl_name)
         );
     };
-    validate_drop_table(catalog, database_id, name, connection)?;
+    validate_drop_table(catalog, namespace, name, connection)?;
     // Like SQLite, a table other tables reference through foreign keys is
     // emptied first by a DELETE, which fires the ON DELETE actions and
     // counts the RESTRICT and NO ACTION violations; any violation fails the
     // statement here.
     if connection.foreign_keys_enabled()
-        && catalog.with_schema(database_id, |s| s.any_resolved_fks_referencing(name))
+        && catalog.with_schema(database_id, |s| {
+            s.any_resolved_fks_referencing(namespace.id, name)
+        })
     {
         let database = connection.namespaces().name(database_id).ok_or_else(|| {
             crate::LimboError::InternalError(format!("no database with id {database_id}"))
@@ -1962,7 +1975,7 @@ pub fn translate_drop_table(
 
     let schema_table = catalog
         .main_schema()
-        .get_btree_table(SQLITE_TABLEID)
+        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
         .unwrap();
     let sqlite_schema_cursor_id_0 = program.alloc_cursor_id(
         //  cursor 0
@@ -2075,10 +2088,11 @@ pub fn translate_drop_table(
         //     shadow table of the same name (in which case the
         //     unqualified reference resolves to main).
         let temp_has_shadow = catalog.with_schema(crate::TEMP_DB_ID, |s| {
-            s.get_table(tbl_name.name.as_str()).is_some()
+            s.get_table(NamespaceId::ROOT, tbl_name.name.as_str())
+                .is_some()
         });
         let trigger_names_to_drop: Vec<String> = catalog.with_schema(crate::TEMP_DB_ID, |s| {
-            s.get_triggers_for_table(tbl_name.name.as_str())
+            s.get_triggers_for_table(NamespaceId::ROOT, tbl_name.name.as_str())
                 .filter(|trigger| match trigger.target_database_id {
                     Some(db_id) => db_id == database_id,
                     None => !temp_has_shadow && database_id == crate::MAIN_DB_ID,
@@ -2090,8 +2104,9 @@ pub fn translate_drop_table(
         if !trigger_names_to_drop.is_empty() {
             let temp_schema_cookie = catalog.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
             program.begin_write_on_database(crate::TEMP_DB_ID, temp_schema_cookie)?;
-            let temp_schema_table =
-                catalog.with_schema(crate::TEMP_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID));
+            let temp_schema_table = catalog.with_schema(crate::TEMP_DB_ID, |s| {
+                s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+            });
             if let Some(temp_schema_table) = temp_schema_table {
                 let temp_cursor =
                     program.alloc_cursor_id(CursorType::BTreeTable(temp_schema_table));
@@ -2171,8 +2186,8 @@ pub fn translate_drop_table(
 
     //  2. Destroy the indices within a loop
     let indices: Vec<_> = catalog.with_schema(database_id, |s| {
-        s.get_indices(tbl_name.name.as_str())
-            .chain(s.get_unowned_backing_btrees(tbl_name.name.as_str()))
+        s.get_indices(namespace.id, tbl_name.name.as_str())
+            .chain(s.get_unowned_backing_btrees(namespace.id, tbl_name.name.as_str()))
             .cloned()
             .collect()
     });
@@ -2404,7 +2419,7 @@ pub fn translate_drop_table(
     // The matching `OpenWrite` below passes `db: database_id`, so the root
     // page must come from the same schema.
     if let Some(seq_table) = catalog.with_schema(database_id, |s| {
-        s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+        s.get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
     }) {
         let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
         let seq_table_name_reg = program.alloc_register();
@@ -2459,7 +2474,7 @@ pub fn translate_drop_table(
     // Clean up turso_cdc_version entry for the dropped table (if version table exists)
     if let Some(version_table) = catalog
         .main_schema()
-        .get_table(crate::cdc::TURSO_CDC_VERSION_TABLE_NAME)
+        .get_table(NamespaceId::ROOT, crate::cdc::TURSO_CDC_VERSION_TABLE_NAME)
         .and_then(|t| t.btree())
     {
         let version_index_name = format!(
@@ -2469,6 +2484,7 @@ pub fn translate_drop_table(
         let version_index = catalog
             .main_schema()
             .get_index(
+                NamespaceId::ROOT,
                 crate::cdc::TURSO_CDC_VERSION_TABLE_NAME,
                 &version_index_name,
             )
@@ -2662,7 +2678,7 @@ fn persist_type_definition(
 
     if let Some(existing) = catalog
         .main_schema()
-        .get_btree_table(TURSO_TYPES_TABLE_NAME)
+        .get_btree_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME)
     {
         types_table = existing.clone();
         types_root_page = RegisterOrLiteral::Literal(existing.root_page);
@@ -2682,7 +2698,7 @@ fn persist_type_definition(
         // Register it in sqlite_schema so it persists
         let schema_table = catalog
             .main_schema()
-            .get_btree_table(SQLITE_TABLEID)
+            .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
             .unwrap();
         let schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
         program.emit_insn(Insn::OpenWrite {
@@ -3038,18 +3054,21 @@ pub fn translate_drop_type(
     }
     for database_id in database_ids {
         let column_using_type = catalog.with_schema(database_id, |schema| {
-            schema.tables.values().find_map(|table| {
-                table
-                    .columns()
-                    .iter()
-                    .find(|col| type_registry_key(&col.ty_str) == registry_key)
-                    .map(|col| {
-                        (
-                            col.name.as_deref().unwrap_or("?").to_string(),
-                            table.get_name().to_string(),
-                        )
-                    })
-            })
+            schema
+                .namespace_ids()
+                .flat_map(|namespace| schema.tables(namespace))
+                .find_map(|table| {
+                    table
+                        .columns()
+                        .iter()
+                        .find(|col| type_registry_key(&col.ty_str) == registry_key)
+                        .map(|col| {
+                            (
+                                col.name.as_deref().unwrap_or("?").to_string(),
+                                table.get_name().to_string(),
+                            )
+                        })
+                })
         });
         if let Some((column_name, table_name)) = column_using_type {
             bail_parse_error!(
@@ -3072,7 +3091,7 @@ pub fn translate_drop_type(
     // Open cursor to sqlite_turso_types table
     let types_table = catalog
         .main_schema()
-        .get_btree_table(TURSO_TYPES_TABLE_NAME)
+        .get_btree_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME)
         .ok_or_else(|| crate::LimboError::ParseError(format!("no such type: {normalized_name}")))?;
     let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table.clone()));
     program.emit_insn(Insn::OpenWrite {

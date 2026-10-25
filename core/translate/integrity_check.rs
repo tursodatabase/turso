@@ -238,7 +238,11 @@ fn translate_integrity_check_for_schema(
     //    - index cardinality cross-checks
     //    Tables and indexes the connection no longer sees (dropped in its
     //    transaction) are skipped: their pages were checked above.
-    for table in schema.tables.values() {
+    for (namespace, table) in schema.namespace_ids().flat_map(|namespace| {
+        schema
+            .tables(namespace)
+            .map(move |table| (namespace, table))
+    }) {
         let Table::BTree(btree_table) = table.as_ref() else {
             continue;
         };
@@ -248,10 +252,7 @@ fn translate_integrity_check_for_schema(
         }
 
         let table_indexes: Vec<_> = schema
-            .indexes
-            .get(btree_table.name.as_str())
-            .into_iter()
-            .flatten()
+            .indices_including_backing(namespace, btree_table.name.as_str())
             .filter(|index| index.root_page > 0 && connection_root_pages.contains(&index.root_page))
             .cloned()
             .collect();
@@ -736,7 +737,7 @@ fn hir_table_rows(
 /// The root pages of every table and index of `schema`, and of every
 /// materialized view this build cannot read.
 fn resolved_root_pages(schema: &Schema, mv_store: Option<&crate::MvStore>) -> Vec<i64> {
-    let mut root_pages = Vec::with_capacity(schema.tables.len() + schema.indexes.len());
+    let mut root_pages = Vec::new();
 
     // integrity_check verifies the physical file, so a placeholder (negative) root for an
     // object a passive checkpoint has since materialized must be resolved to its real page.
@@ -747,19 +748,21 @@ fn resolved_root_pages(schema: &Schema, mv_store: Option<&crate::MvStore>) -> Ve
         }
     };
 
-    for table in schema.tables.values() {
+    for (namespace, table) in schema.namespace_ids().flat_map(|namespace| {
+        schema
+            .tables(namespace)
+            .map(move |table| (namespace, table))
+    }) {
         if let Table::BTree(btree_table) = table.as_ref() {
             let table_root = resolve_root(btree_table.root_page);
             if table_root < 0 {
                 continue;
             }
             root_pages.push(table_root);
-            if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
-                for index in indexes {
-                    let index_root = resolve_root(index.root_page);
-                    if index_root > 0 {
-                        root_pages.push(index_root);
-                    }
+            for index in schema.indices_including_backing(namespace, btree_table.name.as_str()) {
+                let index_root = resolve_root(index.root_page);
+                if index_root > 0 {
+                    root_pages.push(index_root);
                 }
             }
         }
@@ -771,7 +774,10 @@ fn resolved_root_pages(schema: &Schema, mv_store: Option<&crate::MvStore>) -> Ve
     // recreate" error instead of touching storage this build cannot
     // interpret. Its btree still owns a real page, though, so it must be
     // counted here or the structural pass below reports it as orphaned.
-    for &root_page in schema.incompatible_materialized_view_roots.values() {
+    for root_page in schema
+        .namespace_ids()
+        .flat_map(|namespace| schema.incompatible_materialized_view_roots(namespace))
+    {
         let view_root = resolve_root(root_page);
         if view_root > 0 {
             root_pages.push(view_root);

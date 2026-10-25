@@ -10,6 +10,7 @@ mod expr;
 pub(crate) mod hir;
 mod insert;
 mod query;
+use crate::namespace::NamespaceId;
 pub(crate) use query::compound_column_affinity;
 mod schema_program;
 mod scope;
@@ -96,7 +97,7 @@ pub(crate) fn analyze_root(
             let normalized_name = crate::util::normalize_ident(table_name);
             let table = context
                 .schema(database)?
-                .get_table(&normalized_name)
+                .get_table(NamespaceId::ROOT, &normalized_name)
                 .ok_or_else(|| {
                     crate::LimboError::ParseError(format!("no such table: {normalized_name}"))
                 })?;
@@ -205,6 +206,7 @@ pub(crate) struct TriggerAnalysis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::namespace::NamespaceId;
     use crate::{
         dialect::SqliteDialect,
         schema::{BTreeTable, Schema},
@@ -220,10 +222,13 @@ mod tests {
         let catalog = {
             let mut main_schema = Schema::new();
             main_schema
-                .add_btree_table(Arc::new(
-                    BTreeTable::from_sql("CREATE TABLE items(value TEXT)", 2)
-                        .expect("table SQL parses"),
-                ))
+                .add_btree_table(
+                    NamespaceId::ROOT,
+                    Arc::new(
+                        BTreeTable::from_sql("CREATE TABLE items(value TEXT)", 2)
+                            .expect("table SQL parses"),
+                    ),
+                )
                 .expect("table name is unique");
             let main_schema = Arc::new(main_schema);
             let database_schemas = RwLock::new(HashMap::default());

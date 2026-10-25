@@ -237,3 +237,29 @@ expect {
     2
     1
 }
+
+# A DISTINCT large enough to spill its hash table to disk (the debug budget is
+# 32 KiB). Every key is new, which used to reload a spilled partition per row (#8223).
+@cross-check-integrity
+test distinct-spilled-all-new-keys {
+    SELECT count(*), sum(value) FROM (SELECT DISTINCT value FROM generate_series(1, 20000));
+}
+expect {
+    20000|200010000
+}
+
+# Duplicates of keys already written to disk must still be found after the spill,
+# including NOCASE duplicates that differ only in case.
+@cross-check-integrity
+test distinct-spilled-nocase-duplicates {
+    CREATE TABLE distinct_spill (s TEXT COLLATE NOCASE);
+    INSERT INTO distinct_spill
+        SELECT CASE WHEN value % 2 THEN 'Key' ELSE 'KEY' END || (value % 1500)
+        FROM generate_series(1, 3000);
+    SELECT count(*) FROM (SELECT DISTINCT s FROM distinct_spill);
+    SELECT count(DISTINCT s) FROM distinct_spill;
+}
+expect {
+    1500
+    1500
+}

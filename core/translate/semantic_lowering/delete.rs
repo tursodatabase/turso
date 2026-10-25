@@ -648,6 +648,7 @@ fn emit_delete_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::namespace::NamespaceId;
     use crate::translate::semantic_to_plan::HirRootPlan;
     use crate::{
         schema::{BTreeTable, Schema},
@@ -762,13 +763,16 @@ mod tests {
             )
             .unwrap();
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql(
-                    "CREATE TABLE priced(id INTEGER PRIMARY KEY, amount cents) STRICT",
-                    160,
-                )
-                .unwrap(),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql(
+                        "CREATE TABLE priced(id INTEGER PRIMARY KEY, amount cents) STRICT",
+                        160,
+                    )
+                    .unwrap(),
+                ),
+            )
             .unwrap();
         let program = emit(analyze_plan(
             schema,
@@ -810,7 +814,10 @@ mod tests {
                 ),
             ] {
                 schema
-                    .add_btree_table(Arc::new(BTreeTable::from_sql(sql, root_page).unwrap()))
+                    .add_btree_table(
+                        NamespaceId::ROOT,
+                        Arc::new(BTreeTable::from_sql(sql, root_page).unwrap()),
+                    )
                     .unwrap();
             }
             schema

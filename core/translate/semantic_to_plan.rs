@@ -18,6 +18,7 @@ use super::{
     },
     semantic::hir::{self, ColumnUsage, HirDocument, QueryBlockId, QueryId, SourceId},
 };
+use crate::namespace::NamespaceId;
 use crate::{
     incremental::view::IncrementalView,
     schema::{Index, Schema, Table},
@@ -1956,7 +1957,7 @@ impl<'a> HirPlanContext<'a> {
             .index_stats
             .iter()
             .filter_map(|(index_name, index_stats)| {
-                let index = schema.get_index(&btree.name, index_name)?;
+                let index = schema.get_index(NamespaceId::ROOT, &btree.name, index_name)?;
                 if index.where_clause.is_some() || index.columns.len() < columns.len() {
                     return None;
                 }
@@ -2108,12 +2109,7 @@ impl<'a> HirPlanContext<'a> {
         planned_source_from_definition(self.definition(source), join_info, usage)
     }
 
-    fn cte_materialization(
-        &self,
-        owner: QueryId,
-        cte: hir::CteId,
-        query: QueryId,
-    ) -> HirCteMaterialization {
+    fn cte_materialization(&self, cte: hir::CteId, query: QueryId) -> HirCteMaterialization {
         let definition = self
             .document
             .cte(cte)
@@ -2125,12 +2121,21 @@ impl<'a> HirPlanContext<'a> {
             return HirCteMaterialization::Explicit;
         }
 
-        if self.cte_reference_count(owner, cte) > 1 && !self.query_tree_has_outer_dependency(query)
+        if self.statement_cte_reference_count(cte) > 1
+            && !self.query_tree_has_outer_dependency(query)
         {
             HirCteMaterialization::Shared
         } else {
             HirCteMaterialization::PerReference
         }
+    }
+
+    fn statement_cte_reference_count(&self, target: hir::CteId) -> usize {
+        self.document
+            .sources
+            .iter()
+            .filter(|source| matches!(source.kind, hir::SourceKind::Cte(cte) if cte == target))
+            .count()
     }
 
     /// How many times a DML statement reads a CTE: in its FROM clause and
@@ -2280,8 +2285,8 @@ impl<'a> HirPlanContext<'a> {
                                     HirCteMaterialization::PerReference
                                 }
                             }
-                            hir::SourceOwner::QueryBlock(block) => {
-                                self.cte_materialization(block.query, *cte, *query)
+                            hir::SourceOwner::QueryBlock(_) => {
+                                self.cte_materialization(*cte, *query)
                             }
                             // The FROM clause of UPDATE ... FROM reads the CTE
                             // once per reference, unless it is MATERIALIZED or
@@ -4251,10 +4256,10 @@ fn materialized_view_sources(
             continue;
         }
         let name = table.value().get_name();
-        let Some(view) = schema.get_materialized_view(name) else {
+        let Some(view) = schema.get_materialized_view(NamespaceId::ROOT, name) else {
             continue;
         };
-        if !schema.has_compatible_materialized_view_storage(name) {
+        if !schema.has_compatible_materialized_view_storage(NamespaceId::ROOT, name) {
             use crate::incremental::view::DBSP_CIRCUIT_VERSION;
             return Err(LimboError::InternalError(format!(
                 "Materialized view '{name}' has an incompatible version. \n\
@@ -5826,7 +5831,7 @@ pub(crate) mod tests {
             .validate()
             .expect("non-recursive CTE query HIR is valid");
         let materialization =
-            HirPlanContext::new(&cte_document).cte_materialization(root_query, cte_id, child_query);
+            HirPlanContext::new(&cte_document).cte_materialization(cte_id, child_query);
         assert_eq!(materialization, HirCteMaterialization::Explicit);
         let cte_plan = HirPlan::build(
             Arc::new(cte_document.clone()),
@@ -5932,7 +5937,7 @@ pub(crate) mod tests {
 
         cte_document.ctes[cte_id.index()].materialized = Materialized::Any;
         let materialization =
-            HirPlanContext::new(&cte_document).cte_materialization(root_query, cte_id, child_query);
+            HirPlanContext::new(&cte_document).cte_materialization(cte_id, child_query);
         assert_eq!(materialization, HirCteMaterialization::PerReference);
 
         let second_cte_source = SourceId::new(cte_document.sources.len());
@@ -5984,11 +5989,7 @@ pub(crate) mod tests {
             .validate()
             .expect("correlated CTE body HIR is valid");
         assert_eq!(
-            HirPlanContext::new(&correlated_document).cte_materialization(
-                root_query,
-                cte_id,
-                child_query,
-            ),
+            HirPlanContext::new(&correlated_document).cte_materialization(cte_id, child_query),
             HirCteMaterialization::PerReference,
         );
 

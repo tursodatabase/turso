@@ -1,3 +1,4 @@
+use crate::namespace::NamespaceId;
 use crate::{alloc::TryReserveError, turso_assert};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -1607,7 +1608,7 @@ fn hir_plain_rowid_table(document: &HirDocument, source: &HirPlanSource, schema:
         return false;
     };
     matches!(&planned.table, Table::BTree(table)
-        if table.has_rowid && !schema.is_materialized_view(&table.name))
+        if table.has_rowid && !schema.is_materialized_view(NamespaceId::ROOT, &table.name))
         && definition.column_type_programs.iter().all(Option::is_none)
         && definition
             .columns

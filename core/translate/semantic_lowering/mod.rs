@@ -5,6 +5,7 @@ mod cdc;
 mod delete;
 mod dml;
 mod emit;
+use crate::namespace::NamespaceId;
 pub(crate) use emit::format_unique_violation_desc;
 pub(super) mod expr;
 mod fkey;
@@ -645,22 +646,22 @@ fn check_target(
         .namespace
         .as_ref()
         .is_none_or(|db| crate::util::normalize_ident(db.as_str()) == "main");
-    if in_main && schema.is_materialized_view(&table_name) {
+    if in_main && schema.is_materialized_view(NamespaceId::ROOT, &table_name) {
         crate::bail_parse_error!("cannot modify materialized view {table_name}");
     }
     if in_main
         && schema
-            .get_btree_table(&table_name)
+            .get_btree_table(NamespaceId::ROOT, &table_name)
             .is_some_and(|table| !table.has_rowid)
         && !schema
-            .get_dependent_materialized_views(&table_name)
+            .get_dependent_materialized_views(NamespaceId::ROOT, &table_name)
             .is_empty()
     {
         crate::bail_parse_error!("materialized views on WITHOUT ROWID tables are not supported");
     }
     // The VM keeps dependent materialized views up to date as rows are
     // written; views built by another DBSP version are an error.
-    schema.with_incompatible_dependent_views(&table_name, |views| {
+    schema.with_incompatible_dependent_views(NamespaceId::ROOT, &table_name, |views| {
         if views.is_empty() {
             return Ok(());
         }

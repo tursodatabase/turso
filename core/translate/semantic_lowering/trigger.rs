@@ -36,11 +36,12 @@ use super::HirSession;
 pub(super) struct CompiledTrigger {
     pub(super) time: TriggerTime,
     program: Arc<PreparedProgram>,
-    /// The trigger reads OLD and NEW from parameters in this order: each
-    /// OLD column then the OLD rowid, then each NEW column then the NEW
-    /// rowid. Only the rows its event has are present.
-    has_old: bool,
-    has_new: bool,
+    /// The trigger reads OLD and NEW from parameters in this order: the
+    /// OLD columns its body reads then the OLD rowid, then the NEW columns
+    /// its body reads then the NEW rowid. Only the rows its event has are
+    /// present.
+    old_columns: Option<Vec<usize>>,
+    new_columns: Option<Vec<usize>>,
     /// The databases the trigger body reads or writes, with their schema
     /// versions, which the firing statement must open transactions on.
     databases: Vec<TriggerDatabase>,
@@ -164,13 +165,22 @@ fn compile_trigger(
     builder.prologue();
     builder.set_hir_plan(plan.clone());
     let columns = table.columns().len();
+    let old_columns = environment
+        .old_source
+        .map(|source| columns_read(&plan.document, source, columns));
+    let new_columns = environment
+        .new_source
+        .map(|source| columns_read(&plan.document, source, columns));
     let mut next_parameter = 1u32;
-    for source in [environment.old_source, environment.new_source]
-        .into_iter()
-        .flatten()
+    for (source, read) in [
+        (environment.old_source, &old_columns),
+        (environment.new_source, &new_columns),
+    ]
+    .into_iter()
+    .filter_map(|(source, read)| Some((source?, read.as_deref()?)))
     {
         let start = builder.alloc_registers(columns + 1);
-        for offset in 0..=columns {
+        for &offset in read.iter().chain(core::iter::once(&columns)) {
             let index = NonZeroU32::new(next_parameter).expect("parameters start at 1");
             next_parameter += 1;
             let index = builder.register_parameter(index, &ParameterSpelling::Anonymous);
@@ -285,10 +295,22 @@ fn compile_trigger(
     Ok(Compiled::Trigger(CompiledTrigger {
         time: definition.time,
         program: prepared,
-        has_old: environment.old_source.is_some(),
-        has_new: environment.new_source.is_some(),
+        old_columns,
+        new_columns,
         databases,
     }))
+}
+
+fn columns_read(document: &hir::HirDocument, source: hir::SourceId, columns: usize) -> Vec<usize> {
+    let mut read = vec![false; columns];
+    for expression in document.exprs.iter() {
+        if let hir::Expr::Column(column) = expression {
+            if column.source == source {
+                read[column.column] = true;
+            }
+        }
+    }
+    (0..columns).filter(|position| read[*position]).collect()
 }
 
 /// Compile the triggers an INSERT fires.
@@ -448,14 +470,15 @@ impl CompiledTrigger {
         skip_row: BranchOffset,
     ) -> Result<()> {
         let mut param_registers = Vec::new();
-        for (present, row) in [(self.has_old, old), (self.has_new, new)] {
-            if !present {
+        for (read, row) in [(&self.old_columns, old), (&self.new_columns, new)] {
+            let Some(read) = read else {
                 continue;
-            }
+            };
             let row = row.ok_or_else(|| {
                 LimboError::InternalError("HIR trigger fired without a row it reads".into())
             })?;
-            param_registers.extend(row.columns..row.columns + columns);
+            debug_assert!(read.iter().all(|position| *position < columns));
+            param_registers.extend(read.iter().map(|position| row.columns + position));
             param_registers.push(row.rowid);
         }
         // A subprogram has no Transaction instructions, so the parent takes

@@ -160,7 +160,7 @@ pub use io::{
     CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO, SharedBufferData,
     SyscallIO, WriteCompletion, IO,
 };
-pub use namespace::Namespaces;
+pub use namespace::{NamespaceId, NamespaceRef, Namespaces};
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
 pub use storage::{

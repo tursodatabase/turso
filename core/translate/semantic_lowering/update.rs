@@ -2358,6 +2358,7 @@ fn stored_column_offsets(table: &crate::schema::BTreeTable) -> Vec<Option<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::namespace::NamespaceId;
     use crate::{
         schema::{BTreeTable, Index, IndexColumn, Schema},
         sync::Arc,
@@ -2370,16 +2371,19 @@ mod tests {
     fn schema() -> Schema {
         let mut schema = Schema::new();
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql(
-                    "CREATE TABLE items(id INTEGER PRIMARY KEY, value INTEGER, extra TEXT)",
-                    2,
-                )
-                .unwrap(),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql(
+                        "CREATE TABLE items(id INTEGER PRIMARY KEY, value INTEGER, extra TEXT)",
+                        2,
+                    )
+                    .unwrap(),
+                ),
+            )
             .unwrap();
         schema
-            .add_btree_table(Arc::new(
+            .add_btree_table(NamespaceId::ROOT, Arc::new(
                 BTreeTable::from_sql(
                     "CREATE TABLE checked(id INTEGER PRIMARY KEY, a CHECK (a > 0), b CHECK (b > 0))",
                     4,
@@ -2388,27 +2392,30 @@ mod tests {
             ))
             .unwrap();
         schema
-            .add_index(Arc::new(Index {
-                constraint_name: None,
-                name: "items_value".to_string(),
-                table_name: "items".to_string(),
-                root_page: 3,
-                columns: crate::alloc::vec![IndexColumn {
-                    name: "value".to_string(),
-                    order: SortOrder::Asc,
-                    nulls_order: None,
-                    pos_in_table: 1,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                }],
-                unique: true,
-                ephemeral: false,
-                has_rowid: true,
-                where_clause: None,
-                index_method: None,
-                on_conflict: None,
-            }))
+            .add_index(
+                NamespaceId::ROOT,
+                Arc::new(Index {
+                    constraint_name: None,
+                    name: "items_value".to_string(),
+                    table_name: "items".to_string(),
+                    root_page: 3,
+                    columns: crate::alloc::vec![IndexColumn {
+                        name: "value".to_string(),
+                        order: SortOrder::Asc,
+                        nulls_order: None,
+                        pos_in_table: 1,
+                        collation: None,
+                        default: None,
+                        expr: None,
+                    }],
+                    unique: true,
+                    ephemeral: false,
+                    has_rowid: true,
+                    where_clause: None,
+                    index_method: None,
+                    on_conflict: None,
+                }),
+            )
             .unwrap();
         schema
     }
@@ -2619,7 +2626,10 @@ mod tests {
                 ),
             ] {
                 schema
-                    .add_btree_table(Arc::new(BTreeTable::from_sql(sql, root_page).unwrap()))
+                    .add_btree_table(
+                        NamespaceId::ROOT,
+                        Arc::new(BTreeTable::from_sql(sql, root_page).unwrap()),
+                    )
                     .unwrap();
             }
             schema
@@ -2654,7 +2664,7 @@ mod tests {
     fn update_of_an_array_element_rewrites_the_array() {
         let mut schema = schema();
         schema
-            .add_btree_table(Arc::new(
+            .add_btree_table(NamespaceId::ROOT, Arc::new(
                 BTreeTable::from_sql(
                     "CREATE TABLE tagged(id INTEGER PRIMARY KEY, tags TEXT[], other TEXT[]) STRICT",
                     150,
@@ -2686,7 +2696,7 @@ mod tests {
             )
             .unwrap();
         schema
-            .add_btree_table(Arc::new(
+            .add_btree_table(NamespaceId::ROOT, Arc::new(
                 BTreeTable::from_sql(
                     "CREATE TABLE priced(id INTEGER PRIMARY KEY, amount cents, other cents) STRICT",
                     140,
@@ -2722,13 +2732,16 @@ mod tests {
             )
             .unwrap();
         schema
-            .add_btree_table(Arc::new(
-                BTreeTable::from_sql(
-                    "CREATE TABLE priced(id INTEGER PRIMARY KEY, amount cents) STRICT",
-                    140,
-                )
-                .unwrap(),
-            ))
+            .add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(
+                    BTreeTable::from_sql(
+                        "CREATE TABLE priced(id INTEGER PRIMARY KEY, amount cents) STRICT",
+                        140,
+                    )
+                    .unwrap(),
+                ),
+            )
             .unwrap();
         let program = emit_with(schema, "UPDATE priced SET amount = 99");
         // The encode multiplies the register the constant is loaded into,

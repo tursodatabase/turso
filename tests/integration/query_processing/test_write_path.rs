@@ -2323,3 +2323,76 @@ fn test_upsert_do_update_failure_preserves_indexes(tmp_db: TempDatabase) -> anyh
 
     Ok(())
 }
+
+#[turso_macros::test]
+fn test_backward_index_scan_does_not_repeat_rows_after_insert_between_steps(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b INTEGER)")?;
+    conn.execute("CREATE INDEX tb ON t(b)")?;
+    conn.execute(
+        "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 2000) \
+         INSERT INTO t(id, b) SELECT x, x FROM s",
+    )?;
+    let mut stmt = conn.prepare("SELECT b FROM t ORDER BY b DESC")?;
+    let mut seen = Vec::new();
+    while seen.len() <= 4000 {
+        match stmt.step()? {
+            StepResult::Row => {
+                let b = stmt.row().unwrap().get::<i64>(0)?;
+                seen.push(b);
+                if b % 97 == 0 {
+                    conn.execute(format!("INSERT INTO t(b) VALUES ({})", 1_000_000 + b))?;
+                }
+            }
+            StepResult::IO => stmt._io().step()?,
+            StepResult::Done => break,
+            other => anyhow::bail!("unexpected step result {other:?}"),
+        }
+    }
+    assert_eq!(seen, (1..=2000).rev().collect::<Vec<i64>>());
+    Ok(())
+}
+
+#[test]
+fn multi_row_insert_passes_a_trigger_only_the_new_columns_it_reads() -> anyhow::Result<()> {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE wide(id INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT)")?;
+    conn.execute("CREATE TABLE audit(b TEXT)")?;
+    conn.execute(
+        "CREATE TRIGGER wide_insert AFTER INSERT ON wide BEGIN INSERT INTO audit VALUES (NEW.b); END",
+    )?;
+    let insert = "INSERT INTO wide VALUES (1, 'a1', 'b1', 'c1'), (2, 'a2', 'b2', 'c2')";
+    let explain = limbo_exec_rows(&conn, &format!("EXPLAIN {insert}"));
+    let opcode = |row: &Vec<RValue>| match &row[1] {
+        RValue::Text(opcode) => opcode.clone(),
+        other => panic!("EXPLAIN opcode is not text: {other:?}"),
+    };
+    let statement = explain
+        .iter()
+        .enumerate()
+        .take_while(|(position, row)| *position == 0 || opcode(row) != "Init")
+        .map(|(_, row)| row)
+        .collect::<Vec<_>>();
+    let program = statement
+        .iter()
+        .find(|row| opcode(row) == "Program")
+        .expect("the INSERT fires its trigger");
+    assert_eq!(program[4], RValue::Integer(2), "{explain:?}");
+    assert!(
+        statement.iter().all(|row| opcode(row) != "Copy"),
+        "{explain:?}"
+    );
+
+    conn.execute(insert)?;
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT b FROM audit ORDER BY b"),
+        vec![
+            vec![RValue::Text("b1".into())],
+            vec![RValue::Text("b2".into())],
+        ]
+    );
+    Ok(())
+}

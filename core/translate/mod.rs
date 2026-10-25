@@ -141,6 +141,10 @@ pub fn translate(
         ProgramBuilderOpts::new(1, 32, 2),
     ));
     program.set_mvcc_enabled(connection.mvcc_enabled());
+    program.flags.set_keep_array_results_as_blobs(matches!(
+        origin,
+        crate::statement::StatementOrigin::InternalHelper
+    ));
 
     program.prologue();
     // Engine-generated helper statements are always SQLite text and must
@@ -579,6 +583,7 @@ mod tests {
     use super::*;
     use crate::alloc::TryClone;
     use crate::io::MemoryIO;
+    use crate::namespace::NamespaceId;
     use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
     use crate::vdbe::insn::{ClearBtreeCount, Insn};
     use crate::ConnectOpts;
@@ -802,13 +807,14 @@ mod tests {
 
         let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
         let seq_root_page = schema
-            .get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+            .get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
             .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
             .root_page;
         let malformed_seq =
             BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name)", seq_root_page)
                 .expect("malformed sqlite_sequence SQL should parse");
-        schema.tables.insert(
+        schema.insert_table(
+            NamespaceId::ROOT,
             SQLITE_SEQUENCE_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(Arc::new(malformed_seq))),
         );
@@ -854,7 +860,7 @@ mod tests {
             .unwrap();
 
         let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
-        schema.tables.remove(SQLITE_SEQUENCE_TABLE_NAME);
+        schema.take_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME);
 
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();

@@ -9,6 +9,7 @@ use super::stream::{
     emit_operator_rowid_delta, open_ephemeral_delta, DeltaIdentity, EphemeralDelta,
 };
 use crate::incremental::dag;
+use crate::namespace::NamespaceId;
 use crate::schema::Schema;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -332,13 +333,15 @@ fn emit_deduplicating_set_op(
     );
 
     let state_table_name = operator_state.state_table_name()?.to_string();
-    let state_table = schema.get_btree_table(&state_table_name).ok_or_else(|| {
-        LimboError::InternalError(format!(
-            "state table {state_table_name} of materialized view {view_name} not found"
-        ))
-    })?;
+    let state_table = schema
+        .get_btree_table(NamespaceId::ROOT, &state_table_name)
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "state table {state_table_name} of materialized view {view_name} not found"
+            ))
+        })?;
     let state_index = schema
-        .get_indices(&state_table_name)
+        .get_indices(NamespaceId::ROOT, &state_table_name)
         .next()
         .cloned()
         .ok_or_else(|| {
@@ -349,16 +352,22 @@ fn emit_deduplicating_set_op(
     // Trailing UNION ALL rows preserve source identity in the auxiliary table.
     let (append_table_name, append_table, append_index) = if materializes_append {
         let name = operator_state.set_op_identity_table_name()?.to_string();
-        let table = schema.get_btree_table(&name).ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "append table {name} of materialized view {view_name} not found"
-            ))
-        })?;
-        let index = schema.get_indices(&name).next().cloned().ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "append table {name} of materialized view {view_name} has no index"
-            ))
-        })?;
+        let table = schema
+            .get_btree_table(NamespaceId::ROOT, &name)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "append table {name} of materialized view {view_name} not found"
+                ))
+            })?;
+        let index = schema
+            .get_indices(NamespaceId::ROOT, &name)
+            .next()
+            .cloned()
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "append table {name} of materialized view {view_name} has no index"
+                ))
+            })?;
         (name, table, index)
     } else {
         (
