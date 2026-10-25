@@ -471,11 +471,11 @@ impl BTreeCursor {
                             true
                         }
                         Motion::Next => {
-                            return_if_io!(self.without_mvcc_reader(|cursor| cursor.next()));
+                            return_if_io!(self.btree_next());
                             true
                         }
                         Motion::Prev => {
-                            return_if_io!(self.without_mvcc_reader(|cursor| cursor.prev()));
+                            return_if_io!(self.btree_prev());
                             true
                         }
                         Motion::Seek { rowid, op } => !matches!(
@@ -521,12 +521,8 @@ impl BTreeCursor {
                         }
                     }
                     match self.mvcc().direction {
-                        IterationDirection::Forwards => {
-                            return_if_io!(self.without_mvcc_reader(|cursor| cursor.next()))
-                        }
-                        IterationDirection::Backwards => {
-                            return_if_io!(self.without_mvcc_reader(|cursor| cursor.prev()))
-                        }
+                        IterationDirection::Forwards => return_if_io!(self.btree_next()),
+                        IterationDirection::Backwards => return_if_io!(self.btree_prev()),
                     }
                     let cell = self.cell_under_btree_cursor()?;
                     let reader = self.mvcc_mut();
