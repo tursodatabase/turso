@@ -5,7 +5,7 @@
 use turso_parser::ast;
 
 use super::emitter::Resolver;
-use super::expr::expr_type::{type_of, BuiltinType, ExprType, TypeEnv};
+use super::expr::expr_type::{stored_type, type_of, BuiltinType, ExprType, TypeEnv};
 use super::plan::{ResultSetColumn, TableReferences};
 use crate::schema::Schema;
 use crate::statement::{ColumnTypeInfo, ColumnTypeKind};
@@ -80,10 +80,10 @@ fn expression_type(ty: &ExprType, schema: &Schema) -> Option<ColumnTypeInfo> {
     let declared_name = match element {
         ExprType::Builtin(builtin) => builtin_primitive(*builtin)?,
         ExprType::Untyped => "TEXT",
-        ExprType::Custom { type_def, .. } => {
-            let resolved = schema.resolve_type_unchecked(&type_def.name).ok()??;
-            primitive_of_base_type(&resolved.primitive)?
-        }
+        ExprType::Custom { type_def, .. } => match stored_type(type_def, schema) {
+            ExprType::Builtin(builtin) => builtin_primitive(builtin)?,
+            _ => return None,
+        },
         ExprType::Null | ExprType::Unknown | ExprType::Array { .. } => return None,
     };
     Some(ColumnTypeInfo {
@@ -101,17 +101,5 @@ fn builtin_primitive(ty: BuiltinType) -> Option<&'static str> {
         BuiltinType::Numeric => Some("NUMERIC"),
         BuiltinType::Text => Some("TEXT"),
         BuiltinType::Blob | BuiltinType::Any => None,
-    }
-}
-
-/// A custom type's base type as one of the primitives above. `blob` and `any` give
-/// nothing, like a built-in blob does.
-fn primitive_of_base_type(base_type: &str) -> Option<&'static str> {
-    match base_type.to_ascii_lowercase().as_str() {
-        "integer" => Some("INTEGER"),
-        "real" => Some("REAL"),
-        "numeric" => Some("NUMERIC"),
-        "text" => Some("TEXT"),
-        _ => None,
     }
 }

@@ -161,7 +161,7 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             }
             ast::UnaryOperator::Negative => arithmetic_type(
                 &ExprType::Builtin(BuiltinType::Integer),
-                &type_of(inner, env),
+                &sqlite_operand_type(type_of(inner, env), None, env.schema()),
             ),
             ast::UnaryOperator::Positive => type_of(inner, env),
         },
@@ -305,7 +305,13 @@ fn binary_type(
         | Operator::Subtract
         | Operator::Multiply
         | Operator::Divide
-        | Operator::Modulus => arithmetic_type(&type_of(lhs, env), &type_of(rhs, env)),
+        | Operator::Modulus => {
+            let symbol = arithmetic_symbol(op);
+            arithmetic_type(
+                &sqlite_operand_type(type_of(lhs, env), Some(symbol), env.schema()),
+                &sqlite_operand_type(type_of(rhs, env), Some(symbol), env.schema()),
+            )
+        }
         Operator::BitwiseAnd
         | Operator::BitwiseOr
         | Operator::BitwiseNot
@@ -337,6 +343,53 @@ fn binary_type(
         }
         Operator::ArrowRight | Operator::ArrowRightShift => affinity_type(expr, env),
     }
+}
+
+fn arithmetic_symbol(op: &ast::Operator) -> &'static str {
+    match op {
+        ast::Operator::Add => "+",
+        ast::Operator::Subtract => "-",
+        ast::Operator::Multiply => "*",
+        ast::Operator::Divide => "/",
+        ast::Operator::Modulus => "%",
+        _ => unreachable!("{op:?} is not an arithmetic operator"),
+    }
+}
+
+/// The type an operand has for SQLite's own arithmetic. A custom type that has a
+/// function for the operator stays as it is: the function decides the result. Any
+/// other custom value goes to SQLite's operator as a value of the type it is
+/// stored as, so `smallint * 2` is an integer.
+fn sqlite_operand_type(ty: ExprType, operator: Option<&str>, schema: &Schema) -> ExprType {
+    let ExprType::Custom { type_def, .. } = &ty else {
+        return ty;
+    };
+    let has_function = operator.is_some_and(|operator| {
+        type_def
+            .operators()
+            .iter()
+            .any(|o| o.op == operator && o.func_name.is_some())
+    });
+    if has_function {
+        return ty;
+    }
+    stored_type(type_def, schema)
+}
+
+/// The built-in type a custom type's values are stored as: its base type, after
+/// following domains and custom types built on other custom types.
+pub(crate) fn stored_type(type_def: &TypeDef, schema: &Schema) -> ExprType {
+    let Ok(Some(resolved)) = schema.resolve_type_unchecked(&type_def.name) else {
+        return ExprType::Builtin(BuiltinType::Any);
+    };
+    ExprType::Builtin(match resolved.primitive.to_ascii_lowercase().as_str() {
+        "integer" => BuiltinType::Integer,
+        "real" => BuiltinType::Real,
+        "numeric" => BuiltinType::Numeric,
+        "text" => BuiltinType::Text,
+        "blob" => BuiltinType::Blob,
+        _ => BuiltinType::Any,
+    })
 }
 
 /// `INTEGER + INTEGER` is an integer, an integer or real mixed with a real is a
@@ -380,10 +433,16 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
             common_type(args.iter().map(|arg| arg.as_ref()), env)
         }
         Func::Scalar(ScalarFunc::Iif) => common_type(args.iter().skip(1).map(|a| a.as_ref()), env),
+        // A call with the wrong number of arguments is reported when it is translated.
+        Func::Scalar(ScalarFunc::Nullif | ScalarFunc::Abs | ScalarFunc::ArrayElement)
+            if args.is_empty() =>
+        {
+            ExprType::Builtin(BuiltinType::Any)
+        }
         Func::Scalar(ScalarFunc::Nullif) => type_of(&args[0], env),
         Func::Scalar(ScalarFunc::Abs) => arithmetic_type(
             &ExprType::Builtin(BuiltinType::Integer),
-            &type_of(&args[0], env),
+            &sqlite_operand_type(type_of(&args[0], env), None, env.schema()),
         ),
         Func::Scalar(ScalarFunc::ArrayElement) => match type_of(&args[0], env) {
             ExprType::Array {
@@ -403,7 +462,8 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
 /// NULLs don't count. An array wins over anything else, as main has always decoded
 /// such a value as an array. Numbers widen as in arithmetic. String literals count
 /// as text. The same custom type with different parameters, such as numeric(10,2)
-/// and numeric(5,1), is that type without parameters. Any other mix is `Any`.
+/// and numeric(5,1), is that type without parameters. A custom type mixed with a
+/// built-in one counts as the type it is stored as. Any other mix is `Any`.
 fn common_type<'e>(exprs: impl Iterator<Item = &'e ast::Expr>, env: &TypeEnv) -> ExprType {
     let mut common: Option<ExprType> = None;
     for ty in exprs.map(|expr| type_of(expr, env)) {
@@ -412,13 +472,13 @@ fn common_type<'e>(exprs: impl Iterator<Item = &'e ast::Expr>, env: &TypeEnv) ->
             (Some(common), ExprType::Null) => common,
             (Some(common @ ExprType::Array { .. }), _) => common,
             (_, ty @ ExprType::Array { .. }) => ty,
-            (Some(common), ty) => common_scalar_type(common, ty),
+            (Some(common), ty) => common_scalar_type(common, ty, env.schema()),
         });
     }
     common.unwrap_or(ExprType::Null)
 }
 
-fn common_scalar_type(a: ExprType, b: ExprType) -> ExprType {
+fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
     use BuiltinType::{Integer, Numeric, Real, Text};
     match (a, b) {
         (ExprType::Unknown, _) | (_, ExprType::Unknown) => ExprType::Unknown,
@@ -449,6 +509,12 @@ fn common_scalar_type(a: ExprType, b: ExprType) -> ExprType {
                 Vec::new()
             },
         },
+        // Mixed with anything else, a custom value is a value of the type it is
+        // stored as: coalesce(smallint_column, 0) is an integer.
+        (ExprType::Custom { .. }, ExprType::Custom { .. }) => ExprType::Builtin(BuiltinType::Any),
+        (ExprType::Custom { type_def, .. }, other) | (other, ExprType::Custom { type_def, .. }) => {
+            common_scalar_type(stored_type(&type_def, schema), other, schema)
+        }
         _ => ExprType::Builtin(BuiltinType::Any),
     }
 }

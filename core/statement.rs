@@ -1677,10 +1677,9 @@ impl Drop for Statement {
 }
 
 /// The uppercase primitive name (`"INTEGER"`, `"REAL"`, `"NUMERIC"`, `"TEXT"`) that
-/// [`Statement::get_column_type_info`] reports for an expression of this type, or
-/// None when there is no single one. A custom type reports the primitive its name
-/// implies under SQLite's affinity rules.
-/// `Blob` gives None because it is SQLite's "no affinity", not a usable wire type.
+/// [`Statement::get_column_inferred_type`] reports for an expression with this
+/// affinity. `Blob` gives None because it is SQLite's "no affinity", not a usable
+/// wire type.
 fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'static str> {
     use crate::vdbe::affinity::Affinity;
     match affinity {

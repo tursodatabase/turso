@@ -453,15 +453,17 @@ mod tests {
     }
 
     /// An expression of a custom type that isn't a column reports the primitive
-    /// the type is stored as, not one guessed from the type's name. Arithmetic on
-    /// a custom type reports nothing, because the type's operator decides the
-    /// result.
+    /// the type is stored as, not one guessed from the type's name. A type's own
+    /// operator function reports nothing, because the function decides the result.
     #[test]
     fn type_info_for_custom_type_expressions() {
         let db = fresh_db_with_custom_types("type_info_custom_expressions.db");
         let conn = db.connect_limbo();
-        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
-            .unwrap();
+        conn.execute(
+            "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 \
+             OPERATOR '+' max",
+        )
+        .unwrap();
         conn.execute("CREATE TYPE rev BASE text ENCODE value DECODE value")
             .unwrap();
         conn.execute(
@@ -479,6 +481,29 @@ mod tests {
         assert_eq!(expect_info(&stmt, 1).declared_name, "TEXT");
         assert_eq!(expect_info(&stmt, 2).declared_name, "TEXT");
         assert!(stmt.get_column_type_info(3).unwrap().is_none());
+    }
+
+    /// A custom type with no function for an operator goes to SQLite's operator as
+    /// the type it is stored as, so `si * 2` on a smallint is an integer.
+    #[test]
+    fn type_info_for_sqlite_operators_on_custom_types() {
+        let db = fresh_db_with_custom_types("type_info_sqlite_operators.db");
+        let conn = db.connect_limbo();
+        conn.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, si smallint, bi bigint, b boolean) STRICT",
+        )
+        .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT si * 2, bi + 1, -si, abs(bi), coalesce(si, 0), coalesce(b, 0) FROM t")
+            .unwrap();
+        for idx in 0..6 {
+            assert_eq!(
+                expect_info(&stmt, idx).declared_name,
+                "INTEGER",
+                "column {idx}"
+            );
+        }
     }
 
     /// Expressions whose primitive can't be determined statically — function
