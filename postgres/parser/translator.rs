@@ -3118,14 +3118,7 @@ impl PostgreSQLTranslator {
                     Ok(
                         SqlValueFunctionOp::SvfopLocaltimestamp
                         | SqlValueFunctionOp::SvfopLocaltimestampN,
-                    ) => Ok(ast::Expr::Cast {
-                        expr: Box::new(now_call()),
-                        type_name: Some(ast::Type {
-                            name: "timestamp".to_string(),
-                            size: None,
-                            array_dimensions: 0,
-                        }),
-                    }),
+                    ) => Ok(cast_to(now_call(), "timestamp")),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentUser
                         | SqlValueFunctionOp::SvfopSessionUser
@@ -3574,8 +3567,12 @@ impl PostgreSQLTranslator {
             is_datetime_operand(a_expr.lexpr.as_deref())
                 || is_datetime_operand(a_expr.rexpr.as_deref())
         }) {
-            let lhs_type = declared_datetime_type(a_expr.lexpr.as_deref());
-            let rhs_type = declared_datetime_type(a_expr.rexpr.as_deref());
+            let operand_type = |node| match declared_datetime_type(node) {
+                "" if matches!(op_name, "+" | "-") && is_column_ref(node) => "column",
+                declared => declared,
+            };
+            let lhs_type = operand_type(a_expr.lexpr.as_deref());
+            let rhs_type = operand_type(a_expr.rexpr.as_deref());
             let type_name = |name: &str| {
                 Box::new(ast::Expr::Literal(ast::Literal::String(format!(
                     "'{name}'"
@@ -5647,6 +5644,7 @@ fn declared_datetime_type(node: Option<&pg_query::protobuf::Node>) -> &'static s
                 Some("timestamptz") => "timestamptz",
                 Some("timestamp") => "timestamp",
                 Some("date") => "date",
+                Some("time") => "time",
                 _ => "",
             }
         }
@@ -5682,6 +5680,13 @@ fn declared_datetime_type(node: Option<&pg_query::protobuf::Node>) -> &'static s
         }
         _ => "",
     }
+}
+
+fn is_column_ref(node: Option<&pg_query::protobuf::Node>) -> bool {
+    matches!(
+        node.and_then(|n| n.node.as_ref()),
+        Some(pg_query::protobuf::node::Node::ColumnRef(_))
+    )
 }
 
 fn last_string(names: &[pg_query::protobuf::Node]) -> Option<String> {

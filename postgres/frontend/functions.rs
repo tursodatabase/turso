@@ -81,6 +81,8 @@ scalar_functions! {
     TimeIn(FunctionArity::Exact(1), true),
     DatePl(FunctionArity::Exact(2), true),
     DateMi(FunctionArity::Exact(2), true),
+    TimePl(FunctionArity::Exact(2), true),
+    TimeMi(FunctionArity::Exact(2), true),
     PgInputIsValid(FunctionArity::Exact(2), true),
     Textlike(FunctionArity::Exact(2), true),
     LikeEscape(FunctionArity::Exact(2), true),
@@ -167,6 +169,12 @@ impl ScalarCall for PgScalarFunction {
             Self::TimeIn => crate::datetime::exec_time_in(args[0].get_value())?,
             Self::DatePl => {
                 crate::datetime::exec_date_pl(args[0].get_value(), args[1].get_value())?
+            }
+            Self::TimePl => {
+                crate::datetime::exec_time_pl(args[0].get_value(), args[1].get_value())?
+            }
+            Self::TimeMi => {
+                crate::datetime::exec_time_mi(args[0].get_value(), args[1].get_value())?
             }
             Self::DateMi => {
                 crate::datetime::exec_date_mi(args[0].get_value(), args[1].get_value())?

@@ -244,3 +244,51 @@ test number-divided-by-interval-has-no-operator {
     SELECT 2 / interval '1 day';
 }
 expect error {operator does not exist: integer / interval}
+
+test time-plus-interval-wraps-at-midnight {
+    SELECT '23:00'::time + interval '2 hours', interval '2 hours' + '23:00'::time,
+        '01:00'::time - interval '2 hours', '12:00'::time + interval '1 day 3 hours';
+}
+expect {
+    01:00:00|01:00:00|23:00:00|15:00:00
+}
+
+test time-minus-time-is-interval {
+    SELECT '12:00'::time - '11:00'::time, '11:00'::time - '12:30'::time;
+}
+expect {
+    01:00:00|-01:30:00
+}
+
+test date-plus-time-is-timestamp {
+    SELECT '2026-10-08'::date + '12:30'::time, '12:30'::time + '2026-10-08'::date,
+        '2026-10-08'::date - '01:00'::time;
+}
+expect {
+    2026-10-08 12:30:00|2026-10-08 12:30:00|2026-10-07 23:00:00
+}
+
+test time-column-arithmetic {
+    CREATE TABLE t (a time, b time);
+    INSERT INTO t VALUES ('23:00', '21:30');
+    UPDATE t SET a = a + interval '2 hours';
+    SELECT a, b - interval '22 hours', a - b, interval '1 hour' + b FROM t;
+}
+expect {
+    01:00:00|23:30:00|-20:30:00|22:30:00
+}
+
+test time-plus-integer-is-an-error {
+    SELECT '12:00'::time + 1;
+}
+expect error {operator does not exist: time without time zone \+ integer}
+
+test time-plus-time-is-an-error {
+    SELECT '12:00'::time + '01:00'::time;
+}
+expect error {time without time zone \+ time without time zone}
+
+test time-plus-infinite-interval-is-an-error {
+    SELECT '12:00'::time + interval 'infinity';
+}
+expect error {cannot add infinite interval to time}

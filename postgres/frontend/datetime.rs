@@ -77,10 +77,8 @@ fn interval_out_of_range() -> LimboError {
 /// offset, or `infinity` / `-infinity`. This is the form tursopg stored before
 /// it had its own timestamptz type, so older rows compare equal to new ones.
 pub(crate) fn exec_timestamptz_in(value: &Value) -> Result<Value> {
-    let input = match value {
-        Value::Null => return Ok(Value::Null),
-        Value::Text(text) => text.as_str().to_string(),
-        other => other.to_string(),
+    let Some(input) = input_text(value) else {
+        return Ok(Value::Null);
     };
     let ts = parse_timestamp(&input, now_micros(), true)
         .map_err(|err| input_error(err, TIMESTAMPTZ, &input))?;
@@ -105,10 +103,8 @@ pub(crate) fn timestamptz_value(value: &Value) -> Result<Value> {
 /// Converts a value to the stored form of `timestamp`. A time zone in the
 /// input is ignored, as in PostgreSQL.
 pub(crate) fn exec_timestamp_in(value: &Value) -> Result<Value> {
-    let input = match value {
-        Value::Null => return Ok(Value::Null),
-        Value::Text(text) => text.as_str().to_string(),
-        other => other.to_string(),
+    let Some(input) = input_text(value) else {
+        return Ok(Value::Null);
     };
     let ts = parse_timestamp(&input, now_micros(), false)
         .map_err(|err| input_error(err, "timestamp", &input))?;
@@ -118,10 +114,8 @@ pub(crate) fn exec_timestamp_in(value: &Value) -> Result<Value> {
 /// Converts a value to the stored form of `date`: `YYYY-MM-DD`, `infinity` or
 /// `-infinity`. A time and time zone in the input are ignored.
 pub(crate) fn exec_date_in(value: &Value) -> Result<Value> {
-    let input = match value {
-        Value::Null => return Ok(Value::Null),
-        Value::Text(text) => text.as_str().to_string(),
-        other => other.to_string(),
+    let Some(input) = input_text(value) else {
+        return Ok(Value::Null);
     };
     let date = parse_date(&input, now_micros()).map_err(|err| input_error(err, "date", &input))?;
     Ok(Value::build_text(format_date(date)))
@@ -130,14 +124,21 @@ pub(crate) fn exec_date_in(value: &Value) -> Result<Value> {
 /// Converts a value to the stored form of `time`: `HH:MM:SS` with the
 /// fraction's trailing zeros removed. A time zone in the input is ignored.
 pub(crate) fn exec_time_in(value: &Value) -> Result<Value> {
-    let input = match value {
-        Value::Null => return Ok(Value::Null),
-        Value::Text(text) => text.as_str().to_string(),
-        other => other.to_string(),
+    let Some(input) = input_text(value) else {
+        return Ok(Value::Null);
     };
     let micros =
         parse_time(&input, now_micros()).map_err(|err| input_error(err, "time", &input))?;
     Ok(Value::build_text(format_time(micros)))
+}
+
+/// The text a date/time input function reads, or None for NULL.
+fn input_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::Text(text) => Some(text.as_str().to_string()),
+        other => Some(other.to_string()),
+    }
 }
 
 pub(crate) fn error_message(error: &LimboError) -> String {
@@ -154,6 +155,8 @@ pub(crate) fn error_sqlstate(message: &str) -> &'static str {
         || message.starts_with("timestamp out of range")
         || message.starts_with("date out of range")
         || message == "cannot subtract infinite dates"
+        || message == "cannot add infinite interval to time"
+        || message == "cannot subtract infinite interval from time"
         || message.starts_with("interval out of range")
     {
         "22008"
@@ -177,8 +180,9 @@ pub(crate) fn timestamptz_text(micros: i64) -> String {
 }
 
 /// `+` written in SQL. `lhs_type` and `rhs_type` are the operand types the
-/// query names (`date`, `timestamp`, `timestamptz`, `interval`), or "" when
-/// only the stored value can tell.
+/// query names (`date`, `time`, `timestamp`, `timestamptz`, `interval`),
+/// `column` for a column, whose value is a time when it has the stored form of
+/// a time, or "" when only the stored value can tell.
 pub(crate) fn exec_typed_datetime_pl(
     lhs: &Value,
     rhs: &Value,
@@ -197,6 +201,18 @@ pub(crate) fn exec_typed_datetime_pl(
         classify_declared(rhs, rhs_type)?,
     )
 }
+
+/// `+` for a `time` column. See [exec_typed_datetime_pl].
+pub(crate) fn exec_time_pl(lhs: &Value, rhs: &Value) -> Result<Value> {
+    exec_typed_datetime_pl(lhs, rhs, COLUMN, COLUMN)
+}
+
+/// `-` for a `time` column. See [exec_typed_datetime_pl].
+pub(crate) fn exec_time_mi(lhs: &Value, rhs: &Value) -> Result<Value> {
+    exec_typed_datetime_mi(lhs, rhs, COLUMN, COLUMN)
+}
+
+const COLUMN: &str = "column";
 
 /// `-` written in SQL. See [exec_typed_datetime_pl].
 pub(crate) fn exec_typed_datetime_mi(
@@ -342,6 +358,18 @@ fn datetime_pl(a: Operand, b: Operand) -> Result<Value> {
             DatetimeKind::TimestampTz,
         ),
         (Operand::Interval(a), Operand::Interval(b)) => format_interval(interval_pl(a, b)?),
+        (Operand::Time(time), Operand::Interval(iv))
+        | (Operand::Interval(iv), Operand::Time(time)) => format_time(time_pl_interval(
+            time,
+            iv,
+            1,
+            "cannot add infinite interval to time",
+        )?),
+        (Operand::Time(time), Operand::Datetime(date, DatetimeKind::Date))
+        | (Operand::Datetime(date, DatetimeKind::Date), Operand::Time(time)) => datetime_text(
+            timestamp_pl_interval(date, time_interval(time))?,
+            DatetimeKind::Timestamp,
+        ),
         (a, b) => return Err(operator_does_not_exist(&a, "+", &b)),
     };
     Ok(Value::build_text(result))
@@ -374,9 +402,37 @@ fn datetime_mi(a: Operand, b: Operand) -> Result<Value> {
         (Operand::Interval(a), Operand::Infinite(inf)) => {
             format_interval(interval_mi(a, infinite_interval(inf))?)
         }
+        (Operand::Time(a), Operand::Time(b)) => format_interval(time_interval(a - b)),
+        (Operand::Time(time), Operand::Interval(iv)) => format_time(time_pl_interval(
+            time,
+            iv,
+            -1,
+            "cannot subtract infinite interval from time",
+        )?),
+        (Operand::Datetime(date, DatetimeKind::Date), Operand::Time(time)) => datetime_text(
+            timestamp_pl_interval(date, time_interval(-time))?,
+            DatetimeKind::Timestamp,
+        ),
         (a, b) => return Err(operator_does_not_exist(&a, "-", &b)),
     };
     Ok(Value::build_text(result))
+}
+
+/// `time` plus `sign` times the time part of `span`, wrapped to one day.
+/// The months and days of `span` are ignored, as in PostgreSQL.
+fn time_pl_interval(time: i64, span: Interval, sign: i64, infinite_error: &str) -> Result<i64> {
+    let Interval::Finite { micros, .. } = span else {
+        return Err(LimboError::InvalidDate(infinite_error.to_string()));
+    };
+    Ok((time + sign * micros.rem_euclid(USECS_PER_DAY)).rem_euclid(USECS_PER_DAY))
+}
+
+fn time_interval(micros: i64) -> Interval {
+    Interval::Finite {
+        months: 0,
+        days: 0,
+        micros,
+    }
 }
 
 /// `+` where at least one operand is known to be a `date`, so `infinity` and
@@ -599,6 +655,7 @@ pub(crate) fn now_micros() -> i64 {
 
 enum Operand {
     Datetime(Timestamp, DatetimeKind),
+    Time(i64),
     Interval(Interval),
     Infinite(bool),
     Number(&'static str),
@@ -635,6 +692,17 @@ fn classify_declared(value: &Value, declared: &str) -> Result<Operand> {
                 .map(Operand::Interval)
                 .map_err(|err| input_error(err, "interval", text))
         }
+        "time" => {
+            return stored_time_micros(text)
+                .map(Operand::Time)
+                .ok_or_else(|| input_error(DtErr::BadFormat, "time", text))
+        }
+        COLUMN => {
+            return match stored_time_micros(text) {
+                Some(time) => Ok(Operand::Time(time)),
+                None => classify(value),
+            }
+        }
         "date" => DatetimeKind::Date,
         "timestamp" => DatetimeKind::Timestamp,
         "timestamptz" => DatetimeKind::TimestampTz,
@@ -659,6 +727,7 @@ fn operand_type_name(operand: &Operand) -> &'static str {
         Operand::Datetime(_, DatetimeKind::Date) => "date",
         Operand::Datetime(_, DatetimeKind::Timestamp) => TIMESTAMP,
         Operand::Datetime(..) | Operand::Infinite(_) => TIMESTAMPTZ,
+        Operand::Time(_) => "time without time zone",
         Operand::Interval(_) => "interval",
         Operand::Number(name) => name,
     }

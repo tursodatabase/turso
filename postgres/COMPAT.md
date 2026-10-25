@@ -90,9 +90,7 @@ Catalog introspection functions: `format_type`,
 stored SQL; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
 `pg_input_is_valid`, `to_char` (numeric, date, timestamp, timestamptz),
-`now`/`clock_timestamp`/`transaction_timestamp`/`statement_timestamp` (all
-read the clock at each call; PostgreSQL returns the transaction start time for
-`now`, `transaction_timestamp` and `CURRENT_TIMESTAMP`).
+`now`/`clock_timestamp`/`transaction_timestamp`/`statement_timestamp`.
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
 forms; the first schema of `search_path` that exists), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
@@ -168,7 +166,9 @@ or without an index. PostgreSQL rejects the subquery and text column forms
 Comparing two different datetime types converts a date to timestamp and a
 timestamp to timestamptz first, as PostgreSQL does, when each side is a column
 or a cast. A parameter sent with a date, time, timestamp or timestamptz type
-OID is treated as that type, so `$1 + 1` adds a day to a date. `now()`,
+OID is treated as that type, so `$1 + 1` adds a day to a date. `time`
+plus or minus an interval wraps at midnight, `time - time` gives an interval
+and `date + time` a timestamp. `now()`,
 `CURRENT_TIMESTAMP`, `CURRENT_DATE` and `transaction_timestamp()` return the
 start time of the transaction, `statement_timestamp()` the start time of the
 statement and `clock_timestamp()` the current time; the `now` and `today`
