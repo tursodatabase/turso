@@ -446,13 +446,36 @@ impl ExprId {
 #[derive(Clone, Debug, Default)]
 pub struct ExprArena {
     nodes: Vec<Expr>,
+    constant: Vec<bool>,
 }
 
 impl ExprArena {
     pub fn push(&mut self, expression: Expr) -> ExprId {
         let id = ExprId(u32::try_from(self.nodes.len()).expect("expression arena fits in u32"));
+        self.constant.push(self.children_constant(&expression));
         self.nodes.push(expression);
         id
+    }
+
+    pub(crate) fn is_constant(&self, expression: ExprRef<'_>) -> bool {
+        if expression.id() == ExprId::DETACHED {
+            return self.children_constant(expression.node());
+        }
+        self.constant[expression.id().index()]
+    }
+
+    fn children_constant(&self, expression: &Expr) -> bool {
+        if !expression.constant_by_kind() {
+            return false;
+        }
+        let mut index = 0;
+        while let Some(child) = expression.child(index) {
+            if !self.constant[child.index()] {
+                return false;
+            }
+            index += 1;
+        }
+        true
     }
 
     pub fn at(&self, id: ExprId) -> ExprRef<'_> {
@@ -475,6 +498,7 @@ impl ExprArena {
 
     pub fn reserve(&mut self, additional: usize) {
         self.nodes.reserve(additional);
+        self.constant.reserve(additional);
     }
 
     pub fn get_mut(&mut self, id: ExprId) -> &mut Expr {
@@ -487,6 +511,7 @@ impl ExprArena {
 
     pub fn truncate(&mut self, len: usize) {
         self.nodes.truncate(len);
+        self.constant.truncate(len);
     }
 
     /// Visit `node`, which may not be in this arena yet, and every
@@ -730,6 +755,39 @@ impl Expr {
 
     pub fn rowid(source: SourceId) -> Self {
         Self::RowId(source)
+    }
+
+    fn constant_by_kind(&self) -> bool {
+        match self {
+            Expr::Literal(_)
+            | Expr::Parameter(_)
+            | Expr::Unary { .. }
+            | Expr::Between { .. }
+            | Expr::Case { .. }
+            | Expr::Cast { .. }
+            | Expr::Collate { .. }
+            | Expr::IsNull(_)
+            | Expr::NotNull(_)
+            | Expr::TruthTest { .. }
+            | Expr::InList { .. }
+            | Expr::Row(_) => true,
+            Expr::Binary { custom, .. } => custom.is_none(),
+            Expr::Function(call) => {
+                // Like SQLite's SQLITE_FUNC_SLOCHNG functions, the date and
+                // time functions return the same value for the whole
+                // statement, so a call with constant arguments is computed
+                // once instead of on every row.
+                let function = call.function.value();
+                let same_for_whole_statement =
+                    crate::function::Deterministic::is_deterministic(function)
+                        || matches!(
+                            function,
+                            crate::function::Func::Scalar(scalar) if scalar.is_date_time_function()
+                        );
+                matches!(call.evaluation, FunctionEvaluation::Scalar) && same_for_whole_statement
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn child(&self, mut index: usize) -> Option<ExprId> {
@@ -1602,6 +1660,39 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn an_expression_is_constant_only_when_every_node_under_it_is() {
+        let mut exprs = ExprArena::default();
+        let add = |exprs: &mut ExprArena, lhs, rhs| {
+            exprs.push(Expr::Binary {
+                lhs,
+                operator: Operator::Add,
+                rhs,
+                array_concat: false,
+                custom: None,
+                comparison: None,
+            })
+        };
+        let one = exprs.push(Expr::Literal(Literal::Numeric("1".to_string())));
+        let two = exprs.push(Expr::Literal(Literal::Numeric("2".to_string())));
+        let column = exprs.push(Expr::column(SourceId::new(0), 1));
+        let constant = add(&mut exprs, one, two);
+        let reads_column = add(&mut exprs, constant, column);
+        let negated = exprs.push(Expr::Unary {
+            operator: UnaryOperator::Negative,
+            expr: reads_column,
+        });
+
+        assert!(exprs.is_constant(exprs.at(constant)));
+        assert!(!exprs.is_constant(exprs.at(reads_column)));
+        assert!(!exprs.is_constant(exprs.at(negated)));
+        let detached = Expr::Unary {
+            operator: UnaryOperator::Negative,
+            expr: constant,
+        };
+        assert!(exprs.is_constant(exprs.detached(&detached)));
+    }
 
     #[test]
     fn walking_children_without_children_pushes_no_frames() {

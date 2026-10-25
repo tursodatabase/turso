@@ -441,7 +441,8 @@ fn merge_update_assignment(
         existing.names.push(name);
     }
 
-    if let hir::Expr::Function(call) = exprs.get_mut(value) {
+    let mut node = exprs[value].clone();
+    if let hir::Expr::Function(call) = &mut node {
         if matches!(
             call.function.value(),
             crate::Func::Scalar(ScalarFunc::ArraySetElement)
@@ -449,6 +450,8 @@ fn merge_update_assignment(
             if let hir::FunctionArguments::Expressions { values, .. } = &mut call.arguments {
                 if values.len() == 3 {
                     values[0] = existing.value;
+                    existing.value = exprs.push(node);
+                    return Ok(());
                 }
             }
         }
