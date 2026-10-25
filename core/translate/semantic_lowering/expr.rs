@@ -13,6 +13,7 @@ use crate::vdbe::{
     insn::{CmpInsFlags, Insn},
     BranchOffset, CursorID,
 };
+use crate::HashMap;
 use crate::{LimboError, Numeric, Result, Value};
 use turso_parser::ast::{Literal, Operator, ResolveType, UnaryOperator};
 
@@ -459,6 +460,7 @@ struct ExprLowerer<'program, 'document, 'inputs> {
     program: &'program mut ProgramBuilder,
     document: &'document hir::HirDocument,
     inputs: &'inputs [ExprRegisterInput],
+    constant_operands: HashMap<hir::ExprId, bool>,
 }
 
 impl<'expr> ExprLowerer<'_, 'expr, '_> {
@@ -1832,10 +1834,28 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
 
     /// Whether `expression` has the same value on every row and is not
     /// already computed once by an enclosing constant.
-    fn is_hoisted_constant(&self, expression: hir::ExprRef<'_>) -> bool {
+    fn is_hoisted_constant(&mut self, expression: hir::ExprRef<'_>) -> bool {
         !self.program.constant_span_is_open()
             && !matches!(expression.node(), hir::Expr::Parameter(_))
-            && hir_expr_is_constant(self.program, expression)
+            && self.is_constant(expression)
+    }
+
+    fn is_constant(&mut self, expression: hir::ExprRef<'_>) -> bool {
+        if expression.node().child(0).is_none() {
+            return node_is_constant(self.program, expression);
+        }
+        if let Some(constant) = self.constant_operands.get(&expression.id()) {
+            return *constant;
+        }
+        let program = &*self.program;
+        let constant_operands = &mut self.constant_operands;
+        expression.fold(&mut |node, children: &[bool]| {
+            let constant = children.iter().all(|child| *child) && node_is_constant(program, node);
+            if node.id() != hir::ExprId::DETACHED {
+                constant_operands.insert(node.id(), constant);
+            }
+            constant
+        })
     }
 
     /// Start a block that runs the first time it is reached and is skipped
@@ -4750,6 +4770,7 @@ fn translate_expr_ref<'expr>(
         program,
         document,
         inputs,
+        constant_operands: HashMap::default(),
     };
     // A whole expression with the same value on every row is computed
     // once. One that cannot fail, such as `1` or `'x' || 'y'` as a result
@@ -4962,46 +4983,47 @@ fn expression_is_deterministic(expression: hir::ExprRef<'_>) -> bool {
 fn hir_expr_is_constant(program: &ProgramBuilder, expression: hir::ExprRef<'_>) -> bool {
     let mut constant = true;
     expression.for_each(&mut |node| {
-        if !constant {
-            return;
-        }
-        if program.expression_register(node.id()).is_some() {
-            constant = false;
-            return;
-        }
-        constant = match node.node() {
-            hir::Expr::Literal(_)
-            | hir::Expr::Parameter(_)
-            | hir::Expr::Unary { .. }
-            | hir::Expr::Between { .. }
-            | hir::Expr::Case { .. }
-            | hir::Expr::Cast { .. }
-            | hir::Expr::Collate { .. }
-            | hir::Expr::IsNull(_)
-            | hir::Expr::NotNull(_)
-            | hir::Expr::TruthTest { .. }
-            | hir::Expr::InList { .. }
-            | hir::Expr::Row(_) => true,
-            hir::Expr::Binary { custom, .. } => custom.is_none(),
-            hir::Expr::Function(call) => {
-                // Like SQLite's SQLITE_FUNC_SLOCHNG functions, the date and
-                // time functions return the same value for the whole
-                // statement, so a call with constant arguments is computed
-                // once instead of on every row.
-                let function = call.function.value();
-                let same_for_whole_statement =
-                    crate::function::Deterministic::is_deterministic(function)
-                        || matches!(
-                            function,
-                            crate::function::Func::Scalar(scalar) if scalar.is_date_time_function()
-                        );
-                matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
-                    && same_for_whole_statement
-            }
-            _ => false,
-        };
+        constant = constant && node_is_constant(program, node);
     });
     constant
+}
+
+fn node_is_constant(program: &ProgramBuilder, node: hir::ExprRef<'_>) -> bool {
+    #[cfg(test)]
+    tests::CONSTANT_CHECKS.with(|checks| checks.set(checks.get() + 1));
+    if program.expression_register(node.id()).is_some() {
+        return false;
+    }
+    match node.node() {
+        hir::Expr::Literal(_)
+        | hir::Expr::Parameter(_)
+        | hir::Expr::Unary { .. }
+        | hir::Expr::Between { .. }
+        | hir::Expr::Case { .. }
+        | hir::Expr::Cast { .. }
+        | hir::Expr::Collate { .. }
+        | hir::Expr::IsNull(_)
+        | hir::Expr::NotNull(_)
+        | hir::Expr::TruthTest { .. }
+        | hir::Expr::InList { .. }
+        | hir::Expr::Row(_) => true,
+        hir::Expr::Binary { custom, .. } => custom.is_none(),
+        hir::Expr::Function(call) => {
+            // Like SQLite's SQLITE_FUNC_SLOCHNG functions, the date and
+            // time functions return the same value for the whole
+            // statement, so a call with constant arguments is computed
+            // once instead of on every row.
+            let function = call.function.value();
+            let same_for_whole_statement =
+                crate::function::Deterministic::is_deterministic(function)
+                    || matches!(
+                        function,
+                        crate::function::Func::Scalar(scalar) if scalar.is_date_time_function()
+                    );
+            matches!(call.evaluation, hir::FunctionEvaluation::Scalar) && same_for_whole_statement
+        }
+        _ => false,
+    }
 }
 
 impl ConditionLowerer<'_, '_> {
@@ -5468,6 +5490,28 @@ mod tests {
                 .expect("join table name is unique");
         }
         schema
+    }
+
+    thread_local! {
+        pub(super) static CONSTANT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn nested_operands_are_checked_for_constants_once() {
+        let depth = 50;
+        let mut sql = String::from("id");
+        for value in 0..depth {
+            sql = format!("{sql} + {value}");
+        }
+        let document = analyze_sql(join_schema(), &format!("SELECT {sql} FROM left_values"));
+        CONSTANT_CHECKS.with(|checks| checks.set(0));
+        lower_btree_output(&document, 20);
+        let nodes = 2 * depth + 1;
+        let checks = CONSTANT_CHECKS.with(|checks| checks.get());
+        assert!(
+            checks <= 2 * nodes,
+            "{checks} constant checks for {nodes} nodes"
+        );
     }
 
     fn lower_btree_output(document: &hir::HirDocument, target: usize) -> ProgramBuilder {
