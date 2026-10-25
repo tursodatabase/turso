@@ -2542,6 +2542,37 @@ fn run_fk_constraint_case(
     assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
 }
 
+#[test]
+fn test_fk_parent_scan_affinity_multi_row_rollback() {
+    run_fk_constraint_case(
+        "fk_parent_text_affinity_rollback",
+        &[
+            "CREATE TABLE t1(a TEXT PRIMARY KEY)",
+            "CREATE TABLE t2(a INTEGER REFERENCES t1(a))",
+        ],
+        &[
+            "INSERT INTO t1 VALUES('9'),('8')",
+            "INSERT INTO t2 VALUES(8)",
+        ],
+        "DELETE FROM t1",
+        "SELECT (SELECT count(*) FROM t1), (SELECT count(*) FROM t2)",
+    );
+    run_fk_constraint_case(
+        "fk_parent_partial_index_affinity_rollback",
+        &[
+            "CREATE TABLE t1(a INTEGER PRIMARY KEY)",
+            "CREATE TABLE t2(a TEXT REFERENCES t1(a), b INTEGER)",
+            "CREATE INDEX i1 ON t2(a) WHERE b=1",
+        ],
+        &[
+            "INSERT INTO t1 VALUES(9),(8)",
+            "INSERT INTO t2 VALUES('008',0)",
+        ],
+        "DELETE FROM t1",
+        "SELECT (SELECT count(*) FROM t1), (SELECT count(*) FROM t2)",
+    );
+}
+
 /// Multi-row UPDATE that violates child-side FK: all rows must be rolled back.
 /// The FkCounter is incremented during the scan, then Halt checks the counter.
 /// Statement journal is required because multi_write=true (has_fks) and may_abort=true.

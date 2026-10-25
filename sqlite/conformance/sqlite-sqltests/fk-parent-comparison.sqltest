@@ -1,0 +1,197 @@
+@database :memory:
+
+test fk-parent-text-child-integer-delete {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a TEXT PRIMARY KEY);
+    CREATE TABLE t2(a INTEGER REFERENCES t1(a));
+    INSERT INTO t1 VALUES('8');
+    INSERT INTO t2 VALUES(8);
+    DELETE FROM t1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-parent-text-child-integer-restrict-update {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a TEXT PRIMARY KEY);
+    CREATE TABLE t2(a INTEGER REFERENCES t1(a) ON UPDATE RESTRICT);
+    INSERT INTO t1 VALUES('8');
+    INSERT INTO t2 VALUES(8);
+    UPDATE t1 SET a='9';
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-parent-integer-child-text-delete {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY);
+    CREATE TABLE t2(a TEXT REFERENCES t1(a));
+    INSERT INTO t1 VALUES(8);
+    INSERT INTO t2 VALUES('008');
+    DELETE FROM t1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-parent-text-deferred-child-rowid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a TEXT PRIMARY KEY);
+    CREATE TABLE t2(a INTEGER PRIMARY KEY REFERENCES t1(a) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO t2 VALUES(5);
+    INSERT INTO t1 VALUES(5);
+    COMMIT;
+    SELECT a FROM t2;
+}
+expect {
+    5
+}
+
+test fk-parent-integer-deferred-indexed-text-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY);
+    CREATE TABLE t2(a TEXT REFERENCES t1(a) DEFERRABLE INITIALLY DEFERRED);
+    CREATE INDEX i1 ON t2(a);
+    BEGIN;
+    INSERT INTO t2 VALUES('008');
+    INSERT INTO t1 VALUES(8);
+    COMMIT;
+    SELECT a FROM t2;
+}
+expect {
+    008
+}
+
+test fk-parent-text-indexed-integer-distinct-spelling {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a TEXT PRIMARY KEY);
+    CREATE TABLE t2(a INTEGER REFERENCES t1(a));
+    CREATE INDEX i1 ON t2(a);
+    INSERT INTO t1 VALUES('8'),('08');
+    INSERT INTO t2 VALUES(8);
+    DELETE FROM t1 WHERE a='08';
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-parent-integer-indexed-text-child-delete {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY);
+    CREATE TABLE t2(a TEXT REFERENCES t1(a));
+    CREATE INDEX i1 ON t2(a);
+    INSERT INTO t1 VALUES(8);
+    INSERT INTO t2 VALUES('008');
+    DELETE FROM t1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-parent-composite-mixed-affinity {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a TEXT, b INTEGER, PRIMARY KEY(a,b));
+    CREATE TABLE t2(a INTEGER, b TEXT, FOREIGN KEY(a,b) REFERENCES t1(a,b));
+    INSERT INTO t1 VALUES('8',9);
+    INSERT INTO t2 VALUES(8,'009');
+    DELETE FROM t1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-parent-composite-null-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a TEXT, b INTEGER, PRIMARY KEY(a,b));
+    CREATE TABLE t2(a INTEGER, b TEXT, FOREIGN KEY(a,b) REFERENCES t1(a,b));
+    INSERT INTO t1 VALUES('8',9);
+    INSERT INTO t2 VALUES(8,NULL);
+    DELETE FROM t1;
+    SELECT count(*) FROM t2;
+}
+expect {
+    1
+}
+
+test fk-parent-nocase-indexed-binary-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE t2(a TEXT REFERENCES t1(a));
+    CREATE INDEX i1 ON t2(a);
+    INSERT INTO t1 VALUES('VALUE');
+    INSERT INTO t2 VALUES('value');
+    DELETE FROM t1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-parent-nocase-scanned-binary-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE t2(a TEXT REFERENCES t1(a));
+    INSERT INTO t1 VALUES('VALUE');
+    INSERT INTO t2 VALUES('value');
+    DELETE FROM t1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-parent-self-reference-repairs-older-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER UNIQUE,
+        c TEXT REFERENCES t1(b) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO t1 VALUES(1,1,'2');
+    INSERT INTO t1 VALUES(2,2,NULL);
+    COMMIT;
+    SELECT count(*) FROM t1;
+}
+expect {
+    2
+}
+
+test fk-parent-compatible-index-deferred-multiple-children {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a TEXT PRIMARY KEY);
+    CREATE TABLE t2(a TEXT REFERENCES t1(a) DEFERRABLE INITIALLY DEFERRED);
+    CREATE INDEX i1 ON t2(a);
+    BEGIN;
+    INSERT INTO t2 VALUES('8'),('8');
+    INSERT INTO t1 VALUES('8');
+    COMMIT;
+    SELECT count(*) FROM t2;
+}
+expect {
+    2
+}
+
+test fk-parent-partial-child-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY);
+    CREATE TABLE t2(a INTEGER REFERENCES t1(a), b INTEGER);
+    CREATE INDEX i1 ON t2(a) WHERE b=1;
+    INSERT INTO t1 VALUES(8);
+    INSERT INTO t2 VALUES(8,0);
+    DELETE FROM t1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-parent-expression-child-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY);
+    CREATE TABLE t2(a INTEGER REFERENCES t1(a));
+    CREATE INDEX i1 ON t2(a+1);
+    INSERT INTO t1 VALUES(8);
+    INSERT INTO t2 VALUES(8);
+    DELETE FROM t1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}

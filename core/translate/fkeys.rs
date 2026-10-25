@@ -2,7 +2,7 @@ use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::translate::emitter::emit_columns_and_dependencies;
-use crate::translate::expr::{emit_stored_column, emit_table_column_for_dml};
+use crate::translate::expr::{comparison_affinity, emit_stored_column, emit_table_column_for_dml};
 use crate::translate::plan::ColumnMask;
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
@@ -297,15 +297,14 @@ pub fn open_read_table(program: &mut ProgramBuilder, tbl: &Arc<BTreeTable>, db: 
     tcur
 }
 
-/// Copy `len` registers starting at `src_start` to a fresh block and apply index affinities.
+/// Copy `len` registers starting at `src_start` and apply comparison affinities.
 /// Returns the destination start register.
 #[inline]
 fn copy_with_affinity(
     program: &mut ProgramBuilder,
     src_start: usize,
     len: usize,
-    idx: &Index,
-    aff_from_tbl: &BTreeTable,
+    affinities: &str,
 ) -> usize {
     let dst = program.alloc_registers(len);
     for i in 0..len {
@@ -319,7 +318,7 @@ fn copy_with_affinity(
         program.emit_insn(Insn::Affinity {
             start_reg: dst,
             count,
-            affinities: build_index_affinity_string(idx, aff_from_tbl),
+            affinities: affinities.to_owned(),
         });
     }
     dst
@@ -472,6 +471,54 @@ pub(super) fn emit_skip_if_any_null(
     }
 }
 
+pub fn find_child_comparison_index(
+    fk_ref: &ResolvedFkRef,
+    parent_table: &BTreeTable,
+    resolver: &Resolver,
+    database_id: usize,
+) -> Option<(Arc<Index>, String)> {
+    let keys: Vec<_> = fk_ref
+        .child_pos
+        .iter()
+        .zip(fk_ref.parent_pos.iter())
+        .map(|(&child_pos, &parent_pos)| {
+            let child = &fk_ref.child_table.columns()[child_pos];
+            let parent = &parent_table.columns()[parent_pos];
+            (
+                child_pos,
+                child.affinity(),
+                comparison_affinity(parent.affinity(), child.affinity(), None, None),
+                parent.collation(),
+            )
+        })
+        .collect();
+    let index = resolver.with_schema(database_id, |schema| {
+        schema
+            .get_indices(&fk_ref.child_table.name)
+            .find(|index| {
+                index.where_clause.is_none()
+                    && index.index_method.is_none()
+                    && index.columns.len() == keys.len()
+                    && index.columns.iter().zip(&keys).all(
+                        |(column, &(pos, affinity, comparison, collation))| {
+                            column.expr.is_none()
+                                && column.pos_in_table == pos
+                                && affinity.index_affinity_ok(comparison)
+                                && column.collation.unwrap_or(CollationSeq::Binary) == collation
+                        },
+                    )
+            })
+            .cloned()
+    });
+    index.map(|index| {
+        let affinities = keys
+            .iter()
+            .map(|(_, _, affinity, _)| affinity.aff_mask())
+            .collect();
+        (index, affinities)
+    })
+}
+
 /// Iterate a table and call `on_match` when all child columns equal the
 /// non-NULL key at `parent_key_start`.
 ///
@@ -491,6 +538,11 @@ where
     F: FnMut(&mut ProgramBuilder) -> Result<()>,
 {
     let child_tbl = &fk_ref.child_table;
+    let parent_tbl = resolver
+        .with_schema(database_id, |schema| {
+            schema.get_btree_table(&fk_ref.fk.parent_table)
+        })
+        .expect("resolved FK parent table");
     let child_positions = fk_ref
         .fk
         .child_columns
@@ -557,13 +609,20 @@ where
             target_pc: next_row,
         });
 
+        let parent_column = &parent_tbl.columns()[fk_ref.parent_pos[i]];
+        let affinity = comparison_affinity(
+            parent_column.affinity(),
+            child_tbl.columns()[pos].affinity(),
+            None,
+            None,
+        );
         let cont = program.allocate_label();
         program.emit_insn(Insn::Eq {
             lhs: tmp,
             rhs: parent_key_start + i,
             target_pc: cont,
-            flags: CmpInsFlags::default(),
-            collation: Some(CollationSeq::Binary),
+            flags: CmpInsFlags::default().with_affinity(affinity),
+            collation: Some(parent_column.collation()),
         });
         program.emit_insn(Insn::Goto {
             target_pc: next_row,
@@ -960,8 +1019,6 @@ fn emit_fk_parent_key_probe(
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    let child_tbl = &fk_ref.child_table;
-    let child_cols = &fk_ref.fk.child_columns;
     let is_deferred = fk_ref.fk.deferred;
     let is_restrict = matches!(fk_ref.fk.on_update, RefAct::Restrict);
     let skip_probe = program.allocate_label();
@@ -998,22 +1055,16 @@ fn emit_fk_parent_key_probe(
     // Prefer an exact child index on (child_cols...). If the current row must
     // be excluded, scan only the matching index range so the rowid can be
     // checked before counting the match.
-    let idx = resolver.with_schema(database_id, |s| {
-        s.get_indices(&child_tbl.name)
-            .find(|ix| {
-                ix.columns.len() == child_cols.len()
-                    && ix
-                        .columns
-                        .iter()
-                        .zip(child_cols.iter())
-                        .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-            })
-            .cloned()
-    });
+    let parent_tbl = resolver
+        .with_schema(database_id, |schema| {
+            schema.get_btree_table(&fk_ref.fk.parent_table)
+        })
+        .expect("resolved FK parent table");
+    let idx = find_child_comparison_index(fk_ref, &parent_tbl, resolver, database_id);
 
-    if let Some(ix) = idx.as_ref() {
+    if let Some((ix, affinities)) = idx.as_ref() {
         let icur = open_read_index(program, ix, database_id);
-        let probe = copy_with_affinity(program, parent_key_start, n_cols, ix, child_tbl);
+        let probe = copy_with_affinity(program, parent_key_start, n_cols, affinities);
 
         if self_exclude_rowid.is_some() {
             index_scan_match_any(program, icur, probe, n_cols, self_exclude_rowid, on_match)?;
@@ -1514,19 +1565,8 @@ fn emit_fk_delete_parent_existence_check_single(
     let skip_check = program.allocate_label();
     emit_skip_if_any_null(program, parent_key_start, ncols, skip_check);
 
-    let child_cols = &fk_ref.fk.child_columns;
     let child_idx = if !is_self_ref {
-        let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(&fk_ref.child_table.name).cloned().collect()
-        });
-        indices.into_iter().find(|idx| {
-            idx.columns.len() == child_cols.len()
-                && idx
-                    .columns
-                    .iter()
-                    .zip(child_cols.iter())
-                    .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-        })
+        find_child_comparison_index(fk_ref, parent_bt, resolver, database_id)
     } else {
         None
     };
@@ -1541,9 +1581,9 @@ fn emit_fk_delete_parent_existence_check_single(
         Ok(())
     };
 
-    if let Some(ref idx) = child_idx {
+    if let Some((ref idx, ref affinities)) = child_idx {
         let icur = open_read_index(program, idx, database_id);
-        let probe = copy_with_affinity(program, parent_key_start, ncols, idx, &fk_ref.child_table);
+        let probe = copy_with_affinity(program, parent_key_start, ncols, affinities);
         index_probe(
             program,
             icur,
