@@ -2570,19 +2570,7 @@ impl Database {
         context: ConnectionContext,
         stats: StatsRefresh,
     ) -> Result<Arc<Connection>> {
-        if self.page_codec_id.is_some() && page_codec.is_none() {
-            return Err(LimboError::InvalidArgument(
-                "database requires an external page codec".to_string(),
-            ));
-        }
-        if self.page_codec_id.is_none() && page_codec.is_some() {
-            return Err(LimboError::InvalidArgument(
-                "database was opened without an external page codec".to_string(),
-            ));
-        }
-        if let Some(page_codec) = page_codec.as_deref() {
-            self.validate_page_codec(Some(page_codec))?;
-        }
+        self.validate_connect_page_codec(page_codec.as_ref())?;
         let pager = if let Some(pager) = pager {
             pager
         } else {
@@ -2607,6 +2595,23 @@ impl Database {
             refresh_analyze_stats(&conn);
         }
         Ok(conn)
+    }
+
+    fn validate_connect_page_codec(&self, page_codec: Option<&Arc<dyn PageCodec>>) -> Result<()> {
+        if self.page_codec_id.is_some() && page_codec.is_none() {
+            return Err(LimboError::InvalidArgument(
+                "database requires an external page codec".to_string(),
+            ));
+        }
+        if self.page_codec_id.is_none() && page_codec.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "database was opened without an external page codec".to_string(),
+            ));
+        }
+        if let Some(page_codec) = page_codec {
+            self.validate_page_codec(Some(page_codec.as_ref()))?;
+        }
+        Ok(())
     }
 
     /// Create a connection and run the blocking connect-time stats refresh.
