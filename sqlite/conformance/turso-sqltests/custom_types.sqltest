@@ -748,6 +748,42 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test numeric-insert-text-with-spaces {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (' 2.5');
+    INSERT INTO t1 VALUES ('2.5 ');
+    INSERT INTO t1 VALUES ('  10.25  ');
+    INSERT INTO t1 VALUES (char(9) || '1.5' || char(9));
+    INSERT INTO t1 VALUES (char(11) || '3.5' || char(11));
+    SELECT val FROM t1;
+}
+expect {
+    2.50
+    2.50
+    10.25
+    1.50
+    3.50
+}
+
+@requires strict "uses STRICT tables"
+test numeric-insert-invalid-text-with-spaces-error {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('  bad  ');
+}
+expect error {
+    invalid input for type numeric: "  bad  "
+}
+
+@requires strict "uses STRICT tables"
+test numeric-insert-reject-nbsp-spaces-error {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (char(160) || '4.5');
+}
+expect error {
+    invalid input for type numeric
+}
+
+@requires strict "uses STRICT tables"
 test order-by-numeric-type-with-lt {
     CREATE TABLE t1(val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES (9);

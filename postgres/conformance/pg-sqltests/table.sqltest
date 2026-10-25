@@ -253,6 +253,29 @@ expect {
     0
 }
 
+test table-insert-numeric-with-leading-or-trailing-spaces {
+    CREATE TABLE nm (v numeric(10,2));
+    INSERT INTO nm VALUES (' 2.5');
+    INSERT INTO nm VALUES ('2.5 ');
+    INSERT INTO nm VALUES ('  10.25  ');
+    INSERT INTO nm VALUES (E'\t1.5\t');
+    INSERT INTO nm VALUES (E'\0133.5\013');
+    SELECT v FROM nm;
+}
+expect {
+    2.50
+    2.50
+    10.25
+    1.50
+    3.50
+}
+
+test table-insert-numeric-reject-unicode-whitespace {
+    CREATE TABLE nm_reject (v numeric(10,2));
+    INSERT INTO nm_reject VALUES (E'\u00a04.5');
+}
+expect error {}
+
 test table-uuid-column-omitted-from-insert-is-null {
     CREATE TABLE t (id int PRIMARY KEY, u uuid);
     INSERT INTO t (id) VALUES (1);
