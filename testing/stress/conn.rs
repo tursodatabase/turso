@@ -1,4 +1,6 @@
+use crate::opts::TxMode;
 use crate::sql_logging::SqlLogger;
+use crate::ThreadRng;
 use turso::{Builder, Connection, IntoParams, Row, Rows};
 use turso_stress::sync::Arc;
 use turso_stress::sync::AsyncMutex as Mutex;
@@ -90,6 +92,30 @@ impl StressConn {
             assert_not_engine_bug(&self.thread, sql, error);
         }
         result
+    }
+
+    /// Give this connection a random cache size and checkpoint threshold.
+    /// Small values make cache spills and checkpoints happen far more often
+    /// than the defaults would.
+    pub async fn apply_random_settings(
+        &self,
+        rng: &mut ThreadRng,
+        tx_mode: TxMode,
+    ) -> turso::Result<()> {
+        let cache_size = rng.choose(&[10, 100, 1000, -2000]);
+        self.pragma_update("cache_size", cache_size).await?;
+        match tx_mode {
+            TxMode::SQLite => {
+                let frames = rng.choose(&[0, 10, 100, 1000]);
+                self.pragma_update("wal_autocheckpoint", frames).await?;
+            }
+            TxMode::Concurrent => {
+                let bytes = rng.choose(&[0, 4096, 65536, 4_120_000]);
+                self.pragma_update("mvcc_checkpoint_threshold", bytes)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn rollback_if_open(&self) -> turso::Result<()> {

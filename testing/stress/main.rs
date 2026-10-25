@@ -644,6 +644,11 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         .collect();
 
     let conn = StressDb::connect(&db, ThreadId::new(usize::MAX), opts.busy_timeout).await?;
+    // The page size can only change while the database is empty.
+    if opts.db_ref.is_none() {
+        let page_size = main_rng.choose(&[512, 1024, 4096, 65536]);
+        conn.pragma_update("page_size", page_size).await?;
+    }
     'stmts: for stmt in &ddl_statements {
         let mut retry_counter = 0;
         while retry_counter < 10 {
@@ -707,12 +712,13 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
             let stress_counter = stress_counter.clone();
 
             let handle = turso_stress::future::spawn(async move {
-                let mut conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
                 let mut rng = ThreadRng::new(
                     global_seed
                         .wrapping_add(thread_idx as u64)
                         .wrapping_add(batch_idx.wrapping_mul(1000)),
                 );
+                let mut conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
+                conn.apply_random_settings(&mut rng, opts.tx_mode).await?;
                 let mut iteration_count_this_batch = 0;
 
                 all_threads_ready.wait().await;
@@ -721,6 +727,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     if rng.random_ratio(1, 50) {
                         // Reconnect to the database
                         conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
+                        conn.apply_random_settings(&mut rng, opts.tx_mode).await?;
                     }
 
                     let tx = match opts.tx_mode {
