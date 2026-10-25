@@ -359,6 +359,7 @@ impl ProgramBuilderFlags {
     const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
     const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
     const KEEP_ARRAY_RESULTS_AS_BLOBS: u16 = 1 << 9;
+    const COPY_STORED_VALUES: u16 = 1 << 10;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -476,6 +477,14 @@ impl ProgramBuilderFlags {
     #[inline]
     pub const fn set_keep_array_results_as_blobs(&mut self, v: bool) {
         self.set(Self::KEEP_ARRAY_RESULTS_AS_BLOBS, v)
+    }
+
+    pub(crate) const fn copy_stored_values(self) -> bool {
+        self.get(Self::COPY_STORED_VALUES)
+    }
+
+    pub(crate) const fn set_copy_stored_values(&mut self, v: bool) {
+        self.set(Self::COPY_STORED_VALUES, v)
     }
 
     #[inline]

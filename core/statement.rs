@@ -58,6 +58,8 @@ pub(crate) enum StatementOrigin {
     Root,
     InternalHelper,
     Subprogram,
+    StorageCopyRead,
+    StorageCopyWrite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +74,18 @@ pub enum StatementStatusCounter {
 
 impl StatementOrigin {
     pub(crate) const fn needs_nested_guard(self) -> bool {
-        matches!(self, Self::InternalHelper)
+        matches!(self, Self::InternalHelper | Self::StorageCopyRead)
+    }
+
+    pub(crate) const fn is_internal_helper(self) -> bool {
+        matches!(
+            self,
+            Self::InternalHelper | Self::StorageCopyRead | Self::StorageCopyWrite
+        )
+    }
+
+    pub(crate) const fn copies_stored_values(self) -> bool {
+        matches!(self, Self::StorageCopyRead | Self::StorageCopyWrite)
     }
 }
 
@@ -704,7 +717,7 @@ impl Statement {
             }
         }
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
-            && self.origin != StatementOrigin::InternalHelper
+            && !self.origin.is_internal_helper()
         {
             if self.state.db_mv_store(&self.program.connection).is_some() {
                 // MVCC checkpoints can publish internal schema roots without changing

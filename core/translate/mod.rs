@@ -105,9 +105,15 @@ pub fn translate(
         ProgramBuilderOpts::new(1, 32, 2),
     ));
     program.set_mvcc_enabled(connection.mvcc_enabled());
-    program.flags.set_keep_array_results_as_blobs(matches!(
+    program
+        .flags
+        .set_keep_array_results_as_blobs(origin.is_internal_helper());
+    program
+        .flags
+        .set_copy_stored_values(origin.copies_stored_values());
+    program.flags.set_suppress_custom_type_decode(matches!(
         origin,
-        crate::statement::StatementOrigin::InternalHelper
+        crate::statement::StatementOrigin::StorageCopyRead
     ));
 
     program.prologue();
@@ -116,7 +122,7 @@ pub fn translate(
     // database's dialect — the same invariant as unmarked schema rows.
     // They look names up in every database, like SQLite does, whatever
     // the connection's search path says.
-    let is_internal_helper = matches!(origin, crate::statement::StatementOrigin::InternalHelper);
+    let is_internal_helper = origin.is_internal_helper();
     let search_path = if is_internal_helper {
         None
     } else {

@@ -23,6 +23,69 @@ expect {
     3
 }
 
+@requires custom_types "uses custom type codecs"
+@skip-if mvcc "plain VACUUM requires a checkpoint first on an MVCC database"
+test vacuum-preserves-encoded-custom-values {
+    CREATE TYPE e BASE integer ENCODE value * 10;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, s e, a e[]) STRICT;
+    INSERT INTO t VALUES(1, 1, ARRAY[1, 2]);
+    SELECT s, hex(a) FROM t;
+    VACUUM;
+    SELECT s, hex(a) FROM t;
+    INSERT INTO t VALUES(2, 3, ARRAY[4]);
+    SELECT s FROM t WHERE id = 2;
+}
+expect {
+    10|0301010A14
+    10|0301010A14
+    30
+}
+
+@requires custom_types "uses custom type codecs"
+@skip-if mvcc "plain VACUUM requires a checkpoint first on an MVCC database"
+test vacuum-preserves-decoded-custom-values {
+    CREATE TYPE d BASE integer DECODE value * 10;
+    CREATE TABLE t(a d) STRICT;
+    INSERT INTO t VALUES(1);
+    SELECT a FROM t;
+    VACUUM;
+    SELECT a FROM t;
+}
+expect {
+    10
+    10
+}
+
+@requires custom_types "uses custom type codecs"
+@skip-if mvcc "plain VACUUM requires a checkpoint first on an MVCC database"
+test vacuum-preserves-decoded-array-values {
+    CREATE TYPE d BASE integer DECODE value * 10;
+    CREATE TABLE t(a d[]) STRICT;
+    INSERT INTO t VALUES(ARRAY[1, 2]);
+    CREATE TABLE t2(a TEXT);
+    INSERT INTO t2 SELECT hex(a) FROM t;
+    VACUUM;
+    SELECT hex(a) = (SELECT a FROM t2) FROM t;
+}
+expect {
+    1
+}
+
+@requires custom_types "uses custom type codecs"
+@skip-if mvcc "plain VACUUM requires a checkpoint first on an MVCC database"
+test vacuum-preserves-custom-values-with-check {
+    CREATE TYPE d BASE integer DECODE value * 10;
+    CREATE TABLE t(a d CHECK(CAST(a AS INTEGER) > 0)) STRICT;
+    INSERT INTO t VALUES(1);
+    SELECT a FROM t;
+    VACUUM;
+    SELECT a FROM t;
+}
+expect {
+    10
+    10
+}
+
 test vacuum-rejects-query-only {
     CREATE TABLE t(a INTEGER);
     PRAGMA query_only = 1;
