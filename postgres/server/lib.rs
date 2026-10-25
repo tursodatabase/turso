@@ -211,7 +211,7 @@ impl SimpleQueryHandler for TursoPgHandler {
                 self.cleanup_dropped_schema_file(sql);
                 responses.push(response);
             } else {
-                let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+                let header = Arc::new(build_field_info(&stmt, sql, &Format::UnifiedText));
                 responses.push(execute_query(&mut stmt, header)?);
             }
         }
@@ -275,7 +275,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
             return Ok(response);
         }
 
-        let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
+        let header = Arc::new(build_field_info(&stmt, query, &portal.result_column_format));
         execute_query(&mut stmt, header)
     }
 
@@ -296,7 +296,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
             .map(|t| t.clone().unwrap_or(Type::TEXT))
             .collect();
 
-        let fields = build_field_info(&stmt, &Format::UnifiedText);
+        let fields = build_field_info(&stmt, &target.statement, &Format::UnifiedText);
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -313,14 +313,18 @@ impl ExtendedQueryHandler for TursoPgHandler {
             .prepare(&portal.statement.statement)
             .map_err(pg_error)?;
 
-        let fields = build_field_info(&stmt, &portal.result_column_format);
+        let fields = build_field_info(
+            &stmt,
+            &portal.statement.statement,
+            &portal.result_column_format,
+        );
         Ok(DescribePortalResponse::new(fields))
     }
 }
 
 /// Build FieldInfo metadata from a prepared statement's column information.
-fn build_field_info(stmt: &turso_pg::Statement, format: &Format) -> Vec<FieldInfo> {
-    if is_pg_non_query(stmt.get_sql()) {
+fn build_field_info(stmt: &turso_pg::Statement, query: &str, format: &Format) -> Vec<FieldInfo> {
+    if is_pg_non_query(query) || is_pg_non_query(stmt.get_sql()) {
         return vec![];
     }
     (0..stmt.num_columns())
@@ -668,10 +672,34 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
     }
 }
 
+fn strip_leading_sql_comments(mut sql: &str) -> &str {
+    loop {
+        sql = sql.trim_start();
+        if let Some(rest) = sql.strip_prefix("/*") {
+            if let Some(end) = rest.find("*/") {
+                sql = &rest[end + 2..];
+            } else {
+                break;
+            }
+        } else if let Some(rest) = sql.strip_prefix("--") {
+            if let Some(end) = rest.find('\n') {
+                sql = &rest[end + 1..];
+            } else {
+                sql = "";
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    sql.trim_start()
+}
+
 /// PG statements handled by `try_prepare_pg()` that return a dummy SELECT
 /// but should produce a command-tag response, not a result set.
 fn is_pg_non_query(sql: &str) -> bool {
-    let upper = sql.trim().to_uppercase();
+    let stripped = strip_leading_sql_comments(sql);
+    let upper = stripped.to_uppercase();
     upper.starts_with("COPY")
         || upper.starts_with("SET")
         || upper.starts_with("LOCK")
@@ -682,7 +710,8 @@ fn is_pg_non_query(sql: &str) -> bool {
 }
 
 fn command_tag(query: &str, affected_rows: usize) -> Tag {
-    let upper = query.trim().to_uppercase();
+    let stripped = strip_leading_sql_comments(query);
+    let upper = stripped.to_uppercase();
     if upper.starts_with("INSERT") {
         Tag::new("INSERT").with_oid(0).with_rows(affected_rows)
     } else if upper.starts_with("UPDATE") {
@@ -877,7 +906,7 @@ mod tests {
         ] {
             for format in [Format::UnifiedText, Format::UnifiedBinary] {
                 let mut stmt = conn.prepare(sql).unwrap();
-                let fields = Arc::new(build_field_info(&stmt, &format));
+                let fields = Arc::new(build_field_info(&stmt, sql, &format));
                 assert_eq!(*fields[0].datatype(), Type::TEXT, "{sql}");
                 let rows = stmt.run_collect_rows().unwrap();
                 assert_eq!(rows.len(), 1);
@@ -889,7 +918,7 @@ mod tests {
             }
         }
         let stmt = conn.prepare("SELECT 7 AS pg_is_in_recovery").unwrap();
-        let fields = build_field_info(&stmt, &Format::UnifiedText);
+        let fields = build_field_info(&stmt, "SELECT 7 AS pg_is_in_recovery", &Format::UnifiedText);
         assert_eq!(*fields[0].datatype(), Type::INT4);
     }
 
@@ -914,7 +943,7 @@ mod tests {
             "SELECT coalesce(x, 2) FROM t",
         ] {
             let stmt = conn.prepare(sql).unwrap();
-            let fields = build_field_info(&stmt, &Format::UnifiedText);
+            let fields = build_field_info(&stmt, sql, &Format::UnifiedText);
             assert_eq!(*fields[0].datatype(), Type::INT4, "{sql}");
         }
     }
@@ -925,9 +954,29 @@ mod tests {
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
         ));
         assert!(is_pg_non_query("  set\ntransaction read only"));
+        assert!(is_pg_non_query("/* comment */ SET search_path = public"));
+        assert!(is_pg_non_query("-- comment\nSET search_path = public"));
         assert!(!is_pg_non_query(
             "SELECT set_config('search_path', '', false)"
         ));
+    }
+
+    #[test]
+    fn test_strip_leading_sql_comments() {
+        assert_eq!(strip_leading_sql_comments("SELECT 1"), "SELECT 1");
+        assert_eq!(
+            strip_leading_sql_comments("/* comment */ CREATE SCHEMA s"),
+            "CREATE SCHEMA s"
+        );
+        assert_eq!(
+            strip_leading_sql_comments("/* a */ /* b */ -- line\n  CREATE SCHEMA s"),
+            "CREATE SCHEMA s"
+        );
+        assert_eq!(
+            strip_leading_sql_comments("-- line 1\n-- line 2\nCOPY t FROM 'f'"),
+            "COPY t FROM 'f'"
+        );
+        assert_eq!(strip_leading_sql_comments("-- line without newline"), "");
     }
 
     #[test]
@@ -962,10 +1011,49 @@ mod tests {
             .prepare("LOCK TABLE items IN ACCESS SHARE MODE")
             .unwrap();
         for format in [Format::UnifiedText, Format::UnifiedBinary] {
-            assert!(build_field_info(&stmt, &format).is_empty());
+            assert!(
+                build_field_info(&stmt, "LOCK TABLE items IN ACCESS SHARE MODE", &format)
+                    .is_empty()
+            );
         }
         let query = conn.prepare("SELECT 'LOCK TABLE items'").unwrap();
-        assert_eq!(build_field_info(&query, &Format::UnifiedText).len(), 1);
+        assert_eq!(
+            build_field_info(&query, "SELECT 'LOCK TABLE items'", &Format::UnifiedText).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_utility_statements_have_no_result_fields() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = turso_pg::PgConnection::connect(&db).unwrap();
+        conn.execute("CREATE TABLE cpy (v int)").unwrap();
+
+        for sql in [
+            "CREATE SCHEMA es",
+            "DROP SCHEMA es",
+            "COPY cpy FROM '/tmp/rows.tsv'",
+            "LOCK TABLE cpy IN ACCESS SHARE MODE",
+            "COMMENT ON TABLE cpy IS 'test'",
+            "SET search_path = public",
+            "/* leading comment */ CREATE SCHEMA es2",
+            "-- line comment\nCOPY cpy FROM '/tmp/rows.tsv'",
+        ] {
+            let stmt = conn.prepare(sql).unwrap();
+            for format in [Format::UnifiedText, Format::UnifiedBinary] {
+                let fields = build_field_info(&stmt, sql, &format);
+                assert!(
+                    fields.is_empty(),
+                    "expected empty fields for {sql}, got {fields:?}"
+                );
+            }
+        }
     }
 
     #[test]
