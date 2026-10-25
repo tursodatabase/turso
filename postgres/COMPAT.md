@@ -135,7 +135,11 @@ cidr, macaddr, macaddr8 map to Turso custom types. varchar(n) and
 numeric(p,s) keep their type modifiers; type modifiers on any other type,
 including char(n), timestamp(p) and bit(n), are rejected. interval, xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
-INTEGER. Unknown type names pass through as custom types.
+INTEGER. Unknown type names pass through as custom types. An integer primary
+key is stored as the rowid, but behaves as in PostgreSQL: an INSERT that leaves
+it out uses its DEFAULT, and an INSERT or UPDATE that makes it NULL fails with
+a NOT NULL error. A serial primary key, or one whose DEFAULT calls `nextval()`,
+still gets the next rowid when left out rather than a value from its sequence.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
