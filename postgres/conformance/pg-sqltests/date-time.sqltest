@@ -375,3 +375,18 @@ expect {
     01:00:00
     01:00:00|01:00:00|01:00:00|01:00:00
 }
+
+test time-cast-inside-max-coalesce-and-case-wraps-at-midnight {
+    CREATE TABLE t (a time, s text);
+    INSERT INTO t VALUES ('23:00', '23:00');
+    SELECT coalesce(a, '00:00'::time) + interval '2 hours' FROM t;
+    SELECT max(s::time) + interval '2 hours', min(CAST(s AS time)) - interval '23 hours 30 minutes' FROM t;
+    SELECT coalesce(s::time, a) + interval '2 hours',
+        (CASE WHEN s IS NOT NULL THEN s::time END) + interval '2 hours'
+    FROM t;
+}
+expect {
+    01:00:00
+    01:00:00|23:30:00
+    01:00:00|01:00:00
+}

@@ -308,7 +308,8 @@ pub(super) fn expr_custom_type_info(
 
 /// The declared custom type of `expr`, or "" when core does not know it.
 /// min, max, coalesce, nullif and CASE return one of their arguments, so
-/// `max(a)` has the type of the column `a`.
+/// `max(a)` has the type of the column `a`, and `coalesce(a, '00:00'::time)`
+/// has the type of the cast.
 pub(super) fn declared_custom_type_name(
     expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
@@ -341,6 +342,21 @@ pub(super) fn declared_custom_type_name(
         ),
         ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
             declared_custom_type_name(&exprs[0], referenced_tables, resolver)
+        }
+        ast::Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } if type_name.array_dimensions == 0 => {
+            let cast_type_name = crate::util::dequote(&type_name.name).to_lowercase();
+            if resolver
+                .schema()
+                .get_type_def(&cast_type_name, true)
+                .is_some()
+            {
+                cast_type_name
+            } else {
+                String::new()
+            }
         }
         _ => expr_custom_type_info(expr, referenced_tables, resolver)
             .map(|info| info.type_name)
