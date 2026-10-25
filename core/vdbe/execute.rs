@@ -15926,7 +15926,7 @@ pub fn op_parse_schema(
         let db_name = conn
             .namespace_name(*db)
             .unwrap_or_else(|| "main".to_string());
-        format!("{db_name}.sqlite_schema")
+        format!("\"{}\".sqlite_schema", db_name.replace('"', "\"\""))
     } else {
         SCHEMA_TABLE_NAME.to_string()
     };
