@@ -193,19 +193,18 @@ pub(super) fn translate_sequence_function(
     let is_nextval = matches!(&func_ctx.func, Func::Scalar(ScalarFunc::NextVal));
 
     let seq_name_raw = extract_string_literal(&args[0])?;
-    let (namespace, normalized_name) = if let Some((schema, name)) = seq_name_raw.split_once('.') {
-        let qualified = ast::QualifiedName {
-            namespace: Some(ast::Name::exact(schema.to_string())),
-            name: ast::Name::exact(name.to_string()),
-            alias: None,
-        };
-        (
-            resolver.resolve_namespace(&qualified)?,
-            normalize_ident(name),
-        )
-    } else {
-        let name = normalize_ident(&seq_name_raw);
-        (resolver.resolve_existing_sequence(&name)?, name)
+    let (schema, name) = crate::util::split_qualified_name(&seq_name_raw);
+    let normalized_name = normalize_ident(&name);
+    let namespace = match schema {
+        Some(schema) => {
+            let qualified = ast::QualifiedName {
+                namespace: Some(ast::Name::exact(schema)),
+                name: ast::Name::exact(name),
+                alias: None,
+            };
+            resolver.resolve_namespace(&qualified)?
+        }
+        None => resolver.resolve_existing_sequence(&normalized_name)?,
     };
     let database_id = namespace.database_id;
     let stored_seq_name = resolver.stored_name(namespace, &normalized_name);
@@ -367,10 +366,11 @@ pub(crate) fn qualify_sequence_argument(
     resolver: &Resolver,
 ) -> Option<Box<[Box<ast::Expr>]>> {
     let seq_name_raw = extract_string_literal(args.first()?).ok()?;
-    if seq_name_raw.contains('.') {
+    let (schema, name) = crate::util::split_qualified_name(&seq_name_raw);
+    if schema.is_some() {
         return None;
     }
-    let name = normalize_ident(&seq_name_raw);
+    let name = normalize_ident(&name);
     let namespace = resolver.find_existing_sequence(&name)?;
     let runtime_name = resolver.runtime_sequence_name(namespace, &name);
     let mut args = args.to_vec();

@@ -960,7 +960,11 @@ impl<'a> Resolver<'a> {
             .namespaces
             .name_of(namespace)
             .expect("the namespace of a sequence has a name");
-        format!("{namespace_name}.{seq_name}")
+        format!(
+            "{}.{}",
+            ast::Name::exact(namespace_name).as_ident(),
+            ast::Name::exact(seq_name.to_string()).as_ident()
+        )
     }
 
     /// The name that object `name` of `namespace` is stored under in the

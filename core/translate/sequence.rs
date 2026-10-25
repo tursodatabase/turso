@@ -44,14 +44,15 @@ pub fn sequence_backing_table_sql(seq_name: &str) -> String {
     // compaction emitted by `emit_backing_table_compaction` collapses each
     // backing table down to a single watermark row via DELETE-all + INSERT.
     format!(
-        "CREATE TABLE \"{table_name}\"(\
+        "CREATE TABLE \"{}\"(\
          value INTEGER PRIMARY KEY,\
          is_called INTEGER,\
          start INTEGER,\
          inc INTEGER,\
          min INTEGER,\
          max INTEGER,\
-         cycle INTEGER)"
+         cycle INTEGER)",
+        table_name.replace('"', "\"\"")
     )
 }
 
