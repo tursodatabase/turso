@@ -60,7 +60,6 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::any::Any;
 #[cfg(host_shared_wal)]
 use std::path::Path;
-#[cfg(host_shared_wal)]
 use std::sync::OnceLock;
 use std::{fmt, ops::Deref};
 #[cfg(feature = "fs")]
@@ -640,6 +639,9 @@ pub(crate) enum RegistryEntry {
 /// across I/O yields. Holding it across yields deadlocks single-threaded
 /// event loops because the blocked thread
 /// can never resume the coroutine that owns the lock.
+///
+/// Never drop an `Arc<Database>` while holding the mutex either: dropping the
+/// last one runs `Database::drop`, which locks the mutex to remove the entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum DatabaseKey {
     File(io::FileId),
@@ -708,6 +710,9 @@ pub struct Database<
     pub(crate) incarnation: u64,
 
     pager_state: Arc<SharedPagerState>,
+    /// Key of this database's entry in `DATABASE_MANAGER`, set once the
+    /// database is registered. `Drop` uses it to remove the entry.
+    registry_key: OnceLock<DatabaseKey>,
 
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
@@ -768,6 +773,20 @@ impl fmt::Debug for Database {
                 .load(crate::sync::atomic::Ordering::SeqCst),
         );
         debug_struct.finish()
+    }
+}
+
+impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Drop for Database<A, F> {
+    fn drop(&mut self) {
+        let Some(key) = self.registry_key.get() else {
+            return;
+        };
+        let mut registry = DATABASE_MANAGER.lock();
+        // Another open of the same file may have replaced the entry already.
+        if matches!(registry.get(key), Some(RegistryEntry::Ready(weak)) if weak.strong_count() == 0)
+        {
+            registry.remove(key);
+        }
     }
 }
 
@@ -858,6 +877,7 @@ impl Database {
             },
 
             pager_state: Arc::new(SharedPagerState::new(init_page_1)),
+            registry_key: OnceLock::new(),
 
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
@@ -897,6 +917,7 @@ impl Database {
             let registry = DATABASE_MANAGER.lock();
             if let Some(RegistryEntry::Ready(weak)) = registry.get(&key) {
                 if let Some(db) = weak.upgrade() {
+                    drop(registry);
                     Self::check_registry_dialect(&db, dialect.as_ref())?;
                     return Ok(db);
                 }
@@ -909,10 +930,14 @@ impl Database {
         let mut registry = DATABASE_MANAGER.lock();
         if let Some(RegistryEntry::Ready(weak)) = registry.get(&key) {
             if let Some(existing) = weak.upgrade() {
+                drop(registry);
                 Self::check_registry_dialect(&existing, dialect.as_ref())?;
                 return Ok(existing);
             }
         }
+        db.registry_key
+            .set(key.clone())
+            .expect("database is registered once");
         registry.insert(key, RegistryEntry::Ready(Arc::downgrade(&db)));
         Ok(db)
     }
@@ -1116,6 +1141,7 @@ impl Database {
             },
             _ => return Ok(None),
         };
+        drop(registry);
 
         // Validate encryption compatibility (key is not stored for security,
         // so we can only check cipher mode)
@@ -1349,6 +1375,7 @@ impl Database {
                 match registry.get(&key) {
                     Some(RegistryEntry::Ready(weak)) => {
                         if let Some(db) = weak.upgrade() {
+                            drop(registry);
                             tracing::debug!("took database {path:?} from the registry");
 
                             let db_is_encrypted =
@@ -1406,6 +1433,9 @@ impl Database {
             Ok(IOResult::Done(db)) => {
                 // Register the opened database and remove the Opening sentinel.
                 if let Some(registry_key) = state.registry_key.take() {
+                    db.registry_key
+                        .set(registry_key.clone())
+                        .expect("database is registered once");
                     let mut registry = DATABASE_MANAGER.lock();
                     registry.insert(registry_key, RegistryEntry::Ready(Arc::downgrade(db)));
                 }
@@ -3664,7 +3694,7 @@ mod database_tests {
         Arc,
     };
 
-    use super::{is_memory_like, Database, InitState};
+    use super::{is_memory_like, Database, DatabaseKey, InitState, DATABASE_MANAGER};
     use crate::storage::encryption::EncryptionKey;
     use crate::storage::page_transform::{
         PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation,
@@ -4369,6 +4399,31 @@ mod database_tests {
         let second = open_with_page_codec(io, path, second_codec);
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn registry_entry_is_removed_when_last_database_reference_drops() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("registry-drop.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
+        let file_key = DatabaseKey::File(crate::io::get_file_id(path).unwrap());
+        let reopened = Database::open_file(io, path, Arc::new(SqliteDialect)).unwrap();
+        assert!(Arc::ptr_eq(&db, &reopened));
+        drop(reopened);
+        assert!(DATABASE_MANAGER.lock().contains_key(&file_key));
+        drop(db);
+        assert!(!DATABASE_MANAGER.lock().contains_key(&file_key));
+
+        let name = "registry-entry-is-removed-when-last-database-reference-drops";
+        let memory_key = DatabaseKey::SharedMemory(name.to_string());
+        let db = Database::open_shared_memory(name, Arc::new(SqliteDialect)).unwrap();
+        assert!(DATABASE_MANAGER.lock().contains_key(&memory_key));
+        drop(db);
+        assert!(!DATABASE_MANAGER.lock().contains_key(&memory_key));
     }
 
     #[cfg(feature = "fs")]
