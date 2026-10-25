@@ -274,6 +274,7 @@ impl DatabaseTape {
             cached_insert_stmt: HashMap::new(),
             cached_update_stmt: HashMap::new(),
             in_txn: true,
+            temporary_table_name: None,
             generator: DatabaseReplayGenerator { conn, opts },
         })
     }
@@ -586,6 +587,7 @@ pub struct DatabaseReplaySession {
     pub(crate) cached_insert_stmt: HashMap<(String, usize), CachedStmt>,
     pub(crate) cached_update_stmt: HashMap<(String, Vec<bool>), CachedStmt>,
     pub(crate) in_txn: bool,
+    pub(crate) temporary_table_name: Option<String>,
     pub(crate) generator: DatabaseReplayGenerator,
 }
 
@@ -678,6 +680,25 @@ impl DatabaseReplaySession {
                     }
                     DatabaseSchemaReplay::Drop { kind, name } => {
                         self.conn.execute(Self::schema_drop_sql(kind, &name))?;
+                    }
+                    DatabaseSchemaReplay::RenameTable { old_name, new_name } => {
+                        self.generator
+                            .execute_ddl(&rename_table_sql(&old_name, &new_name))?;
+                    }
+                    DatabaseSchemaReplay::RenameTableToTemporaryName { name } => {
+                        assert!(self.temporary_table_name.is_none());
+                        let temporary_name =
+                            self.generator.unused_temporary_table_name(coro).await?;
+                        self.generator
+                            .execute_ddl(&rename_table_sql(&name, &temporary_name))?;
+                        self.temporary_table_name = Some(temporary_name);
+                    }
+                    DatabaseSchemaReplay::RenameTemporaryTable { new_name } => {
+                        let temporary_name = self.temporary_table_name.take().expect(
+                            "a table must be renamed to a temporary name before it is renamed back",
+                        );
+                        self.generator
+                            .execute_ddl(&rename_table_sql(&temporary_name, &new_name))?;
                     }
                 }
                 self.clear_cached_statements();
@@ -899,6 +920,14 @@ impl DatabaseReplaySession {
             .insert(key.clone(), CachedStmt { stmt, info });
         Ok(key)
     }
+}
+
+fn rename_table_sql(old_name: &str, new_name: &str) -> String {
+    format!(
+        "ALTER TABLE {} RENAME TO {}",
+        quote_ident(old_name),
+        quote_ident(new_name)
+    )
 }
 
 fn quote_ident(name: &str) -> String {
