@@ -625,7 +625,23 @@ fn test_delete_collects_rowids_first_only_when_foreign_keys_are_on(
     assert!(delete_uses_rowset(&conn, "parent", "u = 5"));
     assert!(!delete_uses_rowset(&conn, "parent", "id = 1"));
     assert!(!delete_uses_rowset(&conn, "parent", "id = ?"));
+    assert!(!delete_uses_rowset(&conn, "parent", "id = random()"));
+    assert!(!delete_uses_rowset(
+        &conn,
+        "parent",
+        "id = 1 + (random() & 1)"
+    ));
     assert!(!delete_uses_rowset(&conn, "plain_parent", "id > 5"));
+
+    conn.execute("INSERT INTO parent(id) VALUES (1), (2)")?;
+    conn.execute("INSERT INTO child(id, pid) VALUES (1, 1), (2, 2)")?;
+    conn.execute("DELETE FROM parent WHERE id = 1 + (random() & 1)")?;
+    let remaining = limbo_exec_rows(&conn, "SELECT id FROM parent");
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(limbo_exec_rows(&conn, "SELECT pid FROM child"), remaining);
+
+    conn.execute("CREATE TRIGGER parent_delete AFTER DELETE ON parent BEGIN SELECT 1; END")?;
+    assert!(delete_uses_rowset(&conn, "parent", "id = 1"));
     Ok(())
 }
 
