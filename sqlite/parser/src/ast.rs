@@ -2039,6 +2039,11 @@ pub enum PragmaName {
     FtsMergeThreshold,
     /// List all available types (built-in and custom)
     ListTypes,
+    /// When ON, Turso's internal bookkeeping tables (the `__turso_internal_`
+    /// prefix) stay visible to this connection's schema scans. OFF (the
+    /// default) hides them from sqlite_master/sqlite_schema and PRAGMA
+    /// table_list so table-enumeration idioms do not trip over them.
+    ShowInternalSchema,
     /// Deprecated no-op: control whether callback is invoked for empty result sets
     EmptyResultCallbacks,
     /// VDBE opcode trace output

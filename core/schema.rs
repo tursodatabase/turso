@@ -651,6 +651,30 @@ pub fn is_system_table(table_name: &str) -> bool {
         .any(|prefix| table_name.to_lowercase().starts_with(prefix))
 }
 
+/// True for the schema table under any of its spellings (`sqlite_schema` /
+/// `sqlite_master` and their temp variants).
+pub fn is_schema_table(table_name: &str) -> bool {
+    [
+        SCHEMA_TABLE_NAME,
+        SCHEMA_TABLE_NAME_ALT,
+        TEMP_SCHEMA_TABLE_NAME,
+        TEMP_SCHEMA_TABLE_NAME_ALT,
+    ]
+    .iter()
+    .any(|n| n.eq_ignore_ascii_case(table_name))
+}
+
+/// True for Turso's internal bookkeeping tables (sequence backing tables,
+/// materialized-view state, the custom-types table, …), which share the
+/// `__turso_internal_` prefix and should stay hidden from user-facing schema
+/// enumeration — the same way SQLite keeps its machinery behind the `sqlite_`
+/// prefix.
+pub fn is_turso_internal_table(table_name: &str) -> bool {
+    table_name
+        .get(..TURSO_INTERNAL_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(TURSO_INTERNAL_PREFIX))
+}
+
 /// Check if a table is one of the internal tables that store a materialized
 /// view's state, of any storage version.
 pub fn is_materialized_view_state_table(table_name: &str) -> bool {

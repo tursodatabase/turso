@@ -2507,7 +2507,49 @@ pub fn parse_from(
     }
 
     program.unmask_shadowed_ctes_being_defined(shadowed_outer_ctes);
+
+    // For ordinary statements, hide Turso's internal bookkeeping tables (the
+    // `__turso_internal_` prefix) from any scan of the schema table, so enumerating
+    // sqlite_master returns the same tables SQLite would. Engine-internal helpers
+    // (schema reparse, recovery) keep the flag off and still see every row.
+    if program.hide_internal_schema_rows() {
+        append_internal_schema_filters(out_where_clause, table_references);
+    }
+
     Ok(())
+}
+
+/// Add a synthetic `name NOT GLOB '__turso_internal_*'` term for every schema-table
+/// reference in `table_references`, so scans of sqlite_schema / sqlite_master skip
+/// Turso's internal tables. `name` is column 1 of the schema table. Running through a
+/// normal WHERE term means the filter composes with the user's own predicates, joins
+/// and subqueries without any special-casing in the loop emitter.
+fn append_internal_schema_filters(
+    out_where_clause: &mut Vec<WhereTerm>,
+    table_references: &TableReferences,
+) {
+    // Column 1 of `sqlite_schema (type, name, tbl_name, rootpage, sql)`.
+    const SCHEMA_NAME_COLUMN: usize = 1;
+    for joined in table_references.joined_tables() {
+        if !crate::schema::is_schema_table(joined.table.get_name()) {
+            continue;
+        }
+        let name_col = Expr::Column {
+            database: None,
+            table: joined.internal_id,
+            column: SCHEMA_NAME_COLUMN,
+            is_rowid_alias: false,
+        };
+        // The string literal must carry its single quotes: the emitter strips the
+        // first and last character (see sanitize_string). GLOB treats `_` literally,
+        // so the prefix matches exactly (unlike LIKE, where `_` is a wildcard).
+        let pattern = Expr::Literal(ast::Literal::String(format!(
+            "'{}*'",
+            crate::schema::TURSO_INTERNAL_PREFIX
+        )));
+        let term = Expr::like(name_col, true, ast::LikeOperator::Glob, pattern, None);
+        out_where_clause.push(WhereTerm::from(term));
+    }
 }
 
 /// Plans the CTEs that subqueries read and adds them as outer query references.

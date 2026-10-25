@@ -444,6 +444,10 @@ pub struct Connection {
     /// can skip the catalog locks while no such pager can exist.
     pub(super) has_non_main_pagers: AtomicBool,
     pub(super) query_only: AtomicBool,
+    /// When true, this connection's schema scans keep the internal
+    /// `__turso_internal_*` bookkeeping tables visible (PRAGMA
+    /// show_internal_schema). Default false: they are hidden.
+    pub(super) show_internal_schema: AtomicBool,
     pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
@@ -1469,7 +1473,9 @@ impl Connection {
             Ok::<_, crate::alloc::TryReserveError>(())
         })??;
 
-        let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
+        // Internal helper: must see every schema row, including Turso's internal
+        // bookkeeping tables that user queries now hide.
+        let stmt = self.prepare_internal("SELECT * FROM sqlite_schema")?;
 
         // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
         let mv_tx = if self.is_mvcc_bootstrap_connection() {
@@ -2909,9 +2915,9 @@ impl Connection {
         // would deadlock against the schema write lock.
         let mut rows_data: Vec<(String, String, String, i64, Option<String>)> = Vec::new();
         {
-            let mut rows = self
-                .query("SELECT * FROM sqlite_schema")?
-                .expect("query must be parsed to statement");
+            // Internal helper: must see every schema row, including Turso's internal
+            // bookkeeping tables that user queries now hide.
+            let mut rows = self.prepare_internal("SELECT * FROM sqlite_schema")?;
             rows.run_with_row_callback(|row| {
                 let ty = row.get::<&str>(0)?.to_string();
                 let name = row.get::<&str>(1)?.to_string();
@@ -3591,6 +3597,17 @@ impl Connection {
 
     pub fn set_query_only(&self, value: bool) {
         self.query_only.store(value, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn get_show_internal_schema(&self) -> bool {
+        self.show_internal_schema.load(Ordering::SeqCst)
+    }
+
+    pub fn set_show_internal_schema(&self, value: bool) {
+        self.show_internal_schema.store(value, Ordering::SeqCst);
+        // The flag changes how schema scans are translated, so already-cached
+        // statements must be re-prepared.
         self.bump_prepare_context_generation();
     }
 

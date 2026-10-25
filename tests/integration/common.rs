@@ -463,6 +463,40 @@ pub fn limbo_exec_rows(
     rows
 }
 
+/// Like `limbo_exec_rows`, but runs the query with internal-statement origin so it can
+/// see Turso's internal bookkeeping tables (the `__turso_internal_` prefix), which
+/// ordinary user queries now hide from schema scans. For white-box tests that inspect
+/// those tables directly.
+#[allow(dead_code)]
+pub fn limbo_exec_rows_internal(
+    conn: &Arc<turso_core::Connection>,
+    query: &str,
+) -> Vec<Vec<rusqlite::types::Value>> {
+    let mut stmt = conn.prepare_internal(query).unwrap();
+    let mut rows = Vec::new();
+
+    stmt.run_with_row_callback(|row| {
+        let row = row
+            .get_values()
+            .map(|x| match x {
+                turso_core::Value::Null => rusqlite::types::Value::Null,
+                turso_core::Value::Numeric(turso_core::Numeric::Integer(x)) => {
+                    rusqlite::types::Value::Integer(*x)
+                }
+                turso_core::Value::Numeric(turso_core::Numeric::Float(x)) => {
+                    rusqlite::types::Value::Real(f64::from(*x))
+                }
+                turso_core::Value::Text(x) => rusqlite::types::Value::Text(x.as_str().to_string()),
+                turso_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.to_vec()),
+            })
+            .collect();
+        rows.push(row);
+        Ok(())
+    })
+    .unwrap();
+    rows
+}
+
 /// Like `limbo_exec_rows`, but returns a Result instead of panicking on errors.
 /// Useful for fuzz tests that may generate invalid SQL.
 #[allow(dead_code)]

@@ -535,6 +535,29 @@ fn create_table_schema_from_search_path(
     Ok(Some((location, schema)))
 }
 
+/// Keeps the connection's internal `__turso_internal_*` bookkeeping tables
+/// visible to schema scans (PRAGMA show_internal_schema) for as long as it
+/// lives, then restores the previous setting. The Postgres layer needs them
+/// visible to find sequence backing tables while the ordinary scans hide them.
+struct InternalSchemaVisible<'a> {
+    conn: &'a Arc<Connection>,
+    previous: bool,
+}
+
+impl<'a> InternalSchemaVisible<'a> {
+    fn new(conn: &'a Arc<Connection>) -> Self {
+        let previous = conn.get_show_internal_schema();
+        conn.set_show_internal_schema(true);
+        Self { conn, previous }
+    }
+}
+
+impl Drop for InternalSchemaVisible<'_> {
+    fn drop(&mut self) {
+        self.conn.set_show_internal_schema(self.previous);
+    }
+}
+
 /// Whether the schema of table `table` already has a table, index, view or
 /// sequence named `name`, which makes PostgreSQL choose another name for a
 /// new index on the table. A table named with a schema is in that schema.
@@ -547,6 +570,9 @@ fn relation_name_is_taken(
     name: &str,
 ) -> Result<bool> {
     let namespaces = relation_lookup_namespaces(conn, schema);
+    // A chosen name also collides with the `__turso_internal_seq_*` backing
+    // table of a sequence, which is hidden from ordinary schema scans.
+    let _internal = InternalSchemaVisible::new(conn);
     let mut taken = false;
     for namespace in namespaces {
         let database = database_of(conn, &namespace);

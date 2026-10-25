@@ -9672,11 +9672,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     else {
                         unreachable!("state is ReadCookie");
                     };
-                    let stmt = connection
-                        .query(
-                            "SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema",
-                        )?
-                        .map(Box::new);
+                    // Internal helper: recovery must see every schema row, including
+                    // Turso's internal bookkeeping tables that user queries now hide.
+                    let stmt = Some(Box::new(connection.prepare_internal(
+                        "SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema",
+                    )?));
                     *st = RecoverLogicalLogState::QuerySchema {
                         reader,
                         preserved_tvfs,
