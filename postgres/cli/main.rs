@@ -43,8 +43,8 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use turso_core::{DatabaseOpts, OpenFlags, Value};
-use turso_pg::{Connection, Error, Statement};
+use turso_core::{DatabaseOpts, Numeric, OpenFlags, Value};
+use turso_pg::{format_float8, Connection, Error, Statement};
 use turso_pg_server::TursoPgServer;
 
 // ---------------------------------------------------------------------------
@@ -758,7 +758,7 @@ fn print_result_set(
         for (idx, value) in row.get_values().enumerate() {
             let (content, alignment) = match value {
                 Value::Null => ("NULL".to_string(), CellAlignment::Left),
-                Value::Numeric(_) => (format!("{value}"), CellAlignment::Right),
+                Value::Numeric(_) => (format_value(value), CellAlignment::Right),
                 Value::Text(_) => (format!("{value}"), CellAlignment::Left),
                 Value::Blob(_) => (format!("{value}"), CellAlignment::Left),
             };
@@ -801,7 +801,7 @@ fn print_result_set_expanded(stmt: &mut Statement, w: &mut dyn Write) -> Result<
             let col = &column_names[idx];
             let val_str = match value {
                 Value::Null => "NULL".to_string(),
-                _ => format!("{value}"),
+                _ => format_value(value),
             };
             writeln!(w, "{col:<max_col_width$} | {val_str}")
                 .map_err(|e| turso_core::io_error(e, "write"))?;
@@ -809,6 +809,15 @@ fn print_result_set_expanded(stmt: &mut Statement, w: &mut dyn Write) -> Result<
         Ok(())
     })?;
     Ok(())
+}
+
+/// Renders a value the way PostgreSQL prints it, so floats show as `1` and
+/// `1e+20` rather than SQLite's `1.0` and `1.0e+20`.
+fn format_value(value: &Value) -> String {
+    match value {
+        Value::Numeric(Numeric::Float(f)) => format_float8(f64::from(*f)),
+        _ => value.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------

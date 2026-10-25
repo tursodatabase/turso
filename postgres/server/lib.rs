@@ -10,7 +10,7 @@ use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::Value;
-use turso_pg::{split_statements, Connection, PgConnection};
+use turso_pg::{format_float8, split_statements, Connection, PgConnection};
 
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format, Portal};
@@ -429,11 +429,11 @@ fn execute_query(
     stmt.run_with_row_callback(|row| {
         let mut encoder = DataRowEncoder::new(header_clone.clone());
         for (i, val) in row.get_values().enumerate() {
-            let pg_type = header_clone
+            let (pg_type, format) = header_clone
                 .get(i)
-                .map(|fi| fi.datatype().clone())
-                .unwrap_or(Type::TEXT);
-            encode_value(&mut encoder, val, &pg_type)?;
+                .map(|fi| (fi.datatype().clone(), fi.format()))
+                .unwrap_or((Type::TEXT, FieldFormat::Text));
+            encode_value(&mut encoder, val, &pg_type, format)?;
         }
         rows.push(encoder.finish());
         Ok(())
@@ -575,6 +575,7 @@ fn encode_value(
     encoder: &mut DataRowEncoder,
     val: &Value,
     pg_type: &Type,
+    format: FieldFormat,
 ) -> turso_core::Result<()> {
     match val {
         Value::Null => encoder
@@ -591,6 +592,21 @@ fn encode_value(
                     .encode_field(i)
                     .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
             }
+        }
+        // NUMERIC values are stored as floats too, but PostgreSQL prints them
+        // with their scale (`1.0::numeric` is `1.0`), so only float columns
+        // use the float8 text format.
+        Value::Numeric(turso_core::Numeric::Float(f))
+            if format == FieldFormat::Text && *pg_type != Type::NUMERIC =>
+        {
+            encoder
+                .encode_field_with_type_and_format(
+                    &format_float8(f64::from(*f)).as_str(),
+                    &Type::TEXT,
+                    FieldFormat::Text,
+                    &FormatOptions::default(),
+                )
+                .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
         }
         Value::Numeric(turso_core::Numeric::Float(f)) => encoder
             .encode_field(&f64::from(*f))

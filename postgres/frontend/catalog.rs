@@ -185,6 +185,10 @@ impl Dialect for PostgresDialect {
     fn errors_on_zero_divisor(&self) -> bool {
         true
     }
+
+    fn format_float(&self, value: f64) -> String {
+        crate::float::format_float8(value)
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {

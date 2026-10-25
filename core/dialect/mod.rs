@@ -205,6 +205,14 @@ pub trait Dialect: Send + Sync + 'static {
     fn errors_on_zero_divisor(&self) -> bool {
         false
     }
+
+    /// The text a floating-point value becomes when cast to TEXT.
+    ///
+    /// SQLite always writes a fraction (`1.0`, `1.0e+20`). PostgreSQL writes
+    /// the shortest form that reads back as the same value (`1`, `1e+20`).
+    fn format_float(&self, value: f64) -> String {
+        crate::numeric::format_float(value)
+    }
 }
 
 #[cfg(test)]

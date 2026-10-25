@@ -1,0 +1,76 @@
+# float8 text output through the PostgreSQL frontend.
+#
+# PostgreSQL prints the shortest digits that read back as the same value:
+# no trailing ".0" on whole numbers, a signed two-digit exponent outside the
+# 1e-4 .. 1e15 range, and a sign on negative zero.
+
+@database :memory:
+
+test float8-whole-number-has-no-fraction {
+    SELECT 1::float8;
+    SELECT 3::double precision;
+    SELECT -42::float8;
+}
+expect {
+    1
+    3
+    -42
+}
+
+test float8-fraction-uses-shortest-digits {
+    SELECT 2.5::float8;
+    SELECT 0.1::float8 + 0.2::float8;
+}
+expect {
+    2.5
+    0.30000000000000004
+}
+
+test float8-plain-notation-range {
+    SELECT 0.0001::float8, 1e14::float8;
+}
+expect {
+    0.0001|100000000000000
+}
+
+test float8-exponent-has-sign-and-two-digits {
+    SELECT 1e20::float8;
+    SELECT 1e15::float8;
+    SELECT 0.00001::float8;
+}
+expect {
+    1e+20
+    1e+15
+    1e-05
+}
+
+test float8-negative-zero-keeps-sign {
+    SELECT '-0'::float8;
+    SELECT ('-0'::float8)::text;
+}
+expect {
+    -0
+    -0
+}
+
+test float8-cast-to-text {
+    SELECT 1::float8::text;
+    SELECT 2.5::float8::text;
+    SELECT 1e20::float8::text;
+}
+expect {
+    1
+    2.5
+    1e+20
+}
+
+test float8-column-values {
+    CREATE TABLE float8_values(x float8);
+    INSERT INTO float8_values VALUES (1), (2.5), (1e20);
+    SELECT x FROM float8_values ORDER BY x;
+}
+expect {
+    1
+    2.5
+    1e+20
+}
