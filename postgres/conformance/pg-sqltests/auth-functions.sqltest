@@ -205,6 +205,33 @@ expect error {
 }
 
 @setup auth_functions
+test auth-uid-of-a-braced-uuid-without-its-closing-brace-errors {
+    SELECT set_config('request.jwt.claim.sub', '\{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    SELECT auth.uid();
+}
+expect error {
+    invalid input syntax for type uuid: ".a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+}
+
+@setup auth_functions
+test auth-uid-of-a-braced-uuid-with-text-after-the-closing-brace-errors {
+    SELECT set_config('request.jwt.claim.sub', '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}x', false);
+    SELECT auth.uid();
+}
+expect error {
+    invalid input syntax for type uuid: ".a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11.x"
+}
+
+@setup auth_functions
+test auth-uid-of-a-uuid-with-a-hyphen-after-two-digits-errors {
+    SELECT set_config('request.jwt.claim.sub', 'a0-eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    SELECT auth.uid();
+}
+expect error {
+    invalid input syntax for type uuid: "a0-eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+}
+
+@setup auth_functions
 test auth-uid-of-a-short-uuid-errors {
     SELECT set_config('request.jwt.claims', '{"sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1"}', false);
     SELECT auth.uid();
@@ -250,6 +277,20 @@ test auth-functions-of-claims-that-are-not-an-object-return-null {
 expect {
     [1, 2]
     <null>|<null>|[1, 2]
+}
+
+@setup auth_functions
+test auth-functions-of-claims-that-are-a-scalar-return-null {
+    SELECT set_config('request.jwt.claims', '"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"', false);
+    SELECT coalesce(auth.uid()::text, '<null>'), coalesce(auth.email(), '<null>'), auth.jwt();
+    SELECT set_config('request.jwt.claims', 'null', false);
+    SELECT coalesce(auth.uid()::text, '<null>'), coalesce(auth.email(), '<null>'), auth.jwt();
+}
+expect {
+    "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+    <null>|<null>|"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+    null
+    <null>|<null>|null
 }
 
 @setup auth_functions
@@ -334,6 +375,16 @@ expect error {
 }
 
 @setup auth_functions
+test auth-jwt-of-request-jwt-claim-that-is-not-json-errors {
+    SELECT set_config('request.jwt.claims', '{"role": "authenticated"}', false);
+    SELECT set_config('request.jwt.claim', 'not json', false);
+    SELECT auth.jwt();
+}
+expect error {
+    invalid input syntax for type json
+}
+
+@setup auth_functions
 test auth-email-of-claims-in-json5-errors {
     SELECT set_config('request.jwt.claims', '{''email'': "user@example.com"}', false);
     SELECT auth.email();
@@ -354,6 +405,24 @@ expect error {
 @setup auth_functions
 test auth-email-of-claims-with-a-nul-escape-errors {
     SELECT set_config('request.jwt.claims', '{"role": "a\u0000b", "email": "user@example.com"}', false);
+    SELECT auth.email();
+}
+expect error {
+    unsupported Unicode escape sequence
+}
+
+@setup auth_functions
+test auth-email-of-claims-with-a-nul-escape-in-a-member-name-errors {
+    SELECT set_config('request.jwt.claims', '{"a\u0000": 1, "email": "user@example.com"}', false);
+    SELECT auth.email();
+}
+expect error {
+    unsupported Unicode escape sequence
+}
+
+@setup auth_functions
+test auth-email-of-claims-with-a-nul-escape-in-an-array-errors {
+    SELECT set_config('request.jwt.claims', '{"amr": ["a\u0000"], "email": "user@example.com"}', false);
     SELECT auth.email();
 }
 expect error {
@@ -424,6 +493,21 @@ test auth-uid-finds-the-rows-of-the-user {
 }
 expect {
     A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11
+    mine
+    mine
+}
+
+@setup auth_functions
+test auth-uid-finds-the-rows-of-the-user-through-an-index {
+    CREATE TABLE todos (id int, user_id uuid, task text);
+    CREATE INDEX todos_user_id ON todos (user_id);
+    INSERT INTO todos VALUES (1, '{A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11}', 'mine'), (2, '11111111-1111-1111-1111-111111111111', 'theirs');
+    SELECT set_config('request.jwt.claims', '{"sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}', false);
+    SELECT task FROM todos WHERE user_id = auth.uid();
+    SELECT task FROM todos WHERE auth.uid() = user_id;
+}
+expect {
+    {"sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}
     mine
     mine
 }
