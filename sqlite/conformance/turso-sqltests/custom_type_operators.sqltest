@@ -808,3 +808,24 @@ expect {
     1
     3
 }
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test op-index-seek-encodes-key-of-type-with-parameters {
+    CREATE TYPE scaled(value integer, mult integer) BASE integer
+        ENCODE value * mult
+        DECODE value / mult
+        OPERATOR '<';
+    CREATE TABLE a(x scaled(100)) STRICT;
+    CREATE TABLE b(x scaled(100)) STRICT;
+    CREATE INDEX b_x ON b(x);
+    INSERT INTO a VALUES (5);
+    INSERT INTO b VALUES (5);
+    SELECT (SELECT count(*) FROM a WHERE x = 5),
+           (SELECT count(*) FROM b WHERE x = 5),
+           (SELECT count(*) FROM a JOIN b ON a.x = b.x),
+           (SELECT count(*) FROM b WHERE x = '5');
+}
+expect {
+    1|1|1|1
+}

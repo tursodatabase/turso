@@ -117,10 +117,82 @@ pub(super) fn emit_custom_type_operator(
     Ok(result_reg)
 }
 
+/// Wraps one side of each comparison between two different custom types in a
+/// CAST to the type the dialect compares them as (see
+/// `Dialect::comparison_type`). This runs before the optimizer, so an index
+/// seek uses the converted value.
+pub(super) fn cast_compared_custom_types(
+    expr: &mut ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<()> {
+    walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
+        let ast::Expr::Binary(lhs, op, rhs) = expr else {
+            return Ok(WalkControl::Continue);
+        };
+        if !op.is_comparison() {
+            return Ok(WalkControl::Continue);
+        }
+        let (Some(lhs_type), Some(rhs_type)) = (
+            custom_type_name_of(lhs, referenced_tables, resolver),
+            custom_type_name_of(rhs, referenced_tables, resolver),
+        ) else {
+            return Ok(WalkControl::Continue);
+        };
+        if lhs_type == rhs_type {
+            return Ok(WalkControl::Continue);
+        }
+        let Some(common_type) = resolver.dialect.comparison_type(&lhs_type, &rhs_type) else {
+            return Ok(WalkControl::Continue);
+        };
+        for (side, side_type) in [(lhs, lhs_type), (rhs, rhs_type)] {
+            if side_type != common_type {
+                let value =
+                    std::mem::replace(side.as_mut(), ast::Expr::Literal(ast::Literal::Null));
+                **side = ast::Expr::Cast {
+                    expr: Box::new(value),
+                    type_name: Some(ast::Type {
+                        name: common_type.to_string(),
+                        size: None,
+                        array_dimensions: 0,
+                    }),
+                };
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+/// The lowercase custom type name of a column of a custom type or of a CAST
+/// to a custom type.
+fn custom_type_name_of(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Option<String> {
+    match expr {
+        ast::Expr::Column { .. } => {
+            let info = expr_custom_type_info(expr, referenced_tables, resolver)?;
+            (!info.column.is_array()).then_some(info.type_name)
+        }
+        ast::Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } if type_name.array_dimensions == 0 => {
+            let name = crate::util::dequote(&type_name.name).to_lowercase();
+            resolver.schema().get_type_def_unchecked(&name)?;
+            Some(name)
+        }
+        _ => None,
+    }
+}
+
 /// Info about a column with a custom type, extracted from an expression.
 pub(super) struct ExprCustomTypeInfo {
     type_name: String,
     column: Column,
+    is_strict: bool,
     type_def: Arc<TypeDef>,
 }
 
@@ -136,24 +208,36 @@ pub(super) fn expr_custom_type_info(
         ..
     } = expr
     {
-        let (col, is_strict) = match referenced_tables
+        return match referenced_tables
             .and_then(|tables| tables.find_table_by_internal_id(*table_ref_id))
         {
-            Some((_, table)) => (table.get_column_at(*column)?.clone(), table.is_strict()),
+            Some((_, table)) => custom_type_info_of_column(
+                table.get_column_at(*column)?,
+                table.is_strict(),
+                resolver,
+            ),
             None if table_ref_id.is_self_table() => {
                 let table = resolver.self_table_with_custom_type_operators()?;
-                (table.columns().get(*column)?.clone(), table.is_strict)
+                custom_type_info_of_column(table.columns().get(*column)?, table.is_strict, resolver)
             }
-            None => return None,
+            None => None,
         };
-        let type_def = resolver.schema().get_type_def(&col.ty_str, is_strict)?;
-        return Some(ExprCustomTypeInfo {
-            type_name: col.ty_str.to_lowercase(),
-            type_def: Arc::clone(type_def),
-            column: col,
-        });
     }
     None
+}
+
+fn custom_type_info_of_column(
+    column: &Column,
+    is_strict: bool,
+    resolver: &Resolver,
+) -> Option<ExprCustomTypeInfo> {
+    let type_def = resolver.schema().get_type_def(&column.ty_str, is_strict)?;
+    Some(ExprCustomTypeInfo {
+        type_name: column.ty_str.to_lowercase(),
+        type_def: Arc::clone(type_def),
+        column: column.clone(),
+        is_strict,
+    })
 }
 
 /// Get the effective type name of a literal expression.
@@ -217,11 +301,17 @@ pub(super) struct ResolvedOperator {
 /// 1. Both operands are columns of the same custom type, OR
 /// 2. One operand is a custom type column and the other is a literal whose type
 ///    is compatible with the custom type's `value` input type, OR
-/// 3. The operator is arithmetic, the type reads stored values back unchanged,
-///    one operand is a column of that type and the other is anything except a
-///    column of a different custom type. This lets `date + 1`, `date + int_col`
+/// 3. The operator is arithmetic, the type reads stored values back unchanged
+///    (or the dialect applies custom type arithmetic to any operand that is not
+///    a floating-point column or cast), one operand is a column of that type
+///    and the other is anything except a column of a different custom type. This lets `date + 1`, `date + int_col`
 ///    and `date + ?` add days, while a comparison such as `int_col = '10'` still
 ///    uses the standard operator.
+/// 4. The operator is arithmetic and the operands are columns of two different
+///    types that both read stored values back unchanged (or the dialect applies
+///    custom type arithmetic to any operand) and both declare a function for the
+///    operator. The left type's function is used. This lets
+///    `timestamptz_col - date_col` subtract.
 ///
 /// When case 2 applies, the literal is encoded before being passed to the operator
 /// function so both arguments are in the same (encoded) representation. In case 3
@@ -282,18 +372,45 @@ pub(super) fn find_custom_type_operator(
                     encode_info: None,
                 });
             }
+            return None;
         }
-        // Different custom types: fall through to standard operator.
-        return None;
+        // Case 4: Different custom types with an arithmetic operator.
+        let both_decode_unchanged = lhs.type_def.decode_returns_value_unchanged()
+            && rhs.type_def.decode_returns_value_unchanged();
+        let applies_to_any_operand = both_decode_unchanged
+            || resolver
+                .dialect
+                .applies_custom_type_arithmetic_to_any_operand();
+        if op.is_comparison() || !applies_to_any_operand {
+            return None;
+        }
+        arithmetic_function(&rhs.type_def, op_str)?;
+        let func_name = arithmetic_function(&lhs.type_def, op_str)?;
+        return Some(ResolvedOperator {
+            func_name,
+            swap_args: false,
+            negate: false,
+            encode_info: None,
+        });
     }
 
     let resolve_one_custom_operand =
         |info: &ExprCustomTypeInfo, other: &ast::Expr, which: EncodeArg| {
-            let encode_other = literal_type_name(other).is_some_and(|lit_type| {
-                literal_compatible_with_value_type(lit_type, info.type_def.value_input_type())
-            });
-            let pass_other_unencoded =
-                !op.is_comparison() && info.type_def.decode_returns_value_unchanged();
+            let applies_to_any_operand = !op.is_comparison()
+                && resolver
+                    .dialect
+                    .applies_custom_type_arithmetic_to_any_operand();
+            let other_is_literal = literal_type_name(other).is_some();
+            let encode_other = !applies_to_any_operand
+                && literal_type_name(other).is_some_and(|lit_type| {
+                    literal_compatible_with_value_type(lit_type, info.type_def.value_input_type())
+                });
+            let pass_other_unencoded = !op.is_comparison()
+                && (info.type_def.decode_returns_value_unchanged()
+                    || (applies_to_any_operand
+                        && (other_is_literal
+                            || get_expr_affinity(other, referenced_tables, Some(resolver))
+                                != Affinity::Real)));
             if !encode_other && !pass_other_unencoded {
                 return None;
             }
@@ -315,6 +432,437 @@ pub(super) fn find_custom_type_operator(
         (None, Some(rhs)) => resolve_one_custom_operand(rhs, e1, EncodeArg::First),
         _ => None,
     }
+}
+
+fn arithmetic_function(type_def: &TypeDef, op_str: &str) -> Option<String> {
+    type_def
+        .operators()
+        .iter()
+        .find(|o| o.op == op_str)
+        .and_then(|o| o.func_name.clone())
+}
+
+/// Converts a value that has no custom type of its own (a quoted literal, a
+/// bound parameter, a subquery result, ...) and is compared with an expression
+/// of a custom type (a column, or a CAST to the type) to that type, the same
+/// way storing it would. A column is decoded when it is read, so the
+/// value is encoded and then decoded; a CAST gives the stored form, so the
+/// value is only encoded. Returns the register that holds the value to compare.
+pub(super) fn emit_comparison_value_as_column_type(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    value_expr: &ast::Expr,
+    value_reg: usize,
+    typed_expr: &ast::Expr,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let Some(typed) = comparison_type_of(typed_expr, referenced_tables, resolver)? else {
+        return Ok(value_reg);
+    };
+    let converted = emit_untyped_value_as_type(
+        program,
+        referenced_tables,
+        value_expr,
+        value_reg,
+        &typed.column,
+        &typed.chain,
+        typed.form,
+        resolver,
+    )?;
+    Ok(converted.unwrap_or(value_reg))
+}
+
+/// Wraps the values that `lhs IN (SELECT ...)` compares `lhs` with in a CAST
+/// to the type of `lhs`, so they are converted the way a single value compared
+/// with `lhs` is (see [emit_untyped_value_as_type]). Values that have a custom
+/// type of their own are left as they are. A domain is cast to its base type,
+/// which converts the value without checking the domain's constraints.
+pub(crate) fn cast_in_subquery_values_to_lhs_type(
+    plan: &mut crate::translate::plan::Plan,
+    lhs: &ast::Expr,
+    referenced_tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<()> {
+    let Some(typed) = comparison_type_of(unwrap_parens(lhs)?, Some(referenced_tables), resolver)?
+    else {
+        return Ok(());
+    };
+    if !converts_compared_values(&typed.chain, resolver) {
+        return Ok(());
+    }
+    let Some(cast_type) = cast_type_for(&typed) else {
+        return Ok(());
+    };
+    for select_plan in plan.select_plans_mut() {
+        if let Some(result_column) = select_plan.result_columns.first_mut() {
+            if !value_has_custom_type(
+                &result_column.expr,
+                Some(&select_plan.table_references),
+                resolver,
+            )? {
+                wrap_in_cast(&mut result_column.expr, &cast_type);
+            }
+        }
+        for row in select_plan.values.iter_mut() {
+            if let Some(value) = row.first_mut() {
+                if !value_has_custom_type(value, None, resolver)? {
+                    wrap_in_cast(value, &cast_type);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// In a compound SELECT, wraps each quoted string in a result column in a CAST
+/// to the custom type of the same column in another arm, in dialects that
+/// convert values compared with custom types. PostgreSQL gives
+/// `SELECT ts FROM t UNION SELECT '2026-10-08 12:00'` the type of `ts`, so
+/// UNION compares the two rows as values of that type.
+pub(crate) fn cast_compound_string_literals_to_column_types(
+    arms: &mut [&mut crate::translate::plan::SelectPlan],
+    resolver: &Resolver,
+) -> Result<()> {
+    if !resolver
+        .dialect
+        .converts_strings_compared_with_custom_types()
+    {
+        return Ok(());
+    }
+    let num_columns = arms.first().map_or(0, |arm| arm.result_columns.len());
+    for column in 0..num_columns {
+        let Some(cast_type) = compound_column_cast_type(arms, column, resolver)? else {
+            continue;
+        };
+        for arm in arms.iter_mut() {
+            let values = arm.values.iter_mut().filter_map(|row| row.get_mut(column));
+            let result_column = arm
+                .result_columns
+                .get_mut(column)
+                .map(|result_column| &mut result_column.expr);
+            for expr in values.chain(result_column) {
+                if matches!(expr, ast::Expr::Literal(ast::Literal::String(_))) {
+                    wrap_in_cast(expr, &cast_type);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compound_column_cast_type(
+    arms: &[&mut crate::translate::plan::SelectPlan],
+    column: usize,
+    resolver: &Resolver,
+) -> Result<Option<ast::Type>> {
+    for arm in arms {
+        let Some(result_column) = arm.result_columns.get(column) else {
+            continue;
+        };
+        if let Some(typed) =
+            comparison_type_of(&result_column.expr, Some(&arm.table_references), resolver)?
+        {
+            if !converts_compared_values(&typed.chain, resolver) {
+                return Ok(None);
+            }
+            return Ok(cast_type_for(&typed));
+        }
+    }
+    Ok(None)
+}
+
+fn cast_type_for(typed: &ComparisonType) -> Option<ast::Type> {
+    let base_type = typed.chain.iter().find(|td| !td.is_domain)?;
+    let params: &[Box<ast::Expr>] = if typed.chain.first()?.is_domain {
+        if base_type.user_params().next().is_some() {
+            return None;
+        }
+        &[]
+    } else {
+        &typed.column.ty_params
+    };
+    let size = match params {
+        [] => None,
+        [max] => Some(ast::TypeSize::MaxSize(max.clone())),
+        [first, second] => Some(ast::TypeSize::TypeSize(first.clone(), second.clone())),
+        _ => return None,
+    };
+    Some(ast::Type {
+        name: base_type.name.clone(),
+        size,
+        array_dimensions: 0,
+    })
+}
+
+fn wrap_in_cast(expr: &mut ast::Expr, cast_type: &ast::Type) {
+    let value = std::mem::take(expr);
+    *expr = ast::Expr::Cast {
+        expr: Box::new(value),
+        type_name: Some(cast_type.clone()),
+    };
+}
+
+struct ComparisonType {
+    column: Column,
+    chain: crate::alloc::Vec<Arc<TypeDef>>,
+    form: ValueForm,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValueForm {
+    Stored,
+    Decoded,
+}
+
+fn comparison_type_of(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<Option<ComparisonType>> {
+    match expr {
+        ast::Expr::Column { table, column, .. } => {
+            if let Some(Table::FromClauseSubquery(subquery)) = referenced_tables
+                .and_then(|tables| tables.find_table_by_internal_id(*table))
+                .map(|(_, table)| table)
+            {
+                return subquery_column_comparison_type(&subquery.plan, *column, resolver);
+            }
+            let Some(info) = expr_custom_type_info(expr, referenced_tables, resolver) else {
+                return Ok(None);
+            };
+            if info.column.is_array() {
+                return Ok(None);
+            }
+            let Some(resolved) = resolver
+                .schema()
+                .resolve_type(&info.column.ty_str, info.is_strict)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(ComparisonType {
+                column: info.column,
+                chain: resolved.chain,
+                form: ValueForm::Decoded,
+            }))
+        }
+        ast::Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } if type_name.array_dimensions == 0 => {
+            let cast_type_name = crate::util::dequote(&type_name.name);
+            let Some(resolved) = resolver.schema().resolve_type_unchecked(&cast_type_name)? else {
+                return Ok(None);
+            };
+            let ty_params: Vec<Box<ast::Expr>> = match &type_name.size {
+                Some(ast::TypeSize::MaxSize(e)) => vec![e.clone()],
+                Some(ast::TypeSize::TypeSize(e1, e2)) => vec![e1.clone(), e2.clone()],
+                None => Vec::new(),
+            };
+            let user_param_count = resolved.leaf().user_params().count();
+            if !resolved.is_domain() && user_param_count != 0 && ty_params.len() != user_param_count
+            {
+                return Ok(None);
+            }
+            let mut column = Column::new(
+                None,
+                cast_type_name,
+                None,
+                None,
+                Type::Null,
+                None,
+                ColDef::default(),
+            );
+            if !resolved.is_domain() {
+                column.ty_params = ty_params;
+            }
+            let form = if resolver.dialect.cast_to_custom_type_decodes() {
+                ValueForm::Decoded
+            } else {
+                ValueForm::Stored
+            };
+            Ok(Some(ComparisonType {
+                column,
+                chain: resolved.chain,
+                form,
+            }))
+        }
+        ast::Expr::FunctionCall { name, args, .. }
+            if args.len() == 1
+                && (name.as_str().eq_ignore_ascii_case("min")
+                    || name.as_str().eq_ignore_ascii_case("max")) =>
+        {
+            comparison_type_of(&args[0], referenced_tables, resolver)
+        }
+        ast::Expr::FunctionCall { name, args, .. }
+            if !args.is_empty()
+                && (name.as_str().eq_ignore_ascii_case("coalesce")
+                    || name.as_str().eq_ignore_ascii_case("nullif")) =>
+        {
+            comparison_type_of(&args[0], referenced_tables, resolver)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The type of column `column` of a FROM-clause subquery, view or CTE: the
+/// type of that result column in the first SELECT of the subquery that has
+/// one.
+fn subquery_column_comparison_type(
+    plan: &crate::translate::plan::Plan,
+    column: usize,
+    resolver: &Resolver,
+) -> Result<Option<ComparisonType>> {
+    use crate::translate::plan::{Plan, SelectPlan};
+    let selects: Vec<&SelectPlan> = match plan {
+        Plan::Select(select) => vec![select],
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => left
+            .iter()
+            .map(|(select, _)| select)
+            .chain(std::iter::once(right_most.as_ref()))
+            .collect(),
+        _ => return Ok(None),
+    };
+    for select in selects {
+        let Some(result_column) = select.result_columns.get(column) else {
+            continue;
+        };
+        if let Some(typed) = comparison_type_of(
+            &result_column.expr,
+            Some(&select.table_references),
+            resolver,
+        )? {
+            return Ok(Some(typed));
+        }
+    }
+    Ok(None)
+}
+
+/// Converts `value_expr`, whose value is in `value_reg`, to the custom type
+/// described by `chain` when the value has no custom type of its own, the type
+/// compares its values with the standard comparison, and the dialect converts
+/// such values (PostgreSQL). Returns None when the value is left as it is.
+///
+/// A constant value is converted once per execution, before the first row is
+/// read, whenever the type's ENCODE and DECODE expressions allow it. An
+/// invalid literal then fails even when no row is read.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_untyped_value_as_type(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    value_expr: &ast::Expr,
+    value_reg: usize,
+    column: &Column,
+    chain: &[Arc<TypeDef>],
+    form: ValueForm,
+    resolver: &Resolver,
+) -> Result<Option<usize>> {
+    if !converts_compared_values(chain, resolver)
+        || value_has_custom_type(value_expr, referenced_tables, resolver)?
+    {
+        return Ok(None);
+    }
+    let decodes: Vec<&ast::Expr> = match form {
+        ValueForm::Stored => Vec::new(),
+        ValueForm::Decoded => chain.iter().rev().filter_map(|td| td.decode()).collect(),
+    };
+    let value_is_constant = value_expr.is_constant(resolver);
+    let same_for_every_row = value_is_constant
+        && chain
+            .iter()
+            .filter_map(|td| td.encode())
+            .chain(decodes.iter().copied())
+            .all(|expr| expr.is_constant(resolver));
+    let constant_span = (same_for_every_row && !program.constant_span_is_open())
+        .then(|| program.constant_span_start());
+
+    let converted_reg = program.alloc_register();
+    if value_is_constant {
+        translate_expr(program, None, value_expr, converted_reg, resolver)?;
+    } else {
+        program.emit_insn(Insn::Copy {
+            src_reg: value_reg,
+            dst_reg: converted_reg,
+            extra_amount: 0,
+        });
+    }
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg: converted_reg,
+        target_pc: skip_label,
+    });
+    for td in chain {
+        if let Some(encode_expr) = td.encode() {
+            emit_type_expr(
+                program,
+                encode_expr,
+                converted_reg,
+                converted_reg,
+                column,
+                td,
+                resolver,
+            )?;
+        }
+    }
+    if form == ValueForm::Decoded {
+        for td in chain.iter().rev() {
+            if let Some(decode_expr) = td.decode() {
+                emit_type_expr(
+                    program,
+                    decode_expr,
+                    converted_reg,
+                    converted_reg,
+                    column,
+                    td,
+                    resolver,
+                )?;
+            }
+        }
+    }
+    program.preassign_label_to_next_insn(skip_label);
+
+    if let Some(span) = constant_span {
+        program.constant_span_end(span);
+    }
+    Ok(Some(converted_reg))
+}
+
+/// Whether the dialect converts values compared with the custom type described
+/// by `chain` to that type: the type compares its values with the standard
+/// comparison, accepts text and has an ENCODE that the comparison does not skip.
+fn converts_compared_values(chain: &[Arc<TypeDef>], resolver: &Resolver) -> bool {
+    if !resolver
+        .dialect
+        .converts_strings_compared_with_custom_types()
+    {
+        return false;
+    }
+    let Some(leaf_type) = chain.first() else {
+        return false;
+    };
+    let comparing_type = chain
+        .iter()
+        .find(|td| !td.operators().is_empty())
+        .unwrap_or(leaf_type);
+    let compares_natively =
+        comparing_type.operators().is_empty() || comparing_type.compares_with_standard_operator();
+    let accepts_text =
+        literal_compatible_with_value_type("text", comparing_type.value_input_type());
+    let encode_is_skipped = chain
+        .iter()
+        .any(|td| td.encode().is_some() && td.encode_for_comparison_value().is_none());
+    let has_encode = chain.iter().any(|td| td.encode().is_some());
+    compares_natively && accepts_text && !encode_is_skipped && has_encode
+}
+
+fn value_has_custom_type(
+    value_expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<bool> {
+    let value_expr = unwrap_parens(value_expr)?;
+    Ok(comparison_type_of(value_expr, referenced_tables, resolver)?.is_some())
 }
 
 /// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).
@@ -459,6 +1007,12 @@ pub(super) fn emit_domain_cast_constraints(
         });
     }
 
+    let value_base_type = chain
+        .iter()
+        .find(|td| !td.is_domain)
+        .filter(|_| resolver.dialect.check_constraints_see_decoded_values())
+        .map(|td| td.name.clone());
+
     for td in chain {
         for (i, dc) in td.domain_checks.iter().enumerate() {
             let constraint_name = dc
@@ -471,8 +1025,12 @@ pub(super) fn emit_domain_cast_constraints(
                 .id_register_overrides
                 .insert("value".to_string(), reg);
 
+            let check = match &value_base_type {
+                Some(base_type) => cast_domain_value_to_base_type(&dc.check, base_type),
+                None => dc.check.clone(),
+            };
             let expr_result_reg = program.alloc_register();
-            translate_expr(program, None, &dc.check, expr_result_reg, resolver)?;
+            translate_expr(program, None, &check, expr_result_reg, resolver)?;
 
             program.id_register_overrides.remove("value");
 
@@ -507,6 +1065,33 @@ pub(super) fn emit_domain_cast_constraints(
     Ok(())
 }
 
+/// Returns `check` with each `value` replaced by `CAST(value AS base_type)`, so
+/// a literal compared with `value` is converted to the domain's base type.
+fn cast_domain_value_to_base_type(check: &ast::Expr, base_type: &str) -> Box<ast::Expr> {
+    let mut check = check.clone();
+    let _ = walk_expr_mut(
+        &mut check,
+        &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+            let ast::Expr::Id(name) = e else {
+                return Ok(WalkControl::Continue);
+            };
+            if !name.as_str().eq_ignore_ascii_case("value") {
+                return Ok(WalkControl::Continue);
+            }
+            *e = ast::Expr::Cast {
+                expr: Box::new(e.clone()),
+                type_name: Some(ast::Type {
+                    name: base_type.to_string(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            };
+            Ok(WalkControl::SkipChildren)
+        },
+    );
+    Box::new(check)
+}
+
 /// Emit bytecode for a custom type encode/decode expression.
 /// Sets up `value` to reference `value_reg`, and type parameter overrides
 /// from `column.ty_params` matched against `type_def.params`.
@@ -520,6 +1105,7 @@ pub(crate) fn emit_type_expr(
     type_def: &TypeDef,
     resolver: &Resolver,
 ) -> Result<usize> {
+    let outer_overrides = program.id_register_overrides.clone();
     // Set up value override
     program
         .id_register_overrides
@@ -558,7 +1144,7 @@ pub(crate) fn emit_type_expr(
     });
 
     // Always clean up overrides, even on error
-    program.id_register_overrides.clear();
+    program.id_register_overrides = outer_overrides;
 
     result
 }

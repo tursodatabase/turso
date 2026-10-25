@@ -677,14 +677,25 @@ fn translate_case_expr(
         )?;
         match base_reg {
             // CASE 1 WHEN 0 THEN 0 ELSE 1 becomes 1==0, Ne branch to next clause
-            Some(base_reg) => program.emit_insn(Insn::Ne {
-                lhs: base_reg,
-                rhs: expr_reg,
-                target_pc: next_case_label,
-                // A NULL result is considered untrue when evaluating WHEN terms.
-                flags: CmpInsFlags::default().jump_if_null(),
-                collation: program.curr_collation(),
-            }),
+            Some(base_reg) => {
+                let when_reg = emit_comparison_value_as_column_type(
+                    program,
+                    referenced_tables,
+                    when_expr,
+                    expr_reg,
+                    base.as_deref()
+                        .expect("CASE with a base register has a base expression"),
+                    resolver,
+                )?;
+                program.emit_insn(Insn::Ne {
+                    lhs: base_reg,
+                    rhs: when_reg,
+                    target_pc: next_case_label,
+                    // A NULL result is considered untrue when evaluating WHEN terms.
+                    flags: CmpInsFlags::default().jump_if_null(),
+                    collation: program.curr_collation(),
+                })
+            }
             // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
             None => program.emit_insn(Insn::IfNot {
                 reg: expr_reg,
@@ -800,8 +811,30 @@ fn translate_cast_expr(
                     }
                 }
 
-                // Validate domain constraints on the encoded value
+                if resolver.dialect.check_constraints_see_decoded_values() {
+                    emit_cast_decodes(
+                        program,
+                        &resolved.chain,
+                        target_register,
+                        &cast_col,
+                        resolver,
+                    )?;
+                    emit_domain_cast_constraints(
+                        program,
+                        &resolved.chain,
+                        target_register,
+                        resolver,
+                    )?;
+                    return Ok(target_register);
+                }
                 emit_domain_cast_constraints(program, &resolved.chain, target_register, resolver)?;
+                emit_cast_decodes(
+                    program,
+                    &resolved.chain,
+                    target_register,
+                    &cast_col,
+                    resolver,
+                )?;
                 return Ok(target_register);
             }
 
@@ -836,6 +869,13 @@ fn translate_cast_expr(
                         resolver,
                     )?;
                 }
+                emit_cast_decodes(
+                    program,
+                    &resolved.chain[..1],
+                    target_register,
+                    &cast_col,
+                    resolver,
+                )?;
                 return Ok(target_register);
             }
         }
@@ -850,6 +890,27 @@ fn translate_cast_expr(
         affinity: type_affinity,
     });
     Ok(target_register)
+}
+
+/// Turns the stored value a cast produced back into the value a column of
+/// the cast type shows, when the dialect wants that (see
+/// [crate::Dialect::cast_to_custom_type_decodes]).
+fn emit_cast_decodes(
+    program: &mut ProgramBuilder,
+    chain: &[Arc<TypeDef>],
+    reg: usize,
+    cast_col: &Column,
+    resolver: &Resolver,
+) -> Result<()> {
+    if !resolver.dialect.cast_to_custom_type_decodes() {
+        return Ok(());
+    }
+    for td in chain.iter().rev() {
+        if let Some(decode_expr) = td.decode() {
+            emit_type_expr(program, decode_expr, reg, reg, cast_col, td, resolver)?;
+        }
+    }
+    Ok(())
 }
 
 #[inline(never)]

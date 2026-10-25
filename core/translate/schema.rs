@@ -254,6 +254,13 @@ fn resolve_check_expr_type(
                     Ok(CheckExprType::Integer)
                 }
             }
+            Literal::String(_)
+                if resolver
+                    .dialect
+                    .converts_strings_compared_with_custom_types() =>
+            {
+                Ok(CheckExprType::Any)
+            }
             Literal::String(_) => Ok(CheckExprType::Text),
             Literal::Blob(_) => Ok(CheckExprType::Blob),
             Literal::Null => Ok(CheckExprType::Null),

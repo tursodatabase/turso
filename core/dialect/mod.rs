@@ -212,6 +212,60 @@ pub trait Dialect: Send + Sync + 'static {
     fn mod_of_integers_is_integer(&self) -> bool {
         false
     }
+
+    /// Whether a quoted string or a bound parameter compared with a value of
+    /// a custom type is first converted to that type, the way it would be
+    /// when stored.
+    ///
+    /// PostgreSQL converts it, so `date_col = '20261008'` matches and
+    /// `date_col < '2027'` is an invalid date. SQLite compares the string as
+    /// it is.
+    fn converts_strings_compared_with_custom_types(&self) -> bool {
+        false
+    }
+
+    /// Whether `CAST(x AS t)` to a custom type gives the value the way a
+    /// column of type `t` shows it (ENCODE then DECODE) instead of the
+    /// stored value (ENCODE only).
+    ///
+    /// PostgreSQL has no stored form: `CAST('A0EEBC99-...' AS uuid)` is the
+    /// uuid text in lowercase. With SQLite, `CAST(42 AS cents)` is the
+    /// stored value 4200.
+    fn cast_to_custom_type_decodes(&self) -> bool {
+        false
+    }
+
+    /// Whether a CHECK constraint sees the values of custom-type columns the
+    /// way a SELECT shows them (decoded) instead of the stored values.
+    ///
+    /// PostgreSQL has no stored form, so in `CHECK (ts = '2026-10-08 12:00')`
+    /// on a timestamptz column both sides are timestamptz values. With
+    /// SQLite, a CHECK on a uuid column sees the stored blob.
+    fn check_constraints_see_decoded_values(&self) -> bool {
+        false
+    }
+
+    /// Whether `+` or `-` between a column of a custom type and any other
+    /// value calls the type's operator function, even when the type's DECODE
+    /// changes the stored value.
+    ///
+    /// PostgreSQL picks the operator from the operand types, so
+    /// `timestamptz_col + interval_col` adds the interval. SQLite calls the
+    /// function only for types whose DECODE returns the stored value
+    /// unchanged and uses the standard `+` otherwise.
+    fn applies_custom_type_arithmetic_to_any_operand(&self) -> bool {
+        false
+    }
+
+    /// The custom type that both sides of a comparison are cast to when one
+    /// side has custom type `lhs_type` and the other has the different custom
+    /// type `rhs_type`. None compares the values as they are.
+    ///
+    /// PostgreSQL converts a `date` to `timestamp` before comparing it with a
+    /// `timestamp`. SQLite has no such conversions.
+    fn comparison_type(&self, _lhs_type: &str, _rhs_type: &str) -> Option<&'static str> {
+        None
+    }
 }
 
 #[cfg(test)]

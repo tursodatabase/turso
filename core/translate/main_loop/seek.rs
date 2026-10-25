@@ -18,12 +18,23 @@ fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
         .collect()
 }
 
-fn encode_seek_keys_for_custom_types(
+/// Converts seek keys on custom-type index columns to the form the index
+/// stores, so that a seek finds the same rows as a scan with the same filter.
+/// `key_exprs[i]` is the expression of key `i`, or None when the key does not
+/// come from an expression of its own (e.g. an `IN (subquery)` value).
+///
+/// When the dialect converts values compared with custom types, a key that
+/// has no custom type of its own is converted to the column's type, as the
+/// scan does. Any other key is compared by the scan with the decoded column
+/// value as it is, so it is used as it is when stored and decoded values look
+/// the same, and encoded otherwise (uuid, boolean), which maps a decoded value
+/// of the type back to its stored form. Other dialects encode every key.
+pub(super) fn encode_seek_keys_for_custom_types(
     program: &mut ProgramBuilder,
     tables: &TableReferences,
     seek_index: &Arc<Index>,
     start_reg: usize,
-    num_keys: usize,
+    key_exprs: &[Option<&Expr>],
     idx_col_offset: usize,
     resolver: &Resolver<'_>,
 ) -> crate::Result<()> {
@@ -35,7 +46,7 @@ fn encode_seek_keys_for_custom_types(
         None => return Ok(()),
     };
     let columns = table.columns();
-    for i in 0..num_keys {
+    for (i, key_expr) in key_exprs.iter().enumerate() {
         let idx_col_pos = idx_col_offset + i;
         if idx_col_pos >= seek_index.columns.len() {
             break;
@@ -51,17 +62,44 @@ fn encode_seek_keys_for_custom_types(
         else {
             continue;
         };
-        if resolved.chain.iter().all(|td| td.encode().is_none()) {
+        let reg = start_reg + i;
+        if let Some(key_expr) = key_expr {
+            if let Some(converted_reg) = crate::translate::expr::emit_untyped_value_as_type(
+                program,
+                Some(tables),
+                key_expr,
+                reg,
+                table_col,
+                &resolved.chain,
+                crate::translate::expr::ValueForm::Stored,
+                resolver,
+            )? {
+                program.emit_insn(Insn::Copy {
+                    src_reg: converted_reg,
+                    dst_reg: reg,
+                    extra_amount: 0,
+                });
+                continue;
+            }
+        }
+        let converts_compared_values = resolver
+            .dialect
+            .converts_strings_compared_with_custom_types();
+        if (converts_compared_values && resolved.reads_stored_values_unchanged())
+            || resolved
+                .chain
+                .iter()
+                .all(|td| seek_key_encode(td, converts_compared_values).is_none())
+        {
             continue;
         }
-        let reg = start_reg + i;
         let skip_label = program.allocate_label();
         program.emit_insn(Insn::IsNull {
             reg,
             target_pc: skip_label,
         });
         for td in &resolved.chain {
-            if let Some(encode_expr) = td.encode() {
+            if let Some(encode_expr) = seek_key_encode(td, converts_compared_values) {
                 crate::translate::expr::emit_type_expr(
                     program,
                     encode_expr,
@@ -76,6 +114,14 @@ fn encode_seek_keys_for_custom_types(
         program.preassign_label_to_next_insn(skip_label);
     }
     Ok(())
+}
+
+fn seek_key_encode(td: &crate::schema::TypeDef, converts_compared_values: bool) -> Option<&Expr> {
+    if converts_compared_values {
+        td.encode_for_comparison_value()
+    } else {
+        td.encode()
+    }
 }
 
 /// Seek-based loop setup.
@@ -212,12 +258,20 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         let null_matching_mask = NullMatchingMask::from(null_matching_bits);
 
         if let Some(idx) = self.seek_index {
+            let key_exprs: Vec<Option<&Expr>> = self
+                .seek_def
+                .iter(&self.seek_def.start)
+                .map(|key| match key {
+                    SeekKeyComponent::Expr(expr) => Some(expr),
+                    SeekKeyComponent::Null | SeekKeyComponent::None => None,
+                })
+                .collect();
             encode_seek_keys_for_custom_types(
                 self.program,
                 self.tables,
                 idx,
                 self.start_reg,
-                num_regs,
+                &key_exprs,
                 0,
                 &self.t_ctx.resolver,
             )?;
@@ -344,7 +398,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         self.tables,
                         idx,
                         last_reg,
-                        1,
+                        &[Some(expr)],
                         self.seek_def.prefix.len(),
                         &self.t_ctx.resolver,
                     )?;

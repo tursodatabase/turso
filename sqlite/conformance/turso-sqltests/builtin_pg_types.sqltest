@@ -429,3 +429,106 @@ test numeric-invalid-input {
 }
 expect error {
 }
+
+@requires strict "uses STRICT tables"
+test boolean-compare-with-text-literal-compares-text {
+    CREATE TABLE t1(b boolean) STRICT;
+    INSERT INTO t1 VALUES (1), (0);
+    SELECT
+        (SELECT count(*) FROM t1 WHERE b = 'true'),
+        (SELECT count(*) FROM t1 WHERE b = 1);
+}
+expect {
+    0|1
+}
+
+@requires strict "uses STRICT tables"
+test date-compare-with-invalid-literal-compares-text {
+    CREATE TABLE t1(d date) STRICT;
+    INSERT INTO t1 VALUES ('2026-10-08');
+    SELECT count(*) FROM t1 WHERE d = 'garbage';
+}
+expect {
+    0
+}
+
+@requires strict "uses STRICT tables"
+test timestamp-in-list-spellings-of-one-value-indexed {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    CREATE INDEX t_ts ON t(ts);
+    INSERT INTO t VALUES (1, '2026-10-09 12:00:00.5');
+    SELECT id FROM t WHERE ts IN ('2026-10-09 12:00:00.5', '2026-10-09T12:00:00.500');
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test date-and-timestamp-column-subtraction-uses-standard-operator {
+    CREATE TABLE t1(d date, ts timestamp) STRICT;
+    INSERT INTO t1 VALUES ('2026-10-08', '2026-10-08 12:00:00');
+    SELECT d - ts, ts - d FROM t1;
+}
+expect {
+    0|0
+}
+
+@requires strict "uses STRICT tables"
+test domain-over-date-compare-with-literal-compares-text {
+    CREATE DOMAIN recent AS date CHECK (value > '2000-01-01');
+    CREATE TABLE dm(id INTEGER PRIMARY KEY, r recent) STRICT;
+    INSERT INTO dm VALUES (1, '2026-01-05');
+    SELECT
+        (SELECT count(*) FROM dm WHERE r = '2026-01-05 00:00'),
+        (SELECT count(*) FROM dm WHERE r = '2026-01-05');
+}
+expect {
+    0|1
+}
+
+@requires strict "uses STRICT tables"
+test cast-to-date-compare-with-literal-compares-text {
+    SELECT
+        CAST('2026-01-05' AS date) = '2026-01-05 00:00',
+        CAST('2026-01-05' AS date) = '2026-01-05';
+}
+expect {
+    0|1
+}
+
+@requires strict "uses STRICT tables"
+test date-and-timestamptz-compare-with-text-prefix {
+    CREATE TABLE t1(d date, ts timestamptz) STRICT;
+    CREATE TABLE t2(d date, ts timestamptz) STRICT;
+    CREATE INDEX t2_d ON t2(d);
+    CREATE INDEX t2_ts ON t2(ts);
+    INSERT INTO t1 VALUES ('2026-10-08', '2026-10-08 12:00:00');
+    INSERT INTO t2 VALUES ('2026-10-08', '2026-10-08 12:00:00');
+    SELECT
+        (SELECT count(*) FROM t1 WHERE d < '2027'),
+        (SELECT count(*) FROM t2 WHERE d < '2027'),
+        (SELECT count(*) FROM t1 WHERE ts < '2026-11'),
+        (SELECT count(*) FROM t2 WHERE ts < '2026-11'),
+        (SELECT count(*) FROM t1 WHERE ts > 'abc'),
+        (SELECT count(*) FROM t2 WHERE ts > 'abc');
+}
+expect {
+    1|1|1|1|0|0
+}
+
+@requires strict "uses STRICT tables"
+test timestamp-in-list-compares-text-with-and-without-index {
+    CREATE TABLE t1(ts timestamp) STRICT;
+    CREATE TABLE t2(ts timestamp) STRICT;
+    CREATE INDEX t2_ts ON t2(ts);
+    INSERT INTO t1 VALUES ('2026-10-09 12:00:00.5');
+    INSERT INTO t2 VALUES ('2026-10-09 12:00:00.5');
+    SELECT
+        (SELECT count(*) FROM t1 WHERE ts IN ('2026-10-09T12:00:00.500')),
+        (SELECT count(*) FROM t2 WHERE ts IN ('2026-10-09T12:00:00.500')),
+        (SELECT count(*) FROM t1 WHERE ts IN (SELECT '2026-10-09T12:00:00.500')),
+        (SELECT count(*) FROM t2 WHERE ts IN (SELECT '2026-10-09T12:00:00.500'));
+}
+expect {
+    0|0|0|0
+}

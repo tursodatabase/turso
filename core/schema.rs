@@ -371,6 +371,28 @@ impl TypeDef {
         }
     }
 
+    /// True when the type declares `<` or `=` without a function, so values of
+    /// the type are compared with the standard comparison.
+    pub fn compares_with_standard_operator(&self) -> bool {
+        self.operators()
+            .iter()
+            .any(|o| (o.op == "<" || o.op == "=") && o.func_name.is_none())
+    }
+
+    /// The ENCODE expression to run on a value that a column of this type is
+    /// compared with. None for a type with parameters whose stored value reads
+    /// back unchanged, such as `varchar(3)`: its ENCODE only checks the
+    /// parameter, and `col = 'abcd'` must be false, not an error.
+    pub fn encode_for_comparison_value(&self) -> Option<&ast::Expr> {
+        if self.compares_with_standard_operator()
+            && self.user_params().next().is_some()
+            && self.decode_returns_value_unchanged()
+        {
+            return None;
+        }
+        self.encode()
+    }
+
     /// Returns the default expression (Custom types only).
     pub fn default_expr(&self) -> Option<&ast::Expr> {
         match &self.kind {
@@ -838,9 +860,6 @@ impl Default for Schema {
 }
 
 fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crate::Result<()> {
-    use turso_parser::ast::{Cmd, Stmt};
-    use turso_parser::parser::Parser;
-
     let type_sqls: &[&str] = &[
         #[cfg(feature = "uuid")]
         "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'",
@@ -872,6 +891,23 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
     ];
 
+    let aliases: &[(&str, &str)] = &[
+        ("bool", "boolean"),
+        ("int2", "smallint"),
+        ("int8", "bigint"),
+    ];
+    register_builtin_types(registry, type_sqls, aliases)
+}
+
+/// Adds a type for each CREATE TYPE statement in `type_sqls`, and each
+/// `(alias, target)` pair as another name for the target type.
+pub fn register_builtin_types(
+    registry: &mut HashMap<String, Arc<TypeDef>>,
+    type_sqls: &[&str],
+    aliases: &[(&str, &str)],
+) -> crate::Result<()> {
+    use turso_parser::ast::{Cmd, Stmt};
+    use turso_parser::parser::Parser;
     for sql in type_sqls {
         let mut parser = Parser::new(sql.as_bytes());
         let Ok(Some(Cmd::Stmt(Stmt::CreateType {
@@ -887,12 +923,6 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         registry.insert(type_name.to_lowercase(), Arc::new(type_def));
     }
 
-    // Register aliases
-    let aliases: &[(&str, &str)] = &[
-        ("bool", "boolean"),
-        ("int2", "smallint"),
-        ("int8", "bigint"),
-    ];
     for (alias, target) in aliases {
         if let Some(type_def) = registry.get(*target).cloned() {
             registry.insert(alias.to_string(), type_def);

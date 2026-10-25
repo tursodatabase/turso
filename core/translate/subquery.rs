@@ -979,6 +979,12 @@ fn get_subquery_parser<'a>(
                         _ => unreachable!("prepare_select_plan cannot return Delete/Update"),
                     }
                 }
+                crate::translate::expr::cast_in_subquery_values_to_lhs_type(
+                    &mut plan,
+                    lhs.as_ref(),
+                    referenced_tables,
+                    resolver,
+                )?;
                 let result_columns = plan.select_result_columns();
                 let table_references = plan.select_table_references();
                 // e.g. (x,y) IN (SELECT ...)

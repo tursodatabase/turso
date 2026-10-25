@@ -187,6 +187,32 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn converts_strings_compared_with_custom_types(&self) -> bool {
+        true
+    }
+
+    fn cast_to_custom_type_decodes(&self) -> bool {
+        true
+    }
+
+    fn check_constraints_see_decoded_values(&self) -> bool {
+        true
+    }
+
+    fn applies_custom_type_arithmetic_to_any_operand(&self) -> bool {
+        true
+    }
+
+    fn comparison_type(&self, lhs_type: &str, rhs_type: &str) -> Option<&'static str> {
+        match (lhs_type, rhs_type) {
+            ("date", "timestamp") | ("timestamp", "date") => Some("timestamp"),
+            ("date" | "timestamp", "timestamptz") | ("timestamptz", "date" | "timestamp") => {
+                Some("timestamptz")
+            }
+            _ => None,
+        }
+    }
+
     fn mod_of_integers_is_integer(&self) -> bool {
         true
     }

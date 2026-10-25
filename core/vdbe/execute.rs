@@ -641,7 +641,13 @@ fn check_divisor(
     let rhs_val = state.registers[rhs].get_value();
     if let Value::Text(t) = rhs_val {
         match Numeric::from_value_strict(rhs_val) {
-            None => return Err(LimboError::InvalidTextRepresentation(t.as_str().to_owned()).into()),
+            None => {
+                return Err(LimboError::InvalidTextRepresentation {
+                    type_name: "numeric",
+                    input: t.as_str().to_owned(),
+                }
+                .into())
+            }
             Some(n) if !n.to_bool() => return Err(LimboError::DivisionByZero.into()),
             _ => {}
         }

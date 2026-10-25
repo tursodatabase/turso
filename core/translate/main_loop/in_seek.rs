@@ -48,9 +48,10 @@ pub(super) fn emit_in_seek_start(
             src_reg: seek_reg,
             target_pc: next_value,
         });
-    } else {
+    } else if let Some(index) = index {
         let index_cursor_id =
             index_cursor_id.expect("an indexed IN search must have an index cursor");
+        encode_subquery_in_seek_key(program, table_references, resolver, index, source, seek_reg)?;
         program.emit_insn(Insn::SeekGE {
             cursor_id: index_cursor_id,
             start_reg: seek_reg,
@@ -145,6 +146,21 @@ pub(super) fn open_in_seek_source_cursor(
                     resolver,
                     NoConstantOptReason::InListEphemeral,
                 )?;
+                if let Some(index) = index.filter(|_| {
+                    resolver
+                        .dialect
+                        .converts_strings_compared_with_custom_types()
+                }) {
+                    encode_seek_keys_for_custom_types(
+                        program,
+                        table_references,
+                        index,
+                        val_reg,
+                        &[Some(value)],
+                        0,
+                        resolver,
+                    )?;
+                }
                 program.emit_insn(Insn::MakeRecord {
                     start_reg: to_u32(val_reg),
                     count: 1,
@@ -166,6 +182,38 @@ pub(super) fn open_in_seek_source_cursor(
             Ok(eph_cursor)
         }
         InSeekSource::Subquery { cursor_id } => Ok(*cursor_id),
+    }
+}
+
+/// Converts a value read from an `IN (subquery)` to the form the index stores,
+/// in dialects that convert values compared with custom types. Literal lists
+/// are converted when the list is built, so that duplicates are removed after
+/// the conversion.
+pub(super) fn encode_subquery_in_seek_key(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    resolver: &Resolver<'_>,
+    index: &Arc<Index>,
+    source: &InSeekSource,
+    seek_reg: usize,
+) -> Result<()> {
+    if !resolver
+        .dialect
+        .converts_strings_compared_with_custom_types()
+    {
+        return Ok(());
+    }
+    match source {
+        InSeekSource::LiteralList { .. } => Ok(()),
+        InSeekSource::Subquery { .. } => encode_seek_keys_for_custom_types(
+            program,
+            table_references,
+            index,
+            seek_reg,
+            &[None],
+            0,
+            resolver,
+        ),
     }
 }
 

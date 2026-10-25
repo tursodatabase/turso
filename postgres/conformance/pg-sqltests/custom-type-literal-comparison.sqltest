@@ -1,0 +1,79 @@
+# Comparing a column with a quoted literal converts the literal to the
+# column's type first, the same way an INSERT would. The result must not
+# depend on whether the column has an index.
+
+@database :memory:
+
+test uuid-literal-uppercase {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT
+        (SELECT count(*) FROM t WHERE u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'),
+        (SELECT count(*) FROM t WHERE u = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'),
+        (SELECT count(*) FROM t WHERE u > '00000000-0000-0000-0000-000000000000');
+}
+expect {
+    1|1|1
+}
+
+test uuid-literal-uppercase-indexed {
+    CREATE TABLE t (u uuid);
+    CREATE INDEX t_u ON t (u);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT
+        (SELECT count(*) FROM t WHERE u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'),
+        (SELECT count(*) FROM t WHERE u = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+}
+expect {
+    1|1
+}
+
+test boolean-literal-spellings {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES (true), (false);
+    SELECT
+        (SELECT count(*) FROM t WHERE b = 'true'),
+        (SELECT count(*) FROM t WHERE b = 't'),
+        (SELECT count(*) FROM t WHERE b = 'no'),
+        (SELECT count(*) FROM t WHERE b <> 'yes');
+}
+expect {
+    1|1|1|1
+}
+
+test varchar-literal-longer-than-limit {
+    CREATE TABLE t (v varchar(3));
+    INSERT INTO t VALUES ('abc');
+    SELECT
+        (SELECT count(*) FROM t WHERE v = 'abcd'),
+        (SELECT count(*) FROM t WHERE v < 'abcd'),
+        (SELECT count(*) FROM t WHERE v = 'abc');
+}
+expect {
+    0|1|1
+}
+
+test varchar-literal-longer-than-limit-indexed {
+    CREATE TABLE t (v varchar(3));
+    CREATE INDEX t_v ON t (v);
+    INSERT INTO t VALUES ('abc');
+    SELECT
+        (SELECT count(*) FROM t WHERE v = 'abcd'),
+        (SELECT count(*) FROM t WHERE v < 'abcd'),
+        (SELECT count(*) FROM t WHERE v = 'abc');
+}
+expect {
+    0|1|1
+}
+
+test smallint-literal-compare {
+    CREATE TABLE t (s smallint);
+    INSERT INTO t VALUES (5);
+    SELECT
+        (SELECT count(*) FROM t WHERE s = '5'),
+        (SELECT count(*) FROM t WHERE s = 5),
+        (SELECT count(*) FROM t WHERE s < 100000);
+}
+expect {
+    1|1|1
+}
