@@ -26,6 +26,41 @@ test fail-alter-column-unique {
 expect error {
 }
 
+test fail-alter-column-drops-primary-key {
+    CREATE TABLE t_pk (a TEXT, b TEXT PRIMARY KEY);
+    INSERT INTO t_pk VALUES ('1', '2');
+    ALTER TABLE t_pk ALTER COLUMN b TO bx TEXT;
+}
+expect error {
+    PRIMARY KEY constraint cannot be altered
+}
+
+test fail-alter-column-drops-unique {
+    CREATE TABLE t_uq (a TEXT, b TEXT UNIQUE);
+    INSERT INTO t_uq VALUES ('1', '2');
+    ALTER TABLE t_uq ALTER COLUMN b TO bx TEXT;
+}
+expect error {
+    UNIQUE constraint cannot be altered
+}
+
+test fail-alter-column-table-level-pk {
+    CREATE TABLE t_tpk (a INT, b INT, PRIMARY KEY (a, b));
+    ALTER TABLE t_tpk ALTER COLUMN a TO a2 INT;
+}
+expect error {
+    PRIMARY KEY constraint cannot be altered
+}
+
+test fail-alter-column-table-level-unique {
+    CREATE TABLE t_tuq (a INT, b INT, UNIQUE (a, b));
+    ALTER TABLE t_tuq ALTER COLUMN a TO a2 INT;
+}
+expect error {
+    UNIQUE constraint cannot be altered
+}
+
+
 test alter-table-rename-pk-column {
     CREATE TABLE customers (cust_id INTEGER PRIMARY KEY, cust_name TEXT);
     INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob');
