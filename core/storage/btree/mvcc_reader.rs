@@ -192,20 +192,14 @@ impl BTreeCursor {
             inject_io_yield!(self, CursorYieldPoint::SeekStart);
         }
         return_if_io!(self.drive_mvcc_step());
-        let found = match self.mvcc().row.rowid() {
-            Some(found_rowid) => {
-                turso_assert!(
-                    !op.eq_only() || found_rowid == rowid,
-                    "an exact seek must stop on its key or on no row"
-                );
-                true
-            }
-            None => false,
-        };
-        Ok(IOResult::Done(if found {
-            SeekResult::Found
-        } else {
-            SeekResult::NotFound
+        let found = self.mvcc().row.rowid();
+        turso_assert!(
+            !op.eq_only() || found.is_none_or(|found_rowid| found_rowid == rowid),
+            "an exact seek must stop on its key or on no row"
+        );
+        Ok(IOResult::Done(match found {
+            Some(_) => SeekResult::Found,
+            None => SeekResult::NotFound,
         }))
     }
 
@@ -561,13 +555,16 @@ impl BTreeCursor {
                     reader
                         .store
                         .require_readable_transaction(reader.snapshot.tx_id)?;
-                    let payload = reader
+                    let visible = reader
                         .store
-                        .visible_table_payload(reader.snapshot, reader.chain.versions())?;
-                    let Some(payload) = payload else {
+                        .read_visible_from_versions(reader.snapshot, reader.chain.versions())?;
+                    let Some(visible) = visible else {
                         reader.advance_chain();
                         continue;
                     };
+                    let payload = visible
+                        .data
+                        .expect("a table row version must have a payload");
                     reader.row = Row::Chain { rowid, payload };
                     reader.step = Step::Idle;
                     self.settle_mvcc_row(false, true);

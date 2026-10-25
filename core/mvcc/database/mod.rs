@@ -5961,17 +5961,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(false)
     }
 
-    pub(crate) fn visible_table_payload(
-        &self,
-        snapshot: MvccReadSnapshot,
-        versions: &RowVersions<A>,
-    ) -> Result<Option<crate::alloc::ArcSlice<u8>>> {
-        let versions = versions.read();
-        Ok(self
-            .find_visible_version(snapshot, &versions)?
-            .map(table_row_payload))
-    }
-
     pub(crate) fn resolve_cell_with_chain(
         &self,
         snapshot: MvccReadSnapshot,
@@ -6000,14 +5989,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     let tx = self.txs.get(&snapshot.tx_id).ok_or_else(|| {
                         LimboError::NoSuchTransactionID(snapshot.tx_id.to_string())
                     })?;
-                    let tx = tx.value();
-                    return Ok(versions.iter().rev().any(|version| {
-                        version.is_btree_invalidating_version(
-                            tx,
-                            &self.txs,
-                            &self.finalized_tx_states,
-                        )
-                    }));
+                    return Ok(self.chain_invalidates_btree_row(tx.value(), versions));
                 }
             }
         }
@@ -6193,9 +6175,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
             return Ok(false);
         }
-        Ok(versions.iter().rev().any(|version| {
-            version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
-        }))
+        Ok(self.chain_invalidates_btree_row(tx, &versions))
     }
 
     /// Check if the B-tree version of a row should be shown to the given transaction.
@@ -6251,13 +6231,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if self.btree_covers_chain_for_tx(tx, table_id, versions) {
             return Ok(true);
         }
+        Ok(!self.chain_invalidates_btree_row(tx, versions))
+    }
 
-        // Check if any version invalidates the B-tree row
-        let btree_is_invalid = versions.iter().rev().any(|version| {
+    fn chain_invalidates_btree_row(&self, tx: &Transaction<A>, versions: &[RowVersion]) -> bool {
+        versions.iter().rev().any(|version| {
             version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
-        });
-
-        Ok(!btree_is_invalid)
+        })
     }
 
     fn find_visible_version<'a>(
