@@ -286,6 +286,43 @@ expect {
     3.00|-2.50
 }
 
+test numeric-arithmetic-result-sorts-and-compares-as-numeric {
+    CREATE TABLE p (n numeric(10,2), i int);
+    INSERT INTO p VALUES (1.5, 8), (1.5, 9);
+    SELECT n + i FROM p ORDER BY 1;
+    SELECT count(*) FROM p WHERE n + i < 10;
+    SELECT count(*) FROM p WHERE n + 8 < 10;
+    SELECT count(*) FROM p WHERE n + 8.5 < 10.5;
+    SELECT count(*) FROM p WHERE n + n < 10;
+    SELECT count(*) FROM p WHERE (n * i) BETWEEN 12 AND 13;
+    SELECT max(n + i), min(n * i) FROM p;
+}
+expect {
+    9.50
+    10.50
+    1
+    2
+    2
+    2
+    1
+    10.50|12.00
+}
+
+test numeric-min-max-in-order-by-sorts-as-numeric {
+    CREATE TABLE p (n numeric(10,2), i int);
+    INSERT INTO p VALUES (9.5, 8), (10.5, 9), (-3.25, 2);
+    SELECT i, max(n) FROM p GROUP BY i ORDER BY 2;
+    SELECT i, min(n + 0) FROM p GROUP BY i ORDER BY min(n + 0) DESC;
+}
+expect {
+    2|-3.25
+    8|9.50
+    9|10.50
+    9|10.50
+    8|9.50
+    2|-3.25
+}
+
 test numeric-literal-is-compared-without-rounding-to-column-scale {
     CREATE TABLE n (v numeric(10,2));
     INSERT INTO n VALUES (1.50), (1.51);

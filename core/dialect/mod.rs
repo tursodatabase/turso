@@ -235,6 +235,17 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// The custom type of the value that the operator function `func_name`
+    /// returns, such as `numeric` for `numeric_add`. Core then compares and
+    /// sorts `n + i` as that type, the same as a column of the type.
+    ///
+    /// PostgreSQL gives `numeric_col + int_col` the type numeric, so
+    /// `n + i < 10` compares numbers. SQLite has no type for the result and
+    /// compares the value as it is, so the text `'10.50'` sorts before `'9.50'`.
+    fn custom_type_operator_result_type(&self, _func_name: &str) -> Option<&'static str> {
+        None
+    }
+
     /// Whether `CAST(x AS t)` to a custom type gives the value the way a
     /// column of type `t` shows it (ENCODE then DECODE) instead of the
     /// stored value (ENCODE only).
