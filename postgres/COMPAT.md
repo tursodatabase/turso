@@ -138,6 +138,11 @@ including char(n), timestamp(p) and bit(n), are rejected. interval, xml, tsvecto
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
 
+A quoted string or bound parameter compared with a value of one of these types
+is converted to that type first, so `uuid_col = 'A0EEBC99-...'` matches the
+lowercase uuid, with or without an index. Arithmetic between numeric and a
+floating-point value gives a floating-point result, as in PostgreSQL.
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |

@@ -217,9 +217,9 @@ pub trait Dialect: Send + Sync + 'static {
     /// a custom type is first converted to that type, the way it would be
     /// when stored.
     ///
-    /// PostgreSQL converts it, so `date_col = '20261008'` matches and
-    /// `date_col < '2027'` is an invalid date. SQLite compares the string as
-    /// it is.
+    /// PostgreSQL converts it, so `uuid_col = 'A0EEBC99-...'` matches the
+    /// lowercase uuid and `date_col < '2027'` is an invalid date. SQLite
+    /// compares the string as it is.
     fn converts_strings_compared_with_custom_types(&self) -> bool {
         false
     }

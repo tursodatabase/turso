@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::ValueType;
 
 /// Map an AST operator to the string representation used in custom type operator definitions.
 pub(super) fn operator_to_str(op: &ast::Operator) -> Option<&'static str> {
@@ -102,12 +103,25 @@ pub(super) fn emit_custom_type_operator(
     };
 
     let result_reg = program.alloc_register();
-    program.emit_insn(Insn::Function {
+    let call = Insn::Function {
         constant_mask: 0,
         start_reg: func_start,
         dest: result_reg,
         func: FuncCtx { func, arg_count: 2 },
-    });
+    };
+    match &resolved.standard_arithmetic_if_real {
+        Some(real_operand) => emit_call_unless_real(
+            program,
+            referenced_tables,
+            call,
+            real_operand,
+            func_start,
+            (first, second),
+            result_reg,
+            resolver,
+        )?,
+        None => program.emit_insn(call),
+    }
     if resolved.negate {
         program.emit_insn(Insn::Not {
             reg: result_reg,
@@ -115,6 +129,50 @@ pub(super) fn emit_custom_type_operator(
         });
     }
     Ok(result_reg)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_call_unless_real(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    call: Insn,
+    real_operand: &RealOperand,
+    func_start: usize,
+    (first, second): (&ast::Expr, &ast::Expr),
+    result_reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let real_reg = match real_operand.which {
+        EncodeArg::First => func_start,
+        EncodeArg::Second => func_start + 1,
+    };
+    let call_label = program.allocate_label();
+    let done_label = program.allocate_label();
+    for value_type in [ValueType::Integer, ValueType::Text, ValueType::Blob] {
+        program.emit_insn(Insn::IsType {
+            reg: real_reg,
+            target_pc: call_label,
+            value_type,
+        });
+    }
+    emit_binary_insn(
+        program,
+        &real_operand.op,
+        func_start,
+        func_start + 1,
+        result_reg,
+        first,
+        second,
+        referenced_tables,
+        Some(resolver),
+    )?;
+    program.emit_insn(Insn::Goto {
+        target_pc: done_label,
+    });
+    program.preassign_label_to_next_insn(call_label);
+    program.emit_insn(call);
+    program.preassign_label_to_next_insn(done_label);
+    Ok(())
 }
 
 /// Wraps one side of each comparison between two different custom types in a
@@ -265,6 +323,7 @@ pub(super) fn literal_compatible_with_value_type(
 }
 
 /// Which operand of a binary expression needs encoding before the operator call.
+#[derive(Clone, Copy)]
 pub(super) enum EncodeArg {
     /// Encode the first argument (e1 is a literal, e2 is the custom type column)
     First,
@@ -287,6 +346,12 @@ pub(super) struct ResolvedOperator {
     negate: bool,
     /// If a literal operand needs encoding before the operator call.
     encode_info: Option<OperatorEncodeInfo>,
+    standard_arithmetic_if_real: Option<RealOperand>,
+}
+
+pub(super) struct RealOperand {
+    which: EncodeArg,
+    op: ast::Operator,
 }
 
 /// Find a custom type operator function for a binary expression.
@@ -297,7 +362,7 @@ pub(super) struct ResolvedOperator {
 ///    is compatible with the custom type's `value` input type, OR
 /// 3. The operator is arithmetic, the type reads stored values back unchanged
 ///    (or the dialect applies custom type arithmetic to any operand that is not
-///    a floating-point column or cast), one operand is a column of that type
+///    a floating-point value), one operand is a column of that type
 ///    and the other is anything except a column of a different custom type. This lets `date + 1`, `date + int_col`
 ///    and `date + ?` add days, while a comparison such as `int_col = '10'` still
 ///    uses the standard operator.
@@ -357,6 +422,7 @@ pub(super) fn find_custom_type_operator(
                     swap_args,
                     negate,
                     encode_info: None,
+                    standard_arithmetic_if_real: None,
                 });
             }
             return None;
@@ -376,6 +442,7 @@ pub(super) fn find_custom_type_operator(
             swap_args: false,
             negate: false,
             encode_info: None,
+            standard_arithmetic_if_real: None,
         });
     }
 
@@ -386,16 +453,16 @@ pub(super) fn find_custom_type_operator(
                     .dialect
                     .applies_custom_type_arithmetic_to_any_operand();
             let other_is_literal = literal_type_name(other).is_some();
+            let other_affinity = get_expr_affinity(other, referenced_tables, Some(resolver));
+            let decodes_unchanged = info.type_def.decode_returns_value_unchanged();
             let encode_other = !applies_to_any_operand
                 && literal_type_name(other).is_some_and(|lit_type| {
                     literal_compatible_with_value_type(lit_type, info.type_def.value_input_type())
                 });
             let pass_other_unencoded = !op.is_comparison()
-                && (info.type_def.decode_returns_value_unchanged()
+                && (decodes_unchanged
                     || (applies_to_any_operand
-                        && (other_is_literal
-                            || get_expr_affinity(other, referenced_tables, Some(resolver))
-                                != Affinity::Real)));
+                        && (other_is_literal || other_affinity != Affinity::Real)));
             if !encode_other && !pass_other_unencoded {
                 return None;
             }
@@ -404,6 +471,10 @@ pub(super) fn find_custom_type_operator(
                 func_name,
                 swap_args,
                 negate,
+                standard_arithmetic_if_real: (applies_to_any_operand
+                    && !decodes_unchanged
+                    && !other_is_literal)
+                    .then_some(RealOperand { which, op: *op }),
                 encode_info: encode_other.then(|| OperatorEncodeInfo {
                     column: info.column.clone(),
                     type_def: info.type_def.clone(),

@@ -258,3 +258,30 @@ test date-column-joined-with-timestamp-indexed {
 expect {
     1
 }
+
+test numeric-times-float-function-is-float {
+    CREATE TABLE p (n numeric(10,2), f float8);
+    INSERT INTO p VALUES (1.5, 0.125);
+    SELECT n * pi(), n * abs(f), n * sqrt(f * 2) FROM p;
+}
+expect {
+    4.71238898038469|0.1875|0.75
+}
+
+test numeric-plus-float-arithmetic-is-float {
+    CREATE TABLE p (n numeric(10,2), f float8);
+    INSERT INTO p VALUES (1.5, 0.125);
+    SELECT n + f * 2, f * 2 - n FROM p;
+}
+expect {
+    1.75|-1.25
+}
+
+test numeric-times-integer-expression-stays-numeric {
+    CREATE TABLE p (n numeric(10,2), i int);
+    INSERT INTO p VALUES (1.5, -2);
+    SELECT n * abs(i), n + i * 2 FROM p;
+}
+expect {
+    3.00|-2.50
+}
