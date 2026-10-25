@@ -270,6 +270,34 @@ expect {
     3|4|9|3|2|3|3|2|3|0
 }
 
+# When an object key is not followed by ':', SQLite parses what follows
+# as a value. If that parse fails, its own error position is reported;
+# otherwise the position of the value is reported.
+test json_error_position_reports_bad_character_after_unquoted_key {
+    SELECT json_error_position('{a,:1}'), json_error_position('{a}'),
+           json_error_position('{ab]:1}'), json_error_position('{a b:1}'),
+           json_error_position(char(123) || 'ab'), json_error_position('{a$]:1}'),
+           json_error_position('{a"x":1}'), json_error_position('{a''x'':1}'),
+           json_error_position('{a1:2}');
+}
+expect {
+    3|3|4|4|4|4|3|3|0
+}
+
+test json_error_position_reports_value_error_after_object_key {
+    SELECT json_error_position(char(123) || 'a['),
+           json_error_position(char(123) || 'a' || char(123)),
+           json_error_position(char(123) || 'a[1'),
+           json_error_position(char(123) || 'a' || char(123) || '"x":1e' || char(125)),
+           json_error_position(char(123) || '"a"[1'),
+           json_error_position(char(123) || '"a"' || char(123) || '"x":1e' || char(125)),
+           json_error_position('{a tru}'), json_error_position('{a 1:2}'),
+           json_error_position('{a[1]:2}');
+}
+expect {
+    4|4|5|9|7|11|4|4|3
+}
+
 # JSON5 does not allow a digit right after \0.
 test json_error_position_rejects_nul_escape_followed_by_digit {
     SELECT json_error_position('"\01"'), json_error_position('["\01"]'),
