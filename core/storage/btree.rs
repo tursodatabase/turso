@@ -6597,10 +6597,10 @@ impl BTreeCursor {
         }
     }
 
-    /// A range seek op comes from a cursor saved with skip_advance (see
-    /// try_save_position_for_external_balance): it sat in the gap before an
-    /// entry. The seek put the cursor on the entry after that gap, so put it
-    /// back in the gap: no record, and the next next() returns this entry.
+    /// A non-exact seek op (GE { eq_only: false } or GT) means the cursor was
+    /// saved in a gap by try_save_position_for_external_balance. The seek
+    /// landed on the row after the gap; put the cursor back in the gap so the
+    /// next next() returns that row instead of skipping it.
     fn stay_before_entry_if_saved_in_gap(&mut self, seek_op: SeekOp) {
         if !seek_op.eq_only() {
             self.set_has_record(false);
@@ -7792,13 +7792,13 @@ impl CursorTrait for BTreeCursor {
                 contents.cell_count(),
             )
         };
-        // A cursor with skip_advance returns the cell at cell_idx on its next
-        // next(), so it sits in the gap before that cell, whether or not it
-        // has a record, or after the last cell of a leaf when it has none: a
-        // restore that did not find its row leaves it there. Save the entry
-        // after the gap with GE, or the last cell of the leaf with GT. A range
-        // seek op in the saved context tells restore_context to put the cursor
-        // back in the gap.
+        // With skip_advance, the next next() returns the cell at cell_idx
+        // without advancing, i.e. the cursor is in a gap (e.g. its row was
+        // deleted). Save the gap, not a row:
+        //   gap before cell K:                SeekTo(K, GE { eq_only: false })
+        //   gap after the leaf's last cell K: SeekTo(K, GT)
+        // restore_context sees the non-exact op and puts the cursor back in
+        // the gap. Without skip_advance, save the exact row as before.
         let (key_cell, seek_op) = if !self.skip_advance {
             if (cell_idx as usize) >= cell_count {
                 return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
@@ -7825,9 +7825,9 @@ impl CursorTrait for BTreeCursor {
             });
             return Ok(IOResult::Done(SavePositionResult::Saved));
         }
-        // record() reads the current cell and only when the cursor has a
-        // record, so a cursor in a gap steps onto the key cell while reading
-        // it and steps back before returning, also when it yields IO.
+        // record() only reads the cell when has_record is set. A cursor in a
+        // gap has no record, so point it at key_cell to copy the key, then
+        // move it back (also when the read yields IO).
         let in_gap = !self.has_record();
         if in_gap {
             self.stack.set_cell_index(key_cell as i32);
@@ -15249,9 +15249,9 @@ mod tests {
             );
         }
 
-        /// Deletes the last row of the first leaf while `peer` sits on it, so
-        /// the peer's restore leaves it after the last cell of that leaf with
-        /// no record. Returns the rowid of the row before the deleted one.
+        /// Deletes the last row of the first leaf while `peer` is on it. The
+        /// peer ends up past the leaf's last cell: no record, skip_advance set.
+        /// Returns the rowid of the row before the deleted one.
         fn delete_last_row_of_first_leaf_under_peer(
             pager: &Arc<Pager>,
             writer: &mut BTreeCursor,
@@ -15299,8 +15299,8 @@ mod tests {
             previous_rowid.unwrap()
         }
 
-        /// Inserts rows at the start of the first leaf and right before
-        /// `deleted_rowid`, so the first leaf splits and its cells move.
+        /// Inserts 1..=5 and the two rowids before `deleted_rowid`, which
+        /// splits the first leaf.
         fn split_first_leaf(pager: &Arc<Pager>, writer: &mut BTreeCursor, deleted_rowid: i64) {
             for rowid in (1..=5).chain(deleted_rowid - 2..deleted_rowid) {
                 insert_record(
@@ -15514,9 +15514,9 @@ mod tests {
             assert_eq!(peer_key(&mut peer), None);
             assert!(peer.skip_advance && !peer.has_record());
 
-            // The first insert leaves the first leaf alone, so the peer comes
-            // back on the divider cell after the deleted key, in an interior
-            // page. The second one splits the first leaf.
+            // Inserting 1000 doesn't split the first leaf, but the peer is
+            // restored onto the divider cell after the deleted key (an
+            // interior page). Inserting 1..=9 then splits the first leaf.
             insert(&mut writer, 1000);
             assert_eq!(peer_key(&mut peer), None);
             assert!(!peer.stack.top_ref().get_contents().is_leaf());
