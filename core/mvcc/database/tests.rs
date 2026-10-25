@@ -25667,6 +25667,86 @@ impl YieldInjector for NthHitYieldInjector {
 }
 
 #[test]
+fn mvcc_table_scan_ignores_the_writes_of_another_transaction_made_during_the_scan() {
+    for other_commits in [true, false] {
+        let db = MvccTestDb::new();
+        let conn = &db.conn;
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO t VALUES (1, 'v'), (2, 'v'), (3, 'v'), (4, 'v'), (6, 'v'), \
+             (7, 'v'), (8, 'v'), (9, 'v'), (10, 'v')",
+        )
+        .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("UPDATE t SET v = 'w' WHERE id IN (2, 9)")
+            .unwrap();
+        let other = db.db.connect(ConnectOpts::new()).unwrap();
+
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut scan = conn.prepare("SELECT id, v FROM t").unwrap();
+        let mut rows = Vec::new();
+        let mut written = false;
+        loop {
+            if !written && rows.len() == 3 {
+                other.execute("BEGIN CONCURRENT").unwrap();
+                other.execute("UPDATE t SET v = 'b' WHERE id = 4").unwrap();
+                other.execute("INSERT INTO t VALUES (5, 'b')").unwrap();
+                other.execute("DELETE FROM t WHERE id = 6").unwrap();
+                other.execute("INSERT INTO t VALUES (11, 'b')").unwrap();
+                if other_commits {
+                    other.execute("COMMIT").unwrap();
+                }
+                written = true;
+            }
+            match scan.step().unwrap() {
+                StepResult::Row => {
+                    let row = scan.row().unwrap();
+                    rows.push((
+                        row.get::<i64>(0).unwrap(),
+                        row.get_value(1).to_text().unwrap().to_string(),
+                    ));
+                }
+                StepResult::IO => scan.get_pager().io.step().unwrap(),
+                StepResult::Done => break,
+                other => panic!("unexpected step result {other:?}"),
+            }
+        }
+        drop(scan);
+        conn.execute("COMMIT").unwrap();
+        if !other_commits {
+            other.execute("ROLLBACK").unwrap();
+        }
+
+        let snapshot = [
+            (1, "v"),
+            (2, "w"),
+            (3, "v"),
+            (4, "v"),
+            (6, "v"),
+            (7, "v"),
+            (8, "v"),
+            (9, "w"),
+            (10, "v"),
+        ]
+        .map(|(id, v)| (id, v.to_string()));
+        assert_eq!(rows, snapshot, "other transaction commits: {other_commits}");
+        let ids_after = get_rows(conn, "SELECT id FROM t")
+            .into_iter()
+            .map(|row| row[0].as_int().unwrap())
+            .collect::<Vec<_>>();
+        let expected_ids_after = if other_commits {
+            vec![1, 2, 3, 4, 5, 7, 8, 9, 10, 11]
+        } else {
+            vec![1, 2, 3, 4, 6, 7, 8, 9, 10]
+        };
+        assert_eq!(ids_after, expected_ids_after);
+    }
+}
+
+#[test]
 fn mvcc_table_reader_returns_the_same_rows_after_an_injected_yield() {
     for checkpoint in [true, false] {
         let (db, unfinished, rows) = reader_yield_fixture(checkpoint);
