@@ -999,6 +999,12 @@ impl Schema {
         self.type_registry.get(&type_registry_key(type_name))
     }
 
+    /// Whether the column's values are encoded before they are stored: an array column, or a
+    /// column whose type is a custom type of a STRICT table.
+    pub fn column_has_custom_type(&self, column: &Column, is_strict: bool) -> bool {
+        column.is_array() || self.get_type_def(&column.ty_str, is_strict).is_some()
+    }
+
     /// Look up a custom type definition by name without a strictness check.
     /// Only use this for operations that aren't column-scoped (e.g. DROP TYPE,
     /// CREATE TABLE validation, CAST).
@@ -3871,7 +3877,7 @@ impl BTreeTable {
         let has_custom = table
             .columns
             .iter()
-            .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
+            .any(|c| schema.column_has_custom_type(c, table.is_strict));
         if !has_custom {
             return Arc::clone(table);
         }
@@ -3901,7 +3907,7 @@ impl BTreeTable {
         let has_custom = table
             .columns
             .iter()
-            .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
+            .any(|c| schema.column_has_custom_type(c, table.is_strict));
         if !has_custom {
             return Ok(Arc::clone(table));
         }
