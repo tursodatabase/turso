@@ -853,6 +853,42 @@ fn test_postgres_alter_table_keeps_non_literal_defaults_readable_after_reopen(db
     );
 }
 
+#[turso_macros::test]
+fn test_postgres_indexes_on_boolean_casts_are_readable_after_reopen(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (i int, b boolean)").unwrap();
+    conn.execute("CREATE INDEX t_i ON t ((i::boolean))")
+        .unwrap();
+    conn.execute("CREATE INDEX t_b ON t (i) WHERE b = 't'::boolean")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (5, true), (0, false)")
+        .unwrap();
+
+    let path = db.path.clone();
+    let io = db.io.clone();
+    drop(conn);
+    drop(db);
+
+    let db = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new().with_custom_types(true),
+    )
+    .unwrap();
+    let conn = turso_pg::Connection::connect(&db).unwrap();
+    conn.execute("INSERT INTO t VALUES (3, true)").unwrap();
+    let mut rows = conn
+        .query("SELECT i FROM t WHERE i::boolean AND b = 't'::boolean ORDER BY i")
+        .unwrap()
+        .unwrap();
+    let mut values = Vec::new();
+    while let StepResult::Row = rows.step().unwrap() {
+        values.push(rows.row().unwrap().get_value(0).to_string());
+    }
+    assert_eq!(values, vec!["3", "5"]);
+}
+
 #[turso_macros::test(mvcc)]
 fn test_postgres_alter_table_rename_column(db: TempDatabase) {
     let conn = db.connect_postgres();

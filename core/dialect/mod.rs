@@ -199,6 +199,16 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a function registered by the frontend, not a built-in one, may
+    /// be used in an index expression or in the WHERE clause of a partial
+    /// index.
+    ///
+    /// A frontend can insert its own function calls when it translates SQL,
+    /// for example to implement a cast. SQLite allows no such functions.
+    fn allows_frontend_function_in_index(&self, _name: &str) -> bool {
+        false
+    }
+
     /// Whether integer division by zero raises an error.
     ///
     /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.

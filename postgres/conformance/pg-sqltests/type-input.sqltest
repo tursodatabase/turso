@@ -162,3 +162,44 @@ test cast-uuid-array-column-to-uuid-array {
 expect {
     {9e6cfba0-0f51-2201-1410-6069e05b8756}|9e6cfba0-0f51-2201-1410-6069e05b8756
 }
+
+test cast-null-to-uuid-and-boolean-arrays {
+    SELECT CASE WHEN NULL::uuid[] IS NULL THEN 'null' END,
+        CASE WHEN NULL::boolean[] IS NULL THEN 'null' END,
+        CASE WHEN CAST(NULL AS uuid[]) IS NULL THEN 'null' END;
+}
+expect {
+    null|null|null
+}
+
+test cast-null-array-column-values {
+    CREATE TABLE t (u uuid[], b boolean[]);
+    INSERT INTO t VALUES (NULL, NULL);
+    SELECT CASE WHEN u::uuid[] IS NULL THEN 'null' END,
+        CASE WHEN b::boolean[] IS NULL THEN 'null' END
+    FROM t;
+}
+expect {
+    null|null
+}
+
+test boolean-cast-in-index-expression {
+    CREATE TABLE t (i int, b boolean);
+    CREATE INDEX t_i ON t ((i::boolean));
+    CREATE INDEX t_b ON t (i) WHERE b = 't'::boolean;
+    INSERT INTO t VALUES (5, true), (0, false);
+    SELECT i FROM t WHERE i::boolean ORDER BY i;
+}
+expect {
+    5
+}
+
+test boolean-cast-in-check-constraint {
+    CREATE TABLE t (i int CHECK (i::boolean OR i = 0));
+    INSERT INTO t VALUES (7), (0);
+    SELECT i FROM t ORDER BY i;
+}
+expect {
+    0
+    7
+}

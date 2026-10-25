@@ -184,6 +184,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn allows_frontend_function_in_index(&self, name: &str) -> bool {
+        name.eq_ignore_ascii_case("integer_to_boolean")
+    }
+
     fn errors_on_zero_divisor(&self) -> bool {
         true
     }

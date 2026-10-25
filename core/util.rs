@@ -344,6 +344,7 @@ pub fn parse_schema_rows(
     let has_mv_store = inner.rows.mv_store().is_some();
     schema.populate_materialized_views_then_indices(
         syms,
+        dialect,
         inner.materialized_view_info,
         inner.dbsp_state_roots,
         inner.dbsp_state_index_roots,

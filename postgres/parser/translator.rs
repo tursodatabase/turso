@@ -5812,8 +5812,9 @@ fn cast_with_type_modifier(
 }
 
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
-/// Maps PG types to their base SQLite storage types. Other names are kept as
-/// written so that enums and domains resolve to their custom type.
+/// Maps most PG types to their base SQLite storage types. boolean and uuid
+/// map to the custom types that the PG frontend registers. Other names are
+/// kept as written so that enums and domains resolve to their custom type.
 fn pg_type_name_to_ast_type(
     type_name: &pg_query::protobuf::TypeName,
 ) -> Result<ast::Type, ParseError> {

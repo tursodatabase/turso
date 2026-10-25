@@ -16117,6 +16117,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
 
                 let populate_result = schema.populate_materialized_views_then_indices(
                     &syms,
+                    conn.dialect().as_ref(),
                     materialized_view_info,
                     dbsp_state_roots,
                     dbsp_state_index_roots,

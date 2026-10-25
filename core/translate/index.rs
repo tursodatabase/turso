@@ -170,7 +170,12 @@ pub fn translate_create_index(
     if !tbl.has_rowid {
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
     }
-    let columns = resolve_sorted_columns_with_resolver(&tbl, &columns, Some(resolver))?;
+    let columns = resolve_sorted_columns_with_resolver(
+        &tbl,
+        &columns,
+        resolver.dialect.as_ref(),
+        Some(resolver),
+    )?;
 
     // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
     for col in &columns {
@@ -939,8 +944,9 @@ fn index_matches_collation(index: &Index, collation: CollationSeq) -> bool {
 pub fn resolve_sorted_columns(
     table: &BTreeTable,
     cols: &[SortedColumn],
+    dialect: &dyn crate::dialect::Dialect,
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
-    resolve_sorted_columns_with_resolver(table, cols, None)
+    resolve_sorted_columns_with_resolver(table, cols, dialect, None)
 }
 
 pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
@@ -955,6 +961,7 @@ pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
 fn resolve_sorted_columns_with_resolver(
     table: &BTreeTable,
     cols: &[SortedColumn],
+    dialect: &dyn crate::dialect::Dialect,
     resolver: Option<&Resolver>,
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
     let mut resolved =
@@ -986,7 +993,7 @@ fn resolve_sorted_columns_with_resolver(
                 .expect("resolved index columns vector was preallocated to cols.len()");
             continue;
         }
-        if !validate_index_expression(unwrapped_expr, table) {
+        if !validate_index_expression(unwrapped_expr, table, dialect) {
             crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
         }
         resolved
@@ -1075,7 +1082,11 @@ fn resolve_index_column<'a>(
 /// Expressions in CREATE INDEX statements may not use subqueries.
 /// Additionally, a standalone string literal is interpreted as a column name (for backwards
 /// compatibility with SQLite), not as a string literal. It is rejected if no such column exists.
-fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
+fn validate_index_expression(
+    expr: &Expr,
+    table: &BTreeTable,
+    dialect: &dyn crate::dialect::Dialect,
+) -> bool {
     // A top-level string literal would have been handled by resolve_index_column().
     // If we get here with a string literal, it means the column doesn't exist.
     // (SQLite interprets standalone string literals as column names for backwards compat.)
@@ -1097,6 +1108,7 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
         let n = normalize_ident(name);
         Func::resolve_function(&n, args.len())
             .is_ok_and(|f| f.is_some_and(|f| is_deterministic_schema_function_call(&f, args)))
+            || dialect.allows_frontend_function_in_index(&n)
     };
 
     let mut ok = true;

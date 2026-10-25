@@ -17,6 +17,11 @@ pub(super) fn emit_array_element_loop(
     type_def: &TypeDef,
     resolver: &Resolver,
 ) -> Result<()> {
+    let null_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: null_label,
+    });
     let reg_len = program.alloc_register();
     let reg_idx = program.alloc_register();
     let reg_elem = program.alloc_register();
@@ -119,6 +124,7 @@ pub(super) fn emit_array_element_loop(
         count_reg: reg_len,
         dest: reg,
     });
+    program.preassign_label_to_next_insn(null_label);
 
     Ok(())
 }
