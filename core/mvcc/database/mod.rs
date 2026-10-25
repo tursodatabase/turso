@@ -5971,7 +5971,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             return Ok(VisibleRow::Cell);
         }
         Ok(match self.find_visible_version(snapshot, &versions)? {
-            Some(version) => VisibleRow::Version(table_row_payload(version)),
+            Some(version) => VisibleRow::Version(
+                version
+                    .row
+                    .data
+                    .clone()
+                    .expect("a table row version must have a payload"),
+            ),
             None => VisibleRow::NoRow,
         })
     }
@@ -11056,14 +11062,6 @@ fn lookup_tx_state<A: ConcurrentAllocator>(
     txs.get(&tx_id)
         .map(|entry| entry.value().state.load())
         .or_else(|| finalized_tx_states.get(&tx_id).map(|entry| *entry.value()))
-}
-
-fn table_row_payload(version: &RowVersion) -> crate::alloc::ArcSlice<u8> {
-    version
-        .row
-        .data
-        .clone()
-        .expect("a table row version must have a payload")
 }
 
 fn lookup_finalized_tx_state<A: ConcurrentAllocator>(
