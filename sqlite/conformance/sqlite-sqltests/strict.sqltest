@@ -134,3 +134,43 @@ test strict-insert-before-trigger-type-error-before-not-null {
 expect error {
     cannot store TEXT value in INT column t10.a
 }
+
+@cross-check-integrity
+test strict-insert-or-ignore-ipk-conflict-before-type-error {
+    CREATE TABLE r1 (id INTEGER PRIMARY KEY, a INT) STRICT;
+    INSERT INTO r1 VALUES (1, 1);
+    INSERT OR IGNORE INTO r1 VALUES (1, 'x');
+    SELECT * FROM r1;
+}
+expect {
+    1|1
+}
+
+test strict-insert-ipk-conflict-error-before-type-error {
+    CREATE TABLE r2 (id INTEGER PRIMARY KEY, a INT) STRICT;
+    INSERT INTO r2 VALUES (1, 1);
+    INSERT INTO r2 VALUES (1, 'x');
+}
+expect error {
+    UNIQUE constraint failed: r2.id
+}
+
+@cross-check-integrity
+test strict-insert-upsert-ipk-conflict-before-type-error {
+    CREATE TABLE r3 (id INTEGER PRIMARY KEY, a INT) STRICT;
+    INSERT INTO r3 VALUES (1, 1);
+    INSERT INTO r3 VALUES (1, 'x') ON CONFLICT (id) DO NOTHING;
+    SELECT * FROM r3;
+}
+expect {
+    1|1
+}
+
+test strict-insert-secondary-unique-conflict-after-type-error {
+    CREATE TABLE r4 (id INTEGER PRIMARY KEY, a INT, b INT UNIQUE) STRICT;
+    INSERT INTO r4 VALUES (1, 10, 20);
+    INSERT OR IGNORE INTO r4 VALUES (2, 'x', 20);
+}
+expect error {
+    cannot store TEXT value in INT column r4.a
+}
