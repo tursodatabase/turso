@@ -326,3 +326,17 @@ expect {
     1
     1
 }
+
+test numeric-literal-too-big-for-column-precision-with-index {
+    CREATE TABLE a (v numeric(10,2));
+    CREATE INDEX a_v ON a(v);
+    INSERT INTO a VALUES (1.50);
+    SELECT count(*) FROM a WHERE v IN (12345678901.5);
+    SELECT count(*) FROM a WHERE v = 12345678901.5;
+    SELECT count(*) FROM a WHERE v IN (12345678901.5, 1.5);
+}
+expect {
+    0
+    0
+    1
+}

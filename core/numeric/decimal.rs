@@ -181,23 +181,16 @@ pub fn validate_precision_scale(
             "numeric precision must be positive, got {precision}"
         )));
     }
-    if scale < 0 {
-        return Err(LimboError::Constraint(format!(
-            "numeric scale must be non-negative, got {scale}"
-        )));
-    }
     if scale > precision {
         return Err(LimboError::Constraint(format!(
             "numeric scale ({scale}) must not exceed precision ({precision})"
         )));
     }
 
-    if val.is_zero() {
-        return Ok(BigDecimal::new(BigInt::from(0), scale));
+    let rounded = round_to_scale(val, scale)?;
+    if rounded.is_zero() {
+        return Ok(rounded);
     }
-
-    // Round to the requested scale
-    let rounded = val.with_scale(scale);
 
     // Count total significant digits (excluding leading zeros)
     let (bigint, _) = rounded.as_bigint_and_exponent();
@@ -211,6 +204,22 @@ pub fn validate_precision_scale(
     }
 
     Ok(rounded)
+}
+
+/// Rounds `val` to `scale` digits after the decimal point, with no limit on
+/// the number of digits before it.
+pub fn round_to_scale(val: &BigDecimal, scale: i64) -> crate::Result<BigDecimal> {
+    use bigdecimal::Zero;
+
+    if scale < 0 {
+        return Err(LimboError::Constraint(format!(
+            "numeric scale must be non-negative, got {scale}"
+        )));
+    }
+    if val.is_zero() {
+        return Ok(BigDecimal::new(BigInt::from(0), scale));
+    }
+    Ok(val.with_scale(scale))
 }
 
 #[cfg(test)]

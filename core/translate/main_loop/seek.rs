@@ -137,6 +137,8 @@ pub(super) fn encode_seek_keys_for_custom_types(
 /// parameters change the value, as they round `1.501` to `1.50`, no stored
 /// value equals the key, so the key is encoded without the parameters
 /// instead: that form is never stored in the index, so the seek finds no row.
+/// The precision limit is never applied to the key, so a value too big for
+/// the column finds no row instead of failing.
 fn encode_seek_key_that_parameters_would_change(
     program: &mut ProgramBuilder,
     encode_expr: &Expr,
@@ -166,7 +168,7 @@ fn encode_seek_key_that_parameters_would_change(
         encode_expr,
         reg,
         with_parameters,
-        table_col,
+        &column_without_precision_limit(table_col, td),
         td,
         resolver,
     )?;
@@ -212,6 +214,22 @@ fn encode_seek_key_that_parameters_would_change(
     });
     program.preassign_label_to_next_insn(done_label);
     Ok(())
+}
+
+/// A value with more digits than the column's precision allows is never
+/// stored, so a seek for it must find no row instead of failing with
+/// "numeric value out of range".
+fn column_without_precision_limit(
+    table_col: &crate::schema::Column,
+    td: &crate::schema::TypeDef,
+) -> crate::schema::Column {
+    let mut column = table_col.clone();
+    for (param, value) in td.user_params().zip(column.ty_params.iter_mut()) {
+        if param.name.eq_ignore_ascii_case("precision") {
+            **value = Expr::Literal(turso_parser::ast::Literal::Null);
+        }
+    }
+    column
 }
 
 fn seek_key_encode(td: &crate::schema::TypeDef, converts_compared_values: bool) -> Option<&Expr> {

@@ -11561,31 +11561,31 @@ pub fn op_function(
                     Value::Null => Value::Null,
                     other => {
                         use crate::numeric::decimal::{
-                            bigdecimal_to_blob, validate_precision_scale,
+                            bigdecimal_to_blob, round_to_scale, validate_precision_scale,
                         };
                         use bigdecimal::BigDecimal;
                         use std::str::FromStr;
 
-                        let precision_and_scale =
-                            match (precision_reg.get_value(), scale_reg.get_value()) {
-                                (Value::Null, Value::Null) => None,
-                                (
-                                    Value::Numeric(Numeric::Integer(p)),
-                                    Value::Numeric(Numeric::Integer(s)),
-                                ) => Some((*p, *s)),
-                                (Value::Numeric(Numeric::Integer(_)), _) => {
-                                    return Err(LimboError::Constraint(
-                                        "numeric_encode: scale must be an integer".to_string(),
-                                    )
-                                    .into());
-                                }
-                                _ => {
-                                    return Err(LimboError::Constraint(
-                                        "numeric_encode: precision must be an integer".to_string(),
-                                    )
-                                    .into());
-                                }
-                            };
+                        let precision = match precision_reg.get_value() {
+                            Value::Null => None,
+                            Value::Numeric(Numeric::Integer(p)) => Some(*p),
+                            _ => {
+                                return Err(LimboError::Constraint(
+                                    "numeric_encode: precision must be an integer".to_string(),
+                                )
+                                .into());
+                            }
+                        };
+                        let scale = match scale_reg.get_value() {
+                            Value::Null if precision.is_none() => None,
+                            Value::Numeric(Numeric::Integer(s)) => Some(*s),
+                            _ => {
+                                return Err(LimboError::Constraint(
+                                    "numeric_encode: scale must be an integer".to_string(),
+                                )
+                                .into());
+                            }
+                        };
                         let text = match other {
                             Value::Numeric(Numeric::Integer(i)) => i.to_string(),
                             Value::Numeric(Numeric::Float(f)) => f.to_string(),
@@ -11602,11 +11602,12 @@ pub fn op_function(
                                 "invalid input for type numeric: \"{text}\""
                             ))
                         })?;
-                        let validated = match precision_and_scale {
-                            Some((precision, scale)) => {
+                        let validated = match (precision, scale) {
+                            (Some(precision), Some(scale)) => {
                                 validate_precision_scale(&bd, precision, scale)?
                             }
-                            None => bd,
+                            (None, Some(scale)) => round_to_scale(&bd, scale)?,
+                            _ => bd,
                         };
                         Value::from_blob(bigdecimal_to_blob(&validated))
                     }
