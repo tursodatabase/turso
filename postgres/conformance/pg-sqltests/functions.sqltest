@@ -255,6 +255,7 @@ expect {
 test current-setting-unknown-parameter-errors {
     SELECT current_setting('no_such_setting');
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "no_such_setting"
 }
@@ -262,6 +263,7 @@ expect error {
 test current-setting-unknown-parameter-without-missing-ok-errors {
     SELECT current_setting('no_such_setting', false);
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "no_such_setting"
 }
@@ -269,6 +271,7 @@ expect error {
 test current-setting-does-not-trim-the-parameter-name {
     SELECT current_setting('search_path ');
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "search_path "
 }
@@ -276,21 +279,25 @@ expect error {
 test current-setting-integer-parameter-name-errors {
     SELECT current_setting(5);
 }
+@sqlstate 42883
 expect error {}
 
 test current-setting-text-missing-ok-errors {
     SELECT current_setting('search_path', 'x');
 }
+@sqlstate 22P02
 expect error {}
 
 test current-setting-without-arguments-errors {
     SELECT current_setting();
 }
+@sqlstate 42883
 expect error {}
 
 test current-setting-with-three-arguments-errors {
     SELECT current_setting('search_path', true, true);
 }
+@sqlstate 42883
 expect error {}
 
 test set-config-custom-parameter {
@@ -344,6 +351,7 @@ expect {
 test current-setting-undefined-custom-parameter-errors {
     SELECT current_setting('app.never_set');
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "app\.never_set"
 }
@@ -364,6 +372,7 @@ expect {
 test set-config-custom-parameter-name-with-an-empty-part-errors {
     SELECT set_config('app..user_id', 'v', false);
 }
+@sqlstate 42602
 expect error {
     invalid configuration parameter name "app\.\.user_id"
 }
@@ -371,6 +380,7 @@ expect error {
 test set-config-custom-parameter-name-with-a-trailing-dot-errors {
     SELECT set_config('app.', 'v', false);
 }
+@sqlstate 42602
 expect error {
     invalid configuration parameter name "app\."
 }
@@ -378,6 +388,7 @@ expect error {
 test set-config-custom-parameter-name-with-a-leading-digit-errors {
     SELECT set_config('app.1user', 'v', false);
 }
+@sqlstate 42602
 expect error {
     invalid configuration parameter name "app\.1user"
 }
@@ -385,6 +396,7 @@ expect error {
 test set-config-custom-parameter-name-with-a-space-errors {
     SELECT set_config('app.user id', 'v', false);
 }
+@sqlstate 42602
 expect error {
     invalid configuration parameter name "app\.user id"
 }
@@ -392,6 +404,7 @@ expect error {
 test set-config-unknown-parameter-without-a-dot-errors {
     SELECT set_config('no_such_setting', 'v', false);
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "no_such_setting"
 }
@@ -599,11 +612,13 @@ expect {
 test version-wrong-arity-errors {
     SELECT version(1);
 }
+@sqlstate 42883
 expect error {}
 
 test quote-ident-wrong-arity-errors {
     SELECT quote_ident();
 }
+@sqlstate 42883
 expect error {}
 
 test pg-get-expr-default-two-args {
@@ -633,11 +648,13 @@ test pg-get-expr-non-text-expression-errors {
     CREATE TABLE demo (id int DEFAULT 7, label text);
     SELECT pg_get_expr(42, 1::oid) FROM pg_attrdef;
 }
+@sqlstate 42883
 expect error {}
 
 test pg-get-expr-null-oid-does-not-hide-invalid-expression {
     SELECT pg_get_expr(42, NULL::oid);
 }
+@sqlstate 42883
 expect error {}
 
 @skip-if postgres "PostgreSQL prints (val > 0), and also lists the CHECK constraints of the information_schema domains"
@@ -747,26 +764,31 @@ expect {
 test acldefault-unknown-object-kind-errors {
     SELECT acldefault('?', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test acldefault-empty-object-kind-errors {
     SELECT acldefault('', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test acldefault-leading-space-object-kind-errors {
     SELECT acldefault(' r', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test acldefault-uppercase-object-kind-errors {
     SELECT acldefault('R', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test acldefault-non-ascii-object-kind-errors {
     SELECT acldefault('é', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test format-type-expanded {
@@ -873,6 +895,7 @@ expect {
 test pg-options-to-table-null-element {
     SELECT * FROM pg_options_to_table(ARRAY['a=b', NULL]);
 }
+@sqlstate 22004
 expect error {
     null array element not allowed in this context
 }
@@ -1007,6 +1030,7 @@ expect {
 test json-to-record-requires-column-list {
     SELECT * FROM json_to_record('{"id":1}') AS _;
 }
+@sqlstate 42601
 expect error {
     a column definition list is required for functions returning "record"
 }
@@ -1036,6 +1060,7 @@ expect {
 test json-to-recordset-object-errors {
     SELECT * FROM json_to_recordset('{"a":1}') AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call json_to_recordset on an object
 }
@@ -1043,6 +1068,7 @@ expect error {
 test json-to-recordset-scalar-errors {
     SELECT * FROM jsonb_to_recordset('5'::jsonb) AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call jsonb_to_recordset on a non-array
 }
@@ -1050,6 +1076,7 @@ expect error {
 test json-to-recordset-json-scalar-errors {
     SELECT * FROM json_to_recordset('5') AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call json_to_recordset on a scalar
 }
@@ -1057,6 +1084,7 @@ expect error {
 test json-to-recordset-non-object-element-errors {
     SELECT * FROM json_to_recordset('[{"a":1},5]') AS _(a int);
 }
+@sqlstate 22023
 expect error {
     argument of json_to_recordset must be an array of objects
 }
@@ -1064,6 +1092,7 @@ expect error {
 test json-to-recordset-null-element-errors {
     SELECT * FROM jsonb_to_recordset('[null]'::jsonb) AS _(a int);
 }
+@sqlstate 22023
 expect error {
     argument of jsonb_to_recordset must be an array of objects
 }
@@ -1071,6 +1100,7 @@ expect error {
 test json-to-record-array-errors {
     SELECT * FROM json_to_record('[{"a":1}]') AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call populate_composite on an array
 }
@@ -1078,6 +1108,7 @@ expect error {
 test json-to-record-scalar-errors {
     SELECT * FROM jsonb_to_record('null'::jsonb) AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call populate_composite on a scalar
 }
