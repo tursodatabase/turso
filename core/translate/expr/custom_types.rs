@@ -396,16 +396,21 @@ pub(super) fn find_custom_type_operator(
 
     let resolve_one_custom_operand =
         |info: &ExprCustomTypeInfo, other: &ast::Expr, which: EncodeArg| {
-            let encode_other = literal_type_name(other).is_some_and(|lit_type| {
-                literal_compatible_with_value_type(lit_type, info.type_def.value_input_type())
-            });
+            let applies_to_any_operand = !op.is_comparison()
+                && resolver
+                    .dialect
+                    .applies_custom_type_arithmetic_to_any_operand();
+            let other_is_literal = literal_type_name(other).is_some();
+            let encode_other = !applies_to_any_operand
+                && literal_type_name(other).is_some_and(|lit_type| {
+                    literal_compatible_with_value_type(lit_type, info.type_def.value_input_type())
+                });
             let pass_other_unencoded = !op.is_comparison()
                 && (info.type_def.decode_returns_value_unchanged()
-                    || (resolver
-                        .dialect
-                        .applies_custom_type_arithmetic_to_any_operand()
-                        && get_expr_affinity(other, referenced_tables, Some(resolver))
-                            != Affinity::Real));
+                    || (applies_to_any_operand
+                        && (other_is_literal
+                            || get_expr_affinity(other, referenced_tables, Some(resolver))
+                                != Affinity::Real)));
             if !encode_other && !pass_other_unencoded {
                 return None;
             }
@@ -478,11 +483,7 @@ pub(crate) fn cast_in_subquery_values_to_lhs_type(
     referenced_tables: &TableReferences,
     resolver: &Resolver,
 ) -> Result<()> {
-    let Some(typed) = comparison_type_of(
-        unwrap_single_parenthesized(lhs),
-        Some(referenced_tables),
-        resolver,
-    )?
+    let Some(typed) = comparison_type_of(unwrap_parens(lhs)?, Some(referenced_tables), resolver)?
     else {
         return Ok(());
     };
@@ -827,9 +828,6 @@ pub(crate) fn emit_untyped_value_as_type(
     Ok(Some(converted_reg))
 }
 
-/// A quoted string or a bound parameter, as opposed to a number or an
-/// expression with a type. PostgreSQL converts such a value to the type of
-/// the column it is compared with.
 /// Whether the dialect converts values compared with the custom type described
 /// by `chain` to that type: the type compares its values with the standard
 /// comparison, accepts text and has an ENCODE that the comparison does not skip.
@@ -863,17 +861,8 @@ fn value_has_custom_type(
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
 ) -> Result<bool> {
-    let value_expr = unwrap_single_parenthesized(value_expr);
+    let value_expr = unwrap_parens(value_expr)?;
     Ok(comparison_type_of(value_expr, referenced_tables, resolver)?.is_some())
-}
-
-fn unwrap_single_parenthesized(expr: &ast::Expr) -> &ast::Expr {
-    match expr {
-        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            unwrap_single_parenthesized(&exprs[0])
-        }
-        _ => expr,
-    }
 }
 
 /// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).
@@ -1018,6 +1007,12 @@ pub(super) fn emit_domain_cast_constraints(
         });
     }
 
+    let value_base_type = chain
+        .iter()
+        .find(|td| !td.is_domain)
+        .filter(|_| resolver.dialect.check_constraints_see_decoded_values())
+        .map(|td| td.name.clone());
+
     for td in chain {
         for (i, dc) in td.domain_checks.iter().enumerate() {
             let constraint_name = dc
@@ -1030,8 +1025,12 @@ pub(super) fn emit_domain_cast_constraints(
                 .id_register_overrides
                 .insert("value".to_string(), reg);
 
+            let check = match &value_base_type {
+                Some(base_type) => cast_domain_value_to_base_type(&dc.check, base_type),
+                None => dc.check.clone(),
+            };
             let expr_result_reg = program.alloc_register();
-            translate_expr(program, None, &dc.check, expr_result_reg, resolver)?;
+            translate_expr(program, None, &check, expr_result_reg, resolver)?;
 
             program.id_register_overrides.remove("value");
 
@@ -1064,6 +1063,33 @@ pub(super) fn emit_domain_cast_constraints(
         }
     }
     Ok(())
+}
+
+/// Returns `check` with each `value` replaced by `CAST(value AS base_type)`, so
+/// a literal compared with `value` is converted to the domain's base type.
+fn cast_domain_value_to_base_type(check: &ast::Expr, base_type: &str) -> Box<ast::Expr> {
+    let mut check = check.clone();
+    let _ = walk_expr_mut(
+        &mut check,
+        &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+            let ast::Expr::Id(name) = e else {
+                return Ok(WalkControl::Continue);
+            };
+            if !name.as_str().eq_ignore_ascii_case("value") {
+                return Ok(WalkControl::Continue);
+            }
+            *e = ast::Expr::Cast {
+                expr: Box::new(e.clone()),
+                type_name: Some(ast::Type {
+                    name: base_type.to_string(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            };
+            Ok(WalkControl::SkipChildren)
+        },
+    );
+    Box::new(check)
 }
 
 /// Emit bytecode for a custom type encode/decode expression.

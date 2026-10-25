@@ -811,7 +811,22 @@ fn translate_cast_expr(
                     }
                 }
 
-                // Validate domain constraints on the encoded value
+                if resolver.dialect.check_constraints_see_decoded_values() {
+                    emit_cast_decodes(
+                        program,
+                        &resolved.chain,
+                        target_register,
+                        &cast_col,
+                        resolver,
+                    )?;
+                    emit_domain_cast_constraints(
+                        program,
+                        &resolved.chain,
+                        target_register,
+                        resolver,
+                    )?;
+                    return Ok(target_register);
+                }
                 emit_domain_cast_constraints(program, &resolved.chain, target_register, resolver)?;
                 emit_cast_decodes(
                     program,

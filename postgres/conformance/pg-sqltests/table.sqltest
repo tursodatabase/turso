@@ -250,6 +250,15 @@ expect {
     1.625|0.1875|-1.375|0.75|0.1875
 }
 
+test table-numeric-column-with-more-precise-literal-keeps-literal-digits {
+    CREATE TABLE prices (val numeric(10,2));
+    INSERT INTO prices VALUES (1.5);
+    SELECT val + 0.005, val * 0.125, val - 0.001 FROM prices;
+}
+expect {
+    1.505|0.18750|1.499
+}
+
 test table-uuid-column-omitted-from-insert-is-null {
     CREATE TABLE t (id int PRIMARY KEY, u uuid);
     INSERT INTO t (id) VALUES (1);

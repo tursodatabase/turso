@@ -320,3 +320,19 @@ expect {
     2026-10-08 12:00:00+00
     2026-10-08 12:00:00+00
 }
+
+test domain-cast-check-compares-timestamptz-with-literal {
+    CREATE DOMAIN after_noon AS timestamptz CHECK (VALUE > '2026-10-08 13:00+02');
+    SELECT '2026-10-08 11:30:00'::after_noon, '2026-10-08 13:30+02'::after_noon;
+}
+expect {
+    2026-10-08 11:30:00+00|2026-10-08 11:30:00+00
+}
+
+test domain-cast-check-with-timestamptz-literal-rejects-earlier-value {
+    CREATE DOMAIN after_noon AS timestamptz CHECK (VALUE > '2026-10-08 13:00+02');
+    SELECT '2026-10-08 10:30:00'::after_noon;
+}
+expect error {
+    violates check constraint
+}
