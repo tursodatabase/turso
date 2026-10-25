@@ -163,6 +163,10 @@ impl Dialect for PostgresDialect {
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
+        // Leave `mod` to the PostgreSQL scalar registered in `functions.rs`.
+        if name.eq_ignore_ascii_case("mod") {
+            return Ok(None);
+        }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
 

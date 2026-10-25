@@ -1140,35 +1140,13 @@ impl Value {
         }
     }
 
-    pub fn exec_math_binary(
-        &self,
-        rhs: &Value,
-        function: &MathFunc,
-        errors_on_zero_divisor: bool,
-    ) -> Result<Value, LimboError> {
+    pub fn exec_math_binary(&self, rhs: &Value, function: &MathFunc) -> Value {
         let Some(lhs) = Numeric::from_value_strict(self).map(|v| v.to_f64()) else {
-            return Ok(Value::Null);
+            return Value::Null;
         };
 
-        if matches!(function, MathFunc::Mod) && errors_on_zero_divisor {
-            match rhs {
-                Value::Text(t) => match Numeric::from_value_strict(rhs) {
-                    None => {
-                        return Err(LimboError::InvalidTextRepresentation(t.as_str().to_owned()))
-                    }
-                    Some(n) if n.to_f64() == 0.0 => return Err(LimboError::DivisionByZero),
-                    _ => {}
-                },
-                _ => {
-                    if Numeric::from_value_strict(rhs).is_some_and(|n| n.to_f64() == 0.0) {
-                        return Err(LimboError::DivisionByZero);
-                    }
-                }
-            }
-        }
-
         let Some(rhs) = Numeric::from_value_strict(rhs).map(|v| v.to_f64()) else {
-            return Ok(Value::Null);
+            return Value::Null;
         };
 
         #[allow(unused_unsafe)]
@@ -1179,11 +1157,11 @@ impl Value {
             _ => unreachable!("Unexpected mathematical binary function {:?}", function),
         };
 
-        Ok(if result.is_nan() {
+        if result.is_nan() {
             Value::Null
         } else {
             Value::from_f64(result)
-        })
+        }
     }
 
     /// Mirrors SQLite's logFunc: log(X) calls log10 directly, and log(B,X)

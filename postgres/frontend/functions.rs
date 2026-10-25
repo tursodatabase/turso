@@ -84,6 +84,7 @@ scalar_functions! {
     PgIsInRecovery(FunctionArity::Exact(0), false),
     PgLockAccessShare(FunctionArity::Exact(0), false),
     PgLimitValue(FunctionArity::Exact(2), true),
+    Mod(FunctionArity::Exact(2), true),
     Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
 }
 
@@ -151,6 +152,7 @@ impl ScalarCall for PgScalarFunction {
                 Value::from_i64(0)
             }
             Self::PgLimitValue => exec_pg_limit_value(args)?,
+            Self::Mod => exec_mod(args[0].get_value(), args[1].get_value())?,
             Self::Now
             | Self::ClockTimestamp
             | Self::TransactionTimestamp
@@ -472,6 +474,30 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Value> {
         )));
     }
     Ok(Value::from_i64(value))
+}
+
+/// PostgreSQL's `mod` keeps integer arguments integer, unlike SQLite's,
+/// which always returns a float.
+fn exec_mod(lhs: &Value, rhs: &Value) -> Result<Value> {
+    let (Some(lhs), Some(rhs)) = (numeric_arg(lhs)?, numeric_arg(rhs)?) else {
+        return Ok(Value::Null);
+    };
+    if rhs.to_f64() == 0.0 {
+        return Err(LimboError::DivisionByZero);
+    }
+    Ok(match (lhs, rhs) {
+        (Numeric::Integer(lhs), Numeric::Integer(rhs)) => Value::from_i64(lhs.wrapping_rem(rhs)),
+        _ => Value::from_f64(lhs.to_f64() % rhs.to_f64()),
+    })
+}
+
+fn numeric_arg(value: &Value) -> Result<Option<Numeric>> {
+    match value {
+        Value::Text(text) => Numeric::from_value_strict(value)
+            .map(Some)
+            .ok_or_else(|| LimboError::InvalidTextRepresentation(text.as_str().to_owned())),
+        _ => Ok(Numeric::from_value_strict(value)),
+    }
 }
 
 fn exec_pg_get_user_by_id(_oid: i64) -> Value {
