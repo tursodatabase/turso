@@ -8810,7 +8810,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // another data structure, e.g. a BTreeSet. If it proves to be too quadratic empirically,
         // we can either switch to a tree-like structure, or at least use partition_point()
         // which performs a binary search for the insertion point.
-        versions.try_reserve(1)?;
+        Self::reserve_space_for_one_version(versions)?;
         let mut position = 0_usize;
         for (i, v) in versions.iter().enumerate().rev() {
             let existing_begin = self.resolve_begin_timestamp(&v.begin());
@@ -8845,6 +8845,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // reaching here). Track it for the GC trigger heuristic.
         self.live_version_count_approx
             .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Chains with fewer versions than this grow by exactly one slot.
+    const CHAIN_EXACT_GROWTH_MAX_LEN: usize = 4;
+
+    /// Most chains hold one or two versions. Amortized `Vec` growth gives an
+    /// empty chain four slots of about 100 bytes each, so a short chain grows
+    /// by one slot at a time and a long chain doubles as before.
+    fn reserve_space_for_one_version(
+        versions: &mut RowVersionChain<A>,
+    ) -> Result<(), TryReserveError> {
+        if versions.len() < Self::CHAIN_EXACT_GROWTH_MAX_LEN {
+            versions.try_reserve_exact(1)?;
+        } else {
+            versions.try_reserve(1)?;
+        }
         Ok(())
     }
 
