@@ -2825,7 +2825,11 @@ impl Schema {
     /// Compute all resolved FKs *referencing* `table_name` (arg: `table_name` is the parent).
     /// Each item contains the child table, normalized columns/positions, and the parent lookup
     /// strategy (rowid vs. UNIQUE index or PK).
-    pub fn resolved_fks_referencing(&self, table_name: &str) -> Result<Vec<ResolvedFkRef>> {
+    pub fn resolved_fks_referencing(
+        &self,
+        table_name: &str,
+        updated_cols: Option<&ColumnMask>,
+    ) -> Result<Vec<ResolvedFkRef>> {
         let target = normalize_ident(table_name);
         let parent_tbl = self
             .get_btree_table(&target)
@@ -2839,6 +2843,11 @@ impl Schema {
             for fk in &child.foreign_keys {
                 if !fk.parent_table.eq_ignore_ascii_case(&target) {
                     continue;
+                }
+                if let Some(updated_cols) = updated_cols {
+                    if !fk.parent_key_assigned(&parent_tbl, updated_cols) {
+                        continue;
+                    }
                 }
                 out.try_push(self.resolve_fk(
                     fk,
@@ -5761,6 +5770,40 @@ impl ForeignKey {
         })
     }
 
+    pub fn parent_key_assigned(&self, parent: &BTreeTable, updated_cols: &ColumnMask) -> bool {
+        if self.parent_columns.is_empty() {
+            if updated_cols.get(ROWID_SENTINEL) {
+                return true;
+            }
+            if parent.primary_key_columns.is_empty() {
+                if let Some((pos, _)) = parent
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .find(|(_, c)| c.is_rowid_alias())
+                {
+                    return updated_cols.get(pos);
+                }
+                return false;
+            }
+            parent.primary_key_columns.iter().any(|(cname, _)| {
+                parent
+                    .get_column(cname)
+                    .is_some_and(|(pos, _)| updated_cols.get(pos))
+            })
+        } else {
+            self.parent_columns.iter().any(|cname| {
+                if ROWID_STRS.iter().any(|r| cname.eq_ignore_ascii_case(r)) {
+                    return updated_cols.get(ROWID_SENTINEL);
+                }
+                parent.get_column(cname).is_some_and(|(pos, col)| {
+                    updated_cols.get(pos)
+                        || (col.is_rowid_alias() && updated_cols.get(ROWID_SENTINEL))
+                })
+            })
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         if self
             .parent_columns
@@ -5840,7 +5883,7 @@ impl ResolvedFkRef {
                 return updated_parent_positions.get(idx);
             }
             // Without a rowid alias, a direct rowid update is represented separately with ROWID_SENTINEL
-            return true;
+            return updated_parent_positions.get(ROWID_SENTINEL);
         }
         self.parent_pos
             .iter()

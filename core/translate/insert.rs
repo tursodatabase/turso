@@ -4245,7 +4245,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
     database_id: usize,
 ) -> crate::Result<()> {
     for pref in resolver.with_schema(database_id, |s| {
-        s.resolved_fks_referencing(&parent_table.name)
+        s.resolved_fks_referencing(&parent_table.name, None)
     })? {
         let is_self_ref = pref
             .child_table

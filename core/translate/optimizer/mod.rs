@@ -1465,7 +1465,7 @@ fn update_write_set_reason(
         // target during the scan. Materialize target rowids first to keep
         // the write set stable. (See issue #6460.)
         let referencing_fks = resolver.with_schema(database_id, |s| {
-            s.resolved_fks_referencing(&btree_table.name)
+            s.resolved_fks_referencing(&btree_table.name, Some(&updated_cols))
         })?;
         for fk in &referencing_fks {
             if matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict) {

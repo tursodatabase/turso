@@ -565,6 +565,31 @@ expect {
     2|1
 }
 
+@cross-check-integrity
+test fk-mismatch-bare-fk-update-other-column-ok {
+    CREATE TABLE c(x, w);
+    CREATE TABLE d(r REFERENCES c);
+    INSERT INTO c VALUES (1, 1);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET w = 3;
+    SELECT * FROM c;
+}
+expect {
+    1|3
+}
+
+@cross-check-integrity
+test fk-mismatch-self-ref-unresolved-column-update-other-column-ok {
+    CREATE TABLE c(x, y REFERENCES c(nosuch));
+    INSERT INTO c VALUES (1, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET x = 2;
+    SELECT * FROM c;
+}
+expect {
+    2|
+}
+
 test fk-mismatch-self-ref-update-parent-key {
     CREATE TABLE c(id INTEGER PRIMARY KEY, x, y REFERENCES c(x));
     INSERT INTO c VALUES (1, 1, NULL);
