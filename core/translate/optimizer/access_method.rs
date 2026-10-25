@@ -1376,6 +1376,7 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
                         if usable.iter().all(|(_, constraint)| constraint.table_col_pos == Some(position)))
             )
     });
+    let mut ordered_walk = None;
     if extremum_constraints_compatible || usable.is_empty() {
         // Reading forwards gives the subquery's own order; only a stored
         // CTE can be read backwards for the opposite one.
@@ -1401,17 +1402,22 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
         if let Some(iter_dir) = direction {
             let mut method = scan(scan_cost);
             method.params = AccessMethodParams::Subquery { iter_dir };
-            return Ok(method);
+            if usable.is_empty() {
+                return Ok(method);
+            }
+            ordered_walk = Some(method);
         }
     }
     if usable.is_empty() {
         return Ok(scan(scan_cost));
     }
+    let walk_gives_order = ordered_walk.is_some();
+    let scan_method = ordered_walk.unwrap_or_else(|| scan(scan_cost));
     let usable_constraints: Vec<&Constraint<hir::ExprId>> =
         usable.iter().map(|(_, constraint)| *constraint).collect();
     let key_col_positions = super::constraints::ordered_ephemeral_key_columns(&usable_constraints);
     if key_col_positions.is_empty() {
-        return Ok(scan(scan_cost));
+        return Ok(scan_method);
     }
     let mut constraint_refs: Vec<ConstraintRef> = usable
         .iter()
@@ -1440,7 +1446,7 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
     )
     .into_vec();
     if constraint_refs.is_empty() {
-        return Ok(scan(scan_cost));
+        return Ok(scan_method);
     }
     let index = hir_materialized_subquery_ephemeral_index(definition, &key_col_positions)?;
     let estimated_rows_per_outer_row =
@@ -1518,7 +1524,11 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
             ))
         })
         .unwrap_or((IterationDirection::Forwards, Cost(0.0)));
-    let scan_method = scan(scan_cost);
+    let order_bonus = if walk_gives_order {
+        Cost(0.0)
+    } else {
+        order_bonus
+    };
     let index_method = AccessMethod {
         cost: subquery_cost + seek_setup_cost + seek_cost,
         estimated_rows_per_outer_row,
