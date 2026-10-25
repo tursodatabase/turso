@@ -1101,6 +1101,16 @@ expect {
     {"y":2}|"z"
 }
 
+test function-whose-name-starts-with-a-bracket-does-not-exist {
+    SELECT "[x"();
+}
+expect error {
+    function \[x\(\) does not exist
+}
+expect @tursopg error {
+    no such function: \[x
+}
+
 test mod-of-integers-is-integer {
     SELECT mod(67, 100), mod(-7, 3), mod(7::bigint, 2::smallint), mod(-9223372036854775808, -1);
 }

@@ -48,19 +48,19 @@ impl PostgreSQLTranslator {
         } else {
             self.map_table_name(&range_var.relname)
         };
-        let name = ast::Name::from_string(mapped_name);
+        let name = exact_name(mapped_name);
         let alias = range_var
             .alias
             .as_ref()
             .filter(|a| !a.aliasname.is_empty())
-            .map(|a| ast::Name::from_string(&a.aliasname));
+            .map(|a| exact_name(&a.aliasname));
         let schema = if range_var.schemaname.is_empty() {
             is_catalog_table_name(name.as_str()).then_some("main")
         } else {
             Some(map_schema_name(&range_var.schemaname))
         };
         let mut qn = match schema {
-            Some(schema) => ast::QualifiedName::fullname(ast::Name::from_string(schema), name),
+            Some(schema) => ast::QualifiedName::fullname(exact_name(schema), name),
             None => ast::QualifiedName::single(name),
         };
         qn.alias = alias;
@@ -244,7 +244,7 @@ impl PostgreSQLTranslator {
             order_by: vec![],
             limit: Some(ast::Limit {
                 expr: Box::new(ast::Expr::FunctionCall {
-                    name: ast::Name::from_string("pg_lock_access_share"),
+                    name: exact_name("pg_lock_access_share"),
                     distinctness: None,
                     args: vec![],
                     order_by: vec![],
@@ -369,17 +369,15 @@ impl PostgreSQLTranslator {
                             let pk_cols = extract_key_columns(&constraint.keys)?;
                             table_constraints.push(ast::NamedTableConstraint {
                                 name: if constraint.conname.is_empty() {
-                                    Some(ast::Name::from_string(format!("{tbl_name_str}_pkey")))
+                                    Some(exact_name(format!("{tbl_name_str}_pkey")))
                                 } else {
-                                    Some(ast::Name::from_string(constraint.conname.clone()))
+                                    Some(exact_name(constraint.conname.clone()))
                                 },
                                 constraint: ast::TableConstraint::PrimaryKey {
                                     columns: pk_cols
                                         .into_iter()
                                         .map(|c| ast::SortedColumn {
-                                            expr: Box::new(ast::Expr::Id(ast::Name::from_string(
-                                                c,
-                                            ))),
+                                            expr: Box::new(ast::Expr::Id(exact_name(c))),
                                             order: None,
                                             nulls: None,
                                         })
@@ -395,15 +393,13 @@ impl PostgreSQLTranslator {
                                 name: if constraint.conname.is_empty() {
                                     None
                                 } else {
-                                    Some(ast::Name::from_string(constraint.conname.clone()))
+                                    Some(exact_name(constraint.conname.clone()))
                                 },
                                 constraint: ast::TableConstraint::Unique {
                                     columns: unique_cols
                                         .into_iter()
                                         .map(|c| ast::SortedColumn {
-                                            expr: Box::new(ast::Expr::Id(ast::Name::from_string(
-                                                c,
-                                            ))),
+                                            expr: Box::new(ast::Expr::Id(exact_name(c))),
                                             order: None,
                                             nulls: None,
                                         })
@@ -488,8 +484,8 @@ impl PostgreSQLTranslator {
             .map(|seq_name| ast::Stmt::CreateSequence {
                 if_not_exists: true,
                 seq_name: ast::QualifiedName::fullname(
-                    ast::Name::from_string(&namespace),
-                    ast::Name::from_string(seq_name),
+                    exact_name(&namespace),
+                    exact_name(seq_name),
                 ),
                 start: None,
                 increment: None,
@@ -550,14 +546,14 @@ impl PostgreSQLTranslator {
                 ConstrType::ConstrPrimary => {
                     is_primary_key = true;
                     if !constraint.conname.is_empty() {
-                        pk_conname = Some(ast::Name::from_string(constraint.conname.clone()));
+                        pk_conname = Some(exact_name(constraint.conname.clone()));
                     }
                 }
                 ConstrType::ConstrNotnull => is_not_null = true,
                 ConstrType::ConstrUnique => {
                     is_unique = true;
                     if !constraint.conname.is_empty() {
-                        unique_conname = Some(ast::Name::from_string(constraint.conname.clone()));
+                        unique_conname = Some(exact_name(constraint.conname.clone()));
                     }
                 }
                 ConstrType::ConstrDefault => {
@@ -633,7 +629,7 @@ impl PostgreSQLTranslator {
             serial_sequences.push(seq_name.clone());
             let namespace = serial_sequence_namespace(tbl_name);
             default_expr = Some(ast::Expr::FunctionCall {
-                name: ast::Name::from_string("nextval"),
+                name: exact_name("nextval"),
                 distinctness: None,
                 args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(format!(
                     "'{namespace}.{seq_name}'"
@@ -650,9 +646,10 @@ impl PostgreSQLTranslator {
         // PRIMARY KEY (only on column level if there's no table-level PK)
         if is_primary_key && !has_table_pk {
             constraints.push(ast::NamedColumnConstraint {
-                name: Some(pk_conname.unwrap_or_else(|| {
-                    ast::Name::from_string(format!("{}_pkey", tbl_name.name.as_str()))
-                })),
+                name: Some(
+                    pk_conname
+                        .unwrap_or_else(|| exact_name(format!("{}_pkey", tbl_name.name.as_str()))),
+                ),
                 constraint: ast::ColumnConstraint::PrimaryKey {
                     order: None,
                     conflict_clause: None,
@@ -692,7 +689,7 @@ impl PostgreSQLTranslator {
         if let Some(ref fk) = foreign_key {
             let clause = self.pg_fk_to_fk_clause(fk);
             constraints.push(ast::NamedColumnConstraint {
-                name: fk.name.clone().map(ast::Name::from_string),
+                name: fk.name.clone().map(exact_name),
                 constraint: ast::ColumnConstraint::ForeignKey {
                     clause,
                     defer_clause: None,
@@ -703,7 +700,7 @@ impl PostgreSQLTranslator {
         constraints.extend(check_constraints);
 
         Ok(ast::ColumnDefinition {
-            col_name: ast::Name::from_string(name),
+            col_name: exact_name(name),
             col_type,
             constraints,
         })
@@ -723,12 +720,12 @@ impl PostgreSQLTranslator {
             }
         }
         ast::ForeignKeyClause {
-            tbl_name: ast::Name::from_string(fk.ref_table.clone()),
+            tbl_name: exact_name(fk.ref_table.clone()),
             columns: fk
                 .ref_columns
                 .iter()
                 .map(|c| ast::IndexedColumn {
-                    col_name: ast::Name::from_string(c.clone()),
+                    col_name: exact_name(c.clone()),
                     collation_name: None,
                     order: None,
                 })
@@ -746,14 +743,14 @@ impl PostgreSQLTranslator {
         let columns = extract_key_columns(fk_attr_nodes)?
             .into_iter()
             .map(|c| ast::IndexedColumn {
-                col_name: ast::Name::from_string(c),
+                col_name: exact_name(c),
                 collation_name: None,
                 order: None,
             })
             .collect();
 
         Ok(ast::NamedTableConstraint {
-            name: fk.name.clone().map(ast::Name::from_string),
+            name: fk.name.clone().map(exact_name),
             constraint: ast::TableConstraint::ForeignKey {
                 columns,
                 clause: self.pg_fk_to_fk_clause(fk),
@@ -786,14 +783,14 @@ impl PostgreSQLTranslator {
                 savepoint_name: None,
             }),
             Ok(TransactionStmtKind::TransStmtSavepoint) => Ok(ast::Stmt::Savepoint {
-                name: ast::Name::from_string(&txn.savepoint_name),
+                name: exact_name(&txn.savepoint_name),
             }),
             Ok(TransactionStmtKind::TransStmtRelease) => Ok(ast::Stmt::Release {
-                name: ast::Name::from_string(&txn.savepoint_name),
+                name: exact_name(&txn.savepoint_name),
             }),
             Ok(TransactionStmtKind::TransStmtRollbackTo) => Ok(ast::Stmt::Rollback {
                 tx_name: None,
-                savepoint_name: Some(ast::Name::from_string(&txn.savepoint_name)),
+                savepoint_name: Some(exact_name(&txn.savepoint_name)),
             }),
             _ => Err(ParseError::ParseError(format!(
                 "Unsupported transaction statement kind: {}",
@@ -878,9 +875,7 @@ impl PostgreSQLTranslator {
                 let col = self.translate_column_def(col_def, &relation.schemaname)?;
                 ast::AlterTableBody::AddColumn(col)
             }
-            AlterTableType::AtDropColumn => {
-                ast::AlterTableBody::DropColumn(ast::Name::from_string(&cmd.name))
-            }
+            AlterTableType::AtDropColumn => ast::AlterTableBody::DropColumn(exact_name(&cmd.name)),
             AlterTableType::AtAlterColumnType => {
                 // ALTER TABLE t ALTER COLUMN c TYPE new_type
                 // Map to AlterColumn with the new column definition
@@ -967,15 +962,15 @@ impl PostgreSQLTranslator {
 
         match rename_type {
             ObjectType::ObjectTable => {
-                let new_name = ast::Name::from_string(&rename.newname);
+                let new_name = exact_name(&rename.newname);
                 Ok(ast::Stmt::AlterTable(ast::AlterTable {
                     name,
                     body: ast::AlterTableBody::RenameTo(new_name),
                 }))
             }
             ObjectType::ObjectColumn => {
-                let old = ast::Name::from_string(&rename.subname);
-                let new = ast::Name::from_string(&rename.newname);
+                let old = exact_name(&rename.subname);
+                let new = exact_name(&rename.newname);
                 Ok(ast::Stmt::AlterTable(ast::AlterTable {
                     name,
                     body: ast::AlterTableBody::RenameColumn { old, new },
@@ -996,7 +991,7 @@ impl PostgreSQLTranslator {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
 
-        let col_name = ast::Name::from_string(&col_def.colname);
+        let col_name = exact_name(&col_def.colname);
         reject_column_def_clauses(col_def)?;
 
         let pg_type = extract_type_name(col_def)?;
@@ -1076,7 +1071,7 @@ impl PostgreSQLTranslator {
             .relation
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE INDEX missing table name".into()))?;
-        let tbl_name = ast::Name::from_string(self.map_table_name(&relation.relname));
+        let tbl_name = exact_name(self.map_table_name(&relation.relname));
 
         if !idx.access_method.is_empty() && !idx.access_method.eq_ignore_ascii_case("btree") {
             return Err(not_supported(format!(
@@ -1097,11 +1092,11 @@ impl PostgreSQLTranslator {
         // SQLite names the database on the index, not on the table, and
         // looks the table up there.
         let idx_name = if relation.schemaname.is_empty() {
-            ast::QualifiedName::single(ast::Name::from_string(&idx.idxname))
+            ast::QualifiedName::single(exact_name(&idx.idxname))
         } else {
             ast::QualifiedName::fullname(
-                ast::Name::from_string(map_schema_name(&relation.schemaname)),
-                ast::Name::from_string(&idx.idxname),
+                exact_name(map_schema_name(&relation.schemaname)),
+                exact_name(&idx.idxname),
             )
         };
 
@@ -1137,7 +1132,7 @@ impl PostgreSQLTranslator {
             };
             reject_index_elem_clauses(elem, "CREATE INDEX")?;
             let expr = if !elem.name.is_empty() {
-                Box::new(ast::Expr::Id(ast::Name::from_string(&elem.name)))
+                Box::new(ast::Expr::Id(exact_name(&elem.name)))
             } else if let Some(ref expr_node) = elem.expr {
                 Box::new(self.translate_expr(expr_node)?)
             } else {
@@ -1201,20 +1196,20 @@ impl PostgreSQLTranslator {
                 let names = extract_key_columns(&list.items)?;
                 match names.as_slice() {
                     [] => return Err(ParseError::ParseError("DROP: empty name list".into())),
-                    [name] => ast::QualifiedName::single(ast::Name::from_string(name.clone())),
+                    [name] => ast::QualifiedName::single(exact_name(name.clone())),
                     [schema, name] => ast::QualifiedName::fullname(
-                        ast::Name::from_string(map_schema_name(schema)),
-                        ast::Name::from_string(name.clone()),
+                        exact_name(map_schema_name(schema)),
+                        exact_name(name.clone()),
                     ),
                     _ => return Err(not_supported("a cross-database reference")),
                 }
             }
-            Some(Node::String(s)) => {
-                ast::QualifiedName::single(ast::Name::from_string(s.sval.clone()))
-            }
-            Some(Node::TypeName(tn)) => ast::QualifiedName::single(ast::Name::from_string(
-                object_name(&tn.names, is_default_schema, "type")?,
-            )),
+            Some(Node::String(s)) => ast::QualifiedName::single(exact_name(s.sval.clone())),
+            Some(Node::TypeName(tn)) => ast::QualifiedName::single(exact_name(object_name(
+                &tn.names,
+                is_default_schema,
+                "type",
+            )?)),
             _ => {
                 return Err(ParseError::ParseError(
                     "DROP: unexpected object format".into(),
@@ -1319,7 +1314,7 @@ impl PostgreSQLTranslator {
             .iter()
             .filter_map(|alias| match &alias.node {
                 Some(pg_query::protobuf::node::Node::String(s)) => Some(ast::IndexedColumn {
-                    col_name: ast::Name::from_string(&s.sval),
+                    col_name: exact_name(&s.sval),
                     collation_name: None,
                     order: None,
                 }),
@@ -1427,7 +1422,7 @@ impl PostgreSQLTranslator {
             .iter()
             .filter_map(|node| match &node.node {
                 Some(pg_query::protobuf::node::Node::String(s)) => Some(ast::IndexedColumn {
-                    col_name: ast::Name::from_string(&s.sval),
+                    col_name: exact_name(&s.sval),
                     collation_name: None,
                     order: None,
                 }),
@@ -1523,7 +1518,7 @@ impl PostgreSQLTranslator {
             .iter()
             .map(|col_node| match &col_node.node {
                 Some(Node::ResTarget(res_target)) if res_target.indirection.is_empty() => {
-                    Ok(ast::Name::from_string(&res_target.name))
+                    Ok(exact_name(&res_target.name))
                 }
                 Some(Node::ResTarget(_)) => Err(not_supported(
                     "INSERT into an array element or composite field",
@@ -1715,7 +1710,7 @@ impl PostgreSQLTranslator {
                             "UPDATE of an array element or composite field",
                         ));
                     }
-                    let col_name = ast::Name::from_string(&res_target.name);
+                    let col_name = exact_name(&res_target.name);
                     let expr = if let Some(val) = &res_target.val {
                         Box::new(self.translate_expr(val)?)
                     } else {
@@ -2205,7 +2200,7 @@ impl PostgreSQLTranslator {
             }
             None => None,
         }
-        .map(|name| ast::As::Elided(ast::Name::from_string(name)));
+        .map(|name| ast::As::Elided(exact_name(name)));
 
         Ok(ast::SelectTable::Table(qualified_name, alias, None))
     }
@@ -2233,7 +2228,7 @@ impl PostgreSQLTranslator {
         let alias = range_sub
             .alias
             .as_ref()
-            .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
+            .map(|a| ast::As::Elided(exact_name(a.aliasname.clone())));
         Ok(ast::SelectTable::Select {
             select,
             alias,
@@ -2311,7 +2306,7 @@ impl PostgreSQLTranslator {
         let alias = range_func
             .alias
             .as_ref()
-            .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
+            .map(|a| ast::As::Elided(exact_name(a.aliasname.clone())));
 
         // PostgreSQL exposes scalar functions in FROM position as one-row,
         // one-column tables (clients issue `SELECT * FROM current_schema()`),
@@ -2324,10 +2319,10 @@ impl PostgreSQLTranslator {
             reject_column_aliases(&range_func.alias, "a function")?;
             let column_name = match &alias {
                 Some(ast::As::As(name) | ast::As::Elided(name)) => name.clone(),
-                _ => ast::Name::from_string(func_name),
+                _ => exact_name(func_name),
             };
             let call = ast::Expr::FunctionCall {
-                name: ast::Name::from_string(func_name),
+                name: exact_name(func_name),
                 distinctness: None,
                 args: vec![],
                 order_by: vec![],
@@ -2371,9 +2366,9 @@ impl PostgreSQLTranslator {
             });
         }
 
-        let name = ast::Name::from_string(func_name);
+        let name = exact_name(func_name);
         let qualified_name = if function_uses_main_schema(func_name) {
-            ast::QualifiedName::fullname(ast::Name::from_string("main"), name)
+            ast::QualifiedName::fullname(exact_name("main"), name)
         } else {
             ast::QualifiedName::single(name)
         };
@@ -2516,7 +2511,7 @@ impl PostgreSQLTranslator {
             ),
         };
         let json_type = |args: Vec<Box<ast::Expr>>| ast::Expr::FunctionCall {
-            name: ast::Name::from_string("json_type"),
+            name: exact_name("json_type"),
             distinctness: None,
             args,
             order_by: vec![],
@@ -2541,7 +2536,7 @@ impl PostgreSQLTranslator {
                         distinctness: None,
                         columns: vec![ast::ResultColumn::Expr(
                             Box::new(checked_arg),
-                            Some(ast::As::Elided(ast::Name::from_string("json"))),
+                            Some(ast::As::Elided(exact_name("json"))),
                         )],
                         from: None,
                         where_clause: None,
@@ -2553,25 +2548,18 @@ impl PostgreSQLTranslator {
                 order_by: vec![],
                 limit: None,
             },
-            alias: Some(ast::As::Elided(ast::Name::from_string("arg"))),
+            alias: Some(ast::As::Elided(exact_name("arg"))),
             lateral: false,
         };
-        let arg_json = ast::Expr::Qualified(
-            ast::Name::from_string("arg"),
-            ast::Name::from_string("json"),
-        );
+        let arg_json = ast::Expr::Qualified(exact_name("arg"), exact_name("json"));
         let (source, joins) = if is_recordset {
             let json_each = ast::SelectTable::TableCall(
-                ast::QualifiedName::single(ast::Name::from_string("json_each")),
+                ast::QualifiedName::single(exact_name("json_each")),
                 vec![Box::new(arg_json)],
-                Some(ast::As::Elided(ast::Name::from_string("element"))),
+                Some(ast::As::Elided(exact_name("element"))),
             );
-            let element = |column: &str| {
-                ast::Expr::Qualified(
-                    ast::Name::from_string("element"),
-                    ast::Name::from_string(column),
-                )
-            };
+            let element =
+                |column: &str| ast::Expr::Qualified(exact_name("element"), exact_name(column));
             (
                 json_type_or_raise(
                     element("type"),
@@ -2648,9 +2636,7 @@ impl PostgreSQLTranslator {
                 };
                 Ok(ast::ResultColumn::Expr(
                     Box::new(cast),
-                    Some(ast::As::Elided(ast::Name::from_string(
-                        col_def.colname.clone(),
-                    ))),
+                    Some(ast::As::Elided(exact_name(col_def.colname.clone()))),
                 ))
             })
             .collect::<Result<Vec<_>, ParseError>>()?;
@@ -2674,9 +2660,7 @@ impl PostgreSQLTranslator {
                 order_by: vec![],
                 limit: None,
             },
-            alias: Some(
-                alias.unwrap_or_else(|| ast::As::Elided(ast::Name::from_string(func_name))),
-            ),
+            alias: Some(alias.unwrap_or_else(|| ast::As::Elided(exact_name(func_name)))),
             lateral: true,
         })
     }
@@ -2791,7 +2775,7 @@ impl PostgreSQLTranslator {
         } else if !join_expr.using_clause.is_empty() {
             let names = extract_key_columns(&join_expr.using_clause)?
                 .into_iter()
-                .map(ast::Name::from_string)
+                .map(exact_name)
                 .collect();
             Some(ast::JoinConstraint::Using(names))
         } else {
@@ -2843,7 +2827,7 @@ impl PostgreSQLTranslator {
                                             ));
                                         };
                                         result_columns.push(ast::ResultColumn::TableStar(
-                                            ast::Name::from_string(&s.sval),
+                                            exact_name(&s.sval),
                                         ));
                                     }
                                     continue;
@@ -2854,20 +2838,18 @@ impl PostgreSQLTranslator {
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
                                 None
                             } else {
-                                Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
+                                Some(ast::As::Elided(exact_name(&res_target.name)))
                             };
                             result_columns.push(ast::ResultColumn::Expr(Box::new(expr), alias));
                         } else {
                             let expr = self.translate_expr(val)?;
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
                                 Some(match derived_column_name(val) {
-                                    Some(name) => ast::As::Elided(ast::Name::from_string(name)),
-                                    None => ast::As::ImplicitColumnName(ast::Name::from_string(
-                                        "?column?",
-                                    )),
+                                    Some(name) => ast::As::Elided(exact_name(name)),
+                                    None => ast::As::ImplicitColumnName(exact_name("?column?")),
                                 })
                             } else {
-                                Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
+                                Some(ast::As::Elided(exact_name(&res_target.name)))
                             };
                             result_columns.push(ast::ResultColumn::Expr(Box::new(expr), alias));
                         }
@@ -2893,7 +2875,7 @@ impl PostgreSQLTranslator {
                         Some(pg_query::protobuf::node::Node::String(s)) => {
                             if col_ref.fields.len() == 1 {
                                 // Simple column reference
-                                Ok(ast::Expr::Id(ast::Name::from_string(s.sval.clone())))
+                                Ok(ast::Expr::Id(exact_name(s.sval.clone())))
                             } else {
                                 // Qualified column reference (table.column)
                                 let mut parts = vec![];
@@ -2910,16 +2892,16 @@ impl PostgreSQLTranslator {
                                         // schema.table.column. The table name is not mapped:
                                         // FROM aliases a renamed table with its original name.
                                         Ok(ast::Expr::DoublyQualified(
-                                            ast::Name::from_string(map_schema_name(&parts[0])),
-                                            ast::Name::from_string(parts[1].clone()),
-                                            ast::Name::from_string(parts[2].clone()),
+                                            exact_name(map_schema_name(&parts[0])),
+                                            exact_name(parts[1].clone()),
+                                            exact_name(parts[2].clone()),
                                         ))
                                     }
                                     2 => {
                                         // table.column
                                         Ok(ast::Expr::Qualified(
-                                            ast::Name::from_string(parts[0].clone()),
-                                            ast::Name::from_string(parts[1].clone()),
+                                            exact_name(parts[0].clone()),
+                                            exact_name(parts[1].clone()),
                                         ))
                                     }
                                     _ => Err(not_supported("a cross-database reference")),
@@ -3047,7 +3029,7 @@ impl PostgreSQLTranslator {
                     .map(|a| Ok(Box::new(self.translate_expr(a)?)))
                     .collect::<Result<Vec<_>, ParseError>>()?;
                 Ok(ast::Expr::FunctionCall {
-                    name: ast::Name::from_string("COALESCE"),
+                    name: exact_name("COALESCE"),
                     distinctness: None,
                     args,
                     order_by: vec![],
@@ -3071,7 +3053,7 @@ impl PostgreSQLTranslator {
                     .map(|a| Ok(Box::new(self.translate_expr(a)?)))
                     .collect::<Result<Vec<_>, ParseError>>()?;
                 Ok(ast::Expr::FunctionCall {
-                    name: ast::Name::from_string(func_name),
+                    name: exact_name(func_name),
                     distinctness: None,
                     args,
                     order_by: vec![],
@@ -3124,7 +3106,7 @@ impl PostgreSQLTranslator {
                     // The bare keywords route through the frontend scalars so both
                     // syntaxes share one implementation and agree with pg_catalog.
                     Ok(SqlValueFunctionOp::SvfopCurrentSchema) => Ok(ast::Expr::FunctionCall {
-                        name: ast::Name::from_string("current_schema"),
+                        name: exact_name("current_schema"),
                         distinctness: None,
                         args: vec![],
                         order_by: vec![],
@@ -3135,7 +3117,7 @@ impl PostgreSQLTranslator {
                         },
                     }),
                     Ok(SqlValueFunctionOp::SvfopCurrentCatalog) => Ok(ast::Expr::FunctionCall {
-                        name: ast::Name::from_string("current_database"),
+                        name: exact_name("current_database"),
                         distinctness: None,
                         args: vec![],
                         order_by: vec![],
@@ -3164,7 +3146,7 @@ impl PostgreSQLTranslator {
                     .map(|e| Ok(Box::new(self.translate_expr(e)?)))
                     .collect::<Result<Vec<_>, ParseError>>()?;
                 Ok(ast::Expr::FunctionCall {
-                    name: ast::Name::from_string("array"),
+                    name: exact_name("array"),
                     distinctness: None,
                     args,
                     order_by: vec![],
@@ -3196,7 +3178,7 @@ impl PostgreSQLTranslator {
                                 let start_expr = self.translate_expr(start)?;
                                 let end_expr = self.translate_expr(end)?;
                                 expr = ast::Expr::FunctionCall {
-                                    name: ast::Name::from_string("array_slice"),
+                                    name: exact_name("array_slice"),
                                     distinctness: None,
                                     args: vec![
                                         Box::new(expr),
@@ -3217,7 +3199,7 @@ impl PostgreSQLTranslator {
                                 })?;
                                 let index_expr = self.translate_expr(index_node)?;
                                 expr = ast::Expr::FunctionCall {
-                                    name: ast::Name::from_string("array_element"),
+                                    name: exact_name("array_element"),
                                     distinctness: None,
                                     args: vec![Box::new(expr), Box::new(index_expr)],
                                     order_by: vec![],
@@ -3240,7 +3222,7 @@ impl PostgreSQLTranslator {
                                         ))
                                     }
                                 },
-                                ast::Name::from_string(s.sval.clone()),
+                                exact_name(s.sval.clone()),
                             );
                         }
                         other => {
@@ -3364,7 +3346,7 @@ impl PostgreSQLTranslator {
                     args.push(Box::new(self.translate_expr(rexpr)?));
                 }
                 Ok(ast::Expr::FunctionCall {
-                    name: ast::Name::from_string("NULLIF"),
+                    name: exact_name("NULLIF"),
                     distinctness: None,
                     args,
                     order_by: vec![],
@@ -3580,7 +3562,7 @@ impl PostgreSQLTranslator {
                     _ => unreachable!(),
                 };
                 return Ok(ast::Expr::FunctionCall {
-                    name: ast::Name::from_string(func_name),
+                    name: exact_name(func_name),
                     distinctness: None,
                     args,
                     order_by: vec![],
@@ -3704,7 +3686,7 @@ impl PostgreSQLTranslator {
 
         let array = self.translate_expr(rhs_node)?;
         let call = ast::Expr::FunctionCall {
-            name: ast::Name::from_string("array_contains"),
+            name: exact_name("array_contains"),
             distinctness: None,
             args: vec![Box::new(array), Box::new(lhs)],
             order_by: vec![],
@@ -3882,7 +3864,7 @@ impl PostgreSQLTranslator {
         // COUNT(*) and similar aggregate star calls
         if func_call.agg_star {
             return Ok(ast::Expr::FunctionCallStar {
-                name: ast::Name::from_string(func_name),
+                name: exact_name(func_name),
                 filter_over,
             });
         }
@@ -3960,7 +3942,7 @@ impl PostgreSQLTranslator {
         };
 
         Ok(ast::Expr::FunctionCall {
-            name: ast::Name::from_string(func_name),
+            name: exact_name(func_name),
             distinctness,
             args,
             order_by,
@@ -3989,7 +3971,7 @@ impl PostgreSQLTranslator {
                 };
                 let window = self.translate_window_spec(wd)?;
                 Ok(ast::WindowDef {
-                    name: ast::Name::from_string(&wd.name),
+                    name: exact_name(&wd.name),
                     window,
                 })
             })
@@ -4012,7 +3994,7 @@ impl PostgreSQLTranslator {
             && window_def.partition_clause.is_empty()
             && window_def.order_clause.is_empty()
         {
-            return Ok(ast::Over::Name(ast::Name::from_string(&window_def.name)));
+            return Ok(ast::Over::Name(exact_name(&window_def.name)));
         }
 
         let window = self.translate_window_spec(window_def)?;
@@ -4027,7 +4009,7 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::Window, ParseError> {
         // Base window reference (for window inheritance)
         let base = if !window_def.refname.is_empty() {
-            Some(ast::Name::from_string(&window_def.refname))
+            Some(exact_name(&window_def.refname))
         } else {
             None
         };
@@ -4304,10 +4286,10 @@ impl PostgreSQLTranslator {
         while query.contains(&table_name) {
             table_name.push('_');
         }
-        let table = ast::Name::from_string(table_name);
-        let column = ast::Name::from_string("_turso_array_value");
+        let table = exact_name(table_name);
+        let column = exact_name("_turso_array_value");
         let call = |name: &str, args: Vec<Box<ast::Expr>>| ast::Expr::FunctionCall {
-            name: ast::Name::from_string(name),
+            name: exact_name(name),
             distinctness: None,
             args,
             order_by: vec![],
@@ -4386,7 +4368,7 @@ impl PostgreSQLTranslator {
                 }
             };
 
-            let tbl_name = ast::Name::from_string(&cte.ctename);
+            let tbl_name = exact_name(&cte.ctename);
 
             // PostgreSQL evaluates SEARCH/CYCLE by adding computed columns to
             // the recursion; silently dropping them would change results (and
@@ -4408,7 +4390,7 @@ impl PostgreSQLTranslator {
                 .iter()
                 .filter_map(|n| match &n.node {
                     Some(Node::String(s)) => Some(ast::IndexedColumn {
-                        col_name: ast::Name::from_string(&s.sval),
+                        col_name: exact_name(&s.sval),
                         collation_name: None,
                         order: None,
                     }),
@@ -4577,7 +4559,7 @@ impl PostgreSQLTranslator {
                                     "ON CONFLICT DO UPDATE of an array element or composite field",
                                 ));
                             }
-                            let col_name = ast::Name::from_string(&res_target.name);
+                            let col_name = exact_name(&res_target.name);
                             let expr = if let Some(val) = &res_target.val {
                                 Box::new(self.translate_expr(val)?)
                             } else {
@@ -4636,9 +4618,7 @@ impl PostgreSQLTranslator {
                                 ));
                             }
                             Ok(ast::SortedColumn {
-                                expr: Box::new(ast::Expr::Id(ast::Name::from_string(
-                                    &idx_elem.name,
-                                ))),
+                                expr: Box::new(ast::Expr::Id(exact_name(&idx_elem.name))),
                                 order: None,
                                 nulls: None,
                             })
@@ -5072,8 +5052,8 @@ fn single_column_function_select(
             select: ast::OneSelect::Select {
                 distinctness: None,
                 columns: vec![ast::ResultColumn::Expr(
-                    Box::new(ast::Expr::Id(ast::Name::from_string(source_column))),
-                    Some(ast::As::Elided(ast::Name::from_string(column_name))),
+                    Box::new(ast::Expr::Id(exact_name(source_column))),
+                    Some(ast::As::Elided(exact_name(column_name))),
                 )],
                 from: Some(from),
                 where_clause: None,
@@ -5176,11 +5156,11 @@ fn rename_result_columns(
         with: Some(ast::With {
             recursive: false,
             ctes: vec![ast::CommonTableExpr {
-                tbl_name: ast::Name::from_string(&cte_name),
+                tbl_name: exact_name(&cte_name),
                 columns: names
                     .iter()
                     .map(|name| ast::IndexedColumn {
-                        col_name: ast::Name::from_string(name),
+                        col_name: exact_name(name),
                         collation_name: None,
                         order: None,
                     })
@@ -5195,7 +5175,7 @@ fn rename_result_columns(
                 columns: vec![ast::ResultColumn::Star],
                 from: Some(ast::FromClause {
                     select: Box::new(ast::SelectTable::Table(
-                        ast::QualifiedName::single(ast::Name::from_string(&cte_name)),
+                        ast::QualifiedName::single(exact_name(&cte_name)),
                         None,
                         None,
                     )),
@@ -5249,7 +5229,7 @@ fn pg_check_constraint_name(
     used_names: &mut std::collections::HashSet<String>,
 ) -> ast::Name {
     if !constraint.conname.is_empty() {
-        return ast::Name::from_string(constraint.conname.clone());
+        return exact_name(constraint.conname.clone());
     }
     let mut columns = Vec::new();
     if let Some(node) = constraint
@@ -5278,7 +5258,7 @@ fn pg_check_constraint_name(
         name = format!("{base}{suffix}");
         suffix += 1;
     }
-    ast::Name::from_string(name)
+    exact_name(name)
 }
 
 fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
@@ -5693,11 +5673,11 @@ fn translate_create_enum(
         base: None,
         when_then_pairs: vec![(
             Box::new(ast::Expr::InList {
-                lhs: Box::new(ast::Expr::Id(ast::Name::from_string("value"))),
+                lhs: Box::new(ast::Expr::Id(exact_name("value"))),
                 not: false,
                 rhs: in_list,
             }),
-            Box::new(ast::Expr::Id(ast::Name::from_string("value"))),
+            Box::new(ast::Expr::Id(exact_name("value"))),
         )],
         else_expr: Some(Box::new(ast::Expr::Raise(
             ast::ResolveType::Abort,
@@ -5707,7 +5687,7 @@ fn translate_create_enum(
         ))),
     };
 
-    let decode = ast::Expr::Id(ast::Name::from_string("value"));
+    let decode = ast::Expr::Id(exact_name("value"));
 
     Ok(ast::Stmt::CreateType {
         if_not_exists: false,
@@ -5750,7 +5730,7 @@ fn json_type_or_raise(
     let expected_type = string(expected_type);
     ast::Expr::Case {
         base: Some(Box::new(ast::Expr::FunctionCall {
-            name: ast::Name::from_string("coalesce"),
+            name: exact_name("coalesce"),
             distinctness: None,
             args: vec![Box::new(json_type), expected_type.clone()],
             order_by: vec![],
@@ -6687,7 +6667,7 @@ fn deparse_default_expr(node: &pg_query::protobuf::Node) -> Option<String> {
 
 fn function_call(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
     ast::Expr::FunctionCall {
-        name: ast::Name::from_string(name),
+        name: exact_name(name),
         distinctness: None,
         args: args.into_iter().map(Box::new).collect(),
         order_by: vec![],
@@ -6697,6 +6677,10 @@ fn function_call(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
             over_clause: None,
         },
     }
+}
+
+fn exact_name(name: impl Into<String>) -> ast::Name {
+    ast::Name::exact(name.into())
 }
 
 /// SQLite's default SQLITE_MAX_LIKE_PATTERN_LENGTH, which core enforces on
