@@ -84,9 +84,7 @@ impl PgConnection {
     }
 
     pub fn prepare(&self, sql: impl AsRef<str>) -> crate::Result<crate::Statement> {
-        prepare_statement(&self.inner, sql.as_ref())
-            .map(crate::Statement::new)
-            .map_err(Into::into)
+        prepare_statement(&self.inner, sql.as_ref()).map_err(Into::into)
     }
 
     pub fn query(&self, sql: impl AsRef<str>) -> crate::Result<Option<crate::Statement>> {
@@ -151,12 +149,10 @@ impl Iterator for PgQueryRunner<'_> {
 
         let sql = &self.stmts[self.index];
         self.index += 1;
-        Some(
-            prepare_statement(self.conn, sql)
-                .map(crate::Statement::new)
-                .map(Some)
-                .map_err(Into::into),
-        )
+        let res = prepare_statement(self.conn, sql)
+            .map(Some)
+            .map_err(Into::into);
+        Some(res)
     }
 }
 
@@ -168,7 +164,7 @@ pub fn split_statements(sql: &str) -> crate::Result<Vec<String>> {
     }
 }
 
-fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Statement> {
+fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crate::Statement> {
     let sql = sql.trim();
     if sql.is_empty() {
         return Err(LimboError::InvalidArgument(
@@ -213,13 +209,115 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
     }
 
-    for prereq in translated.prereqs {
-        let input = prereq.to_string();
-        let mut stmt = pg_conn.conn.prepare_translated_stmt(prereq, &input)?;
-        stmt.run_ignore_rows()?;
+    if translated.prereqs.is_empty() {
+        return pg_conn
+            .conn
+            .prepare_translated_cmd(translated.cmd, &sql)
+            .map(crate::Statement::new);
     }
 
-    pg_conn.conn.prepare_translated_cmd(translated.cmd, &sql)
+    // Validate prerequisites and the target command during prepare without
+    // executing any writes. Side-effecting prerequisites run atomically with
+    // the command only when the returned Statement is actually executed.
+    for prereq in &translated.prereqs {
+        let input = prereq.to_string();
+        let _ = pg_conn
+            .conn
+            .prepare_translated_stmt(prereq.clone(), &input)?;
+    }
+    let cmd = translated.cmd;
+    let inner = pg_conn.conn.prepare_translated_cmd(cmd.clone(), &sql)?;
+    let pg_conn = Arc::clone(pg_conn);
+    let prereqs = translated.prereqs;
+    let sql_owned = sql.into_owned();
+    Ok(crate::Statement::with_deferred(
+        inner,
+        Box::new(move |inner| {
+            execute_cmd_with_prereqs(&pg_conn, &prereqs, &cmd, &sql_owned, inner)
+        }),
+    ))
+}
+
+const PG_STMT_SAVEPOINT: &str = "__turso_pg_stmt";
+
+fn execute_cmd_with_prereqs(
+    pg_conn: &Arc<PgConnectionInner>,
+    prereqs: &[ast::Stmt],
+    cmd: &ast::Cmd,
+    sql: &str,
+    inner: &mut Statement,
+) -> Result<()> {
+    let conn = &pg_conn.conn;
+    if create_table_if_not_exists_target_present(conn, cmd)? {
+        *inner = conn.prepare_translated_cmd(cmd.clone(), sql)?;
+        return inner.run_ignore_rows();
+    }
+
+    let started_in_autocommit = conn.get_auto_commit();
+    let begin_sp = format!("SAVEPOINT \"{PG_STMT_SAVEPOINT}\"");
+    let release_sp = format!("RELEASE SAVEPOINT \"{PG_STMT_SAVEPOINT}\"");
+    execute_sqlite(conn, begin_sp)?;
+    let result = (|| {
+        for prereq in prereqs {
+            let input = prereq.to_string();
+            let mut stmt = conn.prepare_translated_stmt(prereq.clone(), &input)?;
+            stmt.run_ignore_rows()?;
+        }
+        *inner = conn.prepare_translated_cmd(cmd.clone(), sql)?;
+        inner.run_ignore_rows()
+    })();
+
+    match result {
+        Ok(()) => execute_sqlite(conn, release_sp),
+        Err(err) => {
+            if started_in_autocommit {
+                let _ = execute_sqlite(conn, "ROLLBACK");
+            } else {
+                let rollback_sp = format!("ROLLBACK TO SAVEPOINT \"{PG_STMT_SAVEPOINT}\"");
+                let _ = execute_sqlite(conn, rollback_sp);
+                let _ = execute_sqlite(conn, release_sp);
+            }
+            Err(err)
+        }
+    }
+}
+
+fn create_table_if_not_exists_target_present(
+    conn: &Arc<Connection>,
+    cmd: &ast::Cmd,
+) -> Result<bool> {
+    let ast::Cmd::Stmt(ast::Stmt::CreateTable {
+        if_not_exists: true,
+        tbl_name,
+        ..
+    }) = cmd
+    else {
+        return Ok(false);
+    };
+    let default_schema;
+    let schema = match &tbl_name.namespace {
+        Some(ns) => Some(ns.as_str()),
+        None => {
+            default_schema = current_schema(conn);
+            default_schema.as_deref()
+        }
+    };
+    let Some(database) = relation_lookup_databases(conn, schema).into_iter().next() else {
+        return Ok(false);
+    };
+    let mut stmt = conn.prepare_sqlite(format!(
+        "SELECT EXISTS (SELECT 1 FROM \"{database}\".sqlite_schema \
+         WHERE type IN ('table', 'view') AND name COLLATE NOCASE = ?1)"
+    ))?;
+    stmt.bind_at(
+        NonZero::new(1).unwrap(),
+        Value::build_text(tbl_name.name.as_str().to_string()),
+    )?;
+    let rows = stmt.run_collect_rows()?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.first())
+        .is_some_and(|val| *val == Value::from_i64(1)))
 }
 
 /// The schema that a CREATE TABLE statement naming its table without a
@@ -402,7 +500,10 @@ fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
     Ok(())
 }
 
-fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Option<Statement>> {
+fn try_prepare_special(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
+) -> Result<Option<crate::Statement>> {
     let parse_result = match turso_pg_parser::parse(sql) {
         Ok(result) => result,
         Err(_) => return Ok(None),
@@ -410,44 +511,59 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
 
     if let Some(set_stmt) = try_extract_set(&parse_result) {
         let stmt = handle_pg_set(pg_conn, &set_stmt)?;
-        return Ok(Some(stmt));
+        return Ok(Some(crate::Statement::new(stmt)));
     }
 
     if check_set_transaction(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))? {
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
+        return Ok(Some(crate::Statement::new(noop_statement(&pg_conn.conn)?)));
     }
 
     if let Some(show_stmt) = try_extract_show(&parse_result) {
-        return Ok(Some(handle_pg_show(pg_conn, &show_stmt)?));
+        let stmt = handle_pg_show(pg_conn, &show_stmt)?;
+        return Ok(Some(crate::Statement::new(stmt)));
     }
 
     if let Some(stmt) = try_extract_create_schema(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?
     {
-        handle_pg_create_schema(pg_conn, &stmt)?;
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
+        let inner = noop_statement(&pg_conn.conn)?;
+        let pg_conn = Arc::clone(pg_conn);
+        return Ok(Some(crate::Statement::with_deferred(
+            inner,
+            Box::new(move |_inner| handle_pg_create_schema(&pg_conn, &stmt)),
+        )));
     }
 
     if let Some(stmt) = try_extract_drop_schema(&parse_result) {
-        handle_pg_drop_schema(&pg_conn.conn, &stmt)?;
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
+        let inner = noop_statement(&pg_conn.conn)?;
+        let conn = Arc::clone(&pg_conn.conn);
+        return Ok(Some(crate::Statement::with_deferred(
+            inner,
+            Box::new(move |_inner| handle_pg_drop_schema(&conn, &stmt)),
+        )));
     }
 
     if is_refresh_matview(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))? {
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
+        return Ok(Some(crate::Statement::new(noop_statement(&pg_conn.conn)?)));
     }
 
     if is_comment_on(&parse_result) {
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
+        return Ok(Some(crate::Statement::new(noop_statement(&pg_conn.conn)?)));
     }
 
     if let Some(stmt) =
         try_extract_copy_from(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))?
     {
-        let rows_inserted = handle_pg_copy_from(&pg_conn.conn, &stmt)?;
-        let stmt = noop_statement(&pg_conn.conn)?;
-        stmt.set_n_change(rows_inserted as i64);
-        return Ok(Some(stmt));
+        let inner = noop_statement(&pg_conn.conn)?;
+        let conn = Arc::clone(&pg_conn.conn);
+        return Ok(Some(crate::Statement::with_deferred(
+            inner,
+            Box::new(move |inner| {
+                let rows_inserted = handle_pg_copy_from(&conn, &stmt)?;
+                inner.set_n_change(rows_inserted as i64);
+                Ok(())
+            }),
+        )));
     }
 
     Ok(None)
@@ -715,10 +831,11 @@ fn handle_pg_create_schema(
         search_path = format!("{search_path}, {rest}");
     }
     set_search_path(conn, Some(&search_path), SettingScope::Session)?;
-    let result = stmt
-        .elements
-        .iter()
-        .try_for_each(|sql| prepare_statement(pg_conn, sql)?.run_ignore_rows());
+    let result = stmt.elements.iter().try_for_each(|sql| {
+        prepare_statement(pg_conn, sql)?
+            .run_ignore_rows()
+            .map_err(crate::Error::into_core_error)
+    });
     set_search_path(conn, setting.as_deref(), SettingScope::Session)?;
     if let Err(err) = result {
         handle_pg_drop_schema(
