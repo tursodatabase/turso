@@ -312,12 +312,15 @@ impl VirtualTableCursor {
         result.map(IOResult::Done).map_err(Into::into)
     }
 
-    pub(crate) fn rowid(&self) -> i64 {
-        match &self.inner {
+    pub(crate) fn rowid(&self) -> Option<i64> {
+        if self.null_flag {
+            return None;
+        }
+        Some(match &self.inner {
             VirtualTableCursorInner::Pragma(cursor) => cursor.rowid(),
             VirtualTableCursorInner::External(cursor) => cursor.rowid(),
             VirtualTableCursorInner::Internal(cursor) => cursor.read().rowid(),
-        }
+        })
     }
 
     pub(crate) fn column(&mut self, column: usize) -> IOResultOr<Value> {
