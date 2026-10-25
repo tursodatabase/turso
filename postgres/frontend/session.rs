@@ -847,6 +847,11 @@ fn handle_pg_create_schema(
 ) -> Result<()> {
     let conn = &pg_conn.conn;
     let name = stmt.name.to_lowercase();
+    if is_core_database_name(&name) {
+        return Err(LimboError::ParseError(format!(
+            "unacceptable schema name \"{name}\": the name is reserved for a database"
+        )));
+    }
     if conn.namespace(&name).is_some() {
         if stmt.if_not_exists {
             return Ok(());
