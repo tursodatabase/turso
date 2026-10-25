@@ -76,7 +76,8 @@ The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
 `pg_foreign_table`, `pg_partitioned_table`, `pg_collation`, `pg_description`,
-`pg_publication*`. `pg_statistic_ext` exposes the hidden system column
+`pg_publication*`, `pg_seclabels` (security labels are not supported).
+`pg_statistic_ext` exposes the hidden system column
 `tableoid` for pg_dump discovery. `pg_trigger` exposes `tgparentid` for
 parent-trigger lookup and hidden `tableoid` during dump discovery.
 `pg_rewrite` also exposes hidden `tableoid` for rule discovery, and `pg_policy`

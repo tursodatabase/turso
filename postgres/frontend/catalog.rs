@@ -2189,6 +2189,17 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_description (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)".to_string() },
     );
     options = options.native_module(
+        "pg_seclabels",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_seclabels (
+                objoid INTEGER, classoid INTEGER, objsubid INTEGER, objtype TEXT,
+                objnamespace INTEGER, objname TEXT, provider TEXT, label TEXT
+            )"
+            .to_string(),
+        },
+    );
+    options = options.native_module(
         "pg_publication",
         VTabKind::TableValuedFunction,
         EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables INTEGER, pubinsert INTEGER, pubupdate INTEGER, pubdelete INTEGER, pubtruncate INTEGER, pubviaroot INTEGER, tableoid INTEGER HIDDEN)".to_string() },
