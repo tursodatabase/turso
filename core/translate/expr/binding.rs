@@ -114,7 +114,7 @@ enum QualifiedNameMatch {
 
 /// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
 /// using the provided TableReferences, and replacing anonymous parameters with internal named
-/// ones
+/// ones. Then decides which function runs each arithmetic operator on a custom type.
 #[turso_macros::trace_stack]
 pub fn bind_and_rewrite_expr<'a>(
     top_level_expr: &mut ast::Expr,
@@ -595,7 +595,8 @@ pub fn bind_and_rewrite_expr<'a>(
             Ok(WalkControl::Continue)
         },
     )?;
-    Ok(())
+    // Every column is bound now, so the type of every operand is known.
+    resolve_custom_type_operators(top_level_expr, referenced_tables.as_deref(), resolver)
 }
 
 pub(crate) fn validate_function_tail(
@@ -1038,7 +1039,7 @@ pub(super) fn resolve_typedef_from_column(
         ast::Expr::Column { table, column, .. } => {
             resolve_column_type_str(*table, *column, referenced_tables, resolver)?
         }
-        ast::Expr::Variable(var) => var.col_type.as_ref()?.to_string(),
+        ast::Expr::Variable(var) => var.custom_type.as_ref()?.name.clone(),
         _ => return None,
     };
     let td = resolver.schema().get_type_def_unchecked(&ty_str)?;

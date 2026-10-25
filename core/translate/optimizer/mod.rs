@@ -4075,7 +4075,9 @@ impl Optimizable for ast::Expr {
             Expr::Subquery(..) => false,
             Expr::Unary(_, expr) => expr.is_nonnull(tables),
             Expr::Variable(..) => false,
-            Expr::Register(..) => false, // Register values can be null
+            Expr::Register { .. } => false, // Register values can be null
+            // A type's function or ENCODE may return NULL for any input.
+            Expr::TypedCall { .. } | Expr::Convert { .. } => false,
             Expr::Default => false,
             Expr::Array { .. } | Expr::Subscript { .. } => {
                 unreachable!("Array and Subscript are desugared into function calls by the parser")
@@ -4175,7 +4177,11 @@ impl Optimizable for ast::Expr {
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => true,
-            Expr::Register(_) => false,
+            Expr::Register { .. } => false,
+            Expr::TypedCall { args, .. } => args.iter().all(|arg| arg.is_constant(resolver)),
+            // A type's ENCODE may fail or give a different value each time, so it runs
+            // per row, where main's custom operators always ran it.
+            Expr::Convert { .. } => false,
             Expr::Default => true,
             Expr::Array { .. } | Expr::Subscript { .. } => {
                 unreachable!("Array and Subscript are desugared into function calls by the parser")

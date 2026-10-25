@@ -7,7 +7,10 @@ use crate::translate::subquery::{
 };
 use crate::translate::{
     emitter::Resolver,
-    expr::{self, translate_expr, walk_expr_mut},
+    expr::{
+        self, expr_type::column_custom_type_names, resolve_custom_type_operators, translate_expr,
+        walk_expr_mut,
+    },
     planner::ROWID_STRS,
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
@@ -190,19 +193,22 @@ struct TriggerSubprogramContext {
     /// Whether this trigger has OLD registers
     has_old: bool,
     table: Arc<BTreeTable>,
+    /// The custom type of each column. NEW and OLD parameters hold decoded
+    /// values, so they say which custom type they hold.
+    column_types: Vec<Option<Box<ast::Type>>>,
     /// Override conflict resolution for statements within this trigger.
     override_conflict: Option<ast::ResolveType>,
     /// Database name for the trigger's database (used to qualify unqualified table names in body)
     db_name: Option<ast::Name>,
 }
 
-fn variable_from_parameter_index(index: NonZero<usize>, col_type: Option<&str>) -> Expr {
+fn variable_from_parameter_index(index: NonZero<usize>, custom_type: Option<&ast::Type>) -> Expr {
     let nz = u32::try_from(index.get())
         .ok()
         .and_then(std::num::NonZeroU32::new)
         .expect("trigger parameter index must fit into NonZeroU32");
-    match col_type {
-        Some(ty) => Expr::Variable(ast::Variable::indexed_typed(nz, ty)),
+    match custom_type {
+        Some(ty) => Expr::Variable(ast::Variable::indexed_typed(nz, ty.clone())),
         None => Expr::Variable(ast::Variable::indexed(nz)),
     }
 }
@@ -428,7 +434,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                 if ctx.has_new {
                     let num_cols = ctx.table.columns().len();
                     if let Some((idx, col_def)) = ctx.table.get_column(&col) {
-                        let ty = Some(col_def.ty_str.as_str());
+                        let ty = ctx.column_types[idx].as_deref();
                         if col_def.is_rowid_alias() {
                             *e = variable_from_parameter_index(
                                 ctx.get_new_rowid_param()
@@ -470,7 +476,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                 if ctx.has_old {
                     let num_cols = ctx.table.columns().len();
                     if let Some((idx, col_def)) = ctx.table.get_column(&col) {
-                        let ty = Some(col_def.ty_str.as_str());
+                        let ty = ctx.column_types[idx].as_deref();
                         if col_def.is_rowid_alias() {
                             *e = variable_from_parameter_index(
                                 ctx.get_old_rowid_param()
@@ -569,6 +575,11 @@ fn execute_trigger_commands(
         has_new,
         has_old,
         table: ctx.table.clone(),
+        column_types: column_custom_type_names(
+            ctx.table.columns(),
+            ctx.table.is_strict,
+            resolver.schema(),
+        ),
         override_conflict: ctx.override_conflict,
         db_name,
     };
@@ -892,7 +903,15 @@ pub fn fire_trigger(
         if let Some(mut when_expr) = trigger.when_clause.clone() {
             crate::stack::trace_stack!("when_clause");
             // Rewrite NEW/OLD references in WHEN clause to use registers
-            rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
+            // NEW and OLD registers hold decoded values, so they say which
+            // custom type they hold.
+            let column_types = column_custom_type_names(
+                ctx.table.columns(),
+                ctx.table.is_strict,
+                resolver.schema(),
+            );
+            rewrite_trigger_expr_for_when_clause(&mut when_expr, ctx, &column_types)?;
+            resolve_custom_type_operators(&mut when_expr, None, resolver)?;
 
             // Plan and emit any subqueries in the WHEN clause (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
             // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
@@ -1080,11 +1099,11 @@ fn populate_trigger_row_register_affinities(
 #[turso_macros::trace_stack]
 fn rewrite_trigger_expr_for_when_clause(
     expr: &mut ast::Expr,
-    table: &BTreeTable,
     ctx: &TriggerContext,
+    column_types: &[Option<Box<ast::Type>>],
 ) -> Result<()> {
     walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        rewrite_trigger_expr_single_for_when_clause(e, table, ctx, false)?;
+        rewrite_trigger_expr_single_for_when_clause(e, ctx, column_types, false)?;
         Ok(WalkControl::Continue)
     })?;
     Ok(())
@@ -1093,11 +1112,11 @@ fn rewrite_trigger_expr_for_when_clause(
 /// Rewrite NEW/OLD references in all expressions within a SELECT statement for trigger WHEN clauses.
 fn rewrite_expressions_in_select_for_when_clause(
     select: &mut ast::Select,
-    table: &BTreeTable,
     ctx: &TriggerContext,
+    column_types: &[Option<Box<ast::Type>>],
 ) -> Result<()> {
     rewrite_select_expressions(select, &mut |e: &mut ast::Expr| {
-        rewrite_trigger_expr_single_for_when_clause(e, table, ctx, true)
+        rewrite_trigger_expr_single_for_when_clause(e, ctx, column_types, true)
     })
 }
 
@@ -1295,10 +1314,15 @@ where
 
 fn rewrite_trigger_expr_single_for_when_clause(
     expr: &mut ast::Expr,
-    table: &BTreeTable,
     ctx: &TriggerContext,
+    column_types: &[Option<Box<ast::Type>>],
     allow_non_trigger_qualified: bool,
 ) -> Result<()> {
+    let table = &ctx.table;
+    let decoded_column = |register: usize, column: usize| Expr::Register {
+        register,
+        custom_type: column_types[column].clone(),
+    };
     match expr {
         // Bare column references are not valid in trigger WHEN clauses.
         // Per SQLite docs, columns must be qualified with NEW or OLD.
@@ -1312,11 +1336,11 @@ fn rewrite_trigger_expr_single_for_when_clause(
             return Ok(());
         }
         Expr::Exists(select) | Expr::Subquery(select) => {
-            rewrite_expressions_in_select_for_when_clause(select, table, ctx)?;
+            rewrite_expressions_in_select_for_when_clause(select, ctx, column_types)?;
             return Ok(());
         }
         Expr::InSelect { rhs, .. } => {
-            rewrite_expressions_in_select_for_when_clause(rhs, table, ctx)?;
+            rewrite_expressions_in_select_for_when_clause(rhs, ctx, column_types)?;
             return Ok(());
         }
         Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
@@ -1329,19 +1353,19 @@ fn rewrite_trigger_expr_single_for_when_clause(
                     if let Some((idx, col_def)) = table.get_column(&col) {
                         if col_def.is_rowid_alias() {
                             // Rowid alias columns map to the rowid register (last element)
-                            *expr = Expr::Register(
+                            *expr = Expr::register(
                                 *new_regs.last().expect("NEW registers must be provided"),
                             );
                             return Ok(());
                         }
                         if idx < new_regs.len() {
-                            *expr = Expr::Register(new_regs[idx]);
+                            *expr = decoded_column(new_regs[idx], idx);
                             return Ok(());
                         }
                     }
                     // Handle NEW.rowid
                     if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
-                        *expr = Expr::Register(
+                        *expr = Expr::register(
                             *ctx.new_registers
                                 .as_ref()
                                 .expect("NEW registers must be provided")
@@ -1363,13 +1387,13 @@ fn rewrite_trigger_expr_single_for_when_clause(
                 if let Some(old_regs) = &ctx.old_registers {
                     if let Some((idx, _)) = table.get_column(&col) {
                         if idx < old_regs.len() {
-                            *expr = Expr::Register(old_regs[idx]);
+                            *expr = decoded_column(old_regs[idx], idx);
                             return Ok(());
                         }
                     }
                     // Handle OLD.rowid
                     if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
-                        *expr = Expr::Register(
+                        *expr = Expr::register(
                             *ctx.old_registers
                                 .as_ref()
                                 .expect("OLD registers must be provided")

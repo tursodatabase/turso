@@ -90,7 +90,7 @@ pub(crate) fn get_expr_affinity(
         }
         // Literals have NO affinity in SQLite.
         ast::Expr::Literal(_) => Affinity::None,
-        ast::Expr::Register(reg) => {
+        ast::Expr::Register { register: reg, .. } => {
             // During UPDATE expression index evaluation, column references are
             // rewritten to Expr::Register. Look up the original column affinity
             // from the resolver's register_affinities map.

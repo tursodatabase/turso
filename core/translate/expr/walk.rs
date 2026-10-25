@@ -58,6 +58,14 @@ where
                         stack.push(WalkItem::Expr(rhs));
                         stack.push(WalkItem::Expr(lhs));
                     }
+                    ast::Expr::TypedCall { args, .. } => {
+                        for arg in args.iter().rev() {
+                            stack.push(WalkItem::Expr(arg));
+                        }
+                    }
+                    ast::Expr::Convert { expr, .. } => {
+                        stack.push(WalkItem::Expr(expr));
+                    }
                     ast::Expr::Case {
                         base,
                         when_then_pairs,
@@ -170,7 +178,7 @@ where
                     | ast::Expr::Name(_)
                     | ast::Expr::Qualified(..)
                     | ast::Expr::Variable(_)
-                    | ast::Expr::Register(_)
+                    | ast::Expr::Register { .. }
                     | ast::Expr::Default => {}
                     ast::Expr::FieldAccess { base, .. } => {
                         stack.push(WalkItem::Expr(base));
@@ -252,6 +260,9 @@ pub fn expression_can_fail_on_input(expr: &ast::Expr) -> bool {
                 | ast::Expr::FunctionCallStar { .. }
                 | ast::Expr::Like { .. }
                 | ast::Expr::Raise(_, _)
+                // Custom-type functions and ENCODE reject values they can't read.
+                | ast::Expr::TypedCall { .. }
+                | ast::Expr::Convert { .. }
                 | ast::Expr::Binary(
                     _,
                     ast::Operator::ArrowRight
@@ -345,6 +356,23 @@ fn expr_contains_function(
             ast::Expr::FunctionCallStar { name, .. } => {
                 resolver.resolve_function(name.as_str(), 0)?
             }
+            ast::Expr::TypedCall { func, args, .. } => {
+                resolver.resolve_function(func.as_str(), args.len())?
+            }
+            // A conversion runs the type's ENCODE expression, which can call any function.
+            ast::Expr::Convert { to, .. } => {
+                let encode = resolver
+                    .schema()
+                    .get_type_def_unchecked(&to.name)
+                    .and_then(|type_def| type_def.encode());
+                if let Some(encode) = encode {
+                    found = expr_contains_nondeterministic_scalar_function(encode, resolver)?;
+                }
+                if found {
+                    return Ok(WalkControl::SkipChildren);
+                }
+                None
+            }
             _ => None,
         };
 
@@ -412,6 +440,14 @@ where
                     ast::Expr::Binary(lhs, _, rhs) => {
                         stack.push(WalkItem::Expr(rhs));
                         stack.push(WalkItem::Expr(lhs));
+                    }
+                    ast::Expr::TypedCall { args, .. } => {
+                        for arg in args.iter_mut().rev() {
+                            stack.push(WalkItem::Expr(arg));
+                        }
+                    }
+                    ast::Expr::Convert { expr, .. } => {
+                        stack.push(WalkItem::Expr(expr));
                     }
                     ast::Expr::Case {
                         base,
@@ -525,7 +561,7 @@ where
                     | ast::Expr::Name(_)
                     | ast::Expr::Qualified(..)
                     | ast::Expr::Variable(_)
-                    | ast::Expr::Register(_)
+                    | ast::Expr::Register { .. }
                     | ast::Expr::Default => {}
                     ast::Expr::FieldAccess { base, .. } => {
                         stack.push(WalkItem::Expr(base));

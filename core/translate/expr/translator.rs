@@ -160,6 +160,17 @@ fn translate_expr_by_kind(
         ast::Expr::Binary(..) => {
             translate_binary_expr(program, referenced_tables, expr, target_register, resolver)
         }
+        ast::Expr::TypedCall { .. } => {
+            translate_typed_call_expr(program, referenced_tables, expr, target_register, resolver)
+        }
+        ast::Expr::Convert { expr, to } => emit_convert(
+            program,
+            referenced_tables,
+            expr,
+            to,
+            target_register,
+            resolver,
+        ),
         ast::Expr::Case { .. } => {
             translate_case_expr(program, referenced_tables, expr, target_register, resolver)
         }
@@ -247,7 +258,9 @@ fn translate_expr_by_kind(
             translate_unary_expr(program, referenced_tables, expr, target_register, resolver)
         }
         ast::Expr::Variable(_) => translate_variable_expr(program, expr, target_register),
-        ast::Expr::Register(_) => translate_register_expr(program, expr, target_register, resolver),
+        ast::Expr::Register { .. } => {
+            translate_register_expr(program, expr, target_register, resolver)
+        }
         ast::Expr::Default => {
             crate::bail_parse_error!("DEFAULT is only valid in INSERT VALUES");
         }
@@ -558,7 +571,7 @@ fn translate_binary_expr(
         }
     }
 
-    if try_translate_custom_type_operator(
+    if try_translate_custom_comparison(
         program,
         referenced_tables,
         e1,
@@ -569,6 +582,7 @@ fn translate_binary_expr(
     )? {
         return Ok(target_register);
     }
+    assert_custom_type_arithmetic_resolved(e1, op, e2, referenced_tables, resolver)?;
 
     binary_expr_shared(
         program,
@@ -606,10 +620,10 @@ fn translate_truth_test_expr(
     Ok(target_register)
 }
 
-/// Translates the binary expression with the operator of a custom type, if
-/// either operand has a custom type that defines one. Returns false otherwise.
+/// Translates a comparison with the function of a custom type, if either
+/// operand has a custom type that defines one. Returns false otherwise.
 #[inline(never)]
-fn try_translate_custom_type_operator(
+fn try_translate_custom_comparison(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
     e1: &ast::Expr,
@@ -618,11 +632,32 @@ fn try_translate_custom_type_operator(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<bool> {
-    let Some(resolved) = find_custom_type_operator(e1, e2, op, referenced_tables, resolver) else {
+    let Some(resolved) = find_custom_comparison(e1, e2, op, referenced_tables, resolver) else {
         return Ok(false);
     };
     let result_reg =
-        emit_custom_type_operator(program, referenced_tables, e1, e2, &resolved, resolver)?;
+        emit_custom_comparison(program, referenced_tables, e1, e2, &resolved, resolver)?;
+    copy_to_target(program, result_reg, target_register);
+    Ok(true)
+}
+
+#[inline(never)]
+fn translate_typed_call_expr(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let ast::Expr::TypedCall { func, args, .. } = expr else {
+        unreachable!("translate_typed_call_expr expects Expr::TypedCall");
+    };
+    let result_reg = emit_typed_call(program, referenced_tables, func, args, resolver)?;
+    copy_to_target(program, result_reg, target_register);
+    Ok(target_register)
+}
+
+fn copy_to_target(program: &mut ProgramBuilder, result_reg: usize, target_register: usize) {
     if result_reg != target_register {
         program.emit_insn(Insn::Copy {
             src_reg: result_reg,
@@ -630,7 +665,6 @@ fn try_translate_custom_type_operator(
             extra_amount: 0,
         });
     }
-    Ok(true)
 }
 
 #[inline(never)]
@@ -3281,7 +3315,10 @@ fn translate_register_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    let ast::Expr::Register(src_reg) = expr else {
+    let ast::Expr::Register {
+        register: src_reg, ..
+    } = expr
+    else {
         unreachable!("translate_register_expr expects Expr::Register");
     };
     // When a column reference has been rewritten to a register

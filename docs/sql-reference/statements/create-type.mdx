@@ -113,6 +113,25 @@ OPERATOR 'op' function-name
 
 When an operator is defined, expressions like `column + 1` are rewritten into `function_name(column, 1)`.
 
+#### Which arithmetic operator runs
+
+For `+`, `-`, `*`, `/` and `%`, the operator is chosen once, when the statement is compiled:
+
+- `OPERATOR '+' f` runs `f` when both operands are columns of the type, or when one is a column of the type and the other is a literal its ENCODE accepts. The literal is encoded first.
+- If either operand has a custom type and no operator fits, the statement fails with `operator does not exist`. Turso does not fall back to SQLite's `+`.
+- If neither operand has a custom type, or one is the literal `NULL`, SQLite's operator runs.
+- A domain uses the operators of its base type.
+- A column of a subquery, view or CTE does not keep the custom type of the value it selects yet, so SQLite's operator runs on it. In `SELECT x * 2 FROM (SELECT d AS x FROM t)`, `x` is treated as plain text.
+
+```sql
+CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+CREATE TABLE t(c cents) STRICT;
+SELECT c + 1 FROM t;
+-- Parse error: operator does not exist: cents + integer
+```
+
+The result of a type's operator function has no known type, so it can't be the operand of another custom operator: `(a + b) + c` fails with `operator does not exist: value + uint`.
+
 #### Ordering with OPERATOR '<'
 
 The `<` operator is special: it controls how values of this type are sorted in ORDER BY, MIN, MAX, and CREATE INDEX.
@@ -265,11 +284,11 @@ Turso provides the following built-in custom types in STRICT tables:
 | `smallint` | integer | -- | Integer constrained to -32768 through 32767. Aliases: `int2`. |
 | `bigint` | integer | -- | Integer (no range constraint). Aliases: `int8`. |
 | `varchar(N)` | text | `maxlen` | Text with a maximum length of N characters. |
-| `date` | text | -- | ISO 8601 date (YYYY-MM-DD), validated on insert. Supports `+` and `-` with whole-day integers. |
+| `date` | text | -- | ISO 8601 date (YYYY-MM-DD), validated on insert. `date + n`, `n + date` and `date - n` add or subtract whole days and give a date; `date - date` gives the number of days between them. |
 | `time` | text | -- | ISO 8601 time (HH:MM:SS), validated on insert. |
 | `timestamp` | text | -- | ISO 8601 datetime, validated on insert. |
 | `timestamptz` | text | -- | ISO 8601 datetime with the same validation and normalization as `timestamp`. PostgreSQL-compatible name; the stored text carries no offset. |
-| `numeric(P,S)` | blob | `precision`, `scale` | Fixed-point decimal with P total digits and S decimal places. Supports arithmetic operators. |
+| `numeric(P,S)` | blob | `precision`, `scale` | Fixed-point decimal with P total digits and S decimal places. `+ - * /` with another numeric, an integer, a real or a numeric literal compute exactly (`n * 0.005` is not rounded to S places first) and give a numeric. |
 | `uuid` | blob | -- | UUID stored as 16-byte blob, displayed as string. Default: `uuid4_str()`. |
 | `inet` | text | -- | Validated IP address (IPv4 or IPv6). |
 | `cidr` | text | -- | Network address in CIDR notation. Stored as given; no validation yet. |
@@ -278,6 +297,8 @@ Turso provides the following built-in custom types in STRICT tables:
 | `bytea` | blob | -- | Binary data (PostgreSQL-compatible alias). |
 | `json` | text | -- | Validated JSON text. |
 | `jsonb` | blob | -- | JSON stored in binary format, returned as JSON text on read. |
+
+Other operators on built-in types fail: `d * 2` on a `date` is `operator does not exist: date * integer`. `smallint` and `bigint` use SQLite's operators.
 
 <Info>
 The `uuid`, `json`, and `jsonb` types require their respective extensions to be compiled in. They are available by default in standard Turso builds.

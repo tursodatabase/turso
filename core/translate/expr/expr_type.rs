@@ -7,7 +7,6 @@
 
 use turso_parser::ast;
 
-use super::custom_types::operator_to_str;
 use super::get_expr_affinity;
 use crate::function::{AggFunc, Func, ScalarFunc};
 use crate::schema::{Column, Schema, TypeDef};
@@ -38,8 +37,8 @@ pub(crate) enum ExprType {
     /// Parameters (`?`) should be untyped too, but are `Builtin(Any)` for now.
     Untyped,
     Null,
-    /// The result of an operator or function applied to a custom type or an array.
-    /// Which function runs, and so the result type, is not decided here.
+    /// A value whose type nothing declares: the result of a custom type's own
+    /// operator function, or of an operator on an array.
     Unknown,
 }
 
@@ -120,6 +119,15 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             column_reference_type(*table, *column, env).unwrap_or_else(|| affinity_type(expr, env))
         }
         ast::Expr::RowId { .. } => ExprType::Builtin(BuiltinType::Integer),
+        ast::Expr::Register { .. } | ast::Expr::Variable(_) => {
+            match column_custom_type(expr, env) {
+                Some(ty) => ExprType::Custom {
+                    type_def: ty.type_def,
+                    params: ty.params,
+                },
+                None => affinity_type(expr, env),
+            }
+        }
         ast::Expr::Cast {
             type_name: Some(type_name),
             ..
@@ -130,11 +138,16 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             }
             ast::UnaryOperator::Negative => arithmetic_type(
                 &ExprType::Builtin(BuiltinType::Integer),
-                &sqlite_operand_type(type_of(inner, env), None, env.schema()),
+                &sqlite_operand_type(type_of(inner, env), env.schema()),
             ),
             ast::UnaryOperator::Positive => type_of(inner, env),
         },
         ast::Expr::Binary(lhs, op, rhs) => binary_type(lhs, op, rhs, expr, env),
+        ast::Expr::TypedCall { result, .. } => match result {
+            Some(result) => call_result_type(result, env.schema()),
+            None => ExprType::Unknown,
+        },
+        ast::Expr::Convert { to, .. } => cast_type(to, env.schema()),
         ast::Expr::Case {
             when_then_pairs,
             else_expr,
@@ -159,22 +172,91 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
 ///
 /// Only a column read has a known form today: operators read columns decoded and
 /// the sorter reads them stored, while a CAST to a custom type gives the stored form
-/// and other expressions aren't tracked. Once registers always hold the stored form,
+/// and other expressions aren't tracked. A register or parameter that holds a
+/// decoded column value counts as a column read. Once registers always hold the stored form,
 /// `type_of` is enough and this goes away.
 pub(crate) fn column_custom_type(expr: &ast::Expr, env: &TypeEnv) -> Option<ColumnCustomType> {
-    let ast::Expr::Column { table, column, .. } = expr else {
-        return None;
-    };
-    match column_reference_type(*table, *column, env)? {
+    match expr {
+        ast::Expr::Column { table, column, .. } => {
+            match column_reference_type(*table, *column, env)? {
+                ExprType::Custom { type_def, params } => {
+                    Some(ColumnCustomType { type_def, params })
+                }
+                _ => None,
+            }
+        }
+        ast::Expr::Register { custom_type, .. } => Some(ColumnCustomType::from_type_name(
+            custom_type.as_deref()?,
+            env.schema(),
+        )),
+        ast::Expr::Variable(variable) => Some(ColumnCustomType::from_type_name(
+            variable.custom_type.as_deref()?,
+            env.schema(),
+        )),
+        _ => None,
+    }
+}
+
+/// The custom type of a column of a table, for a register that holds its
+/// decoded value.
+pub(crate) fn column_custom_type_of(
+    column: &Column,
+    is_strict: bool,
+    schema: &Schema,
+) -> Option<ColumnCustomType> {
+    match column_type(column, is_strict, schema) {
         ExprType::Custom { type_def, params } => Some(ColumnCustomType { type_def, params }),
         _ => None,
     }
 }
 
+/// The custom type of each column, written the way a CAST names it, e.g.
+/// `numeric(10, 2)`, for registers or parameters that hold the decoded values.
 #[allow(clippy::vec_box)]
+pub(crate) fn column_custom_type_names(
+    columns: &[Column],
+    is_strict: bool,
+    schema: &Schema,
+) -> Vec<Option<Box<ast::Type>>> {
+    columns
+        .iter()
+        .map(|column| {
+            column_custom_type_of(column, is_strict, schema).map(|ty| Box::new(ty.type_name()))
+        })
+        .collect()
+}
+
+#[allow(clippy::vec_box)]
+#[derive(Clone)]
 pub(crate) struct ColumnCustomType {
     pub(crate) type_def: Arc<TypeDef>,
     pub(crate) params: Vec<Box<ast::Expr>>,
+}
+
+impl ColumnCustomType {
+    /// The type written the way a CAST names it, e.g. `numeric(10, 2)`.
+    pub(crate) fn type_name(&self) -> ast::Type {
+        let size = match self.params.as_slice() {
+            [] => None,
+            [max] => Some(ast::TypeSize::MaxSize(max.clone())),
+            [precision, scale] => Some(ast::TypeSize::TypeSize(precision.clone(), scale.clone())),
+            _ => unreachable!("a column type has at most two parameters"),
+        };
+        ast::Type {
+            name: self.type_def.name.clone(),
+            size,
+            array_dimensions: 0,
+        }
+    }
+
+    /// The inverse of [Self::type_name]. The name was written from a column's
+    /// type, so the type exists.
+    fn from_type_name(type_name: &ast::Type, schema: &Schema) -> Self {
+        match custom_cast_target(&type_name.name, type_name, schema) {
+            Some(ExprType::Custom { type_def, params }) => Self { type_def, params },
+            _ => panic!("custom type {} must exist", type_name.name),
+        }
+    }
 }
 
 fn literal_type(literal: &ast::Literal) -> ExprType {
@@ -261,6 +343,18 @@ fn custom_cast_target(name: &str, type_name: &ast::Type, schema: &Schema) -> Opt
     })
 }
 
+/// The type a function returns. Unlike a CAST target, a custom type needs no
+/// arguments: `numeric_add` returns a numeric of any precision and scale.
+fn call_result_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
+    match schema.get_type_def_unchecked(&type_name.name) {
+        Some(type_def) => ExprType::Custom {
+            type_def: Arc::clone(type_def),
+            params: Vec::new(),
+        },
+        None => cast_type(type_name, schema),
+    }
+}
+
 fn binary_type(
     lhs: &ast::Expr,
     op: &ast::Operator,
@@ -274,13 +368,10 @@ fn binary_type(
         | Operator::Subtract
         | Operator::Multiply
         | Operator::Divide
-        | Operator::Modulus => {
-            let symbol = operator_to_str(op);
-            arithmetic_type(
-                &sqlite_operand_type(type_of(lhs, env), symbol, env.schema()),
-                &sqlite_operand_type(type_of(rhs, env), symbol, env.schema()),
-            )
-        }
+        | Operator::Modulus => arithmetic_type(
+            &sqlite_operand_type(type_of(lhs, env), env.schema()),
+            &sqlite_operand_type(type_of(rhs, env), env.schema()),
+        ),
         Operator::BitwiseAnd
         | Operator::BitwiseOr
         | Operator::BitwiseNot
@@ -314,24 +405,15 @@ fn binary_type(
     }
 }
 
-/// The type an operand has for SQLite's own arithmetic. A custom type that has a
-/// function for the operator stays as it is: the function decides the result. Any
-/// other custom value goes to SQLite's operator as a value of the type it is
-/// stored as, so `smallint * 2` is an integer.
-fn sqlite_operand_type(ty: ExprType, operator: Option<&str>, schema: &Schema) -> ExprType {
-    let ExprType::Custom { type_def, .. } = &ty else {
-        return ty;
-    };
-    let has_function = operator.is_some_and(|operator| {
-        type_def
-            .operators()
-            .iter()
-            .any(|o| o.op == operator && o.func_name.is_some())
-    });
-    if has_function {
-        return ty;
+/// The type an operand has for SQLite's own arithmetic. Arithmetic that a custom
+/// type has a function for is a `TypedCall` by now, so a custom value here goes to
+/// SQLite's operator as a value of the type it is stored as: `smallint * 2` is an
+/// integer.
+fn sqlite_operand_type(ty: ExprType, schema: &Schema) -> ExprType {
+    match &ty {
+        ExprType::Custom { type_def, .. } => stored_type(type_def, schema),
+        _ => ty,
     }
-    stored_type(type_def, schema)
 }
 
 /// The built-in type a custom type's values are stored as: its base type, after
@@ -350,18 +432,19 @@ pub(crate) fn stored_type(type_def: &TypeDef, schema: &Schema) -> ExprType {
     })
 }
 
-/// `INTEGER + INTEGER` is an integer, an integer or real mixed with a real is a
-/// real, and any other mix of built-in values is some number. With a custom type
-/// or an array on either side the result depends on which function runs.
+/// The result of SQLite's arithmetic: `INTEGER + INTEGER` is an integer, an
+/// integer or real mixed with a real is a real, and any other mix of built-in
+/// values is some number. With an array or an unknown value on either side the
+/// result is unknown.
 fn arithmetic_type(lhs: &ExprType, rhs: &ExprType) -> ExprType {
     use BuiltinType::{Integer, Numeric, Real};
-    let is_custom_or_array = |ty: &ExprType| {
-        matches!(
-            ty,
-            ExprType::Custom { .. } | ExprType::Array { .. } | ExprType::Unknown
-        )
-    };
-    if is_custom_or_array(lhs) || is_custom_or_array(rhs) {
+    assert!(
+        !matches!(lhs, ExprType::Custom { .. }) && !matches!(rhs, ExprType::Custom { .. }),
+        "custom operands of SQLite arithmetic must be typed by their stored type first"
+    );
+    let is_array_or_unknown =
+        |ty: &ExprType| matches!(ty, ExprType::Array { .. } | ExprType::Unknown);
+    if is_array_or_unknown(lhs) || is_array_or_unknown(rhs) {
         return ExprType::Unknown;
     }
     ExprType::Builtin(match (lhs, rhs) {
@@ -400,7 +483,7 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
         Func::Scalar(ScalarFunc::Nullif) => type_of(&args[0], env),
         Func::Scalar(ScalarFunc::Abs) => arithmetic_type(
             &ExprType::Builtin(BuiltinType::Integer),
-            &sqlite_operand_type(type_of(&args[0], env), None, env.schema()),
+            &sqlite_operand_type(type_of(&args[0], env), env.schema()),
         ),
         Func::Scalar(ScalarFunc::ArrayElement) => match type_of(&args[0], env) {
             ExprType::Array {

@@ -240,10 +240,140 @@ pub enum TypeDefKind {
         encode: Option<Box<ast::Expr>>,
         decode: Option<Box<ast::Expr>>,
         operators: std::vec::Vec<TypeOperator>,
+        /// How arithmetic operators run on values of this type.
+        arithmetic: std::vec::Vec<ArithmeticSignature>,
         default: Option<Box<ast::Expr>>,
     },
     Struct(StructDef),
     Union(UnionDef),
+}
+
+/// One way an arithmetic operator runs when an operand has a custom type:
+/// `args[0] op args[1]` runs `func`, or SQLite's operator when `func` is `None`.
+#[derive(Debug, Clone)]
+pub struct ArithmeticSignature {
+    /// `+`, `-`, `*`, `/` or `%`.
+    pub op: &'static str,
+    pub args: [ArithmeticArg; 2],
+    pub func: Option<String>,
+    /// The result's type, or `None` when the function decides it.
+    pub result: Option<&'static str>,
+}
+
+/// An operand that a signature accepts. "This type" is the type that declares
+/// the signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithmeticArg {
+    /// A column of this type. A user type's function is only given columns: a
+    /// CAST gives the stored form, a column the value its DECODE returns, and
+    /// the function can't tell them apart.
+    Column,
+    /// A literal that this type's ENCODE accepts. It is encoded before the call.
+    EncodableLiteral,
+    /// Any value of this type.
+    Value,
+    /// A value SQLite can compute with: anything without a custom type, or a
+    /// value of a type whose own arithmetic is SQLite's operator.
+    PlainValue,
+}
+
+const ARITHMETIC_OPERATORS: [&str; 5] = ["+", "-", "*", "/", "%"];
+
+/// `CREATE TYPE ... OPERATOR '+' f` runs f for two values of the type, or for a
+/// value of the type and a literal its ENCODE accepts. A type that declares
+/// no arithmetic operator computes with SQLite's operators, like `smallint`.
+fn declared_arithmetic(operators: &[TypeOperator]) -> std::vec::Vec<ArithmeticSignature> {
+    use ArithmeticArg::{Column, EncodableLiteral};
+    let declares_arithmetic = operators
+        .iter()
+        .any(|o| ARITHMETIC_OPERATORS.contains(&o.op.as_str()) && o.func_name.is_some());
+    if !declares_arithmetic {
+        return sqlite_arithmetic();
+    }
+    let mut signatures = std::vec::Vec::new();
+    for op in ARITHMETIC_OPERATORS {
+        let declared = operators.iter().find(|o| o.op == op);
+        let Some(func) = declared.and_then(|o| o.func_name.as_ref()) else {
+            continue;
+        };
+        for args in [
+            [Column, Column],
+            [Column, EncodableLiteral],
+            [EncodableLiteral, Column],
+        ] {
+            signatures.push(ArithmeticSignature {
+                op,
+                args,
+                func: Some(func.clone()),
+                result: None,
+            });
+        }
+    }
+    signatures
+}
+
+/// Arithmetic on built-in types, which an OPERATOR clause can't express. The
+/// functions read plain values as they are, so nothing is encoded first:
+/// - `numeric op x` and `x op numeric` for `+ - * /` compute exactly, and the
+///   result is a numeric. Encoding a literal to the column's type would round it
+///   to the column's scale first (`n * 0.005` would be `n * 0.01`).
+/// - `date + x`, `x + date` and `date - x` add or subtract a whole number of days
+///   and give a date; `date - date` gives the number of days between them, and
+///   so does `x - date` when `x` is a date string. The function rejects anything
+///   else, so `d + 1.5` is an error, not SQLite's `+`.
+/// - `smallint` and `bigint` store plain integers, so SQLite's operators run.
+///
+/// Other built-in types have no arithmetic.
+fn builtin_arithmetic(type_name: &str) -> std::vec::Vec<ArithmeticSignature> {
+    use ArithmeticArg::{PlainValue, Value};
+    let call = |op, args, func: &str, result| ArithmeticSignature {
+        op,
+        args,
+        func: Some(func.to_string()),
+        result,
+    };
+    match type_name {
+        "numeric" => [
+            ("+", "numeric_add"),
+            ("-", "numeric_sub"),
+            ("*", "numeric_mul"),
+            ("/", "numeric_div"),
+        ]
+        .into_iter()
+        .flat_map(|(op, func)| {
+            [[Value, Value], [Value, PlainValue], [PlainValue, Value]]
+                .map(|args| call(op, args, func, Some("numeric")))
+        })
+        .collect(),
+        "date" => vec![
+            call("+", [Value, PlainValue], "date_plus", Some("date")),
+            call("+", [PlainValue, Value], "date_plus", Some("date")),
+            call("-", [Value, Value], "date_minus", Some("integer")),
+            // A date or a number of days: the function decides which.
+            call("-", [Value, PlainValue], "date_minus", None),
+            call("-", [PlainValue, Value], "date_minus", None),
+        ]
+        .into_iter()
+        .collect(),
+        "smallint" | "bigint" => sqlite_arithmetic(),
+        _ => std::vec::Vec::new(),
+    }
+}
+
+/// SQLite's operators, for every arithmetic operator.
+fn sqlite_arithmetic() -> std::vec::Vec<ArithmeticSignature> {
+    use ArithmeticArg::{PlainValue, Value};
+    ARITHMETIC_OPERATORS
+        .into_iter()
+        .flat_map(|op| {
+            [[Value, PlainValue], [PlainValue, Value]].map(|args| ArithmeticSignature {
+                op,
+                args,
+                func: None,
+                result: None,
+            })
+        })
+        .collect()
 }
 
 /// Custom type definition, loaded from sqlite_turso_types
@@ -371,6 +501,15 @@ impl TypeDef {
         }
     }
 
+    /// How `op` can run on a value of this type, most specific first.
+    pub fn arithmetic<'a>(&'a self, op: &'a str) -> impl Iterator<Item = &'a ArithmeticSignature> {
+        let signatures: &[ArithmeticSignature] = match &self.kind {
+            TypeDefKind::Custom { arithmetic, .. } => arithmetic,
+            _ => &[],
+        };
+        signatures.iter().filter(move |s| s.op == op)
+    }
+
     /// Returns the default expression (Custom types only).
     pub fn default_expr(&self) -> Option<&ast::Expr> {
         match &self.kind {
@@ -433,6 +572,11 @@ impl TypeDef {
                     encode: encode.clone(),
                     decode: decode.clone(),
                     operators: operators.clone(),
+                    arithmetic: if is_builtin {
+                        builtin_arithmetic(type_name)
+                    } else {
+                        declared_arithmetic(operators)
+                    },
                     default: default.clone(),
                 },
             },
@@ -521,6 +665,8 @@ impl TypeDef {
                 encode: None,
                 decode: None,
                 operators: std::vec::Vec::new(),
+                // A domain has the arithmetic of the type it is based on.
+                arithmetic: std::vec::Vec::new(),
                 default,
             },
         }
@@ -848,7 +994,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         #[cfg(feature = "json")]
         "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
         "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
-        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '+' date_plus OPERATOR '-' date_minus OPERATOR '<'",
+        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
         // ENCODE preserves sub-second precision through strftime + a rtrim pair
         // that strips trailing zeros and the dangling dot, matching PostgreSQL's
         // text format: whole seconds render as `HH:MM:SS` (no .000), trailing
@@ -867,7 +1013,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
-        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
     ];
 
     for sql in type_sqls {

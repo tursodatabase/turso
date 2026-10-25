@@ -511,6 +511,20 @@ mod tests {
         }
     }
 
+    /// Date arithmetic declares its result: `date + n` is a date, which is stored
+    /// as text, and `date - date` is a number of days.
+    #[test]
+    fn type_info_for_date_arithmetic() {
+        let db = fresh_db_with_custom_types("type_info_date_arithmetic.db");
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT")
+            .unwrap();
+
+        let stmt = conn.prepare("SELECT d + 1, d - d FROM t").unwrap();
+        assert_eq!(expect_info(&stmt, 0).declared_name, "TEXT");
+        assert_eq!(expect_info(&stmt, 1).declared_name, "INTEGER");
+    }
+
     /// Expressions whose primitive can't be determined statically — function
     /// calls without a declared return affinity, BLOB literals, NULL literals
     /// — yield `Ok(None)`. Callers fall through to their own default (TEXT

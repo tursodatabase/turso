@@ -444,9 +444,15 @@ pub enum Expr {
     },
     /// binary expression
     Binary(Box<Expr>, Operator, Box<Expr>),
-    /// Register reference for DBSP expression compilation
-    /// This is not part of SQL syntax but used internally for incremental computation
-    Register(usize),
+    /// A value already in a register, e.g. a column reference that the compiler
+    /// replaced with the register holding the column's value. Not SQL syntax.
+    Register {
+        /// The register.
+        register: usize,
+        /// The custom type of the decoded column value the register holds, so
+        /// that operators on it work as they do on the column.
+        custom_type: Option<Box<Type>>,
+    },
     /// `CASE` expression
     Case {
         /// operand
@@ -616,6 +622,29 @@ pub enum Expr {
         /// The type of subquery.
         query_type: SubqueryType,
     },
+    /// An operator on a custom type, after the compiler chose the function that
+    /// runs it. Not SQL syntax: written by the compiler's type resolution. It
+    /// prints as the operator it came from.
+    TypedCall {
+        /// The operator as written, e.g. `+` in `amount + 1`.
+        operator: Operator,
+        /// The function that runs it, e.g. `numeric_add`.
+        func: Name,
+        /// The operands, in the order written, which is also the order the
+        /// function takes them.
+        args: Vec<Box<Expr>>,
+        /// The type of the result, or `None` when the function decides it.
+        result: Option<Box<Type>>,
+    },
+    /// A value converted to a custom type's stored form (its ENCODE), e.g. the
+    /// literal in `amount + '1.50'`. Not SQL syntax: written by the compiler's
+    /// type resolution. It prints as the value.
+    Convert {
+        /// The value being converted.
+        expr: Box<Expr>,
+        /// The custom type, with its parameters.
+        to: Box<Type>,
+    },
     /// `DEFAULT` keyword in INSERT VALUES
     Default,
     /// `ARRAY[expr, ...]` array literal
@@ -643,8 +672,9 @@ impl Default for Expr {
 pub struct Variable {
     pub index: NonZeroU32,
     pub name: Option<Box<str>>,
-    /// Type of the source column, if known (e.g. from trigger NEW/OLD rewrite).
-    pub col_type: Option<Box<str>>,
+    /// The custom type of the decoded column value this parameter holds: a
+    /// trigger's NEW and OLD columns in its body.
+    pub custom_type: Option<Box<Type>>,
     /// True for an explicit `?N` marker. Numbered markers carry no allocated
     /// name; their "?N" spelling is derived from the index on demand.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -656,7 +686,7 @@ impl Variable {
         Self {
             index,
             name: None,
-            col_type: None,
+            custom_type: None,
             numbered: false,
         }
     }
@@ -666,20 +696,16 @@ impl Variable {
         Self {
             index,
             name: None,
-            col_type: None,
+            custom_type: None,
             numbered: true,
         }
     }
 
-    pub fn indexed_typed(index: NonZeroU32, col_type: &str) -> Self {
+    pub fn indexed_typed(index: NonZeroU32, custom_type: Type) -> Self {
         Self {
             index,
             name: None,
-            col_type: if col_type.is_empty() {
-                None
-            } else {
-                Some(col_type.into())
-            },
+            custom_type: Some(Box::new(custom_type)),
             numbered: false,
         }
     }
@@ -688,7 +714,7 @@ impl Variable {
         Self {
             index,
             name: Some(name.into()),
-            col_type: None,
+            custom_type: None,
             numbered: false,
         }
     }
@@ -733,6 +759,14 @@ impl Expr {
 
     pub fn binary(lhs: Expr, operator: Operator, rhs: Expr) -> Expr {
         Expr::Binary(Box::new(lhs), operator, Box::new(rhs))
+    }
+
+    /// A register that holds no custom-type value.
+    pub fn register(register: usize) -> Expr {
+        Expr::Register {
+            register,
+            custom_type: None,
+        }
     }
 
     pub fn not_null(expr: Expr) -> Expr {
