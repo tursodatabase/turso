@@ -4,8 +4,7 @@ use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
 use turso_core::{
-    Connection, ExternalFunc, IOResult, LimboError, MathFunc, Numeric, OpenOptions, Register,
-    Result, Value,
+    Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
 };
 
 pub(crate) fn register_functions(mut options: OpenOptions) -> OpenOptions {
@@ -85,7 +84,6 @@ scalar_functions! {
     PgIsInRecovery(FunctionArity::Exact(0), false),
     PgLockAccessShare(FunctionArity::Exact(0), false),
     PgLimitValue(FunctionArity::Exact(2), true),
-    Mod(FunctionArity::Exact(2), true),
     Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
 }
 
@@ -153,7 +151,6 @@ impl ScalarCall for PgScalarFunction {
                 Value::from_i64(0)
             }
             Self::PgLimitValue => exec_pg_limit_value(args)?,
-            Self::Mod => exec_mod(args[0].get_value(), args[1].get_value())?,
             Self::Now
             | Self::ClockTimestamp
             | Self::TransactionTimestamp
@@ -475,23 +472,6 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Value> {
         )));
     }
     Ok(Value::from_i64(value))
-}
-
-/// PostgreSQL's `mod` keeps integer arguments integer, unlike SQLite's,
-/// which always returns a float.
-fn exec_mod(lhs: &Value, rhs: &Value) -> Result<Value> {
-    let result = lhs.exec_math_binary(rhs, &MathFunc::Mod, true)?;
-    Ok(
-        match (
-            Numeric::from_value_strict(lhs),
-            Numeric::from_value_strict(rhs),
-        ) {
-            (Some(Numeric::Integer(lhs)), Some(Numeric::Integer(rhs))) => {
-                Value::from_i64(lhs.wrapping_rem(rhs))
-            }
-            _ => result,
-        },
-    )
 }
 
 fn exec_pg_get_user_by_id(_oid: i64) -> Value {

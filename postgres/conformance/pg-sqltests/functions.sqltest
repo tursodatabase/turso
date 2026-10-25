@@ -1116,6 +1116,15 @@ expect {
     10|1
 }
 
+test mod-in-check-constraint {
+    CREATE TABLE even_numbers (x int CHECK (mod(x, 2) = 0), y int, CHECK (mod(y, 3) = 1));
+    INSERT INTO even_numbers VALUES (4, 7);
+    SELECT x, y, mod(x, 3) FROM even_numbers;
+}
+expect {
+    4|7|1
+}
+
 test mod-of-fractions-keeps-the-fraction {
     SELECT mod(7.5, 2), mod(-7.5, 2);
 }
