@@ -184,3 +184,39 @@ test array-custom-type-decode-next-to-literal {
 expect {
     l|{1,2,3}
 }
+
+test array-custom-type-update-copy {
+    CREATE TYPE cents_copy BASE integer ENCODE value*100 DECODE value/100;
+    CREATE TABLE copies (xs cents_copy[], ys cents_copy[]) STRICT;
+    INSERT INTO copies VALUES ('{1,2,3}', '{4}');
+    UPDATE copies SET ys = xs;
+    SELECT xs, ys FROM copies;
+}
+expect {
+    {1,2,3}|{1,2,3}
+}
+
+test array-custom-type-update-convert {
+    CREATE TYPE cents_src BASE integer ENCODE value*100 DECODE value/100;
+    CREATE TYPE dimes_dst BASE integer ENCODE value*10 DECODE value/10;
+    CREATE TABLE converted (xs cents_src[], ys dimes_dst[]) STRICT;
+    INSERT INTO converted VALUES ('{1,2,3}', '{4}');
+    UPDATE converted SET ys = xs;
+    SELECT xs, ys FROM converted;
+}
+expect {
+    {1,2,3}|{1,2,3}
+}
+
+test array-custom-type-update-null-empty {
+    CREATE TYPE cents_empty BASE integer ENCODE value*100 DECODE value/100;
+    CREATE TABLE empty_copies (id INTEGER PRIMARY KEY, xs cents_empty[], ys cents_empty[]) STRICT;
+    INSERT INTO empty_copies VALUES (1,NULL,'{4}'), (2,'{}','{4}'), (3,'{1,2}','{4}');
+    UPDATE empty_copies SET ys = xs;
+    SELECT id, xs, ys FROM empty_copies ORDER BY id;
+}
+expect {
+    1||
+    2|{}|{}
+    3|{1,2}|{1,2}
+}
