@@ -1035,3 +1035,40 @@ fn test_wal_watermark_read_page_out_of_range_returns_error(db: TempDatabase) {
     let result = conn.try_wal_watermark_read_page(1, &mut page, Some(max_frame - 1));
     assert!(matches!(result, Err(LimboError::InvalidArgument(_))));
 }
+
+#[test]
+fn wal_insert_end_syncs_committed_frames() {
+    for force_commit in [false, true] {
+        let source = TempDatabase::new_empty();
+        let src = source.connect_limbo();
+        src.execute("CREATE TABLE t(x)").unwrap();
+        src.execute("INSERT INTO t VALUES (1)").unwrap();
+        let frames = src.wal_state().unwrap().max_frame;
+        let io = Arc::new(crate::unreliable_io::UnreliableIo::new());
+        let db = turso_core::Database::open_file(io.clone(), "target.db", Arc::new(SqliteDialect))
+            .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("PRAGMA synchronous = FULL").unwrap();
+        let mut frame = [0u8; 24 + 4096];
+        conn.wal_insert_begin().unwrap();
+        for frame_no in 1..=frames {
+            src.wal_get_frame(frame_no, &mut frame).unwrap();
+            conn.wal_insert_frame(frame_no, &frame).unwrap();
+        }
+        conn.wal_insert_end(force_commit).unwrap();
+        let rows: Vec<(i64,)> = db
+            .connect(ConnectOpts::new())
+            .unwrap()
+            .exec_rows("SELECT count(*) FROM t");
+        assert_eq!(rows, [(1,)]);
+        let durable_wal = io
+            .durable_files()
+            .remove("target.db-wal")
+            .unwrap_or_default();
+        assert_eq!(
+            durable_wal.len(),
+            32 + frames as usize * (24 + 4096),
+            "WAL bytes that survive a power loss with force_commit={force_commit}"
+        );
+    }
+}
