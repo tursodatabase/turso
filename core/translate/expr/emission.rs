@@ -164,6 +164,7 @@ pub fn process_returning_clause(
                     expr: expr.as_ref().clone(),
                     alias,
                     implicit_column_name,
+                    written_column_name: None,
                     contains_aggregates: false,
                 });
             }
@@ -188,6 +189,7 @@ pub fn process_returning_clause(
                         expr: column_expr,
                         alias: column.name.clone(),
                         implicit_column_name: None,
+                        written_column_name: None,
                         contains_aggregates: false,
                     });
                 }

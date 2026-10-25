@@ -1658,6 +1658,7 @@ fn build_update_write_set_plan(
         },
         alias: None,
         implicit_column_name: None,
+        written_column_name: None,
         contains_aggregates: false,
     });
 
@@ -1761,6 +1762,7 @@ fn update_from_set_result_columns(set_clauses: &[UpdateSetClause]) -> Vec<Result
             expr: set_clause.expr.as_ref().clone(),
             alias: Some(update_from_scratch_col_name(idx)),
             implicit_column_name: None,
+            written_column_name: None,
             contains_aggregates: false,
         })
         .collect()
