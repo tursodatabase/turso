@@ -70,6 +70,7 @@ scalar_functions! {
     PgGetExpr(FunctionArity::OneOf(&[2, 3]), true),
     ToChar(FunctionArity::Exact(2), true),
     BoolIn(FunctionArity::Exact(1), true),
+    IntegerToBoolean(FunctionArity::Exact(1), true),
     VarcharIn(FunctionArity::Exact(2), true),
     PgInputIsValid(FunctionArity::Exact(2), true),
     Textlike(FunctionArity::Exact(2), true),
@@ -124,6 +125,7 @@ impl ScalarCall for PgScalarFunction {
             Self::PgGetExpr => exec_pg_get_expr(args)?,
             Self::ToChar => exec_to_char(args[0].get_value(), &text_arg(args, 1)),
             Self::BoolIn => exec_bool_in(args[0].get_value())?,
+            Self::IntegerToBoolean => exec_integer_to_boolean(args[0].get_value()),
             Self::VarcharIn => exec_varchar_in(args[0].get_value(), int_arg(args, 1, 0))?,
             Self::PgInputIsValid => exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1)),
             Self::Textlike => exec_textlike(args)?,
@@ -166,12 +168,12 @@ impl ScalarCall for PgScalarFunction {
     }
 }
 
-/// Converts a value to the stored form of `boolean`: 1 or 0. An integer is
-/// true when it is not 0, as in a PostgreSQL cast from integer.
+/// Converts a value to the stored form of `boolean`: 1 or 0. The integers
+/// 1 and 0 are kept as they are.
 fn exec_bool_in(value: &Value) -> Result<Value> {
     let input = match value {
         Value::Null => return Ok(Value::Null),
-        Value::Numeric(Numeric::Integer(i)) => return Ok(Value::from_i64((*i != 0) as i64)),
+        Value::Numeric(Numeric::Integer(i @ (0 | 1))) => return Ok(Value::from_i64(*i)),
         Value::Text(text) => text.as_str().to_string(),
         other => other.to_string(),
     };
@@ -181,6 +183,16 @@ fn exec_bool_in(value: &Value) -> Result<Value> {
             type_name: "boolean",
             input,
         }),
+    }
+}
+
+/// Turns an integer into 1 when it is not 0 and into 0 otherwise, as a
+/// PostgreSQL cast from integer to boolean does. Other values are returned
+/// unchanged.
+fn exec_integer_to_boolean(value: &Value) -> Value {
+    match value {
+        Value::Numeric(Numeric::Integer(i)) => Value::from_i64((*i != 0) as i64),
+        other => other.clone(),
     }
 }
 

@@ -190,15 +190,25 @@ pub(crate) fn emit_array_decode(
     col: &Column,
     resolver: &Resolver,
 ) -> Result<()> {
-    if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
-        if let Some(decode_expr) = type_def.decode() {
-            emit_array_element_loop(program, reg, decode_expr, col, type_def, resolver)?;
-        }
-    }
+    emit_array_element_decodes(program, reg, col, resolver)?;
 
     // Convert record blob to JSON text for display
     if !program.flags.keep_array_results_as_blobs() {
         program.emit_insn(Insn::ArrayDecode { reg });
+    }
+    Ok(())
+}
+
+pub(super) fn emit_array_element_decodes(
+    program: &mut ProgramBuilder,
+    reg: usize,
+    col: &Column,
+    resolver: &Resolver,
+) -> Result<()> {
+    if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
+        if let Some(decode_expr) = type_def.decode() {
+            emit_array_element_loop(program, reg, decode_expr, col, type_def, resolver)?;
+        }
     }
     Ok(())
 }

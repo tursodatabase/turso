@@ -2977,6 +2977,11 @@ impl PostgreSQLTranslator {
                     return cast_with_type_modifier(expr, pg_type_name);
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
+                let expr = if type_name.name == "boolean" && type_name.array_dimensions == 0 {
+                    Box::new(function_call("integer_to_boolean", vec![*expr]))
+                } else {
+                    expr
+                };
                 Ok(ast::Expr::Cast {
                     expr,
                     type_name: Some(type_name),
@@ -5771,9 +5776,6 @@ fn json_type_or_raise(
     }
 }
 
-/// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
-/// Maps PG types to their base SQLite storage types. Other names are kept as
-/// written so that enums and domains resolve to their custom type.
 /// `CAST(x AS varchar(n))`. Unlike an INSERT, an explicit cast cuts longer
 /// text to `n` characters instead of failing, so it becomes
 /// `substr(CAST(x AS TEXT), 1, n)`.
@@ -5809,6 +5811,9 @@ fn cast_with_type_modifier(
     })
 }
 
+/// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
+/// Maps PG types to their base SQLite storage types. Other names are kept as
+/// written so that enums and domains resolve to their custom type.
 fn pg_type_name_to_ast_type(
     type_name: &pg_query::protobuf::TypeName,
 ) -> Result<ast::Type, ParseError> {

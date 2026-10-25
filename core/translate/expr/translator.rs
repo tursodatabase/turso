@@ -771,6 +771,14 @@ fn translate_cast_expr(
             );
             column.set_array_dimensions(tn.array_dimensions);
             super::arrays::emit_array_encode(program, target_register, &column, resolver, "")?;
+            if resolver.dialect.cast_to_custom_type_decodes() {
+                super::arrays::emit_array_element_decodes(
+                    program,
+                    target_register,
+                    &column,
+                    resolver,
+                )?;
+            }
             return Ok(target_register);
         }
         if let Some(resolved) = resolver.schema().resolve_type_unchecked(cast_type_name)? {
@@ -905,7 +913,14 @@ fn emit_cast_decodes(
     if !resolver.dialect.cast_to_custom_type_decodes() {
         return Ok(());
     }
-    emit_decodes(program, chain, reg, cast_col, resolver)
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_label,
+    });
+    emit_decodes(program, chain, reg, cast_col, resolver)?;
+    program.preassign_label_to_next_insn(skip_label);
+    Ok(())
 }
 
 #[inline(never)]

@@ -141,7 +141,9 @@ INTEGER. Unknown type names pass through as custom types.
 A quoted string or bound parameter compared with a value of one of these types
 is converted to that type first, so `uuid_col = 'A0EEBC99-...'` matches the
 lowercase uuid, with or without an index. Arithmetic between numeric and a
-floating-point value gives a floating-point result, as in PostgreSQL.
+floating-point value gives a floating-point result, as in PostgreSQL. An integer cast
+to boolean is true when it is not 0; storing an integer other than 0 or 1 in
+a boolean column is an error.
 
 | Feature | Status | Notes |
 |---------|--------|-------|

@@ -104,3 +104,61 @@ test insert-varchar-with-trailing-spaces-past-limit {
 expect {
     abc||3
 }
+
+test cast-null-to-boolean-is-null {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES (NULL::boolean);
+    SELECT count(*) FROM t WHERE b IS NULL;
+    SELECT CASE WHEN NULL::boolean IS NULL THEN 'null' END,
+        CASE WHEN CAST((CASE WHEN false THEN 'yes' END) AS boolean) IS NULL THEN 'null' END;
+}
+expect {
+    1
+    null|null
+}
+
+test cast-integer-to-boolean {
+    SELECT 2::boolean, 0::boolean, (-1)::boolean, CAST(1 AS boolean);
+}
+expect {
+    t|f|t|t
+}
+
+test cast-integer-column-to-boolean {
+    CREATE TABLE t (i int);
+    INSERT INTO t VALUES (7), (0);
+    SELECT i::boolean FROM t ORDER BY i;
+}
+expect {
+    f
+    t
+}
+
+test insert-integer-other-than-0-or-1-into-boolean-is-an-error {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES (-1);
+}
+expect error {boolean}
+
+test update-boolean-to-integer-2-is-an-error {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES (true);
+    UPDATE t SET b = 2;
+}
+expect error {boolean}
+
+test cast-text-array-to-uuid-array {
+    SELECT '{9E6CFBA0-0F51-2201-1410-6069E05B8756}'::uuid[], ('{9e6cfba0-0f51-2201-1410-6069e05b8756}'::uuid[])[1];
+}
+expect {
+    {9e6cfba0-0f51-2201-1410-6069e05b8756}|9e6cfba0-0f51-2201-1410-6069e05b8756
+}
+
+test cast-uuid-array-column-to-uuid-array {
+    CREATE TABLE t (u uuid[]);
+    INSERT INTO t VALUES ('{9e6cfba0-0f51-2201-1410-6069e05b8756}');
+    SELECT u::uuid[], (u::uuid[])[1] FROM t;
+}
+expect {
+    {9e6cfba0-0f51-2201-1410-6069e05b8756}|9e6cfba0-0f51-2201-1410-6069e05b8756
+}
