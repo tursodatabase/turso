@@ -638,6 +638,15 @@ pub struct PlanningTerms {
     pub(crate) always_true: Option<ExprId>,
     /// A literal NULL, which `x IS NULL` seeks.
     pub(crate) null: Option<ExprId>,
+    pub(crate) queries: Vec<QueryFacts>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct QueryFacts {
+    pub(crate) subqueries: Vec<QueryId>,
+    pub(crate) dependencies: Vec<QueryId>,
+    pub(crate) outer_sources: Vec<SourceId>,
+    pub(crate) source_column_usage: Vec<ColumnUsage>,
 }
 
 impl PlanningTerms {
@@ -663,6 +672,32 @@ impl PlanningTerms {
     pub(crate) fn null(&self) -> ExprId {
         self.null
             .expect("binding prepares the NULL literal an IS NULL seek uses")
+    }
+
+    fn query(&self, query: QueryId) -> &QueryFacts {
+        self.queries
+            .get(query.index())
+            .expect("binding prepares the facts of every query")
+    }
+
+    pub(crate) fn subqueries(&self, query: QueryId) -> &[QueryId] {
+        &self.query(query).subqueries
+    }
+
+    pub(crate) fn dependencies(&self, query: QueryId) -> &[QueryId] {
+        &self.query(query).dependencies
+    }
+
+    pub(crate) fn outer_sources(&self, query: QueryId) -> &[SourceId] {
+        &self.query(query).outer_sources
+    }
+
+    pub(crate) fn reads_outer_sources(&self, query: QueryId) -> bool {
+        !self.outer_sources(query).is_empty()
+    }
+
+    pub(crate) fn source_column_usage(&self, query: QueryId) -> &[ColumnUsage] {
+        &self.query(query).source_column_usage
     }
 }
 

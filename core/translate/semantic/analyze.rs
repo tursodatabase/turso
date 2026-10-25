@@ -2632,6 +2632,68 @@ mod tests {
         schema
     }
 
+    #[test]
+    fn planning_facts_match_what_walking_the_queries_finds() {
+        let schema = schema_with_join_tables();
+        for sql in [
+            "SELECT id FROM items",
+            "SELECT id, (SELECT max(note) FROM tags WHERE tags.item_id = items.id) FROM items \
+             WHERE EXISTS (SELECT 1 FROM extras WHERE extras.item_id = items.id AND extras.flag = items.score)",
+            "SELECT d.id FROM (SELECT id, value FROM items WHERE score > 1) AS d \
+             WHERE d.value IN (SELECT label FROM codes WHERE codes.value = d.id)",
+            "WITH c AS (SELECT id FROM categories) SELECT label FROM categories \
+             WHERE id IN (SELECT id FROM c) AND label = (SELECT value FROM items WHERE items.id = categories.id)",
+            "SELECT id FROM items UNION SELECT item_id FROM tags WHERE note = (SELECT label FROM codes LIMIT 1)",
+        ] {
+            let document = analyze_sql_with_schema(&schema, sql).expect("SQL analyzes");
+            assert!(document.queries.len() > 1 || sql == "SELECT id FROM items");
+            for query in &document.queries {
+                let id = query.id;
+                assert_eq!(
+                    document.planning.subqueries(id),
+                    document.expression_subqueries(id),
+                    "{sql}"
+                );
+                assert_eq!(
+                    document.planning.dependencies(id),
+                    document.direct_query_dependencies(id),
+                    "{sql}"
+                );
+                assert_eq!(
+                    document.planning.outer_sources(id),
+                    document.outer_sources(id),
+                    "{sql}"
+                );
+                let mut expected = std::collections::BTreeMap::new();
+                for nested in &document.queries {
+                    for usage in
+                        nested.direct_column_usage(|source| document.source(source), &document.exprs)
+                    {
+                        let owner = document.source(usage.reference.source).map(|source| source.owner);
+                        if nested.id == id
+                            || matches!(owner, Some(SourceOwner::QueryBlock(block)) if block.query == id)
+                        {
+                            let key = (usage.reference.source.index(), usage.reference.column);
+                            *expected.entry(key).or_insert(0) += usage.count;
+                        }
+                    }
+                }
+                let stored = document
+                    .planning
+                    .source_column_usage(id)
+                    .iter()
+                    .map(|usage| {
+                        (
+                            (usage.reference.source.index(), usage.reference.column),
+                            usage.count,
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                assert_eq!(stored, expected, "{sql}");
+            }
+        }
+    }
+
     fn schema_with_indexes() -> Schema {
         let mut schema = schema_with_join_tables();
         let symbols = SymbolTable::new();

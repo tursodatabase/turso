@@ -55,37 +55,6 @@ impl ColumnUsageCollector {
 }
 
 impl HirDocument {
-    /// Count every column of `query`'s own sources that is read anywhere:
-    /// by the query itself or by a nested query, such as a correlated
-    /// subquery reading an outer column. An index covers a source only if it
-    /// holds all of these.
-    pub(crate) fn source_column_usage(&self, query: QueryId) -> Vec<ColumnUsage> {
-        let Some(owner) = self.query(query) else {
-            return Vec::new();
-        };
-        let owns = |source: SourceId| {
-            self.source(source).is_some_and(|source| {
-                matches!(source.owner, SourceOwner::QueryBlock(block) if block.query == query)
-            })
-        };
-        let mut counts = ColumnUsageCollector::default();
-        owner.record_direct_column_reads(|source| self.source(source), &self.exprs, &mut counts);
-        let mut nested_reads = Vec::new();
-        for nested in self.queries.iter().filter(|nested| nested.id != query) {
-            nested.direct_column_reads(
-                |source| self.source(source),
-                &self.exprs,
-                &mut nested_reads,
-            );
-        }
-        for reference in nested_reads {
-            if owns(reference.source) {
-                counts.record(reference);
-            }
-        }
-        counts.into_usage()
-    }
-
     /// Column reads of a DML statement: `direct`, its own reads, plus the
     /// reads of every subquery that reads a source the statement owns, such
     /// as `t.c` in `DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.c)`.
@@ -120,6 +89,10 @@ impl HirDocument {
                 pending.extend(self.direct_query_dependencies(id));
             }
         }
+        self.outer_sources_of(&nested)
+    }
+
+    fn outer_sources_of(&self, nested: &HashSet<QueryId>) -> Vec<SourceId> {
         let mut outer = nested
             .iter()
             .filter_map(|id| self.query(*id))
@@ -196,34 +169,64 @@ impl HirDocument {
         let Some(query) = self.query(id) else {
             return Vec::new();
         };
-        let mut subqueries = Vec::new();
-        visit_query_parts(self, query, &mut |part| {
-            let QueryPart::Expression(expression) = part else {
-                return;
-            };
-            expression.for_each(&mut |expression| {
-                let Expr::Subquery(subquery) = expression.node() else {
-                    return;
-                };
-                let query = match subquery {
-                    SubqueryExpr::Scalar { query, .. }
-                    | SubqueryExpr::Row { query }
-                    | SubqueryExpr::In { query, .. }
-                    | SubqueryExpr::Exists(query) => *query,
-                };
-                if !subqueries.contains(&query) {
-                    subqueries.push(query);
-                }
-            });
-        });
-        subqueries.sort_unstable();
-        subqueries
+        self.direct_query_links(query).0
     }
 
     pub(crate) fn direct_query_dependencies(&self, id: QueryId) -> Vec<QueryId> {
         let Some(query) = self.query(id) else {
             return Vec::new();
         };
+        self.direct_query_links(query).1
+    }
+
+    pub(crate) fn query_facts(&self) -> Vec<QueryFacts> {
+        let mut facts = self
+            .queries
+            .iter()
+            .map(|query| {
+                let (subqueries, dependencies) = self.direct_query_links(query);
+                QueryFacts {
+                    subqueries,
+                    dependencies,
+                    ..QueryFacts::default()
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut usage = (0..self.queries.len())
+            .map(|_| ColumnUsageCollector::default())
+            .collect::<Vec<_>>();
+        let mut reads = Vec::new();
+        for query in &self.queries {
+            query.direct_column_reads(|source| self.source(source), &self.exprs, &mut reads);
+            for reference in reads.drain(..) {
+                usage[query.id.index()].record(reference);
+                if let Some(SourceOwner::QueryBlock(block)) =
+                    self.source(reference.source).map(|source| source.owner)
+                {
+                    if block.query != query.id {
+                        usage[block.query.index()].record(reference);
+                    }
+                }
+            }
+        }
+        for (index, usage) in usage.into_iter().enumerate() {
+            facts[index].source_column_usage = usage.into_usage();
+        }
+        for index in 0..facts.len() {
+            let mut pending = vec![self.queries[index].id];
+            let mut nested = HashSet::default();
+            while let Some(id) = pending.pop() {
+                if nested.insert(id) {
+                    pending.extend(facts[id.index()].dependencies.iter().copied());
+                }
+            }
+            facts[index].outer_sources = self.outer_sources_of(&nested);
+        }
+        facts
+    }
+
+    fn direct_query_links(&self, query: &Query) -> (Vec<QueryId>, Vec<QueryId>) {
+        let mut subqueries = HashSet::default();
         let mut dependencies = HashSet::default();
         visit_query_parts(self, query, &mut |part| match part {
             QueryPart::Source(source) => match &source.kind {
@@ -255,14 +258,17 @@ impl HirDocument {
                         | SubqueryExpr::In { query, .. }
                         | SubqueryExpr::Exists(query) => *query,
                     };
+                    subqueries.insert(query);
                     dependencies.insert(query);
                 });
             }
         });
 
+        let mut subqueries = subqueries.into_iter().collect::<Vec<_>>();
+        subqueries.sort_unstable();
         let mut dependencies = dependencies.into_iter().collect::<Vec<_>>();
         dependencies.sort_unstable();
-        dependencies
+        (subqueries, dependencies)
     }
 
     /// The outer values that `query`, or any query it runs, reads: one
@@ -408,8 +414,8 @@ impl HirDocument {
                         | SubqueryExpr::In { query, .. }
                         | SubqueryExpr::Exists(query) => query,
                     };
-                    for source in self.outer_sources(*query) {
-                        visit(source);
+                    for source in self.planning.outer_sources(*query) {
+                        visit(*source);
                     }
                 }
                 _ => {}

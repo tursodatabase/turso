@@ -490,7 +490,7 @@ pub(crate) fn hir_source_is_lateral(
     let Some(owner) = document.source(source).map(|source| source.owner) else {
         return false;
     };
-    document.outer_sources(query).iter().any(|read| {
+    document.planning.outer_sources(query).iter().any(|read| {
         document
             .source(*read)
             .is_some_and(|read| read.owner == owner)
@@ -1444,7 +1444,13 @@ impl<'a> HirPlanContext<'a> {
                 "HIR query dependency cycle at {query_id}"
             )));
         }
-        for dependency in self.document.direct_query_dependencies(query_id) {
+        for dependency in self
+            .document
+            .planning
+            .dependencies(query_id)
+            .iter()
+            .copied()
+        {
             self.plan_query_tree(dependency, schema, params, planned, active)?;
         }
         let estimate = self.plan_query(query_id, 1.0, schema, params, planned)?;
@@ -1480,8 +1486,8 @@ impl<'a> HirPlanContext<'a> {
             .iter()
             .flat_map(|block| block.subquery_calls.iter().copied())
             .collect::<Vec<_>>();
-        for subquery in self.document.expression_subqueries(query_id) {
-            if !self.document.reads_outer_sources(subquery) {
+        for subquery in self.document.planning.subqueries(query_id).iter().copied() {
+            if !self.document.planning.reads_outer_sources(subquery) {
                 continue;
             }
             let calls = counted
@@ -2684,9 +2690,9 @@ impl<'a> HirPlanContext<'a> {
             .document
             .query(block.id.query)
             .expect("validated HIR query block has owning query");
-        let usage = self.document.source_column_usage(query.id);
+        let usage = self.document.planning.source_column_usage(query.id);
         if block.from.is_none() {
-            let input = self.query_block_input(block, order_by, &usage)?;
+            let input = self.query_block_input(block, order_by, usage)?;
             let output_cardinality = match &block.body {
                 hir::QueryBlockBody::Values { rows } => initial_cardinality * rows.len() as f64,
                 hir::QueryBlockBody::Select { .. } => initial_cardinality,
@@ -2712,8 +2718,8 @@ impl<'a> HirPlanContext<'a> {
             });
         }
 
-        let mut input = self.query_block_input(block, order_by, &usage)?;
-        input.subqueries = self.document.expression_subqueries(block.id.query);
+        let mut input = self.query_block_input(block, order_by, usage)?;
+        input.subqueries = self.document.planning.subqueries(block.id.query).to_vec();
         if let Some(predicate) = extra_predicate {
             append_predicates(self.document, &mut input.predicates, predicate, None);
         }
@@ -2769,13 +2775,13 @@ impl<'a> HirPlanContext<'a> {
         // block reads.
         let mut subquery_reads = Vec::new();
         for query in &input.subqueries {
-            subquery_reads.extend(self.document.outer_sources(*query));
+            subquery_reads.extend(self.document.planning.outer_sources(*query).iter().copied());
         }
         let hash = crate::translate::optimizer::join::HirHashJoins {
             allowed: self.hash_joins_allowed(&input),
             // A materialized build input is filled once per statement, so
             // the block must not read an outer row.
-            materialize: !self.document.reads_outer_sources(block.id.query),
+            materialize: !self.document.planning.reads_outer_sources(block.id.query),
             subquery_reads: &subquery_reads,
         };
         let access = self
@@ -3897,7 +3903,7 @@ impl<'a> HirPlanContext<'a> {
         let mut subqueries = Vec::with_capacity(input.subqueries.len());
         for query in &input.subqueries {
             let mut required = crate::translate::planner::TableMask::default();
-            for source in self.document.outer_sources(*query) {
+            for source in self.document.planning.outer_sources(*query).iter().copied() {
                 if let Some(position) = input
                     .sources
                     .iter()
@@ -5815,6 +5821,7 @@ pub(crate) mod tests {
             materialized: Materialized::Yes,
             body: CteBody::Query(child_query),
         });
+        crate::translate::plan::prepare_planning_terms(&mut cte_document);
         cte_document
             .validate()
             .expect("non-recursive CTE query HIR is valid");
@@ -5897,6 +5904,7 @@ pub(crate) mod tests {
             queue_order: Vec::new(),
             limit: None,
         });
+        crate::translate::plan::prepare_planning_terms(&mut recursive_document);
         recursive_document
             .validate()
             .expect("recursive CTE source HIR is valid");
@@ -5942,6 +5950,7 @@ pub(crate) mod tests {
                 constraint: JoinConstraint::None,
             });
         cte_document.ctes[cte_id.index()].materialized = Materialized::No;
+        crate::translate::plan::prepare_planning_terms(&mut cte_document);
         cte_document
             .validate()
             .expect("two references to a NOT MATERIALIZED CTE are valid");
@@ -5970,6 +5979,7 @@ pub(crate) mod tests {
                 .exprs
                 .push(hir::Expr::column(outer_source, 0));
         correlated_document.queries[child_query.index()].captures = vec![outer_source];
+        crate::translate::plan::prepare_planning_terms(&mut correlated_document);
         correlated_document
             .validate()
             .expect("correlated CTE body HIR is valid");

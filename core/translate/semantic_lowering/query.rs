@@ -899,7 +899,8 @@ pub(crate) fn prepare_subquery(
     Ok(PreparedSubquery {
         query: query_id,
         destination: prepared.destination,
-        correlated: document.reads_outer_sources(query_id) || program.reruns_subquery(query_id),
+        correlated: document.planning.reads_outer_sources(query_id)
+            || program.reruns_subquery(query_id),
     })
 }
 
@@ -7069,7 +7070,7 @@ fn hir_hash_kept_columns(
     source: &hir::Source,
     mut columns: Vec<usize>,
 ) -> Vec<usize> {
-    for usage in document.source_column_usage(query) {
+    for usage in document.planning.source_column_usage(query).iter() {
         if usage.reference.source == source.id && !columns.contains(&usage.reference.column) {
             columns.push(usage.reference.column);
         }
@@ -8397,7 +8398,7 @@ fn hir_recursive_cte_reads_outer_sources(
 ) -> bool {
     std::iter::once(recursive.seed)
         .chain(recursive.arms.iter().map(|arm| arm.query))
-        .flat_map(|query| document.outer_sources(query))
+        .flat_map(|query| document.planning.outer_sources(query).iter().copied())
         .any(|source| !recursive.input_sources.contains(&source))
 }
 
@@ -8549,7 +8550,7 @@ fn prepare_hir_materialized_loop<'a>(
     let source = validate_hir_materialized_query(plan, source_id, materialized_query)?;
     // A subquery that reads outer columns runs inside the outer loop, so it
     // is filled again, into a fresh table, every time this point is reached.
-    let correlated = plan.document.reads_outer_sources(query_id);
+    let correlated = plan.document.planning.reads_outer_sources(query_id);
 
     let table = hir_materialized_table(source);
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));

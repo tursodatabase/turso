@@ -80,6 +80,7 @@ impl From<hir::ExprId> for HirWhereTerm {
 /// already built is left alone, so this runs again after a rewrite adds
 /// predicates.
 pub(crate) fn prepare_planning_terms(document: &mut hir::HirDocument) {
+    document.planning.queries = document.query_facts();
     let mut predicates = Vec::new();
     let mut filters = Vec::new();
     for query in &document.queries {
@@ -2420,6 +2421,7 @@ mod tests {
         let duplicate_left = exprs.push(hir::Expr::column(first, 0));
         let duplicate_right = exprs.push(hir::Expr::column(first, 1));
         let duplicate = hir_and(exprs, duplicate_left, duplicate_right);
+        prepare_planning_terms(&mut document);
 
         let direct_mask =
             crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), direct)?;

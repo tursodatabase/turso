@@ -1325,7 +1325,7 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
     let coroutine_cost = coroutine_scan_cost
         + coroutine_reexecution_overhead
         + Cost(input_cardinality * subquery_cost.0);
-    if document.reads_outer_sources(query) {
+    if document.planning.reads_outer_sources(query) {
         return Ok(scan(coroutine_cost));
     }
     if !may_seek {
