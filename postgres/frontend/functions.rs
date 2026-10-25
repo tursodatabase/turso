@@ -4,7 +4,8 @@ use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
 use turso_core::{
-    Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
+    Connection, ExternalFunc, IOResult, LimboError, MathFunc, Numeric, OpenOptions, Register,
+    Result, Value,
 };
 
 pub(crate) fn register_functions(mut options: OpenOptions) -> OpenOptions {
@@ -479,25 +480,18 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Value> {
 /// PostgreSQL's `mod` keeps integer arguments integer, unlike SQLite's,
 /// which always returns a float.
 fn exec_mod(lhs: &Value, rhs: &Value) -> Result<Value> {
-    let (Some(lhs), Some(rhs)) = (numeric_arg(lhs)?, numeric_arg(rhs)?) else {
-        return Ok(Value::Null);
-    };
-    if rhs.to_f64() == 0.0 {
-        return Err(LimboError::DivisionByZero);
-    }
-    Ok(match (lhs, rhs) {
-        (Numeric::Integer(lhs), Numeric::Integer(rhs)) => Value::from_i64(lhs.wrapping_rem(rhs)),
-        _ => Value::from_f64(lhs.to_f64() % rhs.to_f64()),
-    })
-}
-
-fn numeric_arg(value: &Value) -> Result<Option<Numeric>> {
-    match value {
-        Value::Text(text) => Numeric::from_value_strict(value)
-            .map(Some)
-            .ok_or_else(|| LimboError::InvalidTextRepresentation(text.as_str().to_owned())),
-        _ => Ok(Numeric::from_value_strict(value)),
-    }
+    let result = lhs.exec_math_binary(rhs, &MathFunc::Mod, true)?;
+    Ok(
+        match (
+            Numeric::from_value_strict(lhs),
+            Numeric::from_value_strict(rhs),
+        ) {
+            (Some(Numeric::Integer(lhs)), Some(Numeric::Integer(rhs))) => {
+                Value::from_i64(lhs.wrapping_rem(rhs))
+            }
+            _ => result,
+        },
+    )
 }
 
 fn exec_pg_get_user_by_id(_oid: i64) -> Value {

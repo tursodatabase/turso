@@ -11889,7 +11889,11 @@ pub fn op_function(
             MathFuncArity::Binary => {
                 let lhs = &state.registers[*start_reg];
                 let rhs = &state.registers[*start_reg + 1];
-                let result = lhs.get_value().exec_math_binary(rhs.get_value(), math_func);
+                let result = lhs.get_value().exec_math_binary(
+                    rhs.get_value(),
+                    math_func,
+                    program.connection.dialect().errors_on_zero_divisor(),
+                )?;
                 state.registers[*dest].set_value(result);
             }
 
