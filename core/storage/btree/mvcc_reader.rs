@@ -1,4 +1,4 @@
-use super::{BTreeCursor, NotedPayload};
+use super::{BTreeCursor, CursorTrait, NotedPayload};
 use crate::alloc::{ArcSlice, DynAllocator};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::cursor::{cursor_yield_key, CursorYieldPoint};
@@ -219,7 +219,7 @@ impl BTreeCursor {
                         };
                 }
                 CountStep::Cells => {
-                    let count = return_if_io!(self.btree_count());
+                    let count = return_if_io!(self.without_mvcc_reader(|cursor| cursor.count()));
                     let reader = self.mvcc_mut();
                     reader.count_step = CountStep::Idle;
                     reader.cell = None;
@@ -463,23 +463,25 @@ impl BTreeCursor {
                     }
                     let landed = match motion {
                         Motion::Rewind => {
-                            return_if_io!(self.btree_rewind());
+                            return_if_io!(self.without_mvcc_reader(|cursor| cursor.rewind()));
                             true
                         }
                         Motion::Last => {
-                            return_if_io!(self.btree_last());
+                            return_if_io!(self.without_mvcc_reader(|cursor| cursor.last()));
                             true
                         }
                         Motion::Next => {
-                            return_if_io!(self.btree_next());
+                            return_if_io!(self.without_mvcc_reader(|cursor| cursor.next()));
                             true
                         }
                         Motion::Prev => {
-                            return_if_io!(self.btree_prev());
+                            return_if_io!(self.without_mvcc_reader(|cursor| cursor.prev()));
                             true
                         }
                         Motion::Seek { rowid, op } => !matches!(
-                            return_if_io!(self.btree_seek(SeekKey::TableRowId(rowid), op)),
+                            return_if_io!(self.without_mvcc_reader(
+                                |cursor| cursor.seek(SeekKey::TableRowId(rowid), op)
+                            )),
                             SeekResult::TryAdvance
                         ),
                     };
@@ -519,8 +521,12 @@ impl BTreeCursor {
                         }
                     }
                     match self.mvcc().direction {
-                        IterationDirection::Forwards => return_if_io!(self.btree_next()),
-                        IterationDirection::Backwards => return_if_io!(self.btree_prev()),
+                        IterationDirection::Forwards => {
+                            return_if_io!(self.without_mvcc_reader(|cursor| cursor.next()))
+                        }
+                        IterationDirection::Backwards => {
+                            return_if_io!(self.without_mvcc_reader(|cursor| cursor.prev()))
+                        }
                     }
                     let cell = self.cell_under_btree_cursor()?;
                     let reader = self.mvcc_mut();
@@ -530,6 +536,16 @@ impl BTreeCursor {
                 }
             }
         }
+    }
+
+    fn without_mvcc_reader<T>(
+        &mut self,
+        step: impl FnOnce(&mut BTreeCursor) -> IOResultOr<T>,
+    ) -> IOResultOr<T> {
+        let reader = self.mvcc_reader.take();
+        let result = step(self);
+        self.mvcc_reader = reader;
+        result
     }
 
     fn resolve_mvcc_row(&mut self) -> Result<bool> {
