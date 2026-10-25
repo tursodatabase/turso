@@ -275,7 +275,7 @@ fn write_set_take_transfers_entries_without_cloning() {
     let row_versions: RowVersions<TursoAllocator> = Arc::new(RwLock::new(crate::alloc::vec![]));
     let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
 
-    assert!(write_set.insert(row_id, Arc::clone(&row_versions)));
+    write_set.push(row_id, Arc::clone(&row_versions));
     let entries_ptr = write_set.entries.as_ptr();
     let entries_capacity = write_set.entries.capacity();
     let strong_count = Arc::strong_count(&row_versions);
@@ -283,10 +283,8 @@ fn write_set_take_transfers_entries_without_cloning() {
     let transferred = write_set.take();
 
     assert!(write_set.entries.is_empty());
-    assert!(write_set.seen.is_empty());
     assert_eq!(transferred.entries.as_ptr(), entries_ptr);
     assert_eq!(transferred.entries.capacity(), entries_capacity);
-    assert_eq!(transferred.seen.len(), 1);
     assert_eq!(Arc::strong_count(&row_versions), strong_count);
     assert!(Arc::ptr_eq(&transferred.entries[0].1, &row_versions));
 }
@@ -298,7 +296,7 @@ fn aborted_transaction_rejects_write_set_insert() {
     let row_versions: RowVersions<TursoAllocator> = Arc::new(RwLock::new(crate::alloc::vec![]));
     let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
 
-    tx.insert_to_write_set(row_id, row_versions);
+    tx.add_to_write_set(row_id, row_versions);
 }
 
 #[test]
@@ -523,7 +521,6 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
     let savepoints = tx.savepoint_stack.read();
     let savepoint = savepoints.last().unwrap();
     assert!(savepoint.created_table_versions.is_empty());
-    assert!(savepoint.newly_added_to_write_set.is_empty());
 }
 
 impl MvccTestDb {
@@ -9785,8 +9782,8 @@ fn transaction_display() {
     let empty_versions = || Arc::new(RwLock::new(crate::alloc::vec![]));
     let write_set = Mutex::new({
         let mut write_set: WriteSet = WriteSet::new();
-        write_set.insert(RowID::new((-2).into(), RowKey::Int(11)), empty_versions());
-        write_set.insert(RowID::new((-2).into(), RowKey::Int(13)), empty_versions());
+        write_set.push(RowID::new((-2).into(), RowKey::Int(11)), empty_versions());
+        write_set.push(RowID::new((-2).into(), RowKey::Int(13)), empty_versions());
         write_set
     });
 
@@ -12256,6 +12253,97 @@ fn test_tombstone_keeps_deleted_row_only_for_sqlite_schema() {
         "SELECT name FROM sqlite_schema WHERE name = 'dropped'"
     )
     .is_empty());
+}
+
+/// A transaction adds a version chain to its write set only on its first write
+/// to the chain. Later writes to the same table row or index key find a version
+/// of the transaction in the chain and add nothing.
+#[test]
+fn test_write_set_has_one_entry_for_each_written_chain() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("UPDATE t SET v = 'b' WHERE id = 1").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let tx_id = conn.get_mv_tx_id().unwrap();
+    // The table row 1 and the index keys 'a' and 'b'.
+    assert_eq!(
+        write_set_len_and_distinct_chains(&mvcc_store, tx_id),
+        (3, 3)
+    );
+    conn.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t");
+    assert_eq!(rows, vec![vec![Value::from_i64(1), Value::build_text("a")]]);
+}
+
+/// A rollback to a savepoint removes the chains that the savepoint added to the
+/// write set. A chain that the transaction wrote before the savepoint stays,
+/// also when the savepoint wrote to it again. A second rollback to the same
+/// savepoint removes the chains that were added after the first rollback.
+#[test]
+fn test_savepoint_rollback_removes_only_the_chains_that_the_savepoint_added() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let tx_id = conn.get_mv_tx_id().unwrap();
+    assert_eq!(
+        write_set_len_and_distinct_chains(&mvcc_store, tx_id),
+        (2, 2)
+    );
+
+    conn.execute("SAVEPOINT sp").unwrap();
+    conn.execute("UPDATE t SET v = 'b' WHERE id = 1").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'c')").unwrap();
+    assert_eq!(
+        write_set_len_and_distinct_chains(&mvcc_store, tx_id),
+        (5, 5)
+    );
+    conn.execute("ROLLBACK TO sp").unwrap();
+    assert_eq!(
+        write_set_len_and_distinct_chains(&mvcc_store, tx_id),
+        (2, 2)
+    );
+
+    conn.execute("INSERT INTO t VALUES (3, 'd')").unwrap();
+    assert_eq!(
+        write_set_len_and_distinct_chains(&mvcc_store, tx_id),
+        (4, 4)
+    );
+    conn.execute("ROLLBACK TO sp").unwrap();
+    assert_eq!(
+        write_set_len_and_distinct_chains(&mvcc_store, tx_id),
+        (2, 2)
+    );
+
+    conn.execute("RELEASE sp").unwrap();
+    conn.execute("COMMIT").unwrap();
+    let rows = get_rows(&conn, "SELECT id, v FROM t");
+    assert_eq!(rows, vec![vec![Value::from_i64(1), Value::build_text("a")]]);
+}
+
+fn write_set_len_and_distinct_chains(
+    mvcc_store: &Arc<crate::MvStore>,
+    tx_id: TxID,
+) -> (usize, usize) {
+    let tx = mvcc_store.txs.get(&tx_id).unwrap();
+    let write_set = tx.value().write_set.lock();
+    let distinct_chains: HashSet<usize> = write_set
+        .iter()
+        .map(|(_, row_versions)| Arc::as_ptr(row_versions) as usize)
+        .collect();
+    (write_set.len(), distinct_chains.len())
 }
 
 /// `drop_unused_row_versions_and_slots` removes emptied SkipMap entries.

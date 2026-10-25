@@ -4270,7 +4270,7 @@ mod tests {
         version: RowVersion,
     ) {
         let stamp = version_stamp(&version);
-        let (key, _) = mvstore
+        let (key, _, _) = mvstore
             .insert_index_version(index_id, key, version)
             .unwrap();
         mvstore
