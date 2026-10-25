@@ -74,37 +74,11 @@ fn claim(conn: &Connection, setting_name: &str, claim_name: &str) -> Result<Opti
 }
 
 fn canonical_uuid(text: &str) -> Result<String> {
-    let invalid =
-        || LimboError::InvalidArgument(format!("invalid input syntax for type uuid: \"{text}\""));
-    let (mut rest, braced) = match text.strip_prefix('{') {
-        Some(rest) => (rest.as_bytes(), true),
-        None => (text.as_bytes(), false),
-    };
-    let mut uuid = String::with_capacity(36);
-    for byte_index in 0..16 {
-        let [high, low, tail @ ..] = rest else {
-            return Err(invalid());
-        };
-        if !high.is_ascii_hexdigit() || !low.is_ascii_hexdigit() {
-            return Err(invalid());
-        }
-        if matches!(byte_index, 4 | 6 | 8 | 10) {
-            uuid.push('-');
-        }
-        uuid.push(char::from(high.to_ascii_lowercase()));
-        uuid.push(char::from(low.to_ascii_lowercase()));
-        rest = match tail {
-            [b'-', after_hyphen @ ..] if byte_index % 2 == 1 && byte_index < 15 => after_hyphen,
-            _ => tail,
-        };
-    }
-    if braced {
-        rest = rest.strip_prefix(b"}").ok_or_else(invalid)?;
-    }
-    if !rest.is_empty() {
-        return Err(invalid());
-    }
-    Ok(uuid)
+    uuid::Uuid::parse_str(text)
+        .map(|uuid| uuid.hyphenated().to_string())
+        .map_err(|_| {
+            LimboError::InvalidArgument(format!("invalid input syntax for type uuid: \"{text}\""))
+        })
 }
 
 fn jwt(conn: &Connection) -> Result<Option<String>> {
