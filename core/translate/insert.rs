@@ -780,8 +780,14 @@ pub fn translate_insert(
         .table
         .is_strict
         .then(|| BTreeTable::type_check_table_ref(ctx.table, resolver.schema()));
+    let has_custom_columns = ctx.table.columns().iter().any(|c| {
+        resolver
+            .schema()
+            .column_has_custom_type(c, ctx.table.is_strict)
+    });
     let types_checked_first = has_before_triggers || insertion.has_virtual_columns();
-    let types_checked_early = types_checked_first || !ctx.table.check_constraints.is_empty();
+    let types_checked_early =
+        types_checked_first || !ctx.table.check_constraints.is_empty() || has_custom_columns;
 
     if !types_checked_early {
         let is_strict = ctx.table.is_strict;
