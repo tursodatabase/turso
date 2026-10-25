@@ -2183,6 +2183,45 @@ pub unsafe extern "C" fn sqlite3_bind_int64(
     sqlite3_bind_result(stmt, result)
 }
 
+struct BindDestructorGuard {
+    destructor: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
+    ptr: *mut ffi::c_void,
+}
+
+impl BindDestructorGuard {
+    fn new(
+        ptr: *mut ffi::c_void,
+        len: ffi::c_int,
+        destructor: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
+    ) -> Self {
+        let transient_ptr = usize::MAX as *const ffi::c_void;
+        let destructor_ptr = destructor.map(|f| f as *const ffi::c_void);
+        let should_call = !ptr.is_null()
+            && len >= 0
+            && destructor_ptr.is_some_and(|f| !f.is_null() && f != transient_ptr);
+        Self {
+            destructor: should_call.then_some(destructor).flatten(),
+            ptr,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.destructor = None;
+    }
+
+    fn run(&mut self) {
+        if let Some(destructor) = self.destructor.take() {
+            unsafe { destructor(self.ptr) };
+        }
+    }
+}
+
+impl Drop for BindDestructorGuard {
+    fn drop(&mut self) {
+        self.run();
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_double(
     stmt: *mut sqlite3_stmt,
@@ -2209,6 +2248,7 @@ pub unsafe extern "C" fn sqlite3_bind_text(
     len: ffi::c_int,
     destructor: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
 ) -> ffi::c_int {
+    let mut destructor_guard = BindDestructorGuard::new(text as *mut _, len, destructor);
     if stmt.is_null() {
         return SQLITE_MISUSE;
     }
@@ -2264,6 +2304,7 @@ pub unsafe extern "C" fn sqlite3_bind_text(
             return rc;
         }
 
+        destructor_guard.disarm();
         stmt_ref
             .destructors
             .push((idx as usize, destructor, text as *mut ffi::c_void));
@@ -2280,6 +2321,7 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
     len: ffi::c_int,
     destructor: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
 ) -> ffi::c_int {
+    let mut destructor_guard = BindDestructorGuard::new(blob as *mut _, len, destructor);
     if stmt.is_null() {
         return SQLITE_MISUSE;
     }
@@ -2302,15 +2344,7 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
         return rc;
     }
 
-    if let Some(destructor_fn) = destructor {
-        let ptr_val = destructor_fn as *const ffi::c_void;
-        let static_ptr = std::ptr::null();
-        let transient_ptr = usize::MAX as *const ffi::c_void;
-
-        if ptr_val != static_ptr && ptr_val != transient_ptr {
-            destructor_fn(blob as *mut _);
-        }
-    }
+    destructor_guard.run();
 
     SQLITE_OK
 }
