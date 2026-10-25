@@ -193,3 +193,30 @@ expect {
     1|1
     2|0
 }
+
+# ============================================================================
+# ALTER TABLE ADD COLUMN with custom type validates default value
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test alter-table-add-custom-type-rejects-invalid-default {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t_alter(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO t_alter VALUES (1);
+    ALTER TABLE t_alter ADD COLUMN amount cents DEFAULT 'not-an-int';
+}
+expect error {
+    cannot store TEXT value in INTEGER column
+}
+
+@requires strict "uses STRICT tables"
+test alter-table-add-custom-type-accepts-valid-default {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t_alter_ok(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO t_alter_ok VALUES (1);
+    ALTER TABLE t_alter_ok ADD COLUMN amount cents DEFAULT 5;
+    SELECT id, amount FROM t_alter_ok;
+}
+expect {
+    1|5
+}

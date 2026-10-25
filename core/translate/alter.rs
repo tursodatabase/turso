@@ -561,6 +561,76 @@ fn emit_add_column_default_type_validation(
     Ok(())
 }
 
+fn emit_validate_custom_type_default(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    original_btree: &Arc<BTreeTable>,
+    column: &Column,
+    database_id: usize,
+) -> Result<()> {
+    let Some(default_expr) = column.default.as_ref() else {
+        return Ok(());
+    };
+
+    let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, true) else {
+        return Ok(());
+    };
+
+    let has_encode = resolved.chain.iter().any(|td| td.encode().is_some());
+    if !has_encode {
+        return Ok(());
+    }
+
+    let check_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: check_cursor_id,
+        root_page: original_btree.root_page,
+        db: database_id,
+    });
+
+    let skip_check_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: check_cursor_id,
+        pc_if_empty: skip_check_label,
+    });
+
+    let val_reg = program.alloc_register();
+    crate::translate::expr::translate_expr(program, None, default_expr, val_reg, resolver)?;
+
+    let any_not_null = resolved.chain.iter().any(|td| td.not_null);
+    let null_skip_label = if !any_not_null {
+        let label = program.allocate_label();
+        program.emit_insn(Insn::IsNull {
+            reg: val_reg,
+            target_pc: label,
+        });
+        Some(label)
+    } else {
+        None
+    };
+
+    for td in &resolved.chain {
+        if let Some(encode_expr) = td.encode() {
+            crate::translate::expr::emit_type_expr(
+                program,
+                encode_expr,
+                val_reg,
+                val_reg,
+                column,
+                td,
+                resolver,
+            )?;
+        }
+    }
+
+    if let Some(label) = null_skip_label {
+        program.preassign_label_to_next_insn(label);
+    }
+
+    program.preassign_label_to_next_insn(skip_check_label);
+    Ok(())
+}
+
 /// Validate NOT NULL and CHECK constraints for a new or altered column by
 /// scanning each existing row, computing virtual generated columns as needed.
 #[allow(clippy::too_many_arguments)]
@@ -1402,6 +1472,15 @@ pub fn translate_alter_table(
 
                 if default_type_mismatch {
                     emit_add_column_default_type_validation(program, &original_btree, database_id)?;
+                }
+                if btree.is_strict {
+                    emit_validate_custom_type_default(
+                        program,
+                        resolver,
+                        &original_btree,
+                        &column,
+                        database_id,
+                    )?;
                 }
             }
 

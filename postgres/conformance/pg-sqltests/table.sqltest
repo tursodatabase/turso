@@ -407,3 +407,31 @@ test drop-view-on-a-table-errors {
 expect error {
     "t" is not a view
 }
+
+test alter-table-add-column-with-invalid-custom-default-rejects {
+    CREATE TABLE al (i int);
+    INSERT INTO al VALUES (1);
+    ALTER TABLE al ADD COLUMN v varchar(2) DEFAULT 'toolong';
+}
+expect error {
+    value too long
+}
+
+test alter-table-add-column-with-invalid-boolean-default-rejects {
+    CREATE TABLE al2 (i int);
+    INSERT INTO al2 VALUES (1);
+    ALTER TABLE al2 ADD COLUMN b boolean DEFAULT 'maybe';
+}
+expect error {
+    for type boolean
+}
+
+test alter-table-add-column-with-valid-custom-default-succeeds {
+    CREATE TABLE al3 (i int);
+    INSERT INTO al3 VALUES (1);
+    ALTER TABLE al3 ADD COLUMN v varchar(5) DEFAULT 'ok';
+    SELECT i, v FROM al3;
+}
+expect {
+    1|ok
+}
