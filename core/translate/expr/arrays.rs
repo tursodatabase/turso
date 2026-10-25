@@ -197,7 +197,9 @@ pub(crate) fn emit_array_decode(
     }
 
     // Convert record blob to JSON text for display
-    program.emit_insn(Insn::ArrayDecode { reg });
+    if !program.flags.keep_array_results_as_blobs() {
+        program.emit_insn(Insn::ArrayDecode { reg });
+    }
     Ok(())
 }
 
