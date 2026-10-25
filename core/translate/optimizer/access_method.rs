@@ -62,13 +62,19 @@ impl<T: AccessSource + ?Sized> AccessSource for &T {
 pub(crate) struct HirAccessSource<'a> {
     planned: &'a HirPlannedSource,
     definition: &'a hir::Source,
+    exprs: &'a hir::ExprArena,
 }
 
 impl<'a> HirAccessSource<'a> {
-    pub(crate) fn new(planned: &'a HirPlannedSource, definition: &'a hir::Source) -> Self {
+    pub(crate) fn new(
+        planned: &'a HirPlannedSource,
+        definition: &'a hir::Source,
+        exprs: &'a hir::ExprArena,
+    ) -> Self {
         Self {
             planned,
             definition,
+            exprs,
         }
     }
 }
@@ -79,7 +85,8 @@ impl AccessSource for HirAccessSource<'_> {
     }
 
     fn index_is_covering(&self, index: &Index) -> bool {
-        self.planned.index_is_covering(self.definition, index)
+        self.planned
+            .index_is_covering(self.definition, index, self.exprs)
     }
 
     fn keeps_right_rows(&self) -> bool {
@@ -108,17 +115,17 @@ pub(super) trait BtreeAccessSource<I, O>: BtreeCandidateSource<I, O> {
     fn used_column_count(&self) -> usize;
 }
 
-impl<'a> BtreeCandidateSource<hir::SourceId, &'a hir::Expr> for HirAccessSource<'a> {
+impl<'a> BtreeCandidateSource<hir::SourceId, hir::ExprId> for HirAccessSource<'a> {
     fn order_consumed(
         &self,
         iter_dir: IterationDirection,
         index: Option<&Index>,
         constraint_refs: &[RangeConstraintRef],
-        order_target: &OrderTarget<hir::SourceId, &'a hir::Expr>,
+        order_target: &OrderTarget<hir::SourceId, hir::ExprId>,
         schema: &Schema,
     ) -> Result<OrderConsumption> {
         hir_btree_access_order_consumed(
-            &HirOrderSource::new(self.planned, self.definition),
+            &HirOrderSource::new(self.planned, self.definition, self.exprs),
             iter_dir,
             index,
             constraint_refs,
@@ -130,7 +137,7 @@ impl<'a> BtreeCandidateSource<hir::SourceId, &'a hir::Expr> for HirAccessSource<
     }
 }
 
-impl<'a> BtreeAccessSource<hir::SourceId, &'a hir::Expr> for HirAccessSource<'a> {
+impl<'a> BtreeAccessSource<hir::SourceId, hir::ExprId> for HirAccessSource<'a> {
     fn allows_alternative_access(&self) -> bool {
         matches!(self.planned.indexed, hir::IndexHint::None)
     }
@@ -881,22 +888,23 @@ pub(super) fn choose_in_seek_access_method<E>(
 /// built for a read that runs once; an IN seek is still considered.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn choose_hir_single_read_access_method(
+    exprs: &hir::ExprArena,
     source: &HirPlannedSource,
     definition: &hir::Source,
-    constraints: &TableConstraints<hir::Expr>,
+    constraints: &TableConstraints<hir::ExprId>,
     lhs_mask: &TableMask,
     source_position: usize,
     schema: &Schema,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
 ) -> Result<AccessMethod> {
-    let source = HirAccessSource::new(source, definition);
+    let source = HirAccessSource::new(source, definition, exprs);
     let mut best = choose_btree_access_method(
         &source,
         constraints,
         lhs_mask,
         source_position,
-        None::<&OrderTarget<hir::SourceId, &hir::Expr>>,
+        None::<&OrderTarget<hir::SourceId, hir::ExprId>>,
         schema,
         &schema.analyze_stats,
         1.0,
@@ -1281,9 +1289,9 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
     query: hir::QueryId,
     table_materialization_required: bool,
     may_seek: bool,
-    order_target: Option<&super::order::HirOrderTarget<'_>>,
+    order_target: Option<&super::order::HirOrderTarget>,
     output_order: &[super::order::HirOutputOrder],
-    constraints: &TableConstraints<hir::Expr>,
+    constraints: &TableConstraints<hir::ExprId>,
     lhs_mask: &TableMask,
     source_position: usize,
     ready_where: &[(usize, usize)],
@@ -1317,7 +1325,7 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
     let coroutine_cost = coroutine_scan_cost
         + coroutine_reexecution_overhead
         + Cost(input_cardinality * subquery_cost.0);
-    if document.reads_outer_sources(query) {
+    if document.planning.reads_outer_sources(query) {
         return Ok(scan(coroutine_cost));
     }
     if !may_seek {
@@ -1335,7 +1343,7 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
     let definition = document.source(source).ok_or_else(|| {
         crate::LimboError::InternalError(format!("HIR subquery source {source} is missing"))
     })?;
-    let usable: Vec<(usize, &Constraint<hir::Expr>)> = constraints
+    let usable: Vec<(usize, &Constraint<hir::ExprId>)> = constraints
         .constraints
         .iter()
         .enumerate()
@@ -1399,7 +1407,7 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
     if usable.is_empty() {
         return Ok(scan(scan_cost));
     }
-    let usable_constraints: Vec<&Constraint<hir::Expr>> =
+    let usable_constraints: Vec<&Constraint<hir::ExprId>> =
         usable.iter().map(|(_, constraint)| *constraint).collect();
     let key_col_positions = super::constraints::ordered_ephemeral_key_columns(&usable_constraints);
     if key_col_positions.is_empty() {
@@ -1599,9 +1607,12 @@ fn hir_grouped_subquery_lookup_is_unique(
                 .output
                 .iter()
                 .position(|output| {
-                    document
-                        .output(*output)
-                        .is_some_and(|output| output.expr.equivalent(key))
+                    document.output(*output).is_some_and(|output| {
+                        document
+                            .exprs
+                            .at(output.expr)
+                            .equivalent(document.exprs.at(*key))
+                    })
                 })
                 .is_some_and(|position| {
                     constraint_refs.iter().any(|constraint| {

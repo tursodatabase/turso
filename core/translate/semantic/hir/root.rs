@@ -4,8 +4,8 @@ use crate::{alloc::BoxedSlice, schema::ForeignKey, sync::Arc};
 use turso_parser::ast::ResolveType;
 
 use super::{
-    Expr, From, Limit, OrderTerm, Output, QueryId, ResolvedCollation, ResolvedIndex, ResolvedTable,
-    ResolvedTrigger, SourceId,
+    ExprId, From, Limit, OrderTerm, Output, QueryId, ResolvedCollation, ResolvedIndex,
+    ResolvedTable, ResolvedTrigger, SourceId,
 };
 
 #[derive(Clone, Debug)]
@@ -34,7 +34,7 @@ pub enum HirRoot {
 #[derive(Clone, Debug)]
 pub struct SchemaExpressionRoot {
     pub source: SourceId,
-    pub expressions: Vec<Expr>,
+    pub expressions: Vec<ExprId>,
 }
 
 #[derive(Clone, Debug)]
@@ -54,7 +54,7 @@ pub enum TriggerBody {
     /// One part of a trigger body on its own, which the analyzer tests
     /// analyze.
     #[cfg(test)]
-    Predicate(Expr),
+    Predicate(ExprId),
     #[cfg(test)]
     Command(TriggerCommand),
     Program(TriggerProgram),
@@ -62,7 +62,7 @@ pub enum TriggerBody {
 
 #[derive(Clone, Debug)]
 pub struct TriggerProgram {
-    pub predicate: Option<Expr>,
+    pub predicate: Option<ExprId>,
     pub commands: Vec<TriggerCommand>,
 }
 
@@ -156,7 +156,7 @@ pub struct ResolvedAutoincrement {
 #[derive(Clone, Debug)]
 pub struct ResolvedDefault {
     pub column: usize,
-    pub value: Expr,
+    pub value: ExprId,
 }
 
 /// One INSERT target position and whether its paired source value supplies it.
@@ -172,7 +172,7 @@ pub struct InsertTarget {
 #[derive(Clone, Debug)]
 pub enum InsertSource {
     DefaultValues,
-    Values(Vec<Vec<Expr>>),
+    Values(Vec<Vec<ExprId>>),
     Query(QueryId),
 }
 
@@ -186,13 +186,13 @@ pub struct Upsert {
 #[derive(Clone, Debug)]
 pub struct ConflictTarget {
     pub terms: Vec<ConflictTerm>,
-    pub predicate: Option<Expr>,
+    pub predicate: Option<ExprId>,
     pub matched_index: Option<ResolvedIndex>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ConflictTerm {
-    pub expr: Expr,
+    pub expr: ExprId,
     pub collation: Option<ResolvedCollation>,
 }
 
@@ -202,7 +202,7 @@ pub enum UpsertAction {
     Nothing,
     Update {
         assignments: Vec<Assignment>,
-        predicate: Option<Expr>,
+        predicate: Option<ExprId>,
     },
 }
 
@@ -214,7 +214,7 @@ pub struct Assignment {
     /// written as `rowid` fires a trigger on `rowid` and not one on the
     /// INTEGER PRIMARY KEY column, and the other way round.
     pub names: Vec<String>,
-    pub value: Expr,
+    pub value: ExprId,
 }
 
 /// A writable destination in a DML target.
@@ -234,7 +234,7 @@ pub struct Update {
     pub target_kind: UpdateTargetKind,
     pub from: Option<From>,
     pub assignments: Vec<Assignment>,
-    pub predicate: Option<Expr>,
+    pub predicate: Option<ExprId>,
     pub order_by: Vec<OrderTerm>,
     pub limit: Option<Limit>,
     pub conflict: Option<ResolveType>,
@@ -263,7 +263,7 @@ pub enum UpdateTargetKind {
 pub struct Delete {
     pub target: SourceId,
     pub target_kind: DeleteTargetKind,
-    pub predicate: Option<Expr>,
+    pub predicate: Option<ExprId>,
     pub order_by: Vec<OrderTerm>,
     pub limit: Option<Limit>,
     pub returning: Option<Returning>,

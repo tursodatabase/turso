@@ -3,7 +3,7 @@
 use turso_parser::ast::{CompoundOperator, Distinctness, Materialized, NullsOrder, SortOrder};
 
 use super::{
-    BoundColumnTypePrograms, ColumnRef, CteId, DatabaseId, Expr, OutputId, QueryBlockId, QueryId,
+    BoundColumnTypePrograms, ColumnRef, CteId, DatabaseId, ExprId, OutputId, QueryBlockId, QueryId,
     ResolvedIndex, ResolvedTable, ResolvedWindow, SourceId, TypeFact,
 };
 use crate::vdbe::affinity::Affinity;
@@ -89,11 +89,11 @@ impl QueryBlock {
 pub enum QueryBlockBody {
     Select {
         distinctness: Option<Distinctness>,
-        filter: Option<Expr>,
+        filter: Option<ExprId>,
         grouping: Option<Grouping>,
     },
     Values {
-        rows: Vec<Vec<Expr>>,
+        rows: Vec<Vec<ExprId>>,
     },
 }
 
@@ -101,7 +101,7 @@ pub enum QueryBlockBody {
 pub struct Output {
     pub id: OutputId,
     pub name: String,
-    pub expr: Expr,
+    pub expr: ExprId,
     pub type_fact: TypeFact,
     pub affinity: Affinity,
     /// Affinity used when this result becomes a stored schema column.
@@ -129,18 +129,18 @@ pub enum OutputNameKind {
 
 #[derive(Clone, Debug)]
 pub struct Grouping {
-    pub keys: Vec<Expr>,
+    pub keys: Vec<ExprId>,
     /// Type and custom-comparison facts aligned with `keys`.
     pub key_type_facts: Vec<TypeFact>,
     /// Resolved SQL collations aligned with `keys`.
     pub key_collations: Vec<Option<super::ResolvedCollation>>,
-    pub having: Option<Expr>,
+    pub having: Option<ExprId>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Limit {
-    pub limit: Expr,
-    pub offset: Option<Expr>,
+    pub limit: ExprId,
+    pub offset: Option<ExprId>,
 }
 
 /// A non-empty resolved FROM clause.
@@ -229,7 +229,7 @@ pub enum JoinKind {
 #[allow(clippy::large_enum_variant)]
 pub enum JoinConstraint {
     None,
-    On(Expr),
+    On(ExprId),
     Using(Vec<UsingColumn>),
     Natural(Vec<UsingColumn>),
 }
@@ -240,7 +240,7 @@ pub struct UsingColumn {
     pub name: String,
     /// The visible value from the already-built left side. It may represent
     /// an earlier USING/NATURAL merge.
-    pub left: Box<Expr>,
+    pub left: ExprId,
     pub right: ColumnRef,
     pub value: MergedColumnValue,
     pub type_fact: TypeFact,
@@ -248,6 +248,8 @@ pub struct UsingColumn {
     pub has_affinity: bool,
     pub collation: Option<super::ResolvedCollation>,
     pub comparison: super::ComparisonSemantics,
+    /// `left = right`, the term the join plans.
+    pub equality: ExprId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,7 +270,7 @@ pub struct CheckConstraint {
     /// Position in the frozen catalog table's CHECK list.
     pub catalog_position: usize,
     /// CHECK expression instantiated for one exact source occurrence.
-    pub expression: Expr,
+    pub expression: ExprId,
     /// What a failure reports: the constraint's name, or its expression's
     /// text as the user wrote it.
     pub description: String,
@@ -285,7 +287,7 @@ pub struct CheckConstraint {
 pub enum ColumnReadExpression {
     Absent,
     NotRequired,
-    Planned(Box<Expr>),
+    Planned(ExprId),
 }
 
 /// One value per column of a source. While every column holds the empty
@@ -389,7 +391,7 @@ impl<T: EmptySlot> std::iter::FromIterator<T> for ColumnSlots<T> {
 }
 
 const _: () =
-    assert!(std::mem::size_of::<ColumnReadExpression>() == 2 * std::mem::size_of::<usize>());
+    assert!(std::mem::size_of::<ColumnReadExpression>() == 2 * std::mem::size_of::<u32>());
 const _: () = assert!(
     std::mem::size_of::<Option<Box<BoundColumnTypePrograms>>>() == std::mem::size_of::<usize>()
 );
@@ -439,7 +441,7 @@ pub enum SourceKind {
     TableFunction {
         table: ResolvedTable,
         /// Resolved hidden-column constraints produced from call arguments.
-        argument_predicates: Vec<Expr>,
+        argument_predicates: Vec<ExprId>,
     },
     Cte(CteId),
     Derived(QueryId),
@@ -455,7 +457,7 @@ pub enum SourceKind {
 pub struct FromGroup {
     pub from: Box<From>,
     /// Value supplied by each group column, aligned with `Source::columns`.
-    pub columns: Vec<Expr>,
+    pub columns: Vec<ExprId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -704,8 +706,8 @@ pub enum IndexCoverage {
 #[derive(Clone, Debug)]
 pub struct IndexExpressions {
     pub index: ResolvedIndex,
-    pub columns: Vec<Option<Expr>>,
-    pub predicate: Option<Expr>,
+    pub columns: Vec<Option<ExprId>>,
+    pub predicate: Option<ExprId>,
 }
 
 #[derive(Clone, Debug)]
@@ -713,7 +715,7 @@ pub struct IndexMethodPattern {
     pub id: super::IndexMethodPatternId,
     pub index: ResolvedIndex,
     pub outputs: Vec<Output>,
-    pub predicate: Option<Expr>,
+    pub predicate: Option<ExprId>,
     pub order_by: Vec<super::OrderTerm>,
     pub limit: Option<Limit>,
 }

@@ -265,13 +265,13 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
     }
 
     fn append_returning_star_outputs(
-        &self,
+        &mut self,
         outputs: &mut Vec<hir::Output>,
         expanded: Vec<ExpandedColumn<'_>>,
         scope: &Scope,
     ) -> Result<()> {
         for column in expanded {
-            let resolved = self.resolve_atomic_expr(column.resolved.expr, scope)?;
+            let resolved = self.resolve_atomic_expr(column.expr, scope)?;
             outputs.push(output_from_resolved(
                 hir::OutputId::root(outputs.len()),
                 column.name,

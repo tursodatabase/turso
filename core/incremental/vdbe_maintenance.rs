@@ -291,7 +291,7 @@ fn emit_plan_nodes(
                     node_id,
                     &upstream,
                     output_contract,
-                    predicate,
+                    *predicate,
                 )?
             }
             dag::OpNode::Project {

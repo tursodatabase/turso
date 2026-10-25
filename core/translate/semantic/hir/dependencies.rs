@@ -1,6 +1,6 @@
 //! Derived dependency summaries for resolved queries.
 
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
 use crate::function::Deterministic;
@@ -13,7 +13,7 @@ pub(crate) struct ColumnUsage {
 
 #[derive(Default)]
 struct ColumnUsageCollector {
-    counts: HashMap<ColumnRef, usize>,
+    reads: Vec<ColumnUsage>,
 }
 
 trait RecordColumnRead {
@@ -22,7 +22,10 @@ trait RecordColumnRead {
 
 impl RecordColumnRead for ColumnUsageCollector {
     fn record(&mut self, reference: ColumnRef) {
-        *self.counts.entry(reference).or_default() += 1;
+        self.add(ColumnUsage {
+            reference,
+            count: 1,
+        });
     }
 }
 
@@ -33,46 +36,25 @@ impl RecordColumnRead for Vec<ColumnRef> {
 }
 
 impl ColumnUsageCollector {
-    fn into_usage(self) -> Vec<ColumnUsage> {
-        let mut usage = self
-            .counts
-            .into_iter()
-            .map(|(reference, count)| ColumnUsage { reference, count })
-            .collect::<Vec<_>>();
-        usage
-            .sort_unstable_by_key(|usage| (usage.reference.source.index(), usage.reference.column));
+    fn add(&mut self, usage: ColumnUsage) {
+        self.reads.push(usage);
+    }
+
+    fn into_usage(mut self) -> Vec<ColumnUsage> {
+        self.reads
+            .sort_by_key(|usage| (usage.reference.source.index(), usage.reference.column));
+        let mut usage: Vec<ColumnUsage> = Vec::with_capacity(self.reads.len());
+        for read in self.reads {
+            match usage.last_mut() {
+                Some(last) if last.reference == read.reference => last.count += read.count,
+                _ => usage.push(read),
+            }
+        }
         usage
     }
 }
 
 impl HirDocument {
-    /// Count every column of `query`'s own sources that is read anywhere:
-    /// by the query itself or by a nested query, such as a correlated
-    /// subquery reading an outer column. An index covers a source only if it
-    /// holds all of these.
-    pub(crate) fn source_column_usage(&self, query: QueryId) -> Vec<ColumnUsage> {
-        let Some(owner) = self.query(query) else {
-            return Vec::new();
-        };
-        let owns = |source: SourceId| {
-            self.source(source).is_some_and(|source| {
-                matches!(source.owner, SourceOwner::QueryBlock(block) if block.query == query)
-            })
-        };
-        let mut counts = ColumnUsageCollector::default();
-        for usage in owner.direct_column_usage(|source| self.source(source)) {
-            *counts.counts.entry(usage.reference).or_default() += usage.count;
-        }
-        for nested in self.queries.iter().filter(|nested| nested.id != query) {
-            for usage in nested.direct_column_usage(|source| self.source(source)) {
-                if owns(usage.reference.source) {
-                    *counts.counts.entry(usage.reference).or_default() += usage.count;
-                }
-            }
-        }
-        counts.into_usage()
-    }
-
     /// Column reads of a DML statement: `direct`, its own reads, plus the
     /// reads of every subquery that reads a source the statement owns, such
     /// as `t.c` in `DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.c)`.
@@ -83,12 +65,12 @@ impl HirDocument {
         };
         let mut counts = ColumnUsageCollector::default();
         for usage in direct {
-            *counts.counts.entry(usage.reference).or_default() += usage.count;
+            counts.add(usage);
         }
         for query in &self.queries {
-            for usage in query.direct_column_usage(|source| self.source(source)) {
+            for usage in query.direct_column_usage(|source| self.source(source), &self.exprs) {
                 if owns(usage.reference.source) {
-                    *counts.counts.entry(usage.reference).or_default() += usage.count;
+                    counts.add(usage);
                 }
             }
         }
@@ -107,6 +89,10 @@ impl HirDocument {
                 pending.extend(self.direct_query_dependencies(id));
             }
         }
+        self.outer_sources_of(&nested)
+    }
+
+    fn outer_sources_of(&self, nested: &HashSet<QueryId>) -> Vec<SourceId> {
         let mut outer = nested
             .iter()
             .filter_map(|id| self.query(*id))
@@ -183,34 +169,64 @@ impl HirDocument {
         let Some(query) = self.query(id) else {
             return Vec::new();
         };
-        let mut subqueries = Vec::new();
-        visit_query_parts(self, query, &mut |part| {
-            let QueryPart::Expression(expression) = part else {
-                return;
-            };
-            expression.for_each(&mut |expression| {
-                let Expr::Subquery(subquery) = expression else {
-                    return;
-                };
-                let query = match subquery {
-                    SubqueryExpr::Scalar { query, .. }
-                    | SubqueryExpr::Row { query }
-                    | SubqueryExpr::In { query, .. }
-                    | SubqueryExpr::Exists(query) => *query,
-                };
-                if !subqueries.contains(&query) {
-                    subqueries.push(query);
-                }
-            });
-        });
-        subqueries.sort_unstable();
-        subqueries
+        self.direct_query_links(query).0
     }
 
     pub(crate) fn direct_query_dependencies(&self, id: QueryId) -> Vec<QueryId> {
         let Some(query) = self.query(id) else {
             return Vec::new();
         };
+        self.direct_query_links(query).1
+    }
+
+    pub(crate) fn query_facts(&self) -> Vec<QueryFacts> {
+        let mut facts = self
+            .queries
+            .iter()
+            .map(|query| {
+                let (subqueries, dependencies) = self.direct_query_links(query);
+                QueryFacts {
+                    subqueries,
+                    dependencies,
+                    ..QueryFacts::default()
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut usage = (0..self.queries.len())
+            .map(|_| ColumnUsageCollector::default())
+            .collect::<Vec<_>>();
+        let mut reads = Vec::new();
+        for query in &self.queries {
+            query.direct_column_reads(|source| self.source(source), &self.exprs, &mut reads);
+            for reference in reads.drain(..) {
+                usage[query.id.index()].record(reference);
+                if let Some(SourceOwner::QueryBlock(block)) =
+                    self.source(reference.source).map(|source| source.owner)
+                {
+                    if block.query != query.id {
+                        usage[block.query.index()].record(reference);
+                    }
+                }
+            }
+        }
+        for (index, usage) in usage.into_iter().enumerate() {
+            facts[index].source_column_usage = usage.into_usage();
+        }
+        for index in 0..facts.len() {
+            let mut pending = vec![self.queries[index].id];
+            let mut nested = HashSet::default();
+            while let Some(id) = pending.pop() {
+                if nested.insert(id) {
+                    pending.extend(facts[id.index()].dependencies.iter().copied());
+                }
+            }
+            facts[index].outer_sources = self.outer_sources_of(&nested);
+        }
+        facts
+    }
+
+    fn direct_query_links(&self, query: &Query) -> (Vec<QueryId>, Vec<QueryId>) {
+        let mut subqueries = HashSet::default();
         let mut dependencies = HashSet::default();
         visit_query_parts(self, query, &mut |part| match part {
             QueryPart::Source(source) => match &source.kind {
@@ -233,7 +249,7 @@ impl HirDocument {
             },
             QueryPart::Expression(expression) => {
                 expression.for_each(&mut |expression| {
-                    let Expr::Subquery(subquery) = expression else {
+                    let Expr::Subquery(subquery) = expression.node() else {
                         return;
                     };
                     let query = match subquery {
@@ -242,14 +258,17 @@ impl HirDocument {
                         | SubqueryExpr::In { query, .. }
                         | SubqueryExpr::Exists(query) => *query,
                     };
+                    subqueries.insert(query);
                     dependencies.insert(query);
                 });
             }
         });
 
+        let mut subqueries = subqueries.into_iter().collect::<Vec<_>>();
+        subqueries.sort_unstable();
         let mut dependencies = dependencies.into_iter().collect::<Vec<_>>();
         dependencies.sort_unstable();
-        dependencies
+        (subqueries, dependencies)
     }
 
     /// The outer values that `query`, or any query it runs, reads: one
@@ -294,17 +313,20 @@ impl HirDocument {
                     };
                 }
                 QueryPart::Expression(expression) => {
-                    expression.for_each(&mut |expression| match expression {
+                    expression.for_each(&mut |expression| {
+                        match expression.node() {
                         Expr::Column(reference) if !in_tree(reference.source) => {
-                            let value = Expr::Column(*reference);
-                            if !values.iter().any(|known: &Expr| known.equivalent(&value)) {
-                                values.push(value);
+                            if !values.iter().any(|known: &Expr| {
+                                matches!(known, Expr::Column(known) if known == reference)
+                            }) {
+                                values.push(Expr::Column(*reference));
                             }
                         }
                         Expr::RowId(source) if !in_tree(*source) => {
-                            let value = Expr::RowId(*source);
-                            if !values.iter().any(|known: &Expr| known.equivalent(&value)) {
-                                values.push(value);
+                            if !values.iter().any(|known: &Expr| {
+                                matches!(known, Expr::RowId(known) if known == source)
+                            }) {
+                                values.push(Expr::RowId(*source));
                             }
                         }
                         Expr::Function(call) => {
@@ -337,6 +359,7 @@ impl HirDocument {
                             );
                         }
                         _ => {}
+                    }
                     });
                 }
             });
@@ -360,7 +383,7 @@ impl HirDocument {
                     | SubqueryExpr::Row { query }
                     | SubqueryExpr::In { query, .. }
                     | SubqueryExpr::Exists(query),
-                ) = expression
+                ) = expression.node()
                 {
                     uses += usize::from(*query == child);
                 }
@@ -373,34 +396,39 @@ impl HirDocument {
     /// query. Output references follow their resolved expression; subqueries
     /// contribute their validated outer captures rather than their local
     /// sources.
-    pub(crate) fn visit_expr_sources(&self, expression: &Expr, visit: &mut impl FnMut(SourceId)) {
-        expression.for_each(&mut |expression| match expression {
-            Expr::Column(reference) => visit(reference.source),
-            Expr::RowId(source) => visit(*source),
-            Expr::Output(id) => {
-                let output = self
-                    .output(*id)
-                    .expect("validated HIR output reference must exist");
-                self.visit_expr_sources(&output.expr, visit);
-            }
-            Expr::Subquery(subquery) => {
-                let query = match subquery {
-                    SubqueryExpr::Scalar { query, .. }
-                    | SubqueryExpr::Row { query }
-                    | SubqueryExpr::In { query, .. }
-                    | SubqueryExpr::Exists(query) => query,
-                };
-                for source in self.outer_sources(*query) {
-                    visit(source);
+    pub(crate) fn visit_expr_sources(&self, expression: ExprId, visit: &mut impl FnMut(SourceId)) {
+        self.expr(expression)
+            .for_each(&mut |expression| match expression.node() {
+                Expr::Column(reference) => visit(reference.source),
+                Expr::RowId(source) => visit(*source),
+                Expr::Output(id) => {
+                    let output = self
+                        .output(*id)
+                        .expect("validated HIR output reference must exist");
+                    self.visit_expr_sources(output.expr, visit);
                 }
-            }
-            _ => {}
-        });
+                Expr::Subquery(subquery) => {
+                    let query = match subquery {
+                        SubqueryExpr::Scalar { query, .. }
+                        | SubqueryExpr::Row { query }
+                        | SubqueryExpr::In { query, .. }
+                        | SubqueryExpr::Exists(query) => query,
+                    };
+                    for source in self.planning.outer_sources(*query) {
+                        visit(*source);
+                    }
+                }
+                _ => {}
+            });
     }
 
     /// Visit every expression written in `query`'s own clauses, without the
     /// expressions of the queries it runs.
-    pub(crate) fn for_each_query_expression(&self, query: QueryId, visit: &mut impl FnMut(&Expr)) {
+    pub(crate) fn for_each_query_expression(
+        &self,
+        query: QueryId,
+        visit: &mut impl FnMut(ExprRef<'_>),
+    ) {
         let Some(query) = self.query(query) else {
             return;
         };
@@ -417,13 +445,13 @@ impl HirDocument {
         let Some(query) = self.query(id) else {
             return Vec::new();
         };
-        query.direct_captures(|source| self.source(source))
+        query.direct_captures(|source| self.source(source), &self.exprs)
     }
 }
 
 enum QueryPart<'hir> {
     Source(&'hir Source),
-    Expression(&'hir Expr),
+    Expression(ExprRef<'hir>),
 }
 
 fn visit_query_parts<'hir>(
@@ -436,50 +464,50 @@ fn visit_query_parts<'hir>(
             visit_from_parts(document, from, visit);
         }
         for output in &block.outputs {
-            visit(QueryPart::Expression(&output.expr));
+            visit(QueryPart::Expression(document.expr(output.expr)));
         }
         match &block.body {
             QueryBlockBody::Select {
                 filter, grouping, ..
             } => {
                 if let Some(filter) = filter {
-                    visit(QueryPart::Expression(filter));
+                    visit(QueryPart::Expression(document.expr(*filter)));
                 }
                 if let Some(grouping) = grouping {
                     for key in &grouping.keys {
-                        visit(QueryPart::Expression(key));
+                        visit(QueryPart::Expression(document.expr(*key)));
                     }
                     if let Some(having) = &grouping.having {
-                        visit(QueryPart::Expression(having));
+                        visit(QueryPart::Expression(document.expr(*having)));
                     }
                 }
             }
             QueryBlockBody::Values { rows } => {
                 for expression in rows.iter().flatten() {
-                    visit(QueryPart::Expression(expression));
+                    visit(QueryPart::Expression(document.expr(*expression)));
                 }
             }
         }
         for window in &block.windows {
             for term in &window.partition_by {
-                visit(QueryPart::Expression(&term.expr));
+                visit(QueryPart::Expression(document.expr(term.expr)));
             }
             for term in &window.order_by {
-                visit(QueryPart::Expression(&term.expr));
+                visit(QueryPart::Expression(document.expr(term.expr)));
             }
-            visit_window_bound_part(&window.frame.start, visit);
+            visit_window_bound_part(document, &window.frame.start, visit);
             if let Some(end) = &window.frame.end {
-                visit_window_bound_part(end, visit);
+                visit_window_bound_part(document, end, visit);
             }
         }
     }
     for term in &query.order_by {
-        visit(QueryPart::Expression(&term.expr));
+        visit(QueryPart::Expression(document.expr(term.expr)));
     }
     if let Some(limit) = &query.limit {
-        visit(QueryPart::Expression(&limit.limit));
+        visit(QueryPart::Expression(document.expr(limit.limit)));
         if let Some(offset) = &limit.offset {
-            visit(QueryPart::Expression(offset));
+            visit(QueryPart::Expression(document.expr(*offset)));
         }
     }
 }
@@ -502,13 +530,13 @@ fn visit_from_parts<'hir>(
                     ..
                 } => {
                     for predicate in argument_predicates {
-                        visit(QueryPart::Expression(predicate));
+                        visit(QueryPart::Expression(document.expr(*predicate)));
                     }
                 }
                 SourceKind::FromGroup(group) => {
                     pending.push(&group.from);
                     for column in &group.columns {
-                        visit(QueryPart::Expression(column));
+                        visit(QueryPart::Expression(document.expr(*column)));
                     }
                 }
                 _ => {}
@@ -517,10 +545,12 @@ fn visit_from_parts<'hir>(
         for join in &from.joins {
             match &join.constraint {
                 JoinConstraint::None => {}
-                JoinConstraint::On(expression) => visit(QueryPart::Expression(expression)),
+                JoinConstraint::On(expression) => {
+                    visit(QueryPart::Expression(document.expr(*expression)))
+                }
                 JoinConstraint::Using(columns) | JoinConstraint::Natural(columns) => {
                     for column in columns {
-                        visit(QueryPart::Expression(&column.left));
+                        visit(QueryPart::Expression(document.expr(column.left)));
                     }
                 }
             }
@@ -529,21 +559,22 @@ fn visit_from_parts<'hir>(
 }
 
 fn visit_window_bound_part<'hir>(
+    document: &'hir HirDocument,
     bound: &'hir WindowFrameBound,
     visit: &mut impl FnMut(QueryPart<'hir>),
 ) {
     if let WindowFrameBound::Following(expression) | WindowFrameBound::Preceding(expression) = bound
     {
-        visit(QueryPart::Expression(expression));
+        visit(QueryPart::Expression(document.expr(*expression)));
     }
 }
 
-impl Expr {
+impl ExprRef<'_> {
     /// Return distinct column positions when this expression reads exactly
     /// one source. Output definitions and nested queries remain separate work.
-    pub(crate) fn single_source_column_usage(&self) -> Option<(SourceId, Vec<usize>)> {
+    pub(crate) fn single_source_column_usage(self) -> Option<(SourceId, Vec<usize>)> {
         let mut reads = ColumnUsageCollector::default();
-        collect_expr_column_reads(self, &mut reads);
+        collect_expr_column_reads(self.arena(), self.id(), &mut reads);
         let usage = reads.into_usage();
         let source = usage.first()?.reference.source;
         if usage.iter().any(|usage| usage.reference.source != source) {
@@ -565,39 +596,40 @@ impl Query {
     pub(crate) fn direct_captures<'source>(
         &self,
         source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
+        exprs: &ExprArena,
     ) -> Vec<SourceId> {
         let mut references = HashSet::default();
         for block in &self.blocks {
             if let Some(from) = &block.from {
-                collect_from_references(from, &mut references, source_by_id);
+                collect_from_references(exprs, from, &mut references, source_by_id);
             }
             for output in &block.outputs {
-                collect_expr_references(&output.expr, &mut references);
+                collect_expr_references(exprs, output.expr, &mut references);
             }
             match &block.body {
                 QueryBlockBody::Select {
                     filter, grouping, ..
                 } => {
-                    collect_optional_expr_references(filter.as_ref(), &mut references);
+                    collect_optional_expr_references(exprs, *filter, &mut references);
                     if let Some(grouping) = grouping {
-                        collect_exprs_references(&grouping.keys, &mut references);
-                        collect_optional_expr_references(grouping.having.as_ref(), &mut references);
+                        collect_exprs_references(exprs, &grouping.keys, &mut references);
+                        collect_optional_expr_references(exprs, grouping.having, &mut references);
                     }
                 }
                 QueryBlockBody::Values { rows } => {
                     for row in rows {
-                        collect_exprs_references(row, &mut references);
+                        collect_exprs_references(exprs, row, &mut references);
                     }
                 }
             }
             for window in &block.windows {
-                collect_window_references(window, &mut references);
+                collect_window_references(exprs, window, &mut references);
             }
         }
-        collect_order_references(&self.order_by, &mut references);
+        collect_order_references(exprs, &self.order_by, &mut references);
         if let Some(limit) = &self.limit {
-            collect_expr_references(&limit.limit, &mut references);
-            collect_optional_expr_references(limit.offset.as_ref(), &mut references);
+            collect_expr_references(exprs, limit.limit, &mut references);
+            collect_optional_expr_references(exprs, limit.offset, &mut references);
         }
 
         let mut captures = references
@@ -618,9 +650,10 @@ impl Query {
     pub(crate) fn direct_column_usage<'source>(
         &self,
         source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
+        exprs: &ExprArena,
     ) -> Vec<ColumnUsage> {
         let mut reads = ColumnUsageCollector::default();
-        self.record_direct_column_reads(source_by_id, &mut reads);
+        self.record_direct_column_reads(source_by_id, exprs, &mut reads);
         reads.into_usage()
     }
 
@@ -630,47 +663,49 @@ impl Query {
     pub(crate) fn direct_column_reads<'source>(
         &self,
         source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
+        exprs: &ExprArena,
         reads: &mut Vec<ColumnRef>,
     ) {
-        self.record_direct_column_reads(source_by_id, reads);
+        self.record_direct_column_reads(source_by_id, exprs, reads);
     }
 
     fn record_direct_column_reads<'source>(
         &self,
         source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
+        exprs: &ExprArena,
         reads: &mut impl RecordColumnRead,
     ) {
         for block in &self.blocks {
             if let Some(from) = &block.from {
-                collect_from_column_reads(from, reads, source_by_id);
+                collect_from_column_reads(exprs, from, reads, source_by_id);
             }
             for output in &block.outputs {
-                collect_expr_column_reads(&output.expr, reads);
+                collect_expr_column_reads(exprs, output.expr, reads);
             }
             match &block.body {
                 QueryBlockBody::Select {
                     filter, grouping, ..
                 } => {
-                    collect_optional_expr_column_reads(filter.as_ref(), reads);
+                    collect_optional_expr_column_reads(exprs, *filter, reads);
                     if let Some(grouping) = grouping {
-                        collect_exprs_column_reads(&grouping.keys, reads);
-                        collect_optional_expr_column_reads(grouping.having.as_ref(), reads);
+                        collect_exprs_column_reads(exprs, &grouping.keys, reads);
+                        collect_optional_expr_column_reads(exprs, grouping.having, reads);
                     }
                 }
                 QueryBlockBody::Values { rows } => {
                     for row in rows {
-                        collect_exprs_column_reads(row, reads);
+                        collect_exprs_column_reads(exprs, row, reads);
                     }
                 }
             }
             for window in &block.windows {
-                collect_window_column_reads(window, reads);
+                collect_window_column_reads(exprs, window, reads);
             }
         }
-        collect_order_column_reads(&self.order_by, reads);
+        collect_order_column_reads(exprs, &self.order_by, reads);
         if let Some(limit) = &self.limit {
-            collect_expr_column_reads(&limit.limit, reads);
-            collect_optional_expr_column_reads(limit.offset.as_ref(), reads);
+            collect_expr_column_reads(exprs, limit.limit, reads);
+            collect_optional_expr_column_reads(exprs, limit.offset, reads);
         }
     }
 }
@@ -681,28 +716,29 @@ impl Update {
     pub(crate) fn direct_column_usage<'source>(
         &self,
         source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
+        exprs: &ExprArena,
     ) -> Vec<ColumnUsage> {
         let mut reads = ColumnUsageCollector::default();
         if let Some(from) = &self.from {
-            collect_from_column_reads(from, &mut reads, source_by_id);
+            collect_from_column_reads(exprs, from, &mut reads, source_by_id);
         }
         if let UpdateTargetKind::BTree { defaults, .. } = &self.target_kind {
             for default in defaults {
-                collect_expr_column_reads(&default.value, &mut reads);
+                collect_expr_column_reads(exprs, default.value, &mut reads);
             }
         }
         for assignment in &self.assignments {
-            collect_expr_column_reads(&assignment.value, &mut reads);
+            collect_expr_column_reads(exprs, assignment.value, &mut reads);
         }
-        collect_optional_expr_column_reads(self.predicate.as_ref(), &mut reads);
-        collect_order_column_reads(&self.order_by, &mut reads);
+        collect_optional_expr_column_reads(exprs, self.predicate, &mut reads);
+        collect_order_column_reads(exprs, &self.order_by, &mut reads);
         if let Some(limit) = &self.limit {
-            collect_expr_column_reads(&limit.limit, &mut reads);
-            collect_optional_expr_column_reads(limit.offset.as_ref(), &mut reads);
+            collect_expr_column_reads(exprs, limit.limit, &mut reads);
+            collect_optional_expr_column_reads(exprs, limit.offset, &mut reads);
         }
         if let Some(returning) = &self.returning {
             for output in &returning.outputs {
-                collect_expr_column_reads(&output.expr, &mut reads);
+                collect_expr_column_reads(exprs, output.expr, &mut reads);
             }
         }
 
@@ -714,8 +750,9 @@ impl Update {
     pub(crate) fn direct_column_reads<'source>(
         &self,
         source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
+        exprs: &ExprArena,
     ) -> impl Iterator<Item = ColumnRef> {
-        self.direct_column_usage(source_by_id)
+        self.direct_column_usage(source_by_id, exprs)
             .into_iter()
             .map(|usage| usage.reference)
     }
@@ -724,17 +761,17 @@ impl Update {
 impl Delete {
     /// Count every table column read directly by the DELETE root. Nested
     /// queries own their usage and are visited separately by later phases.
-    pub(crate) fn direct_column_usage(&self) -> Vec<ColumnUsage> {
+    pub(crate) fn direct_column_usage(&self, exprs: &ExprArena) -> Vec<ColumnUsage> {
         let mut reads = ColumnUsageCollector::default();
-        collect_optional_expr_column_reads(self.predicate.as_ref(), &mut reads);
-        collect_order_column_reads(&self.order_by, &mut reads);
+        collect_optional_expr_column_reads(exprs, self.predicate, &mut reads);
+        collect_order_column_reads(exprs, &self.order_by, &mut reads);
         if let Some(limit) = &self.limit {
-            collect_expr_column_reads(&limit.limit, &mut reads);
-            collect_optional_expr_column_reads(limit.offset.as_ref(), &mut reads);
+            collect_expr_column_reads(exprs, limit.limit, &mut reads);
+            collect_optional_expr_column_reads(exprs, limit.offset, &mut reads);
         }
         if let Some(returning) = &self.returning {
             for output in &returning.outputs {
-                collect_expr_column_reads(&output.expr, &mut reads);
+                collect_expr_column_reads(exprs, output.expr, &mut reads);
             }
         }
 
@@ -743,27 +780,28 @@ impl Delete {
 
     /// Return every table column read directly by the DELETE root. Nested
     /// queries own their reads and are visited separately by the analyzer.
-    pub(crate) fn direct_column_reads(&self) -> impl Iterator<Item = ColumnRef> {
-        self.direct_column_usage()
+    pub(crate) fn direct_column_reads(&self, exprs: &ExprArena) -> impl Iterator<Item = ColumnRef> {
+        self.direct_column_usage(exprs)
             .into_iter()
             .map(|usage| usage.reference)
     }
 }
 
 fn collect_from_column_reads<'source>(
+    exprs: &ExprArena,
     from: &From,
     reads: &mut impl RecordColumnRead,
     source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
 ) {
-    collect_source_argument_column_reads(from.first, reads, source_by_id);
+    collect_source_argument_column_reads(exprs, from.first, reads, source_by_id);
     for join in &from.joins {
-        collect_source_argument_column_reads(join.right, reads, source_by_id);
+        collect_source_argument_column_reads(exprs, join.right, reads, source_by_id);
         match &join.constraint {
             JoinConstraint::None => {}
-            JoinConstraint::On(expression) => collect_expr_column_reads(expression, reads),
+            JoinConstraint::On(expression) => collect_expr_column_reads(exprs, *expression, reads),
             JoinConstraint::Using(columns) | JoinConstraint::Natural(columns) => {
                 for column in columns {
-                    collect_expr_column_reads(&column.left, reads);
+                    collect_expr_column_reads(exprs, column.left, reads);
                     reads.record(column.right);
                 }
             }
@@ -772,6 +810,7 @@ fn collect_from_column_reads<'source>(
 }
 
 fn collect_source_argument_column_reads<'source>(
+    exprs: &ExprArena,
     id: SourceId,
     reads: &mut impl RecordColumnRead,
     source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
@@ -784,80 +823,102 @@ fn collect_source_argument_column_reads<'source>(
             argument_predicates,
             ..
         } => {
-            collect_exprs_column_reads(argument_predicates, reads);
+            collect_exprs_column_reads(exprs, argument_predicates, reads);
         }
         SourceKind::FromGroup(group) => {
-            collect_from_column_reads(&group.from, reads, source_by_id);
-            collect_exprs_column_reads(&group.columns, reads);
+            collect_from_column_reads(exprs, &group.from, reads, source_by_id);
+            collect_exprs_column_reads(exprs, &group.columns, reads);
         }
         _ => {}
     }
 }
 
-fn collect_expr_column_reads(expression: &Expr, reads: &mut impl RecordColumnRead) {
-    expression.for_each(&mut |expression| {
-        if let Expr::Column(reference) = expression {
+fn collect_expr_column_reads(
+    exprs: &ExprArena,
+    expression: ExprId,
+    reads: &mut impl RecordColumnRead,
+) {
+    exprs.at(expression).for_each(&mut |expression| {
+        if let Expr::Column(reference) = expression.node() {
             reads.record(*reference);
         }
     });
 }
 
-fn collect_exprs_column_reads(expressions: &[Expr], reads: &mut impl RecordColumnRead) {
+fn collect_exprs_column_reads(
+    exprs: &ExprArena,
+    expressions: &[ExprId],
+    reads: &mut impl RecordColumnRead,
+) {
     for expression in expressions {
-        collect_expr_column_reads(expression, reads);
+        collect_expr_column_reads(exprs, *expression, reads);
     }
 }
 
 fn collect_optional_expr_column_reads(
-    expression: Option<&Expr>,
+    exprs: &ExprArena,
+    expression: Option<ExprId>,
     reads: &mut impl RecordColumnRead,
 ) {
     if let Some(expression) = expression {
-        collect_expr_column_reads(expression, reads);
+        collect_expr_column_reads(exprs, expression, reads);
     }
 }
 
-fn collect_order_column_reads(terms: &[OrderTerm], reads: &mut impl RecordColumnRead) {
+fn collect_order_column_reads(
+    exprs: &ExprArena,
+    terms: &[OrderTerm],
+    reads: &mut impl RecordColumnRead,
+) {
     for term in terms {
-        collect_expr_column_reads(&term.expr, reads);
+        collect_expr_column_reads(exprs, term.expr, reads);
     }
 }
 
-fn collect_window_column_reads(window: &ResolvedWindow, reads: &mut impl RecordColumnRead) {
+fn collect_window_column_reads(
+    exprs: &ExprArena,
+    window: &ResolvedWindow,
+    reads: &mut impl RecordColumnRead,
+) {
     for term in &window.partition_by {
-        collect_expr_column_reads(&term.expr, reads);
+        collect_expr_column_reads(exprs, term.expr, reads);
     }
-    collect_order_column_reads(&window.order_by, reads);
+    collect_order_column_reads(exprs, &window.order_by, reads);
     let frame = &window.frame;
-    collect_window_bound_column_reads(&frame.start, reads);
+    collect_window_bound_column_reads(exprs, &frame.start, reads);
     if let Some(end) = &frame.end {
-        collect_window_bound_column_reads(end, reads);
+        collect_window_bound_column_reads(exprs, end, reads);
     }
 }
 
-fn collect_window_bound_column_reads(bound: &WindowFrameBound, reads: &mut impl RecordColumnRead) {
+fn collect_window_bound_column_reads(
+    exprs: &ExprArena,
+    bound: &WindowFrameBound,
+    reads: &mut impl RecordColumnRead,
+) {
     if let WindowFrameBound::Following(expression) | WindowFrameBound::Preceding(expression) = bound
     {
-        collect_expr_column_reads(expression, reads);
+        collect_expr_column_reads(exprs, *expression, reads);
     }
 }
 
 fn collect_from_references<'source>(
+    exprs: &ExprArena,
     from: &From,
     references: &mut HashSet<SourceId>,
     source: impl Fn(SourceId) -> Option<&'source Source> + Copy,
 ) {
-    collect_source_arguments(from.first, references, source);
+    collect_source_arguments(exprs, from.first, references, source);
     for join in &from.joins {
-        collect_source_arguments(join.right, references, source);
+        collect_source_arguments(exprs, join.right, references, source);
         match &join.constraint {
             JoinConstraint::None => {}
             JoinConstraint::On(expression) => {
-                collect_expr_references(expression, references);
+                collect_expr_references(exprs, *expression, references);
             }
             JoinConstraint::Using(columns) | JoinConstraint::Natural(columns) => {
                 for column in columns {
-                    collect_expr_references(&column.left, references);
+                    collect_expr_references(exprs, column.left, references);
                     references.insert(column.right.source);
                 }
             }
@@ -866,6 +927,7 @@ fn collect_from_references<'source>(
 }
 
 fn collect_source_arguments<'source>(
+    exprs: &ExprArena,
     id: SourceId,
     references: &mut HashSet<SourceId>,
     source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
@@ -878,28 +940,32 @@ fn collect_source_arguments<'source>(
             argument_predicates,
             ..
         } => {
-            collect_exprs_references(argument_predicates, references);
+            collect_exprs_references(exprs, argument_predicates, references);
         }
         SourceKind::FromGroup(group) => {
-            collect_from_references(&group.from, references, source_by_id);
-            collect_exprs_references(&group.columns, references);
+            collect_from_references(exprs, &group.from, references, source_by_id);
+            collect_exprs_references(exprs, &group.columns, references);
         }
         _ => {}
     }
 }
 
-fn collect_expr_references(expression: &Expr, references: &mut HashSet<SourceId>) {
-    match expression {
+fn collect_expr_references(
+    exprs: &ExprArena,
+    expression: ExprId,
+    references: &mut HashSet<SourceId>,
+) {
+    match &exprs[expression] {
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Output(_) => {}
         Expr::Column(reference) => {
             references.insert(reference.source);
         }
         Expr::MergedColumn(column) => match column.value {
-            MergedColumnValue::Left => collect_expr_references(&column.left, references),
-            MergedColumnValue::Right => collect_expr_references(&column.right, references),
+            MergedColumnValue::Left => collect_expr_references(exprs, column.left, references),
+            MergedColumnValue::Right => collect_expr_references(exprs, column.right, references),
             MergedColumnValue::Coalesce => {
-                collect_expr_references(&column.left, references);
-                collect_expr_references(&column.right, references);
+                collect_expr_references(exprs, column.left, references);
+                collect_expr_references(exprs, column.right, references);
             }
         },
         Expr::RowId(source) => {
@@ -909,27 +975,27 @@ fn collect_expr_references(expression: &Expr, references: &mut HashSet<SourceId>
         | Expr::IsNull(expr)
         | Expr::NotNull(expr)
         | Expr::TruthTest { expr, .. } => {
-            collect_expr_references(expr, references);
+            collect_expr_references(exprs, *expr, references);
         }
         Expr::Binary {
             lhs, rhs, custom, ..
         } => {
-            collect_expr_references(lhs, references);
-            collect_expr_references(rhs, references);
+            collect_expr_references(exprs, *lhs, references);
+            collect_expr_references(exprs, *rhs, references);
             if let Some(call) = custom
                 .as_ref()
                 .and_then(|custom| custom.literal_encoding.as_ref())
                 .and_then(|encoding| encoding.encoder.as_ref())
             {
-                collect_exprs_references(&call.arguments, references);
+                collect_exprs_references(exprs, &call.arguments, references);
             }
         }
         Expr::Between {
             expr, start, end, ..
         } => {
-            collect_expr_references(expr, references);
-            collect_expr_references(start, references);
-            collect_expr_references(end, references);
+            collect_expr_references(exprs, *expr, references);
+            collect_expr_references(exprs, *start, references);
+            collect_expr_references(exprs, *end, references);
         }
         Expr::Case {
             base,
@@ -937,37 +1003,37 @@ fn collect_expr_references(expression: &Expr, references: &mut HashSet<SourceId>
             else_expr,
             ..
         } => {
-            collect_optional_expr_references(base.as_deref(), references);
+            collect_optional_expr_references(exprs, *base, references);
             for (when, then) in when_then {
-                collect_expr_references(when, references);
-                collect_expr_references(then, references);
+                collect_expr_references(exprs, *when, references);
+                collect_expr_references(exprs, *then, references);
             }
-            collect_optional_expr_references(else_expr.as_deref(), references);
+            collect_optional_expr_references(exprs, *else_expr, references);
         }
         Expr::Cast { expr, target } => {
-            collect_expr_references(expr, references);
-            collect_exprs_references(&target.parameters, references);
+            collect_expr_references(exprs, *expr, references);
+            collect_exprs_references(exprs, &target.parameters, references);
             for call in &target.programs.encode {
-                collect_exprs_references(&call.arguments, references);
+                collect_exprs_references(exprs, &call.arguments, references);
             }
             if let Some(domain) = &target.programs.domain {
                 for check in &domain.checks {
-                    collect_exprs_references(&check.call.arguments, references);
+                    collect_exprs_references(exprs, &check.call.arguments, references);
                 }
             }
         }
-        Expr::Collate { expr, .. } => collect_expr_references(expr, references),
+        Expr::Collate { expr, .. } => collect_expr_references(exprs, *expr, references),
         Expr::Function(function) => {
-            collect_exprs_references(function.arguments.expressions(), references);
-            collect_order_references(function.arguments.order_terms(), references);
-            collect_optional_expr_references(function.evaluation.filter(), references);
+            collect_exprs_references(exprs, function.arguments.expressions(), references);
+            collect_order_references(exprs, function.arguments.order_terms(), references);
+            collect_optional_expr_references(exprs, function.evaluation.filter(), references);
         }
         Expr::InList { lhs, values, .. } => {
-            collect_expr_references(lhs, references);
-            collect_exprs_references(values, references);
+            collect_expr_references(exprs, *lhs, references);
+            collect_exprs_references(exprs, values, references);
         }
         Expr::Subquery(SubqueryExpr::In { lhs, .. }) => {
-            collect_expr_references(lhs, references);
+            collect_expr_references(exprs, *lhs, references);
         }
         Expr::Subquery(
             SubqueryExpr::Scalar { .. } | SubqueryExpr::Row { .. } | SubqueryExpr::Exists(_),
@@ -975,58 +1041,78 @@ fn collect_expr_references(expression: &Expr, references: &mut HashSet<SourceId>
         Expr::Like {
             lhs, rhs, escape, ..
         } => {
-            collect_expr_references(lhs, references);
-            collect_expr_references(rhs, references);
-            collect_optional_expr_references(escape.as_deref(), references);
+            collect_expr_references(exprs, *lhs, references);
+            collect_expr_references(exprs, *rhs, references);
+            collect_optional_expr_references(exprs, *escape, references);
         }
         Expr::Row(expressions) | Expr::Array(expressions) => {
-            collect_exprs_references(expressions, references);
+            collect_exprs_references(exprs, expressions, references);
         }
         Expr::Subscript { base, index } => {
-            collect_expr_references(base, references);
-            collect_expr_references(index, references);
+            collect_expr_references(exprs, *base, references);
+            collect_expr_references(exprs, *index, references);
         }
-        Expr::FieldAccess(access) => collect_expr_references(&access.base, references),
+        Expr::FieldAccess(access) => collect_expr_references(exprs, access.base, references),
         Expr::Raise { message, .. } => {
-            collect_optional_expr_references(message.as_deref(), references);
+            collect_optional_expr_references(exprs, *message, references);
         }
     }
 }
 
-fn collect_exprs_references(expressions: &[Expr], references: &mut HashSet<SourceId>) {
+fn collect_exprs_references(
+    exprs: &ExprArena,
+    expressions: &[ExprId],
+    references: &mut HashSet<SourceId>,
+) {
     for expression in expressions {
-        collect_expr_references(expression, references);
+        collect_expr_references(exprs, *expression, references);
     }
 }
 
-fn collect_optional_expr_references(expression: Option<&Expr>, references: &mut HashSet<SourceId>) {
+fn collect_optional_expr_references(
+    exprs: &ExprArena,
+    expression: Option<ExprId>,
+    references: &mut HashSet<SourceId>,
+) {
     if let Some(expression) = expression {
-        collect_expr_references(expression, references);
+        collect_expr_references(exprs, expression, references);
     }
 }
 
-fn collect_order_references(terms: &[OrderTerm], references: &mut HashSet<SourceId>) {
+fn collect_order_references(
+    exprs: &ExprArena,
+    terms: &[OrderTerm],
+    references: &mut HashSet<SourceId>,
+) {
     for term in terms {
-        collect_expr_references(&term.expr, references);
+        collect_expr_references(exprs, term.expr, references);
     }
 }
 
-fn collect_window_references(window: &ResolvedWindow, references: &mut HashSet<SourceId>) {
+fn collect_window_references(
+    exprs: &ExprArena,
+    window: &ResolvedWindow,
+    references: &mut HashSet<SourceId>,
+) {
     for term in &window.partition_by {
-        collect_expr_references(&term.expr, references);
+        collect_expr_references(exprs, term.expr, references);
     }
-    collect_order_references(&window.order_by, references);
+    collect_order_references(exprs, &window.order_by, references);
     let frame = &window.frame;
-    collect_window_bound_references(&frame.start, references);
+    collect_window_bound_references(exprs, &frame.start, references);
     if let Some(end) = &frame.end {
-        collect_window_bound_references(end, references);
+        collect_window_bound_references(exprs, end, references);
     }
 }
 
-fn collect_window_bound_references(bound: &WindowFrameBound, references: &mut HashSet<SourceId>) {
+fn collect_window_bound_references(
+    exprs: &ExprArena,
+    bound: &WindowFrameBound,
+    references: &mut HashSet<SourceId>,
+) {
     if let WindowFrameBound::Following(expression) | WindowFrameBound::Preceding(expression) = bound
     {
-        collect_expr_references(expression, references);
+        collect_expr_references(exprs, *expression, references);
     }
 }
 
@@ -1034,7 +1120,7 @@ fn collect_window_bound_references(bound: &WindowFrameBound, references: &mut Ha
 mod tests {
     use super::*;
 
-    fn query(filter: Expr, from: Option<From>) -> Query {
+    fn query(filter: ExprId, from: Option<From>) -> Query {
         let query = QueryId::new(0);
         let block = QueryBlockId::new(query, 0);
         let mut block_value = QueryBlock::new(
@@ -1067,24 +1153,22 @@ mod tests {
     #[test]
     fn repeated_column_reads_are_counted() {
         let source = SourceId::new(0);
-        let query = query(
-            Expr::Row(vec![
-                Expr::column(source, 0),
-                Expr::column(source, 0),
-                Expr::column(source, 0),
-            ]),
-            None,
-        );
+        let mut exprs = ExprArena::default();
+        let columns = (0..3)
+            .map(|_| exprs.push(Expr::column(source, 0)))
+            .collect();
+        let row = exprs.push(Expr::Row(columns));
+        let query = query(row, None);
 
         assert_eq!(
-            query.direct_column_usage(no_source),
+            query.direct_column_usage(no_source, &exprs),
             vec![ColumnUsage {
                 reference: ColumnRef { source, column: 0 },
                 count: 3,
             }]
         );
         let mut reads = Vec::new();
-        query.direct_column_reads(no_source, &mut reads);
+        query.direct_column_reads(no_source, &exprs, &mut reads);
         assert_eq!(reads, vec![ColumnRef { source, column: 0 }; 3]);
     }
 
@@ -1092,43 +1176,54 @@ mod tests {
     fn expression_usage_requires_exactly_one_source() {
         let first = SourceId::new(0);
         let second = SourceId::new(1);
-        let single_source = Expr::Row(vec![
-            Expr::column(first, 1),
-            Expr::column(first, 0),
-            Expr::column(first, 1),
-        ]);
+        let mut exprs = ExprArena::default();
+        let single_source = vec![
+            exprs.push(Expr::column(first, 1)),
+            exprs.push(Expr::column(first, 0)),
+            exprs.push(Expr::column(first, 1)),
+        ];
+        let single_source = exprs.push(Expr::Row(single_source));
+        let multiple_sources = vec![
+            exprs.push(Expr::column(first, 0)),
+            exprs.push(Expr::column(second, 0)),
+        ];
+        let multiple_sources = exprs.push(Expr::Row(multiple_sources));
+        let null = exprs.push(Expr::Literal(turso_parser::ast::Literal::Null));
         assert_eq!(
-            single_source.single_source_column_usage(),
+            exprs.at(single_source).single_source_column_usage(),
             Some((first, vec![0, 1]))
         );
 
-        let multiple_sources = Expr::Row(vec![Expr::column(first, 0), Expr::column(second, 0)]);
-        assert_eq!(multiple_sources.single_source_column_usage(), None);
         assert_eq!(
-            Expr::Literal(turso_parser::ast::Literal::Null).single_source_column_usage(),
+            exprs.at(multiple_sources).single_source_column_usage(),
             None
         );
+        assert_eq!(exprs.at(null).single_source_column_usage(), None);
     }
 
     #[test]
     fn join_constraint_reads_are_counted() {
         let left = SourceId::new(0);
         let right = SourceId::new(1);
+        let mut exprs = ExprArena::default();
+        let constraint = vec![
+            exprs.push(Expr::column(left, 0)),
+            exprs.push(Expr::column(right, 1)),
+        ];
+        let constraint = exprs.push(Expr::Row(constraint));
+        let filter = exprs.push(Expr::Row(Vec::new()));
         let from = From {
             first: left,
             joins: vec![Join {
                 right,
                 kind: JoinKind::Inner,
-                constraint: JoinConstraint::On(Expr::Row(vec![
-                    Expr::column(left, 0),
-                    Expr::column(right, 1),
-                ])),
+                constraint: JoinConstraint::On(constraint),
             }],
         };
-        let query = query(Expr::Row(Vec::new()), Some(from));
+        let query = query(filter, Some(from));
 
         assert_eq!(
-            query.direct_column_usage(no_source),
+            query.direct_column_usage(no_source, &exprs),
             vec![
                 ColumnUsage {
                     reference: ColumnRef {
@@ -1151,16 +1246,16 @@ mod tests {
     #[test]
     fn nested_query_references_are_not_counted_by_parent() {
         let source = SourceId::new(0);
-        let query = query(
-            Expr::Row(vec![
-                Expr::column(source, 0),
-                Expr::Subquery(SubqueryExpr::Exists(QueryId::new(1))),
-            ]),
-            None,
-        );
+        let mut exprs = ExprArena::default();
+        let values = vec![
+            exprs.push(Expr::column(source, 0)),
+            exprs.push(Expr::Subquery(SubqueryExpr::Exists(QueryId::new(1)))),
+        ];
+        let row = exprs.push(Expr::Row(values));
+        let query = query(row, None);
 
         assert_eq!(
-            query.direct_column_usage(no_source),
+            query.direct_column_usage(no_source, &exprs),
             vec![ColumnUsage {
                 reference: ColumnRef { source, column: 0 },
                 count: 1,

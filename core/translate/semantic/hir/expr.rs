@@ -38,8 +38,8 @@ pub struct ColumnRef {
 pub struct MergedColumn {
     /// The visible value produced by the joins to the left. This may itself
     /// be a merged column when USING/NATURAL joins are chained.
-    pub left: Box<Expr>,
-    pub right: Box<Expr>,
+    pub left: ExprId,
+    pub right: ExprId,
     pub value: MergedColumnValue,
     pub type_fact: TypeFact,
     pub affinity: Affinity,
@@ -52,7 +52,7 @@ pub struct MergedColumn {
 #[derive(Clone, Debug)]
 pub struct TypeName {
     pub name: String,
-    pub parameters: Vec<Expr>,
+    pub parameters: Vec<ExprId>,
     pub array_dimensions: u32,
     pub type_fact: TypeFact,
     /// Exact VDBE affinity selected for the CAST operation.
@@ -62,7 +62,7 @@ pub struct TypeName {
 
 #[derive(Clone, Debug)]
 pub struct OrderTerm {
-    pub expr: Expr,
+    pub expr: ExprId,
     pub order: SortOrder,
     pub nulls: Option<NullsOrder>,
     /// Final type facts of `expr` in the scope where this term was bound.
@@ -75,7 +75,7 @@ pub struct OrderTerm {
 
 #[derive(Clone, Debug)]
 pub struct WindowPartitionTerm {
-    pub expr: Expr,
+    pub expr: ExprId,
     /// Final type facts of `expr` in the scope where this term was bound.
     pub type_fact: TypeFact,
     /// Final SQLite collation after explicit-COLLATE and declared-column
@@ -102,8 +102,8 @@ pub struct WindowFrame {
 #[derive(Clone, Debug)]
 pub enum WindowFrameBound {
     CurrentRow,
-    Following(Box<Expr>),
-    Preceding(Box<Expr>),
+    Following(ExprId),
+    Preceding(ExprId),
     UnboundedFollowing,
     UnboundedPreceding,
 }
@@ -225,19 +225,19 @@ pub struct FunctionArgumentFacts {
 pub enum FunctionArguments {
     Star,
     Expressions {
-        values: Vec<Expr>,
+        values: Vec<ExprId>,
         facts: Vec<FunctionArgumentFacts>,
         distinctness: Option<Distinctness>,
         order_by: Vec<OrderTerm>,
     },
     OrderedSet {
-        direct: Vec<Expr>,
+        direct: Vec<ExprId>,
         order_by: Box<OrderTerm>,
     },
 }
 
 impl FunctionArguments {
-    pub fn expressions(&self) -> &[Expr] {
+    pub fn expressions(&self) -> &[ExprId] {
         match self {
             Self::Star => &[],
             Self::Expressions { values, .. } => values,
@@ -267,19 +267,19 @@ pub enum FunctionEvaluation {
     Scalar,
     Aggregate {
         id: AggregateId,
-        filter: Option<Box<Expr>>,
+        filter: Option<ExprId>,
     },
     Window {
         id: WindowFunctionId,
         window: WindowId,
-        filter: Option<Box<Expr>>,
+        filter: Option<ExprId>,
     },
 }
 
 impl FunctionEvaluation {
-    pub fn filter(&self) -> Option<&Expr> {
+    pub fn filter(&self) -> Option<ExprId> {
         match self {
-            Self::Aggregate { filter, .. } | Self::Window { filter, .. } => filter.as_deref(),
+            Self::Aggregate { filter, .. } | Self::Window { filter, .. } => *filter,
             Self::Scalar => None,
         }
     }
@@ -311,7 +311,7 @@ impl WindowFunctionId {
 
 #[derive(Clone, Debug)]
 pub struct FieldAccess {
-    pub base: Box<Expr>,
+    pub base: ExprId,
     pub field_name: String,
     pub kind: FieldAccessKind,
     pub container_type: ResolvedType,
@@ -335,7 +335,7 @@ pub enum SubqueryExpr {
     },
     Exists(QueryId),
     In {
-        lhs: Box<Expr>,
+        lhs: ExprId,
         query: QueryId,
         negated: bool,
         comparison: ComparisonSemantics,
@@ -353,12 +353,12 @@ pub enum Expr {
     Output(OutputId),
     Unary {
         operator: UnaryOperator,
-        expr: Box<Expr>,
+        expr: ExprId,
     },
     Binary {
-        lhs: Box<Expr>,
+        lhs: ExprId,
         operator: Operator,
-        rhs: Box<Expr>,
+        rhs: ExprId,
         /// `||` uses the array opcode when either operand is an array. This
         /// decision depends on bound type facts and must not be rediscovered
         /// during physical emission.
@@ -367,69 +367,271 @@ pub enum Expr {
         comparison: Option<ComparisonSemantics>,
     },
     Between {
-        expr: Box<Expr>,
+        expr: ExprId,
         negated: bool,
-        start: Box<Expr>,
-        end: Box<Expr>,
+        start: ExprId,
+        end: ExprId,
         start_comparison: ComparisonSemantics,
         end_comparison: ComparisonSemantics,
     },
     Case {
-        base: Option<Box<Expr>>,
-        when_then: Vec<(Expr, Expr)>,
-        else_expr: Option<Box<Expr>>,
+        base: Option<ExprId>,
+        when_then: Vec<(ExprId, ExprId)>,
+        else_expr: Option<ExprId>,
         /// Present exactly when `base` is present, one comparison per WHEN.
         base_comparisons: Vec<ComparisonSemantics>,
     },
     Cast {
-        expr: Box<Expr>,
+        expr: ExprId,
         target: Box<TypeName>,
     },
     Collate {
-        expr: Box<Expr>,
+        expr: ExprId,
         collation: ResolvedCollation,
     },
     /// Boxed: a call is the largest node by far, and every expression is
     /// moved by value while it is built and planned.
     Function(Box<FunctionCall>),
-    IsNull(Box<Expr>),
-    NotNull(Box<Expr>),
+    IsNull(ExprId),
+    NotNull(ExprId),
     TruthTest {
-        expr: Box<Expr>,
+        expr: ExprId,
         is_true: bool,
         negated: bool,
     },
     InList {
-        lhs: Box<Expr>,
+        lhs: ExprId,
         negated: bool,
-        values: Vec<Expr>,
+        values: Vec<ExprId>,
         comparisons: Vec<ComparisonSemantics>,
     },
     Subquery(SubqueryExpr),
     Like {
-        lhs: Box<Expr>,
+        lhs: ExprId,
         negated: bool,
         operator: LikeOperator,
         function: ResolvedFunction,
         argument_count: usize,
-        rhs: Box<Expr>,
-        escape: Option<Box<Expr>>,
+        rhs: ExprId,
+        escape: Option<ExprId>,
     },
-    Row(Vec<Expr>),
-    Array(Vec<Expr>),
+    Row(Vec<ExprId>),
+    Array(Vec<ExprId>),
     Subscript {
-        base: Box<Expr>,
-        index: Box<Expr>,
+        base: ExprId,
+        index: ExprId,
     },
     FieldAccess(Box<FieldAccess>),
     Raise {
         action: ResolveType,
-        message: Option<Box<Expr>>,
+        message: Option<ExprId>,
     },
 }
 
+/// Index of one expression node in its document's [`ExprArena`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExprId(u32);
+
+impl ExprId {
+    pub(crate) const DETACHED: ExprId = ExprId(u32::MAX);
+
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Every expression node of one HIR document. A node's children are always
+/// stored before it, so walking the nodes in order visits every child
+/// before its parent.
+#[derive(Clone, Debug, Default)]
+pub struct ExprArena {
+    nodes: Vec<Expr>,
+    constant: Vec<bool>,
+}
+
+impl ExprArena {
+    pub fn push(&mut self, expression: Expr) -> ExprId {
+        let id = ExprId(u32::try_from(self.nodes.len()).expect("expression arena fits in u32"));
+        self.constant.push(self.children_constant(&expression));
+        self.nodes.push(expression);
+        id
+    }
+
+    pub(crate) fn is_constant(&self, expression: ExprRef<'_>) -> bool {
+        if expression.id() == ExprId::DETACHED {
+            return self.children_constant(expression.node());
+        }
+        self.constant[expression.id().index()]
+    }
+
+    fn children_constant(&self, expression: &Expr) -> bool {
+        if !expression.constant_by_kind() {
+            return false;
+        }
+        let mut index = 0;
+        while let Some(child) = expression.child(index) {
+            if !self.constant[child.index()] {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+
+    pub fn at(&self, id: ExprId) -> ExprRef<'_> {
+        ExprRef {
+            arena: self,
+            id,
+            node: &self[id],
+        }
+    }
+
+    /// `node`, which is not stored in this arena, with its children read
+    /// from the arena. Its id matches no stored node.
+    pub(crate) fn detached<'a>(&'a self, node: &'a Expr) -> ExprRef<'a> {
+        ExprRef {
+            arena: self,
+            id: ExprId::DETACHED,
+            node,
+        }
+    }
+
+    pub fn reserve(&mut self, additional: usize) {
+        self.nodes.reserve(additional);
+        self.constant.reserve(additional);
+    }
+
+    pub fn get_mut(&mut self, id: ExprId) -> &mut Expr {
+        &mut self.nodes[id.index()]
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        self.nodes.truncate(len);
+        self.constant.truncate(len);
+    }
+
+    /// Visit `node`, which may not be in this arena yet, and every
+    /// expression it owns.
+    pub(crate) fn for_each_from(&self, node: &Expr, visitor: &mut impl FnMut(&Expr)) {
+        visitor(node);
+        let mut index = 0;
+        while let Some(child) = node.child(index) {
+            self.at(child)
+                .for_each(&mut |expression| visitor(expression.node()));
+            index += 1;
+        }
+    }
+
+    /// Copy the expression at `id` and everything it owns into new nodes,
+    /// and return the copy's root.
+    #[cfg(test)]
+    pub fn deep_copy(&mut self, id: ExprId) -> ExprId {
+        let mut order = Vec::new();
+        let mut pending = vec![id];
+        while let Some(next) = pending.pop() {
+            order.push(next);
+            let node = &self.nodes[next.index()];
+            let mut index = 0;
+            while let Some(child) = node.child(index) {
+                pending.push(child);
+                index += 1;
+            }
+        }
+        let mut copies: rustc_hash::FxHashMap<ExprId, ExprId> = Default::default();
+        for old in order.into_iter().rev() {
+            if copies.contains_key(&old) {
+                continue;
+            }
+            let mut node = self.nodes[old.index()].clone();
+            node.for_each_child_mut(&mut |child| *child = copies[child]);
+            let new = self.push(node);
+            copies.insert(old, new);
+        }
+        copies[&id]
+    }
+}
+
+impl std::ops::Index<ExprId> for ExprArena {
+    type Output = Expr;
+
+    fn index(&self, id: ExprId) -> &Expr {
+        &self.nodes[id.index()]
+    }
+}
+
+/// One expression node together with the arena that holds its children.
+#[derive(Clone, Copy)]
+pub struct ExprRef<'a> {
+    arena: &'a ExprArena,
+    id: ExprId,
+    node: &'a Expr,
+}
+
+impl<'a> ExprRef<'a> {
+    pub fn id(self) -> ExprId {
+        self.id
+    }
+
+    pub fn arena(self) -> &'a ExprArena {
+        self.arena
+    }
+
+    pub fn node(self) -> &'a Expr {
+        self.node
+    }
+
+    /// Another expression of the same arena, such as a child of this one.
+    pub fn at(self, id: ExprId) -> ExprRef<'a> {
+        self.arena.at(id)
+    }
+
+    pub(crate) fn child(self, index: usize) -> Option<ExprRef<'a>> {
+        self.node().child(index).map(|id| self.at(id))
+    }
+
+    /// The terms this expression ANDs together, left to right.
+    pub(crate) fn conjuncts(self) -> impl Iterator<Item = ExprRef<'a>> {
+        let mut pending = vec![self];
+        std::iter::from_fn(move || {
+            while let Some(expression) = pending.pop() {
+                if let Expr::Binary {
+                    lhs,
+                    operator: turso_parser::ast::Operator::And,
+                    rhs,
+                    ..
+                } = expression.node()
+                {
+                    pending.push(expression.at(*rhs));
+                    pending.push(expression.at(*lhs));
+                } else {
+                    return Some(expression);
+                }
+            }
+            None
+        })
+    }
+}
+
+impl std::ops::Deref for ExprRef<'_> {
+    type Target = Expr;
+
+    fn deref(&self) -> &Expr {
+        self.node
+    }
+}
+
+impl std::fmt::Debug for ExprRef<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:?}: {:?}", self.id, self.node())
+    }
+}
+
 struct ExprFrame<'expr, C, T> {
-    expression: &'expr Expr,
+    expression: ExprRef<'expr>,
     context: C,
     next_child: usize,
     child_values: SmallVec<[T; 3]>,
@@ -440,21 +642,21 @@ pub(crate) trait ExprVisitor<'expr> {
     type Output;
     type Error;
 
-    fn child(&mut self, expression: &'expr Expr, index: usize) -> Option<&'expr Expr> {
+    fn child(&mut self, expression: ExprRef<'expr>, index: usize) -> Option<ExprRef<'expr>> {
         expression.child(index)
     }
 
     fn pre_order(
         &mut self,
-        parent: &'expr Expr,
+        parent: ExprRef<'expr>,
         context: &mut Self::Context,
         child_index: usize,
-        child: &'expr Expr,
+        child: ExprRef<'expr>,
     ) -> Result<ControlFlow<(), Self::Context>, Self::Error>;
 
     fn post_order(
         &mut self,
-        expression: &'expr Expr,
+        expression: ExprRef<'expr>,
         context: Self::Context,
         children: &[Self::Output],
     ) -> Result<Self::Output, Self::Error>;
@@ -464,17 +666,17 @@ struct WalkVisitor<'a, F> {
     visit: &'a mut F,
 }
 
-impl<'expr, F: FnMut(&Expr)> ExprVisitor<'expr> for WalkVisitor<'_, F> {
+impl<'expr, F: FnMut(ExprRef<'expr>)> ExprVisitor<'expr> for WalkVisitor<'_, F> {
     type Context = ();
     type Output = ();
     type Error = Infallible;
 
     fn pre_order(
         &mut self,
-        _parent: &Expr,
+        _parent: ExprRef<'expr>,
         _context: &mut (),
         _child_index: usize,
-        child: &Expr,
+        child: ExprRef<'expr>,
     ) -> Result<ControlFlow<(), ()>, Infallible> {
         (self.visit)(child);
         Ok(ControlFlow::Continue(()))
@@ -482,7 +684,7 @@ impl<'expr, F: FnMut(&Expr)> ExprVisitor<'expr> for WalkVisitor<'_, F> {
 
     fn post_order(
         &mut self,
-        _expression: &Expr,
+        _expression: ExprRef<'expr>,
         _context: (),
         _children: &[()],
     ) -> Result<(), Infallible> {
@@ -495,24 +697,24 @@ struct FoldVisitor<'a, F, T> {
     output: std::marker::PhantomData<fn() -> T>,
 }
 
-impl<'expr, T, F: FnMut(&Expr, &[T]) -> T> ExprVisitor<'expr> for FoldVisitor<'_, F, T> {
+impl<'expr, T, F: FnMut(ExprRef<'expr>, &[T]) -> T> ExprVisitor<'expr> for FoldVisitor<'_, F, T> {
     type Context = ();
     type Output = T;
     type Error = Infallible;
 
     fn pre_order(
         &mut self,
-        _parent: &Expr,
+        _parent: ExprRef<'expr>,
         _context: &mut (),
         _child_index: usize,
-        _child: &Expr,
+        _child: ExprRef<'expr>,
     ) -> Result<ControlFlow<(), ()>, Infallible> {
         Ok(ControlFlow::Continue(()))
     }
 
     fn post_order(
         &mut self,
-        expression: &Expr,
+        expression: ExprRef<'expr>,
         _context: (),
         children: &[T],
     ) -> Result<T, Infallible> {
@@ -521,7 +723,7 @@ impl<'expr, T, F: FnMut(&Expr, &[T]) -> T> ExprVisitor<'expr> for FoldVisitor<'_
 }
 
 impl<'expr, C, T> ExprFrame<'expr, C, T> {
-    fn new(expression: &'expr Expr, context: C) -> Self {
+    fn new(expression: ExprRef<'expr>, context: C) -> Self {
         Self {
             expression,
             context,
@@ -533,7 +735,7 @@ impl<'expr, C, T> ExprFrame<'expr, C, T> {
     fn next_child<V: ExprVisitor<'expr>>(
         &mut self,
         visitor: &mut V,
-    ) -> Option<(usize, &'expr Expr)> {
+    ) -> Option<(usize, ExprRef<'expr>)> {
         let index = self.next_child;
         let child = visitor.child(self.expression, index)?;
         self.next_child += 1;
@@ -555,7 +757,40 @@ impl Expr {
         Self::RowId(source)
     }
 
-    pub(crate) fn child(&self, mut index: usize) -> Option<&Self> {
+    fn constant_by_kind(&self) -> bool {
+        match self {
+            Expr::Literal(_)
+            | Expr::Parameter(_)
+            | Expr::Unary { .. }
+            | Expr::Between { .. }
+            | Expr::Case { .. }
+            | Expr::Cast { .. }
+            | Expr::Collate { .. }
+            | Expr::IsNull(_)
+            | Expr::NotNull(_)
+            | Expr::TruthTest { .. }
+            | Expr::InList { .. }
+            | Expr::Row(_) => true,
+            Expr::Binary { custom, .. } => custom.is_none(),
+            Expr::Function(call) => {
+                // Like SQLite's SQLITE_FUNC_SLOCHNG functions, the date and
+                // time functions return the same value for the whole
+                // statement, so a call with constant arguments is computed
+                // once instead of on every row.
+                let function = call.function.value();
+                let same_for_whole_statement =
+                    crate::function::Deterministic::is_deterministic(function)
+                        || matches!(
+                            function,
+                            crate::function::Func::Scalar(scalar) if scalar.is_date_time_function()
+                        );
+                matches!(call.evaluation, FunctionEvaluation::Scalar) && same_for_whole_statement
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn child(&self, mut index: usize) -> Option<ExprId> {
         match self {
             Self::Literal(_)
             | Self::Parameter(_)
@@ -566,22 +801,20 @@ impl Expr {
                 SubqueryExpr::Scalar { .. } | SubqueryExpr::Row { .. } | SubqueryExpr::Exists(_),
             ) => None,
             Self::MergedColumn(column) => match column.value {
-                MergedColumnValue::Left => (index == 0).then_some(column.left.as_ref()),
-                MergedColumnValue::Right => (index == 0).then_some(column.right.as_ref()),
-                MergedColumnValue::Coalesce => [column.left.as_ref(), column.right.as_ref()]
-                    .get(index)
-                    .copied(),
+                MergedColumnValue::Left => (index == 0).then_some(column.left),
+                MergedColumnValue::Right => (index == 0).then_some(column.right),
+                MergedColumnValue::Coalesce => [column.left, column.right].get(index).copied(),
             },
             Self::Unary { expr, .. }
             | Self::IsNull(expr)
             | Self::NotNull(expr)
             | Self::TruthTest { expr, .. }
-            | Self::Collate { expr, .. } => (index == 0).then_some(expr.as_ref()),
+            | Self::Collate { expr, .. } => (index == 0).then_some(*expr),
             Self::Binary {
                 lhs, rhs, custom, ..
             } => match index {
-                0 => Some(lhs),
-                1 => Some(rhs),
+                0 => Some(*lhs),
+                1 => Some(*rhs),
                 _ => {
                     index -= 2;
                     let encoder = custom
@@ -593,28 +826,26 @@ impl Expr {
             },
             Self::Between {
                 expr, start, end, ..
-            } => [expr.as_ref(), start.as_ref(), end.as_ref()]
-                .get(index)
-                .copied(),
+            } => [*expr, *start, *end].get(index).copied(),
             Self::Case {
                 base,
                 when_then,
                 else_expr,
                 ..
             } => {
-                if let Some(child) = child_from_optional_expr(base.as_deref(), &mut index) {
+                if let Some(child) = child_from_optional_expr(*base, &mut index) {
                     return Some(child);
                 }
                 let pair_index = index / 2;
                 if let Some((when, then)) = when_then.get(pair_index) {
-                    return Some(if index % 2 == 0 { when } else { then });
+                    return Some(if index % 2 == 0 { *when } else { *then });
                 }
                 index -= when_then.len() * 2;
-                child_from_optional_expr(else_expr.as_deref(), &mut index)
+                child_from_optional_expr(*else_expr, &mut index)
             }
             Self::Cast { expr, target } => {
                 if index == 0 {
-                    return Some(expr);
+                    return Some(*expr);
                 }
                 index -= 1;
                 if let Some(child) = child_from_exprs(&target.parameters, &mut index) {
@@ -643,77 +874,195 @@ impl Expr {
             }
             Self::InList { lhs, values, .. } => {
                 if index == 0 {
-                    return Some(lhs);
+                    return Some(*lhs);
                 }
                 index -= 1;
                 child_from_exprs(values, &mut index)
             }
-            Self::Subquery(SubqueryExpr::In { lhs, .. }) => (index == 0).then_some(lhs.as_ref()),
+            Self::Subquery(SubqueryExpr::In { lhs, .. }) => (index == 0).then_some(*lhs),
             Self::Like {
                 lhs, rhs, escape, ..
             } => match index {
-                0 => Some(lhs),
-                1 => Some(rhs),
-                2 => escape.as_deref(),
+                0 => Some(*lhs),
+                1 => Some(*rhs),
+                2 => *escape,
                 _ => None,
             },
-            Self::Row(expressions) | Self::Array(expressions) => expressions.get(index),
+            Self::Row(expressions) | Self::Array(expressions) => expressions.get(index).copied(),
             Self::Subscript {
                 base,
                 index: offset,
             } => match index {
-                0 => Some(base),
-                1 => Some(offset),
+                0 => Some(*base),
+                1 => Some(*offset),
                 _ => None,
             },
-            Self::FieldAccess(access) => (index == 0).then_some(access.base.as_ref()),
-            Self::Raise { message, .. } => (index == 0).then_some(message.as_deref()).flatten(),
+            Self::FieldAccess(access) => (index == 0).then_some(access.base),
+            Self::Raise { message, .. } => (index == 0).then_some(*message).flatten(),
         }
     }
+}
 
+impl Expr {
+    /// Call `visit` on every child id this node owns, in no particular order.
+    pub(crate) fn for_each_child_mut(&mut self, visit: &mut impl FnMut(&mut ExprId)) {
+        match self {
+            Self::Literal(_)
+            | Self::Parameter(_)
+            | Self::Column(_)
+            | Self::RowId(_)
+            | Self::Output(_)
+            | Self::Subquery(
+                SubqueryExpr::Scalar { .. } | SubqueryExpr::Row { .. } | SubqueryExpr::Exists(_),
+            ) => {}
+            Self::MergedColumn(column) => {
+                visit(&mut column.left);
+                visit(&mut column.right);
+            }
+            Self::Unary { expr, .. }
+            | Self::IsNull(expr)
+            | Self::NotNull(expr)
+            | Self::TruthTest { expr, .. }
+            | Self::Collate { expr, .. }
+            | Self::Subquery(SubqueryExpr::In { lhs: expr, .. }) => visit(expr),
+            Self::Binary {
+                lhs, rhs, custom, ..
+            } => {
+                visit(lhs);
+                visit(rhs);
+                if let Some(encoder) = custom
+                    .as_mut()
+                    .and_then(|custom| custom.literal_encoding.as_mut())
+                    .and_then(|encoding| encoding.encoder.as_mut())
+                {
+                    encoder.arguments.iter_mut().for_each(&mut *visit);
+                }
+            }
+            Self::Between {
+                expr, start, end, ..
+            } => {
+                visit(expr);
+                visit(start);
+                visit(end);
+            }
+            Self::Case {
+                base,
+                when_then,
+                else_expr,
+                ..
+            } => {
+                base.iter_mut().for_each(&mut *visit);
+                for (when, then) in when_then {
+                    visit(when);
+                    visit(then);
+                }
+                else_expr.iter_mut().for_each(&mut *visit);
+            }
+            Self::Cast { expr, target } => {
+                visit(expr);
+                target.parameters.iter_mut().for_each(&mut *visit);
+                for call in &mut target.programs.encode {
+                    call.arguments.iter_mut().for_each(&mut *visit);
+                }
+                if let Some(domain) = &mut target.programs.domain {
+                    for check in &mut domain.checks {
+                        check.call.arguments.iter_mut().for_each(&mut *visit);
+                    }
+                }
+            }
+            Self::Function(call) => {
+                match &mut call.arguments {
+                    FunctionArguments::Star => {}
+                    FunctionArguments::Expressions {
+                        values, order_by, ..
+                    } => {
+                        values.iter_mut().for_each(&mut *visit);
+                        for term in order_by {
+                            visit(&mut term.expr);
+                        }
+                    }
+                    FunctionArguments::OrderedSet { direct, order_by } => {
+                        direct.iter_mut().for_each(&mut *visit);
+                        visit(&mut order_by.expr);
+                    }
+                }
+                match &mut call.evaluation {
+                    FunctionEvaluation::Scalar => {}
+                    FunctionEvaluation::Aggregate { filter, .. }
+                    | FunctionEvaluation::Window { filter, .. } => {
+                        filter.iter_mut().for_each(&mut *visit)
+                    }
+                }
+            }
+            Self::InList { lhs, values, .. } => {
+                visit(lhs);
+                values.iter_mut().for_each(&mut *visit);
+            }
+            Self::Like {
+                lhs, rhs, escape, ..
+            } => {
+                visit(lhs);
+                visit(rhs);
+                escape.iter_mut().for_each(&mut *visit);
+            }
+            Self::Row(expressions) | Self::Array(expressions) => {
+                expressions.iter_mut().for_each(&mut *visit)
+            }
+            Self::Subscript { base, index } => {
+                visit(base);
+                visit(index);
+            }
+            Self::FieldAccess(access) => visit(&mut access.base),
+            Self::Raise { message, .. } => message.iter_mut().for_each(&mut *visit),
+        }
+    }
+}
+
+impl<'a> ExprRef<'a> {
     /// Compare resolved expression shapes.
     ///
     /// Work stays on explicit stacks because expressions can be deeply
     /// nested. Commutative operators retain the existing equivalence rule that
     /// permits their operands to appear in either order.
-    pub(crate) fn equivalent(&self, other: &Self) -> bool {
-        let mut pending = vec![(self, other)];
+    pub(crate) fn equivalent(self, other: ExprRef<'_>) -> bool {
+        let (left_arena, right_arena) = (self.arena, other.arena);
+        let mut pending = vec![(self.id, other.id)];
         let mut alternatives = Vec::new();
 
         'search: loop {
             while let Some((left, right)) = pending.pop() {
-                let equivalent = match (left, right) {
-                    (Self::Literal(left), Self::Literal(right)) => {
+                let equivalent = match (&left_arena[left], &right_arena[right]) {
+                    (Expr::Literal(left), Expr::Literal(right)) => {
                         check_literal_equivalency(left, right)
                     }
-                    (Self::Parameter(left), Self::Parameter(right)) => left.index == right.index,
-                    (Self::Column(left), Self::Column(right)) => left == right,
-                    (Self::MergedColumn(left), Self::MergedColumn(right)) => {
-                        pending.push((&left.left, &right.left));
-                        pending.push((&left.right, &right.right));
+                    (Expr::Parameter(left), Expr::Parameter(right)) => left.index == right.index,
+                    (Expr::Column(left), Expr::Column(right)) => left == right,
+                    (Expr::MergedColumn(left), Expr::MergedColumn(right)) => {
+                        pending.push((left.left, right.left));
+                        pending.push((left.right, right.right));
                         left.value == right.value
                             && left.type_fact == right.type_fact
                             && left.affinity == right.affinity
                             && left.has_affinity == right.has_affinity
                             && left.collation == right.collation
                     }
-                    (Self::RowId(left), Self::RowId(right)) => left == right,
-                    (Self::Output(left), Self::Output(right)) => left == right,
+                    (Expr::RowId(left), Expr::RowId(right)) => left == right,
+                    (Expr::Output(left), Expr::Output(right)) => left == right,
                     (
-                        Self::Unary {
+                        Expr::Unary {
                             operator: left_operator,
                             expr: left,
                         },
-                        Self::Unary {
+                        Expr::Unary {
                             operator: right_operator,
                             expr: right,
                         },
                     ) => {
-                        pending.push((left, right));
+                        pending.push((*left, *right));
                         left_operator == right_operator
                     }
                     (
-                        Self::Binary {
+                        Expr::Binary {
                             lhs: left_lhs,
                             operator: left_operator,
                             rhs: left_rhs,
@@ -721,7 +1070,7 @@ impl Expr {
                             custom: left_custom,
                             comparison: left_comparison,
                         },
-                        Self::Binary {
+                        Expr::Binary {
                             lhs: right_lhs,
                             operator: right_operator,
                             rhs: right_rhs,
@@ -736,16 +1085,16 @@ impl Expr {
                             && left_comparison == right_comparison;
                         if metadata_matches && left_operator.is_commutative() {
                             let mut swapped = pending.clone();
-                            swapped.push((left_lhs, right_rhs));
-                            swapped.push((left_rhs, right_lhs));
+                            swapped.push((*left_lhs, *right_rhs));
+                            swapped.push((*left_rhs, *right_lhs));
                             alternatives.push(swapped);
                         }
-                        pending.push((left_lhs, right_lhs));
-                        pending.push((left_rhs, right_rhs));
+                        pending.push((*left_lhs, *right_lhs));
+                        pending.push((*left_rhs, *right_rhs));
                         metadata_matches
                     }
                     (
-                        Self::Between {
+                        Expr::Between {
                             expr: left_expr,
                             negated: left_negated,
                             start: left_start,
@@ -753,7 +1102,7 @@ impl Expr {
                             start_comparison: left_start_comparison,
                             end_comparison: left_end_comparison,
                         },
-                        Self::Between {
+                        Expr::Between {
                             expr: right_expr,
                             negated: right_negated,
                             start: right_start,
@@ -762,57 +1111,52 @@ impl Expr {
                             end_comparison: right_end_comparison,
                         },
                     ) => {
-                        pending.push((left_expr, right_expr));
-                        pending.push((left_start, right_start));
-                        pending.push((left_end, right_end));
+                        pending.push((*left_expr, *right_expr));
+                        pending.push((*left_start, *right_start));
+                        pending.push((*left_end, *right_end));
                         left_negated == right_negated
                             && left_start_comparison == right_start_comparison
                             && left_end_comparison == right_end_comparison
                     }
                     (
-                        Self::Case {
+                        Expr::Case {
                             base: left_base,
                             when_then: left_when_then,
                             else_expr: left_else,
                             base_comparisons: left_comparisons,
                         },
-                        Self::Case {
+                        Expr::Case {
                             base: right_base,
                             when_then: right_when_then,
                             else_expr: right_else,
                             base_comparisons: right_comparisons,
                         },
                     ) => {
-                        let shapes_match = push_optional_pair(
-                            &mut pending,
-                            left_base.as_deref(),
-                            right_base.as_deref(),
-                        ) && push_optional_pair(
-                            &mut pending,
-                            left_else.as_deref(),
-                            right_else.as_deref(),
-                        ) && left_when_then.len() == right_when_then.len();
+                        let shapes_match =
+                            push_optional_pair(&mut pending, *left_base, *right_base)
+                                && push_optional_pair(&mut pending, *left_else, *right_else)
+                                && left_when_then.len() == right_when_then.len();
                         if shapes_match {
                             for ((left_when, left_then), (right_when, right_then)) in
                                 left_when_then.iter().zip(right_when_then)
                             {
-                                pending.push((left_when, right_when));
-                                pending.push((left_then, right_then));
+                                pending.push((*left_when, *right_when));
+                                pending.push((*left_then, *right_then));
                             }
                         }
                         shapes_match && left_comparisons == right_comparisons
                     }
                     (
-                        Self::Cast {
+                        Expr::Cast {
                             expr: left_expr,
                             target: left_target,
                         },
-                        Self::Cast {
+                        Expr::Cast {
                             expr: right_expr,
                             target: right_target,
                         },
                     ) => {
-                        pending.push((left_expr, right_expr));
+                        pending.push((*left_expr, *right_expr));
                         push_pairs(
                             &mut pending,
                             &left_target.parameters,
@@ -829,62 +1173,62 @@ impl Expr {
                                 == right_target.programs.apply_builtin_affinity
                     }
                     (
-                        Self::Collate {
+                        Expr::Collate {
                             expr: left_expr,
                             collation: left_collation,
                         },
-                        Self::Collate {
+                        Expr::Collate {
                             expr: right_expr,
                             collation: right_collation,
                         },
                     ) => {
-                        pending.push((left_expr, right_expr));
+                        pending.push((*left_expr, *right_expr));
                         left_collation == right_collation
                     }
-                    (Self::Function(left), Self::Function(right)) => {
+                    (Expr::Function(left), Expr::Function(right)) => {
                         function_calls_match(left, right, &mut pending)
                     }
-                    (Self::IsNull(left), Self::IsNull(right))
-                    | (Self::NotNull(left), Self::NotNull(right)) => {
-                        pending.push((left, right));
+                    (Expr::IsNull(left), Expr::IsNull(right))
+                    | (Expr::NotNull(left), Expr::NotNull(right)) => {
+                        pending.push((*left, *right));
                         true
                     }
                     (
-                        Self::TruthTest {
+                        Expr::TruthTest {
                             expr: left,
                             is_true: left_is_true,
                             negated: left_negated,
                         },
-                        Self::TruthTest {
+                        Expr::TruthTest {
                             expr: right,
                             is_true: right_is_true,
                             negated: right_negated,
                         },
                     ) => {
-                        pending.push((left, right));
+                        pending.push((*left, *right));
                         left_is_true == right_is_true && left_negated == right_negated
                     }
                     (
-                        Self::InList {
+                        Expr::InList {
                             lhs: left_lhs,
                             negated: left_negated,
                             values: left_values,
                             comparisons: left_comparisons,
                         },
-                        Self::InList {
+                        Expr::InList {
                             lhs: right_lhs,
                             negated: right_negated,
                             values: right_values,
                             comparisons: right_comparisons,
                         },
                     ) => {
-                        pending.push((left_lhs, right_lhs));
+                        pending.push((*left_lhs, *right_lhs));
                         push_pairs(&mut pending, left_values, right_values)
                             && left_negated == right_negated
                             && left_comparisons == right_comparisons
                     }
                     (
-                        Self::Like {
+                        Expr::Like {
                             lhs: left_lhs,
                             negated: left_negated,
                             operator: left_operator,
@@ -893,7 +1237,7 @@ impl Expr {
                             rhs: left_rhs,
                             escape: left_escape,
                         },
-                        Self::Like {
+                        Expr::Like {
                             lhs: right_lhs,
                             negated: right_negated,
                             operator: right_operator,
@@ -903,95 +1247,88 @@ impl Expr {
                             escape: right_escape,
                         },
                     ) => {
-                        pending.push((left_lhs, right_lhs));
-                        pending.push((left_rhs, right_rhs));
-                        push_optional_pair(
-                            &mut pending,
-                            left_escape.as_deref(),
-                            right_escape.as_deref(),
-                        ) && left_negated == right_negated
+                        pending.push((*left_lhs, *right_lhs));
+                        pending.push((*left_rhs, *right_rhs));
+                        push_optional_pair(&mut pending, *left_escape, *right_escape)
+                            && left_negated == right_negated
                             && left_operator == right_operator
                             && left_function == right_function
                             && left_argument_count == right_argument_count
                     }
-                    (Self::Row(left), Self::Row(right))
-                    | (Self::Array(left), Self::Array(right)) => {
+                    (Expr::Row(left), Expr::Row(right))
+                    | (Expr::Array(left), Expr::Array(right)) => {
                         push_pairs(&mut pending, left, right)
                     }
                     (
-                        Self::Subscript {
+                        Expr::Subscript {
                             base: left_base,
                             index: left_index,
                         },
-                        Self::Subscript {
+                        Expr::Subscript {
                             base: right_base,
                             index: right_index,
                         },
                     ) => {
-                        pending.push((left_base, right_base));
-                        pending.push((left_index, right_index));
+                        pending.push((*left_base, *right_base));
+                        pending.push((*left_index, *right_index));
                         true
                     }
-                    (Self::FieldAccess(left), Self::FieldAccess(right)) => {
-                        pending.push((&left.base, &right.base));
+                    (Expr::FieldAccess(left), Expr::FieldAccess(right)) => {
+                        pending.push((left.base, right.base));
                         left.field_name.eq_ignore_ascii_case(&right.field_name)
                             && left.kind == right.kind
                             && left.container_type == right.container_type
                             && left.result_type == right.result_type
                     }
                     (
-                        Self::Subquery(SubqueryExpr::Scalar {
+                        Expr::Subquery(SubqueryExpr::Scalar {
                             query: left_query,
                             output: left_output,
                         }),
-                        Self::Subquery(SubqueryExpr::Scalar {
+                        Expr::Subquery(SubqueryExpr::Scalar {
                             query: right_query,
                             output: right_output,
                         }),
                     ) => left_query == right_query && left_output == right_output,
                     (
-                        Self::Subquery(SubqueryExpr::Row { query: left }),
-                        Self::Subquery(SubqueryExpr::Row { query: right }),
+                        Expr::Subquery(SubqueryExpr::Row { query: left }),
+                        Expr::Subquery(SubqueryExpr::Row { query: right }),
                     )
                     | (
-                        Self::Subquery(SubqueryExpr::Exists(left)),
-                        Self::Subquery(SubqueryExpr::Exists(right)),
+                        Expr::Subquery(SubqueryExpr::Exists(left)),
+                        Expr::Subquery(SubqueryExpr::Exists(right)),
                     ) => left == right,
                     (
-                        Self::Subquery(SubqueryExpr::In {
+                        Expr::Subquery(SubqueryExpr::In {
                             lhs: left_lhs,
                             query: left_query,
                             negated: left_negated,
                             comparison: left_comparison,
                         }),
-                        Self::Subquery(SubqueryExpr::In {
+                        Expr::Subquery(SubqueryExpr::In {
                             lhs: right_lhs,
                             query: right_query,
                             negated: right_negated,
                             comparison: right_comparison,
                         }),
                     ) => {
-                        pending.push((left_lhs, right_lhs));
+                        pending.push((*left_lhs, *right_lhs));
                         left_query == right_query
                             && left_negated == right_negated
                             && left_comparison == right_comparison
                     }
                     (
-                        Self::Raise {
+                        Expr::Raise {
                             action: left_action,
                             message: left_message,
                         },
-                        Self::Raise {
+                        Expr::Raise {
                             action: right_action,
                             message: right_message,
                         },
                     ) => {
                         left_action == right_action
-                            && push_optional_pair(
-                                &mut pending,
-                                left_message.as_deref(),
-                                right_message.as_deref(),
-                            )
+                            && push_optional_pair(&mut pending, *left_message, *right_message)
                     }
                     _ => false,
                 };
@@ -1011,7 +1348,7 @@ impl Expr {
     /// Visit this expression and every expression it owns. References to
     /// outputs and subqueries remain references; their definitions are walked
     /// by the query that owns them.
-    pub(crate) fn for_each(&self, visitor: &mut impl FnMut(&Expr)) {
+    pub(crate) fn for_each(self, visitor: &mut impl FnMut(ExprRef<'a>)) {
         visitor(self);
         let result = self.walk((), &mut WalkVisitor { visit: visitor });
         if let Err(error) = result {
@@ -1022,7 +1359,7 @@ impl Expr {
     /// Reduce this expression from leaves to root without using the call stack.
     /// Child values keep expression-child order, letting callers handle nodes
     /// whose result depends on more than one child.
-    pub(crate) fn fold<T>(&self, folder: &mut impl FnMut(&Expr, &[T]) -> T) -> T {
+    pub(crate) fn fold<T>(self, folder: &mut impl FnMut(ExprRef<'a>, &[T]) -> T) -> T {
         match self.walk(
             (),
             &mut FoldVisitor {
@@ -1039,8 +1376,8 @@ impl Expr {
     /// after all selected children. The pre-order callback chooses the
     /// context for a child or skips that child. The post-order callback
     /// reduces completed child values into the current node's value.
-    pub(crate) fn walk<'expr, V: ExprVisitor<'expr>>(
-        &'expr self,
+    pub(crate) fn walk<V: ExprVisitor<'a>>(
+        self,
         root_context: V::Context,
         visitor: &mut V,
     ) -> Result<V::Output, V::Error> {
@@ -1078,22 +1415,18 @@ impl Expr {
     }
 }
 
-fn push_pairs<'expr>(
-    pending: &mut Vec<(&'expr Expr, &'expr Expr)>,
-    left: &'expr [Expr],
-    right: &'expr [Expr],
-) -> bool {
+fn push_pairs(pending: &mut Vec<(ExprId, ExprId)>, left: &[ExprId], right: &[ExprId]) -> bool {
     if left.len() != right.len() {
         return false;
     }
-    pending.extend(left.iter().zip(right));
+    pending.extend(left.iter().copied().zip(right.iter().copied()));
     true
 }
 
-fn push_optional_pair<'expr>(
-    pending: &mut Vec<(&'expr Expr, &'expr Expr)>,
-    left: Option<&'expr Expr>,
-    right: Option<&'expr Expr>,
+fn push_optional_pair(
+    pending: &mut Vec<(ExprId, ExprId)>,
+    left: Option<ExprId>,
+    right: Option<ExprId>,
 ) -> bool {
     match (left, right) {
         (Some(left), Some(right)) => {
@@ -1132,7 +1465,7 @@ fn custom_binary_operators_match(
 fn function_calls_match<'expr>(
     left: &'expr FunctionCall,
     right: &'expr FunctionCall,
-    pending: &mut Vec<(&'expr Expr, &'expr Expr)>,
+    pending: &mut Vec<(ExprId, ExprId)>,
 ) -> bool {
     // Two calls of one aggregate (the same `AggregateId`) are the same
     // value; calls of different aggregates never are, even when they look
@@ -1208,7 +1541,7 @@ fn function_operations_match(left: &FunctionOperation, right: &FunctionOperation
 fn function_arguments_match<'expr>(
     left: &'expr FunctionArguments,
     right: &'expr FunctionArguments,
-    pending: &mut Vec<(&'expr Expr, &'expr Expr)>,
+    pending: &mut Vec<(ExprId, ExprId)>,
 ) -> bool {
     match (left, right) {
         (FunctionArguments::Star, FunctionArguments::Star) => true,
@@ -1255,7 +1588,7 @@ fn function_arguments_match<'expr>(
 fn order_terms_match<'expr>(
     left: &'expr [OrderTerm],
     right: &'expr [OrderTerm],
-    pending: &mut Vec<(&'expr Expr, &'expr Expr)>,
+    pending: &mut Vec<(ExprId, ExprId)>,
 ) -> bool {
     if left.len() != right.len() {
         return false;
@@ -1268,23 +1601,20 @@ fn order_terms_match<'expr>(
         {
             return false;
         }
-        pending.push((&left.expr, &right.expr));
+        pending.push((left.expr, right.expr));
     }
     true
 }
 
-fn child_from_exprs<'expr>(expressions: &'expr [Expr], index: &mut usize) -> Option<&'expr Expr> {
+fn child_from_exprs(expressions: &[ExprId], index: &mut usize) -> Option<ExprId> {
     if let Some(expression) = expressions.get(*index) {
-        return Some(expression);
+        return Some(*expression);
     }
     *index -= expressions.len();
     None
 }
 
-fn child_from_optional_expr<'expr>(
-    expression: Option<&'expr Expr>,
-    index: &mut usize,
-) -> Option<&'expr Expr> {
+fn child_from_optional_expr(expression: Option<ExprId>, index: &mut usize) -> Option<ExprId> {
     let expression = expression?;
     if *index == 0 {
         return Some(expression);
@@ -1293,28 +1623,25 @@ fn child_from_optional_expr<'expr>(
     None
 }
 
-fn child_from_order_terms<'expr>(
-    terms: &'expr [OrderTerm],
-    index: &mut usize,
-) -> Option<&'expr Expr> {
+fn child_from_order_terms(terms: &[OrderTerm], index: &mut usize) -> Option<ExprId> {
     if let Some(term) = terms.get(*index) {
-        return Some(&term.expr);
+        return Some(term.expr);
     }
     *index -= terms.len();
     None
 }
 
-fn child_from_optional_schema_call<'expr>(
-    call: Option<&'expr BoundSchemaCall>,
+fn child_from_optional_schema_call(
+    call: Option<&BoundSchemaCall>,
     index: &mut usize,
-) -> Option<&'expr Expr> {
+) -> Option<ExprId> {
     child_from_schema_calls(call, index)
 }
 
 fn child_from_schema_calls<'expr>(
     calls: impl IntoIterator<Item = &'expr BoundSchemaCall>,
     index: &mut usize,
-) -> Option<&'expr Expr> {
+) -> Option<ExprId> {
     for call in calls {
         if let Some(child) = child_from_exprs(&call.arguments, index) {
             return Some(child);
@@ -1335,20 +1662,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_expression_is_constant_only_when_every_node_under_it_is() {
+        let mut exprs = ExprArena::default();
+        let add = |exprs: &mut ExprArena, lhs, rhs| {
+            exprs.push(Expr::Binary {
+                lhs,
+                operator: Operator::Add,
+                rhs,
+                array_concat: false,
+                custom: None,
+                comparison: None,
+            })
+        };
+        let one = exprs.push(Expr::Literal(Literal::Numeric("1".to_string())));
+        let two = exprs.push(Expr::Literal(Literal::Numeric("2".to_string())));
+        let column = exprs.push(Expr::column(SourceId::new(0), 1));
+        let constant = add(&mut exprs, one, two);
+        let reads_column = add(&mut exprs, constant, column);
+        let negated = exprs.push(Expr::Unary {
+            operator: UnaryOperator::Negative,
+            expr: reads_column,
+        });
+
+        assert!(exprs.is_constant(exprs.at(constant)));
+        assert!(!exprs.is_constant(exprs.at(reads_column)));
+        assert!(!exprs.is_constant(exprs.at(negated)));
+        let detached = Expr::Unary {
+            operator: UnaryOperator::Negative,
+            expr: constant,
+        };
+        assert!(exprs.is_constant(exprs.detached(&detached)));
+    }
+
+    #[test]
     fn walking_children_without_children_pushes_no_frames() {
-        let row = Expr::Row(vec![
-            Expr::column(SourceId::new(0), 1),
-            Expr::Unary {
-                operator: UnaryOperator::Negative,
-                expr: Box::new(Expr::column(SourceId::new(0), 2)),
-            },
-            Expr::column(SourceId::new(0), 3),
-        ]);
+        let mut exprs = ExprArena::default();
+        let first = exprs.push(Expr::column(SourceId::new(0), 1));
+        let negated = exprs.push(Expr::column(SourceId::new(0), 2));
+        let unary = exprs.push(Expr::Unary {
+            operator: UnaryOperator::Negative,
+            expr: negated,
+        });
+        let last = exprs.push(Expr::column(SourceId::new(0), 3));
+        let row = exprs.push(Expr::Row(vec![first, unary, last]));
         CHILD_FRAMES_CREATED.with(|created| created.set(0));
 
         let mut visited = Vec::new();
-        row.for_each(&mut |expression| {
-            visited.push(matches!(expression, Expr::Column(_)));
+        exprs.at(row).for_each(&mut |expression| {
+            visited.push(matches!(*expression, Expr::Column(_)));
         });
 
         assert_eq!(visited, [false, true, false, true, true]);
@@ -1357,44 +1718,52 @@ mod tests {
 
     #[test]
     fn walking_an_expression_without_children_creates_no_frame_stack() {
-        let leaf = Expr::column(SourceId::new(0), 3);
-        let binary = Expr::Binary {
-            lhs: Box::new(Expr::column(SourceId::new(0), 1)),
+        let mut exprs = ExprArena::default();
+        let leaf = exprs.push(Expr::column(SourceId::new(0), 3));
+        let lhs = exprs.push(Expr::column(SourceId::new(0), 1));
+        let rhs = exprs.push(Expr::column(SourceId::new(0), 2));
+        let binary = exprs.push(Expr::Binary {
+            lhs,
             operator: Operator::Add,
-            rhs: Box::new(Expr::column(SourceId::new(0), 2)),
+            rhs,
             array_concat: false,
             custom: None,
             comparison: None,
-        };
+        });
         FRAME_STACKS_CREATED.with(|created| created.set(0));
 
         let mut visited = 0;
-        leaf.for_each(&mut |_| visited += 1);
+        exprs.at(leaf).for_each(&mut |_| visited += 1);
         assert_eq!(visited, 1);
         assert_eq!(FRAME_STACKS_CREATED.with(|created| created.get()), 0);
 
-        binary.for_each(&mut |_| visited += 1);
+        exprs.at(binary).for_each(&mut |_| visited += 1);
         assert_eq!(visited, 4);
         assert_eq!(FRAME_STACKS_CREATED.with(|created| created.get()), 1);
     }
 
     #[test]
     fn expression_frames_preserve_child_order_for_walk_and_fold() {
-        let expression = Expr::Binary {
-            lhs: Box::new(Expr::Literal(Literal::Numeric("2".into()))),
+        let mut exprs = ExprArena::default();
+        let two = exprs.push(Expr::Literal(Literal::Numeric("2".into())));
+        let three = exprs.push(Expr::Literal(Literal::Numeric("3".into())));
+        let negated = exprs.push(Expr::Unary {
+            operator: UnaryOperator::Negative,
+            expr: three,
+        });
+        let sum = exprs.push(Expr::Binary {
+            lhs: two,
             operator: Operator::Add,
-            rhs: Box::new(Expr::Unary {
-                operator: UnaryOperator::Negative,
-                expr: Box::new(Expr::Literal(Literal::Numeric("3".into()))),
-            }),
+            rhs: negated,
             array_concat: false,
             custom: None,
             comparison: None,
-        };
+        });
+        let expression = exprs.at(sum);
 
         let mut visited = Vec::new();
         expression.for_each(&mut |expression| {
-            visited.push(match expression {
+            visited.push(match *expression {
                 Expr::Binary { .. } => "binary",
                 Expr::Unary { .. } => "unary",
                 Expr::Literal(_) => "literal",
@@ -1403,18 +1772,20 @@ mod tests {
         });
         assert_eq!(visited, ["binary", "literal", "unary", "literal"]);
 
-        let value = expression.fold(&mut |expression, children: &[i64]| match expression {
-            Expr::Literal(Literal::Numeric(value)) => value.parse().expect("integer literal"),
-            Expr::Unary {
-                operator: UnaryOperator::Negative,
-                ..
-            } => -children[0],
-            Expr::Binary {
-                operator: Operator::Add,
-                ..
-            } => children[0] + children[1],
-            _ => unreachable!("test expression contains only addition and negation"),
-        });
+        let value = expression.fold(
+            &mut |expression, children: &[i64]| match expression.node() {
+                Expr::Literal(Literal::Numeric(value)) => value.parse().expect("integer literal"),
+                Expr::Unary {
+                    operator: UnaryOperator::Negative,
+                    ..
+                } => -children[0],
+                Expr::Binary {
+                    operator: Operator::Add,
+                    ..
+                } => children[0] + children[1],
+                _ => unreachable!("test expression contains only addition and negation"),
+            },
+        );
         assert_eq!(value, -1);
     }
 }

@@ -89,10 +89,7 @@ impl Analyzer<'_, '_, '_> {
         let program = result?;
         Ok(Some(BoundSchemaCall {
             program,
-            arguments: arguments
-                .iter()
-                .map(|argument| argument.expr.clone())
-                .collect(),
+            arguments: arguments.iter().map(|argument| argument.expr).collect(),
         }))
     }
 

@@ -520,19 +520,20 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         table: &Table,
         column: hir::TargetColumn,
         expressions: InsertExprContext<'_>,
-    ) -> Result<hir::Expr> {
+    ) -> Result<hir::ExprId> {
         if matches!(syntax, ast::Expr::Default) {
             return self.analyze_write_default(target, table, column);
         }
         let policy = expressions.policies.insert_values();
-        Ok(self
+        let value = self
             .analyze_root_expr_with_expected_type(
                 syntax,
                 expressions.outer_scope,
                 policy,
                 self.write_target_type(target, table, column)?,
             )?
-            .expr)
+            .expr;
+        Ok(value)
     }
 
     fn analyze_insert_defaults(
@@ -605,7 +606,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         target: hir::SourceId,
         table: &Table,
         column: hir::TargetColumn,
-    ) -> Result<hir::Expr> {
+    ) -> Result<hir::ExprId> {
         let syntax = match column {
             hir::TargetColumn::RowId => ast::Expr::Literal(ast::Literal::Null),
             hir::TargetColumn::Column(column) => {
@@ -730,7 +731,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         .map(|predicate| self.analyze_expr(predicate, &scope, policy))
                         .transpose()?;
                     let matched_index =
-                        self.match_conflict_target(target, table, &terms, predicate.as_ref())?;
+                        self.match_conflict_target(target, table, &terms, predicate)?;
                     Ok::<_, LimboError>(hir::ConflictTarget {
                         terms,
                         predicate,
@@ -836,21 +837,25 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         target: hir::SourceId,
         table: &hir::ResolvedTable,
         terms: &[hir::ConflictTerm],
-        predicate: Option<&hir::Expr>,
+        predicate: Option<hir::ExprId>,
     ) -> Result<Option<hir::ResolvedIndex>> {
         // Strip COLLATE, keeping the outermost collation.
-        fn unwrap(
+        fn unwrap<'a>(
             term: &hir::ConflictTerm,
-        ) -> (&hir::Expr, Option<crate::translate::collate::CollationSeq>) {
-            let mut expression = &term.expr;
+            exprs: &'a hir::ExprArena,
+        ) -> (
+            hir::ExprRef<'a>,
+            Option<crate::translate::collate::CollationSeq>,
+        ) {
+            let mut expression = exprs.at(term.expr);
             let mut collation = term.collation.as_ref().map(|collation| *collation.value());
             while let hir::Expr::Collate {
                 expr,
                 collation: inner,
-            } = expression
+            } = expression.node()
             {
                 collation.get_or_insert(*inner.value());
-                expression = expr;
+                expression = expression.at(*expr);
             }
             (expression, collation)
         }
@@ -862,7 +867,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         if let [term] = terms {
             // SQLite takes the rowid only from a bare term, without COLLATE:
             // `rowid` or the INTEGER PRIMARY KEY column.
-            let names_rowid = match &term.expr {
+            let names_rowid = match &self.exprs[term.expr] {
                 hir::Expr::RowId(source) => *source == target,
                 expression => target_column(expression)
                     .is_some_and(|column| columns.get(column).is_some_and(|c| c.is_rowid_alias())),
@@ -877,7 +882,10 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         for expressions in &source.index_expressions {
             let index = expressions.index.value();
             let predicate_matches = match (&expressions.predicate, predicate) {
-                (Some(index_predicate), Some(predicate)) => index_predicate.equivalent(predicate),
+                (Some(index_predicate), Some(predicate)) => self
+                    .exprs
+                    .at(*index_predicate)
+                    .equivalent(self.exprs.at(predicate)),
                 (Some(_), None) => false,
                 (None, _) => true,
             };
@@ -895,7 +903,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             };
             let mut matched = vec![false; index.columns.len()];
             let all_match = terms.iter().all(|term| {
-                let (expression, collation) = unwrap(term);
+                let (expression, collation) = unwrap(term, &self.exprs);
                 let found = (0..index.columns.len()).find(|&position| {
                     if matched[position] {
                         return false;
@@ -906,12 +914,16 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     let key_column = &index.columns[position];
                     let is_expression_column =
                         key_column.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL;
-                    let same_key = match (target_column(expression), &expressions.columns[position])
-                    {
+                    let same_key = match (
+                        target_column(expression.node()),
+                        &expressions.columns[position],
+                    ) {
                         (Some(column), _) => {
                             !is_expression_column && key_column.pos_in_table == column
                         }
-                        (None, Some(key)) => is_expression_column && key.equivalent(expression),
+                        (None, Some(key)) => {
+                            is_expression_column && self.exprs.at(*key).equivalent(expression)
+                        }
                         (None, None) => false,
                     };
                     same_key

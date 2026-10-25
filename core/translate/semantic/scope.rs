@@ -84,8 +84,21 @@ impl ExprCollation {
     }
 }
 
+/// An analyzed expression: its node in the document's expression arena,
+/// with the facts the expressions around it need.
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedScopeExpr {
+    pub(crate) expr: hir::ExprId,
+    pub(crate) type_fact: TypeFact,
+    pub(crate) affinity: Affinity,
+    pub(crate) has_affinity: bool,
+    pub(crate) collation: ExprCollation,
+}
+
+/// A value a name in the scope finds. The scope does not own the
+/// expression arena, so it keeps the node itself.
+#[derive(Clone, Debug)]
+pub(crate) struct ScopeValue {
     pub(crate) expr: hir::Expr,
     pub(crate) type_fact: TypeFact,
     pub(crate) affinity: Affinity,
@@ -93,12 +106,24 @@ pub(crate) struct ResolvedScopeExpr {
     pub(crate) collation: ExprCollation,
 }
 
+impl ScopeValue {
+    pub(crate) fn push_into(self, exprs: &mut hir::ExprArena) -> ResolvedScopeExpr {
+        ResolvedScopeExpr {
+            expr: exprs.push(self.expr),
+            type_fact: self.type_fact,
+            affinity: self.affinity,
+            has_affinity: self.has_affinity,
+            collation: self.collation,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ExpandedColumn<'scope> {
     pub(crate) name: String,
     /// The source's alias, or its table name or `(subquery-N)` without one.
     pub(crate) qualifier: Cow<'scope, str>,
-    pub(crate) resolved: ResolvedScopeExpr,
+    pub(crate) expr: hir::Expr,
 }
 
 #[derive(Debug)]
@@ -106,7 +131,7 @@ struct ColumnBinding {
     source: SourceId,
     display_name: Arc<str>,
     lookup_name: ColumnName,
-    resolved: ResolvedScopeExpr,
+    resolved: ScopeValue,
     hidden: bool,
     /// The implicit rowid a parenthesized join group saved for one of its
     /// tables: a bare `rowid`, `oid` or `_rowid_` finds it.
@@ -147,9 +172,14 @@ impl Clone for ColumnBinding {
 }
 
 impl ColumnBinding {
-    fn from_source(source: &hir::Source, index: usize, column: hir::SourceColumnRef<'_>) -> Self {
+    fn from_source(
+        source: &hir::Source,
+        index: usize,
+        column: hir::SourceColumnRef<'_>,
+        exprs: &hir::ExprArena,
+    ) -> Self {
         let expr = match &source.kind {
-            hir::SourceKind::FromGroup(group) => group.columns[index].clone(),
+            hir::SourceKind::FromGroup(group) => exprs[group.columns[index]].clone(),
             _ => hir::Expr::Column(ColumnRef {
                 source: source.id,
                 column: index,
@@ -169,7 +199,7 @@ impl ColumnBinding {
             source,
             display_name: name.clone(),
             lookup_name: ColumnName(name.clone()),
-            resolved: ResolvedScopeExpr {
+            resolved: ScopeValue {
                 expr,
                 type_fact: column.type_fact().into_owned(),
                 affinity: column.affinity(),
@@ -182,19 +212,23 @@ impl ColumnBinding {
         }
     }
 
-    fn resolved(&self) -> ResolvedScopeExpr {
+    fn resolved(&self) -> ScopeValue {
         self.resolved.clone()
     }
 }
 
-pub(crate) fn resolve_source_column(source: &hir::Source, name: &str) -> Result<ResolvedScopeExpr> {
+pub(crate) fn resolve_source_column(
+    source: &hir::Source,
+    name: &str,
+    exprs: &hir::ExprArena,
+) -> Result<ScopeValue> {
     let normalized = crate::util::normalize_ident(name);
     source
         .columns
         .iter()
         .enumerate()
         .find(|(_, column)| column.name().eq_ignore_ascii_case(&normalized))
-        .map(|(index, column)| ColumnBinding::from_source(source, index, column).resolved())
+        .map(|(index, column)| ColumnBinding::from_source(source, index, column, exprs).resolved())
         .ok_or_else(|| {
             crate::LimboError::ParseError(format!(
                 "cannot join using column {name} - column not present in both tables"
@@ -277,11 +311,11 @@ impl<'a> ColumnView<'a> {
         }
     }
 
-    fn resolved(self) -> ResolvedScopeExpr {
+    fn resolved(self) -> ScopeValue {
         match self {
             Self::Source { source, index } => {
                 let column = source.columns.column(index);
-                ResolvedScopeExpr {
+                ScopeValue {
                     expr: self.expr().into_owned(),
                     type_fact: column.type_fact().into_owned(),
                     affinity: column.affinity(),
@@ -414,7 +448,7 @@ impl SavedGroupColumnKind {
 
 /// What a qualified name found among one scope's own sources.
 enum QualifiedLookup {
-    Found(Box<ResolvedScopeExpr>),
+    Found(Box<ScopeValue>),
     /// A source of that name exists here, but none has the column.
     NoSuchColumn,
     /// No source of that name exists here.
@@ -431,7 +465,7 @@ pub(crate) struct SavedGroupColumn {
 pub(crate) struct GroupColumnDef {
     /// The column's name in the group, unique among the group's columns.
     pub(crate) name: String,
-    pub(crate) value: ResolvedScopeExpr,
+    pub(crate) value: ScopeValue,
     pub(crate) saved: SavedGroupColumn,
 }
 
@@ -498,10 +532,6 @@ impl Scope {
     pub(crate) fn add_source(&mut self, source: &hir::Source, unqualified: bool) {
         #[cfg(test)]
         tests::SOURCES_ADDED.with(|added| added.set(added.get() + 1));
-        let group_values = match &source.kind {
-            hir::SourceKind::FromGroup(group) => Some(group.columns.clone()),
-            _ => None,
-        };
         if unqualified {
             Arc::make_mut(&mut self.visible).push(VisibleColumn::AllOfSource(self.sources.len()));
         }
@@ -514,7 +544,7 @@ impl Scope {
             database: source.database,
             database_qualified: source.alias.is_none(),
             columns: source.columns.clone(),
-            group_values,
+            group_values: None,
             rowid_available: source.rowid_available,
             unqualified,
             star_merged: Vec::new(),
@@ -527,7 +557,12 @@ impl Scope {
     /// a column by the name it had in the group, not by the unique name the
     /// group gave it; a column a USING merged is found through a qualified
     /// name only.
-    pub(crate) fn add_group_source(&mut self, source: &hir::Source, saved: Vec<SavedGroupColumn>) {
+    pub(crate) fn add_group_source(
+        &mut self,
+        source: &hir::Source,
+        saved: Vec<SavedGroupColumn>,
+        exprs: &hir::ExprArena,
+    ) {
         assert_eq!(
             source.columns.len(),
             saved.len(),
@@ -537,6 +572,9 @@ impl Scope {
         let added = Arc::make_mut(&mut self.sources)
             .last_mut()
             .expect("source was just added");
+        if let hir::SourceKind::FromGroup(group) = &source.kind {
+            added.group_values = Some(group.columns.iter().map(|id| exprs[*id].clone()).collect());
+        }
         added.unqualified = true;
         for (column, saved) in added.column_views().zip(&saved) {
             if saved.visibility == GroupColumnVisibility::QualifiedOnly {
@@ -781,7 +819,7 @@ impl Scope {
         &self,
         ordinal: usize,
         clause: &str,
-    ) -> Result<ResolvedScopeExpr> {
+    ) -> Result<ScopeValue> {
         let Some(output) = ordinal
             .checked_sub(1)
             .and_then(|index| self.outputs.get(index))
@@ -823,7 +861,7 @@ impl Scope {
         &self,
         name: &str,
         precedence: NamePrecedence,
-    ) -> Result<Option<ResolvedScopeExpr>> {
+    ) -> Result<Option<ScopeValue>> {
         let normalized = crate::util::normalize_ident(name);
         let current = match precedence {
             NamePrecedence::SourcesOnly => self.resolve_source_column(&normalized)?,
@@ -856,7 +894,7 @@ impl Scope {
         &self,
         qualifier: &str,
         column: &str,
-    ) -> Result<Option<ResolvedScopeExpr>> {
+    ) -> Result<Option<ScopeValue>> {
         let normalized_qualifier = crate::util::normalize_ident(qualifier);
         let normalized_column = crate::util::normalize_ident(column);
         let lookup =
@@ -913,13 +951,13 @@ impl Scope {
         column: &str,
         written: impl Fn() -> String,
     ) -> Result<QualifiedLookup> {
-        let mut found: Option<ResolvedScopeExpr> = None;
+        let mut found: Option<ScopeValue> = None;
         let mut table_seen = false;
         // Like SQLite's `lookupName`: of the copies of a USING column that
         // the name matches, a LEFT or inner join reads the left one, a
         // RIGHT JOIN the right one, and a FULL JOIN the coalesced value.
         let mut add =
-            |candidate: ResolvedScopeExpr, merged: Option<hir::MergedColumnValue>| -> Result<()> {
+            |candidate: ScopeValue, merged: Option<hir::MergedColumnValue>| -> Result<()> {
                 match (merged, &found) {
                     (Some(hir::MergedColumnValue::Right), _) | (_, None) => found = Some(candidate),
                     (Some(hir::MergedColumnValue::Coalesce), Some(_)) => {
@@ -1045,7 +1083,7 @@ impl Scope {
         database: hir::DatabaseId,
         table: &str,
         column: &str,
-    ) -> Result<Option<ResolvedScopeExpr>> {
+    ) -> Result<Option<ScopeValue>> {
         let normalized_table = crate::util::normalize_ident(table);
         let normalized_column = crate::util::normalize_ident(column);
         let written = || {
@@ -1123,9 +1161,9 @@ impl Scope {
         // `database.table.column`, which a source of the same name inside a
         // join group can make ambiguous.
         let several = self.sources.len() > 1;
-        self.visible_columns()
-            .filter(|column| !column.hidden())
-            .map(|column| {
+        let mut expanded = Vec::with_capacity(self.visible_columns().count());
+        for column in self.visible_columns().filter(|column| !column.hidden()) {
+            expanded.push({
                 if bare_group {
                     self.resolve_source_column(&crate::util::normalize_ident(column.lookup_name()))?;
                 }
@@ -1166,13 +1204,14 @@ impl Scope {
                             column.display_name()
                         ))
                     })?;
-                Ok(ExpandedColumn {
+                ExpandedColumn {
                     name: column.display_name().to_string(),
                     qualifier,
-                    resolved: column.resolved(),
-                })
-            })
-            .collect()
+                    expr: column.expr().into_owned(),
+                }
+            });
+        }
+        Ok(expanded)
     }
 
     pub(crate) fn expand_table_star(&self, qualifier: &str) -> Result<Vec<ExpandedColumn<'_>>> {
@@ -1212,12 +1251,12 @@ impl Scope {
                     // With several sources, the column expands as
                     // `database.table.column`, which a source of the same
                     // name in another database does not make ambiguous.
-                    let resolved = if source
+                    let expr = if source
                         .star_merged
                         .iter()
                         .any(|name| column.lookup_matches(name))
                     {
-                        self.merged_star_column(column)?
+                        self.merged_star_column(column)?.expr
                     } else {
                         match source.database {
                             Some(database) => self.resolve_database_qualified(
@@ -1227,12 +1266,12 @@ impl Scope {
                             )?,
                             None => self.resolve_qualified(qualifier, column.display_name())?,
                         }
-                        .unwrap_or_else(|| column.resolved())
+                        .map_or_else(|| column.expr().into_owned(), |resolved| resolved.expr)
                     };
                     expanded.push(ExpandedColumn {
                         name: column.display_name().to_string(),
                         qualifier: Cow::Borrowed(source.qualifier.as_str()),
-                        resolved,
+                        expr,
                     });
                 }
             }
@@ -1243,18 +1282,19 @@ impl Scope {
                 // own name, so a direct source cannot make them ambiguous.
                 // The one source of a FROM clause expands them as bare
                 // names, by the unique names the group gave them.
-                let resolved = if bare {
+                let expr = if bare {
                     let Some(resolved) = self.resolve_source_column(
                         &crate::util::normalize_ident(column.using_name()),
                     )?
                     else {
                         crate::bail_parse_error!("no such column: {}", column.display_name());
                     };
-                    resolved
+                    resolved.expr
                 } else if source.star_merged.contains(&saved_name) {
                     self.merged_star_column_named(&saved_name, column.display_name())?
+                        .expr
                 } else {
-                    column.resolved()
+                    column.expr().into_owned()
                 };
                 // SQLite names a column of a join group after the group,
                 // which it treats as a subquery, unless the group is the
@@ -1266,7 +1306,7 @@ impl Scope {
                     } else {
                         Cow::Borrowed(source.qualifier.as_str())
                     },
-                    resolved,
+                    expr,
                 });
             }
             return Ok(expanded);
@@ -1276,19 +1316,19 @@ impl Scope {
             .column_views()
             .filter(|column| !column.hidden())
             .map(|column| {
-                let resolved = if source
+                let expr = if source
                     .star_merged
                     .iter()
                     .any(|name| column.lookup_matches(name))
                 {
-                    self.merged_star_column(column)?
+                    self.merged_star_column(column)?.expr
                 } else {
-                    column.resolved()
+                    column.expr().into_owned()
                 };
                 Ok(ExpandedColumn {
                     name: column.display_name().to_string(),
                     qualifier: Cow::Borrowed(source.qualifier.as_str()),
-                    resolved,
+                    expr,
                 })
             })
             .collect()
@@ -1315,7 +1355,7 @@ impl Scope {
 
     /// The value `table.*` reads for a column a later USING merged: the one
     /// visible column of that name, as an unqualified reference would find.
-    fn merged_star_column(&self, column: ColumnView<'_>) -> Result<ResolvedScopeExpr> {
+    fn merged_star_column(&self, column: ColumnView<'_>) -> Result<ScopeValue> {
         self.merged_star_column_named(column.lookup_name(), column.display_name())
     }
 
@@ -1323,7 +1363,7 @@ impl Scope {
         &self,
         lookup_name: &str,
         display_name: &str,
-    ) -> Result<ResolvedScopeExpr> {
+    ) -> Result<ScopeValue> {
         let mut matches = self
             .visible_columns()
             .filter(|visible| visible.lookup_matches(lookup_name));
@@ -1354,7 +1394,7 @@ impl Scope {
         name: &str,
         natural: bool,
         has_right_or_full_join: bool,
-    ) -> Result<ResolvedScopeExpr> {
+    ) -> Result<ScopeValue> {
         let normalized = crate::util::normalize_ident(name);
         // One copy per source: a join group is one source with one column
         // of each name.
@@ -1395,7 +1435,11 @@ impl Scope {
             .collect()
     }
 
-    pub(crate) fn apply_using(&mut self, columns: &[hir::UsingColumn]) -> Result<()> {
+    pub(crate) fn apply_using(
+        &mut self,
+        columns: &[hir::UsingColumn],
+        exprs: &mut hir::ExprArena,
+    ) -> Result<()> {
         for using in columns {
             let right_position = self.visible_columns().position(|column| {
                 matches!(
@@ -1424,7 +1468,7 @@ impl Scope {
                 .find(|(position, column)| {
                     *position != right_position
                         && column.using_matches(&lookup_name)
-                        && same_join_column(&column.expr(), &using.left)
+                        && same_join_column(&column.expr(), &exprs[using.left], exprs)
                 })
                 .map(|(position, _)| position);
             let Some(left_position) = left_position else {
@@ -1435,8 +1479,8 @@ impl Scope {
             };
 
             let merged = hir::Expr::MergedColumn(Box::new(hir::MergedColumn {
-                left: using.left.clone(),
-                right: Box::new(hir::Expr::Column(using.right)),
+                left: using.left,
+                right: exprs.push(hir::Expr::Column(using.right)),
                 value: using.value,
                 type_fact: using.type_fact.clone(),
                 affinity: using.affinity,
@@ -1448,7 +1492,7 @@ impl Scope {
             let VisibleColumn::Binding(left) = &mut visible[left_position] else {
                 unreachable!("owned visible columns are bindings");
             };
-            left.resolved = ResolvedScopeExpr {
+            left.resolved = ScopeValue {
                 expr: merged,
                 type_fact: using.type_fact.clone(),
                 affinity: using.affinity,
@@ -1471,7 +1515,7 @@ impl Scope {
                 if !column.lookup_name.matches(&lookup_name) {
                     return true;
                 }
-                if same_join_column(&column.resolved.expr, &merged_expr) {
+                if same_join_column(&column.resolved.expr, &merged_expr, exprs) {
                     return true;
                 }
                 if right_join {
@@ -1483,7 +1527,7 @@ impl Scope {
         Ok(())
     }
 
-    fn resolve_source_column(&self, name: &str) -> Result<Option<ResolvedScopeExpr>> {
+    fn resolve_source_column(&self, name: &str) -> Result<Option<ScopeValue>> {
         let mut found = None;
         for column in self
             .visible_columns()
@@ -1522,7 +1566,7 @@ impl Scope {
         Ok(found)
     }
 
-    fn resolve_output(&self, name: &str) -> Option<ResolvedScopeExpr> {
+    fn resolve_output(&self, name: &str) -> Option<ScopeValue> {
         self.outputs
             .iter()
             .find(|output| {
@@ -1583,8 +1627,8 @@ impl ScopeOutput {
         ExprCollation::output(self.collation.clone(), self.collation_is_explicit)
     }
 
-    fn resolved(&self) -> ResolvedScopeExpr {
-        ResolvedScopeExpr {
+    fn resolved(&self) -> ScopeValue {
+        ScopeValue {
             expr: hir::Expr::Output(self.id),
             type_fact: self.type_fact.clone(),
             affinity: self.affinity,
@@ -1594,20 +1638,20 @@ impl ScopeOutput {
     }
 }
 
-fn same_join_column(left: &hir::Expr, right: &hir::Expr) -> bool {
+fn same_join_column(left: &hir::Expr, right: &hir::Expr, exprs: &hir::ExprArena) -> bool {
     match (left, right) {
         (hir::Expr::Column(left), hir::Expr::Column(right)) => left == right,
         (hir::Expr::MergedColumn(left), hir::Expr::MergedColumn(right)) => {
-            same_join_column(&left.right, &right.right)
+            same_join_column(&exprs[left.right], &exprs[right.right], exprs)
                 && left.value == right.value
-                && same_join_column(&left.left, &right.left)
+                && same_join_column(&exprs[left.left], &exprs[right.left], exprs)
         }
         _ => false,
     }
 }
 
-fn resolved_rowid(source: SourceId) -> ResolvedScopeExpr {
-    ResolvedScopeExpr {
+fn resolved_rowid(source: SourceId) -> ScopeValue {
+    ScopeValue {
         expr: hir::Expr::RowId(source),
         type_fact: TypeFact::known(Type::Integer),
         affinity: Affinity::Integer,
@@ -1635,8 +1679,9 @@ pub(crate) mod tests {
     use crate::translate::collate::CollationSeq;
     use crate::translate::semantic::hir::{
         CatalogObject, CatalogObjectId, CatalogSnapshot, ComparisonComponent, ComparisonSemantics,
-        DatabaseId, Expr, IndexCoverage, IndexHint, MergedColumnValue, Output, OutputNameKind,
-        QueryBlockId, QueryId, Source, SourceColumn, SourceKind, SourceOwner, UsingColumn,
+        DatabaseId, Expr, ExprArena, IndexCoverage, IndexHint, MergedColumnValue, Output,
+        OutputNameKind, QueryBlockId, QueryId, Source, SourceColumn, SourceKind, SourceOwner,
+        UsingColumn,
     };
     use turso_parser::ast::Literal;
 
@@ -1680,12 +1725,17 @@ pub(crate) mod tests {
         }
     }
 
-    fn output(position: usize, name: &str, name_kind: OutputNameKind) -> Output {
+    fn output(
+        exprs: &mut ExprArena,
+        position: usize,
+        name: &str,
+        name_kind: OutputNameKind,
+    ) -> Output {
         let block = QueryBlockId::new(QueryId::new(0), 0);
         Output {
             id: OutputId::query(block, position),
             name: name.to_string(),
-            expr: Expr::Literal(Literal::Null),
+            expr: exprs.push(Expr::Literal(Literal::Null)),
             type_fact: TypeFact::known(Type::Integer),
             affinity: Affinity::Integer,
             schema_affinity: Affinity::Integer,
@@ -1710,27 +1760,44 @@ pub(crate) mod tests {
         source
     }
 
-    fn using_column(left: Expr, right: ColumnRef, value: MergedColumnValue) -> UsingColumn {
+    fn using_column(
+        exprs: &mut ExprArena,
+        left: Expr,
+        right: ColumnRef,
+        value: MergedColumnValue,
+    ) -> UsingColumn {
+        let left = exprs.push(left);
+        let comparison = ComparisonSemantics {
+            components: vec![ComparisonComponent {
+                affinity: Affinity::Text,
+                collation: None,
+                array: false,
+            }],
+        };
+        let right_expr = exprs.push(Expr::Column(right));
+        let equality = exprs.push(Expr::Binary {
+            lhs: left,
+            operator: turso_parser::ast::Operator::Equals,
+            rhs: right_expr,
+            array_concat: false,
+            custom: None,
+            comparison: Some(comparison.clone()),
+        });
         UsingColumn {
             name: "id".to_string(),
-            left: Box::new(left),
+            left,
             right,
             value,
             type_fact: TypeFact::known(Type::Text),
             affinity: Affinity::Text,
             has_affinity: true,
             collation: None,
-            comparison: ComparisonSemantics {
-                components: vec![ComparisonComponent {
-                    affinity: Affinity::Text,
-                    collation: None,
-                    array: false,
-                }],
-            },
+            comparison,
+            equality,
         }
     }
 
-    fn expect_column(resolved: ResolvedScopeExpr, source: SourceId, column: usize) {
+    fn expect_column(resolved: ScopeValue, source: SourceId, column: usize) {
         assert!(resolved.has_affinity);
         assert_eq!(resolved.affinity, Affinity::Text);
         assert_eq!(resolved.type_fact.storage, Some(Type::Text));
@@ -1744,7 +1811,7 @@ pub(crate) mod tests {
         ));
     }
 
-    fn expect_output(resolved: ResolvedScopeExpr, output: OutputId) {
+    fn expect_output(resolved: ScopeValue, output: OutputId) {
         assert!(matches!(resolved.expr, Expr::Output(actual) if actual == output));
         assert_eq!(resolved.type_fact.storage, Some(Type::Integer));
         assert_eq!(resolved.affinity, Affinity::Integer);
@@ -2009,6 +2076,7 @@ pub(crate) mod tests {
 
     #[test]
     fn using_exposes_one_merged_column_and_keeps_qualified_columns() {
+        let mut exprs = ExprArena::default();
         for value in [
             MergedColumnValue::Left,
             MergedColumnValue::Right,
@@ -2024,12 +2092,12 @@ pub(crate) mod tests {
                 source: right.id,
                 column: 0,
             };
-            let using = using_column(Expr::Column(left_ref), right_ref, value);
+            let using = using_column(&mut exprs, Expr::Column(left_ref), right_ref, value);
             let mut scope = Scope::default();
             scope.add_source(&left, true);
             scope.add_source(&right, true);
             scope
-                .apply_using(std::slice::from_ref(&using))
+                .apply_using(std::slice::from_ref(&using), &mut exprs)
                 .expect("USING identities belong to visible sources");
 
             let unqualified = scope
@@ -2043,8 +2111,8 @@ pub(crate) mod tests {
             let Expr::MergedColumn(merged) = unqualified.expr else {
                 panic!("USING produces a merged column");
             };
-            assert!(matches!(*merged.left, Expr::Column(actual) if actual == left_ref));
-            assert!(matches!(*merged.right, Expr::Column(actual) if actual == right_ref));
+            assert!(matches!(exprs[merged.left], Expr::Column(actual) if actual == left_ref));
+            assert!(matches!(exprs[merged.right], Expr::Column(actual) if actual == right_ref));
             assert_eq!(merged.value, value);
 
             let qualified_left = scope
@@ -2062,6 +2130,7 @@ pub(crate) mod tests {
 
     #[test]
     fn using_can_extend_an_earlier_merged_column() {
+        let mut exprs = ExprArena::default();
         let left = source(0, "left", None, vec![column("id", false)], false);
         let middle = source(1, "middle", None, vec![column("id", false)], false);
         let right = source(2, "right", None, vec![column("id", false)], false);
@@ -2077,26 +2146,36 @@ pub(crate) mod tests {
             source: right.id,
             column: 0,
         };
-        let first = using_column(Expr::Column(left_ref), middle_ref, MergedColumnValue::Left);
+        let first = using_column(
+            &mut exprs,
+            Expr::Column(left_ref),
+            middle_ref,
+            MergedColumnValue::Left,
+        );
         let first_expr = Expr::MergedColumn(Box::new(hir::MergedColumn {
-            left: first.left.clone(),
-            right: Box::new(Expr::Column(first.right)),
+            left: first.left,
+            right: exprs.push(Expr::Column(first.right)),
             value: first.value,
             type_fact: first.type_fact.clone(),
             affinity: first.affinity,
             has_affinity: first.has_affinity,
             collation: first.collation.clone(),
         }));
-        let second = using_column(first_expr, right_ref, MergedColumnValue::Coalesce);
+        let second = using_column(
+            &mut exprs,
+            first_expr,
+            right_ref,
+            MergedColumnValue::Coalesce,
+        );
         let mut scope = Scope::default();
         scope.add_source(&left, true);
         scope.add_source(&middle, true);
         scope
-            .apply_using(std::slice::from_ref(&first))
+            .apply_using(std::slice::from_ref(&first), &mut exprs)
             .expect("first USING identities are valid");
         scope.add_source(&right, true);
         scope
-            .apply_using(std::slice::from_ref(&second))
+            .apply_using(std::slice::from_ref(&second), &mut exprs)
             .expect("earlier merged column remains a valid left identity");
 
         let resolved = scope
@@ -2106,9 +2185,9 @@ pub(crate) mod tests {
         let Expr::MergedColumn(merged) = resolved.expr else {
             panic!("second USING produces a merged column");
         };
-        assert!(matches!(*merged.right, Expr::Column(actual) if actual == right_ref));
+        assert!(matches!(exprs[merged.right], Expr::Column(actual) if actual == right_ref));
         assert_eq!(merged.value, MergedColumnValue::Coalesce);
-        assert!(matches!(*merged.left, Expr::MergedColumn(_)));
+        assert!(matches!(exprs[merged.left], Expr::MergedColumn(_)));
     }
 
     #[test]
@@ -2178,9 +2257,11 @@ pub(crate) mod tests {
 
     #[test]
     fn using_rejects_source_identities_outside_visible_sides() {
+        let mut exprs = ExprArena::default();
         let left = source(0, "left", None, vec![column("id", false)], false);
         let right = source(1, "right", None, vec![column("id", false)], false);
         let using = using_column(
+            &mut exprs,
             Expr::Column(ColumnRef {
                 source: left.id,
                 column: 0,
@@ -2196,7 +2277,7 @@ pub(crate) mod tests {
         scope.add_source(&right, true);
 
         let error = scope
-            .apply_using(std::slice::from_ref(&using))
+            .apply_using(std::slice::from_ref(&using), &mut exprs)
             .expect_err("unknown right identity violates scope invariant");
 
         assert!(error
@@ -2219,6 +2300,7 @@ pub(crate) mod tests {
 
     #[test]
     fn star_preserves_order_filters_hidden_and_uses_merged_columns() {
+        let mut exprs = ExprArena::default();
         let left = source(
             0,
             "left",
@@ -2242,6 +2324,7 @@ pub(crate) mod tests {
             false,
         );
         let using = using_column(
+            &mut exprs,
             Expr::Column(ColumnRef {
                 source: left.id,
                 column: 1,
@@ -2256,7 +2339,7 @@ pub(crate) mod tests {
         scope.add_source(&left, true);
         scope.add_source(&right, true);
         scope
-            .apply_using(std::slice::from_ref(&using))
+            .apply_using(std::slice::from_ref(&using), &mut exprs)
             .expect("USING identities belong to visible sources");
 
         let expanded = scope.expand_star().expect("star namespace is valid");
@@ -2268,14 +2351,13 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             ["left_value", "id", "right_value"]
         );
-        assert!(matches!(&expanded[1].resolved.expr, Expr::MergedColumn(_)));
-        assert_eq!(expanded[1].resolved.type_fact.storage, Some(Type::Text));
-        assert_eq!(expanded[1].resolved.affinity, Affinity::Text);
-        assert!(expanded[1].resolved.has_affinity);
-        assert!(matches!(
-            expanded[1].resolved.collation,
-            ExprCollation::Absent
-        ));
+        let Expr::MergedColumn(merged) = &expanded[1].expr else {
+            panic!("a USING column expands as its merged value");
+        };
+        assert_eq!(merged.type_fact.storage, Some(Type::Text));
+        assert_eq!(merged.affinity, Affinity::Text);
+        assert!(merged.has_affinity);
+        assert!(merged.collation.is_none());
 
         let qualified = scope
             .expand_table_star("right")
@@ -2288,7 +2370,7 @@ pub(crate) mod tests {
             ["id", "right_value"]
         );
         assert!(matches!(
-            &qualified[0].resolved.expr,
+            &qualified[0].expr,
             Expr::Column(ColumnRef { source, column: 0 }) if *source == right.id
         ));
     }
@@ -2339,6 +2421,7 @@ pub(crate) mod tests {
 
     #[test]
     fn fully_merged_self_join_has_one_unqualified_star_column() {
+        let mut exprs = ExprArena::default();
         let left = in_database(
             source(0, "items", None, vec![column("id", false)], false),
             0,
@@ -2348,6 +2431,7 @@ pub(crate) mod tests {
             0,
         );
         let using = using_column(
+            &mut exprs,
             Expr::Column(ColumnRef {
                 source: left.id,
                 column: 0,
@@ -2362,7 +2446,7 @@ pub(crate) mod tests {
         scope.add_source(&left, true);
         scope.add_source(&right, true);
         scope
-            .apply_using(std::slice::from_ref(&using))
+            .apply_using(std::slice::from_ref(&using), &mut exprs)
             .expect("USING identities belong to self-join sources");
 
         let expanded = scope
@@ -2371,7 +2455,7 @@ pub(crate) mod tests {
 
         assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0].name, "id");
-        assert!(matches!(&expanded[0].resolved.expr, Expr::MergedColumn(_)));
+        assert!(matches!(&expanded[0].expr, Expr::MergedColumn(_)));
     }
 
     #[test]
@@ -2397,10 +2481,11 @@ pub(crate) mod tests {
 
     #[test]
     fn source_then_output_prefers_source_and_uses_alias_as_fallback() {
+        let mut exprs = ExprArena::default();
         let items = source(0, "items", None, vec![column("name", false)], false);
         let outputs = [
-            output(0, "name", OutputNameKind::ExplicitAlias),
-            output(1, "alias_only", OutputNameKind::ExplicitAlias),
+            output(&mut exprs, 0, "name", OutputNameKind::ExplicitAlias),
+            output(&mut exprs, 1, "alias_only", OutputNameKind::ExplicitAlias),
         ];
         let mut scope = Scope::default();
         scope.add_source(&items, true);
@@ -2421,8 +2506,9 @@ pub(crate) mod tests {
 
     #[test]
     fn output_then_source_prefers_alias() {
+        let mut exprs = ExprArena::default();
         let items = source(0, "items", None, vec![column("name", false)], false);
-        let outputs = [output(0, "name", OutputNameKind::ExplicitAlias)];
+        let outputs = [output(&mut exprs, 0, "name", OutputNameKind::ExplicitAlias)];
         let mut scope = Scope::default();
         scope.add_source(&items, true);
         scope.set_outputs(&outputs);
@@ -2437,9 +2523,10 @@ pub(crate) mod tests {
 
     #[test]
     fn output_first_lookup_still_rejects_ambiguous_sources() {
+        let mut exprs = ExprArena::default();
         let left = source(0, "left", None, vec![column("name", false)], false);
         let right = source(1, "right", None, vec![column("name", false)], false);
-        let outputs = [output(0, "name", OutputNameKind::ExplicitAlias)];
+        let outputs = [output(&mut exprs, 0, "name", OutputNameKind::ExplicitAlias)];
         let mut scope = Scope::default();
         scope.add_source(&left, true);
         scope.add_source(&right, true);
@@ -2454,9 +2541,10 @@ pub(crate) mod tests {
 
     #[test]
     fn explicit_alias_wins_over_inferred_output_name() {
+        let mut exprs = ExprArena::default();
         let outputs = [
-            output(0, "chosen", OutputNameKind::Inferred),
-            output(1, "chosen", OutputNameKind::ExplicitAlias),
+            output(&mut exprs, 0, "chosen", OutputNameKind::Inferred),
+            output(&mut exprs, 1, "chosen", OutputNameKind::ExplicitAlias),
         ];
         let mut scope = Scope::default();
         scope.set_outputs(&outputs);
@@ -2471,7 +2559,13 @@ pub(crate) mod tests {
 
     #[test]
     fn source_only_lookup_ignores_output_names() {
-        let outputs = [output(0, "chosen", OutputNameKind::ExplicitAlias)];
+        let mut exprs = ExprArena::default();
+        let outputs = [output(
+            &mut exprs,
+            0,
+            "chosen",
+            OutputNameKind::ExplicitAlias,
+        )];
         let mut scope = Scope::default();
         scope.set_outputs(&outputs);
 
@@ -2484,9 +2578,10 @@ pub(crate) mod tests {
 
     #[test]
     fn output_ordinals_are_one_based_and_keep_output_facts() {
+        let mut exprs = ExprArena::default();
         let outputs = [
-            output(0, "first", OutputNameKind::Inferred),
-            output(1, "second", OutputNameKind::Inferred),
+            output(&mut exprs, 0, "first", OutputNameKind::Inferred),
+            output(&mut exprs, 1, "second", OutputNameKind::Inferred),
         ];
         let mut scope = Scope::default();
         scope.set_outputs(&outputs);
@@ -2509,8 +2604,9 @@ pub(crate) mod tests {
 
     #[test]
     fn output_metadata_is_available_from_nested_scopes() {
-        let mut output = output(0, "value", OutputNameKind::Inferred);
-        output.expr = Expr::Literal(Literal::Numeric("7".into()));
+        let mut exprs = ExprArena::default();
+        let mut output = output(&mut exprs, 0, "value", OutputNameKind::Inferred);
+        output.expr = exprs.push(Expr::Literal(Literal::Numeric("7".into())));
         output.type_fact = TypeFact::known(Type::Real);
         output.affinity = Affinity::Real;
         output.has_affinity = false;
@@ -2536,10 +2632,11 @@ pub(crate) mod tests {
 
     #[test]
     fn output_collation_distinguishes_explicit_and_inherited_values() {
-        let mut explicit = output(0, "explicit", OutputNameKind::Inferred);
+        let mut exprs = ExprArena::default();
+        let mut explicit = output(&mut exprs, 0, "explicit", OutputNameKind::Inferred);
         explicit.collation = Some(collation(10));
         explicit.collation_is_explicit = true;
-        let mut inherited = output(1, "inherited", OutputNameKind::Inferred);
+        let mut inherited = output(&mut exprs, 1, "inherited", OutputNameKind::Inferred);
         inherited.collation = Some(collation(11));
         let explicit_id = explicit.id;
         let inherited_id = inherited.id;

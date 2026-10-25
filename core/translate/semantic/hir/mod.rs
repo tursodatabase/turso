@@ -619,6 +619,86 @@ pub struct HirDocument {
     pub ctes: Vec<Cte>,
     pub schema_programs: Vec<BoundSchemaProgram>,
     pub cdc: Option<CdcPlan>,
+    pub exprs: ExprArena,
+    pub planning: PlanningTerms,
+}
+
+/// Expressions the planner reads that are not written in the statement:
+/// the terms a predicate splits into and the `col IN (...)` terms an OR
+/// implies. They are built when binding ends, so planning only reads the
+/// expression arena.
+#[derive(Clone, Debug, Default)]
+pub struct PlanningTerms {
+    pub(crate) conjuncts: rustc_hash::FxHashMap<ExprId, Vec<ExprId>>,
+    pub(crate) implied_in: rustc_hash::FxHashMap<ExprId, Vec<(ColumnRef, ExprId)>>,
+    /// For a subquery of `x IN (SELECT y ...)`, the `x = y` term it runs
+    /// with when it runs like `EXISTS (SELECT ... AND x = y)`.
+    pub(crate) in_probes: rustc_hash::FxHashMap<QueryId, ExprId>,
+    /// A literal `1`, which stands for a term a plan cannot use.
+    pub(crate) always_true: Option<ExprId>,
+    /// A literal NULL, which `x IS NULL` seeks.
+    pub(crate) null: Option<ExprId>,
+    pub(crate) queries: Vec<QueryFacts>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct QueryFacts {
+    pub(crate) subqueries: Vec<QueryId>,
+    pub(crate) dependencies: Vec<QueryId>,
+    pub(crate) outer_sources: Vec<SourceId>,
+    pub(crate) source_column_usage: Vec<ColumnUsage>,
+}
+
+impl PlanningTerms {
+    pub(crate) fn conjuncts(&self, predicate: ExprId) -> &[ExprId] {
+        self.conjuncts
+            .get(&predicate)
+            .expect("binding prepares the planning terms of every predicate")
+    }
+
+    pub(crate) fn implied_in(&self, term: ExprId) -> &[(ColumnRef, ExprId)] {
+        self.implied_in.get(&term).map_or(&[], Vec::as_slice)
+    }
+
+    pub(crate) fn in_probe(&self, query: QueryId) -> Option<ExprId> {
+        self.in_probes.get(&query).copied()
+    }
+
+    pub(crate) fn always_true(&self) -> ExprId {
+        self.always_true
+            .expect("binding prepares the literal that stands for an unusable term")
+    }
+
+    pub(crate) fn null(&self) -> ExprId {
+        self.null
+            .expect("binding prepares the NULL literal an IS NULL seek uses")
+    }
+
+    fn query(&self, query: QueryId) -> &QueryFacts {
+        self.queries
+            .get(query.index())
+            .expect("binding prepares the facts of every query")
+    }
+
+    pub(crate) fn subqueries(&self, query: QueryId) -> &[QueryId] {
+        &self.query(query).subqueries
+    }
+
+    pub(crate) fn dependencies(&self, query: QueryId) -> &[QueryId] {
+        &self.query(query).dependencies
+    }
+
+    pub(crate) fn outer_sources(&self, query: QueryId) -> &[SourceId] {
+        &self.query(query).outer_sources
+    }
+
+    pub(crate) fn reads_outer_sources(&self, query: QueryId) -> bool {
+        !self.outer_sources(query).is_empty()
+    }
+
+    pub(crate) fn source_column_usage(&self, query: QueryId) -> &[ColumnUsage] {
+        &self.query(query).source_column_usage
+    }
 }
 
 /// One database schema frozen into the semantic-analysis snapshot.
@@ -629,6 +709,10 @@ pub struct DatabaseSnapshot {
 }
 
 impl HirDocument {
+    pub fn expr(&self, id: ExprId) -> ExprRef<'_> {
+        self.exprs.at(id)
+    }
+
     pub fn database(&self, id: DatabaseId) -> Option<&DatabaseSnapshot> {
         self.databases
             .iter()

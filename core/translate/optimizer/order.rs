@@ -78,10 +78,8 @@ pub struct OrderTarget<I, E> {
     pub purpose: OrderTargetPurpose,
 }
 
-pub type HirOrderTarget<'a> = OrderTarget<
-    crate::translate::semantic::hir::SourceId,
-    &'a crate::translate::semantic::hir::Expr,
->;
+pub type HirOrderTarget =
+    OrderTarget<crate::translate::semantic::hir::SourceId, crate::translate::semantic::hir::ExprId>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EqualityPrefixScope {
@@ -109,7 +107,7 @@ pub(crate) fn hir_plan_satisfies_order_target(
     access_methods: &[AccessMethod],
     sources: &[HirPlanSource],
     document: &hir::HirDocument,
-    order_target: &HirOrderTarget<'_>,
+    order_target: &HirOrderTarget,
     schema: &Schema,
 ) -> Result<bool> {
     // A hash build is read into an unordered hash table, so its scan order
@@ -263,7 +261,7 @@ pub(crate) fn hir_plan_satisfies_order_target(
             return Ok(false);
         };
         let consumed = hir_btree_access_order_consumed(
-            &HirOrderSource::new(source, definition),
+            &HirOrderSource::new(source, definition, &document.exprs),
             *iter_dir,
             index.as_deref(),
             constraint_refs,
@@ -352,7 +350,7 @@ pub(crate) fn hir_subquery_intrinsic_order_consumed(
     source: hir::SourceId,
     output_order: &[HirOutputOrder],
     iter_dir: IterationDirection,
-    target: &[ColumnOrder<hir::SourceId, &hir::Expr>],
+    target: &[ColumnOrder<hir::SourceId, hir::ExprId>],
 ) -> usize {
     let intrinsic = output_order
         .iter()
@@ -423,14 +421,20 @@ trait OrderedSource<I, E> {
 pub(crate) struct HirOrderSource<'a> {
     planned: &'a HirPlannedSource,
     definition: &'a hir::Source,
+    exprs: &'a hir::ExprArena,
 }
 
 impl<'a> HirOrderSource<'a> {
-    pub(crate) fn new(planned: &'a HirPlannedSource, definition: &'a hir::Source) -> Self {
+    pub(crate) fn new(
+        planned: &'a HirPlannedSource,
+        definition: &'a hir::Source,
+        exprs: &'a hir::ExprArena,
+    ) -> Self {
         debug_assert_eq!(planned.internal_id, definition.id);
         Self {
             planned,
             definition,
+            exprs,
         }
     }
 
@@ -452,7 +456,7 @@ impl<'a> HirOrderSource<'a> {
     }
 }
 
-impl<'a> OrderedSource<hir::SourceId, &'a hir::Expr> for HirOrderSource<'a> {
+impl OrderedSource<hir::SourceId, hir::ExprId> for HirOrderSource<'_> {
     fn id(&self) -> hir::SourceId {
         self.definition.id
     }
@@ -472,8 +476,8 @@ impl<'a> OrderedSource<hir::SourceId, &'a hir::Expr> for HirOrderSource<'a> {
             .is_none_or(|column| !column.notnull())
     }
 
-    fn expressions_match(&self, target: &'a hir::Expr, indexed: &'a hir::Expr) -> bool {
-        target.equivalent(indexed)
+    fn expressions_match(&self, target: hir::ExprId, indexed: hir::ExprId) -> bool {
+        self.exprs.at(target).equivalent(self.exprs.at(indexed))
     }
 }
 
@@ -482,7 +486,7 @@ impl<'a> OrderedSource<hir::SourceId, &'a hir::Expr> for HirOrderSource<'a> {
 /// index would store encoded, and the index has no expression columns.
 struct SubqueryOrderSource(hir::SourceId);
 
-impl<'a> OrderedSource<hir::SourceId, &'a hir::Expr> for SubqueryOrderSource {
+impl OrderedSource<hir::SourceId, hir::ExprId> for SubqueryOrderSource {
     fn id(&self) -> hir::SourceId {
         self.0
     }
@@ -495,7 +499,7 @@ impl<'a> OrderedSource<hir::SourceId, &'a hir::Expr> for SubqueryOrderSource {
         true
     }
 
-    fn expressions_match(&self, _target: &'a hir::Expr, _indexed: &'a hir::Expr) -> bool {
+    fn expressions_match(&self, _target: hir::ExprId, _indexed: hir::ExprId) -> bool {
         false
     }
 }
@@ -508,12 +512,12 @@ impl<'a> OrderedSource<hir::SourceId, &'a hir::Expr> for SubqueryOrderSource {
 /// ascending, so after an equality-pinned prefix the rows come out in the
 /// order of the remaining index columns.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn hir_materialized_subquery_order_consumed<'a>(
+pub(super) fn hir_materialized_subquery_order_consumed(
     source: hir::SourceId,
     index: &Index,
     constraint_refs: &[RangeConstraintRef],
     iter_dir: IterationDirection,
-    order_target: &HirOrderTarget<'a>,
+    order_target: &HirOrderTarget,
     start_col: usize,
     schema: &Schema,
     equality_prefix_scope: EqualityPrefixScope,
@@ -640,7 +644,7 @@ pub(super) fn hir_btree_access_order_consumed<'a>(
     iter_dir: IterationDirection,
     index: Option<&Index>,
     constraint_refs: &[RangeConstraintRef],
-    order_target: &HirOrderTarget<'a>,
+    order_target: &HirOrderTarget,
     start_col: usize,
     schema: &Schema,
     equality_prefix_scope: EqualityPrefixScope,
@@ -690,7 +694,7 @@ pub(super) fn hir_btree_access_order_consumed<'a>(
                 order: column.order,
                 nulls_order: column.nulls_order,
                 collation: column.collation,
-                expr: expression.as_ref(),
+                expr: *expression,
             }),
         index.columns.len(),
         index.has_rowid,
@@ -829,9 +833,9 @@ mod tests {
         translate::{
             plan::{ColumnUsedMask, HirPlannedSource},
             semantic::hir::{
-                CatalogObject, CatalogObjectId, CatalogSnapshot, DatabaseId, Expr, IndexCoverage,
-                IndexExpressions, IndexHint, Source, SourceColumn, SourceId, SourceKind,
-                SourceOwner, TypeFact,
+                CatalogObject, CatalogObjectId, CatalogSnapshot, DatabaseId, Expr, ExprArena,
+                IndexCoverage, IndexExpressions, IndexHint, Source, SourceColumn, SourceId,
+                SourceKind, SourceOwner, TypeFact,
             },
         },
         vdbe::affinity::Affinity,
@@ -841,11 +845,12 @@ mod tests {
     #[test]
     fn hir_order_target_borrows_resolved_expression() {
         let source = SourceId::new(3);
-        let expression = Expr::column(source, 1);
-        let target: HirOrderTarget<'_> = OrderTarget {
+        let mut exprs = ExprArena::default();
+        let expression = exprs.push(Expr::column(source, 1));
+        let target: HirOrderTarget = OrderTarget {
             columns: vec![ColumnOrder {
                 source,
-                target: ColumnTarget::Expr(&expression),
+                target: ColumnTarget::Expr(expression),
                 order: SortOrder::Asc,
                 collation: CollationSeq::Binary,
                 nulls_order: None,
@@ -856,7 +861,7 @@ mod tests {
         let ColumnTarget::Expr(stored) = target.columns[0].target else {
             panic!("HIR expression target is preserved");
         };
-        assert!(std::ptr::eq(stored, &expression));
+        assert_eq!(stored, expression);
         assert_eq!(target.columns[0].source, source);
     }
 
@@ -888,14 +893,17 @@ mod tests {
             Some(DatabaseId::new(0)),
             Arc::new(table.clone()),
         );
-        let indexed_expression = Expr::Binary {
-            lhs: Box::new(Expr::column(source_id, 0)),
+        let mut exprs = ExprArena::default();
+        let lhs = exprs.push(Expr::column(source_id, 0));
+        let rhs = exprs.push(Expr::Literal(ast::Literal::Numeric("1".to_string())));
+        let indexed_expression = exprs.push(Expr::Binary {
+            lhs,
             operator: Operator::Add,
-            rhs: Box::new(Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+            rhs,
             array_concat: false,
             custom: None,
             comparison: None,
-        };
+        });
         let index = CatalogObject::new(
             CatalogObjectId::new(2),
             CatalogSnapshot::from_id(1),
@@ -939,7 +947,7 @@ mod tests {
             index_hint: IndexHint::None,
             index_expressions: vec![IndexExpressions {
                 index: index.clone(),
-                columns: vec![Some(indexed_expression.clone())],
+                columns: vec![Some(indexed_expression)],
                 predicate: None,
             }],
             index_coverage: IndexCoverage::Complete {
@@ -956,11 +964,11 @@ mod tests {
             expression_index_usages: Vec::new(),
             indexed: IndexHint::None,
         };
-        let target_expression = indexed_expression;
+        let target_expression = exprs.deep_copy(indexed_expression);
         let target = OrderTarget {
             columns: vec![ColumnOrder {
                 source: source_id,
-                target: ColumnTarget::Expr(&target_expression),
+                target: ColumnTarget::Expr(target_expression),
                 order: SortOrder::Asc,
                 collation: CollationSeq::Binary,
                 nulls_order: None,
@@ -969,7 +977,7 @@ mod tests {
         };
 
         let consumption = hir_btree_access_order_consumed(
-            &HirOrderSource::new(&planned, &definition),
+            &HirOrderSource::new(&planned, &definition, &exprs),
             IterationDirection::Forwards,
             Some(index.value()),
             &[],

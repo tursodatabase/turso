@@ -24,10 +24,10 @@ pub(crate) struct HirIndexMethodAccess {
     pub(crate) pattern: usize,
     /// The expressions the pattern's placeholders stand for, in placeholder
     /// order.
-    pub(crate) arguments: Vec<hir::Expr>,
+    pub(crate) arguments: Vec<hir::ExprId>,
     /// Query expressions the index returns, each with the column of the
     /// index cursor that holds it.
-    pub(crate) covered: Vec<(hir::Expr, usize)>,
+    pub(crate) covered: Vec<(hir::ExprId, usize)>,
     /// Which of the pattern's FTS columns the query names, as a
     /// comma-separated list of positions ("0,2"); None for other methods.
     /// Passed to the index after the placeholder values.
@@ -111,7 +111,7 @@ pub(crate) fn match_index_method_predicate(
     term: &HirWhereTerm,
 ) -> Option<HirIndexMethodAccess> {
     let term = HirWhereTerm {
-        expr: term.expr.clone(),
+        expr: term.expr,
         from_outer_join: None,
         consumed: false,
     };
@@ -182,20 +182,20 @@ fn match_pattern(
                 return None;
             }
             let pattern_expr = resolve_alias(columns, &pattern_term.expr);
-            if !matcher.capture(pattern_expr, &query_term.expr) {
+            if !matcher.capture(pattern_expr, query_term.expr) {
                 return None;
             }
         }
     }
     if let Some(pattern_limit) = &pattern.limit {
         let limit = query.limit?;
-        if !matcher.capture(&pattern_limit.expr, &limit.limit) {
+        if !matcher.capture(&pattern_limit.expr, limit.limit) {
             return None;
         }
         // The index only skips rows the pattern asks it to.
         match (&pattern_limit.offset, &limit.offset) {
             (Some(pattern_offset), Some(offset)) => {
-                if !matcher.capture(pattern_offset, offset) {
+                if !matcher.capture(pattern_offset, *offset) {
                     return None;
                 }
             }
@@ -217,7 +217,7 @@ fn match_pattern(
                 return None;
             }
             let mut attempt = matcher.clone();
-            attempt.capture(pattern_where, &term.expr).then(|| {
+            attempt.capture(pattern_where, term.expr).then(|| {
                 matcher = attempt;
                 *position
             })
@@ -234,39 +234,40 @@ fn match_pattern(
     numbers.sort_unstable();
     let arguments = numbers
         .iter()
-        .map(|number| matcher.captures[number].clone())
+        .map(|number| matcher.captures[number])
         .collect::<Vec<_>>();
 
     // Every query expression a result column of the pattern stands for is
     // read from the index.
-    let mut covered: Vec<(hir::Expr, usize)> = Vec::new();
+    let exprs = &query.document.exprs;
+    let mut covered: Vec<(hir::ExprId, usize)> = Vec::new();
     for (column, result_column) in columns.iter().enumerate() {
         let ast::ResultColumn::Expr(pattern_expr, _) = result_column else {
             continue;
         };
-        let mut visit = |expression: &hir::Expr| {
+        let mut visit = |expression: hir::ExprRef<'_>| {
             if covered
                 .iter()
-                .any(|(existing, _)| existing.equivalent(expression))
+                .any(|(existing, _)| exprs.at(*existing).equivalent(expression))
             {
                 return;
             }
             let mut attempt = matcher.clone();
-            if attempt.capture(pattern_expr, expression)
+            if attempt.capture(pattern_expr, expression.id())
                 && attempt.captures.len() == matcher.captures.len()
             {
-                covered.push((expression.clone(), column));
+                covered.push((expression.id(), column));
             }
         };
         for output in query.outputs {
-            output.expr.for_each(&mut visit);
+            exprs.at(output.expr).for_each(&mut visit);
         }
         for term in query.order_by {
-            term.expr.for_each(&mut visit);
+            exprs.at(term.expr).for_each(&mut visit);
         }
         for (position, term) in &where_terms {
             if Some(*position) != predicate {
-                term.expr.for_each(&mut visit);
+                exprs.at(term.expr).for_each(&mut visit);
             }
         }
     }
@@ -276,14 +277,14 @@ fn match_pattern(
     // index even when the pattern returns no column for it.
     if let Some(fts_arguments) = fts_search_arguments(pattern) {
         let score_column = fts_score_column(position);
-        let mut visit = |expression: &hir::Expr| {
+        let mut visit = |expression: hir::ExprRef<'_>| {
             if covered
                 .iter()
-                .any(|(existing, _)| existing.equivalent(expression))
+                .any(|(existing, _)| exprs.at(*existing).equivalent(expression))
             {
                 return;
             }
-            let hir::Expr::Function(call) = expression else {
+            let hir::Expr::Function(call) = expression.node() else {
                 return;
             };
             if !call
@@ -295,21 +296,21 @@ fn match_pattern(
                 return;
             }
             let mut attempt = matcher.clone();
-            if attempt.capture_call("fts_score", fts_arguments, expression)
+            if attempt.capture_call("fts_score", fts_arguments, expression.id())
                 && attempt.captures.len() == matcher.captures.len()
             {
-                covered.push((expression.clone(), score_column));
+                covered.push((expression.id(), score_column));
             }
         };
         for output in query.outputs {
-            output.expr.for_each(&mut visit);
+            exprs.at(output.expr).for_each(&mut visit);
         }
         for term in query.order_by {
-            term.expr.for_each(&mut visit);
+            exprs.at(term.expr).for_each(&mut visit);
         }
         for (position, term) in &where_terms {
             if Some(*position) != predicate {
-                term.expr.for_each(&mut visit);
+                exprs.at(term.expr).for_each(&mut visit);
             }
         }
     }
@@ -412,7 +413,7 @@ fn resolve_alias<'a>(columns: &'a [ast::ResultColumn], expr: &'a ast::Expr) -> &
 struct Matcher<'a> {
     document: &'a HirDocument,
     source: &'a hir::Source,
-    captures: HashMap<u32, &'a hir::Expr>,
+    captures: HashMap<u32, hir::ExprId>,
     /// The pattern's FTS column positions the query names, sorted. Every
     /// FTS function of one query names the same columns.
     fields: Option<Vec<usize>>,
@@ -420,18 +421,19 @@ struct Matcher<'a> {
 
 impl<'a> Matcher<'a> {
     /// An ORDER BY term that names a result column stands for its expression.
-    fn resolve(&self, expr: &'a hir::Expr) -> &'a hir::Expr {
-        match expr {
+    fn resolve(&self, expr: hir::ExprId) -> hir::ExprId {
+        match &self.document.exprs[expr] {
             hir::Expr::Output(id) => self
                 .document
                 .output(*id)
-                .map_or(expr, |output| self.resolve(&output.expr)),
+                .map_or(expr, |output| self.resolve(output.expr)),
             _ => expr,
         }
     }
 
-    fn capture(&mut self, pattern: &ast::Expr, query: &'a hir::Expr) -> bool {
+    fn capture(&mut self, pattern: &ast::Expr, query: hir::ExprId) -> bool {
         let query = self.resolve(query);
+        let exprs = &self.document.exprs;
         match pattern {
             ast::Expr::Variable(variable) => {
                 if !variable.is_positional() {
@@ -440,7 +442,7 @@ impl<'a> Matcher<'a> {
                 let number = variable.index.get();
                 match self.captures.get(&number) {
                     // A placeholder used twice stands for one expression.
-                    Some(previous) => previous.equivalent(query),
+                    Some(previous) => exprs.at(*previous).equivalent(exprs.at(query)),
                     None => {
                         self.captures.insert(number, query);
                         true
@@ -448,7 +450,7 @@ impl<'a> Matcher<'a> {
                 }
             }
             ast::Expr::Id(name) | ast::Expr::Name(name) => {
-                let hir::Expr::Column(column) = query else {
+                let hir::Expr::Column(column) = &exprs[query] else {
                     return false;
                 };
                 column.source == self.source.id
@@ -485,10 +487,11 @@ impl<'a> Matcher<'a> {
     /// pattern's columns, in any order, and the same subset in every call
     /// of one query; the arguments after the columns are positional.
     /// `x MATCH y` and `(x, ...) MATCH y` are calls of `fts_match`.
-    fn capture_call(&mut self, name: &str, args: &[Box<ast::Expr>], query: &'a hir::Expr) -> bool {
+    fn capture_call(&mut self, name: &str, args: &[Box<ast::Expr>], query: hir::ExprId) -> bool {
         let query = self.resolve(query);
-        let mut row_values: Vec<&'a hir::Expr> = Vec::new();
-        let values: &[&'a hir::Expr] = match query {
+        let exprs = &self.document.exprs;
+        let mut row_values: Vec<hir::ExprId> = Vec::new();
+        let values: &[hir::ExprId] = match &exprs[query] {
             hir::Expr::Function(call) => {
                 let hir::FunctionArguments::Expressions {
                     values,
@@ -516,11 +519,11 @@ impl<'a> Matcher<'a> {
                 escape: None,
                 ..
             } if name.eq_ignore_ascii_case("fts_match") => {
-                match lhs.as_ref() {
+                match &exprs[*lhs] {
                     hir::Expr::Row(items) => row_values.extend(items.iter()),
-                    other => row_values.push(other),
+                    _ => row_values.push(*lhs),
                 }
-                row_values.push(rhs);
+                row_values.push(*rhs);
                 &row_values
             }
             _ => return false,
@@ -531,7 +534,7 @@ impl<'a> Matcher<'a> {
                 && args
                     .iter()
                     .zip(values)
-                    .all(|(arg, value)| self.capture(arg, value));
+                    .all(|(arg, value)| self.capture(arg, *value));
         }
         let rest = args.len() - columns;
         let Some(query_columns) = values.len().checked_sub(rest) else {
@@ -545,7 +548,7 @@ impl<'a> Matcher<'a> {
             let Some(position) = (0..columns).find(|&position| {
                 !used[position] && {
                     let mut attempt = self.clone();
-                    attempt.capture(&args[position], value) && {
+                    attempt.capture(&args[position], *value) && {
                         *self = attempt;
                         true
                     }
@@ -564,7 +567,7 @@ impl<'a> Matcher<'a> {
         args[columns..]
             .iter()
             .zip(&values[query_columns..])
-            .all(|(arg, value)| self.capture(arg, value))
+            .all(|(arg, value)| self.capture(arg, *value))
     }
 }
 

@@ -23,7 +23,6 @@ use turso_parser::ast::{Distinctness, Operator, UnaryOperator};
 
 use super::{
     optimizer::CostModelParams,
-    plan::PredicateExpr,
     semantic::hir::{self, HirDocument, QueryBlockId, QueryId, SourceId, SourceOwner},
     semantic_to_plan::{hir_expr_can_fail, HirPlan},
 };
@@ -42,7 +41,7 @@ pub(crate) fn unnest_correlated_subqueries(
     params: &CostModelParams,
     mode: crate::SubqueryUnnestingMode,
 ) -> Result<(Arc<HirDocument>, Vec<hir::Parameter>)> {
-    if mode == crate::SubqueryUnnestingMode::Disabled {
+    if mode == crate::SubqueryUnnestingMode::Disabled || document.queries.len() < 2 {
         return Ok((document, Vec::new()));
     }
     let candidates = queries_innermost_first(&document)
@@ -65,6 +64,7 @@ pub(crate) fn unnest_correlated_subqueries(
         if !rewrite_block(&mut rewritten, block, &mut dropped)? {
             continue;
         }
+        super::plan::prepare_planning_terms(&mut rewritten);
         #[cfg(debug_assertions)]
         rewritten.validate().map_err(|error| {
             crate::LimboError::InternalError(format!(
@@ -170,34 +170,38 @@ fn query_cost(plan: &HirPlan, query: QueryId, params: &CostModelParams) -> Optio
     Some(cost)
 }
 
-fn block_filter(document: &HirDocument, block: QueryBlockId) -> Option<&hir::Expr> {
+fn block_filter(document: &HirDocument, block: QueryBlockId) -> Option<hir::ExprId> {
     match &document.query_block(block)?.body {
-        hir::QueryBlockBody::Select { filter, .. } => filter.as_ref(),
+        hir::QueryBlockBody::Select { filter, .. } => *filter,
         hir::QueryBlockBody::Values { .. } => None,
     }
 }
 
-fn filter_conjuncts(document: &HirDocument, block: QueryBlockId) -> Vec<hir::Expr> {
+fn filter_conjuncts(document: &HirDocument, block: QueryBlockId) -> Vec<hir::ExprId> {
     block_filter(document, block)
-        .map(|filter| filter.conjuncts().cloned().collect())
+        .map(|filter| conjunct_ids(document.expr(filter)))
         .unwrap_or_default()
 }
 
+fn conjunct_ids(expression: hir::ExprRef<'_>) -> Vec<hir::ExprId> {
+    expression.conjuncts().map(|term| term.id()).collect()
+}
+
 /// One subquery test that may become a join.
-enum Candidate<'a> {
+enum Candidate {
     Exists {
         query: QueryId,
         negated: bool,
     },
     In {
-        lhs: &'a hir::Expr,
+        lhs: hir::ExprId,
         query: QueryId,
-        comparison: &'a hir::ComparisonSemantics,
+        comparison: hir::ComparisonSemantics,
     },
 }
 
-fn candidate(conjunct: &hir::Expr) -> Option<Candidate<'_>> {
-    match conjunct {
+fn candidate(document: &HirDocument, conjunct: hir::ExprId) -> Option<Candidate> {
+    match &document.exprs[conjunct] {
         hir::Expr::Subquery(hir::SubqueryExpr::Exists(query)) => Some(Candidate::Exists {
             query: *query,
             negated: false,
@@ -205,7 +209,7 @@ fn candidate(conjunct: &hir::Expr) -> Option<Candidate<'_>> {
         hir::Expr::Unary {
             operator: UnaryOperator::Not,
             expr,
-        } => match expr.as_ref() {
+        } => match &document.exprs[*expr] {
             hir::Expr::Subquery(hir::SubqueryExpr::Exists(query)) => Some(Candidate::Exists {
                 query: *query,
                 negated: true,
@@ -219,15 +223,15 @@ fn candidate(conjunct: &hir::Expr) -> Option<Candidate<'_>> {
             negated: false,
             comparison,
         }) => Some(Candidate::In {
-            lhs,
+            lhs: *lhs,
             query: *query,
-            comparison,
+            comparison: comparison.clone(),
         }),
         _ => None,
     }
 }
 
-fn candidate_query(candidate: &Candidate<'_>) -> QueryId {
+fn candidate_query(candidate: &Candidate) -> QueryId {
     match candidate {
         Candidate::Exists { query, .. } | Candidate::In { query, .. } => *query,
     }
@@ -256,7 +260,7 @@ fn rewrite_block(
         let Some(conjunct) = conjuncts.get(position) else {
             break;
         };
-        let rewritten = match candidate(conjunct) {
+        let rewritten = match candidate(document, *conjunct) {
             Some(candidate @ Candidate::Exists { query, .. })
                 if document.reads_outer_sources(query) =>
             {
@@ -275,7 +279,7 @@ fn rewrite_block(
     let mut tried = HashSet::default();
     // Each one-value subquery rewritten into a grouped table: the clause it
     // was in, its query as it was written, and what replaced it.
-    let mut grouped: Vec<(Clause, hir::Query, hir::Expr)> = Vec::new();
+    let mut grouped: Vec<(Clause, hir::Query, hir::ExprId)> = Vec::new();
     while let Some(query) = block_subqueries(document, block)
         .into_iter()
         .find(|query| !tried.contains(query) && document.reads_outer_sources(*query))
@@ -288,10 +292,10 @@ fn rewrite_block(
             .iter()
             .find_map(|(found_clause, found, replacement)| {
                 (*found_clause == clause && queries_match(document, found, query))
-                    .then(|| replacement.clone())
+                    .then_some(*replacement)
             })
         {
-            if replace_scalar_subquery(document, block, query, &replacement) {
+            if replace_scalar_subquery(document, block, query, replacement) {
                 detach_query(document, query);
                 changed = true;
             }
@@ -300,12 +304,12 @@ fn rewrite_block(
         let conjuncts = filter_conjuncts(document, block);
         let in_conjunct = conjuncts.iter().position(|conjunct| {
             matches!(
-                candidate(conjunct),
+                candidate(document, *conjunct),
                 Some(Candidate::In { query: found, .. }) if found == query
             )
         });
         if let Some(position) = in_conjunct {
-            let candidate = candidate(&conjuncts[position]).expect("found above");
+            let candidate = candidate(document, conjuncts[position]).expect("found above");
             changed |=
                 try_semi_or_anti_join(document, block, &conjuncts, position, &candidate, dropped);
             continue;
@@ -339,18 +343,17 @@ fn subquery_clause(document: &HirDocument, block_id: QueryBlockId, query: QueryI
         filter, grouping, ..
     } = &block.body
     {
-        if filter
-            .as_ref()
-            .is_some_and(|filter| runs_query(filter, query))
-        {
+        if filter.is_some_and(|filter| runs_query(document.expr(filter), query)) {
             return Clause::Where;
         }
         if grouping.as_ref().is_some_and(|grouping| {
-            grouping.keys.iter().any(|key| runs_query(key, query))
+            grouping
+                .keys
+                .iter()
+                .any(|key| runs_query(document.expr(*key), query))
                 || grouping
                     .having
-                    .as_ref()
-                    .is_some_and(|having| runs_query(having, query))
+                    .is_some_and(|having| runs_query(document.expr(having), query))
         }) {
             return Clause::GroupBy;
         }
@@ -358,7 +361,7 @@ fn subquery_clause(document: &HirDocument, block_id: QueryBlockId, query: QueryI
     if block
         .outputs
         .iter()
-        .any(|output| runs_query(&output.expr, query))
+        .any(|output| runs_query(document.expr(output.expr), query))
     {
         return Clause::Outputs;
     }
@@ -399,44 +402,29 @@ fn queries_match(document: &HirDocument, written: &hir::Query, query: QueryId) -
     let (from_source, to_source) = (source.id, written_source.id);
     let (from_block, to_block) = (block.id, written_block.id);
     // The debug form of an expression names every part of it.
-    let rename = |expression: &hir::Expr| {
-        let mut expression = expression.clone();
-        replace_expression(&mut expression, &|expression| match expression {
+    let rename = |expression: hir::ExprId| {
+        expression_shape(document.expr(expression), &|node| match node {
             hir::Expr::Column(column) if column.source == from_source => {
-                Some(hir::Expr::Column(hir::ColumnRef {
-                    source: to_source,
-                    column: column.column,
-                }))
+                column.source = to_source;
             }
-            hir::Expr::RowId(source) if *source == from_source => Some(hir::Expr::RowId(to_source)),
-            _ => None,
-        });
-        replace_expression(&mut expression, &|expression| {
-            let hir::Expr::Function(call) = expression else {
-                return None;
-            };
-            let hir::FunctionEvaluation::Aggregate { id, filter } = &call.evaluation else {
-                return None;
-            };
-            if id.block != from_block {
-                return None;
+            hir::Expr::RowId(source) if *source == from_source => *source = to_source,
+            hir::Expr::Function(call) => {
+                if let hir::FunctionEvaluation::Aggregate { id, .. } = &mut call.evaluation {
+                    if id.block == from_block {
+                        *id = hir::AggregateId::new(to_block, id.index);
+                    }
+                }
             }
-            let mut call = call.clone();
-            call.evaluation = hir::FunctionEvaluation::Aggregate {
-                id: hir::AggregateId::new(to_block, id.index),
-                filter: filter.clone(),
-            };
-            Some(hir::Expr::Function(call))
-        });
-        format!("{expression:?}")
+            _ => {}
+        })
     };
-    let debug = |expression: &hir::Expr| format!("{expression:?}");
-    let body = |block: &hir::QueryBlock, show: &dyn Fn(&hir::Expr) -> String| match &block.body {
+    let debug = |expression: hir::ExprId| expression_shape(document.expr(expression), &|_| {});
+    let body = |block: &hir::QueryBlock, show: &dyn Fn(hir::ExprId) -> String| match &block.body {
         hir::QueryBlockBody::Select {
             distinctness,
             filter,
             grouping: None,
-        } => Some((format!("{distinctness:?}"), filter.as_ref().map(show))),
+        } => Some((format!("{distinctness:?}"), filter.map(show))),
         _ => None,
     };
     written.compounds.is_empty()
@@ -454,10 +442,21 @@ fn queries_match(document: &HirDocument, written: &hir::Query, query: QueryId) -
             .iter()
             .zip(&block.outputs)
             .all(|(written, output)| {
-                written.name == output.name && debug(&written.expr) == rename(&output.expr)
+                written.name == output.name && debug(written.expr) == rename(output.expr)
             })
         && body(written_block, &debug).is_some()
         && body(written_block, &debug) == body(block, &rename)
+}
+
+/// The debug form of every node of `expression`, each changed by `rename`
+/// and without the ids of its children, which differ between copies.
+fn expression_shape(expression: hir::ExprRef<'_>, rename: &dyn Fn(&mut hir::Expr)) -> String {
+    expression.fold(&mut |node, children: &[String]| {
+        let mut node = node.node().clone();
+        node.for_each_child_mut(&mut |child| *child = hir::ExprId::DETACHED);
+        rename(&mut node);
+        format!("{node:?}{children:?}")
+    })
 }
 
 /// Replace every use of the value of `query` in `block` with `replacement`.
@@ -465,15 +464,15 @@ fn replace_scalar_subquery(
     document: &mut HirDocument,
     block: QueryBlockId,
     query: QueryId,
-    replacement: &hir::Expr,
+    replacement: hir::ExprId,
 ) -> bool {
-    replace_in_block(document, block, &|expression| {
+    replace_in_block(document, block, &mut |exprs, expression| {
         matches!(
-            expression,
+            &exprs[expression],
             hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query: found, output: 0 })
                 if *found == query
         )
-        .then(|| replacement.clone())
+        .then_some(replacement)
     })
 }
 
@@ -481,7 +480,7 @@ fn replace_scalar_subquery(
 enum AggregateRewrite {
     /// A column of a grouped table, which a copy of the same subquery can
     /// read too.
-    GroupedTable(hir::Expr),
+    GroupedTable(hir::ExprId),
     /// The aggregate moved into the outer block's HAVING clause.
     Joined,
 }
@@ -492,8 +491,8 @@ enum AggregateRewrite {
 fn block_subqueries(document: &HirDocument, block_id: QueryBlockId) -> Vec<QueryId> {
     let mut subqueries = Vec::new();
     for_each_block_expression(document, block_id, &mut |expression| {
-        expression.for_each(&mut |expression| {
-            if let hir::Expr::Subquery(subquery) = expression {
+        document.expr(expression).for_each(&mut |expression| {
+            if let hir::Expr::Subquery(subquery) = expression.node() {
                 let query = subquery_query(subquery);
                 if !subqueries.contains(&query) {
                     subqueries.push(query);
@@ -509,7 +508,7 @@ fn block_subqueries(document: &HirDocument, block_id: QueryBlockId) -> Vec<Query
 fn for_each_block_expression(
     document: &HirDocument,
     block_id: QueryBlockId,
-    visit: &mut impl FnMut(&hir::Expr),
+    visit: &mut impl FnMut(hir::ExprId),
 ) {
     let (Some(query), Some(block)) = (
         document.query(block_id.query),
@@ -522,42 +521,49 @@ fn for_each_block_expression(
     } = &block.body
     {
         if let Some(filter) = filter {
-            visit(filter);
+            visit(*filter);
         }
         if let Some(grouping) = grouping {
             for key in &grouping.keys {
-                visit(key);
+                visit(*key);
             }
-            if let Some(having) = &grouping.having {
+            if let Some(having) = grouping.having {
                 visit(having);
             }
         }
     }
     for output in &block.outputs {
-        visit(&output.expr);
+        visit(output.expr);
     }
     if query.blocks.len() == 1 {
         for term in &query.order_by {
-            visit(&term.expr);
+            visit(term.expr);
         }
         if let Some(limit) = &query.limit {
-            visit(&limit.limit);
-            if let Some(offset) = &limit.offset {
+            visit(limit.limit);
+            if let Some(offset) = limit.offset {
                 visit(offset);
             }
         }
     }
 }
 
-/// Replace, in place, every expression of `block` that `replace` gives a
-/// replacement for. Return whether anything was replaced.
+/// Replace every expression of `block` that `replace` gives a replacement
+/// for. Return whether anything was replaced.
 fn replace_in_block(
     document: &mut HirDocument,
     block_id: QueryBlockId,
-    replace: &impl Fn(&hir::Expr) -> Option<hir::Expr>,
+    replace: &mut impl FnMut(&mut hir::ExprArena, hir::ExprId) -> Option<hir::ExprId>,
 ) -> bool {
     let mut replaced = false;
-    let query = &mut document.queries[block_id.query.index()];
+    let HirDocument { queries, exprs, .. } = document;
+    let mut visit = |slot: &mut hir::ExprId| {
+        if let Some(replacement) = replace_expression(exprs, *slot, replace) {
+            *slot = replacement;
+            replaced = true;
+        }
+    };
+    let query = &mut queries[block_id.query.index()];
     let single_block = query.blocks.len() == 1;
     let block = &mut query.blocks[block_id.index];
     if let hir::QueryBlockBody::Select {
@@ -565,166 +571,63 @@ fn replace_in_block(
     } = &mut block.body
     {
         if let Some(filter) = filter {
-            replaced |= replace_expression(filter, replace);
+            visit(filter);
         }
         if let Some(grouping) = grouping {
             for key in &mut grouping.keys {
-                replaced |= replace_expression(key, replace);
+                visit(key);
             }
             if let Some(having) = &mut grouping.having {
-                replaced |= replace_expression(having, replace);
+                visit(having);
             }
         }
     }
     for output in &mut block.outputs {
-        replaced |= replace_expression(&mut output.expr, replace);
+        visit(&mut output.expr);
     }
     if single_block {
         for term in &mut query.order_by {
-            replaced |= replace_expression(&mut term.expr, replace);
+            visit(&mut term.expr);
         }
         if let Some(limit) = &mut query.limit {
-            replaced |= replace_expression(&mut limit.limit, replace);
+            visit(&mut limit.limit);
             if let Some(offset) = &mut limit.offset {
-                replaced |= replace_expression(offset, replace);
+                visit(offset);
             }
         }
     }
     replaced
 }
 
-/// Replace `expression`, or each of its parts, that `replace` gives a
-/// replacement for. Parts of a replacement are not visited again.
+/// A copy of `expression` with each part that `replace` gives a replacement
+/// for replaced, or `None` when nothing is replaced. Only the nodes above a
+/// replacement are copied; the rest are shared with `expression`. Parts of a
+/// replacement are not visited again.
 fn replace_expression(
-    expression: &mut hir::Expr,
-    replace: &impl Fn(&hir::Expr) -> Option<hir::Expr>,
-) -> bool {
-    if let Some(replacement) = replace(expression) {
-        *expression = replacement;
-        return true;
+    exprs: &mut hir::ExprArena,
+    expression: hir::ExprId,
+    replace: &mut impl FnMut(&mut hir::ExprArena, hir::ExprId) -> Option<hir::ExprId>,
+) -> Option<hir::ExprId> {
+    if let Some(replacement) = replace(exprs, expression) {
+        return Some(replacement);
     }
+    let mut node = exprs[expression].clone();
     let mut replaced = false;
-    let mut visit = |child: &mut hir::Expr| replaced |= replace_expression(child, replace);
-    match expression {
-        hir::Expr::Literal(_)
-        | hir::Expr::Parameter(_)
-        | hir::Expr::Column(_)
-        | hir::Expr::RowId(_)
-        | hir::Expr::Output(_)
-        | hir::Expr::Subquery(
-            hir::SubqueryExpr::Scalar { .. }
-            | hir::SubqueryExpr::Row { .. }
-            | hir::SubqueryExpr::Exists(_),
-        ) => {}
-        hir::Expr::MergedColumn(column) => {
-            visit(&mut column.left);
-            visit(&mut column.right);
+    node.for_each_child_mut(&mut |child| {
+        if let Some(replacement) = replace_expression(exprs, *child, replace) {
+            *child = replacement;
+            replaced = true;
         }
-        hir::Expr::Unary { expr, .. }
-        | hir::Expr::IsNull(expr)
-        | hir::Expr::NotNull(expr)
-        | hir::Expr::TruthTest { expr, .. }
-        | hir::Expr::Collate { expr, .. }
-        | hir::Expr::Cast { expr, .. } => visit(expr),
-        hir::Expr::Binary { lhs, rhs, .. } => {
-            visit(lhs);
-            visit(rhs);
-        }
-        hir::Expr::Between {
-            expr, start, end, ..
-        } => {
-            visit(expr);
-            visit(start);
-            visit(end);
-        }
-        hir::Expr::Case {
-            base,
-            when_then,
-            else_expr,
-            ..
-        } => {
-            if let Some(base) = base {
-                visit(base);
-            }
-            for (when, then) in when_then {
-                visit(when);
-                visit(then);
-            }
-            if let Some(else_expr) = else_expr {
-                visit(else_expr);
-            }
-        }
-        hir::Expr::Function(call) => {
-            match &mut call.arguments {
-                hir::FunctionArguments::Star => {}
-                hir::FunctionArguments::Expressions {
-                    values, order_by, ..
-                } => {
-                    for value in values {
-                        visit(value);
-                    }
-                    for term in order_by {
-                        visit(&mut term.expr);
-                    }
-                }
-                hir::FunctionArguments::OrderedSet { direct, order_by } => {
-                    for value in direct {
-                        visit(value);
-                    }
-                    visit(&mut order_by.expr);
-                }
-            }
-            match &mut call.evaluation {
-                hir::FunctionEvaluation::Scalar => {}
-                hir::FunctionEvaluation::Aggregate { filter, .. }
-                | hir::FunctionEvaluation::Window { filter, .. } => {
-                    if let Some(filter) = filter {
-                        visit(filter);
-                    }
-                }
-            }
-        }
-        hir::Expr::InList { lhs, values, .. } => {
-            visit(lhs);
-            for value in values {
-                visit(value);
-            }
-        }
-        hir::Expr::Subquery(hir::SubqueryExpr::In { lhs, .. }) => visit(lhs),
-        hir::Expr::Like {
-            lhs, rhs, escape, ..
-        } => {
-            visit(lhs);
-            visit(rhs);
-            if let Some(escape) = escape {
-                visit(escape);
-            }
-        }
-        hir::Expr::Row(expressions) | hir::Expr::Array(expressions) => {
-            for expression in expressions {
-                visit(expression);
-            }
-        }
-        hir::Expr::Subscript { base, index } => {
-            visit(base);
-            visit(index);
-        }
-        hir::Expr::FieldAccess(access) => visit(&mut access.base),
-        hir::Expr::Raise { message, .. } => {
-            if let Some(message) = message {
-                visit(message);
-            }
-        }
-    }
-    replaced
+    });
+    replaced.then(|| exprs.push(node))
 }
 
 /// Every source of an expression's own columns and rowids, without looking
 /// into subqueries.
-fn expression_sources(expression: &hir::Expr) -> Vec<SourceId> {
+fn expression_sources(expression: hir::ExprRef<'_>) -> Vec<SourceId> {
     let mut sources = Vec::new();
     expression.for_each(&mut |expression| {
-        let source = match expression {
+        let source = match expression.node() {
             hir::Expr::Column(column) => column.source,
             hir::Expr::RowId(source) => *source,
             _ => return,
@@ -738,11 +641,11 @@ fn expression_sources(expression: &hir::Expr) -> Vec<SourceId> {
 
 /// Whether evaluating `expression`, or a subquery it runs, may call a
 /// function whose result can change between calls, such as `random()`.
-fn calls_nondeterministic_function(document: &HirDocument, expression: &hir::Expr) -> bool {
+fn calls_nondeterministic_function(document: &HirDocument, expression: hir::ExprRef<'_>) -> bool {
     let mut found = false;
     let mut pending_queries = Vec::new();
-    let mut visit = |expression: &hir::Expr, pending_queries: &mut Vec<QueryId>| {
-        expression.for_each(&mut |expression| match expression {
+    let mut visit = |expression: hir::ExprRef<'_>, pending_queries: &mut Vec<QueryId>| {
+        expression.for_each(&mut |expression| match expression.node() {
             hir::Expr::Function(call) => {
                 let function = call.function.value();
                 found |= !matches!(
@@ -783,15 +686,15 @@ fn subquery_query(subquery: &hir::SubqueryExpr) -> QueryId {
     }
 }
 
-fn and(lhs: hir::Expr, rhs: hir::Expr) -> hir::Expr {
-    hir::Expr::Binary {
-        lhs: Box::new(lhs),
+fn and(exprs: &mut hir::ExprArena, lhs: hir::ExprId, rhs: hir::ExprId) -> hir::ExprId {
+    exprs.push(hir::Expr::Binary {
+        lhs,
         operator: Operator::And,
-        rhs: Box::new(rhs),
+        rhs,
         array_concat: false,
         custom: None,
         comparison: None,
-    }
+    })
 }
 
 /// Move one subquery of `block` into it as a semi-join or anti-join, when
@@ -799,9 +702,9 @@ fn and(lhs: hir::Expr, rhs: hir::Expr) -> hir::Expr {
 fn try_semi_or_anti_join(
     document: &mut HirDocument,
     block_id: QueryBlockId,
-    conjuncts: &[hir::Expr],
+    conjuncts: &[hir::ExprId],
     position: usize,
-    candidate: &Candidate<'_>,
+    candidate: &Candidate,
     dropped: &mut Vec<hir::Parameter>,
 ) -> bool {
     let subquery_id = candidate_query(candidate);
@@ -852,7 +755,7 @@ fn try_semi_or_anti_join(
     };
     // The argument checks of a table function stay with its source, so they
     // move with it and must pass the same checks as the WHERE terms.
-    let mut source_terms: &[hir::Expr] = &[];
+    let mut source_terms: &[hir::ExprId] = &[];
     match &inner_definition.kind {
         hir::SourceKind::Table(_) => {}
         hir::SourceKind::TableFunction {
@@ -912,8 +815,8 @@ fn try_semi_or_anti_join(
     }
     let mut moved_nested = Vec::new();
     if let Some(filter) = inner_filter {
-        filter.for_each(&mut |expression| {
-            if let hir::Expr::Subquery(subquery) = expression {
+        document.expr(*filter).for_each(&mut |expression| {
+            if let hir::Expr::Subquery(subquery) = expression.node() {
                 let query = subquery_query(subquery);
                 if !moved_nested.contains(&query) {
                     moved_nested.push(query);
@@ -928,9 +831,9 @@ fn try_semi_or_anti_join(
         .collect::<Vec<_>>();
 
     let mut terms = inner_filter
-        .as_ref()
-        .map(|filter| filter.conjuncts().cloned().collect::<Vec<_>>())
+        .map(|filter| conjunct_ids(document.expr(filter)))
         .unwrap_or_default();
+    let mut in_link = None;
     match candidate {
         Candidate::Exists { .. } => {
             // EXISTS ignores its SELECT list, which disappears with the
@@ -943,7 +846,7 @@ fn try_semi_or_anti_join(
             }
             // A join can skip an inner row the subquery tests, and so hide
             // an error that row's WHERE terms would raise.
-            if terms.iter().any(|term| hir_expr_can_fail(document, term)) {
+            if terms.iter().any(|term| hir_expr_can_fail(document, *term)) {
                 return false;
             }
         }
@@ -958,25 +861,30 @@ fn try_semi_or_anti_join(
             // semi-join stops at its first match, and the left side runs once
             // for every inner row instead of once. So nothing involved may
             // fail.
-            if hir_expr_can_fail(document, lhs)
-                || hir_expr_can_fail(document, &output.expr)
-                || terms.iter().any(|term| hir_expr_can_fail(document, term))
+            if hir_expr_can_fail(document, *lhs)
+                || hir_expr_can_fail(document, output.expr)
+                || terms.iter().any(|term| hir_expr_can_fail(document, *term))
             {
                 return false;
             }
-            terms.push(hir::Expr::Binary {
-                lhs: Box::new((*lhs).clone()),
+            in_link = Some(hir::Expr::Binary {
+                lhs: *lhs,
                 operator: Operator::Equals,
-                rhs: Box::new(output.expr.clone()),
+                rhs: output.expr,
                 array_concat: false,
                 custom: None,
-                comparison: Some((*comparison).clone()),
+                comparison: Some(comparison.clone()),
             });
         }
     }
     let negated = matches!(candidate, Candidate::Exists { negated: true, .. });
 
-    for term in terms.iter().chain(source_terms) {
+    let checked = terms
+        .iter()
+        .chain(source_terms)
+        .map(|term| document.expr(*term))
+        .chain(in_link.as_ref().map(|link| document.exprs.detached(link)));
+    for term in checked {
         // A function such as random() could run a different number of times.
         if calls_nondeterministic_function(document, term) {
             return false;
@@ -1004,7 +912,7 @@ fn try_semi_or_anti_join(
     }
     if matches!(candidate, Candidate::Exists { .. }) {
         for output in &document.queries[subquery_id.index()].blocks[0].outputs {
-            collect_parameters(&output.expr, dropped);
+            collect_parameters(document.expr(output.expr), dropped);
         }
         for query in dropped_nested {
             drop_query_tree(document, query, dropped);
@@ -1015,9 +923,15 @@ fn try_semi_or_anti_join(
     }
     document.sources[inner_source.index()].owner = SourceOwner::QueryBlock(block_id);
 
+    if let Some(link) = in_link {
+        terms.push(document.exprs.push(link));
+    }
     let mut remaining = conjuncts.to_vec();
     remaining.remove(position);
     remaining.extend(terms);
+    let remaining = remaining
+        .into_iter()
+        .reduce(|lhs, rhs| and(&mut document.exprs, lhs, rhs));
     let block = &mut document.queries[block_id.query.index()].blocks[block_id.index];
     let from = block.from.as_mut().expect("checked above");
     from.joins.push(hir::Join {
@@ -1032,7 +946,7 @@ fn try_semi_or_anti_join(
     let hir::QueryBlockBody::Select { filter, .. } = &mut block.body else {
         unreachable!("a block with a WHERE clause is a SELECT");
     };
-    *filter = remaining.into_iter().reduce(and);
+    *filter = remaining;
 
     detach_query(document, subquery_id);
     true
@@ -1052,22 +966,22 @@ fn push_join_before_semi_anti(from: &mut hir::From, join: hir::Join) {
 
 /// Whether one side of a comparison reads only the inner source and the
 /// other only outer sources.
-fn is_inner_outer_comparison(expression: &hir::Expr, inner_source: SourceId) -> bool {
+fn is_inner_outer_comparison(expression: hir::ExprRef<'_>, inner_source: SourceId) -> bool {
     let hir::Expr::Binary {
         lhs,
         operator,
         rhs,
         custom: None,
         ..
-    } = expression
+    } = expression.node()
     else {
         return false;
     };
     if !operator.is_comparison() {
         return false;
     }
-    let side = |expression: &hir::Expr| {
-        let sources = expression_sources(expression);
+    let side = |side: hir::ExprId| {
+        let sources = expression_sources(expression.at(side));
         if sources.is_empty() {
             return None;
         }
@@ -1080,14 +994,14 @@ fn is_inner_outer_comparison(expression: &hir::Expr, inner_source: SourceId) -> 
         }
     };
     matches!(
-        (side(lhs), side(rhs)),
+        (side(*lhs), side(*rhs)),
         (Some(true), Some(false)) | (Some(false), Some(true))
     )
 }
 
-fn collect_parameters(expression: &hir::Expr, parameters: &mut Vec<hir::Parameter>) {
+fn collect_parameters(expression: hir::ExprRef<'_>, parameters: &mut Vec<hir::Parameter>) {
     expression.for_each(&mut |expression| {
-        if let hir::Expr::Parameter(parameter) = expression {
+        if let hir::Expr::Parameter(parameter) = expression.node() {
             parameters.push(parameter.clone());
         }
     });
@@ -1188,9 +1102,9 @@ fn aggregate_function(expression: &hir::Expr) -> Option<&crate::function::AggFun
 
 /// The result of a one-value aggregate subquery for no input rows, if it is
 /// known.
-fn result_on_empty_input(expression: &hir::Expr) -> Option<EmptyInputValue> {
+fn result_on_empty_input(expression: hir::ExprRef<'_>) -> Option<EmptyInputValue> {
     use crate::function::AggFunc;
-    if let Some(function) = aggregate_function(expression) {
+    if let Some(function) = aggregate_function(expression.node()) {
         return match function {
             AggFunc::Count | AggFunc::Count0 => Some(EmptyInputValue::IntegerZero),
             AggFunc::Total => Some(EmptyInputValue::RealZero),
@@ -1207,9 +1121,9 @@ fn result_on_empty_input(expression: &hir::Expr) -> Option<EmptyInputValue> {
 }
 
 /// Whether an expression must be NULL when its aggregates read no row.
-fn is_null_on_empty_input(expression: &hir::Expr) -> bool {
+fn is_null_on_empty_input(expression: hir::ExprRef<'_>) -> bool {
     use crate::function::AggFunc;
-    if aggregate_function(expression).is_some_and(|function| {
+    if aggregate_function(expression.node()).is_some_and(|function| {
         matches!(
             function,
             AggFunc::Avg
@@ -1222,7 +1136,7 @@ fn is_null_on_empty_input(expression: &hir::Expr) -> bool {
     }) {
         return true;
     }
-    match expression {
+    match expression.node() {
         hir::Expr::Binary {
             lhs,
             operator:
@@ -1240,10 +1154,13 @@ fn is_null_on_empty_input(expression: &hir::Expr) -> bool {
             custom: None,
             array_concat: false,
             ..
-        } => is_null_on_empty_input(lhs) || is_null_on_empty_input(rhs),
+        } => {
+            is_null_on_empty_input(expression.at(*lhs))
+                || is_null_on_empty_input(expression.at(*rhs))
+        }
         hir::Expr::Unary { expr, .. }
         | hir::Expr::Cast { expr, .. }
-        | hir::Expr::Collate { expr, .. } => is_null_on_empty_input(expr),
+        | hir::Expr::Collate { expr, .. } => is_null_on_empty_input(expression.at(*expr)),
         _ => false,
     }
 }
@@ -1253,13 +1170,13 @@ struct ColumnPair {
     inner: hir::ColumnRef,
     outer: hir::ColumnRef,
     /// The `=` term, which keeps its comparison rules.
-    term: hir::Expr,
+    term: hir::ExprId,
 }
 
 /// An `=` between one column of the subquery's own sources and one column
 /// of `outer`.
 fn read_column_pair(
-    term: &hir::Expr,
+    term: hir::ExprRef<'_>,
     inner_sources: &[SourceId],
     outer: SourceId,
 ) -> Option<ColumnPair> {
@@ -1269,11 +1186,13 @@ fn read_column_pair(
         rhs,
         custom: None,
         ..
-    } = term
+    } = term.node()
     else {
         return None;
     };
-    let (hir::Expr::Column(left), hir::Expr::Column(right)) = (lhs.as_ref(), rhs.as_ref()) else {
+    let (hir::Expr::Column(left), hir::Expr::Column(right)) =
+        (term.at(*lhs).node(), term.at(*rhs).node())
+    else {
         return None;
     };
     let (inner, outer_column) = if inner_sources.contains(&left.source) && right.source == outer {
@@ -1286,7 +1205,7 @@ fn read_column_pair(
     Some(ColumnPair {
         inner,
         outer: outer_column,
-        term: term.clone(),
+        term: term.id(),
     })
 }
 
@@ -1330,13 +1249,13 @@ fn column_pair_compares_the_same(document: &HirDocument, pair: &ColumnPair) -> b
 fn aggregate_can_run_for_unused_rows(
     document: &HirDocument,
     block: &hir::QueryBlock,
-    inner_where: &[hir::Expr],
+    inner_where: &[hir::ExprId],
 ) -> bool {
     use crate::function::AggFunc;
     let mut safe = true;
     for output in &block.outputs {
-        output.expr.for_each(&mut |expression| {
-            let Some(function) = aggregate_function(expression) else {
+        document.expr(output.expr).for_each(&mut |expression| {
+            let Some(function) = aggregate_function(&expression) else {
                 return;
             };
             safe &= matches!(
@@ -1348,20 +1267,21 @@ fn aggregate_can_run_for_unused_rows(
                     | AggFunc::Min
                     | AggFunc::Total
             );
-            let hir::Expr::Function(call) = expression else {
+            let hir::Expr::Function(call) = expression.node() else {
                 unreachable!("an aggregate is a function call");
             };
             safe &= !call
                 .arguments
                 .expressions()
                 .iter()
+                .copied()
                 .chain(call.evaluation.filter())
                 .any(|argument| hir_expr_can_fail(document, argument));
         });
     }
     safe && !inner_where
         .iter()
-        .any(|term| hir_expr_can_fail(document, term))
+        .any(|term| hir_expr_can_fail(document, *term))
 }
 
 /// Every source of a FROM clause, including those in parenthesized groups.
@@ -1398,26 +1318,32 @@ fn join_constraints_read(
             {
                 pending.push(&group.from);
             }
-            let mut visit = |expression: &hir::Expr| {
-                expression.for_each(&mut |expression| match expression {
-                    hir::Expr::Column(column) => reads |= sources.contains(&column.source),
-                    hir::Expr::RowId(source) => reads |= sources.contains(source),
-                    hir::Expr::Subquery(subquery) => {
-                        reads |= Some(subquery_query(subquery)) == query
-                    }
-                    _ => {}
-                });
+            let mut visit = |expression: hir::ExprId| {
+                document
+                    .expr(expression)
+                    .for_each(&mut |expression| match expression.node() {
+                        hir::Expr::Column(column) => reads |= sources.contains(&column.source),
+                        hir::Expr::RowId(source) => reads |= sources.contains(source),
+                        hir::Expr::Subquery(subquery) => {
+                            reads |= Some(subquery_query(subquery)) == query
+                        }
+                        _ => {}
+                    });
             };
+            let mut right_read = false;
+            let mut visit_right =
+                |column: hir::ColumnRef| right_read |= sources.contains(&column.source);
             match &join.constraint {
                 hir::JoinConstraint::None => {}
-                hir::JoinConstraint::On(expression) => visit(expression),
+                hir::JoinConstraint::On(expression) => visit(*expression),
                 hir::JoinConstraint::Using(columns) | hir::JoinConstraint::Natural(columns) => {
                     for column in columns {
-                        visit(&column.left);
-                        visit(&hir::Expr::Column(column.right));
+                        visit(column.left);
+                        visit_right(column.right);
                     }
                 }
             }
+            reads |= right_read;
         }
     }
     reads
@@ -1464,8 +1390,8 @@ fn try_aggregate_rewrite(
     // Only a one-value use reads the grouped table: IN and EXISTS stay.
     let mut used_only_as_value = true;
     for_each_block_expression(document, block_id, &mut |expression| {
-        expression.for_each(&mut |expression| {
-            if let hir::Expr::Subquery(subquery) = expression {
+        document.expr(expression).for_each(&mut |expression| {
+            if let hir::Expr::Subquery(subquery) = expression.node() {
                 used_only_as_value &= subquery_query(subquery) != query_id
                     || matches!(subquery, hir::SubqueryExpr::Scalar { output: 0, .. });
             }
@@ -1487,7 +1413,7 @@ fn try_aggregate_rewrite(
     let limit_is_one = query.limit.as_ref().is_none_or(|limit| {
         limit.offset.is_none()
             && matches!(
-                &limit.limit,
+                &document.exprs[limit.limit],
                 hir::Expr::Literal(turso_parser::ast::Literal::Numeric(value))
                     if value.parse::<i64>() == Ok(1)
             )
@@ -1530,14 +1456,13 @@ fn try_aggregate_rewrite(
             return None;
         }
     }
-    if calls_nondeterministic_function(document, &output.expr)
+    if calls_nondeterministic_function(document, document.expr(output.expr))
         || inner_filter
-            .as_ref()
-            .is_some_and(|filter| calls_nondeterministic_function(document, filter))
+            .is_some_and(|filter| calls_nondeterministic_function(document, document.expr(filter)))
     {
         return None;
     }
-    let empty_value = result_on_empty_input(&output.expr)?;
+    let empty_value = result_on_empty_input(document.expr(output.expr))?;
     // A grouped table linked to more than one outer table can move before
     // one of those tables after its left join becomes an inner join.
     let outer_sources = document.outer_sources(query_id);
@@ -1553,22 +1478,22 @@ fn try_aggregate_rewrite(
     let mut pairs = Vec::new();
     let mut inner_where = Vec::new();
     for term in inner_filter
-        .as_ref()
-        .map(|filter| filter.conjuncts().cloned().collect::<Vec<_>>())
+        .map(|filter| conjunct_ids(document.expr(filter)))
         .unwrap_or_default()
     {
-        if !expression_sources(&term).contains(&outer) {
-            inner_where.push(term);
+        let term = document.expr(term);
+        if !expression_sources(term).contains(&outer) {
+            inner_where.push(term.id());
             continue;
         }
-        let pair = read_column_pair(&term, &inner_sources, outer)?;
+        let pair = read_column_pair(term, &inner_sources, outer)?;
         if !column_pair_compares_the_same(document, &pair) {
             return None;
         }
         pairs.push(pair);
     }
     // The outer row may only be read by the links.
-    if pairs.is_empty() || expression_sources(&output.expr).contains(&outer) {
+    if pairs.is_empty() || expression_sources(document.expr(output.expr)).contains(&outer) {
         return None;
     }
     if !aggregate_can_run_for_unused_rows(document, inner_block, &inner_where) {
@@ -1609,17 +1534,28 @@ fn try_aggregate_rewrite(
         rowid_alias: false,
     };
     let inner_block_id = inner_block.id;
+    let key_outputs = keys
+        .iter()
+        .map(|key| document.exprs.push(hir::Expr::Column(*key)))
+        .collect::<Vec<_>>();
+    let grouping_keys = keys
+        .iter()
+        .map(|key| document.exprs.push(hir::Expr::Column(*key)))
+        .collect::<Vec<_>>();
+    let inner_where = inner_where
+        .into_iter()
+        .reduce(|lhs, rhs| and(&mut document.exprs, lhs, rhs));
 
     let query = &mut document.queries[query_id.index()];
     query.captures.clear();
     query.limit = None;
     let inner_block = &mut query.blocks[0];
-    for (index, (key, column)) in keys.iter().zip(&key_columns).enumerate() {
+    for (index, (expr, column)) in key_outputs.into_iter().zip(&key_columns).enumerate() {
         let id = hir::OutputId::query(inner_block_id, inner_block.outputs.len());
         inner_block.outputs.push(hir::Output {
             id,
             name: format!("correlation_key_{index}"),
-            expr: hir::Expr::Column(*key),
+            expr,
             type_fact: column.type_fact.clone(),
             affinity: column.affinity,
             schema_affinity: column.affinity,
@@ -1637,9 +1573,9 @@ fn try_aggregate_rewrite(
     else {
         unreachable!("checked above");
     };
-    *filter = inner_where.into_iter().reduce(and);
+    *filter = inner_where;
     *grouping = Some(hir::Grouping {
-        keys: keys.iter().map(|key| hir::Expr::Column(*key)).collect(),
+        keys: grouping_keys,
         key_type_facts: key_columns
             .iter()
             .map(|column| column.type_fact.clone())
@@ -1691,18 +1627,19 @@ fn try_aggregate_rewrite(
         .into_iter()
         .zip(positions)
         .map(|(pair, position)| {
-            let mut term = pair.term;
             let grouped_column = hir::ColumnRef {
                 source: grouped,
                 column: position,
             };
-            replace_expression(&mut term, &|expression| {
-                matches!(expression, hir::Expr::Column(column) if *column == pair.inner)
-                    .then_some(hir::Expr::Column(grouped_column))
-            });
-            term
+            replace_expression(&mut document.exprs, pair.term, &mut |exprs, expression| {
+                matches!(&exprs[expression], hir::Expr::Column(column) if *column == pair.inner)
+                    .then(|| exprs.push(hir::Expr::Column(grouped_column)))
+            })
+            .unwrap_or(pair.term)
         })
-        .reduce(and)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .reduce(|lhs, rhs| and(&mut document.exprs, lhs, rhs))
         .expect("a grouped table has a link");
     let block = &mut document.queries[block_id.query.index()].blocks[block_id.index];
     push_join_before_semi_anti(
@@ -1720,44 +1657,50 @@ fn try_aggregate_rewrite(
     });
     // Keep the zero that count and total return for no row.
     let replacement = match empty_value {
-        EmptyInputValue::Null => result,
-        EmptyInputValue::IntegerZero | EmptyInputValue::RealZero => hir::Expr::Case {
-            base: None,
-            when_then: vec![(
-                hir::Expr::IsNull(Box::new(result.clone())),
-                hir::Expr::Literal(turso_parser::ast::Literal::Numeric(
-                    if matches!(empty_value, EmptyInputValue::IntegerZero) {
-                        "0"
-                    } else {
-                        "0.0"
-                    }
-                    .to_string(),
-                )),
-            )],
-            else_expr: Some(Box::new(result)),
-            base_comparisons: Vec::new(),
-        },
+        EmptyInputValue::Null => document.exprs.push(result),
+        EmptyInputValue::IntegerZero | EmptyInputValue::RealZero => {
+            let tested = document.exprs.push(result.clone());
+            let is_null = document.exprs.push(hir::Expr::IsNull(tested));
+            let zero =
+                document
+                    .exprs
+                    .push(hir::Expr::Literal(turso_parser::ast::Literal::Numeric(
+                        if matches!(empty_value, EmptyInputValue::IntegerZero) {
+                            "0"
+                        } else {
+                            "0.0"
+                        }
+                        .to_string(),
+                    )));
+            let value = document.exprs.push(result);
+            document.exprs.push(hir::Expr::Case {
+                base: None,
+                when_then: vec![(is_null, zero)],
+                else_expr: Some(value),
+                base_comparisons: Vec::new(),
+            })
+        }
     };
-    let replaced = replace_scalar_subquery(document, block_id, query_id, &replacement);
+    let replaced = replace_scalar_subquery(document, block_id, query_id, replacement);
     assert!(replaced, "a block subquery is used by the block");
     Some(AggregateRewrite::GroupedTable(replacement))
 }
 
 /// Whether `expression` runs `query`.
-fn runs_query(expression: &hir::Expr, query: QueryId) -> bool {
+fn runs_query(expression: hir::ExprRef<'_>, query: QueryId) -> bool {
     let mut runs = false;
     expression.for_each(&mut |expression| {
-        if let hir::Expr::Subquery(subquery) = expression {
+        if let hir::Expr::Subquery(subquery) = expression.node() {
             runs |= subquery_query(subquery) == query;
         }
     });
     runs
 }
 
-fn runs_any_query(expression: &hir::Expr) -> bool {
+fn runs_any_query(expression: hir::ExprRef<'_>) -> bool {
     let mut runs = false;
     expression.for_each(&mut |expression| {
-        runs |= matches!(expression, hir::Expr::Subquery(_));
+        runs |= matches!(expression.node(), hir::Expr::Subquery(_));
     });
     runs
 }
@@ -1829,7 +1772,7 @@ fn try_join_first(document: &mut HirDocument, block_id: QueryBlockId, query_id: 
         return false;
     }
     let inner = inner_from.first;
-    let result = inner_block.outputs[0].expr.clone();
+    let result = inner_block.outputs[0].expr;
 
     // The subquery must be one whole side of one WHERE comparison, and every
     // other WHERE term must give the same value each time it runs, since it
@@ -1837,17 +1780,18 @@ fn try_join_first(document: &mut HirDocument, block_id: QueryBlockId, query_id: 
     if block
         .outputs
         .iter()
-        .any(|output| runs_query(&output.expr, query_id))
+        .any(|output| runs_query(document.expr(output.expr), query_id))
     {
         return false;
     }
-    let conjuncts = filter.conjuncts().cloned().collect::<Vec<_>>();
+    let conjuncts = conjunct_ids(document.expr(*filter));
     let mut found = None;
     for (position, term) in conjuncts.iter().enumerate() {
+        let term = document.expr(*term);
         if !runs_query(term, query_id) {
             let mut reads_correlated_subquery = false;
             term.for_each(&mut |expression| {
-                if let hir::Expr::Subquery(subquery) = expression {
+                if let hir::Expr::Subquery(subquery) = expression.node() {
                     reads_correlated_subquery |=
                         document.reads_outer_sources(subquery_query(subquery));
                 }
@@ -1867,40 +1811,40 @@ fn try_join_first(document: &mut HirDocument, block_id: QueryBlockId, query_id: 
             array_concat,
             custom,
             comparison,
-        } = term
+        } = term.node()
         else {
             return false;
         };
         if !operator.is_comparison() {
             return false;
         }
-        let is_subquery = |expression: &hir::Expr| {
+        let is_subquery = |expression: hir::ExprId| {
             matches!(
-                expression,
+                &document.exprs[expression],
                 hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output: 0 })
                     if *query == query_id
             )
         };
-        let (lhs, rhs) = if is_subquery(lhs) && !runs_any_query(rhs) {
-            (result.clone(), rhs.as_ref().clone())
-        } else if is_subquery(rhs) && !runs_any_query(lhs) {
-            (lhs.as_ref().clone(), result.clone())
+        let (lhs, rhs) = if is_subquery(*lhs) && !runs_any_query(term.at(*rhs)) {
+            (result, *rhs)
+        } else if is_subquery(*rhs) && !runs_any_query(term.at(*lhs)) {
+            (*lhs, result)
         } else {
             return false;
         };
         found = Some((
             position,
             hir::Expr::Binary {
-                lhs: Box::new(lhs),
+                lhs,
                 operator: *operator,
-                rhs: Box::new(rhs),
+                rhs,
                 array_concat: *array_concat,
                 custom: custom.clone(),
                 comparison: comparison.clone(),
             },
         ));
     }
-    let Some((position, mut having)) = found else {
+    let Some((position, having)) = found else {
         return false;
     };
     let hir::QueryBlockBody::Select {
@@ -1910,38 +1854,45 @@ fn try_join_first(document: &mut HirDocument, block_id: QueryBlockId, query_id: 
     else {
         return false;
     };
-    let inner_filter = inner_filter.clone();
+    let inner_filter = *inner_filter;
     let inner_block_id = inner_block.id;
     let inner_aggregates = inner_block.aggregate_count;
     let outer_aggregates = block.aggregate_count;
 
     // Every check passed. The aggregates move into the outer block, and the
     // NULL row the LEFT JOIN makes when nothing matches stays out of them.
-    let inner_row_exists = hir::Expr::NotNull(Box::new(hir::Expr::RowId(inner)));
-    replace_expression(&mut having, &|expression| {
-        let hir::Expr::Function(call) = expression else {
+    let having = document.exprs.push(having);
+    let having = replace_expression(&mut document.exprs, having, &mut |exprs, expression| {
+        let hir::Expr::Function(call) = &exprs[expression] else {
             return None;
         };
-        let hir::FunctionEvaluation::Aggregate { id, filter } = &call.evaluation else {
+        let hir::FunctionEvaluation::Aggregate { id, filter } = call.evaluation else {
             return None;
         };
         if id.block != inner_block_id {
             return None;
         }
         let mut call = call.clone();
+        let rowid = exprs.push(hir::Expr::RowId(inner));
+        let inner_row_exists = exprs.push(hir::Expr::NotNull(rowid));
         call.evaluation = hir::FunctionEvaluation::Aggregate {
             id: hir::AggregateId::new(block_id, outer_aggregates + id.index),
-            filter: Some(Box::new(match filter {
-                Some(filter) => and(inner_row_exists.clone(), filter.as_ref().clone()),
-                None => inner_row_exists.clone(),
-            })),
+            filter: Some(match filter {
+                Some(filter) => and(exprs, inner_row_exists, filter),
+                None => inner_row_exists,
+            }),
         };
-        Some(hir::Expr::Function(call))
-    });
+        Some(exprs.push(hir::Expr::Function(call)))
+    })
+    .unwrap_or(having);
 
     document.sources[inner.index()].owner = SourceOwner::QueryBlock(block_id);
     let mut remaining = conjuncts;
     remaining.remove(position);
+    let remaining = remaining
+        .into_iter()
+        .reduce(|lhs, rhs| and(&mut document.exprs, lhs, rhs));
+    let grouping_key = document.exprs.push(hir::Expr::RowId(outer));
     let block = &mut document.queries[block_id.query.index()].blocks[block_id.index];
     push_join_before_semi_anti(
         block.from.as_mut().expect("checked above"),
@@ -1961,9 +1912,9 @@ fn try_join_first(document: &mut HirDocument, block_id: QueryBlockId, query_id: 
     else {
         unreachable!("checked above");
     };
-    *filter = remaining.into_iter().reduce(and);
+    *filter = remaining;
     *grouping = Some(hir::Grouping {
-        keys: vec![hir::Expr::RowId(outer)],
+        keys: vec![grouping_key],
         key_type_facts: vec![hir::TypeFact::known(crate::schema::Type::Integer)],
         key_collations: vec![None],
         having: Some(having),

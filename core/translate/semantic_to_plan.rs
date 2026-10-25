@@ -14,7 +14,7 @@ use super::{
     },
     plan::{
         ColumnUsedMask, HirCteMaterialization, HirFromGroupBoundary, HirFromLayout, HirJoinInfo,
-        HirPlanSource, HirPlannedSource, HirWhereTerm, PredicateExpr,
+        HirPlanSource, HirPlannedSource, HirWhereTerm,
     },
     semantic::hir::{self, ColumnUsage, HirDocument, QueryBlockId, QueryId, SourceId},
 };
@@ -80,16 +80,16 @@ pub(crate) fn group_key_order(
     };
     let mut order: Vec<GroupKeyOrder> = Vec::with_capacity(grouping.keys.len());
     for term in order_by {
-        let mut expression = &term.expr;
-        while let hir::Expr::Output(output) = expression {
-            expression = &document.output(*output)?.expr;
+        let mut expression = term.expr;
+        while let hir::Expr::Output(output) = &document.exprs[expression] {
+            expression = document.output(*output)?.expr;
         }
         let key = grouping
             .keys
             .iter()
             .zip(&grouping.key_collations)
             .position(|(key, key_collation)| {
-                expression.equivalent(key)
+                document.expr(expression).equivalent(document.expr(*key))
                     && collation(term.collation.as_ref()) == collation(key_collation.as_ref())
             })?;
         if !order.iter().any(|known| known.key == key) {
@@ -116,10 +116,10 @@ pub(crate) fn group_key_order(
 /// Function calls, LIKE, RAISE, JSON and array operators, custom types,
 /// casts and nested subqueries all count; plain columns, literals,
 /// parameters, arithmetic and comparisons do not.
-pub(crate) fn hir_expr_can_fail(document: &HirDocument, expression: &hir::Expr) -> bool {
+pub(crate) fn hir_expr_can_fail(document: &HirDocument, expression: hir::ExprId) -> bool {
     let mut can_fail = false;
-    expression.for_each(&mut |expression| {
-        can_fail |= match expression {
+    document.expr(expression).for_each(&mut |expression| {
+        can_fail |= match expression.node() {
             hir::Expr::Function(_)
             | hir::Expr::Like { .. }
             | hir::Expr::Raise { .. }
@@ -179,7 +179,7 @@ fn hir_from_can_fail(document: &HirDocument, from: &hir::From) -> bool {
         })
         || from.joins.iter().any(|join| match &join.constraint {
             hir::JoinConstraint::None => false,
-            hir::JoinConstraint::On(expression) => hir_expr_can_fail(document, expression),
+            hir::JoinConstraint::On(expression) => hir_expr_can_fail(document, *expression),
             hir::JoinConstraint::Using(_) | hir::JoinConstraint::Natural(_) => true,
         })
 }
@@ -190,13 +190,14 @@ fn hir_from_can_fail(document: &HirDocument, from: &hir::From) -> bool {
 /// MIN and descending for MAX. Like SQLite, a scan in that order stops at
 /// the first non-NULL x.
 fn simple_min_max_term(
+    document: &HirDocument,
     block: &hir::QueryBlock,
     input: &HirQueryBlockPlanInput,
 ) -> Option<hir::OrderTerm> {
     let [output] = block.outputs.as_slice() else {
         return None;
     };
-    let hir::Expr::Function(call) = &output.expr else {
+    let hir::Expr::Function(call) = &document.exprs[output.expr] else {
         return None;
     };
     let order = match call.function.value() {
@@ -237,7 +238,7 @@ fn simple_min_max_term(
         )
         && single_btree)
         .then(|| hir::OrderTerm {
-            expr: argument.clone(),
+            expr: *argument,
             order,
             nulls: None,
             type_fact: fact.type_fact.clone(),
@@ -248,6 +249,7 @@ fn simple_min_max_term(
 /// Whether a block is `SELECT count(*) FROM t` with nothing else, which
 /// SQLite answers without a loop over the table.
 fn is_simple_count(
+    document: &HirDocument,
     block: &hir::QueryBlock,
     input: &HirQueryBlockPlanInput,
     limit: Option<&hir::Limit>,
@@ -255,7 +257,7 @@ fn is_simple_count(
     let [output] = block.outputs.as_slice() else {
         return false;
     };
-    let hir::Expr::Function(call) = &output.expr else {
+    let hir::Expr::Function(call) = &document.exprs[output.expr] else {
         return false;
     };
     let [HirPlanSource::BTree(source)] = input.sources.as_slice() else {
@@ -278,7 +280,7 @@ fn is_simple_count(
                     Some(turso_parser::ast::Distinctness::Distinct)
                 ) && matches!(
                     values.as_slice(),
-                    [argument] if hir_column_never_null(argument, source)
+                    [argument] if hir_column_never_null(&document.exprs[*argument], source)
                 )
             }
             _ => false,
@@ -488,7 +490,7 @@ pub(crate) fn hir_source_is_lateral(
     let Some(owner) = document.source(source).map(|source| source.owner) else {
         return false;
     };
-    document.outer_sources(query).iter().any(|read| {
+    document.planning.outer_sources(query).iter().any(|read| {
         document
             .source(*read)
             .is_some_and(|read| read.owner == owner)
@@ -580,12 +582,12 @@ fn plan_hir_unmatched_btree_read(
         let usable = index >= input.where_start
             && !left_of_later_right_join
             && term.from_outer_join.is_none()
-            && available.contains_all_set_bits_of(&layout.table_mask(document, &term.expr)?);
+            && available.contains_all_set_bits_of(&layout.table_mask(document, term.expr)?);
         if usable {
             // The main loop may have used the term for its own seek.
             term.consumed = false;
         } else {
-            term.expr = hir::Expr::Literal(turso_parser::ast::Literal::Numeric("1".into()));
+            term.expr = document.planning.always_true();
             term.consumed = true;
         }
     }
@@ -616,6 +618,7 @@ fn plan_hir_unmatched_btree_read(
     let mut unmatched_source = source.clone();
     unmatched_source.join_info = None;
     let mut method = super::optimizer::access_method::choose_hir_single_read_access_method(
+        &document.exprs,
         &unmatched_source,
         definition,
         &constraints,
@@ -626,6 +629,7 @@ fn plan_hir_unmatched_btree_read(
         params,
     )?;
     let operation = apply_hir_selected_btree_access(
+        &document.exprs,
         &unmatched_source,
         &constraints,
         &mut predicates,
@@ -664,7 +668,7 @@ fn plan_hir_unmatched_btree_read(
                     if null_extended {
                         !source.index_covers_columns_without_expressions(index)
                     } else {
-                        !source.index_is_covering(definition, index)
+                        !source.index_is_covering(definition, index, &document.exprs)
                     }
                 })
                 .map_or(BtreeTableLookup::ScanOnly, |_| {
@@ -691,7 +695,9 @@ fn plan_hir_unmatched_btree_read(
 /// table-function arguments alone to the table, as SQLite does by planning
 /// the read from a one-table FROM clause. The arguments are evaluated again
 /// in the pass, over the NULL-extended left sources.
+#[allow(clippy::too_many_arguments)]
 fn plan_hir_unmatched_virtual_read(
+    exprs: &hir::ExprArena,
     vtab: &crate::VirtualTable,
     constraints: &super::optimizer::constraints::HirTableConstraints,
     input: &HirQueryBlockPlanInput,
@@ -735,6 +741,7 @@ fn plan_hir_unmatched_virtual_read(
     // read must not change that, so it marks a scratch copy.
     let mut scratch = input.predicates.clone();
     super::optimizer::apply_hir_selected_virtual_access(
+        exprs,
         &argument_constraints,
         &mut scratch,
         &method,
@@ -960,8 +967,8 @@ pub(crate) struct HirHashBuildInput {
 /// an earlier loop.
 pub(crate) struct HirHashKey {
     /// An expression that reads only the hashed table.
-    pub(crate) build: hir::Expr,
-    pub(crate) value: hir::Expr,
+    pub(crate) build: hir::ExprId,
+    pub(crate) value: hir::ExprId,
     pub(crate) affinity: crate::vdbe::affinity::Affinity,
     pub(crate) collation: Option<crate::translate::collate::CollationSeq>,
 }
@@ -998,14 +1005,16 @@ fn materialized_hash_build_inputs(
 /// Turn each LEFT JOIN whose NULL row a WHERE term rejects into an inner
 /// join, so its tables can be joined in any order, and return the
 /// right sources of those joins. Its ON terms become ordinary terms.
-fn left_joins_rejected_by_where(input: &mut HirQueryBlockPlanInput) -> Vec<SourceId> {
+fn left_joins_rejected_by_where(
+    document: &HirDocument,
+    input: &mut HirQueryBlockPlanInput,
+) -> Vec<SourceId> {
     let mut converted = Vec::new();
     loop {
         let rejects_rows_of = |source: SourceId| {
-            input
-                .predicates
-                .iter()
-                .any(|term| term.from_outer_join.is_none() && rejects_null_row(&term.expr, source))
+            input.predicates.iter().any(|term| {
+                term.from_outer_join.is_none() && rejects_null_row(document.expr(term.expr), source)
+            })
         };
         let rejected = input.sources.iter().position(|source| {
             source
@@ -1052,10 +1061,10 @@ fn left_joins_rejected_by_where(input: &mut HirQueryBlockPlanInput) -> Vec<Sourc
 
 /// Whether `expr` can never be TRUE when every column of `source` is NULL
 /// (SQLite's `impliesNotNullRow`). When unsure, it says no.
-pub(crate) fn rejects_null_row(expr: &hir::Expr, source: SourceId) -> bool {
+pub(crate) fn rejects_null_row(expr: hir::ExprRef<'_>, source: SourceId) -> bool {
     use turso_parser::ast::Operator::{And, Is, IsNot, Or};
-    let rejects = |expr: &hir::Expr| rejects_null_row(expr, source);
-    match expr {
+    let rejects = |child: &hir::ExprId| rejects_null_row(expr.at(*child), source);
+    match expr.node() {
         hir::Expr::Column(column) => column.source == source,
         hir::Expr::RowId(rowid) => *rowid == source,
         // These can be TRUE, or not NULL, when every input is NULL.
@@ -1181,7 +1190,8 @@ impl<'a> HirPlanContext<'a> {
         params: &CostModelParams,
         query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
     ) -> Result<HirAccessPlan> {
-        let usage = update.direct_column_usage(|source| self.document.source(source));
+        let usage =
+            update.direct_column_usage(|source| self.document.source(source), &self.document.exprs);
         let mut input = HirQueryBlockPlanInput {
             sources: Vec::new(),
             groups: Vec::new(),
@@ -1222,7 +1232,7 @@ impl<'a> HirPlanContext<'a> {
         }
         input.where_start = input.predicates.len();
         if let Some(predicate) = &update.predicate {
-            append_predicates(&mut input.predicates, predicate, None);
+            append_predicates(self.document, &mut input.predicates, *predicate, None);
         }
         self.add_implied_in_terms(&mut input);
         self.check_match_terms(&input.predicates)?;
@@ -1251,9 +1261,10 @@ impl<'a> HirPlanContext<'a> {
     /// with an FTS index. Any other MATCH term fails with "unable to use
     /// function MATCH in the requested context".
     fn check_match_terms(&self, predicates: &[HirWhereTerm]) -> Result<()> {
-        let column_source = |expression: &hir::Expr| match expression {
+        let exprs = &self.document.exprs;
+        let column_source = |expression: hir::ExprId| match &exprs[expression] {
             hir::Expr::Column(column) => Some(column.source),
-            hir::Expr::Row(items) => match items.first() {
+            hir::Expr::Row(items) => match items.first().map(|item| &exprs[*item]) {
                 Some(hir::Expr::Column(column)) => Some(column.source),
                 _ => None,
             },
@@ -1278,14 +1289,14 @@ impl<'a> HirPlanContext<'a> {
         };
         for term in predicates {
             let mut unusable = false;
-            term.expr.for_each(&mut |expression| {
+            exprs.at(term.expr).for_each(&mut |expression| {
                 if let hir::Expr::Like {
                     lhs,
                     operator: turso_parser::ast::LikeOperator::Match,
                     ..
-                } = expression
+                } = expression.node()
                 {
-                    unusable |= !column_source(lhs).is_some_and(has_fts_index);
+                    unusable |= !column_source(*lhs).is_some_and(has_fts_index);
                 }
             });
             if unusable {
@@ -1362,7 +1373,7 @@ impl<'a> HirPlanContext<'a> {
     ) -> Result<HirAccessPlan> {
         let usage = self
             .document
-            .root_column_usage(delete.direct_column_usage());
+            .root_column_usage(delete.direct_column_usage(&self.document.exprs));
         let mut input = HirQueryBlockPlanInput {
             sources: vec![self.plan_source(delete.target, None, &usage)?],
             groups: Vec::new(),
@@ -1373,16 +1384,16 @@ impl<'a> HirPlanContext<'a> {
             argument_predicates: Vec::new(),
         };
         if let Some(predicate) = &delete.predicate {
-            append_predicates(&mut input.predicates, predicate, None);
+            append_predicates(self.document, &mut input.predicates, *predicate, None);
         }
         self.add_implied_in_terms(&mut input);
         self.check_match_terms(&input.predicates)?;
         for term in &delete.order_by {
-            self.register_expression_index_usage(&mut input.sources, &term.expr)?;
+            self.register_expression_index_usage(&mut input.sources, term.expr)?;
         }
         if let Some(returning) = &delete.returning {
             for output in &returning.outputs {
-                self.register_expression_index_usage(&mut input.sources, &output.expr)?;
+                self.register_expression_index_usage(&mut input.sources, output.expr)?;
             }
         }
 
@@ -1433,7 +1444,13 @@ impl<'a> HirPlanContext<'a> {
                 "HIR query dependency cycle at {query_id}"
             )));
         }
-        for dependency in self.document.direct_query_dependencies(query_id) {
+        for dependency in self
+            .document
+            .planning
+            .dependencies(query_id)
+            .iter()
+            .copied()
+        {
             self.plan_query_tree(dependency, schema, params, planned, active)?;
         }
         let estimate = self.plan_query(query_id, 1.0, schema, params, planned)?;
@@ -1469,8 +1486,8 @@ impl<'a> HirPlanContext<'a> {
             .iter()
             .flat_map(|block| block.subquery_calls.iter().copied())
             .collect::<Vec<_>>();
-        for subquery in self.document.expression_subqueries(query_id) {
-            if !self.document.reads_outer_sources(subquery) {
+        for subquery in self.document.planning.subqueries(query_id).iter().copied() {
+            if !self.document.planning.reads_outer_sources(subquery) {
                 continue;
             }
             let calls = counted
@@ -1534,7 +1551,7 @@ impl<'a> HirPlanContext<'a> {
                     block,
                     block_order_by,
                     block_limit,
-                    in_probe.as_ref(),
+                    in_probe,
                     runs,
                     schema,
                     params,
@@ -1562,7 +1579,9 @@ impl<'a> HirPlanContext<'a> {
             })
             .collect::<Vec<_>>();
         let mut estimate = query_estimate_from_blocks(query, &blocks, &block_rows, params);
-        if let Some(limit) = block_limit.and_then(|limit| hir_literal_limit(&limit.limit)) {
+        if let Some(limit) =
+            block_limit.and_then(|limit| hir_literal_limit(&self.document.exprs[limit.limit]))
+        {
             let rows_before_limit = estimate.output_cardinality;
             estimate.output_cardinality = rows_before_limit.min(limit);
             // The calls cover the full result, and LIMIT only needs the same
@@ -1621,18 +1640,20 @@ impl<'a> HirPlanContext<'a> {
         let nulls = |order: SortOrder, nulls: Option<NullsOrder>| {
             nulls.unwrap_or_else(|| NullsOrder::default_for(order))
         };
-        let output_position = |expression: &hir::Expr| match expression {
+        let output_position = |expression: hir::ExprId| match &self.document.exprs[expression] {
             hir::Expr::Output(output) => query.output.iter().position(|id| id == output),
-            expression => query.output.iter().position(|id| {
-                self.document
-                    .output(*id)
-                    .is_some_and(|output| output.expr.equivalent(expression))
+            _ => query.output.iter().position(|id| {
+                self.document.output(*id).is_some_and(|output| {
+                    self.document
+                        .expr(output.expr)
+                        .equivalent(self.document.expr(expression))
+                })
             }),
         };
         let mut columns = Vec::new();
         if !query.order_by.is_empty() {
             for term in &query.order_by {
-                let Some(column) = output_position(&term.expr) else {
+                let Some(column) = output_position(term.expr) else {
                     break;
                 };
                 columns.push(HirOutputOrder {
@@ -1658,7 +1679,7 @@ impl<'a> HirPlanContext<'a> {
         };
         if let Some(grouping) = grouping {
             for (key, key_collation) in grouping.keys.iter().zip(&grouping.key_collations) {
-                let Some(column) = output_position(key) else {
+                let Some(column) = output_position(*key) else {
                     break;
                 };
                 columns.push(HirOutputOrder {
@@ -1681,7 +1702,7 @@ impl<'a> HirPlanContext<'a> {
         let source_column_position = |column: usize| {
             query.output.iter().position(|id| {
                 self.document.output(*id).is_some_and(|output| {
-                    matches!(&output.expr, hir::Expr::Column(reference)
+                    matches!(&self.document.exprs[output.expr], hir::Expr::Column(reference)
                         if reference.source == source && reference.column == column)
                 })
             })
@@ -1707,16 +1728,16 @@ impl<'a> HirPlanContext<'a> {
                 // alias column.
                 let rowid_output_position = || {
                     query.output.iter().position(|id| {
-                        self.document
-                            .output(*id)
-                            .is_some_and(|output| match &output.expr {
+                        self.document.output(*id).is_some_and(|output| {
+                            match &self.document.exprs[output.expr] {
                                 hir::Expr::RowId(rowid_source) => *rowid_source == source,
                                 hir::Expr::Column(reference) => {
                                     reference.source == source
                                         && rowid_alias == Some(reference.column)
                                 }
                                 _ => false,
-                            })
+                            }
+                        })
                     })
                 };
                 // The keys a scan reads the table in: an index's columns,
@@ -1863,9 +1884,9 @@ impl<'a> HirPlanContext<'a> {
         }
         let mut sources: Vec<SourceId> = Vec::new();
         for key in &grouping.keys {
-            key.for_each(&mut |expression| {
+            self.document.expr(*key).for_each(&mut |expression| {
                 if let hir::Expr::Column(hir::ColumnRef { source, .. }) | hir::Expr::RowId(source) =
-                    expression
+                    expression.node()
                 {
                     if !sources.contains(source) {
                         sources.push(*source);
@@ -1913,7 +1934,7 @@ impl<'a> HirPlanContext<'a> {
         let mut source = None;
         let mut columns: Vec<usize> = Vec::new();
         for key in &grouping.keys {
-            let hir::Expr::Column(column) = key else {
+            let hir::Expr::Column(column) = &self.document.exprs[*key] else {
                 return None;
             };
             if source.is_some_and(|source| source != column.source) {
@@ -2007,7 +2028,7 @@ impl<'a> HirPlanContext<'a> {
     ///   the IN form, so no expression of the subquery may fail.
     /// - IN evaluates `x` once per outer row, and the probe once per inner
     ///   row it tests, so `x` may not fail either.
-    fn in_probe_equality(&self, query: &hir::Query) -> Option<hir::Expr> {
+    fn in_probe_equality(&self, query: &hir::Query) -> Option<hir::ExprId> {
         let [block] = query.blocks.as_slice() else {
             return None;
         };
@@ -2037,32 +2058,30 @@ impl<'a> HirPlanContext<'a> {
                 ..
             } = &parent_block.body
             {
-                for conjunct in parent_filter.conjuncts() {
+                for conjunct in self.document.expr(*parent_filter).conjuncts() {
                     if let hir::Expr::Subquery(hir::SubqueryExpr::In {
                         lhs,
                         query: in_query,
                         negated: false,
                         comparison,
-                    }) = conjunct
+                    }) = conjunct.node()
                     {
                         if *in_query == query.id && comparison.components.len() == 1 {
-                            probe = Some((lhs, comparison));
+                            probe = Some(*lhs);
                         }
                     }
                 }
             }
         }
-        let (lhs, comparison) = probe?;
+        let lhs = probe?;
         if self.document.subquery_use_count(parent.id, query.id) != 1
             || hir_expr_can_fail(self.document, lhs)
         {
             return None;
         }
-        let output = &block.outputs[0].expr;
+        let output = block.outputs[0].expr;
         if hir_expr_can_fail(self.document, output)
-            || filter
-                .as_ref()
-                .is_some_and(|filter| hir_expr_can_fail(self.document, filter))
+            || filter.is_some_and(|filter| hir_expr_can_fail(self.document, filter))
             || block
                 .from
                 .as_ref()
@@ -2070,14 +2089,12 @@ impl<'a> HirPlanContext<'a> {
         {
             return None;
         }
-        Some(hir::Expr::Binary {
-            lhs: lhs.clone(),
-            operator: turso_parser::ast::Operator::Equals,
-            rhs: Box::new(output.clone()),
-            array_concat: false,
-            custom: None,
-            comparison: Some(comparison.clone()),
-        })
+        Some(
+            self.document
+                .planning
+                .in_probe(query.id)
+                .expect("binding builds the probe term of every IN subquery it can use"),
+        )
     }
 
     /// Build planner source metadata without resolving names, allocating a
@@ -2428,16 +2445,16 @@ impl<'a> HirPlanContext<'a> {
             {
                 continue;
             }
-            let terms =
-                crate::translate::plan::hir_implied_in_terms(&term.expr, &|source, columns| {
-                    self.sole_indexed_column(source, columns)
-                });
+            let terms = crate::translate::plan::hir_implied_in_terms(
+                self.document.planning.implied_in(term.expr),
+                &|source, columns| self.sole_indexed_column(source, columns),
+            );
             for expr in terms {
-                if !predicates
-                    .iter()
-                    .chain(implied.iter())
-                    .any(|known| known.expr.equivalent(&expr))
-                {
+                if !predicates.iter().chain(implied.iter()).any(|known| {
+                    self.document
+                        .expr(known.expr)
+                        .equivalent(self.document.expr(expr))
+                }) {
                     implied.push(HirWhereTerm {
                         expr,
                         from_outer_join: None,
@@ -2487,12 +2504,12 @@ impl<'a> HirPlanContext<'a> {
         match &join.constraint {
             hir::JoinConstraint::None => {}
             hir::JoinConstraint::On(expression) => {
-                append_predicates(predicates, expression, from_outer_join)
+                append_predicates(self.document, predicates, *expression, from_outer_join)
             }
             hir::JoinConstraint::Using(columns) | hir::JoinConstraint::Natural(columns) => {
                 for column in columns {
                     predicates.push(HirWhereTerm {
-                        expr: using_equality(column),
+                        expr: column.equality,
                         from_outer_join,
                         consumed: false,
                     });
@@ -2528,7 +2545,7 @@ impl<'a> HirPlanContext<'a> {
             ..
         } = &block.body
         {
-            append_predicates(&mut input.predicates, filter, None);
+            append_predicates(self.document, &mut input.predicates, *filter, None);
         }
         self.add_implied_in_terms(&mut input);
 
@@ -2540,7 +2557,7 @@ impl<'a> HirPlanContext<'a> {
             return Ok(input);
         }
         for output in &block.outputs {
-            self.register_expression_index_usage(&mut input.sources, &output.expr)?;
+            self.register_expression_index_usage(&mut input.sources, output.expr)?;
         }
         if let hir::QueryBlockBody::Select {
             grouping: Some(grouping),
@@ -2548,14 +2565,14 @@ impl<'a> HirPlanContext<'a> {
         } = &block.body
         {
             for key in &grouping.keys {
-                self.register_expression_index_usage(&mut input.sources, key)?;
+                self.register_expression_index_usage(&mut input.sources, *key)?;
             }
             if let Some(having) = &grouping.having {
-                self.register_expression_index_usage(&mut input.sources, having)?;
+                self.register_expression_index_usage(&mut input.sources, *having)?;
             }
         }
         for term in order_by {
-            self.register_expression_index_usage(&mut input.sources, &term.expr)?;
+            self.register_expression_index_usage(&mut input.sources, term.expr)?;
         }
         // A WHERE term equal to a partial index's predicate is not evaluated
         // when the index is read, so the columns only it reads need not be
@@ -2569,8 +2586,8 @@ impl<'a> HirPlanContext<'a> {
             ..
         } = &block.body
         {
-            for term in filter.conjuncts() {
-                self.register_expression_index_usage(&mut input.sources, term)?;
+            for term in self.document.expr(*filter).conjuncts() {
+                self.register_expression_index_usage(&mut input.sources, term.id())?;
             }
         }
 
@@ -2659,7 +2676,7 @@ impl<'a> HirPlanContext<'a> {
         block: &hir::QueryBlock,
         order_by: &[hir::OrderTerm],
         limit: Option<&hir::Limit>,
-        extra_predicate: Option<&hir::Expr>,
+        extra_predicate: Option<hir::ExprId>,
         initial_cardinality: f64,
         schema: &Schema,
         params: &CostModelParams,
@@ -2673,9 +2690,9 @@ impl<'a> HirPlanContext<'a> {
             .document
             .query(block.id.query)
             .expect("validated HIR query block has owning query");
-        let usage = self.document.source_column_usage(query.id);
+        let usage = self.document.planning.source_column_usage(query.id);
         if block.from.is_none() {
-            let input = self.query_block_input(block, order_by, &usage)?;
+            let input = self.query_block_input(block, order_by, usage)?;
             let output_cardinality = match &block.body {
                 hir::QueryBlockBody::Values { rows } => initial_cardinality * rows.len() as f64,
                 hir::QueryBlockBody::Select { .. } => initial_cardinality,
@@ -2701,10 +2718,10 @@ impl<'a> HirPlanContext<'a> {
             });
         }
 
-        let mut input = self.query_block_input(block, order_by, &usage)?;
-        input.subqueries = self.document.expression_subqueries(block.id.query);
+        let mut input = self.query_block_input(block, order_by, usage)?;
+        input.subqueries = self.document.planning.subqueries(block.id.query).to_vec();
         if let Some(predicate) = extra_predicate {
-            append_predicates(&mut input.predicates, predicate, None);
+            append_predicates(self.document, &mut input.predicates, predicate, None);
         }
         self.check_match_terms(&input.predicates)?;
         // Join planning tracks tables in a 64-bit mask.
@@ -2715,7 +2732,7 @@ impl<'a> HirPlanContext<'a> {
             );
         }
         let where_start = input.where_start;
-        let inner_joins = left_joins_rejected_by_where(&mut input);
+        let inner_joins = left_joins_rejected_by_where(self.document, &mut input);
         if let Some(plan) = self.plan_index_method(block, order_by, limit, &mut input)? {
             return Ok(plan);
         }
@@ -2729,7 +2746,7 @@ impl<'a> HirPlanContext<'a> {
         )? {
             return Ok(plan);
         }
-        let min_max_terms = simple_min_max_term(block, &input)
+        let min_max_terms = simple_min_max_term(self.document, block, &input)
             .into_iter()
             .collect::<Vec<_>>();
         // A grouped block aims for its GROUP BY order even when it has an
@@ -2753,18 +2770,18 @@ impl<'a> HirPlanContext<'a> {
                 OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
             )
         };
-        let simple_count = is_simple_count(block, &input, limit);
+        let simple_count = is_simple_count(self.document, block, &input, limit);
         // A hash join never reads a source that a correlated subquery of the
         // block reads.
         let mut subquery_reads = Vec::new();
         for query in &input.subqueries {
-            subquery_reads.extend(self.document.outer_sources(*query));
+            subquery_reads.extend(self.document.planning.outer_sources(*query).iter().copied());
         }
         let hash = crate::translate::optimizer::join::HirHashJoins {
             allowed: self.hash_joins_allowed(&input),
             // A materialized build input is filled once per statement, so
             // the block must not read an outer row.
-            materialize: !self.document.reads_outer_sources(block.id.query),
+            materialize: !self.document.planning.reads_outer_sources(block.id.query),
             subquery_reads: &subquery_reads,
         };
         let access = self
@@ -2846,7 +2863,7 @@ impl<'a> HirPlanContext<'a> {
                     rhs,
                     comparison,
                     ..
-                } = &predicates[key.where_clause_idx].expr
+                } = &self.document.exprs[predicates[key.where_clause_idx].expr]
                 else {
                     return Err(LimboError::InternalError(
                         "HIR hash join key is not a binary term".to_string(),
@@ -2860,8 +2877,8 @@ impl<'a> HirPlanContext<'a> {
                     .as_ref()
                     .and_then(|comparison| comparison.components.first());
                 Ok(HirHashKey {
-                    build: build.as_ref().clone(),
-                    value: probe.as_ref().clone(),
+                    build: *build,
+                    value: *probe,
                     affinity: component
                         .map_or(crate::vdbe::affinity::Affinity::Blob, |component| {
                             component.affinity
@@ -2874,8 +2891,8 @@ impl<'a> HirPlanContext<'a> {
             .collect::<Result<Vec<_>>>()?;
         let mut columns = Vec::new();
         for key in &keys {
-            key.build.for_each(&mut |expression| {
-                if let hir::Expr::Column(column) = expression {
+            self.document.expr(key.build).for_each(&mut |expression| {
+                if let hir::Expr::Column(column) = expression.node() {
                     if !columns.contains(&column.column) {
                         columns.push(column.column);
                     }
@@ -2988,7 +3005,7 @@ impl<'a> HirPlanContext<'a> {
     ) -> bool {
         let mut reads = false;
         for argument in &access.arguments {
-            self.document.visit_expr_sources(argument, &mut |read| {
+            self.document.visit_expr_sources(*argument, &mut |read| {
                 reads |= read == source;
             });
         }
@@ -3064,7 +3081,7 @@ impl<'a> HirPlanContext<'a> {
                     // read, which loop outside the index.
                     let mut outer = Vec::new();
                     for argument in &matched.access.arguments {
-                        self.document.visit_expr_sources(argument, &mut |read| {
+                        self.document.visit_expr_sources(*argument, &mut |read| {
                             if let Some(read) = block_sources.iter().position(|id| *id == read) {
                                 if !outer.contains(&read) {
                                     outer.push(read);
@@ -3136,7 +3153,7 @@ impl<'a> HirPlanContext<'a> {
                 .enumerate()
                 .filter(|(_, term)| {
                     let mut reads_later = false;
-                    self.document.visit_expr_sources(&term.expr, &mut |read| {
+                    self.document.visit_expr_sources(term.expr, &mut |read| {
                         reads_later |= block_sources.contains(&read) && !outer_ids.contains(&read);
                     });
                     !term.consumed && reads_later
@@ -3251,7 +3268,7 @@ impl<'a> HirPlanContext<'a> {
     fn plan_source_access(
         &self,
         mut input: HirQueryBlockPlanInput,
-        order_target: Option<&HirOrderTarget<'_>>,
+        order_target: Option<&HirOrderTarget>,
         // Whether a table may be read through one seek per branch of an OR
         // term.
         or_union: bool,
@@ -3485,6 +3502,7 @@ impl<'a> HirPlanContext<'a> {
                 };
                 let mut scratch = input.predicates.clone();
                 let operation = apply_hir_selected_btree_access(
+                    &self.document.exprs,
                     source,
                     &constraints[source_position],
                     &mut scratch,
@@ -3494,7 +3512,9 @@ impl<'a> HirPlanContext<'a> {
                 )?;
                 let definition = self.definition(source.internal_id);
                 let table_lookup = selected_btree_index(&operation)
-                    .filter(|index| !source.index_is_covering(definition, index))
+                    .filter(|index| {
+                        !source.index_is_covering(definition, index, &self.document.exprs)
+                    })
                     .map_or(BtreeTableLookup::ScanOnly, |_| {
                         BtreeTableLookup::TableRequired
                     });
@@ -3577,7 +3597,7 @@ impl<'a> HirPlanContext<'a> {
                         let mut outside = term
                             .from_outer_join
                             .is_some_and(|owner| !sources.contains(&owner));
-                        self.document.visit_expr_sources(&term.expr, &mut |source| {
+                        self.document.visit_expr_sources(term.expr, &mut |source| {
                             outside |= !sources.contains(&source);
                         });
                         if outside {
@@ -3643,6 +3663,7 @@ impl<'a> HirPlanContext<'a> {
                 HirPlanSource::BTree(source) => match &source.table {
                     Table::BTree(_) => {
                         let operation = apply_hir_selected_btree_access(
+                            &self.document.exprs,
                             source,
                             &constraints[source_position],
                             &mut input.predicates,
@@ -3694,12 +3715,13 @@ impl<'a> HirPlanContext<'a> {
                                 );
                                 let table_lookup = selected_btree_index(&operation)
                                     .filter(|index| {
-                                        !source.index_is_covering(definition, index)
-                                            || (null_extended
-                                                && !source
-                                                    .index_covers_columns_without_expressions(
-                                                        index,
-                                                    ))
+                                        !source.index_is_covering(
+                                            definition,
+                                            index,
+                                            &self.document.exprs,
+                                        ) || (null_extended
+                                            && !source
+                                                .index_covers_columns_without_expressions(index))
                                     })
                                     .map_or(BtreeTableLookup::ScanOnly, |_| {
                                         BtreeTableLookup::TableRequired
@@ -3713,6 +3735,7 @@ impl<'a> HirPlanContext<'a> {
                     }
                     Table::Virtual(vtab) => {
                         let mut operation = apply_hir_selected_virtual_access(
+                            &self.document.exprs,
                             &constraints[source_position],
                             &mut input.predicates,
                             &access_methods[access_method_position],
@@ -3722,6 +3745,7 @@ impl<'a> HirPlanContext<'a> {
                         }) {
                             operation.unmatched_right_rows =
                                 Some(Box::new(plan_hir_unmatched_virtual_read(
+                                    &self.document.exprs,
                                     vtab,
                                     &constraints[source_position],
                                     &input,
@@ -3745,6 +3769,7 @@ impl<'a> HirPlanContext<'a> {
                 } => HirSourceAccess::Derived {
                     query: *query,
                     seek: crate::translate::optimizer::apply_hir_materialized_subquery_access(
+                        &self.document.exprs,
                         &constraints[source_position],
                         &mut input.predicates,
                         &access_methods[access_method_position],
@@ -3771,6 +3796,7 @@ impl<'a> HirPlanContext<'a> {
                         _ => crate::translate::plan::IterationDirection::Forwards,
                     },
                     seek: crate::translate::optimizer::apply_hir_materialized_subquery_access(
+                        &self.document.exprs,
                         &constraints[source_position],
                         &mut input.predicates,
                         &access_methods[access_method_position],
@@ -3877,7 +3903,7 @@ impl<'a> HirPlanContext<'a> {
         let mut subqueries = Vec::with_capacity(input.subqueries.len());
         for query in &input.subqueries {
             let mut required = crate::translate::planner::TableMask::default();
-            for source in self.document.outer_sources(*query) {
+            for source in self.document.planning.outer_sources(*query).iter().copied() {
                 if let Some(position) = input
                     .sources
                     .iter()
@@ -3890,14 +3916,17 @@ impl<'a> HirPlanContext<'a> {
             let mut exists = false;
             let first_predicate = input.predicates.iter().position(|term| {
                 let mut found = false;
-                term.expr.for_each(&mut |expression| {
-                    if let hir::Expr::Subquery(subquery) = expression {
-                        if hir_subquery_query(subquery) == *query {
-                            found = true;
-                            exists |= matches!(subquery, hir::SubqueryExpr::Exists(_));
+                self.document
+                    .exprs
+                    .at(term.expr)
+                    .for_each(&mut |expression| {
+                        if let hir::Expr::Subquery(subquery) = expression.node() {
+                            if hir_subquery_query(subquery) == *query {
+                                found = true;
+                                exists |= matches!(subquery, hir::SubqueryExpr::Exists(_));
+                            }
                         }
-                    }
-                });
+                    });
                 reading_terms += usize::from(found);
                 found
             });
@@ -3913,6 +3942,7 @@ impl<'a> HirPlanContext<'a> {
         let mut deferred = Vec::new();
         for (query, subquery_calls, runs_after) in
             crate::translate::optimizer::join::hir_subquery_calls_for_plan(
+                &self.document.exprs,
                 plan,
                 access_methods,
                 constraints,
@@ -3947,7 +3977,7 @@ impl<'a> HirPlanContext<'a> {
         &self,
         terms: &'term [hir::OrderTerm],
         purpose: OrderTargetPurpose,
-    ) -> Option<HirOrderTarget<'term>>
+    ) -> Option<HirOrderTarget>
     where
         'a: 'term,
     {
@@ -3968,7 +3998,7 @@ impl<'a> HirPlanContext<'a> {
         &self,
         block: &'term hir::QueryBlock,
         order_by: &'term [hir::OrderTerm],
-    ) -> Option<HirOrderTarget<'term>>
+    ) -> Option<HirOrderTarget>
     where
         'a: 'term,
     {
@@ -3983,7 +4013,7 @@ impl<'a> HirPlanContext<'a> {
                 .iter()
                 .map(|key| {
                     self.ordering_column(
-                        &grouping.keys[key.key],
+                        grouping.keys[key.key],
                         key.order,
                         grouping.key_collations[key.key]
                             .as_ref()
@@ -4004,7 +4034,7 @@ impl<'a> HirPlanContext<'a> {
             .zip(&grouping.key_collations)
             .map(|(expression, collation)| {
                 self.ordering_column(
-                    expression,
+                    *expression,
                     turso_parser::ast::SortOrder::Asc,
                     collation
                         .as_ref()
@@ -4024,7 +4054,7 @@ impl<'a> HirPlanContext<'a> {
     /// sorts them in: PARTITION BY terms ascending, then ORDER BY terms, each
     /// key once. Rows already in that order need no window sort. A key that
     /// a custom type sorts by its stored value is left to the sorter.
-    fn window_target<'term>(&self, block: &'term hir::QueryBlock) -> Option<HirOrderTarget<'term>>
+    fn window_target<'term>(&self, block: &'term hir::QueryBlock) -> Option<HirOrderTarget>
     where
         'a: 'term,
     {
@@ -4036,7 +4066,7 @@ impl<'a> HirPlanContext<'a> {
         };
         let partition = window.partition_by.iter().map(|term| {
             (
-                &term.expr,
+                term.expr,
                 &term.type_fact,
                 turso_parser::ast::SortOrder::Asc,
                 collation(term.collation.as_ref()),
@@ -4045,17 +4075,21 @@ impl<'a> HirPlanContext<'a> {
         });
         let order = window.order_by.iter().map(|term| {
             (
-                &term.expr,
+                term.expr,
                 &term.type_fact,
                 term.order,
                 collation(term.collation.as_ref()),
                 term.nulls,
             )
         });
-        let mut keys: Vec<&'term hir::Expr> = Vec::new();
+        let mut keys: Vec<hir::ExprId> = Vec::new();
         let mut columns = Vec::new();
         for (expression, type_fact, order, collation, nulls) in partition.chain(order) {
-            if keys.iter().any(|key| key.equivalent(expression)) {
+            let exprs = &self.document.exprs;
+            if keys
+                .iter()
+                .any(|key| exprs.at(*key).equivalent(exprs.at(expression)))
+            {
                 continue;
             }
             let encoded = type_fact
@@ -4078,12 +4112,12 @@ impl<'a> HirPlanContext<'a> {
     fn order_column<'term>(
         &self,
         term: &'term hir::OrderTerm,
-    ) -> Option<ColumnOrder<SourceId, &'term hir::Expr>>
+    ) -> Option<ColumnOrder<SourceId, hir::ExprId>>
     where
         'a: 'term,
     {
         self.ordering_column(
-            &term.expr,
+            term.expr,
             term.order,
             term.collation
                 .as_ref()
@@ -4093,25 +4127,26 @@ impl<'a> HirPlanContext<'a> {
         )
     }
 
-    fn ordering_column<'term>(
+    fn ordering_column(
         &self,
-        mut expression: &'term hir::Expr,
+        mut expression: hir::ExprId,
         order: turso_parser::ast::SortOrder,
         collation: crate::translate::collate::CollationSeq,
         nulls_order: Option<turso_parser::ast::NullsOrder>,
-    ) -> Option<ColumnOrder<SourceId, &'term hir::Expr>>
-    where
-        'a: 'term,
-    {
-        while let hir::Expr::Output(output) = expression {
-            expression = &self.document.output(*output)?.expr;
+    ) -> Option<ColumnOrder<SourceId, hir::ExprId>> {
+        while let hir::Expr::Output(output) = &self.document.exprs[expression] {
+            expression = self.document.output(*output)?.expr;
         }
 
-        let (source, target) = match expression {
+        let (source, target) = match &self.document.exprs[expression] {
             hir::Expr::Column(column) => (column.source, ColumnTarget::Column(column.column)),
             hir::Expr::RowId(source) => (*source, ColumnTarget::RowId),
-            expression => {
-                let (source, _) = expression.single_source_column_usage()?;
+            _ => {
+                let (source, _) = self
+                    .document
+                    .exprs
+                    .at(expression)
+                    .single_source_column_usage()?;
                 (source, ColumnTarget::Expr(expression))
             }
         };
@@ -4130,7 +4165,7 @@ impl<'a> HirPlanContext<'a> {
     fn register_expression_index_usage(
         &self,
         sources: &mut [HirPlanSource],
-        expression: &hir::Expr,
+        expression: hir::ExprId,
     ) -> Result<()> {
         let reads_expression_index = sources.iter().any(|planned| {
             matches!(planned, HirPlanSource::BTree(_))
@@ -4142,9 +4177,10 @@ impl<'a> HirPlanContext<'a> {
         #[cfg(test)]
         tests::EXPRESSION_INDEX_WALKS.with(|walks| walks.set(walks.get() + 1));
         let mut result = Ok(());
-        expression.for_each(&mut |part| {
+        self.document.expr(expression).for_each(&mut |part| {
             // A column read on its own is never an index expression.
-            if result.is_ok() && !matches!(part, hir::Expr::Column(_) | hir::Expr::RowId(_)) {
+            if result.is_ok() && !matches!(part.node(), hir::Expr::Column(_) | hir::Expr::RowId(_))
+            {
                 result = self.register_expression_index_usage_part(sources, part);
             }
         });
@@ -4154,7 +4190,7 @@ impl<'a> HirPlanContext<'a> {
     fn register_expression_index_usage_part(
         &self,
         sources: &mut [HirPlanSource],
-        expression: &hir::Expr,
+        expression: hir::ExprRef<'_>,
     ) -> Result<()> {
         let Some((source, columns)) = expression.single_source_column_usage() else {
             return Ok(());
@@ -4175,7 +4211,11 @@ impl<'a> HirPlanContext<'a> {
         for column in columns {
             columns_mask.set(column)?;
         }
-        planned.register_expression_index_usage(expression.clone(), columns_mask);
+        planned.register_expression_index_usage(
+            expression.id(),
+            columns_mask,
+            &self.document.exprs,
+        );
         Ok(())
     }
 
@@ -4290,30 +4330,22 @@ fn query_estimate_from_blocks(
 }
 
 fn append_predicates(
+    document: &HirDocument,
     predicates: &mut Vec<HirWhereTerm>,
-    expression: &hir::Expr,
+    expression: hir::ExprId,
     from_outer_join: Option<SourceId>,
 ) {
     predicates.extend(
-        crate::translate::plan::hir_planning_conjuncts(expression)
-            .into_iter()
+        document
+            .planning
+            .conjuncts(expression)
+            .iter()
             .map(|expr| HirWhereTerm {
-                expr,
+                expr: *expr,
                 from_outer_join,
                 consumed: false,
             }),
     );
-}
-
-fn using_equality(column: &hir::UsingColumn) -> hir::Expr {
-    hir::Expr::Binary {
-        lhs: column.left.clone(),
-        operator: turso_parser::ast::Operator::Equals,
-        rhs: Box::new(hir::Expr::Column(column.right)),
-        array_concat: false,
-        custom: None,
-        comparison: Some(column.comparison.clone()),
-    }
 }
 
 fn planned_source_from_definition(
@@ -4513,6 +4545,8 @@ pub(crate) mod tests {
             ctes: Vec::new(),
             schema_programs: Vec::new(),
             cdc: None,
+            exprs: hir::ExprArena::default(),
+            planning: hir::PlanningTerms::default(),
         }
     }
 
@@ -4533,15 +4567,31 @@ pub(crate) mod tests {
         });
     }
 
-    fn binary(lhs: hir::Expr, operator: Operator, rhs: hir::Expr) -> hir::Expr {
-        hir::Expr::Binary {
-            lhs: Box::new(lhs),
+    fn binary(
+        exprs: &mut hir::ExprArena,
+        lhs: hir::Expr,
+        operator: Operator,
+        rhs: hir::Expr,
+    ) -> hir::ExprId {
+        let lhs = exprs.push(lhs);
+        let rhs = exprs.push(rhs);
+        binary_of(exprs, lhs, operator, rhs)
+    }
+
+    fn binary_of(
+        exprs: &mut hir::ExprArena,
+        lhs: hir::ExprId,
+        operator: Operator,
+        rhs: hir::ExprId,
+    ) -> hir::ExprId {
+        exprs.push(hir::Expr::Binary {
+            lhs,
             operator,
-            rhs: Box::new(rhs),
+            rhs,
             array_concat: false,
             custom: None,
             comparison: None,
-        }
+        })
     }
 
     #[test]
@@ -4550,6 +4600,7 @@ pub(crate) mod tests {
         let query = QueryId::new(0);
         let block_id = QueryBlockId::new(query, 0);
         let output_id = OutputId::query(block_id, 0);
+        let mut document = document(vec![source_with_id(0, "items")]);
         let mut block = QueryBlock::new(
             block_id,
             QueryBlockBody::Select {
@@ -4561,7 +4612,7 @@ pub(crate) mod tests {
         block.outputs.push(Output {
             id: output_id,
             name: "first".to_string(),
-            expr: hir::Expr::column(source, 0),
+            expr: document.exprs.push(hir::Expr::column(source, 0)),
             type_fact: TypeFact::known(Type::Integer),
             affinity: Affinity::Integer,
             schema_affinity: Affinity::Integer,
@@ -4570,7 +4621,6 @@ pub(crate) mod tests {
             collation_is_explicit: false,
             name_kind: hir::OutputNameKind::Inferred,
         });
-        let mut document = document(vec![source_with_id(0, "items")]);
         document.root = hir::HirRoot::Query(QueryRoot { query });
         document.queries.push(Query {
             id: query,
@@ -4586,10 +4636,12 @@ pub(crate) mod tests {
         });
 
         let computed = binary(
+            &mut document.exprs,
             hir::Expr::column(source, 0),
             Operator::Add,
             hir::Expr::column(source, 1),
         );
+        let output_reference = document.exprs.push(hir::Expr::output(output_id));
         let collation = CatalogObject::new(
             CatalogObjectId::new(20),
             CatalogSnapshot::from_id(1),
@@ -4598,7 +4650,7 @@ pub(crate) mod tests {
         );
         let terms = [
             OrderTerm {
-                expr: hir::Expr::output(output_id),
+                expr: output_reference,
                 order: SortOrder::Desc,
                 nulls: Some(NullsOrder::First),
                 type_fact: TypeFact::known(Type::Integer),
@@ -4628,7 +4680,7 @@ pub(crate) mod tests {
         let ColumnTarget::Expr(expression) = target.columns[1].target else {
             panic!("computed HIR order term remains an expression");
         };
-        assert!(std::ptr::eq(expression, &terms[1].expr));
+        assert_eq!(expression, terms[1].expr);
         assert_eq!(target.columns[1].collation, CollationSeq::NoCase);
     }
 
@@ -4650,6 +4702,8 @@ pub(crate) mod tests {
             ctes: Vec::new(),
             schema_programs: Vec::new(),
             cdc: None,
+            exprs: hir::ExprArena::default(),
+            planning: hir::PlanningTerms::default(),
         };
         let context = HirPlanContext::new(&document);
         let joined = context
@@ -4732,7 +4786,9 @@ pub(crate) mod tests {
     #[test]
     fn hir_covering_index_matches_frozen_expression_keys() {
         let mut source = source();
+        let mut exprs = hir::ExprArena::default();
         let indexed_expression = binary(
+            &mut exprs,
             hir::Expr::column(source.id, 0),
             Operator::Add,
             hir::Expr::column(source.id, 1),
@@ -4757,7 +4813,7 @@ pub(crate) mod tests {
         );
         source.index_expressions.push(hir::IndexExpressions {
             index: index.clone(),
-            columns: vec![Some(indexed_expression.clone())],
+            columns: vec![Some(indexed_expression)],
             predicate: None,
         });
 
@@ -4793,7 +4849,7 @@ pub(crate) mod tests {
         block.outputs.push(hir::Output {
             id: hir::OutputId::query(block_id, 0),
             name: "sum".to_string(),
-            expr: indexed_expression.clone(),
+            expr: exprs.deep_copy(indexed_expression),
             type_fact: TypeFact::known(Type::Integer),
             affinity: Affinity::Integer,
             schema_affinity: Affinity::Integer,
@@ -4803,13 +4859,16 @@ pub(crate) mod tests {
             name_kind: hir::OutputNameKind::Inferred,
         });
         let order_by = [hir::OrderTerm {
-            expr: indexed_expression,
+            expr: exprs.deep_copy(indexed_expression),
             order: turso_parser::ast::SortOrder::Asc,
             nulls: None,
             type_fact: TypeFact::known(Type::Integer),
             collation: None,
         }];
-        let document = document(vec![source.clone()]);
+        let mut document = document(vec![source.clone()]);
+        document.exprs = exprs;
+        add_query(&mut document, &block);
+        crate::translate::plan::prepare_planning_terms(&mut document);
         let input = HirPlanContext::new(&document)
             .query_block_input(&block, &order_by, &usage)
             .expect("query block input converts");
@@ -4821,11 +4880,11 @@ pub(crate) mod tests {
         // Output and ORDER BY use the same expression, so registration deduplicates them.
         assert_eq!(planned.expression_index_usages.len(), 1);
 
-        assert!(planned.index_is_covering(&source, index.value()));
+        assert!(planned.index_is_covering(&source, index.value(), &document.exprs));
 
         planned.expression_index_usages[0].normalized_expr =
-            Box::new(hir::Expr::column(source.id, 0));
-        assert!(!planned.index_is_covering(&source, index.value()));
+            Box::new(document.exprs.push(hir::Expr::column(source.id, 0)));
+        assert!(!planned.index_is_covering(&source, index.value(), &document.exprs));
     }
 
     #[test]
@@ -4844,24 +4903,30 @@ pub(crate) mod tests {
     fn query_block_input_preserves_source_order_and_right_join_predicates() {
         let left = SourceId::new(0);
         let right = SourceId::new(1);
-        let document = document(vec![
+        let mut document = document(vec![
             source_with_id(0, "left_items"),
             source_with_id(1, "right_items"),
         ]);
-        let on = binary(
-            binary(
-                hir::Expr::column(left, 0),
-                Operator::Equals,
-                hir::Expr::column(right, 0),
-            ),
+        let first_equality = binary(
+            &mut document.exprs,
+            hir::Expr::column(left, 0),
+            Operator::Equals,
+            hir::Expr::column(right, 0),
+        );
+        let second_equality = binary(
+            &mut document.exprs,
+            hir::Expr::column(left, 1),
+            Operator::Equals,
+            hir::Expr::column(right, 1),
+        );
+        let on = binary_of(
+            &mut document.exprs,
+            first_equality,
             Operator::And,
-            binary(
-                hir::Expr::column(left, 1),
-                Operator::Equals,
-                hir::Expr::column(right, 1),
-            ),
+            second_equality,
         );
         let filter = binary(
+            &mut document.exprs,
             hir::Expr::column(right, 0),
             Operator::NotEquals,
             hir::Expr::column(right, 1),
@@ -4882,6 +4947,8 @@ pub(crate) mod tests {
                 constraint: JoinConstraint::On(on),
             }],
         });
+        add_query(&mut document, &block);
+        crate::translate::plan::prepare_planning_terms(&mut document);
 
         let input = HirPlanContext::new(&document)
             .query_block_input(&block, &[], &[])
@@ -4904,21 +4971,21 @@ pub(crate) mod tests {
             .all(|predicate| predicate.from_outer_join == Some(right)));
         assert_eq!(input.predicates[2].from_outer_join, None);
         assert!(matches!(
-            &input.predicates[0].expr,
+            &document.exprs[input.predicates[0].expr],
             hir::Expr::Binary {
                 operator: Operator::Equals,
                 ..
             }
         ));
         assert!(matches!(
-            &input.predicates[1].expr,
+            &document.exprs[input.predicates[1].expr],
             hir::Expr::Binary {
                 operator: Operator::Equals,
                 ..
             }
         ));
         assert!(matches!(
-            &input.predicates[2].expr,
+            &document.exprs[input.predicates[2].expr],
             hir::Expr::Binary {
                 operator: Operator::NotEquals,
                 ..
@@ -4932,12 +4999,15 @@ pub(crate) mod tests {
         let inner_left = SourceId::new(1);
         let inner_right = SourceId::new(2);
         let group = SourceId::new(3);
+        let mut exprs = hir::ExprArena::default();
         let inner_predicate = binary(
+            &mut exprs,
             hir::Expr::column(inner_left, 0),
             Operator::Equals,
             hir::Expr::column(inner_right, 0),
         );
         let outer_predicate = binary(
+            &mut exprs,
             hir::Expr::column(outer, 0),
             Operator::Equals,
             hir::Expr::column(inner_right, 0),
@@ -4950,12 +5020,13 @@ pub(crate) mod tests {
                 constraint: JoinConstraint::On(inner_predicate),
             }],
         };
-        let document = document(vec![
+        let mut document = document(vec![
             source_with_id(0, "outer_items"),
             source_with_id(1, "inner_left"),
             source_with_id(2, "inner_right"),
             group_source(3, group_from),
         ]);
+        document.exprs = exprs;
         let mut block = QueryBlock::new(
             QueryBlockId::new(QueryId::new(0), 0),
             QueryBlockBody::Select {
@@ -4972,6 +5043,8 @@ pub(crate) mod tests {
                 constraint: JoinConstraint::On(outer_predicate),
             }],
         });
+        add_query(&mut document, &block);
+        crate::translate::plan::prepare_planning_terms(&mut document);
 
         let input = HirPlanContext::new(&document)
             .query_block_input(&block, &[], &[])
@@ -5002,7 +5075,7 @@ pub(crate) mod tests {
 
         let layout = HirFromLayout::new(&input.sources, &input.groups);
         let mask = layout
-            .table_mask(&document, &input.predicates[0].expr)
+            .table_mask(&document, input.predicates[0].expr)
             .expect("group predicate has a physical source mask");
         assert!(!mask.get(0));
         assert!(mask.get(1));
@@ -5047,6 +5120,7 @@ pub(crate) mod tests {
                 right: group,
                 kind: JoinKind::Left,
                 constraint: JoinConstraint::On(binary(
+                    &mut document.exprs,
                     hir::Expr::column(outer, 0),
                     Operator::Equals,
                     hir::Expr::column(inner_right, 0),
@@ -5054,6 +5128,7 @@ pub(crate) mod tests {
             }],
         });
         add_query(&mut document, &block);
+        crate::translate::plan::prepare_planning_terms(&mut document);
 
         let plan = HirPlan::build(
             Arc::new(document),
@@ -5106,7 +5181,7 @@ pub(crate) mod tests {
                 constraint: JoinConstraint::None,
             }],
         };
-        let document = document(vec![
+        let mut document = document(vec![
             source_with_id(0, "last"),
             source_with_id(1, "first"),
             source_with_id(2, "second"),
@@ -5125,6 +5200,8 @@ pub(crate) mod tests {
             first: outer_group,
             joins: Vec::new(),
         });
+        add_query(&mut document, &block);
+        crate::translate::plan::prepare_planning_terms(&mut document);
 
         let input = HirPlanContext::new(&document)
             .query_block_input(&block, &[], &[])
@@ -5208,7 +5285,9 @@ pub(crate) mod tests {
         let left = SourceId::new(0);
         let function = SourceId::new(1);
         let mut function_source = source_with_id(1, "table_function");
+        let mut exprs = hir::ExprArena::default();
         let argument_predicate = binary(
+            &mut exprs,
             hir::Expr::column(function, 1),
             Operator::Equals,
             hir::Expr::column(left, 0),
@@ -5220,7 +5299,8 @@ pub(crate) mod tests {
             table,
             argument_predicates: vec![argument_predicate],
         };
-        let document = document(vec![source_with_id(0, "items"), function_source]);
+        let mut document = document(vec![source_with_id(0, "items"), function_source]);
+        document.exprs = exprs;
         let mut block = QueryBlock::new(
             QueryBlockId::new(QueryId::new(0), 0),
             QueryBlockBody::Select {
@@ -5237,6 +5317,8 @@ pub(crate) mod tests {
                 constraint: JoinConstraint::None,
             }],
         });
+        add_query(&mut document, &block);
+        crate::translate::plan::prepare_planning_terms(&mut document);
 
         let input = HirPlanContext::new(&document)
             .query_block_input(&block, &[], &[])
@@ -5246,10 +5328,10 @@ pub(crate) mod tests {
         assert_eq!(input.sources[1].source(), function);
         assert_eq!(input.predicates.len(), 1);
         assert!(matches!(
-            &input.predicates[0].expr,
+            &document.exprs[input.predicates[0].expr],
             hir::Expr::Binary { lhs, operator: Operator::Equals, rhs, .. }
-                if matches!(lhs.as_ref(), hir::Expr::Column(column) if *column == hir::ColumnRef { source: function, column: 1 })
-                    && matches!(rhs.as_ref(), hir::Expr::Column(column) if *column == hir::ColumnRef { source: left, column: 0 })
+                if matches!(&document.exprs[*lhs], hir::Expr::Column(column) if *column == hir::ColumnRef { source: function, column: 1 })
+                    && matches!(&document.exprs[*rhs], hir::Expr::Column(column) if *column == hir::ColumnRef { source: left, column: 0 })
         ));
         assert_eq!(input.predicates[0].from_outer_join, Some(function));
         assert!(!input.predicates[0].consumed);
@@ -5270,6 +5352,16 @@ pub(crate) mod tests {
                 array: false,
             }],
         };
+        let using_left = document.exprs.push(hir::Expr::column(left, 0));
+        let using_right = document.exprs.push(hir::Expr::column(right, 0));
+        let equality = document.exprs.push(hir::Expr::Binary {
+            lhs: using_left,
+            operator: Operator::Equals,
+            rhs: using_right,
+            array_concat: false,
+            custom: None,
+            comparison: Some(comparison.clone()),
+        });
         let mut block = QueryBlock::new(
             QueryBlockId::new(QueryId::new(0), 0),
             QueryBlockBody::Select {
@@ -5285,7 +5377,7 @@ pub(crate) mod tests {
                 kind: JoinKind::Left,
                 constraint: JoinConstraint::Using(vec![UsingColumn {
                     name: "first".to_string(),
-                    left: Box::new(hir::Expr::column(left, 0)),
+                    left: using_left,
                     right: hir::ColumnRef {
                         source: right,
                         column: 0,
@@ -5296,6 +5388,7 @@ pub(crate) mod tests {
                     has_affinity: true,
                     collation: None,
                     comparison: comparison.clone(),
+                    equality,
                 }]),
             }],
         });
@@ -5318,6 +5411,7 @@ pub(crate) mod tests {
         ];
 
         add_query(&mut document, &block);
+        crate::translate::plan::prepare_planning_terms(&mut document);
 
         let context = HirPlanContext::new(&document);
         let input = context
@@ -5333,17 +5427,17 @@ pub(crate) mod tests {
             rhs,
             comparison: actual_comparison,
             ..
-        } = &input.predicates[0].expr
+        } = &document.exprs[input.predicates[0].expr]
         else {
             panic!("USING becomes equality predicate");
         };
         assert_eq!(*operator, Operator::Equals);
         assert!(matches!(
-            lhs.as_ref(),
+            &document.exprs[*lhs],
             hir::Expr::Column(column) if *column == hir::ColumnRef { source: left, column: 0 }
         ));
         assert!(matches!(
-            rhs.as_ref(),
+            &document.exprs[*rhs],
             hir::Expr::Column(column) if *column == hir::ColumnRef { source: right, column: 0 }
         ));
         assert_eq!(actual_comparison.as_ref(), Some(&comparison));
@@ -5419,13 +5513,14 @@ pub(crate) mod tests {
             QueryBlockId::new(QueryId::new(0), 0),
             QueryBlockBody::Select {
                 distinctness: None,
-                filter: Some(hir::Expr::Literal(turso_parser::ast::Literal::Numeric(
-                    "1".into(),
+                filter: Some(document.exprs.push(hir::Expr::Literal(
+                    turso_parser::ast::Literal::Numeric("1".into()),
                 ))),
                 grouping: None,
             },
         );
         add_query(&mut document, &block);
+        crate::translate::plan::prepare_planning_terms(&mut document);
         let plan = HirPlanContext::new(&document)
             .plan_query_block(
                 &block,
@@ -5452,12 +5547,13 @@ pub(crate) mod tests {
         let block = QueryBlock::new(
             QueryBlockId::new(QueryId::new(0), 0),
             QueryBlockBody::Values {
-                rows: vec![vec![hir::Expr::Literal(
+                rows: vec![vec![document.exprs.push(hir::Expr::Literal(
                     turso_parser::ast::Literal::Numeric("1".into()),
-                )]],
+                ))]],
             },
         );
         add_query(&mut document, &block);
+        crate::translate::plan::prepare_planning_terms(&mut document);
         let document = Arc::new(document);
 
         let plan = HirPlan::build(
@@ -5484,14 +5580,20 @@ pub(crate) mod tests {
         let query_id = QueryId::new(0);
         let first_id = QueryBlockId::new(query_id, 0);
         let second_id = QueryBlockId::new(query_id, 1);
-        let value = || QueryBlockBody::Values {
-            rows: vec![vec![hir::Expr::Literal(
+        let mut document = document(vec![source()]);
+        let mut value = || QueryBlockBody::Values {
+            rows: vec![vec![document.exprs.push(hir::Expr::Literal(
                 turso_parser::ast::Literal::Numeric("1".into()),
-            )]],
+            ))]],
         };
         let first = QueryBlock::new(first_id, value());
         let second = QueryBlock::new(second_id, value());
-        let mut document = document(vec![source()]);
+        let order_value =
+            document
+                .exprs
+                .push(hir::Expr::Literal(turso_parser::ast::Literal::Numeric(
+                    "1".into(),
+                )));
         document.root = hir::HirRoot::Query(QueryRoot { query: query_id });
         document.queries.push(Query {
             id: query_id,
@@ -5505,7 +5607,7 @@ pub(crate) mod tests {
                 block: second_id,
             }],
             order_by: vec![OrderTerm {
-                expr: hir::Expr::Literal(turso_parser::ast::Literal::Numeric("1".into())),
+                expr: order_value,
                 order: SortOrder::Desc,
                 nulls: None,
                 type_fact: TypeFact::known(Type::Integer),
@@ -5514,6 +5616,7 @@ pub(crate) mod tests {
             limit: None,
             output: Vec::new(),
         });
+        crate::translate::plan::prepare_planning_terms(&mut document);
         let document = Arc::new(document);
 
         let plan = HirPlan::build(document, &Schema::default(), &CostModelParams::default())
@@ -5541,17 +5644,20 @@ pub(crate) mod tests {
         let root_block_id = QueryBlockId::new(root_query, 0);
         let child_block_id = QueryBlockId::new(child_query, 0);
         let source_id = SourceId::new(0);
+        let mut exprs = hir::ExprArena::default();
+        let filter_lhs = exprs.push(hir::Expr::column(source_id, 0));
+        let filter_rhs = exprs.push(hir::Expr::Literal(turso_parser::ast::Literal::Numeric(
+            "1".into(),
+        )));
 
         let mut root_block = QueryBlock::new(
             root_block_id,
             QueryBlockBody::Select {
                 distinctness: None,
-                filter: Some(hir::Expr::Binary {
-                    lhs: Box::new(hir::Expr::column(source_id, 0)),
+                filter: Some(exprs.push(hir::Expr::Binary {
+                    lhs: filter_lhs,
                     operator: Operator::Equals,
-                    rhs: Box::new(hir::Expr::Literal(turso_parser::ast::Literal::Numeric(
-                        "1".into(),
-                    ))),
+                    rhs: filter_rhs,
                     array_concat: false,
                     custom: None,
                     comparison: Some(ComparisonSemantics {
@@ -5561,7 +5667,7 @@ pub(crate) mod tests {
                             array: false,
                         }],
                     }),
-                }),
+                })),
                 grouping: None,
             },
         );
@@ -5573,19 +5679,25 @@ pub(crate) mod tests {
             child_block_id,
             QueryBlockBody::Values {
                 rows: vec![
-                    vec![hir::Expr::Literal(turso_parser::ast::Literal::Numeric(
-                        "1".into(),
-                    ))],
-                    vec![hir::Expr::Literal(turso_parser::ast::Literal::Numeric(
-                        "2".into(),
-                    ))],
+                    vec![
+                        exprs.push(hir::Expr::Literal(turso_parser::ast::Literal::Numeric(
+                            "1".into(),
+                        ))),
+                    ],
+                    vec![
+                        exprs.push(hir::Expr::Literal(turso_parser::ast::Literal::Numeric(
+                            "2".into(),
+                        ))),
+                    ],
                 ],
             },
         );
         child_block.outputs.push(Output {
             id: OutputId::query(child_block_id, 0),
             name: "column1".to_string(),
-            expr: hir::Expr::Literal(turso_parser::ast::Literal::Numeric("1".into())),
+            expr: exprs.push(hir::Expr::Literal(turso_parser::ast::Literal::Numeric(
+                "1".into(),
+            ))),
             type_fact: TypeFact::known(Type::Integer),
             affinity: Affinity::Integer,
             schema_affinity: Affinity::Integer,
@@ -5624,11 +5736,13 @@ pub(crate) mod tests {
         derived_source.default_expressions.truncate(1);
         derived_source.column_type_programs.truncate(1);
         let mut document = document(vec![derived_source]);
+        document.exprs = exprs;
         document.root = hir::HirRoot::Query(QueryRoot { query: root_query });
         document.queries = vec![
             query(root_query, None, root_block),
             query(child_query, Some(root_query), child_block),
         ];
+        crate::translate::plan::prepare_planning_terms(&mut document);
         document.validate().expect("derived query HIR is valid");
         let plan = HirPlan::build(
             Arc::new(document),
@@ -5667,12 +5781,16 @@ pub(crate) mod tests {
         subquery_definition.blocks[0].outputs[0].id = OutputId::query(subquery_block, 0);
         subquery_definition.output = vec![OutputId::query(subquery_block, 0)];
         subquery_document.queries.push(subquery_definition);
+        let exists = subquery_document
+            .exprs
+            .push(hir::Expr::Subquery(SubqueryExpr::Exists(subquery)));
         let QueryBlockBody::Select { filter, .. } =
             &mut subquery_document.queries[root_query.index()].blocks[0].body
         else {
             panic!("root query is SELECT");
         };
-        *filter = Some(hir::Expr::Subquery(SubqueryExpr::Exists(subquery)));
+        *filter = Some(exists);
+        crate::translate::plan::prepare_planning_terms(&mut subquery_document);
         subquery_document
             .validate()
             .expect("expression subquery HIR is valid");
@@ -5703,6 +5821,7 @@ pub(crate) mod tests {
             materialized: Materialized::Yes,
             body: CteBody::Query(child_query),
         });
+        crate::translate::plan::prepare_planning_terms(&mut cte_document);
         cte_document
             .validate()
             .expect("non-recursive CTE query HIR is valid");
@@ -5758,7 +5877,9 @@ pub(crate) mod tests {
         let mut arm_output =
             recursive_document.queries[child_query.index()].blocks[0].outputs[0].clone();
         arm_output.id = OutputId::query(arm_block_id, 0);
-        arm_output.expr = hir::Expr::column(input_source, 0);
+        arm_output.expr = recursive_document
+            .exprs
+            .push(hir::Expr::column(input_source, 0));
         arm_block.outputs.push(arm_output);
         recursive_document.queries.push(Query {
             id: arm_query,
@@ -5783,6 +5904,7 @@ pub(crate) mod tests {
             queue_order: Vec::new(),
             limit: None,
         });
+        crate::translate::plan::prepare_planning_terms(&mut recursive_document);
         recursive_document
             .validate()
             .expect("recursive CTE source HIR is valid");
@@ -5828,6 +5950,7 @@ pub(crate) mod tests {
                 constraint: JoinConstraint::None,
             });
         cte_document.ctes[cte_id.index()].materialized = Materialized::No;
+        crate::translate::plan::prepare_planning_terms(&mut cte_document);
         cte_document
             .validate()
             .expect("two references to a NOT MATERIALIZED CTE are valid");
@@ -5852,8 +5975,11 @@ pub(crate) mod tests {
                 constraint: JoinConstraint::None,
             });
         correlated_document.queries[child_query.index()].blocks[0].outputs[0].expr =
-            hir::Expr::column(outer_source, 0);
+            correlated_document
+                .exprs
+                .push(hir::Expr::column(outer_source, 0));
         correlated_document.queries[child_query.index()].captures = vec![outer_source];
+        crate::translate::plan::prepare_planning_terms(&mut correlated_document);
         correlated_document
             .validate()
             .expect("correlated CTE body HIR is valid");
@@ -5903,28 +6029,34 @@ pub(crate) mod tests {
             schema_version: 0,
         });
         mixed_document.sources.push(table_source);
+        let on_lhs = mixed_document
+            .exprs
+            .push(hir::Expr::column(table_source_id, 0));
+        let on_rhs = mixed_document.exprs.push(hir::Expr::column(source_id, 0));
+        let on = mixed_document.exprs.push(hir::Expr::Binary {
+            lhs: on_lhs,
+            operator: Operator::Equals,
+            rhs: on_rhs,
+            array_concat: false,
+            custom: None,
+            comparison: Some(ComparisonSemantics {
+                components: vec![ComparisonComponent {
+                    affinity: Affinity::Integer,
+                    collation: None,
+                    array: false,
+                }],
+            }),
+        });
         let root_block = &mut mixed_document.queries[root_query.index()].blocks[0];
         root_block.from = Some(hir::From {
             first: table_source_id,
             joins: vec![Join {
                 right: source_id,
                 kind: JoinKind::Inner,
-                constraint: JoinConstraint::On(hir::Expr::Binary {
-                    lhs: Box::new(hir::Expr::column(table_source_id, 0)),
-                    operator: Operator::Equals,
-                    rhs: Box::new(hir::Expr::column(source_id, 0)),
-                    array_concat: false,
-                    custom: None,
-                    comparison: Some(ComparisonSemantics {
-                        components: vec![ComparisonComponent {
-                            affinity: Affinity::Integer,
-                            collation: None,
-                            array: false,
-                        }],
-                    }),
-                }),
+                constraint: JoinConstraint::On(on),
             }],
         });
+        crate::translate::plan::prepare_planning_terms(&mut mixed_document);
         mixed_document
             .validate()
             .expect("mixed table and derived query HIR is valid");
@@ -5969,96 +6101,124 @@ pub(crate) mod tests {
     fn null_rejection_needs_a_column_of_the_target_source() {
         let target = SourceId::new(7);
         let other = SourceId::new(8);
+        let mut exprs = hir::ExprArena::default();
         // A term that never mentions the target can be TRUE on the join's
         // null-extended rows, so it proves nothing about them.
-        let expr = binary(hir::Expr::column(other, 0), Operator::Greater, number("1"));
-        assert!(!rejects_null_row(&expr, target));
-        let expr = binary(hir::Expr::column(target, 0), Operator::Greater, number("1"));
-        assert!(rejects_null_row(&expr, target));
+        let expr = binary(
+            &mut exprs,
+            hir::Expr::column(other, 0),
+            Operator::Greater,
+            number("1"),
+        );
+        assert!(!rejects_null_row(exprs.at(expr), target));
+        let expr = binary(
+            &mut exprs,
+            hir::Expr::column(target, 0),
+            Operator::Greater,
+            number("1"),
+        );
+        assert!(rejects_null_row(exprs.at(expr), target));
     }
 
     #[test]
     fn null_rejection_treats_is_and_null_tests_as_non_rejecting() {
         let target = SourceId::new(42);
         let column = || hir::Expr::column(target, 0);
-        assert!(!rejects_null_row(
-            &binary(column(), Operator::Is, number("5")),
-            target
-        ));
-        assert!(!rejects_null_row(
-            &binary(column(), Operator::IsNot, number("5")),
-            target
-        ));
-        assert!(!rejects_null_row(
-            &hir::Expr::IsNull(Box::new(column())),
-            target
-        ));
+        let mut exprs = hir::ExprArena::default();
+        let is = binary(&mut exprs, column(), Operator::Is, number("5"));
+        assert!(!rejects_null_row(exprs.at(is), target));
+        let is_not = binary(&mut exprs, column(), Operator::IsNot, number("5"));
+        assert!(!rejects_null_row(exprs.at(is_not), target));
+        let tested = exprs.push(column());
+        let is_null = exprs.push(hir::Expr::IsNull(tested));
+        assert!(!rejects_null_row(exprs.at(is_null), target));
         // A null test nested inside a comparison still does not reject.
+        let tested = exprs.push(column());
         let nested = binary(
-            hir::Expr::IsNull(Box::new(column())),
+            &mut exprs,
+            hir::Expr::IsNull(tested),
             Operator::Equals,
             number("1"),
         );
-        assert!(!rejects_null_row(&nested, target));
+        assert!(!rejects_null_row(exprs.at(nested), target));
     }
 
     #[test]
     fn null_rejection_treats_empty_not_in_as_non_rejecting() {
         let target = SourceId::new(42);
-        let in_list = |values: Vec<hir::Expr>| hir::Expr::InList {
-            lhs: Box::new(hir::Expr::column(target, 0)),
-            negated: true,
-            comparisons: values.iter().map(|_| integer_comparison()).collect(),
-            values,
+        let mut exprs = hir::ExprArena::default();
+        let mut in_list = |values: Vec<hir::Expr>| {
+            let lhs = exprs.push(hir::Expr::column(target, 0));
+            let comparisons = values.iter().map(|_| integer_comparison()).collect();
+            let values = values.into_iter().map(|value| exprs.push(value)).collect();
+            exprs.push(hir::Expr::InList {
+                lhs,
+                negated: true,
+                comparisons,
+                values,
+            })
         };
+        let empty = in_list(vec![]);
+        let one = in_list(vec![number("1")]);
         // `x NOT IN ()` is TRUE for NULL x.
-        assert!(!rejects_null_row(&in_list(vec![]), target));
-        assert!(rejects_null_row(&in_list(vec![number("1")]), target));
+        assert!(!rejects_null_row(exprs.at(empty), target));
+        assert!(rejects_null_row(exprs.at(one), target));
     }
 
     #[test]
     fn null_rejection_or_needs_both_arms() {
         let target = SourceId::new(1);
         let other = SourceId::new(2);
-        let rejecting = binary(hir::Expr::column(target, 0), Operator::Greater, number("1"));
-        let unrelated = binary(hir::Expr::column(other, 0), Operator::Greater, number("1"));
-        assert!(!rejects_null_row(
-            &binary(rejecting.clone(), Operator::Or, unrelated.clone()),
-            target
-        ));
-        assert!(rejects_null_row(
-            &binary(rejecting.clone(), Operator::Or, rejecting.clone()),
-            target
-        ));
+        let mut exprs = hir::ExprArena::default();
+        let rejecting = binary(
+            &mut exprs,
+            hir::Expr::column(target, 0),
+            Operator::Greater,
+            number("1"),
+        );
+        let unrelated = binary(
+            &mut exprs,
+            hir::Expr::column(other, 0),
+            Operator::Greater,
+            number("1"),
+        );
+        let rejecting_copy = exprs.deep_copy(rejecting);
+        let either = binary_of(&mut exprs, rejecting, Operator::Or, unrelated);
+        assert!(!rejects_null_row(exprs.at(either), target));
+        let both = binary_of(&mut exprs, rejecting, Operator::Or, rejecting_copy);
+        assert!(rejects_null_row(exprs.at(both), target));
         // An AND sits under a NOT or in parentheses here, so its polarity
         // is unknown and both arms must reject too.
-        assert!(!rejects_null_row(
-            &binary(rejecting, Operator::And, unrelated),
-            target
-        ));
+        let and = binary_of(&mut exprs, rejecting, Operator::And, unrelated);
+        assert!(!rejects_null_row(exprs.at(and), target));
     }
 
     #[test]
     fn null_rejection_sees_through_null_propagating_wrappers() {
         let target = SourceId::new(3);
-        let column = hir::Expr::column(target, 1);
+        let mut exprs = hir::ExprArena::default();
+        let negated = exprs.push(hir::Expr::column(target, 1));
         let expr = binary(
+            &mut exprs,
             hir::Expr::Unary {
                 operator: turso_parser::ast::UnaryOperator::Negative,
-                expr: Box::new(column.clone()),
+                expr: negated,
             },
             Operator::Less,
             number("0"),
         );
-        assert!(rejects_null_row(&expr, target));
-        let between = hir::Expr::Between {
-            expr: Box::new(number("1")),
+        assert!(rejects_null_row(exprs.at(expr), target));
+        let between_value = exprs.push(number("1"));
+        let start = exprs.push(hir::Expr::column(target, 1));
+        let end = exprs.push(hir::Expr::column(target, 1));
+        let between = exprs.push(hir::Expr::Between {
+            expr: between_value,
             negated: true,
-            start: Box::new(column.clone()),
-            end: Box::new(column),
+            start,
+            end,
             start_comparison: integer_comparison(),
             end_comparison: integer_comparison(),
-        };
-        assert!(rejects_null_row(&between, target));
+        });
+        assert!(rejects_null_row(exprs.at(between), target));
     }
 }

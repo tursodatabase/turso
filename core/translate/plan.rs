@@ -61,75 +61,102 @@ pub struct PredicateTerm<E, S> {
 }
 
 /// Predicate term used by HIR planning without parser expressions or planner IDs.
-pub(crate) type HirWhereTerm =
-    PredicateTerm<crate::translate::semantic::hir::Expr, crate::translate::semantic::hir::SourceId>;
+pub(crate) type HirWhereTerm = PredicateTerm<hir::ExprId, hir::SourceId>;
 
-/// Expression behavior needed to split predicates for planning.
-pub(crate) trait PredicateExpr: Clone {
-    fn ungrouped(&self) -> &Self {
-        self
-    }
-
-    fn and_operands(&self) -> Option<(&Self, &Self)>;
-
-    #[cfg(test)]
-    fn append_conjuncts<T>(&self, output: &mut Vec<T>)
-    where
-        Self: Sized,
-        T: From<Self>,
-    {
-        let expression = self.ungrouped();
-        if let Some((lhs, rhs)) = expression.and_operands() {
-            lhs.append_conjuncts(output);
-            rhs.append_conjuncts(output);
-        } else {
-            output.push(expression.clone().into());
-        }
-    }
-
-    fn conjuncts(&self) -> PredicateConjuncts<'_, Self>
-    where
-        Self: Sized,
-    {
-        PredicateConjuncts {
-            pending: vec![self],
+impl From<hir::ExprId> for HirWhereTerm {
+    fn from(expr: hir::ExprId) -> Self {
+        Self {
+            expr,
+            from_outer_join: None,
+            consumed: false,
         }
     }
 }
 
-pub(crate) struct PredicateConjuncts<'expr, E: PredicateExpr> {
-    pending: Vec<&'expr E>,
-}
-
-impl<'expr, E: PredicateExpr> Iterator for PredicateConjuncts<'expr, E> {
-    type Item = &'expr E;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(expression) = self.pending.pop() {
-            let expression = expression.ungrouped();
-            if let Some((lhs, rhs)) = expression.and_operands() {
-                self.pending.push(rhs);
-                self.pending.push(lhs);
-            } else {
-                return Some(expression);
+/// Build the planning terms of every predicate of `document`: the
+/// conjuncts each WHERE, ON, DML and partial-index predicate splits into,
+/// the `col IN (...)` terms their ORs imply, and the equality each
+/// `x IN (SELECT y ...)` subquery can run with. A predicate whose terms are
+/// already built is left alone, so this runs again after a rewrite adds
+/// predicates.
+pub(crate) fn prepare_planning_terms(document: &mut hir::HirDocument) {
+    document.planning.queries = document.query_facts();
+    let mut predicates = Vec::new();
+    let mut filters = Vec::new();
+    for query in &document.queries {
+        for block in &query.blocks {
+            if let Some(from) = &block.from {
+                collect_join_predicates(from, &mut predicates);
+            }
+            if let hir::QueryBlockBody::Select {
+                filter: Some(filter),
+                ..
+            } = &block.body
+            {
+                predicates.push(*filter);
+                filters.push(*filter);
             }
         }
-        None
+    }
+    for source in &document.sources {
+        if let hir::SourceKind::FromGroup(group) = &source.kind {
+            collect_join_predicates(&group.from, &mut predicates);
+        }
+        predicates.extend(
+            source
+                .index_expressions
+                .iter()
+                .filter_map(|index| index.predicate),
+        );
+    }
+    collect_root_predicates(&document.root, &mut predicates);
+    for predicate in predicates {
+        add_planning_terms(&mut document.exprs, &mut document.planning, predicate);
+    }
+    for filter in filters {
+        add_in_probes(document, filter);
+    }
+    if document.planning.always_true.is_none() {
+        document.planning.always_true = Some(
+            document
+                .exprs
+                .push(hir::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+        );
+        document.planning.null = Some(document.exprs.push(hir::Expr::Literal(ast::Literal::Null)));
     }
 }
 
-impl PredicateExpr for crate::translate::semantic::hir::Expr {
-    fn and_operands(&self) -> Option<(&Self, &Self)> {
-        let Self::Binary {
-            lhs,
-            operator: ast::Operator::And,
-            rhs,
-            ..
-        } = self
-        else {
-            return None;
-        };
-        Some((lhs, rhs))
+fn collect_join_predicates(from: &hir::From, predicates: &mut Vec<hir::ExprId>) {
+    for join in &from.joins {
+        if let hir::JoinConstraint::On(expression) = join.constraint {
+            predicates.push(expression);
+        }
+    }
+}
+
+fn collect_root_predicates(root: &hir::HirRoot, predicates: &mut Vec<hir::ExprId>) {
+    let add_update = |update: &hir::Update, predicates: &mut Vec<hir::ExprId>| {
+        predicates.extend(update.predicate);
+        if let Some(from) = &update.from {
+            collect_join_predicates(from, predicates);
+        }
+    };
+    let add_command = |command: &hir::TriggerCommand| match command {
+        hir::TriggerCommand::Update(update) => add_update(update, predicates),
+        hir::TriggerCommand::Delete(delete) => predicates.extend(delete.predicate),
+        hir::TriggerCommand::Select(_) | hir::TriggerCommand::Insert(_) => {}
+    };
+    match root {
+        hir::HirRoot::Update(update) => add_update(update, predicates),
+        hir::HirRoot::Delete(delete) => predicates.extend(delete.predicate),
+        hir::HirRoot::Trigger(trigger) => match &trigger.body {
+            #[cfg(test)]
+            hir::TriggerBody::Predicate(_) => {}
+            #[cfg(test)]
+            hir::TriggerBody::Command(command) => std::iter::once(command).for_each(add_command),
+            hir::TriggerBody::Program(program) => program.commands.iter().for_each(add_command),
+        },
+        hir::HirRoot::Query(_) | hir::HirRoot::Insert(_) | hir::HirRoot::SchemaExpressions(_) => {}
     }
 }
 
@@ -141,74 +168,89 @@ impl PredicateExpr for crate::translate::semantic::hir::Expr {
 /// - a conjunct every branch of an OR has is lifted out of it:
 ///   `(x = 1 AND a) OR (x = 1 AND b)` becomes `x = 1` and `a OR b`, and
 ///   `x = 1 OR (x = 1 AND b)` becomes `x = 1`.
-pub(crate) fn hir_planning_conjuncts(
-    expression: &crate::translate::semantic::hir::Expr,
-) -> Vec<crate::translate::semantic::hir::Expr> {
-    let mut lifted = Vec::new();
-    for conjunct in expression.conjuncts() {
-        match lift_or_common_conjuncts(conjunct) {
+fn add_planning_terms(
+    exprs: &mut hir::ExprArena,
+    planning: &mut hir::PlanningTerms,
+    predicate: hir::ExprId,
+) {
+    if planning.conjuncts.contains_key(&predicate) {
+        return;
+    }
+    let written = exprs
+        .at(predicate)
+        .conjuncts()
+        .map(|conjunct| conjunct.id())
+        .collect::<Vec<_>>();
+    let mut lifted = Vec::with_capacity(written.len());
+    for conjunct in written {
+        match lift_or_common_conjuncts(exprs, conjunct) {
             Some((common, rest)) => {
                 lifted.extend(common);
                 lifted.extend(rest);
             }
-            None => lifted.push(conjunct.clone()),
+            None => lifted.push(conjunct),
         }
     }
     let mut conjuncts = Vec::with_capacity(lifted.len());
     for conjunct in lifted {
-        split_column_between(conjunct, &mut conjuncts);
+        split_column_between(exprs, conjunct, &mut conjuncts);
     }
-    conjuncts
+    for conjunct in &conjuncts {
+        let implied = implied_in_terms(exprs, *conjunct);
+        if !implied.is_empty() {
+            planning.implied_in.insert(*conjunct, implied);
+        }
+    }
+    planning.conjuncts.insert(predicate, conjuncts);
 }
 
-fn hir_operands<'a>(
-    expression: &'a crate::translate::semantic::hir::Expr,
+fn hir_operands(
+    expression: hir::ExprRef<'_>,
     operator: ast::Operator,
-    operands: &mut Vec<&'a crate::translate::semantic::hir::Expr>,
+    operands: &mut Vec<hir::ExprId>,
 ) {
-    use crate::translate::semantic::hir::Expr;
-    match expression {
-        Expr::Binary {
+    match expression.node() {
+        hir::Expr::Binary {
             lhs,
             operator: found,
             rhs,
             custom: None,
             ..
         } if *found == operator => {
-            hir_operands(lhs, operator, operands);
-            hir_operands(rhs, operator, operands);
+            hir_operands(expression.at(*lhs), operator, operands);
+            hir_operands(expression.at(*rhs), operator, operands);
         }
-        _ => operands.push(expression),
+        _ => operands.push(expression.id()),
     }
 }
 
 fn hir_chain(
-    mut operands: Vec<crate::translate::semantic::hir::Expr>,
+    exprs: &mut hir::ExprArena,
+    operands: Vec<hir::ExprId>,
     operator: ast::Operator,
-) -> crate::translate::semantic::hir::Expr {
-    use crate::translate::semantic::hir::Expr;
-    let first = operands.remove(0);
-    operands.into_iter().fold(first, |lhs, rhs| Expr::Binary {
-        lhs: Box::new(lhs),
-        operator,
-        rhs: Box::new(rhs),
-        array_concat: false,
-        custom: None,
-        comparison: None,
+) -> hir::ExprId {
+    let mut operands = operands.into_iter();
+    let first = operands.next().expect("a chain has at least one operand");
+    operands.fold(first, |lhs, rhs| {
+        exprs.push(hir::Expr::Binary {
+            lhs,
+            operator,
+            rhs,
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        })
     })
 }
 
 /// The conjuncts every branch of an OR shares, and the OR without them, or
 /// none when it is no longer needed. `None` when nothing is shared.
-#[allow(clippy::type_complexity)]
 fn lift_or_common_conjuncts(
-    expression: &crate::translate::semantic::hir::Expr,
-) -> Option<(
-    Vec<crate::translate::semantic::hir::Expr>,
-    Option<crate::translate::semantic::hir::Expr>,
-)> {
+    exprs: &mut hir::ExprArena,
+    expression: hir::ExprId,
+) -> Option<(Vec<hir::ExprId>, Option<hir::ExprId>)> {
     let mut disjuncts = Vec::new();
-    hir_operands(expression, ast::Operator::Or, &mut disjuncts);
+    hir_operands(exprs.at(expression), ast::Operator::Or, &mut disjuncts);
     if disjuncts.len() < 2 {
         return None;
     }
@@ -216,59 +258,56 @@ fn lift_or_common_conjuncts(
         .into_iter()
         .map(|disjunct| {
             let mut conjuncts = Vec::new();
-            hir_operands(disjunct, ast::Operator::And, &mut conjuncts);
+            hir_operands(exprs.at(disjunct), ast::Operator::And, &mut conjuncts);
             conjuncts
         })
         .collect::<Vec<_>>();
-    let mut common: Vec<&crate::translate::semantic::hir::Expr> = Vec::new();
+    let same = |left: hir::ExprId, right: hir::ExprId| exprs.at(left).equivalent(exprs.at(right));
+    let mut common: Vec<hir::ExprId> = Vec::new();
     for candidate in &branches[0] {
-        if !common.iter().any(|found| found.equivalent(candidate))
+        if !common.iter().any(|found| same(*found, *candidate))
             && branches[1..]
                 .iter()
-                .all(|branch| branch.iter().any(|other| other.equivalent(candidate)))
+                .all(|branch| branch.iter().any(|other| same(*other, *candidate)))
         {
-            common.push(candidate);
+            common.push(*candidate);
         }
     }
     if common.is_empty() {
         return None;
     }
-    let mut rest = Vec::with_capacity(branches.len());
+    let mut remaining_branches = Vec::with_capacity(branches.len());
     for branch in &branches {
         let remaining = branch
             .iter()
-            .filter(|conjunct| !common.iter().any(|found| found.equivalent(conjunct)))
-            .map(|conjunct| (*conjunct).clone())
+            .copied()
+            .filter(|conjunct| !common.iter().any(|found| same(*found, *conjunct)))
             .collect::<Vec<_>>();
         if remaining.is_empty() {
             // One branch is the shared conjuncts alone, so the OR adds
             // nothing to them.
-            return Some((common.into_iter().cloned().collect(), None));
+            return Some((common, None));
         }
-        rest.push(hir_chain(remaining, ast::Operator::And));
+        remaining_branches.push(remaining);
     }
-    Some((
-        common.into_iter().cloned().collect(),
-        Some(hir_chain(rest, ast::Operator::Or)),
-    ))
+    let rest = remaining_branches
+        .into_iter()
+        .map(|remaining| hir_chain(exprs, remaining, ast::Operator::And))
+        .collect();
+    Some((common, Some(hir_chain(exprs, rest, ast::Operator::Or))))
 }
 
 /// `col IN (v1, v2, ...)` terms an OR term implies: every branch of the
 /// OR, its ANDs flattened, compares `col` with a literal by `=`. The OR
 /// stays, since the IN only narrows the rows it is checked on, but the IN
-/// can drive an index seek the OR cannot. With several such columns of one
-/// table, only the one that alone starts an index is used, so that two
-/// seeks do not compete for the same table.
-pub(crate) fn hir_implied_in_terms(
-    expression: &crate::translate::semantic::hir::Expr,
-    sole_indexed_column: &dyn Fn(
-        crate::translate::semantic::hir::SourceId,
-        &[usize],
-    ) -> Option<usize>,
-) -> Vec<crate::translate::semantic::hir::Expr> {
-    use crate::translate::semantic::hir::{ColumnRef, Expr};
+/// can drive an index seek the OR cannot. The planner keeps only some of
+/// them; see [`hir_implied_in_terms`].
+fn implied_in_terms(
+    exprs: &mut hir::ExprArena,
+    expression: hir::ExprId,
+) -> Vec<(hir::ColumnRef, hir::ExprId)> {
     let mut disjuncts = Vec::new();
-    hir_operands(expression, ast::Operator::Or, &mut disjuncts);
+    hir_operands(exprs.at(expression), ast::Operator::Or, &mut disjuncts);
     if disjuncts.len() < 2 {
         return Vec::new();
     }
@@ -276,35 +315,39 @@ pub(crate) fn hir_implied_in_terms(
         .into_iter()
         .map(|disjunct| {
             let mut conjuncts = Vec::new();
-            hir_operands(disjunct, ast::Operator::And, &mut conjuncts);
+            hir_operands(exprs.at(disjunct), ast::Operator::And, &mut conjuncts);
             conjuncts
         })
         .collect::<Vec<_>>();
     // A filter true for every branch names a column of the first branch.
-    let mut candidates: Vec<ColumnRef> = Vec::new();
+    let mut candidates: Vec<hir::ColumnRef> = Vec::new();
     for term in &branches[0] {
-        if let Some((column, _, _)) = hir_column_literal_equality(term) {
+        if let Some((column, _, _)) = hir_column_literal_equality(exprs.at(*term)) {
             if !candidates.contains(&column) {
                 candidates.push(column);
             }
         }
     }
-    let mut filters: Vec<(ColumnRef, Expr)> = Vec::new();
+    let mut filters = Vec::new();
     'candidates: for column in candidates {
-        let mut values: Vec<Expr> = Vec::new();
+        let mut values: Vec<hir::ExprId> = Vec::new();
         let mut comparisons = Vec::new();
         for branch in &branches {
             let mut found = false;
             for term in branch {
-                let Some((other, value, comparison)) = hir_column_literal_equality(term) else {
+                let Some((other, value, comparison)) = hir_column_literal_equality(exprs.at(*term))
+                else {
                     continue;
                 };
                 if other != column {
                     continue;
                 }
                 found = true;
-                if !values.iter().any(|known| known.equivalent(value)) {
-                    values.push(value.clone());
+                if !values
+                    .iter()
+                    .any(|known| exprs.at(*known).equivalent(exprs.at(value)))
+                {
+                    values.push(value);
                     comparisons.push(comparison.clone());
                 }
             }
@@ -315,30 +358,40 @@ pub(crate) fn hir_implied_in_terms(
             }
         }
         // One value for every branch is a conjunct the OR shares, which
-        // `hir_planning_conjuncts` lifts out of it.
+        // `add_planning_terms` lifts out of it.
         if values.len() > 1 {
-            filters.push((
-                column,
-                Expr::InList {
-                    lhs: Box::new(Expr::Column(column)),
-                    negated: false,
-                    values,
-                    comparisons,
-                },
-            ));
+            let lhs = exprs.push(hir::Expr::Column(column));
+            let filter = exprs.push(hir::Expr::InList {
+                lhs,
+                negated: false,
+                values,
+                comparisons,
+            });
+            filters.push((column, filter));
         }
     }
     filters
+}
+
+/// Of the `col IN (...)` terms `implied` an OR term implies, the ones to
+/// plan: with several such columns of one table, only the one that alone
+/// starts an index is used, so that two seeks do not compete for the same
+/// table.
+pub(crate) fn hir_implied_in_terms(
+    implied: &[(hir::ColumnRef, hir::ExprId)],
+    sole_indexed_column: &dyn Fn(hir::SourceId, &[usize]) -> Option<usize>,
+) -> Vec<hir::ExprId> {
+    implied
         .iter()
         .filter_map(|(column, filter)| {
-            let same_source = filters
+            let same_source = implied
                 .iter()
                 .filter(|(other, _)| other.source == column.source)
                 .map(|(other, _)| other.column)
                 .collect::<Vec<_>>();
             (same_source.len() == 1
                 || sole_indexed_column(column.source, &same_source) == Some(column.column))
-            .then(|| filter.clone())
+            .then_some(*filter)
         })
         .collect()
 }
@@ -346,107 +399,136 @@ pub(crate) fn hir_implied_in_terms(
 /// The column and literal of `col = literal` or `literal = col`, with the
 /// comparison's semantics.
 fn hir_column_literal_equality(
-    expression: &crate::translate::semantic::hir::Expr,
-) -> Option<(
-    crate::translate::semantic::hir::ColumnRef,
-    &crate::translate::semantic::hir::Expr,
-    &crate::translate::semantic::hir::ComparisonSemantics,
-)> {
-    use crate::translate::semantic::hir::Expr;
-    let Expr::Binary {
+    expression: hir::ExprRef<'_>,
+) -> Option<(hir::ColumnRef, hir::ExprId, &hir::ComparisonSemantics)> {
+    let hir::Expr::Binary {
         lhs,
         operator: ast::Operator::Equals,
         rhs,
         custom: None,
         comparison: Some(comparison),
         ..
-    } = expression
+    } = expression.node()
     else {
         return None;
     };
-    match (lhs.as_ref(), rhs.as_ref()) {
-        (Expr::Column(column), value) if hir_literal_can_be_copied(value) => {
-            Some((*column, value, comparison))
+    match (expression.at(*lhs).node(), expression.at(*rhs)) {
+        (hir::Expr::Column(column), value) if hir_literal_can_be_copied(value) => {
+            Some((*column, *rhs, comparison))
         }
-        (value, Expr::Column(column)) if hir_literal_can_be_copied(value) => {
-            Some((*column, value, comparison))
-        }
-        _ => None,
+        _ => match (expression.at(*lhs), expression.at(*rhs).node()) {
+            (value, hir::Expr::Column(column)) if hir_literal_can_be_copied(value) => {
+                Some((*column, *lhs, comparison))
+            }
+            _ => None,
+        },
     }
 }
 
 /// A number, string, blob or boolean, possibly signed. NULL never satisfies
 /// `=`, so it is left out.
-fn hir_literal_can_be_copied(expression: &crate::translate::semantic::hir::Expr) -> bool {
-    use crate::translate::semantic::hir::Expr;
+fn hir_literal_can_be_copied(expression: hir::ExprRef<'_>) -> bool {
     use turso_parser::ast::{Literal, UnaryOperator};
-    match expression {
-        Expr::Literal(
+    match expression.node() {
+        hir::Expr::Literal(
             Literal::Numeric(_)
             | Literal::String(_)
             | Literal::Blob(_)
             | Literal::True
             | Literal::False,
         ) => true,
-        Expr::Unary {
+        hir::Expr::Unary {
             operator: UnaryOperator::Negative | UnaryOperator::Positive,
             expr,
-        } => matches!(expr.as_ref(), Expr::Literal(Literal::Numeric(_))),
+        } => matches!(
+            expression.at(*expr).node(),
+            hir::Expr::Literal(Literal::Numeric(_))
+        ),
         _ => false,
     }
 }
 
 fn split_column_between(
-    conjunct: crate::translate::semantic::hir::Expr,
-    conjuncts: &mut Vec<crate::translate::semantic::hir::Expr>,
+    exprs: &mut hir::ExprArena,
+    conjunct: hir::ExprId,
+    conjuncts: &mut Vec<hir::ExprId>,
 ) {
-    use crate::translate::semantic::hir::Expr;
-    {
-        match conjunct {
-            Expr::Between {
-                expr,
-                negated: false,
-                start,
-                end,
-                start_comparison,
-                end_comparison,
-            } if matches!(expr.as_ref(), Expr::Column(_) | Expr::RowId(_)) => {
-                for (operator, bound, comparison, lhs) in [
-                    (
-                        ast::Operator::GreaterEquals,
-                        start,
-                        start_comparison,
-                        expr.clone(),
-                    ),
-                    (ast::Operator::LessEquals, end, end_comparison, expr),
-                ] {
-                    conjuncts.push(Expr::Binary {
-                        lhs,
-                        operator,
-                        rhs: bound,
-                        array_concat: false,
-                        custom: None,
-                        comparison: Some(comparison),
-                    });
-                }
-            }
-            conjunct => conjuncts.push(conjunct),
-        }
+    let hir::Expr::Between {
+        expr,
+        negated: false,
+        start,
+        end,
+        start_comparison,
+        end_comparison,
+    } = &exprs[conjunct]
+    else {
+        conjuncts.push(conjunct);
+        return;
+    };
+    if !matches!(exprs[*expr], hir::Expr::Column(_) | hir::Expr::RowId(_)) {
+        conjuncts.push(conjunct);
+        return;
+    }
+    let bounds = [
+        (
+            ast::Operator::GreaterEquals,
+            *start,
+            start_comparison.clone(),
+        ),
+        (ast::Operator::LessEquals, *end, end_comparison.clone()),
+    ];
+    let lhs = *expr;
+    for (operator, rhs, comparison) in bounds {
+        conjuncts.push(exprs.push(hir::Expr::Binary {
+            lhs,
+            operator,
+            rhs,
+            array_concat: false,
+            custom: None,
+            comparison: Some(comparison),
+        }));
     }
 }
 
-impl From<crate::translate::semantic::hir::Expr>
-    for PredicateTerm<
-        crate::translate::semantic::hir::Expr,
-        crate::translate::semantic::hir::SourceId,
-    >
-{
-    fn from(expr: crate::translate::semantic::hir::Expr) -> Self {
-        Self {
-            expr,
-            from_outer_join: None,
-            consumed: false,
+/// Build the `x = y` term of each `x IN (SELECT y ...)` conjunct of
+/// `filter` whose subquery has one block with one output.
+fn add_in_probes(document: &mut hir::HirDocument, filter: hir::ExprId) {
+    let mut probes = Vec::new();
+    for conjunct in document.expr(filter).conjuncts() {
+        let hir::Expr::Subquery(hir::SubqueryExpr::In {
+            lhs,
+            query,
+            negated: false,
+            comparison,
+        }) = conjunct.node()
+        else {
+            continue;
+        };
+        if comparison.components.len() != 1 || document.planning.in_probe(*query).is_some() {
+            continue;
         }
+        let Some(definition) = document.query(*query) else {
+            continue;
+        };
+        let [block] = definition.blocks.as_slice() else {
+            continue;
+        };
+        let [output] = block.outputs.as_slice() else {
+            continue;
+        };
+        probes.push((*query, *lhs, output.expr, comparison.clone()));
+    }
+    for (query, lhs, rhs, comparison) in probes {
+        let probe = document.exprs.push(hir::Expr::Binary {
+            lhs,
+            operator: ast::Operator::Equals,
+            rhs,
+            array_concat: false,
+            custom: None,
+            comparison: Some(comparison),
+        });
+        add_planning_terms(&mut document.exprs, &mut document.planning, probe);
+        document.planning.in_probes.insert(query, probe);
     }
 }
 
@@ -816,7 +898,7 @@ impl<'a> HirFromLayout<'a> {
     pub(crate) fn table_mask(
         &self,
         document: &hir::HirDocument,
-        expression: &hir::Expr,
+        expression: hir::ExprId,
     ) -> Result<TableMask> {
         table_mask_from_hir_scope(document, self, expression)
     }
@@ -933,7 +1015,7 @@ fn join_kind_may_null_extend(
 pub(crate) type HirPlannedSource = PlannedSource<
     crate::translate::semantic::hir::SourceId,
     crate::translate::semantic::hir::IndexHint,
-    crate::translate::semantic::hir::Expr,
+    hir::ExprId,
     HirJoinInfo,
 >;
 
@@ -1186,23 +1268,24 @@ impl
     PlannedSource<
         crate::translate::semantic::hir::SourceId,
         crate::translate::semantic::hir::IndexHint,
-        crate::translate::semantic::hir::Expr,
+        hir::ExprId,
         HirJoinInfo,
     >
 {
     pub(crate) fn register_expression_index_usage(
         &mut self,
-        expression: crate::translate::semantic::hir::Expr,
+        expression: hir::ExprId,
         columns_mask: ColumnUsedMask,
+        exprs: &hir::ExprArena,
     ) {
         if columns_mask.is_empty() {
             return;
         }
-        if self
-            .expression_index_usages
-            .iter()
-            .any(|usage| usage.normalized_expr.equivalent(&expression))
-        {
+        if self.expression_index_usages.iter().any(|usage| {
+            exprs
+                .at(*usage.normalized_expr)
+                .equivalent(exprs.at(expression))
+        }) {
             return;
         }
         self.expression_index_usages.push(ExpressionIndexUsage {
@@ -1222,8 +1305,10 @@ impl
         &self,
         source: &crate::translate::semantic::hir::Source,
         index: &Index,
+        exprs: &hir::ExprArena,
     ) -> bool {
         self.index_is_covering_with(index, |expression, index| {
+            let expression = exprs.at(*expression);
             source
                 .index_expressions
                 .iter()
@@ -1233,11 +1318,10 @@ impl
                         .columns
                         .iter()
                         .flatten()
-                        .any(|indexed| expression.equivalent(indexed))
+                        .any(|indexed| expression.equivalent(exprs.at(*indexed)))
                         || expressions
                             .predicate
-                            .as_ref()
-                            .is_some_and(|predicate| expression.equivalent(predicate))
+                            .is_some_and(|predicate| expression.equivalent(exprs.at(predicate)))
                 })
         })
     }
@@ -1809,7 +1893,7 @@ pub struct SeekDef<E = ast::Expr> {
     pub iter_dir: IterationDirection,
 }
 
-pub(crate) type HirSeekDef = SeekDef<crate::translate::semantic::hir::Expr>;
+pub(crate) type HirSeekDef = SeekDef<hir::ExprId>;
 
 pub struct SeekDefKeyIterator<'a, E, T> {
     seek_def: &'a SeekDef<E>,
@@ -1991,31 +2075,33 @@ mod tests {
 
     type TestResult = std::result::Result<(), alloc::TryReserveError>;
 
-    fn hir_integer(value: i64) -> crate::translate::semantic::hir::Expr {
-        crate::translate::semantic::hir::Expr::Literal(ast::Literal::Numeric(value.to_string()))
+    fn hir_integer(exprs: &mut hir::ExprArena, value: i64) -> hir::ExprId {
+        exprs.push(hir::Expr::Literal(ast::Literal::Numeric(value.to_string())))
     }
 
-    fn hir_and(
-        lhs: crate::translate::semantic::hir::Expr,
-        rhs: crate::translate::semantic::hir::Expr,
-    ) -> crate::translate::semantic::hir::Expr {
-        crate::translate::semantic::hir::Expr::Binary {
-            lhs: Box::new(lhs),
+    fn hir_and(exprs: &mut hir::ExprArena, lhs: hir::ExprId, rhs: hir::ExprId) -> hir::ExprId {
+        exprs.push(hir::Expr::Binary {
+            lhs,
             operator: ast::Operator::And,
-            rhs: Box::new(rhs),
+            rhs,
             array_concat: false,
             custom: None,
             comparison: None,
-        }
+        })
     }
 
     #[test]
     fn hir_seek_definition_keeps_resolved_expressions() {
+        let mut exprs = hir::ExprArena::default();
         let seek: HirSeekDef = SeekDef {
             prefix: vec![SeekRangeConstraint::new_eq(
                 SortOrder::Asc,
                 ast::NullsOrder::First,
-                (ast::Operator::Equals, hir_integer(7), Affinity::Integer),
+                (
+                    ast::Operator::Equals,
+                    hir_integer(&mut exprs, 7),
+                    Affinity::Integer,
+                ),
             )],
             start: SeekKey {
                 last_component: SeekKeyComponent::None,
@@ -2033,9 +2119,10 @@ mod tests {
         let values = seek.iter(&seek.start).collect::<Vec<_>>();
         assert!(matches!(
             values.as_slice(),
-            [SeekKeyComponent::Expr(hir::Expr::Literal(
-                ast::Literal::Numeric(value)
-            ))] if value == "7"
+            [SeekKeyComponent::Expr(value)] if matches!(
+                &exprs[**value],
+                hir::Expr::Literal(ast::Literal::Numeric(value)) if value == "7"
+            )
         ));
         assert_eq!(
             seek.iter_affinity(&seek.start).collect::<Vec<_>>(),
@@ -2043,7 +2130,7 @@ mod tests {
         );
     }
 
-    fn hir_output(id: hir::OutputId, expr: hir::Expr) -> hir::Output {
+    fn hir_output(id: hir::OutputId, expr: hir::ExprId) -> hir::Output {
         hir::Output {
             id,
             name: "value".into(),
@@ -2062,6 +2149,8 @@ mod tests {
         output_expr: hir::Expr,
         captures: Vec<hir::SourceId>,
     ) -> hir::HirDocument {
+        let mut exprs = hir::ExprArena::default();
+        let output_expr = exprs.push(output_expr);
         let outer_query = hir::QueryId::new(0);
         let outer_block = hir::QueryBlockId::new(outer_query, 0);
         let output = hir::OutputId::query(outer_block, 0);
@@ -2110,6 +2199,8 @@ mod tests {
             ctes: Vec::new(),
             schema_programs: Vec::new(),
             cdc: None,
+            exprs,
+            planning: hir::PlanningTerms::default(),
         }
     }
 
@@ -2124,27 +2215,36 @@ mod tests {
                 array: false,
             }],
         };
-        let equals = |column: usize, value: Expr| Expr::Binary {
-            lhs: Box::new(Expr::column(table, column)),
-            operator: ast::Operator::Equals,
-            rhs: Box::new(value),
-            array_concat: false,
-            custom: None,
-            comparison: Some(comparison.clone()),
+        let mut exprs = hir::ExprArena::default();
+        let equals = |exprs: &mut hir::ExprArena, column: usize, value: hir::ExprId| {
+            let lhs = exprs.push(Expr::column(table, column));
+            exprs.push(Expr::Binary {
+                lhs,
+                operator: ast::Operator::Equals,
+                rhs: value,
+                array_concat: false,
+                custom: None,
+                comparison: Some(comparison.clone()),
+            })
         };
-        let or = |lhs: Expr, rhs: Expr| Expr::Binary {
-            lhs: Box::new(lhs),
-            operator: ast::Operator::Or,
-            rhs: Box::new(rhs),
-            array_concat: false,
-            custom: None,
-            comparison: None,
+        let or = |exprs: &mut hir::ExprArena, lhs: hir::ExprId, rhs: hir::ExprId| {
+            exprs.push(Expr::Binary {
+                lhs,
+                operator: ast::Operator::Or,
+                rhs,
+                array_concat: false,
+                custom: None,
+                comparison: None,
+            })
         };
-        let negative = |value: i64| Expr::Unary {
-            operator: ast::UnaryOperator::Negative,
-            expr: Box::new(hir_integer(value)),
+        let negative = |exprs: &mut hir::ExprArena, value: i64| {
+            let expr = hir_integer(exprs, value);
+            exprs.push(Expr::Unary {
+                operator: ast::UnaryOperator::Negative,
+                expr,
+            })
         };
-        let in_values = |term: &Expr| match term {
+        let in_values = |exprs: &hir::ExprArena, term: hir::ExprId| match &exprs[term] {
             Expr::InList {
                 lhs,
                 negated: false,
@@ -2152,75 +2252,109 @@ mod tests {
                 comparisons,
             } => {
                 assert_eq!(values.len(), comparisons.len());
-                let Expr::Column(column) = lhs.as_ref() else {
+                let Expr::Column(column) = &exprs[*lhs] else {
                     panic!("an implied IN tests a column");
                 };
                 (column.column, values.clone())
             }
             _ => panic!("an implied term is an IN list"),
         };
+        let implied =
+            |exprs: &mut hir::ExprArena,
+             expression: hir::ExprId,
+             starts_index: &dyn Fn(hir::SourceId, &[usize]) -> Option<usize>| {
+                hir_implied_in_terms(&implied_in_terms(exprs, expression), starts_index)
+            };
 
         // Both columns are fixed by every branch; only the one that starts
         // an index gets a filter. A repeated value is listed once.
-        let expression = or(
-            or(
-                hir_and(equals(0, hir_integer(1)), equals(1, hir_integer(10))),
-                hir_and(equals(1, hir_integer(20)), equals(0, negative(2))),
-            ),
-            hir_and(equals(0, hir_integer(1)), equals(1, hir_integer(30))),
-        );
+        let one = hir_integer(&mut exprs, 1);
+        let ten = hir_integer(&mut exprs, 10);
+        let first_left = equals(&mut exprs, 0, one);
+        let first_right = equals(&mut exprs, 1, ten);
+        let first = hir_and(&mut exprs, first_left, first_right);
+        let twenty = hir_integer(&mut exprs, 20);
+        let minus_two = negative(&mut exprs, 2);
+        let second_left = equals(&mut exprs, 1, twenty);
+        let second_right = equals(&mut exprs, 0, minus_two);
+        let second = hir_and(&mut exprs, second_left, second_right);
+        let one = hir_integer(&mut exprs, 1);
+        let thirty = hir_integer(&mut exprs, 30);
+        let third_left = equals(&mut exprs, 0, one);
+        let third_right = equals(&mut exprs, 1, thirty);
+        let third = hir_and(&mut exprs, third_left, third_right);
+        let first_two = or(&mut exprs, first, second);
+        let expression = or(&mut exprs, first_two, third);
         let starts_index = |_: hir::SourceId, columns: &[usize]| {
             assert_eq!(columns, [0, 1]);
             Some(1)
         };
-        let same_values = |values: &[Expr], expected: &[Expr]| {
-            values.len() == expected.len()
-                && values
-                    .iter()
-                    .zip(expected)
-                    .all(|(value, expected)| value.equivalent(expected))
-        };
-        let implied = hir_implied_in_terms(&expression, &starts_index);
-        assert_eq!(implied.len(), 1);
-        let (column, values) = in_values(&implied[0]);
+        let same_values =
+            |exprs: &hir::ExprArena, values: &[hir::ExprId], expected: &[hir::ExprId]| {
+                values.len() == expected.len()
+                    && values
+                        .iter()
+                        .zip(expected)
+                        .all(|(value, expected)| exprs.at(*value).equivalent(exprs.at(*expected)))
+            };
+        let terms = implied(&mut exprs, expression, &starts_index);
+        assert_eq!(terms.len(), 1);
+        let (column, values) = in_values(&exprs, terms[0]);
         assert_eq!(column, 1);
-        assert!(same_values(
-            &values,
-            &[hir_integer(10), hir_integer(20), hir_integer(30)]
-        ));
+        let expected = [
+            hir_integer(&mut exprs, 10),
+            hir_integer(&mut exprs, 20),
+            hir_integer(&mut exprs, 30),
+        ];
+        assert!(same_values(&exprs, &values, &expected));
 
         // With one fixed column, no index is needed.
-        let expression = or(equals(0, hir_integer(1)), equals(0, negative(2)));
-        let implied = hir_implied_in_terms(&expression, &|_, _| None);
-        assert_eq!(implied.len(), 1);
-        let (column, values) = in_values(&implied[0]);
+        let one = hir_integer(&mut exprs, 1);
+        let left = equals(&mut exprs, 0, one);
+        let minus_two = negative(&mut exprs, 2);
+        let right = equals(&mut exprs, 0, minus_two);
+        let expression = or(&mut exprs, left, right);
+        let terms = implied(&mut exprs, expression, &|_, _| None);
+        assert_eq!(terms.len(), 1);
+        let (column, values) = in_values(&exprs, terms[0]);
         assert_eq!(column, 0);
-        assert!(same_values(&values, &[hir_integer(1), negative(2)]));
+        let expected = [hir_integer(&mut exprs, 1), negative(&mut exprs, 2)];
+        assert!(same_values(&exprs, &values, &expected));
 
         // A branch that does not fix the column, or fixes it to a non-literal
         // or to NULL, gives no filter.
-        for expression in [
-            or(equals(0, hir_integer(1)), equals(1, hir_integer(2))),
-            or(equals(0, hir_integer(1)), equals(0, Expr::column(table, 2))),
-            or(
-                equals(0, hir_integer(1)),
-                equals(0, Expr::Literal(ast::Literal::Null)),
-            ),
-        ] {
-            assert!(hir_implied_in_terms(&expression, &|_, _| None).is_empty());
+        let other_column_value = hir_integer(&mut exprs, 2);
+        let other_column = equals(&mut exprs, 1, other_column_value);
+        let column_value = exprs.push(Expr::column(table, 2));
+        let non_literal = equals(&mut exprs, 0, column_value);
+        let null_value = exprs.push(Expr::Literal(ast::Literal::Null));
+        let null = equals(&mut exprs, 0, null_value);
+        for second in [other_column, non_literal, null] {
+            let one = hir_integer(&mut exprs, 1);
+            let first = equals(&mut exprs, 0, one);
+            let expression = or(&mut exprs, first, second);
+            assert!(implied(&mut exprs, expression, &|_, _| None).is_empty());
         }
     }
 
     #[test]
     fn hir_predicates_split_without_ast_conversion() {
-        let expression = hir_and(hir_integer(1), hir_and(hir_integer(2), hir_integer(3)));
-        let mut terms: Vec<HirWhereTerm> = Vec::new();
+        let mut exprs = hir::ExprArena::default();
+        let one = hir_integer(&mut exprs, 1);
+        let two = hir_integer(&mut exprs, 2);
+        let three = hir_integer(&mut exprs, 3);
+        let rest = hir_and(&mut exprs, two, three);
+        let expression = hir_and(&mut exprs, one, rest);
 
-        expression.append_conjuncts(&mut terms);
+        let terms: Vec<HirWhereTerm> = exprs
+            .at(expression)
+            .conjuncts()
+            .map(|conjunct| conjunct.id().into())
+            .collect();
 
         let values = terms
             .iter()
-            .map(|term| match &term.expr {
+            .map(|term| match &exprs[term.expr] {
                 crate::translate::semantic::hir::Expr::Literal(ast::Literal::Numeric(value)) => {
                     value.as_str()
                 }
@@ -2245,41 +2379,34 @@ mod tests {
             }],
         };
         let output = hir::OutputId::query(hir::QueryBlockId::new(hir::QueryId::new(0), 0), 0);
-        let document = hir_dependency_document(hir::Expr::column(joined, 0), vec![joined, outside]);
+        let mut document =
+            hir_dependency_document(hir::Expr::column(joined, 0), vec![joined, outside]);
+        let exprs = &mut document.exprs;
 
-        let direct = hir_and(hir::Expr::column(first, 0), hir::Expr::rowid(joined));
-        let direct_mask =
-            crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), &direct)?;
-        assert!(direct_mask.get(0));
-        assert!(direct_mask.get(1));
+        let first_column = exprs.push(hir::Expr::column(first, 0));
+        let joined_rowid = exprs.push(hir::Expr::rowid(joined));
+        let direct = hir_and(exprs, first_column, joined_rowid);
 
-        let merged = hir::Expr::MergedColumn(Box::new(hir::MergedColumn {
-            left: Box::new(hir::Expr::column(first, 0)),
-            right: Box::new(hir::Expr::Column(hir::ColumnRef {
-                source: joined,
-                column: 0,
-            })),
+        let merged_left = exprs.push(hir::Expr::column(first, 0));
+        let merged_right = exprs.push(hir::Expr::Column(hir::ColumnRef {
+            source: joined,
+            column: 0,
+        }));
+        let merged = exprs.push(hir::Expr::MergedColumn(Box::new(hir::MergedColumn {
+            left: merged_left,
+            right: merged_right,
             value: hir::MergedColumnValue::Coalesce,
             type_fact: hir::TypeFact::dynamic(),
             affinity: Affinity::Blob,
             has_affinity: false,
             collation: None,
-        }));
-        let merged_mask =
-            crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), &merged)?;
-        assert!(merged_mask.get(0));
-        assert!(merged_mask.get(1));
+        })));
 
-        let output_mask = crate::translate::planner::table_mask_from_hir_expr(
-            &document,
-            Some(&from),
-            &hir::Expr::output(output),
-        )?;
-        assert!(!output_mask.get(0));
-        assert!(output_mask.get(1));
+        let output_expr = exprs.push(hir::Expr::output(output));
 
-        let subquery = hir::Expr::Subquery(hir::SubqueryExpr::In {
-            lhs: Box::new(hir::Expr::column(first, 0)),
+        let subquery_lhs = exprs.push(hir::Expr::column(first, 0));
+        let subquery = exprs.push(hir::Expr::Subquery(hir::SubqueryExpr::In {
+            lhs: subquery_lhs,
             query: hir::QueryId::new(1),
             negated: false,
             comparison: hir::ComparisonSemantics {
@@ -2289,19 +2416,39 @@ mod tests {
                     array: false,
                 }],
             },
-        });
+        }));
+
+        let duplicate_left = exprs.push(hir::Expr::column(first, 0));
+        let duplicate_right = exprs.push(hir::Expr::column(first, 1));
+        let duplicate = hir_and(exprs, duplicate_left, duplicate_right);
+        prepare_planning_terms(&mut document);
+
+        let direct_mask =
+            crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), direct)?;
+        assert!(direct_mask.get(0));
+        assert!(direct_mask.get(1));
+
+        let merged_mask =
+            crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), merged)?;
+        assert!(merged_mask.get(0));
+        assert!(merged_mask.get(1));
+
+        let output_mask = crate::translate::planner::table_mask_from_hir_expr(
+            &document,
+            Some(&from),
+            output_expr,
+        )?;
+        assert!(!output_mask.get(0));
+        assert!(output_mask.get(1));
+
         let subquery_mask =
-            crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), &subquery)?;
+            crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), subquery)?;
         assert!(subquery_mask.get(0));
         assert!(subquery_mask.get(1));
         assert_eq!(subquery_mask.iter().count(), 2);
 
-        let duplicate = hir_and(hir::Expr::column(first, 0), hir::Expr::column(first, 1));
-        let duplicate_mask = crate::translate::planner::table_mask_from_hir_expr(
-            &document,
-            Some(&from),
-            &duplicate,
-        )?;
+        let duplicate_mask =
+            crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), duplicate)?;
         assert_eq!(duplicate_mask.iter().collect::<Vec<_>>(), [0]);
 
         Ok(())

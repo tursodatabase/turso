@@ -101,13 +101,13 @@ impl AggregationArguments<'_> {
         }
     }
 
-    fn hir_argument(call: &hir::FunctionCall, index: usize) -> Option<&hir::Expr> {
+    fn hir_argument(call: &hir::FunctionCall, index: usize) -> Option<hir::ExprId> {
         match &call.arguments {
             hir::FunctionArguments::Star => None,
-            hir::FunctionArguments::Expressions { values, .. } => values.get(index),
+            hir::FunctionArguments::Expressions { values, .. } => values.get(index).copied(),
             hir::FunctionArguments::OrderedSet { direct, order_by } => match index {
-                0 => Some(&order_by.expr),
-                _ => direct.get(index - 1),
+                0 => Some(order_by.expr),
+                _ => direct.get(index - 1).copied(),
             },
         }
     }

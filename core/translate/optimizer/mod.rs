@@ -111,20 +111,20 @@ pub(crate) enum SelectedBtreeOperation<E, InSource> {
 #[derive(Clone, Debug)]
 pub(crate) enum HirInSeekSource {
     Values {
-        values: Vec<hir::Expr>,
+        values: Vec<hir::ExprId>,
         affinity: Affinity,
     },
     /// The IN subquery whose ephemeral index supplies the seek keys.
     Query(hir::SubqueryExpr),
 }
 
-pub(crate) type HirBtreeOperation = SelectedBtreeOperation<hir::Expr, HirInSeekSource>;
+pub(crate) type HirBtreeOperation = SelectedBtreeOperation<hir::ExprId, HirInSeekSource>;
 
 #[derive(Clone, Debug)]
 pub(crate) struct HirVirtualTableOperation {
     pub(crate) idx_num: i32,
     pub(crate) idx_str: Option<String>,
-    pub(crate) arguments: Vec<hir::Expr>,
+    pub(crate) arguments: Vec<hir::ExprId>,
     /// For the right table of a RIGHT or FULL JOIN: the read that finds its
     /// unmatched rows after the main loops, planned from the table-function
     /// arguments alone, as SQLite plans that read from a one-table FROM
@@ -148,9 +148,11 @@ trait BtreeOperationBuilder<E, P> {
     fn in_seek_source(&self, predicate: &P, affinity: Affinity) -> Result<Self::InSource>;
 }
 
-struct HirBtreeOperationBuilder;
+struct HirBtreeOperationBuilder<'a> {
+    exprs: &'a hir::ExprArena,
+}
 
-impl BtreeOperationBuilder<hir::Expr, HirWhereTerm> for HirBtreeOperationBuilder {
+impl BtreeOperationBuilder<hir::ExprId, HirWhereTerm> for HirBtreeOperationBuilder<'_> {
     type InSource = HirInSeekSource;
 
     fn seek_def(
@@ -160,15 +162,23 @@ impl BtreeOperationBuilder<hir::Expr, HirWhereTerm> for HirBtreeOperationBuilder
         iter_dir: IterationDirection,
         predicates: &[HirWhereTerm],
     ) -> Result<HirSeekDef> {
-        build_hir_seek_def_from_constraints(constraints, constraint_refs, iter_dir, predicates)
+        build_hir_seek_def_from_constraints(
+            self.exprs,
+            constraints,
+            constraint_refs,
+            iter_dir,
+            predicates,
+        )
     }
 
     fn rowid_eq(
         &self,
         constraint: &HirConstraint,
         predicates: &[HirWhereTerm],
-    ) -> Result<hir::Expr> {
-        Ok(constraint.get_hir_constraining_expr(predicates).1)
+    ) -> Result<hir::ExprId> {
+        Ok(constraint
+            .get_hir_constraining_expr(self.exprs, predicates)
+            .1)
     }
 
     fn in_seek_source(
@@ -176,7 +186,7 @@ impl BtreeOperationBuilder<hir::Expr, HirWhereTerm> for HirBtreeOperationBuilder
         predicate: &HirWhereTerm,
         affinity: Affinity,
     ) -> Result<HirInSeekSource> {
-        match &predicate.expr {
+        match &self.exprs[predicate.expr] {
             hir::Expr::InList { values, .. } => Ok(HirInSeekSource::Values {
                 values: values.clone(),
                 affinity,
@@ -403,7 +413,7 @@ pub(crate) struct HirOrUnion {
     /// For each branch, its conditions that read only the sources before
     /// this one. Each is checked before the branch's seek, so an outer row
     /// the branch rejects seeks nothing.
-    pub(crate) branch_filters: Vec<Vec<hir::Expr>>,
+    pub(crate) branch_filters: Vec<Vec<hir::ExprId>>,
     /// Position of the OR term in the block's predicates.
     pub(crate) term: usize,
     /// Every condition of every branch is applied by that branch's seek, so
@@ -479,7 +489,7 @@ pub(crate) fn hir_or_union_with_cost(
     })?;
     let mut allowed = crate::alloc::TryClone::try_clone(prior_sources)?;
     allowed.set(source_position)?;
-    let scan_cost = cost::estimate_cost_for_scan_or_seek::<hir::Expr>(
+    let scan_cost = cost::estimate_cost_for_scan_or_seek::<hir::ExprId>(
         None,
         &[],
         &[],
@@ -489,16 +499,21 @@ pub(crate) fn hir_or_union_with_cost(
         params,
         None,
     );
-    fn split<'a>(expr: &'a hir::Expr, operator: ast::Operator, parts: &mut Vec<&'a hir::Expr>) {
-        match expr {
+    fn split(
+        exprs: &hir::ExprArena,
+        expr: hir::ExprId,
+        operator: ast::Operator,
+        parts: &mut Vec<hir::ExprId>,
+    ) {
+        match &exprs[expr] {
             hir::Expr::Binary {
                 lhs,
                 operator: found,
                 rhs,
                 ..
             } if *found == operator => {
-                split(lhs, operator, parts);
-                split(rhs, operator, parts);
+                split(exprs, *lhs, operator, parts);
+                split(exprs, *rhs, operator, parts);
             }
             _ => parts.push(expr),
         }
@@ -509,7 +524,7 @@ pub(crate) fn hir_or_union_with_cost(
         .filter(|(_, term)| !term.consumed && term.from_outer_join.is_none())
     {
         if !matches!(
-            &term.expr,
+            &document.exprs[term.expr],
             hir::Expr::Binary {
                 operator: ast::Operator::Or,
                 ..
@@ -517,12 +532,17 @@ pub(crate) fn hir_or_union_with_cost(
         ) {
             continue;
         }
-        let mask = layout.table_mask(document, &term.expr)?;
+        let mask = layout.table_mask(document, term.expr)?;
         if !mask.get(source_position) || !allowed.contains_all_set_bits_of(&mask) {
             continue;
         }
         let mut disjuncts = Vec::new();
-        split(&term.expr, ast::Operator::Or, &mut disjuncts);
+        split(
+            &document.exprs,
+            term.expr,
+            ast::Operator::Or,
+            &mut disjuncts,
+        );
         let mut branches = Vec::with_capacity(disjuncts.len());
         let mut branch_filters = Vec::with_capacity(disjuncts.len());
         let mut covers_term = true;
@@ -530,11 +550,16 @@ pub(crate) fn hir_or_union_with_cost(
         let mut branch_rows = Vec::with_capacity(disjuncts.len());
         for disjunct in disjuncts {
             let mut conjuncts = Vec::new();
-            split(disjunct, ast::Operator::And, &mut conjuncts);
+            split(
+                &document.exprs,
+                disjunct,
+                ast::Operator::And,
+                &mut conjuncts,
+            );
             let mut terms = conjuncts
                 .into_iter()
                 .map(|expr| HirWhereTerm {
-                    expr: expr.clone(),
+                    expr,
                     from_outer_join: None,
                     consumed: false,
                 })
@@ -549,7 +574,7 @@ pub(crate) fn hir_or_union_with_cost(
                 query_rows,
             )?;
             let mut access = access_method::choose_single_btree_access_method(
-                &access_method::HirAccessSource::new(source, definition),
+                &access_method::HirAccessSource::new(source, definition, &document.exprs),
                 &constraints,
                 prior_sources,
                 source_position,
@@ -619,6 +644,7 @@ pub(crate) fn hir_or_union_with_cost(
             branch_cost = branch_cost + access.cost;
             branch_rows.push(access.estimated_rows_per_outer_row);
             branches.push(apply_hir_selected_btree_access(
+                &document.exprs,
                 source,
                 &constraints,
                 &mut terms,
@@ -630,8 +656,8 @@ pub(crate) fn hir_or_union_with_cost(
             // table scanned.
             let runs_subquery = |term: &HirWhereTerm| {
                 let mut runs = false;
-                term.expr.for_each(&mut |expression| {
-                    runs |= matches!(expression, hir::Expr::Subquery(_));
+                document.exprs.at(term.expr).for_each(&mut |expression| {
+                    runs |= matches!(expression.node(), hir::Expr::Subquery(_));
                 });
                 runs
             };
@@ -649,9 +675,9 @@ pub(crate) fn hir_or_union_with_cost(
                 if term.consumed {
                     continue;
                 }
-                let mask = layout.table_mask(document, &term.expr)?;
+                let mask = layout.table_mask(document, term.expr)?;
                 if prior_sources.contains_all_set_bits_of(&mask) {
-                    filters.push(term.expr.clone());
+                    filters.push(term.expr);
                     term.consume();
                 }
             }
@@ -690,6 +716,7 @@ pub(crate) fn hir_or_union_with_cost(
 }
 
 pub(crate) fn apply_hir_selected_btree_access(
+    exprs: &hir::ExprArena,
     source: &HirPlannedSource,
     constraints: &constraints::HirTableConstraints,
     predicates: &mut [HirWhereTerm],
@@ -713,7 +740,7 @@ pub(crate) fn apply_hir_selected_btree_access(
         source_position,
         outer_join_source,
         false,
-        &HirBtreeOperationBuilder,
+        &HirBtreeOperationBuilder { exprs },
         |_| {},
     )?
     .ok_or_else(|| {
@@ -727,6 +754,7 @@ pub(crate) fn apply_hir_selected_btree_access(
 /// are consumed and its key is built like any index seek. `None` when the
 /// subquery is scanned.
 pub(crate) fn apply_hir_materialized_subquery_access(
+    exprs: &hir::ExprArena,
     constraints: &constraints::HirTableConstraints,
     predicates: &mut [HirWhereTerm],
     access_method: &AccessMethod,
@@ -748,7 +776,7 @@ pub(crate) fn apply_hir_materialized_subquery_access(
             );
             Ok(Some(SelectedBtreeOperation::Seek {
                 index: Some(index.clone()),
-                seek_def: HirBtreeOperationBuilder.seek_def(
+                seek_def: HirBtreeOperationBuilder { exprs }.seek_def(
                     &constraints.constraints,
                     constraint_refs,
                     *iter_dir,
@@ -763,6 +791,7 @@ pub(crate) fn apply_hir_materialized_subquery_access(
 }
 
 pub(crate) fn apply_hir_selected_virtual_access(
+    exprs: &hir::ExprArena,
     constraints: &constraints::HirTableConstraints,
     predicates: &mut [HirWhereTerm],
     access_method: &AccessMethod,
@@ -808,7 +837,7 @@ pub(crate) fn apply_hir_selected_virtual_access(
         if usage.omit {
             predicates[constraint.where_clause_pos.0].consumed = true;
         }
-        *argument = Some(constraint.get_hir_constraining_expr(predicates).1);
+        *argument = Some(constraint.get_hir_constraining_expr(exprs, predicates).1);
         argument_count += 1;
     }
     let arguments = arguments
@@ -903,6 +932,7 @@ where
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_hir_seek_def_from_constraints(
+    exprs: &hir::ExprArena,
     constraints: &[HirConstraint],
     constraint_refs: &[RangeConstraintRef],
     iter_dir: IterationDirection,
@@ -910,7 +940,7 @@ pub(crate) fn build_hir_seek_def_from_constraints(
 ) -> Result<HirSeekDef> {
     let key = constraint_refs
         .iter()
-        .map(|constraint| constraint.as_hir_seek_range_constraint(constraints, where_clause))
+        .map(|constraint| constraint.as_hir_seek_range_constraint(exprs, constraints, where_clause))
         .collect();
     build_seek_def(iter_dir, key)
 }

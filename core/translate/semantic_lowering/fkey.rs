@@ -828,7 +828,7 @@ pub(super) fn emit_parent_key(
                 column,
             })
         };
-        super::expr::translate_expr_no_constant_opt(
+        super::expr::translate_detached_expr_no_constant_opt(
             program,
             document,
             &expression,
@@ -873,7 +873,7 @@ fn emit_child_key_values(
 ) -> Result<usize> {
     let start = program.alloc_registers(foreign_key.child_positions.len());
     for (offset, &column) in foreign_key.child_positions.iter().enumerate() {
-        super::expr::translate_expr_no_constant_opt(
+        super::expr::translate_detached_expr_no_constant_opt(
             program,
             document,
             &hir::Expr::Column(hir::ColumnRef {

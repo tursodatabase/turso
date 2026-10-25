@@ -329,7 +329,13 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                             output_width
                         );
                     }
-                    merge_update_row_assignment(&mut assignments, columns, names, query)?;
+                    merge_update_row_assignment(
+                        &mut assignments,
+                        columns,
+                        names,
+                        query,
+                        &mut self.exprs,
+                    )?;
                     continue;
                 }
             }
@@ -382,6 +388,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     column,
                     normalize_ident(name.as_str()),
                     value,
+                    &mut self.exprs,
                 )?;
             }
         }
@@ -413,9 +420,10 @@ fn merge_update_assignment(
     assignments: &mut Vec<hir::Assignment>,
     column: hir::TargetColumn,
     name: String,
-    mut value: hir::Expr,
+    value: hir::ExprId,
+    exprs: &mut hir::ExprArena,
 ) -> Result<()> {
-    split_overlapping_row_assignment(assignments, column)?;
+    split_overlapping_row_assignment(assignments, column, exprs)?;
     let Some(existing) = assignments
         .iter_mut()
         .find(|assignment| assignment.columns == [column])
@@ -433,14 +441,17 @@ fn merge_update_assignment(
         existing.names.push(name);
     }
 
-    if let hir::Expr::Function(call) = &mut value {
+    let mut node = exprs[value].clone();
+    if let hir::Expr::Function(call) = &mut node {
         if matches!(
             call.function.value(),
             crate::Func::Scalar(ScalarFunc::ArraySetElement)
         ) {
             if let hir::FunctionArguments::Expressions { values, .. } = &mut call.arguments {
                 if values.len() == 3 {
-                    values[0] = existing.value.clone();
+                    values[0] = existing.value;
+                    existing.value = exprs.push(node);
+                    return Ok(());
                 }
             }
         }
@@ -454,6 +465,7 @@ fn merge_update_row_assignment(
     columns: Vec<hir::TargetColumn>,
     names: Vec<String>,
     query: hir::QueryId,
+    exprs: &mut hir::ExprArena,
 ) -> Result<()> {
     if columns
         .iter()
@@ -461,18 +473,17 @@ fn merge_update_row_assignment(
         .any(|(index, column)| columns[..index].contains(column))
     {
         for (output, (column, name)) in columns.into_iter().zip(names).enumerate() {
-            merge_update_assignment(
-                assignments,
-                column,
-                name,
-                hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output }),
-            )?;
+            let value = exprs.push(hir::Expr::Subquery(hir::SubqueryExpr::Scalar {
+                query,
+                output,
+            }));
+            merge_update_assignment(assignments, column, name, value, exprs)?;
         }
         return Ok(());
     }
 
     for column in &columns {
-        split_overlapping_row_assignment(assignments, *column)?;
+        split_overlapping_row_assignment(assignments, *column, exprs)?;
     }
     assignments.retain(|assignment| {
         !assignment
@@ -483,7 +494,7 @@ fn merge_update_row_assignment(
     assignments.push(hir::Assignment {
         columns,
         names,
-        value: hir::Expr::Subquery(hir::SubqueryExpr::Row { query }),
+        value: exprs.push(hir::Expr::Subquery(hir::SubqueryExpr::Row { query })),
     });
     Ok(())
 }
@@ -491,6 +502,7 @@ fn merge_update_row_assignment(
 fn split_overlapping_row_assignment(
     assignments: &mut Vec<hir::Assignment>,
     column: hir::TargetColumn,
+    exprs: &mut hir::ExprArena,
 ) -> Result<()> {
     let Some(index) = assignments.iter().position(|assignment| {
         assignment.columns.len() > 1 && assignment.columns.contains(&column)
@@ -498,7 +510,7 @@ fn split_overlapping_row_assignment(
         return Ok(());
     };
     let assignment = assignments.remove(index);
-    let hir::Expr::Subquery(hir::SubqueryExpr::Row { query }) = assignment.value else {
+    let hir::Expr::Subquery(hir::SubqueryExpr::Row { query }) = exprs[assignment.value] else {
         return Err(LimboError::InternalError(
             "multi-column UPDATE assignment is not a row subquery".to_string(),
         ));
@@ -514,7 +526,10 @@ fn split_overlapping_row_assignment(
             hir::Assignment {
                 columns: vec![column],
                 names: vec![name],
-                value: hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output }),
+                value: exprs.push(hir::Expr::Subquery(hir::SubqueryExpr::Scalar {
+                    query,
+                    output,
+                })),
             },
         );
     }

@@ -1,12 +1,12 @@
 //! Bound schema expressions owned by one HIR document.
 
-use super::{Expr, SchemaProgramId, SourceId};
+use super::{ExprId, SchemaProgramId, SourceId};
 
 /// One schema expression bound against a synthetic document-local source.
 #[derive(Clone, Debug)]
 pub struct BoundSchemaProgram {
     pub input_source: SourceId,
-    pub body: Expr,
+    pub body: ExprId,
 }
 
 /// One invocation of a bound schema program.
@@ -15,7 +15,7 @@ pub struct BoundSchemaProgram {
 #[derive(Clone, Debug)]
 pub struct BoundSchemaCall {
     pub program: SchemaProgramId,
-    pub arguments: Vec<Expr>,
+    pub arguments: Vec<ExprId>,
 }
 
 /// Bound transformations for one source column's declared type.

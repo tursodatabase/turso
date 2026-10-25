@@ -7,7 +7,7 @@ use super::{
     analyze::{Analyzer, CatalogObjectKind},
     context::DoubleQuotedDml,
     hir,
-    scope::{ExprCollation, NamePrecedence, ResolvedScopeExpr, Scope},
+    scope::{ExprCollation, NamePrecedence, ResolvedScopeExpr, Scope, ScopeValue},
 };
 use crate::{
     function::{AggFunc, Func, ScalarFunc, WindowFunc},
@@ -362,18 +362,18 @@ impl ExprOperand {
         }
     }
 
-    fn into_expr(self) -> hir::Expr {
+    fn into_expr_id(self, exprs: &mut hir::ExprArena) -> hir::ExprId {
         match self {
             Self::Scalar(value) => value.expr,
             Self::RowSubquery { query, .. } => {
-                hir::Expr::Subquery(hir::SubqueryExpr::Row { query })
+                exprs.push(hir::Expr::Subquery(hir::SubqueryExpr::Row { query }))
             }
-            Self::RowValue(components) => hir::Expr::Row(
+            Self::RowValue(components) => exprs.push(hir::Expr::Row(
                 components
                     .into_iter()
                     .map(|component| component.expr)
                     .collect(),
-            ),
+            )),
         }
     }
 }
@@ -426,21 +426,22 @@ impl<'ast> QueryFunctionState<'ast> {
         &mut self,
         window: FunctionWindow,
         function: &Func,
+        exprs: &mut hir::ExprArena,
     ) -> Result<hir::WindowId> {
         let name = window.name.clone();
         let id = hir::WindowId::new(self.block, self.windows.len());
-        let resolved = window.into_hir(id, function)?;
+        let resolved = window.into_hir(id, function, exprs)?;
         let existing = match &name {
             Some(name) => self.windows.iter().zip(&self.window_names).rposition(
                 |(existing, existing_name)| {
                     existing_name.as_ref() == Some(name)
-                        && frames_are_equivalent(&existing.frame, &resolved.frame)
+                        && frames_are_equivalent(&existing.frame, &resolved.frame, exprs)
                 },
             ),
             None => self
                 .windows
                 .iter()
-                .position(|existing| windows_are_equivalent(existing, &resolved)),
+                .position(|existing| windows_are_equivalent(existing, &resolved, exprs)),
         };
         if let Some(index) = existing {
             return Ok(self.windows[index].id);
@@ -451,27 +452,35 @@ impl<'ast> QueryFunctionState<'ast> {
     }
 }
 
-fn windows_are_equivalent(left: &hir::ResolvedWindow, right: &hir::ResolvedWindow) -> bool {
-    frames_are_equivalent(&left.frame, &right.frame)
+fn windows_are_equivalent(
+    left: &hir::ResolvedWindow,
+    right: &hir::ResolvedWindow,
+    exprs: &hir::ExprArena,
+) -> bool {
+    frames_are_equivalent(&left.frame, &right.frame, exprs)
         && left.partition_by.len() == right.partition_by.len()
         && left
             .partition_by
             .iter()
             .zip(&right.partition_by)
-            .all(|(left, right)| left.expr.equivalent(&right.expr))
+            .all(|(left, right)| exprs.at(left.expr).equivalent(exprs.at(right.expr)))
         && left.order_by.len() == right.order_by.len()
         && left
             .order_by
             .iter()
             .zip(&right.order_by)
             .all(|(left, right)| {
-                left.expr.equivalent(&right.expr)
+                exprs.at(left.expr).equivalent(exprs.at(right.expr))
                     && left.order == right.order
                     && left.nulls == right.nulls
             })
 }
 
-fn frames_are_equivalent(left: &hir::WindowFrame, right: &hir::WindowFrame) -> bool {
+fn frames_are_equivalent(
+    left: &hir::WindowFrame,
+    right: &hir::WindowFrame,
+    exprs: &hir::ExprArena,
+) -> bool {
     let bounds_are_equivalent = |left: &hir::WindowFrameBound, right: &hir::WindowFrameBound| {
         use hir::WindowFrameBound::*;
         match (left, right) {
@@ -479,7 +488,7 @@ fn frames_are_equivalent(left: &hir::WindowFrame, right: &hir::WindowFrame) -> b
             | (UnboundedPreceding, UnboundedPreceding)
             | (UnboundedFollowing, UnboundedFollowing) => true,
             (Preceding(left), Preceding(right)) | (Following(left), Following(right)) => {
-                left.equivalent(right)
+                exprs.at(*left).equivalent(exprs.at(*right))
             }
             _ => false,
         }
@@ -581,9 +590,14 @@ enum NestedFunction {
 }
 
 impl FunctionWindow {
-    fn into_hir(self, id: hir::WindowId, function: &Func) -> Result<hir::ResolvedWindow> {
+    fn into_hir(
+        self,
+        id: hir::WindowId,
+        function: &Func,
+        exprs: &mut hir::ExprArena,
+    ) -> Result<hir::ResolvedWindow> {
         let frame = match function {
-            Func::Window(window) => match coerced_window_frame(window) {
+            Func::Window(window) => match coerced_window_frame(window, exprs) {
                 Some(frame) => frame,
                 None => effective_window_frame(self.frame, self.order_by.len(), function)?,
             },
@@ -609,17 +623,19 @@ impl FunctionWindow {
         })
     }
 
-    fn nested_window(&self) -> Option<NestedFunction> {
+    fn nested_window(&self, exprs: &hir::ExprArena) -> Option<NestedFunction> {
         let nested = NestedSearch::WindowsOnly;
-        nested_function_iter(&self.partition_by, nested)
-            .or_else(|| nested_function_iter(self.order_by.iter().map(|term| &term.value), nested))
+        nested_function_iter(&self.partition_by, nested, exprs)
+            .or_else(|| {
+                nested_function_iter(self.order_by.iter().map(|term| &term.value), nested, exprs)
+            })
             .or_else(|| {
                 let frame = self.frame.as_ref()?;
-                nested_function_in_window_bound(&frame.start, nested).or_else(|| {
+                nested_function_in_window_bound(&frame.start, nested, exprs).or_else(|| {
                     frame
                         .end
                         .as_ref()
-                        .and_then(|bound| nested_function_in_window_bound(bound, nested))
+                        .and_then(|bound| nested_function_in_window_bound(bound, nested, exprs))
                 })
             })
     }
@@ -772,6 +788,7 @@ impl FunctionInput {
 }
 
 fn normalize_scalar_input(
+    analyzer: &mut Analyzer<'_, '_, '_>,
     name: &ast::Name,
     function: &Func,
     input: FunctionInput,
@@ -801,11 +818,12 @@ fn normalize_scalar_input(
             let mut values = ExprChildren::with_capacity(expanded.len() * 2);
             for column in expanded {
                 values.push(computed_expr(
+                    &mut analyzer.exprs,
                     hir::Expr::Literal(ast::Literal::String(format!("'{}'", column.name))),
                     hir::TypeFact::known(Type::Text),
                     ExprCollation::Absent,
                 ));
-                values.push(column.resolved);
+                values.push(analyzer.resolve_atomic_expr(column.expr, scope)?);
             }
             Ok(FunctionInput::Expressions {
                 distinctness: None,
@@ -912,11 +930,11 @@ fn require_at_least_arguments(function: &Func, count: usize, minimum: usize) -> 
     Ok(())
 }
 
-fn validate_likelihood_arguments(input: &FunctionInput) -> Result<()> {
+fn validate_likelihood_arguments(input: &FunctionInput, exprs: &hir::ExprArena) -> Result<()> {
     if input.argument_count() != 2 {
         crate::bail_parse_error!("likelihood() function must have exactly 2 arguments");
     }
-    let hir::Expr::Literal(ast::Literal::Numeric(value)) = &input.facts()[1].expr else {
+    let hir::Expr::Literal(ast::Literal::Numeric(value)) = &exprs[input.facts()[1].expr] else {
         crate::bail_parse_error!(
             "second argument to likelihood() must be a constant between 0.0 and 1.0"
         );
@@ -939,7 +957,11 @@ fn validate_likelihood_arguments(input: &FunctionInput) -> Result<()> {
     Ok(())
 }
 
-fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<()> {
+fn validate_scalar_arguments(
+    function: &Func,
+    input: &FunctionInput,
+    exprs: &hir::ExprArena,
+) -> Result<()> {
     let count = input.argument_count();
     match function {
         Func::Scalar(
@@ -983,7 +1005,7 @@ fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<(
         Func::Scalar(ScalarFunc::Unlikely) if count != 1 => {
             crate::bail_parse_error!("Unlikely function must have exactly 1 argument")
         }
-        Func::Scalar(ScalarFunc::Likelihood) => validate_likelihood_arguments(input),
+        Func::Scalar(ScalarFunc::Likelihood) => validate_likelihood_arguments(input, exprs),
         Func::Scalar(ScalarFunc::TableColumnsJsonArray) if count != 1 => {
             crate::bail_parse_error!(
                 "table_columns_json_array() function must have exactly 1 argument"
@@ -1371,13 +1393,14 @@ fn build_in_list_expr(
     negated: bool,
     rhs_syntax: &[Box<ast::Expr>],
     children: FrameChildren,
+    exprs: &mut hir::ExprArena,
 ) -> Result<ResolvedScopeExpr> {
     if expression_operand_width(lhs_syntax) == 1
         && rhs_syntax
             .iter()
             .all(|value| expression_operand_width(value) == 1)
     {
-        return build_scalar_in_list_expr(negated, children);
+        return build_scalar_in_list_expr(negated, children, exprs);
     }
     let operands = take_expression_operands(
         std::iter::once(lhs_syntax).chain(rhs_syntax.iter().map(Box::as_ref)),
@@ -1401,11 +1424,16 @@ fn build_in_list_expr(
         .iter()
         .map(|value| in_operand_comparison(lhs.components(), value.components()))
         .collect();
-    let mut operands = operands.into_iter().map(ExprOperand::into_expr);
+    let mut operands = operands
+        .into_iter()
+        .map(|operand| operand.into_expr_id(exprs))
+        .collect::<Vec<_>>()
+        .into_iter();
     let lhs = operands.next().expect("IN has a left operand");
     Ok(computed_expr(
+        exprs,
         hir::Expr::InList {
-            lhs: Box::new(lhs),
+            lhs,
             negated,
             values: operands.collect(),
             comparisons,
@@ -1415,7 +1443,11 @@ fn build_in_list_expr(
     ))
 }
 
-fn build_scalar_in_list_expr(negated: bool, children: FrameChildren) -> Result<ResolvedScopeExpr> {
+fn build_scalar_in_list_expr(
+    negated: bool,
+    children: FrameChildren,
+    exprs: &mut hir::ExprArena,
+) -> Result<ResolvedScopeExpr> {
     let mut children = children.into_iter();
     let lhs = children
         .next()
@@ -1432,8 +1464,9 @@ fn build_scalar_in_list_expr(negated: bool, children: FrameChildren) -> Result<R
         values.push(value.expr);
     }
     Ok(computed_expr(
+        exprs,
         hir::Expr::InList {
-            lhs: Box::new(lhs.expr),
+            lhs: lhs.expr,
             negated,
             values,
             comparisons,
@@ -1548,7 +1581,19 @@ fn window_function_ignores_frame(name: &ast::Name, argument_count: usize) -> boo
 }
 
 fn function_ignores_user_frame(function: &Func) -> bool {
-    matches!(function, Func::Window(window) if coerced_window_frame(window).is_some())
+    matches!(
+        function,
+        Func::Window(
+            WindowFunc::RowNumber
+                | WindowFunc::Lag
+                | WindowFunc::Rank
+                | WindowFunc::DenseRank
+                | WindowFunc::PercentRank
+                | WindowFunc::CumeDist
+                | WindowFunc::Ntile
+                | WindowFunc::Lead
+        )
+    )
 }
 
 fn window_expression_count(
@@ -1641,18 +1686,18 @@ fn take_window_frame_bound(
 ) -> hir::WindowFrameBound {
     match bound {
         ast::FrameBound::CurrentRow => hir::WindowFrameBound::CurrentRow,
-        ast::FrameBound::Following(_) => hir::WindowFrameBound::Following(Box::new(
+        ast::FrameBound::Following(_) => hir::WindowFrameBound::Following(
             children
                 .next()
                 .expect("window child count includes FOLLOWING offset")
                 .expr,
-        )),
-        ast::FrameBound::Preceding(_) => hir::WindowFrameBound::Preceding(Box::new(
+        ),
+        ast::FrameBound::Preceding(_) => hir::WindowFrameBound::Preceding(
             children
                 .next()
                 .expect("window child count includes PRECEDING offset")
                 .expr,
-        )),
+        ),
         ast::FrameBound::UnboundedFollowing => hir::WindowFrameBound::UnboundedFollowing,
         ast::FrameBound::UnboundedPreceding => hir::WindowFrameBound::UnboundedPreceding,
     }
@@ -1664,8 +1709,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         syntax: &ast::Expr,
         scope: &Scope,
         policy: ExprPolicy,
-    ) -> Result<hir::Expr> {
-        Ok(self.analyze_resolved_expr(syntax, scope, policy)?.expr)
+    ) -> Result<hir::ExprId> {
+        let expression = self.analyze_resolved_expr(syntax, scope, policy)?.expr;
+        Ok(expression)
     }
 
     pub(super) fn analyze_expr_with_expected_type(
@@ -1674,8 +1720,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         scope: &Scope,
         policy: ExprPolicy,
         expected_type: Option<Arc<TypeDef>>,
-    ) -> Result<hir::Expr> {
-        Ok(self
+    ) -> Result<hir::ExprId> {
+        let expression = self
             .analyze_resolved_expr_with_functions(
                 syntax,
                 scope,
@@ -1683,7 +1729,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 &mut FunctionContext::ScalarOnly,
                 expected_type,
             )?
-            .expr)
+            .expr;
+        Ok(expression)
     }
 
     pub(super) fn analyze_resolved_expr(
@@ -1880,7 +1927,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let mut reads_block = false;
         let mut reads_outside = false;
         let mut visit = |expression: &hir::Expr| {
-            expression.for_each(&mut |expression| {
+            self.exprs.for_each_from(expression, &mut |expression| {
                 let source = match expression {
                     hir::Expr::Column(column) => column.source,
                     hir::Expr::RowId(source) => *source,
@@ -1895,13 +1942,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             });
         };
         for value in input.facts() {
-            visit(&value.expr);
+            visit(&self.exprs[value.expr]);
         }
         for term in input.order_terms() {
-            visit(&term.value.expr);
+            visit(&self.exprs[term.value.expr]);
         }
         if let Some(filter) = filter {
-            visit(&filter.expr);
+            visit(&self.exprs[filter.expr]);
         }
         reads_outside && !reads_block
     }
@@ -1925,7 +1972,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let mut reads_host = false;
         let mut reads_other = false;
         let mut visit = |expression: &hir::Expr| {
-            expression.for_each(&mut |expression| {
+            self.exprs.for_each_from(expression, &mut |expression| {
                 let source = match expression {
                     hir::Expr::Column(column) => column.source,
                     hir::Expr::RowId(source) => *source,
@@ -1942,13 +1989,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             });
         };
         for value in input.facts() {
-            visit(&value.expr);
+            visit(&self.exprs[value.expr]);
         }
         for term in input.order_terms() {
-            visit(&term.value.expr);
+            visit(&self.exprs[term.value.expr]);
         }
         if let Some(filter) = filter {
-            visit(&filter.expr);
+            visit(&self.exprs[filter.expr]);
         }
         if reads_host && !reads_other {
             host
@@ -1975,6 +2022,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 expect_no_frame_children(children)?;
                 let query = self.analyze_subquery(select, owner.query(), scope, policies)?;
                 Ok(FrameValue::Scalar(computed_expr(
+                    &mut self.exprs,
                     hir::Expr::Subquery(hir::SubqueryExpr::Exists(query)),
                     hir::TypeFact::known(Type::Integer),
                     ExprCollation::Absent,
@@ -2023,7 +2071,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     }
 
     fn build_in_query(
-        &self,
+        &mut self,
         lhs: ExprChildren,
         query: hir::QueryId,
         negated: bool,
@@ -2050,7 +2098,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             );
         }
         let rhs = (0..output_width)
-            .map(|output| self.query_output_fact(query, output))
+            .map(|output| {
+                self.query_output_fact(query, output)
+                    .map(|value| value.push_into(&mut self.exprs))
+            })
             .collect::<Result<Vec<_>>>()?;
         let comparison = hir::ComparisonSemantics {
             components: lhs
@@ -2066,11 +2117,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 .expect("IN query left side has one value")
                 .expr
         } else {
-            hir::Expr::Row(lhs.into_iter().map(|value| value.expr).collect())
+            self.exprs.push(hir::Expr::Row(
+                lhs.into_iter().map(|value| value.expr).collect(),
+            ))
         };
         Ok(computed_expr(
+            &mut self.exprs,
             hir::Expr::Subquery(hir::SubqueryExpr::In {
-                lhs: Box::new(lhs),
+                lhs,
                 query,
                 negated,
                 comparison,
@@ -2081,7 +2135,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     }
 
     fn resolve_query_output(
-        &self,
+        &mut self,
         query: hir::QueryId,
         output: usize,
     ) -> Result<ResolvedScopeExpr> {
@@ -2094,10 +2148,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
         let mut resolved = self.query_output_fact(query, output)?;
         resolved.expr = hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output });
-        Ok(resolved)
+        Ok(resolved.push_into(&mut self.exprs))
     }
 
-    fn resolve_query_value(&self, query: hir::QueryId) -> Result<FrameValue> {
+    fn resolve_query_value(&mut self, query: hir::QueryId) -> Result<FrameValue> {
         let width = self
             .query(query)
             .ok_or_else(|| LimboError::InternalError(format!("missing semantic query {query}")))?
@@ -2107,7 +2161,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             return self.resolve_query_output(query, 0).map(FrameValue::Scalar);
         }
         let components = (0..width)
-            .map(|output| self.query_output_fact(query, output))
+            .map(|output| {
+                self.query_output_fact(query, output)
+                    .map(|value| value.push_into(&mut self.exprs))
+            })
             .collect::<Result<ExprChildren>>()?;
         Ok(FrameValue::RowSubquery {
             query,
@@ -2115,7 +2172,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         })
     }
 
-    fn query_output_fact(&self, query: hir::QueryId, output: usize) -> Result<ResolvedScopeExpr> {
+    fn query_output_fact(&self, query: hir::QueryId, output: usize) -> Result<ScopeValue> {
         let definition = self
             .query(query)
             .ok_or_else(|| LimboError::InternalError(format!("missing semantic query {query}")))?;
@@ -2129,7 +2186,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     definition.id
                 ))
             })?;
-        Ok(ResolvedScopeExpr {
+        Ok(ScopeValue {
             expr: hir::Expr::Output(facts.id),
             type_fact: facts.type_fact.clone(),
             affinity: facts.affinity,
@@ -2241,12 +2298,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     ) -> Result<hir::WindowFrameBound> {
         Ok(match bound {
             ast::FrameBound::CurrentRow => hir::WindowFrameBound::CurrentRow,
-            ast::FrameBound::Following(expression) => hir::WindowFrameBound::Following(Box::new(
-                self.analyze_resolved_expr(expression, scope, policy)?.expr,
-            )),
-            ast::FrameBound::Preceding(expression) => hir::WindowFrameBound::Preceding(Box::new(
-                self.analyze_resolved_expr(expression, scope, policy)?.expr,
-            )),
+            ast::FrameBound::Following(expression) => {
+                let offset = self.analyze_resolved_expr(expression, scope, policy)?.expr;
+                hir::WindowFrameBound::Following(offset)
+            }
+            ast::FrameBound::Preceding(expression) => {
+                let offset = self.analyze_resolved_expr(expression, scope, policy)?.expr;
+                hir::WindowFrameBound::Preceding(offset)
+            }
             ast::FrameBound::UnboundedFollowing => hir::WindowFrameBound::UnboundedFollowing,
             ast::FrameBound::UnboundedPreceding => hir::WindowFrameBound::UnboundedPreceding,
         })
@@ -2327,7 +2386,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     }
 
     fn resolve_trigger_qualified(
-        &self,
+        &mut self,
         policy: ExprPolicy,
         namespace: &str,
         column: &str,
@@ -2340,7 +2399,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         })?;
         let mut scope = Scope::default();
         scope.add_source(source, false);
-        scope.resolve_qualified(namespace, column)
+        let value = scope.resolve_qualified(namespace, column)?;
+        Ok(value.map(|value| value.push_into(&mut self.exprs)))
     }
 
     fn build_expr_from_frames(
@@ -2366,7 +2426,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             ast::Expr::InList { lhs, not, rhs, .. } => {
                 let mut children = children;
                 scalarize_frame_values(&mut children, policy.policies.row_values)?;
-                build_in_list_expr(lhs, *not, rhs, children)
+                build_in_list_expr(lhs, *not, rhs, children, &mut self.exprs)
             }
             _ => {
                 let children = if policy.policies.row_values == RowValueChecks::None {
@@ -2402,6 +2462,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             return Ok(null_test_expr(
                 take_scalar_operand(lhs)?,
                 operator == ast::Operator::Is,
+                &mut self.exprs,
             ));
         }
         if matches!(lhs_syntax, ast::Expr::Literal(ast::Literal::Null))
@@ -2410,6 +2471,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             return Ok(null_test_expr(
                 take_scalar_operand(rhs)?,
                 operator == ast::Operator::Is,
+                &mut self.exprs,
             ));
         }
         if matches!(operator, ast::Operator::Is | ast::Operator::IsNot) {
@@ -2420,6 +2482,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     is_true,
                     operator == ast::Operator::IsNot,
                     collation,
+                    &mut self.exprs,
                 ));
             }
         }
@@ -2431,11 +2494,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         if lhs.components().len() > 1 {
             let comparison = expression_operand_comparison(lhs.components(), rhs.components());
             let collation = expression_operands_collation([&lhs, &rhs]);
+            let lhs = lhs.into_expr_id(&mut self.exprs);
+            let rhs = rhs.into_expr_id(&mut self.exprs);
             return Ok(computed_expr(
+                &mut self.exprs,
                 hir::Expr::Binary {
-                    lhs: Box::new(lhs.into_expr()),
+                    lhs,
                     operator,
-                    rhs: Box::new(rhs.into_expr()),
+                    rhs,
                     array_concat: false,
                     custom: None,
                     comparison: Some(comparison),
@@ -2451,7 +2517,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             matches!(rhs_syntax, ast::Expr::Literal(_)),
         ];
         let (lhs, rhs) = if operator.is_comparison() {
-            read_other_side_as_array(lhs, rhs)
+            read_other_side_as_array(lhs, rhs, &mut self.exprs)
         } else {
             (lhs, rhs)
         };
@@ -2465,7 +2531,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         rhs: ResolvedScopeExpr,
     ) -> Result<ResolvedScopeExpr> {
         let (lhs, rhs) = if operator.is_comparison() {
-            read_other_side_as_array(lhs, rhs)
+            read_other_side_as_array(lhs, rhs, &mut self.exprs)
         } else {
             (lhs, rhs)
         };
@@ -2507,10 +2573,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         // comparison's own collation above.
         let collation = explicit_collation([&lhs, &rhs]);
         Ok(computed_expr(
+            &mut self.exprs,
             hir::Expr::Binary {
-                lhs: Box::new(lhs.expr),
+                lhs: lhs.expr,
                 operator,
-                rhs: Box::new(rhs.expr),
+                rhs: rhs.expr,
                 array_concat,
                 custom: custom.map(Box::new),
                 comparison,
@@ -2578,9 +2645,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     return Ok(both);
                 }
                 return Ok(computed_expr(
+                    &mut self.exprs,
                     hir::Expr::Unary {
                         operator: ast::UnaryOperator::Not,
-                        expr: Box::new(both.expr),
+                        expr: both.expr,
                     },
                     hir::TypeFact::known(Type::Integer),
                     ExprCollation::Absent,
@@ -2590,12 +2658,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let start_comparison = expression_operand_comparison(expr.components(), start.components());
         let end_comparison = expression_operand_comparison(expr.components(), end.components());
         let collation = ExprCollation::Absent;
+        let expr = expr.into_expr_id(&mut self.exprs);
+        let start = start.into_expr_id(&mut self.exprs);
+        let end = end.into_expr_id(&mut self.exprs);
         Ok(computed_expr(
+            &mut self.exprs,
             hir::Expr::Between {
-                expr: Box::new(expr.into_expr()),
+                expr,
                 negated,
-                start: Box::new(start.into_expr()),
-                end: Box::new(end.into_expr()),
+                start,
+                end,
                 start_comparison,
                 end_comparison,
             },
@@ -2655,7 +2727,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         }
                         error => error,
                     })?;
-                if let Some(base) = base {
+                if let Some(base) = base.map(|base| base.push_into(&mut self.exprs)) {
                     if custom_argument_type(&base, |definition| {
                         definition.is_struct() || definition.is_union()
                     })
@@ -2712,6 +2784,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 }
 
                 if let Some(base) = scope.resolve_qualified(database.as_str(), table.as_str())? {
+                    let base = base.push_into(&mut self.exprs);
                     if custom_argument_type(&base, |definition| {
                         definition.is_struct() || definition.is_union()
                     })
@@ -2729,6 +2802,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 if let Some(base) =
                     scope.resolve_unqualified(database.as_str(), NamePrecedence::SourcesOnly)?
                 {
+                    let base = base.push_into(&mut self.exprs);
                     if let Some(first) = self.try_build_field_access(base, table.as_str())? {
                         if custom_argument_type(&first, |definition| {
                             definition.is_struct() || definition.is_union()
@@ -2769,10 +2843,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let [base] = expect_expr_children(children)?;
                 self.build_field_access(base, field.as_str())
             }
-            ast::Expr::Array { .. } => Ok(array_expr(children)),
+            ast::Expr::Array { .. } => Ok(array_expr(children, &mut self.exprs)),
             ast::Expr::Subscript { .. } => {
                 let [base, index] = expect_expr_children(children)?;
-                Ok(subscript_expr(base, index))
+                Ok(subscript_expr(base, index, &mut self.exprs))
             }
             ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
                 let [inner] = expect_expr_children(children)?;
@@ -2832,9 +2906,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     }
                 };
                 Ok(computed_expr(
+                    &mut self.exprs,
                     hir::Expr::Unary {
                         operator: *operator,
-                        expr: Box::new(inner.expr),
+                        expr: inner.expr,
                     },
                     type_fact,
                     inner.collation,
@@ -2899,13 +2974,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         .chain(else_expr.iter().map(|value| &value.type_fact)),
                 );
                 Ok(computed_expr(
+                    &mut self.exprs,
                     hir::Expr::Case {
-                        base: base.map(|value| Box::new(value.expr)),
+                        base: base.map(|value| value.expr),
                         when_then: when_then
                             .into_iter()
                             .map(|(when, then)| (when.expr, then.expr))
                             .collect(),
-                        else_expr: else_expr.map(|value| Box::new(value.expr)),
+                        else_expr: else_expr.map(|value| value.expr),
                         base_comparisons,
                     },
                     type_fact,
@@ -2935,10 +3011,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let type_fact = target.type_fact.clone();
                 let affinity = target.affinity;
                 Ok(ResolvedScopeExpr {
-                    expr: hir::Expr::Cast {
-                        expr: Box::new(input.expr),
+                    expr: self.exprs.push(hir::Expr::Cast {
+                        expr: input.expr,
                         target: Box::new(target),
-                    },
+                    }),
                     type_fact,
                     affinity,
                     has_affinity: true,
@@ -3075,10 +3151,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let [inner] = expect_expr_children(children)?;
                 let collation = self.resolve_collation(name)?;
                 Ok(ResolvedScopeExpr {
-                    expr: hir::Expr::Collate {
-                        expr: Box::new(inner.expr),
+                    expr: self.exprs.push(hir::Expr::Collate {
+                        expr: inner.expr,
                         collation: collation.clone(),
-                    },
+                    }),
                     type_fact: inner.type_fact,
                     affinity: inner.affinity,
                     has_affinity: inner.has_affinity,
@@ -3087,11 +3163,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             ast::Expr::IsNull(_) => {
                 let [inner] = expect_expr_children(children)?;
-                Ok(null_test_expr(inner, true))
+                Ok(null_test_expr(inner, true, &mut self.exprs))
             }
             ast::Expr::NotNull(_) => {
                 let [inner] = expect_expr_children(children)?;
-                Ok(null_test_expr(inner, false))
+                Ok(null_test_expr(inner, false, &mut self.exprs))
             }
             ast::Expr::Register(index) => {
                 expect_no_expr_children(children)?;
@@ -3113,7 +3189,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let message = match message {
                     Some(_) => {
                         let [message] = expect_expr_children(children)?;
-                        Some(Box::new(message.expr))
+                        Some(message.expr)
                     }
                     None => {
                         expect_no_expr_children(children)?;
@@ -3121,6 +3197,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     }
                 };
                 Ok(computed_expr(
+                    &mut self.exprs,
                     hir::Expr::Raise {
                         action: *action,
                         message,
@@ -3163,25 +3240,23 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 .expect("LIKE child count includes left expression")
                 .expr
         } else {
-            hir::Expr::Row(
+            self.exprs.push(hir::Expr::Row(
                 children
                     .by_ref()
                     .take(lhs_count)
                     .map(|value| value.expr)
                     .collect(),
-            )
+            ))
         };
         let rhs = children
             .next()
             .expect("LIKE child count includes right expression")
             .expr;
         let escape = has_escape.then(|| {
-            Box::new(
-                children
-                    .next()
-                    .expect("LIKE child count includes ESCAPE expression")
-                    .expr,
-            )
+            children
+                .next()
+                .expect("LIKE child count includes ESCAPE expression")
+                .expr
         });
         debug_assert!(children.next().is_none());
 
@@ -3216,13 +3291,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             hir::CatalogObject::new(id, self.context().snapshot(), None, Arc::new(function));
 
         Ok(computed_expr(
+            &mut self.exprs,
             hir::Expr::Like {
-                lhs: Box::new(lhs),
+                lhs,
                 negated,
                 operator,
                 function,
                 argument_count,
-                rhs: Box::new(rhs),
+                rhs,
                 escape,
             },
             hir::TypeFact::known(Type::Integer),
@@ -3299,12 +3375,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             );
         }
         let (input, filter) = if matches!(binding, FunctionBinding::Scalar) {
-            (normalize_scalar_input(name, &function, input, scope)?, None)
+            (
+                normalize_scalar_input(self, name, &function, input, scope)?,
+                None,
+            )
         } else {
             (input, filter)
         };
         if matches!(binding, FunctionBinding::Scalar) {
-            validate_scalar_arguments(&function, &input)?;
+            validate_scalar_arguments(&function, &input, &self.exprs)?;
         }
         let special_operation =
             match self.resolve_custom_type_operation(&function, &input, expected_type)? {
@@ -3321,16 +3400,25 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             } else {
                 NestedSearch::AggregatesAndWindows
             };
-            if let Some(nested) = nested_function_iter(input.facts(), search)
+            let exprs = &self.exprs;
+            if let Some(nested) = nested_function_iter(input.facts(), search, exprs)
                 .or_else(|| {
-                    nested_function_iter(input.order_terms().iter().map(|term| &term.value), search)
+                    nested_function_iter(
+                        input.order_terms().iter().map(|term| &term.value),
+                        search,
+                        exprs,
+                    )
                 })
                 .or_else(|| {
                     filter
                         .as_ref()
-                        .and_then(|filter| nested_function_iter([filter], search))
+                        .and_then(|filter| nested_function_iter([filter], search, exprs))
                 })
-                .or_else(|| window.as_ref().and_then(FunctionWindow::nested_window))
+                .or_else(|| {
+                    window
+                        .as_ref()
+                        .and_then(|window| window.nested_window(exprs))
+                })
             {
                 match nested {
                     NestedFunction::Aggregate(name) => {
@@ -3348,14 +3436,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     let FunctionInput::Expressions { values, .. } = input else {
                         unreachable!("array() only accepts ordinary expression arguments")
                     };
-                    return Ok(array_expr(values));
+                    return Ok(array_expr(values, &mut self.exprs));
                 }
                 Func::Scalar(ScalarFunc::ArrayElement) => {
                     let FunctionInput::Expressions { values, .. } = input else {
                         unreachable!("array_element() only accepts ordinary expression arguments")
                     };
                     let [base, index] = expect_expr_children(values)?;
-                    return Ok(subscript_expr(base, index));
+                    return Ok(subscript_expr(base, index, &mut self.exprs));
                 }
                 _ => {}
             }
@@ -3388,7 +3476,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let block = self.aggregate_owner(binding.block, &input, filter.as_ref());
                 hir::FunctionEvaluation::Aggregate {
                     id: self.allocate_aggregate(block),
-                    filter: filter.map(|filter| Box::new(filter.expr)),
+                    filter: filter.map(|filter| filter.expr),
                 }
             }
             FunctionBinding::Window(binding) => hir::FunctionEvaluation::Window {
@@ -3397,12 +3485,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     FunctionContext::Query(state) => state.allocate_resolved_window(
                         window.expect("window binding requires an OVER clause"),
                         function.value(),
+                        &mut self.exprs,
                     )?,
                     FunctionContext::ScalarOnly => {
                         unreachable!("window binding rejects scalar-only expression contexts")
                     }
                 },
-                filter: filter.map(|filter| Box::new(filter.expr)),
+                filter: filter.map(|filter| filter.expr),
             },
         };
         // A function's value keeps an explicit COLLATE of an argument, as
@@ -3410,6 +3499,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let collation = explicit_collation(input.facts());
         let arguments = input.into_hir();
         Ok(computed_expr(
+            &mut self.exprs,
             hir::Expr::Function(Box::new(hir::FunctionCall {
                 function,
                 evaluation,
@@ -3451,6 +3541,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let tag_name = string_literal_argument(
                     &arguments[0],
                     "union_value() first argument must be a string literal",
+                    &self.exprs,
                 )?;
                 let (tag_index, _) = union.find_union_variant(&tag_name).ok_or_else(|| {
                     LimboError::ParseError(format!(
@@ -3515,6 +3606,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let tag_name = string_literal_argument(
                     &arguments[1],
                     "union_extract() second argument must be a string literal",
+                    &self.exprs,
                 )?;
                 let union_type =
                     custom_argument_type(&arguments[0], |definition| definition.is_union())
@@ -3548,6 +3640,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let field_name = string_literal_argument(
                     &arguments[1],
                     "struct_extract() second argument must be a string literal",
+                    &self.exprs,
                 )?;
                 // An unknown type and an unknown field report the same error.
                 let unresolved = || {
@@ -3584,7 +3677,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let Some(member) = self.resolve_custom_member(&base, field_name)? else {
             return Ok(None);
         };
-        Ok(Some(field_access_expr(base, field_name, member)))
+        Ok(Some(field_access_expr(
+            base,
+            field_name,
+            member,
+            &mut self.exprs,
+        )))
     }
 
     fn build_field_access(
@@ -3593,7 +3691,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         field_name: &str,
     ) -> Result<ResolvedScopeExpr> {
         if let Some(member) = self.resolve_custom_member(&base, field_name)? {
-            return Ok(field_access_expr(base, field_name, member));
+            return Ok(field_access_expr(base, field_name, member, &mut self.exprs));
         }
 
         let normalized = normalize_ident(field_name);
@@ -3686,7 +3784,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 hir::BinaryOperand::Right => written_literals[1],
             };
             let encode_other = other_is_written_literal
-                && literal_matches_custom_type(other, column.definition.value());
+                && literal_matches_custom_type(other, column.definition.value(), &self.exprs);
             let pass_other_as_is = !operator.is_comparison()
                 && column.definition.value().decode_returns_value_unchanged();
             if !encode_other && !pass_other_as_is {
@@ -3751,7 +3849,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         &self,
         expression: &ResolvedScopeExpr,
     ) -> Result<Option<CustomOperatorColumn>> {
-        let hir::Expr::Column(reference) = &expression.expr else {
+        let hir::Expr::Column(reference) = &self.exprs[expression.expr] else {
             return Ok(None);
         };
         let Some(declared) = expression.type_fact.declared.as_ref() else {
@@ -3813,8 +3911,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             Func::Scalar(ScalarFunc::SetVal) => hir::SequenceOperationKind::SetValue,
             _ => return Ok(None),
         };
-        let user_name =
-            string_literal_argument(&input.facts()[0], "expected a string literal argument")?;
+        let user_name = string_literal_argument(
+            &input.facts()[0],
+            "expected a string literal argument",
+            &self.exprs,
+        )?;
         let (database, normalized_name) = match user_name.split_once('.') {
             Some((schema, name)) => {
                 let schema = normalize_ident(schema);
@@ -3906,19 +4007,25 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     }
 
     pub(super) fn resolve_atomic_expr(
-        &self,
+        &mut self,
         expression: hir::Expr,
         scope: &Scope,
     ) -> Result<ResolvedScopeExpr> {
+        Ok(self
+            .atomic_value(expression, scope)?
+            .push_into(&mut self.exprs))
+    }
+
+    fn atomic_value(&self, expression: hir::Expr, scope: &Scope) -> Result<ScopeValue> {
         match expression {
-            hir::Expr::Literal(literal) => Ok(ResolvedScopeExpr {
+            hir::Expr::Literal(literal) => Ok(ScopeValue {
                 type_fact: super::analyze::literal_type_fact(&literal)?,
                 expr: hir::Expr::Literal(literal),
                 affinity: Affinity::Blob,
                 has_affinity: false,
                 collation: ExprCollation::Absent,
             }),
-            hir::Expr::Parameter(parameter) => Ok(ResolvedScopeExpr {
+            hir::Expr::Parameter(parameter) => Ok(ScopeValue {
                 type_fact: parameter.type_fact.clone(),
                 expr: hir::Expr::Parameter(parameter),
                 affinity: Affinity::Blob,
@@ -3938,7 +4045,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         reference.source, reference.column
                     ))
                 })?;
-                Ok(ResolvedScopeExpr {
+                Ok(ScopeValue {
                     expr: hir::Expr::Column(reference),
                     type_fact: column.type_fact().into_owned(),
                     affinity: column.affinity(),
@@ -3949,14 +4056,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     ),
                 })
             }
-            hir::Expr::MergedColumn(merged) => Ok(ResolvedScopeExpr {
+            hir::Expr::MergedColumn(merged) => Ok(ScopeValue {
                 type_fact: merged.type_fact.clone(),
                 affinity: merged.affinity,
                 has_affinity: merged.has_affinity,
                 collation: ExprCollation::column(merged.collation.clone(), &self.binary_collation),
                 expr: hir::Expr::MergedColumn(merged),
             }),
-            hir::Expr::RowId(source) => Ok(ResolvedScopeExpr {
+            hir::Expr::RowId(source) => Ok(ScopeValue {
                 expr: hir::Expr::RowId(source),
                 type_fact: hir::TypeFact::known(Type::Integer),
                 affinity: Affinity::Integer,
@@ -3980,7 +4087,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         "missing output collation state for {output:?}"
                     ))
                 })?;
-                Ok(ResolvedScopeExpr {
+                Ok(ScopeValue {
                     expr: hir::Expr::Output(output),
                     type_fact,
                     affinity,
@@ -4011,10 +4118,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         syntax: Option<&ast::Type>,
         parameters: Vec<ResolvedScopeExpr>,
     ) -> Result<hir::TypeName> {
-        let parameter_expressions = parameters
-            .iter()
-            .map(|parameter| parameter.expr.clone())
-            .collect();
+        let parameter_expressions = parameters.iter().map(|parameter| parameter.expr).collect();
         let Some(syntax) = syntax else {
             return Ok(hir::TypeName {
                 name: String::new(),
@@ -4126,6 +4230,7 @@ fn reserve_in_list_values(values: &mut Vec<FrameValue>, syntax: &ast::Expr) {
 fn read_other_side_as_array(
     lhs: ResolvedScopeExpr,
     rhs: ResolvedScopeExpr,
+    exprs: &mut hir::ExprArena,
 ) -> (ResolvedScopeExpr, ResolvedScopeExpr) {
     fn declared_array(operand: &ResolvedScopeExpr) -> Option<Arc<hir::DeclaredType>> {
         operand
@@ -4135,18 +4240,18 @@ fn read_other_side_as_array(
             .filter(|declared| declared.array_dimensions > 0 && declared.custom_chain.is_empty())
             .cloned()
     }
-    fn is_plain_scalar(operand: &ResolvedScopeExpr) -> bool {
+    fn is_plain_scalar(operand: &ResolvedScopeExpr, exprs: &hir::ExprArena) -> bool {
         !operand.type_fact.is_array()
             && !operand.type_fact.array_rank_unbounded
-            && !matches!(operand.expr, hir::Expr::Literal(ast::Literal::Null))
+            && !matches!(exprs[operand.expr], hir::Expr::Literal(ast::Literal::Null))
     }
     match (declared_array(&lhs), declared_array(&rhs)) {
-        (Some(declared), None) if is_plain_scalar(&rhs) => {
-            let rhs = read_as_array(rhs, &declared);
+        (Some(declared), None) if is_plain_scalar(&rhs, exprs) => {
+            let rhs = read_as_array(rhs, &declared, exprs);
             (lhs, rhs)
         }
-        (None, Some(declared)) if is_plain_scalar(&lhs) => {
-            let lhs = read_as_array(lhs, &declared);
+        (None, Some(declared)) if is_plain_scalar(&lhs, exprs) => {
+            let lhs = read_as_array(lhs, &declared, exprs);
             (lhs, rhs)
         }
         _ => (lhs, rhs),
@@ -4154,12 +4259,17 @@ fn read_other_side_as_array(
 }
 
 /// `value` cast to the array type `declared` names.
-fn read_as_array(value: ResolvedScopeExpr, declared: &hir::DeclaredType) -> ResolvedScopeExpr {
+fn read_as_array(
+    value: ResolvedScopeExpr,
+    declared: &hir::DeclaredType,
+    exprs: &mut hir::ExprArena,
+) -> ResolvedScopeExpr {
     let target = builtin_cast_target(&declared.name, declared.array_dimensions, Vec::new());
     let type_fact = target.type_fact.clone();
     computed_expr(
+        exprs,
         hir::Expr::Cast {
-            expr: Box::new(value.expr),
+            expr: value.expr,
             target: Box::new(target),
         },
         type_fact,
@@ -4171,7 +4281,7 @@ fn read_as_array(value: ResolvedScopeExpr, declared: &hir::DeclaredType) -> Reso
 fn builtin_cast_target(
     name: &str,
     array_dimensions: u32,
-    parameters: Vec<hir::Expr>,
+    parameters: Vec<hir::ExprId>,
 ) -> hir::TypeName {
     let affinity = Affinity::of_written_type(name);
     let type_fact = hir::TypeFact::declared(hir::DeclaredType {
@@ -4263,8 +4373,9 @@ fn resolve_custom_operator(
 fn literal_matches_custom_type(
     expression: &ResolvedScopeExpr,
     definition: &crate::schema::TypeDef,
+    exprs: &hir::ExprArena,
 ) -> bool {
-    let hir::Expr::Literal(literal) = &expression.expr else {
+    let hir::Expr::Literal(literal) = &exprs[expression.expr] else {
         return false;
     };
     let literal_type = match literal {
@@ -4287,8 +4398,12 @@ fn literal_matches_custom_type(
     input_type.eq_ignore_ascii_case("any") || input_type.eq_ignore_ascii_case(literal_type)
 }
 
-fn string_literal_argument(argument: &ResolvedScopeExpr, error: &str) -> Result<String> {
-    match &argument.expr {
+fn string_literal_argument(
+    argument: &ResolvedScopeExpr,
+    error: &str,
+    exprs: &hir::ExprArena,
+) -> Result<String> {
+    match &exprs[argument.expr] {
         hir::Expr::Literal(ast::Literal::String(value)) => Ok(value.trim_matches('\'').to_string()),
         _ => Err(LimboError::ParseError(error.to_string())),
     }
@@ -4424,13 +4539,18 @@ fn expect_expr_children<const N: usize>(children: ExprChildren) -> Result<[Resol
     }))
 }
 
-fn null_test_expr(inner: ResolvedScopeExpr, is_null: bool) -> ResolvedScopeExpr {
+fn null_test_expr(
+    inner: ResolvedScopeExpr,
+    is_null: bool,
+    exprs: &mut hir::ExprArena,
+) -> ResolvedScopeExpr {
     let expression = if is_null {
-        hir::Expr::IsNull(Box::new(inner.expr))
+        hir::Expr::IsNull(inner.expr)
     } else {
-        hir::Expr::NotNull(Box::new(inner.expr))
+        hir::Expr::NotNull(inner.expr)
     };
     computed_expr(
+        exprs,
         expression,
         hir::TypeFact::known(Type::Integer),
         inner.collation,
@@ -4456,10 +4576,12 @@ fn truth_test_expr(
     is_true: bool,
     negated: bool,
     collation: ExprCollation,
+    exprs: &mut hir::ExprArena,
 ) -> ResolvedScopeExpr {
     computed_expr(
+        exprs,
         hir::Expr::TruthTest {
-            expr: Box::new(inner.expr),
+            expr: inner.expr,
             is_true,
             negated,
         },
@@ -4469,12 +4591,13 @@ fn truth_test_expr(
 }
 
 fn computed_expr(
+    exprs: &mut hir::ExprArena,
     expr: hir::Expr,
     type_fact: hir::TypeFact,
     collation: ExprCollation,
 ) -> ResolvedScopeExpr {
     ResolvedScopeExpr {
-        expr,
+        expr: exprs.push(expr),
         type_fact,
         affinity: Affinity::Blob,
         has_affinity: false,
@@ -4482,26 +4605,32 @@ fn computed_expr(
     }
 }
 
-fn array_expr(elements: ExprChildren) -> ResolvedScopeExpr {
+fn array_expr(elements: ExprChildren, exprs: &mut hir::ExprArena) -> ResolvedScopeExpr {
     let type_fact = hir::TypeFact::array_literal_result(
         elements.iter().map(|element| element.type_fact.clone()),
     );
     computed_expr(
+        exprs,
         hir::Expr::Array(elements.into_iter().map(|element| element.expr).collect()),
         type_fact,
         ExprCollation::Absent,
     )
 }
 
-fn subscript_expr(base: ResolvedScopeExpr, index: ResolvedScopeExpr) -> ResolvedScopeExpr {
+fn subscript_expr(
+    base: ResolvedScopeExpr,
+    index: ResolvedScopeExpr,
+    exprs: &mut hir::ExprArena,
+) -> ResolvedScopeExpr {
     let type_fact = base
         .type_fact
         .array_element()
         .unwrap_or_else(hir::TypeFact::dynamic);
     computed_expr(
+        exprs,
         hir::Expr::Subscript {
-            base: Box::new(base.expr),
-            index: Box::new(index.expr),
+            base: base.expr,
+            index: index.expr,
         },
         type_fact,
         ExprCollation::Absent,
@@ -4512,11 +4641,13 @@ fn field_access_expr(
     base: ResolvedScopeExpr,
     field_name: &str,
     member: ResolvedCustomMember,
+    exprs: &mut hir::ExprArena,
 ) -> ResolvedScopeExpr {
     let result_type = member.result_type;
     computed_expr(
+        exprs,
         hir::Expr::FieldAccess(Box::new(hir::FieldAccess {
-            base: Box::new(base.expr),
+            base: base.expr,
             field_name: normalize_ident(field_name),
             kind: member.kind,
             container_type: member.container_type,
@@ -4615,7 +4746,10 @@ fn function_supports_sliding_frame(function: &Func) -> bool {
     supported
 }
 
-fn coerced_window_frame(function: &WindowFunc) -> Option<hir::WindowFrame> {
+fn coerced_window_frame(
+    function: &WindowFunc,
+    exprs: &mut hir::ExprArena,
+) -> Option<hir::WindowFrame> {
     use hir::WindowFrameBound::{CurrentRow, Following, UnboundedFollowing, UnboundedPreceding};
     let (mode, start, end) = match function {
         WindowFunc::RowNumber | WindowFunc::Lag => {
@@ -4627,9 +4761,7 @@ fn coerced_window_frame(function: &WindowFunc) -> Option<hir::WindowFrame> {
         WindowFunc::PercentRank => (ast::FrameMode::Groups, CurrentRow, UnboundedFollowing),
         WindowFunc::CumeDist => (
             ast::FrameMode::Groups,
-            Following(Box::new(hir::Expr::Literal(ast::Literal::Numeric(
-                "1".to_string(),
-            )))),
+            Following(exprs.push(hir::Expr::Literal(ast::Literal::Numeric("1".to_string())))),
             UnboundedFollowing,
         ),
         WindowFunc::Ntile => (ast::FrameMode::Rows, CurrentRow, UnboundedFollowing),
@@ -4801,15 +4933,20 @@ enum NestedSearch {
 fn nested_function_iter<'a>(
     arguments: impl IntoIterator<Item = &'a ResolvedScopeExpr>,
     search: NestedSearch,
+    exprs: &hir::ExprArena,
 ) -> Option<NestedFunction> {
     arguments
         .into_iter()
-        .find_map(|argument| nested_function_in_expr(&argument.expr, search))
+        .find_map(|argument| nested_function_in_expr(&exprs[argument.expr], search, exprs))
 }
 
-fn nested_function_in_expr(expression: &hir::Expr, search: NestedSearch) -> Option<NestedFunction> {
+fn nested_function_in_expr(
+    expression: &hir::Expr,
+    search: NestedSearch,
+    exprs: &hir::ExprArena,
+) -> Option<NestedFunction> {
     let mut nested = None;
-    expression.for_each(&mut |expression| {
+    exprs.for_each_from(expression, &mut |expression| {
         if nested.is_some() {
             return;
         }
@@ -4835,11 +4972,12 @@ fn nested_function_in_expr(expression: &hir::Expr, search: NestedSearch) -> Opti
 fn nested_function_in_window_bound(
     bound: &hir::WindowFrameBound,
     search: NestedSearch,
+    exprs: &hir::ExprArena,
 ) -> Option<NestedFunction> {
     match bound {
         hir::WindowFrameBound::Following(expression)
         | hir::WindowFrameBound::Preceding(expression) => {
-            nested_function_in_expr(expression, search)
+            nested_function_in_expr(&exprs[*expression], search, exprs)
         }
         hir::WindowFrameBound::CurrentRow
         | hir::WindowFrameBound::UnboundedFollowing
@@ -5075,8 +5213,9 @@ pub(super) fn build_using_column(
     left: ResolvedScopeExpr,
     right: ResolvedScopeExpr,
     value: hir::MergedColumnValue,
+    exprs: &mut hir::ExprArena,
 ) -> Result<hir::UsingColumn> {
-    let hir::Expr::Column(right_reference) = &right.expr else {
+    let hir::Expr::Column(right_reference) = &exprs[right.expr] else {
         return Err(LimboError::InternalError(
             "USING right side is not a source column".to_string(),
         ));
@@ -5104,9 +5243,19 @@ pub(super) fn build_using_column(
         ),
     };
 
+    let left = left.expr;
+    let right = exprs.push(hir::Expr::Column(right_reference));
+    let equality = exprs.push(hir::Expr::Binary {
+        lhs: left,
+        operator: ast::Operator::Equals,
+        rhs: right,
+        array_concat: false,
+        custom: None,
+        comparison: Some(comparison.clone()),
+    });
     Ok(hir::UsingColumn {
         name,
-        left: Box::new(left.expr),
+        left,
         right: right_reference,
         value,
         type_fact,
@@ -5114,6 +5263,7 @@ pub(super) fn build_using_column(
         has_affinity,
         collation,
         comparison,
+        equality,
     })
 }
 
@@ -5165,8 +5315,8 @@ mod tests {
         translate::semantic::{
             context::{DoubleQuotedDml, SemanticContext},
             hir::{
-                DatabaseId, Expr, IndexCoverage, IndexHint, Source, SourceColumn, SourceId,
-                SourceKind, SourceOwner, TypeFact,
+                DatabaseId, Expr, ExprArena, ExprId, IndexCoverage, IndexHint, Source,
+                SourceColumn, SourceId, SourceKind, SourceOwner, TypeFact,
             },
             scope::Scope,
         },
@@ -5270,7 +5420,11 @@ mod tests {
         }
     }
 
-    fn analyze_expression(syntax: &ast::Expr, scope: &Scope, policy: ExprPolicy) -> Result<Expr> {
+    fn analyze_expression(
+        syntax: &ast::Expr,
+        scope: &Scope,
+        policy: ExprPolicy,
+    ) -> Result<(ExprArena, ExprId)> {
         let schema = Schema::new();
         let symbols = SymbolTable::new();
         let context = SemanticContext::for_main_schema_object(
@@ -5282,12 +5436,13 @@ mod tests {
         let mut analyzer = Analyzer::new(&context);
         let source_id = analyzer.reserve_source();
         analyzer.insert_source(source_id, source())?;
-        analyzer.analyze_expr(syntax, scope, policy)
+        let expression = analyzer.analyze_expr(syntax, scope, policy)?;
+        Ok((std::mem::take(&mut analyzer.exprs), expression))
     }
 
-    fn expect_column(expression: Expr) {
+    fn expect_column((exprs, expression): (ExprArena, ExprId)) {
         assert!(matches!(
-            expression,
+            &exprs[expression],
             Expr::Column(column) if column.source == SourceId::new(0) && column.column == 0
         ));
     }
@@ -5300,7 +5455,7 @@ mod tests {
                 not: negated,
                 rhs: Vec::new(),
             };
-            let expression = analyze_expression(
+            let (exprs, expression) = analyze_expression(
                 &syntax,
                 &Scope::default(),
                 ExprPolicy::select(DoubleQuotedDml::Enabled),
@@ -5311,7 +5466,7 @@ mod tests {
                 values,
                 comparisons,
                 ..
-            } = expression
+            } = exprs[expression].clone()
             else {
                 panic!("empty IN list becomes HIR");
             };
@@ -5354,32 +5509,32 @@ mod tests {
             ("SELECT 2 IS NOT FALSE", false, true),
             ("SELECT 2 IS (TRUE)", true, false),
         ] {
-            let analyzed = analyze_expression(
+            let (exprs, analyzed) = analyze_expression(
                 &expression(sql),
                 &Scope::default(),
                 ExprPolicy::select(DoubleQuotedDml::Enabled),
             )
             .expect("truth test binds");
             assert!(matches!(
-                analyzed,
+                &exprs[analyzed],
                 Expr::TruthTest {
                     expr,
                     is_true,
                     negated,
-                } if matches!(*expr, Expr::Literal(ast::Literal::Numeric(ref value)) if value == "2")
-                    && is_true == expected_is_true
-                    && negated == expected_negated
+                } if matches!(&exprs[*expr], Expr::Literal(ast::Literal::Numeric(value)) if value == "2")
+                    && *is_true == expected_is_true
+                    && *negated == expected_negated
             ));
         }
 
-        let unary_true = analyze_expression(
+        let (exprs, unary_true) = analyze_expression(
             &expression("SELECT 2 IS +TRUE"),
             &Scope::default(),
             ExprPolicy::select(DoubleQuotedDml::Enabled),
         )
         .expect("unary plus blocks truth-test recognition");
         assert!(matches!(
-            unary_true,
+            &exprs[unary_true],
             Expr::Binary {
                 operator: ast::Operator::Is,
                 ..
@@ -5498,8 +5653,12 @@ mod tests {
                 "is_autocommit is an internal function used by CDC",
             ),
         ] {
-            let error = validate_scalar_arguments(&Func::Scalar(function), &input)
-                .expect_err("statement-only or internal function is rejected");
+            let error = validate_scalar_arguments(
+                &Func::Scalar(function),
+                &input,
+                &hir::ExprArena::default(),
+            )
+            .expect_err("statement-only or internal function is rejected");
             assert_eq!(error.to_string(), format!("Parse error: {expected}"));
         }
 
@@ -5559,13 +5718,13 @@ mod tests {
             }
         }
 
-        let analyzed = analyze_expression(
+        let (exprs, analyzed) = analyze_expression(
             &expression("SELECT abs(1)"),
             &Scope::default(),
             ExprPolicy::select(DoubleQuotedDml::Enabled),
         )
         .expect("valid unary call binds");
-        assert!(matches!(analyzed, Expr::Function(_)));
+        assert!(matches!(&exprs[analyzed], Expr::Function(_)));
     }
 
     #[test]
@@ -5637,13 +5796,13 @@ mod tests {
             "SELECT table_columns_json_array(1)",
             "SELECT bin_record_json_object(1, 2)",
         ] {
-            let analyzed = analyze_expression(
+            let (exprs, analyzed) = analyze_expression(
                 &expression(sql),
                 &Scope::default(),
                 ExprPolicy::select(DoubleQuotedDml::Enabled),
             )
             .expect("valid fixed-arity call binds");
-            assert!(matches!(analyzed, Expr::Function(_)));
+            assert!(matches!(&exprs[analyzed], Expr::Function(_)));
         }
     }
 
@@ -5681,13 +5840,13 @@ mod tests {
             "SELECT glob(1, 2)",
             "SELECT glob(1, 2, 3)",
         ] {
-            let analyzed = analyze_expression(
+            let (exprs, analyzed) = analyze_expression(
                 &expression(sql),
                 &Scope::default(),
                 ExprPolicy::select(DoubleQuotedDml::Enabled),
             )
             .expect("valid minimum-arity call binds");
-            assert!(matches!(analyzed, Expr::Function(_)));
+            assert!(matches!(&exprs[analyzed], Expr::Function(_)));
         }
     }
 
@@ -5745,13 +5904,13 @@ mod tests {
             "SELECT unlikely(1)",
             "SELECT likelihood(1, 0.5)",
         ] {
-            let analyzed = analyze_expression(
+            let (exprs, analyzed) = analyze_expression(
                 &expression(sql),
                 &Scope::default(),
                 ExprPolicy::select(DoubleQuotedDml::Enabled),
             )
             .expect("valid planner hint binds");
-            assert!(matches!(analyzed, Expr::Function(_)));
+            assert!(matches!(&exprs[analyzed], Expr::Function(_)));
         }
     }
 
@@ -5775,13 +5934,13 @@ mod tests {
             }
 
             for arguments in ["1", "1, 2"] {
-                let analyzed = analyze_expression(
+                let (exprs, analyzed) = analyze_expression(
                     &expression(&format!("SELECT {function}({arguments})")),
                     &Scope::default(),
                     ExprPolicy::select(DoubleQuotedDml::Enabled),
                 )
                 .expect("valid one-or-two argument call binds");
-                assert!(matches!(analyzed, Expr::Function(_)));
+                assert!(matches!(&exprs[analyzed], Expr::Function(_)));
             }
         }
     }
@@ -5807,13 +5966,13 @@ mod tests {
             .expect_err("invalid nullary call fails during semantic analysis");
             assert_eq!(error.to_string(), format!("Parse error: {expected}"));
 
-            let analyzed = analyze_expression(
+            let (exprs, analyzed) = analyze_expression(
                 &expression(&format!("SELECT {function}()")),
                 &Scope::default(),
                 ExprPolicy::select(DoubleQuotedDml::Enabled),
             )
             .expect("valid nullary call binds");
-            assert!(matches!(analyzed, Expr::Function(_)));
+            assert!(matches!(&exprs[analyzed], Expr::Function(_)));
         }
 
         #[cfg(feature = "test_helper")]
@@ -5829,13 +5988,13 @@ mod tests {
                 "Parse error: test_nondet_counter function with arguments"
             );
 
-            let analyzed = analyze_expression(
+            let (exprs, analyzed) = analyze_expression(
                 &expression("SELECT test_nondet_counter()"),
                 &Scope::default(),
                 ExprPolicy::select(DoubleQuotedDml::Enabled),
             )
             .expect("nullary test counter binds");
-            assert!(matches!(analyzed, Expr::Function(_)));
+            assert!(matches!(&exprs[analyzed], Expr::Function(_)));
         }
     }
 
@@ -5850,13 +6009,13 @@ mod tests {
             "SELECT json_array()",
             "SELECT json_valid('{}', 6)",
         ] {
-            let analyzed = analyze_expression(
+            let (exprs, analyzed) = analyze_expression(
                 &expression(sql),
                 &Scope::default(),
                 ExprPolicy::select(DoubleQuotedDml::Enabled),
             )
             .expect("valid JSON call binds");
-            assert!(matches!(analyzed, Expr::Function(_)));
+            assert!(matches!(&exprs[analyzed], Expr::Function(_)));
         }
 
         for (sql, expected) in [
@@ -5922,7 +6081,7 @@ mod tests {
                 3,
             ),
         ] {
-            let analyzed = analyze_expression(
+            let (exprs, analyzed) = analyze_expression(
                 &expression(sql),
                 &Scope::default(),
                 ExprPolicy::select(DoubleQuotedDml::Enabled),
@@ -5935,7 +6094,7 @@ mod tests {
                 function,
                 escape,
                 ..
-            } = analyzed
+            } = exprs[analyzed].clone()
             else {
                 panic!("LIKE-family syntax becomes LIKE HIR");
             };
@@ -5975,7 +6134,7 @@ mod tests {
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     #[test]
     fn match_accepts_a_row_valued_left_side() {
-        let analyzed = analyze_expression(
+        let (exprs, analyzed) = analyze_expression(
             &expression("SELECT ('one', 'two') MATCH 'query'"),
             &Scope::default(),
             ExprPolicy::select(DoubleQuotedDml::Enabled),
@@ -5987,11 +6146,11 @@ mod tests {
             function,
             argument_count: 3,
             ..
-        } = analyzed
+        } = exprs[analyzed].clone()
         else {
             panic!("MATCH becomes resolved LIKE-family HIR");
         };
-        assert!(matches!(*lhs, Expr::Row(values) if values.len() == 2));
+        assert!(matches!(&exprs[lhs], Expr::Row(values) if values.len() == 2));
         assert!(matches!(
             function.value(),
             Func::Fts(crate::function::FtsFunc::Match)
@@ -6028,20 +6187,20 @@ mod tests {
             };
         }
 
-        let mut analyzed = analyze_expression(
+        let (exprs, mut analyzed) = analyze_expression(
             &syntax,
             &Scope::default(),
             ExprPolicy::select(DoubleQuotedDml::Enabled),
         )
         .expect("deep LIKE expression binds without using the call stack");
         for _ in 0..DEPTH {
-            let Expr::Like { lhs, .. } = analyzed else {
+            let Expr::Like { lhs, .. } = exprs[analyzed] else {
                 panic!("expected nested LIKE HIR expression");
             };
-            analyzed = *lhs;
+            analyzed = lhs;
         }
         assert!(matches!(
-            analyzed,
+            &exprs[analyzed],
             Expr::Literal(ast::Literal::String(value)) if value == "value"
         ));
 
@@ -6066,7 +6225,7 @@ mod tests {
             syntax = ast::Expr::Unary(ast::UnaryOperator::Positive, Box::new(syntax));
         }
 
-        let mut analyzed = analyze_expression(
+        let (exprs, mut analyzed) = analyze_expression(
             &syntax,
             &Scope::default(),
             ExprPolicy::select(DoubleQuotedDml::Enabled),
@@ -6077,14 +6236,14 @@ mod tests {
             let Expr::Unary {
                 operator: ast::UnaryOperator::Positive,
                 expr,
-            } = analyzed
+            } = exprs[analyzed]
             else {
                 panic!("expected nested unary HIR expression");
             };
-            analyzed = *expr;
+            analyzed = expr;
         }
         assert!(matches!(
-            analyzed,
+            &exprs[analyzed],
             Expr::Literal(ast::Literal::Numeric(value)) if value == "1"
         ));
 

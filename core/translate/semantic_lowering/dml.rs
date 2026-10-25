@@ -348,7 +348,7 @@ fn emit_index_key_values(
             // operators, even over custom-typed columns, so the key is read
             // as the column, never as the index's copy of its expression.
             (_, Some(table_column)) if table_column.is_virtual_generated() => {
-                super::expr::translate_expr_no_constant_opt(
+                super::expr::translate_detached_expr_no_constant_opt(
                     program,
                     document,
                     &hir::Expr::Column(hir::ColumnRef {
@@ -361,7 +361,10 @@ fn emit_index_key_values(
             }
             (Some(expression), _) => {
                 super::expr::translate_expr_no_constant_opt(
-                    program, document, expression, register,
+                    program,
+                    document,
+                    *expression,
+                    register,
                 )?;
             }
             (None, Some(table_column)) => emit_stored_column(
@@ -449,7 +452,7 @@ pub(super) fn emit_replace_delete(
                 let skip = program.allocate_label();
                 let register = program.alloc_register();
                 super::expr::translate_expr_no_constant_opt(
-                    program, document, predicate, register,
+                    program, document, *predicate, register,
                 )?;
                 program.emit_insn(Insn::IfNot {
                     reg: register,
@@ -528,7 +531,7 @@ pub(super) fn collect_target_rowids(
     let hir_loop = start_hir_loop(program, document, &prepared, None)?;
     emit_access_predicates(program, document, access, Some(0), hir_loop.next)?;
     let rowid = program.alloc_register();
-    super::expr::translate_expr(
+    super::expr::translate_detached_expr(
         program,
         document,
         &hir::Expr::RowId(target.source.id),
@@ -548,7 +551,10 @@ pub(super) fn collect_target_rowids(
 
 /// Whether a DML access path finds at most one row: a rowid lookup, or a
 /// seek where every column of a unique index (or the rowid) is fixed by `=`.
-pub(super) fn touches_at_most_one_row(operation: &HirBtreeOperation) -> bool {
+pub(super) fn touches_at_most_one_row(
+    document: &HirDocument,
+    operation: &HirBtreeOperation,
+) -> bool {
     use crate::translate::plan::SeekKeyComponent;
     match operation {
         HirBtreeOperation::RowidEq { .. } => true,
@@ -574,7 +580,8 @@ pub(super) fn touches_at_most_one_row(operation: &HirBtreeOperation) -> bool {
                 // `x IS NULL` can match many NULL keys of a UNIQUE index.
                 && seek_def.prefix.iter().all(|component| {
                     component.eq.as_ref().is_none_or(|(operator, expression, _)| {
-                        *operator != ast::Operator::Is || is_non_null_literal(expression)
+                        *operator != ast::Operator::Is
+                            || is_non_null_literal(&document.exprs[*expression])
                     })
                 })
         }
@@ -712,8 +719,8 @@ impl<'a> ReturningBuffer<'a> {
         // target table runs again for each row, so it sees the rows written
         // so far; any other runs once.
         for output in self.outputs {
-            output.expr.for_each(&mut |expression| {
-                if let hir::Expr::Subquery(subquery) = expression {
+            document.exprs.at(output.expr).for_each(&mut |expression| {
+                if let hir::Expr::Subquery(subquery) = expression.node() {
                     let query = subquery_query(subquery);
                     if document.query_reads_table_directly(query, target) {
                         program.rerun_subquery(query);
@@ -726,7 +733,7 @@ impl<'a> ReturningBuffer<'a> {
             super::expr::translate_expr_no_constant_opt(
                 program,
                 document,
-                &output.expr,
+                output.expr,
                 start + position,
             )?;
         }
@@ -837,7 +844,7 @@ fn emit_check_constraint_list<'c>(
         super::expr::translate_expr_no_constant_opt(
             program,
             document,
-            &constraint.expression,
+            constraint.expression,
             result,
         )?;
         let passed = program.allocate_label();
@@ -979,7 +986,7 @@ pub(super) fn emit_stored_column(
             program.emit_column_or_rowid(table_cursor, position, register);
             let has_field = program.allocate_label();
             program.emit_column_has_field(table_cursor, position, has_field);
-            super::expr::translate_expr_no_constant_opt(program, document, default, register)?;
+            super::expr::translate_expr_no_constant_opt(program, document, *default, register)?;
             super::expr::translate_schema_calls_in_place(
                 program,
                 document,
@@ -1189,7 +1196,7 @@ pub(super) fn emit_virtual_columns(
         .iter()
         .filter(|(_, column)| column.is_virtual_generated())
     {
-        super::expr::translate_expr_no_constant_opt(
+        super::expr::translate_detached_expr_no_constant_opt(
             program,
             document,
             &hir::Expr::Column(hir::ColumnRef { source, column }),
@@ -1267,10 +1274,10 @@ pub(super) fn is_virtual_key_column(
 }
 
 /// Whether an expression contains a subquery.
-pub(super) fn has_subquery(expression: &hir::Expr) -> bool {
+pub(super) fn has_subquery(document: &HirDocument, expression: hir::ExprId) -> bool {
     let mut found = false;
-    expression.for_each(&mut |expression| {
-        found |= matches!(expression, hir::Expr::Subquery(_));
+    document.exprs.at(expression).for_each(&mut |expression| {
+        found |= matches!(expression.node(), hir::Expr::Subquery(_));
     });
     found
 }

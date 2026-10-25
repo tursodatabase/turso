@@ -150,14 +150,15 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         environment: &hir::TriggerEnvironment,
         scope: &Scope,
         expression: &'ast ast::Expr,
-    ) -> Result<hir::Expr> {
-        Ok(self
+    ) -> Result<hir::ExprId> {
+        let predicate = self
             .analyze_root_expr(
                 expression,
                 scope,
                 ExprPolicies::trigger(self.context().dqs_dml(), environment).where_clause(),
             )?
-            .expr)
+            .expr;
+        Ok(predicate)
     }
 
     fn analyze_trigger_select_in(

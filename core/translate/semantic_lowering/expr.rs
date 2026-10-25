@@ -119,73 +119,73 @@ struct CursorColumn {
     column: usize,
 }
 
-enum ColumnChild<'expr> {
-    Generated(&'expr hir::Expr),
-    Default(&'expr hir::Expr),
+enum ColumnChild {
+    Generated(hir::ExprId),
+    Default(hir::ExprId),
     Program {
         phase: ColumnProgram,
-        child: SchemaCallChild<'expr>,
+        child: SchemaCallChild,
     },
 }
 
-enum SchemaCallChild<'expr> {
+enum SchemaCallChild {
     Argument {
         call: usize,
         argument: usize,
         argument_count: usize,
-        expression: &'expr hir::Expr,
+        expression: hir::ExprId,
     },
     Body {
         call: usize,
         argument_count: usize,
         input_source: hir::SourceId,
-        expression: &'expr hir::Expr,
+        expression: hir::ExprId,
     },
 }
 
-enum CastChild<'expr> {
-    Value(&'expr hir::Expr),
+enum CastChild {
+    Value(hir::ExprId),
     Program {
         phase: CastProgram,
-        child: SchemaCallChild<'expr>,
+        child: SchemaCallChild,
     },
 }
 
-enum BinaryChild<'expr> {
-    Operand(&'expr hir::Expr),
-    Encoder(SchemaCallChild<'expr>),
+enum BinaryChild {
+    Operand(hir::ExprId),
+    Encoder(SchemaCallChild),
 }
 
-impl<'expr> ColumnChild<'expr> {
-    const fn expression(&self) -> &'expr hir::Expr {
+impl ColumnChild {
+    const fn expression(&self) -> hir::ExprId {
         match self {
-            Self::Generated(expression) | Self::Default(expression) => expression,
+            Self::Generated(expression) | Self::Default(expression) => *expression,
             Self::Program { child, .. } => child.expression(),
         }
     }
 }
 
-impl<'expr> SchemaCallChild<'expr> {
-    const fn expression(&self) -> &'expr hir::Expr {
+impl SchemaCallChild {
+    const fn expression(&self) -> hir::ExprId {
         match self {
-            Self::Argument { expression, .. } | Self::Body { expression, .. } => expression,
+            Self::Argument { expression, .. } | Self::Body { expression, .. } => *expression,
         }
     }
 }
 
-impl<'expr> CastChild<'expr> {
-    const fn expression(&self) -> &'expr hir::Expr {
+impl CastChild {
+    const fn expression(&self) -> hir::ExprId {
         match self {
-            Self::Value(expression) => expression,
+            Self::Value(expression) => *expression,
             Self::Program { child, .. } => child.expression(),
         }
     }
 }
 
-impl<'expr> BinaryChild<'expr> {
-    const fn expression(&self) -> &'expr hir::Expr {
+impl BinaryChild {
+    const fn expression(&self) -> hir::ExprId {
         match self {
-            Self::Operand(expression) => expression,
+            Self::Operand(expression) => *expression,
             Self::Encoder(child) => child.expression(),
         }
     }
@@ -441,13 +441,13 @@ fn plain_function_lowering(function: &Func) -> Option<EmptyArgumentStart> {
 /// The node is matched by identity. This keeps temporary runtime inputs scoped
 /// to the exact resolved expression being lowered.
 #[derive(Clone, Copy)]
-pub(crate) struct ExprRegisterInput<'expr> {
-    expression: &'expr hir::Expr,
+pub(crate) struct ExprRegisterInput {
+    expression: hir::ExprId,
     register: usize,
 }
 
-impl<'expr> ExprRegisterInput<'expr> {
-    pub(crate) const fn new(expression: &'expr hir::Expr, register: usize) -> Self {
+impl ExprRegisterInput {
+    pub(crate) const fn new(expression: hir::ExprId, register: usize) -> Self {
         Self {
             expression,
             register,
@@ -458,7 +458,7 @@ impl<'expr> ExprRegisterInput<'expr> {
 struct ExprLowerer<'program, 'document, 'inputs> {
     program: &'program mut ProgramBuilder,
     document: &'document hir::HirDocument,
-    inputs: &'inputs [ExprRegisterInput<'document>],
+    inputs: &'inputs [ExprRegisterInput],
 }
 
 impl<'expr> ExprLowerer<'_, 'expr, '_> {
@@ -480,10 +480,10 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
         })
     }
 
-    fn input_register(&self, expression: &hir::Expr) -> Option<usize> {
+    fn input_register(&self, expression: hir::ExprId) -> Option<usize> {
         self.inputs
             .iter()
-            .find(|input| std::ptr::eq(input.expression, expression))
+            .find(|input| input.expression == expression)
             .map(|input| input.register)
             .or_else(|| self.program.expression_register(expression))
     }
@@ -492,9 +492,9 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
         &self,
         calls: impl IntoIterator<Item = &'expr hir::BoundSchemaCall>,
         mut index: usize,
-    ) -> Option<SchemaCallChild<'expr>> {
+    ) -> Option<SchemaCallChild> {
         for (call_index, call) in calls.into_iter().enumerate() {
-            if let Some(expression) = call.arguments.get(index) {
+            if let Some(&expression) = call.arguments.get(index) {
                 return Some(SchemaCallChild::Argument {
                     call: call_index,
                     argument: index,
@@ -509,7 +509,7 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
                     call: call_index,
                     argument_count: call.arguments.len(),
                     input_source: program.input_source,
-                    expression: &program.body,
+                    expression: program.body,
                 });
             }
             index -= 1;
@@ -517,11 +517,7 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
         None
     }
 
-    fn column_child(
-        &self,
-        reference: hir::ColumnRef,
-        mut index: usize,
-    ) -> Option<ColumnChild<'expr>> {
+    fn column_child(&self, reference: hir::ColumnRef, mut index: usize) -> Option<ColumnChild> {
         let source = self.document.source(reference.source)?;
         let generated = source.generated_expressions.get(reference.column)?;
         if let hir::ColumnReadExpression::Planned(expression) = generated {
@@ -529,7 +525,7 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
             // and never stored, so its value is neither decoded nor given a
             // default: decoding it once more would read 0 for
             // `cents AS (a * 2)` while its index holds 4.
-            return (index == 0).then_some(ColumnChild::Generated(expression));
+            return (index == 0).then_some(ColumnChild::Generated(*expression));
         }
 
         let column = source.columns.get(reference.column)?;
@@ -544,7 +540,7 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
         {
             if !programs.encode.is_empty() {
                 if index == 0 {
-                    return Some(ColumnChild::Default(default));
+                    return Some(ColumnChild::Default(*default));
                 }
                 index -= 1;
                 let encode_children: usize = programs
@@ -578,10 +574,10 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
 
     fn cast_child(
         &self,
-        expression: &'expr hir::Expr,
+        expression: hir::ExprId,
         target: &'expr hir::TypeName,
         mut index: usize,
-    ) -> Option<CastChild<'expr>> {
+    ) -> Option<CastChild> {
         if index == 0 {
             return Some(CastChild::Value(expression));
         }
@@ -613,11 +609,11 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
 
     fn binary_child(
         &self,
-        lhs: &'expr hir::Expr,
-        rhs: &'expr hir::Expr,
+        lhs: hir::ExprId,
+        rhs: hir::ExprId,
         custom: Option<&'expr hir::CustomBinaryOperator>,
         mut index: usize,
-    ) -> Option<BinaryChild<'expr>> {
+    ) -> Option<BinaryChild> {
         let (first, second) = match custom {
             Some(custom) if custom.swap_args => (rhs, lhs),
             _ => (lhs, rhs),
@@ -639,21 +635,25 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
     type Output = usize;
     type Error = LimboError;
 
-    fn child(&mut self, expression: &'expr hir::Expr, index: usize) -> Option<&'expr hir::Expr> {
-        if self.input_register(expression).is_some() {
+    fn child(
+        &mut self,
+        expression: hir::ExprRef<'expr>,
+        index: usize,
+    ) -> Option<hir::ExprRef<'expr>> {
+        if self.input_register(expression.id()).is_some() {
             return None;
         }
-        match expression {
+        let child = match expression.node() {
             hir::Expr::Column(reference) => self
                 .column_child(*reference, index)
                 .map(|child| child.expression()),
             hir::Expr::Cast { expr, target } => self
-                .cast_child(expr, target, index)
+                .cast_child(*expr, target, index)
                 .map(|child| child.expression()),
             hir::Expr::Binary {
                 lhs, rhs, custom, ..
             } => self
-                .binary_child(lhs, rhs, custom.as_deref(), index)
+                .binary_child(*lhs, *rhs, custom.as_deref(), index)
                 .map(|child| child.expression()),
             // A probe evaluates the left side inside the subquery.
             hir::Expr::Subquery(hir::SubqueryExpr::In { query, .. })
@@ -661,29 +661,36 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
             {
                 None
             }
-            hir::Expr::Subquery(hir::SubqueryExpr::In { lhs, .. }) => match lhs.as_ref() {
-                hir::Expr::Row(values) => values.get(index),
-                expression => (index == 0).then_some(expression),
-            },
+            hir::Expr::Subquery(hir::SubqueryExpr::In { lhs, .. }) => {
+                match &self.document.exprs[*lhs] {
+                    hir::Expr::Row(values) => values.get(index).copied(),
+                    _ => (index == 0).then_some(*lhs),
+                }
+            }
             // A reference to an output that has not been evaluated yet, as in
             // WHERE, GROUP BY, or HAVING, evaluates the aliased expression in
             // place, like SQLite's alias expansion.
             hir::Expr::Output(output)
                 if index == 0 && self.program.output_binding(*output).is_none() =>
             {
-                self.document.output(*output).map(|output| &output.expr)
+                self.document.output(*output).map(|output| output.expr)
             }
-            _ => expression.child(index),
-        }
+            _ => expression.node().child(index),
+        };
+        child.map(|child| expression.at(child))
     }
 
     fn pre_order(
         &mut self,
-        parent: &hir::Expr,
+        parent: hir::ExprRef<'expr>,
         context: &mut LoweringContext,
         child_index: usize,
-        child: &hir::Expr,
+        child: hir::ExprRef<'expr>,
     ) -> Result<ControlFlow<(), LoweringContext>> {
+        let exprs = &self.document.exprs;
+        let parent = parent.node();
+        let child_ref = child;
+        let child = child.node();
         // Query lowering evaluates aggregate/window inputs while stepping the
         // function. Reading its result must not evaluate those inputs again.
         if matches!(
@@ -810,7 +817,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                 expr,
                 target: cast_target,
             } => {
-                let Some(cast_child) = self.cast_child(expr, cast_target, child_index) else {
+                let Some(cast_child) = self.cast_child(*expr, cast_target, child_index) else {
                     return Err(LimboError::InternalError(format!(
                         "HIR CAST has an invalid linked child {child_index}"
                     )));
@@ -905,7 +912,9 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                         let width = comparison
                             .as_ref()
                             .map_or(1, |comparison| comparison.components.len());
-                        let operands = if lhs.equivalent(rhs) && expression_is_deterministic(lhs) {
+                        let operands = if exprs.at(*lhs).equivalent(exprs.at(*rhs))
+                            && expression_is_deterministic(exprs.at(*lhs))
+                        {
                             BinaryOperands::Shared(self.program.alloc_registers(width))
                         } else {
                             let lhs = self.program.alloc_registers(width * 2);
@@ -978,7 +987,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                                 extra_amount: 0,
                             });
                         }
-                        let Some(child) = self.binary_child(lhs, rhs, Some(custom), child_index)
+                        let Some(child) = self.binary_child(*lhs, *rhs, Some(custom), child_index)
                         else {
                             return Err(LimboError::InternalError(format!(
                                 "HIR custom binary operator has an invalid linked child {child_index}"
@@ -1043,13 +1052,13 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                     }
                     let value = self.program.alloc_registers(width);
                     let lower = self.program.alloc_register();
-                    let start_register = if expr.equivalent(start) {
+                    let start_register = if exprs.at(*expr).equivalent(exprs.at(*start)) {
                         value
                     } else {
                         self.program.alloc_registers(width)
                     };
                     let upper = self.program.alloc_register();
-                    let end_register = if expr.equivalent(end) {
+                    let end_register = if exprs.at(*expr).equivalent(exprs.at(*end)) {
                         value
                     } else {
                         self.program.alloc_registers(width)
@@ -1328,7 +1337,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                 debug_assert_eq!(child_index, 0);
                 if *action == ResolveType::Ignore
                     || matches!(
-                        message.as_deref(),
+                        message.map(|message| &exprs[message]),
                         Some(hir::Expr::Literal(Literal::String(_)))
                     )
                 {
@@ -1763,14 +1772,14 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
             _ => false,
         };
         if own_register && !child_context.in_hoisted {
-            child_context.hoisted = self.begin_hoisted_constant(child);
+            child_context.hoisted = self.begin_hoisted_constant(child_ref);
         }
         Ok(ControlFlow::Continue(child_context))
     }
 
     fn post_order(
         &mut self,
-        expression: &hir::Expr,
+        expression: hir::ExprRef<'expr>,
         mut context: LoweringContext,
         children: &[usize],
     ) -> Result<usize> {
@@ -1788,10 +1797,10 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
 /// Whether a constant expression can fail: it calls a function, as
 /// `abs(-9223372036854775808)` fails, or CASTs to a custom type, which runs
 /// the type's encoder and domain checks.
-fn constant_may_fail(expression: &hir::Expr) -> bool {
+fn constant_may_fail(expression: hir::ExprRef<'_>) -> bool {
     let mut may_fail = false;
     expression.for_each(&mut |expression| {
-        may_fail |= match expression {
+        may_fail |= match expression.node() {
             hir::Expr::Function(_) => true,
             hir::Expr::Cast { target, .. } => {
                 !target.programs.encode.is_empty()
@@ -1811,7 +1820,7 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
     /// custom type it cannot fail, so it moves before the loops. A function
     /// might fail, as `abs(-9223372036854775808)` does, so an operand that
     /// calls one still runs only where it is first reached, as SQLite's does.
-    fn begin_hoisted_constant(&mut self, operand: &hir::Expr) -> Option<Hoisted> {
+    fn begin_hoisted_constant(&mut self, operand: hir::ExprRef<'_>) -> Option<Hoisted> {
         if !self.is_hoisted_constant(operand) {
             return None;
         }
@@ -1823,9 +1832,9 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
 
     /// Whether `expression` has the same value on every row and is not
     /// already computed once by an enclosing constant.
-    fn is_hoisted_constant(&self, expression: &hir::Expr) -> bool {
+    fn is_hoisted_constant(&self, expression: hir::ExprRef<'_>) -> bool {
         !self.program.constant_span_is_open()
-            && !matches!(expression, hir::Expr::Parameter(_))
+            && !matches!(expression.node(), hir::Expr::Parameter(_))
             && hir_expr_is_constant(self.program, expression)
     }
 
@@ -1841,12 +1850,14 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
 
     fn post_order_value(
         &mut self,
-        expression: &hir::Expr,
+        expression: hir::ExprRef<'expr>,
         context: LoweringContext,
         children: &[usize],
     ) -> Result<usize> {
         let target = context.target;
-        if let Some(register) = self.input_register(expression) {
+        let expression_ref = expression;
+        let expression = expression.node();
+        if let Some(register) = self.input_register(expression_ref.id()) {
             debug_assert!(children.is_empty());
             if register != target {
                 self.program.emit_insn(Insn::Copy {
@@ -2063,7 +2074,7 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
                 Ok(target)
             }
             hir::Expr::Unary { operator, expr } => {
-                self.emit_unary(*operator, expr, target, children)
+                self.emit_unary(*operator, &self.document.exprs[*expr], target, children)
             }
             hir::Expr::IsNull(_) => self.emit_null_test(NullTest::IsNull, target, children),
             hir::Expr::NotNull(_) => self.emit_null_test(NullTest::NotNull, target, children),
@@ -2290,8 +2301,10 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
                 let constant_mask = if matches!(
                     operator,
                     turso_parser::ast::LikeOperator::Like | turso_parser::ast::LikeOperator::Glob
-                ) && matches!(rhs.as_ref(), hir::Expr::Literal(_))
-                {
+                ) && matches!(
+                    self.document.exprs[*rhs],
+                    hir::Expr::Literal(_)
+                ) {
                     self.program.mark_last_insn_constant();
                     1
                 } else {
@@ -2394,7 +2407,7 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
                         let Some(message) = message else {
                             crate::bail_parse_error!("RAISE requires an error message");
                         };
-                        let (description, description_reg) = match message.as_ref() {
+                        let (description, description_reg) = match &self.document.exprs[*message] {
                             hir::Expr::Literal(Literal::String(value)) => {
                                 debug_assert!(children.is_empty());
                                 (expr::sanitize_string(value), None)
@@ -4671,7 +4684,7 @@ impl ExprLowerer<'_, '_, '_> {
 pub(crate) fn translate_expr(
     program: &mut ProgramBuilder,
     document: &hir::HirDocument,
-    expression: &hir::Expr,
+    expression: hir::ExprId,
     target: usize,
 ) -> Result<usize> {
     translate_expr_with_inputs(program, document, expression, target, &[])
@@ -4679,12 +4692,59 @@ pub(crate) fn translate_expr(
 
 /// Lower a resolved expression while taking selected node values from
 /// registers prepared by its caller.
-pub(crate) fn translate_expr_with_inputs<'expr>(
+pub(crate) fn translate_expr_with_inputs(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    expression: hir::ExprId,
+    target: usize,
+    inputs: &[ExprRegisterInput],
+) -> Result<usize> {
+    translate_expr_ref(
+        program,
+        document,
+        document.exprs.at(expression),
+        target,
+        inputs,
+    )
+}
+
+/// Lower an expression node built during lowering, such as a column or
+/// rowid read, which is not stored in the document.
+pub(crate) fn translate_detached_expr(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    expression: &hir::Expr,
+    target: usize,
+) -> Result<usize> {
+    translate_expr_ref(
+        program,
+        document,
+        document.exprs.detached(expression),
+        target,
+        &[],
+    )
+}
+
+/// Like [translate_detached_expr], keeping its instructions at the current
+/// use.
+pub(crate) fn translate_detached_expr_no_constant_opt(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    expression: &hir::Expr,
+    target: usize,
+) -> Result<usize> {
+    let first_new_span = program.constant_spans_next_idx();
+    let result = translate_detached_expr(program, document, expression, target);
+    program.constant_spans_invalidate_after(first_new_span);
+    result
+}
+
+fn translate_expr_ref<'expr>(
     program: &mut ProgramBuilder,
     document: &'expr hir::HirDocument,
-    expression: &'expr hir::Expr,
+    expression: hir::ExprRef<'expr>,
     target: usize,
-    inputs: &[ExprRegisterInput<'expr>],
+    inputs: &[ExprRegisterInput],
 ) -> Result<usize> {
     let mut lowerer = ExprLowerer {
         program,
@@ -4748,10 +4808,14 @@ impl<'expr> hir::ExprVisitor<'expr> for ConditionLowerer<'_, 'expr> {
     type Output = ();
     type Error = LimboError;
 
-    fn child(&mut self, expression: &'expr hir::Expr, index: usize) -> Option<&'expr hir::Expr> {
+    fn child(
+        &mut self,
+        expression: hir::ExprRef<'expr>,
+        index: usize,
+    ) -> Option<hir::ExprRef<'expr>> {
         // A condition whose value a register already holds, such as a GROUP
         // BY key the HAVING clause repeats, is tested from that register.
-        if self.program.expression_register(expression).is_some() {
+        if self.program.expression_register(expression.id()).is_some() {
             return None;
         }
         let hir::Expr::Binary {
@@ -4760,21 +4824,21 @@ impl<'expr> hir::ExprVisitor<'expr> for ConditionLowerer<'_, 'expr> {
             rhs,
             custom: None,
             ..
-        } = expression
+        } = expression.node()
         else {
             return None;
         };
-        [lhs.as_ref(), rhs.as_ref()].get(index).copied()
+        [*lhs, *rhs].get(index).map(|child| expression.at(*child))
     }
 
     fn pre_order(
         &mut self,
-        parent: &hir::Expr,
+        parent: hir::ExprRef<'expr>,
         context: &mut ConditionContext,
         child_index: usize,
-        _child: &hir::Expr,
+        _child: hir::ExprRef<'expr>,
     ) -> Result<ControlFlow<(), ConditionContext>> {
-        let hir::Expr::Binary { operator, .. } = parent else {
+        let hir::Expr::Binary { operator, .. } = parent.node() else {
             unreachable!("condition visitor only exposes binary AND/OR children")
         };
         match (operator, child_index) {
@@ -4830,14 +4894,14 @@ impl<'expr> hir::ExprVisitor<'expr> for ConditionLowerer<'_, 'expr> {
 
     fn post_order(
         &mut self,
-        expression: &hir::Expr,
+        expression: hir::ExprRef<'expr>,
         context: ConditionContext,
         _children: &[()],
     ) -> Result<()> {
-        let stored = self.program.expression_register(expression).is_some();
+        let stored = self.program.expression_register(expression.id()).is_some();
         if !stored
             && matches!(
-                expression,
+                expression.node(),
                 hir::Expr::Binary {
                     operator: Operator::And | Operator::Or,
                     custom: None,
@@ -4851,7 +4915,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ConditionLowerer<'_, 'expr> {
             return Ok(());
         }
         let register = self.program.alloc_register();
-        translate_condition_operand(self.program, self.document, expression, register)?;
+        translate_condition_operand(self.program, self.document, expression.id(), register)?;
         expr::emit_cond_jump(self.program, context.metadata(), register);
         Ok(())
     }
@@ -4863,11 +4927,12 @@ impl<'expr> hir::ExprVisitor<'expr> for ConditionLowerer<'_, 'expr> {
 fn translate_condition_operand(
     program: &mut ProgramBuilder,
     document: &hir::HirDocument,
-    expression: &hir::Expr,
+    expression: hir::ExprId,
     target: usize,
 ) -> Result<usize> {
-    let span = (!program.constant_span_is_open() && hir_expr_is_constant(program, expression))
-        .then(|| program.constant_span_start());
+    let span = (!program.constant_span_is_open()
+        && hir_expr_is_constant(program, document.exprs.at(expression)))
+    .then(|| program.constant_span_start());
     let result = translate_expr(program, document, expression, target);
     if let Some(span) = span {
         program.constant_span_end(span);
@@ -4877,9 +4942,9 @@ fn translate_condition_operand(
 
 /// Whether every function `expression` calls gives the same value for the
 /// same arguments, so two equal copies of it may share one evaluation.
-fn expression_is_deterministic(expression: &hir::Expr) -> bool {
+fn expression_is_deterministic(expression: hir::ExprRef<'_>) -> bool {
     let mut deterministic = true;
-    expression.for_each(&mut |expression| match expression {
+    expression.for_each(&mut |expression| match expression.node() {
         hir::Expr::Function(call) => {
             if !crate::function::Deterministic::is_deterministic(call.function.value()) {
                 deterministic = false;
@@ -4894,49 +4959,21 @@ fn expression_is_deterministic(expression: &hir::Expr) -> bool {
 /// Whether an expression has the same value on every row. An expression
 /// whose value a register holds at run time, such as a group key, is not:
 /// that register is filled later.
-fn hir_expr_is_constant(program: &ProgramBuilder, expression: &hir::Expr) -> bool {
-    let mut constant = true;
+fn hir_expr_is_constant(program: &ProgramBuilder, expression: hir::ExprRef<'_>) -> bool {
+    expression.arena().is_constant(expression) && !reads_bound_register(program, expression)
+}
+
+fn reads_bound_register(program: &ProgramBuilder, expression: hir::ExprRef<'_>) -> bool {
+    if program.expression_register_count() == 0 {
+        return false;
+    }
+    let mut bound = false;
     expression.for_each(&mut |node| {
-        if !constant {
-            return;
-        }
-        if program.expression_register(node).is_some() {
-            constant = false;
-            return;
-        }
-        constant = match node {
-            hir::Expr::Literal(_)
-            | hir::Expr::Parameter(_)
-            | hir::Expr::Unary { .. }
-            | hir::Expr::Between { .. }
-            | hir::Expr::Case { .. }
-            | hir::Expr::Cast { .. }
-            | hir::Expr::Collate { .. }
-            | hir::Expr::IsNull(_)
-            | hir::Expr::NotNull(_)
-            | hir::Expr::TruthTest { .. }
-            | hir::Expr::InList { .. }
-            | hir::Expr::Row(_) => true,
-            hir::Expr::Binary { custom, .. } => custom.is_none(),
-            hir::Expr::Function(call) => {
-                // Like SQLite's SQLITE_FUNC_SLOCHNG functions, the date and
-                // time functions return the same value for the whole
-                // statement, so a call with constant arguments is computed
-                // once instead of on every row.
-                let function = call.function.value();
-                let same_for_whole_statement =
-                    crate::function::Deterministic::is_deterministic(function)
-                        || matches!(
-                            function,
-                            crate::function::Func::Scalar(scalar) if scalar.is_date_time_function()
-                        );
-                matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
-                    && same_for_whole_statement
-            }
-            _ => false,
-        };
+        #[cfg(test)]
+        tests::CONSTANT_CHECKS.with(|checks| checks.set(checks.get() + 1));
+        bound = bound || program.expression_register(node.id()).is_some();
     });
-    constant
+    bound
 }
 
 impl ConditionLowerer<'_, '_> {
@@ -4946,7 +4983,7 @@ impl ConditionLowerer<'_, '_> {
     /// false, having emitted nothing, for other expressions.
     fn emit_comparison_jump(
         &mut self,
-        expression: &hir::Expr,
+        expression: hir::ExprRef<'_>,
         metadata: expr::ConditionMetadata,
     ) -> Result<bool> {
         let hir::Expr::Binary {
@@ -4956,7 +4993,7 @@ impl ConditionLowerer<'_, '_> {
             array_concat: false,
             custom: None,
             comparison: Some(comparison),
-        } = expression
+        } = expression.node()
         else {
             return Ok(false);
         };
@@ -4972,7 +5009,7 @@ impl ConditionLowerer<'_, '_> {
             | Operator::GreaterEquals => false,
             Operator::Is | Operator::IsNot
                 if !matches!(
-                    rhs.as_ref(),
+                    self.document.exprs[*rhs],
                     hir::Expr::Literal(Literal::True | Literal::False)
                 ) =>
             {
@@ -5002,9 +5039,9 @@ impl ConditionLowerer<'_, '_> {
             }
         };
         let lhs_register = self.program.alloc_register();
-        translate_condition_operand(self.program, self.document, lhs, lhs_register)?;
+        translate_condition_operand(self.program, self.document, *lhs, lhs_register)?;
         let rhs_register = self.program.alloc_register();
-        translate_condition_operand(self.program, self.document, rhs, rhs_register)?;
+        translate_condition_operand(self.program, self.document, *rhs, rhs_register)?;
         let flags = if null_equal {
             CmpInsFlags::default()
                 .with_affinity(component.affinity)
@@ -5072,10 +5109,10 @@ impl ConditionLowerer<'_, '_> {
 pub(crate) fn translate_condition_expr(
     program: &mut ProgramBuilder,
     document: &hir::HirDocument,
-    expression: &hir::Expr,
+    expression: hir::ExprId,
     metadata: expr::ConditionMetadata,
 ) -> Result<()> {
-    expression.walk(
+    document.exprs.at(expression).walk(
         ConditionContext::Predicate(metadata),
         &mut ConditionLowerer { program, document },
     )
@@ -5085,19 +5122,19 @@ pub(crate) fn translate_condition_expr(
 pub(crate) fn translate_expr_no_constant_opt(
     program: &mut ProgramBuilder,
     document: &hir::HirDocument,
-    expression: &hir::Expr,
+    expression: hir::ExprId,
     target: usize,
 ) -> Result<usize> {
     translate_expr_with_inputs_no_constant_opt(program, document, expression, target, &[])
 }
 
 /// Keep register-dependent expressions inside the row or subroutine using them.
-pub(crate) fn translate_expr_with_inputs_no_constant_opt<'expr>(
+pub(crate) fn translate_expr_with_inputs_no_constant_opt(
     program: &mut ProgramBuilder,
-    document: &'expr hir::HirDocument,
-    expression: &'expr hir::Expr,
+    document: &hir::HirDocument,
+    expression: hir::ExprId,
     target: usize,
-    inputs: &[ExprRegisterInput<'expr>],
+    inputs: &[ExprRegisterInput],
 ) -> Result<usize> {
     let first_new_span = program.constant_spans_next_idx();
     let result = translate_expr_with_inputs(program, document, expression, target, inputs);
@@ -5210,7 +5247,7 @@ pub(crate) fn translate_schema_calls_in_place(
             ))
         })?;
         let arguments_start = program.alloc_registers(call.arguments.len());
-        for (position, argument) in call.arguments.iter().enumerate() {
+        for (position, &argument) in call.arguments.iter().enumerate() {
             translate_expr_no_constant_opt(
                 program,
                 document,
@@ -5225,15 +5262,19 @@ pub(crate) fn translate_schema_calls_in_place(
                 arguments_start,
             },
         );
-        translate_expr_no_constant_opt(program, document, &schema_program.body, target)?;
+        translate_expr_no_constant_opt(program, document, schema_program.body, target)?;
     }
     Ok(())
 }
 
 /// Register parameter slots in an expression that runtime lowering may skip.
-pub(crate) fn register_parameters(program: &mut ProgramBuilder, expression: &hir::Expr) {
-    expression.for_each(&mut |expression| {
-        if let hir::Expr::Parameter(parameter) = expression {
+pub(crate) fn register_parameters(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    expression: hir::ExprId,
+) {
+    document.exprs.at(expression).for_each(&mut |expression| {
+        if let hir::Expr::Parameter(parameter) = expression.node() {
             program.register_parameter(parameter.index, &parameter.spelling);
         }
     });
@@ -5298,6 +5339,8 @@ mod tests {
             ctes: Vec::new(),
             schema_programs: Vec::new(),
             cdc: None,
+            exprs: hir::ExprArena::default(),
+            planning: hir::PlanningTerms::default(),
         }
     }
 
@@ -5342,14 +5385,14 @@ mod tests {
         document
     }
 
-    fn root_output(document: &hir::HirDocument) -> &hir::Expr {
+    fn root_output(document: &hir::HirDocument) -> hir::ExprId {
         let hir::HirRoot::Query(root) = &document.root else {
             panic!("SELECT produces a query root");
         };
-        &document.query(root.query).expect("query exists").blocks[0].outputs[0].expr
+        document.query(root.query).expect("query exists").blocks[0].outputs[0].expr
     }
 
-    fn root_filter(document: &hir::HirDocument) -> &hir::Expr {
+    fn root_filter(document: &hir::HirDocument) -> hir::ExprId {
         let hir::HirRoot::Query(root) = &document.root else {
             panic!("SELECT produces a query root");
         };
@@ -5360,7 +5403,7 @@ mod tests {
         else {
             panic!("SELECT has a filter");
         };
-        filter
+        *filter
     }
 
     fn custom_operator_schema() -> crate::schema::Schema {
@@ -5399,6 +5442,28 @@ mod tests {
         schema
     }
 
+    thread_local! {
+        pub(super) static CONSTANT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn nested_operands_are_checked_for_constants_once() {
+        let depth = 50;
+        let mut sql = String::from("id");
+        for value in 0..depth {
+            sql = format!("{sql} + {value}");
+        }
+        let document = analyze_sql(join_schema(), &format!("SELECT {sql} FROM left_values"));
+        CONSTANT_CHECKS.with(|checks| checks.set(0));
+        lower_btree_output(&document, 20);
+        let nodes = 2 * depth + 1;
+        let checks = CONSTANT_CHECKS.with(|checks| checks.get());
+        assert!(
+            checks <= 2 * nodes,
+            "{checks} constant checks for {nodes} nodes"
+        );
+    }
+
     fn lower_btree_output(document: &hir::HirDocument, target: usize) -> ProgramBuilder {
         let hir::HirRoot::Query(root) = &document.root else {
             panic!("SELECT produces a query root");
@@ -5421,7 +5486,7 @@ mod tests {
                 table_cursor: None,
             },
         );
-        super::translate_expr(&mut program, document, &block.outputs[0].expr, target)
+        super::translate_expr(&mut program, document, block.outputs[0].expr, target)
             .expect("analyzed output lowers");
         program
     }
@@ -5456,17 +5521,21 @@ mod tests {
             );
             cursors.push(cursor);
         }
-        super::translate_expr(&mut program, document, &block.outputs[0].expr, target)
+        super::translate_expr(&mut program, document, block.outputs[0].expr, target)
             .expect("analyzed join output lowers");
         (program, cursors)
     }
 
     fn translate_expr(
         program: &mut ProgramBuilder,
-        expression: &hir::Expr,
+        exprs: &ExprBuilder,
+        expression: hir::Expr,
         target: usize,
     ) -> Result<usize> {
-        translate_expr_in(program, &document(Vec::new()), expression, target)
+        let expression = exprs.push(expression);
+        let mut document = document(Vec::new());
+        document.exprs = exprs.0.borrow().clone();
+        translate_expr_in(program, &document, expression, target)
     }
 
     /// Lower `expression` as a caller that computes the whole expression
@@ -5476,13 +5545,22 @@ mod tests {
     fn translate_expr_in(
         program: &mut ProgramBuilder,
         document: &hir::HirDocument,
-        expression: &hir::Expr,
+        expression: hir::ExprId,
         target: usize,
     ) -> Result<usize> {
         let span = program.constant_span_start();
         let result = super::translate_expr(program, document, expression, target);
         program.constant_span_end(span);
         result
+    }
+
+    #[derive(Default)]
+    struct ExprBuilder(std::cell::RefCell<hir::ExprArena>);
+
+    impl ExprBuilder {
+        fn push(&self, expression: hir::Expr) -> hir::ExprId {
+            self.0.borrow_mut().push(expression)
+        }
     }
 
     fn resolved_function(function: Func) -> hir::ResolvedFunction {
@@ -5548,8 +5626,8 @@ mod tests {
             panic!("SELECT produces a query root");
         };
         let query = document.query(root.query).expect("query exists");
-        let expression = &query.order_by[0].expr;
-        let hir::Expr::Output(output) = expression else {
+        let expression = query.order_by[0].expr;
+        let hir::Expr::Output(output) = &document.exprs[expression] else {
             panic!("ORDER BY alias becomes an output reference");
         };
 
@@ -5580,7 +5658,8 @@ mod tests {
     fn unbound_output_reference_is_rejected() {
         let block = hir::QueryBlockId::new(hir::QueryId::new(0), 0);
         let expression = hir::Expr::output(hir::OutputId::query(block, 0));
-        let error = translate_expr(&mut program(), &expression, 7)
+        let exprs = ExprBuilder::default();
+        let error = translate_expr(&mut program(), &exprs, expression, 7)
             .expect_err("output needs a runtime binding");
 
         assert!(error.to_string().contains("has no runtime binding"));
@@ -5590,7 +5669,7 @@ mod tests {
     fn aggregate_results_use_the_register_bound_by_aggregate_identity() {
         let document = analyze_sql(crate::schema::Schema::new(), "SELECT sum(random())");
         let expression = root_output(&document);
-        let hir::Expr::Function(call) = expression else {
+        let hir::Expr::Function(call) = &document.exprs[expression] else {
             panic!("sum becomes a function call");
         };
         let hir::FunctionEvaluation::Aggregate { id, .. } = &call.evaluation else {
@@ -5619,7 +5698,7 @@ mod tests {
     fn window_results_use_the_register_bound_by_window_identity() {
         let document = analyze_sql(crate::schema::Schema::new(), "SELECT sum(random()) OVER ()");
         let expression = root_output(&document);
-        let hir::Expr::Function(call) = expression else {
+        let hir::Expr::Function(call) = &document.exprs[expression] else {
             panic!("sum OVER becomes a function call");
         };
         let hir::FunctionEvaluation::Window { id, .. } = &call.evaluation else {
@@ -5664,7 +5743,8 @@ mod tests {
             let block = &mut document.queries[root.query.index()].blocks[0];
             let aggregate_count = block.aggregate_count;
             let window_function_count = block.window_function_count;
-            let hir::Expr::Function(call) = &mut block.outputs[0].expr else {
+            let output = block.outputs[0].expr;
+            let hir::Expr::Function(call) = document.exprs.get_mut(output) else {
                 panic!("output is a query function");
             };
             match &mut call.evaluation {
@@ -5689,7 +5769,7 @@ mod tests {
         ] {
             let document = analyze_sql(crate::schema::Schema::new(), sql);
             let expression = root_output(&document);
-            let query = match expression {
+            let query = match &document.exprs[expression] {
                 hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output: 0 }) => {
                     assert!(!exists);
                     *query
@@ -5735,10 +5815,10 @@ mod tests {
             crate::schema::Schema::new(),
             "SELECT (1, 2) = (SELECT random(), random())",
         );
-        let hir::Expr::Binary { rhs, .. } = root_output(&document) else {
+        let hir::Expr::Binary { rhs, .. } = &document.exprs[root_output(&document)] else {
             panic!("output is a row comparison");
         };
-        let hir::Expr::Subquery(hir::SubqueryExpr::Row { query }) = rhs.as_ref() else {
+        let hir::Expr::Subquery(hir::SubqueryExpr::Row { query }) = &document.exprs[*rhs] else {
             panic!("comparison RHS is a row subquery");
         };
         let mut program = program();
@@ -5752,7 +5832,7 @@ mod tests {
             },
         );
 
-        super::translate_expr(&mut program, &document, rhs, target)
+        super::translate_expr(&mut program, &document, *rhs, target)
             .expect("bound row subquery lowers");
 
         assert!(matches!(
@@ -5768,7 +5848,8 @@ mod tests {
     #[test]
     fn subquery_result_binding_must_match_the_hir_shape() {
         let scalar = analyze_sql(crate::schema::Schema::new(), "SELECT (SELECT 1)");
-        let hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, .. }) = root_output(&scalar)
+        let hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, .. }) =
+            &scalar.exprs[root_output(&scalar)]
         else {
             panic!("output is a scalar subquery");
         };
@@ -5782,15 +5863,15 @@ mod tests {
             crate::schema::Schema::new(),
             "SELECT (1, 2) = (SELECT 3, 4)",
         );
-        let hir::Expr::Binary { rhs, .. } = root_output(&row) else {
+        let hir::Expr::Binary { rhs, .. } = &row.exprs[root_output(&row)] else {
             panic!("output is a row comparison");
         };
-        let hir::Expr::Subquery(hir::SubqueryExpr::Row { query }) = rhs.as_ref() else {
+        let hir::Expr::Subquery(hir::SubqueryExpr::Row { query }) = &row.exprs[*rhs] else {
             panic!("comparison RHS is a row subquery");
         };
         let mut wrong_width = program();
         wrong_width.bind_subquery(*query, SubqueryBinding::RowValue { start: 1, count: 1 });
-        let error = super::translate_expr(&mut wrong_width, &row, rhs, 1)
+        let error = super::translate_expr(&mut wrong_width, &row, *rhs, 1)
             .expect_err("row subquery runtime width must match HIR");
         assert!(error.to_string().contains("does not match output width"));
     }
@@ -5807,7 +5888,7 @@ mod tests {
             negated: false,
             comparison,
             ..
-        }) = expression
+        }) = &document.exprs[expression]
         else {
             panic!("output is an IN subquery");
         };
@@ -5875,7 +5956,7 @@ mod tests {
             query,
             negated: true,
             ..
-        }) = expression
+        }) = &document.exprs[expression]
         else {
             panic!("output is a NOT IN subquery");
         };
@@ -5903,7 +5984,8 @@ mod tests {
     fn in_subquery_requires_an_index_binding() {
         let document = analyze_sql(crate::schema::Schema::new(), "SELECT 1 IN (SELECT 2)");
         let expression = root_output(&document);
-        let hir::Expr::Subquery(hir::SubqueryExpr::In { query, .. }) = expression else {
+        let hir::Expr::Subquery(hir::SubqueryExpr::In { query, .. }) = &document.exprs[expression]
+        else {
             panic!("output is an IN subquery");
         };
         let mut program = program();
@@ -5921,8 +6003,9 @@ mod tests {
             panic!("SELECT produces a query root");
         };
         let root_query = root.query;
+        let subquery = document.queries[root_query.index()].blocks[0].outputs[0].expr;
         let hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, .. }) =
-            &document.queries[root_query.index()].blocks[0].outputs[0].expr
+            &document.exprs[subquery]
         else {
             panic!("output is a scalar subquery");
         };
@@ -5930,7 +6013,7 @@ mod tests {
         let hir::Expr::Subquery(hir::SubqueryExpr::Scalar {
             output: invalid_output,
             ..
-        }) = &mut document.queries[root_query.index()].blocks[0].outputs[0].expr
+        }) = document.exprs.get_mut(subquery)
         else {
             unreachable!("scalar subquery shape was checked");
         };
@@ -5954,6 +6037,7 @@ mod tests {
             )],
             false,
         ));
+        let column = document.exprs.push(hir::Expr::column(source_id, 0));
         let mut program = program();
         program.bind_source(
             source_id,
@@ -5963,7 +6047,7 @@ mod tests {
             },
         );
 
-        super::translate_expr(&mut program, &document, &hir::Expr::column(source_id, 0), 3)
+        super::translate_expr(&mut program, &document, column, 3)
             .expect("bound register column lowers");
 
         assert!(matches!(
@@ -5982,6 +6066,7 @@ mod tests {
     #[test]
     fn generated_columns_use_linked_expression_and_declared_affinity() {
         let source_id = hir::SourceId::new(0);
+        let mut document = document(Vec::new());
         let mut definition = source(
             source_id,
             hir::SourceKind::SchemaExpression,
@@ -5991,10 +6076,11 @@ mod tests {
             ],
             false,
         );
-        definition.generated_expressions[1] =
-            hir::ColumnReadExpression::Planned(Box::new(hir::Expr::column(source_id, 0)));
-        let mut document = document(Vec::new());
+        definition.generated_expressions[1] = hir::ColumnReadExpression::Planned(
+            document.exprs.push(hir::Expr::column(source_id, 0)),
+        );
         document.sources.push(definition);
+        let column = document.exprs.push(hir::Expr::column(source_id, 1));
         let mut program = program();
         program.bind_source(
             source_id,
@@ -6004,8 +6090,7 @@ mod tests {
             },
         );
 
-        super::translate_expr(&mut program, &document, &hir::Expr::column(source_id, 1), 3)
-            .expect("generated column lowers");
+        super::translate_expr(&mut program, &document, column, 3).expect("generated column lowers");
 
         assert!(matches!(
             program.insns.as_slice(),
@@ -6054,7 +6139,7 @@ mod tests {
         let Table::BTree(table) = table.value() else {
             panic!("source is a B-tree table");
         };
-        let expression = &block.outputs[0].expr;
+        let expression = block.outputs[0].expr;
         let mut decoded = program();
         let cursor = decoded.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
         decoded.bind_source(
@@ -6318,12 +6403,14 @@ mod tests {
             panic!("SELECT produces a query root");
         };
         let query = root.query;
-        let hir::Expr::MergedColumn(merged) =
-            &mut document.queries[query.index()].blocks[0].outputs[0].expr
-        else {
+        let literal = document
+            .exprs
+            .push(hir::Expr::Literal(Literal::Numeric("1".to_string())));
+        let output = document.queries[query.index()].blocks[0].outputs[0].expr;
+        let hir::Expr::MergedColumn(merged) = document.exprs.get_mut(output) else {
             panic!("USING output is a merged column");
         };
-        merged.right = Box::new(hir::Expr::Literal(Literal::Numeric("1".to_string())));
+        merged.right = literal;
 
         let error = document
             .validate()
@@ -6352,11 +6439,14 @@ mod tests {
             vec![source_column("value", Type::Text, Affinity::Text, false)],
             true,
         );
-        definition.default_expressions[0] = hir::ColumnReadExpression::Planned(Box::new(
-            hir::Expr::Literal(Literal::Numeric("7".to_string())),
-        ));
         let mut document = document(Vec::new());
+        definition.default_expressions[0] = hir::ColumnReadExpression::Planned(
+            document
+                .exprs
+                .push(hir::Expr::Literal(Literal::Numeric("7".to_string()))),
+        );
         document.sources.push(definition);
+        let column = document.exprs.push(hir::Expr::column(source_id, 0));
         let mut program = program();
         let table_cursor = program.alloc_cursor_id(CursorType::BTreeTable(table));
         program.bind_source(
@@ -6367,7 +6457,7 @@ mod tests {
             },
         );
 
-        super::translate_expr(&mut program, &document, &hir::Expr::column(source_id, 0), 3)
+        super::translate_expr(&mut program, &document, column, 3)
             .expect("column with an ordinary default lowers");
 
         assert!(matches!(
@@ -6401,13 +6491,14 @@ mod tests {
             columns.push(column);
         }
         let mut definition = source(source_id, hir::SourceKind::SchemaExpression, columns, false);
-        for index in 1..WIDTH {
-            definition.generated_expressions[index] = hir::ColumnReadExpression::Planned(Box::new(
-                hir::Expr::column(source_id, index - 1),
-            ));
-        }
         let mut document = document(Vec::new());
+        for index in 1..WIDTH {
+            definition.generated_expressions[index] = hir::ColumnReadExpression::Planned(
+                document.exprs.push(hir::Expr::column(source_id, index - 1)),
+            );
+        }
         document.sources.push(definition);
+        let last = document.exprs.push(hir::Expr::column(source_id, WIDTH - 1));
         let mut program = program();
         program.bind_source(
             source_id,
@@ -6417,13 +6508,8 @@ mod tests {
             },
         );
 
-        super::translate_expr(
-            &mut program,
-            &document,
-            &hir::Expr::column(source_id, WIDTH - 1),
-            3,
-        )
-        .expect("deep generated chain lowers iteratively");
+        super::translate_expr(&mut program, &document, last, 3)
+            .expect("deep generated chain lowers iteratively");
 
         assert!(matches!(
             program.insns.as_slice(),
@@ -6498,12 +6584,13 @@ mod tests {
             },
         );
 
-        super::translate_expr(&mut program, &document, &hir::Expr::column(source_id, 1), 4)
-            .expect("indexed column lowers");
-        super::translate_expr(&mut program, &document, &hir::Expr::column(source_id, 2), 6)
+        let indexed = document.exprs.push(hir::Expr::column(source_id, 1));
+        let fallback = document.exprs.push(hir::Expr::column(source_id, 2));
+        let rowid = document.exprs.push(hir::Expr::rowid(source_id));
+        super::translate_expr(&mut program, &document, indexed, 4).expect("indexed column lowers");
+        super::translate_expr(&mut program, &document, fallback, 6)
             .expect("table fallback column lowers");
-        super::translate_expr(&mut program, &document, &hir::Expr::rowid(source_id), 5)
-            .expect("index rowid lowers");
+        super::translate_expr(&mut program, &document, rowid, 5).expect("index rowid lowers");
 
         assert!(matches!(
             program.insns.as_slice(),
@@ -6528,7 +6615,12 @@ mod tests {
         ));
     }
 
-    fn ordinary_scalar_call(function: Func, values: Vec<hir::Expr>) -> hir::Expr {
+    fn ordinary_scalar_call(
+        exprs: &ExprBuilder,
+        function: Func,
+        values: Vec<hir::Expr>,
+    ) -> hir::Expr {
+        let values: Vec<_> = values.into_iter().map(|value| exprs.push(value)).collect();
         hir::Expr::Function(Box::new(hir::FunctionCall {
             function: resolved_function(function),
             evaluation: hir::FunctionEvaluation::Scalar,
@@ -6550,10 +6642,12 @@ mod tests {
     }
 
     fn custom_type_call(
+        exprs: &ExprBuilder,
         function: ScalarFunc,
         values: Vec<hir::Expr>,
         operation: hir::CustomTypeOperation,
     ) -> hir::Expr {
+        let values: Vec<_> = values.into_iter().map(|value| exprs.push(value)).collect();
         hir::Expr::Function(Box::new(hir::FunctionCall {
             function: resolved_function(Func::Scalar(function)),
             evaluation: hir::FunctionEvaluation::Scalar,
@@ -6574,7 +6668,12 @@ mod tests {
         }))
     }
 
-    fn sequence_call(kind: hir::SequenceOperationKind, values: Vec<hir::Expr>) -> hir::Expr {
+    fn sequence_call(
+        exprs: &ExprBuilder,
+        kind: hir::SequenceOperationKind,
+        values: Vec<hir::Expr>,
+    ) -> hir::Expr {
+        let values: Vec<_> = values.into_iter().map(|value| exprs.push(value)).collect();
         let database = hir::DatabaseId::new(2);
         let normalized_name = "seq".to_string();
         let backing_sql = crate::translate::sequence::sequence_backing_table_sql("seq");
@@ -6649,6 +6748,7 @@ mod tests {
 
     #[test]
     fn custom_type_calls_use_resolved_metadata_and_skip_name_arguments() {
+        let exprs = ExprBuilder::default();
         #[derive(Debug)]
         enum ExpectedInsn {
             UnionPack,
@@ -6672,6 +6772,7 @@ mod tests {
         let cases = [
             (
                 custom_type_call(
+                    &exprs,
                     ScalarFunc::UnionValueFunc,
                     vec![semantic_name(), runtime_value()],
                     hir::CustomTypeOperation::UnionValue {
@@ -6683,6 +6784,7 @@ mod tests {
             ),
             (
                 custom_type_call(
+                    &exprs,
                     ScalarFunc::UnionTagFunc,
                     vec![runtime_value()],
                     hir::CustomTypeOperation::UnionTag {
@@ -6697,6 +6799,7 @@ mod tests {
             ),
             (
                 custom_type_call(
+                    &exprs,
                     ScalarFunc::UnionExtractFunc,
                     vec![runtime_value(), semantic_name()],
                     hir::CustomTypeOperation::UnionExtract {
@@ -6708,6 +6811,7 @@ mod tests {
             ),
             (
                 custom_type_call(
+                    &exprs,
                     ScalarFunc::StructExtractFunc,
                     vec![runtime_value(), semantic_name()],
                     hir::CustomTypeOperation::StructExtract {
@@ -6721,7 +6825,7 @@ mod tests {
 
         for (expression, expected_operation) in cases {
             let mut program = program();
-            translate_expr(&mut program, &expression, 8).unwrap();
+            translate_expr(&mut program, &exprs, expression, 8).unwrap();
 
             assert_eq!(program.insns.len(), 2);
             assert!(matches!(
@@ -6835,17 +6939,21 @@ mod tests {
 
     #[test]
     fn unary_lowering_keeps_existing_register_and_opcode_order() {
+        let exprs = ExprBuilder::default();
         let mut program = program();
         let expression = hir::Expr::Unary {
             operator: UnaryOperator::Negative,
-            expr: Box::new(hir::Expr::Parameter(hir::Parameter {
+            expr: exprs.push(hir::Expr::Parameter(hir::Parameter {
                 index: NonZeroU32::new(1).unwrap(),
                 spelling: ParameterSpelling::Anonymous,
                 type_fact: TypeFact::dynamic(),
             })),
         };
 
-        assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+        assert_eq!(
+            translate_expr(&mut program, &exprs, expression, 8).unwrap(),
+            8
+        );
         assert!(matches!(
             program.insns.as_slice(),
             [
@@ -6858,6 +6966,7 @@ mod tests {
 
     #[test]
     fn unary_literal_fast_paths_skip_child_emission() {
+        let exprs = ExprBuilder::default();
         let cases = [
             (
                 UnaryOperator::Negative,
@@ -6875,9 +6984,9 @@ mod tests {
             let mut program = program();
             let expression = hir::Expr::Unary {
                 operator,
-                expr: Box::new(hir::Expr::Literal(literal)),
+                expr: exprs.push(hir::Expr::Literal(literal)),
             };
-            translate_expr(&mut program, &expression, 4).unwrap();
+            translate_expr(&mut program, &exprs, expression, 4).unwrap();
             assert!(matches!(
                 program.insns.as_slice(),
                 [(Insn::Integer { value, dest: 4 }, _)] if *value == expected
@@ -6887,9 +6996,9 @@ mod tests {
         let mut program = program();
         let expression = hir::Expr::Unary {
             operator: UnaryOperator::BitwiseNot,
-            expr: Box::new(hir::Expr::Literal(Literal::Null)),
+            expr: exprs.push(hir::Expr::Literal(Literal::Null)),
         };
-        translate_expr(&mut program, &expression, 4).unwrap();
+        translate_expr(&mut program, &exprs, expression, 4).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [(
@@ -6904,23 +7013,27 @@ mod tests {
 
     #[test]
     fn null_test_lowering_keeps_existing_sequence_for_nested_expressions() {
+        let exprs = ExprBuilder::default();
         for is_null in [true, false] {
             let value = hir::Expr::Binary {
-                lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                lhs: exprs.push(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
                 operator: Operator::Add,
-                rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                rhs: exprs.push(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
                 array_concat: false,
                 custom: None,
                 comparison: None,
             };
             let expression = if is_null {
-                hir::Expr::IsNull(Box::new(value))
+                hir::Expr::IsNull(exprs.push(value))
             } else {
-                hir::Expr::NotNull(Box::new(value))
+                hir::Expr::NotNull(exprs.push(value))
             };
             let mut program = program();
 
-            assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+            assert_eq!(
+                translate_expr(&mut program, &exprs, expression, 8).unwrap(),
+                8
+            );
             assert!(matches!(
                 &program.insns[..4],
                 [
@@ -6951,6 +7064,7 @@ mod tests {
 
     #[test]
     fn truth_test_lowering_keeps_existing_flags_for_nested_expressions() {
+        let exprs = ExprBuilder::default();
         for (is_true, negated, expected_invert) in [
             (true, false, false),
             (false, false, true),
@@ -6958,10 +7072,10 @@ mod tests {
             (false, true, false),
         ] {
             let expression = hir::Expr::TruthTest {
-                expr: Box::new(hir::Expr::Binary {
-                    lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                expr: exprs.push(hir::Expr::Binary {
+                    lhs: exprs.push(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
                     operator: Operator::Add,
-                    rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                    rhs: exprs.push(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
                     array_concat: false,
                     custom: None,
                     comparison: None,
@@ -6971,7 +7085,10 @@ mod tests {
             };
             let mut program = program();
 
-            assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+            assert_eq!(
+                translate_expr(&mut program, &exprs, expression, 8).unwrap(),
+                8
+            );
             assert!(matches!(
                 program.insns.as_slice(),
                 [
@@ -7001,6 +7118,7 @@ mod tests {
 
     #[test]
     fn collate_lowers_only_its_child_and_comparison_uses_resolved_metadata() {
+        let exprs = ExprBuilder::default();
         let collation = hir::CatalogObject::new(
             hir::CatalogObjectId::new(1),
             hir::CatalogSnapshot::from_id(1),
@@ -7008,12 +7126,12 @@ mod tests {
             crate::sync::Arc::new(crate::translate::collate::CollationSeq::NoCase),
         );
         let expression = hir::Expr::Binary {
-            lhs: Box::new(hir::Expr::Collate {
-                expr: Box::new(hir::Expr::Literal(Literal::String("'left'".to_string()))),
+            lhs: exprs.push(hir::Expr::Collate {
+                expr: exprs.push(hir::Expr::Literal(Literal::String("'left'".to_string()))),
                 collation: collation.clone(),
             }),
             operator: Operator::Equals,
-            rhs: Box::new(hir::Expr::Literal(Literal::String("'right'".to_string()))),
+            rhs: exprs.push(hir::Expr::Literal(Literal::String("'right'".to_string()))),
             array_concat: false,
             custom: None,
             comparison: Some(hir::ComparisonSemantics {
@@ -7026,7 +7144,7 @@ mod tests {
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             &program.insns[..2],
             [
@@ -7046,22 +7164,25 @@ mod tests {
 
     #[test]
     fn builtin_cast_uses_resolved_affinity_and_skips_type_parameters() {
+        let exprs = ExprBuilder::default();
         for affinity in [
             crate::vdbe::affinity::Affinity::Numeric,
             crate::vdbe::affinity::Affinity::Text,
         ] {
             let expression = hir::Expr::Cast {
-                expr: Box::new(hir::Expr::Binary {
-                    lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                expr: exprs.push(hir::Expr::Binary {
+                    lhs: exprs.push(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
                     operator: Operator::Add,
-                    rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                    rhs: exprs.push(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
                     array_concat: false,
                     custom: None,
                     comparison: None,
                 }),
                 target: Box::new(hir::TypeName {
                     name: "resolved".to_string(),
-                    parameters: vec![hir::Expr::Literal(Literal::Numeric("99".to_string()))],
+                    parameters: vec![
+                        exprs.push(hir::Expr::Literal(Literal::Numeric("99".to_string())))
+                    ],
                     array_dimensions: 0,
                     type_fact: TypeFact::dynamic(),
                     affinity,
@@ -7074,7 +7195,10 @@ mod tests {
             };
             let mut program = program();
 
-            assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+            assert_eq!(
+                translate_expr(&mut program, &exprs, expression, 8).unwrap(),
+                8
+            );
             assert!(matches!(
                 program.insns.as_slice(),
                 [
@@ -7221,6 +7345,7 @@ mod tests {
 
     #[test]
     fn simple_case_evaluates_base_once_and_uses_resolved_comparisons() {
+        let exprs = ExprBuilder::default();
         let collation = hir::CatalogObject::new(
             hir::CatalogObjectId::new(1),
             hir::CatalogSnapshot::from_id(1),
@@ -7228,22 +7353,18 @@ mod tests {
             crate::sync::Arc::new(crate::translate::collate::CollationSeq::NoCase),
         );
         let expression = hir::Expr::Case {
-            base: Some(Box::new(hir::Expr::Literal(Literal::Numeric(
-                "99".to_string(),
-            )))),
+            base: Some(exprs.push(hir::Expr::Literal(Literal::Numeric("99".to_string())))),
             when_then: vec![
                 (
-                    hir::Expr::Literal(Literal::Numeric("1".to_string())),
-                    hir::Expr::Literal(Literal::String("'one'".to_string())),
+                    exprs.push(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
+                    exprs.push(hir::Expr::Literal(Literal::String("'one'".to_string()))),
                 ),
                 (
-                    hir::Expr::Literal(Literal::Numeric("2".to_string())),
-                    hir::Expr::Literal(Literal::String("'two'".to_string())),
+                    exprs.push(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                    exprs.push(hir::Expr::Literal(Literal::String("'two'".to_string()))),
                 ),
             ],
-            else_expr: Some(Box::new(hir::Expr::Literal(Literal::String(
-                "'other'".to_string(),
-            )))),
+            else_expr: Some(exprs.push(hir::Expr::Literal(Literal::String("'other'".to_string())))),
             base_comparisons: vec![
                 hir::ComparisonSemantics {
                     components: vec![hir::ComparisonComponent {
@@ -7257,7 +7378,7 @@ mod tests {
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert_eq!(
             program
                 .insns
@@ -7313,16 +7434,17 @@ mod tests {
 
     #[test]
     fn searched_case_uses_if_not_and_missing_else_writes_null() {
+        let exprs = ExprBuilder::default();
         let expression = hir::Expr::Case {
             base: None,
             when_then: vec![
                 (
-                    hir::Expr::Literal(Literal::Null),
-                    hir::Expr::Literal(Literal::String("'null'".to_string())),
+                    exprs.push(hir::Expr::Literal(Literal::Null)),
+                    exprs.push(hir::Expr::Literal(Literal::String("'null'".to_string()))),
                 ),
                 (
-                    hir::Expr::Literal(Literal::Numeric("1".to_string())),
-                    hir::Expr::Literal(Literal::String("'true'".to_string())),
+                    exprs.push(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
+                    exprs.push(hir::Expr::Literal(Literal::String("'true'".to_string()))),
                 ),
             ],
             else_expr: None,
@@ -7330,7 +7452,7 @@ mod tests {
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         let tests = program
             .insns
             .iter()
@@ -7353,21 +7475,22 @@ mod tests {
 
     #[test]
     fn case_lowering_does_not_use_the_call_stack() {
+        let exprs = ExprBuilder::default();
         let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
         for _ in 0..10_000 {
             expression = hir::Expr::Case {
                 base: None,
                 when_then: vec![(
-                    hir::Expr::Literal(Literal::Numeric("1".to_string())),
-                    expression,
+                    exprs.push(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
+                    exprs.push(expression),
                 )],
-                else_expr: Some(Box::new(hir::Expr::Literal(Literal::Null))),
+                else_expr: Some(exprs.push(hir::Expr::Literal(Literal::Null))),
                 base_comparisons: Vec::new(),
             };
         }
 
         let mut program = program();
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert_eq!(
             program
                 .insns
@@ -7376,15 +7499,14 @@ mod tests {
                 .count(),
             10_000
         );
-
-        std::mem::forget(expression);
     }
 
     #[test]
     fn empty_in_list_skips_its_left_operand() {
+        let exprs = ExprBuilder::default();
         for (negated, expected) in [(false, 0), (true, 1)] {
             let expression = hir::Expr::InList {
-                lhs: Box::new(hir::Expr::Parameter(hir::Parameter {
+                lhs: exprs.push(hir::Expr::Parameter(hir::Parameter {
                     index: NonZeroU32::new(1).unwrap(),
                     spelling: ParameterSpelling::Anonymous,
                     type_fact: TypeFact::dynamic(),
@@ -7395,7 +7517,7 @@ mod tests {
             };
             let mut program = program();
 
-            translate_expr(&mut program, &expression, 8).unwrap();
+            translate_expr(&mut program, &exprs, expression, 8).unwrap();
             assert!(matches!(
                 program.insns.as_slice(),
                 [(Insn::Integer { value, dest: 8 }, _)] if *value == expected
@@ -7405,6 +7527,7 @@ mod tests {
 
     #[test]
     fn scalar_in_list_uses_resolved_comparisons_and_tracks_nulls() {
+        let exprs = ExprBuilder::default();
         let collation = hir::CatalogObject::new(
             hir::CatalogObjectId::new(1),
             hir::CatalogSnapshot::from_id(1),
@@ -7419,17 +7542,17 @@ mod tests {
             }],
         };
         let expression = hir::Expr::InList {
-            lhs: Box::new(hir::Expr::Literal(Literal::String("'a'".to_string()))),
+            lhs: exprs.push(hir::Expr::Literal(Literal::String("'a'".to_string()))),
             negated: true,
             values: vec![
-                hir::Expr::Literal(Literal::String("'b'".to_string())),
-                hir::Expr::Literal(Literal::Null),
+                exprs.push(hir::Expr::Literal(Literal::String("'b'".to_string()))),
+                exprs.push(hir::Expr::Literal(Literal::Null)),
             ],
             comparisons: vec![comparison.clone(), comparison],
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert_eq!(
             program
                 .insns
@@ -7479,21 +7602,22 @@ mod tests {
 
     #[test]
     fn row_in_list_compares_each_component() {
+        let exprs = ExprBuilder::default();
         let expression = hir::Expr::InList {
-            lhs: Box::new(hir::Expr::Row(vec![
-                hir::Expr::Literal(Literal::Numeric("1".to_string())),
-                hir::Expr::Literal(Literal::Numeric("2".to_string())),
+            lhs: exprs.push(hir::Expr::Row(vec![
+                exprs.push(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
+                exprs.push(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
             ])),
             negated: false,
-            values: vec![hir::Expr::Row(vec![
-                hir::Expr::Literal(Literal::Numeric("3".to_string())),
-                hir::Expr::Literal(Literal::Numeric("4".to_string())),
-            ])],
+            values: vec![exprs.push(hir::Expr::Row(vec![
+                exprs.push(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                exprs.push(hir::Expr::Literal(Literal::Numeric("4".to_string()))),
+            ]))],
             comparisons: vec![numeric_row_comparison(2)],
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         let comparisons = program
             .insns
             .iter()
@@ -7520,18 +7644,19 @@ mod tests {
 
     #[test]
     fn nested_in_list_lowering_does_not_use_the_call_stack() {
+        let exprs = ExprBuilder::default();
         let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
         for _ in 0..10_000 {
             expression = hir::Expr::InList {
-                lhs: Box::new(expression),
+                lhs: exprs.push(expression),
                 negated: false,
-                values: vec![hir::Expr::Literal(Literal::Numeric("1".to_string()))],
+                values: vec![exprs.push(hir::Expr::Literal(Literal::Numeric("1".to_string())))],
                 comparisons: vec![numeric_comparison()],
             };
         }
 
         let mut program = program();
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert_eq!(
             program
                 .insns
@@ -7540,24 +7665,23 @@ mod tests {
                 .count(),
             10_000
         );
-
-        std::mem::forget(expression);
     }
 
     #[test]
     fn like_passes_pattern_then_text_to_the_resolved_function() {
+        let exprs = ExprBuilder::default();
         let expression = hir::Expr::Like {
-            lhs: Box::new(hir::Expr::Literal(Literal::String("'value'".to_string()))),
+            lhs: exprs.push(hir::Expr::Literal(Literal::String("'value'".to_string()))),
             negated: false,
             operator: turso_parser::ast::LikeOperator::Like,
             function: resolved_function(Func::Scalar(ScalarFunc::Like)),
             argument_count: 2,
-            rhs: Box::new(hir::Expr::Literal(Literal::String("'pattern'".to_string()))),
+            rhs: exprs.push(hir::Expr::Literal(Literal::String("'pattern'".to_string()))),
             escape: None,
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [
@@ -7582,20 +7706,19 @@ mod tests {
 
     #[test]
     fn like_escape_and_negation_keep_existing_register_shape() {
+        let exprs = ExprBuilder::default();
         let expression = hir::Expr::Like {
-            lhs: Box::new(hir::Expr::Literal(Literal::String("'value'".to_string()))),
+            lhs: exprs.push(hir::Expr::Literal(Literal::String("'value'".to_string()))),
             negated: true,
             operator: turso_parser::ast::LikeOperator::Like,
             function: resolved_function(Func::Scalar(ScalarFunc::Like)),
             argument_count: 3,
-            rhs: Box::new(hir::Expr::Literal(Literal::String("'pattern'".to_string()))),
-            escape: Some(Box::new(hir::Expr::Literal(Literal::String(
-                "'!'".to_string(),
-            )))),
+            rhs: exprs.push(hir::Expr::Literal(Literal::String("'pattern'".to_string()))),
+            escape: Some(exprs.push(hir::Expr::Literal(Literal::String("'!'".to_string())))),
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [
@@ -7618,18 +7741,19 @@ mod tests {
 
     #[test]
     fn regexp_uses_the_function_resolved_by_semantic_analysis() {
+        let exprs = ExprBuilder::default();
         let expression = hir::Expr::Like {
-            lhs: Box::new(hir::Expr::Literal(Literal::String("'value'".to_string()))),
+            lhs: exprs.push(hir::Expr::Literal(Literal::String("'value'".to_string()))),
             negated: false,
             operator: turso_parser::ast::LikeOperator::Regexp,
             function: resolved_function(Func::Scalar(ScalarFunc::Abs)),
             argument_count: 2,
-            rhs: Box::new(hir::Expr::Literal(Literal::String("'pattern'".to_string()))),
+            rhs: exprs.push(hir::Expr::Literal(Literal::String("'pattern'".to_string()))),
             escape: None,
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             program.insns.last().map(|(instruction, _)| instruction),
             Some(Insn::Function {
@@ -7648,21 +7772,22 @@ mod tests {
     /// to a register before lowering reaches it.
     #[test]
     fn match_without_an_index_query_is_an_error() {
+        let exprs = ExprBuilder::default();
         let expression = hir::Expr::Like {
-            lhs: Box::new(hir::Expr::Row(vec![
-                hir::Expr::Literal(Literal::String("'one'".to_string())),
-                hir::Expr::Literal(Literal::String("'two'".to_string())),
+            lhs: exprs.push(hir::Expr::Row(vec![
+                exprs.push(hir::Expr::Literal(Literal::String("'one'".to_string()))),
+                exprs.push(hir::Expr::Literal(Literal::String("'two'".to_string()))),
             ])),
             negated: false,
             operator: turso_parser::ast::LikeOperator::Match,
             function: resolved_function(Func::Scalar(ScalarFunc::Abs)),
             argument_count: 3,
-            rhs: Box::new(hir::Expr::Literal(Literal::String("'query'".to_string()))),
+            rhs: exprs.push(hir::Expr::Literal(Literal::String("'query'".to_string()))),
             escape: None,
         };
         let mut program = program();
 
-        let error = translate_expr(&mut program, &expression, 8).unwrap_err();
+        let error = translate_expr(&mut program, &exprs, expression, 8).unwrap_err();
         assert_eq!(
             error.to_string(),
             "Parse error: MATCH requires an FTS index query"
@@ -7671,22 +7796,23 @@ mod tests {
 
     #[test]
     fn nested_like_lowering_does_not_use_the_call_stack() {
+        let exprs = ExprBuilder::default();
         let function = resolved_function(Func::Scalar(ScalarFunc::Like));
         let mut expression = hir::Expr::Literal(Literal::String("'value'".to_string()));
         for _ in 0..10_000 {
             expression = hir::Expr::Like {
-                lhs: Box::new(expression),
+                lhs: exprs.push(expression),
                 negated: false,
                 operator: turso_parser::ast::LikeOperator::Like,
                 function: function.clone(),
                 argument_count: 2,
-                rhs: Box::new(hir::Expr::Literal(Literal::String("'pattern'".to_string()))),
+                rhs: exprs.push(hir::Expr::Literal(Literal::String("'pattern'".to_string()))),
                 escape: None,
             };
         }
 
         let mut program = program();
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert_eq!(
             program
                 .insns
@@ -7695,15 +7821,14 @@ mod tests {
                 .count(),
             10_000
         );
-
-        std::mem::forget(expression);
     }
 
     #[test]
     fn empty_array_uses_the_existing_make_array_opcode() {
+        let exprs = ExprBuilder::default();
         let mut program = program();
 
-        translate_expr(&mut program, &hir::Expr::Array(Vec::new()), 8).unwrap();
+        translate_expr(&mut program, &exprs, hir::Expr::Array(Vec::new()), 8).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [(
@@ -7719,20 +7844,21 @@ mod tests {
 
     #[test]
     fn array_elements_use_consecutive_registers() {
+        let exprs = ExprBuilder::default();
         let expression = hir::Expr::Array(vec![
-            hir::Expr::Literal(Literal::Numeric("1".to_string())),
-            hir::Expr::Binary {
-                lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+            exprs.push(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
+            exprs.push(hir::Expr::Binary {
+                lhs: exprs.push(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
                 operator: Operator::Add,
-                rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                rhs: exprs.push(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
                 array_concat: false,
                 custom: None,
                 comparison: None,
-            },
+            }),
         ]);
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [
@@ -7761,16 +7887,17 @@ mod tests {
 
     #[test]
     fn subscript_uses_separate_base_and_index_registers() {
+        let exprs = ExprBuilder::default();
         let expression = hir::Expr::Subscript {
-            base: Box::new(hir::Expr::Array(vec![
-                hir::Expr::Literal(Literal::Numeric("10".to_string())),
-                hir::Expr::Literal(Literal::Numeric("20".to_string())),
+            base: exprs.push(hir::Expr::Array(vec![
+                exprs.push(hir::Expr::Literal(Literal::Numeric("10".to_string()))),
+                exprs.push(hir::Expr::Literal(Literal::Numeric("20".to_string()))),
             ])),
-            index: Box::new(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
+            index: exprs.push(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [
@@ -7799,13 +7926,14 @@ mod tests {
 
     #[test]
     fn nested_array_lowering_does_not_use_the_call_stack() {
+        let exprs = ExprBuilder::default();
         let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
         for _ in 0..10_000 {
-            expression = hir::Expr::Array(vec![expression]);
+            expression = hir::Expr::Array(vec![exprs.push(expression)]);
         }
 
         let mut program = program();
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert_eq!(
             program
                 .insns
@@ -7814,12 +7942,11 @@ mod tests {
                 .count(),
             10_000
         );
-
-        std::mem::forget(expression);
     }
 
     #[test]
     fn field_access_uses_the_resolved_member_index() {
+        let exprs = ExprBuilder::default();
         let cases = [
             (
                 hir::FieldAccessKind::Struct { field_index: 7 },
@@ -7840,7 +7967,7 @@ mod tests {
 
         for (kind, container_type) in cases {
             let expression = hir::Expr::FieldAccess(Box::new(hir::FieldAccess {
-                base: Box::new(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
+                base: exprs.push(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
                 field_name: "already_resolved".to_string(),
                 kind,
                 container_type,
@@ -7848,7 +7975,7 @@ mod tests {
             }));
             let mut program = program();
 
-            translate_expr(&mut program, &expression, 8).unwrap();
+            translate_expr(&mut program, &exprs, expression, 8).unwrap();
             assert!(matches!(
                 (&program.insns[0].0, &program.insns[1].0, kind),
                 (
@@ -7874,6 +8001,7 @@ mod tests {
 
     #[test]
     fn nested_field_access_writes_each_result_into_its_parent_register() {
+        let exprs = ExprBuilder::default();
         let struct_type = resolved_type(crate::schema::TypeDefKind::Struct(
             crate::schema::StructDef {
                 fields: crate::alloc::vec![],
@@ -7885,8 +8013,8 @@ mod tests {
                 tag_names: crate::sync::Arc::from(Vec::<String>::new()),
             }));
         let expression = hir::Expr::FieldAccess(Box::new(hir::FieldAccess {
-            base: Box::new(hir::Expr::FieldAccess(Box::new(hir::FieldAccess {
-                base: Box::new(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
+            base: exprs.push(hir::Expr::FieldAccess(Box::new(hir::FieldAccess {
+                base: exprs.push(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
                 field_name: "variant".to_string(),
                 kind: hir::FieldAccessKind::Union { tag_index: 2 },
                 container_type: union_type,
@@ -7899,7 +8027,7 @@ mod tests {
         }));
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [
@@ -7926,6 +8054,7 @@ mod tests {
 
     #[test]
     fn nested_field_access_lowering_does_not_use_the_call_stack() {
+        let exprs = ExprBuilder::default();
         let container_type = resolved_type(crate::schema::TypeDefKind::Struct(
             crate::schema::StructDef {
                 fields: crate::alloc::vec![],
@@ -7934,7 +8063,7 @@ mod tests {
         let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
         for _ in 0..10_000 {
             expression = hir::Expr::FieldAccess(Box::new(hir::FieldAccess {
-                base: Box::new(expression),
+                base: exprs.push(expression),
                 field_name: "field".to_string(),
                 kind: hir::FieldAccessKind::Struct { field_index: 0 },
                 container_type: container_type.clone(),
@@ -7943,7 +8072,7 @@ mod tests {
         }
 
         let mut program = program();
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert_eq!(
             program
                 .insns
@@ -7952,21 +8081,20 @@ mod tests {
                 .count(),
             10_000
         );
-
-        std::mem::forget(expression);
     }
 
     #[test]
     fn standalone_abort_embeds_a_literal_message() {
+        let exprs = ExprBuilder::default();
         let expression = hir::Expr::Raise {
             action: ResolveType::Abort,
-            message: Some(Box::new(hir::Expr::Literal(Literal::String(
+            message: Some(exprs.push(hir::Expr::Literal(Literal::String(
                 "'stop'' now'".to_string(),
             )))),
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [(
@@ -7984,12 +8112,13 @@ mod tests {
 
     #[test]
     fn dynamic_raise_message_uses_one_result_register() {
+        let exprs = ExprBuilder::default();
         let expression = hir::Expr::Raise {
             action: ResolveType::Abort,
-            message: Some(Box::new(hir::Expr::Binary {
-                lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+            message: Some(exprs.push(hir::Expr::Binary {
+                lhs: exprs.push(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
                 operator: Operator::Add,
-                rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                rhs: exprs.push(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
                 array_concat: false,
                 custom: None,
                 comparison: None,
@@ -7997,7 +8126,7 @@ mod tests {
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [
@@ -8026,6 +8155,7 @@ mod tests {
 
     #[test]
     fn trigger_raise_uses_trigger_error_codes_and_ignore_shape() {
+        let exprs = ExprBuilder::default();
         let cases = [
             (
                 hir::Expr::Raise {
@@ -8038,9 +8168,9 @@ mod tests {
             (
                 hir::Expr::Raise {
                     action: ResolveType::Fail,
-                    message: Some(Box::new(hir::Expr::Literal(Literal::String(
-                        "'stop'".to_string(),
-                    )))),
+                    message: Some(
+                        exprs.push(hir::Expr::Literal(Literal::String("'stop'".to_string()))),
+                    ),
                 },
                 ResolveType::Fail,
                 SQLITE_CONSTRAINT_TRIGGER,
@@ -8049,7 +8179,7 @@ mod tests {
 
         for (expression, expected_action, expected_code) in cases {
             let mut program = trigger_program();
-            translate_expr(&mut program, &expression, 8).unwrap();
+            translate_expr(&mut program, &exprs, expression, 8).unwrap();
             assert!(matches!(
                 program.insns.as_slice(),
                 [(Insn::Halt { err_code, on_error: Some(action), .. }, _)]
@@ -8060,16 +8190,17 @@ mod tests {
 
     #[test]
     fn nested_raise_lowering_does_not_use_the_call_stack() {
+        let exprs = ExprBuilder::default();
         let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
         for _ in 0..10_000 {
             expression = hir::Expr::Raise {
                 action: ResolveType::Abort,
-                message: Some(Box::new(expression)),
+                message: Some(exprs.push(expression)),
             };
         }
 
         let mut program = program();
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert_eq!(
             program
                 .insns
@@ -8078,8 +8209,6 @@ mod tests {
                 .count(),
             10_000
         );
-
-        std::mem::forget(expression);
     }
 
     #[derive(Clone, Copy)]
@@ -8107,11 +8236,15 @@ mod tests {
         Ge,
     }
 
-    fn comparison_expression(operator: Operator, component: hir::ComparisonComponent) -> hir::Expr {
+    fn comparison_expression(
+        exprs: &ExprBuilder,
+        operator: Operator,
+        component: hir::ComparisonComponent,
+    ) -> hir::Expr {
         hir::Expr::Binary {
-            lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+            lhs: exprs.push(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
             operator,
-            rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+            rhs: exprs.push(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
             array_concat: false,
             custom: None,
             comparison: Some(hir::ComparisonSemantics {
@@ -8121,18 +8254,19 @@ mod tests {
     }
 
     fn row_comparison_expression(
+        exprs: &ExprBuilder,
         operator: Operator,
         components: Vec<hir::ComparisonComponent>,
     ) -> hir::Expr {
         hir::Expr::Binary {
-            lhs: Box::new(hir::Expr::Row(vec![
-                hir::Expr::Literal(Literal::String("'a'".to_string())),
-                hir::Expr::Literal(Literal::Numeric("2".to_string())),
+            lhs: exprs.push(hir::Expr::Row(vec![
+                exprs.push(hir::Expr::Literal(Literal::String("'a'".to_string()))),
+                exprs.push(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
             ])),
             operator,
-            rhs: Box::new(hir::Expr::Row(vec![
-                hir::Expr::Literal(Literal::String("'b'".to_string())),
-                hir::Expr::Literal(Literal::Numeric("3".to_string())),
+            rhs: exprs.push(hir::Expr::Row(vec![
+                exprs.push(hir::Expr::Literal(Literal::String("'b'".to_string()))),
+                exprs.push(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
             ])),
             array_concat: false,
             custom: None,
@@ -8142,6 +8276,7 @@ mod tests {
 
     #[test]
     fn ordinary_binary_lowering_keeps_existing_register_and_opcode_shape() {
+        let exprs = ExprBuilder::default();
         let cases = [
             (Operator::Add, ExpectedBinaryInsn::Add),
             (Operator::Subtract, ExpectedBinaryInsn::Subtract),
@@ -8158,16 +8293,19 @@ mod tests {
 
         for (operator, expected) in cases {
             let expression = hir::Expr::Binary {
-                lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                lhs: exprs.push(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
                 operator,
-                rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                rhs: exprs.push(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
                 array_concat: false,
                 custom: None,
                 comparison: None,
             };
             let mut program = program();
 
-            assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+            assert_eq!(
+                translate_expr(&mut program, &exprs, expression, 8).unwrap(),
+                8
+            );
             assert!(matches!(
                 &program.insns[..2],
                 [
@@ -8272,23 +8410,27 @@ mod tests {
     #[cfg(feature = "json")]
     #[test]
     fn json_arrow_lowering_keeps_existing_function_and_register_shape() {
+        let exprs = ExprBuilder::default();
         for (operator, expected) in [
             (Operator::ArrowRight, JsonFunc::JsonArrowExtract),
             (Operator::ArrowRightShift, JsonFunc::JsonArrowShiftExtract),
         ] {
             let expression = hir::Expr::Binary {
-                lhs: Box::new(hir::Expr::Literal(Literal::String(
+                lhs: exprs.push(hir::Expr::Literal(Literal::String(
                     "'{\"value\": 3}'".to_string(),
                 ))),
                 operator,
-                rhs: Box::new(hir::Expr::Literal(Literal::String("'$.value'".to_string()))),
+                rhs: exprs.push(hir::Expr::Literal(Literal::String("'$.value'".to_string()))),
                 array_concat: false,
                 custom: None,
                 comparison: None,
             };
             let mut program = program();
 
-            assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+            assert_eq!(
+                translate_expr(&mut program, &exprs, expression, 8).unwrap(),
+                8
+            );
             assert!(matches!(
                 &program.insns[..2],
                 [
@@ -8337,18 +8479,22 @@ mod tests {
 
     #[test]
     fn scalar_between_lowering_keeps_existing_comparison_order() {
+        let exprs = ExprBuilder::default();
         for negated in [false, true] {
             let expression = hir::Expr::Between {
-                expr: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                expr: exprs.push(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
                 negated,
-                start: Box::new(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
-                end: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                start: exprs.push(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
+                end: exprs.push(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
                 start_comparison: numeric_comparison(),
                 end_comparison: numeric_comparison(),
             };
             let mut program = program();
 
-            assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+            assert_eq!(
+                translate_expr(&mut program, &exprs, expression, 8).unwrap(),
+                8
+            );
             assert!(matches!(
                 &program.insns[..4],
                 [
@@ -8431,18 +8577,19 @@ mod tests {
 
     #[test]
     fn scalar_between_reuses_equivalent_value_bounds() {
+        let exprs = ExprBuilder::default();
         let value = hir::Expr::Literal(Literal::Numeric("7".to_string()));
         let expression = hir::Expr::Between {
-            expr: Box::new(value.clone()),
+            expr: exprs.push(value.clone()),
             negated: false,
-            start: Box::new(value.clone()),
-            end: Box::new(value),
+            start: exprs.push(value.clone()),
+            end: exprs.push(value),
             start_comparison: numeric_comparison(),
             end_comparison: numeric_comparison(),
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert_eq!(
             program
                 .insns
@@ -8465,6 +8612,7 @@ mod tests {
 
     #[test]
     fn row_between_uses_register_ranges_resolved_facts_and_existing_order() {
+        let exprs = ExprBuilder::default();
         let collation = hir::CatalogObject::new(
             hir::CatalogObjectId::new(1),
             hir::CatalogSnapshot::from_id(1),
@@ -8486,25 +8634,25 @@ mod tests {
             ],
         };
         let expression = hir::Expr::Between {
-            expr: Box::new(hir::Expr::Row(vec![
-                hir::Expr::Literal(Literal::Numeric("20".to_string())),
-                hir::Expr::Literal(Literal::Numeric("21".to_string())),
+            expr: exprs.push(hir::Expr::Row(vec![
+                exprs.push(hir::Expr::Literal(Literal::Numeric("20".to_string()))),
+                exprs.push(hir::Expr::Literal(Literal::Numeric("21".to_string()))),
             ])),
             negated: false,
-            start: Box::new(hir::Expr::Row(vec![
-                hir::Expr::Literal(Literal::Numeric("10".to_string())),
-                hir::Expr::Literal(Literal::Numeric("11".to_string())),
+            start: exprs.push(hir::Expr::Row(vec![
+                exprs.push(hir::Expr::Literal(Literal::Numeric("10".to_string()))),
+                exprs.push(hir::Expr::Literal(Literal::Numeric("11".to_string()))),
             ])),
-            end: Box::new(hir::Expr::Row(vec![
-                hir::Expr::Literal(Literal::Numeric("30".to_string())),
-                hir::Expr::Literal(Literal::Numeric("31".to_string())),
+            end: exprs.push(hir::Expr::Row(vec![
+                exprs.push(hir::Expr::Literal(Literal::Numeric("30".to_string()))),
+                exprs.push(hir::Expr::Literal(Literal::Numeric("31".to_string()))),
             ])),
             start_comparison: comparison.clone(),
             end_comparison: comparison,
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 12).unwrap();
+        translate_expr(&mut program, &exprs, expression, 12).unwrap();
         let value_destinations = program
             .insns
             .iter()
@@ -8608,26 +8756,27 @@ mod tests {
 
     #[test]
     fn row_not_between_uses_less_greater_and_or() {
+        let exprs = ExprBuilder::default();
         let expression = hir::Expr::Between {
-            expr: Box::new(hir::Expr::Row(vec![
-                hir::Expr::Literal(Literal::Numeric("2".to_string())),
-                hir::Expr::Literal(Literal::Numeric("3".to_string())),
+            expr: exprs.push(hir::Expr::Row(vec![
+                exprs.push(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                exprs.push(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
             ])),
             negated: true,
-            start: Box::new(hir::Expr::Row(vec![
-                hir::Expr::Literal(Literal::Numeric("1".to_string())),
-                hir::Expr::Literal(Literal::Numeric("1".to_string())),
+            start: exprs.push(hir::Expr::Row(vec![
+                exprs.push(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
+                exprs.push(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
             ])),
-            end: Box::new(hir::Expr::Row(vec![
-                hir::Expr::Literal(Literal::Numeric("4".to_string())),
-                hir::Expr::Literal(Literal::Numeric("4".to_string())),
+            end: exprs.push(hir::Expr::Row(vec![
+                exprs.push(hir::Expr::Literal(Literal::Numeric("4".to_string()))),
+                exprs.push(hir::Expr::Literal(Literal::Numeric("4".to_string()))),
             ])),
             start_comparison: numeric_row_comparison(2),
             end_comparison: numeric_row_comparison(2),
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 12).unwrap();
+        translate_expr(&mut program, &exprs, expression, 12).unwrap();
         assert_eq!(
             program
                 .insns
@@ -8656,21 +8805,22 @@ mod tests {
 
     #[test]
     fn row_between_reuses_equivalent_value_ranges() {
+        let exprs = ExprBuilder::default();
         let value = hir::Expr::Row(vec![
-            hir::Expr::Literal(Literal::Numeric("7".to_string())),
-            hir::Expr::Literal(Literal::Numeric("8".to_string())),
+            exprs.push(hir::Expr::Literal(Literal::Numeric("7".to_string()))),
+            exprs.push(hir::Expr::Literal(Literal::Numeric("8".to_string()))),
         ]);
         let expression = hir::Expr::Between {
-            expr: Box::new(value.clone()),
+            expr: exprs.push(value.clone()),
             negated: false,
-            start: Box::new(value.clone()),
-            end: Box::new(value),
+            start: exprs.push(value.clone()),
+            end: exprs.push(value),
             start_comparison: numeric_row_comparison(2),
             end_comparison: numeric_row_comparison(2),
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 12).unwrap();
+        translate_expr(&mut program, &exprs, expression, 12).unwrap();
         assert_eq!(
             program
                 .insns
@@ -8698,6 +8848,7 @@ mod tests {
 
     #[test]
     fn row_comparison_uses_consecutive_registers_and_resolved_component_facts() {
+        let exprs = ExprBuilder::default();
         let collation = hir::CatalogObject::new(
             hir::CatalogObjectId::new(1),
             hir::CatalogSnapshot::from_id(1),
@@ -8705,6 +8856,7 @@ mod tests {
             crate::sync::Arc::new(crate::translate::collate::CollationSeq::NoCase),
         );
         let expression = row_comparison_expression(
+            &exprs,
             Operator::Less,
             vec![
                 hir::ComparisonComponent {
@@ -8721,7 +8873,7 @@ mod tests {
         );
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             &program.insns[..4],
             [
@@ -8762,8 +8914,10 @@ mod tests {
 
     #[test]
     fn row_equality_preserves_null_and_is_uses_null_equal() {
+        let exprs = ExprBuilder::default();
         for (operator, null_equal) in [(Operator::Equals, false), (Operator::Is, true)] {
             let expression = row_comparison_expression(
+                &exprs,
                 operator,
                 vec![
                     hir::ComparisonComponent {
@@ -8780,7 +8934,7 @@ mod tests {
             );
             let mut program = program();
 
-            translate_expr(&mut program, &expression, 8).unwrap();
+            translate_expr(&mut program, &exprs, expression, 8).unwrap();
             let equality_flags = program
                 .insns
                 .iter()
@@ -8808,6 +8962,7 @@ mod tests {
 
     #[test]
     fn row_ordering_emits_each_component_in_lexicographic_order() {
+        let exprs = ExprBuilder::default();
         for (operator, inclusive) in [
             (Operator::Less, false),
             (Operator::LessEquals, true),
@@ -8815,6 +8970,7 @@ mod tests {
             (Operator::GreaterEquals, true),
         ] {
             let expression = row_comparison_expression(
+                &exprs,
                 operator,
                 vec![
                     hir::ComparisonComponent {
@@ -8831,7 +8987,7 @@ mod tests {
             );
             let mut program = program();
 
-            translate_expr(&mut program, &expression, 8).unwrap();
+            translate_expr(&mut program, &exprs, expression, 8).unwrap();
             let equality_pairs = program
                 .insns
                 .iter()
@@ -8859,6 +9015,7 @@ mod tests {
 
     #[test]
     fn scalar_comparison_lowering_keeps_existing_opcode_and_null_shape() {
+        let exprs = ExprBuilder::default();
         let cases = [
             (Operator::Equals, ExpectedComparisonInsn::Eq, false),
             (Operator::NotEquals, ExpectedComparisonInsn::Ne, false),
@@ -8872,6 +9029,7 @@ mod tests {
 
         for (operator, expected, null_equal) in cases {
             let expression = comparison_expression(
+                &exprs,
                 operator,
                 hir::ComparisonComponent {
                     affinity: crate::vdbe::affinity::Affinity::Numeric,
@@ -8881,7 +9039,10 @@ mod tests {
             );
             let mut program = program();
 
-            assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+            assert_eq!(
+                translate_expr(&mut program, &exprs, expression, 8).unwrap(),
+                8
+            );
             assert!(matches!(
                 &program.insns[..3],
                 [
@@ -8979,6 +9140,7 @@ mod tests {
 
     #[test]
     fn scalar_comparison_uses_resolved_array_and_collation_metadata() {
+        let exprs = ExprBuilder::default();
         let collation = hir::CatalogObject::new(
             hir::CatalogObjectId::new(1),
             hir::CatalogSnapshot::from_id(1),
@@ -8986,6 +9148,7 @@ mod tests {
             crate::sync::Arc::new(crate::translate::collate::CollationSeq::NoCase),
         );
         let expression = comparison_expression(
+            &exprs,
             Operator::Equals,
             hir::ComparisonComponent {
                 affinity: crate::vdbe::affinity::Affinity::Text,
@@ -8995,7 +9158,7 @@ mod tests {
         );
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         let Insn::Eq {
             flags, collation, ..
         } = &program.insns[3].0
@@ -9012,20 +9175,24 @@ mod tests {
 
     #[test]
     fn array_binary_lowering_keeps_existing_function_and_register_shape() {
+        let exprs = ExprBuilder::default();
         for operator in [Operator::ArrayContains, Operator::ArrayOverlap] {
             for shared in [false, true] {
                 let rhs = if shared { "2" } else { "3" };
                 let expression = hir::Expr::Binary {
-                    lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                    lhs: exprs.push(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
                     operator,
-                    rhs: Box::new(hir::Expr::Literal(Literal::Numeric(rhs.to_string()))),
+                    rhs: exprs.push(hir::Expr::Literal(Literal::Numeric(rhs.to_string()))),
                     array_concat: false,
                     custom: None,
                     comparison: None,
                 };
                 let mut program = program();
 
-                assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+                assert_eq!(
+                    translate_expr(&mut program, &exprs, expression, 8).unwrap(),
+                    8
+                );
                 let function_index = if shared {
                     assert!(matches!(
                         &program.insns[..3],
@@ -9086,18 +9253,22 @@ mod tests {
 
     #[test]
     fn concat_lowering_uses_resolved_array_semantics() {
+        let exprs = ExprBuilder::default();
         for array_concat in [false, true] {
             let expression = hir::Expr::Binary {
-                lhs: Box::new(hir::Expr::Literal(Literal::String("'left'".to_string()))),
+                lhs: exprs.push(hir::Expr::Literal(Literal::String("'left'".to_string()))),
                 operator: Operator::Concat,
-                rhs: Box::new(hir::Expr::Literal(Literal::String("'right'".to_string()))),
+                rhs: exprs.push(hir::Expr::Literal(Literal::String("'right'".to_string()))),
                 array_concat,
                 custom: None,
                 comparison: None,
             };
             let mut program = program();
 
-            assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+            assert_eq!(
+                translate_expr(&mut program, &exprs, expression, 8).unwrap(),
+                8
+            );
             assert!(matches!(
                 &program.insns[..2],
                 [
@@ -9129,17 +9300,18 @@ mod tests {
 
     #[test]
     fn concat_can_share_equivalent_operand_registers() {
+        let exprs = ExprBuilder::default();
         let expression = hir::Expr::Binary {
-            lhs: Box::new(hir::Expr::Literal(Literal::String("'value'".to_string()))),
+            lhs: exprs.push(hir::Expr::Literal(Literal::String("'value'".to_string()))),
             operator: Operator::Concat,
-            rhs: Box::new(hir::Expr::Literal(Literal::String("'value'".to_string()))),
+            rhs: exprs.push(hir::Expr::Literal(Literal::String("'value'".to_string()))),
             array_concat: true,
             custom: None,
             comparison: None,
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [
@@ -9158,17 +9330,18 @@ mod tests {
 
     #[test]
     fn equivalent_binary_operands_share_one_register() {
+        let exprs = ExprBuilder::default();
         let expression = hir::Expr::Binary {
-            lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+            lhs: exprs.push(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
             operator: Operator::Add,
-            rhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+            rhs: exprs.push(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
             array_concat: false,
             custom: None,
             comparison: None,
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [
@@ -9187,24 +9360,25 @@ mod tests {
 
     #[test]
     fn nested_binary_operands_are_allocated_before_lowering_children() {
+        let exprs = ExprBuilder::default();
         let expression = hir::Expr::Binary {
-            lhs: Box::new(hir::Expr::Binary {
-                lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+            lhs: exprs.push(hir::Expr::Binary {
+                lhs: exprs.push(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
                 operator: Operator::Add,
-                rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                rhs: exprs.push(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
                 array_concat: false,
                 custom: None,
                 comparison: None,
             }),
             operator: Operator::Multiply,
-            rhs: Box::new(hir::Expr::Literal(Literal::Numeric("4".to_string()))),
+            rhs: exprs.push(hir::Expr::Literal(Literal::Numeric("4".to_string()))),
             array_concat: false,
             custom: None,
             comparison: None,
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [
@@ -9233,12 +9407,13 @@ mod tests {
 
     #[test]
     fn binary_lowering_does_not_use_the_call_stack() {
+        let exprs = ExprBuilder::default();
         let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
         for value in 2..=10_000 {
             expression = hir::Expr::Binary {
-                lhs: Box::new(expression),
+                lhs: exprs.push(expression),
                 operator: Operator::Add,
-                rhs: Box::new(hir::Expr::Literal(Literal::Numeric(value.to_string()))),
+                rhs: exprs.push(hir::Expr::Literal(Literal::Numeric(value.to_string()))),
                 array_concat: false,
                 custom: None,
                 comparison: None,
@@ -9246,22 +9421,22 @@ mod tests {
         }
 
         let mut program = program();
-        translate_expr(&mut program, &expression, 4).unwrap();
+        translate_expr(&mut program, &exprs, expression, 4).unwrap();
         assert_eq!(program.insns.len(), 19_999);
-
-        std::mem::forget(expression);
     }
 
     #[test]
     fn dialect_scalar_function_uses_consecutive_argument_registers() {
+        let exprs = ExprBuilder::default();
         let expression = ordinary_scalar_call(
+            &exprs,
             Func::Dialect("catalog_value".to_string()),
             vec![
                 hir::Expr::Literal(Literal::Numeric("1".to_string())),
                 hir::Expr::Binary {
-                    lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                    lhs: exprs.push(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
                     operator: Operator::Add,
-                    rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                    rhs: exprs.push(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
                     array_concat: false,
                     custom: None,
                     comparison: None,
@@ -9270,7 +9445,7 @@ mod tests {
         );
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [
@@ -9303,11 +9478,15 @@ mod tests {
 
     #[test]
     fn zero_argument_dialect_function_reserves_a_start_register() {
-        let expression =
-            ordinary_scalar_call(Func::Dialect("catalog_value".to_string()), Vec::new());
+        let exprs = ExprBuilder::default();
+        let expression = ordinary_scalar_call(
+            &exprs,
+            Func::Dialect("catalog_value".to_string()),
+            Vec::new(),
+        );
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [(
@@ -9324,6 +9503,7 @@ mod tests {
 
     #[test]
     fn math_functions_read_arguments_from_consecutive_registers() {
+        let exprs = ExprBuilder::default();
         use crate::function::MathFunc;
 
         let cases = [
@@ -9362,9 +9542,9 @@ mod tests {
 
         for (function, arguments, expected_start, expected_count) in cases {
             let mut program = program();
-            let expression = ordinary_scalar_call(Func::Math(function), arguments);
+            let expression = ordinary_scalar_call(&exprs, Func::Math(function), arguments);
 
-            translate_expr(&mut program, &expression, 8).unwrap();
+            translate_expr(&mut program, &exprs, expression, 8).unwrap();
             assert!(matches!(
                 program.insns.last().map(|(instruction, _)| instruction),
                 Some(Insn::Function {
@@ -9383,6 +9563,7 @@ mod tests {
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     #[test]
     fn direct_fts_functions_use_consecutive_argument_registers() {
+        let exprs = ExprBuilder::default();
         use crate::function::FtsFunc;
 
         let literal_arguments = |count: usize| {
@@ -9392,12 +9573,13 @@ mod tests {
         };
         let argument_count = 4;
         let expression = ordinary_scalar_call(
+            &exprs,
             Func::Fts(FtsFunc::Highlight),
             literal_arguments(argument_count),
         );
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(program.insns[..argument_count].iter().enumerate().all(
             |(index, (instruction, _))| {
                 matches!(instruction, Insn::Integer { dest, .. } if *dest == index + 1)
@@ -9426,16 +9608,20 @@ mod tests {
             ),
             (FtsFunc::Match, 3, "fts_match requires an FTS index query"),
         ] {
-            let expression =
-                ordinary_scalar_call(Func::Fts(function), literal_arguments(argument_count));
+            let expression = ordinary_scalar_call(
+                &exprs,
+                Func::Fts(function),
+                literal_arguments(argument_count),
+            );
             let mut without_index = self::program();
-            let error = translate_expr(&mut without_index, &expression, 8).unwrap_err();
+            let error = translate_expr(&mut without_index, &exprs, expression, 8).unwrap_err();
             assert_eq!(error.to_string(), format!("Parse error: {message}"));
         }
     }
 
     #[test]
     fn vector_functions_use_consecutive_argument_registers() {
+        let exprs = ExprBuilder::default();
         use crate::function::VectorFunc;
 
         let cases = [
@@ -9448,10 +9634,10 @@ mod tests {
             let arguments = (0..argument_count)
                 .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
                 .collect();
-            let expression = ordinary_scalar_call(Func::Vector(function), arguments);
+            let expression = ordinary_scalar_call(&exprs, Func::Vector(function), arguments);
             let mut program = program();
 
-            translate_expr(&mut program, &expression, 8).unwrap();
+            translate_expr(&mut program, &exprs, expression, 8).unwrap();
             assert!(program.insns[..argument_count].iter().enumerate().all(
                 |(index, (instruction, _))| {
                     matches!(instruction, Insn::Integer { dest, .. } if *dest == index + 1)
@@ -9474,10 +9660,11 @@ mod tests {
 
     #[test]
     fn plain_builtin_functions_read_arguments_from_consecutive_registers() {
+        let exprs = ExprBuilder::default();
         let mut empty_program = program();
-        let expression = ordinary_scalar_call(Func::Scalar(ScalarFunc::Char), Vec::new());
+        let expression = ordinary_scalar_call(&exprs, Func::Scalar(ScalarFunc::Char), Vec::new());
 
-        translate_expr(&mut empty_program, &expression, 8).unwrap();
+        translate_expr(&mut empty_program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             empty_program.insns.as_slice(),
             [(
@@ -9523,10 +9710,11 @@ mod tests {
             let arguments = (0..argument_count)
                 .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
                 .collect();
-            let expression = ordinary_scalar_call(Func::Scalar(function.clone()), arguments);
+            let expression =
+                ordinary_scalar_call(&exprs, Func::Scalar(function.clone()), arguments);
             let mut program = program();
 
-            translate_expr(&mut program, &expression, 8).unwrap();
+            translate_expr(&mut program, &exprs, expression, 8).unwrap();
             assert!(program.insns[..argument_count].iter().enumerate().all(
                 |(index, (instruction, _))| {
                     matches!(instruction, Insn::Integer { dest, .. } if *dest == index + 1)
@@ -9549,10 +9737,11 @@ mod tests {
 
     #[test]
     fn struct_pack_builds_its_array_from_consecutive_registers() {
+        let exprs = ExprBuilder::default();
         let mut empty_program = program();
-        let empty = ordinary_scalar_call(Func::Scalar(ScalarFunc::StructPack), Vec::new());
+        let empty = ordinary_scalar_call(&exprs, Func::Scalar(ScalarFunc::StructPack), Vec::new());
 
-        translate_expr(&mut empty_program, &empty, 8).unwrap();
+        translate_expr(&mut empty_program, &exprs, empty, 8).unwrap();
         assert!(matches!(
             empty_program.insns.as_slice(),
             [(
@@ -9567,6 +9756,7 @@ mod tests {
         assert_eq!(empty_program.alloc_register(), 1);
 
         let expression = ordinary_scalar_call(
+            &exprs,
             Func::Scalar(ScalarFunc::StructPack),
             vec![
                 hir::Expr::Literal(Literal::Numeric("10".to_string())),
@@ -9575,7 +9765,7 @@ mod tests {
         );
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [
@@ -9595,7 +9785,9 @@ mod tests {
 
     #[test]
     fn currval_uses_ordinary_function_lowering() {
+        let exprs = ExprBuilder::default();
         let expression = ordinary_scalar_call(
+            &exprs,
             Func::Scalar(ScalarFunc::CurrVal),
             vec![hir::Expr::Literal(Literal::String(
                 "'main.seq'".to_string(),
@@ -9603,7 +9795,7 @@ mod tests {
         );
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [
@@ -9626,19 +9818,23 @@ mod tests {
 
     #[test]
     fn sequence_calls_use_resolved_hir_objects_and_database_snapshot() {
+        let exprs = ExprBuilder::default();
         let database = hir::DatabaseId::new(2);
-        let document = document(vec![hir::DatabaseSnapshot {
+        let mut document = document(vec![hir::DatabaseSnapshot {
             database,
             schema_version: 37,
         }]);
 
         let nextval = sequence_call(
+            &exprs,
             hir::SequenceOperationKind::NextValue,
             vec![hir::Expr::Literal(Literal::String("'aux.seq'".to_string()))],
         );
+        let nextval = exprs.push(nextval);
+        document.exprs = exprs.0.borrow().clone();
         let mut nextval_program = program();
         nextval_program.prologue();
-        super::translate_expr(&mut nextval_program, &document, &nextval, 8).unwrap();
+        super::translate_expr(&mut nextval_program, &document, nextval, 8).unwrap();
         nextval_program.epilogue(&crate::schema::Schema::new());
         assert!(nextval_program
             .insns
@@ -9654,14 +9850,17 @@ mod tests {
         )));
 
         let setval = sequence_call(
+            &exprs,
             hir::SequenceOperationKind::SetValue,
             vec![
                 hir::Expr::Literal(Literal::String("'aux.seq'".to_string())),
                 hir::Expr::Literal(Literal::Numeric("12".to_string())),
             ],
         );
+        let setval = exprs.push(setval);
+        document.exprs = exprs.0.borrow().clone();
         let mut setval_program = program();
-        super::translate_expr(&mut setval_program, &document, &setval, 8).unwrap();
+        super::translate_expr(&mut setval_program, &document, setval, 8).unwrap();
         assert!(setval_program.insns.iter().any(|(insn, _)| matches!(
             insn,
             Insn::Function {
@@ -9680,15 +9879,17 @@ mod tests {
 
     #[test]
     fn direct_like_functions_read_plain_argument_registers() {
+        let exprs = ExprBuilder::default();
         for function in [ScalarFunc::Like, ScalarFunc::Glob] {
             for argument_count in [2, 3] {
                 let arguments = (0..argument_count)
                     .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
                     .collect();
-                let expression = ordinary_scalar_call(Func::Scalar(function.clone()), arguments);
+                let expression =
+                    ordinary_scalar_call(&exprs, Func::Scalar(function.clone()), arguments);
                 let mut program = program();
 
-                translate_expr(&mut program, &expression, 8).unwrap();
+                translate_expr(&mut program, &exprs, expression, 8).unwrap();
                 assert!(program.insns[..argument_count].iter().enumerate().all(
                     |(index, (instruction, _))| {
                         matches!(instruction, Insn::Integer { dest, .. } if *dest == index + 1)
@@ -9712,6 +9913,7 @@ mod tests {
 
     #[test]
     fn planner_hints_only_lower_the_value_expression() {
+        let exprs = ExprBuilder::default();
         for (function, arguments) in [
             (
                 ScalarFunc::Likely,
@@ -9729,10 +9931,10 @@ mod tests {
                 ],
             ),
         ] {
-            let expression = ordinary_scalar_call(Func::Scalar(function), arguments);
+            let expression = ordinary_scalar_call(&exprs, Func::Scalar(function), arguments);
             let mut program = program();
 
-            translate_expr(&mut program, &expression, 8).unwrap();
+            translate_expr(&mut program, &exprs, expression, 8).unwrap();
             assert!(matches!(
                 program.insns.as_slice(),
                 [(Insn::Integer { value: 7, dest: 8 }, _)]
@@ -9743,14 +9945,16 @@ mod tests {
 
     #[test]
     fn concat_ws_writes_its_result_after_the_argument_registers() {
+        let exprs = ExprBuilder::default();
         for argument_count in [2, 3] {
             let arguments = (0..argument_count)
                 .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
                 .collect();
-            let expression = ordinary_scalar_call(Func::Scalar(ScalarFunc::ConcatWs), arguments);
+            let expression =
+                ordinary_scalar_call(&exprs, Func::Scalar(ScalarFunc::ConcatWs), arguments);
             let mut program = program();
 
-            translate_expr(&mut program, &expression, 8).unwrap();
+            translate_expr(&mut program, &exprs, expression, 8).unwrap();
             assert!(program.insns[..argument_count].iter().enumerate().all(
                 |(index, (instruction, _))| {
                     matches!(instruction, Insn::Integer { dest, .. } if *dest == index + 2)
@@ -9784,7 +9988,9 @@ mod tests {
 
     #[test]
     fn ifnull_short_circuits_on_the_first_non_null_argument() {
+        let exprs = ExprBuilder::default();
         let expression = ordinary_scalar_call(
+            &exprs,
             Func::Scalar(ScalarFunc::IfNull),
             vec![
                 hir::Expr::Literal(Literal::Numeric("1".to_string())),
@@ -9793,7 +9999,7 @@ mod tests {
         );
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [
@@ -9815,6 +10021,7 @@ mod tests {
 
     #[test]
     fn iif_branches_on_its_condition_register() {
+        let exprs = ExprBuilder::default();
         for (argument_count, expected_shape) in [
             (2, "condition if-not value goto null"),
             (
@@ -9829,10 +10036,10 @@ mod tests {
             let arguments = (0..argument_count)
                 .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
                 .collect();
-            let expression = ordinary_scalar_call(Func::Scalar(ScalarFunc::Iif), arguments);
+            let expression = ordinary_scalar_call(&exprs, Func::Scalar(ScalarFunc::Iif), arguments);
             let mut program = program();
 
-            translate_expr(&mut program, &expression, 8).unwrap();
+            translate_expr(&mut program, &exprs, expression, 8).unwrap();
             let shape = program
                 .insns
                 .iter()
@@ -9860,14 +10067,16 @@ mod tests {
 
     #[test]
     fn coalesce_writes_the_first_non_null_argument_to_the_target() {
+        let exprs = ExprBuilder::default();
         for argument_count in [2, 3] {
             let arguments = (0..argument_count)
                 .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
                 .collect();
-            let expression = ordinary_scalar_call(Func::Scalar(ScalarFunc::Coalesce), arguments);
+            let expression =
+                ordinary_scalar_call(&exprs, Func::Scalar(ScalarFunc::Coalesce), arguments);
             let mut program = program();
 
-            translate_expr(&mut program, &expression, 8).unwrap();
+            translate_expr(&mut program, &exprs, expression, 8).unwrap();
             assert_eq!(program.insns.len(), argument_count * 2 - 1);
             for (index, (instruction, _)) in program.insns.iter().enumerate() {
                 if index % 2 == 0 {
@@ -9882,15 +10091,16 @@ mod tests {
 
     #[test]
     fn last_insert_rowid_ignores_its_arguments() {
+        let exprs = ExprBuilder::default();
         for argument_count in [0, 2] {
             let arguments = (0..argument_count)
                 .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
                 .collect();
             let expression =
-                ordinary_scalar_call(Func::Scalar(ScalarFunc::LastInsertRowid), arguments);
+                ordinary_scalar_call(&exprs, Func::Scalar(ScalarFunc::LastInsertRowid), arguments);
             let mut program = program();
 
-            translate_expr(&mut program, &expression, 8).unwrap();
+            translate_expr(&mut program, &exprs, expression, 8).unwrap();
             assert!(matches!(
                 program.insns.as_slice(),
                 [(
@@ -9912,15 +10122,17 @@ mod tests {
 
     #[test]
     fn version_functions_copy_their_constant_into_the_target() {
+        let exprs = ExprBuilder::default();
         for function in [
             ScalarFunc::SqliteVersion,
             ScalarFunc::TursoVersion,
             ScalarFunc::SqliteSourceId,
         ] {
-            let expression = ordinary_scalar_call(Func::Scalar(function.clone()), Vec::new());
+            let expression =
+                ordinary_scalar_call(&exprs, Func::Scalar(function.clone()), Vec::new());
             let mut program = program();
 
-            translate_expr(&mut program, &expression, 8).unwrap();
+            translate_expr(&mut program, &exprs, expression, 8).unwrap();
             assert!(matches!(
                 program.insns.as_slice(),
                 [
@@ -9952,15 +10164,17 @@ mod tests {
 
     #[test]
     fn substring_functions_always_reserve_three_argument_registers() {
+        let exprs = ExprBuilder::default();
         for function in [ScalarFunc::Substr, ScalarFunc::Substring] {
             for argument_count in [2, 3] {
                 let arguments = (0..argument_count)
                     .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
                     .collect();
-                let expression = ordinary_scalar_call(Func::Scalar(function.clone()), arguments);
+                let expression =
+                    ordinary_scalar_call(&exprs, Func::Scalar(function.clone()), arguments);
                 let mut program = program();
 
-                translate_expr(&mut program, &expression, 8).unwrap();
+                translate_expr(&mut program, &exprs, expression, 8).unwrap();
                 assert!(program.insns[..argument_count].iter().enumerate().all(
                     |(index, (instruction, _))| {
                         matches!(instruction, Insn::Integer { dest, .. } if *dest == index + 1)
@@ -9985,6 +10199,7 @@ mod tests {
 
     #[test]
     fn empty_plain_functions_reserve_a_start_register() {
+        let exprs = ExprBuilder::default();
         for function in [
             ScalarFunc::Changes,
             ScalarFunc::TotalChanges,
@@ -9998,10 +10213,10 @@ mod tests {
             #[cfg(feature = "test_helper")]
             ScalarFunc::TestNondetCounter,
         ] {
-            let expression = ordinary_scalar_call(Func::Scalar(function), Vec::new());
+            let expression = ordinary_scalar_call(&exprs, Func::Scalar(function), Vec::new());
             let mut program = program();
 
-            translate_expr(&mut program, &expression, 8).unwrap();
+            translate_expr(&mut program, &exprs, expression, 8).unwrap();
             assert!(matches!(
                 program.insns.as_slice(),
                 [(
@@ -10021,10 +10236,11 @@ mod tests {
     #[cfg(feature = "json")]
     #[test]
     fn json_functions_preserve_empty_and_nonempty_register_shapes() {
+        let exprs = ExprBuilder::default();
         let mut empty_array_program = program();
-        let expression = ordinary_scalar_call(Func::Json(JsonFunc::JsonArray), Vec::new());
+        let expression = ordinary_scalar_call(&exprs, Func::Json(JsonFunc::JsonArray), Vec::new());
 
-        translate_expr(&mut empty_array_program, &expression, 8).unwrap();
+        translate_expr(&mut empty_array_program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             empty_array_program.insns.as_slice(),
             [(
@@ -10040,9 +10256,9 @@ mod tests {
         assert_eq!(empty_array_program.alloc_register(), 1);
 
         let mut empty_remove_program = program();
-        let expression = ordinary_scalar_call(Func::Json(JsonFunc::JsonRemove), Vec::new());
+        let expression = ordinary_scalar_call(&exprs, Func::Json(JsonFunc::JsonRemove), Vec::new());
 
-        translate_expr(&mut empty_remove_program, &expression, 8).unwrap();
+        translate_expr(&mut empty_remove_program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             empty_remove_program.insns.as_slice(),
             [(
@@ -10059,6 +10275,7 @@ mod tests {
 
         let mut object_program = program();
         let expression = ordinary_scalar_call(
+            &exprs,
             Func::Json(JsonFunc::JsonObject),
             vec![
                 hir::Expr::Literal(Literal::String("'key'".to_string())),
@@ -10066,7 +10283,7 @@ mod tests {
             ],
         );
 
-        translate_expr(&mut object_program, &expression, 8).unwrap();
+        translate_expr(&mut object_program, &exprs, expression, 8).unwrap();
         assert!(matches!(
             object_program.insns.as_slice(),
             [
@@ -10088,13 +10305,15 @@ mod tests {
     #[cfg(feature = "json")]
     #[test]
     fn nested_json_functions_do_not_use_the_call_stack() {
+        let exprs = ExprBuilder::default();
         let mut expression = hir::Expr::Literal(Literal::String("'value'".to_string()));
         for _ in 0..10_000 {
-            expression = ordinary_scalar_call(Func::Json(JsonFunc::JsonQuote), vec![expression]);
+            expression =
+                ordinary_scalar_call(&exprs, Func::Json(JsonFunc::JsonQuote), vec![expression]);
         }
 
         let mut program = program();
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert_eq!(
             program
                 .insns
@@ -10103,20 +10322,22 @@ mod tests {
                 .count(),
             10_000
         );
-
-        std::mem::forget(expression);
     }
 
     #[test]
     fn nested_dialect_functions_do_not_use_the_call_stack() {
+        let exprs = ExprBuilder::default();
         let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
         for _ in 0..10_000 {
-            expression =
-                ordinary_scalar_call(Func::Dialect("catalog_value".to_string()), vec![expression]);
+            expression = ordinary_scalar_call(
+                &exprs,
+                Func::Dialect("catalog_value".to_string()),
+                vec![expression],
+            );
         }
 
         let mut program = program();
-        translate_expr(&mut program, &expression, 8).unwrap();
+        translate_expr(&mut program, &exprs, expression, 8).unwrap();
         assert_eq!(
             program
                 .insns
@@ -10125,28 +10346,25 @@ mod tests {
                 .count(),
             10_000
         );
-
-        std::mem::forget(expression);
     }
 
     #[test]
     fn expression_lowering_does_not_use_call_stack() {
+        let exprs = ExprBuilder::default();
         let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
         for _ in 0..10_000 {
             expression = hir::Expr::Unary {
                 operator: UnaryOperator::Positive,
-                expr: Box::new(expression),
+                expr: exprs.push(expression),
             };
         }
 
         let mut program = program();
-        translate_expr(&mut program, &expression, 4).unwrap();
+        translate_expr(&mut program, &exprs, expression, 4).unwrap();
         assert!(matches!(
             program.insns.as_slice(),
             [(Insn::Integer { value: 1, dest: 4 }, _)]
         ));
-
-        std::mem::forget(expression);
     }
 
     #[test]
@@ -10195,24 +10413,28 @@ mod tests {
 
     #[test]
     fn condition_lowering_does_not_use_call_stack() {
+        let exprs = ExprBuilder::default();
         let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
         for _ in 0..10_000 {
             expression = hir::Expr::Binary {
-                lhs: Box::new(expression),
+                lhs: exprs.push(expression),
                 operator: Operator::And,
-                rhs: Box::new(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
+                rhs: exprs.push(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
                 array_concat: false,
                 custom: None,
                 comparison: None,
             };
         }
+        let expression = exprs.push(expression);
+        let mut document = document(Vec::new());
+        document.exprs = exprs.0.take();
         let mut program = program();
         let when_true = program.allocate_label();
         let when_false = program.allocate_label();
         super::translate_condition_expr(
             &mut program,
-            &document(Vec::new()),
-            &expression,
+            &document,
+            expression,
             expr::ConditionMetadata {
                 jump_if_condition_is_true: false,
                 jump_target_when_true: when_true,
@@ -10228,6 +10450,5 @@ mod tests {
                 .count(),
             10_001
         );
-        std::mem::forget(expression);
     }
 }

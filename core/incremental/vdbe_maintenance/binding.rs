@@ -15,19 +15,19 @@ use crate::vdbe::insn::Insn;
 
 /// The registers one row of a stream was loaded into.
 #[derive(Default)]
-pub(super) struct StreamRow<'a> {
+pub(super) struct StreamRow {
     /// Each published value with its register.
-    columns: Vec<(&'a hir::Expr, usize)>,
+    columns: Vec<(hir::ExprId, usize)>,
     /// The rowid register of each source whose rowid the stream carries.
     rowids: Vec<(SourceId, usize)>,
 }
 
-impl<'a> StreamRow<'a> {
+impl StreamRow {
     pub(super) fn new() -> Self {
         Self::default()
     }
 
-    pub(super) fn add_column(&mut self, expression: Option<&'a hir::Expr>, register: usize) {
+    pub(super) fn add_column(&mut self, expression: Option<hir::ExprId>, register: usize) {
         if let Some(expression) = expression {
             self.columns.push((expression, register));
         }
@@ -38,7 +38,7 @@ impl<'a> StreamRow<'a> {
     }
 
     /// Read the current row of `channel` into fresh registers.
-    pub(super) fn load(program: &mut ProgramBuilder, channel: &'a EphemeralDelta) -> Self {
+    pub(super) fn load(program: &mut ProgramBuilder, channel: &EphemeralDelta) -> Self {
         let mut row = Self::new();
         for (column, expression) in channel.schema.columns.iter().enumerate() {
             let Some(expression) = expression else {
@@ -51,7 +51,7 @@ impl<'a> StreamRow<'a> {
                 dest: register,
                 default: None,
             });
-            row.add_column(Some(expression), register);
+            row.add_column(Some(*expression), register);
         }
         for (rowid_column, binding) in channel
             .binding_rowid_columns
@@ -73,15 +73,15 @@ impl<'a> StreamRow<'a> {
         row
     }
 
-    fn register_of(&self, node: &hir::Expr) -> Option<usize> {
-        if let hir::Expr::RowId(source) = node {
+    fn register_of(&self, node: hir::ExprRef<'_>) -> Option<usize> {
+        if let hir::Expr::RowId(source) = node.node() {
             if let Some((_, register)) = self.rowids.iter().find(|(bound, _)| bound == source) {
                 return Some(*register);
             }
         }
         self.columns
             .iter()
-            .find(|(published, _)| published.equivalent(node))
+            .find(|(published, _)| node.at(*published).equivalent(node))
             .map(|(_, register)| *register)
     }
 
@@ -92,7 +92,7 @@ impl<'a> StreamRow<'a> {
         &self,
         program: &mut ProgramBuilder,
         document: &HirDocument,
-        expression: &hir::Expr,
+        expression: hir::ExprId,
     ) {
         bind_expression(program, document, expression, &mut |node| {
             self.register_of(node)
@@ -111,7 +111,7 @@ impl<'a> StreamRow<'a> {
         let mut bindings = Vec::new();
         let mut sources: Vec<SourceId> = Vec::new();
         for (expression, _) in &self.columns {
-            if let hir::Expr::Column(column) = expression {
+            if let hir::Expr::Column(column) = &document.exprs[*expression] {
                 if !sources.contains(&column.source) {
                     sources.push(column.source);
                 }
@@ -123,7 +123,7 @@ impl<'a> StreamRow<'a> {
             };
             let column_count = definition.columns.len();
             let first = self.columns.iter().position(|(expression, _)| {
-                matches!(expression, hir::Expr::Column(column)
+                matches!(&document.exprs[*expression], hir::Expr::Column(column)
                     if column.source == source && column.column == 0)
             });
             let Some(first) = first else {
@@ -133,7 +133,7 @@ impl<'a> StreamRow<'a> {
                 self.columns
                     .get(first + index)
                     .is_some_and(|(expression, register)| {
-                        matches!(expression, hir::Expr::Column(column)
+                        matches!(&document.exprs[*expression], hir::Expr::Column(column)
                         if column.source == source && column.column == index)
                             && *register == self.columns[first].1 + index
                     })
@@ -165,21 +165,22 @@ impl<'a> StreamRow<'a> {
 pub(super) fn bind_expression(
     program: &mut ProgramBuilder,
     document: &HirDocument,
-    expression: &hir::Expr,
-    lookup: &mut impl FnMut(&hir::Expr) -> Option<usize>,
+    expression: hir::ExprId,
+    lookup: &mut impl FnMut(hir::ExprRef<'_>) -> Option<usize>,
 ) {
-    if let Some(register) = lookup(expression) {
+    if let Some(register) = lookup(document.exprs.at(expression)) {
         program.bind_expression_register(expression, register);
         return;
     }
-    if let hir::Expr::Output(output) = expression {
+    let node = &document.exprs[expression];
+    if let hir::Expr::Output(output) = node {
         if let Some(output) = document.output(*output) {
-            bind_expression(program, document, &output.expr, lookup);
+            bind_expression(program, document, output.expr, lookup);
         }
         return;
     }
     let mut index = 0;
-    while let Some(child) = expression.child(index) {
+    while let Some(child) = node.child(index) {
         bind_expression(program, document, child, lookup);
         index += 1;
     }
@@ -190,149 +191,24 @@ pub(super) fn bind_expression(
 /// into the node's children.
 pub(super) fn visit_expression(
     document: &HirDocument,
-    expression: &hir::Expr,
-    visit: &mut impl FnMut(&hir::Expr) -> crate::Result<bool>,
+    exprs: &hir::ExprArena,
+    expression: hir::ExprId,
+    visit: &mut impl FnMut(hir::ExprRef<'_>) -> crate::Result<bool>,
 ) -> crate::Result<()> {
-    if !visit(expression)? {
+    let node = exprs.at(expression);
+    if !visit(node)? {
         return Ok(());
     }
-    if let hir::Expr::Output(output) = expression {
+    if let hir::Expr::Output(output) = node.node() {
         if let Some(output) = document.output(*output) {
-            visit_expression(document, &output.expr, visit)?;
+            visit_expression(document, exprs, output.expr, visit)?;
         }
         return Ok(());
     }
     let mut index = 0;
-    while let Some(child) = expression.child(index) {
-        visit_expression(document, child, visit)?;
+    while let Some(child) = node.node().child(index) {
+        visit_expression(document, exprs, child, visit)?;
         index += 1;
     }
     Ok(())
-}
-
-/// Replace every node of `expression` for which `replace` gives a
-/// replacement, not descending into a replaced node. Returns whether any
-/// node was replaced.
-pub(super) fn replace_expression(
-    expression: &mut hir::Expr,
-    replace: &impl Fn(&hir::Expr) -> Option<hir::Expr>,
-) -> bool {
-    if let Some(replacement) = replace(expression) {
-        *expression = replacement;
-        return true;
-    }
-    let mut replaced = false;
-    let mut visit = |child: &mut hir::Expr| replaced |= replace_expression(child, replace);
-    match expression {
-        hir::Expr::Literal(_)
-        | hir::Expr::Parameter(_)
-        | hir::Expr::Column(_)
-        | hir::Expr::RowId(_)
-        | hir::Expr::Output(_)
-        | hir::Expr::Subquery(
-            hir::SubqueryExpr::Scalar { .. }
-            | hir::SubqueryExpr::Row { .. }
-            | hir::SubqueryExpr::Exists(_),
-        ) => {}
-        hir::Expr::MergedColumn(column) => {
-            visit(&mut column.left);
-            visit(&mut column.right);
-        }
-        hir::Expr::Unary { expr, .. }
-        | hir::Expr::IsNull(expr)
-        | hir::Expr::NotNull(expr)
-        | hir::Expr::TruthTest { expr, .. }
-        | hir::Expr::Collate { expr, .. }
-        | hir::Expr::Cast { expr, .. } => visit(expr),
-        hir::Expr::Binary { lhs, rhs, .. } => {
-            visit(lhs);
-            visit(rhs);
-        }
-        hir::Expr::Between {
-            expr, start, end, ..
-        } => {
-            visit(expr);
-            visit(start);
-            visit(end);
-        }
-        hir::Expr::Case {
-            base,
-            when_then,
-            else_expr,
-            ..
-        } => {
-            if let Some(base) = base {
-                visit(base);
-            }
-            for (when, then) in when_then {
-                visit(when);
-                visit(then);
-            }
-            if let Some(else_expr) = else_expr {
-                visit(else_expr);
-            }
-        }
-        hir::Expr::Function(call) => {
-            match &mut call.arguments {
-                hir::FunctionArguments::Star => {}
-                hir::FunctionArguments::Expressions {
-                    values, order_by, ..
-                } => {
-                    for value in values {
-                        visit(value);
-                    }
-                    for term in order_by {
-                        visit(&mut term.expr);
-                    }
-                }
-                hir::FunctionArguments::OrderedSet { direct, order_by } => {
-                    for value in direct {
-                        visit(value);
-                    }
-                    visit(&mut order_by.expr);
-                }
-            }
-            match &mut call.evaluation {
-                hir::FunctionEvaluation::Scalar => {}
-                hir::FunctionEvaluation::Aggregate { filter, .. }
-                | hir::FunctionEvaluation::Window { filter, .. } => {
-                    if let Some(filter) = filter {
-                        visit(filter);
-                    }
-                }
-            }
-        }
-        hir::Expr::InList { lhs, values, .. } => {
-            visit(lhs);
-            for value in values {
-                visit(value);
-            }
-        }
-        hir::Expr::Subquery(hir::SubqueryExpr::In { lhs, .. }) => visit(lhs),
-        hir::Expr::Like {
-            lhs, rhs, escape, ..
-        } => {
-            visit(lhs);
-            visit(rhs);
-            if let Some(escape) = escape {
-                visit(escape);
-            }
-        }
-        hir::Expr::Row(expressions) | hir::Expr::Array(expressions) => {
-            for expression in expressions {
-                visit(expression);
-            }
-        }
-        hir::Expr::Subscript { base, index } => {
-            visit(base);
-            visit(index);
-        }
-        hir::Expr::FieldAccess(access) => visit(&mut access.base),
-        hir::Expr::Raise { message, .. } => {
-            if let Some(message) = message {
-                visit(message);
-            }
-        }
-    }
-    replaced
 }

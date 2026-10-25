@@ -128,7 +128,7 @@ pub(super) fn emit_insert(
             "HIR INSERT target is not a B-tree table".into(),
         ));
     };
-    let (rows, query): (&[Vec<hir::Expr>], _) = match &insert.source {
+    let (rows, query): (&[Vec<hir::ExprId>], _) = match &insert.source {
         hir::InsertSource::DefaultValues => (&[Vec::new()], None),
         hir::InsertSource::Values(rows) => (rows, None),
         hir::InsertSource::Query(query) => (&[], Some(*query)),
@@ -162,7 +162,7 @@ pub(super) fn emit_insert(
     }
     for default in defaults {
         if !table.columns()[default.column].is_rowid_alias() {
-            column_values[default.column] = ColumnValue::Default(&default.value);
+            column_values[default.column] = ColumnValue::Default(default.value);
         }
     }
 
@@ -298,7 +298,7 @@ pub(super) fn emit_insert(
             });
             program.preassign_label_to_next_insn(start);
             for value_row in rows {
-                for (position, value) in value_row.iter().enumerate() {
+                for (position, &value) in value_row.iter().enumerate() {
                     super::expr::translate_expr_no_constant_opt(
                         program,
                         document,
@@ -322,7 +322,7 @@ pub(super) fn emit_insert(
             let reads_target = rows
                 .iter()
                 .flatten()
-                .any(|value| subquery_reads_table(document, value, target_table));
+                .any(|value| subquery_reads_table(document, *value, target_table));
             emit_coroutine_rows(
                 program,
                 insert,
@@ -353,12 +353,12 @@ pub(super) fn emit_insert(
 /// Whether `expression` has a subquery that reads `table`.
 fn subquery_reads_table(
     document: &hir::HirDocument,
-    expression: &hir::Expr,
+    expression: hir::ExprId,
     table: &hir::ResolvedTable,
 ) -> bool {
     let mut reads = false;
-    expression.for_each(&mut |expression| {
-        if let hir::Expr::Subquery(subquery) = expression {
+    document.exprs.at(expression).for_each(&mut |expression| {
+        if let hir::Expr::Subquery(subquery) = expression.node() {
             reads |= document.query_reads_table(super::dml::subquery_query(subquery), table);
         }
     });
@@ -379,7 +379,7 @@ fn emit_virtual_insert(
         crate::bail_constraint_error!("Table is read-only: {}", table.name);
     }
     let document = &plan.document;
-    let rows: &[Vec<hir::Expr>] = match &insert.source {
+    let rows: &[Vec<hir::ExprId>] = match &insert.source {
         hir::InsertSource::DefaultValues => &[Vec::new()],
         hir::InsertSource::Values(rows) => rows,
         hir::InsertSource::Query(_) => {
@@ -443,7 +443,7 @@ fn emit_virtual_insert(
                     super::expr::translate_expr_no_constant_opt(
                         program,
                         document,
-                        &row[position],
+                        row[position],
                         register,
                     )?;
                 }
@@ -556,16 +556,16 @@ pub(super) fn insert_root(plan: &HirPlan) -> Result<&hir::Insert> {
 }
 
 #[derive(Clone, Copy)]
-enum ColumnValue<'a> {
+enum ColumnValue {
     Null,
     /// The value at this position of each VALUES row.
     Row(usize),
-    Default(&'a hir::Expr),
+    Default(hir::ExprId),
 }
 
 /// What every inserted row needs besides its values.
 struct RowSink<'a, 'b> {
-    column_values: &'a [ColumnValue<'b>],
+    column_values: &'a [ColumnValue],
     rowid_value: Option<usize>,
     index_cursors: &'a [(&'b hir::IndexExpressions, CursorID)],
     returning: Option<ReturningBuffer<'b>>,
@@ -749,7 +749,7 @@ fn emit_coroutine_rows(
 /// Where the values of the row being inserted are.
 #[derive(Clone, Copy)]
 enum RowValues<'a> {
-    Expressions(&'a [hir::Expr]),
+    Expressions(&'a [hir::ExprId]),
     /// A coroutine yields each row into registers starting here.
     Registers(usize),
 }
@@ -791,7 +791,7 @@ impl InsertRow<'_> {
     fn emit(
         &self,
         program: &mut ProgramBuilder,
-        column_values: &[ColumnValue<'_>],
+        column_values: &[ColumnValue],
         rowid_value: Option<usize>,
         values: RowValues<'_>,
         index_cursors: &[(&hir::IndexExpressions, CursorID)],
@@ -807,7 +807,7 @@ impl InsertRow<'_> {
                     super::expr::translate_expr_no_constant_opt(
                         program,
                         document,
-                        &values[position],
+                        values[position],
                         register,
                     )?;
                 }
@@ -826,7 +826,7 @@ impl InsertRow<'_> {
                 ColumnValue::Row(position) => emit_value(program, *position, register)?,
                 ColumnValue::Default(value) => {
                     super::expr::translate_expr_no_constant_opt(
-                        program, document, value, register,
+                        program, document, *value, register,
                     )?;
                 }
             }
@@ -1196,7 +1196,7 @@ impl InsertRow<'_> {
                     } => self.emit_do_update(
                         program,
                         assignments,
-                        predicate.as_ref(),
+                        *predicate,
                         actions,
                         index_cursors,
                         returning,
@@ -1217,7 +1217,7 @@ impl InsertRow<'_> {
         &self,
         program: &mut ProgramBuilder,
         assignments: &[hir::Assignment],
-        predicate: Option<&hir::Expr>,
+        predicate: Option<hir::ExprId>,
         actions: &[CompiledAction<'_>],
         index_cursors: &[(&hir::IndexExpressions, CursorID)],
         returning: Option<ReturningBuffer<'_>>,
@@ -1310,7 +1310,7 @@ impl InsertRow<'_> {
         let new_rowid = rowid_value
             .map(|value| -> Result<usize> {
                 let register = program.alloc_register();
-                super::expr::translate_expr_no_constant_opt(program, document, value, register)?;
+                super::expr::translate_expr_no_constant_opt(program, document, *value, register)?;
                 program.emit_insn(Insn::MustBeInt {
                     reg: register,
                     target_pc: None,
@@ -1326,7 +1326,7 @@ impl InsertRow<'_> {
             match value {
                 Some(value) => {
                     super::expr::translate_expr_no_constant_opt(
-                        program, document, value, register,
+                        program, document, **value, register,
                     )?;
                     if column.notnull() && !column.is_rowid_alias() {
                         program.emit_insn(Insn::HaltIfNull {
@@ -1346,7 +1346,7 @@ impl InsertRow<'_> {
                 // NULL; reads of it use the rowid.
                 None if column.is_rowid_alias() => program.emit_null(register, None),
                 None => {
-                    super::expr::translate_expr_no_constant_opt(
+                    super::expr::translate_detached_expr_no_constant_opt(
                         program,
                         document,
                         &hir::Expr::Column(hir::ColumnRef {
@@ -1423,7 +1423,7 @@ impl InsertRow<'_> {
                 // given them as stored.
                 super::dml::with_stored_values(program, |program| {
                     for column in 0..columns {
-                        super::expr::translate_expr_no_constant_opt(
+                        super::expr::translate_detached_expr_no_constant_opt(
                             program,
                             document,
                             &hir::Expr::Column(hir::ColumnRef {
@@ -1451,7 +1451,7 @@ impl InsertRow<'_> {
             let new_trigger_row = if super::dml::has_custom_types(source) {
                 let start = program.alloc_registers(columns);
                 for column in 0..columns {
-                    super::expr::translate_expr_no_constant_opt(
+                    super::expr::translate_detached_expr_no_constant_opt(
                         program,
                         document,
                         &hir::Expr::Column(hir::ColumnRef {
@@ -1605,7 +1605,7 @@ impl InsertRow<'_> {
         // Every index entry holds the rowid, so a new rowid changes them all.
         for (old, cursor) in index_cursors {
             if new_rowid.is_none()
-                && !super::update::index_reads_assigned_column(source.id, old, &assigned)
+                && !super::update::index_reads_assigned_column(document, source.id, old, &assigned)
             {
                 continue;
             }
@@ -1626,7 +1626,7 @@ impl InsertRow<'_> {
                 .map(|predicate| -> Result<usize> {
                     let register = program.alloc_register();
                     super::expr::translate_expr_no_constant_opt(
-                        program, document, predicate, register,
+                        program, document, *predicate, register,
                     )?;
                     Ok(register)
                 })
@@ -1637,7 +1637,7 @@ impl InsertRow<'_> {
                 .map(|predicate| -> Result<usize> {
                     let register = program.alloc_register();
                     super::expr::translate_expr_no_constant_opt(
-                        program, document, predicate, register,
+                        program, document, *predicate, register,
                     )?;
                     Ok(register)
                 })
@@ -1661,7 +1661,7 @@ impl InsertRow<'_> {
                         super::expr::translate_expr_no_constant_opt(
                             program,
                             document,
-                            expression,
+                            *expression,
                             start + offset,
                         )?
                     }
@@ -2051,7 +2051,7 @@ impl InsertRow<'_> {
                 super::expr::translate_expr_no_constant_opt(
                     program,
                     self.target.document,
-                    &default.value,
+                    default.value,
                     register,
                 )?;
                 let affinity = column.affinity();
@@ -2315,7 +2315,7 @@ impl InsertRow<'_> {
             .map(|predicate| {
                 let register = program.alloc_register();
                 super::expr::translate_expr_no_constant_opt(
-                    program, document, predicate, register,
+                    program, document, *predicate, register,
                 )?;
                 Ok::<_, LimboError>(register)
             })
@@ -2329,7 +2329,10 @@ impl InsertRow<'_> {
             match expression {
                 Some(expression) if !super::dml::is_virtual_key_column(table, column) => {
                     super::expr::translate_expr_no_constant_opt(
-                        program, document, expression, register,
+                        program,
+                        document,
+                        *expression,
+                        register,
                     )?;
                 }
                 _ => {

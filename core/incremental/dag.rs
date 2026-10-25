@@ -46,14 +46,14 @@ pub struct Aggregate {
     pub func: AggFunc,
     /// The argument expressions, bound against the node's input schema.
     /// Empty for `COUNT(*)`.
-    pub args: Vec<hir::Expr>,
+    pub args: Vec<hir::ExprId>,
     pub distinct: bool,
     /// The FILTER clause, bound against the node's input schema.
-    pub filter: Option<hir::Expr>,
+    pub filter: Option<hir::ExprId>,
     /// The expression downstream operators read this aggregate's value
     /// through: the aggregate call of the view's query. `None` for the
     /// hidden liveness `COUNT(*)`, which no expression reads.
-    pub published: Option<hir::Expr>,
+    pub published: Option<hir::ExprId>,
 }
 
 /// The value layout of an operator's delta stream.
@@ -65,7 +65,7 @@ pub struct StreamSchema {
     /// Canonical expression used by downstream operators to bind each value
     /// slot. Base-table columns without a SQL name cannot be referenced by a
     /// later expression, so their slot deliberately has no expression.
-    pub columns: Vec<Option<hir::Expr>>,
+    pub columns: Vec<Option<hir::ExprId>>,
     pub bindings: Vec<StreamBinding>,
 }
 
@@ -140,14 +140,14 @@ pub enum OpNode {
     Filter {
         input: NodeId,
         /// Binds against the input's output schema.
-        predicate: hir::Expr,
+        predicate: hir::ExprId,
     },
 
     /// Projection (π). Linear. Output schema: `projections`, each an
     /// expression over the input's output schema.
     Project {
         input: NodeId,
-        projections: Vec<hir::Expr>,
+        projections: Vec<hir::ExprId>,
     },
 
     /// Rename a derived relation into the namespace exposed by its FROM-clause
@@ -175,7 +175,7 @@ pub enum OpNode {
         inputs: [NodeId; 2],
         /// ON predicates, desugared from USING/NATURAL; bind against the
         /// concatenated input schema.
-        on: Vec<hir::Expr>,
+        on: Vec<hir::ExprId>,
         kind: JoinKind,
     },
 
@@ -199,7 +199,7 @@ pub enum OpNode {
         input: NodeId,
         /// Group keys, bound against the input's output schema. Empty for a
         /// scalar aggregate (`scalar`).
-        group_exprs: Vec<hir::Expr>,
+        group_exprs: Vec<hir::ExprId>,
         /// One entry per group key.
         group_keys: Vec<KeyColumn>,
         /// `aggregates[0]` is the hidden liveness `COUNT(*)`. Its physical
@@ -268,15 +268,21 @@ impl MaintenanceDag {
 
 /// Accumulates nodes during decomposition, handing back the topological index
 /// of each pushed node.
-#[derive(Default)]
 pub struct DagBuilder {
     nodes: Vec<OpNode>,
     output_schemas: Vec<Arc<StreamSchema>>,
+    /// The expressions of the view's query, which the builder extends with
+    /// the expressions it creates.
+    pub exprs: hir::ExprArena,
 }
 
 impl DagBuilder {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(exprs: hir::ExprArena) -> Self {
+        Self {
+            nodes: Vec::new(),
+            output_schemas: Vec::new(),
+            exprs,
+        }
     }
 
     /// Append a node whose inputs were already pushed, returning its id.
@@ -297,7 +303,7 @@ impl DagBuilder {
     }
 
     /// Finalize with `root` as the output node.
-    pub fn finish(self, root: NodeId) -> Result<MaintenanceDag> {
+    pub fn finish(self, root: NodeId) -> Result<(MaintenanceDag, hir::ExprArena)> {
         if root + 1 != self.nodes.len() || self.nodes.len() != self.output_schemas.len() {
             return Err(LimboError::InternalError(
                 "maintenance DAG root must be the last node".to_string(),
@@ -316,14 +322,17 @@ impl DagBuilder {
                 "every maintenance DAG node must contribute to the root".to_string(),
             ));
         }
-        Ok(MaintenanceDag {
-            nodes: self.nodes,
-            output_schemas: self.output_schemas,
-            root,
-        })
+        Ok((
+            MaintenanceDag {
+                nodes: self.nodes,
+                output_schemas: self.output_schemas,
+                root,
+            },
+            self.exprs,
+        ))
     }
 
-    fn derive_output_schema(&self, node: &OpNode) -> Result<StreamSchema> {
+    fn derive_output_schema(&mut self, node: &OpNode) -> Result<StreamSchema> {
         let (columns, bindings) = match node {
             OpNode::Scan { table, source } => (
                 table
@@ -334,7 +343,7 @@ impl DagBuilder {
                         column
                             .name
                             .as_ref()
-                            .map(|_| hir::Expr::column(*source, column_index))
+                            .map(|_| self.exprs.push(hir::Expr::column(*source, column_index)))
                     })
                     .collect(),
                 vec![StreamBinding { source: *source }],
@@ -344,7 +353,7 @@ impl DagBuilder {
                 self.output_schemas[*input].bindings.clone(),
             ),
             OpNode::Project { input, projections } => (
-                projections.iter().map(|expr| Some(expr.clone())).collect(),
+                projections.iter().map(|expr| Some(*expr)).collect(),
                 self.output_schemas[*input].bindings.clone(),
             ),
             OpNode::Alias {
@@ -366,7 +375,7 @@ impl DagBuilder {
                             column
                                 .name
                                 .as_ref()
-                                .map(|_| hir::Expr::column(*source, column_index))
+                                .map(|_| self.exprs.push(hir::Expr::column(*source, column_index)))
                         })
                         .collect(),
                     vec![StreamBinding { source: *source }],
@@ -427,11 +436,7 @@ impl DagBuilder {
                     .iter()
                     .cloned()
                     .map(Some)
-                    .chain(
-                        aggregates
-                            .iter()
-                            .map(|aggregate| aggregate.published.clone()),
-                    )
+                    .chain(aggregates.iter().map(|aggregate| aggregate.published))
                     .collect(),
                 self.output_schemas[*input].bindings.clone(),
             ),
@@ -482,7 +487,7 @@ mod tests {
 
     #[test]
     fn finish_rejects_nodes_disconnected_from_root() {
-        let mut builder = DagBuilder::new();
+        let mut builder = DagBuilder::new(hir::ExprArena::default());
         builder.push(scan("orphan", 0)).unwrap();
         let root = builder.push(scan("root", 1)).unwrap();
 
@@ -494,35 +499,40 @@ mod tests {
 
     #[test]
     fn aggregate_schema_does_not_publish_hidden_liveness_count() {
-        let count = hir::Expr::Literal(ast::Literal::Numeric("0".to_string()));
-        let aggregate = |published: Option<hir::Expr>| Aggregate {
+        let mut builder = DagBuilder::new(hir::ExprArena::default());
+        let count = builder
+            .exprs
+            .push(hir::Expr::Literal(ast::Literal::Numeric("0".to_string())));
+        let aggregate = |published: Option<hir::ExprId>| Aggregate {
             func: AggFunc::Count0,
             args: Vec::new(),
             distinct: false,
             filter: None,
             published,
         };
-        let mut builder = DagBuilder::new();
         let input = builder.push(scan("t", 0)).unwrap();
         let root = builder
             .push(OpNode::Aggregate {
                 input,
-                group_exprs: vec![count.clone()],
+                group_exprs: vec![count],
                 group_keys: vec![KeyColumn {
                     collation: CollationSeq::Binary,
                     ambiguous: false,
                 }],
-                aggregates: vec![aggregate(None), aggregate(Some(count.clone()))],
+                aggregates: vec![aggregate(None), aggregate(Some(count))],
                 multiset_keys: vec![None, None],
                 scalar: false,
             })
             .unwrap();
-        let dag = builder.finish(root).unwrap();
+        let (dag, exprs) = builder.finish(root).unwrap();
 
         let columns = &dag.root_schema().columns;
+        let is_count = |column: &Option<hir::ExprId>| {
+            column.is_some_and(|c| exprs.at(c).equivalent(exprs.at(count)))
+        };
         assert_eq!(columns.len(), 3);
-        assert!(columns[0].as_ref().is_some_and(|c| c.equivalent(&count)));
+        assert!(is_count(&columns[0]));
         assert!(columns[1].is_none());
-        assert!(columns[2].as_ref().is_some_and(|c| c.equivalent(&count)));
+        assert!(is_count(&columns[2]));
     }
 }
