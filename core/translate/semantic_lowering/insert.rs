@@ -717,18 +717,35 @@ fn emit_coroutine_rows(
     let next = program.allocate_label();
     program.preassign_label_to_next_insn(top);
     for position in 0..width {
+        let mut destinations = sink
+            .column_values
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| matches!(value, ColumnValue::Row(row) if *row == position))
+            .map(|(column, _)| row.columns + column)
+            .chain((sink.rowid_value == Some(position)).then_some(row.rowid));
+        let Some(first) = destinations.next() else {
+            continue;
+        };
         program.emit_insn(Insn::Column {
             cursor_id: temp,
             column: position,
-            dest: values + position,
+            dest: first,
             default: None,
         });
+        for destination in destinations {
+            program.emit_insn(Insn::Copy {
+                src_reg: first,
+                dst_reg: destination,
+                extra_amount: 0,
+            });
+        }
     }
     row.emit(
         program,
         sink.column_values,
         sink.rowid_value,
-        RowValues::Registers(values),
+        RowValues::InPlace,
         sink.index_cursors,
         sink.returning,
         next,
@@ -752,6 +769,7 @@ enum RowValues<'a> {
     Expressions(&'a [hir::ExprId]),
     /// A coroutine yields each row into registers starting here.
     Registers(usize),
+    InPlace,
 }
 
 /// The registers of the row an INSERT writes: the rowid, then one register
@@ -816,6 +834,7 @@ impl InsertRow<'_> {
                     dst_reg: register,
                     extra_amount: 0,
                 }),
+                RowValues::InPlace => {}
             }
             Ok::<_, LimboError>(())
         };

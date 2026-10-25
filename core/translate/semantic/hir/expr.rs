@@ -509,6 +509,10 @@ impl ExprArena {
         self.nodes.len()
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &Expr> {
+        self.nodes.iter()
+    }
+
     pub fn truncate(&mut self, len: usize) {
         self.nodes.truncate(len);
         self.constant.truncate(len);
