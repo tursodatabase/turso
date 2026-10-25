@@ -303,7 +303,7 @@ fn aborted_transaction_rejects_write_set_insert() {
 fn rollback_only_reports_rowids_restored_by_a_delete() {
     let tx_id = 1;
     let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(666));
-    let row = Row::new_table_row(row_id, &[], 0).unwrap();
+    let row = Row::new_table_row(row_id, &[]).unwrap();
 
     let replacement = RowVersion::new(
         1,
@@ -411,7 +411,7 @@ fn mv_store_skiplist_allocations_are_fallible() {
         id: 1,
         begin: PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
         end: PackedTs::pack(None),
-        row: Row::new_table_row(row_id.clone(), &[], 0).unwrap(),
+        row: Row::new_table_row(row_id.clone(), &[]).unwrap(),
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -427,11 +427,11 @@ fn row_payload_allocation_uses_passed_allocator() {
     let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
 
     alloc.fail_allocations(true);
-    let result = Row::new_table_row_in(row_id.clone(), &[1, 2, 3], 1, alloc.clone());
+    let result = Row::new_table_row_in(row_id.clone(), &[1, 2, 3], alloc.clone());
     assert!(matches!(result, Err(crate::alloc::TryReserveError)));
 
     alloc.fail_allocations(false);
-    let row = Row::new_table_row_in(row_id, &[1, 2, 3], 1, alloc).unwrap();
+    let row = Row::new_table_row_in(row_id, &[1, 2, 3], alloc).unwrap();
     assert_eq!(row.payload(), &[1, 2, 3]);
 }
 
@@ -483,7 +483,7 @@ fn seqcompact_tombstone_payload_uses_store_allocator() {
     versions.write().try_reserve(1).unwrap();
 
     alloc.fail_allocations(true);
-    store.seqcompact_commit_delete(row_id, 1, 10);
+    store.seqcompact_commit_delete(row_id, 10);
 }
 
 #[test]
@@ -504,7 +504,7 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
 
     let table_id = MVTableId::from(-2);
     let row_id = RowID::new(table_id, RowKey::Int(42));
-    let row = Row::new_table_row(row_id.clone(), &[], 0).unwrap();
+    let row = Row::new_table_row(row_id.clone(), &[]).unwrap();
     let allocator = store.get_rowid_allocator(&table_id);
 
     alloc.fail_allocations(true);
@@ -1831,7 +1831,7 @@ impl MvccTestDbNoConn {
 pub(crate) fn generate_simple_string_row(table_id: MVTableId, id: i64, data: &str) -> Row {
     let record =
         ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1).unwrap();
-    Row::new_table_row(RowID::new(table_id, RowKey::Int(id)), record.as_blob(), 1).unwrap()
+    Row::new_table_row(RowID::new(table_id, RowKey::Int(id)), record.as_blob()).unwrap()
 }
 
 pub(crate) fn generate_simple_string_record(data: &str) -> ImmutableRecord {
@@ -2476,7 +2476,6 @@ fn test_recovery_replays_schema_op_after_data_op_in_frame() {
         row: Row::new_table_row(
             RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(2)),
             schema_record.as_blob(),
-            5,
         )
         .unwrap(),
         btree_resident: false,
@@ -7255,7 +7254,7 @@ fn setup_test_db() -> (MvccTestDb, u64, MVTableId, i64) {
         let id = RowID::new(table_id, RowKey::Int(*row_id));
         let record =
             ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1).unwrap();
-        let row = Row::new_table_row(id, record.as_blob(), 1).unwrap();
+        let row = Row::new_table_row(id, record.as_blob()).unwrap();
         db.mvcc_store.insert(tx_id, row).unwrap();
     }
 
@@ -7291,7 +7290,7 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
         let id = RowID::new(table_id, RowKey::Int(*i));
         let data = format!("row{i}");
         let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data))], 1).unwrap();
-        let row = Row::new_table_row(id, record.as_blob(), 1).unwrap();
+        let row = Row::new_table_row(id, record.as_blob()).unwrap();
         db.mvcc_store.insert(tx_id, row).unwrap();
     }
 
@@ -8452,7 +8451,7 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
         id: 20,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(5))),
         end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(writer_id))),
-        row: Row::new_index_row(row_id, 1),
+        row: Row::new_index_row(row_id),
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -9372,7 +9371,6 @@ fn write_synthetic_row(db: &MvccTestDbNoConn, value: &str) {
             Row::new_table_row(
                 RowID::new((-1).into(), RowKey::Int(next_schema_rowid)),
                 data.as_blob(),
-                5,
             )
             .unwrap(),
         )
@@ -10504,10 +10502,10 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
     let row_key =
         SortableIndexKey::new_from_payload_in(&record, index_info, crate::alloc::TursoAllocator)
             .unwrap();
-    let row = Row::new_index_row(
-        RowID::new(MVTableId::new(-42), RowKey::Record(Arc::new(row_key))),
-        index.columns.len(),
-    );
+    let row = Row::new_index_row(RowID::new(
+        MVTableId::new(-42),
+        RowKey::Record(Arc::new(row_key)),
+    ));
     let mut write_row_sm = db
         .mvcc_store
         .write_row_to_pager(&row, cursor.clone(), true)
@@ -12200,7 +12198,20 @@ fn test_short_version_chain_has_no_unused_capacity() {
 #[test]
 fn test_row_version_size() {
     assert_eq!(std::mem::size_of::<WalPos>(), 12);
-    assert_eq!(std::mem::size_of::<RowVersion>(), 88);
+    assert_eq!(std::mem::size_of::<RowVersion>(), 80);
+}
+
+/// A row does not store its column count. It reads the count from its record,
+/// and a tombstone with an empty payload has no columns.
+#[test]
+fn test_row_column_count_comes_from_the_record() {
+    let id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
+    let record =
+        ImmutableRecord::from_values(&[Value::from_i64(7), Value::build_text("seven")], 2).unwrap();
+    let row = Row::new_table_row(id.clone(), record.as_blob()).unwrap();
+    assert_eq!(row.column_count(), 2);
+    let tombstone = Row::new_table_row(id, &[]).unwrap();
+    assert_eq!(tombstone.column_count(), 0);
 }
 
 /// A tombstone over a B-tree row keeps a copy of the deleted row only for the

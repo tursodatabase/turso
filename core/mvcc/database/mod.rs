@@ -362,37 +362,26 @@ pub struct Row {
     pub id: RowID,
     /// Data is None for index rows because the key holds all the data.
     pub data: Option<crate::alloc::ArcSlice<u8>>,
-    pub column_count: usize,
 }
 
 impl Row {
-    pub fn new_table_row(
-        id: RowID,
-        data: &[u8],
-        column_count: usize,
-    ) -> Result<Self, TryReserveError> {
-        Self::new_table_row_in(id, data, column_count, TursoAllocator)
+    pub fn new_table_row(id: RowID, data: &[u8]) -> Result<Self, TryReserveError> {
+        Self::new_table_row_in(id, data, TursoAllocator)
     }
 
     pub fn new_table_row_in<A: ConcurrentAllocator>(
         id: RowID,
         data: &[u8],
-        column_count: usize,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
         Ok(Self {
             id,
             data: Some(crate::alloc::try_arc_slice_from_slice_in(data, alloc)?),
-            column_count,
         })
     }
 
-    pub fn new_index_row(id: RowID, column_count: usize) -> Self {
-        Self {
-            id,
-            data: None,
-            column_count,
-        }
+    pub fn new_index_row(id: RowID) -> Self {
+        Self { id, data: None }
     }
 
     pub fn is_index_row(&self) -> bool {
@@ -404,6 +393,13 @@ impl Row {
             RowKey::Int(_) => self.data.as_deref().expect("table rows should have data"),
             RowKey::Record(ref sortable_key) => sortable_key.key.get_payload(),
         }
+    }
+
+    /// The number of columns in the record of the row. A tombstone with an
+    /// empty payload has none. Each row version stores the record, so it does
+    /// not also store this number.
+    pub fn column_count(&self) -> usize {
+        ImmutableRecordRef::from_bin_record(self.payload()).column_count()
     }
 }
 
@@ -5701,11 +5697,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         tx.record_deleted_index_version((index_id, arc_key), version_id);
                         return Ok(true);
                     }
-                    let Some(record) = btree_record else {
+                    if btree_record.is_none() {
                         return Ok(false);
-                    };
+                    }
                     let id = RowID::new(id.table_id, RowKey::Record(arc_key.clone()));
-                    let row = Row::new_index_row(id.clone(), record.column_count());
+                    let row = Row::new_index_row(id.clone());
                     let version_id = self.insert_tombstone(tx_id, row, &mut locked_row_versions)?;
                     drop(locked_row_versions);
                     self.bump_index_rows_epoch();
@@ -5755,15 +5751,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let Some(record) = btree_record else {
                     return Ok(false);
                 };
-                let (payload, column_count) = if Self::tombstone_keeps_deleted_row(tx, id.table_id)
-                {
-                    (record.get_payload(), record.column_count())
+                let payload = if Self::tombstone_keeps_deleted_row(tx, id.table_id) {
+                    record.get_payload()
                 } else {
-                    (&[][..], 0)
+                    &[]
                 };
                 let row = crate::with_mv_store_allocation_site!(
                     RowPayload,
-                    Row::new_table_row_in(id.clone(), payload, column_count, self.allocator())
+                    Row::new_table_row_in(id.clone(), payload, self.allocator())
                 )?;
                 let version_id = self.insert_tombstone(tx_id, row, &mut locked_row_versions)?;
                 drop(locked_row_versions);
@@ -8933,8 +8928,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Passive sequence compaction: record end-stamped deletes instead of inline B-tree purge.
-    pub fn seqcompact_commit_delete(&self, rowid: RowID, num_cols: usize, end_ts: u64) {
-        if !self.seqcompact_stamp_delete(&rowid, num_cols, end_ts) {
+    pub fn seqcompact_commit_delete(&self, rowid: RowID, end_ts: u64) {
+        if !self.seqcompact_stamp_delete(&rowid, end_ts) {
             return;
         }
         if self.mark_checkpoint_dirty_key(&rowid, end_ts).is_err() {
@@ -8942,7 +8937,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    fn seqcompact_stamp_delete(&self, rowid: &RowID, num_cols: usize, end_ts: u64) -> bool {
+    fn seqcompact_stamp_delete(&self, rowid: &RowID, end_ts: u64) -> bool {
         loop {
             let Ok(row_versions) = self.get_or_create_table_row_versions(rowid.clone()) else {
                 return false;
@@ -8965,7 +8960,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
             // B-tree-only row: btree-resident tombstone so collection materializes the delete.
             let version_id = self.get_version_id();
-            let row = Row::new_table_row_in(rowid.clone(), &[], num_cols, self.alloc.clone())
+            let row = Row::new_table_row_in(rowid.clone(), &[], self.alloc.clone())
                 .expect("empty tombstone row");
             let _ = self.insert_version_raw(
                 &mut versions,
@@ -10145,24 +10140,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                         Row::new_table_row_in(
                                             rowid.clone(),
                                             record.as_blob(),
-                                            record.column_count(),
                                             self.alloc.clone(),
                                         )?
                                     } else {
                                         Row::new_table_row_in(
                                             rowid.clone(),
                                             &[],
-                                            0,
                                             self.alloc.clone(),
                                         )?
                                     }
                                 } else {
-                                    Row::new_table_row_in(
-                                        rowid.clone(),
-                                        &[],
-                                        0,
-                                        self.alloc.clone(),
-                                    )?
+                                    Row::new_table_row_in(rowid.clone(), &[], self.alloc.clone())?
                                 }
                             );
                             if let Some(versions) = self.rows.get(&rowid) {

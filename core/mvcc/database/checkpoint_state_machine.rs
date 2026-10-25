@@ -368,7 +368,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// on first entry to that state; cleared when the driver completes.
     seq_compact: Option<SeqCompactDriver<Clock, A>>,
     /// Sequence deletes recorded in passive mode; applied in the publish window.
-    pending_seq_deletes: Vec<(RowID, usize)>,
+    pending_seq_deletes: Vec<RowID>,
     /// Collection upper bound (`last_committed_tx_ts` at snapshot). `u64::MAX` = no bound.
     snapshot_ts: u64,
     build_local_schema_sm: Option<StateMachine<BuildLocalSchemaViewStateMachine<Clock, A>>>,
@@ -490,7 +490,7 @@ struct SeqCompactDriver<Clock: LogicalClock, A: ConcurrentAllocator = TursoAlloc
     passive: bool,
     /// Rows recorded for deletion in passive mode (drained by the checkpoint
     /// state machine into its publish window).
-    compacted: Vec<(RowID, usize)>,
+    compacted: Vec<RowID>,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -693,13 +693,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> SeqCompactDriver<Clock, A> {
                                 // purge contract needs the lock). Record the row; the publish
                                 // window turns it into a proper end-stamped delete and a later
                                 // checkpoint materializes the physical delete.
-                                self.compacted.push((
-                                    RowID {
-                                        table_id: seq.table_id,
-                                        row_id: RowKey::Int(k),
-                                    },
-                                    seq.backing_num_cols,
-                                ));
+                                self.compacted.push(RowID {
+                                    table_id: seq.table_id,
+                                    row_id: RowKey::Int(k),
+                                });
                                 self.phase = SeqCompactPhase::ScanNext;
                             } else {
                                 // Stash the key for the paired MVCC purge that
@@ -1447,7 +1444,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 special_write = Some(SpecialWrite::BTreeDestroy {
                                     table_id,
                                     root_page: root_page as u64,
-                                    num_columns: version.row.column_count,
+                                    num_columns: version.row.column_count(),
                                 });
                             }
                         } else if root_page < 0 {
@@ -2147,10 +2144,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // row live and conflict, never re-synthesize a tombstone) and > durable_txid_max_new (the
         // boundary stored below), so the next checkpoint still materializes the physical delete.
         if let Some(ts) = seq_delete_ts {
-            for (rowid, num_cols) in
-                std::mem::replace(&mut self.pending_seq_deletes, crate::alloc::vec![])
-            {
-                self.mvstore.seqcompact_commit_delete(rowid, num_cols, ts);
+            for rowid in std::mem::replace(&mut self.pending_seq_deletes, crate::alloc::vec![]) {
+                self.mvstore.seqcompact_commit_delete(rowid, ts);
             }
         }
         let ops = std::mem::replace(&mut self.pending_rootmap_ops, crate::alloc::vec![]);
@@ -2419,7 +2414,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             return Ok(());
         }
 
-        let (table_id, num_columns) = self.mvcc_meta_table.ok_or_else(|| {
+        let (table_id, _) = self.mvcc_meta_table.ok_or_else(|| {
             LimboError::Corrupt(format!(
                 "Missing required internal metadata table {MVCC_META_TABLE_NAME}"
             ))
@@ -2442,7 +2437,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             Row::new_table_row_in(
                 RowID::new(table_id, RowKey::Int(1)),
                 record.get_payload(),
-                num_columns,
                 self.mvstore.allocator(),
             )?
         );
@@ -2711,7 +2705,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         _ => None,
                     };
                     (
-                        row_version.row.column_count,
+                        row_version.row.column_count(),
                         row_version.row.id.table_id,
                         *special_write,
                         drop_ts,
@@ -3888,7 +3882,6 @@ mod tests {
             row: Row::new_table_row(
                 RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(rowid)),
                 record.as_blob(),
-                5,
             )
             .unwrap(),
             btree_resident: false,
@@ -3972,12 +3965,8 @@ mod tests {
             id: 1,
             begin: crate::mvcc::database::PackedTs::pack(None),
             end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(2))),
-            row: Row::new_table_row(
-                RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(9)),
-                &[],
-                0,
-            )
-            .unwrap(),
+            row: Row::new_table_row(RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(9)), &[])
+                .unwrap(),
             btree_resident: false,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
@@ -4026,10 +4015,7 @@ mod tests {
         let sortable_key =
             SortableIndexKey::new_from_payload_in(&key_record, index_info, TursoAllocator).unwrap();
         let key_arc = Arc::new(sortable_key.clone());
-        let row = Row::new_index_row(
-            RowID::new(index_id, RowKey::Record(Arc::new(sortable_key))),
-            2,
-        );
+        let row = Row::new_index_row(RowID::new(index_id, RowKey::Record(Arc::new(sortable_key))));
         let row_version = RowVersion {
             id: version_id,
             begin: crate::mvcc::database::PackedTs::pack(begin.map(TxTimestampOrID::Timestamp)),
@@ -4105,12 +4091,8 @@ mod tests {
             id: version_id,
             begin: crate::mvcc::database::PackedTs::pack(begin.map(TxTimestampOrID::Timestamp)),
             end: crate::mvcc::database::PackedTs::pack(end.map(TxTimestampOrID::Timestamp)),
-            row: Row::new_table_row(
-                RowID::new(table_id, RowKey::Int(rowid)),
-                record.as_blob(),
-                1,
-            )
-            .unwrap(),
+            row: Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), record.as_blob())
+                .unwrap(),
             btree_resident,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }

@@ -1905,25 +1905,19 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 let record = record.as_ref().ok_or_else(|| {
                     LimboError::InternalError("TableRowId should have a record".to_string())
                 })?;
-                let num_columns = record.column_count();
                 crate::with_mv_store_allocation_site!(
                     RowPayload,
-                    Row::new_table_row_in(
-                        row_id,
-                        record.get_payload(),
-                        num_columns,
-                        self.db.allocator(),
-                    )
+                    Row::new_table_row_in(row_id, record.get_payload(), self.db.allocator(),)
                 )
             }
             MvccCursorType::Index(_) => {
-                let BTreeKey::IndexKey(record) = key else {
+                let BTreeKey::IndexKey(_) = key else {
                     return Err(LimboError::InternalError(
                         "Index cursor requires an IndexKey".to_string(),
                     )
                     .into());
                 };
-                Ok(Row::new_index_row(row_id, record.column_count()))
+                Ok(Row::new_index_row(row_id))
             }
         }?;
 

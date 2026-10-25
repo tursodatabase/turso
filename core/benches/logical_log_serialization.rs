@@ -13,7 +13,7 @@ fn main() {
 fn table_upsert(payload_len: usize) -> RowVersion {
     let payload = vec![0x5a; payload_len];
     let row =
-        Row::new_table_row(RowID::new(MVTableId::new(-1), RowKey::Int(42)), &payload, 1).unwrap();
+        Row::new_table_row(RowID::new(MVTableId::new(-1), RowKey::Int(42)), &payload).unwrap();
     RowVersion::new(1, Some(TxTimestampOrID::Timestamp(1)), None, row, false)
 }
 
