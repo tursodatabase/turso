@@ -20394,6 +20394,21 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                         .io
                         .block(|| pager.with_header(|header| header.reserved_space))?
                 };
+                // Like SQLite, a valid size from the last PRAGMA page_size wins over the
+                // source's, except when the source is in memory. A 512-byte page has too
+                // little usable space for more than 32 reserved bytes, so SQLite uses 1024.
+                let next_page_size = program.connection.next_page_size.load(Ordering::SeqCst);
+                let page_size =
+                    if PageSize::new(next_page_size).is_some() && !source_db.is_in_memory_db() {
+                        next_page_size
+                    } else {
+                        page_size
+                    };
+                let page_size = if reserved_space > 32 && page_size == 512 {
+                    1024
+                } else {
+                    page_size
+                };
 
                 // Mirror source feature flags to the output so schema replay
                 // can resolve custom types, generated columns, vtab modules, etc.

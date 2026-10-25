@@ -1905,6 +1905,9 @@ fn vacuum_in_place_step(
                         });
                         cleanup_state.source_tx_open = true;
                         cleanup_state.vacuum_lock_held = true;
+                        // SQLite drops the pending PRAGMA page_size when it vacuums a WAL
+                        // database in place, so a later VACUUM INTO does not use it.
+                        connection.next_page_size.store(0, Ordering::SeqCst);
                         *phase = VacuumInPlacePhase::ReadSourceMetadata;
                         continue;
                     }
