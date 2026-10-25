@@ -86,7 +86,9 @@ mod time;
 mod translate;
 mod util;
 #[cfg(feature = "uuid")]
-mod uuid;
+pub mod uuid;
+#[cfg(feature = "uuid")]
+pub use uuid::parse_uuid_bytes;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod vdbe;
 mod vtab;

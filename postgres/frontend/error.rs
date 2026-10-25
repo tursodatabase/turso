@@ -81,6 +81,11 @@ impl From<&LimboError> for ErrorReport {
                 report.detail = constraint_detail(violation);
             }
         }
+        if let LimboError::Raise(_, msg) = error {
+            if msg == "invalid UUID value" {
+                report.message = "invalid input syntax for type uuid".to_string();
+            }
+        }
         report
     }
 }
@@ -268,10 +273,27 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::OutOfMemory => SQLSTATE_OUT_OF_MEMORY,
         LimboError::TableLocked | LimboError::Busy => SQLSTATE_LOCK_NOT_AVAILABLE,
         LimboError::Interrupt => SQLSTATE_QUERY_CANCELED,
-        LimboError::Raise(_, _) => SQLSTATE_RAISE_EXCEPTION,
+        LimboError::Raise(_, msg) => raise_error_sqlstate(msg),
         LimboError::RaiseIgnore => SQLSTATE_ASSERT_FAILURE,
         LimboError::Corrupt(_) | LimboError::NotADB => SQLSTATE_DATA_CORRUPTED,
         _ => SQLSTATE_INTERNAL_ERROR,
+    }
+}
+
+fn raise_error_sqlstate(msg: &str) -> &'static str {
+    if msg == "invalid UUID value" || msg.starts_with("invalid input value for enum") {
+        SQLSTATE_INVALID_TEXT_REPRESENTATION
+    } else if msg == "invalid date value"
+        || msg == "invalid time value"
+        || msg == "invalid timestamp value"
+    {
+        SQLSTATE_INVALID_DATETIME_FORMAT
+    } else if msg == "integer out of range for smallint" {
+        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
+    } else if msg == "value too long for varchar" {
+        SQLSTATE_STRING_DATA_RIGHT_TRUNCATION
+    } else {
+        SQLSTATE_RAISE_EXCEPTION
     }
 }
 
@@ -395,6 +417,52 @@ mod tests {
                 code,
                 "wrong SQLSTATE for tx error {msg:?}"
             );
+        }
+    }
+
+    #[test]
+    fn raise_errors_classify_by_message() {
+        for (msg, code, expected_msg) in [
+            (
+                "invalid UUID value",
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                Some("invalid input syntax for type uuid"),
+            ),
+            (
+                "invalid input value for enum mood",
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                None,
+            ),
+            ("invalid date value", SQLSTATE_INVALID_DATETIME_FORMAT, None),
+            ("invalid time value", SQLSTATE_INVALID_DATETIME_FORMAT, None),
+            (
+                "invalid timestamp value",
+                SQLSTATE_INVALID_DATETIME_FORMAT,
+                None,
+            ),
+            (
+                "integer out of range for smallint",
+                SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                None,
+            ),
+            (
+                "value too long for varchar",
+                SQLSTATE_STRING_DATA_RIGHT_TRUNCATION,
+                None,
+            ),
+            ("custom raise error", SQLSTATE_RAISE_EXCEPTION, None),
+        ] {
+            let e = LimboError::Raise(turso_parser::ast::ResolveType::Abort, msg.to_string());
+            let report = ErrorReport::from(&e);
+            assert_eq!(
+                report.sqlstate, code,
+                "wrong SQLSTATE for raise error {msg:?}"
+            );
+            if let Some(exp_msg) = expected_msg {
+                assert_eq!(report.message, exp_msg);
+            } else {
+                assert_eq!(report.message, msg);
+            }
         }
     }
 }
