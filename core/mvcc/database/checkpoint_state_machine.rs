@@ -4,7 +4,7 @@ use crate::alloc::{
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
+    DeleteRowStateMachine, MVTableId, MvStore, RowID, RowKey, RowVersion, SortableIndexKey,
     TxTimestampOrID, WalPos, WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
     MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
@@ -307,9 +307,9 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     yield_instance_id: u64,
     /// Lock used to block other transactions from running during the checkpoint
     checkpoint_lock: Arc<TursoRwLock>,
-    /// All committed versions to write to the B-tree.
+    /// All committed versions to write to the B-tree, with the `RowID` of their chain.
     /// In the case of CREATE TABLE / DROP TABLE ops, contains a [SpecialWrite] to create/destroy the B-tree.
-    write_set: Vec<(RowVersion, Option<SpecialWrite>)>,
+    write_set: Vec<(RowID, RowVersion, Option<SpecialWrite>)>,
     /// State machine for writing rows to the B-tree
     write_row_state_machine: Option<StateMachine<WriteRowStateMachine>>,
     /// State machine for deleting rows from the B-tree
@@ -323,8 +323,9 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     destroyed_tables: HashSet<MVTableId>,
     /// Indexes that were destroyed in this checkpoint
     destroyed_indexes: HashSet<MVTableId>,
-    /// Index row changes to write: (index_id, row_version, is_delete)
-    index_write_set: Vec<(MVTableId, RowVersion, bool)>,
+    /// Index row changes to write: (row_id, row_version, is_delete). The table id of
+    /// `row_id` is the index id.
+    index_write_set: Vec<(RowID, RowVersion, bool)>,
     /// Map from index_id to Index struct (for creating cursors)
     /// This is populated when we process sqlite_schema rows for indexes
     index_id_to_index: HashMap<MVTableId, Arc<Index>>,
@@ -551,19 +552,26 @@ pub struct SqliteSchemaBtreeIdentity {
     id = "mvcc_recovered_schema_record_wellformed",
     verify = "full"
 )]
-pub fn sqlite_schema_btree_identity(version: &RowVersion) -> Option<SqliteSchemaBtreeIdentity> {
-    if version.row.id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+pub fn sqlite_schema_btree_identity(
+    table_id: MVTableId,
+    version: &RowVersion,
+) -> Option<SqliteSchemaBtreeIdentity> {
+    if table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
         return None;
     }
 
     // Recovery can synthesize payload-less sqlite_schema tombstones when the
     // pre-delete record is no longer available. Those versions do not carry
     // enough information to recover B-tree identity.
-    if version.row.payload().is_empty() {
+    let payload = version
+        .data
+        .as_deref()
+        .expect("sqlite_schema rows are table rows");
+    if payload.is_empty() {
         return None;
     }
 
-    let row_data = ImmutableRecordRef::from_bin_record(version.row.payload());
+    let row_data = ImmutableRecordRef::from_bin_record(payload);
     let Ok((col0, col3)) = row_data.get_two_values(0, 3) else {
         return None;
     };
@@ -588,9 +596,13 @@ pub fn sqlite_schema_btree_identity(version: &RowVersion) -> Option<SqliteSchema
     Some(SqliteSchemaBtreeIdentity { kind, root_page })
 }
 
+/// `lhs` and `rhs` are versions of a `sqlite_schema` row.
 fn sqlite_schema_versions_refer_to_btree(lhs: &RowVersion, rhs: &RowVersion) -> bool {
-    sqlite_schema_btree_identity(lhs)
-        .zip(sqlite_schema_btree_identity(rhs))
+    sqlite_schema_btree_identity(SQLITE_SCHEMA_MVCC_TABLE_ID, lhs)
+        .zip(sqlite_schema_btree_identity(
+            SQLITE_SCHEMA_MVCC_TABLE_ID,
+            rhs,
+        ))
         .is_some_and(|(lhs_id, rhs_id)| lhs_id == rhs_id)
 }
 
@@ -607,7 +619,9 @@ fn is_schema_metadata_only_rewrite(current: &RowVersion, next: Option<&RowVersio
         return false;
     }
 
-    let Some(_current_identity) = sqlite_schema_btree_identity(current) else {
+    let Some(_current_identity) =
+        sqlite_schema_btree_identity(SQLITE_SCHEMA_MVCC_TABLE_ID, current)
+    else {
         return false;
     };
 
@@ -1134,7 +1148,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             //   deleting a missing sqlite_schema row would be wrong.
             let is_schema_delete = table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
                 && !exists_in_db_file
-                && sqlite_schema_btree_identity(version).is_some()
+                && sqlite_schema_btree_identity(table_id, version).is_some()
                 && self
                     .durable_txid_max_old
                     .is_none_or(|txid_max_old| end_ts.is_some_and(|e| e > u64::from(txid_max_old)));
@@ -1283,12 +1297,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         if self.full_scan_generation.is_none() {
             self.debug_assert_checkpointable_table_keys_are_dirty();
         }
-        self.write_set.sort_by_key(|version| {
+        self.write_set.sort_by_key(|(row_id, _, _)| {
             (
                 // Sort by table_id descending (schema changes first)
-                std::cmp::Reverse(version.0.row.id.table_id),
+                std::cmp::Reverse(row_id.table_id),
                 // Then by row_id ascending
-                version.0.row.id.row_id.clone(),
+                row_id.row_id.clone(),
             )
         });
         Ok(None)
@@ -1361,7 +1375,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             // These don't need to be written to the B-tree, we just need to track them.
             let mut skip_write = false;
 
-            if let Some(schema_identity) = sqlite_schema_btree_identity(&version) {
+            if let Some(schema_identity) = sqlite_schema_btree_identity(key.table_id, &version) {
                 let root_page = schema_identity.root_page;
                 match schema_identity.kind {
                     SqliteSchemaBtreeKind::Index => {
@@ -1406,7 +1420,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         } else if root_page < 0 {
                             // CREATE INDEX (root page is negative so the index has not been checkpointed yet).
                             let index_id = MVTableId::from(root_page);
-                            let sqlite_schema_rowid = version.row.id.row_id.to_int_or_panic();
+                            let sqlite_schema_rowid = key.row_id.to_int_or_panic();
                             special_write = Some(SpecialWrite::BTreeCreateIndex {
                                 index_id,
                                 sqlite_schema_rowid,
@@ -1442,13 +1456,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 special_write = Some(SpecialWrite::BTreeDestroy {
                                     table_id,
                                     root_page: root_page as u64,
-                                    num_columns: version.row.column_count(),
+                                    num_columns: version.column_count(key),
                                 });
                             }
                         } else if root_page < 0 {
                             // CREATE TABLE (root page is negative so the table has not been checkpointed yet).
                             let table_id = MVTableId::from(root_page);
-                            let sqlite_schema_rowid = version.row.id.row_id.to_int_or_panic();
+                            let sqlite_schema_rowid = key.row_id.to_int_or_panic();
                             special_write = Some(SpecialWrite::BTreeCreate {
                                 table_id,
                                 sqlite_schema_rowid,
@@ -1459,7 +1473,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     }
                 }
             } else if is_delete
-                && version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
+                && key.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
                 && !version.btree_resident
             {
                 // Schema row without a B-tree identity (e.g. sequence, trigger, view).
@@ -1483,9 +1497,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 skip_write = true;
             }
             if !skip_write {
-                tracing::trace!("adding to write_set {:?}", (&version, &special_write));
+                tracing::trace!("adding to write_set {:?}", (key, &version, &special_write));
                 with_mvcc_checkpoint_allocation_site!(CheckpointWriteSet, {
-                    self.write_set.try_push((version, special_write))?;
+                    self.write_set
+                        .try_push((key.clone(), version, special_write))?;
                 });
             }
         }
@@ -1694,8 +1709,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in
                 // the database file.
                 with_mvcc_checkpoint_allocation_site!(CheckpointIndexWriteSet, {
-                    self.index_write_set
-                        .try_push((index_id, version, is_delete))?;
+                    self.index_write_set.try_push((
+                        RowID::new(index_id, RowKey::Record(index_key.clone())),
+                        version,
+                        is_delete,
+                    ))?;
                 });
             }
         }
@@ -1833,7 +1851,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let table_max = self
             .write_set
             .iter()
-            .map(|(version, _)| max_version_timestamp(version))
+            .map(|(_, version, _)| max_version_timestamp(version))
             .max()
             .unwrap_or_default();
         let index_max = self
@@ -1849,7 +1867,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn get_current_row_version(
         &self,
         write_set_index: usize,
-    ) -> Option<&(RowVersion, Option<SpecialWrite>)> {
+    ) -> Option<&(RowID, RowVersion, Option<SpecialWrite>)> {
         self.write_set.get(write_set_index)
     }
 
@@ -1857,7 +1875,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn get_current_row_version_mut(
         &mut self,
         write_set_index: usize,
-    ) -> Option<&mut (RowVersion, Option<SpecialWrite>)> {
+    ) -> Option<&mut (RowID, RowVersion, Option<SpecialWrite>)> {
         self.write_set.get_mut(write_set_index)
     }
 
@@ -1874,16 +1892,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             return true;
         };
         // Table not the same, then seek
-        if curr.0.row.id.table_id != next.0.row.id.table_id {
+        if curr.0.table_id != next.0.table_id {
             return true;
         }
         // If we have special write then seek
-        if curr.1.is_some() || next.1.is_some() {
+        if curr.2.is_some() || next.2.is_some() {
             return true;
         }
-        let (RowKey::Int(prev_id), RowKey::Int(next_id)) =
-            (&curr.0.row.id.row_id, &next.0.row.id.row_id)
-        else {
+        let (RowKey::Int(prev_id), RowKey::Int(next_id)) = (&curr.0.row_id, &next.0.row_id) else {
             return true;
         };
         // if next id is strictly prev_id + 1 then we don't need to seek
@@ -2028,9 +2044,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             // replace of the collected clone would resurrect the table (#7956).
             let vid = row_version.id;
             if let Some(existing) = row_versions.iter_mut().find(|rv| rv.id == vid) {
-                existing.row.data = row_version.row.data;
+                existing.data = row_version.data;
                 if existing.end().is_some() {
-                    if let Some(identity) = sqlite_schema_btree_identity(existing) {
+                    if let Some(identity) =
+                        sqlite_schema_btree_identity(SQLITE_SCHEMA_MVCC_TABLE_ID, existing)
+                    {
                         if identity.root_page > 0 {
                             self.ended_created_roots.insert(identity.root_page);
                         }
@@ -2249,12 +2267,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             let current = index;
             index += 1;
             let (row_id, stamp) = if current < self.write_set.len() {
-                if current > 0
-                    && self.write_set[current - 1].0.row.id == self.write_set[current].0.row.id
-                {
+                if current > 0 && self.write_set[current - 1].0 == self.write_set[current].0 {
                     continue;
                 }
-                let row_id = &self.write_set[current].0.row.id;
+                let row_id = &self.write_set[current].0;
                 let written = match row_id.row_id {
                     RowKey::Int(n) => self.written_table_rowids.contains(&(row_id.table_id, n)),
                     RowKey::Record(_) => false,
@@ -2328,12 +2344,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             index += 1;
             {
                 let (index_id, sortable_key, stamp) = if current < self.index_write_set.len() {
-                    let (index_id, row_version, _is_delete) = &self.index_write_set[current];
-                    let RowKey::Record(sortable_key) = &row_version.row.id.row_id else {
+                    let (row_id, _row_version, _is_delete) = &self.index_write_set[current];
+                    let RowKey::Record(sortable_key) = &row_id.row_id else {
                         unreachable!("index row versions always have Record keys");
                     };
                     (
-                        *index_id,
+                        row_id.table_id,
                         sortable_key,
                         self.written_index_slots.contains(&current),
                     )
@@ -2387,7 +2403,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn record_written_table_row(&mut self, write_set_index: usize) {
         let Some(row_id) = self
             .get_current_row_version(write_set_index)
-            .map(|(row_version, _)| row_version.row.id.clone())
+            .map(|(row_id, _, _)| row_id.clone())
         else {
             return;
         };
@@ -2430,23 +2446,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 2,
             )?
         );
-        let row = with_mvcc_checkpoint_allocation_site!(
+        let data = with_mvcc_checkpoint_allocation_site!(
             CheckpointMetadataPayload,
-            Row::new_table_row_in(
-                RowID::new(table_id, RowKey::Int(1)),
+            crate::alloc::try_arc_slice_from_slice_in(
                 record.get_payload(),
                 self.mvstore.allocator(),
             )?
         );
         with_mvcc_checkpoint_allocation_site!(CheckpointWriteSet, {
             self.write_set.try_push((
+                RowID::new(table_id, RowKey::Int(1)),
                 RowVersion {
                     id: 0,
                     begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(
                         new,
                     ))),
                     end: crate::mvcc::database::PackedTs::pack(None),
-                    row,
+                    data: Some(data),
                     btree_resident: true,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 },
@@ -2687,7 +2703,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
 
                 let (num_columns, table_id, special_write, drop_ts) = {
-                    let (row_version, special_write) = self
+                    let (row_id, row_version, special_write) = self
                         .get_current_row_version(write_set_index)
                         .ok_or_else(|| {
                             LimboError::InternalError(
@@ -2703,8 +2719,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         _ => None,
                     };
                     (
-                        row_version.row.column_count(),
-                        row_version.row.id.table_id,
+                        row_version.column_count(row_id),
+                        row_id.table_id,
                         *special_write,
                         drop_ts,
                     )
@@ -2850,7 +2866,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
                 let is_delete = self
                     .get_current_row_version(write_set_index)
-                    .is_some_and(|(v, _)| v.end().is_some());
+                    .is_some_and(|(_, v, _)| v.end().is_some());
                 if is_delete && !self.table_exists_for_snapshot(table_id) {
                     self.state = CheckpointState::WriteRow {
                         write_set_index: write_set_index + 1,
@@ -2881,14 +2897,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         .expect("Table ID does not have a root page");
                     let row_version = {
                         let alloc = self.mvstore.allocator();
-                        let (row_version, _) = self
+                        let (row_id, row_version, _) = self
                             .get_current_row_version_mut(write_set_index)
                             .ok_or_else(|| {
                                 LimboError::InternalError(
                                     "row version not found in write set".to_string(),
                                 )
                             })?;
-                        let record = ImmutableRecordRef::from_bin_record(row_version.row.payload());
+                        let record =
+                            ImmutableRecordRef::from_bin_record(row_version.payload(row_id));
 
                         let mut values = record.get_values_owned()?;
                         values[3] = Value::from_i64(root_page as i64);
@@ -2897,7 +2914,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         // while publishing the sqlite_schema root page can leave retry state with
                         // a durable btree and a stale rootpage=0 schema row.
                         // TODO: make this rewrite resumable before re-enabling fault injection.
-                        row_version.row.data = Some(crate::without_allocation_faults!(
+                        row_version.data = Some(crate::without_allocation_faults!(
                             crate::alloc::try_arc_slice_from_slice_in(record.get_payload(), alloc)?
                         ));
                         row_version.clone()
@@ -2915,14 +2932,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         .expect("Index ID does not have a root page");
                     let row_version = {
                         let alloc = self.mvstore.allocator();
-                        let (row_version, _) = self
+                        let (row_id, row_version, _) = self
                             .get_current_row_version_mut(write_set_index)
                             .ok_or_else(|| {
                                 LimboError::InternalError(
                                     "row version not found in write set".to_string(),
                                 )
                             })?;
-                        let record = ImmutableRecordRef::from_bin_record(row_version.row.payload());
+                        let record =
+                            ImmutableRecordRef::from_bin_record(row_version.payload(row_id));
                         let mut values = record.get_values_owned()?;
                         values[3] = Value::from_i64(root_page as i64);
                         let record = ImmutableRecord::from_values(&values, values.len())?;
@@ -2930,7 +2948,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         // while publishing the sqlite_schema root page can leave retry state with
                         // a durable btree and a stale rootpage=0 schema row.
                         // TODO: make this rewrite resumable before re-enabling fault injection.
-                        row_version.row.data = Some(crate::without_allocation_faults!(
+                        row_version.data = Some(crate::without_allocation_faults!(
                             crate::alloc::try_arc_slice_from_slice_in(record.get_payload(), alloc)?
                         ));
                         row_version.clone()
@@ -2951,13 +2969,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     cursor
                 };
 
-                let (row_version, _) =
-                    self.get_current_row_version(write_set_index)
-                        .ok_or_else(|| {
-                            LimboError::InternalError(
-                                "row version not found in write set".to_string(),
-                            )
-                        })?;
+                let (row_id, row_version, _) = self
+                    .get_current_row_version(write_set_index)
+                    .ok_or_else(|| {
+                        LimboError::InternalError("row version not found in write set".to_string())
+                    })?;
 
                 // Check if this is an insert or delete
                 if row_version.end().is_some() {
@@ -2967,7 +2983,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     if self
                         .created_btrees
                         .values()
-                        .any(|(table_id, _)| *table_id == row_version.row.id.table_id)
+                        .any(|(table_id, _)| *table_id == row_id.table_id)
                     {
                         self.state = CheckpointState::WriteRow {
                             write_set_index: write_set_index + 1,
@@ -2975,16 +2991,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         };
                         return Ok(TransitionResult::Continue);
                     }
-                    let state_machine = self
-                        .mvstore
-                        .delete_row_from_pager(row_version.row.id.clone(), cursor)?;
+                    let state_machine =
+                        self.mvstore.delete_row_from_pager(row_id.clone(), cursor)?;
                     self.delete_row_state_machine = Some(state_machine);
                     self.state = CheckpointState::DeleteRowStateMachine { write_set_index };
                 } else {
                     // This is an insert/update operation
-                    let state_machine =
-                        self.mvstore
-                            .write_row_to_pager(&row_version.row, cursor, requires_seek)?;
+                    let state_machine = self.mvstore.write_row_to_pager(
+                        &row_version.row(row_id),
+                        cursor,
+                        requires_seek,
+                    )?;
                     self.write_row_state_machine = Some(state_machine);
                     self.state = CheckpointState::WriteRowStateMachine { write_set_index };
                 }
@@ -3051,8 +3068,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     return Ok(TransitionResult::Continue);
                 }
 
-                let (index_id, row_version, is_delete) =
-                    &self.index_write_set[index_write_set_index];
+                let (row_id, row_version, is_delete) = &self.index_write_set[index_write_set_index];
+                let index_id = &row_id.table_id;
 
                 // Skip destroyed indexes
                 if self.destroyed_indexes.contains(index_id) {
@@ -3113,7 +3130,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     if self
                         .created_btrees
                         .values()
-                        .any(|(table_id, _)| *table_id == row_version.row.id.table_id)
+                        .any(|(table_id, _)| *table_id == row_id.table_id)
                     {
                         self.state = CheckpointState::WriteIndexRow {
                             index_write_set_index: index_write_set_index + 1,
@@ -3121,18 +3138,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         };
                         return Ok(TransitionResult::Continue);
                     }
-                    let state_machine = self
-                        .mvstore
-                        .delete_row_from_pager(row_version.row.id.clone(), cursor)?;
+                    let state_machine =
+                        self.mvstore.delete_row_from_pager(row_id.clone(), cursor)?;
                     self.delete_row_state_machine = Some(state_machine);
                     self.state = CheckpointState::DeleteIndexRowStateMachine {
                         index_write_set_index,
                     };
                 } else {
                     // This is an insert/update operation
-                    let state_machine =
-                        self.mvstore
-                            .write_row_to_pager(&row_version.row, cursor, requires_seek)?;
+                    let state_machine = self.mvstore.write_row_to_pager(
+                        &row_version.row(row_id),
+                        cursor,
+                        requires_seek,
+                    )?;
                     self.write_row_state_machine = Some(state_machine);
                     self.state = CheckpointState::WriteIndexRowStateMachine {
                         index_write_set_index,
@@ -3737,7 +3755,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> BuildLocalSchemaViewStateMachi
             match present {
                 Some(version) => {
                     let data = version
-                        .row
                         .data
                         .as_ref()
                         .expect("present schema version must carry row data at snapshot_ts");
@@ -3848,7 +3865,7 @@ mod tests {
     use super::*;
     use crate::alloc::vec;
     use crate::mvcc::database::tests::MvccTestDbNoConn;
-    use crate::mvcc::database::SortableIndexKey;
+    use crate::mvcc::database::{Row, SortableIndexKey};
     use crate::translate::collate::CollationSeq;
     use crate::types::{IndexInfo, KeyInfo};
     use turso_parser::ast::SortOrder;
@@ -3877,11 +3894,12 @@ mod tests {
             id: 1,
             begin: crate::mvcc::database::PackedTs::pack(begin.map(TxTimestampOrID::Timestamp)),
             end: crate::mvcc::database::PackedTs::pack(end.map(TxTimestampOrID::Timestamp)),
-            row: Row::new_table_row(
+            data: Row::new_table_row(
                 RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(rowid)),
                 record.as_blob(),
             )
-            .unwrap(),
+            .unwrap()
+            .data,
             btree_resident: false,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
@@ -3890,7 +3908,7 @@ mod tests {
     #[test]
     fn local_schema_record_shares_mvcc_payload() {
         let version = sqlite_schema_row_version(2, "table", "t", "t", -2, Some(1), None);
-        let payload = version.row.data.as_ref().unwrap();
+        let payload = version.data.as_ref().unwrap();
         let payload_ptr = payload.as_ptr();
 
         let record = ImmutableRecordRef::from_shared_record(payload.clone());
@@ -3905,7 +3923,7 @@ mod tests {
         let new = sqlite_schema_row_version(3, "index", "idx_t_a", "t", 7, Some(2), None);
 
         assert_eq!(
-            sqlite_schema_btree_identity(&old),
+            sqlite_schema_btree_identity(SQLITE_SCHEMA_MVCC_TABLE_ID, &old),
             Some(SqliteSchemaBtreeIdentity {
                 kind: SqliteSchemaBtreeKind::Index,
                 root_page: 7,
@@ -3946,7 +3964,10 @@ mod tests {
         let rewritten_trigger =
             sqlite_schema_row_version(9, "trigger", "trg_t", "t", 0, Some(2), None);
 
-        assert_eq!(sqlite_schema_btree_identity(&trigger), None);
+        assert_eq!(
+            sqlite_schema_btree_identity(SQLITE_SCHEMA_MVCC_TABLE_ID, &trigger),
+            None
+        );
         assert!(!sqlite_schema_versions_refer_to_btree(
             &trigger,
             &rewritten_trigger
@@ -3963,18 +3984,21 @@ mod tests {
             id: 1,
             begin: crate::mvcc::database::PackedTs::pack(None),
             end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(2))),
-            row: Row::new_table_row(RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(9)), &[])
-                .unwrap(),
+            data: Row::new_table_row(RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(9)), &[])
+                .unwrap()
+                .data,
             btree_resident: false,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
 
-        assert_eq!(sqlite_schema_btree_identity(&tombstone), None);
+        assert_eq!(
+            sqlite_schema_btree_identity(SQLITE_SCHEMA_MVCC_TABLE_ID, &tombstone),
+            None
+        );
         assert!(!is_schema_metadata_only_rewrite(&tombstone, None));
     }
 
     fn index_row_version(
-        index_id: MVTableId,
         key_text: &str,
         rowid: i64,
         version_id: u64,
@@ -4012,13 +4036,12 @@ mod tests {
         .unwrap();
         let sortable_key =
             SortableIndexKey::new_from_payload_in(&key_record, index_info, TursoAllocator).unwrap();
-        let key_arc = Arc::new(sortable_key.clone());
-        let row = Row::new_index_row(RowID::new(index_id, RowKey::Record(Arc::new(sortable_key))));
+        let key_arc = Arc::new(sortable_key);
         let row_version = RowVersion {
             id: version_id,
             begin: crate::mvcc::database::PackedTs::pack(begin.map(TxTimestampOrID::Timestamp)),
             end: crate::mvcc::database::PackedTs::pack(end.map(TxTimestampOrID::Timestamp)),
-            row,
+            data: None,
             btree_resident,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
@@ -4047,9 +4070,9 @@ mod tests {
 
         let index_id = MVTableId::from(-42);
         let (garbage_key, garbage_version) =
-            index_row_version(index_id, "blue_river_906", 75, 1, None, None, true);
+            index_row_version("blue_river_906", 75, 1, None, None, true);
         let (_, tombstone_version) =
-            index_row_version(index_id, "blue_river_906", 75, 2, None, Some(10), true);
+            index_row_version("blue_river_906", 75, 2, None, Some(10), true);
 
         insert_dirty_index_version(&mvstore, index_id, garbage_key, garbage_version);
         let entry = mvstore
@@ -4072,7 +4095,7 @@ mod tests {
         );
     }
 
-    fn committed_table_row_version(table_id: MVTableId, rowid: i64) -> RowVersion {
+    fn committed_table_row_version(table_id: MVTableId, rowid: i64) -> (RowID, RowVersion) {
         table_row_version(table_id, rowid, 1, Some(5), None, false)
     }
 
@@ -4083,17 +4106,19 @@ mod tests {
         begin: Option<u64>,
         end: Option<u64>,
         btree_resident: bool,
-    ) -> RowVersion {
+    ) -> (RowID, RowVersion) {
         let record = ImmutableRecord::from_values(&[Value::from_i64(rowid)], 1).unwrap();
-        RowVersion {
+        let row =
+            Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), record.as_blob()).unwrap();
+        let version = RowVersion {
             id: version_id,
             begin: crate::mvcc::database::PackedTs::pack(begin.map(TxTimestampOrID::Timestamp)),
             end: crate::mvcc::database::PackedTs::pack(end.map(TxTimestampOrID::Timestamp)),
-            row: Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), record.as_blob())
-                .unwrap(),
+            data: row.data,
             btree_resident,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-        }
+        };
+        (row.id, version)
     }
 
     fn checkpoint_for_collect_tests(
@@ -4121,8 +4146,8 @@ mod tests {
     fn checkpoint_collection_uses_btree_marker_for_existence_but_writes_surviving_replacement() {
         let checkpoint = checkpoint_for_collect_tests();
         let table_id = MVTableId::from(-2);
-        let btree_tombstone = table_row_version(table_id, 1, 1, None, Some(5), true);
-        let replacement = table_row_version(table_id, 1, 2, Some(5), None, false);
+        let (_, btree_tombstone) = table_row_version(table_id, 1, 1, None, Some(5), true);
+        let (_, replacement) = table_row_version(table_id, 1, 2, Some(5), None, false);
 
         let checkpointable =
             checkpoint.maybe_get_checkpointable_versions(&[btree_tombstone, replacement], table_id);
@@ -4136,8 +4161,8 @@ mod tests {
     fn checkpoint_collection_uses_btree_marker_for_later_delete_of_replacement() {
         let checkpoint = checkpoint_for_collect_tests();
         let table_id = MVTableId::from(-2);
-        let btree_tombstone = table_row_version(table_id, 1, 1, None, Some(5), true);
-        let deleted_replacement = table_row_version(table_id, 1, 2, Some(5), Some(6), false);
+        let (_, btree_tombstone) = table_row_version(table_id, 1, 1, None, Some(5), true);
+        let (_, deleted_replacement) = table_row_version(table_id, 1, 2, Some(5), Some(6), false);
 
         let checkpointable = checkpoint
             .maybe_get_checkpointable_versions(&[btree_tombstone, deleted_replacement], table_id);
@@ -4151,7 +4176,7 @@ mod tests {
     fn checkpoint_collection_skips_delete_of_never_checkpointed_replacement_without_btree_marker() {
         let checkpoint = checkpoint_for_collect_tests();
         let table_id = MVTableId::from(-2);
-        let deleted_replacement = table_row_version(table_id, 1, 2, Some(5), Some(6), false);
+        let (_, deleted_replacement) = table_row_version(table_id, 1, 2, Some(5), Some(6), false);
 
         let checkpointable =
             checkpoint.maybe_get_checkpointable_versions(&[deleted_replacement], table_id);
@@ -4200,9 +4225,8 @@ mod tests {
         mvstore: &crate::sync::Arc<
             MvStore<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator>,
         >,
-        version: RowVersion,
+        (key, version): (RowID, RowVersion),
     ) {
-        let key = version.row.id.clone();
         let mut versions =
             <crate::mvcc::database::RowVersionChain<crate::alloc::DynAllocator> as crate::alloc::TursoVecInExt<
                 RowVersion,
@@ -4231,9 +4255,8 @@ mod tests {
         mvstore: &crate::sync::Arc<
             MvStore<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator>,
         >,
-        version: RowVersion,
+        (key, version): (RowID, RowVersion),
     ) {
-        let key = version.row.id.clone();
         let mut versions =
             <crate::mvcc::database::RowVersionChain<crate::alloc::DynAllocator> as crate::alloc::TursoVecInExt<
                 RowVersion,
@@ -4268,7 +4291,10 @@ mod tests {
         let kept = MVTableId::from(-3);
         insert_row_version(
             &mvstore,
-            sqlite_schema_row_version(2, "table", "t", "t", -2, Some(5), Some(6)),
+            (
+                RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(2)),
+                sqlite_schema_row_version(2, "table", "t", "t", -2, Some(5), Some(6)),
+            ),
         );
         insert_row_version(&mvstore, committed_table_row_version(dropped, 1));
         insert_row_version(&mvstore, committed_table_row_version(dropped, 2));
@@ -4284,14 +4310,14 @@ mod tests {
             checkpoint
                 .write_set
                 .iter()
-                .all(|(version, _)| version.row.id.table_id != dropped),
+                .all(|(row_id, _, _)| row_id.table_id != dropped),
             "user rows of a table dropped in the schema pass must not enter write_set"
         );
         assert!(
             checkpoint
                 .write_set
                 .iter()
-                .any(|(version, _)| version.row.id.table_id == kept),
+                .any(|(row_id, _, _)| row_id.table_id == kept),
             "rows of a table that was not dropped must still be collected"
         );
     }
@@ -4305,7 +4331,10 @@ mod tests {
         for i in 0..schema_count as i64 {
             insert_row_version(
                 &mvstore,
-                sqlite_schema_row_version(i + 1, "table", "t", "t", -2, Some(5), None),
+                (
+                    RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(i + 1)),
+                    sqlite_schema_row_version(i + 1, "table", "t", "t", -2, Some(5), None),
+                ),
             );
         }
         insert_row_version(&mvstore, committed_table_row_version(table_id, 1));
@@ -4330,7 +4359,7 @@ mod tests {
             checkpoint
                 .write_set
                 .iter()
-                .any(|(version, _)| version.row.id.table_id == table_id),
+                .any(|(row_id, _, _)| row_id.table_id == table_id),
             "user rows after a schema-pass yield must still be collected"
         );
     }
@@ -4342,7 +4371,10 @@ mod tests {
         let table_id = MVTableId::from(-2);
         insert_row_version(
             &mvstore,
-            sqlite_schema_row_version(2, "table", "t", "t", -2, Some(5), None),
+            (
+                RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(2)),
+                sqlite_schema_row_version(2, "table", "t", "t", -2, Some(5), None),
+            ),
         );
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
         for i in 0..row_count as i64 {
@@ -4369,7 +4401,7 @@ mod tests {
             checkpoint
                 .write_set
                 .iter()
-                .filter(|(version, _)| version.row.id.table_id == table_id)
+                .filter(|(row_id, _, _)| row_id.table_id == table_id)
                 .count(),
             row_count
         );
@@ -4396,7 +4428,7 @@ mod tests {
         let index_id = MVTableId::from(-7);
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
         for i in 0..row_count as i64 {
-            let (key, version) = index_row_version(index_id, "k", i, 1, Some(5), None, false);
+            let (key, version) = index_row_version("k", i, 1, Some(5), None, false);
             insert_dirty_index_version(&mvstore, index_id, key, version);
         }
 
@@ -4433,16 +4465,17 @@ mod tests {
         let table_id = MVTableId::from(-2);
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
         for i in 0..row_count as i64 {
-            let version = committed_table_row_version(table_id, i);
-            let row_id = RowID::new(table_id, RowKey::Int(i));
+            let (row_id, version) = committed_table_row_version(table_id, i);
             let mut versions =
                 <crate::mvcc::database::RowVersionChain<crate::alloc::DynAllocator> as crate::alloc::TursoVecInExt<
                     RowVersion,
                     crate::alloc::DynAllocator,
                 >>::new_in(crate::alloc::DynAllocator::default());
             versions.push(version.clone());
-            mvstore.rows.insert(row_id, Arc::new(RwLock::new(versions)));
-            checkpoint.write_set.push((version, None));
+            mvstore
+                .rows
+                .insert(row_id.clone(), Arc::new(RwLock::new(versions)));
+            checkpoint.write_set.push((row_id, version, None));
             checkpoint.written_table_rowids.insert((table_id, i));
         }
         // The real run publishes `backfill_floor` from the checkpointed WAL right
@@ -4512,9 +4545,10 @@ mod tests {
         let index_id = MVTableId::from(-7);
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
         for i in 0..row_count as i64 {
-            let (key, version) = index_row_version(index_id, "k", i, 1, Some(5), None, false);
+            let (key, version) = index_row_version("k", i, 1, Some(5), None, false);
+            let row_id = RowID::new(index_id, RowKey::Record(key.clone()));
             insert_dirty_index_version(&mvstore, index_id, key, version.clone());
-            checkpoint.index_write_set.push((index_id, version, false));
+            checkpoint.index_write_set.push((row_id, version, false));
             checkpoint.written_index_slots.insert(i as usize);
         }
         // See the table variant: publish the floor the real `GcIndexRows` entry
@@ -4588,7 +4622,7 @@ mod tests {
         while checkpoint.collect_table_rows().unwrap().is_some() {}
 
         assert_eq!(checkpoint.write_set.len(), 1);
-        assert_eq!(checkpoint.write_set[0].0.row.id.row_id, RowKey::Int(5));
+        assert_eq!(checkpoint.write_set[0].0.row_id, RowKey::Int(5));
     }
 
     #[test]
@@ -4612,7 +4646,7 @@ mod tests {
             1,
             "a full scan must find a checkpointable row that no commit marked"
         );
-        assert_eq!(checkpoint.write_set[0].0.row.id.row_id, RowKey::Int(5));
+        assert_eq!(checkpoint.write_set[0].0.row_id, RowKey::Int(5));
     }
 
     #[test]
@@ -4657,13 +4691,11 @@ mod tests {
         let mut checkpoint = checkpoint_for_collect_tests();
         let mvstore = checkpoint.mvstore.clone();
         let index_id = MVTableId::from(-7);
-        let (clean_key, clean_version) =
-            index_row_version(index_id, "k", 1, 1, Some(1), None, false);
+        let (clean_key, clean_version) = index_row_version("k", 1, 1, Some(1), None, false);
         mvstore
             .insert_index_version(index_id, clean_key, clean_version)
             .unwrap();
-        let (dirty_key, dirty_version) =
-            index_row_version(index_id, "k", 2, 1, Some(5), None, false);
+        let (dirty_key, dirty_version) = index_row_version("k", 2, 1, Some(5), None, false);
         insert_dirty_index_version(&mvstore, index_id, dirty_key, dirty_version);
 
         while checkpoint.collect_index_rows().unwrap().is_some() {}
@@ -4713,8 +4745,7 @@ mod tests {
         next_rowid: &mut i64,
     ) {
         for _ in 0..COLLECT_PREEMPTION_THRESHOLD {
-            let (key, version) =
-                index_row_version(index_id, "k", *next_rowid, 1, Some(20), None, false);
+            let (key, version) = index_row_version("k", *next_rowid, 1, Some(20), None, false);
             insert_dirty_index_version(mvstore, index_id, key, version);
             *next_rowid += 1;
         }
@@ -4760,10 +4791,10 @@ mod tests {
             let other = MVTableId::from(-7);
             let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
             for rowid in 0..row_count as i64 {
-                let (key, version) = index_row_version(walked, "k", rowid, 1, Some(5), None, false);
+                let (key, version) = index_row_version("k", rowid, 1, Some(5), None, false);
                 insert_dirty_index_version(&mvstore, walked, key, version);
             }
-            let (key, version) = index_row_version(other, "k", 1, 1, Some(5), None, false);
+            let (key, version) = index_row_version("k", 1, 1, Some(5), None, false);
             insert_dirty_index_version(&mvstore, other, key, version);
 
             let mut next_rowid = row_count as i64;
@@ -4795,9 +4826,9 @@ mod tests {
             table_row_version(table_id, 3, 1, Some(5), Some(50), false),
         );
         let index_id = MVTableId::from(-7);
-        let (old_key, old_version) = index_row_version(index_id, "k", 1, 1, Some(5), None, false);
+        let (old_key, old_version) = index_row_version("k", 1, 1, Some(5), None, false);
         insert_dirty_index_version(&mvstore, index_id, old_key, old_version);
-        let (new_key, new_version) = index_row_version(index_id, "k", 2, 1, Some(50), None, false);
+        let (new_key, new_version) = index_row_version("k", 2, 1, Some(50), None, false);
         insert_dirty_index_version(&mvstore, index_id, new_key, new_version);
         checkpoint.snapshot_ts = 10;
         while checkpoint.collect_table_rows().unwrap().is_some() {}
@@ -4875,7 +4906,7 @@ mod tests {
         let collected: std::vec::Vec<i64> = checkpoint
             .write_set
             .iter()
-            .map(|(version, _)| version.row.id.row_id.to_int_or_panic())
+            .map(|(row_id, _, _)| row_id.row_id.to_int_or_panic())
             .collect();
         assert_eq!(collected, vec![1, 2, 3, 150, 200]);
     }
@@ -4893,7 +4924,7 @@ mod tests {
             table_row_version(table_id, 2, 1, Some(50), None, false),
         );
         let index_id = MVTableId::from(-7);
-        let (key, version) = index_row_version(index_id, "k", 1, 1, Some(5), None, false);
+        let (key, version) = index_row_version("k", 1, 1, Some(5), None, false);
         insert_dirty_index_version(&mvstore, index_id, key, version);
 
         while checkpoint.collect_table_rows().unwrap().is_some() {}
