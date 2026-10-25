@@ -94,6 +94,22 @@ impl StressConn {
         result
     }
 
+    /// Run a query and read all of its rows, so that errors hit while
+    /// scanning are seen too.
+    pub async fn query_all(&self, sql: &str) -> turso::Result<()> {
+        let result = async {
+            let mut rows = self.conn.query(sql, ()).await?;
+            while rows.next().await?.is_some() {}
+            Ok(())
+        }
+        .await;
+        self.sql_logger.log_result(&self.thread, sql, &result);
+        if let Err(error) = &result {
+            assert_not_engine_bug(&self.thread, sql, error);
+        }
+        result
+    }
+
     /// Give this connection a random cache size and checkpoint threshold.
     /// Small values make cache spills and checkpoints happen far more often
     /// than the defaults would.
