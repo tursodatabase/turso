@@ -807,6 +807,73 @@ fn a_schema_keeps_its_oid_and_id_while_others_come_and_go(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn foreign_key_references_table_through_search_path(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.pragma_update("foreign_keys", "ON").unwrap();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE owners (id int PRIMARY KEY)")
+        .unwrap();
+    conn.execute("SET search_path TO app, public").unwrap();
+    conn.execute("CREATE TABLE parents (id int PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE children (pid int REFERENCES parents (id))")
+        .unwrap();
+    conn.execute("CREATE TABLE siblings (pid int, FOREIGN KEY (pid) REFERENCES parents (id))")
+        .unwrap();
+    conn.execute("CREATE TABLE nodes (id int PRIMARY KEY, parent int REFERENCES nodes (id))")
+        .unwrap();
+    conn.execute("CREATE TABLE pets (owner int REFERENCES owners (id))")
+        .unwrap();
+    conn.execute("INSERT INTO parents VALUES (1)").unwrap();
+    conn.execute("INSERT INTO owners VALUES (1)").unwrap();
+    conn.execute("INSERT INTO nodes VALUES (1, NULL)").unwrap();
+
+    for (table, column) in [("children", "pid"), ("siblings", "pid"), ("pets", "owner")] {
+        conn.execute(format!("INSERT INTO {table} ({column}) VALUES (1)"))
+            .unwrap();
+        assert!(
+            conn.execute(format!("INSERT INTO {table} ({column}) VALUES (5)"))
+                .is_err(),
+            "{table}"
+        );
+    }
+    conn.execute("INSERT INTO nodes VALUES (2, 1)").unwrap();
+    assert!(conn.execute("INSERT INTO nodes VALUES (3, 9)").is_err());
+
+    conn.execute("SET search_path TO public").unwrap();
+    assert!(conn.execute("INSERT INTO app.children VALUES (5)").is_err());
+    conn.execute("INSERT INTO app.children VALUES (1)").unwrap();
+}
+
+#[turso_macros::test]
+fn foreign_key_binds_to_the_first_schema_of_search_path_that_has_the_table(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.pragma_update("foreign_keys", "ON").unwrap();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE parents (id int PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO parents VALUES (5)").unwrap();
+    conn.execute("CREATE TABLE app.parents (id int PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO app.parents VALUES (1)").unwrap();
+    conn.execute("SET search_path TO app, public").unwrap();
+    conn.execute(
+        "CREATE TABLE children (pid int REFERENCES parents (id), other int, \
+         FOREIGN KEY (other) REFERENCES parents (id))",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO children VALUES (1, 1)").unwrap();
+    assert!(conn.execute("INSERT INTO children VALUES (5, 1)").is_err());
+    assert!(conn.execute("INSERT INTO children VALUES (1, 5)").is_err());
+
+    conn.execute("SET search_path TO public").unwrap();
+    conn.execute("CREATE TABLE app.siblings (pid int REFERENCES parents (id))")
+        .unwrap();
+    conn.execute("INSERT INTO app.siblings VALUES (5)").unwrap();
+    assert!(conn.execute("INSERT INTO app.siblings VALUES (1)").is_err());
+}
+
+#[turso_macros::test]
 fn test_postgres_drop_schema_cascade_drops_tables_that_reference_each_other(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.pragma_update("foreign_keys", "ON").unwrap();

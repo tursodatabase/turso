@@ -334,35 +334,69 @@ fn create_table_if_not_exists_target_present(
         .is_some_and(|val| *val == Value::from_i64(1)))
 }
 
-/// `sql` with each table that a foreign key names with a schema replaced
-/// by the name the table is stored under, so that the stored text of the
-/// statement names the table as it is stored, which is how the text is
-/// read when the schema loads. A table named without a schema keeps its
-/// name, which core looks up in public.
+/// `sql` with each table that a foreign key names replaced by the name the
+/// table is stored under, so that the stored text of the statement names
+/// the table as it is stored, which is how the text is read when the
+/// schema loads. A table named with a schema is in that schema. A table
+/// named without a schema binds the way PostgreSQL binds it when the
+/// referencing table is created: to the first schema of `search_path` that
+/// has the table, where the table being created counts as a table of its
+/// schema. A table of public, or of no schema, keeps its name as written,
+/// since public is where core looks.
 fn name_foreign_key_tables<'a>(
     conn: &Arc<Connection>,
     sql: Cow<'a, str>,
     parse_result: turso_pg_parser::ParseResult,
 ) -> Result<(Cow<'a, str>, turso_pg_parser::ParseResult)> {
-    let tables: Vec<_> = foreign_key_tables(&parse_result)
-        .into_iter()
-        .filter(|table| table.schema.is_some())
-        .collect();
+    let tables = foreign_key_tables(&parse_result);
     if tables.is_empty() {
         return Ok((sql, parse_result));
     }
+    let created = turso_pg_parser::created_table(&parse_result);
     let mut sql = sql.into_owned();
     for table in tables.iter().rev() {
-        let schema = table.schema.as_deref().expect("tables with a schema");
-        let namespace = conn
-            .namespace(&schema.to_lowercase())
-            .ok_or_else(|| LimboError::ParseError(format!("schema \"{schema}\" does not exist")))?;
+        let namespace = match &table.schema {
+            Some(schema) => conn.namespace(&schema.to_lowercase()).ok_or_else(|| {
+                LimboError::ParseError(format!("schema \"{schema}\" does not exist"))
+            })?,
+            None => match foreign_key_table_namespace(conn, &table.name, created.as_ref()) {
+                Some(namespace) if namespace.is_stored() => namespace,
+                _ => continue,
+            },
+        };
         sql = turso_pg_parser::name_at(&sql, table.location, &namespace.stored_name(&table.name))
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
     }
     let parse_result =
         turso_pg_parser::parse(&sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
     Ok((Cow::Owned(sql), parse_result))
+}
+
+/// The first namespace of the search path that has table `name`, where
+/// the table that the statement creates, `created`, counts as a table of
+/// the schema it is created in. None when no namespace has it.
+fn foreign_key_table_namespace(
+    conn: &Connection,
+    name: &str,
+    created: Option<&turso_pg_parser::ForeignKeyTable>,
+) -> Option<Namespace> {
+    let schema = conn.current_schema();
+    let created_in = created
+        .filter(|created| created.name == name)
+        .map(|created| {
+            created
+                .schema
+                .as_deref()
+                .map(str::to_lowercase)
+                .unwrap_or_else(|| "public".to_string())
+        });
+    conn.search_order()
+        .into_iter()
+        .filter(|namespace| namespace.database_id() == turso_core::MAIN_DB_ID)
+        .find(|namespace| {
+            created_in.as_deref() == Some(namespace.name.as_str())
+                || schema.get_table(namespace.target.id, name).is_some()
+        })
 }
 
 /// Core reports a name whose namespace does not exist as a missing

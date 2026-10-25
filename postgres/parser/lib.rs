@@ -146,6 +146,23 @@ fn collect_foreign_key_tables(node: &pg_query::protobuf::Node, tables: &mut Vec<
     }
 }
 
+/// The table that a CREATE TABLE statement creates, with the schema the
+/// statement names for it, if any. None for other statements.
+pub fn created_table(parse_result: &ParseResult) -> Option<ForeignKeyTable> {
+    use pg_query::NodeEnum;
+
+    let stmt = parse_result.protobuf.stmts.first()?.stmt.as_ref()?;
+    let Some(NodeEnum::CreateStmt(create)) = &stmt.node else {
+        return None;
+    };
+    let relation = create.relation.as_ref()?;
+    Some(ForeignKeyTable {
+        location: relation.location as usize,
+        schema: (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
+        name: relation.relname.clone(),
+    })
+}
+
 /// `sql` with the name that starts at byte offset `location`, which may
 /// have a schema in front of it, replaced by `name` alone.
 pub fn name_at(sql: &str, location: usize, name: &str) -> Result<String, ParseError> {
@@ -216,6 +233,19 @@ mod tests {
             "CREATE TABLE t (x int)"
         );
         assert_eq!(name_create_table("SELECT 1", "t").unwrap(), "SELECT 1");
+    }
+
+    #[test]
+    fn created_table_is_the_table_of_a_create_table_statement() {
+        let table =
+            created_table(&parse("CREATE TABLE app.c (a int REFERENCES p (id))").unwrap()).unwrap();
+        assert_eq!(table.schema.as_deref(), Some("app"));
+        assert_eq!(table.name, "c");
+        let table = created_table(&parse("CREATE TABLE c (a int)").unwrap()).unwrap();
+        assert_eq!(table.schema, None);
+        assert_eq!(table.name, "c");
+        assert!(created_table(&parse("ALTER TABLE c ADD COLUMN b int").unwrap()).is_none());
+        assert!(created_table(&parse("SELECT 1").unwrap()).is_none());
     }
 
     #[test]
