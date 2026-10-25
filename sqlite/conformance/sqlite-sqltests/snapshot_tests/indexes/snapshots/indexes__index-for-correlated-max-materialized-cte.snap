@@ -24,4 +24,4 @@ QUERY PLAN
 |--SCAN products USING COVERING INDEX idx_products_price
 |--SCAN prices AS p1
 `--CORRELATED SCALAR SUBQUERY 1
-   `--SCAN prices AS p2
+   `--SEARCH p2 USING INDEX ephemeral_subquery_s2 (price<?)
