@@ -1,7 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rustc_hash::FxHashMap as HashMap;
-
 use crate::{
     alloc::TursoIteratorExt,
     dialect::Dialect,
@@ -53,11 +51,11 @@ pub(crate) struct SemanticContext<'catalog> {
     /// The captured catalog this context reads, when it was built from one.
     catalog: Option<&'catalog SemanticCatalog>,
     main_schema: &'catalog Schema,
-    database_schemas: HashMap<DatabaseId, &'catalog Schema>,
+    database_schemas: Vec<(DatabaseId, &'catalog Schema)>,
     symbols: &'catalog SymbolTable,
     custom_types_enabled: bool,
     dialect: Arc<dyn Dialect>,
-    database_names: HashMap<String, DatabaseId>,
+    database_names: Vec<(String, DatabaseId)>,
     unqualified_database_search_path: Vec<DatabaseId>,
     /// See [super::catalog::SemanticCatalog::has_temp_database].
     has_temp_database: bool,
@@ -122,8 +120,15 @@ impl<'catalog> SemanticContext<'catalog> {
 
     fn with_empty_temp_database_name(mut self, catalog: &SemanticCatalog) -> Self {
         if catalog.empty_temp_schema.is_some() {
-            self.database_names
-                .insert("temp".to_string(), DatabaseId::new(TEMP_DB_ID));
+            let temp = DatabaseId::new(TEMP_DB_ID);
+            match self
+                .database_names
+                .iter_mut()
+                .find(|(name, _)| name == "temp")
+            {
+                Some((_, id)) => *id = temp,
+                None => self.database_names.push(("temp".to_string(), temp)),
+            }
         }
         self
     }
@@ -159,31 +164,31 @@ impl<'catalog> SemanticContext<'catalog> {
         let snapshot = NEXT_SNAPSHOT_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("catalog snapshot identity space exhausted");
-        let mut database_names = HashMap::default();
-        let mut database_schemas = HashMap::default();
+        let mut database_names: Vec<(String, DatabaseId)> = Vec::new();
+        let mut database_schemas: Vec<(DatabaseId, &Schema)> = Vec::new();
         for database in databases {
             let name = normalize_ident(&database.name);
-            if database_names.insert(name.clone(), database.id).is_some() {
+            if database_names.iter().any(|(existing, _)| *existing == name) {
                 return Err(LimboError::InvalidArgument(format!(
                     "duplicate database name: {name}"
                 )));
             }
-            if database_schemas
-                .insert(database.id, database.schema)
-                .is_some()
-            {
+            if database_schemas.iter().any(|(id, _)| *id == database.id) {
                 return Err(LimboError::InvalidArgument(format!(
                     "duplicate database id: {}",
                     database.id.index()
                 )));
             }
+            database_names.push((name, database.id));
+            database_schemas.push((database.id, database.schema));
         }
         let main_schema = database_schemas
-            .get(&DatabaseId::new(MAIN_DB_ID))
-            .copied()
+            .iter()
+            .find(|(id, _)| *id == DatabaseId::new(MAIN_DB_ID))
+            .map(|(_, schema)| *schema)
             .ok_or_else(|| LimboError::InvalidArgument("missing main database".to_string()))?;
         for database in &unqualified_database_search_path {
-            if !database_schemas.contains_key(database) {
+            if !database_schemas.iter().any(|(id, _)| id == database) {
                 return Err(LimboError::InvalidArgument(format!(
                     "search path contains unknown database id: {}",
                     database.index()
@@ -320,8 +325,8 @@ impl<'catalog> SemanticContext<'catalog> {
     pub(crate) fn attached_database_ids_in_search_order(&self) -> Result<BitSet> {
         let mut ids: Vec<usize> = self
             .database_schemas
-            .keys()
-            .map(|database| database.index())
+            .iter()
+            .map(|(database, _)| database.index())
             .filter(|&database| database != MAIN_DB_ID && database != TEMP_DB_ID)
             .collect();
         ids.sort_unstable();
@@ -528,7 +533,7 @@ impl<'catalog> SemanticContext<'catalog> {
     pub(crate) fn database_name(&self, database: DatabaseId) -> Option<&str> {
         self.database_names
             .iter()
-            .find(|(_, id)| **id == database)
+            .find(|(_, id)| *id == database)
             .map(|(name, _)| name.as_str())
     }
 
@@ -537,7 +542,10 @@ impl<'catalog> SemanticContext<'catalog> {
         if name == "public" {
             return Some(DatabaseId::new(MAIN_DB_ID));
         }
-        self.database_names.get(&name).copied()
+        self.database_names
+            .iter()
+            .find(|(existing, _)| *existing == name)
+            .map(|(_, id)| *id)
     }
 
     pub(crate) fn schema(&self, database: DatabaseId) -> Result<&Schema> {
@@ -591,35 +599,6 @@ impl<'catalog> SemanticContext<'catalog> {
     /// Whether `name` resolves to a table, without reporting a missing one,
     /// with unqualified names looked up as inside a
     /// view of `view_database`.
-    pub(crate) fn table_exists_in(
-        &self,
-        name: &turso_parser::ast::QualifiedName,
-        view_database: Option<DatabaseId>,
-    ) -> Result<bool> {
-        let table_name = normalize_ident(name.name.as_str());
-        Ok(match &name.namespace {
-            Some(database) => {
-                let database = self.database(database.as_str()).ok_or_else(|| {
-                    LimboError::InvalidArgument(format!(
-                        "no such database: {}",
-                        normalize_ident(database.as_str())
-                    ))
-                })?;
-                self.schema(database)?
-                    .get_table(NamespaceId::ROOT, &table_name)
-                    .is_some()
-            }
-            None => self
-                .unqualified_databases(&table_name, view_database)
-                .iter()
-                .any(|database| {
-                    self.database_schema(*database).is_some_and(|schema| {
-                        schema.get_table(NamespaceId::ROOT, &table_name).is_some()
-                    })
-                }),
-        })
-    }
-
     /// Find a view by name when no table has it, searching databases in the
     /// same order as tables, with unqualified names looked up as inside a
     /// view of `view_database`. Returns the database the view is in.
@@ -672,36 +651,48 @@ impl<'catalog> SemanticContext<'catalog> {
         name: &turso_parser::ast::QualifiedName,
         view_database: Option<DatabaseId>,
     ) -> Result<(DatabaseId, Arc<Table>)> {
+        self.find_table_in(name, view_database)?
+            .ok_or_else(|| no_such_table(name))
+    }
+
+    pub(crate) fn find_table_in(
+        &self,
+        name: &turso_parser::ast::QualifiedName,
+        view_database: Option<DatabaseId>,
+    ) -> Result<Option<(DatabaseId, Arc<Table>)>> {
         let table_name = normalize_ident(name.name.as_str());
-        let database = match &name.namespace {
-            Some(database) => self.database(database.as_str()).ok_or_else(|| {
-                LimboError::InvalidArgument(format!(
-                    "no such database: {}",
-                    normalize_ident(database.as_str())
-                ))
-            })?,
+        let found = match &name.namespace {
+            Some(database) => {
+                let database = self.database(database.as_str()).ok_or_else(|| {
+                    LimboError::InvalidArgument(format!(
+                        "no such database: {}",
+                        normalize_ident(database.as_str())
+                    ))
+                })?;
+                self.schema(database)?
+                    .get_table(NamespaceId::ROOT, &table_name)
+                    .map(|table| (database, table))
+            }
             None => self
                 .unqualified_databases(&table_name, view_database)
                 .into_iter()
-                .find(|database| {
-                    self.database_schema(*database).is_some_and(|schema| {
-                        schema.get_table(NamespaceId::ROOT, &table_name).is_some()
-                    })
-                })
-                .ok_or_else(|| no_such_table(name))?,
+                .find_map(|database| {
+                    self.database_schema(database)?
+                        .get_table(NamespaceId::ROOT, &table_name)
+                        .map(|table| (database, table))
+                }),
+        };
+        let Some((database, table)) = found else {
+            return Ok(None);
         };
         if let Some(altered) = &self.altered_table {
             if altered.database == database
                 && altered.table.get_name().eq_ignore_ascii_case(&table_name)
             {
-                return Ok((database, altered.table.clone()));
+                return Ok(Some((database, altered.table.clone())));
             }
         }
-        let table = self
-            .schema(database)?
-            .get_table(NamespaceId::ROOT, &table_name)
-            .ok_or_else(|| no_such_table(name))?;
-        Ok((database, table))
+        Ok(Some((database, table)))
     }
 
     /// Whether `name` is a view whose stored SQL failed to parse when the
@@ -771,7 +762,7 @@ impl<'catalog> SemanticContext<'catalog> {
     }
 
     fn database_schema(&self, database: DatabaseId) -> Option<&'catalog Schema> {
-        if let Some(schema) = self.database_schemas.get(&database) {
+        if let Some((_, schema)) = self.database_schemas.iter().find(|(id, _)| *id == database) {
             return Some(schema);
         }
         if database.index() != TEMP_DB_ID {

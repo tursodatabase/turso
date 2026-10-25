@@ -1824,6 +1824,21 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         functions: &mut FunctionContext<'_, 'ast>,
         expected_type: Option<Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
+        if let ast::Expr::Id(_)
+        | ast::Expr::Name(_)
+        | ast::Expr::Qualified(..)
+        | ast::Expr::Literal(_)
+        | ast::Expr::Variable(_) = syntax
+        {
+            return self.build_expr(
+                syntax,
+                ExprChildren::new(),
+                scope,
+                policy,
+                functions,
+                expected_type.as_ref(),
+            );
+        }
         let mut frames = vec![ExprFrame::new(syntax, expected_type, 0)?];
         let mut values = Vec::<FrameValue>::new();
         reserve_in_list_values(&mut values, syntax);
@@ -2694,8 +2709,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             ast::Expr::Id(name) | ast::Expr::Name(name) => {
                 expect_no_expr_children(children)?;
                 let expression =
-                    match scope.resolve_unqualified(name.as_str(), policy.precedence)? {
-                        Some(resolved) => resolved.expr,
+                    match scope.resolve_unqualified_expr(name.as_str(), policy.precedence)? {
+                        Some(expression) => expression,
                         None if policy.allow_dqs_fallback && name.quoted_with('"') => {
                             hir::Expr::Literal(ast::Literal::String(name.as_literal()))
                         }

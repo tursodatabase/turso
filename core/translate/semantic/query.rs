@@ -662,8 +662,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         });
                     }
                 }
-                let id = if self.table_exists_in_scope(name)? {
-                    self.analyze_base_table_source(name, alias, indexed.as_ref(), owner)?
+                let id = if let Some((database, table)) = self.find_table_in_scope(name)? {
+                    self.analyze_catalog_table_source(
+                        &name.name,
+                        alias.map(ast::As::name).or(name.alias.as_ref()),
+                        indexed.as_ref(),
+                        owner,
+                        database,
+                        table,
+                        CatalogSourceKind::Table,
+                    )?
                 } else if let Some((database, view)) = self.resolve_view_in_scope(name)? {
                     if let Some(ast::Indexed::IndexedBy(index)) = indexed {
                         crate::bail_parse_error!("no such index: {}", index.as_str());

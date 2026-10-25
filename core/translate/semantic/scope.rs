@@ -339,6 +339,31 @@ impl<'a> ColumnView<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum NameMatch<'a> {
+    Column(ColumnView<'a>),
+    Output(&'a ScopeOutput),
+    RowId(SourceId),
+}
+
+impl NameMatch<'_> {
+    fn expr(self) -> hir::Expr {
+        match self {
+            Self::Column(column) => column.expr().into_owned(),
+            Self::Output(output) => hir::Expr::Output(output.id),
+            Self::RowId(source) => hir::Expr::RowId(source),
+        }
+    }
+
+    fn value(self) -> ScopeValue {
+        match self {
+            Self::Column(column) => column.resolved(),
+            Self::Output(output) => output.resolved(),
+            Self::RowId(source) => resolved_rowid(source),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum VisibleColumn {
     AllOfSource(usize),
@@ -862,20 +887,39 @@ impl Scope {
         name: &str,
         precedence: NamePrecedence,
     ) -> Result<Option<ScopeValue>> {
-        let normalized = crate::util::normalize_ident(name);
+        Ok(self
+            .find_unqualified(name, precedence)?
+            .map(NameMatch::value))
+    }
+
+    pub(crate) fn resolve_unqualified_expr(
+        &self,
+        name: &str,
+        precedence: NamePrecedence,
+    ) -> Result<Option<hir::Expr>> {
+        Ok(self
+            .find_unqualified(name, precedence)?
+            .map(NameMatch::expr))
+    }
+
+    fn find_unqualified(
+        &self,
+        name: &str,
+        precedence: NamePrecedence,
+    ) -> Result<Option<NameMatch<'_>>> {
         let current = match precedence {
-            NamePrecedence::SourcesOnly => self.resolve_source_column(&normalized)?,
+            NamePrecedence::SourcesOnly => self.find_source_column(name)?,
             NamePrecedence::SourceThenOutput => self
-                .resolve_source_column(&normalized)?
-                .or_else(|| self.resolve_output(&normalized)),
+                .find_source_column(name)?
+                .or_else(|| self.find_output(name)),
             NamePrecedence::OutputThenSource => {
-                if let Some(output) = self.resolve_output(&normalized) {
+                if let Some(output) = self.find_output(name) {
                     // SQLite still reports an ambiguous source name when an
                     // output alias wins this clause's namespace order.
-                    self.resolve_source_column(&normalized)?;
+                    self.find_source_column(name)?;
                     Some(output)
                 } else {
-                    self.resolve_source_column(&normalized)?
+                    self.find_source_column(name)?
                 }
             }
         };
@@ -886,7 +930,7 @@ impl Scope {
             return Ok(None);
         }
         self.outer.as_deref().map_or(Ok(None), |outer| {
-            outer.resolve_unqualified(name, NamePrecedence::SourceThenOutput)
+            outer.find_unqualified(name, NamePrecedence::SourceThenOutput)
         })
     }
 
@@ -1528,15 +1572,22 @@ impl Scope {
     }
 
     fn resolve_source_column(&self, name: &str) -> Result<Option<ScopeValue>> {
+        Ok(self.find_source_column(name)?.map(NameMatch::value))
+    }
+
+    fn find_source_column(&self, name: &str) -> Result<Option<NameMatch<'_>>> {
         let mut found = None;
         for column in self
             .visible_columns()
             .filter(|column| !column.rowid_names() && column.lookup_matches(name))
         {
             if found.is_some() {
-                crate::bail_parse_error!("ambiguous column name: {}", name);
+                crate::bail_parse_error!(
+                    "ambiguous column name: {}",
+                    crate::util::normalize_ident(name)
+                );
             }
-            found = Some(column.resolved());
+            found = Some(NameMatch::Column(column));
         }
         if found.is_some() {
             return Ok(found);
@@ -1549,9 +1600,12 @@ impl Scope {
         }
         for column in self.visible_columns().filter(|column| column.rowid_names()) {
             if found.is_some() {
-                crate::bail_parse_error!("ambiguous column name: {}", name);
+                crate::bail_parse_error!(
+                    "ambiguous column name: {}",
+                    crate::util::normalize_ident(name)
+                );
             }
-            found = Some(column.resolved());
+            found = Some(NameMatch::Column(column));
         }
         for source in self
             .sources
@@ -1559,21 +1613,29 @@ impl Scope {
             .filter(|source| source.unqualified && source.rowid_available)
         {
             if found.is_some() {
-                crate::bail_parse_error!("ambiguous column name: {}", name);
+                crate::bail_parse_error!(
+                    "ambiguous column name: {}",
+                    crate::util::normalize_ident(name)
+                );
             }
-            found = Some(resolved_rowid(source.id));
+            found = Some(NameMatch::RowId(source.id));
         }
         Ok(found)
     }
 
-    fn resolve_output(&self, name: &str) -> Option<ScopeValue> {
+    fn find_output(&self, name: &str) -> Option<NameMatch<'_>> {
         self.outputs
             .iter()
             .find(|output| {
-                output.name_kind == hir::OutputNameKind::ExplicitAlias && output.name == name
+                output.name_kind == hir::OutputNameKind::ExplicitAlias
+                    && output.name.eq_ignore_ascii_case(name)
             })
-            .or_else(|| self.outputs.iter().find(|output| output.name == name))
-            .map(ScopeOutput::resolved)
+            .or_else(|| {
+                self.outputs
+                    .iter()
+                    .find(|output| output.name.eq_ignore_ascii_case(name))
+            })
+            .map(NameMatch::Output)
     }
 
     fn output(&self, id: OutputId) -> Option<&ScopeOutput> {
@@ -1661,7 +1723,9 @@ fn resolved_rowid(source: SourceId) -> ScopeValue {
 }
 
 fn is_rowid_name(name: &str) -> bool {
-    matches!(name, "rowid" | "_rowid_" | "oid")
+    ["rowid", "_rowid_", "oid"]
+        .iter()
+        .any(|rowid| rowid.eq_ignore_ascii_case(name))
 }
 
 #[cfg(test)]

@@ -247,7 +247,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             sources: Vec::new(),
             ctes: Vec::new(),
             schema_programs: Vec::new(),
-            exprs: super::hir::ExprArena::default(),
+            exprs: super::hir::ExprArena::with_capacity(32),
             schema_programs_in_progress: HashSet::default(),
             catalog_ids: HashMap::default(),
             cte_scopes: Vec::new(),
@@ -357,8 +357,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         self.context().resolve_table_in(name, self.view_database)
     }
 
-    pub(super) fn table_exists_in_scope(&self, name: &ast::QualifiedName) -> Result<bool> {
-        self.context().table_exists_in(name, self.view_database)
+    pub(super) fn find_table_in_scope(
+        &self,
+        name: &ast::QualifiedName,
+    ) -> Result<Option<(DatabaseId, Arc<crate::schema::Table>)>> {
+        self.context().find_table_in(name, self.view_database)
     }
 
     pub(super) fn resolve_view_in_scope(
