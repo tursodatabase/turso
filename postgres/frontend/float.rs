@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn fractions_use_shortest_digits() {
-        assert_eq!(format_float8(3.14), "3.14");
+        assert_eq!(format_float8(2.75), "2.75");
         assert_eq!(format_float8(0.1), "0.1");
         assert_eq!(format_float8(0.1 + 0.2), "0.30000000000000004");
         assert_eq!(format_float8(-123.456), "-123.456");

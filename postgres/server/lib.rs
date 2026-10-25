@@ -898,7 +898,13 @@ mod tests {
                 let rows = stmt.run_collect_rows().unwrap();
                 assert_eq!(rows.len(), 1);
                 let mut encoder = DataRowEncoder::new(fields.clone());
-                encode_value(&mut encoder, &rows[0][0], fields[0].datatype()).unwrap();
+                encode_value(
+                    &mut encoder,
+                    &rows[0][0],
+                    fields[0].datatype(),
+                    fields[0].format(),
+                )
+                .unwrap();
                 let row = encoder.finish().unwrap();
                 assert_eq!(row.field_count, 1);
                 assert_eq!(&row.data[..], b"\0\0\0\x01t");
