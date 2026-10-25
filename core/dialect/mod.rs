@@ -224,6 +224,17 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a value compared with a column of a custom type that has
+    /// parameters, such as `numeric(10,2)`, is converted to the type without
+    /// those parameters.
+    ///
+    /// PostgreSQL compares with the value as written, so `v = 1.501` is false
+    /// for a `numeric(10,2)` holding 1.50. SQLite rounds the value to the
+    /// column's scale first, so it is true.
+    fn compares_values_without_column_type_parameters(&self) -> bool {
+        false
+    }
+
     /// Whether `CAST(x AS t)` to a custom type gives the value the way a
     /// column of type `t` shows it (ENCODE then DECODE) instead of the
     /// stored value (ENCODE only).

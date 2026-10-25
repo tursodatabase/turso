@@ -77,15 +77,30 @@ pub(super) fn emit_custom_type_operator(
                 extra_amount: 0,
             });
             // Encode the literal into the fresh function arg slot.
-            emit_type_expr(
-                program,
-                encode_expr,
-                lit_tmp,
-                lit_dst,
-                &encode_info.column,
-                &encode_info.type_def,
-                resolver,
-            )?;
+            if resolver
+                .dialect
+                .compares_values_without_column_type_parameters()
+            {
+                emit_type_expr_without_type_parameters(
+                    program,
+                    encode_expr,
+                    lit_tmp,
+                    lit_dst,
+                    &encode_info.column,
+                    &encode_info.type_def,
+                    resolver,
+                )?;
+            } else {
+                emit_type_expr(
+                    program,
+                    encode_expr,
+                    lit_tmp,
+                    lit_dst,
+                    &encode_info.column,
+                    &encode_info.type_def,
+                    resolver,
+                )?;
+            }
             func_args
         } else {
             // Type has no encode expression; translate directly into arg slots.
@@ -1136,6 +1151,28 @@ fn cast_domain_value_to_base_type(check: &ast::Expr, base_type: &str) -> Box<ast
         },
     );
     Box::new(check)
+}
+
+/// Like `emit_type_expr`, but with every parameter of the type set to NULL,
+/// so `numeric_encode(1.501, NULL, NULL)` keeps the value as it is instead of
+/// rounding it to the column's scale.
+pub(crate) fn emit_type_expr_without_type_parameters(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    value_reg: usize,
+    dest_reg: usize,
+    column: &Column,
+    type_def: &TypeDef,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let mut column = column.clone();
+    column.ty_params = type_def
+        .user_params()
+        .map(|_| Box::new(ast::Expr::Literal(ast::Literal::Null)))
+        .collect();
+    emit_type_expr(
+        program, expr, value_reg, dest_reg, &column, type_def, resolver,
+    )
 }
 
 /// Emit bytecode for a custom type encode/decode expression.

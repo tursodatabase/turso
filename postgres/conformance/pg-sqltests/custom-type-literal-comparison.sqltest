@@ -285,3 +285,44 @@ test numeric-times-integer-expression-stays-numeric {
 expect {
     3.00|-2.50
 }
+
+test numeric-literal-is-compared-without-rounding-to-column-scale {
+    CREATE TABLE n (v numeric(10,2));
+    INSERT INTO n VALUES (1.50), (1.51);
+    SELECT count(*) FROM n WHERE v = 1.501;
+    SELECT count(*) FROM n WHERE v = '1.501';
+    SELECT count(*) FROM n WHERE v >= 1.504;
+    SELECT count(*) FROM n WHERE v < 1.505;
+    SELECT count(*) FROM n WHERE v <> 1.501;
+    SELECT v + 1.501 FROM n WHERE v = 1.5;
+}
+expect {
+    0
+    0
+    1
+    1
+    2
+    3.001
+}
+
+test numeric-literal-is-compared-without-rounding-to-column-scale-with-index {
+    CREATE TABLE n (v numeric(10,2));
+    CREATE INDEX n_v ON n (v);
+    INSERT INTO n VALUES (1.50), (1.51);
+    SELECT count(*) FROM n WHERE v = 1.501;
+    SELECT count(*) FROM n WHERE v = '1.501';
+    SELECT count(*) FROM n WHERE v IN (1.501, 7);
+    SELECT count(*) FROM n WHERE v IN (1.5, 7);
+    SELECT count(*) FROM n WHERE v IN ('1.501', '1.510');
+    SELECT count(*) FROM n WHERE v = 1.5;
+    SELECT count(*) FROM n WHERE v >= 1.504;
+}
+expect {
+    0
+    0
+    0
+    1
+    1
+    1
+    1
+}

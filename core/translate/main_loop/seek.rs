@@ -99,7 +99,23 @@ pub(super) fn encode_seek_keys_for_custom_types(
             target_pc: skip_label,
         });
         for td in &resolved.chain {
-            if let Some(encode_expr) = seek_key_encode(td, converts_compared_values) {
+            let Some(encode_expr) = seek_key_encode(td, converts_compared_values) else {
+                continue;
+            };
+            if td.user_params().next().is_some()
+                && resolver
+                    .dialect
+                    .compares_values_without_column_type_parameters()
+            {
+                encode_seek_key_that_parameters_would_change(
+                    program,
+                    encode_expr,
+                    reg,
+                    table_col,
+                    td,
+                    resolver,
+                )?;
+            } else {
                 crate::translate::expr::emit_type_expr(
                     program,
                     encode_expr,
@@ -113,6 +129,88 @@ pub(super) fn encode_seek_keys_for_custom_types(
         }
         program.preassign_label_to_next_insn(skip_label);
     }
+    Ok(())
+}
+
+/// Encodes a seek key with the column's type parameters, so that `1.5` sought
+/// in a `numeric(10,2)` index becomes the stored form of `1.50`. When the
+/// parameters change the value, as they round `1.501` to `1.50`, no stored
+/// value equals the key, so the key is encoded without the parameters
+/// instead: that form is never stored in the index, so the seek finds no row.
+fn encode_seek_key_that_parameters_would_change(
+    program: &mut ProgramBuilder,
+    encode_expr: &Expr,
+    reg: usize,
+    table_col: &crate::schema::Column,
+    td: &crate::schema::TypeDef,
+    resolver: &Resolver<'_>,
+) -> crate::Result<()> {
+    let eq_func_name = td
+        .operators()
+        .iter()
+        .find(|o| o.op == "=")
+        .and_then(|o| o.func_name.as_deref())
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "type {} has parameters but no = function",
+                td.name
+            ))
+        })?;
+    let eq_func = resolver.resolve_function(eq_func_name, 2)?.ok_or_else(|| {
+        crate::LimboError::InternalError(format!("function not found: {eq_func_name}"))
+    })?;
+    let keys = program.alloc_registers(2);
+    let (with_parameters, without_parameters) = (keys, keys + 1);
+    crate::translate::expr::emit_type_expr(
+        program,
+        encode_expr,
+        reg,
+        with_parameters,
+        table_col,
+        td,
+        resolver,
+    )?;
+    crate::translate::expr::emit_type_expr_without_type_parameters(
+        program,
+        encode_expr,
+        reg,
+        without_parameters,
+        table_col,
+        td,
+        resolver,
+    )?;
+    let unchanged = program.alloc_register();
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: keys,
+        dest: unchanged,
+        func: crate::function::FuncCtx {
+            func: eq_func,
+            arg_count: 2,
+        },
+    });
+    let changed_label = program.allocate_label();
+    let done_label = program.allocate_label();
+    program.emit_insn(Insn::IfNot {
+        reg: unchanged,
+        target_pc: changed_label,
+        jump_if_null: true,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: with_parameters,
+        dst_reg: reg,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: done_label,
+    });
+    program.preassign_label_to_next_insn(changed_label);
+    program.emit_insn(Insn::Copy {
+        src_reg: without_parameters,
+        dst_reg: reg,
+        extra_amount: 0,
+    });
+    program.preassign_label_to_next_insn(done_label);
     Ok(())
 }
 

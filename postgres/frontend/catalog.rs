@@ -191,6 +191,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn compares_values_without_column_type_parameters(&self) -> bool {
+        true
+    }
+
     fn cast_to_custom_type_decodes(&self) -> bool {
         true
     }
