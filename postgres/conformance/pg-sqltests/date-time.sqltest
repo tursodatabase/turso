@@ -360,3 +360,18 @@ expect {
     1
     1
 }
+
+test time-from-max-coalesce-and-case-wraps-at-midnight {
+    CREATE TABLE t (a time);
+    INSERT INTO t VALUES ('23:00');
+    SELECT max(a) + interval '2 hours' FROM t;
+    SELECT coalesce(a, '00:00') + interval '2 hours',
+        greatest(a, '01:00') + interval '2 hours',
+        nullif(a, '00:00') + interval '2 hours',
+        (CASE WHEN a IS NOT NULL THEN a END) + interval '2 hours'
+    FROM t;
+}
+expect {
+    01:00:00
+    01:00:00|01:00:00|01:00:00|01:00:00
+}

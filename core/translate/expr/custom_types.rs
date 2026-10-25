@@ -306,16 +306,65 @@ pub(super) fn expr_custom_type_info(
     None
 }
 
-/// The declared custom type of a column, or "" when `expr` is not a column of
-/// a custom type.
+/// The declared custom type of `expr`, or "" when core does not know it.
+/// min, max, coalesce, nullif and CASE return one of their arguments, so
+/// `max(a)` has the type of the column `a`.
 pub(super) fn declared_custom_type_name(
     expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
 ) -> String {
-    expr_custom_type_info(expr, referenced_tables, resolver)
-        .map(|info| info.type_name)
-        .unwrap_or_default()
+    match expr {
+        ast::Expr::FunctionCall { name, args, .. } => {
+            let returned_args = match name.as_str().to_ascii_lowercase().as_str() {
+                "min" | "max" | "coalesce" | "ifnull" => &args[..],
+                "nullif" => &args[..args.len().min(1)],
+                _ => return String::new(),
+            };
+            common_custom_type_name(
+                returned_args.iter().map(|arg| arg.as_ref()),
+                referenced_tables,
+                resolver,
+            )
+        }
+        ast::Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } => common_custom_type_name(
+            when_then_pairs
+                .iter()
+                .map(|(_, then)| then.as_ref())
+                .chain(else_expr.as_deref()),
+            referenced_tables,
+            resolver,
+        ),
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            declared_custom_type_name(&exprs[0], referenced_tables, resolver)
+        }
+        _ => expr_custom_type_info(expr, referenced_tables, resolver)
+            .map(|info| info.type_name)
+            .unwrap_or_default(),
+    }
+}
+
+/// The custom type that all non-literal `exprs` share, or "" when one of them
+/// has no known custom type or they disagree. Literals are skipped because
+/// they take the type of the other values, as in `coalesce(a, '00:00')`.
+fn common_custom_type_name<'a>(
+    exprs: impl Iterator<Item = &'a ast::Expr>,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> String {
+    let mut common = String::new();
+    for expr in exprs.filter(|expr| !matches!(expr, ast::Expr::Literal(_))) {
+        let type_name = declared_custom_type_name(expr, referenced_tables, resolver);
+        if type_name.is_empty() || (!common.is_empty() && type_name != common) {
+            return String::new();
+        }
+        common = type_name;
+    }
+    common
 }
 
 fn custom_type_info_of_column(
