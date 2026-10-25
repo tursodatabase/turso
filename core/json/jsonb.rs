@@ -1638,7 +1638,7 @@ impl Jsonb {
         if depth > MAX_JSON_DEPTH {
             return Err(PError::Message {
                 msg: "Too deep".to_string(),
-                location: Some(pos),
+                location: Some(pos - 1),
             });
         }
         if self.data.capacity() - self.data.len() < 50 {
@@ -1684,7 +1684,7 @@ impl Jsonb {
                     location: Some(pos),
                 });
             } else {
-                self.deserialize_value(input, key_start, pos, depth + 1, info)?;
+                self.deserialize_value(input, key_start, pos, depth, info)?;
                 return Err(PError::Message {
                     msg: "Object key must be a string".to_string(),
                     location: Some(key_start),
@@ -1693,7 +1693,7 @@ impl Jsonb {
 
             pos = skip_whitespace_tracking(input, pos, info);
             if pos >= input.len() || input[pos] != b':' {
-                self.deserialize_value(input, pos, pos, depth + 1, info)?;
+                self.deserialize_value(input, pos, pos, depth, info)?;
                 return Err(PError::Message {
                     msg: "Expected : after object key".to_string(),
                     location: Some(pos),
@@ -1703,7 +1703,7 @@ impl Jsonb {
 
             let value_start = pos;
             pos = skip_whitespace_tracking(input, pos, info);
-            pos = self.deserialize_value(input, value_start, pos, depth + 1, info)?;
+            pos = self.deserialize_value(input, value_start, pos, depth, info)?;
             first = false;
 
             pos = skip_whitespace_tracking(input, pos, info);
@@ -1745,7 +1745,7 @@ impl Jsonb {
         if depth > MAX_JSON_DEPTH {
             return Err(PError::Message {
                 msg: "Too deep".to_string(),
-                location: Some(pos),
+                location: Some(pos - 1),
             });
         }
 
@@ -1767,7 +1767,7 @@ impl Jsonb {
                 }
                 break;
             }
-            pos = self.deserialize_value(input, element_start, pos, depth + 1, info)?;
+            pos = self.deserialize_value(input, element_start, pos, depth, info)?;
             first = false;
 
             pos = skip_whitespace_tracking(input, pos, info);
