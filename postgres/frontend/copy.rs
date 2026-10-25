@@ -22,9 +22,10 @@ pub fn parse_copy_text_format(
     num_columns: usize,
     header: bool,
 ) -> Result<Vec<CopyRow>> {
-    let mut rows = Vec::new();
+    let lines = split_copy_lines(data);
+    let mut rows = Vec::with_capacity(lines.len());
 
-    for (line_num, line) in data.lines().enumerate() {
+    for (line_num, line) in lines.into_iter().enumerate() {
         // End-of-data marker (used in STDIN mode, but handle it for files too)
         if line == "\\." {
             break;
@@ -34,12 +35,7 @@ pub fn parse_copy_text_format(
             continue;
         }
 
-        // Skip empty lines at the end of file
-        if line.is_empty() {
-            continue;
-        }
-
-        let fields: Vec<&str> = line.split(delimiter).collect();
+        let fields = split_copy_fields(line, delimiter);
         if fields.len() != num_columns {
             return Err(LimboError::ParseError(format!(
                 "COPY: line {}: expected {} columns, got {}",
@@ -64,6 +60,61 @@ pub fn parse_copy_text_format(
     }
 
     Ok(rows)
+}
+
+/// Splits input into lines while respecting backslash escapes (such as `\\\n` or `\\\r\n`).
+fn split_copy_lines(data: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut i = 0;
+    let mut line_start = 0;
+    let bytes = data.as_bytes();
+    let len = bytes.len();
+
+    while i < len {
+        if bytes[i] == b'\\' {
+            if i + 2 < len && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
+                i += 3;
+            } else if i + 1 < len {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if bytes[i] == b'\r' && i + 1 < len && bytes[i + 1] == b'\n' {
+            lines.push(&data[line_start..i]);
+            i += 2;
+            line_start = i;
+        } else if bytes[i] == b'\n' || bytes[i] == b'\r' {
+            lines.push(&data[line_start..i]);
+            i += 1;
+            line_start = i;
+        } else {
+            i += 1;
+        }
+    }
+
+    if line_start < len {
+        lines.push(&data[line_start..len]);
+    }
+
+    lines
+}
+
+/// Splits a line into fields by delimiter while respecting backslash escapes (such as `\\<delimiter>`).
+fn split_copy_fields(line: &str, delimiter: char) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let mut field_start = 0;
+    let mut chars = line.char_indices().peekable();
+
+    while let Some((idx, c)) = chars.next() {
+        if c == '\\' {
+            chars.next();
+        } else if c == delimiter {
+            fields.push(&line[field_start..idx]);
+            field_start = idx + c.len_utf8();
+        }
+    }
+    fields.push(&line[field_start..]);
+    fields
 }
 
 /// Unescape backslash sequences in a COPY text field.
@@ -105,6 +156,10 @@ fn unescape_copy_field(field: &str) -> Result<String> {
                     }
                 }
                 result.push(value);
+            }
+            Some(b'\r') => {
+                bytes.next_if(|&b| b == b'\n');
+                result.push(b'\n');
             }
             Some(other) => result.push(other),
             None => result.push(b'\\'),
@@ -260,5 +315,62 @@ mod tests {
     fn test_end_of_data_marker_on_header_line() {
         let rows = parse_copy_text_format("\\.\nok\n", '\t', "\\N", 1, true).unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_empty_lines_load_empty_string_rows() {
+        let data = "x\n\ny\n";
+        let rows = parse_copy_text_format(data, '\t', "\\N", 1, false).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("x".into())],
+                vec![Some("".into())],
+                vec![Some("y".into())]
+            ]
+        );
+    }
+
+    #[test]
+    fn test_consecutive_empty_lines() {
+        let data = "x\n\n\ny\n";
+        let rows = parse_copy_text_format(data, '\t', "\\N", 1, false).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("x".into())],
+                vec![Some("".into())],
+                vec![Some("".into())],
+                vec![Some("y".into())]
+            ]
+        );
+    }
+
+    #[test]
+    fn test_empty_line_wrong_column_count() {
+        let data = "1\thello\n\n2\tworld\n";
+        let result = parse_copy_text_format(data, '\t', "\\N", 2, false);
+        assert!(
+            matches!(&result, Err(LimboError::ParseError(msg)) if msg == "COPY: line 2: expected 2 columns, got 1"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_backslash_escaped_delimiter() {
+        let data = "a\\\tb\tc\n";
+        let rows = parse_copy_text_format(data, '\t', "\\N", 2, false).unwrap();
+        assert_eq!(rows, vec![vec![Some("a\tb".into()), Some("c".into())]]);
+    }
+
+    #[test]
+    fn test_backslash_escaped_newline() {
+        let data = "x\\\n";
+        let rows = parse_copy_text_format(data, '\t', "\\N", 1, false).unwrap();
+        assert_eq!(rows, vec![vec![Some("x\n".into())]]);
+
+        let data_crlf = "x\\\r\n";
+        let rows_crlf = parse_copy_text_format(data_crlf, '\t', "\\N", 1, false).unwrap();
+        assert_eq!(rows_crlf, vec![vec![Some("x\n".into())]]);
     }
 }
