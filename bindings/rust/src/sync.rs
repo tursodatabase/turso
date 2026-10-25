@@ -1919,7 +1919,22 @@ mod tests {
                 for row_id in 0..iterations_cnt {
                     let tag = format!("conn{conn_id}_row{row_id}");
                     let data = format!("{tag}_{payload}");
-                    insert_retrying_busy(&conn, data).await;
+                    loop {
+                        match conn
+                            .execute(
+                                "INSERT INTO test_data (payload) VALUES (?)",
+                                crate::params::Params::Positional(vec![Value::Text(data.clone())]),
+                            )
+                            .await
+                        {
+                            Ok(_) => break,
+                            Err(crate::Error::Busy(_)) => {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                                continue;
+                            }
+                            Err(e) => panic!("insert failed (conn{conn_id}, row{row_id}): {e:?}"),
+                        }
+                    }
                 }
             }));
         }
@@ -1930,7 +1945,24 @@ mod tests {
         // Sequential writes: 3 more large inserts
         for i in 0..after_cnt {
             let data = format!("sequential_{i}_{payload}");
-            insert_retrying_busy(&conn, data).await;
+            // A running pull or checkpoint makes inserts fail with Busy right away.
+            loop {
+                let result = conn
+                    .execute(
+                        "INSERT INTO test_data (payload) VALUES (?)",
+                        crate::params::Params::Positional(vec![Value::Text(data.clone())]),
+                    )
+                    .await;
+                match result {
+                    Err(crate::Error::Busy(_)) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await
+                    }
+                    result => {
+                        result.unwrap();
+                        break;
+                    }
+                }
+            }
         }
 
         // Signal sync task to stop and wait for it
@@ -1957,26 +1989,6 @@ mod tests {
             stats.main_wal_size,
             stats.main_wal_size as f64 / 1024.0
         );
-    }
-
-    /// Statements fail with Busy right away while a pull or checkpoint is
-    /// running, whatever the busy_timeout, so the caller has to retry.
-    async fn insert_retrying_busy(conn: &crate::Connection, data: String) {
-        loop {
-            match conn
-                .execute(
-                    "INSERT INTO test_data (payload) VALUES (?)",
-                    crate::params::Params::Positional(vec![Value::Text(data.clone())]),
-                )
-                .await
-            {
-                Ok(_) => return,
-                Err(crate::Error::Busy(_)) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(e) => panic!("insert failed: {e:?}"),
-            }
-        }
     }
 
     /// Reproducer for schema-divergence during sync.
