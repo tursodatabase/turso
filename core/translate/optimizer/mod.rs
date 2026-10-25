@@ -10,6 +10,7 @@ use super::{
     },
 };
 use crate::alloc::TursoIteratorExt;
+use crate::namespace::NamespaceId;
 use crate::schema::GeneratedType;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::{table_mask_from_expr, TableMask};
@@ -105,9 +106,15 @@ impl AvailableIndexes {
             .filter(|jt| matches!(jt.table, Table::BTree(_) | Table::Virtual(_))) // only b-tree tables can have indexes
             .filter(|jt| jt.btree().is_none_or(|btree| btree.has_rowid))
             .filter_map(|jt| {
-                let indexes = resolver.with_schema(jt.database_id, |schema| {
-                    schema.indexes.get(jt.table.get_name()).cloned()
-                })?;
+                let indexes: VecDeque<_> = resolver.with_schema(jt.database_id, |schema| {
+                    schema
+                        .indices_including_backing(NamespaceId::ROOT, jt.table.get_name())
+                        .cloned()
+                        .collect()
+                });
+                if indexes.is_empty() {
+                    return None;
+                }
                 Some((jt.internal_id, indexes))
             })
             .collect();
@@ -786,10 +793,9 @@ fn transform_match_to_fts_match(
             .find(|t| t.internal_id == table_id)
             .and_then(|t| {
                 if let Table::BTree(btree) = &t.table {
-                    Some(
-                        resolver
-                            .with_schema(t.database_id, |schema| schema.has_fts_index(&btree.name)),
-                    )
+                    Some(resolver.with_schema(t.database_id, |schema| {
+                        schema.has_fts_index(NamespaceId::ROOT, &btree.name)
+                    }))
                 } else {
                     None
                 }
@@ -1465,7 +1471,7 @@ fn update_write_set_reason(
         // target during the scan. Materialize target rowids first to keep
         // the write set stable. (See issue #6460.)
         let referencing_fks = resolver.with_schema(database_id, |s| {
-            s.resolved_fks_referencing(&btree_table.name)
+            s.resolved_fks_referencing(NamespaceId::ROOT, &btree_table.name)
         })?;
         for fk in &referencing_fks {
             if matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict) {
@@ -2171,7 +2177,7 @@ fn group_count_from_analyze(plan: &SelectPlan, group_by: &GroupBy, schema: &Sche
         .index_stats
         .iter()
         .filter_map(|(index_name, index_stats)| {
-            let index = schema.get_index(&btree.name, index_name)?;
+            let index = schema.get_index(NamespaceId::ROOT, &btree.name, index_name)?;
             if index.where_clause.is_some() || index.columns.len() < columns.len() {
                 return None;
             }

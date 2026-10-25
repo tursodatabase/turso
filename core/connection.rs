@@ -3,6 +3,7 @@ use crate::connection_hooks::{ConnectionHooks, SavepointMemo};
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
+use crate::namespace::NamespaceId;
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
@@ -1519,7 +1520,7 @@ impl Connection {
                     // descriptor SELECTs can resolve the backing tables.
                     if pending.is_none() {
                         if let Some(sequences) = inner.preserved_sequences.take() {
-                            inner.fresh.sequences = sequences;
+                            inner.fresh.set_sequences(NamespaceId::ROOT, sequences);
                             *pending = Some(crate::alloc::vec![]);
                         } else {
                             let work = inner.fresh.sequence_backing_table_names();
@@ -1548,7 +1549,11 @@ impl Connection {
                         };
                         let (backing_table_name, seq_name) = entry;
                         let normalized = crate::util::normalize_ident(&seq_name);
-                        if inner.fresh.sequences.contains_key(&normalized) {
+                        if inner
+                            .fresh
+                            .get_sequence(NamespaceId::ROOT, &normalized)
+                            .is_some()
+                        {
                             *idx += 1;
                             *stmt = None;
                             *meta = None;
@@ -1588,7 +1593,11 @@ impl Connection {
                             mv_store.set_sequence_watermark(&normalized, watermark);
                         }
                         let sequence = seq.take().expect("sequence set above");
-                        inner.fresh.sequences.insert(normalized, Arc::new(sequence));
+                        inner.fresh.insert_sequence(
+                            NamespaceId::ROOT,
+                            normalized,
+                            Arc::new(sequence),
+                        );
                         *idx += 1;
                         *stmt = None;
                         *meta = None;
@@ -1600,8 +1609,7 @@ impl Connection {
                     if self.experimental_custom_types_enabled()
                         && inner
                             .fresh
-                            .tables
-                            .contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+                            .has_table(NamespaceId::ROOT, crate::schema::TURSO_TYPES_TABLE_NAME)
                     {
                         // Temporarily install the schema so we can query against it.
                         self.with_schema_mut(|schema| {
@@ -1646,7 +1654,7 @@ impl Connection {
                     tracing::debug!(
                         "reparse_schema: schema_version={}, tables={:?}",
                         fresh.schema_version,
-                        fresh.tables.keys()
+                        fresh.table_names(NamespaceId::ROOT).collect::<Vec<_>>()
                     );
                     self.with_schema_mut(|schema| {
                         *schema = fresh;
@@ -1937,7 +1945,7 @@ impl Connection {
     pub(crate) fn query_stored_type_definitions(self: &Arc<Connection>) -> Result<Vec<String>> {
         let has_types_table = {
             let s = self.schema.read();
-            s.tables.contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+            s.has_table(NamespaceId::ROOT, crate::schema::TURSO_TYPES_TABLE_NAME)
         };
         if !has_types_table {
             return Ok(Vec::new());
@@ -3301,7 +3309,7 @@ impl Connection {
         let entry = attached_dbs
             .index_to_data
             .get(&database_id)
-            .expect("Database ID should be valid after resolve_database_id");
+            .expect("Database ID should be valid after resolve_namespace");
         let schema = entry.db.schema.lock().clone();
         schema
     }
@@ -3602,7 +3610,9 @@ impl Connection {
         };
         let get = |db_id: usize, seq_name: &str| {
             self.with_schema(db_id, |schema| {
-                schema.get_sequence(seq_name).map(Arc::clone)
+                schema
+                    .get_sequence(NamespaceId::ROOT, seq_name)
+                    .map(Arc::clone)
             })
             .map(|sequence| (db_id, sequence))
         };
@@ -3734,8 +3744,9 @@ impl Connection {
                     };
                     let (backing_table_name, seq_name) = entry;
                     let normalized = crate::util::normalize_ident(&seq_name);
-                    let already_present =
-                        self.with_schema(MAIN_DB_ID, |s| s.get_sequence(&normalized).is_some());
+                    let already_present = self.with_schema(MAIN_DB_ID, |s| {
+                        s.get_sequence(NamespaceId::ROOT, &normalized).is_some()
+                    });
                     if already_present {
                         *idx += 1;
                         *stmt = None;
@@ -3777,9 +3788,11 @@ impl Connection {
                     }
                     let sequence = seq.take().expect("sequence set above");
                     self.with_database_schema_mut(MAIN_DB_ID, |schema| {
-                        schema
-                            .sequences
-                            .insert(normalized.clone(), Arc::new(sequence));
+                        schema.insert_sequence(
+                            NamespaceId::ROOT,
+                            normalized.clone(),
+                            Arc::new(sequence),
+                        );
                     })?;
                     *idx += 1;
                     *stmt = None;
@@ -3978,7 +3991,8 @@ impl Connection {
             match state {
                 SyncAutoincrementState::Start => {
                     let has_seq_table = self.with_schema(MAIN_DB_ID, |s| {
-                        s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME).is_some()
+                        s.get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
+                            .is_some()
                     });
                     if !has_seq_table {
                         return Ok(IOResult::Done(()));
@@ -4032,14 +4046,15 @@ impl Connection {
                             let sequence_name = autoincrement_sequence_name(&rows[*idx].0);
                             let backing_table_name = sequence_backing_table_name(&sequence_name);
                             let has_backing = self.with_schema(MAIN_DB_ID, |s| {
-                                s.get_btree_table(&backing_table_name).is_some()
+                                s.get_btree_table(NamespaceId::ROOT, &backing_table_name)
+                                    .is_some()
                             });
                             if !has_backing {
                                 *idx += 1;
                                 continue;
                             }
                             let seq = self
-                                .with_schema(MAIN_DB_ID, |s| s.get_sequence(&sequence_name).cloned())
+                                .with_schema(MAIN_DB_ID, |s| s.get_sequence(NamespaceId::ROOT, &sequence_name).cloned())
                                 .ok_or_else(|| {
                                     LimboError::InternalError(format!(
                                         "sequence \"{sequence_name}\" is not loaded although its backing table exists"

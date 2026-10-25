@@ -1,3 +1,4 @@
+use crate::namespace::NamespaceId;
 use crate::types::IOResultOr;
 use rustc_hash::FxHashMap;
 use std::sync::{atomic::Ordering, Arc};
@@ -690,7 +691,11 @@ pub(crate) fn vacuum_target_build_step(
                                     .source_conn
                                     .with_schema(config.source_db_id, |schema| {
                                         schema
-                                            .get_index(&entry.tbl_name, &entry.name)
+                                            .get_index(
+                                                NamespaceId::ROOT,
+                                                &entry.tbl_name,
+                                                &entry.name,
+                                            )
                                             .is_some_and(|idx| idx.is_backing_btree_index())
                                     })
                             })
@@ -805,7 +810,10 @@ pub(crate) fn vacuum_target_build_step(
                         .target_conn
                         .schema
                         .read()
-                        .get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
+                        .get_btree_table(
+                            NamespaceId::ROOT,
+                            crate::schema::SQLITE_SEQUENCE_TABLE_NAME,
+                        )
                         .is_some();
                     if !target_has_sequence {
                         state.phase = VacuumTargetBuildPhase::StartCopyTable {
@@ -873,7 +881,7 @@ pub(crate) fn vacuum_target_build_step(
                 let source_btree_table = config
                     .source_conn
                     .with_schema(config.source_db_id, |schema| {
-                        schema.get_btree_table(table_name)
+                        schema.get_btree_table(NamespaceId::ROOT, table_name)
                     });
 
                 let (select_sql, insert_sql) = build_copy_sql(
@@ -1766,7 +1774,11 @@ fn reload_physical_schema_for_mvcc_vacuum(
     // blocking `Schema::populate_sequences` and `populate_sequences_via_sql`
     // helpers, which violate the vdbe async contract from inside the
     // VACUUM state machine.
-    let preserved_sequences = connection.schema.read().sequences.clone();
+    let preserved_sequences = connection
+        .schema
+        .read()
+        .sequences_by_name(NamespaceId::ROOT)
+        .clone();
     let reparse_result = connection.read_current_schema_cookie().and_then(|cookie| {
         connection.reparse_schema_with_cookie_keeping_sequences(cookie, preserved_sequences)
     });
@@ -1978,7 +1990,11 @@ fn vacuum_in_place_step(
                 let temp_db_ref = temp_db
                     .as_ref()
                     .expect("VACUUM CaptureTargetMetadata phase requires temp db");
-                let source_sequences = connection.schema.read().sequences.clone();
+                let source_sequences = connection
+                    .schema
+                    .read()
+                    .sequences_by_name(NamespaceId::ROOT)
+                    .clone();
                 *committed_image = Some(capture_target_metadata(temp_db_ref, source_sequences)?);
                 *phase = VacuumInPlacePhase::BeginTempReadTx;
                 continue;
@@ -2826,11 +2842,9 @@ mod tests {
             Ok(())
         })?;
 
-        let replacement = Schema {
-            generated_columns_enabled: true,
-            schema_version: 0,
-            ..Default::default()
-        };
+        let mut replacement = Schema::new();
+        replacement.generated_columns_enabled = true;
+        replacement.schema_version = 0;
         replace_shared_schema_after_vacuum(db.as_ref(), Arc::new(replacement));
 
         let schema = db.clone_schema();
@@ -2856,13 +2870,12 @@ mod tests {
 
         let mut header = DatabaseHeader::default();
         header.schema_cookie = 42.into();
+        let mut schema = Schema::new();
+        schema.generated_columns_enabled = true;
+        schema.schema_version = 42;
         let committed = VacuumCommittedImageMeta {
             header,
-            schema: Arc::new(Schema {
-                generated_columns_enabled: true,
-                schema_version: 42,
-                ..Default::default()
-            }),
+            schema: Arc::new(schema),
         };
 
         install_committed_vacuum_image(&conn, crate::MAIN_DB_ID, &committed);
@@ -2892,13 +2905,12 @@ mod tests {
 
         let mut header = DatabaseHeader::default();
         header.schema_cookie = 43.into();
+        let mut schema = Schema::new();
+        schema.generated_columns_enabled = true;
+        schema.schema_version = 43;
         let committed = VacuumCommittedImageMeta {
             header,
-            schema: Arc::new(Schema {
-                generated_columns_enabled: true,
-                schema_version: 43,
-                ..Default::default()
-            }),
+            schema: Arc::new(schema),
         };
 
         vacuum_in_place_cleanup(
@@ -2973,19 +2985,25 @@ mod tests {
         assert_eq!(committed.header.write_version, mvcc_version);
         assert_eq!(committed.schema.schema_version, 42);
         assert!(
-            committed.schema.tables.contains_key("generate_series"),
+            committed
+                .schema
+                .has_table(NamespaceId::ROOT, "generate_series"),
             "captured schema must retain built-in table-valued functions"
         );
-        let table_root = match committed.schema.tables.get("t").expect("table t").as_ref() {
+        let table_root = match committed
+            .schema
+            .get_table(NamespaceId::ROOT, "t")
+            .expect("table t")
+            .as_ref()
+        {
             crate::schema::Table::BTree(btree) => btree.root_page,
             _ => panic!("expected btree table"),
         };
         assert!(table_root > 0);
         let index_root = committed
             .schema
-            .indexes
-            .get("t")
-            .and_then(|indexes| indexes.front())
+            .indices_including_backing(NamespaceId::ROOT, "t")
+            .next()
             .map(|index| index.root_page)
             .expect("index idx_t_v");
         assert!(index_root > 0);

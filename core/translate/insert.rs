@@ -1,3 +1,4 @@
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::ColumnLayout;
 use crate::translate::emitter::{
     emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
@@ -72,7 +73,7 @@ fn validate(
     table_name: &str,
     resolver: &Resolver,
     _table: &Table,
-    database_id: usize,
+    namespace: NamespaceRef,
     conn: &Arc<Connection>,
 ) -> Result<()> {
     // Check if this is a system table that should be protected from direct writes
@@ -86,10 +87,12 @@ fn validate(
     // Check if this is a materialized view. Must look up the schema of the
     // table's own database: a table in an attached database can share a name
     // with a materialized view in a different database.
-    if resolver.with_schema(database_id, |s| s.is_materialized_view(table_name)) {
+    if resolver.with_schema(namespace.database_id, |s| {
+        s.is_materialized_view(namespace.id, table_name)
+    }) {
         crate::bail_parse_error!("cannot modify materialized view {}", table_name);
     }
-    resolver.with_schema(database_id, |s| s.with_incompatible_dependent_views(table_name, |views| {
+    resolver.with_schema(namespace.database_id, |s| s.with_incompatible_dependent_views(namespace.id, table_name, |views| {
     if !views.is_empty() {
         use crate::incremental::view::DBSP_CIRCUIT_VERSION;
         crate::bail_parse_error!(
@@ -167,6 +170,8 @@ pub struct InsertEmitCtx<'a> {
     pub autoincrement_meta: Option<AutoincMeta>,
     /// The database index (0 = main, 1 = temp, 2+ = attached)
     pub database_id: usize,
+    /// The namespace of the table.
+    pub namespace: NamespaceRef,
     /// Ephemeral table for buffering RETURNING results.
     /// When present, RETURNING rows are buffered into an ephemeral table during the DML loop,
     /// then scanned back and yielded to the caller after all DML is complete.
@@ -187,11 +192,13 @@ impl<'a> InsertEmitCtx<'a> {
         cdc_table: Option<(usize, Arc<BTreeTable>)>,
         num_values: usize,
         temp_table_ctx: Option<TempTableCtx>,
-        database_id: usize,
+        namespace: NamespaceRef,
     ) -> Result<Self> {
         // allocate cursor id's for each btree index cursor we'll need to populate the indexes
-        let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(table.name.as_str()).cloned().collect()
+        let indices: Vec<_> = resolver.with_schema(namespace.database_id, |s| {
+            s.get_indices(namespace.id, table.name.as_str())
+                .cloned()
+                .collect()
         });
         let mut idx_cursors = Vec::new();
         for idx in &indices {
@@ -226,7 +233,8 @@ impl<'a> InsertEmitCtx<'a> {
             cdc_table,
             num_values,
             autoincrement_meta: None,
-            database_id,
+            database_id: namespace.database_id,
+            namespace,
             returning_buffer: None,
             written_rowids_cursor_id: None,
         })
@@ -276,9 +284,12 @@ pub fn translate_insert(
         // for RETURNING clause subqueries - handled below via with_for_returning.
     }
 
-    let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
+    let namespace = resolver.resolve_existing_table(&tbl_name)?;
+    let database_id = namespace.database_id;
     let table_name = &tbl_name.name;
-    let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
+    let table = match resolver.with_schema(database_id, |s| {
+        s.get_table(namespace.id, table_name.as_str())
+    }) {
         Some(table) => table,
         None => crate::bail_parse_error!(
             "no such table: {}",
@@ -288,13 +299,7 @@ pub fn translate_insert(
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
     }
-    validate(
-        table_name.as_str(),
-        resolver,
-        &table,
-        database_id,
-        connection,
-    )?;
+    validate(table_name.as_str(), resolver, &table, namespace, connection)?;
 
     let fk_enabled = connection.foreign_keys_enabled();
     if let Some(virtual_table) = &table.virtual_table() {
@@ -399,10 +404,11 @@ pub fn translate_insert(
     let mut result_columns =
         process_returning_clause(&mut returning, &mut table_references, resolver)?;
     let has_fks = fk_enabled
-        && (resolver.with_schema(database_id, |s| s.has_child_fks(table_name.as_str()))
-            || resolver.with_schema(database_id, |s| {
-                s.any_resolved_fks_referencing(table_name.as_str())
-            }));
+        && (resolver.with_schema(database_id, |s| {
+            s.has_child_fks(namespace.id, table_name.as_str())
+        }) || resolver.with_schema(database_id, |s| {
+            s.any_resolved_fks_referencing(namespace.id, table_name.as_str())
+        }));
     if !btree_table.has_rowid {
         if has_fks {
             crate::bail_parse_error!("foreign keys on WITHOUT ROWID tables are not supported");
@@ -417,7 +423,7 @@ pub fn translate_insert(
         }
         if !resolver
             .schema()
-            .get_dependent_materialized_views(&btree_table.name)
+            .get_dependent_materialized_views(NamespaceId::ROOT, &btree_table.name)
             .is_empty()
         {
             crate::bail_parse_error!(
@@ -425,7 +431,9 @@ pub fn translate_insert(
             );
         }
         if resolver.with_schema(database_id, |s| {
-            s.get_indices(table_name.as_str()).next().is_some()
+            s.get_indices(namespace.id, table_name.as_str())
+                .next()
+                .is_some()
         }) {
             crate::bail_parse_error!("secondary indexes on WITHOUT ROWID tables are not supported");
         }
@@ -439,7 +447,7 @@ pub fn translate_insert(
         cdc_table,
         values.len(),
         None,
-        database_id,
+        namespace,
     )?;
     program
         .flags
@@ -692,7 +700,9 @@ pub fn translate_insert(
             // rowid is already <= current watermark.
             let seq_name = crate::schema::autoincrement_sequence_name(&ctx.table.name);
             let seq = resolver
-                .with_schema(ctx.database_id, |s| s.get_sequence(&seq_name).cloned())
+                .with_schema(ctx.database_id, |s| {
+                    s.get_sequence(ctx.namespace.id, &seq_name).cloned()
+                })
                 .ok_or_else(|| {
                     crate::LimboError::InternalError(format!(
                         "missing implicit sequence for AUTOINCREMENT table \"{}\"",
@@ -718,7 +728,7 @@ pub fn translate_insert(
     // see the rowids this statement has used unless they are written first.
     if let Some(meta) = ctx
         .autoincrement_meta
-        .filter(|_| any_trigger_inserts_into(resolver, database_id, &ctx.table.name))
+        .filter(|_| any_trigger_inserts_into(resolver, ctx.namespace, &ctx.table.name))
     {
         emit_write_sqlite_sequence(program, resolver, ctx.database_id, meta)?;
     }
@@ -873,7 +883,7 @@ pub fn translate_insert(
             any_index_or_ipk_has_replace(
                 ctx.table.rowid_alias_conflict_clause,
                 schema
-                    .get_indices(ctx.table.name.as_str())
+                    .get_indices(ctx.namespace.id, ctx.table.name.as_str())
                     .map(|idx| idx.on_conflict),
             )
         });
@@ -1315,22 +1325,27 @@ fn emit_epilogue(
     Ok(())
 }
 
-fn any_trigger_inserts_into(resolver: &Resolver, database_id: usize, table_name: &str) -> bool {
-    let inserts_into_table = |schema: &schema::Schema| {
+fn any_trigger_inserts_into(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    table_name: &str,
+) -> bool {
+    let inserts_into_table = |schema: &schema::Schema, namespace: NamespaceId| {
         schema
-            .triggers
-            .values()
-            .flatten()
+            .triggers(namespace)
             .flat_map(|trigger| trigger.commands.iter())
             .any(|command| {
                 matches!(command, ast::TriggerCmd::Insert { tbl_name, .. }
                     if normalize_ident(tbl_name.as_str()).eq_ignore_ascii_case(table_name))
             })
     };
-    resolver.with_schema(database_id, inserts_into_table)
-        || (database_id != crate::TEMP_DB_ID
-            && resolver.has_temp_database()
-            && resolver.with_schema(crate::TEMP_DB_ID, inserts_into_table))
+    resolver.with_schema(namespace.database_id, |schema| {
+        inserts_into_table(schema, namespace.id)
+    }) || (namespace.database_id != crate::TEMP_DB_ID
+        && resolver.has_temp_database()
+        && resolver.with_schema(crate::TEMP_DB_ID, |schema| {
+            inserts_into_table(schema, NamespaceId::ROOT)
+        }))
 }
 
 fn emit_write_sqlite_sequence(
@@ -1429,7 +1444,9 @@ fn emit_commit_phase(
     skip_replace_indexes: bool,
 ) -> Result<()> {
     let indices: Vec<_> = resolver.with_schema(ctx.database_id, |s| {
-        s.get_indices(ctx.table.name.as_str()).cloned().collect()
+        s.get_indices(ctx.namespace.id, ctx.table.name.as_str())
+            .cloned()
+            .collect()
     });
     for index in &indices {
         // In mixed mode (some constraints REPLACE, some not), REPLACE indexes
@@ -1545,7 +1562,9 @@ fn emit_rowid_generation(
     if ctx.table.has_autoincrement && is_mvcc {
         let seq_name = crate::schema::autoincrement_sequence_name(&ctx.table.name);
         let seq = resolver
-            .with_schema(ctx.database_id, |s| s.get_sequence(&seq_name).cloned())
+            .with_schema(ctx.database_id, |s| {
+                s.get_sequence(ctx.namespace.id, &seq_name).cloned()
+            })
             .ok_or_else(|| {
                 crate::LimboError::InternalError(format!(
                     "missing implicit sequence for AUTOINCREMENT table \"{}\"",
@@ -1696,7 +1715,7 @@ fn get_valid_sqlite_sequence_table(
     database_id: usize,
 ) -> Result<Arc<BTreeTable>> {
     let Some(seq_table) = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+        s.get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
     }) else {
         crate::bail_corrupt_error!("missing sqlite_sequence table");
     };
@@ -2218,7 +2237,7 @@ fn bind_insert(
         upsert_actions.push((
             // resolve the constrained target for UPSERT in the chain
             resolver.with_schema(database_id, |s| {
-                resolve_upsert_target(s, table, &upsert_opt)
+                resolve_upsert_target(s, NamespaceId::ROOT, table, &upsert_opt)
             })?,
             program.allocate_label(),
             upsert_opt,
@@ -3640,7 +3659,9 @@ fn build_constraints_to_check(
         constraints_to_check.push((ResolvedUpsertTarget::PrimaryKey, position));
     }
     let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-        s.get_indices(table_name).cloned().collect()
+        s.get_indices(NamespaceId::ROOT, table_name)
+            .cloned()
+            .collect()
     });
     for index in &indices {
         let position = upsert_actions
@@ -3825,7 +3846,10 @@ fn emit_replace_delete_conflicting_row(
             None,
             ctx.database_id,
         )?;
-        if resolver.schema().has_child_fks(ctx.table.name.as_str()) {
+        if resolver
+            .schema()
+            .has_child_fks(NamespaceId::ROOT, ctx.table.name.as_str())
+        {
             emit_fk_child_decrement_on_delete(
                 program,
                 ctx.table.as_ref(),
@@ -3847,7 +3871,9 @@ fn emit_replace_delete_conflicting_row(
 
     for (name, _, index_cursor_id) in ctx.idx_cursors.iter() {
         let index = resolver
-            .with_schema(ctx.database_id, |s| s.get_index(table_name, name).cloned())
+            .with_schema(ctx.database_id, |s| {
+                s.get_index(ctx.namespace.id, table_name, name).cloned()
+            })
             .expect("index to exist");
         let table_internal_id = table_references.joined_tables()[0].internal_id;
         let skip_delete_label = emit_partial_index_where_old_image(
@@ -3957,7 +3983,7 @@ pub fn emit_fk_child_insert_checks(
     layout: &ColumnLayout,
 ) -> crate::Result<()> {
     for fk_ref in resolver.with_schema(database_id, |s| {
-        s.resolved_fks_for_child(&child_tbl.name, None)
+        s.resolved_fks_for_child(NamespaceId::ROOT, &child_tbl.name, None)
     })? {
         let is_self_ref = fk_ref.fk.parent_table.eq_ignore_ascii_case(&child_tbl.name);
 
@@ -3976,7 +4002,9 @@ pub fn emit_fk_child_insert_checks(
             });
         }
         let parent_tbl = resolver
-            .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
+            .with_schema(database_id, |s| {
+                s.get_btree_table(NamespaceId::ROOT, &fk_ref.fk.parent_table)
+            })
             .expect("parent btree");
         if fk_ref.parent_uses_rowid {
             let pcur = open_read_table(program, &parent_tbl, database_id);
@@ -4267,7 +4295,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
     database_id: usize,
 ) -> crate::Result<()> {
     for pref in resolver.with_schema(database_id, |s| {
-        s.resolved_fks_referencing(&parent_table.name)
+        s.resolved_fks_referencing(NamespaceId::ROOT, &parent_table.name)
     })? {
         let is_self_ref = pref
             .child_table
@@ -4294,7 +4322,9 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         let child_tbl = &pref.child_table;
         let child_cols = &pref.fk.child_columns;
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(&child_tbl.name).cloned().collect()
+            s.get_indices(NamespaceId::ROOT, &child_tbl.name)
+                .cloned()
+                .collect()
         });
         let idx = indices.iter().find(|ix| {
             ix.columns.len() == child_cols.len()

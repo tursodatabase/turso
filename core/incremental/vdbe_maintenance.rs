@@ -24,6 +24,7 @@
 //! completion (or before an in-statement view read), or inside the CREATE
 //! MATERIALIZED VIEW statement for initial population.
 
+use crate::namespace::NamespaceRef;
 use rustc_hash::FxHashMap;
 use turso_parser::ast;
 
@@ -219,9 +220,11 @@ impl Connection {
         view_name: &str,
     ) -> Result<Vec<Option<String>>> {
         let schema = self.schema.read().clone();
-        let view = schema.get_materialized_view(view_name).ok_or_else(|| {
-            LimboError::InvalidArgument(format!("no such materialized view: {view_name}"))
-        })?;
+        let view = schema
+            .get_materialized_view(crate::namespace::NamespaceId::ROOT, view_name)
+            .ok_or_else(|| {
+                LimboError::InvalidArgument(format!("no such materialized view: {view_name}"))
+            })?;
         let select = view.lock().select_stmt.clone();
         let plan = build_plan_for_connection(view_name, &select, &schema, self)?;
         Ok(plan
@@ -256,9 +259,11 @@ fn build_plan_for_connection(
     // names the same way CREATE did: within the view's own database, never
     // through a TEMP table that happens to share a source table's name
     // (#9456). Materialized views always live in main.
-    resolver.with_view_scope(crate::MAIN_DB_ID, view_name.to_string(), || {
-        plan_view(view_name, select, &resolver, connection)
-    })
+    resolver.with_view_scope(
+        NamespaceRef::root_of(crate::MAIN_DB_ID),
+        view_name.to_string(),
+        || plan_view(view_name, select, &resolver, connection),
+    )
 }
 
 /// Emit every node once in DAG topological order.

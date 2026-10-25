@@ -363,13 +363,13 @@ pub fn bind_and_rewrite_expr<'a>(
                         name: tbl_name_clone,
                         alias: None,
                     };
-                    let db_resolution = resolver.resolve_database_id(&qualified_name);
+                    let db_resolution = resolver.resolve_namespace(&qualified_name);
 
-                    if let Ok(database_id) = db_resolution.as_ref() {
+                    if let Ok(namespace) = db_resolution.as_ref() {
                         match resolve_qualified_name(
                             referenced_tables,
                             resolver,
-                            Some(*database_id),
+                            Some(namespace.database_id),
                             &tbl_name_str,
                             &normalized_col_name,
                         )? {
@@ -397,9 +397,10 @@ pub fn bind_and_rewrite_expr<'a>(
                     // the table+column exist, use that. Otherwise fall through to
                     // table.column.field for struct/union field access.
                     let mut resolved_as_db_table_col = false;
-                    if let Ok(database_id) = db_resolution {
-                        let table = resolver
-                            .with_schema(database_id, |schema| schema.get_table(&tbl_name_str));
+                    if let Ok(namespace) = db_resolution {
+                        let table = resolver.with_schema(namespace.database_id, |schema| {
+                            schema.get_table(namespace.id, &tbl_name_str)
+                        });
 
                         if let Some(table) = table {
                             let col_idx = table.columns().iter().position(|c| {

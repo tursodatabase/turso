@@ -11,6 +11,45 @@ use crate::sync::RwLock;
 use crate::{turso_assert, MAIN_DB_ID, TEMP_DB_ID};
 use rustc_hash::FxHashMap as HashMap;
 
+/// A namespace of a database's schema. Every database has the root
+/// namespace, which has the objects of the database itself; a schema can
+/// have more namespaces, each with its own objects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NamespaceId(u32);
+
+impl NamespaceId {
+    pub const ROOT: NamespaceId = NamespaceId(0);
+
+    pub const fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+
+    pub const fn is_root(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// A namespace of one of the connection's databases: the place a name
+/// resolves to, where the object is looked up by its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NamespaceRef {
+    pub database_id: usize,
+    pub id: NamespaceId,
+}
+
+impl NamespaceRef {
+    pub const fn root_of(database_id: usize) -> Self {
+        Self {
+            database_id,
+            id: NamespaceId::ROOT,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Namespaces {
     name_to_database: RwLock<HashMap<String, usize>>,
@@ -103,8 +142,18 @@ impl Namespaces {
 
 #[cfg(test)]
 mod tests {
-    use super::Namespaces;
+    use super::{NamespaceId, NamespaceRef, Namespaces};
     use crate::{MAIN_DB_ID, TEMP_DB_ID};
+
+    #[test]
+    fn the_root_of_a_database_is_namespace_zero_of_that_database() {
+        let namespace = NamespaceRef::root_of(3);
+        assert_eq!(namespace.database_id, 3);
+        assert_eq!(namespace.id, NamespaceId::ROOT);
+        assert!(namespace.id.is_root());
+        assert!(!NamespaceId::new(1).is_root());
+        assert_ne!(NamespaceRef::root_of(3), NamespaceRef::root_of(MAIN_DB_ID));
+    }
 
     fn namespaces_with_app_and_other() -> Namespaces {
         let namespaces = Namespaces::default();

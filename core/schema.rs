@@ -7,6 +7,7 @@ use crate::incremental::view::{
     create_dbsp_state_index, dbsp_version_marker_table_name, DBSP_CIRCUIT_VERSION,
 };
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
+use crate::namespace::NamespaceId;
 use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
@@ -767,46 +768,16 @@ pub enum SchemaObjectType {
     Index,
 }
 
+/// The objects of one database: the root namespace, which every database
+/// has, and the namespaces stored in it, each with its own objects.
 #[derive(Debug)]
 pub struct Schema {
-    pub tables: HashMap<String, Arc<Table>>,
+    namespaces: HashMap<NamespaceId, NamespaceSchema>,
     #[cfg(feature = "conn_raw_api")]
     pub(crate) table_names_by_root_page: HashMap<i64, String>,
-
-    /// Track which tables are actually materialized views
-    pub materialized_view_names: HashSet<String>,
-    /// Store original SQL for materialized views (for .schema command)
-    pub materialized_view_sql: HashMap<String, String>,
-    /// Materialized-view definitions consumed by compiled IVM programs.
-    pub incremental_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
-
-    pub views: ViewsMap,
-
-    /// table_name to list of triggers
-    pub triggers: HashMap<String, VecDeque<Arc<Trigger>>>,
-
-    /// table_name to list of indexes for the table
-    pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
-    pub has_indexes: HashSet<String>,
     pub schema_version: u32,
     /// Statistics collected via ANALYZE for regular B-tree tables and indexes.
     pub analyze_stats: AnalyzeStats,
-
-    /// Mapping from table names to the materialized views that depend on them
-    pub table_to_materialized_views: HashMap<String, Vec<String>>,
-
-    /// Track views that exist but have incompatible versions
-    pub incompatible_views: HashSet<String>,
-    /// Main btree roots for incompatible materialized views. Their logical
-    /// descriptors cannot be loaded, but DROP VIEW must still destroy their
-    /// storage so the documented recreate path remains possible.
-    pub incompatible_materialized_view_roots: HashMap<String, i64>,
-
-    /// View rows in sqlite_schema whose stored SQL failed to parse (e.g.
-    /// older versions wrote view column lists without identifier quoting).
-    /// The rows are tolerated at load time so the database stays usable;
-    /// tracking the names lets DROP VIEW remove them.
-    pub broken_views: HashSet<String>,
 
     /// Root pages of tables/indexes that have been dropped but not yet checkpointed.
     /// In MVCC mode, when a table is dropped, the btree pages are not freed until checkpoint.
@@ -817,8 +788,47 @@ pub struct Schema {
     pub type_registry: HashMap<String, Arc<TypeDef>>,
 
     pub generated_columns_enabled: bool,
+}
+
+/// The objects of one namespace, by name.
+#[derive(Debug, Default)]
+pub struct NamespaceSchema {
+    tables: HashMap<String, Arc<Table>>,
+
+    /// Track which tables are actually materialized views
+    materialized_view_names: HashSet<String>,
+    /// Store original SQL for materialized views (for .schema command)
+    materialized_view_sql: HashMap<String, String>,
+    /// Materialized-view definitions consumed by compiled IVM programs.
+    incremental_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
+
+    views: ViewsMap,
+
+    /// table_name to list of triggers
+    triggers: HashMap<String, VecDeque<Arc<Trigger>>>,
+
+    /// table_name to list of indexes for the table
+    indexes: HashMap<String, VecDeque<Arc<Index>>>,
+    has_indexes: HashSet<String>,
+
+    /// Mapping from table names to the materialized views that depend on them
+    table_to_materialized_views: HashMap<String, Vec<String>>,
+
+    /// Track views that exist but have incompatible versions
+    incompatible_views: HashSet<String>,
+    /// Main btree roots for incompatible materialized views. Their logical
+    /// descriptors cannot be loaded, but DROP VIEW must still destroy their
+    /// storage so the documented recreate path remains possible.
+    incompatible_materialized_view_roots: HashMap<String, i64>,
+
+    /// View rows in sqlite_schema whose stored SQL failed to parse (e.g.
+    /// older versions wrote view column lists without identifier quoting).
+    /// The rows are tolerated at load time so the database stays usable;
+    /// tracking the names lets DROP VIEW remove them.
+    broken_views: HashSet<String>,
+
     /// Named sequences (CREATE SEQUENCE)
-    pub sequences: HashMap<String, Arc<Sequence>>,
+    sequences: HashMap<String, Arc<Sequence>>,
 }
 
 impl Default for Schema {
@@ -918,54 +928,317 @@ impl Schema {
         enable_custom_types: bool,
         dialect: &dyn crate::dialect::Dialect,
     ) -> crate::Result<Self> {
-        let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
+        let mut root = NamespaceSchema::default();
         #[cfg(feature = "conn_raw_api")]
         let mut table_names_by_root_page = HashMap::default();
-        let has_indexes = HashSet::default();
-        let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::default();
         #[allow(clippy::arc_with_non_send_sync)]
-        tables.insert(
+        root.tables.insert(
             SCHEMA_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(sqlite_schema_table()?.into())),
         );
         #[cfg(feature = "conn_raw_api")]
         table_names_by_root_page.insert(1, SCHEMA_TABLE_NAME.to_string());
-        let materialized_view_names = HashSet::default();
-        let materialized_view_sql = HashMap::default();
-        let incremental_views = HashMap::default();
-        let views: ViewsMap = HashMap::default();
-        let triggers = HashMap::default();
-        let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::default();
-        let incompatible_views = HashSet::default();
-        let incompatible_materialized_view_roots = HashMap::default();
         let mut type_registry = HashMap::default();
         if enable_custom_types {
             bootstrap_builtin_types(&mut type_registry)?;
         }
+        let mut namespaces = HashMap::default();
+        namespaces.insert(NamespaceId::ROOT, root);
         let mut schema = Self {
-            tables,
+            namespaces,
             #[cfg(feature = "conn_raw_api")]
             table_names_by_root_page,
-            materialized_view_names,
-            materialized_view_sql,
-            incremental_views,
-            views,
-            triggers,
-            indexes,
-            has_indexes,
             schema_version: 0,
             analyze_stats: AnalyzeStats::default(),
-            table_to_materialized_views,
-            incompatible_views,
-            incompatible_materialized_view_roots,
-            broken_views: HashSet::default(),
             dropped_root_pages: HashSet::default(),
             type_registry,
             generated_columns_enabled: false,
-            sequences: HashMap::default(),
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
+    }
+
+    /// The ids of the namespaces of the schema.
+    pub fn namespace_ids(&self) -> impl Iterator<Item = NamespaceId> + '_ {
+        self.namespaces.keys().copied()
+    }
+
+    pub fn has_namespace(&self, id: NamespaceId) -> bool {
+        self.namespaces.contains_key(&id)
+    }
+
+    /// Adds the empty namespace `id`, which must not be the root and must not
+    /// exist yet.
+    pub fn add_namespace(&mut self, id: NamespaceId) {
+        turso_assert!(!id.is_root(), "the root namespace always exists");
+        let previous = self.namespaces.insert(id, NamespaceSchema::default());
+        turso_assert!(previous.is_none(), "namespace already exists", { "id": id.as_u32() });
+    }
+
+    /// Removes namespace `id` with all its objects. The root cannot be
+    /// removed.
+    pub fn remove_namespace(&mut self, id: NamespaceId) -> bool {
+        turso_assert!(!id.is_root(), "the root namespace always exists");
+        self.namespaces.remove(&id).is_some()
+    }
+
+    pub fn tables(&self, namespace: NamespaceId) -> impl Iterator<Item = &Arc<Table>> {
+        self.namespace(namespace).tables.values()
+    }
+
+    pub fn table_names(&self, namespace: NamespaceId) -> impl Iterator<Item = &str> {
+        self.namespace(namespace).tables.keys().map(String::as_str)
+    }
+
+    pub fn tables_mut(
+        &mut self,
+        namespace: NamespaceId,
+    ) -> impl Iterator<Item = (&str, &mut Arc<Table>)> {
+        self.namespace_mut(namespace)
+            .tables
+            .iter_mut()
+            .map(|(name, table)| (name.as_str(), table))
+    }
+
+    pub fn has_table(&self, namespace: NamespaceId, name: &str) -> bool {
+        self.namespace(namespace).tables.contains_key(name)
+    }
+
+    pub fn table_mut(&mut self, namespace: NamespaceId, name: &str) -> Option<&mut Arc<Table>> {
+        let name = self.normalize_table_lookup_name(name);
+        self.namespace_mut(namespace).tables.get_mut(&name)
+    }
+
+    /// The table named `name` and its indexes, to change together.
+    pub fn table_with_indices_mut(
+        &mut self,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Option<(&mut Arc<Table>, impl Iterator<Item = &mut Arc<Index>>)> {
+        let name = self.normalize_table_lookup_name(name);
+        let objects = self.namespace_mut(namespace);
+        let table = objects.tables.get_mut(&name)?;
+        let indexes = objects
+            .indexes
+            .get_mut(&name)
+            .map(|v| v.iter_mut())
+            .unwrap_or_default();
+        Some((table, indexes))
+    }
+
+    /// Puts `table` in the namespace under `name`, replacing a table of
+    /// that name.
+    pub fn insert_table(&mut self, namespace: NamespaceId, name: String, table: Arc<Table>) {
+        self.namespace_mut(namespace).tables.insert(name, table);
+    }
+
+    /// Takes the table named `name` out of the namespace.
+    pub fn take_table(&mut self, namespace: NamespaceId, name: &str) -> Option<Arc<Table>> {
+        let name = normalize_ident(name);
+        self.namespace_mut(namespace).tables.remove(&name)
+    }
+
+    /// The views of the namespace, as the names they are looked up by and the views.
+    pub fn views(&self, namespace: NamespaceId) -> impl Iterator<Item = (&str, &Arc<View>)> {
+        self.namespace(namespace)
+            .views
+            .iter()
+            .map(|(name, view)| (name.as_str(), view))
+    }
+
+    pub fn view_mut(&mut self, namespace: NamespaceId, name: &str) -> Option<&mut Arc<View>> {
+        let name = normalize_ident(name);
+        self.namespace_mut(namespace).views.get_mut(&name)
+    }
+
+    pub fn is_incompatible_view(&self, namespace: NamespaceId, name: &str) -> bool {
+        self.namespace(namespace)
+            .incompatible_views
+            .contains(&normalize_ident(name))
+    }
+
+    pub fn is_broken_view(&self, namespace: NamespaceId, name: &str) -> bool {
+        self.namespace(namespace).broken_views.contains(name)
+    }
+
+    pub fn remove_broken_view(&mut self, namespace: NamespaceId, name: &str) -> bool {
+        self.namespace_mut(namespace).broken_views.remove(name)
+    }
+
+    /// The root pages of the materialized views of the namespace that were
+    /// written by an incompatible storage version.
+    pub fn incompatible_materialized_view_roots(
+        &self,
+        namespace: NamespaceId,
+    ) -> impl Iterator<Item = i64> + '_ {
+        self.namespace(namespace)
+            .incompatible_materialized_view_roots
+            .values()
+            .copied()
+    }
+
+    pub fn has_materialized_views(&self, namespace: NamespaceId) -> bool {
+        !self
+            .namespace(namespace)
+            .table_to_materialized_views
+            .is_empty()
+    }
+
+    /// Every index of the namespace, backing B-tree indexes included.
+    pub fn indexes(&self, namespace: NamespaceId) -> impl Iterator<Item = &Arc<Index>> {
+        self.namespace(namespace).indexes.values().flatten()
+    }
+
+    pub fn indexes_mut(&mut self, namespace: NamespaceId) -> impl Iterator<Item = &mut Arc<Index>> {
+        self.namespace_mut(namespace).indexes.values_mut().flatten()
+    }
+
+    /// The indexes stored for `table_name`, backing B-tree indexes included.
+    /// `table_name` is the stored name; it is not normalized.
+    pub fn indices_including_backing(
+        &self,
+        namespace: NamespaceId,
+        table_name: &str,
+    ) -> impl Iterator<Item = &Arc<Index>> {
+        self.namespace(namespace)
+            .indexes
+            .get(table_name)
+            .map(|v| v.iter())
+            .unwrap_or_default()
+    }
+
+    pub fn indices_of_table_mut(
+        &mut self,
+        namespace: NamespaceId,
+        table_name: &str,
+    ) -> impl Iterator<Item = &mut Arc<Index>> {
+        let name = normalize_ident(table_name);
+        self.namespace_mut(namespace)
+            .indexes
+            .get_mut(&name)
+            .map(|v| v.iter_mut())
+            .unwrap_or_default()
+    }
+
+    /// Takes every index of `table_name` out of the namespace.
+    pub fn take_indices(
+        &mut self,
+        namespace: NamespaceId,
+        table_name: &str,
+    ) -> Option<VecDeque<Arc<Index>>> {
+        let name = normalize_ident(table_name);
+        self.namespace_mut(namespace).indexes.remove(&name)
+    }
+
+    /// Puts `indexes` in the namespace as the indexes of `table_name`.
+    pub fn insert_indices(
+        &mut self,
+        namespace: NamespaceId,
+        table_name: String,
+        indexes: VecDeque<Arc<Index>>,
+    ) {
+        self.namespace_mut(namespace)
+            .indexes
+            .insert(table_name, indexes);
+    }
+
+    pub fn triggers(&self, namespace: NamespaceId) -> impl Iterator<Item = &Arc<Trigger>> {
+        self.namespace(namespace).triggers.values().flatten()
+    }
+
+    pub fn triggers_mut(
+        &mut self,
+        namespace: NamespaceId,
+    ) -> impl Iterator<Item = &mut Arc<Trigger>> {
+        self.namespace_mut(namespace)
+            .triggers
+            .values_mut()
+            .flatten()
+    }
+
+    pub fn trigger_mut(&mut self, namespace: NamespaceId, name: &str) -> Option<&mut Arc<Trigger>> {
+        self.triggers_mut(namespace)
+            .find(|trigger| trigger.name == name)
+    }
+
+    /// Takes every trigger of `table_name` out of the namespace.
+    pub fn take_triggers(
+        &mut self,
+        namespace: NamespaceId,
+        table_name: &str,
+    ) -> Option<VecDeque<Arc<Trigger>>> {
+        let name = normalize_ident(table_name);
+        self.namespace_mut(namespace).triggers.remove(&name)
+    }
+
+    /// Replaces the triggers of `table_name` with `triggers`.
+    pub fn insert_triggers(
+        &mut self,
+        namespace: NamespaceId,
+        table_name: String,
+        triggers: VecDeque<Arc<Trigger>>,
+    ) {
+        self.namespace_mut(namespace)
+            .triggers
+            .insert(table_name, triggers);
+    }
+
+    /// Adds `triggers` after the triggers `table_name` already has.
+    pub fn append_triggers(
+        &mut self,
+        namespace: NamespaceId,
+        table_name: String,
+        triggers: VecDeque<Arc<Trigger>>,
+    ) {
+        self.namespace_mut(namespace)
+            .triggers
+            .entry(table_name)
+            .or_default()
+            .extend(triggers);
+    }
+
+    pub fn sequences(&self, namespace: NamespaceId) -> impl Iterator<Item = &Arc<Sequence>> {
+        self.namespace(namespace).sequences.values()
+    }
+
+    /// The sequences of the namespace by their normalized name.
+    pub fn sequences_by_name(&self, namespace: NamespaceId) -> &HashMap<String, Arc<Sequence>> {
+        &self.namespace(namespace).sequences
+    }
+
+    /// Replaces the sequences of the namespace with `sequences`, by
+    /// normalized name.
+    pub fn set_sequences(
+        &mut self,
+        namespace: NamespaceId,
+        sequences: HashMap<String, Arc<Sequence>>,
+    ) {
+        self.namespace_mut(namespace).sequences = sequences;
+    }
+
+    pub fn add_sequence(&mut self, namespace: NamespaceId, sequence: Sequence) {
+        let name = normalize_ident(&sequence.name);
+        self.namespace_mut(namespace)
+            .sequences
+            .insert(name, Arc::new(sequence));
+    }
+
+    /// Takes the sequence named `name` out of the namespace.
+    pub fn take_sequence(&mut self, namespace: NamespaceId, name: &str) -> Option<Arc<Sequence>> {
+        let name = normalize_ident(name);
+        self.namespace_mut(namespace).sequences.remove(&name)
+    }
+
+    /// Puts `sequence` in the namespace under `name`.
+    pub fn insert_sequence(
+        &mut self,
+        namespace: NamespaceId,
+        name: String,
+        sequence: Arc<Sequence>,
+    ) {
+        self.namespace_mut(namespace)
+            .sequences
+            .insert(name, sequence);
     }
 
     /// Add an `InternalVirtualTable` to the schema's catalog. The wrapped
@@ -979,10 +1252,11 @@ impl Schema {
     where
         T: crate::vtab::InternalVirtualTable + 'static,
     {
+        let objects = self.namespace_mut(NamespaceId::ROOT);
         let vtab = crate::vtab::VirtualTable::wrap_internal_table(table)?;
         let name = vtab.name.clone();
         let lookup_name = normalize_ident(&name);
-        self.tables.insert(
+        objects.tables.insert(
             lookup_name,
             Arc::new(Table::Virtual(Arc::new((*vtab).clone()))),
         );
@@ -1167,70 +1441,110 @@ impl Schema {
     /// Call this after loading user-defined types from __turso_internal_types
     /// so that columns declared with custom types use the BASE type's affinity.
     pub fn resolve_all_custom_type_affinities(&mut self) -> Result<()> {
-        let mut tables: SmallVec<[(String, Arc<Table>); 8]> = SmallVec::with_capacity(8);
-        for (name, table) in self.tables.iter().filter(|(_, t)| {
-            t.is_strict()
-                && t.btree().is_some_and(|bt| {
-                    bt.columns
-                        .iter()
-                        .any(|c| self.get_type_def_unchecked(&c.ty_str).is_some())
-                })
-        }) {
+        let mut tables: SmallVec<[(NamespaceId, String, Arc<Table>); 8]> =
+            SmallVec::with_capacity(8);
+        for (namespace, name, table) in self
+            .namespaces
+            .iter()
+            .flat_map(|(namespace, objects)| {
+                objects
+                    .tables
+                    .iter()
+                    .map(move |(name, table)| (*namespace, name, table))
+            })
+            .filter(|(_, _, t)| {
+                t.is_strict()
+                    && t.btree().is_some_and(|bt| {
+                        bt.columns
+                            .iter()
+                            .any(|c| self.get_type_def_unchecked(&c.ty_str).is_some())
+                    })
+            })
+        {
             let bt = table.btree().expect("checked btree table");
             let mut modified = (*bt).clone();
             modified.resolve_custom_type_affinities(self);
             modified.propagate_domain_constraints(self)?;
-            tables.push((name.clone(), Arc::new(Table::BTree(Arc::new(modified)))));
+            tables.push((
+                namespace,
+                name.clone(),
+                Arc::new(Table::BTree(Arc::new(modified))),
+            ));
         }
-        for (name, table) in tables {
-            self.tables.insert(name, table);
+        for (namespace, name, table) in tables {
+            self.namespace_mut(namespace).tables.insert(name, table);
         }
         Ok(())
     }
 
-    pub fn is_unique_idx_name(&self, name: &str) -> bool {
-        !self
+    pub fn is_unique_idx_name(&self, namespace: NamespaceId, name: &str) -> bool {
+        let objects = self.namespace(namespace);
+        !objects
             .indexes
             .iter()
             .any(|idx| idx.1.iter().any(|i| i.name == name))
     }
 
-    pub fn add_materialized_view(&mut self, view: IncrementalView, table: Arc<Table>, sql: String) {
+    pub fn add_materialized_view(
+        &mut self,
+        namespace: NamespaceId,
+        view: IncrementalView,
+        table: Arc<Table>,
+        sql: String,
+    ) {
         let name = normalize_ident(view.name());
 
         // Add to tables (so it appears as a regular table)
         #[cfg(feature = "conn_raw_api")]
         self.register_table_root_page(&name, table.as_ref());
-        self.tables.insert(name.clone(), table);
+        let objects = self.namespace_mut(namespace);
+        objects.tables.insert(name.clone(), table);
 
         // Track that this is a materialized view
-        self.materialized_view_names.insert(name.clone());
-        self.materialized_view_sql.insert(name.clone(), sql);
+        objects.materialized_view_names.insert(name.clone());
+        objects.materialized_view_sql.insert(name.clone(), sql);
 
         // Store the definition used to compile maintenance programs.
-        self.incremental_views
+        objects
+            .incremental_views
             .insert(name, Arc::new(Mutex::new(view)));
     }
 
-    pub fn get_materialized_view(&self, name: &str) -> Option<Arc<Mutex<IncrementalView>>> {
+    pub fn get_materialized_view(
+        &self,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Option<Arc<Mutex<IncrementalView>>> {
+        let objects = self.namespace(namespace);
         let name = normalize_ident(name);
-        self.incremental_views.get(&name).cloned()
+        objects.incremental_views.get(&name).cloned()
     }
 
     /// Whether the view has its current storage marker and no hidden operator
     /// storage from an incompatible version.
-    pub fn has_compatible_materialized_view_storage(&self, view_name: &str) -> bool {
+    pub fn has_compatible_materialized_view_storage(
+        &self,
+        namespace: NamespaceId,
+        view_name: &str,
+    ) -> bool {
+        let objects = self.namespace(namespace);
         let view_name = normalize_ident(view_name);
-        self.tables
+        objects
+            .tables
             .contains_key(&dbsp_version_marker_table_name(&view_name))
-            && !self.dbsp_storage_version_mismatch(&view_name)
+            && !self.dbsp_storage_version_mismatch(namespace, &view_name)
     }
 
     /// True when a metadata marker or operator table for this view exists
     /// under a different storage version than the current one.
-    pub(crate) fn dbsp_storage_version_mismatch(&self, view_name: &str) -> bool {
+    pub(crate) fn dbsp_storage_version_mismatch(
+        &self,
+        namespace: NamespaceId,
+        view_name: &str,
+    ) -> bool {
+        let objects = self.namespace(namespace);
         let view_name = normalize_ident(view_name);
-        self.tables.keys().any(|table_name| {
+        objects.tables.keys().any(|table_name| {
             if let Some((version_str, stored_view_name)) = table_name
                 .strip_prefix(DBSP_METADATA_TABLE_PREFIX)
                 .and_then(|suffix| suffix.split_once('_'))
@@ -1256,55 +1570,69 @@ impl Schema {
         })
     }
 
-    pub fn is_materialized_view(&self, name: &str) -> bool {
+    pub fn is_materialized_view(&self, namespace: NamespaceId, name: &str) -> bool {
+        let objects = self.namespace(namespace);
         let name = normalize_ident(name);
-        self.materialized_view_names.contains(&name)
+        objects.materialized_view_names.contains(&name)
     }
 
-    pub fn incompatible_materialized_view_root(&self, name: &str) -> Option<i64> {
-        self.incompatible_materialized_view_roots
+    pub fn incompatible_materialized_view_root(
+        &self,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Option<i64> {
+        let objects = self.namespace(namespace);
+        objects
+            .incompatible_materialized_view_roots
             .get(&normalize_ident(name))
             .copied()
     }
 
-    pub fn materialized_view_exists(&self, name: &str) -> bool {
-        self.is_materialized_view(name) || self.incompatible_materialized_view_root(name).is_some()
+    pub fn materialized_view_exists(&self, namespace: NamespaceId, name: &str) -> bool {
+        self.is_materialized_view(namespace, name)
+            || self
+                .incompatible_materialized_view_root(namespace, name)
+                .is_some()
     }
 
     /// Apply a function to a table's incompatible dependent materialized views
-    pub fn with_incompatible_dependent_views<F, T>(&self, table_name: &str, f: F) -> T
+    pub fn with_incompatible_dependent_views<F, T>(
+        &self,
+        namespace: NamespaceId,
+        table_name: &str,
+        f: F,
+    ) -> T
     where
         F: FnOnce(&[&String]) -> T,
     {
+        let objects = self.namespace(namespace);
         let table_name = normalize_ident(table_name);
         let mut views: SmallVec<[&String; 8]> = SmallVec::with_capacity(8);
 
         // Get all materialized views that depend on this table
-        if let Some(v) = self.table_to_materialized_views.get(&table_name) {
+        if let Some(v) = objects.table_to_materialized_views.get(&table_name) {
             v.iter()
-                .filter(|name| self.incompatible_views.contains(&**name))
+                .filter(|name| objects.incompatible_views.contains(&**name))
                 .for_each(|n| views.push(n));
         }
         f(&views)
     }
 
-    pub fn remove_view(&mut self, name: &str) -> Result<()> {
+    pub fn remove_view(&mut self, namespace: NamespaceId, name: &str) -> Result<()> {
         let name = normalize_ident(name);
+        let objects = self.namespace_mut(namespace);
 
-        if self.views.contains_key(&name) {
-            self.views.remove(&name);
+        if objects.views.contains_key(&name) {
+            objects.views.remove(&name);
             Ok(())
-        } else if self.materialized_view_names.contains(&name)
-            || self
+        } else if objects.materialized_view_names.contains(&name)
+            || objects
                 .incompatible_materialized_view_roots
                 .contains_key(&name)
         {
-            // Remove from tables
-            self.remove_table(&name);
-
             // Remove every version marker and hidden operator table of this
             // view, including incompatible older storage versions.
-            let hidden_tables: Vec<String> = self
+            let hidden_tables: Vec<String> = objects
                 .tables
                 .keys()
                 .filter(|table_name| {
@@ -1312,23 +1640,26 @@ impl Schema {
                 })
                 .cloned()
                 .try_collect()?;
+            // Remove from tables
+            self.remove_table(namespace, &name);
             for table in hidden_tables {
-                self.remove_table(&table);
-                self.remove_indices_for_table(&table);
+                self.remove_table(namespace, &table);
+                self.remove_indices_for_table(namespace, &table);
             }
 
             // Remove from materialized view tracking
-            self.materialized_view_names.remove(&name);
-            self.materialized_view_sql.remove(&name);
-            self.incremental_views.remove(&name);
-            self.incompatible_views.remove(&name);
-            self.incompatible_materialized_view_roots.remove(&name);
+            let objects = self.namespace_mut(namespace);
+            objects.materialized_view_names.remove(&name);
+            objects.materialized_view_sql.remove(&name);
+            objects.incremental_views.remove(&name);
+            objects.incompatible_views.remove(&name);
+            objects.incompatible_materialized_view_roots.remove(&name);
 
             // Remove from table_to_materialized_views dependencies
-            for views in self.table_to_materialized_views.values_mut() {
+            for views in objects.table_to_materialized_views.values_mut() {
                 views.retain(|v| v != &name);
             }
-            self.table_to_materialized_views.remove(&name);
+            objects.table_to_materialized_views.remove(&name);
 
             Ok(())
         } else {
@@ -1339,11 +1670,17 @@ impl Schema {
     }
 
     /// Register that a materialized view depends on a table
-    pub fn add_materialized_view_dependency(&mut self, table_name: &str, view_name: &str) {
+    pub fn add_materialized_view_dependency(
+        &mut self,
+        namespace: NamespaceId,
+        table_name: &str,
+        view_name: &str,
+    ) {
+        let objects = self.namespace_mut(namespace);
         let table_name = normalize_ident(table_name);
         let view_name = normalize_ident(view_name);
 
-        let views = self
+        let views = objects
             .table_to_materialized_views
             .entry(table_name)
             .or_insert_with(|| vec![]);
@@ -1354,12 +1691,18 @@ impl Schema {
     }
 
     /// Get all materialized views that depend on a given table
-    pub fn get_dependent_materialized_views(&self, table_name: &str) -> Vec<String> {
-        if self.table_to_materialized_views.is_empty() {
+    pub fn get_dependent_materialized_views(
+        &self,
+        namespace: NamespaceId,
+        table_name: &str,
+    ) -> Vec<String> {
+        let objects = self.namespace(namespace);
+        if objects.table_to_materialized_views.is_empty() {
             return vec![];
         }
         let table_name = normalize_ident(table_name);
-        self.table_to_materialized_views
+        objects
+            .table_to_materialized_views
             .get(&table_name)
             .cloned()
             .unwrap_or_else(|| vec![])
@@ -1375,18 +1718,22 @@ impl Schema {
     /// snapshot of the initially touched state map.
     pub fn materialized_view_maintenance_order(
         &self,
+        namespace: NamespaceId,
         initially_touched: Vec<String>,
     ) -> Result<Vec<String>> {
+        let objects = self.namespace(namespace);
         let mut reachable = HashSet::default();
         let mut pending = initially_touched
             .into_iter()
             .map(|name| normalize_ident(&name))
             .try_collect::<Vec<_>>()?;
         while let Some(view_name) = pending.pop() {
-            if !self.is_materialized_view(&view_name) || !reachable.insert(view_name.clone()) {
+            if !self.is_materialized_view(namespace, &view_name)
+                || !reachable.insert(view_name.clone())
+            {
                 continue;
             }
-            if let Some(dependents) = self.table_to_materialized_views.get(&view_name) {
+            if let Some(dependents) = objects.table_to_materialized_views.get(&view_name) {
                 pending.try_extend(dependents.iter().cloned())?;
             }
         }
@@ -1396,7 +1743,7 @@ impl Schema {
             .map(|name| (name.clone(), 0usize))
             .collect::<HashMap<_, _>>();
         for source in &reachable {
-            if let Some(dependents) = self.table_to_materialized_views.get(source) {
+            if let Some(dependents) = objects.table_to_materialized_views.get(source) {
                 for dependent in dependents {
                     let dependent = normalize_ident(dependent);
                     if let Some(degree) = indegree.get_mut(&dependent) {
@@ -1414,7 +1761,7 @@ impl Schema {
         let mut ordered = Vec::try_with_capacity_ext(reachable.len())?;
         while let Some(view_name) = ready.pop() {
             ordered.push(view_name.clone());
-            if let Some(dependents) = self.table_to_materialized_views.get(&view_name) {
+            if let Some(dependents) = objects.table_to_materialized_views.get(&view_name) {
                 for dependent in dependents {
                     let dependent = normalize_ident(dependent);
                     let Some(degree) = indegree.get_mut(&dependent) else {
@@ -1438,26 +1785,36 @@ impl Schema {
     }
 
     /// Add a regular (non-materialized) view
-    pub fn add_view(&mut self, view: View) -> Result<()> {
-        self.check_object_name_conflict(&view.name, SchemaObjectType::View)?;
+    pub fn add_view(&mut self, namespace: NamespaceId, view: View) -> Result<()> {
+        self.check_object_name_conflict(namespace, &view.name, SchemaObjectType::View)?;
         let name = normalize_ident(&view.name);
-        self.views.insert(name, Arc::new(view));
+        self.namespace_mut(namespace)
+            .views
+            .insert(name, Arc::new(view));
         Ok(())
     }
 
     /// Get a regular view by name
-    pub fn get_view(&self, name: &str) -> Option<Arc<View>> {
+    pub fn get_view(&self, namespace: NamespaceId, name: &str) -> Option<Arc<View>> {
+        let objects = self.namespace(namespace);
         let name = normalize_ident(name);
-        self.views.get(&name).cloned()
+        objects.views.get(&name).cloned()
     }
 
-    pub fn add_trigger(&mut self, trigger: Trigger, table_name: &str) -> Result<()> {
+    pub fn add_trigger(
+        &mut self,
+        namespace: NamespaceId,
+        trigger: Trigger,
+        table_name: &str,
+    ) -> Result<()> {
+        let objects = self.namespace_mut(namespace);
         // Triggers have their own namespace and duplicate trigger names
         // are checked in `translate_create_trigger`
         let table_name = normalize_ident(table_name);
 
         // See [Schema::add_index] for why we push to the front of the deque.
-        self.triggers
+        objects
+            .triggers
             .entry(table_name)
             .or_default()
             .push_front(Arc::new(trigger));
@@ -1465,11 +1822,12 @@ impl Schema {
         Ok(())
     }
 
-    pub fn remove_trigger(&mut self, name: &str) -> Result<()> {
+    pub fn remove_trigger(&mut self, namespace: NamespaceId, name: &str) -> Result<()> {
+        let objects = self.namespace_mut(namespace);
         let name = normalize_ident(name);
 
         let mut removed = false;
-        for triggers_list in self.triggers.values_mut() {
+        for triggers_list in objects.triggers.values_mut() {
             for i in 0..triggers_list.len() {
                 let trigger = &triggers_list[i];
                 if normalize_ident(&trigger.name) == name {
@@ -1489,18 +1847,21 @@ impl Schema {
         }
         Ok(())
     }
-    pub fn remove_triggers_for_table(&mut self, table_name: &str) {
+    pub fn remove_triggers_for_table(&mut self, namespace: NamespaceId, table_name: &str) {
+        let objects = self.namespace_mut(namespace);
         let table_name = normalize_ident(table_name);
-        self.triggers.remove(&table_name);
+        objects.triggers.remove(&table_name);
     }
 
     pub fn set_trigger_target_database_id(
         &mut self,
+        namespace: NamespaceId,
         trigger_name: &str,
         target_database_id: usize,
     ) -> Result<()> {
+        let objects = self.namespace_mut(namespace);
         let trigger_name = normalize_ident(trigger_name);
-        let trigger = self
+        let trigger = objects
             .triggers
             .values_mut()
             .flatten()
@@ -1521,15 +1882,21 @@ impl Schema {
     /// without accidentally removing ones that target `temp.t` or
     /// `aux.t` (the plain `remove_triggers_for_table` keys only on
     /// table name).
-    pub fn remove_triggers_for_table_with_db(&mut self, table_name: &str, target_db: usize) {
+    pub fn remove_triggers_for_table_with_db(
+        &mut self,
+        namespace: NamespaceId,
+        table_name: &str,
+        target_db: usize,
+    ) {
+        let objects = self.namespace_mut(namespace);
         let table_name = normalize_ident(table_name);
-        let Some(bucket) = self.triggers.get_mut(&table_name) else {
+        let Some(bucket) = objects.triggers.get_mut(&table_name) else {
             return;
         };
         // Check once whether this schema has a table with the same name.
         // If it does, unqualified triggers resolve to that local table,
         // not to the one being dropped in `target_db`.
-        let has_shadow_table = self.tables.contains_key(&table_name);
+        let has_shadow_table = objects.tables.contains_key(&table_name);
         bucket.retain(|trigger| {
             match trigger.target_database_id {
                 Some(db) => db != target_db,
@@ -1539,32 +1906,43 @@ impl Schema {
             }
         });
         if bucket.is_empty() {
-            self.triggers.remove(&table_name);
+            objects.triggers.remove(&table_name);
         }
     }
 
-    pub fn get_trigger_for_table(&self, table_name: &str, name: &str) -> Option<Arc<Trigger>> {
+    pub fn get_trigger_for_table(
+        &self,
+        namespace: NamespaceId,
+        table_name: &str,
+        name: &str,
+    ) -> Option<Arc<Trigger>> {
+        let objects = self.namespace(namespace);
         let table_name = normalize_ident(table_name);
         let name = normalize_ident(name);
-        self.triggers
+        objects
+            .triggers
             .get(&table_name)
             .and_then(|triggers| triggers.iter().find(|t| t.name == name).cloned())
     }
 
     pub fn get_triggers_for_table(
         &self,
+        namespace: NamespaceId,
         table_name: &str,
     ) -> impl Iterator<Item = &Arc<Trigger>> + Clone {
         let table_name = normalize_ident(table_name);
-        self.triggers
+        self.namespace(namespace)
+            .triggers
             .get(&table_name)
             .map(|triggers| triggers.iter())
             .unwrap_or_default()
     }
 
-    pub fn get_trigger(&self, name: &str) -> Option<Arc<Trigger>> {
+    pub fn get_trigger(&self, namespace: NamespaceId, name: &str) -> Option<Arc<Trigger>> {
+        let objects = self.namespace(namespace);
         let name = normalize_ident(name);
-        self.triggers
+        objects
+            .triggers
             .values()
             .flatten()
             .find(|t| t.name == name)
@@ -1572,37 +1950,52 @@ impl Schema {
     }
 
     pub(crate) fn copy_table_valued_functions(&mut self, source: &Schema) {
+        let source = source.namespace(NamespaceId::ROOT);
+        let objects = self.namespace_mut(NamespaceId::ROOT);
         for (name, table) in &source.tables {
             if matches!(table.as_ref(), Table::Virtual(vtab)
                 if vtab.kind == turso_ext::VTabKind::TableValuedFunction)
             {
-                self.tables
+                objects
+                    .tables
                     .entry(name.clone())
                     .or_insert_with(|| table.clone());
             }
         }
     }
 
-    pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
-        self.check_object_name_conflict(&table.name, SchemaObjectType::Table)?;
+    pub fn add_btree_table(
+        &mut self,
+        namespace: NamespaceId,
+        table: Arc<BTreeTable>,
+    ) -> Result<()> {
+        self.check_object_name_conflict(namespace, &table.name, SchemaObjectType::Table)?;
         let name = normalize_ident(&table.name);
         #[cfg(feature = "conn_raw_api")]
         self.table_names_by_root_page
             .insert(table.root_page, name.clone());
-        self.tables.insert(name, Table::BTree(table).into());
+        self.namespace_mut(namespace)
+            .tables
+            .insert(name, Table::BTree(table).into());
         Ok(())
     }
 
-    pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) -> Result<()> {
-        self.check_object_name_conflict(&table.name, SchemaObjectType::Table)?;
+    pub fn add_virtual_table(
+        &mut self,
+        namespace: NamespaceId,
+        table: Arc<VirtualTable>,
+    ) -> Result<()> {
+        self.check_object_name_conflict(namespace, &table.name, SchemaObjectType::Table)?;
         let name = normalize_ident(&table.name);
-        self.tables.insert(name, Table::Virtual(table).into());
+        self.namespace_mut(namespace)
+            .tables
+            .insert(name, Table::Virtual(table).into());
         Ok(())
     }
 
-    pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
+    pub fn get_table(&self, namespace: NamespaceId, name: &str) -> Option<Arc<Table>> {
         let name = self.normalize_table_lookup_name(name);
-        self.tables.get(&name).cloned()
+        self.namespace(namespace).tables.get(&name).cloned()
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -1612,25 +2005,24 @@ impl Schema {
             .map(String::as_str)
     }
 
-    pub fn remove_table(&mut self, table_name: &str) {
+    pub fn remove_table(&mut self, namespace: NamespaceId, table_name: &str) {
         let name = normalize_ident(table_name);
+        let objects = self.namespace_mut(namespace);
         #[cfg(feature = "conn_raw_api")]
-        {
-            if let Some(table) = self.tables.remove(&name) {
-                self.unregister_table_root_page(&table);
-            }
-        }
+        let removed = objects.tables.remove(&name);
         #[cfg(not(feature = "conn_raw_api"))]
-        {
-            self.tables.remove(&name);
-        }
-        self.analyze_stats.remove_table(&name);
+        objects.tables.remove(&name);
 
         // If this was a materialized view, also clean up the metadata
-        if self.materialized_view_names.remove(&name) {
-            self.incremental_views.remove(&name);
-            self.materialized_view_sql.remove(&name);
+        if objects.materialized_view_names.remove(&name) {
+            objects.incremental_views.remove(&name);
+            objects.materialized_view_sql.remove(&name);
         }
+        #[cfg(feature = "conn_raw_api")]
+        if let Some(table) = removed {
+            self.unregister_table_root_page(&table);
+        }
+        self.analyze_stats.remove_table(&name);
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -1648,17 +2040,17 @@ impl Schema {
         }
     }
 
-    pub fn get_btree_table(&self, name: &str) -> Option<Arc<BTreeTable>> {
+    pub fn get_btree_table(&self, namespace: NamespaceId, name: &str) -> Option<Arc<BTreeTable>> {
         let name = self.normalize_table_lookup_name(name);
-        if let Some(table) = self.tables.get(&name) {
+        if let Some(table) = self.namespace(namespace).tables.get(&name) {
             table.btree()
         } else {
             None
         }
     }
 
-    pub fn add_index(&mut self, index: Arc<Index>) -> Result<()> {
-        self.check_object_name_conflict(&index.name, SchemaObjectType::Index)?;
+    pub fn add_index(&mut self, namespace: NamespaceId, index: Arc<Index>) -> Result<()> {
+        self.check_object_name_conflict(namespace, &index.name, SchemaObjectType::Index)?;
         let table_name = normalize_ident(&index.table_name);
         // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
         // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
@@ -1667,7 +2059,11 @@ impl Schema {
         // non-mutating conflict resolutions all happen before mutating ones, ensuring that
         // no half-committed state is left behind.
         let is_replace = index.on_conflict == Some(ResolveType::Replace);
-        let indexes_for_table = self.indexes.entry(table_name).or_default();
+        let indexes_for_table = self
+            .namespace_mut(namespace)
+            .indexes
+            .entry(table_name)
+            .or_default();
         if is_replace {
             // REPLACE indexes sort newest-first among themselves.
             let first_replace = indexes_for_table
@@ -1694,9 +2090,14 @@ impl Schema {
         Ok(())
     }
 
-    pub fn get_indices(&self, table_name: &str) -> impl Iterator<Item = &Arc<Index>> {
+    pub fn get_indices(
+        &self,
+        namespace: NamespaceId,
+        table_name: &str,
+    ) -> impl Iterator<Item = &Arc<Index>> {
         let name = normalize_ident(table_name);
-        self.indexes
+        self.namespace(namespace)
+            .indexes
             .get(&name)
             .map(|v| v.iter())
             .unwrap_or_default()
@@ -1705,18 +2106,24 @@ impl Schema {
 
     pub fn get_unowned_backing_btrees(
         &self,
+        namespace: NamespaceId,
         table_name: &str,
     ) -> impl Iterator<Item = &Arc<Index>> {
         let name = normalize_ident(table_name);
-        self.indexes
+        self.namespace(namespace)
+            .indexes
             .get(&name)
             .map(|v| v.iter())
             .unwrap_or_default()
-            .filter(|i| i.is_backing_btree_index() && !self.backing_btree_has_owner(i))
+            .filter(move |i| {
+                i.is_backing_btree_index() && !self.backing_btree_has_owner(namespace, i)
+            })
     }
 
-    fn backing_btree_has_owner(&self, backing_btree: &Index) -> bool {
-        self.indexes
+    fn backing_btree_has_owner(&self, namespace: NamespaceId, backing_btree: &Index) -> bool {
+        let objects = self.namespace(namespace);
+        objects
+            .indexes
             .values()
             .flatten()
             .filter_map(|index| index.index_method.as_ref())
@@ -1729,44 +2136,53 @@ impl Schema {
     }
 
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    pub fn has_fts_index(&self, table_name: &str) -> bool {
-        self.get_indices(table_name).any(|idx| {
+    pub fn has_fts_index(&self, namespace: NamespaceId, table_name: &str) -> bool {
+        self.get_indices(namespace, table_name).any(|idx| {
             idx.index_method.as_ref().is_some_and(|m| {
                 m.definition().method_name == crate::index_method::fts::FTS_INDEX_METHOD_NAME
             })
         })
     }
 
-    pub fn get_index(&self, table_name: &str, index_name: &str) -> Option<&Arc<Index>> {
+    pub fn get_index(
+        &self,
+        namespace: NamespaceId,
+        table_name: &str,
+        index_name: &str,
+    ) -> Option<&Arc<Index>> {
         let name = normalize_ident(table_name);
-        self.indexes
+        self.namespace(namespace)
+            .indexes
             .get(&name)?
             .iter()
             .find(|index| index.name == index_name)
     }
 
-    pub fn remove_indices_for_table(&mut self, table_name: &str) {
+    pub fn remove_indices_for_table(&mut self, namespace: NamespaceId, table_name: &str) {
         let name = normalize_ident(table_name);
-        self.indexes.remove(&name);
+        self.namespace_mut(namespace).indexes.remove(&name);
         self.analyze_stats.remove_table(&name);
     }
 
-    pub fn remove_index(&mut self, idx: &Index) {
+    pub fn remove_index(&mut self, namespace: NamespaceId, idx: &Index) {
         let name = normalize_ident(&idx.table_name);
-        self.indexes
+        self.namespace_mut(namespace)
+            .indexes
             .get_mut(&name)
             .expect("Must have the index")
             .retain_mut(|other_idx| other_idx.name != idx.name);
         self.analyze_stats.remove_index(&name, &idx.name);
     }
 
-    pub fn table_has_indexes(&self, table_name: &str) -> bool {
+    pub fn table_has_indexes(&self, namespace: NamespaceId, table_name: &str) -> bool {
+        let objects = self.namespace(namespace);
         let name = normalize_ident(table_name);
-        self.has_indexes.contains(&name)
+        objects.has_indexes.contains(&name)
     }
 
-    pub fn table_set_has_index(&mut self, table_name: &str) {
-        self.has_indexes.insert(table_name.to_string());
+    pub fn table_set_has_index(&mut self, namespace: NamespaceId, table_name: &str) {
+        let objects = self.namespace_mut(namespace);
+        objects.has_indexes.insert(table_name.to_string());
     }
 
     /// Update [Schema] by scanning the first root page (sqlite_schema)
@@ -2026,7 +2442,7 @@ impl Schema {
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
             let table = self
-                .get_btree_table(&unparsed_sql_from_index.table_name)
+                .get_btree_table(NamespaceId::ROOT, &unparsed_sql_from_index.table_name)
                 .ok_or_else(|| {
                     LimboError::Corrupt(format!(
                         "sqlite_schema contains index for missing table '{}': rootpage={} sql={}",
@@ -2041,7 +2457,7 @@ impl Schema {
                 unparsed_sql_from_index.root_page,
                 table.as_ref(),
             )?;
-            self.add_index(Arc::new(index))?;
+            self.add_index(NamespaceId::ROOT, Arc::new(index))?;
         }
 
         for automatic_index in automatic_indices {
@@ -2049,12 +2465,14 @@ impl Schema {
             // The SQL statement parser enforces that the column definitions come first, and compounds are defined after that,
             // e.g. CREATE TABLE t (a, b, UNIQUE(a, b)), and you can't do something like CREATE TABLE t (a, b, UNIQUE(a, b), c);
             // Hence, we can process the singles first (unique_set.columns.len() == 1), and then the compounds (unique_set.columns.len() > 1).
-            let table = self.get_btree_table(&automatic_index.0).ok_or_else(|| {
-                LimboError::Corrupt(format!(
+            let table = self
+                .get_btree_table(NamespaceId::ROOT, &automatic_index.0)
+                .ok_or_else(|| {
+                    LimboError::Corrupt(format!(
                     "sqlite_schema contains automatic index for missing table '{}': indexes={:?}",
                     automatic_index.0, automatic_index.1
                 ))
-            })?;
+                })?;
             let mut automatic_indexes = automatic_index.1;
             automatic_indexes.reverse(); // reverse so we can pop() without shifting array elements, while still processing in left-to-right order
 
@@ -2092,14 +2510,17 @@ impl Schema {
                     }
 
                     if let Some(index_entry) = automatic_indexes.pop() {
-                        self.add_index(Arc::new(Index::automatic_from_primary_key(
-                            table.as_ref(),
-                            index_entry,
-                            unique_set.columns.len(),
-                            unique_set.conflict_clause,
-                            &unique_set.columns,
-                            unique_set.constraint_name.clone(),
-                        )?))?;
+                        self.add_index(
+                            NamespaceId::ROOT,
+                            Arc::new(Index::automatic_from_primary_key(
+                                table.as_ref(),
+                                index_entry,
+                                unique_set.columns.len(),
+                                unique_set.conflict_clause,
+                                &unique_set.columns,
+                                unique_set.constraint_name.clone(),
+                            )?),
+                        )?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
                         // Skip creating this index - it will be added later when its schema row is processed
@@ -2126,14 +2547,17 @@ impl Schema {
                             .expect("unique columns vector was preallocated to its input length");
                     }
                     if let Some(index_entry) = automatic_indexes.pop() {
-                        self.add_index(Arc::new(Index::automatic_from_unique(
-                            table.as_ref(),
-                            index_entry,
-                            column_indices_and_sort_orders,
-                            unique_set.conflict_clause,
-                            &unique_set.columns,
-                            unique_set.constraint_name.clone(),
-                        )?))?;
+                        self.add_index(
+                            NamespaceId::ROOT,
+                            Arc::new(Index::automatic_from_unique(
+                                table.as_ref(),
+                                index_entry,
+                                column_indices_and_sort_orders,
+                                unique_set.conflict_clause,
+                                &unique_set.columns,
+                                unique_set.constraint_name.clone(),
+                            )?),
+                        )?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
                         // Skip creating this index - it will be added later when its schema row is processed
@@ -2258,13 +2682,15 @@ impl Schema {
             // The marker is mandatory even when the circuit has no stateful
             // operators, so absence and mismatched operator storage are both
             // incompatible.
-            if !self.has_compatible_materialized_view_storage(&view_name) {
+            if !self.has_compatible_materialized_view_storage(NamespaceId::ROOT, &view_name) {
                 tracing::warn!(
                     "Materialized view '{}' was created with an incompatible storage version; \
                      DROP and recreate it",
                     view_name
                 );
-                self.incompatible_views.insert(view_name.clone());
+                self.namespace_mut(NamespaceId::ROOT)
+                    .incompatible_views
+                    .insert(view_name.clone());
             }
             // Register each DBSP state table's primary-key index so lookups
             // and integrity check can use it; its columns (and collations)
@@ -2288,13 +2714,14 @@ impl Schema {
                 // an older, incompatible version is named with its own
                 // (different) version number.
                 let state_table = self
+                    .namespace(NamespaceId::ROOT)
                     .tables
                     .values()
                     .find_map(|t| t.btree().filter(|bt| bt.root_page == table_root));
                 if let Some(state_table) = state_table {
                     let mut index = create_dbsp_state_index(index_root, &state_table)?;
                     index.name = format!("sqlite_autoindex_{}_1", state_table.name);
-                    if let Err(e) = self.add_index(std::sync::Arc::new(index)) {
+                    if let Err(e) = self.add_index(NamespaceId::ROOT, std::sync::Arc::new(index)) {
                         if !e.to_string().contains("already exists") {
                             return Err(e);
                         }
@@ -2312,10 +2739,14 @@ impl Schema {
                     "materialized view {view_name} has a non-view schema definition"
                 )));
             };
-            let referenced_tables = self.materialized_view_dependencies(&select);
+            let referenced_tables = self.materialized_view_dependencies(NamespaceId::ROOT, &select);
             let incompatible_dependency = referenced_tables
                 .iter()
-                .find(|table_name| self.incompatible_views.contains(*table_name))
+                .find(|table_name| {
+                    self.namespace(NamespaceId::ROOT)
+                        .incompatible_views
+                        .contains(*table_name)
+                })
                 .cloned();
             if let Some(dependency) = incompatible_dependency {
                 tracing::warn!(
@@ -2324,18 +2755,29 @@ impl Schema {
                     view_name,
                     dependency
                 );
-                self.incompatible_views.insert(view_name.clone());
+                self.namespace_mut(NamespaceId::ROOT)
+                    .incompatible_views
+                    .insert(view_name.clone());
             }
 
             // An incompatible view has no live table descriptor, but its
             // dependency metadata must remain so DML is rejected with the
             // actionable DROP-and-recreate error rather than silently losing
             // maintenance.
-            if self.incompatible_views.contains(&view_name) {
-                self.incompatible_materialized_view_roots
+            if self
+                .namespace(NamespaceId::ROOT)
+                .incompatible_views
+                .contains(&view_name)
+            {
+                self.namespace_mut(NamespaceId::ROOT)
+                    .incompatible_materialized_view_roots
                     .insert(view_name.clone(), main_root);
                 for table_name in &referenced_tables {
-                    self.add_materialized_view_dependency(table_name, &view_name);
+                    self.add_materialized_view_dependency(
+                        NamespaceId::ROOT,
+                        table_name,
+                        &view_name,
+                    );
                 }
                 continue;
             }
@@ -2366,11 +2808,11 @@ impl Schema {
                 column_dependencies: Default::default(),
             })));
 
-            self.add_materialized_view(incremental_view, table, sql);
+            self.add_materialized_view(NamespaceId::ROOT, incremental_view, table, sql);
 
             // Register dependencies regardless of compatibility
             for table_name in &referenced_tables {
-                self.add_materialized_view_dependency(table_name, &view_name);
+                self.add_materialized_view_dependency(NamespaceId::ROOT, table_name, &view_name);
             }
         }
         Ok(())
@@ -2391,15 +2833,25 @@ impl Schema {
     /// reject since a view's target need not exist yet) stop expanding
     /// rather than recursing forever; a materialized view actually built on
     /// top of such views would already fail earlier, when its query runs.
-    fn materialized_view_dependencies(&self, select: &ast::Select) -> Vec<String> {
-        fn expand(schema: &Schema, name: &str, seen: &mut HashSet<String>, out: &mut Vec<String>) {
+    fn materialized_view_dependencies(
+        &self,
+        namespace: NamespaceId,
+        select: &ast::Select,
+    ) -> Vec<String> {
+        fn expand(
+            schema: &Schema,
+            namespace: NamespaceId,
+            name: &str,
+            seen: &mut HashSet<String>,
+            out: &mut Vec<String>,
+        ) {
             let name = normalize_ident(name);
             if !seen.insert(name.clone()) {
                 return;
             }
-            if let Some(view) = schema.get_view(&name) {
+            if let Some(view) = schema.get_view(namespace, &name) {
                 for dependency in IncrementalView::referenced_table_names(&view.select_stmt) {
-                    expand(schema, &dependency, seen, out);
+                    expand(schema, namespace, &dependency, seen, out);
                 }
             }
             // Record the plain view's own name alongside the real tables it
@@ -2409,7 +2861,7 @@ impl Schema {
         let mut seen = HashSet::default();
         let mut out = vec![];
         for table_name in IncrementalView::referenced_table_names(select) {
-            expand(self, &table_name, &mut seen, &mut out);
+            expand(self, namespace, &table_name, &mut seen, &mut out);
         }
         out
     }
@@ -2445,7 +2897,8 @@ impl Schema {
     /// currently in the schema. Shared shape for the SQL-based descriptor
     /// loader in `Connection` so the prefix-strip lives in one place.
     pub fn sequence_backing_table_names(&self) -> Vec<(String, String)> {
-        self.tables
+        self.namespace(NamespaceId::ROOT)
+            .tables
             .keys()
             .filter_map(|name| {
                 let seq_name = name.strip_prefix(SEQ_BACKING_TABLE_PREFIX)?;
@@ -2456,7 +2909,8 @@ impl Schema {
     }
 
     fn sequence_backing_tables(&self) -> Vec<SequenceBackingTableSource> {
-        self.tables
+        self.namespace(NamespaceId::ROOT)
+            .tables
             .iter()
             .filter_map(|(name, table)| {
                 let bt = table.btree()?;
@@ -2512,7 +2966,8 @@ impl Schema {
                 metadata.start, metadata.increment, metadata.min, metadata.max, metadata.cycle,
             ))
         })?;
-        self.sequences
+        self.namespace_mut(NamespaceId::ROOT)
+            .sequences
             .insert(normalize_ident(sequence_name), std::sync::Arc::new(seq));
         Ok(())
     }
@@ -2574,7 +3029,7 @@ impl Schema {
                             syms,
                         )?
                     };
-                    self.add_virtual_table(vtab)?;
+                    self.add_virtual_table(NamespaceId::ROOT, vtab)?;
                 } else {
                     let table = dialect.parse_table_sql(sql, root_page)?;
 
@@ -2589,7 +3044,7 @@ impl Schema {
                     // Just add the table (for B-tree access); sequences are created by
                     // AddSequence at CREATE time or initialize_sequences at open time.
                     if table.name.starts_with(SEQ_BACKING_TABLE_PREFIX) {
-                        self.add_btree_table(Arc::new(table))?;
+                        self.add_btree_table(NamespaceId::ROOT, Arc::new(table))?;
                         return Ok(());
                     }
 
@@ -2628,7 +3083,7 @@ impl Schema {
                     table.propagate_domain_constraints(self)?;
                     let has_autoinc = table.has_autoincrement;
                     let tbl_name = table.name.clone();
-                    self.add_btree_table(Arc::new(table))?;
+                    self.add_btree_table(NamespaceId::ROOT, Arc::new(table))?;
 
                     // Create the hidden sequence object owned by this
                     // AUTOINCREMENT table. The `__turso_internal_autoincrement_`
@@ -2637,8 +3092,10 @@ impl Schema {
                     // `__turso_internal_seq_<sequence-name>` backing table.
                     if has_autoinc {
                         let seq_name = autoincrement_sequence_name(&tbl_name);
-                        if let std::collections::hash_map::Entry::Vacant(e) =
-                            self.sequences.entry(normalize_ident(&seq_name))
+                        if let std::collections::hash_map::Entry::Vacant(e) = self
+                            .namespace_mut(NamespaceId::ROOT)
+                            .sequences
+                            .entry(normalize_ident(&seq_name))
                         {
                             let seq = Sequence::new(
                                 seq_name.clone(),
@@ -2718,7 +3175,9 @@ impl Schema {
                         "view '{view_name}' has unparseable SQL in sqlite_schema; \
                          it is unavailable but can be removed with DROP VIEW: {sql}"
                     );
-                    self.broken_views.insert(view_name);
+                    self.namespace_mut(NamespaceId::ROOT)
+                        .broken_views
+                        .insert(view_name);
                 } else if let Ok(Some(Cmd::Stmt(stmt))) = parsed {
                     match stmt {
                         Stmt::CreateMaterializedView { .. } => {
@@ -2729,7 +3188,11 @@ impl Schema {
                                 .insert(view_name.clone(), (sql.to_string(), root_page));
 
                             // Mark the existing view for potential reuse
-                            if self.incremental_views.contains_key(&view_name) {
+                            if self
+                                .namespace_mut(NamespaceId::ROOT)
+                                .incremental_views
+                                .contains_key(&view_name)
+                            {
                                 // We'll check for reuse in the third pass
                             }
                         }
@@ -2752,7 +3215,7 @@ impl Schema {
                                     .map(|column| column.col_name.as_str().to_string())
                                     .try_collect()?,
                             );
-                            self.add_view(view)?;
+                            self.add_view(NamespaceId::ROOT, view)?;
                         }
                         _ => {}
                     }
@@ -2803,6 +3266,7 @@ impl Schema {
                     }
                 });
                 self.add_trigger(
+                    NamespaceId::ROOT,
                     Trigger::new(
                         trigger_name,
                         sql.to_string(),
@@ -2832,14 +3296,19 @@ impl Schema {
     /// Compute all resolved FKs *referencing* `table_name` (arg: `table_name` is the parent).
     /// Each item contains the child table, normalized columns/positions, and the parent lookup
     /// strategy (rowid vs. UNIQUE index or PK).
-    pub fn resolved_fks_referencing(&self, table_name: &str) -> Result<Vec<ResolvedFkRef>> {
+    pub fn resolved_fks_referencing(
+        &self,
+        namespace: NamespaceId,
+        table_name: &str,
+    ) -> Result<Vec<ResolvedFkRef>> {
         let target = normalize_ident(table_name);
         let parent_tbl = self
-            .get_btree_table(&target)
+            .get_btree_table(namespace, &target)
             .ok_or_else(|| fk_mismatch_err("<unknown>", &target))?;
 
         let mut out = Vec::try_with_capacity_ext(4)?; // arbitrary estimate
-        for t in self.tables.values() {
+        let objects = self.namespace(namespace);
+        for t in objects.tables.values() {
             let Some(child) = t.btree() else {
                 continue;
             };
@@ -2848,6 +3317,7 @@ impl Schema {
                     continue;
                 }
                 out.try_push(self.resolve_fk(
+                    namespace,
                     fk,
                     &child,
                     &parent_tbl,
@@ -2863,12 +3333,13 @@ impl Schema {
     /// to be backed by a non-partial UNIQUE index on exactly those columns.
     pub fn resolved_fks_for_child(
         &self,
+        namespace: NamespaceId,
         child_table: &str,
         updated_cols: Option<&ColumnMask>,
     ) -> crate::Result<Vec<ResolvedFkRef>> {
         let child_name = normalize_ident(child_table);
         let child = self
-            .get_btree_table(&child_name)
+            .get_btree_table(namespace, &child_name)
             .ok_or_else(|| fk_mismatch_err(&child_name, "<unknown>"))?;
 
         let mut out = Vec::try_with_capacity_ext(child.foreign_keys.len())?;
@@ -2881,9 +3352,10 @@ impl Schema {
             }
             let parent_name = normalize_ident(&fk.parent_table);
             let parent_tbl = self
-                .get_btree_table(&parent_name)
+                .get_btree_table(namespace, &parent_name)
                 .ok_or_else(|| fk_mismatch_err(&child.name, &parent_name))?;
             out.push_within_capacity(self.resolve_fk(
+                namespace,
                 fk,
                 &child,
                 &parent_tbl,
@@ -2899,6 +3371,7 @@ impl Schema {
     /// a non-partial UNIQUE index on exactly those columns.
     fn resolve_fk(
         &self,
+        namespace: NamespaceId,
         fk: &Arc<ForeignKey>,
         child: &Arc<BTreeTable>,
         parent_tbl: &Arc<BTreeTable>,
@@ -2972,7 +3445,7 @@ impl Schema {
             None
         } else {
             let found = self
-                .get_indices(&parent_tbl.name)
+                .get_indices(namespace, &parent_tbl.name)
                 .find(|idx| {
                     idx.unique
                         && idx.where_clause.is_none()
@@ -3003,8 +3476,9 @@ impl Schema {
     }
 
     /// Returns if any table declares a FOREIGN KEY whose parent is `table_name`.
-    pub fn any_resolved_fks_referencing(&self, table_name: &str) -> bool {
-        self.tables.values().any(|t| {
+    pub fn any_resolved_fks_referencing(&self, namespace: NamespaceId, table_name: &str) -> bool {
+        let objects = self.namespace(namespace);
+        objects.tables.values().any(|t| {
             let Some(bt) = t.btree() else {
                 return false;
             };
@@ -3015,14 +3489,19 @@ impl Schema {
     }
 
     /// Returns true if `table_name` declares any FOREIGN KEYs
-    pub fn has_child_fks(&self, table_name: &str) -> bool {
-        self.get_table(table_name)
+    pub fn has_child_fks(&self, namespace: NamespaceId, table_name: &str) -> bool {
+        self.get_table(namespace, table_name)
             .and_then(|t| t.btree())
             .is_some_and(|t| !t.foreign_keys.is_empty())
     }
 
-    fn check_object_name_conflict(&self, name: &str, creating: SchemaObjectType) -> Result<()> {
-        if let Some(existing) = self.get_object_type(name) {
+    fn check_object_name_conflict(
+        &self,
+        namespace: NamespaceId,
+        name: &str,
+        creating: SchemaObjectType,
+    ) -> Result<()> {
+        if let Some(existing) = self.get_object_type(namespace, name) {
             // Match SQLite's message shapes: indexes and tables/views live in
             // different namespaces, so a cross-namespace clash names the other
             // side ("there is already a ...") instead of "already exists".
@@ -3042,45 +3521,65 @@ impl Schema {
         Ok(())
     }
 
-    pub fn get_sequence(&self, name: &str) -> Option<&Arc<Sequence>> {
-        self.sequences.get(&normalize_ident(name))
+    pub fn get_sequence(&self, namespace: NamespaceId, name: &str) -> Option<&Arc<Sequence>> {
+        self.namespace(namespace)
+            .sequences
+            .get(&normalize_ident(name))
     }
 
     /// Remove a sequence and its backing table from the in-memory schema.
-    pub fn remove_sequence(&mut self, name: &str) {
+    pub fn remove_sequence(&mut self, namespace: NamespaceId, name: &str) {
         let normalized = normalize_ident(name);
-        self.sequences.remove(&normalized);
+        let objects = self.namespace_mut(namespace);
+        objects.sequences.remove(&normalized);
         let backing_table = crate::translate::sequence::sequence_backing_table_name(&normalized);
-        self.tables.remove(&backing_table);
+        objects.tables.remove(&backing_table);
     }
 
     /// Returns the type of schema object with the given name, if one exists.
     /// Checks tables, views, and indexes.
-    pub fn get_object_type(&self, name: &str) -> Option<SchemaObjectType> {
+    pub fn get_object_type(&self, namespace: NamespaceId, name: &str) -> Option<SchemaObjectType> {
         let normalized_name = self.normalize_table_lookup_name(name);
+        let objects = self.namespace(namespace);
 
-        if self.tables.contains_key(&normalized_name) {
+        if objects.tables.contains_key(&normalized_name) {
             return Some(SchemaObjectType::Table);
         }
 
-        if self.views.contains_key(&normalized_name) {
+        if objects.views.contains_key(&normalized_name) {
             return Some(SchemaObjectType::View);
         }
 
-        if self
+        if objects
             .incompatible_materialized_view_roots
             .contains_key(&normalized_name)
         {
             return Some(SchemaObjectType::View);
         }
 
-        for index_list in self.indexes.values() {
+        for index_list in objects.indexes.values() {
             if index_list.iter().any(|i| i.name.eq_ignore_ascii_case(name)) {
                 return Some(SchemaObjectType::Index);
             }
         }
 
         None
+    }
+
+    /// The objects of namespace `id`. The namespace must exist: the root
+    /// always does, and any other id comes from this schema.
+    fn namespace(&self, id: NamespaceId) -> &NamespaceSchema {
+        self.namespaces
+            .get(&id)
+            .expect("the schema has the namespace whose objects are read")
+    }
+
+    /// The objects of namespace `id`, to change. The namespace must exist:
+    /// the root always does, and any other id comes from this schema.
+    fn namespace_mut(&mut self, id: NamespaceId) -> &mut NamespaceSchema {
+        self.namespaces
+            .get_mut(&id)
+            .expect("the schema has the namespace whose objects are changed")
     }
 }
 
@@ -3253,6 +3752,28 @@ impl TryClone for Schema {
     type Error = TryReserveError;
 
     fn try_clone(&self) -> Result<Self, Self::Error> {
+        let namespaces = self
+            .namespaces
+            .iter()
+            .map(|(id, objects)| Ok::<_, TryReserveError>((*id, objects.try_clone()?)))
+            .try_collect::<Result<_, TryReserveError>>()??;
+        Ok(Self {
+            namespaces,
+            #[cfg(feature = "conn_raw_api")]
+            table_names_by_root_page: self.table_names_by_root_page.try_clone()?,
+            schema_version: self.schema_version,
+            analyze_stats: self.analyze_stats.clone(),
+            dropped_root_pages: self.dropped_root_pages.try_clone()?,
+            type_registry: self.type_registry.try_clone()?,
+            generated_columns_enabled: self.generated_columns_enabled,
+        })
+    }
+}
+
+impl TryClone for NamespaceSchema {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
         let tables = self
             .tables
             .iter()
@@ -3303,8 +3824,6 @@ impl TryClone for Schema {
             self.incompatible_materialized_view_roots.try_clone()?;
         Ok(Self {
             tables,
-            #[cfg(feature = "conn_raw_api")]
-            table_names_by_root_page: self.table_names_by_root_page.try_clone()?,
             materialized_view_names,
             materialized_view_sql,
             incremental_views,
@@ -3312,15 +3831,10 @@ impl TryClone for Schema {
             triggers,
             indexes,
             has_indexes: self.has_indexes.try_clone()?,
-            schema_version: self.schema_version,
-            analyze_stats: self.analyze_stats.clone(),
             table_to_materialized_views: self.table_to_materialized_views.try_clone()?,
             incompatible_views,
             incompatible_materialized_view_roots,
             broken_views: self.broken_views.try_clone()?,
-            dropped_root_pages: self.dropped_root_pages.try_clone()?,
-            type_registry: self.type_registry.try_clone()?,
-            generated_columns_enabled: self.generated_columns_enabled,
             sequences: self.sequences.try_clone()?,
         })
     }
@@ -6918,6 +7432,75 @@ impl Index {
 mod tests {
     use super::*;
 
+    fn table(sql: &str, root_page: i64) -> Arc<BTreeTable> {
+        Arc::new(BTreeTable::from_sql(sql, root_page).unwrap())
+    }
+
+    #[test]
+    fn a_new_schema_has_only_the_root_namespace_with_the_schema_table() {
+        let schema = Schema::new();
+        let ids: std::vec::Vec<NamespaceId> = schema.namespace_ids().collect();
+        assert_eq!(ids, vec![NamespaceId::ROOT]);
+        assert!(schema
+            .get_table(NamespaceId::ROOT, SCHEMA_TABLE_NAME)
+            .is_some());
+    }
+
+    #[test]
+    fn a_namespace_holds_only_its_own_objects() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(1);
+        schema.add_namespace(other);
+        schema
+            .add_btree_table(NamespaceId::ROOT, table("CREATE TABLE t (x)", 2))
+            .unwrap();
+        schema
+            .add_btree_table(other, table("CREATE TABLE t (x, y)", 3))
+            .unwrap();
+
+        let root_t = schema.get_btree_table(NamespaceId::ROOT, "t").unwrap();
+        let other_t = schema.get_btree_table(other, "t").unwrap();
+        assert_eq!(root_t.root_page, 2);
+        assert_eq!(other_t.root_page, 3);
+        assert_eq!(
+            schema.get_object_type(other, "t"),
+            Some(SchemaObjectType::Table)
+        );
+        assert!(schema.get_table(other, SCHEMA_TABLE_NAME).is_none());
+
+        schema.remove_table(other, "t");
+        assert!(schema.get_table(other, "t").is_none());
+        assert!(schema.get_table(NamespaceId::ROOT, "t").is_some());
+    }
+
+    #[test]
+    fn removing_a_namespace_removes_its_objects() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(7);
+        schema.add_namespace(other);
+        schema
+            .add_btree_table(other, table("CREATE TABLE t (x)", 3))
+            .unwrap();
+        assert!(schema.has_namespace(other));
+
+        assert!(schema.remove_namespace(other));
+        assert!(!schema.has_namespace(other));
+        let ids: std::vec::Vec<NamespaceId> = schema.namespace_ids().collect();
+        assert_eq!(ids, vec![NamespaceId::ROOT]);
+    }
+
+    #[test]
+    fn a_cloned_schema_keeps_every_namespace() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(2);
+        schema.add_namespace(other);
+        schema
+            .add_btree_table(other, table("CREATE TABLE t (x)", 3))
+            .unwrap();
+        let clone = schema.try_clone().unwrap();
+        assert_eq!(clone.get_btree_table(other, "t").unwrap().root_page, 3);
+    }
+
     #[test]
     fn persisted_materialized_views_are_loaded_in_dependency_order() {
         let mut views = HashMap::default();
@@ -6978,23 +7561,24 @@ mod tests {
     #[test]
     fn incompatible_materialized_view_can_be_removed() {
         let mut schema = Schema::new();
-        schema.incompatible_views.insert("old_view".to_string());
-        schema
-            .incompatible_materialized_view_roots
+        let root = schema.namespace_mut(NamespaceId::ROOT);
+        root.incompatible_views.insert("old_view".to_string());
+        root.incompatible_materialized_view_roots
             .insert("old_view".to_string(), 42);
-        schema
-            .table_to_materialized_views
+        root.table_to_materialized_views
             .insert("base".to_string(), vec!["old_view".to_string()]);
 
-        assert!(schema.materialized_view_exists("old_view"));
+        assert!(schema.materialized_view_exists(NamespaceId::ROOT, "old_view"));
         assert_eq!(
-            schema.incompatible_materialized_view_root("old_view"),
+            schema.incompatible_materialized_view_root(NamespaceId::ROOT, "old_view"),
             Some(42)
         );
-        schema.remove_view("old_view").unwrap();
-        assert!(!schema.materialized_view_exists("old_view"));
-        assert!(!schema.incompatible_views.contains("old_view"));
-        assert!(schema.get_dependent_materialized_views("base").is_empty());
+        schema.remove_view(NamespaceId::ROOT, "old_view").unwrap();
+        assert!(!schema.materialized_view_exists(NamespaceId::ROOT, "old_view"));
+        assert!(!schema.is_incompatible_view(NamespaceId::ROOT, "old_view"));
+        assert!(schema
+            .get_dependent_materialized_views(NamespaceId::ROOT, "base")
+            .is_empty());
     }
 
     #[test]
@@ -7004,27 +7588,30 @@ mod tests {
                 "CREATE TABLE {} (version INTEGER)",
                 crate::util::quote_identifier(name)
             );
-            schema.add_btree_table(Arc::new(BTreeTable::from_sql(&sql, root_page)?))
+            schema.add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(BTreeTable::from_sql(&sql, root_page)?),
+            )
         }
 
         let mut schema = Schema::new();
-        assert!(!schema.has_compatible_materialized_view_storage("stateless"));
+        assert!(!schema.has_compatible_materialized_view_storage(NamespaceId::ROOT, "stateless"));
 
         let old_version = DBSP_CIRCUIT_VERSION - 1;
         let other_view_marker = format!("{DBSP_METADATA_TABLE_PREFIX}{old_version}_stateless__n1");
         add_marker(&mut schema, &other_view_marker, 2)?;
         assert!(
-            !schema.dbsp_storage_version_mismatch("stateless"),
+            !schema.dbsp_storage_version_mismatch(NamespaceId::ROOT, "stateless"),
             "a similarly prefixed view must not own this view's version marker"
         );
 
         let current_marker = dbsp_version_marker_table_name("stateless");
         add_marker(&mut schema, &current_marker, 3)?;
-        assert!(schema.has_compatible_materialized_view_storage("stateless"));
+        assert!(schema.has_compatible_materialized_view_storage(NamespaceId::ROOT, "stateless"));
 
         let old_marker = format!("{DBSP_METADATA_TABLE_PREFIX}{old_version}_stateless");
         add_marker(&mut schema, &old_marker, 4)?;
-        assert!(!schema.has_compatible_materialized_view_storage("stateless"));
+        assert!(!schema.has_compatible_materialized_view_storage(NamespaceId::ROOT, "stateless"));
         Ok(())
     }
 
@@ -8101,7 +8688,7 @@ mod tests {
             &crate::dialect::SqliteDialect,
         );
         assert!(result.is_err());
-        assert!(schema.get_table("v1").is_none());
+        assert!(schema.get_table(NamespaceId::ROOT, "v1").is_none());
     }
 
     #[test]
@@ -8124,7 +8711,7 @@ mod tests {
             &crate::dialect::SqliteDialect,
         );
         assert!(result.is_err());
-        assert!(schema.get_table("v1").is_none());
+        assert!(schema.get_table(NamespaceId::ROOT, "v1").is_none());
     }
 
     #[test]
@@ -8150,7 +8737,7 @@ mod tests {
                 &crate::dialect::SqliteDialect,
             )
             .unwrap();
-        let table = schema.get_btree_table("t1").unwrap();
+        let table = schema.get_btree_table(NamespaceId::ROOT, "t1").unwrap();
         assert_eq!(table.root_page, 2);
     }
 
@@ -8438,7 +9025,9 @@ mod tests {
             "expected Corrupt error for unreadable internal backing table, got: {err:?}",
         );
         assert!(
-            !schema.sequences.contains_key("broken_seq"),
+            schema
+                .get_sequence(NamespaceId::ROOT, "broken_seq")
+                .is_none(),
             "rejected descriptor must not land in the sequences map",
         );
     }
@@ -8615,7 +9204,7 @@ mod tests {
             .populate_indices(&SymbolTable::default(), vec![], automatic_indices, false)
             .unwrap();
 
-        let indexes: std::vec::Vec<_> = schema.get_indices("t_u").collect();
+        let indexes: std::vec::Vec<_> = schema.get_indices(NamespaceId::ROOT, "t_u").collect();
         let unique_idx = indexes
             .iter()
             .find(|idx| !idx.columns.iter().any(|c| c.name == "id"))
