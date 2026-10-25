@@ -623,6 +623,10 @@ it is not included in `SELECT *`.
 `pg_catalog.pg_publication_namespace` expose the hidden system column `tableoid`
 for publication discovery. These catalogs currently return no rows. Select `tableoid` explicitly; it is not included in `SELECT *`.
 
+`pg_catalog.pg_seclabels` exposes the security-label columns `objoid`, `classoid`,
+`objsubid`, `objtype`, `objnamespace`, `objname`, `provider`, and `label`. It
+currently returns no rows because security labels are not supported.
+
 In the PostgreSQL frontend, `generate_series(...)` and
 `pg_catalog.generate_series(...)` are available even when `search_path` is empty.
 A table alias also names the output column: `FROM generate_series(1, 3) AS s`
