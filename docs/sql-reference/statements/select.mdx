@@ -71,6 +71,12 @@ SELECT * FROM employees;
 SELECT * FROM (SELECT name, salary FROM employees WHERE salary > 50000) AS high_earners;
 ```
 
+Unqualified `rowid`, `_rowid_`, and `oid` names first match declared columns.
+Otherwise, they refer to the sole table or virtual table in the query scope that
+provides an implicit rowid. FROM subqueries and CTEs do not add implicit rowid
+candidates, although columns they explicitly name `rowid` are still available.
+If multiple sources provide an implicit rowid, qualify the name with a table alias.
+
 ## WHERE Clause
 
 Filters rows based on a condition. Only rows where the expression evaluates to true are included in the result.
