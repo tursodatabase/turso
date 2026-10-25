@@ -45,6 +45,9 @@ fn encode_seek_keys_for_custom_types(
             Some(c) => c,
             None => continue,
         };
+        if table_col.is_array() {
+            continue;
+        }
         let Ok(Some(resolved)) = resolver
             .schema()
             .resolve_type(&table_col.ty_str, table.is_strict())

@@ -131,6 +131,8 @@ The `@>` operator tests if the left array contains all elements of the right arr
 
 Array comparison is element-wise from left to right. If all compared elements are equal, the shorter array is considered less than the longer one.
 
+Use an array-valued expression such as `ARRAY[1,2,3]` when comparing an array column. A quoted string such as `'{1,2,3}'` is text, not an array comparison operand. Index lookups on arrays of custom-type elements do not apply the element's scalar `ENCODE` expression to the whole array key.
+
 ```sql
 SELECT ARRAY[1,2,3] @> ARRAY[1,3];     -- 1 (contains both 1 and 3)
 SELECT ARRAY[1,2] && ARRAY[3,4];       -- 0 (no common elements)
