@@ -681,40 +681,6 @@ pub fn translate_insert(
 
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
 
-    //TODO building the type-check table is expensive, we should cache it somehow.
-    let maybe_type_check_table = ctx
-        .table
-        .is_strict
-        .then(|| BTreeTable::type_check_table_ref(ctx.table, resolver.schema()));
-    if let Some(type_check_table) = &maybe_type_check_table {
-        // Pre-encoding TypeCheck: validate input types match the custom type's declared value type
-        // to catch things like a TEXT value inserted into an INTEGER-based custom type.
-        program.emit_insn(Insn::TypeCheck {
-            start_reg: insertion.first_col_register(),
-            count: insertion.num_non_virtual_cols,
-            check_generated: false,
-            table_reference: BTreeTable::input_type_check_table_ref(
-                ctx.table,
-                resolver.schema(),
-                None,
-            )?,
-        });
-
-        // Encode values for columns with custom types.
-        emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
-
-        // Post-encode TypeCheck: validate that encode produced the correct storage type (BASE).
-        // We don't check generated columns in this initial pass because their dependencies could
-        // still be REPLACEd.
-        program.emit_insn(Insn::TypeCheck {
-            start_reg: insertion.first_col_register(),
-            count: insertion.num_non_virtual_cols,
-            check_generated: false,
-            table_reference: Arc::clone(type_check_table),
-        });
-    }
-    // Non-STRICT tables: Affinity was already emitted earlier (before BEFORE triggers).
-
     // For AUTOINCREMENT tables with an explicit rowid, record it before CHECK
     // constraints. SQLite advances sqlite_sequence even when INSERT OR IGNORE
     // skips the row due to a CHECK failure.
@@ -768,7 +734,57 @@ pub fn translate_insert(
     //    1. replace `a` with 5 (the NOT NULL REPLACE action)
     //    2. compute `b`
     //    3. check that `b` isn't null (the NOT NULL constraint)
-    emit_notnulls(program, &ctx, &insertion, resolver, false)?;
+    //
+    // SQLite checks NOT NULL before the STRICT types, unless the table has generated columns or
+    // BEFORE triggers: then the row is type checked first, before computing the generated
+    // columns or firing the triggers. Columns with a custom type are always checked for NOT NULL
+    // after encoding, because their NOT NULL check looks at the decoded value.
+    //TODO building the type-check table is expensive, we should cache it somehow.
+    let maybe_type_check_table = ctx
+        .table
+        .is_strict
+        .then(|| BTreeTable::type_check_table_ref(ctx.table, resolver.schema()));
+    let has_custom_type = |column: &Column| {
+        resolver
+            .schema()
+            .column_has_custom_type(column, ctx.table.is_strict)
+    };
+    let types_checked_first = has_before_triggers || insertion.has_virtual_columns();
+    if !types_checked_first {
+        emit_notnulls(program, &ctx, &insertion, resolver, |column| {
+            !column.is_virtual_generated() && !has_custom_type(column)
+        })?;
+    }
+    if let Some(type_check_table) = &maybe_type_check_table {
+        // Pre-encoding TypeCheck: validate input types match the custom type's declared value type
+        // to catch things like a TEXT value inserted into an INTEGER-based custom type.
+        program.emit_insn(Insn::TypeCheck {
+            start_reg: insertion.first_col_register(),
+            count: insertion.num_non_virtual_cols,
+            check_generated: false,
+            table_reference: BTreeTable::input_type_check_table_ref(
+                ctx.table,
+                resolver.schema(),
+                None,
+            )?,
+        });
+
+        // Encode values for columns with custom types.
+        emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
+
+        // Post-encode TypeCheck: validate that encode produced the correct storage type (BASE).
+        // We don't check generated columns in this initial pass because their dependencies could
+        // still be REPLACEd.
+        program.emit_insn(Insn::TypeCheck {
+            start_reg: insertion.first_col_register(),
+            count: insertion.num_non_virtual_cols,
+            check_generated: false,
+            table_reference: Arc::clone(type_check_table),
+        });
+    }
+    emit_notnulls(program, &ctx, &insertion, resolver, |column| {
+        !column.is_virtual_generated() && (types_checked_first || has_custom_type(column))
+    })?;
 
     if insertion.has_virtual_columns() {
         //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
@@ -791,7 +807,13 @@ pub fn translate_insert(
             });
         }
 
-        emit_notnulls(program, &ctx, &insertion, resolver, true)?;
+        emit_notnulls(
+            program,
+            &ctx,
+            &insertion,
+            resolver,
+            Column::is_virtual_generated,
+        )?;
     }
 
     // Evaluate CHECK constraints after NOT NULL default substitution and before index mutations.
@@ -1827,12 +1849,12 @@ fn emit_notnulls(
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
     resolver: &Resolver,
-    virtual_columns: bool,
+    include_column: impl Fn(&Column) -> bool,
 ) -> Result<()> {
     for column_mapping in insertion
         .col_mappings
         .iter()
-        .filter(|m| m.column.notnull() && m.column.is_virtual_generated() == virtual_columns)
+        .filter(|m| m.column.notnull() && include_column(m.column))
     {
         // if this is rowid alias - turso-db will emit NULL as a column value and always use rowid for the row as a column value
         if column_mapping.column.is_rowid_alias() {

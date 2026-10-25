@@ -188,6 +188,8 @@ impl Dialect for PostgresDialect {
 
     fn format_float(&self, value: f64) -> String {
         crate::float::format_float8(value)
+    fn mod_of_integers_is_integer(&self) -> bool {
+        true
     }
 }
 

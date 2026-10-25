@@ -11890,13 +11890,23 @@ pub fn op_function(
             }
 
             MathFuncArity::Binary => {
-                let lhs = &state.registers[*start_reg];
-                let rhs = &state.registers[*start_reg + 1];
-                let result = lhs.get_value().exec_math_binary(
-                    rhs.get_value(),
+                let lhs = state.registers[*start_reg].get_value();
+                let rhs = state.registers[*start_reg + 1].get_value();
+                let dialect = program.connection.dialect();
+                let result =
+                    lhs.exec_math_binary(rhs, math_func, dialect.errors_on_zero_divisor())?;
+                let result = match (
                     math_func,
-                    program.connection.dialect().errors_on_zero_divisor(),
-                )?;
+                    Numeric::from_value_strict(lhs),
+                    Numeric::from_value_strict(rhs),
+                ) {
+                    (MathFunc::Mod, Some(Numeric::Integer(lhs)), Some(Numeric::Integer(rhs)))
+                        if rhs != 0 && dialect.mod_of_integers_is_integer() =>
+                    {
+                        Value::from_i64(lhs.wrapping_rem(rhs))
+                    }
+                    _ => result,
+                };
                 state.registers[*dest].set_value(result);
             }
 

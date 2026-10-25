@@ -206,10 +206,10 @@ impl SimpleQueryHandler for TursoPgHandler {
         for sql in &statements {
             let mut stmt = conn.prepare(sql).map_err(pg_error)?;
 
-            self.cleanup_dropped_schema_file(sql);
-
             if stmt.num_columns() == 0 || is_pg_non_query(sql) {
-                responses.push(execute_non_query(&mut stmt, sql)?);
+                let response = execute_non_query(&mut stmt, sql)?;
+                self.cleanup_dropped_schema_file(sql);
+                responses.push(response);
             } else {
                 let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
                 responses.push(execute_query(&mut stmt, header)?);
@@ -265,14 +265,14 @@ impl ExtendedQueryHandler for TursoPgHandler {
 
         let mut stmt = conn.prepare(query).map_err(pg_error)?;
 
-        // Clean up schema file after successful DROP SCHEMA
-        self.cleanup_dropped_schema_file(query);
-
         // Bind parameters from the portal
         bind_portal_parameters(&mut stmt, portal)?;
 
         if stmt.num_columns() == 0 || is_pg_non_query(query) {
-            return execute_non_query(&mut stmt, query);
+            let response = execute_non_query(&mut stmt, query)?;
+            // Clean up schema file after successful DROP SCHEMA execution
+            self.cleanup_dropped_schema_file(query);
+            return Ok(response);
         }
 
         let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));

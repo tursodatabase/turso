@@ -212,6 +212,11 @@ pub trait Dialect: Send + Sync + 'static {
     /// the shortest form that reads back as the same value (`1`, `1e+20`).
     fn format_float(&self, value: f64) -> String {
         crate::numeric::format_float(value)
+    /// Whether `mod` of two integers returns an integer.
+    ///
+    /// PostgreSQL returns an integer. SQLite always returns a REAL.
+    fn mod_of_integers_is_integer(&self) -> bool {
+        false
     }
 }
 

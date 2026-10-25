@@ -2175,3 +2175,63 @@ fn wire_frontend_errors_preserve_extended_query_sync() {
         count
     }
 }
+
+#[test]
+fn failed_create_table_serial_leaves_no_orphan_sequence_cli() {
+    let test_dir = std::env::temp_dir().join(format!("tursopg_repro_8110_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).expect("failed to create temp test directory");
+    let db_path = test_dir.join("repro_8110.db");
+
+    let out1 = run_tursopg_with_db(&db_path, b"CREATE TABLE c (id SERIAL);\n");
+    assert_eq!(out1.status.code(), Some(0));
+
+    let out2 = run_tursopg_with_db(&db_path, b"CREATE TABLE c (should_fail SERIAL);\n");
+    let combined2 = format!("{}{}", stdout(&out2), String::from_utf8_lossy(&out2.stderr));
+    assert!(
+        combined2.contains("already exists"),
+        "expected table-exists error, got: {combined2}"
+    );
+
+    let out3 = run_tursopg_with_db(
+        &db_path,
+        b"SELECT sequencename FROM pg_sequences ORDER BY sequencename;\n",
+    );
+    assert_eq!(out3.status.code(), Some(0));
+    let seq_out = stdout(&out3);
+    assert!(
+        seq_out.contains("c_id_seq"),
+        "expected c_id_seq in pg_sequences output: {seq_out}"
+    );
+    assert!(
+        !seq_out.contains("c_should_fail_seq"),
+        "failed CREATE TABLE leaked c_should_fail_seq: {seq_out}"
+    );
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn wire_describe_ddl_and_schema_commands_perform_no_writes() {
+    with_pg_client(|client| {
+        client.send_extended("CREATE TABLE described_tbl (id SERIAL)", true);
+        client.send_message(b'S', &[]);
+        let _ = client.read_until_ready();
+
+        client.send_extended("CREATE SCHEMA described_schema", true);
+        client.send_message(b'S', &[]);
+        let _ = client.read_until_ready();
+
+        assert_eq!(
+            client.query_single_text(
+                "SELECT count(*) FROM pg_sequences WHERE sequencename = 'described_tbl_id_seq'"
+            ),
+            "0"
+        );
+        assert_eq!(
+            client.query_single_text(
+                "SELECT count(*) FROM pg_namespace WHERE nspname = 'described_schema'"
+            ),
+            "0"
+        );
+    });
+}

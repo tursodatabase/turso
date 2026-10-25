@@ -999,6 +999,12 @@ impl Schema {
         self.type_registry.get(&type_registry_key(type_name))
     }
 
+    /// Whether the column's values are encoded before they are stored: an array column, or a
+    /// column whose type is a custom type of a STRICT table.
+    pub fn column_has_custom_type(&self, column: &Column, is_strict: bool) -> bool {
+        column.is_array() || self.get_type_def(&column.ty_str, is_strict).is_some()
+    }
+
     /// Look up a custom type definition by name without a strictness check.
     /// Only use this for operations that aren't column-scoped (e.g. DROP TYPE,
     /// CREATE TABLE validation, CAST).
@@ -2346,6 +2352,7 @@ impl Schema {
                 root_page: main_root,
                 columns: cols,
                 primary_key_columns: vec![],
+                primary_key_is_inline: false,
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
@@ -3090,6 +3097,7 @@ impl TryClone for UniqueSet {
         Ok(Self {
             columns: self.columns.try_clone()?,
             is_primary_key: self.is_primary_key,
+            is_inline: self.is_inline,
             conflict_clause: self.conflict_clause,
             constraint_name: self.constraint_name.clone(),
         })
@@ -3156,6 +3164,7 @@ impl TryClone for BTreeTable {
             root_page: self.root_page,
             name: self.name.clone(),
             primary_key_columns: self.primary_key_columns.try_clone()?,
+            primary_key_is_inline: self.primary_key_is_inline,
             columns: self.columns.try_clone()?,
             has_rowid: self.has_rowid,
             is_strict: self.is_strict,
@@ -3592,6 +3601,8 @@ impl PartialEq for Table {
 pub struct UniqueSet {
     pub columns: Vec<UniqueSetColumn>,
     pub is_primary_key: bool,
+    /// True if declared as an inline column constraint rather than a table-level constraint.
+    pub is_inline: bool,
     pub conflict_clause: Option<ResolveType>,
     /// Explicit constraint name from `CONSTRAINT name UNIQUE/PRIMARY KEY`, if given.
     pub constraint_name: Option<String>,
@@ -3769,6 +3780,7 @@ pub struct BTreeTable {
     pub root_page: i64,
     pub name: String,
     pub primary_key_columns: Vec<(String, SortOrder)>,
+    pub primary_key_is_inline: bool,
     columns: Vec<Column>,
     pub has_rowid: bool,
     pub is_strict: bool,
@@ -3836,10 +3848,18 @@ impl BTreeTable {
             .iter()
             .find(|set| set.is_primary_key)
             .and_then(|set| set.constraint_name.clone());
+        let primary_key_is_inline = unique_sets
+            .iter()
+            .find(|set| set.is_primary_key)
+            .map_or_else(
+                || primary_key_columns.len() == 1 && columns.iter().any(|c| c.primary_key()),
+                |set| set.is_inline,
+            );
         Self {
             root_page,
             name,
             primary_key_columns,
+            primary_key_is_inline,
             columns,
             has_rowid,
             is_strict: characteristics.contains(BTreeCharacteristics::STRICT),
@@ -3871,7 +3891,7 @@ impl BTreeTable {
         let has_custom = table
             .columns
             .iter()
-            .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
+            .any(|c| schema.column_has_custom_type(c, table.is_strict));
         if !has_custom {
             return Arc::clone(table);
         }
@@ -3901,7 +3921,7 @@ impl BTreeTable {
         let has_custom = table
             .columns
             .iter()
-            .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
+            .any(|c| schema.column_has_custom_type(c, table.is_strict));
         if !has_custom {
             return Ok(Arc::clone(table));
         }
@@ -4032,7 +4052,11 @@ impl BTreeTable {
     /// `CREATE TABLE t (x)`, whereas sqlite stores it with the original extra whitespace.
     pub fn to_sql(&self) -> String {
         let mut sql = format!("CREATE TABLE {} (", quote_ident(&self.name));
-        let needs_pk_inline = self.primary_key_columns.len() == 1
+        let needs_pk_inline = self.primary_key_is_inline
+            && self.primary_key_columns.len() == 1
+            && self
+                .get_column(&self.primary_key_columns[0].0)
+                .is_some_and(|(_, col)| col.primary_key())
             && self
                 .primary_key_constraint_collation(&self.primary_key_columns[0].0)
                 .is_none();
@@ -4121,8 +4145,7 @@ impl BTreeTable {
         }
 
         let has_table_pk = !self.primary_key_columns.is_empty();
-        // Add table-level PRIMARY KEY constraint if exists
-        if !needs_pk_inline && has_table_pk {
+        let push_table_pk = |sql: &mut String| {
             sql.push_str(", ");
             if let Some(name) = &self.primary_key_constraint_name {
                 sql.push_str("CONSTRAINT ");
@@ -4135,13 +4158,65 @@ impl BTreeTable {
                     sql.push_str(", ");
                 }
                 sql.push_str(&quote_ident(&col.0));
-                push_collation(&mut sql, self.primary_key_constraint_collation(&col.0));
+                push_collation(sql, self.primary_key_constraint_collation(&col.0));
                 if col.1 == SortOrder::Desc {
+                    sql.push_str(" DESC");
+                }
+                if self.has_autoincrement && self.primary_key_columns.len() == 1 {
+                    sql.push_str(" AUTOINCREMENT");
+                }
+            }
+            sql.push(')');
+            push_on_conflict_clause(sql, self.primary_key_conflict_clause());
+        };
+
+        // Emit table-level PRIMARY KEY and UNIQUE constraints in `unique_sets` order so
+        // `sqlite_autoindex_<table>_<N>` numbering matches the original schema on reopen.
+        let mut emitted_table_pk = false;
+        for unique_set in &self.unique_sets {
+            if unique_set.is_primary_key {
+                if !needs_pk_inline && has_table_pk {
+                    push_table_pk(&mut sql);
+                    emitted_table_pk = true;
+                }
+                continue;
+            }
+            // Skip inline unique constraints only when their column still carries `UNIQUE`
+            // (if an earlier `ALTER COLUMN` cleared `column.unique()` while keeping the
+            // `UniqueSet` and its autoindex, emit `UNIQUE (...)` so reopen consumes it).
+            if unique_set.is_inline
+                && unique_set.columns.len() == 1
+                && self
+                    .get_column(&unique_set.columns[0].name)
+                    .is_some_and(|(_, col)| col.unique())
+            {
+                continue;
+            }
+            sql.push_str(", ");
+            if let Some(name) = &unique_set.constraint_name {
+                sql.push_str("CONSTRAINT ");
+                sql.push_str(&quote_ident(name));
+                sql.push(' ');
+            }
+            sql.push_str("UNIQUE (");
+            for (i, unique_column) in unique_set.columns.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&quote_ident(&unique_column.name));
+                push_collation(&mut sql, unique_column.collation);
+                if unique_column.sort_order == SortOrder::Desc {
                     sql.push_str(" DESC");
                 }
             }
             sql.push(')');
-            push_on_conflict_clause(&mut sql, self.primary_key_conflict_clause());
+            push_on_conflict_clause(&mut sql, unique_set.conflict_clause);
+        }
+
+        // Table-level PRIMARY KEYs that did not retain their own UniqueSet entry (e.g. a
+        // rowid-alias `PRIMARY KEY(id)` or a duplicate `UNIQUE(a), PRIMARY KEY(a)`).
+        if !needs_pk_inline && has_table_pk && !emitted_table_pk {
+            push_table_pk(&mut sql);
         }
 
         for fk in &self.foreign_keys {
@@ -4209,36 +4284,6 @@ impl BTreeTable {
                 sql.push(' ');
             }
             sql.push_str(&check_constraint.sql());
-        }
-
-        // Add table-level UNIQUE constraints
-        for unique_set in &self.unique_sets {
-            // Skip primary key (handled above)
-            if unique_set.is_primary_key {
-                continue;
-            }
-            // Skip single-column unique constraints that were already emitted inline
-            if unique_set.columns.len() == 1 {
-                let col_name = &unique_set.columns[0].name;
-                if let Some((_, col)) = self.get_column(col_name) {
-                    if col.unique() {
-                        continue;
-                    }
-                }
-            }
-            sql.push_str(", UNIQUE (");
-            for (i, unique_column) in unique_set.columns.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
-                }
-                sql.push_str(&quote_ident(&unique_column.name));
-                push_collation(&mut sql, unique_column.collation);
-                if unique_column.sort_order == SortOrder::Desc {
-                    sql.push_str(" DESC");
-                }
-            }
-            sql.push(')');
-            push_on_conflict_clause(&mut sql, unique_set.conflict_clause);
         }
 
         sql.push(')');
@@ -5056,6 +5101,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let has_rowid;
     let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
+    let mut primary_key_is_inline = false;
     let mut foreign_keys = vec![];
     let mut check_constraints = vec![];
     let mut cols: Vec<Column> = vec![];
@@ -5128,6 +5174,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     unique_sets_constraints.try_push(UniqueSet {
                         columns: pk_unique_set_columns,
                         is_primary_key: true,
+                        is_inline: false,
                         conflict_clause: *conflict_clause,
                         constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
                     })?;
@@ -5160,6 +5207,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     let unique_set = UniqueSet {
                         columns: unique_columns,
                         is_primary_key: false,
+                        is_inline: false,
                         conflict_clause: *conflict_clause,
                         constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
                     };
@@ -5333,6 +5381,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 );
                             }
                             primary_key = true;
+                            primary_key_is_inline = true;
                             if *auto_increment {
                                 has_autoincrement = true;
                             }
@@ -5347,6 +5396,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     nulls_order: None,
                                 }]?,
                                 is_primary_key: true,
+                                is_inline: true,
                                 conflict_clause: *conflict_clause,
                                 constraint_name: c_def
                                     .name
@@ -5379,6 +5429,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     nulls_order: None,
                                 }]?,
                                 is_primary_key: false,
+                                is_inline: true,
                                 conflict_clause: *conflict,
                                 constraint_name: c_def
                                     .name
@@ -5611,6 +5662,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         name: table_name,
         has_rowid,
         primary_key_columns,
+        primary_key_is_inline,
         has_autoincrement,
         columns: cols,
         is_strict,
@@ -6366,6 +6418,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
         is_strict: false,
         has_autoincrement: false,
         primary_key_columns: try_vec![]?,
+        primary_key_is_inline: false,
         columns,
         foreign_keys: try_vec![]?,
         check_constraints: try_vec![]?,
@@ -7621,6 +7674,7 @@ mod tests {
             is_strict: false,
             has_autoincrement: false,
             primary_key_columns: vec![("nonexistent".to_string(), SortOrder::Asc)],
+            primary_key_is_inline: false,
             columns,
             unique_sets: vec![],
             foreign_keys: vec![],
@@ -8493,6 +8547,34 @@ mod tests {
             let restored = BTreeTable::from_sql(&sql, 1).unwrap();
             assert_eq!(restored.primary_key_constraint_name.as_deref(), Some("custom_pk"), "{sql}");
             assert_eq!(restored.foreign_keys[0].constraint_name.as_deref(), Some("custom_fk"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn table_level_pk_and_unique_order_survives_to_sql() {
+        for (original_sql, expected_sql) in [
+            (
+                "CREATE TABLE t (a TEXT, b TEXT, UNIQUE (a), PRIMARY KEY (b))",
+                "CREATE TABLE t (a TEXT, b TEXT, UNIQUE (a), PRIMARY KEY (b))",
+            ),
+            (
+                "CREATE TABLE u (a TEXT, b TEXT, PRIMARY KEY (b), UNIQUE (a))",
+                "CREATE TABLE u (a TEXT, b TEXT, PRIMARY KEY (b), UNIQUE (a))",
+            ),
+            (
+                "CREATE TABLE v (a TEXT, b TEXT, x TEXT, UNIQUE (a), PRIMARY KEY (b, x))",
+                "CREATE TABLE v (a TEXT, b TEXT, x TEXT, UNIQUE (a), PRIMARY KEY (b, x))",
+            ),
+            (
+                "CREATE TABLE w (a TEXT UNIQUE, b TEXT, PRIMARY KEY (b))",
+                "CREATE TABLE w (a TEXT UNIQUE, b TEXT, PRIMARY KEY (b))",
+            ),
+        ] {
+            let table = BTreeTable::from_sql(original_sql, 2).unwrap();
+            let sql = table.to_sql();
+            assert_eq!(sql, expected_sql);
+            let restored = BTreeTable::from_sql(&sql, 2).unwrap();
+            assert_eq!(restored.unique_sets, table.unique_sets, "{sql}");
         }
     }
 

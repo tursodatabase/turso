@@ -2291,8 +2291,6 @@ impl Connection {
 
             self.auto_commit.store(true, Ordering::SeqCst);
             self.set_tx_state(TransactionState::None);
-            wal.end_write_tx();
-            wal.end_read_tx();
 
             if !force_commit {
                 // remove all non-commited changes in case if WAL session left some suffix without commit frame
@@ -2303,6 +2301,8 @@ impl Connection {
                 }
                 pager.rollback(false, self, true);
             }
+            wal.end_write_tx();
+            wal.end_read_tx();
             if let Some(err) = commit_err {
                 return Err(err);
             }
