@@ -1186,6 +1186,9 @@ pub struct GroupBy {
     pub exprs: Vec<Box<Expr>>,
     /// `HAVING`
     pub having: Option<Box<Expr>>, // HAVING clause on a non-aggregate query
+    /// Whether this frontend allows HAVING to define an implicit group without a local aggregate.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub allow_having_without_aggregate: bool,
 }
 
 /// identifier or string or `CROSS` or `FULL` or `INNER` or `LEFT` or `NATURAL` or `OUTER` or `RIGHT`.

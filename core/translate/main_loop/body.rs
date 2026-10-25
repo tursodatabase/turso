@@ -104,7 +104,7 @@ impl<'prog, 'ctx, 'plan> LoopBody<'prog, 'ctx, 'plan> {
         {
             return LoopEmitTarget::GroupBy;
         }
-        if !self.plan.aggregates.is_empty() {
+        if !self.plan.aggregates.is_empty() || self.plan.has_implicit_having_group() {
             return LoopEmitTarget::AggStep;
         }
         if self.plan.window.is_some() {

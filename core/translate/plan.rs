@@ -873,6 +873,15 @@ impl SelectPlan {
         self.aggregates.iter().map(|agg| agg.args.len()).sum()
     }
 
+    /// Whether HAVING defines one implicit group without a local aggregate.
+    pub fn has_implicit_having_group(&self) -> bool {
+        self.aggregates.is_empty()
+            && self
+                .group_by
+                .as_ref()
+                .is_some_and(|group_by| group_by.exprs.is_empty() && group_by.having.is_some())
+    }
+
     /// Whether this query or any of its subqueries reference columns from the outer query.
     pub fn is_correlated(&self) -> bool {
         self.table_references

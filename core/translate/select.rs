@@ -576,6 +576,10 @@ fn prepare_one_select_plan(
                 add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, resolver)?;
             }
 
+            let allow_having_without_aggregate = group_by
+                .as_ref()
+                .is_some_and(|group_by| group_by.allow_having_without_aggregate);
+
             {
                 trace_stack!("process_group_by");
                 if let Some(mut group_by) = group_by {
@@ -657,11 +661,12 @@ fn prepare_one_select_plan(
                     && resolver.move_aggregate_to_enclosing_query(agg.clone()))
             });
 
-            // HAVING without GROUP BY requires aggregates in the SELECT
+            // SQLite requires an aggregate here; other frontends may treat HAVING as an implicit group.
             if let Some(ref group_by) = plan.group_by {
                 if group_by.exprs.is_empty()
                     && group_by.having.is_some()
                     && plan.aggregates.is_empty()
+                    && !allow_having_without_aggregate
                 {
                     crate::bail_parse_error!("HAVING clause on a non-aggregate query");
                 }
@@ -747,7 +752,12 @@ fn prepare_one_select_plan(
                     // e.g. SELECT f1 FROM t ORDER BY min(f1);
                     // But SELECT 1 ORDER BY sum(1) is allowed (no FROM clause).
                     let has_from = !plan.table_references.joined_tables().is_empty();
-                    if had_agg && has_from && !has_group_by && agg_count_before_order_by == 0 {
+                    if had_agg
+                        && has_from
+                        && !has_group_by
+                        && agg_count_before_order_by == 0
+                        && !allow_having_without_aggregate
+                    {
                         let agg = &plan.aggregates[agg_count_before_order_by];
                         crate::bail_parse_error!("misuse of aggregate: {}()", agg.func);
                     }
@@ -764,7 +774,8 @@ fn prepare_one_select_plan(
                         &mut cut_named_windows,
                     )?;
                 }
-                let is_aggregate_query = has_group_by || agg_count_before_order_by > 0;
+                let is_aggregate_query =
+                    has_group_by || agg_count_before_order_by > 0 || allow_having_without_aggregate;
                 if !cut_windows.is_empty() && !is_aggregate_query {
                     for (expr, _, _) in terms_cut_after_rowid.iter() {
                         if let Some(name) = first_aggregate_without_over_clause(expr, resolver)? {
@@ -775,11 +786,11 @@ fn prepare_one_select_plan(
             }
             plan.order_by = key;
 
-            // Single-row aggregate queries (aggregates without GROUP BY and without window functions)
-            // produce exactly one row, so ORDER BY is meaningless. Clearing it here also avoids
-            // eagerly validating subqueries in ORDER BY that SQLite would skip due to optimization.
-            // Note: HAVING without GROUP BY sets group_by to Some with empty exprs, still single-row.
-            let is_single_row_aggregate = !plan.aggregates.is_empty()
+            // Single-row aggregate queries and HAVING-only implicit groups produce at most
+            // one row, so ORDER BY is meaningless. Clearing it here also avoids eagerly validating
+            // subqueries in ORDER BY that SQLite would skip due to optimization.
+            let is_single_row_aggregate = (!plan.aggregates.is_empty()
+                || plan.has_implicit_having_group())
                 && plan.group_by.as_ref().is_none_or(|gb| gb.exprs.is_empty())
                 && windows.is_empty();
             if is_single_row_aggregate {
