@@ -989,8 +989,21 @@ fn translate_function_call_expr(
             crate::bail_parse_error!("misuse of window function {}()", name.as_str())
         }
         Func::External(_) | Func::Dialect(_) => {
+            let fills_type_names =
+                args_count == 4 && resolver.dialect.takes_operand_type_names(name.as_str());
             let regs = program.alloc_registers(args_count);
             for (i, arg_expr) in args.iter().enumerate() {
+                if fills_type_names && i >= 2 && is_empty_string_literal(arg_expr) {
+                    program.emit_insn(Insn::String8 {
+                        value: super::custom_types::declared_custom_type_name(
+                            &args[i - 2],
+                            referenced_tables,
+                            resolver,
+                        ),
+                        dest: regs + i,
+                    });
+                    continue;
+                }
                 translate_expr(program, referenced_tables, arg_expr, regs + i, resolver)?;
             }
 
@@ -2233,6 +2246,10 @@ fn translate_function_call_expr(
         }
         Func::AlterTable(_) => unreachable!(),
     }
+}
+
+fn is_empty_string_literal(expr: &ast::Expr) -> bool {
+    matches!(expr, ast::Expr::Literal(ast::Literal::String(s)) if s == "''")
 }
 
 #[inline(never)]

@@ -6,7 +6,6 @@
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
-use std::collections::HashSet;
 use turso_parser::ast;
 use turso_parser::ast::GroupBy;
 
@@ -25,22 +24,11 @@ pub struct TranslateResult {
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
     translating_index: std::cell::Cell<bool>,
-    /// Names of the `time` columns of the tables the statement reads. The
-    /// stored text of a time looks like an interval, so `+` and `-` need the
-    /// declared type to read it.
-    time_columns: HashSet<String>,
 }
 
 impl PostgreSQLTranslator {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn with_time_columns(time_columns: HashSet<String>) -> Self {
-        Self {
-            time_columns,
-            ..Self::default()
-        }
     }
 
     /// Build a `QualifiedName` from a PG `RangeVar`, preserving schema qualifier.
@@ -3568,7 +3556,6 @@ impl PostgreSQLTranslator {
             _ => {}
         }
 
-        let time_columns = &self.time_columns;
         let datetime_function = match op_name {
             "+" => Some("datetime_pl"),
             "-" => Some("datetime_mi"),
@@ -3577,11 +3564,11 @@ impl PostgreSQLTranslator {
             _ => None,
         };
         if let Some(func_name) = datetime_function.filter(|_| {
-            is_datetime_operand(a_expr.lexpr.as_deref(), time_columns)
-                || is_datetime_operand(a_expr.rexpr.as_deref(), time_columns)
+            is_datetime_operand(a_expr.lexpr.as_deref())
+                || is_datetime_operand(a_expr.rexpr.as_deref())
         }) {
-            let lhs_type = declared_datetime_type(a_expr.lexpr.as_deref(), time_columns);
-            let rhs_type = declared_datetime_type(a_expr.rexpr.as_deref(), time_columns);
+            let lhs_type = declared_datetime_type(a_expr.lexpr.as_deref());
+            let rhs_type = declared_datetime_type(a_expr.rexpr.as_deref());
             let type_name = |name: &str| {
                 Box::new(ast::Expr::Literal(ast::Literal::String(format!(
                     "'{name}'"
@@ -3603,7 +3590,6 @@ impl PostgreSQLTranslator {
                     op_name,
                     a_expr.lexpr.as_deref(),
                     a_expr.rexpr.as_deref(),
-                    time_columns,
                 ) {
                     Some(result_type) => cast_to(call, result_type),
                     None => call,
@@ -5588,9 +5574,8 @@ fn datetime_result_type(
     op: &str,
     lhs: Option<&pg_query::protobuf::Node>,
     rhs: Option<&pg_query::protobuf::Node>,
-    time_columns: &HashSet<String>,
 ) -> Option<&'static str> {
-    let operand_type = |node| match declared_datetime_type(node, time_columns) {
+    let operand_type = |node| match declared_datetime_type(node) {
         "" if is_integer_constant(node) => "integer",
         declared => declared,
     };
@@ -5620,11 +5605,8 @@ fn cast_to(expr: ast::Expr, type_name: &str) -> ast::Expr {
     }
 }
 
-fn is_datetime_operand(
-    node: Option<&pg_query::protobuf::Node>,
-    time_columns: &HashSet<String>,
-) -> bool {
-    if !declared_datetime_type(node, time_columns).is_empty() {
+fn is_datetime_operand(node: Option<&pg_query::protobuf::Node>) -> bool {
+    if !declared_datetime_type(node).is_empty() {
         return true;
     }
     match node.and_then(|n| n.node.as_ref()) {
@@ -5632,31 +5614,21 @@ fn is_datetime_operand(
             if a_expr.kind == pg_query::protobuf::AExprKind::AexprOp as i32 =>
         {
             last_string(&a_expr.name).is_some_and(|op| matches!(op.as_str(), "+" | "-" | "*" | "/"))
-                && (is_datetime_operand(a_expr.lexpr.as_deref(), time_columns)
-                    || is_datetime_operand(a_expr.rexpr.as_deref(), time_columns))
+                && (is_datetime_operand(a_expr.lexpr.as_deref())
+                    || is_datetime_operand(a_expr.rexpr.as_deref()))
         }
         _ => false,
     }
 }
 
 /// The type of a datetime operand when the expression itself names it (a cast,
-/// `now()`, `CURRENT_DATE`, a time column, ...), or "" when only
-/// the value can tell. The
+/// `now()`, `CURRENT_DATE`, ...), or "" when only the value can tell. The
 /// runtime needs this because `'infinity'` is a valid date, timestamp and
 /// interval.
-fn declared_datetime_type(
-    node: Option<&pg_query::protobuf::Node>,
-    time_columns: &HashSet<String>,
-) -> &'static str {
+fn declared_datetime_type(node: Option<&pg_query::protobuf::Node>) -> &'static str {
     use pg_query::protobuf::node::Node;
     use pg_query::protobuf::SqlValueFunctionOp as Op;
     match node.and_then(|n| n.node.as_ref()) {
-        Some(Node::ColumnRef(column_ref)) => {
-            match column_ref.fields.last().and_then(|f| f.node.as_ref()) {
-                Some(Node::String(name)) if time_columns.contains(&name.sval) => "time",
-                _ => "",
-            }
-        }
         Some(Node::TypeCast(type_cast)) => {
             match type_cast
                 .type_name
@@ -5691,14 +5663,12 @@ fn declared_datetime_type(
             let rhs = a_expr.rexpr.as_deref();
             match last_string(&a_expr.name).as_deref() {
                 Some("*" | "/")
-                    if declared_datetime_type(lhs, time_columns) == "interval"
-                        || declared_datetime_type(rhs, time_columns) == "interval" =>
+                    if declared_datetime_type(lhs) == "interval"
+                        || declared_datetime_type(rhs) == "interval" =>
                 {
                     "interval"
                 }
-                Some(op @ ("+" | "-"))
-                    if datetime_result_type(op, lhs, rhs, time_columns) == Some("date") =>
-                {
+                Some(op @ ("+" | "-")) if datetime_result_type(op, lhs, rhs) == Some("date") => {
                     "date"
                 }
                 _ => "",

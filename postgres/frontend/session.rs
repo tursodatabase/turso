@@ -1,6 +1,6 @@
 use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::num::NonZero;
 use std::str;
 use std::sync::Arc;
@@ -200,8 +200,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
         }
         None => (Cow::Borrowed(sql), parse_result),
     };
-    let translator =
-        PostgreSQLTranslator::with_time_columns(time_columns(&pg_conn.conn, &parse_result));
+    let translator = PostgreSQLTranslator::new();
     let translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
@@ -319,38 +318,6 @@ fn create_table_if_not_exists_target_present(
         .first()
         .and_then(|row| row.first())
         .is_some_and(|val| *val == Value::from_i64(1)))
-}
-
-/// Names of the `time` columns of the tables a statement reads. A name that
-/// one of these tables uses for a column of another type is left out.
-fn time_columns(
-    conn: &Arc<Connection>,
-    parse_result: &turso_pg_parser::ParseResult,
-) -> HashSet<String> {
-    let schema = conn.current_schema();
-    let mut time_columns = HashSet::new();
-    let mut other_columns = HashSet::new();
-    for (table_name, _) in &parse_result.tables {
-        let table_name = table_name.strip_prefix("public.").unwrap_or(table_name);
-        if parse_result.cte_names.iter().any(|cte| cte == table_name) {
-            continue;
-        }
-        let Some(table) = schema.get_table(table_name) else {
-            continue;
-        };
-        for column in table.columns() {
-            let Some(column_name) = &column.name else {
-                continue;
-            };
-            let base_type = column.ty_str.split('(').next().unwrap_or_default().trim();
-            if base_type.eq_ignore_ascii_case("time") {
-                time_columns.insert(column_name.to_lowercase());
-            } else {
-                other_columns.insert(column_name.to_lowercase());
-            }
-        }
-    }
-    &time_columns - &other_columns
 }
 
 /// The schema that a CREATE TABLE statement naming its table without a

@@ -201,20 +201,6 @@ pub(crate) fn exec_typed_datetime_pl(
     )
 }
 
-/// `+` for a `time` column whose other operand has no known type, so an
-/// operand whose stored text is a time is read as a time. See
-/// [exec_typed_datetime_pl].
-pub(crate) fn exec_time_pl(lhs: &Value, rhs: &Value) -> Result<Value> {
-    exec_typed_datetime_pl(lhs, rhs, COLUMN, COLUMN)
-}
-
-/// `-` for a `time` column. See [exec_typed_datetime_pl].
-pub(crate) fn exec_time_mi(lhs: &Value, rhs: &Value) -> Result<Value> {
-    exec_typed_datetime_mi(lhs, rhs, COLUMN, COLUMN)
-}
-
-const COLUMN: &str = "column";
-
 /// `-` written in SQL. See [exec_typed_datetime_pl].
 pub(crate) fn exec_typed_datetime_mi(
     lhs: &Value,
@@ -697,12 +683,6 @@ fn classify_declared(value: &Value, declared: &str) -> Result<Operand> {
             return stored_time_micros(text)
                 .map(Operand::Time)
                 .ok_or_else(|| input_error(DtErr::BadFormat, "time", text))
-        }
-        COLUMN => {
-            return match stored_time_micros(text) {
-                Some(time) => Ok(Operand::Time(time)),
-                None => classify(value),
-            }
         }
         "date" => DatetimeKind::Date,
         "timestamp" => DatetimeKind::Timestamp,

@@ -29,8 +29,12 @@ pub(super) fn emit_custom_type_operator(
     resolved: &ResolvedOperator,
     resolver: &Resolver,
 ) -> Result<usize> {
+    let passes_type_names = resolver
+        .dialect
+        .takes_operand_type_names(&resolved.func_name);
+    let arg_count = if passes_type_names { 4 } else { 2 };
     let func = resolver
-        .resolve_function(&resolved.func_name, 2)?
+        .resolve_function(&resolved.func_name, arg_count)?
         .ok_or_else(|| {
             LimboError::InternalError(format!("function not found: {}", resolved.func_name))
         })?;
@@ -61,7 +65,7 @@ pub(super) fn emit_custom_type_operator(
             };
 
             // Allocate fresh contiguous registers for the function call.
-            let func_args = program.alloc_registers(2);
+            let func_args = program.alloc_registers(arg_count);
             // The literal goes in the same position it occupied in arg layout.
             let (lit_dst, col_dst) = match encode_info.which {
                 EncodeArg::First if resolved.swap_args => (func_args + 1, func_args),
@@ -104,25 +108,34 @@ pub(super) fn emit_custom_type_operator(
             func_args
         } else {
             // Type has no encode expression; translate directly into arg slots.
-            let arg_reg = program.alloc_registers(2);
+            let arg_reg = program.alloc_registers(arg_count);
             translate_expr(program, referenced_tables, first, arg_reg, resolver)?;
             translate_expr(program, referenced_tables, second, arg_reg + 1, resolver)?;
             arg_reg
         }
     } else {
         // No encoding needed; translate directly into arg slots.
-        let arg_reg = program.alloc_registers(2);
+        let arg_reg = program.alloc_registers(arg_count);
         translate_expr(program, referenced_tables, first, arg_reg, resolver)?;
         translate_expr(program, referenced_tables, second, arg_reg + 1, resolver)?;
         arg_reg
     };
+
+    if passes_type_names {
+        for (i, operand) in [first, second].into_iter().enumerate() {
+            program.emit_insn(Insn::String8 {
+                value: declared_custom_type_name(operand, referenced_tables, resolver),
+                dest: func_start + 2 + i,
+            });
+        }
+    }
 
     let result_reg = program.alloc_register();
     let call = Insn::Function {
         constant_mask: 0,
         start_reg: func_start,
         dest: result_reg,
-        func: FuncCtx { func, arg_count: 2 },
+        func: FuncCtx { func, arg_count },
     };
     match &resolved.standard_arithmetic_if_real {
         Some(real_operand) => emit_call_unless_real(
@@ -291,6 +304,18 @@ pub(super) fn expr_custom_type_info(
         };
     }
     None
+}
+
+/// The declared custom type of a column, or "" when `expr` is not a column of
+/// a custom type.
+pub(super) fn declared_custom_type_name(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> String {
+    expr_custom_type_info(expr, referenced_tables, resolver)
+        .map(|info| info.type_name)
+        .unwrap_or_default()
 }
 
 fn custom_type_info_of_column(

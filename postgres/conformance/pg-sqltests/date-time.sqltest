@@ -298,6 +298,32 @@ expect {
     01:00:00|01:00:00|21:00:00
 }
 
+test time-column-arithmetic-in-joins {
+    CREATE TABLE t1 (a time);
+    CREATE TABLE t2 (a text, b int);
+    INSERT INTO t1 VALUES ('23:00');
+    INSERT INTO t2 VALUES ('x', 3);
+    SELECT t1.a + interval '2 hours', t1.a - interval '2 hours' FROM t1, t2;
+    SELECT x.a + interval '2 hours' FROM t1 x JOIN t2 y ON y.b = 3;
+    SELECT t2.b + 1 FROM t1 JOIN t2 ON true;
+}
+expect {
+    01:00:00|21:00:00
+    01:00:00
+    4
+}
+
+test integer-column-named-like-a-time-column {
+    CREATE TABLE s (start2 time, n int);
+    INSERT INTO s VALUES ('23:00', 3);
+    SELECT x.start2 + 1, x.start2 * 2 FROM (SELECT 1 AS start2) x WHERE EXISTS (SELECT 1 FROM s);
+    SELECT x.start2 - 1 FROM (SELECT n AS start2 FROM s) x;
+}
+expect {
+    2|2
+    2
+}
+
 test time-plus-integer-is-an-error {
     SELECT '12:00'::time + 1;
 }

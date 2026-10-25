@@ -209,6 +209,19 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether the frontend function `name` takes the type names of its first
+    /// two arguments as its third and fourth arguments, e.g.
+    /// `datetime_pl(a, b, 'time', 'interval')`.
+    ///
+    /// When a custom type operator calls such a function, core passes the
+    /// declared custom types of the two operands. When SQL calls it with an
+    /// empty type name for an argument that is a column of a custom type, core
+    /// passes the column's type instead. The type name is empty when core does
+    /// not know the type.
+    fn takes_operand_type_names(&self, _name: &str) -> bool {
+        false
+    }
+
     /// Whether integer division by zero raises an error.
     ///
     /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.
