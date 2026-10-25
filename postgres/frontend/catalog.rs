@@ -200,6 +200,13 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn custom_type_operator_result_type(&self, func_name: &str) -> Option<&'static str> {
+        match func_name {
+            "numeric_add" | "numeric_sub" | "numeric_mul" | "numeric_div" => Some("numeric"),
+            _ => None,
+        }
+    }
+
     fn cast_to_custom_type_decodes(&self) -> bool {
         true
     }

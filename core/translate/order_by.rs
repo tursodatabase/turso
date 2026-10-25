@@ -41,15 +41,24 @@ fn sort_comparator_from_func_name(func_name: &str) -> Option<SortComparatorType>
     }
 }
 
-/// For an ORDER BY expression that is a column reference to a custom type,
-/// returns the SortComparatorType if the type has a `<` operator with a known
-/// comparator. Returns None otherwise, which causes the sorter to use encoded
-/// blob ordering instead of silently wrong results.
+/// For an ORDER BY expression with a custom type (a column, arithmetic whose
+/// result has a custom type, or `min`/`max` of either), returns the
+/// SortComparatorType if the type has a `<` operator with a known comparator.
+/// Returns None otherwise, which causes the sorter to use encoded blob ordering
+/// instead of silently wrong results.
 pub(crate) fn custom_type_comparator(
     expr: &ast::Expr,
     referenced_tables: &TableReferences,
-    schema: &Schema,
+    resolver: &Resolver,
 ) -> Option<SortComparatorType> {
+    if let ast::Expr::FunctionCall { name, args, .. } = expr {
+        if args.len() == 1
+            && (name.as_str().eq_ignore_ascii_case("min")
+                || name.as_str().eq_ignore_ascii_case("max"))
+        {
+            return custom_type_comparator(&args[0], referenced_tables, resolver);
+        }
+    }
     if let ast::Expr::Column {
         table: table_ref_id,
         column,
@@ -62,18 +71,25 @@ pub(crate) fn custom_type_comparator(
         if col.is_array() {
             return Some(SortComparatorType::ArrayLt);
         }
-        let type_def = schema.get_type_def(&col.ty_str, table.is_strict())?;
-        type_def
-            .operators()
-            .iter()
-            .find(|op| op.op == "<")
-            .and_then(|op| op.func_name.as_ref())
-            .and_then(|func_name| sort_comparator_from_func_name(func_name))
+        let type_def = resolver
+            .schema()
+            .get_type_def(&col.ty_str, table.is_strict())?;
+        less_than_comparator(type_def)
     } else if super::expr::expr_is_array(expr, Some(referenced_tables)) {
         Some(SortComparatorType::ArrayLt)
     } else {
-        None
+        let type_def = super::expr::expr_custom_type_def(expr, Some(referenced_tables), resolver)?;
+        less_than_comparator(&type_def)
     }
+}
+
+fn less_than_comparator(type_def: &crate::schema::TypeDef) -> Option<SortComparatorType> {
+    type_def
+        .operators()
+        .iter()
+        .find(|op| op.op == "<")
+        .and_then(|op| op.func_name.as_ref())
+        .and_then(|func_name| sort_comparator_from_func_name(func_name))
 }
 
 /// For a result column expression that is a column reference to a custom type,
@@ -720,7 +736,7 @@ pub(crate) fn sorter_open_data<'a>(
         data.order_collations_nulls
             .try_push((direction, Some(collation), nulls))?;
         data.comparators
-            .try_push(custom_type_comparator(expr, tables, resolver.schema()))?;
+            .try_push(custom_type_comparator(expr, tables, resolver))?;
     }
     data.columns = data.order_collations_nulls.len();
     Ok(data)
