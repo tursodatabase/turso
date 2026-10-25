@@ -24613,7 +24613,7 @@ fn check_reader_against_model(
     let pager = reader.pager.load().clone();
     let keys: Vec<i64> = rows.keys().copied().collect();
     for _ in 0..4 {
-        let mut cursor = open_mvcc_table_reader(db, reader);
+        let mut cursor = open_mvcc_table_reader(db, reader, 2);
         walk_mvcc_table_reader(&mut cursor, &pager, rows, &keys, rng);
     }
 
@@ -24671,7 +24671,11 @@ fn check_reader_against_model(
     }
 }
 
-fn open_mvcc_table_reader(db: &MvccTestDbNoConn, reader: &Arc<Connection>) -> BTreeCursor {
+fn open_mvcc_table_reader(
+    db: &MvccTestDbNoConn,
+    reader: &Arc<Connection>,
+    num_columns: usize,
+) -> BTreeCursor {
     use crate::storage::btree::{CursorTrait, MvccReader};
 
     let mv_store = db.get_mvcc_store();
@@ -24687,7 +24691,8 @@ fn open_mvcc_table_reader(db: &MvccTestDbNoConn, reader: &Arc<Connection>) -> BT
     } else {
         root_page
     };
-    let mut cursor = BTreeCursor::new_table(reader.pager.load().clone(), btree_root_page, 2);
+    let mut cursor =
+        BTreeCursor::new_table(reader.pager.load().clone(), btree_root_page, num_columns);
     cursor.install_yield_context(reader);
     cursor.read_mvcc_table(MvccReader::new(mv_store, reader, tx_id, root_page).unwrap());
     assert!(cursor.is_mvcc());
@@ -24925,7 +24930,7 @@ fn mvcc_exact_seek_that_misses_leaves_the_cursor_without_a_row() {
     let pager = reader.pager.load().clone();
     let rows = BTreeMap::from([(10, "a".to_string()), (13, "c".to_string())]);
     let keys: Vec<i64> = rows.keys().copied().collect();
-    let mut cursor = open_mvcc_table_reader(&db, &reader);
+    let mut cursor = open_mvcc_table_reader(&db, &reader, 2);
     for (key, op) in [
         (11, SeekOp::GE { eq_only: true }),
         (11, SeekOp::LE { eq_only: true }),
@@ -24995,7 +25000,7 @@ fn mvcc_reader_has_no_row_after_its_btree_cache_is_dropped() {
         (3, "c".to_string()),
     ]);
     let keys: Vec<i64> = rows.keys().copied().collect();
-    let mut cursor = open_mvcc_table_reader(&db, &reader);
+    let mut cursor = open_mvcc_table_reader(&db, &reader, 2);
 
     drive_cursor_io(&pager, || cursor.rewind());
     assert_cursor_row(&mut cursor, &pager, ModelPosition::At(0), &rows, &keys);
@@ -25050,66 +25055,79 @@ fn mvcc_reader_has_no_row_after_its_btree_cache_is_dropped() {
 
 #[test]
 fn mvcc_table_reader_returns_the_same_rows_after_an_injected_yield() {
-    let (db, unfinished, rows) = reader_yield_fixture();
-    let queries = reader_yield_queries(&rows);
-    let reader = db.connect();
-    reader.execute("BEGIN CONCURRENT").unwrap();
-    for point in READER_YIELD_POINTS {
-        let mut yielded = false;
-        for (query, expected) in &queries {
-            let injector = FixedYieldInjector::new([point.point()]);
-            reader.set_yield_injector(Some(injector.clone()));
-            assert_eq!(
-                &get_rows(&reader, query),
-                expected,
-                "{query} with a yield at {point:?}"
+    for checkpoint in [true, false] {
+        let (db, unfinished, rows) = reader_yield_fixture(checkpoint);
+        let queries = reader_yield_queries(&rows);
+        let reader = db.connect();
+        reader.execute("BEGIN CONCURRENT").unwrap();
+        for point in READER_YIELD_POINTS {
+            let mut yielded = false;
+            for (query, expected) in &queries {
+                let injector = FixedYieldInjector::new([point.point()]);
+                reader.set_yield_injector(Some(injector.clone()));
+                assert_eq!(
+                    &get_rows(&reader, query),
+                    expected,
+                    "{query} with a yield at {point:?}, checkpoint: {checkpoint}"
+                );
+                reader.set_yield_injector(None);
+                yielded |= injector.is_empty();
+            }
+            let reads_only_version_chains = matches!(
+                point,
+                CursorYieldPoint::NextStart
+                    | CursorYieldPoint::SeekStart
+                    | CursorYieldPoint::CountProgress
             );
-            reader.set_yield_injector(None);
-            yielded |= injector.is_empty();
+            assert!(
+                yielded || !(checkpoint || reads_only_version_chains),
+                "no query yielded at {point:?}, checkpoint: {checkpoint}"
+            );
         }
-        assert!(yielded, "no query yielded at {point:?}");
+        reader.execute("ROLLBACK").unwrap();
+        unfinished.execute("ROLLBACK").unwrap();
     }
-    reader.execute("ROLLBACK").unwrap();
-    unfinished.execute("ROLLBACK").unwrap();
 }
 
 #[test]
 fn dropping_a_statement_at_an_mvcc_reader_yield_leaves_the_transaction_usable() {
-    let (db, unfinished, rows) = reader_yield_fixture();
-    let queries = reader_yield_queries(&rows);
-    let reader = db.connect();
-    reader.execute("BEGIN CONCURRENT").unwrap();
-    let io = reader.pager.load().io.clone();
-    for point in READER_YIELD_POINTS {
-        for (query, _) in &queries {
-            reader.set_yield_injector(Some(FixedYieldInjector::new([point.point()])));
-            let mut stmt = reader.prepare(query).unwrap();
-            loop {
-                match stmt.step().unwrap() {
-                    StepResult::Yield | StepResult::Done => break,
-                    StepResult::IO => io.step().unwrap(),
-                    StepResult::Row => {}
-                    other => panic!("unexpected step result {other:?} for {query}"),
+    for checkpoint in [true, false] {
+        let (db, unfinished, rows) = reader_yield_fixture(checkpoint);
+        let queries = reader_yield_queries(&rows);
+        let reader = db.connect();
+        reader.execute("BEGIN CONCURRENT").unwrap();
+        let io = reader.pager.load().io.clone();
+        for point in READER_YIELD_POINTS {
+            for (query, _) in &queries {
+                reader.set_yield_injector(Some(FixedYieldInjector::new([point.point()])));
+                let mut stmt = reader.prepare(query).unwrap();
+                loop {
+                    match stmt.step().unwrap() {
+                        StepResult::Yield | StepResult::Done => break,
+                        StepResult::IO => io.step().unwrap(),
+                        StepResult::Row => {}
+                        other => panic!("unexpected step result {other:?} for {query}"),
+                    }
                 }
+                drop(stmt);
+                reader.set_yield_injector(None);
             }
-            drop(stmt);
-            reader.set_yield_injector(None);
         }
+        for (query, expected) in &queries {
+            assert_eq!(
+                &get_rows(&reader, query),
+                expected,
+                "{query} after statements were dropped at a yield, checkpoint: {checkpoint}"
+            );
+        }
+        reader.execute("COMMIT").unwrap();
+        unfinished.execute("ROLLBACK").unwrap();
+        let checkpointer = db.connect();
+        checkpointer
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        assert_eq!(get_rows(&checkpointer, "SELECT id, v FROM t"), queries[0].1);
     }
-    for (query, expected) in &queries {
-        assert_eq!(
-            &get_rows(&reader, query),
-            expected,
-            "{query} after statements were dropped at a yield"
-        );
-    }
-    reader.execute("COMMIT").unwrap();
-    unfinished.execute("ROLLBACK").unwrap();
-    let checkpointer = db.connect();
-    checkpointer
-        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        .unwrap();
-    assert_eq!(get_rows(&checkpointer, "SELECT id, v FROM t"), queries[0].1);
 }
 
 #[test]
@@ -25118,7 +25136,7 @@ fn mvcc_table_reader_yields_with_the_cursor_key_of_its_transaction_and_table() {
     use crate::mvcc::yield_hooks::ProvidesYieldContext;
     use crate::storage::btree::CursorTrait;
 
-    let (db, unfinished, _) = reader_yield_fixture();
+    let (db, unfinished, _) = reader_yield_fixture(true);
     let reader = db.connect();
     reader.execute("BEGIN CONCURRENT").unwrap();
     get_rows(&reader, "SELECT count(*) FROM t");
@@ -25131,7 +25149,7 @@ fn mvcc_table_reader_yields_with_the_cursor_key_of_its_transaction_and_table() {
     let table_id = db.get_mvcc_store().get_table_id_from_root_page(root_page);
     let expected_key = cursor_yield_key(reader.get_mv_tx_id().unwrap(), table_id);
     let pager = reader.pager.load().clone();
-    let mut cursor = open_mvcc_table_reader(&db, &reader);
+    let mut cursor = open_mvcc_table_reader(&db, &reader, 2);
     assert_eq!(cursor.yield_context().selection_key, expected_key);
     drive_cursor_io(&pager, || cursor.rewind());
     assert_eq!(cursor.yield_context().selection_key, expected_key);
@@ -25144,12 +25162,12 @@ fn mvcc_table_reader_yields_with_the_cursor_key_of_its_transaction_and_table() {
 fn reading_the_cell_bytes_of_a_version_chain_row_panics() {
     use crate::storage::btree::{CursorTrait, KeptRead};
 
-    let (db, unfinished, _) = reader_yield_fixture();
+    let (db, unfinished, _) = reader_yield_fixture(true);
     let reader = db.connect();
     reader.execute("BEGIN CONCURRENT").unwrap();
     get_rows(&reader, "SELECT count(*) FROM t");
     let pager = reader.pager.load().clone();
-    let mut cursor = open_mvcc_table_reader(&db, &reader);
+    let mut cursor = open_mvcc_table_reader(&db, &reader, 2);
     let result = drive_cursor_io(&pager, || {
         cursor.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true })
     });
@@ -25183,7 +25201,9 @@ const READER_YIELD_POINTS: [CursorYieldPoint; 8] = [
     CursorYieldPoint::AdvanceBtreeBackwardProgress,
 ];
 
-fn reader_yield_fixture() -> (MvccTestDbNoConn, Arc<Connection>, BTreeMap<i64, String>) {
+fn reader_yield_fixture(
+    checkpoint: bool,
+) -> (MvccTestDbNoConn, Arc<Connection>, BTreeMap<i64, String>) {
     let db = MvccTestDbNoConn::new_with_random_db();
     let writer = db.connect();
     writer
@@ -25192,19 +25212,47 @@ fn reader_yield_fixture() -> (MvccTestDbNoConn, Arc<Connection>, BTreeMap<i64, S
     writer
         .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
+    writer
+        .execute("CREATE TABLE s(id INTEGER PRIMARY KEY, v TEXT, w TEXT)")
+        .unwrap();
+    writer.execute("CREATE INDEX s_v ON s(v)").unwrap();
+    writer
+        .execute("CREATE TABLE a(x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE b(x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO a VALUES (1, 1), (2, 2)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO b VALUES (1, NULL), (2, 3)")
+        .unwrap();
     let mut rows = BTreeMap::new();
     for id in 1..=10 {
         writer
             .execute(format!("INSERT INTO t VALUES ({id}, 'b{id}')"))
             .unwrap();
+        writer
+            .execute(format!("INSERT INTO s VALUES ({id}, 'b{id}', 'w{id}')"))
+            .unwrap();
         rows.insert(id, format!("b{id}"));
     }
-    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-    writer
-        .execute("UPDATE t SET v = 'u3' WHERE id = 3")
-        .unwrap();
-    writer.execute("DELETE FROM t WHERE id IN (5, 8)").unwrap();
+    if checkpoint {
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    for table in ["t", "s"] {
+        writer
+            .execute(format!("UPDATE {table} SET v = 'u3' WHERE id = 3"))
+            .unwrap();
+        writer
+            .execute(format!("DELETE FROM {table} WHERE id IN (5, 8)"))
+            .unwrap();
+    }
     writer.execute("INSERT INTO t VALUES (11, 'n11')").unwrap();
+    writer
+        .execute("INSERT INTO s VALUES (11, 'n11', 'w11')")
+        .unwrap();
     rows.insert(3, "u3".to_string());
     rows.remove(&5);
     rows.remove(&8);
@@ -25216,8 +25264,13 @@ fn reader_yield_fixture() -> (MvccTestDbNoConn, Arc<Connection>, BTreeMap<i64, S
         .execute("INSERT INTO t VALUES (12, 'x12')")
         .unwrap();
     unfinished
-        .execute("UPDATE t SET v = 'x4' WHERE id = 4")
+        .execute("INSERT INTO s VALUES (12, 'x12', 'w12')")
         .unwrap();
+    for table in ["t", "s"] {
+        unfinished
+            .execute(format!("UPDATE {table} SET v = 'x4' WHERE id = 4"))
+            .unwrap();
+    }
     (db, unfinished, rows)
 }
 
@@ -25249,6 +25302,43 @@ fn reader_yield_queries(rows: &BTreeMap<i64, String>) -> Vec<(&'static str, Vec<
         (
             "SELECT count(*) FROM t",
             vec![vec![Value::from_i64(rows.len() as i64)]],
+        ),
+        (
+            "SELECT v FROM t WHERE id IN (2, 5, 8, 11, 12, 100) ORDER BY id",
+            [2, 5, 8, 11, 12, 100]
+                .into_iter()
+                .filter_map(|id| rows.get(&id))
+                .map(|v| vec![Value::from_text(v.clone())])
+                .collect(),
+        ),
+        (
+            "SELECT id, w FROM s WHERE v IN ('u3', 'b3', 'b4', 'b5', 'x4', 'x12') ORDER BY id",
+            rows.iter()
+                .filter(|(_, v)| ["u3", "b3", "b4", "b5", "x4", "x12"].contains(&v.as_str()))
+                .map(|(id, _)| vec![Value::from_i64(*id), Value::from_text(format!("w{id}"))])
+                .collect(),
+        ),
+        (
+            "SELECT o.id FROM t AS o WHERE EXISTS (SELECT 1 FROM t AS i WHERE i.id = o.id + 1) ORDER BY o.id",
+            rows.keys()
+                .filter(|id| rows.contains_key(&(**id + 1)))
+                .map(|id| vec![Value::from_i64(*id)])
+                .collect(),
+        ),
+        (
+            "SELECT o.id FROM t AS o WHERE NOT EXISTS (SELECT 1 FROM t AS i WHERE i.id = o.id + 1) ORDER BY o.id",
+            rows.keys()
+                .filter(|id| !rows.contains_key(&(**id + 1)))
+                .map(|id| vec![Value::from_i64(*id)])
+                .collect(),
+        ),
+        (
+            "SELECT a.x, b.x, t.id FROM a LEFT JOIN b ON a.y = b.x LEFT JOIN t ON t.id > b.y ORDER BY a.x, t.id",
+            std::iter::once(vec![Value::from_i64(1), Value::from_i64(1), Value::Null])
+                .chain(rows.range(4..).map(|(id, _)| {
+                    vec![Value::from_i64(2), Value::from_i64(2), Value::from_i64(*id)]
+                }))
+                .collect(),
         ),
     ]
 }
