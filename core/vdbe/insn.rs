@@ -454,6 +454,101 @@ pub enum ClearBtreeCount {
     ChangesAndRowsWritten,
 }
 
+#[derive(Debug, Clone)]
+pub struct ConstraintInfo {
+    pub kind: crate::ConstraintKind,
+    pub constraint_name: Option<String>,
+    pub index_name: Option<String>,
+    pub table_name: String,
+    pub column_names: Vec<String>,
+    pub violation_regs: Vec<usize>,
+    pub row_col_names: Vec<String>,
+    pub parent_table: Option<String>,
+}
+
+impl ConstraintInfo {
+    pub fn primary_key(
+        table: &str,
+        name: Option<String>,
+        cols: Vec<String>,
+        regs: Vec<usize>,
+    ) -> Self {
+        Self {
+            kind: crate::ConstraintKind::PrimaryKey,
+            constraint_name: name,
+            index_name: None,
+            table_name: table.to_string(),
+            column_names: cols,
+            violation_regs: regs,
+            row_col_names: vec![],
+            parent_table: None,
+        }
+    }
+
+    pub fn unique_index(table: &str, index: &Index, regs: Vec<usize>) -> Self {
+        Self {
+            kind: crate::ConstraintKind::Unique,
+            constraint_name: index.constraint_name.clone(),
+            index_name: Some(index.name.clone()),
+            table_name: table.to_string(),
+            column_names: index.columns.iter().map(|col| col.name.clone()).collect(),
+            violation_regs: regs,
+            row_col_names: vec![],
+            parent_table: None,
+        }
+    }
+
+    pub fn not_null(table: &str, col: String) -> Self {
+        Self {
+            kind: crate::ConstraintKind::NotNull,
+            constraint_name: None,
+            index_name: None,
+            table_name: table.to_string(),
+            column_names: vec![col],
+            violation_regs: vec![],
+            row_col_names: vec![],
+            parent_table: None,
+        }
+    }
+
+    pub fn check(
+        table: &str,
+        name: Option<String>,
+        regs: Vec<usize>,
+        row_names: Vec<String>,
+    ) -> Self {
+        Self {
+            kind: crate::ConstraintKind::Check,
+            constraint_name: name,
+            index_name: None,
+            table_name: table.to_string(),
+            column_names: vec![],
+            violation_regs: regs,
+            row_col_names: row_names,
+            parent_table: None,
+        }
+    }
+
+    pub fn fk(
+        child_table: &str,
+        name: Option<String>,
+        cols: Vec<String>,
+        regs: Vec<usize>,
+        parent_table: String,
+    ) -> Self {
+        Self {
+            kind: crate::ConstraintKind::ForeignKey,
+            constraint_name: name,
+            index_name: None,
+            table_name: child_table.to_string(),
+            column_names: cols,
+            violation_regs: regs,
+            row_col_names: vec![],
+            parent_table: Some(parent_table),
+        }
+    }
+}
+
 // The opcodes the dispatch loop matches directly come first.
 #[repr(u8)]
 #[derive(Description, Debug, Clone, EnumDiscriminants)]
@@ -1063,6 +1158,7 @@ pub enum Insn {
 
     /// Halt the program.
     Halt {
+        constraint_info: Option<Box<ConstraintInfo>>,
         err_code: usize,
         description: String,
         /// Override the program's resolve_type for error handling.
@@ -1074,6 +1170,7 @@ pub enum Insn {
 
     /// Halt the program if P3 is null.
     HaltIfNull {
+        constraint_info: Option<Box<ConstraintInfo>>,
         target_reg: usize,   // P3
         description: String, // p4
         err_code: usize,     // p1
@@ -1089,9 +1186,14 @@ pub enum Insn {
     },
 
     /// Set database auto-commit mode and potentially rollback.
+    /// On BEGIN (`auto_commit: false`), `concurrent` records that the
+    /// transaction was started with BEGIN CONCURRENT: like BEGIN DEFERRED
+    /// it opens nothing by itself, and the first statement materializes
+    /// the MVCC transaction in concurrent mode.
     AutoCommit {
         auto_commit: bool,
         rollback: bool,
+        concurrent: bool,
     },
 
     /// Execute a named savepoint operation.
@@ -1507,6 +1609,21 @@ pub enum Insn {
         target_pc: Option<BranchOffset>,
     },
 
+    /// Write the subtype of src_reg to dest_reg as an integer.
+    /// Values without a subtype produce zero; JSON text produces 74.
+    GetSubtype {
+        src_reg: usize,
+        dest_reg: usize,
+    },
+
+    /// Read a supported integer subtype from subtype_reg and apply it to the
+    /// text value in dest_reg without changing its contents. Non-text values
+    /// are unchanged. Zero clears the subtype; 74 marks JSON when enabled.
+    SetSubtype {
+        subtype_reg: usize,
+        dest_reg: usize,
+    },
+
     SoftNull {
         reg: usize,
     },
@@ -1740,12 +1857,12 @@ pub enum Insn {
         was_empty_reg: usize,
         out_value_reg: usize,
     },
-    /// Record this connection's currval for a sequence after a successful
-    /// nextval/setval. Pure synchronous register operation. currval is
-    /// per-connection global (not schema-qualified), so no database id
-    /// is carried — schema-qualified currvals would be a separate feature.
+    /// Record this connection's currval for the sequence `seq_name` of
+    /// database `db` after a successful nextval/setval. Pure synchronous
+    /// register operation.
     SetSequenceCurrval {
-        seq_name_reg: usize,
+        db: usize,
+        seq_name: String,
         value_reg: usize,
     },
     /// Publish sequence allocation metadata for sync watermarks after a
@@ -2056,6 +2173,7 @@ pub enum Insn {
     // If P1 is non-zero, the database constraint counter is incremented (deferred foreign key constraints).
     // Otherwise, if P1 is zero, the statement counter is incremented (immediate foreign key constraints).
     FkCounter {
+        constraint_info: Option<Box<ConstraintInfo>>,
         increment_value: isize,
         deferred: bool,
     },
@@ -2148,10 +2266,12 @@ pub enum Insn {
         hash_table_id: usize,
     },
 
-    /// Reset all matched_bits in a hash table to false.
-    /// Emitted at the start of each outer-loop iteration so that marks from
-    /// a previous probe pass don't suppress NULL-fill rows in the current one.
-    HashResetMatched {
+    /// Start a probe pass over an already built hash table.
+    /// The build side is built once (under `Once`) but probed again every time
+    /// the join runs inside an outer loop or a correlated subquery, so this
+    /// drops what the previous pass left behind: buffered and spilled probe
+    /// rows, grace progress, loaded build partitions and the matched marks.
+    HashProbeInit {
         hash_table_id: usize,
     },
 
@@ -2215,8 +2335,8 @@ pub enum Insn {
     VacuumInto {
         /// Database name to vacuum
         schema_name: String,
-        /// Destination file path for the vacuumed database
-        dest_path: String,
+        /// Register holding the destination file path for the vacuumed database
+        dest_reg: usize,
     },
 
     /// In-place VACUUM - compact the database (by writing to a temporary location and then copying
@@ -2396,6 +2516,8 @@ impl InsnVariants {
             InsnVariants::Delete => execute::op_delete,
             InsnVariants::NewRowid => execute::op_new_rowid,
             InsnVariants::MustBeInt => execute::op_must_be_int,
+            InsnVariants::GetSubtype => execute::op_get_subtype,
+            InsnVariants::SetSubtype => execute::op_set_subtype,
             InsnVariants::SoftNull => execute::op_soft_null,
             InsnVariants::NoConflict => execute::op_no_conflict,
             InsnVariants::NotExists => execute::op_not_exists,
@@ -2476,7 +2598,7 @@ impl InsnVariants {
             InsnVariants::HashClose => execute::op_hash_close,
             InsnVariants::HashClear => execute::op_hash_clear,
             InsnVariants::HashMarkMatched => execute::op_hash_mark_matched,
-            InsnVariants::HashResetMatched => execute::op_hash_reset_matched,
+            InsnVariants::HashProbeInit => execute::op_hash_probe_init,
             InsnVariants::HashScanUnmatched => execute::op_hash_scan_unmatched,
             InsnVariants::HashNextUnmatched => execute::op_hash_next_unmatched,
             InsnVariants::HashGraceInit => execute::op_hash_grace_init,

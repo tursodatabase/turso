@@ -153,11 +153,11 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         ),
         IntegrityCheck => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::ReadOnly | PragmaFlags::Result0,
-            &["message"],
+            &["integrity_check"],
         ),
         QuickCheck => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::ReadOnly | PragmaFlags::Result0,
-            &["message"],
+            &["quick_check"],
         ),
         CaptureDataChangesConn | UnstableCaptureDataChangesConn => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,

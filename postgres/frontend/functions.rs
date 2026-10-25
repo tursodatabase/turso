@@ -1,9 +1,10 @@
+use crate::settings::SettingScope;
 use chrono::Utc;
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
 use turso_core::{
-    Connection, ExternalFunc, IOResult, LimboError, OpenOptions, Register, Result, Value,
+    Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
 };
 
 pub(crate) fn register_functions(mut options: OpenOptions) -> OpenOptions {
@@ -64,10 +65,13 @@ scalar_functions! {
     FormatType(FunctionArity::OneOf(&[1, 2]), true),
     PgGetConstraintdef(FunctionArity::OneOf(&[1, 2]), false),
     PgGetIndexdef(FunctionArity::OneOf(&[1, 2]), false),
+    PgGetTriggerdef(FunctionArity::OneOf(&[1, 2]), false),
     ObjDescription(FunctionArity::OneOf(&[1, 2]), true),
     PgGetExpr(FunctionArity::OneOf(&[2, 3]), true),
     ToChar(FunctionArity::Exact(2), true),
     PgInputIsValid(FunctionArity::Exact(2), true),
+    Textlike(FunctionArity::Exact(2), true),
+    LikeEscape(FunctionArity::Exact(2), true),
     Booleq(FunctionArity::Exact(2), true),
     Boolne(FunctionArity::Exact(2), true),
     ColDescription(FunctionArity::Exact(2), true),
@@ -79,6 +83,7 @@ scalar_functions! {
     PgBackendPid(FunctionArity::Exact(0), true),
     PgIsInRecovery(FunctionArity::Exact(0), false),
     PgLockAccessShare(FunctionArity::Exact(0), false),
+    PgLimitValue(FunctionArity::Exact(2), true),
     Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
 }
 
@@ -103,6 +108,7 @@ impl ScalarCall for PgScalarFunction {
             | Self::PgGetFunctionArguments
             | Self::PgGetStatisticsobjdefColumns
             | Self::PgRelationIsPublishable
+            | Self::PgGetTriggerdef
             | Self::ObjDescription
             | Self::ColDescription => Value::Null,
             Self::QuoteIdent => match args[0].get_value() {
@@ -116,6 +122,8 @@ impl ScalarCall for PgScalarFunction {
             Self::PgGetExpr => exec_pg_get_expr(args)?,
             Self::ToChar => exec_to_char(args[0].get_value(), &text_arg(args, 1)),
             Self::PgInputIsValid => exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1)),
+            Self::Textlike => exec_textlike(args)?,
+            Self::LikeEscape => exec_like_escape(args)?,
             Self::Booleq => Value::from_i64((args[0].get_value() == args[1].get_value()) as i64),
             Self::Boolne => Value::from_i64((args[0].get_value() != args[1].get_value()) as i64),
             Self::SetConfig => exec_set_config(connection, args)?,
@@ -124,7 +132,10 @@ impl ScalarCall for PgScalarFunction {
             Self::CurrentDatabase => {
                 Value::build_text(crate::catalog::db_name_from_path(connection.db_file_path()))
             }
-            Self::CurrentSchema => Value::build_text("public"),
+            Self::CurrentSchema => match crate::session::current_schema(connection) {
+                Some(schema) => Value::build_text(schema),
+                None => Value::Null,
+            },
             Self::PgBackendPid => Value::from_i64(std::process::id() as i64),
             Self::PgIsInRecovery => {
                 // Temporary pg_dump compatibility: "t" means true, not actual recovery state.
@@ -139,6 +150,7 @@ impl ScalarCall for PgScalarFunction {
                 }
                 Value::from_i64(0)
             }
+            Self::PgLimitValue => exec_pg_limit_value(args)?,
             Self::Now
             | Self::ClockTimestamp
             | Self::TransactionTimestamp
@@ -329,6 +341,11 @@ pub(crate) enum ConfigParameter {
     SearchPath,
 }
 
+enum Parameter<'a> {
+    BuiltIn(ConfigParameter),
+    Custom(&'a str),
+}
+
 fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
     let name = match args[0].get_value() {
         Value::Text(name) => name.as_str(),
@@ -343,7 +360,7 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
             ));
         }
     };
-    let parameter = name.parse::<ConfigParameter>().map_err(|_| {
+    let parameter = find_parameter(name).ok_or_else(|| {
         LimboError::InvalidArgument(format!("unrecognized configuration parameter \"{name}\""))
     })?;
     let value = match args[1].get_value() {
@@ -355,11 +372,11 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
             ));
         }
     };
-    let is_local = match args[2].get_value() {
-        Value::Null => false,
+    let scope = match args[2].get_value() {
+        Value::Null => SettingScope::Session,
         value => match value.as_int() {
-            Some(0) => false,
-            Some(1) => true,
+            Some(0) => SettingScope::Session,
+            Some(1) => SettingScope::Transaction,
             _ => {
                 return Err(LimboError::InvalidArgument(
                     "set_config requires a boolean".to_string(),
@@ -367,13 +384,11 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
             }
         },
     };
-    if is_local {
-        return Err(LimboError::InvalidArgument(
-            "transaction-local settings are not supported".to_string(),
-        ));
-    }
     match parameter {
-        ConfigParameter::SearchPath => crate::session::set_search_path(conn, value),
+        Parameter::BuiltIn(ConfigParameter::SearchPath) => {
+            crate::session::set_search_path(conn, value, scope)
+        }
+        Parameter::Custom(name) => crate::session::set_custom_parameter(conn, name, value, scope),
     }
 }
 
@@ -402,16 +417,61 @@ fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Value> {
             }
         },
     };
-    match name.parse::<ConfigParameter>() {
-        Ok(ConfigParameter::SearchPath) => Ok(Value::build_text(
+    let setting = match find_parameter(name) {
+        Some(Parameter::BuiltIn(ConfigParameter::SearchPath)) => Some(
             crate::session::search_path_setting(conn)
                 .unwrap_or_else(|| crate::session::DEFAULT_SEARCH_PATH.to_owned()),
-        )),
-        Err(_) if missing_ok => Ok(Value::Null),
-        Err(_) => Err(LimboError::InvalidArgument(format!(
+        ),
+        Some(Parameter::Custom(name)) => crate::session::custom_parameter(conn, name),
+        None => None,
+    };
+    match setting {
+        Some(setting) => Ok(Value::build_text(setting)),
+        None if missing_ok => Ok(Value::Null),
+        None => Err(LimboError::InvalidArgument(format!(
             "unrecognized configuration parameter \"{name}\""
         ))),
     }
+}
+
+fn find_parameter(name: &str) -> Option<Parameter<'_>> {
+    match name.parse::<ConfigParameter>() {
+        Ok(parameter) => Some(Parameter::BuiltIn(parameter)),
+        Err(_) if name.contains('.') => Some(Parameter::Custom(name)),
+        Err(_) => None,
+    }
+}
+
+/// Converts a LIMIT or OFFSET value to bigint the way PostgreSQL does, rounding
+/// fractions half away from zero, and rejects negative values.
+fn exec_pg_limit_value(args: &[Register]) -> Result<Value> {
+    let value = match args[0].get_value() {
+        Value::Null => return Ok(Value::Null),
+        Value::Numeric(Numeric::Integer(value)) => *value,
+        Value::Numeric(Numeric::Float(value)) => {
+            let rounded = f64::from(*value).round();
+            if !(i64::MIN as f64..i64::MAX as f64).contains(&rounded) {
+                return Err(LimboError::InvalidArgument(
+                    "bigint out of range".to_string(),
+                ));
+            }
+            rounded as i64
+        }
+        Value::Text(text) => text.as_str().trim().parse().map_err(|_| {
+            LimboError::InvalidArgument(format!(
+                "invalid input syntax for type bigint: \"{}\"",
+                text.as_str()
+            ))
+        })?,
+        Value::Blob(_) => return Err(LimboError::InvalidArgument("datatype mismatch".to_string())),
+    };
+    if value < 0 {
+        return Err(LimboError::InvalidArgument(format!(
+            "{} must not be negative",
+            text_arg(args, 1)
+        )));
+    }
+    Ok(Value::from_i64(value))
 }
 
 fn exec_pg_get_user_by_id(_oid: i64) -> Value {
@@ -454,6 +514,100 @@ fn exec_quote_literal(value: &Value) -> Value {
         format!("'{}'", text.replace('\'', "''"))
     };
     Value::build_text(quoted)
+}
+
+fn exec_textlike(args: &[Register]) -> Result<Value> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.get_value(), Value::Null))
+    {
+        return Ok(Value::Null);
+    }
+    let text: Vec<char> = args[0].get_value().to_string().chars().collect();
+    let pattern: Vec<char> = args[1].get_value().to_string().chars().collect();
+    Ok(Value::from_i64(like_matches(&text, &pattern)? as i64))
+}
+
+/// PostgreSQL's LIKE: case-sensitive, `%` and `_` wildcards, and `\` makes the
+/// next pattern character literal. On a mismatch, the last `%` absorbs one more
+/// text character and matching resumes after it.
+fn like_matches(text: &[char], pattern: &[char]) -> Result<bool> {
+    let (mut p, mut t) = (0, 0);
+    let mut backtrack: Option<(usize, usize)> = None;
+    while t < text.len() {
+        let step = match pattern.get(p) {
+            Some('%') => {
+                backtrack = Some((p, t));
+                p += 1;
+                continue;
+            }
+            Some('_') => Some(1),
+            Some('\\') => match pattern.get(p + 1) {
+                Some(&c) => (c == text[t]).then_some(2),
+                None => {
+                    return Err(LimboError::InvalidArgument(
+                        "LIKE pattern must not end with escape character".to_string(),
+                    ));
+                }
+            },
+            Some(&c) => (c == text[t]).then_some(1),
+            None => None,
+        };
+        match (step, backtrack) {
+            (Some(step), _) => {
+                p += step;
+                t += 1;
+            }
+            (None, Some((percent_p, percent_t))) => {
+                p = percent_p + 1;
+                t = percent_t + 1;
+                backtrack = Some((percent_p, t));
+            }
+            (None, None) => return Ok(false),
+        }
+    }
+    Ok(pattern[p..].iter().all(|&c| c == '%'))
+}
+
+/// Rewrites a `LIKE ... ESCAPE` pattern to use `\` as the escape character,
+/// as PostgreSQL's like_escape() does.
+fn exec_like_escape(args: &[Register]) -> Result<Value> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.get_value(), Value::Null))
+    {
+        return Ok(Value::Null);
+    }
+    let pattern = args[0].get_value().to_string();
+    let escape = args[1].get_value().to_string();
+    let mut escape_chars = escape.chars();
+    let result = match (escape_chars.next(), escape_chars.next()) {
+        (None, _) => pattern.replace('\\', "\\\\"),
+        (Some('\\'), None) => pattern,
+        (Some(escape), None) => {
+            let mut result = String::with_capacity(pattern.len());
+            let mut after_escape = false;
+            for c in pattern.chars() {
+                if c == escape && !after_escape {
+                    result.push('\\');
+                    after_escape = true;
+                    continue;
+                }
+                if c == '\\' && !after_escape {
+                    result.push('\\');
+                }
+                result.push(c);
+                after_escape = false;
+            }
+            result
+        }
+        _ => {
+            return Err(LimboError::InvalidArgument(
+                "invalid escape string: Escape string must be empty or one character.".to_string(),
+            ));
+        }
+    };
+    Ok(Value::build_text(result))
 }
 
 fn exec_pg_encoding_to_char(encoding: i64) -> Value {

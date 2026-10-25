@@ -254,6 +254,42 @@ Echo: off
 Headers: off
 ```
 
+## Parameters
+
+### .parameter
+
+Store parameter bindings in the shell and apply them automatically to every SQL
+statement you run afterwards. Useful for running the same parameterized query
+repeatedly with different values. `.param` is a shorter alias.
+
+```
+.parameter <set|list|clear> [ARGS]
+```
+
+```
+tursodb> .parameter set :id 42
+tursodb> SELECT name FROM users WHERE id = :id;
+tursodb> .parameter list
+:id = 42
+tursodb> .parameter set :id 43
+tursodb> .parameter clear :id
+tursodb> .parameter clear
+```
+
+Setting a name again replaces its binding. `.parameter clear NAME` drops one binding,
+and `.parameter clear` drops every binding.
+
+A parameter name must start with one of `:`, `@`, `$`, or be a numbered `?N` where
+`N` is at least 1. A negative value must follow `--`, as in
+`.parameter set :n -- -5`. The value's type is
+inferred: `null` in any casing binds NULL, integers and decimals bind as numbers,
+`x'...'` binds a hex blob, and anything else is bound as a string. Quotes around a
+value are removed before its type is inferred, so `'42'` still binds the integer 42.
+
+Bindings persist until cleared and apply to each statement that uses them: a `?N`
+binding binds slot `N` when the statement has that slot, and a named binding applies
+when a parameter with the same name exists. Unused bindings are skipped silently.
+
 ## Performance & Diagnostics
 
 ### .timer

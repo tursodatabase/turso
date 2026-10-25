@@ -1,6 +1,7 @@
 use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
+use crate::namespace::NamespaceId;
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
@@ -52,7 +53,10 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext},
-        insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
+        insn::{
+            to_u32, CmpInsFlags, ConstraintInfo, IdxInsertFlags, InsertFlags, Insn,
+            RegisterOrLiteral,
+        },
         BranchOffset,
     },
     CaptureDataChangesExt, Connection, HashSet, Result, MAIN_DB_ID,
@@ -188,6 +192,7 @@ pub fn emit_program_for_update(
             identifier: target_table.identifier.clone(),
             internal_id: target_table.internal_id,
             table: target_table.table.clone(),
+            database_id: target_table.database_id,
             join_info: None,
             col_used_mask: target_table.col_used_mask.try_clone()?,
             cte_select: None,
@@ -377,7 +382,9 @@ pub fn emit_program_for_update(
     let all_index_cursors = if any_replace {
         let table_name = target_table.table.get_name();
         let all_indexes: Vec<_> = resolver.with_schema(target_database_id, |s| {
-            s.get_indices(table_name).cloned().collect()
+            s.get_indices(NamespaceId::ROOT, table_name)
+                .cloned()
+                .collect()
         });
         let source_table = write_phase_tables
             .joined_tables()
@@ -590,25 +597,22 @@ fn emit_notnull_constraint_check(
                 )?;
                 program.preassign_label_to_next_insn(continue_label);
             }
-            // The value must still satisfy NOT NULL, whether it is the original
-            // (non-null) value or the substituted default: a column may declare
-            // DEFAULT (NULL), so substituting the default does not resolve the
-            // violation and SQLite aborts.
-            program.emit_insn(Insn::HaltIfNull {
-                target_reg,
-                err_code: SQLITE_CONSTRAINT_NOTNULL,
-                description: description(),
-                on_error: program.constraint_halt_on_error(or_conflict),
-            });
         }
-        _ => {
-            program.emit_insn(Insn::HaltIfNull {
-                target_reg,
-                err_code: SQLITE_CONSTRAINT_NOTNULL,
-                description: description(),
-                on_error: program.constraint_halt_on_error(or_conflict),
-            });
-        }
+        _ => {}
+    }
+    if !matches!(or_conflict, ResolveType::Ignore) {
+        // The value must still satisfy NOT NULL, whether it is the original
+        // (non-null) value or the substituted default: a column may declare
+        // DEFAULT (NULL), so substituting the default does not resolve the
+        // violation and SQLite aborts.
+        let col_name = table_column.name.as_deref().unwrap_or("").to_string();
+        program.emit_insn(Insn::HaltIfNull {
+            constraint_info: Some(Box::new(ConstraintInfo::not_null(table_name, col_name))),
+            target_reg,
+            err_code: SQLITE_CONSTRAINT_NOTNULL,
+            description: description(),
+            on_error: program.constraint_halt_on_error(or_conflict),
+        });
     }
     Ok(())
 }
@@ -686,7 +690,7 @@ fn emit_replace_delete<'a>(
     let internal_id = target_table.internal_id;
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
         let prepared = if t_ctx.resolver.with_schema(update_database_id, |s| {
-            s.any_resolved_fks_referencing(table_name)
+            s.any_resolved_fks_referencing(NamespaceId::ROOT, table_name)
         }) {
             ForeignKeyActions::prepare_fk_delete_actions(
                 program,
@@ -700,10 +704,9 @@ fn emit_replace_delete<'a>(
         } else {
             ForeignKeyActions::default()
         };
-        if t_ctx
-            .resolver
-            .with_schema(update_database_id, |s| s.has_child_fks(table_name))
-        {
+        if t_ctx.resolver.with_schema(update_database_id, |s| {
+            s.has_child_fks(NamespaceId::ROOT, table_name)
+        }) {
             emit_fk_child_decrement_on_delete(
                 program,
                 &target_table
@@ -1215,12 +1218,16 @@ fn emit_update_insns<'a>(
         .iter()
         .map(|set_clause| set_clause.column_index)
         .try_collect()?;
+    let updated_column_names: Vec<_> = set_clauses
+        .iter()
+        .flat_map(|set_clause| set_clause.column_names.iter().cloned())
+        .try_collect()?;
     let has_any_update_triggers = if let Some(btree_table) = target_table.table.btree() {
         has_triggers_including_temp(
             &t_ctx.resolver,
             update_database_id,
             TriggerEvent::Update,
-            Some(&updated_column_indices),
+            Some(&updated_column_names),
             &btree_table,
         )
     } else {
@@ -1347,7 +1354,7 @@ fn emit_update_insns<'a>(
             update_database_id,
             TriggerEvent::Update,
             TriggerTime::Before,
-            Some(updated_column_indices.clone()),
+            Some(&updated_column_names),
             &btree_table,
         ),
         None => Vec::new(),
@@ -1397,7 +1404,7 @@ fn emit_update_insns<'a>(
                 &t_ctx.resolver,
                 update_database_id,
                 TriggerEvent::Update,
-                Some(&updated_column_indices),
+                Some(&updated_column_names),
                 &btree_table,
             );
 
@@ -1706,6 +1713,20 @@ fn emit_update_insns<'a>(
                     String::from(table_name) + ".rowid"
                 };
                 program.emit_insn(Insn::Halt {
+                    constraint_info: Some(Box::new(ConstraintInfo::primary_key(
+                        table_name,
+                        target_table
+                            .table
+                            .btree()
+                            .unwrap()
+                            .primary_key_constraint_name
+                            .clone(),
+                        vec![rowid_alias_index.map_or_else(
+                            || "rowid".to_string(),
+                            |idx| target_table.table.columns()[idx].name.clone().unwrap(),
+                        )],
+                        vec![target_reg],
+                    ))),
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description: raw_desc,
                     on_error: program.constraint_halt_on_error(effective_rowid_alias_conflict),
@@ -2069,6 +2090,11 @@ fn emit_update_insns<'a>(
                         },
                     );
                     program.emit_insn(Insn::Halt {
+                        constraint_info: Some(Box::new(ConstraintInfo::unique_index(
+                            table_name,
+                            index,
+                            (idx_start_reg..idx_start_reg + num_cols).collect(),
+                        ))),
                         err_code: SQLITE_CONSTRAINT_UNIQUE,
                         description: column_names,
                         on_error: program.constraint_halt_on_error(idx_conflict),
@@ -2204,7 +2230,11 @@ fn emit_update_insns<'a>(
     // the parent-side checks above.
     if connection.foreign_keys_enabled() {
         if let Some(table_btree) = target_table.table.btree() {
-            if t_ctx.resolver.schema().has_child_fks(table_name) {
+            if t_ctx
+                .resolver
+                .schema()
+                .has_child_fks(NamespaceId::ROOT, table_name)
+            {
                 emit_fk_child_update_counters(
                     program,
                     &table_btree,
@@ -2213,6 +2243,7 @@ fn emit_update_insns<'a>(
                     start,
                     effective_rowid_reg,
                     &affected_columns,
+                    !affected_parent_fks.is_empty(),
                     update_database_id,
                     &t_ctx.resolver,
                     &layout,
@@ -2489,7 +2520,9 @@ fn emit_update_insns<'a>(
                 let seq_name = crate::schema::autoincrement_sequence_name(&target_table.identifier);
                 let seq = t_ctx
                     .resolver
-                    .with_schema(update_database_id, |s| s.get_sequence(&seq_name).cloned())
+                    .with_schema(update_database_id, |s| {
+                        s.get_sequence(NamespaceId::ROOT, &seq_name).cloned()
+                    })
                     .ok_or_else(|| {
                         crate::LimboError::InternalError(format!(
                             "missing implicit sequence for AUTOINCREMENT table \"{}\"",
@@ -2602,7 +2635,7 @@ fn emit_update_insns<'a>(
                     update_database_id,
                     TriggerEvent::Update,
                     TriggerTime::After,
-                    Some(updated_column_indices.clone()),
+                    Some(&updated_column_names),
                     &btree_table,
                 );
                 if !relevant_triggers.is_empty() {

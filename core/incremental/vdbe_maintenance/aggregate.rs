@@ -13,6 +13,7 @@ use super::stream::{
 use super::MaintenanceInput;
 use crate::function::AggFunc;
 use crate::incremental::dag;
+use crate::namespace::NamespaceId;
 use crate::schema::Schema;
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
@@ -76,11 +77,13 @@ pub(super) fn emit_group_aggregate(
     )?;
 
     let state_table_name = operator_state.state_table_name()?;
-    let state_table = schema.get_btree_table(state_table_name).ok_or_else(|| {
-        LimboError::InternalError(format!(
-            "aggregate arrangement table {state_table_name} not found"
-        ))
-    })?;
+    let state_table = schema
+        .get_btree_table(NamespaceId::ROOT, state_table_name)
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "aggregate arrangement table {state_table_name} not found"
+            ))
+        })?;
     let value_columns = (0..group_exprs.len() + aggregates.len()).collect();
     EmittedNodeOutput::new(
         node_id,
@@ -147,13 +150,15 @@ fn emit_group_aggregate_rows(
     // The state table and its primary-key index are real schema objects
     // created by CREATE MATERIALIZED VIEW and assigned to this DAG node.
     let state_table_name = operator_state.state_table_name()?.to_string();
-    let state_table = schema.get_btree_table(&state_table_name).ok_or_else(|| {
-        LimboError::InternalError(format!(
-            "state table {state_table_name} of materialized view {view_name} not found"
-        ))
-    })?;
+    let state_table = schema
+        .get_btree_table(NamespaceId::ROOT, &state_table_name)
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "state table {state_table_name} of materialized view {view_name} not found"
+            ))
+        })?;
     let state_index = schema
-        .get_indices(&state_table_name)
+        .get_indices(NamespaceId::ROOT, &state_table_name)
         .next()
         .cloned()
         .ok_or_else(|| {
@@ -173,7 +178,7 @@ fn emit_group_aggregate_rows(
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
         Arc::new(crate::dialect::SqliteDialect),
-        &None,
+        None,
     );
 
     turso_assert!(
@@ -1042,6 +1047,7 @@ fn emit_group_aggregate_rows(
     });
     program.preassign_label_to_next_insn(corrupt_label);
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: crate::error::SQLITE_ERROR,
         description: format!("materialized view {view_name} state is corrupted"),
         on_error: None,

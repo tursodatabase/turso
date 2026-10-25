@@ -44,6 +44,59 @@ expect {
     orders|orders_item_idx
 }
 
+test pg-indexes-lists-names-chosen-for-unnamed-indexes {
+    CREATE TABLE t (a int, b int, c text);
+    CREATE INDEX ON t (a);
+    CREATE INDEX ON t (b);
+    CREATE INDEX ON t (a);
+    CREATE INDEX ON t (a) WHERE b > 0;
+    CREATE INDEX ON t (a, b);
+    CREATE UNIQUE INDEX ON t (a, b);
+    CREATE INDEX ON t (a, a);
+    CREATE INDEX ON t ((a + b));
+    CREATE INDEX ON t (lower(c));
+    CREATE INDEX ON t ((c::text));
+    CREATE TABLE u_b_idx (x int);
+    CREATE SEQUENCE u_b_idx1;
+    CREATE TABLE u (b int);
+    CREATE INDEX ON u (b);
+    CREATE TABLE v (c text, arr int[]);
+    CREATE INDEX ON v ((lower(c) COLLATE "C"));
+    CREATE INDEX ON v ((c::text COLLATE "C"));
+    CREATE INDEX ON v (((c || 'x') COLLATE "C"));
+    CREATE INDEX ON v ((arr[1]));
+    CREATE INDEX ON v ((ARRAY[c]));
+    CREATE TABLE w (abcdefghijabcdefghijabcdefghijabcdefghij int, klmnopqrstklmnopqrstklmnopqrstklmnopqrst int);
+    CREATE INDEX ON w (abcdefghijabcdefghijabcdefghijabcdefghij, klmnopqrstklmnopqrstklmnopqrstklmnopqrst);
+    CREATE INDEX ON w (abcdefghijabcdefghijabcdefghijabcdefghij, klmnopqrstklmnopqrstklmnopqrstklmnopqrst);
+    DROP INDEX w_abcdefghijabcdefghijabcdefghijabcdefghij_klmnopqrstklmnop_idx;
+    CREATE INDEX ON w (abcdefghijabcdefghijabcdefghijabcdefghij, klmnopqrstklmnopqrstklmnopqrstklmnopqrst);
+    SELECT tablename, indexname
+    FROM pg_indexes
+    WHERE schemaname = 'public'
+    ORDER BY tablename, indexname;
+}
+expect {
+    t|t_a_a1_idx
+    t|t_a_b_idx
+    t|t_a_b_idx1
+    t|t_a_idx
+    t|t_a_idx1
+    t|t_a_idx2
+    t|t_b_idx
+    t|t_c_idx
+    t|t_expr_idx
+    t|t_lower_idx
+    u|u_b_idx2
+    v|v_arr_idx
+    v|v_array_idx
+    v|v_c_idx
+    v|v_expr_idx
+    v|v_lower_idx
+    w|w_abcdefghijabcdefghijabcdefghijabcdefghij_klmnopqrstklmno_idx1
+    w|w_abcdefghijabcdefghijabcdefghijabcdefghij_klmnopqrstklmnop_idx
+}
+
 test catalog-pg-type-enum-and-domain {
     CREATE TYPE catalog_mood AS ENUM ('sad', 'happy');
     CREATE DOMAIN catalog_posint AS integer;
@@ -872,3 +925,138 @@ expect {
     pg_catalog
     public
 }
+
+test pg-statistic-ext-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT tableoid, oid, stxname, stxnamespace, stxowner, stxrelid, stxstattarget
+    FROM pg_catalog.pg_statistic_ext;
+}
+expect {}
+
+test pg-trigger-parent-discovery-is-empty {
+    SET search_path TO '';
+    SELECT t.tgrelid, t.tgname, t.tgenabled, t.oid,
+           t.tgparentid <> 0 AS tgispartition
+    FROM unnest('{}'::pg_catalog.oid[]) AS src(tbloid)
+    JOIN pg_catalog.pg_trigger t ON src.tbloid = t.tgrelid
+    LEFT JOIN pg_catalog.pg_trigger u ON u.oid = t.tgparentid
+    WHERE (NOT t.tgisinternal AND t.tgparentid = 0)
+       OR t.tgenabled != u.tgenabled
+    ORDER BY t.tgrelid, t.tgname;
+}
+expect {}
+
+test pg-trigger-tableoid-discovery-is-empty {
+    SET search_path TO '';
+    SELECT t.tableoid, t.oid, t.tgrelid, t.tgname, t.tgenabled,
+           t.tgparentid <> 0 AS tgispartition
+    FROM unnest('{}'::pg_catalog.oid[]) AS src(tbloid)
+    JOIN pg_catalog.pg_trigger t ON src.tbloid = t.tgrelid
+    LEFT JOIN pg_catalog.pg_trigger u ON u.oid = t.tgparentid
+    WHERE (NOT t.tgisinternal AND t.tgparentid = 0)
+       OR t.tgenabled != u.tgenabled
+    ORDER BY t.tgrelid, t.tgname;
+}
+expect {}
+
+test pg-get-triggerdef-missing-trigger {
+    SET search_path TO '';
+    SELECT CASE WHEN pg_catalog.pg_get_triggerdef(0) IS NULL THEN 1 ELSE 0 END,
+           CASE WHEN pg_catalog.pg_get_triggerdef(0, false) IS NULL THEN 1 ELSE 0 END,
+           CASE WHEN pg_catalog.pg_get_triggerdef(0, true) IS NULL THEN 1 ELSE 0 END,
+           CASE WHEN pg_catalog.pg_get_triggerdef(NULL) IS NULL THEN 1 ELSE 0 END,
+           CASE WHEN pg_catalog.pg_get_triggerdef(0, NULL) IS NULL THEN 1 ELSE 0 END;
+}
+expect {1|1|1|1|1}
+
+test pg-trigger-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT t.tgrelid, t.tgname, pg_catalog.pg_get_triggerdef(t.oid, false) AS tgdef,
+           t.tgenabled, t.tableoid, t.oid, t.tgparentid <> 0 AS tgispartition
+    FROM unnest('{}'::pg_catalog.oid[]) AS src(tbloid)
+    JOIN pg_catalog.pg_trigger t ON src.tbloid = t.tgrelid
+    LEFT JOIN pg_catalog.pg_trigger u ON u.oid = t.tgparentid
+    WHERE (NOT t.tgisinternal AND t.tgparentid = 0)
+       OR t.tgenabled != u.tgenabled
+    ORDER BY t.tgrelid, t.tgname;
+}
+expect {}
+
+test pg-rewrite-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT tableoid, oid, rulename, ev_class AS ruletable, ev_type, is_instead, ev_enabled
+    FROM pg_rewrite
+    WHERE ev_class IN (
+        SELECT oid FROM pg_class
+        WHERE relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+    )
+    ORDER BY oid;
+}
+expect {}
+
+test pg-policy-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT pol.oid, pol.tableoid, pol.polrelid, pol.polname, pol.polcmd, pol.polpermissive,
+           CASE WHEN pol.polroles = '{0}' THEN NULL ELSE
+               pg_catalog.array_to_string(ARRAY(SELECT pg_catalog.quote_ident(rolname)
+                   FROM pg_catalog.pg_roles WHERE oid = ANY(pol.polroles)), ', ')
+           END AS polroles,
+           pg_catalog.pg_get_expr(pol.polqual, pol.polrelid) AS polqual,
+           pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid) AS polwithcheck
+    FROM unnest('{16384,16385}'::pg_catalog.oid[]) AS src(tbloid)
+    JOIN pg_catalog.pg_policy pol ON src.tbloid = pol.polrelid;
+}
+expect {}
+
+test pg-publication-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT p.tableoid, p.oid, p.pubname, p.pubowner, p.puballtables,
+           p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate, p.pubviaroot,
+           'n' AS pubgencols
+    FROM pg_publication p;
+}
+expect {}
+
+test pg-publication-rel-tableoid-is-selectable {
+    SET search_path TO '';
+    SELECT tableoid, oid, prpubid, prrelid,
+           pg_catalog.pg_get_expr(prqual, prrelid) AS prrelqual, prattrs
+    FROM pg_catalog.pg_publication_rel;
+}
+expect {}
+
+test pg-publication-rel-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT tableoid, oid, prpubid, prrelid,
+           pg_catalog.pg_get_expr(prqual, prrelid) AS prrelqual,
+           CASE WHEN pr.prattrs IS NOT NULL THEN
+               (SELECT array_agg(attname)
+                FROM pg_catalog.generate_series(0, pg_catalog.array_upper(pr.prattrs::pg_catalog.int2[], 1)) s,
+                     pg_catalog.pg_attribute
+                WHERE attrelid = pr.prrelid AND attnum = prattrs[s])
+           ELSE NULL END AS prattrs
+    FROM pg_catalog.pg_publication_rel pr;
+}
+expect {}
+
+test pg-publication-namespace-pgdump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT tableoid, oid, pnpubid, pnnspid
+    FROM pg_catalog.pg_publication_namespace;
+}
+expect {}
+
+test pg-seclabels-pgdump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT label, provider, classoid, objoid, objsubid
+    FROM pg_catalog.pg_seclabels
+    ORDER BY classoid, objoid, objsubid;
+}
+expect {}
+
+test pg-seclabels-columns-are-selectable {
+    SET search_path TO '';
+    SELECT objoid, classoid, objsubid, objtype, objnamespace, objname, provider, label
+    FROM pg_seclabels;
+}
+expect {}

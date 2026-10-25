@@ -1754,6 +1754,105 @@ expect {
     1|active
 }
 
+# CHECK on the new column that references an existing column is evaluated
+# against every existing row
+@cross-check-integrity
+test check_constraint_alter_add_column_other_column_violates_check {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES(-1);
+    ALTER TABLE t ADD COLUMN b INT CHECK (a>0);
+}
+expect error {
+}
+
+@cross-check-integrity
+test check_constraint_alter_add_column_other_column_satisfies_check {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN b INT CHECK (a>0);
+    SELECT a, b FROM t;
+}
+expect {
+    1|
+}
+
+@cross-check-integrity
+test check_constraint_alter_add_column_other_column_last_row_violates_check {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES(1), (2), (-3);
+    ALTER TABLE t ADD COLUMN b INT CHECK (t.a>0);
+}
+expect error {
+}
+
+@cross-check-integrity
+test check_constraint_alter_add_column_default_compared_to_row_violates_check {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES(1), (5);
+    ALTER TABLE t ADD COLUMN b INT DEFAULT 2 CHECK (b>a);
+}
+expect error {
+}
+
+@cross-check-integrity
+test check_constraint_alter_add_column_default_compared_to_row_satisfies_check {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES(0), (1);
+    ALTER TABLE t ADD COLUMN b INT DEFAULT 2 CHECK (b>a);
+    SELECT a, b FROM t;
+}
+expect {
+    0|2
+    1|2
+}
+
+# Existing rows read the DEFAULT with the column's affinity applied
+@cross-check-integrity
+test check_constraint_alter_add_column_default_uses_column_affinity {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN b TEXT DEFAULT 5 CHECK (typeof(b)='text');
+    SELECT a, b, typeof(b) FROM t;
+}
+expect {
+    1|5|text
+}
+
+# Comparisons in the CHECK use the declared collation and affinity of the
+# columns, for existing columns and for the new column's DEFAULT
+@cross-check-integrity
+test check_constraint_alter_add_column_uses_column_collation {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, c TEXT COLLATE RTRIM);
+    INSERT INTO t VALUES('ABC', 'xyz  ');
+    ALTER TABLE t ADD COLUMN b CHECK (a='abc' AND c IN ('xyz') AND a BETWEEN 'abb' AND 'abd');
+    ALTER TABLE t ADD COLUMN d TEXT COLLATE NOCASE DEFAULT 'X' CHECK (d='x');
+    SELECT a, c, b, d FROM t;
+}
+expect {
+    ABC|xyz  ||X
+}
+
+@cross-check-integrity
+test check_constraint_alter_add_column_collation_still_rejects {
+    CREATE TABLE t(a TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES('ABD');
+    ALTER TABLE t ADD COLUMN b CHECK (a='abc');
+}
+expect error {
+}
+
+@cross-check-integrity
+test check_constraint_alter_add_column_uses_column_affinity {
+    CREATE TABLE t(a INTEGER, c TEXT);
+    INSERT INTO t VALUES(5, '6');
+    ALTER TABLE t ADD COLUMN b CHECK (a='5' AND c=6);
+    ALTER TABLE t ADD COLUMN d INTEGER DEFAULT 7 CHECK (d='7' AND d IN ('7'));
+    SELECT a, c, b, d FROM t;
+}
+expect {
+    5|6||7
+}
+
 # UPDATE should only evaluate CHECK constraints referencing changed columns.
 # If a row was inserted while ignore_check_constraints was ON, updating an
 # unrelated column should succeed because the CHECK on x is not re-evaluated.

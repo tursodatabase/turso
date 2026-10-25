@@ -12,6 +12,7 @@
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use turso_core::NamespaceId;
 use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
@@ -772,7 +773,7 @@ fn bench_fts_searcher_cache(criterion: &mut Criterion) {
         let attachment = conn
             .with_schema_mut(|schema| {
                 schema
-                    .get_index("docs", "docs_fts")
+                    .get_index(NamespaceId::ROOT, "docs", "docs_fts")
                     .unwrap()
                     .index_method
                     .clone()

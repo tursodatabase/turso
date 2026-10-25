@@ -314,7 +314,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     }
                     match qualified_match {
                         QualifiedNameMatch::Found(table_id, column) => {
-                            bind_qualified_name(expr, referenced_tables, None, table_id, column)
+                            bind_qualified_name(expr, referenced_tables, table_id, column)
                         }
                         QualifiedNameMatch::Ambiguous => crate::bail_parse_error!(
                             "ambiguous column name: {}.{}",
@@ -363,24 +363,18 @@ pub fn bind_and_rewrite_expr<'a>(
                         name: tbl_name_clone,
                         alias: None,
                     };
-                    let db_resolution = resolver.resolve_database_id(&qualified_name);
+                    let db_resolution = resolver.resolve_namespace(&qualified_name);
 
-                    if let Ok(database_id) = db_resolution.as_ref() {
+                    if let Ok(namespace) = db_resolution.as_ref() {
                         match resolve_qualified_name(
                             referenced_tables,
                             resolver,
-                            Some(*database_id),
+                            Some(namespace.database_id),
                             &tbl_name_str,
                             &normalized_col_name,
                         )? {
                             QualifiedNameMatch::Found(table_id, column) => {
-                                bind_qualified_name(
-                                    expr,
-                                    referenced_tables,
-                                    Some(*database_id),
-                                    table_id,
-                                    column,
-                                );
+                                bind_qualified_name(expr, referenced_tables, table_id, column);
                                 return Ok(WalkControl::Continue);
                             }
                             QualifiedNameMatch::NoColumn => crate::bail_parse_error!(
@@ -403,9 +397,10 @@ pub fn bind_and_rewrite_expr<'a>(
                     // the table+column exist, use that. Otherwise fall through to
                     // table.column.field for struct/union field access.
                     let mut resolved_as_db_table_col = false;
-                    if let Ok(database_id) = db_resolution {
-                        let table = resolver
-                            .with_schema(database_id, |schema| schema.get_table(&tbl_name_str));
+                    if let Ok(namespace) = db_resolution {
+                        let table = resolver.with_schema(namespace.database_id, |schema| {
+                            schema.get_table(namespace.id, &tbl_name_str)
+                        });
 
                         if let Some(table) = table {
                             let col_idx = table.columns().iter().position(|c| {
@@ -423,7 +418,7 @@ pub fn bind_and_rewrite_expr<'a>(
 
                                 if let Some((tbl_id, _)) = matching_tbl {
                                     *expr = Expr::Column {
-                                        database: Some(database_id),
+                                        database: None,
                                         table: tbl_id,
                                         column: col_idx,
                                         is_rowid_alias,
@@ -505,7 +500,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     }
                 }
                 Expr::FunctionCallStar { name, filter_over } => {
-                    validate_function_tail(name.as_str(), 0, filter_over, resolver)?;
+                    validate_function_tail(name.as_str(), 0, filter_over, false, resolver)?;
                     // For functions that need star expansion (json_object, jsonb_object),
                     // expand the * to all columns from the referenced tables as key-value pairs
                     // This needs to happen during bind/rewrite so WHERE clauses can use these functions
@@ -580,9 +575,16 @@ pub fn bind_and_rewrite_expr<'a>(
                     name,
                     args,
                     filter_over,
+                    order_by,
                     ..
                 } => {
-                    validate_function_tail(name.as_str(), args.len(), filter_over, resolver)?;
+                    validate_function_tail(
+                        name.as_str(),
+                        args.len(),
+                        filter_over,
+                        !order_by.is_empty(),
+                        resolver,
+                    )?;
                     validate_custom_type_function_call(name.as_str(), args, resolver)?;
                 }
                 _ => {}
@@ -593,18 +595,22 @@ pub fn bind_and_rewrite_expr<'a>(
     Ok(())
 }
 
-fn validate_function_tail(
+pub(crate) fn validate_function_tail(
     name: &str,
     arg_count: usize,
     filter_over: &ast::FunctionTail,
+    has_order_by: bool,
     resolver: &Resolver,
 ) -> Result<()> {
-    if filter_over.filter_clause.is_none() && filter_over.over_clause.is_none() {
+    if !has_order_by && filter_over.filter_clause.is_none() && filter_over.over_clause.is_none() {
         return Ok(());
     }
     match resolver.resolve_function(name, arg_count)? {
         Some(Func::Agg(_) | Func::Window(_)) | None => Ok(()),
         Some(Func::External(func)) if func.func.is_aggregate() => Ok(()),
+        _ if has_order_by => {
+            crate::bail_parse_error!("ORDER BY may not be used with non-aggregate {}()", name)
+        }
         _ if filter_over.over_clause.is_some() => {
             crate::bail_parse_error!("{} may not be used as a window function", name)
         }
@@ -741,13 +747,7 @@ fn resolve_qualified_name(
             &joined_table.table,
             joined_table.internal_id,
             &joined_table.identifier,
-            if database_id == Some(joined_table.database_id)
-                && matches!(joined_table.table, Table::BTree(_) | Table::Virtual(_))
-            {
-                None
-            } else {
-                database_id
-            },
+            database_id_to_match(&joined_table.table, joined_table.database_id, database_id),
             table_name,
             column_name,
         )?;
@@ -792,7 +792,7 @@ fn resolve_qualified_name(
             &outer_ref.table,
             outer_ref.internal_id,
             &outer_ref.identifier,
-            database_id,
+            database_id_to_match(&outer_ref.table, outer_ref.database_id, database_id),
             table_name,
             column_name,
         )?;
@@ -833,6 +833,22 @@ fn resolve_qualified_name(
         Ok(QualifiedNameMatch::NoColumn)
     } else {
         Ok(QualifiedNameMatch::NoTable)
+    }
+}
+
+/// A schema name that matches the table's own database is already satisfied,
+/// so the table can then be matched by its alias.
+fn database_id_to_match(
+    table: &Table,
+    table_database_id: usize,
+    database_id: Option<usize>,
+) -> Option<usize> {
+    if database_id == Some(table_database_id)
+        && matches!(table, Table::BTree(_) | Table::Virtual(_))
+    {
+        None
+    } else {
+        database_id
     }
 }
 
@@ -918,7 +934,6 @@ fn pick_parenthesized_join_column<'a>(
 fn bind_qualified_name(
     expr: &mut Expr,
     table_references: &mut TableReferences,
-    database_id: Option<usize>,
     table_id: TableInternalId,
     column: QualifiedMatch,
 ) {
@@ -928,7 +943,7 @@ fn bind_qualified_name(
             is_rowid_alias,
         } => {
             *expr = Expr::Column {
-                database: database_id,
+                database: None,
                 table: table_id,
                 column: col_idx,
                 is_rowid_alias,
@@ -938,7 +953,7 @@ fn bind_qualified_name(
         }
         QualifiedMatch::RowId => {
             *expr = Expr::RowId {
-                database: database_id,
+                database: None,
                 table: table_id,
             };
             tracing::debug!("rewritten to rowid");

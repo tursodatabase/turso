@@ -257,6 +257,7 @@ fn read_only_error() -> Box<LimboError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::namespace::NamespaceId;
     use crate::storage::btree::BTreeCursor;
     use crate::sync::Arc;
     use crate::util::IOExt;
@@ -283,6 +284,7 @@ mod tests {
                 enable_generated_columns: false,
                 enable_multiprocess_wal: false,
                 enable_without_rowid: false,
+                enable_mvcc: false,
                 enable_experimental_mvcc_passive_checkpoint: false,
                 unsafe_testing: false,
             },
@@ -324,7 +326,7 @@ mod tests {
         let view_mutex = conn
             .schema
             .read()
-            .get_materialized_view(view_name)
+            .get_materialized_view(NamespaceId::ROOT, view_name)
             .ok_or_else(|| crate::LimboError::InternalError("View not found".to_string()))?;
 
         // Get the view's root page

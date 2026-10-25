@@ -3,6 +3,8 @@
 //! keeps a single `Database` per file, and the per-connection catalog of
 //! attached databases.
 
+use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
+use crate::namespace::NamespaceId;
 use crate::types::IOResultOr;
 use crate::util::IOExt;
 #[cfg(feature = "io_memory_yield")]
@@ -80,6 +82,10 @@ pub struct DatabaseOpts {
     pub enable_generated_columns: bool,
     pub enable_multiprocess_wal: bool,
     pub enable_without_rowid: bool,
+    /// Open the database in MVCC mode. A database that is not in MVCC mode
+    /// yet has its journal mode switched during open; read-only opens cannot
+    /// write the conversion and keep the current mode.
+    pub enable_mvcc: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
@@ -123,6 +129,11 @@ impl DatabaseOpts {
 
     pub fn with_vacuum(mut self, enable: bool) -> Self {
         self.enable_vacuum = enable;
+        self
+    }
+
+    pub fn with_mvcc(mut self, enable: bool) -> Self {
+        self.enable_mvcc = enable;
         self
     }
 
@@ -561,6 +572,9 @@ pub struct OpenDbAsyncState {
     /// Sub state machine for `MvStore::bootstrap_nonblock`, driven in
     /// `BootstrapMvStore`.
     mvcc_bootstrap_state: mvcc::database::BootstrapState,
+    /// The `PRAGMA journal_mode = 'mvcc'` statement that converts the database
+    /// when `DatabaseOpts::with_mvcc` is set, held across yields.
+    mvcc_convert_stmt: Option<crate::Statement>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -584,6 +598,7 @@ impl OpenDbAsyncState {
             header_validation_state: HeaderValidationState::default(),
             mvcc_bootstrap_conn: None,
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
+            mvcc_convert_stmt: None,
         }
     }
 }
@@ -1610,7 +1625,7 @@ impl Database {
                         Some(pager.clone()),
                         state.encryption_key.clone(),
                         page_codec.clone(),
-                        None,
+                        ConnectionContext::default(),
                         StatsRefresh::Blocking,
                     )?;
 
@@ -1726,7 +1741,31 @@ impl Database {
                         .as_ref()
                         .expect("pager must be initialized in Init phase");
 
-                    if let Some(mv_store) = db.get_mv_store().as_ref() {
+                    // DatabaseOpts::with_mvcc on a database that is not in MVCC
+                    // mode yet: switch the journal mode as part of the open. A
+                    // read-only open cannot write the conversion, so it keeps
+                    // the current mode. The pragma performs the full MVCC
+                    // bootstrap itself, so the bootstrap arm below is skipped.
+                    // The in-flight statement gates re-entry: the pragma sets
+                    // the MvStore before it finishes, so `get_mv_store()` alone
+                    // would route a resumed open into the bootstrap arm.
+                    if state.mvcc_convert_stmt.is_some()
+                        || (db.opts.enable_mvcc
+                            && db.get_mv_store().is_none()
+                            && !db.open_flags.contains(OpenFlags::ReadOnly))
+                    {
+                        if state.mvcc_convert_stmt.is_none() {
+                            let conn = state
+                                .conn
+                                .as_ref()
+                                .expect("conn must be initialized in Init phase");
+                            state.mvcc_convert_stmt =
+                                Some(conn.prepare("PRAGMA journal_mode = 'mvcc'")?);
+                        }
+                        let stmt = state.mvcc_convert_stmt.as_mut().expect("created above");
+                        return_if_io!(stmt.run_ignore_rows_nonblock());
+                        state.mvcc_convert_stmt = None;
+                    } else if let Some(mv_store) = db.get_mv_store().as_ref() {
                         // Create the dedicated bootstrap connection once and
                         // hold it across yields. Re-entry reuses the existing
                         // connection and the persisted `BootstrapState`.
@@ -1736,7 +1775,7 @@ impl Database {
                                 Some(pager.clone()),
                                 state.encryption_key.clone(),
                                 page_codec.clone(),
-                                None,
+                                ConnectionContext::default(),
                                 StatsRefresh::Blocking,
                             )?);
                         }
@@ -1867,22 +1906,22 @@ impl Database {
                                         let decoded_page_size = header.page_size.get() as usize;
                                         if decoded_page_size != bootstrap_page_size {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec bootstrap page size {bootstrap_page_size} does not match decoded page-1 size {decoded_page_size}"
-                                        )));
+                                                "page codec bootstrap page size {bootstrap_page_size} does not match decoded page-1 size {decoded_page_size}"
+                                            )));
                                         }
                                         if header.reserved_space != bootstrap_reserved_space {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec bootstrap reserved space {bootstrap_reserved_space} does not match decoded page-1 reserved space {}",
-                                            header.reserved_space
-                                        )));
+                                                "page codec bootstrap reserved space {bootstrap_reserved_space} does not match decoded page-1 reserved space {}",
+                                                header.reserved_space
+                                            )));
                                         }
                                         let required_reserved_space =
                                             codec.required_reserved_bytes();
                                         if header.reserved_space != required_reserved_space {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec requires exactly {required_reserved_space} reserved bytes, but decoded page 1 provides {}",
-                                            header.reserved_space
-                                        )));
+                                                "page codec requires exactly {required_reserved_space} reserved bytes, but decoded page 1 provides {}",
+                                                header.reserved_space
+                                            )));
                                         }
                                     }
                                 }
@@ -2400,8 +2439,14 @@ impl Database {
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             self.mv_store.store(Some(mv_store.clone()));
-            let mvcc_bootstrap_conn =
-                self._connect(true, None, None, None, None, StatsRefresh::Blocking)?;
+            let mvcc_bootstrap_conn = self._connect(
+                true,
+                None,
+                None,
+                None,
+                ConnectionContext::default(),
+                StatsRefresh::Blocking,
+            )?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
                 Err(LimboError::SchemaUpdated) => {
@@ -2423,7 +2468,7 @@ impl Database {
             None,
             opts.encryption_key,
             opts.page_codec,
-            None,
+            ConnectionContext::default(),
             StatsRefresh::Blocking,
         )
     }
@@ -2438,7 +2483,27 @@ impl Database {
             None,
             None,
             None,
-            Some(context),
+            ConnectionContext {
+                value: Some(context),
+                hooks: None,
+            },
+            StatsRefresh::Blocking,
+        )
+    }
+
+    pub fn connect_with_hooks<C: ConnectionHooks + Any>(
+        self: &Arc<Database>,
+        context: Arc<C>,
+    ) -> Result<Arc<Connection>> {
+        self._connect(
+            false,
+            None,
+            None,
+            None,
+            ConnectionContext {
+                value: Some(context.clone()),
+                hooks: Some(context),
+            },
             StatsRefresh::Blocking,
         )
     }
@@ -2478,7 +2543,7 @@ impl Database {
                     None,
                     opts.encryption_key,
                     opts.page_codec,
-                    None,
+                    ConnectionContext::default(),
                     StatsRefresh::Deferred,
                 )?;
                 state.conn = Some(conn.clone());
@@ -2503,7 +2568,7 @@ impl Database {
         pager: Option<Arc<Pager>>,
         encryption_key: Option<EncryptionKey>,
         page_codec: Option<Arc<dyn PageCodec>>,
-        context: Option<Arc<dyn Any + Send + Sync>>,
+        context: ConnectionContext,
         stats: StatsRefresh,
     ) -> Result<Arc<Connection>> {
         if self.page_codec_id.is_some() && page_codec.is_none() {
@@ -2560,7 +2625,7 @@ impl Database {
             pager,
             encryption_key,
             default_cache_size,
-            None,
+            ConnectionContext::default(),
         )?;
         refresh_analyze_stats(&conn);
         Ok(conn)
@@ -2574,12 +2639,13 @@ impl Database {
         pager: Arc<Pager>,
         encryption_key: Option<EncryptionKey>,
         default_cache_size: i32,
-        context: Option<Arc<dyn Any + Send + Sync>>,
+        context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
         let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {
             db: self.clone(),
-            context,
+            context: context.value,
+            hooks: context.hooks,
             pager: ArcSwap::new(pager),
             schema: RwLock::new(self.schema.lock().clone()),
             database_schemas: RwLock::new(HashMap::default()),
@@ -2603,7 +2669,8 @@ impl Database {
             closed: AtomicBool::new(false),
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
-            namespaces: self.dialect.new_namespaces(),
+            namespaces: crate::Namespaces::default(),
+            search_path: RwLock::new(None),
             has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
@@ -3408,7 +3475,7 @@ impl Database {
 
     pub fn register_virtual_table(&self, table: Arc<VirtualTable>) -> Result<String> {
         let name = table.name.clone();
-        self.with_schema_mut(|schema| schema.add_virtual_table(table))?;
+        self.with_schema_mut(|schema| schema.add_virtual_table(NamespaceId::ROOT, table))?;
         Ok(name)
     }
 
@@ -3505,47 +3572,8 @@ pub(crate) struct AttachedDatabase {
     pub(crate) sync_mode: SyncMode,
 }
 
-/// The namespaces of a connection: the names that qualify object names in
-/// SQL.
-///
-/// A namespace is what the qualifier of an object name selects, like `aux`
-/// in `aux.t`. Every namespace refers to a database, the storage that holds
-/// its objects. Core asks [`NamespaceCatalog`] whenever it turns a namespace
-/// name into a database or a database into a namespace name, and when it
-/// looks up a name without a namespace.
-///
-/// SQLite has one namespace per database: `main`, `temp` and one for each
-/// attached database.
-/// [`crate::dialect::sqlite::attach::AttachedNamespaces`] implements that.
-pub trait NamespaceCatalog: Send + Sync {
-    /// The database that namespace `name` refers to. `name` is normalized.
-    fn database_id(&self, name: &str) -> Option<usize>;
-
-    /// The name of the namespace that refers to database `database_id`.
-    fn name(&self, database_id: usize) -> Option<String>;
-
-    /// The namespaces other than `main` and `temp`, with the databases they
-    /// refer to, ordered by database.
-    fn others(&self) -> Vec<(usize, String)>;
-
-    /// Adds namespace `name`, which refers to database `database_id`.
-    fn add(&self, name: &str, database_id: usize);
-
-    /// Removes namespace `name` and returns the database it referred to.
-    fn remove(&self, name: &str) -> Option<usize>;
-
-    /// The first database that `contains` accepts, in the order that a name
-    /// without a namespace is looked up in. The temporary database comes
-    /// before all of them when it has objects.
-    fn find_in_search_order(&self, contains: &mut dyn FnMut(usize) -> bool) -> Option<usize>;
-
-    /// The database that CREATE puts an object in when its name has no
-    /// namespace.
-    fn database_for_create(&self) -> Result<usize>;
-}
-
 /// The databases of a connection other than main and temp, by database id.
-/// Their names are in the connection's [`NamespaceCatalog`].
+/// Their names are in the connection's [`crate::Namespaces`].
 // Optimized for fast get() operations and supports unlimited attached databases.
 pub(crate) struct DatabaseCatalog {
     allocated: Vec<u64>,

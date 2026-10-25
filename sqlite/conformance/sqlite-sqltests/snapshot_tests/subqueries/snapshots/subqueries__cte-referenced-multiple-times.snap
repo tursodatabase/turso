@@ -81,7 +81,7 @@ addr  opcode             p1   p2   p3  p4            p5  comment
   41  EndCoroutine        4    0    0                 0
   42  Null                0   18    0                 0  r[18]=NULL
   43  Integer             1   19    0                 0  r[19]=1; LIMIT counter
-  44  IfNot              19   50    0                 0  if !r[19] goto 50
+  44  IfNot              19   53    0                 0  if !r[19] goto 53
   45  InitCoroutine       4    0    5                 0
   46    Yield             4   50    0                 0
   47    Copy              6   20    0                 0  r[20]=r[6]
@@ -134,7 +134,7 @@ addr  opcode             p1   p2   p3  p4            p5  comment
   94  EndCoroutine       22    0    0                 0
   95  Null                0   36    0                 0  r[36]=NULL
   96  Integer             1   37    0                 0  r[37]=1; LIMIT counter
-  97  IfNot              37  103    0                 0  if !r[37] goto 103
+  97  IfNot              37  106    0                 0  if !r[37] goto 106
   98  InitCoroutine      22    0   58                 0
   99    Yield            22  103    0                 0
  100    Copy             24   38    0                 0  r[38]=r[24]

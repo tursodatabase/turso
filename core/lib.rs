@@ -31,6 +31,7 @@ pub mod json;
 ))]
 mod multiprocess_tests;
 pub mod mvcc;
+mod namespace;
 pub mod native_ext;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
@@ -50,6 +51,7 @@ pub(crate) mod thread;
 
 mod assert;
 mod connection;
+mod connection_hooks;
 mod database;
 pub mod dialect;
 mod error;
@@ -121,20 +123,21 @@ pub use cdc::{
 };
 #[cfg(feature = "simulator")]
 pub use connection::SubqueryUnnestingMode;
-pub use connection::{resolve_ext_path, Connection, PrepareOptions, Row, StepResult, SymbolTable};
+pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
+pub use connection_hooks::{ConnectionHooks, SavepointMemo};
 #[cfg(feature = "simulator")]
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};
 pub(crate) use database::{is_memory_like, DatabaseCatalog, InitState};
 pub use database::{
     ConnectAsyncState, ConnectOpts, Database, DatabaseAllocators, DatabaseOpts, EncryptionOpts,
-    NamespaceCatalog, OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions,
-    SharedWalCoordinationOpenTelemetryMode, SharedWalOpenTelemetry,
+    OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions, SharedWalCoordinationOpenTelemetryMode,
+    SharedWalOpenTelemetry,
 };
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 pub use dialect::{Dialect, SqliteDialect};
-pub use error::{io_error, CompletionError, LimboError};
+pub use error::{io_error, CompletionError, ConstraintKind, ConstraintViolation, LimboError};
 pub use function::ContextCollationFunction;
 #[cfg(feature = "io_memory_yield")]
 pub use io::MemoryYieldIO;
@@ -155,6 +158,7 @@ pub use io::{
     CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO, SharedBufferData,
     SyscallIO, WriteCompletion, IO,
 };
+pub use namespace::{NamespaceId, NamespaceRef, Namespaces};
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
 pub use storage::{

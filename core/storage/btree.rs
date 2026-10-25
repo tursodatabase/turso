@@ -1527,7 +1527,25 @@ impl BTreeCursor {
                             break;
                         }
                         if self.stack.has_parent() {
+                            let child_page_id = self.stack.top_ref().get().id();
                             self.pop_upwards();
+                            // A forward seek, such as the one in restore_context, leaves an
+                            // index interior page at the cell whose left child we came from.
+                            // That cell sorts after the child, so step back to the one before it.
+                            let came_from_left_child_of_current_cell = {
+                                let contents = self.stack.top_ref().get_contents();
+                                let cell_idx = self.stack.current_cell_index();
+                                contents.page_type()? == PageType::IndexInterior
+                                    && cell_idx >= 0
+                                    && (cell_idx as usize) < contents.cell_count()
+                                    && contents
+                                        .cell_interior_read_left_child_page(cell_idx as usize)?
+                                        as usize
+                                        == child_page_id
+                            };
+                            if came_from_left_child_of_current_cell {
+                                self.stack.retreat();
+                            }
                         } else {
                             // moved to begin of btree
                             return Ok(IOResult::Done(false));
@@ -12229,6 +12247,7 @@ mod tests {
                 has_rowid: false,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             };
             let num_columns = index_def.columns.len();
             let mut cursor =
@@ -12405,6 +12424,7 @@ mod tests {
                 has_rowid: false,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             };
             let mut cursor =
                 BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, 1).unwrap();
@@ -12811,6 +12831,7 @@ mod tests {
                 has_rowid: false,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             };
             let mut cursor =
                 BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, 1).unwrap();
@@ -14598,6 +14619,7 @@ mod tests {
             has_rowid: false,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         };
         let mut cursor = BTreeCursor::new_index(pager.clone(), root_page, &index, 1).unwrap();
         let registers = [Register::Value(Value::from_i64(10))];

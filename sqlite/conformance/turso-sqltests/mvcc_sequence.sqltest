@@ -490,3 +490,18 @@ expect {
     0|0|0
     3
 }
+
+test mvcc-sequence-watermark-reads-the-database-the-name-resolves-to {
+    PRAGMA journal_mode = 'mvcc';
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE SEQUENCE aux.only_aux START 5;
+    SELECT nextval('aux.only_aux');
+    SELECT sequence_watermark_experimental('only_aux');
+    SELECT sequence_watermark_experimental('aux.only_aux');
+}
+expect {
+    mvcc
+    5
+    6
+    6
+}

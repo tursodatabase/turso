@@ -699,6 +699,7 @@ pub trait Wal: Debug + Send + Sync {
     ///
     /// TursoDB uses `page_no` and `size_after` from the supplied header, applies
     /// any configured page transform to the body, and overwrites the checksum.
+    /// Returns an error if this connection does not hold the WAL write lock.
     fn write_frame_raw(
         &self,
         buffer_pool: Arc<BufferPool>,
@@ -1944,6 +1945,7 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn publish_commit(&self, commit: WalCommitState) {
+        let previous_snapshot = self.authority.snapshot();
         {
             let mut shared = self.shared.write();
             shared
@@ -1965,13 +1967,26 @@ impl WalCoordination for ShmWalCoordination {
             commit.last_checksum.1,
             commit.transaction_count,
         );
-        if self.authority.frame_index_overflowed() {
-            let snapshot = self.authority.snapshot();
-            let shared = self.shared.read();
-            let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
-            if coverage.covers(snapshot, commit.max_frame.saturating_sub(1)) {
-                coverage.record_snapshot(snapshot, commit.max_frame);
-            }
+        let shared = self.shared.read();
+        let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
+
+        // We record that process-local frame cache maps all committed WAL frames (is complete) if:
+        // * max_frame was 0, since this means we are the first commit of this WAL generation; or
+        // * before our commit, the coverage was already complete
+        if previous_snapshot.max_frame == 0
+            || coverage.covers(previous_snapshot, previous_snapshot.max_frame)
+        {
+            let max_frame = commit.max_frame;
+
+            // Committing doesn't change checkpoint_seq or the salts. Only WAL restarts do,
+            // and we already hold the WAL writer lock, so it's safe to not take a new snapshot and
+            // reuse these fields here.
+            coverage.record(
+                previous_snapshot.checkpoint_seq,
+                previous_snapshot.salt_1,
+                previous_snapshot.salt_2,
+                max_frame,
+            );
         }
     }
 
@@ -3038,20 +3053,6 @@ impl OverflowFallbackCoverage {
     }
 
     #[cfg(host_shared_wal)]
-    pub(crate) fn record_snapshot(
-        &mut self,
-        snapshot: SharedWalCoordinationHeader,
-        max_frame: u64,
-    ) {
-        self.record(
-            snapshot.checkpoint_seq,
-            snapshot.salt_1,
-            snapshot.salt_2,
-            max_frame,
-        );
-    }
-
-    #[cfg(host_shared_wal)]
     pub(crate) fn same_generation(&self, snapshot: SharedWalCoordinationHeader) -> bool {
         self.valid
             && self.checkpoint_seq == snapshot.checkpoint_seq
@@ -4012,6 +4013,11 @@ impl Wal for WalFile {
         page: &[u8],
         sync_type: FileSyncType,
     ) -> Result<()> {
+        if !self.holds_write_lock() {
+            return Err(LimboError::TxError(
+                "cannot write raw WAL frame without holding the WAL write lock".to_string(),
+            ));
+        }
         let Some(page_size) = PageSize::new(page.len() as u32) else {
             bail_corrupt_error!("invalid page size: {}", page.len());
         };
@@ -6550,6 +6556,8 @@ pub mod test {
         }
         let c = wal.prepare_wal_finish(FileSyncType::Fsync).unwrap();
         io.wait_for_completion(c).unwrap();
+        wal.begin_read_tx().unwrap();
+        wal.begin_write_tx(WalAutoActions::empty()).unwrap();
 
         (io, buffer_pool, wal)
     }
@@ -8272,6 +8280,62 @@ pub mod test {
 
     #[cfg(host_shared_wal)]
     #[test]
+    fn test_shm_coordination_open_keeps_sibling_read_tx_reader_slot_after_disk_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-sibling-reader-repair.db-wal");
+        let shm_path = dir.path().join("test-sibling-reader-repair.db-tshm");
+        let io = shared_wal_test_io();
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let snapshot = WalSnapshot {
+            max_frame: 5,
+            nbackfills: 2,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: 9,
+        };
+        set_shared_snapshot(&shared, snapshot);
+        {
+            let shared = shared.write();
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = snapshot.last_checksum.0;
+            header.checksum_2 = snapshot.last_checksum.1;
+            shared
+                .metadata
+                .loaded_from_disk_scan
+                .store(true, Ordering::Release);
+        }
+
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        let first = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let guard = first.try_begin_read_tx(snapshot).unwrap();
+        assert_eq!(
+            authority.min_active_reader_frame(),
+            Some(snapshot.max_frame)
+        );
+
+        let second = ShmWalCoordination::new(shared, authority.clone());
+        assert_eq!(
+            authority.min_active_reader_frame(),
+            Some(snapshot.max_frame),
+            "opening another connection must keep the live reader slot"
+        );
+        assert_eq!(active_shared_reader_slot_count(&authority), 1);
+
+        first.end_read_tx(guard);
+        assert_eq!(authority.min_active_reader_frame(), None);
+        assert_eq!(active_shared_reader_slot_count(&authority), 0);
+        drop(second);
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
     fn test_shm_coordination_uses_one_published_slot_per_active_snapshot_generation() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-mixed-snapshot-readers.db-wal");
@@ -8701,6 +8765,42 @@ pub mod test {
             matches!(wal.begin_read_tx(), Err(LimboError::Busy)),
             "new readers must also refuse an uncovered overflowed frame index without blocking"
         );
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn live_overflow_uses_complete_local_frame_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-covered-live-overflow.db-wal");
+        let shm_path = dir.path().join("test-covered-live-overflow.db-tshm");
+        let io = shared_wal_test_io();
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let (authority, coordination) = make_test_shm_coordination(&shared, &shm_path);
+
+        coordination.cache_frame(7, 1);
+        coordination.publish_commit(WalCommitState {
+            max_frame: 1,
+            last_checksum: (31, 37),
+            transaction_count: 1,
+        });
+
+        authority.mark_frame_index_overflowed_for_tests();
+        coordination.cache_frame(9, 2);
+        coordination.cache_frame(11, 3);
+        coordination.publish_commit(WalCommitState {
+            max_frame: 3,
+            last_checksum: (41, 43),
+            transaction_count: 2,
+        });
+
+        let snapshot = coordination.load_snapshot();
+        coordination
+            .ensure_local_frame_cache_covers(&io, snapshot)
+            .expect("same-process commits must keep the overflow fallback complete");
+        assert_eq!(coordination.find_frame(11, 0, 3, None), Some(3));
     }
 
     #[cfg(host_shared_wal)]

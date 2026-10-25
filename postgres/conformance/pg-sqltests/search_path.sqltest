@@ -90,6 +90,128 @@ test search-path-empty-does-not-find-stored-tables {
 }
 expect error {}
 
+setup local_search_path_commit {
+    CREATE TABLE demo (label text);
+    INSERT INTO demo VALUES ('from public');
+    CREATE SCHEMA IF NOT EXISTS sp_lc_a;
+    DROP TABLE IF EXISTS sp_lc_a.demo;
+    CREATE TABLE sp_lc_a.demo (label text);
+    INSERT INTO sp_lc_a.demo VALUES ('from a');
+}
+
+@setup local_search_path_commit
+test search-path-set-local-ends-at-commit {
+    BEGIN;
+    SET LOCAL search_path TO sp_lc_a;
+    SELECT current_setting('search_path');
+    SELECT label FROM demo;
+    COMMIT;
+    SELECT current_setting('search_path');
+    SELECT label FROM demo;
+}
+expect {
+    sp_lc_a
+    from a
+    "$user", public
+    from public
+}
+
+setup local_search_path_outside_transaction {
+    CREATE TABLE demo (label text);
+    INSERT INTO demo VALUES ('from public');
+    CREATE SCHEMA IF NOT EXISTS sp_lo_a;
+    DROP TABLE IF EXISTS sp_lo_a.demo;
+    CREATE TABLE sp_lo_a.demo (label text);
+    INSERT INTO sp_lo_a.demo VALUES ('from a');
+}
+
+@setup local_search_path_outside_transaction
+test search-path-set-local-outside-a-transaction-ends-with-its-statement {
+    SET LOCAL search_path TO sp_lo_a;
+    SHOW search_path;
+    SELECT label FROM demo;
+}
+expect {
+    "$user", public
+    from public
+}
+
+setup local_search_path_rollback {
+    CREATE TABLE demo (label text);
+    INSERT INTO demo VALUES ('from public');
+    CREATE SCHEMA IF NOT EXISTS sp_lr_a;
+    DROP TABLE IF EXISTS sp_lr_a.demo;
+    CREATE TABLE sp_lr_a.demo (label text);
+    INSERT INTO sp_lr_a.demo VALUES ('from a');
+}
+
+@setup local_search_path_rollback
+test search-path-local-set-config-ends-at-rollback {
+    BEGIN;
+    SELECT set_config('search_path', 'sp_lr_a', true);
+    SELECT label FROM demo;
+    ROLLBACK;
+    SELECT label FROM demo;
+}
+expect {
+    sp_lr_a
+    from a
+    from public
+}
+
+setup rollback_search_path {
+    CREATE TABLE demo (label text);
+    INSERT INTO demo VALUES ('from public');
+    CREATE SCHEMA IF NOT EXISTS sp_rb_a;
+    DROP TABLE IF EXISTS sp_rb_a.demo;
+    CREATE TABLE sp_rb_a.demo (label text);
+    INSERT INTO sp_rb_a.demo VALUES ('from a');
+}
+
+@setup rollback_search_path
+test search-path-set-is-undone-by-rollback {
+    BEGIN;
+    SET search_path TO sp_rb_a;
+    SELECT label FROM demo;
+    ROLLBACK;
+    SELECT current_setting('search_path');
+    SELECT label FROM demo;
+}
+expect {
+    from a
+    "$user", public
+    from public
+}
+
+setup savepoint_search_path {
+    CREATE TABLE demo (label text);
+    INSERT INTO demo VALUES ('from public');
+    CREATE SCHEMA IF NOT EXISTS sp_sv_a;
+    DROP TABLE IF EXISTS sp_sv_a.demo;
+    CREATE TABLE sp_sv_a.demo (label text);
+    INSERT INTO sp_sv_a.demo VALUES ('from a');
+}
+
+@setup savepoint_search_path
+test search-path-rollback-to-savepoint-restores-it {
+    BEGIN;
+    SET search_path TO sp_sv_a;
+    SAVEPOINT s;
+    SET LOCAL search_path TO public;
+    SELECT label FROM demo;
+    ROLLBACK TO SAVEPOINT s;
+    SELECT current_setting('search_path');
+    SELECT label FROM demo;
+    COMMIT;
+    SELECT label FROM demo;
+}
+expect {
+    from public
+    sp_sv_a
+    from a
+    from a
+}
+
 test public-schema-qualified-column-reference {
     DROP TABLE IF EXISTS demo;
     CREATE TABLE demo (id int, label text);
@@ -98,6 +220,20 @@ test public-schema-qualified-column-reference {
 }
 expect {
     b
+}
+
+test schema-qualified-column-reference-in-join {
+    CREATE SCHEMA IF NOT EXISTS sp_join;
+    DROP TABLE IF EXISTS sp_join.jt;
+    DROP TABLE IF EXISTS sp_join.ju;
+    CREATE TABLE sp_join.jt (id int, b text);
+    CREATE TABLE sp_join.ju (id int);
+    INSERT INTO sp_join.jt VALUES (1, 'x');
+    INSERT INTO sp_join.ju VALUES (1);
+    SELECT sp_join.jt.b, jt.b FROM sp_join.jt JOIN sp_join.ju ON jt.id = ju.id;
+}
+expect {
+    x|x
 }
 
 test show-search-path-default {
@@ -129,4 +265,383 @@ expect {
     
     "$user", public
     "$user", public
+}
+
+test create-table-follows-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_ct;
+    DROP TABLE IF EXISTS sp_ct.t;
+    DROP SEQUENCE IF EXISTS sp_ct.t_id_seq;
+    SET search_path TO sp_ct, public;
+    CREATE TABLE t (id serial, x int);
+    INSERT INTO t (x) VALUES (1);
+    SELECT id, x FROM sp_ct.t;
+    SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename = 't';
+}
+expect {
+    1|1
+    0
+}
+
+test create-table-skips-missing-schema-in-search-path {
+    SET search_path TO sp_missing_ct, public;
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (2);
+    SELECT x FROM public.t;
+}
+expect {
+    2
+}
+
+test create-table-with-no-existing-schema-in-search-path-errors {
+    SET search_path TO sp_missing_ct;
+    CREATE TABLE t (x int);
+}
+expect error {
+    no schema has been selected to create in
+}
+
+test create-index-on-qualified-table-outside-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_qi;
+    DROP TABLE IF EXISTS sp_qi.t;
+    CREATE TABLE sp_qi.t (x int);
+    CREATE INDEX t_x_idx ON sp_qi.t (x);
+    DROP INDEX sp_qi.t_x_idx;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test create-index-follows-table-schema-in-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_ci;
+    DROP TABLE IF EXISTS sp_ci.t;
+    CREATE TABLE sp_ci.t (x int);
+    SET search_path TO sp_ci, public;
+    CREATE INDEX t_x_idx ON t (x);
+    SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname = 't_x_idx';
+    DROP INDEX sp_ci.t_x_idx;
+    CREATE UNIQUE INDEX t_x_idx ON t (x);
+    DROP INDEX t_x_idx;
+}
+expect {
+    0
+}
+
+test create-index-without-name-checks-names-in-table-schema {
+    CREATE SCHEMA IF NOT EXISTS sp_un;
+    DROP TABLE IF EXISTS sp_un.t;
+    CREATE TABLE sp_un.t (x int);
+    CREATE TABLE t_x_idx (y int);
+    SET search_path TO sp_un, public;
+    CREATE INDEX ON t (x);
+    CREATE INDEX ON t (x);
+    DROP INDEX sp_un.t_x_idx;
+    DROP INDEX sp_un.t_x_idx1;
+}
+expect {}
+
+test create-index-without-name-on-schema-qualified-table {
+    CREATE SCHEMA IF NOT EXISTS sp_uq;
+    DROP TABLE IF EXISTS sp_uq.t;
+    CREATE TABLE t (x int);
+    CREATE TABLE sp_uq.t (x int);
+    CREATE INDEX ON sp_uq.t (x);
+    CREATE INDEX ON sp_uq.t (x);
+    DROP INDEX sp_uq.t_x_idx;
+    DROP INDEX sp_uq.t_x_idx1;
+    SELECT count(*) FROM pg_indexes WHERE tablename = 't';
+}
+expect {
+    0
+}
+
+test create-index-without-name-on-quoted-mixed-case-schema {
+    CREATE SCHEMA IF NOT EXISTS "Sp_Mc";
+    DROP TABLE IF EXISTS "Sp_Mc".t;
+    CREATE TABLE "Sp_Mc".t (x int);
+    CREATE INDEX ON "Sp_Mc".t (x);
+    CREATE INDEX ON "Sp_Mc".t (x);
+    DROP INDEX "Sp_Mc".t_x_idx;
+    DROP INDEX "Sp_Mc".t_x_idx1;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test create-index-skips-missing-schema-in-search-path {
+    CREATE TABLE t (x int);
+    SET search_path TO sp_missing_ci, public;
+    CREATE INDEX t_x_idx ON t (x);
+    SELECT schemaname, tablename FROM pg_indexes WHERE indexname = 't_x_idx';
+}
+expect {
+    public|t
+}
+
+test current-schema-follows-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_cs;
+    SELECT current_schema();
+    SET search_path TO sp_missing_cs, sp_cs, public;
+    SELECT current_schema();
+    SET search_path TO public, sp_cs;
+    SELECT current_schema();
+    SET search_path TO sp_missing_cs;
+    SELECT coalesce(current_schema(), 'none');
+    SET search_path TO "$user", public;
+    SELECT current_schema();
+}
+expect {
+    public
+    sp_cs
+    public
+    none
+    public
+}
+
+test sequence-functions-follow-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_sq;
+    DROP SEQUENCE IF EXISTS sp_sq.s;
+    CREATE SEQUENCE sp_sq.s START 10;
+    SET search_path TO sp_sq, public;
+    SELECT nextval('s');
+    SELECT currval('s');
+    SELECT setval('s', 20);
+    SELECT nextval('s');
+    DROP SEQUENCE s;
+    CREATE SEQUENCE sp_sq.s START 30;
+    SELECT nextval('s');
+}
+expect {
+    10
+    10
+    20
+    21
+    30
+}
+
+test sequence-first-schema-in-search-path-wins {
+    CREATE SCHEMA IF NOT EXISTS sp_sq2;
+    DROP SEQUENCE IF EXISTS sp_sq2.s;
+    CREATE SEQUENCE sp_sq2.s START 100;
+    CREATE SEQUENCE s START 1;
+    SET search_path TO sp_sq2, public;
+    SELECT nextval('s');
+    SET search_path TO public, sp_sq2;
+    SELECT nextval('s');
+    SET search_path TO sp_missing_sq, public;
+    SELECT nextval('s');
+}
+expect {
+    100
+    1
+    2
+}
+
+test drop-sequence-if-exists-under-search-path {
+    SET search_path TO sp_missing_sq;
+    DROP SEQUENCE IF EXISTS nope;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test serial-sequence-reachable-under-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_sq3;
+    DROP TABLE IF EXISTS sp_sq3.t;
+    DROP SEQUENCE IF EXISTS sp_sq3.t_id_seq;
+    SET search_path TO sp_sq3;
+    CREATE TABLE t (id serial, x int);
+    INSERT INTO t (x) VALUES (1);
+    SELECT currval('t_id_seq');
+}
+expect {
+    1
+}
+
+test serial-sequence-is-created-in-the-table-schema {
+    CREATE SCHEMA IF NOT EXISTS sp_ss;
+    DROP TABLE IF EXISTS sp_ss.t;
+    DROP SEQUENCE IF EXISTS sp_ss.t_id_seq;
+    DROP SEQUENCE IF EXISTS public.t_id_seq;
+    SET search_path TO sp_ss;
+    CREATE TABLE t (id serial, x int);
+    SET search_path TO public;
+    INSERT INTO sp_ss.t (x) VALUES (1);
+    INSERT INTO sp_ss.t (x) VALUES (2);
+    SELECT currval('sp_ss.t_id_seq');
+    SELECT id, x FROM sp_ss.t ORDER BY id;
+}
+expect {
+    2
+    1|1
+    2|2
+}
+
+test computed-sequence-name-follows-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_cn;
+    DROP TABLE IF EXISTS sp_cn.t;
+    DROP SEQUENCE IF EXISTS sp_cn.t_id_seq;
+    SET search_path TO sp_cn;
+    CREATE TABLE t (id serial, x int);
+    INSERT INTO t (x) VALUES (1);
+    SELECT currval('t_' || 'id_seq');
+}
+expect {
+    1
+}
+
+test sequence-qualified-with-public-is-found-outside-search-path {
+    DROP SEQUENCE IF EXISTS public.sp_pq;
+    CREATE SEQUENCE sp_pq START 5;
+    SET search_path TO sp_missing_pq;
+    SELECT nextval('public.sp_pq');
+}
+expect {
+    5
+}
+
+test drop-if-exists-missing-object-under-search-path {
+    SET search_path TO sp_missing_di;
+    DROP TABLE IF EXISTS nope;
+    DROP VIEW IF EXISTS nope;
+    DROP INDEX IF EXISTS nope;
+    DROP SEQUENCE IF EXISTS nope;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test drop-if-exists-finds-object-through-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_di;
+    DROP TABLE IF EXISTS sp_di.t;
+    CREATE TABLE sp_di.t (x int);
+    CREATE INDEX t_x_idx ON sp_di.t (x);
+    SET search_path TO sp_di;
+    DROP INDEX IF EXISTS t_x_idx;
+    DROP TABLE IF EXISTS t;
+    CREATE TABLE sp_di.t (x int);
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+test drop-column-checks-the-views-of-the-table-schema {
+    CREATE SCHEMA IF NOT EXISTS sp_dc;
+    DROP VIEW IF EXISTS sp_dc.v;
+    DROP TABLE IF EXISTS sp_dc.t;
+    DROP VIEW IF EXISTS public.v;
+    DROP TABLE IF EXISTS public.t;
+    CREATE TABLE t (a int, b int);
+    CREATE VIEW v AS SELECT b FROM t;
+    CREATE TABLE sp_dc.t (a int, b int);
+    CREATE VIEW sp_dc.v AS SELECT a FROM sp_dc.t;
+    SET search_path TO sp_dc;
+    ALTER TABLE public.t DROP COLUMN b;
+}
+expect error {
+    cannot drop column
+}
+
+test default-search-path-skips-a-schema-named-user {
+    CREATE SCHEMA IF NOT EXISTS "$user";
+    SET search_path TO "$user", public;
+    SELECT current_schema();
+}
+expect {
+    public
+}
+
+test column-default-keeps-its-sequence-when-search-path-changes {
+    CREATE SCHEMA IF NOT EXISTS sp_bind_default;
+    DROP TABLE IF EXISTS public.sp_bind_t;
+    DROP SEQUENCE IF EXISTS public.sp_bind_s;
+    CREATE SEQUENCE sp_bind_s;
+    CREATE TABLE sp_bind_t (id int DEFAULT nextval('sp_bind_s'), x int);
+    SET search_path TO sp_bind_default;
+    INSERT INTO public.sp_bind_t (x) VALUES (1);
+    SELECT id, x FROM public.sp_bind_t;
+}
+expect {
+    1|1
+}
+
+test view-keeps-its-sequence-when-search-path-changes {
+    CREATE SCHEMA IF NOT EXISTS sp_bind_view;
+    DROP VIEW IF EXISTS public.sp_bind_v;
+    DROP SEQUENCE IF EXISTS public.sp_bind_vs;
+    CREATE SEQUENCE sp_bind_vs;
+    CREATE VIEW sp_bind_v AS SELECT nextval('sp_bind_vs') AS n;
+    SET search_path TO sp_bind_view;
+    SELECT n FROM public.sp_bind_v;
+}
+expect {
+    1
+}
+
+test search-path-main-is-not-a-schema {
+    SET search_path TO main;
+    SELECT current_schema();
+}
+expect {
+}
+
+test search-path-main-does-not-select-a-schema-to-create-in {
+    SET search_path TO main;
+    CREATE TABLE sp_main_t (a int);
+}
+expect error {
+    no schema has been selected to create in
+}
+
+test quoted-uppercase-search-path-does-not-match-a-lowercase-schema {
+    CREATE SCHEMA IF NOT EXISTS sp_case;
+    SET search_path TO "SP_CASE";
+    SELECT current_schema();
+}
+expect {
+}
+
+test search-path-empty-qualified-generate-series {
+    SET search_path TO '';
+    SELECT * FROM pg_catalog.generate_series(1, 3);
+    SELECT sum(g.n) FROM pg_catalog.generate_series(1, 3) AS g(n);
+}
+expect {
+    1
+    2
+    3
+    6
+}
+
+test search-path-empty-unqualified-generate-series {
+    SET search_path TO '';
+    SELECT * FROM generate_series(1, 3);
+    SELECT sum(g.n) FROM generate_series(1, 3) AS g(n);
+}
+expect {
+    1
+    2
+    3
+    6
+}
+
+test drop-view-ignores-relations-outside-the-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_drop_view;
+    DROP VIEW IF EXISTS sp_drop_view.t;
+    DROP VIEW IF EXISTS sp_drop_view.v;
+    DROP VIEW IF EXISTS public.v;
+    DROP TABLE IF EXISTS public.t;
+    CREATE TABLE t (a int);
+    CREATE VIEW v AS SELECT a FROM t;
+    SET search_path TO sp_drop_view;
+    DROP VIEW IF EXISTS t;
+    DROP MATERIALIZED VIEW IF EXISTS v;
+    SELECT count(*) FROM public.v;
+}
+expect {
+    0
 }

@@ -1,4 +1,5 @@
 use crate::alloc::TursoIteratorExt;
+use crate::namespace::NamespaceId;
 use crate::numeric::StrToF64;
 use crate::schema::{ColDef, FromDefinitionFlags};
 use crate::translate::emitter::TransactionMode;
@@ -1190,7 +1191,10 @@ impl<'a> OpenOptions<'a> {
 
         // handle authority + path separately
         if let Some(after_slashes) = without_query.strip_prefix("//") {
-            let (authority, path) = after_slashes.split_once('/').unwrap_or((after_slashes, ""));
+            let (authority, path) = match after_slashes.split_once('/') {
+                Some((authority, path)) => (authority, Some(path)),
+                None => (after_slashes, None),
+            };
 
             // sqlite allows only `localhost` or empty authority.
             if !(authority.is_empty() || authority == "localhost") {
@@ -1204,13 +1208,13 @@ impl<'a> OpenOptions<'a> {
                 Some(authority)
             };
 
-            if is_windows_path(path) {
-                opts.path = normalize_windows_path(&decode_percent(path));
-            } else if !path.is_empty() {
-                opts.path = format!("/{}", decode_percent(path));
-            } else {
-                opts.path = String::new();
-            }
+            opts.path = match path {
+                Some(path) if is_windows_path(path) => {
+                    normalize_windows_path(&decode_percent(path))
+                }
+                Some(path) => format!("/{}", decode_percent(path)),
+                None => String::new(),
+            };
         } else {
             // no authority, must be a normal absolute or relative path.
             opts.path = decode_percent(without_query);
@@ -2046,29 +2050,25 @@ fn validate_select_table_no_cross_db(
     Ok(())
 }
 
-pub fn validate_select_for_unsupported_features(select_stmt: &ast::Select) -> Result<()> {
-    walk_select_expressions(select_stmt, &mut |expr| {
-        if let ast::Expr::FunctionCall { order_by, .. } = expr {
-            if !order_by.is_empty() {
-                crate::bail_parse_error!(
-                    "ORDER BY clause is not supported yet in aggregate functions"
-                );
-            }
-        }
-        Ok(WalkControl::Continue)
-    })
-}
-
 pub fn validate_select_for_views(
     select_stmt: &ast::Select,
     view_db_name: Option<&ast::Name>,
 ) -> Result<()> {
-    validate_select_for_unsupported_features(select_stmt)?;
-
     validate_no_cross_db_references(select_stmt, view_db_name)?;
 
     walk_select_expressions(select_stmt, &mut |expr| {
         match expr {
+            ast::Expr::FunctionCall {
+                name,
+                order_by,
+                filter_over,
+                ..
+            } if !order_by.is_empty() && filter_over.over_clause.is_some() => {
+                crate::bail_parse_error!(
+                    "ORDER BY may not be used with non-aggregate {}()",
+                    name.as_str()
+                );
+            }
             ast::Expr::Subquery(subquery_select) | ast::Expr::Exists(subquery_select) => {
                 validate_no_cross_db_references(subquery_select, view_db_name)?;
             }
@@ -2143,10 +2143,10 @@ fn view_source_from_select_table(
                     .map(|db| normalize_ident(db.as_str())),
                 alias: table_alias,
             });
-            let table = schema.get_table(&table_name);
+            let table = schema.get_table(NamespaceId::ROOT, &table_name);
             let view = table
                 .is_none()
-                .then(|| schema.get_view(&table_name))
+                .then(|| schema.get_view(NamespaceId::ROOT, &table_name))
                 .flatten();
             let source_columns: &[Column] = match (&table, &view) {
                 (Some(table), _) => table.columns(),
@@ -2218,7 +2218,7 @@ fn view_source_from_select_table(
                 alias: table_alias,
             });
             let columns = schema
-                .get_table(&table_name)
+                .get_table(NamespaceId::ROOT, &table_name)
                 .map(|table| {
                     table
                         .columns()
@@ -3292,7 +3292,7 @@ mod rename_column_view {
                     .is_none_or(|db| db == ctx.target_db_norm);
 
                 if is_local {
-                    if let Some(view) = ctx.schema.views.get(&table_name_norm) {
+                    if let Some(view) = ctx.schema.get_view(NamespaceId::ROOT, &table_name_norm) {
                         let columns_before = view
                             .columns
                             .iter()
@@ -3793,7 +3793,7 @@ mod rename_column_view {
     }
 
     fn table_source_columns(schema: &Schema, table_name: &str) -> Option<Vec<String>> {
-        if let Some(table) = schema.get_table(table_name) {
+        if let Some(table) = schema.get_table(NamespaceId::ROOT, table_name) {
             return Some(
                 table
                     .columns()
@@ -3803,7 +3803,7 @@ mod rename_column_view {
             );
         }
         let table_norm = normalize_ident(table_name);
-        if let Some(view) = schema.views.get(&table_norm) {
+        if let Some(view) = schema.get_view(NamespaceId::ROOT, &table_norm) {
             return Some(
                 view.columns
                     .iter()
@@ -4191,7 +4191,7 @@ pub mod tests {
             let table = BTreeTable::from_sql(create_table_sql, root_page)
                 .expect("test CREATE TABLE should parse");
             schema
-                .add_btree_table(std::sync::Arc::new(table))
+                .add_btree_table(NamespaceId::ROOT, std::sync::Arc::new(table))
                 .expect("test table should be added to schema");
         }
 
@@ -4976,6 +4976,14 @@ pub mod tests {
         let opts = OpenOptions::parse(uri).unwrap();
         assert_eq!(opts.path, "");
         assert_eq!(opts.authority, Some("localhost"));
+    }
+
+    #[test]
+    fn test_uri_with_authority_and_only_a_slash_names_the_root_directory() {
+        for uri in ["file:///", "file://localhost/"] {
+            let opts = OpenOptions::parse(uri).unwrap();
+            assert_eq!(opts.path, "/", "{uri}");
+        }
     }
 
     #[test]

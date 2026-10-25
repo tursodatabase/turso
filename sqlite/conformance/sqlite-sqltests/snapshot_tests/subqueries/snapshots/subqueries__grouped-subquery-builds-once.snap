@@ -85,7 +85,7 @@ addr  opcode            p1  p2  p3  p4            p5  comment
   50    Return          15   0   0                 0
   51    Null             0  23   0                 0  r[23]=NULL
   52    Integer          1  24   0                 0  r[24]=1; LIMIT counter
-  53    IfNot           24  79   0                 0  if !r[24] goto 79
+  53    IfNot           24  82   0                 0  if !r[24] goto 82
   54    OpenRead         5   3   0  k(3,B,B)       0  table=repeat_middle, root=3, iDb=0
   55    Rewind           5  79   0                 0  Rewind table repeat_middle
   56      Column         5   1  26                 0  r[26]=repeat_middle.tk

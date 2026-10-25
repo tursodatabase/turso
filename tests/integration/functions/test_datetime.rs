@@ -9,25 +9,28 @@ use turso_core::{
     SqliteDialect, WallClockInstant, IO,
 };
 
-struct FixedClockIo {
+struct TestClockIo {
     inner: MemoryIO,
     unix_secs: AtomicI64,
+    secs_added_per_read: i64,
 }
 
-impl Clock for FixedClockIo {
+impl Clock for TestClockIo {
     fn current_time_monotonic(&self) -> MonotonicInstant {
         self.inner.current_time_monotonic()
     }
 
     fn current_time_wall_clock(&self) -> WallClockInstant {
         WallClockInstant {
-            secs: self.unix_secs.load(Ordering::SeqCst),
+            secs: self
+                .unix_secs
+                .fetch_add(self.secs_added_per_read, Ordering::SeqCst),
             micros: 123_456,
         }
     }
 }
 
-impl IO for FixedClockIo {
+impl IO for TestClockIo {
     fn open_file(
         &self,
         path: &str,
@@ -56,9 +59,10 @@ impl IO for FixedClockIo {
 
 #[test]
 fn current_time_comes_from_the_io_clock() {
-    let io = Arc::new(FixedClockIo {
+    let io = Arc::new(TestClockIo {
         inner: MemoryIO::new(),
         unix_secs: AtomicI64::new(1_000_000_000),
+        secs_added_per_read: 0,
     });
     let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -103,5 +107,49 @@ fn current_time_comes_from_the_io_clock() {
     assert_eq!(
         read_row(&mut stmt),
         vec!["2001-09-10", "01:46:40", "2001-09-10 01:46:40"]
+    );
+}
+
+#[test]
+fn current_time_does_not_change_within_one_step() {
+    let io = Arc::new(TestClockIo {
+        inner: MemoryIO::new(),
+        unix_secs: AtomicI64::new(1_000_000_000),
+        secs_added_per_read: 1,
+    });
+    let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+
+    let rows: Vec<(i64, i64, String, String)> = conn.exec_rows(
+        "SELECT unixepoch(), unixepoch('now'), datetime(), \
+         strftime('%Y-%m-%d %H:%M:%S', 'now')",
+    );
+    assert_eq!(
+        rows,
+        vec![(
+            1_000_000_000,
+            1_000_000_000,
+            "2001-09-09 01:46:40".to_string(),
+            "2001-09-09 01:46:40".to_string(),
+        )]
+    );
+
+    let rows: Vec<(i64,)> = conn.exec_rows(
+        "SELECT count(DISTINCT unixepoch('now', column1 || ' seconds') - column1) \
+         FROM (VALUES (1), (2), (3))",
+    );
+    assert_eq!(rows, vec![(1,)]);
+
+    let rows: Vec<(i64, i64)> = conn.exec_rows(
+        "SELECT unixepoch(), unixepoch('now', column1 || ' seconds') - column1 \
+         FROM (VALUES (1), (2), (3))",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            (1_000_000_002, 1_000_000_002),
+            (1_000_000_002, 1_000_000_003),
+            (1_000_000_002, 1_000_000_004),
+        ]
     );
 }

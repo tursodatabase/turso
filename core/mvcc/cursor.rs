@@ -1982,7 +1982,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
     fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
         if self.state.is_none() {
+            let _ = self.table_iterator.take();
+            let _ = self.index_iterator.take();
+            self.reset_dual_peek();
             self.invalidate_record();
+            self.set_null_flag(false);
             let int_key = match key {
                 Value::Numeric(crate::numeric::Numeric::Integer(i)) => i,
                 _ => unreachable!("btree tables are indexed by integers!"),
@@ -2045,6 +2049,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
                 // If B-tree is invalid (row is deleted or shadowed), don't check B-tree
                 if !btree_is_valid {
+                    self.current_pos = CursorPosition::End;
                     self.state = None;
                     return Ok(IOResult::Done(false));
                 }
@@ -2053,6 +2058,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 inject_io_yield!(self, CursorYieldPoint::ExistsBtreeFallback);
             } else {
                 // No B-tree allocated, row doesn't exist
+                self.current_pos = CursorPosition::End;
                 self.state = None;
                 return Ok(IOResult::Done(false));
             }
@@ -2099,11 +2105,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             } else {
                 // B-tree row is shadowed by MVCC (tombstone or update), so it doesn't exist
                 tracing::trace!("B-tree row {int_key} is shadowed by MVCC");
+                self.current_pos = CursorPosition::End;
                 self.state = None;
                 Ok(IOResult::Done(false))
             }
         } else {
             // Not found in B-tree either
+            self.current_pos = CursorPosition::End;
             self.state = None;
             Ok(IOResult::Done(false))
         }

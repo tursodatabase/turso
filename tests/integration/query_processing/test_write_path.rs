@@ -2330,3 +2330,34 @@ fn test_upsert_do_update_failure_preserves_indexes(tmp_db: TempDatabase) -> anyh
 
     Ok(())
 }
+
+#[turso_macros::test]
+fn test_backward_index_scan_does_not_repeat_rows_after_insert_between_steps(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b INTEGER)")?;
+    conn.execute("CREATE INDEX tb ON t(b)")?;
+    conn.execute(
+        "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 2000) \
+         INSERT INTO t(id, b) SELECT x, x FROM s",
+    )?;
+    let mut stmt = conn.prepare("SELECT b FROM t ORDER BY b DESC")?;
+    let mut seen = Vec::new();
+    while seen.len() <= 4000 {
+        match stmt.step()? {
+            StepResult::Row => {
+                let b = stmt.row().unwrap().get::<i64>(0)?;
+                seen.push(b);
+                if b % 97 == 0 {
+                    conn.execute(format!("INSERT INTO t(b) VALUES ({})", 1_000_000 + b))?;
+                }
+            }
+            StepResult::IO => stmt._io().step()?,
+            StepResult::Done => break,
+            other => anyhow::bail!("unexpected step result {other:?}"),
+        }
+    }
+    assert_eq!(seen, (1..=2000).rev().collect::<Vec<i64>>());
+    Ok(())
+}

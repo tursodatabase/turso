@@ -26,10 +26,12 @@ engine can execute. Components:
 - `postgres/server` — PostgreSQL wire protocol (v3) server, built on `pgwire`
 - `postgres/cli` — `tursopg`, a psql-like REPL that can also host the server
 
-Because the parser accepts the full PostgreSQL grammar, some clauses parse
-and run but their semantics are silently dropped, producing wrong results or
-lost information without any error. These are called out as "silently
-ignored" in the notes of the tables below.
+Because the parser accepts the full PostgreSQL grammar, a clause the
+translator does not implement must be rejected explicitly, or its meaning is
+silently dropped. The translator fails closed: unimplemented clauses produce
+a "... is not supported" error rather than running with different semantics.
+The few remaining cases that are accepted without their full meaning are
+called out as "silently ignored" in the notes of the tables below.
 
 ## Core SQL baseline
 
@@ -39,31 +41,31 @@ Basics not enumerated by the official feature matrix.
 |---------|--------|-------|
 | SELECT (projections, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET) | ✅ Supported | |
 | JOINs (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL, USING) | ✅ Supported | |
-| UNION / UNION ALL / INTERSECT / EXCEPT | ✅ Supported | Including ORDER BY/LIMIT on compounds |
+| UNION / UNION ALL / INTERSECT / EXCEPT | 🟡 Partial | Including ORDER BY/LIMIT on compounds; INTERSECT ALL / EXCEPT ALL, a set operation nested on the right (`A UNION B INTERSECT C`, `A EXCEPT (B UNION C)`) and ORDER BY/LIMIT/WITH on a parenthesized branch are rejected |
 | Subqueries (FROM, IN, EXISTS, scalar) | ✅ Supported | `= ANY(array)` and `<> ALL(array)` work, including bound text-array parameters; other ANY/ALL array operators are rejected; `ALL`/row comparison subqueries error |
-| INSERT (column lists, multi-row VALUES, DEFAULT, INSERT ... SELECT) | ✅ Supported | |
-| UPDATE (incl. FROM clause) | ✅ Supported | Multi-column `SET (a,b) = (...)` not supported |
-| DELETE | 🟡 Partial | `USING` clause silently dropped |
+| INSERT (column lists, multi-row VALUES, DEFAULT, INSERT ... SELECT) | ✅ Supported | Duplicate target columns, DEFAULT without a column list, array-element/field targets and OVERRIDING are rejected |
+| UPDATE (incl. FROM clause) | ✅ Supported | Multi-column `SET (a,b) = (...)` not supported; duplicate assignments and array-element/field targets rejected |
+| DELETE | 🟡 Partial | `USING` clause rejected |
 | CREATE TABLE | ✅ Supported | PK, NOT NULL, UNIQUE, DEFAULT, CHECK, FK (with ON DELETE/UPDATE actions); IF NOT EXISTS; tables are created STRICT |
-| CREATE TABLE AS / SELECT INTO | ✅ Supported | Schema derived from the SELECT; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP silently ignored; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
-| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN work; ALTER COLUMN TYPE translates but fails at execution; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
+| CREATE TABLE AS / SELECT INTO | ✅ Supported | Schema derived from the SELECT; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP, WITH (...), TABLESPACE, USING and ON COMMIT rejected; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
+| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN work; one subcommand per statement; ALTER COLUMN TYPE, IF [NOT] EXISTS and CASCADE rejected; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
-| CREATE VIEW | ✅ Supported | Column aliases supported; TEMP silently ignored |
+| CREATE VIEW | ✅ Supported | Column aliases supported when they name every select-list column; TEMP, UNLOGGED, OR REPLACE, WITH (options) and WITH CHECK OPTION rejected |
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
-| CREATE SCHEMA / DROP SCHEMA | ✅ Supported | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased |
-| CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; CACHE accepted (no-op); pg_sequences view |
-| CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced |
+| CREATE SCHEMA / DROP SCHEMA | ✅ Supported | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased; AUTHORIZATION rejected; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists; CREATE SCHEMA can contain CREATE TABLE, VIEW, INDEX and SEQUENCE statements, which create their objects in the new schema, but not inside a transaction block |
+| CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE accepted (no-op); OWNED BY a column, TEMP and other options rejected; pg_sequences view; a sequence named without a schema is looked up through `search_path`, and a column default or view binds it to the schema it is in when the table or view is created; a serial column's sequence is created in the table's schema |
+| CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced; array base types, type modifiers and non-binary COLLATE rejected |
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
-| TRUNCATE | 🟡 Partial | Lowered to DELETE of the first table only; CASCADE / RESTART IDENTITY dropped |
-| BEGIN / COMMIT / ROLLBACK | ✅ Supported | Isolation-level and READ ONLY/WRITE options accepted but ignored |
+| TRUNCATE | 🟡 Partial | Lowered to DELETE of one table; several tables, CASCADE and RESTART IDENTITY rejected |
+| BEGIN / COMMIT / ROLLBACK | ✅ Supported | Every transaction is snapshot isolation, i.e. REPEATABLE READ; `ISOLATION LEVEL REPEATABLE READ` is accepted, every other level, DEFERRABLE, READ ONLY and AND CHAIN are rejected. SET TRANSACTION gets the same checks, except that READ ONLY is accepted there because pg_dump sends it; it is not enforced |
 | LOCK TABLE | 🟡 Partial | ACCESS SHARE without NOWAIT is accepted as a no-op inside a transaction for pg_dump compatibility; table names are not checked, no locks are acquired, and no read snapshot is started; other modes are rejected |
 | Casts (`expr::type`, CAST) | ✅ Supported | Also `int4(x)`-style cast functions |
 | Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
-| Operators: `\|\|`, `%`, bitwise, ILIKE, SIMILAR TO, `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | Regex operators lower to REGEXP; case-insensitive variants treated as sensitive |
+| Operators: `\|\|`, `%`, bitwise, LIKE/ILIKE [ESCAPE], SIMILAR TO, `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | BETWEEN SYMMETRIC, SIMILAR TO ... ESCAPE and non-literal SIMILAR TO patterns are rejected. Regex operators lower to REGEXP; `~*`/`!~*` add the `(?i)` flag. LIKE is case-sensitive with `\` as the default escape; ILIKE applies LOWER() to both sides, then matches like LIKE. In CREATE INDEX, LIKE and ILIKE need a string-literal pattern without ESCAPE |
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
-| generate_series | ✅ Supported | In FROM and with joins; column aliases on the function (`AS g(x)`) do not resolve |
+| generate_series | ✅ Supported | In FROM and with joins; table aliases name the output column (`AS g` gives `g`), explicit column aliases take precedence (`AS g(x)` gives `x`), and without an alias the column is named `generate_series`; qualified and unqualified calls resolve even with an empty search_path |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
-| SET / SHOW | 🟡 Partial | Passed through as PRAGMAs; no PostgreSQL GUCs other than search_path (`SET`, `SHOW`, `set_config`, `current_setting`) |
+| SET / SHOW | 🟡 Partial | Only search_path (`SET`, `SHOW`, `set_config`, `current_setting`). SET of a few parameters to the value Turso already behaves as (e.g. `statement_timeout = 0`, `DateStyle = ISO`, `extra_float_digits = 3`, as sent by pg_dump) is accepted as a no-op; anything else is rejected |
 
 ## Backend
 
@@ -74,7 +76,16 @@ The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
 `pg_foreign_table`, `pg_partitioned_table`, `pg_collation`, `pg_description`,
-`pg_publication*`. Catalog introspection functions: `format_type`,
+`pg_publication*`, `pg_seclabels` (security labels are not supported).
+`pg_statistic_ext` exposes the hidden system column
+`tableoid` for pg_dump discovery. `pg_trigger` exposes `tgparentid` for
+parent-trigger lookup and hidden `tableoid` during dump discovery.
+`pg_rewrite` also exposes hidden `tableoid` for rule discovery, and `pg_policy`
+exposes it for policy discovery. `pg_publication`, `pg_publication_rel`, and
+`pg_publication_namespace` expose hidden `tableoid` for publication discovery.
+`pg_get_triggerdef(oid)` and `pg_get_triggerdef(oid, pretty)` return NULL:
+PostgreSQL triggers are not supported and `pg_trigger` is empty.
+Catalog introspection functions: `format_type`,
 `pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_expr` (returns TursoPG's
 stored SQL; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
@@ -82,12 +93,17 @@ stored SQL; relation oid and pretty printing do not change the output),
 `transaction_timestamp`/`statement_timestamp`.
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
-forms), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
+forms; the first schema of `search_path` that exists), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
 `obj_description()`/`col_description()` always return NULL because COMMENT ON
 is not persisted. DML against pg_catalog is rejected. `pg_typeof` is not
 implemented.
 Configuration settings functions: `set_config()` and `current_setting()`,
-for `search_path` only.
+for `search_path` and for custom parameters (see Configuration Management).
+Setting changes follow the transaction as in PostgreSQL: a value that
+`set_config()` sets with `is_local = true` ends with the transaction,
+ROLLBACK undoes the setting changes of the transaction, ROLLBACK TO
+SAVEPOINT undoes the changes after the savepoint, and a statement that
+fails undoes its own changes.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -116,8 +132,9 @@ for `search_path` only.
 Type mapping: serial/smallserial/bigserial (and serial2/4/8) become
 `INTEGER NOT NULL DEFAULT nextval(...)` with an implicit sequence. boolean,
 smallint, bigint, uuid, date, time, timestamp[tz], bytea, json, jsonb, inet,
-cidr, macaddr, macaddr8 map to Turso custom types. varchar(n)/char(n) and
-numeric(p,s) keep their type modifiers. interval, xml, tsvector/tsquery,
+cidr, macaddr, macaddr8 map to Turso custom types. varchar(n) and
+numeric(p,s) keep their type modifiers; type modifiers on any other type,
+including char(n), timestamp(p) and bit(n), are rejected. interval, xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
 
@@ -133,7 +150,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Phrase search | ❌ Not supported | tsvector/tsquery degrade to TEXT; no full-text search |
 | Range types | ❌ Not supported | |
 | smallserial type | ✅ Supported | serial2/serial4/serial8 aliases too; serial implies NOT NULL + implicit sequence, not PRIMARY KEY |
-| Type modifier support | ✅ Supported | varchar(n) length enforced ("value too long for varchar"); numeric(p,s) scale applied |
+| Type modifier support | 🟡 Partial | varchar(n) length enforced ("value too long for varchar"); numeric(p,s) scale applied; modifiers on other types and in casts (`x::varchar(3)`) rejected |
 | UUIDv7 | ❌ Not supported | |
 | XML data type | ❌ Not supported | xml columns degrade to TEXT; no XML functions |
 
@@ -145,11 +162,11 @@ INTEGER. Unknown type names pass through as custom types.
 | B-tree bottom-up index deletion | ❌ Not supported | |
 | B-tree deduplication | ❌ Not supported | |
 | Concurrent GiST indexes | ❌ Not supported | |
-| Covering Indexes for B-trees (INCLUDE) | ❌ Not supported | INCLUDE clause silently ignored |
+| Covering Indexes for B-trees (INCLUDE) | ❌ Not supported | INCLUDE rejected |
 | Covering indexes for GiST (INCLUDE) | ❌ Not supported | |
-| Deferrable unique constraints | ❌ Not supported | |
+| Deferrable unique constraints | ❌ Not supported | DEFERRABLE / INITIALLY DEFERRED rejected on every constraint |
 | Exclusion constraints | ❌ Not supported | |
-| GIN (Generalized Inverted Index) indexes | ❌ Not supported | `USING <method>` silently ignored; every index is a B-tree |
+| GIN (Generalized Inverted Index) indexes | ❌ Not supported | `USING <method>` other than btree rejected |
 | GIN indexes partial match | ❌ Not supported | |
 | GIN index performance and size improvements | ❌ Not supported | |
 | GiST (Generalized Search Tree) indexes | ❌ Not supported | |
@@ -160,7 +177,7 @@ INTEGER. Unknown type names pass through as custom types.
 | In-memory Bitmap Indexes | ❌ Not supported | |
 | K-nearest neighbor GiST support | ❌ Not supported | |
 | K-nearest neighbor SP-GiST support | ❌ Not supported | |
-| Non-blocking CREATE INDEX | ❌ Not supported | CONCURRENTLY silently ignored |
+| Non-blocking CREATE INDEX | ❌ Not supported | CONCURRENTLY accepted; the index is built the ordinary way |
 | Parallel B-tree index scans | ❌ Not supported | |
 | Parallelized CREATE INDEX for BRIN indexes | ❌ Not supported | |
 | Parallelized CREATE INDEX for B-tree indexes | ❌ Not supported | |
@@ -168,7 +185,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Skip scan on multicolumn B-tree indexes | ❌ Not supported | |
 | Space-Partitioned GiST (SP-GiST) indexes | ❌ Not supported | |
 | SP-GiST indexes for range types | ❌ Not supported | |
-| UNIQUE NULLS NOT DISTINCT | ❌ Not supported | Silently ignored |
+| UNIQUE NULLS NOT DISTINCT | ❌ Not supported | Rejected |
 | WAL support for hash indexes | ❌ Not supported | |
 
 ## SQL
@@ -176,24 +193,24 @@ INTEGER. Unknown type names pass through as custom types.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | ANY_VALUE aggregate | ❌ Not supported | |
-| DISTINCT ON | ❌ Not supported | Accepted but silently degrades to plain DISTINCT (wrong results) |
-| FETCH FIRST .. WITH TIES | ❌ Not supported | `FETCH FIRST n ROWS ONLY` works (lowered to LIMIT); WITH TIES silently ignored |
+| DISTINCT ON | ❌ Not supported | Rejected |
+| FETCH FIRST .. WITH TIES | ❌ Not supported | `FETCH FIRST n ROWS ONLY` works (lowered to LIMIT); WITH TIES rejected |
 | GROUPING SETS, CUBE and ROLLUP support | ❌ Not supported | Translation error |
-| INSERT/UPDATE/DELETE RETURNING | ✅ Supported | Including `RETURNING *` and UPDATE ... FROM ... RETURNING |
-| LATERAL clause | 🟡 Partial | LATERAL subqueries work with a comma, [CROSS] JOIN, and LEFT JOIN. Column alias lists such as `AS s(x)` and outer columns in LIMIT/OFFSET are not supported; LATERAL tvf() is not supported     |
+| INSERT/UPDATE/DELETE RETURNING | ✅ Supported | Including `RETURNING *`; on UPDATE ... FROM, `RETURNING *` is rejected (it would omit the FROM tables' columns) |
+| LATERAL clause | 🟡 Partial | LATERAL subqueries work with a comma, [CROSS] JOIN, and LEFT JOIN. Column alias lists such as `AS s(x)` work on subqueries, unnest() and generate_series(); outer columns in LIMIT/OFFSET are not supported; LATERAL tvf() is not supported     |
 | MERGE | ❌ Not supported | |
 | MERGE ... RETURNING | ❌ Not supported | |
 | Multirow VALUES | ✅ Supported | In INSERT and as standalone VALUES lists |
 | ORDER BY / LIMIT on a standalone VALUES list | ❌ Not supported | Rejected: "ORDER BY clause is not allowed with VALUES clause" |
 | Non-decimal integer literals | ✅ Supported | `0x`, `0o`, `0b` |
-| ORDER BY NULLS FIRST/LAST | ✅ Supported | Honored in SELECT, window, and compound SELECT ORDER BY; rejected (matching SQLite) in CREATE INDEX |
+| ORDER BY NULLS FIRST/LAST | ✅ Supported | Honored in SELECT, window, and compound SELECT ORDER BY; without it, NULLs sort last for ASC and first for DESC, as in PostgreSQL; rejected (matching SQLite) in CREATE INDEX |
 | range_agg range type aggregation function | ❌ Not supported | |
 | Recursive queries | 🟡 Partial | WITH RECURSIVE works with SQLite semantics (row-at-a-time recursive term, so e.g. DISTINCT in the recursive term over a multi-row anchor can differ from PG); SEARCH/CYCLE clauses are rejected |
 | regexp_count, regexp_instr, regexp_like | ❌ Not supported | Regex *operators* (`~`, `~*`, SIMILAR TO) work |
 | Return OLD and NEW values from modified rows | ❌ Not supported | |
 | Row-wise comparison | ❌ Not supported | Row constructors `(a,b) < (c,d)` fail to translate |
-| SELECT ... FOR UPDATE/SHARE | ❌ Not supported | Accepted but silently ignored — no locking happens |
-| SELECT FOR NO KEY UPDATE/SELECT FOR KEY SHARE lock modes | ❌ Not supported | Accepted but silently ignored — no locking happens |
+| SELECT ... FOR UPDATE/SHARE | ❌ Not supported | Rejected |
+| SELECT FOR NO KEY UPDATE/SELECT FOR KEY SHARE lock modes | ❌ Not supported | Rejected |
 | SQL standard interval handling | ❌ Not supported | interval degrades to TEXT; no interval arithmetic |
 | SYSTEM_USER | ❌ Not supported | current_user/current_role return stub values |
 | TABLE statement | ✅ Supported | |
@@ -201,8 +218,8 @@ INTEGER. Unknown type names pass through as custom types.
 | unnest/array_agg | 🟡 Partial | array_agg works; unnest is not implemented |
 | Upsert (INSERT ... ON CONFLICT DO ...) | ✅ Supported | DO NOTHING and DO UPDATE SET ... (with EXCLUDED and conflict targets) |
 | Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented |
-| WITHIN GROUP clause | 🟡 Partial | Supports mode(), percentile_cont(), and percentile_disc() with one ORDER BY expression; DESC and explicit NULLS ordering are not supported |
-| WITH ORDINALITY clause | ❌ Not supported | |
+| WITHIN GROUP clause | 🟡 Partial | Supports mode(), percentile_cont(), and percentile_disc() with one ORDER BY expression; DESC is not supported; NULLS FIRST/LAST is accepted and has no effect because these functions skip NULLs |
+| WITH ORDINALITY clause | ❌ Not supported | Rejected |
 | WITH queries (Common Table Expressions) | ✅ Supported | Including WITH RECURSIVE; MATERIALIZED hints accepted |
 | Writable WITH queries (Common Table Expressions) | ❌ Not supported | "CTE query is not a SELECT statement" |
 
@@ -216,15 +233,15 @@ INTEGER. Unknown type names pass through as custom types.
 | ALTER TABLE ... SET LOGGED / UNLOGGED | ❌ Not supported | |
 | Changing column types (ALTER TABLE .. ALTER COLUMN TYPE) | ❌ Not supported | Translates but breaks at execution ("no such column" on subsequent use) |
 | CREATE ACCESS METHOD | ❌ Not supported | |
-| CREATE TABLE ... (LIKE) with foreign tables, views and composite types | ❌ Not supported | LIKE is silently ignored |
+| CREATE TABLE ... (LIKE) with foreign tables, views and composite types | ❌ Not supported | LIKE rejected |
 | DROP object IF EXISTS | ✅ Supported | TABLE, INDEX, VIEW, MATERIALIZED VIEW, TYPE, DOMAIN, SEQUENCE, SCHEMA |
-| ON COMMIT clause for CREATE TEMPORARY TABLE | ❌ Not supported | TEMP itself is silently ignored |
+| ON COMMIT clause for CREATE TEMPORARY TABLE | ❌ Not supported | Rejected, like TEMP itself |
 | REINDEX CONCURRENTLY | ❌ Not supported | REINDEX not supported at all |
-| Stored generated columns | ❌ Not supported | GENERATED ... AS silently ignored |
+| Stored generated columns | ❌ Not supported | GENERATED ... AS rejected |
 | Temporal constraints | ❌ Not supported | |
-| Temporary tables (CREATE TEMP TABLE) | ❌ Not supported | TEMP silently ignored — the table is persistent |
+| Temporary tables (CREATE TEMP TABLE) | ❌ Not supported | Rejected (UNLOGGED is accepted and creates an ordinary table) |
 | Typed tables | ❌ Not supported | |
-| Virtual generated columns | ❌ Not supported | GENERATED ... AS silently ignored |
+| Virtual generated columns | ❌ Not supported | GENERATED ... AS rejected |
 
 ## Performance
 
@@ -242,7 +259,7 @@ INTEGER. Unknown type names pass through as custom types.
 | CREATE STATISTICS - "OR" and "IN/ANY" statistics | ❌ Not supported | |
 | Cross datatype hashing support | ❌ Not supported | |
 | Distributed checkpointing | ❌ Not supported | |
-| Foreign keys marked as NOT VALID | ❌ Not supported | |
+| Foreign keys marked as NOT VALID | ❌ Not supported | NOT VALID rejected on every constraint; so are MATCH FULL/PARTIAL and ON DELETE SET NULL/DEFAULT (columns) |
 | Frozen page map | ❌ Not supported | |
 | Full text search | ❌ Not supported | tsvector/tsquery degrade to TEXT |
 | Hash aggregation can use disk | ❌ Not supported | |
@@ -273,12 +290,12 @@ INTEGER. Unknown type names pass through as custom types.
 | Partial sort capability (top-n sorting) | ❌ Not supported | |
 | Query pipelining | ❌ Not supported | |
 | Reduced lock levels for ALTER TABLE commands | ❌ Not supported | |
-| SELECT ... FOR UPDATE/SHARE NOWAIT | ❌ Not supported | Silently ignored |
+| SELECT ... FOR UPDATE/SHARE NOWAIT | ❌ Not supported | Rejected |
 | Set costs specific to TABLESPACEs | ❌ Not supported | |
 | Shared row level locking | ❌ Not supported | |
 | SIMD support for ARM | ❌ Not supported | |
 | SIMD support for x86 | ❌ Not supported | |
-| SKIP LOCKED clause | ❌ Not supported | Silently ignored |
+| SKIP LOCKED clause | ❌ Not supported | Rejected |
 | Synchronized sequential scanning | ❌ Not supported | |
 | TABLESAMPLE clause | ❌ Not supported | Translation error |
 | Tablespaces | ❌ Not supported | |
@@ -307,25 +324,25 @@ INTEGER. Unknown type names pass through as custom types.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Accelerated partition pruning | ❌ Not supported | |
-| Declarative table partitioning | ❌ Not supported | PARTITION BY / PARTITION OF silently dropped — the table is created unpartitioned |
+| Declarative table partitioning | ❌ Not supported | PARTITION BY / PARTITION OF rejected |
 | Default partition | ❌ Not supported | |
 | Foreign key references for partitioned tables | ❌ Not supported | |
 | Foreign table inheritance | ❌ Not supported | |
 | Partitioning by a hash key | ❌ Not supported | |
 | Partition pruning during query execution | ❌ Not supported | |
 | Support for PRIMARY KEY, FOREIGN KEY, indexes, and triggers on partitioned tables | ❌ Not supported | |
-| Table inheritance (INHERITS) | ❌ Not supported | INHERITS silently dropped |
-| Table partitioning | ❌ Not supported | PARTITION BY / PARTITION OF silently dropped |
+| Table inheritance (INHERITS) | ❌ Not supported | INHERITS rejected |
+| Table partitioning | ❌ Not supported | PARTITION BY / PARTITION OF rejected |
 | UPDATE on a partition key | ❌ Not supported | |
 
 ## Views & Materialized Views
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Materialized views | ✅ Supported | Incrementally maintained (live, DBSP-based) — always fresh, unlike PostgreSQL snapshots; REFRESH MATERIALIZED VIEW is accepted as a no-op |
+| Materialized views | ✅ Supported | Incrementally maintained (live, DBSP-based) — always fresh, unlike PostgreSQL snapshots; REFRESH MATERIALIZED VIEW is accepted as a no-op; WITH NO DATA (on CREATE or REFRESH) is rejected |
 | Materialized views with concurrent refresh | 🟡 Partial | Moot: views are always fresh; REFRESH (CONCURRENTLY) is a no-op |
 | SECURITY INVOKER views | ❌ Not supported | |
-| Temporary VIEWs | ❌ Not supported | TEMP silently ignored; the view is persistent |
+| Temporary VIEWs | ❌ Not supported | Rejected |
 | Updatable views | ❌ Not supported | |
 | WITH CHECK clause | ❌ Not supported | |
 
@@ -345,10 +362,10 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| COPY table FROM 'file' (text format) | ✅ Supported | DELIMITER, NULL string, HEADER, column lists, backslash escapes, `\.` end-of-data marker; atomic (rolls back on malformed rows) |
+| COPY table FROM 'file' (text format) | ✅ Supported | DELIMITER (one character), NULL string, HEADER (not HEADER MATCH), column lists, backslash escapes, `\.` end-of-data marker; atomic (rolls back on malformed rows); other options rejected |
 | COPY from/to STDIN/STDOUT | ❌ Not supported | Rejected with an error; no wire-level COPY sub-protocol |
-| COPY FROM ... WHERE | ❌ Not supported | |
-| COPY ... ON_ERROR | ❌ Not supported | |
+| COPY FROM ... WHERE | ❌ Not supported | Rejected |
+| COPY ... ON_ERROR | ❌ Not supported | Rejected |
 | COPY with arbitrary SELECT | ❌ Not supported | COPY TO is not supported at all |
 | CSV support for COPY | ❌ Not supported | `FORMAT csv` and `FORMAT binary` rejected with an error |
 
@@ -356,7 +373,8 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| SET / SHOW configuration parameters | 🟡 Partial | Passed through as PRAGMAs; PostgreSQL GUCs other than search_path are not recognized |
+| SET / SHOW configuration parameters | 🟡 Partial | Only search_path; other parameters are rejected, except SET to a value matching existing behaviour (see SET / SHOW above) |
+| Custom configuration parameters (`app.user_id`) | 🟡 Partial | `set_config()` and `current_setting()` only, not SET or SHOW; in server mode, all clients share the values |
 | ALTER SYSTEM | ❌ Not supported | |
 | Fractional input for "integer" values | ❌ Not supported | |
 | Include directives for pg_hba.conf and pg_ident.conf | ❌ Not supported | |
@@ -409,7 +427,7 @@ Upgrade is not supported.
 |---------|--------|-------|
 | Cursors | ❌ Not supported | DECLARE/FETCH/MOVE not translated |
 | Savepoints | ✅ Supported | SAVEPOINT, RELEASE, ROLLBACK TO |
-| Serializable Snapshot Isolation | ❌ Not supported | BEGIN ISOLATION LEVEL ... accepted but the level is ignored |
+| Serializable Snapshot Isolation | ❌ Not supported | BEGIN ISOLATION LEVEL SERIALIZABLE is rejected |
 | Two-phase commit | ❌ Not supported | PREPARE TRANSACTION rejected |
 | Updatable cursors | ❌ Not supported | |
 
@@ -466,7 +484,7 @@ Upgrade is not supported.
 | Statement level triggers | ❌ Not supported | CREATE TRIGGER not translated |
 | Statement level TRUNCATE triggers | ❌ Not supported | |
 | Triggers on views | ❌ Not supported | |
-| Variadic functions | ❌ Not supported | |
+| Variadic functions | ❌ Not supported | VARIADIC arguments rejected |
 | WHEN clause for CREATE TRIGGER | ❌ Not supported | |
 
 ## Procedural Languages
@@ -512,7 +530,7 @@ Upgrade is not supported.
 |---------|--------|-------|
 | Built-in, platform independent immutable collation | ❌ Not supported | |
 | casefold | ❌ Not supported | |
-| Column-level collation support | ❌ Not supported | COLLATE clauses silently stripped |
+| Column-level collation support | ❌ Not supported | Binary collations (C, POSIX, ucs_basic, default) are accepted, as Turso compares text byte-wise; any other COLLATE is rejected |
 | Database level collation | ❌ Not supported | |
 | Default ICU collations for clusters/databases | ❌ Not supported | |
 | EUC_JIS_2004 / SHIFT_JIS_2004 support | ❌ Not supported | |

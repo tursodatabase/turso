@@ -555,11 +555,11 @@ pub fn plan_subqueries_from_returning(
     Ok(())
 }
 
-/// Plan subqueries in a trigger WHEN clause expression.
-/// The WHEN clause has no FROM clause, so there are no outer query references.
-/// NEW/OLD references should already be rewritten to Expr::Register before calling this.
+/// Plan subqueries in an expression that has no FROM clause, such as a trigger
+/// WHEN clause or a VACUUM INTO path, so there are no outer query references.
+/// Trigger NEW/OLD references should already be rewritten to Expr::Register.
 #[turso_macros::trace_stack]
-pub fn plan_subqueries_from_trigger_when_clause(
+pub fn plan_subqueries_in_expr_without_from_clause(
     program: &mut ProgramBuilder,
     non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
     expr: &mut ast::Expr,
@@ -575,7 +575,7 @@ pub fn plan_subqueries_from_trigger_when_clause(
         std::iter::once(expr),
         connection,
         SubqueryPosition::Where,
-        SubqueryOrigin::TriggerWhen,
+        SubqueryOrigin::ExprWithoutFromClause,
         false,
         &mut Vec::new(),
         &mut Vec::new(),
@@ -638,6 +638,7 @@ pub(crate) fn outer_query_refs_for_correlated_subquery(
             };
             let outer_ref = OuterQueryReference {
                 table: t.table.clone(),
+                database_id: t.database_id,
                 identifier: t.identifier.clone(),
                 internal_id: t.internal_id,
                 join_info: t.join_info.clone(),
@@ -656,6 +657,7 @@ pub(crate) fn outer_query_refs_for_correlated_subquery(
         .chain(referenced_tables.outer_query_refs().iter().map(|t| {
             Ok(OuterQueryReference {
                 table: t.table.clone(),
+                database_id: t.database_id,
                 identifier: t.identifier.clone(),
                 internal_id: t.internal_id,
                 join_info: t.join_info.clone(),
@@ -1044,6 +1046,7 @@ fn get_subquery_parser<'a>(
                     where_clause: None,
                     index_method: None,
                     on_conflict: None,
+                    constraint_name: None,
                 });
 
                 let cursor_id =
@@ -2303,7 +2306,7 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
     // first use, so they must keep their phase floor (issue #6807).
     let mut aggregate_subquery_ids: Vec<ast::TableInternalId> = Vec::new();
     for agg in &plan.aggregates {
-        for expr in agg.args.iter().chain(agg.filter_expr.iter()) {
+        for expr in agg.input_exprs() {
             walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
                 if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
                     aggregate_subquery_ids.push(*subquery_id);

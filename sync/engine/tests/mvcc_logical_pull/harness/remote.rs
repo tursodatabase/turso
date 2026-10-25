@@ -71,6 +71,6 @@ impl Remote {
     }
 }
 
-pub(super) fn database_opts() -> DatabaseOpts {
+pub fn database_opts() -> DatabaseOpts {
     DatabaseOpts::new().with_generated_columns(true)
 }

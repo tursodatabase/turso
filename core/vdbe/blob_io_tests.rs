@@ -3,6 +3,7 @@
 //! Programs are hand-assembled with ProgramBuilder and run against a real table so the
 //! whole faithful pager-backed path is exercised, including persistence.
 
+use crate::namespace::NamespaceId;
 use std::sync::Arc;
 
 use crate::vdbe::builder::{CursorType, ProgramBuilder, ProgramBuilderOpts, QueryMode};
@@ -41,8 +42,12 @@ fn exec(conn: &Arc<Connection>, sql: &str) {
 }
 
 fn table_root(conn: &Arc<Connection>, name: &str) -> i64 {
-    conn.with_schema_mut(|s| s.get_btree_table(name).unwrap().root_page)
-        .unwrap()
+    conn.with_schema_mut(|s| {
+        s.get_btree_table(NamespaceId::ROOT, name)
+            .unwrap()
+            .root_page
+    })
+    .unwrap()
 }
 
 /// Build a write program that opens `t`, seeks rowid 1, runs `body` (which emits
@@ -53,7 +58,7 @@ fn run_blob_program(
     body: impl FnOnce(&mut ProgramBuilder, usize),
 ) -> Vec<Vec<Value>> {
     let table = conn
-        .with_schema_mut(|s| s.get_btree_table("t").unwrap())
+        .with_schema_mut(|s| s.get_btree_table(NamespaceId::ROOT, "t").unwrap())
         .unwrap();
     let mut b = ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 64, 8));
     b.prologue();

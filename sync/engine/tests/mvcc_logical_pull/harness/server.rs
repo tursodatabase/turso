@@ -21,11 +21,22 @@ const FRAME_END_MAGIC: u32 = 0x4554564D;
 
 pub struct InProcessServer {
     remote: Arc<Remote>,
+    bootstrap_base: Arc<Remote>,
 }
 
 impl InProcessServer {
     pub fn new(remote: Arc<Remote>) -> Self {
-        Self { remote }
+        Self {
+            bootstrap_base: remote.clone(),
+            remote,
+        }
+    }
+
+    pub fn with_bootstrap_base(remote: Arc<Remote>, bootstrap_base: Arc<Remote>) -> Self {
+        Self {
+            remote,
+            bootstrap_base,
+        }
     }
 }
 
@@ -89,8 +100,8 @@ impl InProcessServer {
     }
 
     fn page_bootstrap(&self) -> Result<Vec<u8>> {
-        let database = self.remote.checkpoint_and_read_database_file()?;
-        let log_end = self.remote.read_logical_log()?.len();
+        let database = self.bootstrap_base.checkpoint_and_read_database_file()?;
+        let log_end = self.bootstrap_base.read_logical_log()?.len();
         let header = PullUpdatesRespProtoBody {
             server_revision: revision_at(log_end),
             db_size: (database.len() / PAGE_SIZE) as u64,

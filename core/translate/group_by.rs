@@ -7,9 +7,8 @@ use super::{
     plan::{Distinctness, GroupBy, SelectPlan, SubqueryEvalPhase, SubqueryOrigin},
     result_row::emit_select_result,
 };
-use crate::function::AccumulatorFunc;
 use crate::translate::{
-    aggregation::{translate_aggregation_step, AggArgumentSource},
+    aggregation::{emit_aggregate_final, emit_aggregate_step, AggArgumentSource},
     expression_index::selected_expression_index,
     order_by::{custom_type_comparator, EmitOrderBy},
     plan::{Aggregate, NonFromClauseSubquery},
@@ -406,11 +405,8 @@ fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Resu
         }
     };
     for agg in aggregates {
-        for arg in &agg.args {
-            walk_expr(arg, &mut collect)?;
-        }
-        if let Some(filter_expr) = &agg.filter_expr {
-            walk_expr(filter_expr, &mut collect)?;
+        for expr in agg.input_exprs() {
+            walk_expr(expr, &mut collect)?;
         }
     }
     Ok(leaf_columns)
@@ -832,13 +828,13 @@ pub fn group_by_process_single_group(
 
                 let agg_arg_source =
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness);
-                translate_aggregation_step(
+                emit_aggregate_step(
                     program,
                     &plan.table_references,
+                    agg,
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
-                    agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -885,15 +881,18 @@ pub fn group_by_process_single_group(
                 };
 
                 let start_reg_aggs = start_reg_src + t_ctx.non_aggregate_expressions.len();
-                let agg_arg_source =
-                    AggArgumentSource::new_from_registers(start_reg_aggs + offset, agg);
-                translate_aggregation_step(
+                let agg_arg_source = if agg.order_by().is_empty() {
+                    AggArgumentSource::new_from_registers(start_reg_aggs + offset, agg)
+                } else {
+                    AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness)
+                };
+                emit_aggregate_step(
                     program,
                     &plan.table_references,
+                    agg,
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
-                    agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -1087,10 +1086,13 @@ pub fn group_by_emit_row_phase<'a>(
             .reg_agg_start
             .expect("aggregate registers must be initialized");
         let agg_result_reg = agg_start_reg + i;
-        program.emit_insn(Insn::AggFinal {
-            register: agg_result_reg,
-            func: AccumulatorFunc::Agg(agg.func.clone()),
-        });
+        emit_aggregate_final(
+            program,
+            &plan.table_references,
+            agg,
+            agg_result_reg,
+            &t_ctx.resolver,
+        )?;
         t_ctx.resolver.cache_expr_reg(
             std::borrow::Cow::Owned(agg.original_expr.clone()),
             agg_result_reg,

@@ -38,6 +38,7 @@ mod affinity;
 mod arrays;
 mod binary;
 mod binding;
+pub(crate) use binding::validate_function_tail;
 mod columns;
 mod condition;
 mod custom_types;

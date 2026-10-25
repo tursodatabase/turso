@@ -1,3 +1,4 @@
+use crate::namespace::NamespaceId;
 use crate::{
     alloc::{self, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
@@ -398,7 +399,7 @@ pub enum SubqueryOrigin {
     DmlWhere,
     DmlSet,
     DmlReturning,
-    TriggerWhen,
+    ExprWithoutFromClause,
 }
 
 impl SubqueryOrigin {
@@ -410,7 +411,7 @@ impl SubqueryOrigin {
             | SubqueryOrigin::SelectHaving
             | SubqueryOrigin::SelectOrderBy
             | SubqueryOrigin::SelectLimitOffset
-            | SubqueryOrigin::TriggerWhen => SubqueryEvalPhase::BeforeLoop,
+            | SubqueryOrigin::ExprWithoutFromClause => SubqueryEvalPhase::BeforeLoop,
             SubqueryOrigin::DmlWhere => SubqueryEvalPhase::BeforeLoop,
             SubqueryOrigin::DmlSet => SubqueryEvalPhase::PreWrite,
             SubqueryOrigin::DmlReturning => SubqueryEvalPhase::PostWriteReturning,
@@ -970,6 +971,10 @@ pub struct DeletePlan {
 #[derive(Debug, Clone)]
 pub struct UpdateSetClause {
     pub column_index: usize,
+    /// Names the SET list used for this column, as written. UPDATE OF triggers
+    /// match against these, so `SET rowid` and `SET id` differ even when `id` is
+    /// the INTEGER PRIMARY KEY.
+    pub column_names: Vec<ast::Name>,
     /// Original user-visible SET expression.
     pub expr: Box<ast::Expr>,
     /// In UPDATE FROM, SET clause expressions are rewritten to read from the
@@ -984,9 +989,10 @@ pub struct UpdateSetClause {
 }
 
 impl UpdateSetClause {
-    pub fn new(column_index: usize, expr: Box<ast::Expr>) -> Self {
+    pub fn new(column_index: usize, column_name: ast::Name, expr: Box<ast::Expr>) -> Self {
         Self {
             column_index,
+            column_names: vec![column_name],
             expr,
             update_from_result: None,
         }
@@ -1142,7 +1148,7 @@ pub(super) fn expand_star(
             {
                 if matches!(&table.table, Table::BTree(_) | Table::Virtual(_)) {
                     let database_name = resolver
-                        .get_database_name_by_index(table.database_id)
+                        .namespace_name(table.database_id)
                         .expect("the table database must exist while compiling a query");
                     crate::bail_parse_error!(
                         "ambiguous column name: {}.{}.{}",
@@ -1789,6 +1795,8 @@ pub struct OuterQueryReference {
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
+    /// The database the table belongs to, used to match schema-qualified names.
+    pub database_id: usize,
     /// The join that added this table in the outer scope's FROM list, so an
     /// unqualified name follows the same USING rules there as it does in the
     /// outer query itself (see [unqualified_column_sources]). None for the
@@ -3416,9 +3424,9 @@ impl JoinedTable {
                     // schema of the table's own database: a table in an
                     // attached database can share a name with a materialized
                     // view in a different database.
-                    let cursor_type = match resolver
-                        .with_schema(self.database_id, |s| s.get_materialized_view(&btree.name))
-                    {
+                    let cursor_type = match resolver.with_schema(self.database_id, |s| {
+                        s.get_materialized_view(NamespaceId::ROOT, &btree.name)
+                    }) {
                         Some(view_mutex) => CursorType::MaterializedView(btree.clone(), view_mutex),
                         None => CursorType::BTreeTable(btree.clone()),
                     };
@@ -3865,6 +3873,7 @@ pub struct IndexMethodQuery {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Aggregate {
+    pub order_cursor: Option<usize>,
     pub func: AggFunc,
     pub args: Vec<ast::Expr>,
     pub original_expr: ast::Expr,
@@ -3885,6 +3894,7 @@ impl Aggregate {
         filter_expr: Option<ast::Expr>,
     ) -> Self {
         Aggregate {
+            order_cursor: None,
             func,
             args: args.iter().map(|arg| *arg.clone()).collect(),
             original_expr: expr.clone(),
@@ -3892,6 +3902,30 @@ impl Aggregate {
             filter_expr,
             fraction_reg: None,
         }
+    }
+
+    pub fn order_by(&self) -> &[ast::SortedColumn] {
+        if matches!(self.func, AggFunc::Min | AggFunc::Max) {
+            return &[];
+        }
+        match &self.original_expr {
+            ast::Expr::FunctionCall { order_by, .. } => order_by,
+            _ => &[],
+        }
+    }
+
+    pub fn distinct_uses_order_key(&self) -> bool {
+        self.is_distinct()
+            && self.args.len() == 1
+            && self.order_by().len() == 1
+            && exprs_are_equivalent(&self.args[0], &self.order_by()[0].expr)
+    }
+
+    pub fn input_exprs(&self) -> impl Iterator<Item = &ast::Expr> {
+        self.args
+            .iter()
+            .chain(self.filter_expr.iter())
+            .chain(self.order_by().iter().map(|term| term.expr.as_ref()))
     }
 
     pub fn is_distinct(&self) -> bool {
@@ -4259,7 +4293,8 @@ pub struct NonFromClauseSubquery {
     pub correlated: bool,
     pub origin: SubqueryOrigin,
     pub eval_phase: SubqueryEvalPhase,
-    /// Run after this table when a later loop needs fewer calls.
+    /// Run after this table, either because a later loop needs fewer calls or
+    /// because this table's hash join loads columns the subquery reads.
     pub preferred_eval_after_table: Option<TableInternalId>,
 }
 

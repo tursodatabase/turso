@@ -348,7 +348,7 @@ SELECT quote(x'CAFE');       -- 'X''CAFE'''
 
 ### random() and randomblob(N)
 
-`random` returns a pseudo-random 64-bit signed integer. `randomblob` returns a blob of N pseudo-random bytes.
+`random` returns a pseudo-random 64-bit signed integer. Each call is evaluated independently, including multiple calls in the same expression. `randomblob` returns a blob of N pseudo-random bytes.
 
 ```sql
 SELECT random();           -- e.g., -4520312828827489743
@@ -477,11 +477,15 @@ SELECT unicode('Hello'); -- 72 (code point of 'H')
 
 Returns the Soundex encoding of string X as a four-character code. Soundex encodes a string based on how it sounds in English, which is useful for fuzzy name matching.
 
+Non-text arguments are converted to text first. Leading characters that are not ASCII letters are skipped, and `'?000'` is returned when X is NULL or contains no ASCII letter.
+
 ```sql
 SELECT soundex('Robert');    -- 'R163'
 SELECT soundex('Rupert');    -- 'R163'
 SELECT soundex('Smith');     -- 'S530'
 SELECT soundex('Smythe');    -- 'S530'
+SELECT soundex('O''Brien');  -- 'O165'
+SELECT soundex('123');       -- '?000'
 ```
 
 ### zeroblob(N)

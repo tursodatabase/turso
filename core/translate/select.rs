@@ -993,7 +993,7 @@ fn validate_expr_correct_column_counts(plan: &SelectPlan) -> Result<()> {
         }
     }
     for aggregate in plan.aggregates.iter() {
-        for arg in aggregate.args.iter() {
+        for arg in aggregate.input_exprs() {
             let vec_size = expr_vector_size(arg)?;
             if vec_size != 1 {
                 crate::bail_parse_error!("row value misused");
@@ -1686,7 +1686,7 @@ fn aggregate_belongs_to_enclosing_query(
 ) -> bool {
     let mut belongs = false;
     let mut disqualified = false;
-    for arg in agg.args.iter().chain(agg.filter_expr.iter()) {
+    for arg in agg.input_exprs() {
         let _ = walk_expr(arg, &mut |e: &ast::Expr| -> Result<WalkControl> {
             if let ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } = e {
                 if tables

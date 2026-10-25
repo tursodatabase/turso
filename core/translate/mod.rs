@@ -47,7 +47,6 @@ mod values;
 pub(crate) mod view;
 mod window;
 
-use crate::connection::PrepareOptions;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
@@ -83,7 +82,6 @@ pub fn translate(
     query_mode: QueryMode,
     input: &str,
     origin: crate::statement::StatementOrigin,
-    prepare_options: &PrepareOptions,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
@@ -107,8 +105,23 @@ pub fn translate(
         ProgramBuilderOpts::new(1, 32, 2),
     ));
     program.set_mvcc_enabled(connection.mvcc_enabled());
+    program.flags.set_keep_array_results_as_blobs(matches!(
+        origin,
+        crate::statement::StatementOrigin::InternalHelper
+    ));
 
     program.prologue();
+    // Engine-generated helper statements are always SQLite text and
+    // must resolve functions with SQLite semantics regardless of the
+    // database's dialect — the same invariant as unmarked schema rows.
+    // They look names up in every database, like SQLite does, whatever
+    // the connection's search path says.
+    let is_internal_helper = matches!(origin, crate::statement::StatementOrigin::InternalHelper);
+    let search_path = if is_internal_helper {
+        None
+    } else {
+        connection.search_path()
+    };
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
@@ -118,15 +131,12 @@ pub fn translate(
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        // Engine-generated helper statements are always SQLite text and
-        // must resolve functions with SQLite semantics regardless of the
-        // database's dialect — the same invariant as unmarked schema rows.
-        if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
+        if is_internal_helper {
             Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
         } else {
             connection.dialect()
         },
-        &prepare_options.unqualified_database_search_path,
+        search_path.as_deref(),
     );
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
@@ -457,9 +467,13 @@ pub fn translate_inner(
             }
             translate_update(update, resolver, program, connection)?
         }
-        ast::Stmt::Vacuum { name, into } => {
-            vacuum::translate_vacuum(program, name.as_ref(), into.as_deref(), connection.clone())?
-        }
+        ast::Stmt::Vacuum { name, into } => vacuum::translate_vacuum(
+            program,
+            resolver,
+            name.as_ref(),
+            into.as_deref(),
+            connection.clone(),
+        )?,
         ast::Stmt::Insert {
             with,
             or_conflict,
@@ -581,6 +595,7 @@ mod tests {
     use super::*;
     use crate::alloc::TryClone;
     use crate::io::MemoryIO;
+    use crate::namespace::NamespaceId;
     use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
     use crate::vdbe::insn::{ClearBtreeCount, Insn};
     use crate::ConnectOpts;
@@ -656,7 +671,6 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
-            &crate::connection::PrepareOptions::default(),
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -847,13 +861,14 @@ mod tests {
 
         let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
         let seq_root_page = schema
-            .get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+            .get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
             .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
             .root_page;
         let malformed_seq =
             BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name)", seq_root_page)
                 .expect("malformed sqlite_sequence SQL should parse");
-        schema.tables.insert(
+        schema.insert_table(
+            NamespaceId::ROOT,
             SQLITE_SEQUENCE_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(Arc::new(malformed_seq))),
         );
@@ -877,7 +892,6 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
-            &crate::connection::PrepareOptions::default(),
         )
         .expect_err("translation should fail with malformed sqlite_sequence");
         match err {
@@ -900,7 +914,7 @@ mod tests {
             .unwrap();
 
         let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
-        schema.tables.remove(SQLITE_SEQUENCE_TABLE_NAME);
+        schema.take_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME);
 
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();
@@ -921,7 +935,6 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
-            &crate::connection::PrepareOptions::default(),
         )
         .expect_err("translation should fail with missing sqlite_sequence");
         match err {

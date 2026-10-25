@@ -448,6 +448,7 @@ pub(super) fn emit_domain_cast_constraints(
 
     if any_not_null {
         program.emit_insn(Insn::HaltIfNull {
+            constraint_info: None,
             target_reg: reg,
             err_code: SQLITE_CONSTRAINT_NOTNULL,
             description: format!(
@@ -490,6 +491,7 @@ pub(super) fn emit_domain_cast_constraints(
             });
 
             program.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: SQLITE_CONSTRAINT_CHECK,
                 description: format!(
                     "value for domain {} violates check constraint \"{}\"",
