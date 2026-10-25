@@ -7792,13 +7792,14 @@ impl CursorTrait for BTreeCursor {
                 contents.cell_count(),
             )
         };
-        // A cursor with skip_advance and no record sits in the gap before the
-        // cell at cell_idx, or after the last cell of a leaf: a restore that
-        // did not find its row leaves it there. Save the entry after the gap
-        // with GE, or the last cell of the leaf with GT. A range seek op in
-        // the saved context tells restore_context to put the cursor back in
-        // the gap.
-        let (key_cell, seek_op) = if self.has_record() {
+        // A cursor with skip_advance returns the cell at cell_idx on its next
+        // next(), so it sits in the gap before that cell, whether or not it
+        // has a record, or after the last cell of a leaf when it has none: a
+        // restore that did not find its row leaves it there. Save the entry
+        // after the gap with GE, or the last cell of the leaf with GT. A range
+        // seek op in the saved context tells restore_context to put the cursor
+        // back in the gap.
+        let (key_cell, seek_op) = if !self.skip_advance {
             if (cell_idx as usize) >= cell_count {
                 return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
             }
