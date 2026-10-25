@@ -184,9 +184,7 @@ impl EmitGroupBy {
             let comparators = group_by
                 .exprs
                 .iter()
-                .map(|expr| {
-                    custom_type_comparator(expr, &plan.table_references, t_ctx.resolver.schema())
-                })
+                .map(|expr| custom_type_comparator(expr, &plan.table_references, &t_ctx.resolver))
                 .try_collect()?;
 
             program.emit_insn(Insn::SorterOpen {

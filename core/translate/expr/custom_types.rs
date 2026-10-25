@@ -276,7 +276,8 @@ pub(super) struct ExprCustomTypeInfo {
     type_def: Arc<TypeDef>,
 }
 
-/// If the expression is a column reference to a custom type, return the type info.
+/// The custom type of a column reference, or of arithmetic whose result has
+/// a custom type, such as `numeric_col + 1`.
 pub(super) fn expr_custom_type_info(
     expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
@@ -303,7 +304,57 @@ pub(super) fn expr_custom_type_info(
             None => None,
         };
     }
-    None
+    match expr {
+        ast::Expr::Parenthesized(exprs)
+            if exprs.len() == 1 && matches!(*exprs[0], ast::Expr::Binary(..)) =>
+        {
+            expr_custom_type_info(&exprs[0], referenced_tables, resolver)
+        }
+        ast::Expr::Binary(lhs, op, rhs) => {
+            custom_type_info_of_arithmetic(lhs, op, rhs, referenced_tables, resolver)
+        }
+        _ => None,
+    }
+}
+
+/// The custom type definition of `expr`, for code outside this module that
+/// only needs the type's operators.
+pub(crate) fn expr_custom_type_def(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Option<Arc<TypeDef>> {
+    expr_custom_type_info(expr, referenced_tables, resolver).map(|info| info.type_def)
+}
+
+/// `a + b`, `a - b`, `a * b` or `a / b` has a custom type when the operator
+/// calls a type's function and the dialect says which type that function
+/// returns.
+fn custom_type_info_of_arithmetic(
+    lhs: &ast::Expr,
+    op: &ast::Operator,
+    rhs: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Option<ExprCustomTypeInfo> {
+    if !matches!(
+        op,
+        ast::Operator::Add
+            | ast::Operator::Subtract
+            | ast::Operator::Multiply
+            | ast::Operator::Divide
+    ) {
+        return None;
+    }
+    let operator = find_custom_type_operator(lhs, rhs, op, referenced_tables, resolver)?;
+    let type_name = resolver
+        .dialect
+        .custom_type_operator_result_type(&operator.func_name)?;
+    custom_type_info_of_column(
+        &Column::new_default_text(None, type_name.to_string(), None),
+        true,
+        resolver,
+    )
 }
 
 /// The declared custom type of `expr`, or "" when core does not know it.
@@ -788,23 +839,11 @@ fn comparison_type_of(
             {
                 return subquery_column_comparison_type(&subquery.plan, *column, resolver);
             }
-            let Some(info) = expr_custom_type_info(expr, referenced_tables, resolver) else {
-                return Ok(None);
-            };
-            if info.column.is_array() {
-                return Ok(None);
-            }
-            let Some(resolved) = resolver
-                .schema()
-                .resolve_type(&info.column.ty_str, info.is_strict)?
-            else {
-                return Ok(None);
-            };
-            Ok(Some(ComparisonType {
-                column: info.column,
-                chain: resolved.chain,
-                form: ValueForm::Decoded,
-            }))
+            decoded_comparison_type(expr, referenced_tables, resolver)
+        }
+        ast::Expr::Binary(..) => decoded_comparison_type(expr, referenced_tables, resolver),
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            comparison_type_of(&exprs[0], referenced_tables, resolver)
         }
         ast::Expr::Cast {
             type_name: Some(type_name),
@@ -863,6 +902,31 @@ fn comparison_type_of(
         }
         _ => Ok(None),
     }
+}
+
+/// The type of a column or of arithmetic on one, whose value has been decoded.
+fn decoded_comparison_type(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<Option<ComparisonType>> {
+    let Some(info) = expr_custom_type_info(expr, referenced_tables, resolver) else {
+        return Ok(None);
+    };
+    if info.column.is_array() {
+        return Ok(None);
+    }
+    let Some(resolved) = resolver
+        .schema()
+        .resolve_type(&info.column.ty_str, info.is_strict)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ComparisonType {
+        column: info.column,
+        chain: resolved.chain,
+        form: ValueForm::Decoded,
+    }))
 }
 
 /// The type of column `column` of a FROM-clause subquery, view or CTE: the
