@@ -203,8 +203,10 @@ pub trait Dialect: Send + Sync + 'static {
     /// be used in an index expression or in the WHERE clause of a partial
     /// index.
     ///
-    /// A frontend can insert its own function calls when it translates SQL,
-    /// for example to implement a cast. SQLite allows no such functions.
+    /// Index expressions otherwise allow only deterministic built-in
+    /// functions. A frontend can insert calls to its own functions when it
+    /// translates SQL, for example to implement a cast, and those calls must
+    /// be allowed too. The SQLite frontend inserts no such calls.
     fn allows_frontend_function_in_index(&self, _name: &str) -> bool {
         false
     }
