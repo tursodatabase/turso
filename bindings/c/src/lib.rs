@@ -2868,12 +2868,20 @@ pub unsafe extern "C" fn sqlite3_result_double(context: *mut ffi::c_void, val: f
     ctx.result = ExtValue::from_float(val);
 }
 
+unsafe fn call_result_destructor(destroy: *mut ffi::c_void, value: *const ffi::c_void) {
+    let destroy_ptr = destroy as *const ffi::c_void;
+    if !destroy.is_null() && destroy_ptr != usize::MAX as *const ffi::c_void {
+        let destructor: unsafe extern "C" fn(*mut ffi::c_void) = std::mem::transmute(destroy);
+        destructor(value as *mut ffi::c_void);
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_text(
     context: *mut ffi::c_void,
     text: *const ffi::c_char,
     len: ffi::c_int,
-    _destroy: *mut ffi::c_void,
+    destroy: *mut ffi::c_void,
 ) {
     if context.is_null() || text.is_null() {
         return;
@@ -2885,6 +2893,7 @@ pub unsafe extern "C" fn sqlite3_result_text(
         let bytes = std::slice::from_raw_parts(text as *const u8, len as usize);
         String::from_utf8_lossy(bytes).into_owned()
     };
+    call_result_destructor(destroy, text as *const ffi::c_void);
     ctx.result = ExtValue::from_text(s);
 }
 
@@ -2893,13 +2902,14 @@ pub unsafe extern "C" fn sqlite3_result_blob(
     context: *mut ffi::c_void,
     blob: *const ffi::c_void,
     len: ffi::c_int,
-    _destroy: *mut ffi::c_void,
+    destroy: *mut ffi::c_void,
 ) {
     if context.is_null() || blob.is_null() || len < 0 {
         return;
     }
     let ctx = &mut *(context as *mut SqliteContext);
     let bytes = std::slice::from_raw_parts(blob as *const u8, len as usize).to_vec();
+    call_result_destructor(destroy, blob);
     ctx.result = ExtValue::from_blob(bytes);
 }
 
