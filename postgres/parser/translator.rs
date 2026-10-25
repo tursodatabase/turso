@@ -3103,7 +3103,7 @@ impl PostgreSQLTranslator {
                 }
                 match SqlValueFunctionOp::try_from(svf.op) {
                     Ok(SqlValueFunctionOp::SvfopCurrentDate) => {
-                        Ok(ast::Expr::Literal(ast::Literal::CurrentDate))
+                        Ok(cast_to(cast_to(now_call(), "timestamptz"), "date"))
                     }
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTime
@@ -3113,10 +3113,19 @@ impl PostgreSQLTranslator {
                     ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTime)),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTimestamp
-                        | SqlValueFunctionOp::SvfopCurrentTimestampN
-                        | SqlValueFunctionOp::SvfopLocaltimestamp
+                        | SqlValueFunctionOp::SvfopCurrentTimestampN,
+                    ) => Ok(cast_to(now_call(), "timestamptz")),
+                    Ok(
+                        SqlValueFunctionOp::SvfopLocaltimestamp
                         | SqlValueFunctionOp::SvfopLocaltimestampN,
-                    ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp)),
+                    ) => Ok(ast::Expr::Cast {
+                        expr: Box::new(now_call()),
+                        type_name: Some(ast::Type {
+                            name: "timestamp".to_string(),
+                            size: None,
+                            array_dimensions: 0,
+                        }),
+                    }),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentUser
                         | SqlValueFunctionOp::SvfopSessionUser
@@ -3554,6 +3563,47 @@ impl PostgreSQLTranslator {
             _ => {}
         }
 
+        let datetime_function = match op_name {
+            "+" => Some("datetime_pl"),
+            "-" => Some("datetime_mi"),
+            "*" => Some("interval_mul"),
+            "/" => Some("interval_div"),
+            _ => None,
+        };
+        if let Some(func_name) = datetime_function.filter(|_| {
+            is_datetime_operand(a_expr.lexpr.as_deref())
+                || is_datetime_operand(a_expr.rexpr.as_deref())
+        }) {
+            let lhs_type = declared_datetime_type(a_expr.lexpr.as_deref());
+            let rhs_type = declared_datetime_type(a_expr.rexpr.as_deref());
+            let type_name = |name: &str| {
+                Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+                    "'{name}'"
+                ))))
+            };
+            let call = ast::Expr::FunctionCall {
+                name: ast::Name::from_string(func_name),
+                distinctness: None,
+                args: vec![left, right, type_name(lhs_type), type_name(rhs_type)],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            };
+            return Ok(
+                match datetime_result_type(
+                    op_name,
+                    a_expr.lexpr.as_deref(),
+                    a_expr.rexpr.as_deref(),
+                ) {
+                    Some(result_type) => cast_to(call, result_type),
+                    None => call,
+                },
+            );
+        }
+
         // Map PostgreSQL operators to Turso operators
         let binary_op = match op_name {
             "=" => ast::Operator::Equals,
@@ -3926,6 +3976,8 @@ impl PostgreSQLTranslator {
             "INT4" | "INT2" | "INT8" => Some("INTEGER"),
             "BOOL" => Some("BOOLEAN"),
             "TEXT" => Some("TEXT"),
+            "DATE" => Some("date"),
+            "TIMESTAMPTZ" => Some("timestamptz"),
             _ => None,
         };
         if let Some(type_name) = cast_type {
@@ -3964,13 +4016,22 @@ impl PostgreSQLTranslator {
             (translated_order, vec![])
         };
 
-        Ok(ast::Expr::FunctionCall {
+        let returns_timestamptz = matches!(
+            func_name.as_str(),
+            "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp"
+        );
+        let call = ast::Expr::FunctionCall {
             name: ast::Name::from_string(func_name),
             distinctness,
             args,
             order_by,
             within_group,
             filter_over,
+        };
+        Ok(if returns_timestamptz {
+            cast_to(call, "timestamptz")
+        } else {
+            call
         })
     }
 
@@ -5496,6 +5557,131 @@ fn is_star_qualified_by(node: &pg_query::protobuf::Node, target_qualifiers: &[&s
     qualifier.iter().rev().zip(target_qualifiers).all(
         |(field, expected)| matches!(&field.node, Some(Node::String(s)) if s.sval == *expected),
     )
+}
+
+fn now_call() -> ast::Expr {
+    ast::Expr::FunctionCall {
+        name: ast::Name::from_string("now"),
+        distinctness: None,
+        args: vec![],
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }
+}
+
+/// The type PostgreSQL gives the result of `+`, `-`, `*` or `/` when the
+/// result is not text: an integer for `date - date`, a date for `date` plus
+/// or minus an integer. None when the result is a timestamp or interval
+/// computed from text, or the operand types are not known.
+fn datetime_result_type(
+    op: &str,
+    lhs: Option<&pg_query::protobuf::Node>,
+    rhs: Option<&pg_query::protobuf::Node>,
+) -> Option<&'static str> {
+    let operand_type = |node| match declared_datetime_type(node) {
+        "" if is_integer_constant(node) => "integer",
+        declared => declared,
+    };
+    match (operand_type(lhs), op, operand_type(rhs)) {
+        ("date", "-", "date") => Some("integer"),
+        ("date", "+" | "-", "integer") | ("integer", "+", "date") => Some("date"),
+        _ => None,
+    }
+}
+
+fn is_integer_constant(node: Option<&pg_query::protobuf::Node>) -> bool {
+    matches!(
+        node.and_then(|n| n.node.as_ref()),
+        Some(pg_query::protobuf::node::Node::AConst(a_const))
+            if matches!(a_const.val, Some(pg_query::protobuf::a_const::Val::Ival(_)))
+    )
+}
+
+fn cast_to(expr: ast::Expr, type_name: &str) -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(expr),
+        type_name: Some(ast::Type {
+            name: type_name.to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    }
+}
+
+fn is_datetime_operand(node: Option<&pg_query::protobuf::Node>) -> bool {
+    if !declared_datetime_type(node).is_empty() {
+        return true;
+    }
+    match node.and_then(|n| n.node.as_ref()) {
+        Some(pg_query::protobuf::node::Node::AExpr(a_expr))
+            if a_expr.kind == pg_query::protobuf::AExprKind::AexprOp as i32 =>
+        {
+            last_string(&a_expr.name).is_some_and(|op| matches!(op.as_str(), "+" | "-" | "*" | "/"))
+                && (is_datetime_operand(a_expr.lexpr.as_deref())
+                    || is_datetime_operand(a_expr.rexpr.as_deref()))
+        }
+        _ => false,
+    }
+}
+
+/// The type of a datetime operand when the expression itself names it (a cast,
+/// `now()`, `CURRENT_DATE`, ...), or "" when only the value can tell. The
+/// runtime needs this because `'infinity'` is a valid date, timestamp and
+/// interval.
+fn declared_datetime_type(node: Option<&pg_query::protobuf::Node>) -> &'static str {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::SqlValueFunctionOp as Op;
+    match node.and_then(|n| n.node.as_ref()) {
+        Some(Node::TypeCast(type_cast)) => {
+            match type_cast
+                .type_name
+                .as_ref()
+                .and_then(|type_name| last_string(&type_name.names))
+                .as_deref()
+            {
+                Some("interval") => "interval",
+                Some("timestamptz") => "timestamptz",
+                Some("timestamp") => "timestamp",
+                Some("date") => "date",
+                _ => "",
+            }
+        }
+        Some(Node::FuncCall(func_call)) => match last_string(&func_call.funcname).as_deref() {
+            Some("now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp") => {
+                "timestamptz"
+            }
+            _ => "",
+        },
+        Some(Node::SqlvalueFunction(svf)) => match Op::try_from(svf.op) {
+            Ok(Op::SvfopCurrentDate) => "date",
+            Ok(Op::SvfopCurrentTimestamp | Op::SvfopCurrentTimestampN) => "timestamptz",
+            Ok(Op::SvfopLocaltimestamp | Op::SvfopLocaltimestampN) => "timestamp",
+            _ => "",
+        },
+        Some(Node::AExpr(a_expr))
+            if a_expr.kind == pg_query::protobuf::AExprKind::AexprOp as i32 =>
+        {
+            let lhs = a_expr.lexpr.as_deref();
+            let rhs = a_expr.rexpr.as_deref();
+            match last_string(&a_expr.name).as_deref() {
+                Some("*" | "/")
+                    if declared_datetime_type(lhs) == "interval"
+                        || declared_datetime_type(rhs) == "interval" =>
+                {
+                    "interval"
+                }
+                Some(op @ ("+" | "-")) if datetime_result_type(op, lhs, rhs) == Some("date") => {
+                    "date"
+                }
+                _ => "",
+            }
+        }
+        _ => "",
+    }
 }
 
 fn last_string(names: &[pg_query::protobuf::Node]) -> Option<String> {
@@ -8789,8 +8975,8 @@ mod tests {
         };
 
         let expected = [
-            ast::Expr::Literal(ast::Literal::CurrentTimestamp),
-            ast::Expr::Literal(ast::Literal::CurrentDate),
+            cast_to(now_call(), "timestamptz"),
+            cast_to(cast_to(now_call(), "timestamptz"), "date"),
             ast::Expr::Literal(ast::Literal::CurrentTime),
         ];
 
@@ -9023,15 +9209,7 @@ mod tests {
         if let ast::Stmt::Select(select) = translated {
             if let ast::OneSelect::Select { columns, .. } = &select.body.select {
                 if let ast::ResultColumn::Expr(expr, _) = &columns[0] {
-                    if let ast::Expr::FunctionCall { name, .. } = &**expr {
-                        assert_eq!(
-                            name.as_str(),
-                            "now",
-                            "now() should pass through as registered scalar"
-                        );
-                    } else {
-                        panic!("Expected FunctionCall");
-                    }
+                    assert_eq!(**expr, cast_to(now_call(), "timestamptz"));
                 }
             }
         }

@@ -27,6 +27,7 @@ turso_pg_parser = { workspace = true }
 
 [dev-dependencies]
 turso_core = { workspace = true, features = ["io_memory_yield"] }
+proptest = "1.9"
 
 [lints]
 workspace = true

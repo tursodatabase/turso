@@ -19,7 +19,7 @@ use pgwire::api::results::{
     DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
     QueryResponse, Response, Tag,
 };
-use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
+use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
     ClientInfo, ClientPortalStore, NoopHandler, PgWireConnectionState, PgWireServerHandlers, Type,
@@ -72,7 +72,7 @@ impl TursoPgServer {
             handler: Arc::new(TursoPgHandler {
                 conn: self.conn.clone(),
                 db_file: self.db_file.clone(),
-                query_parser: Arc::new(NoopQueryParser::new()),
+                query_parser: Arc::new(DatetimeParameterParser),
             }),
         });
 
@@ -113,7 +113,31 @@ impl TursoPgServer {
 struct TursoPgHandler {
     conn: Arc<Mutex<PgConnection>>,
     db_file: String,
-    query_parser: Arc<NoopQueryParser>,
+    query_parser: Arc<DatetimeParameterParser>,
+}
+
+/// Keeps the SQL of a Parse message as the statement, with a cast added to
+/// each parameter the client declared as a date, time or timestamp type.
+/// The cast is part of the stored SQL, so every later prepare of the
+/// statement sees the parameter types.
+struct DatetimeParameterParser;
+
+#[async_trait]
+impl QueryParser for DatetimeParameterParser {
+    type Statement = String;
+
+    async fn parse_sql<C>(
+        &self,
+        _client: &C,
+        sql: &str,
+        types: &[Option<Type>],
+    ) -> PgWireResult<Self::Statement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let oids: Vec<Option<u32>> = types.iter().map(|t| t.as_ref().map(Type::oid)).collect();
+        turso_pg::cast_datetime_parameters(sql, &oids).map_err(|err| pg_error(err.into()))
+    }
 }
 
 impl TursoPgHandler {
@@ -223,7 +247,7 @@ impl SimpleQueryHandler for TursoPgHandler {
 #[async_trait]
 impl ExtendedQueryHandler for TursoPgHandler {
     type Statement = String;
-    type QueryParser = NoopQueryParser;
+    type QueryParser = DatetimeParameterParser;
 
     async fn on_execute<C>(&self, client: &mut C, message: Execute) -> PgWireResult<()>
     where
@@ -429,11 +453,11 @@ fn execute_query(
     stmt.run_with_row_callback(|row| {
         let mut encoder = DataRowEncoder::new(header_clone.clone());
         for (i, val) in row.get_values().enumerate() {
-            let pg_type = header_clone
+            let (pg_type, format) = header_clone
                 .get(i)
-                .map(|fi| fi.datatype().clone())
-                .unwrap_or(Type::TEXT);
-            encode_value(&mut encoder, val, &pg_type)?;
+                .map(|fi| (fi.datatype().clone(), fi.format()))
+                .unwrap_or((Type::TEXT, FieldFormat::Text));
+            encode_value(&mut encoder, val, &pg_type, format)?;
         }
         rows.push(encoder.finish());
         Ok(())
@@ -498,6 +522,10 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
             "invalid UTF-8 in parameter: {e}"
         ))))
     })?;
+
+    if let Some(converted) = turso_pg::datetime_param_in(text, pg_type.oid()) {
+        return converted.map_err(|e| pg_error(e.into()));
+    }
 
     match *pg_type {
         Type::INT2 | Type::INT4 | Type::INT8 => {
@@ -575,6 +603,7 @@ fn encode_value(
     encoder: &mut DataRowEncoder,
     val: &Value,
     pg_type: &Type,
+    format: FieldFormat,
 ) -> turso_core::Result<()> {
     match val {
         Value::Null => encoder
@@ -595,6 +624,34 @@ fn encode_value(
         Value::Numeric(turso_core::Numeric::Float(f)) => encoder
             .encode_field(&f64::from(*f))
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
+        Value::Text(t) if format == FieldFormat::Binary && is_datetime_type(pg_type) => {
+            let text = t.value.as_ref();
+            let micros_or_days =
+                turso_pg::datetime_wire_binary(text, pg_type.oid()).ok_or_else(|| {
+                    turso_core::LimboError::InvalidDate(format!(
+                        "invalid input syntax for type {}: \"{text}\"",
+                        pg_type.name()
+                    ))
+                })?;
+            let encoded = if *pg_type == Type::DATE {
+                let days = i32::try_from(micros_or_days)
+                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))?;
+                encoder.encode_field_with_type_and_format(
+                    &days,
+                    &Type::INT4,
+                    FieldFormat::Binary,
+                    &FormatOptions::default(),
+                )
+            } else {
+                encoder.encode_field_with_type_and_format(
+                    &micros_or_days,
+                    &Type::INT8,
+                    FieldFormat::Binary,
+                    &FormatOptions::default(),
+                )
+            };
+            encoded.map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+        }
         Value::Text(t) => {
             let text = t.value.as_ref();
             // For TIMESTAMPTZ columns, ensure timezone info is present so clients
@@ -604,6 +661,7 @@ fn encode_value(
                 && !text.contains('+')
                 && !text.contains('Z')
                 && !text.ends_with("-00")
+                && text.ends_with(|c: char| c.is_ascii_digit())
             {
                 let with_tz = format!("{text}+00");
                 encoder
@@ -632,6 +690,13 @@ fn encode_value(
             .encode_field(&b.as_slice())
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
     }
+}
+
+fn is_datetime_type(pg_type: &Type) -> bool {
+    *pg_type == Type::DATE
+        || *pg_type == Type::TIME
+        || *pg_type == Type::TIMESTAMP
+        || *pg_type == Type::TIMESTAMPTZ
 }
 
 fn sqlite_type_to_pg_type(type_str: &str) -> Type {
@@ -882,7 +947,13 @@ mod tests {
                 let rows = stmt.run_collect_rows().unwrap();
                 assert_eq!(rows.len(), 1);
                 let mut encoder = DataRowEncoder::new(fields.clone());
-                encode_value(&mut encoder, &rows[0][0], fields[0].datatype()).unwrap();
+                encode_value(
+                    &mut encoder,
+                    &rows[0][0],
+                    fields[0].datatype(),
+                    fields[0].format(),
+                )
+                .unwrap();
                 let row = encoder.finish().unwrap();
                 assert_eq!(row.field_count, 1);
                 assert_eq!(&row.data[..], b"\0\0\0\x01t");

@@ -614,7 +614,7 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
             Value::build_text("x + 7"),
         ),
         ("SELECT pg_get_expr('x + 7', NULL, 1)", Value::Null),
-        ("SELECT length(now(1, 2, 3))", Value::from_i64(23)),
+        ("SELECT substr(now(1, 2, 3), -3)", Value::build_text("+00")),
     ] {
         assert_eq!(
             conn.prepare(sql).unwrap().run_collect_rows().unwrap(),
@@ -709,16 +709,11 @@ fn test_pg_native_timestamps_are_registered_before_connection_wrapping(db: TempD
         let Value::Text(timestamp) = &rows[0][0] else {
             panic!("expected timestamp text for {name}")
         };
-        assert_eq!(timestamp.as_str().len(), 23);
-        for (index, separator) in [
-            (4, b'-'),
-            (7, b'-'),
-            (10, b' '),
-            (13, b':'),
-            (16, b':'),
-            (19, b'.'),
-        ] {
-            assert_eq!(timestamp.as_str().as_bytes()[index], separator, "{name}");
+        let timestamp = timestamp.as_str();
+        assert!(timestamp.ends_with("+00"), "{name}: {timestamp}");
+        assert!((22..=29).contains(&timestamp.len()), "{name}: {timestamp}");
+        for (index, separator) in [(4, b'-'), (7, b'-'), (10, b' '), (13, b':'), (16, b':')] {
+            assert_eq!(timestamp.as_bytes()[index], separator, "{name}");
         }
     }
 }
@@ -771,5 +766,55 @@ fn test_pg_description_stubs_return_null(db: TempDatabase) {
         "SELECT col_description(16384, 1)",
     ] {
         assert_eq!(query_text(&conn, sql), ["NULL"], "{sql}");
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_datetime_input_errors_report_postgres_sqlstates(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (ts timestamptz)").unwrap();
+    for (sql, sqlstate, message) in [
+        (
+            "SELECT 'nope'::timestamptz",
+            "22007",
+            "invalid input syntax for type timestamp with time zone: \"nope\"",
+        ),
+        (
+            "SELECT '2026-02-30'::timestamptz",
+            "22008",
+            "date/time field value out of range: \"2026-02-30\"",
+        ),
+        (
+            "SELECT '2026-10-08 12:00:00+16'::timestamptz",
+            "22009",
+            "time zone displacement out of range: \"2026-10-08 12:00:00+16\"",
+        ),
+        (
+            "INSERT INTO t VALUES ('2026-10-08 12:61:00')",
+            "22008",
+            "date/time field value out of range: \"2026-10-08 12:61:00\"",
+        ),
+        (
+            "SELECT 'x'::timestamp",
+            "22007",
+            "invalid input syntax for type timestamp: \"x\"",
+        ),
+        (
+            "SELECT 'infinity'::timestamptz - 'infinity'::timestamptz",
+            "22008",
+            "interval out of range",
+        ),
+        (
+            "SELECT '2026-10-08 12:00:00+00'::timestamptz + interval '1 fortnight'",
+            "22007",
+            "invalid input syntax for type interval: \"1 fortnight\"",
+        ),
+    ] {
+        let err = conn.execute(sql).unwrap_err();
+        assert_eq!(
+            (err.sqlstate, err.message.as_str()),
+            (sqlstate, message),
+            "{sql}"
+        );
     }
 }

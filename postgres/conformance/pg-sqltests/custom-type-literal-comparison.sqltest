@@ -4,6 +4,121 @@
 
 @database :memory:
 
+test timestamptz-literal-equal-other-offset {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00+00');
+    SELECT count(*) FROM t WHERE ts = '2026-10-08 14:00:00+02';
+}
+expect {
+    1
+}
+
+test timestamptz-literal-equal-other-offset-indexed {
+    CREATE TABLE t (ts timestamptz);
+    CREATE INDEX t_ts ON t (ts);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00+00');
+    SELECT count(*) FROM t WHERE ts = '2026-10-08 14:00:00+02';
+}
+expect {
+    1
+}
+
+test timestamptz-literal-ranges {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00+00');
+    SELECT
+        (SELECT count(*) FROM t WHERE ts > '2026-10-08 13:00:00+02'),
+        (SELECT count(*) FROM t WHERE ts >= '2026-10-08 14:00:00+02'),
+        (SELECT count(*) FROM t WHERE ts < '2026-10-08 15:00:00+02'),
+        (SELECT count(*) FROM t WHERE ts <= '2026-10-08 14:00:00+02'),
+        (SELECT count(*) FROM t WHERE ts != '2026-10-08 14:00:00+02'),
+        (SELECT count(*) FROM t WHERE ts <> '2026-10-08 15:00:00+02');
+}
+expect {
+    1|1|1|1|0|1
+}
+
+test timestamptz-literal-ranges-indexed {
+    CREATE TABLE t (ts timestamptz);
+    CREATE INDEX t_ts ON t (ts);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00+00');
+    SELECT
+        (SELECT count(*) FROM t WHERE ts > '2026-10-08 13:00:00+02'),
+        (SELECT count(*) FROM t WHERE ts >= '2026-10-08 14:00:00+02'),
+        (SELECT count(*) FROM t WHERE ts < '2026-10-08 15:00:00+02'),
+        (SELECT count(*) FROM t WHERE ts <= '2026-10-08 14:00:00+02'),
+        (SELECT count(*) FROM t WHERE ts != '2026-10-08 14:00:00+02'),
+        (SELECT count(*) FROM t WHERE ts <> '2026-10-08 15:00:00+02');
+}
+expect {
+    1|1|1|1|0|1
+}
+
+test timestamptz-literal-on-left {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00+00');
+    SELECT
+        (SELECT count(*) FROM t WHERE '2026-10-08 14:00:00+02' = ts),
+        (SELECT count(*) FROM t WHERE '2026-10-08 13:00:00+02' < ts),
+        (SELECT count(*) FROM t WHERE '2026-10-08 15:00:00+02' > ts);
+}
+expect {
+    1|1|1
+}
+
+test timestamptz-literal-between-and-in {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00+00');
+    SELECT
+        (SELECT count(*) FROM t WHERE ts BETWEEN '2026-10-08 13:00:00+02' AND '2026-10-08 15:00:00+02'),
+        (SELECT count(*) FROM t WHERE ts NOT BETWEEN '2026-10-08 13:00:00+02' AND '2026-10-08 15:00:00+02'),
+        (SELECT count(*) FROM t WHERE ts IN ('2026-10-08 13:00:00+02', '2026-10-08 14:00:00+02')),
+        (SELECT count(*) FROM t WHERE ts NOT IN ('2026-10-08 13:00:00+02', '2026-10-08 14:00:00+02'));
+}
+expect {
+    1|0|1|0
+}
+
+test timestamptz-literal-between-and-in-indexed {
+    CREATE TABLE t (ts timestamptz);
+    CREATE INDEX t_ts ON t (ts);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00+00');
+    SELECT
+        (SELECT count(*) FROM t WHERE ts BETWEEN '2026-10-08 13:00:00+02' AND '2026-10-08 15:00:00+02'),
+        (SELECT count(*) FROM t WHERE ts IN ('2026-10-08 13:00:00+02', '2026-10-08 14:00:00+02'));
+}
+expect {
+    1|1
+}
+
+test timestamptz-literal-in-select-list {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00+00');
+    SELECT
+        CASE WHEN ts = '2026-10-08 14:00:00+02' THEN 'yes' ELSE 'no' END,
+        CASE WHEN ts IN ('2026-10-08 14:00:00+02') THEN 'yes' ELSE 'no' END,
+        CASE ts WHEN '2026-10-08 14:00:00+02' THEN 'yes' ELSE 'no' END
+    FROM t;
+}
+expect {
+    yes|yes|yes
+}
+
+test timestamptz-invalid-literal {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00+00');
+    SELECT count(*) FROM t WHERE ts = 'garbage';
+}
+expect error {invalid input syntax for type timestamp with time zone: "garbage"}
+
+test timestamptz-invalid-literal-indexed {
+    CREATE TABLE t (ts timestamptz);
+    CREATE INDEX t_ts ON t (ts);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00+00');
+    SELECT count(*) FROM t WHERE ts = 'garbage';
+}
+expect error {invalid input syntax for type timestamp with time zone: "garbage"}
+
 test uuid-literal-uppercase {
     CREATE TABLE t (u uuid);
     INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
@@ -41,6 +156,31 @@ expect {
     1|1|1|1
 }
 
+test date-literal-compare {
+    CREATE TABLE t (d date);
+    INSERT INTO t VALUES ('2026-10-08');
+    SELECT
+        (SELECT count(*) FROM t WHERE d = '2026-10-08'),
+        (SELECT count(*) FROM t WHERE d = '20261008'),
+        (SELECT count(*) FROM t WHERE d > '2026-10-07'),
+        (SELECT count(*) FROM t WHERE d BETWEEN '2026-10-01' AND '2026-10-31');
+}
+expect {
+    1|1|1|1
+}
+
+test time-literal-compare {
+    CREATE TABLE t (tm time);
+    INSERT INTO t VALUES ('12:30:00');
+    SELECT
+        (SELECT count(*) FROM t WHERE tm = '12:30'),
+        (SELECT count(*) FROM t WHERE tm > '9:00'),
+        (SELECT count(*) FROM t WHERE tm IN ('12:30', '13:00'));
+}
+expect {
+    1|1|1
+}
+
 test varchar-literal-longer-than-limit {
     CREATE TABLE t (v varchar(3));
     INSERT INTO t VALUES ('abc');
@@ -76,6 +216,125 @@ test smallint-literal-compare {
 }
 expect {
     1|1|1
+}
+
+test timestamptz-minus-date-column {
+    CREATE TABLE t (ts timestamptz, d date);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00+00', '2026-10-07');
+    SELECT ts - d, d - ts FROM t;
+}
+expect {
+    1 day 12:00:00|-1 days -12:00:00
+}
+
+test date-in-list-spellings-of-one-date-indexed {
+    CREATE TABLE t (id int, d date);
+    CREATE INDEX t_d ON t (d);
+    INSERT INTO t VALUES (1, '2026-01-05');
+    SELECT id FROM t WHERE d IN ('2026-01-05', '20260105', 'Jan 5 2026');
+}
+expect {
+    1
+}
+
+test timestamptz-invalid-literal-empty-table {
+    CREATE TABLE t (ts timestamptz);
+    SELECT count(*) FROM t WHERE ts = 'garbage';
+}
+expect error {invalid input syntax for type timestamp with time zone: "garbage"}
+
+test timestamptz-invalid-literal-empty-table-indexed {
+    CREATE TABLE t (ts timestamptz);
+    CREATE INDEX t_ts ON t (ts);
+    SELECT count(*) FROM t WHERE ts = 'garbage';
+}
+expect error {invalid input syntax for type timestamp with time zone: "garbage"}
+
+test domain-over-date-literal-compare {
+    CREATE DOMAIN recent AS date CHECK (VALUE > '2000-01-01');
+    CREATE TABLE dm (id int, r recent);
+    INSERT INTO dm VALUES (1, '2026-01-05');
+    SELECT id FROM dm WHERE r = '20260105';
+}
+expect {
+    1
+}
+
+test cast-compared-with-literal {
+    SELECT
+        CASE WHEN timestamptz '2026-01-05 00:00+00' = '2026-01-05 02:00+02' THEN 'yes' ELSE 'no' END,
+        CASE WHEN date '2026-01-05' = '20260105' THEN 'yes' ELSE 'no' END,
+        CASE WHEN '2026-01-05' = '2026-01-05 00:00'::timestamp THEN 'yes' ELSE 'no' END;
+}
+expect {
+    yes|yes|yes
+}
+
+test timestamp-and-date-column-subtraction {
+    CREATE TABLE t (ts timestamp, d date);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00', '2026-10-07');
+    SELECT ts - d, d - ts FROM t;
+}
+expect {
+    1 day 12:00:00|-1 days -12:00:00
+}
+
+test check-compares-timestamptz-with-string-literals {
+    CREATE TABLE c1 (ts timestamptz CHECK (ts > '2026-01-01 00:00:00+00' AND ts BETWEEN '2026-01-01' AND '2027-01-01' AND ts IN ('2026-10-08 14:00+02', '2026-10-09 12:00')));
+    INSERT INTO c1 VALUES ('2026-10-08 12:00:00');
+    UPDATE c1 SET ts = '2026-10-09 14:00+02';
+    SELECT ts FROM c1;
+}
+expect {
+    2026-10-09 12:00:00+00
+}
+
+test check-with-timestamptz-literal-rejects-earlier-row {
+    CREATE TABLE c1 (ts timestamptz CHECK (ts > '2026-01-01 00:00:00+00'));
+    INSERT INTO c1 VALUES ('2025-10-08 12:00:00');
+}
+expect error {violates check constraint}
+
+test timestamptz-from-view-subquery-and-aggregate-compared-with-literal {
+    CREATE TABLE t (id int, ts timestamptz);
+    INSERT INTO t VALUES (1, '2026-10-08 12:00:00');
+    CREATE VIEW v AS SELECT id, ts FROM t;
+    SELECT
+        (SELECT count(*) FROM v WHERE ts = '2026-10-08 12:00:00'),
+        (SELECT count(*) FROM (SELECT ts FROM t) s WHERE ts = '2026-10-08 14:00:00+02'),
+        (WITH c AS (SELECT ts FROM t) SELECT count(*) FROM c WHERE ts = '2026-10-08 14:00+02'),
+        (SELECT count(*) FROM t HAVING min(ts) = '2026-10-08 12:00:00'),
+        (SELECT count(*) FROM t WHERE coalesce(ts, '2020-01-01') = '2026-10-08 12:00');
+}
+expect {
+    1|1|1|1|1
+}
+
+test timestamptz-union-with-literal-removes-duplicate {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00');
+    SELECT ts FROM t UNION SELECT '2026-10-08 12:00:00';
+    SELECT '2026-10-08 14:00+02' UNION SELECT ts FROM t;
+}
+expect {
+    2026-10-08 12:00:00+00
+    2026-10-08 12:00:00+00
+}
+
+test domain-cast-check-compares-timestamptz-with-literal {
+    CREATE DOMAIN after_noon AS timestamptz CHECK (VALUE > '2026-10-08 13:00+02');
+    SELECT '2026-10-08 11:30:00'::after_noon, '2026-10-08 13:30+02'::after_noon;
+}
+expect {
+    2026-10-08 11:30:00+00|2026-10-08 11:30:00+00
+}
+
+test domain-cast-check-with-timestamptz-literal-rejects-earlier-value {
+    CREATE DOMAIN after_noon AS timestamptz CHECK (VALUE > '2026-10-08 13:00+02');
+    SELECT '2026-10-08 10:30:00'::after_noon;
+}
+expect error {
+    violates check constraint
 }
 
 test uuid-in-subquery-of-cast {

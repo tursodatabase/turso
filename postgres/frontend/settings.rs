@@ -12,9 +12,36 @@ pub(crate) enum SettingScope {
 #[derive(Default)]
 pub(crate) struct PgSessionState {
     settings: Mutex<ConnectionSettings>,
+    clock: Mutex<SessionClock>,
+}
+
+/// Start times, in microseconds since the Unix epoch, that `now()` and
+/// `statement_timestamp()` return. Each is read from the wall clock the first
+/// time it is needed and kept until its transaction or statement ends.
+#[derive(Default)]
+struct SessionClock {
+    transaction_start: Option<i64>,
+    statement_start: Option<i64>,
 }
 
 impl PgSessionState {
+    pub(crate) fn transaction_start(&self) -> i64 {
+        let mut clock = self.clock.lock().unwrap();
+        let statement_start = *clock
+            .statement_start
+            .get_or_insert_with(crate::datetime::now_micros);
+        *clock.transaction_start.get_or_insert(statement_start)
+    }
+
+    pub(crate) fn statement_start(&self) -> i64 {
+        *self
+            .clock
+            .lock()
+            .unwrap()
+            .statement_start
+            .get_or_insert_with(crate::datetime::now_micros)
+    }
+
     pub(crate) fn mutate(&self, conn: &Connection, mutate: impl FnOnce(&mut ConnectionSettings)) {
         let mut settings = self.settings.lock().unwrap();
         settings.save_memo_before_change(conn.has_active_root_statement(), !conn.get_auto_commit());
@@ -46,20 +73,35 @@ impl PgSessionState {
     fn has_changes_to_end(&self) -> bool {
         self.settings.lock().unwrap().has_changes_to_end()
     }
+
+    /// A transaction that is still open after its first statement (BEGIN)
+    /// keeps that statement's start time, as PostgreSQL does.
+    fn end_statement_clock(&self, transaction_ended: bool) {
+        let mut clock = self.clock.lock().unwrap();
+        let statement_start = clock.statement_start.take();
+        if transaction_ended {
+            clock.transaction_start = None;
+        } else if clock.transaction_start.is_none() {
+            clock.transaction_start =
+                Some(statement_start.unwrap_or_else(crate::datetime::now_micros));
+        }
+    }
 }
 
 impl ConnectionHooks for PgSessionState {
     fn root_statement_ended(&self, conn: &Connection, failed: bool) {
+        let transaction_ended = conn.get_auto_commit();
+        self.end_statement_clock(transaction_ended);
         if !self.has_changes_to_end() {
             return;
         }
-        let transaction_ended = conn.get_auto_commit();
         self.update_settings(conn, |settings| {
             settings.end_statement(failed, transaction_ended)
         });
     }
 
     fn transaction_rolled_back(&self, conn: &Connection) {
+        self.clock.lock().unwrap().transaction_start = None;
         if !self.has_changes_to_end() {
             return;
         }

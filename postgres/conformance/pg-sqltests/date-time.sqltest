@@ -1,0 +1,246 @@
+# date and time input, output and arithmetic through the PostgreSQL frontend.
+
+@database :memory:
+
+test date-cast-forms {
+    SELECT '2026-10-08'::date, '20261008'::date, 'October 8, 2026'::date, '2026-10-08 23:30-02'::date, 'epoch'::date, 'infinity'::date;
+}
+expect {
+    2026-10-08|2026-10-08|2026-10-08|2026-10-08|1970-01-01|infinity
+}
+
+test date-cast-invalid {
+    SELECT '2026-02-30'::date;
+}
+expect error {date/time field value out of range: "2026-02-30"}
+
+test date-plus-and-minus-integer {
+    SELECT '2026-10-08'::date + 1, 1 + '2026-10-08'::date, '2026-10-08'::date - 1, '2026-10-08'::date + 1 + 1;
+}
+expect {
+    2026-10-09|2026-10-09|2026-10-07|2026-10-10
+}
+
+test date-minus-date-is-days {
+    SELECT '2026-10-08'::date - '2026-10-01'::date, ('2026-10-08'::date + 1) - '2026-10-08'::date, (CURRENT_DATE + 1) - CURRENT_DATE;
+}
+expect {
+    7|1|1
+}
+
+test date-plus-interval-is-timestamp {
+    SELECT '2026-10-08'::date + interval '1 hour', '2026-10-08'::date - interval '1 day';
+}
+expect {
+    2026-10-08 01:00:00|2026-10-07 00:00:00
+}
+
+test date-minus-timestamptz {
+    SELECT '2026-10-08'::date - '2026-10-07 12:00+00'::timestamptz, '2026-10-08 12:00+00'::timestamptz - '2026-10-08'::date;
+}
+expect {
+    12:00:00|12:00:00
+}
+
+test date-infinity-arithmetic {
+    SELECT 'infinity'::date + 1, 'infinity'::date - interval '1 day', '-infinity'::date - '2026-10-08 12:00+00'::timestamptz;
+}
+expect {
+    infinity|infinity|-infinity
+}
+
+test date-minus-infinite-date {
+    SELECT 'infinity'::date - '2026-10-08'::date;
+}
+expect error {cannot subtract infinite dates}
+
+test date-plus-integer-out-of-range {
+    SELECT '2026-10-08'::date + 2147483647;
+}
+expect error {date out of range}
+
+test date-column-arithmetic-and-order {
+    CREATE TABLE t (id int, d date);
+    INSERT INTO t VALUES (1, '2026-10-08'), (2, 'infinity'), (3, '-infinity'), (4, '0999-01-01');
+    SELECT id, d + 1 FROM t ORDER BY d;
+}
+expect {
+    3|-infinity
+    4|0999-01-02
+    1|2026-10-09
+    2|infinity
+}
+
+test time-cast-forms {
+    SELECT '12:00'::time, '12:00:00.5'::time, '24:00:00'::time, '12:00 +02'::time, '1:02:03 PM'::time, '2026-10-08 13:45'::time;
+}
+expect {
+    12:00:00|12:00:00.5|24:00:00|12:00:00|13:02:03|13:45:00
+}
+
+test time-cast-invalid {
+    SELECT '25:00'::time;
+}
+expect error {date/time field value out of range: "25:00"}
+
+test time-column-order {
+    CREATE TABLE t (id int, tm time);
+    INSERT INTO t VALUES (1, '12:00:00.5'), (2, '9:00'), (3, '12:00'), (4, '24:00');
+    SELECT id, tm FROM t ORDER BY tm;
+}
+expect {
+    2|09:00:00
+    3|12:00:00
+    1|12:00:00.5
+    4|24:00:00
+}
+
+test date-plus-date-has-no-operator {
+    SELECT '2026-10-08'::date + '2026-10-08'::date;
+}
+expect error {operator does not exist: date \+ date}
+
+test to-char-time-zone-of-date-and-timestamp {
+    SELECT to_char('2026-01-05'::date, 'tz TZ OF'), to_char('2026-01-05 10:00'::timestamp, '[tz][TZ] OF');
+}
+expect {
+    utc UTC +00|[][] +00
+}
+
+test date-plus-and-minus-infinite-interval {
+    SELECT '2024-03-06'::date - interval 'infinity', '2024-03-06'::date + interval '-infinity', '2024-03-06'::date - interval '-infinity', 'infinity'::date + interval '1 day';
+}
+expect {
+    -infinity|-infinity|infinity|infinity
+}
+
+test infinite-date-plus-date-has-no-operator {
+    SELECT 'infinity'::date + '2014-11-29'::date;
+}
+expect error {operator does not exist: date \+ date}
+
+test infinite-date-plus-timestamptz-has-no-operator {
+    SELECT '-infinity'::date + now();
+}
+expect error {operator does not exist: date \+ timestamp with time zone}
+
+test interval-month-step-may-pass-through-bc {
+    SELECT '1324-10-30'::timestamp + interval '-26.34 century 91983.1973 weeks', '0010-01-31 00:00+00'::timestamptz + interval '-120 months 3653 days';
+}
+expect {
+    0453-09-19 09:08:47.04|0010-01-31 00:00:00+00
+}
+
+test interval-month-step-before-4714-bc-is-out-of-range {
+    SELECT '0001-01-01'::timestamp - interval '4714 years';
+}
+expect error {timestamp out of range}
+
+test datetime-compare-across-types {
+    SELECT CASE WHEN '2026-10-08'::date = '2026-10-08 00:00:00'::timestamp THEN 'eq' ELSE 'ne' END, CASE WHEN '2026-10-08 12:00+00'::timestamptz = '2026-10-08 12:00'::timestamp THEN 'eq' ELSE 'ne' END, CASE WHEN '2026-10-08'::date < '2026-10-08 00:00:01+00'::timestamptz THEN 'lt' ELSE 'ge' END, CASE WHEN '2026-10-09'::date > '2026-10-08 23:59:59'::timestamp THEN 'gt' ELSE 'le' END, CASE WHEN 'infinity'::date >= 'infinity'::timestamptz THEN 'ge' ELSE 'lt' END;
+}
+expect {
+    eq|eq|lt|gt|ge
+}
+
+setup datetime-columns {
+    CREATE TABLE t (id int, d date, ts timestamp, tz timestamptz);
+    INSERT INTO t VALUES (1, '2026-10-08', '2026-10-08 00:00', '2026-10-08 00:00+00'), (2, '2026-10-08', '2026-10-08 12:00', '2026-10-08 14:00+02'), (3, 'infinity', 'infinity', '-infinity'), (4, NULL, '2026-10-08', '2026-10-08');
+}
+
+@setup datetime-columns
+test datetime-compare-date-column-with-timestamp-column {
+    SELECT id FROM t WHERE d = ts ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup datetime-columns
+test datetime-compare-timestamp-column-with-timestamptz-column {
+    SELECT id FROM t WHERE tz = ts ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+}
+
+@setup datetime-columns
+test datetime-compare-date-column-less-than-timestamptz-column {
+    SELECT id, CASE WHEN d <> ts THEN 'ne' ELSE 'eq' END FROM t WHERE d < tz ORDER BY id;
+}
+expect {
+    2|ne
+}
+
+@setup datetime-columns
+test datetime-compare-indexed-timestamp-column-with-date {
+    CREATE INDEX t_ts ON t (ts);
+    SELECT id FROM t WHERE ts = '2026-10-08'::date ORDER BY id;
+}
+expect {
+    1
+    4
+}
+
+test now-is-the-transaction-start-time {
+    CREATE TABLE t (n int, ts timestamptz);
+    BEGIN;
+    INSERT INTO t SELECT 1, now();
+    INSERT INTO t SELECT 2, CURRENT_TIMESTAMP;
+    INSERT INTO t SELECT 3, transaction_timestamp();
+    INSERT INTO t SELECT 4, LOCALTIMESTAMP;
+    COMMIT;
+    SELECT count(DISTINCT ts) FROM t;
+}
+expect {
+    1
+}
+
+test now-is-the-same-for-every-row {
+    SELECT count(DISTINCT now()::text), count(DISTINCT CURRENT_TIMESTAMP::text) FROM generate_series(1, 2000);
+}
+expect {
+    1|1
+}
+
+test current-date-is-the-date-of-now {
+    SELECT CASE WHEN CURRENT_DATE = now()::date THEN 'same' ELSE 'different' END;
+}
+expect {
+    same
+}
+
+test interval-times-and-divided-by-number {
+    SELECT 3 * interval '1 day', interval '1 day' * 3, 2.5 * interval '1 hour', interval '1 day' / 2, interval '1 month' * 0.5, interval '1 mon 1 day' / 3, '2026-10-08'::date + 2 * interval '1 day', interval '1 year 2 mons 3 days 04:05:06.789' * -1.5, interval 'infinity' * -2, interval '1 mon' / 7, interval '-1 day -1 sec' * 0.3, interval '1 day' * '1.5', (interval '1 day' * 2) * 3;
+}
+expect {
+    3 days|3 days|02:30:00|12:00:00|15 days|10 days 08:00:00|2026-10-10 00:00:00|-1 years -9 mons -4 days -18:07:40.1835|-infinity|4 days 06:51:25.6896|-07:12:00.3|1 day 12:00:00|6 days
+}
+
+test infinite-interval-times-zero-is-out-of-range {
+    SELECT interval 'infinity' * 0;
+}
+expect error {interval out of range}
+
+test interval-divided-by-zero {
+    SELECT interval '1 day' / 0;
+}
+expect error {division by zero}
+
+test date-times-number-has-no-operator {
+    SELECT '2026-10-08'::date * 2;
+}
+expect error {operator does not exist: date \* integer}
+
+test interval-times-interval-has-no-operator {
+    SELECT interval '1 day' * interval '1 day';
+}
+expect error {operator does not exist: interval \* interval}
+
+test number-divided-by-interval-has-no-operator {
+    SELECT 2 / interval '1 day';
+}
+expect error {operator does not exist: integer / interval}
