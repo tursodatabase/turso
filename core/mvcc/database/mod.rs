@@ -497,6 +497,13 @@ pub enum RowVersionState {
     NotFound,
     Deleted,
 }
+
+pub(crate) enum CellAndChain {
+    CellVisible,
+    VersionVisible(crate::alloc::ArcSlice<u8>),
+    NothingVisible,
+}
+
 pub type TxID = u64;
 
 /// A log record contains all durable effects of a committed transaction,
@@ -5917,6 +5924,59 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(false)
     }
 
+    pub(crate) fn visible_table_payload(
+        &self,
+        snapshot: MvccReadSnapshot,
+        versions: &RowVersions<A>,
+    ) -> Result<Option<crate::alloc::ArcSlice<u8>>> {
+        let versions = versions.read();
+        Ok(self
+            .find_visible_version(snapshot, &versions)?
+            .map(table_row_payload))
+    }
+
+    pub(crate) fn resolve_cell_with_chain(
+        &self,
+        snapshot: MvccReadSnapshot,
+        versions: &RowVersions<A>,
+    ) -> Result<CellAndChain> {
+        let versions = versions.read();
+        if !self.chain_hides_btree_row(snapshot, &versions)? {
+            return Ok(CellAndChain::CellVisible);
+        }
+        Ok(match self.find_visible_version(snapshot, &versions)? {
+            Some(version) => CellAndChain::VersionVisible(table_row_payload(version)),
+            None => CellAndChain::NothingVisible,
+        })
+    }
+
+    fn chain_hides_btree_row(
+        &self,
+        snapshot: MvccReadSnapshot,
+        versions: &[RowVersion],
+    ) -> Result<bool> {
+        for version in versions.iter().rev() {
+            match version.hides_btree_row_at(snapshot.begin_ts) {
+                Some(true) => return Ok(true),
+                Some(false) => {}
+                None => {
+                    let tx = self.txs.get(&snapshot.tx_id).ok_or_else(|| {
+                        LimboError::NoSuchTransactionID(snapshot.tx_id.to_string())
+                    })?;
+                    let tx = tx.value();
+                    return Ok(versions.iter().rev().any(|version| {
+                        version.is_btree_invalidating_version(
+                            tx,
+                            &self.txs,
+                            &self.finalized_tx_states,
+                        )
+                    }));
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Gets all row ids in the database.
     pub fn scan_row_ids(&self) -> Result<Vec<RowID>> {
         tracing::trace!("scan_row_ids");
@@ -10562,6 +10622,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             false
         }
     }
+
+    pub(crate) fn require_readable_transaction(&self, tx_id: TxID) -> Result<()> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        if tx.value().abort_now.load(Ordering::Acquire) {
+            return Err(LimboError::CommitDependencyAborted);
+        }
+        Ok(())
+    }
 }
 
 fn rollback_restores_rowid(tx_id: u64, rv: &RowVersion) -> bool {
@@ -10817,6 +10888,19 @@ impl RowVersion {
         }
     }
 
+    fn hides_btree_row_at(&self, begin_ts: u64) -> Option<bool> {
+        if matches!(self.end(), Some(TxTimestampOrID::TxID(_))) {
+            return None;
+        }
+        if self.is_visible_at(begin_ts)? {
+            return Some(true);
+        }
+        Some(matches!(
+            self.end(),
+            Some(TxTimestampOrID::Timestamp(end_ts)) if begin_ts > end_ts
+        ))
+    }
+
     /// Check if this version indicates the B-tree row has been modified (updated or deleted).
     ///
     /// A version is "relevant" to a transaction if:
@@ -10955,6 +11039,14 @@ fn lookup_tx_state<A: ConcurrentAllocator>(
     txs.get(&tx_id)
         .map(|entry| entry.value().state.load())
         .or_else(|| finalized_tx_states.get(&tx_id).map(|entry| *entry.value()))
+}
+
+fn table_row_payload(version: &RowVersion) -> crate::alloc::ArcSlice<u8> {
+    version
+        .row
+        .data
+        .clone()
+        .expect("a table row version must have a payload")
 }
 
 fn lookup_finalized_tx_state<A: ConcurrentAllocator>(

@@ -24441,3 +24441,460 @@ fn step_until_busy_then_release(
         }
     }
 }
+
+#[test]
+fn mvcc_count_matches_the_rows_with_and_without_version_chains() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t SELECT value, 'v' FROM generate_series(1, 500)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let mv_store = db.get_mvcc_store();
+    let root_page = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = mv_store.get_table_id_from_root_page(root_page);
+    let first = RowID::new(table_id, RowKey::Int(i64::MIN));
+    let last = RowID::new(table_id, RowKey::Int(i64::MAX));
+    assert!(
+        mv_store.rows.range(first..=last).next().is_none(),
+        "the checkpoint must leave no version chain for the table"
+    );
+    let count = |conn: &Arc<Connection>| get_rows(conn, "SELECT count(*) FROM t")[0][0].as_int();
+    assert_eq!(count(&conn), Some(500));
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("UPDATE t SET v = 'w' WHERE id = 7").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 8").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 9").unwrap();
+    conn.execute("INSERT INTO t VALUES (501, 'x')").unwrap();
+    let other = db.connect();
+    assert_eq!(count(&other), Some(500));
+    assert_eq!(count(&conn), Some(499));
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(count(&other), Some(499));
+}
+
+use crate::types::{SeekKey, SeekOp, SeekResult};
+use std::collections::BTreeMap;
+
+const READER_KEY_SPACE: i64 = 90;
+
+#[test]
+fn mvcc_table_reader_matches_a_model_of_the_snapshot() {
+    for seed in 0..16 {
+        run_mvcc_table_reader_scenario(seed, false);
+        run_mvcc_table_reader_scenario(seed, true);
+    }
+}
+
+fn run_mvcc_table_reader_scenario(seed: u64, passive: bool) {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let db = if passive {
+        MvccTestDbNoConn::new_with_random_db_passive()
+    } else {
+        MvccTestDbNoConn::new_with_random_db()
+    };
+    let checkpoint = if passive {
+        "PRAGMA wal_checkpoint(PASSIVE)"
+    } else {
+        "PRAGMA wal_checkpoint(TRUNCATE)"
+    };
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    if rng.random_bool(0.5) {
+        writer.execute("PRAGMA mvcc_gc_threshold = 1").unwrap();
+    }
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    let mut committed = BTreeMap::new();
+    for round in 0..rng.random_range(1..6) {
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        for _ in 0..rng.random_range(1..40) {
+            write_random_row(
+                &writer,
+                &mut rng,
+                &mut committed,
+                0..3,
+                &format!("c{round}"),
+            );
+        }
+        writer.execute("COMMIT").unwrap();
+        if rng.random_bool(0.6) {
+            writer.execute(checkpoint).unwrap();
+        }
+    }
+
+    let unfinished = db.connect();
+    unfinished.execute("BEGIN CONCURRENT").unwrap();
+    let mut unfinished_rows = committed.clone();
+    for _ in 0..rng.random_range(0..15) {
+        write_random_row(&unfinished, &mut rng, &mut unfinished_rows, 1..2, "u");
+    }
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    get_rows(&reader, "SELECT count(*) FROM t");
+    let mut snapshot = committed.clone();
+
+    let late = db.connect();
+    for round in 0..rng.random_range(0..3) {
+        late.execute("BEGIN CONCURRENT").unwrap();
+        for _ in 0..rng.random_range(1..15) {
+            write_random_row(&late, &mut rng, &mut committed, 2..3, &format!("l{round}"));
+        }
+        late.execute("COMMIT").unwrap();
+        if passive && rng.random_bool(0.6) {
+            late.execute(checkpoint).unwrap();
+        }
+    }
+    for _ in 0..rng.random_range(0..15) {
+        write_random_row(&reader, &mut rng, &mut snapshot, 0..1, "r");
+    }
+
+    check_reader_against_model(&db, &reader, &snapshot, &mut rng);
+
+    reader.execute("ROLLBACK").unwrap();
+    unfinished.execute("ROLLBACK").unwrap();
+}
+
+fn write_random_row(
+    conn: &Arc<Connection>,
+    rng: &mut ChaCha8Rng,
+    rows: &mut BTreeMap<i64, String>,
+    residues: std::ops::Range<i64>,
+    tag: &str,
+) {
+    let key = loop {
+        let key = rng.random_range(1..=READER_KEY_SPACE);
+        if residues.contains(&(key % 3)) {
+            break key;
+        }
+    };
+    let padding = if rng.random_bool(0.05) {
+        rng.random_range(3000..9000)
+    } else {
+        rng.random_range(0..40)
+    };
+    let value = format!("{tag}-{key}-{}", "x".repeat(padding));
+    if !rows.contains_key(&key) {
+        conn.execute(format!("INSERT INTO t VALUES ({key}, '{value}')"))
+            .unwrap();
+        rows.insert(key, value);
+    } else if rng.random_bool(0.5) {
+        conn.execute(format!("UPDATE t SET v = '{value}' WHERE id = {key}"))
+            .unwrap();
+        rows.insert(key, value);
+    } else {
+        conn.execute(format!("DELETE FROM t WHERE id = {key}"))
+            .unwrap();
+        rows.remove(&key);
+    }
+}
+
+fn check_reader_against_model(
+    db: &MvccTestDbNoConn,
+    reader: &Arc<Connection>,
+    rows: &BTreeMap<i64, String>,
+    rng: &mut ChaCha8Rng,
+) {
+    use crate::storage::btree::{CursorTrait, MvccReader};
+
+    let mv_store = db.get_mvcc_store();
+    let tx_id = reader.get_mv_tx_id().unwrap();
+    let root_page = get_rows(
+        reader,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let btree_root_page = if root_page < 0 {
+        mv_store.get_real_table_id(root_page)
+    } else {
+        root_page
+    };
+    let pager = reader.pager.load().clone();
+    let keys: Vec<i64> = rows.keys().copied().collect();
+    for _ in 0..4 {
+        let mut cursor = BTreeCursor::new_table(pager.clone(), btree_root_page, 2);
+        cursor
+            .read_mvcc_table(MvccReader::new(mv_store.clone(), reader, tx_id, root_page).unwrap());
+        assert!(cursor.is_mvcc());
+        walk_mvcc_table_reader(&mut cursor, &pager, rows, &keys, rng);
+    }
+
+    let expected: Vec<Vec<Value>> = rows
+        .iter()
+        .map(|(id, v)| vec![Value::from_i64(*id), Value::from_text(v.clone())])
+        .collect();
+    assert_eq!(
+        get_rows(reader, "SELECT id, v FROM t ORDER BY id"),
+        expected
+    );
+    let descending: Vec<Vec<Value>> = expected.iter().rev().cloned().collect();
+    assert_eq!(
+        get_rows(reader, "SELECT id, v FROM t ORDER BY id DESC"),
+        descending
+    );
+    assert_eq!(
+        get_rows(reader, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(rows.len() as i64)]]
+    );
+    for _ in 0..8 {
+        let key = rng.random_range(0..=READER_KEY_SPACE + 1);
+        let point: Vec<Vec<Value>> = rows
+            .get(&key)
+            .map(|v| vec![Value::from_text(v.clone())])
+            .into_iter()
+            .collect();
+        assert_eq!(
+            get_rows(reader, &format!("SELECT v FROM t WHERE id = {key}")),
+            point
+        );
+        let above: Vec<Vec<Value>> = rows
+            .range(key + 1..)
+            .map(|(id, _)| vec![Value::from_i64(*id)])
+            .collect();
+        assert_eq!(
+            get_rows(
+                reader,
+                &format!("SELECT id FROM t WHERE id > {key} ORDER BY id")
+            ),
+            above
+        );
+        let below: Vec<Vec<Value>> = rows
+            .range(..=key)
+            .rev()
+            .map(|(id, _)| vec![Value::from_i64(*id)])
+            .collect();
+        assert_eq!(
+            get_rows(
+                reader,
+                &format!("SELECT id FROM t WHERE id <= {key} ORDER BY id DESC")
+            ),
+            below
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelPosition {
+    Unpositioned,
+    BeforeFirst,
+    AfterLast,
+    At(usize),
+    Unknown,
+}
+
+fn walk_mvcc_table_reader(
+    cursor: &mut BTreeCursor,
+    pager: &Arc<Pager>,
+    rows: &BTreeMap<i64, String>,
+    keys: &[i64],
+    rng: &mut ChaCha8Rng,
+) {
+    use crate::storage::btree::CursorTrait;
+
+    let mut position = ModelPosition::Unpositioned;
+    for _ in 0..80 {
+        position = match rng.random_range(0..12) {
+            0 => {
+                drive_cursor_io(pager, || cursor.rewind());
+                first_model_position(keys)
+            }
+            1 => {
+                drive_cursor_io(pager, || cursor.last());
+                last_model_position(keys)
+            }
+            2..=4 => {
+                if position == ModelPosition::Unknown {
+                    continue;
+                }
+                drive_cursor_io(pager, || cursor.next());
+                next_model_position(position, keys)
+            }
+            5 | 6 => {
+                if position == ModelPosition::Unknown {
+                    continue;
+                }
+                drive_cursor_io(pager, || cursor.prev());
+                prev_model_position(position, keys)
+            }
+            7..=9 => {
+                let key = rng.random_range(0..=READER_KEY_SPACE + 1);
+                let op = [
+                    SeekOp::GE { eq_only: false },
+                    SeekOp::GE { eq_only: true },
+                    SeekOp::GT,
+                    SeekOp::LE { eq_only: false },
+                    SeekOp::LE { eq_only: true },
+                    SeekOp::LT,
+                ][rng.random_range(0..6)];
+                let result = drive_cursor_io(pager, || cursor.seek(SeekKey::TableRowId(key), op));
+                let (expected_result, expected_position) = seek_model_position(op, key, keys);
+                assert_eq!(result, expected_result, "seek {op:?} {key} in {keys:?}");
+                expected_position
+            }
+            10 => {
+                let key = rng.random_range(0..=READER_KEY_SPACE + 1);
+                let found = drive_cursor_io(pager, || cursor.exists(&Value::from_i64(key)));
+                match keys.binary_search(&key) {
+                    Ok(index) => {
+                        assert!(found, "exists {key} in {keys:?}");
+                        ModelPosition::At(index)
+                    }
+                    Err(_) => {
+                        assert!(!found, "exists {key} in {keys:?}");
+                        ModelPosition::Unknown
+                    }
+                }
+            }
+            _ => {
+                assert_eq!(drive_cursor_io(pager, || cursor.count()), keys.len());
+                ModelPosition::AfterLast
+            }
+        };
+        assert_cursor_row(cursor, pager, position, rows, keys);
+    }
+}
+
+fn drive_cursor_io<T>(
+    pager: &Arc<Pager>,
+    mut op: impl FnMut() -> crate::types::IOResultOr<T>,
+) -> T {
+    loop {
+        match op().unwrap() {
+            IOResult::Done(value) => return value,
+            IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
+        }
+    }
+}
+
+fn first_model_position(keys: &[i64]) -> ModelPosition {
+    if keys.is_empty() {
+        ModelPosition::AfterLast
+    } else {
+        ModelPosition::At(0)
+    }
+}
+
+fn last_model_position(keys: &[i64]) -> ModelPosition {
+    match keys.len().checked_sub(1) {
+        Some(index) => ModelPosition::At(index),
+        None => ModelPosition::BeforeFirst,
+    }
+}
+
+fn next_model_position(position: ModelPosition, keys: &[i64]) -> ModelPosition {
+    match position {
+        ModelPosition::Unpositioned | ModelPosition::BeforeFirst => first_model_position(keys),
+        ModelPosition::AfterLast => ModelPosition::AfterLast,
+        ModelPosition::At(index) if index + 1 < keys.len() => ModelPosition::At(index + 1),
+        ModelPosition::At(_) => ModelPosition::AfterLast,
+        ModelPosition::Unknown => unreachable!("the walk repositions after an unknown position"),
+    }
+}
+
+fn prev_model_position(position: ModelPosition, keys: &[i64]) -> ModelPosition {
+    match position {
+        ModelPosition::Unpositioned | ModelPosition::AfterLast => last_model_position(keys),
+        ModelPosition::BeforeFirst | ModelPosition::At(0) => ModelPosition::BeforeFirst,
+        ModelPosition::At(index) => ModelPosition::At(index - 1),
+        ModelPosition::Unknown => unreachable!("the walk repositions after an unknown position"),
+    }
+}
+
+fn seek_model_position(op: SeekOp, key: i64, keys: &[i64]) -> (SeekResult, ModelPosition) {
+    let landed = |index: Option<usize>, past_end: ModelPosition| match index {
+        Some(index) => (SeekResult::Found, ModelPosition::At(index)),
+        None => (SeekResult::NotFound, past_end),
+    };
+    match op {
+        SeekOp::GE { eq_only: true } | SeekOp::LE { eq_only: true } => {
+            match keys.binary_search(&key) {
+                Ok(index) => (SeekResult::Found, ModelPosition::At(index)),
+                Err(_) => (SeekResult::NotFound, ModelPosition::Unknown),
+            }
+        }
+        SeekOp::GE { eq_only: false } => {
+            let index = keys.partition_point(|k| *k < key);
+            landed(
+                (index < keys.len()).then_some(index),
+                ModelPosition::AfterLast,
+            )
+        }
+        SeekOp::GT => {
+            let index = keys.partition_point(|k| *k <= key);
+            landed(
+                (index < keys.len()).then_some(index),
+                ModelPosition::AfterLast,
+            )
+        }
+        SeekOp::LE { eq_only: false } => {
+            let index = keys.partition_point(|k| *k <= key);
+            landed(index.checked_sub(1), ModelPosition::BeforeFirst)
+        }
+        SeekOp::LT => {
+            let index = keys.partition_point(|k| *k < key);
+            landed(index.checked_sub(1), ModelPosition::BeforeFirst)
+        }
+    }
+}
+
+fn assert_cursor_row(
+    cursor: &mut BTreeCursor,
+    pager: &Arc<Pager>,
+    position: ModelPosition,
+    rows: &BTreeMap<i64, String>,
+    keys: &[i64],
+) {
+    use crate::storage::btree::CursorTrait;
+
+    match position {
+        ModelPosition::At(index) => {
+            let key = keys[index];
+            assert!(cursor.has_record(), "the cursor must be on row {key}");
+            assert!(!cursor.is_empty(), "the cursor must be on row {key}");
+            assert_eq!(drive_cursor_io(pager, || cursor.rowid()), Some(key));
+            let (value, payload) = loop {
+                match cursor.record().unwrap() {
+                    IOResult::Done(record) => {
+                        let record = record.expect("a positioned cursor must have a record");
+                        let value = record
+                            .get_value_opt(1)
+                            .and_then(|value| value.to_text().map(str::to_string))
+                            .expect("column v must be text");
+                        break (value, record.get_payload().to_vec());
+                    }
+                    IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
+                }
+            };
+            assert_eq!(value, rows[&key], "value of row {key}");
+            let (local, size) = loop {
+                match cursor.payload_fetch().unwrap() {
+                    IOResult::Done(fetched) => {
+                        let (local, size) =
+                            fetched.expect("a positioned cursor must have a payload");
+                        break (local.to_vec(), size);
+                    }
+                    IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
+                }
+            };
+            assert_eq!(size, payload.len(), "payload size of row {key}");
+            assert_eq!(&payload[..local.len()], &local[..], "payload of row {key}");
+        }
+        ModelPosition::BeforeFirst | ModelPosition::AfterLast => {
+            assert!(!cursor.has_record(), "the cursor must have no row");
+            assert!(cursor.is_empty(), "the cursor must have no row");
+            assert_eq!(drive_cursor_io(pager, || cursor.rowid()), None);
+        }
+        ModelPosition::Unpositioned | ModelPosition::Unknown => {}
+    }
+}

@@ -66,6 +66,9 @@ use std::{
     sync::Arc,
 };
 
+mod mvcc_reader;
+pub(crate) use mvcc_reader::MvccReader;
+
 /// Maximum number of key values to store on the stack when converting registers to ValueRefs
 /// during seeking. Since we use a SmallVec it'll gracefully fall back to heap allocating beyond
 /// this threshold.
@@ -987,6 +990,8 @@ pub struct BTreeCursor {
     /// itself into the registry). Direct BTreeCursor::new callers (tests,
     /// internal utilities) bypass that path; their Drop skips unregister.
     did_register: crate::sync::atomic::AtomicBool,
+    mvcc_reader: Option<Box<MvccReader>>,
+    row_is_from_version_chain: bool,
     #[cfg(any(test, injected_yields))]
     yield_injector: Option<Arc<dyn crate::mvcc::yield_points::YieldInjector>>,
     #[cfg(any(test, injected_yields))]
@@ -1338,6 +1343,8 @@ impl BTreeCursor {
             pending_peer_save: None,
             has_peers: crate::sync::atomic::AtomicBool::new(false),
             did_register: crate::sync::atomic::AtomicBool::new(false),
+            mvcc_reader: None,
+            row_is_from_version_chain: false,
             #[cfg(any(test, injected_yields))]
             yield_injector: None,
             #[cfg(any(test, injected_yields))]
@@ -6404,7 +6411,7 @@ impl BTreeCursor {
     /// be >= the rowid being inserted — in which case the caller must re-seek
     /// from the root.
     pub fn is_positioned_past_page_start(&self) -> bool {
-        self.has_record() && self.stack.current_cell_index() > 0
+        self.has_record && self.stack.current_cell_index() > 0
     }
 
     /// True iff the cursor has run off the last cell of the table's rightmost
@@ -6418,7 +6425,7 @@ impl BTreeCursor {
     /// every append pays a full root-to-leaf seek: `next()` after inserting
     /// the last cell always runs off the end.
     pub fn is_at_end_of_rightmost_leaf(&self) -> bool {
-        if self.has_record()
+        if self.has_record
             || self.valid_state != CursorValidState::Valid
             || self.stack.current_page < 0
         {
@@ -6724,54 +6731,10 @@ impl CursorTrait for BTreeCursor {
     }
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn next(&mut self) -> IOResultOr<()> {
-        if self.can_advance_within_leaf() {
-            self.stack.advance();
-            self.invalidate_record();
-            return Ok(IOResult::Done(()));
+        if self.mvcc_reader.is_some() {
+            return self.mvcc_next();
         }
-        if self.is_on_last_cell_of_tree() {
-            self.stack.advance();
-            self.invalidate_record();
-            self.set_has_record(false);
-            return Ok(IOResult::Done(()));
-        }
-        if self.valid_state == CursorValidState::Invalid {
-            return Ok(IOResult::Done(()));
-        }
-        loop {
-            match self.advance_state {
-                AdvanceState::Start => {
-                    return_if_io!(self.restore_context());
-                    // Set by DeleteState::RestoreContextAfterBalancing and by
-                    // restore_context on NotFound: the cursor is already at
-                    // the right iteration target, so return it without
-                    // advancing. If the landed cell has no record (past
-                    // EOF), fall through to Advance.
-                    if self.skip_advance {
-                        self.skip_advance = false;
-                        if self.stack.current_page >= 0 {
-                            let mem_page = self.stack.top_ref();
-                            let contents = mem_page.get_contents();
-                            let cell_idx = self.stack.current_cell_index();
-                            let cell_count = contents.cell_count();
-                            let has_record = cell_idx >= 0 && cell_idx < cell_count as i32;
-                            if has_record {
-                                self.set_has_record(true);
-                                self.read_overflow_state = None;
-                                return Ok(IOResult::Done(()));
-                            }
-                        }
-                    }
-                    self.advance_state = AdvanceState::Advance;
-                }
-                AdvanceState::Advance => {
-                    return_if_io!(self.get_next_record());
-                    self.advance_state = AdvanceState::Start;
-                    self.read_overflow_state = None;
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
+        self.btree_next()
     }
 
     #[inline(always)]
@@ -6780,7 +6743,7 @@ impl CursorTrait for BTreeCursor {
             self.null_flag = false;
             return CursorStep::Empty;
         }
-        if self.can_advance_within_leaf() {
+        if self.mvcc_reader.is_none() && self.can_advance_within_leaf() {
             self.stack.advance();
             self.invalidate_record();
             return CursorStep::Row;
@@ -6788,7 +6751,9 @@ impl CursorTrait for BTreeCursor {
         match self.next() {
             Ok(IOResult::IO(io)) => CursorStep::IO(io),
             Err(err) => CursorStep::Error(err),
-            Ok(IOResult::Done(())) => CursorStep::at_row(self.has_record),
+            Ok(IOResult::Done(())) => {
+                CursorStep::at_row(self.has_record || self.row_is_from_version_chain)
+            }
         }
     }
 
@@ -6800,46 +6765,26 @@ impl CursorTrait for BTreeCursor {
         match self.prev() {
             Ok(IOResult::IO(io)) => CursorStep::IO(io),
             Err(err) => CursorStep::Error(err),
-            Ok(IOResult::Done(())) => CursorStep::at_row(self.has_record),
+            Ok(IOResult::Done(())) => {
+                CursorStep::at_row(self.has_record || self.row_is_from_version_chain)
+            }
         }
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn last(&mut self) -> IOResultOr<()> {
-        self.set_null_flag(false);
-        if self.valid_state == CursorValidState::Invalid {
-            return Ok(IOResult::Done(()));
+        if self.mvcc_reader.is_some() {
+            return self.mvcc_last();
         }
-        self.clear_saved_seek();
-        let cursor_has_record = return_if_io!(self.move_to_rightmost());
-        self.set_has_record(cursor_has_record);
-        self.invalidate_record();
-        self.read_overflow_state = None;
-        Ok(IOResult::Done(()))
+        self.btree_last()
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn prev(&mut self) -> IOResultOr<()> {
-        loop {
-            match self.advance_state {
-                AdvanceState::Start => {
-                    return_if_io!(self.restore_context());
-                    // skip_advance only tells a forward step to stay put. A
-                    // backward step from the cell after a deleted row is
-                    // already right, and it must consume the flag so a later
-                    // next() advances normally. Matches btreePrevious(),
-                    // which clears CURSOR_SKIPNEXT (btree.c:6439-6442).
-                    self.skip_advance = false;
-                    self.advance_state = AdvanceState::Advance;
-                }
-                AdvanceState::Advance => {
-                    return_if_io!(self.get_prev_record());
-                    self.advance_state = AdvanceState::Start;
-                    self.read_overflow_state = None;
-                    return Ok(IOResult::Done(()));
-                }
-            }
+        if self.mvcc_reader.is_some() {
+            return self.mvcc_prev();
         }
+        self.btree_prev()
     }
 
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
@@ -6851,7 +6796,7 @@ impl CursorTrait for BTreeCursor {
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
         }
-        return if self.has_record() {
+        return if self.has_record {
             let page = self.stack.top_ref();
             let contents = page.get_contents();
             if contents.is_table() {
@@ -6866,7 +6811,7 @@ impl CursorTrait for BTreeCursor {
                 index_rowid(self)
             }
         } else {
-            Ok(IOResult::Done(None))
+            Ok(IOResult::Done(self.version_chain_rowid()))
         };
 
         #[inline(never)]
@@ -6895,24 +6840,18 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip(self, key), level = Level::DEBUG))]
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
-        self.skip_advance = false;
-        // Empty trace to capture the span information
-        tracing::trace!("");
-        // We need to clear the null flag for the table cursor before seeking,
-        // because it might have been set to false by an unmatched left-join row during the previous iteration
-        // on the outer loop.
-        self.set_null_flag(false);
-        let seek_result = return_if_io!(self.do_seek(key, op));
-        self.invalidate_record();
-        // Reset seek state
-        self.seek_state = CursorSeekState::Start;
-        self.valid_state = CursorValidState::Valid;
-        self.read_overflow_state = None;
-        Ok(IOResult::Done(seek_result))
+        if self.mvcc_reader.is_some() {
+            return self.mvcc_seek(key, op);
+        }
+        self.btree_seek(key, op)
     }
 
     #[cfg_attr(debug_assertions, instrument(skip(self, registers), level = Level::DEBUG))]
     fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> IOResultOr<SeekResult> {
+        turso_assert!(
+            self.mvcc_reader.is_none(),
+            "an MVCC table cursor cannot seek an index key"
+        );
         self.skip_advance = false;
         // Empty trace to capture the span information
         tracing::trace!("");
@@ -6936,8 +6875,8 @@ impl CursorTrait for BTreeCursor {
         if self.needs_restore() {
             return_if_io!(self.restore_context());
         }
-        if !self.has_record() {
-            return Ok(IOResult::Done(None));
+        if !self.has_record {
+            return Ok(IOResult::Done(self.version_chain_record()?));
         }
         let invalidated = self
             .reusable_immutable_record
@@ -6979,6 +6918,10 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
+        turso_assert!(
+            self.mvcc_reader.is_none(),
+            "an MVCC table cursor is read-only"
+        );
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
         self.noted_payload = NotedPayload::NONE;
         // invalidateOverflowCache in sqlite3BtreeInsert and sqlite3BtreeDelete:
@@ -7008,6 +6951,10 @@ impl CursorTrait for BTreeCursor {
     /// 9. SeekAfterBalancing -> adjust the cursor to a node that is closer to the deleted value. go to Finish
     /// 10. Finish -> Delete operation is done. Return CursorResult(Ok())
     fn delete(&mut self) -> IOResultOr<()> {
+        turso_assert!(
+            self.mvcc_reader.is_none(),
+            "an MVCC table cursor is read-only"
+        );
         self.noted_payload = NotedPayload::NONE;
         self.blob_cache.reset();
         if let CursorState::None = &self.state {
@@ -7040,7 +6987,7 @@ impl CursorTrait for BTreeCursor {
                             self.state = CursorState::None;
                             return Ok(IOResult::Done(()));
                         }
-                    } else if !self.has_record() {
+                    } else if !self.has_record {
                         self.state = CursorState::None;
                         return Ok(IOResult::Done(()));
                     }
@@ -7422,6 +7369,10 @@ impl CursorTrait for BTreeCursor {
     /// this method only clears the tree’s contents. The root page remains
     /// allocated and is reset to an empty leaf page.
     fn clear_btree(&mut self) -> IOResultOr<u64> {
+        turso_assert!(
+            self.mvcc_reader.is_none(),
+            "an MVCC table cursor is read-only"
+        );
         // First entry only — destroy_btree_contents yields IO and resumes
         // through this method, so guard with the same state==None gate it
         // uses for its own state machine. Every page in this btree is about
@@ -7447,6 +7398,10 @@ impl CursorTrait for BTreeCursor {
     /// For cases where the B-Tree should remain allocated but emptied, see [`btree_clear`].
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn btree_destroy(&mut self) -> IOResultOr<Option<usize>> {
+        turso_assert!(
+            self.mvcc_reader.is_none(),
+            "an MVCC table cursor is read-only"
+        );
         // See clear_btree for the state==None gate rationale.
         if matches!(self.state, CursorState::None) {
             self.pager.invalidate_peer_cursors(self);
@@ -7462,6 +7417,431 @@ impl CursorTrait for BTreeCursor {
     ///
     /// Only supposed to be used in the context of a simple Count Select Statement
     fn count(&mut self) -> IOResultOr<usize> {
+        if self.mvcc_reader.is_some() {
+            return self.mvcc_count();
+        }
+        self.btree_count()
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        !self.has_record && !self.row_is_from_version_chain
+    }
+
+    #[inline]
+    fn root_page(&self) -> i64 {
+        self.root_page
+    }
+
+    fn set_root_page(&mut self, root_page: i64) {
+        self.root_page = root_page;
+    }
+
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
+    fn rewind(&mut self) -> IOResultOr<()> {
+        if self.mvcc_reader.is_some() {
+            return self.mvcc_rewind();
+        }
+        self.btree_rewind()
+    }
+
+    #[inline]
+    fn has_rowid(&self) -> bool {
+        match &self.index_info {
+            Some(index_key_info) => index_key_info.has_rowid,
+            None => true,
+        }
+    }
+
+    #[inline]
+    fn invalidate_record(&mut self) {
+        self.noted_payload = NotedPayload::NONE;
+        // SQLite clears BTCF_ValidOvfl on every cursor move: the next row
+        // read parses the cell again and drops the overflow page list and
+        // the kept bytes, which may belong to an earlier version of the row.
+        self.blob_cache.valid = false;
+        if let Some(record) = self.reusable_immutable_record.as_mut() {
+            record.invalidate();
+        }
+    }
+
+    #[inline]
+    fn get_pager(&self) -> Arc<Pager> {
+        self.pager.clone()
+    }
+
+    #[inline]
+    fn get_skip_advance(&self) -> bool {
+        self.skip_advance
+    }
+
+    /// Drop the page stack and auxiliary caches so the cursor will re-navigate
+    /// from the root on its next access. Used when saving the position via
+    /// try_save_position_for_external_balance isn't applicable (the peer
+    /// btree was cleared/destroyed, or the position can't be expressed).
+    /// valid_state stays Valid — only rewind/seek-style entry points are safe
+    /// next; next/prev land on `current_page == -1` and return Done(false).
+    fn invalidate_btree_cache(&mut self) {
+        self.stack.clear();
+        self.has_record = false;
+        self.noted_payload = NotedPayload::NONE;
+        self.move_to_right_state.1 = None;
+        self.invalidate_count_cache();
+        self.blob_cache.reset();
+    }
+
+    fn note_external_row_write(&mut self, rowid: Option<i64>) {
+        // Only cursors that have served incremental blob I/O carry a pin. An unknown
+        // rowid could be the pinned row, so it must expire the handle too — better a
+        // spurious SQLITE_ABORT than byte access to a rewritten value.
+        if let Some(pinned) = self.blob_pinned_rowid {
+            if rowid.is_none_or(|r| r == pinned) {
+                self.blob_expired = true;
+            }
+        }
+    }
+
+    fn register_with_pager(&self) {
+        if self.mvcc_reader.is_some() {
+            return;
+        }
+        // Store before the push so a panic inside register_cursor still
+        // triggers an (idempotent) unregister via Drop.
+        self.did_register
+            .store(true, crate::sync::atomic::Ordering::Relaxed);
+        self.pager.register_cursor(self);
+    }
+
+    fn recycle(self: Box<Self>) {
+        let pager = self.pager.clone();
+        let raw = Box::into_raw(self);
+        // SAFETY: `raw` came from a Box of a live cursor. Its contents are
+        // dropped exactly once here (Drop unregisters the cursor and retires
+        // its record buffer), and the allocation goes on as uninitialized
+        // memory of the same layout.
+        let allocation = unsafe {
+            std::ptr::drop_in_place(raw);
+            Box::from_raw(raw.cast::<std::mem::MaybeUninit<BTreeCursor>>())
+        };
+        pager.recycle_cursor_allocation(allocation);
+    }
+
+    fn set_has_peers_for_external_writes(&self, has_peers: bool) {
+        self.has_peers
+            .store(has_peers, crate::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Mirrors SQLite's saveCursorPosition (btree.c:756). Saves rowid for
+    /// table btrees, the cell record for index btrees; index records can
+    /// yield IO via the overflow chain walk (`record()`). Returns
+    /// [`SavePositionResult::MustInvalidate`] when the page stack is in a
+    /// sentinel/dirty state we can't save from — has_record can lag the stack
+    /// across an in-flight Insert/Delete — in which case the caller falls back
+    /// to invalidate_btree_cache.
+    fn try_save_position_for_external_balance(&mut self) -> IOResultOr<SavePositionResult> {
+        // The peer is about to modify this btree's structure, so any cached
+        // knowledge of the tree shape goes stale: the rightmost page id
+        // (move_to_rightmost's skip-a-seek optimization) and the memoized
+        // count. Positional state is preserved separately via save_context.
+        // Idempotent, so safe across IO re-entry into this function.
+        self.move_to_right_state.1 = None;
+        self.invalidate_count_cache();
+        if self.valid_state != CursorValidState::Valid || !self.has_record {
+            // Nothing to save: cursor has no live position. No invalidation
+            // needed either — the stack is already in a state where the next
+            // entry point will re-navigate from the root.
+            return Ok(IOResult::Done(SavePositionResult::Saved));
+        }
+        // A peer mid-Insert/Delete may not yet have reached its own
+        // save_context-at-balance point, so we can't claim it's saved. Fall
+        // back to invalidation; the peer will re-navigate on next use.
+        if !matches!(self.state, CursorState::None) {
+            return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
+        }
+        if self.stack.current_page < 0
+            || (self.stack.current_page as usize) >= self.stack.stack.len()
+            || self.stack.stack[self.stack.current_page as usize].is_none()
+        {
+            return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
+        }
+        let cell_idx = self.stack.current_cell_index();
+        if cell_idx < 0 {
+            return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
+        }
+        let (is_table, cell_count) = {
+            let page = self.stack.top_ref();
+            let contents = page.get_contents();
+            (contents.page_type()?.is_table(), contents.cell_count())
+        };
+        if (cell_idx as usize) >= cell_count {
+            return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
+        }
+        if is_table {
+            let page = self.stack.top_ref();
+            let contents = page.get_contents();
+            debug_assert!(
+                matches!(contents.page_type(), Ok(PageType::TableLeaf)),
+                "save_position: table cursor with has_record=true must be on a leaf"
+            );
+            let rowid = contents.cell_table_leaf_read_rowid(cell_idx as usize)?;
+            self.save_context(CursorContext {
+                key: CursorContextKey::TableRowId(rowid),
+                seek_op: SeekOp::GE { eq_only: true },
+            });
+            return Ok(IOResult::Done(SavePositionResult::Saved));
+        }
+        // Index btree: yield IO for overflow chains. Allocate to the actual
+        // payload size so wide-key indexes don't keep a page-sized buffer
+        // per saved cursor.
+        let cloned = {
+            let record = return_if_io!(self.record());
+            let record = record.expect("has_record=true but record() returned None");
+            let payload = record.get_payload();
+            let mut owned = crate::with_btree_allocation_site!(
+                SavedCursorRecord,
+                ImmutableRecord::new(payload.len())
+            )?;
+            crate::with_btree_allocation_site!(
+                SavedCursorRecord,
+                owned.start_serialization(payload)
+            )?;
+            owned
+        };
+        self.save_context(CursorContext {
+            key: CursorContextKey::IndexKeyRowId(ImmutableRecordRef::from_owned_record(cloned)),
+            seek_op: SeekOp::GE { eq_only: true },
+        });
+        Ok(IOResult::Done(SavePositionResult::Saved))
+    }
+
+    #[inline]
+    fn has_record(&self) -> bool {
+        self.has_record || self.row_is_from_version_chain
+    }
+
+    #[inline]
+    fn set_has_record(&mut self, has_record: bool) {
+        self.has_record = has_record
+    }
+
+    #[inline]
+    fn index_info(&self) -> Option<&Arc<IndexInfo>> {
+        self.index_info.as_ref()
+    }
+
+    fn is_mvcc(&self) -> bool {
+        self.mvcc_reader.is_some()
+    }
+
+    fn seek_end(&mut self) -> IOResultOr<()> {
+        turso_assert!(
+            self.mvcc_reader.is_none(),
+            "an MVCC table cursor is read-only"
+        );
+        if self.valid_state == CursorValidState::Invalid {
+            return Ok(IOResult::Done(()));
+        }
+        loop {
+            match self.seek_end_state {
+                SeekEndState::Start => {
+                    self.clear_saved_seek();
+                    let c = return_if_io!(self.move_to_root_nonblock());
+                    self.seek_end_state = SeekEndState::ProcessPage;
+                    if let Some(c) = c {
+                        io_yield_one!(c);
+                    }
+                }
+                SeekEndState::ProcessPage => {
+                    let mem_page = self.stack.top_ref();
+                    let contents = mem_page.get_contents();
+                    if contents.is_leaf() {
+                        // set cursor just past the last cell to append
+                        self.stack.set_cell_index(contents.cell_count() as i32);
+                        self.seek_end_state = SeekEndState::Start;
+                        return Ok(IOResult::Done(()));
+                    }
+
+                    match contents.rightmost_pointer()? {
+                        Some(right_most_pointer) => {
+                            let (child, c) =
+                                return_if_io!(self.read_page(right_most_pointer as i64));
+                            self.stack.set_cell_index(contents.cell_count() as i32 + 1); // invalid on interior
+                            self.stack.push(child)?;
+                            if let Some(c) = c {
+                                io_yield_one!(c);
+                            }
+                        }
+                        None => unreachable!("interior page must have rightmost pointer"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
+    fn seek_to_last(&mut self) -> IOResultOr<()> {
+        if self.mvcc_reader.is_some() {
+            return self.mvcc_last();
+        }
+        loop {
+            match self.seek_to_last_state {
+                SeekToLastState::Start => {
+                    // A write through another cursor may save this cursor's old
+                    // position. We need the current largest rowid, not that old
+                    // position. Otherwise rowid() restores the old position.
+                    self.clear_saved_seek();
+                    let has_record = return_if_io!(self.move_to_rightmost());
+                    self.invalidate_record();
+                    self.set_has_record(has_record);
+                    self.read_overflow_state = None;
+                    if !has_record {
+                        self.seek_to_last_state = SeekToLastState::IsEmpty;
+                        continue;
+                    }
+                    return Ok(IOResult::Done(()));
+                }
+                SeekToLastState::IsEmpty => {
+                    let is_empty = return_if_io!(self.is_empty_table());
+                    turso_assert!(is_empty);
+                    self.seek_to_last_state = SeekToLastState::Start;
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+}
+
+impl BTreeCursor {
+    fn btree_next(&mut self) -> IOResultOr<()> {
+        if self.can_advance_within_leaf() {
+            self.stack.advance();
+            self.invalidate_record();
+            return Ok(IOResult::Done(()));
+        }
+        if self.is_on_last_cell_of_tree() {
+            self.stack.advance();
+            self.invalidate_record();
+            self.set_has_record(false);
+            return Ok(IOResult::Done(()));
+        }
+        if self.valid_state == CursorValidState::Invalid {
+            return Ok(IOResult::Done(()));
+        }
+        loop {
+            match self.advance_state {
+                AdvanceState::Start => {
+                    return_if_io!(self.restore_context());
+                    // Set by DeleteState::RestoreContextAfterBalancing and by
+                    // restore_context on NotFound: the cursor is already at
+                    // the right iteration target, so return it without
+                    // advancing. If the landed cell has no record (past
+                    // EOF), fall through to Advance.
+                    if self.skip_advance {
+                        self.skip_advance = false;
+                        if self.stack.current_page >= 0 {
+                            let mem_page = self.stack.top_ref();
+                            let contents = mem_page.get_contents();
+                            let cell_idx = self.stack.current_cell_index();
+                            let cell_count = contents.cell_count();
+                            let has_record = cell_idx >= 0 && cell_idx < cell_count as i32;
+                            if has_record {
+                                self.set_has_record(true);
+                                self.read_overflow_state = None;
+                                return Ok(IOResult::Done(()));
+                            }
+                        }
+                    }
+                    self.advance_state = AdvanceState::Advance;
+                }
+                AdvanceState::Advance => {
+                    return_if_io!(self.get_next_record());
+                    self.advance_state = AdvanceState::Start;
+                    self.read_overflow_state = None;
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+
+    fn btree_last(&mut self) -> IOResultOr<()> {
+        self.set_null_flag(false);
+        if self.valid_state == CursorValidState::Invalid {
+            return Ok(IOResult::Done(()));
+        }
+        self.clear_saved_seek();
+        let cursor_has_record = return_if_io!(self.move_to_rightmost());
+        self.set_has_record(cursor_has_record);
+        self.invalidate_record();
+        self.read_overflow_state = None;
+        Ok(IOResult::Done(()))
+    }
+
+    fn btree_prev(&mut self) -> IOResultOr<()> {
+        loop {
+            match self.advance_state {
+                AdvanceState::Start => {
+                    return_if_io!(self.restore_context());
+                    // skip_advance only tells a forward step to stay put. A
+                    // backward step from the cell after a deleted row is
+                    // already right, and it must consume the flag so a later
+                    // next() advances normally. Matches btreePrevious(),
+                    // which clears CURSOR_SKIPNEXT (btree.c:6439-6442).
+                    self.skip_advance = false;
+                    self.advance_state = AdvanceState::Advance;
+                }
+                AdvanceState::Advance => {
+                    return_if_io!(self.get_prev_record());
+                    self.advance_state = AdvanceState::Start;
+                    self.read_overflow_state = None;
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+
+    fn btree_seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
+        self.skip_advance = false;
+        // Empty trace to capture the span information
+        tracing::trace!("");
+        // We need to clear the null flag for the table cursor before seeking,
+        // because it might have been set to false by an unmatched left-join row during the previous iteration
+        // on the outer loop.
+        self.set_null_flag(false);
+        let seek_result = return_if_io!(self.do_seek(key, op));
+        self.invalidate_record();
+        // Reset seek state
+        self.seek_state = CursorSeekState::Start;
+        self.valid_state = CursorValidState::Valid;
+        self.read_overflow_state = None;
+        Ok(IOResult::Done(seek_result))
+    }
+
+    fn btree_rewind(&mut self) -> IOResultOr<()> {
+        self.set_null_flag(false);
+        if self.valid_state == CursorValidState::Invalid {
+            return Ok(IOResult::Done(()));
+        }
+        self.clear_saved_seek();
+        loop {
+            match self.rewind_state {
+                RewindState::Start => {
+                    let c = return_if_io!(self.move_to_root_nonblock());
+                    self.rewind_state = RewindState::NextRecord;
+                    if let Some(c) = c {
+                        io_yield_one!(c);
+                    }
+                }
+                RewindState::NextRecord => {
+                    return_if_io!(self.get_next_record());
+                    self.rewind_state = RewindState::Start;
+                    self.read_overflow_state = None;
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+
+    fn btree_count(&mut self) -> IOResultOr<usize> {
         let mut mem_page;
         let mut contents;
 
@@ -7609,299 +7989,6 @@ impl CursorTrait for BTreeCursor {
         }
     }
 
-    #[inline]
-    fn is_empty(&self) -> bool {
-        !self.has_record
-    }
-
-    #[inline]
-    fn root_page(&self) -> i64 {
-        self.root_page
-    }
-
-    fn set_root_page(&mut self, root_page: i64) {
-        self.root_page = root_page;
-    }
-
-    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
-    fn rewind(&mut self) -> IOResultOr<()> {
-        self.set_null_flag(false);
-        if self.valid_state == CursorValidState::Invalid {
-            return Ok(IOResult::Done(()));
-        }
-        self.clear_saved_seek();
-        loop {
-            match self.rewind_state {
-                RewindState::Start => {
-                    let c = return_if_io!(self.move_to_root_nonblock());
-                    self.rewind_state = RewindState::NextRecord;
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                RewindState::NextRecord => {
-                    return_if_io!(self.get_next_record());
-                    self.rewind_state = RewindState::Start;
-                    self.read_overflow_state = None;
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
-    }
-
-    #[inline]
-    fn has_rowid(&self) -> bool {
-        match &self.index_info {
-            Some(index_key_info) => index_key_info.has_rowid,
-            None => true,
-        }
-    }
-
-    #[inline]
-    fn invalidate_record(&mut self) {
-        self.noted_payload = NotedPayload::NONE;
-        // SQLite clears BTCF_ValidOvfl on every cursor move: the next row
-        // read parses the cell again and drops the overflow page list and
-        // the kept bytes, which may belong to an earlier version of the row.
-        self.blob_cache.valid = false;
-        if let Some(record) = self.reusable_immutable_record.as_mut() {
-            record.invalidate();
-        }
-    }
-
-    #[inline]
-    fn get_pager(&self) -> Arc<Pager> {
-        self.pager.clone()
-    }
-
-    #[inline]
-    fn get_skip_advance(&self) -> bool {
-        self.skip_advance
-    }
-
-    /// Drop the page stack and auxiliary caches so the cursor will re-navigate
-    /// from the root on its next access. Used when saving the position via
-    /// try_save_position_for_external_balance isn't applicable (the peer
-    /// btree was cleared/destroyed, or the position can't be expressed).
-    /// valid_state stays Valid — only rewind/seek-style entry points are safe
-    /// next; next/prev land on `current_page == -1` and return Done(false).
-    fn invalidate_btree_cache(&mut self) {
-        self.stack.clear();
-        self.has_record = false;
-        self.noted_payload = NotedPayload::NONE;
-        self.move_to_right_state.1 = None;
-        self.invalidate_count_cache();
-        self.blob_cache.reset();
-    }
-
-    fn note_external_row_write(&mut self, rowid: Option<i64>) {
-        // Only cursors that have served incremental blob I/O carry a pin. An unknown
-        // rowid could be the pinned row, so it must expire the handle too — better a
-        // spurious SQLITE_ABORT than byte access to a rewritten value.
-        if let Some(pinned) = self.blob_pinned_rowid {
-            if rowid.is_none_or(|r| r == pinned) {
-                self.blob_expired = true;
-            }
-        }
-    }
-
-    fn register_with_pager(&self) {
-        // Store before the push so a panic inside register_cursor still
-        // triggers an (idempotent) unregister via Drop.
-        self.did_register
-            .store(true, crate::sync::atomic::Ordering::Relaxed);
-        self.pager.register_cursor(self);
-    }
-
-    fn recycle(self: Box<Self>) {
-        let pager = self.pager.clone();
-        let raw = Box::into_raw(self);
-        // SAFETY: `raw` came from a Box of a live cursor. Its contents are
-        // dropped exactly once here (Drop unregisters the cursor and retires
-        // its record buffer), and the allocation goes on as uninitialized
-        // memory of the same layout.
-        let allocation = unsafe {
-            std::ptr::drop_in_place(raw);
-            Box::from_raw(raw.cast::<std::mem::MaybeUninit<BTreeCursor>>())
-        };
-        pager.recycle_cursor_allocation(allocation);
-    }
-
-    fn set_has_peers_for_external_writes(&self, has_peers: bool) {
-        self.has_peers
-            .store(has_peers, crate::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Mirrors SQLite's saveCursorPosition (btree.c:756). Saves rowid for
-    /// table btrees, the cell record for index btrees; index records can
-    /// yield IO via the overflow chain walk (`record()`). Returns
-    /// [`SavePositionResult::MustInvalidate`] when the page stack is in a
-    /// sentinel/dirty state we can't save from — has_record can lag the stack
-    /// across an in-flight Insert/Delete — in which case the caller falls back
-    /// to invalidate_btree_cache.
-    fn try_save_position_for_external_balance(&mut self) -> IOResultOr<SavePositionResult> {
-        // The peer is about to modify this btree's structure, so any cached
-        // knowledge of the tree shape goes stale: the rightmost page id
-        // (move_to_rightmost's skip-a-seek optimization) and the memoized
-        // count. Positional state is preserved separately via save_context.
-        // Idempotent, so safe across IO re-entry into this function.
-        self.move_to_right_state.1 = None;
-        self.invalidate_count_cache();
-        if self.valid_state != CursorValidState::Valid || !self.has_record() {
-            // Nothing to save: cursor has no live position. No invalidation
-            // needed either — the stack is already in a state where the next
-            // entry point will re-navigate from the root.
-            return Ok(IOResult::Done(SavePositionResult::Saved));
-        }
-        // A peer mid-Insert/Delete may not yet have reached its own
-        // save_context-at-balance point, so we can't claim it's saved. Fall
-        // back to invalidation; the peer will re-navigate on next use.
-        if !matches!(self.state, CursorState::None) {
-            return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
-        }
-        if self.stack.current_page < 0
-            || (self.stack.current_page as usize) >= self.stack.stack.len()
-            || self.stack.stack[self.stack.current_page as usize].is_none()
-        {
-            return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
-        }
-        let cell_idx = self.stack.current_cell_index();
-        if cell_idx < 0 {
-            return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
-        }
-        let (is_table, cell_count) = {
-            let page = self.stack.top_ref();
-            let contents = page.get_contents();
-            (contents.page_type()?.is_table(), contents.cell_count())
-        };
-        if (cell_idx as usize) >= cell_count {
-            return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
-        }
-        if is_table {
-            let page = self.stack.top_ref();
-            let contents = page.get_contents();
-            debug_assert!(
-                matches!(contents.page_type(), Ok(PageType::TableLeaf)),
-                "save_position: table cursor with has_record=true must be on a leaf"
-            );
-            let rowid = contents.cell_table_leaf_read_rowid(cell_idx as usize)?;
-            self.save_context(CursorContext {
-                key: CursorContextKey::TableRowId(rowid),
-                seek_op: SeekOp::GE { eq_only: true },
-            });
-            return Ok(IOResult::Done(SavePositionResult::Saved));
-        }
-        // Index btree: yield IO for overflow chains. Allocate to the actual
-        // payload size so wide-key indexes don't keep a page-sized buffer
-        // per saved cursor.
-        let cloned = {
-            let record = return_if_io!(self.record());
-            let record = record.expect("has_record=true but record() returned None");
-            let payload = record.get_payload();
-            let mut owned = crate::with_btree_allocation_site!(
-                SavedCursorRecord,
-                ImmutableRecord::new(payload.len())
-            )?;
-            crate::with_btree_allocation_site!(
-                SavedCursorRecord,
-                owned.start_serialization(payload)
-            )?;
-            owned
-        };
-        self.save_context(CursorContext {
-            key: CursorContextKey::IndexKeyRowId(ImmutableRecordRef::from_owned_record(cloned)),
-            seek_op: SeekOp::GE { eq_only: true },
-        });
-        Ok(IOResult::Done(SavePositionResult::Saved))
-    }
-
-    #[inline]
-    fn has_record(&self) -> bool {
-        self.has_record
-    }
-
-    #[inline]
-    fn set_has_record(&mut self, has_record: bool) {
-        self.has_record = has_record
-    }
-
-    #[inline]
-    fn index_info(&self) -> Option<&Arc<IndexInfo>> {
-        self.index_info.as_ref()
-    }
-
-    fn seek_end(&mut self) -> IOResultOr<()> {
-        if self.valid_state == CursorValidState::Invalid {
-            return Ok(IOResult::Done(()));
-        }
-        loop {
-            match self.seek_end_state {
-                SeekEndState::Start => {
-                    self.clear_saved_seek();
-                    let c = return_if_io!(self.move_to_root_nonblock());
-                    self.seek_end_state = SeekEndState::ProcessPage;
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                SeekEndState::ProcessPage => {
-                    let mem_page = self.stack.top_ref();
-                    let contents = mem_page.get_contents();
-                    if contents.is_leaf() {
-                        // set cursor just past the last cell to append
-                        self.stack.set_cell_index(contents.cell_count() as i32);
-                        self.seek_end_state = SeekEndState::Start;
-                        return Ok(IOResult::Done(()));
-                    }
-
-                    match contents.rightmost_pointer()? {
-                        Some(right_most_pointer) => {
-                            let (child, c) =
-                                return_if_io!(self.read_page(right_most_pointer as i64));
-                            self.stack.set_cell_index(contents.cell_count() as i32 + 1); // invalid on interior
-                            self.stack.push(child)?;
-                            if let Some(c) = c {
-                                io_yield_one!(c);
-                            }
-                        }
-                        None => unreachable!("interior page must have rightmost pointer"),
-                    }
-                }
-            }
-        }
-    }
-
-    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
-    fn seek_to_last(&mut self) -> IOResultOr<()> {
-        loop {
-            match self.seek_to_last_state {
-                SeekToLastState::Start => {
-                    // A write through another cursor may save this cursor's old
-                    // position. We need the current largest rowid, not that old
-                    // position. Otherwise rowid() restores the old position.
-                    self.clear_saved_seek();
-                    let has_record = return_if_io!(self.move_to_rightmost());
-                    self.invalidate_record();
-                    self.set_has_record(has_record);
-                    self.read_overflow_state = None;
-                    if !has_record {
-                        self.seek_to_last_state = SeekToLastState::IsEmpty;
-                        continue;
-                    }
-                    return Ok(IOResult::Done(()));
-                }
-                SeekToLastState::IsEmpty => {
-                    let is_empty = return_if_io!(self.is_empty_table());
-                    turso_assert!(is_empty);
-                    self.seek_to_last_state = SeekToLastState::Start;
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
-    }
-}
-
-impl BTreeCursor {
     /// The bytes of the current record that are stored on the b-tree page,
     /// and the size of the whole record. The two differ when the record
     /// spills into overflow pages; `read_payload` reads any part of it.
@@ -7990,8 +8077,8 @@ impl BTreeCursor {
         if self.needs_restore() {
             return restore_and_fetch_payload(self);
         }
-        if self.null_flag || !self.has_record() {
-            return Ok(IOResult::Done(None));
+        if self.null_flag || !self.has_record {
+            return Ok(IOResult::Done(self.version_chain_payload()));
         }
         let noted = self.noted_payload;
         if noted.size != 0 {

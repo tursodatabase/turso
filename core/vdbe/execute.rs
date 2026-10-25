@@ -107,7 +107,7 @@ use turso_macros::turso_debug_assert;
 
 use crate::pseudo::PseudoCursor;
 
-use crate::storage::btree::{BTreeCursor, BTreeKey};
+use crate::storage::btree::{BTreeCursor, BTreeKey, MvccReader};
 
 #[inline]
 fn btree_cursor_with_yield_context(
@@ -1531,7 +1531,7 @@ pub fn op_open_read(
                 )
                 .into());
             }
-            let btree_cursor: Box<BTreeCursor> = if table.has_rowid {
+            let mut btree_cursor: Box<BTreeCursor> = if table.has_rowid {
                 BTreeCursor::new_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
@@ -1547,11 +1547,22 @@ pub fn op_open_read(
                 )
                 .into_boxed()
             };
-            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
+            if let (Some(mv_store), Some(tx_id)) = (
+                mv_store.as_ref(),
+                program.connection.get_mv_tx_id_for_db(*db),
+            ) {
+                btree_cursor = btree_cursor_with_yield_context(btree_cursor, &program.connection);
+                btree_cursor.read_mvcc_table(MvccReader::new(
+                    mv_store.clone(),
+                    &program.connection,
+                    tx_id,
+                    *root_page,
+                )?);
+            }
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(cursor.into_cursor());
+                .replace(Cursor::new_btree(btree_cursor));
         }
         CursorType::BTreeIndex(index) => {
             let btree_cursor = BTreeCursor::new_index_boxed(
@@ -14538,7 +14549,9 @@ pub fn op_open_write(
 
     // Reuse the existing cursor if the root_page matches (same table/index)
     let can_reuse_cursor = match cursors.get(*cursor_id) {
-        Some(Some(Cursor::BTree(btree_cursor, ..))) => btree_cursor.root_page() == root_page,
+        Some(Some(Cursor::BTree(btree_cursor, ..))) => {
+            !btree_cursor.is_mvcc() && btree_cursor.root_page() == root_page
+        }
         Some(Some(Cursor::Dyn(btree_cursor, ..))) => btree_cursor.root_page() == root_page,
         _ => false,
     };
