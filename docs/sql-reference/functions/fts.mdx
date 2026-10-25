@@ -185,9 +185,11 @@ The query string passed to `fts_match` and `fts_score` supports Tantivy's query 
 | Syntax | Example | Description |
 |--------|---------|-------------|
 | Phrase search | `'"exact phrase"'` | Match the exact phrase |
-| Prefix search | `'data*'` | Match terms starting with "data" |
+| Prefix search | `'data*'` or `'"data"*'` | Match terms starting with "data" |
 | Column-specific | `'title:database'` | Match "database" only in the `title` field |
 | Boosting | `'title:database^2'` | Boost matches in `title` by a factor of 2 |
+
+Single-term prefixes use the selected field’s tokenizer and match indexed terms with that prefix. Matches use BM25 scoring, including field weights and query boosts. Each prefix can expand to at most 50 distinct field/term pairs across the current index snapshot. A query that exceeds this limit returns an error; use a longer prefix to narrow it. Repeated terms across segments count once per field.
 
 ### Examples
 
