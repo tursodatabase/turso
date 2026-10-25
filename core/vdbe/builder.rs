@@ -251,6 +251,9 @@ pub struct ProgramBuilder {
     explain: ExplainInfo,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
+    /// What `Statement::get_column_type_info` reports for each result column. Only
+    /// filled in when custom types are enabled.
+    pub result_column_types: Vec<Option<crate::statement::ColumnTypeInfo>>,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
     /// Registry of materialized CTEs, keyed by cte_id.
@@ -786,6 +789,7 @@ impl ProgramBuilder {
             explain: ExplainInfo::default(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
+            result_column_types: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
             collation: None,
             nested_level: 0,
@@ -2495,6 +2499,7 @@ impl ProgramBuilder {
             change_cnt_on,
             readonly: self.flags.readonly(),
             result_columns: self.result_columns,
+            result_column_types: self.result_column_types,
             table_references: self.table_references,
             sql: sql.to_string(),
             refreshes_analyze_stats: sql

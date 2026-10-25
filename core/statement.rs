@@ -167,183 +167,6 @@ pub enum ColumnTypeKind {
     Union,
 }
 
-/// Recursively infer the result primitive of a non-table-column expression
-/// and return its uppercase name (`"INTEGER"`, `"REAL"`, `"TEXT"`,
-/// `"NUMERIC"`, `"BLOB"`) or `None` when no determination can be made.
-///
-/// Used by [`Statement::get_column_type_info`] to give wire-protocol layers
-/// a usable type for `SELECT 1+1`-style result columns. Goes beyond SQLite's
-/// `get_expr_affinity` (which deliberately stops at binary operators because
-/// SQLite's affinity model is about *column* coercion, not expression
-/// inference) by walking through arithmetic, bitwise, comparison, logical,
-/// and concat operators — letting `SELECT 42 + 1` report INT4 to a
-/// PostgreSQL client the way PG itself does.
-fn infer_expression_primitive(
-    expr: &turso_parser::ast::Expr,
-    referenced_tables: Option<&translate::plan::TableReferences>,
-) -> Option<&'static str> {
-    use crate::function::ScalarFunc;
-    use turso_parser::ast::{Expr, Operator, UnaryOperator};
-
-    match expr {
-        // Bare literal: read the parsed concrete value type.
-        Expr::Literal(lit) => match translate::alter::literal_default_value(lit)
-            .ok()?
-            .value_type()
-        {
-            crate::types::ValueType::Integer => Some("INTEGER"),
-            crate::types::ValueType::Float => Some("REAL"),
-            crate::types::ValueType::Text => Some("TEXT"),
-            _ => None,
-        },
-        Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            infer_expression_primitive(exprs.first().unwrap(), referenced_tables)
-        }
-        Expr::Collate(inner, _) => infer_expression_primitive(inner, referenced_tables),
-        Expr::Unary(op, inner) => match op {
-            UnaryOperator::Not | UnaryOperator::BitwiseNot => Some("INTEGER"),
-            UnaryOperator::Negative => Some(combine_arithmetic_primitive(
-                Some("INTEGER"),
-                infer_expression_primitive(inner, referenced_tables),
-            )),
-            UnaryOperator::Positive => infer_expression_primitive(inner, referenced_tables),
-        },
-        Expr::Binary(left, op, right) => match op {
-            // Arithmetic: widen INTEGER × INTEGER to INTEGER, anything mixed
-            // with REAL becomes REAL, fall through to NUMERIC otherwise.
-            Operator::Add
-            | Operator::Subtract
-            | Operator::Multiply
-            | Operator::Divide
-            | Operator::Modulus => {
-                let l = infer_expression_primitive(left, referenced_tables);
-                let r = infer_expression_primitive(right, referenced_tables);
-                Some(combine_arithmetic_primitive(l, r))
-            }
-            // Bitwise: result is always INTEGER in both SQLite and PG.
-            Operator::BitwiseAnd
-            | Operator::BitwiseOr
-            | Operator::BitwiseNot
-            | Operator::LeftShift
-            | Operator::RightShift => Some("INTEGER"),
-            // Comparison and logical: SQLite returns 0/1 INTEGER; tursopg
-            // maps INTEGER to BOOL at the wire layer for boolean columns,
-            // but the type the wire layer reports is still INTEGER here.
-            Operator::Equals
-            | Operator::NotEquals
-            | Operator::Less
-            | Operator::LessEquals
-            | Operator::Greater
-            | Operator::GreaterEquals
-            | Operator::Is
-            | Operator::IsNot
-            | Operator::And
-            | Operator::Or
-            | Operator::ArrayContains
-            | Operator::ArrayOverlap => Some("INTEGER"),
-            // Concat is always TEXT.
-            Operator::Concat => Some("TEXT"),
-            // JSON ops fall through to the affinity machinery — `->` returns
-            // JSON / blob, `->>` returns TEXT; the existing affinity rules
-            // give the correct answer.
-            Operator::ArrowRight | Operator::ArrowRightShift => affinity_to_primitive(
-                translate::expr::get_expr_affinity(expr, referenced_tables, None),
-            ),
-        },
-        Expr::RowId { .. } => Some("INTEGER"),
-        Expr::Case {
-            when_then_pairs,
-            else_expr,
-            ..
-        } => common_primitive(
-            when_then_pairs
-                .iter()
-                .map(|(_, then)| then.as_ref())
-                .chain(else_expr.as_deref()),
-            referenced_tables,
-        ),
-        Expr::FunctionCall { name, args, .. } => {
-            match crate::function::Func::resolve_function(name.as_str(), args.len()) {
-                Ok(Some(crate::function::Func::Scalar(
-                    ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Max | ScalarFunc::Min,
-                ))) => common_primitive(args.iter().map(|arg| arg.as_ref()), referenced_tables),
-                Ok(Some(crate::function::Func::Scalar(ScalarFunc::Nullif))) => {
-                    infer_expression_primitive(&args[0], referenced_tables)
-                }
-                Ok(Some(crate::function::Func::Scalar(ScalarFunc::Abs))) => {
-                    Some(combine_arithmetic_primitive(
-                        Some("INTEGER"),
-                        infer_expression_primitive(&args[0], referenced_tables),
-                    ))
-                }
-                _ => None,
-            }
-        }
-        // CAST, column references, and anything else: defer to the affinity
-        // machinery, which handles these shapes correctly.
-        _ => affinity_to_primitive(translate::expr::get_expr_affinity(
-            expr,
-            referenced_tables,
-            None,
-        )),
-    }
-}
-
-/// The type that every non-NULL expression can be converted to, following
-/// PostgreSQL's rule for CASE branches and COALESCE arguments: mixed numeric
-/// types widen the way arithmetic does, any other mix has no common type.
-fn common_primitive<'a>(
-    exprs: impl Iterator<Item = &'a turso_parser::ast::Expr>,
-    referenced_tables: Option<&translate::plan::TableReferences>,
-) -> Option<&'static str> {
-    use turso_parser::ast::{Expr, Literal};
-
-    let is_numeric = |primitive| matches!(primitive, "INTEGER" | "REAL" | "NUMERIC");
-    let mut common = None;
-    for expr in exprs.filter(|expr| !matches!(expr, Expr::Literal(Literal::Null))) {
-        let primitive = infer_expression_primitive(expr, referenced_tables)?;
-        common = match common {
-            None => Some(primitive),
-            Some(common) if common == primitive => Some(common),
-            Some(common) if is_numeric(common) && is_numeric(primitive) => {
-                Some(combine_arithmetic_primitive(Some(common), Some(primitive)))
-            }
-            Some(_) => return None,
-        };
-    }
-    common
-}
-
-/// Map [`crate::vdbe::affinity::Affinity`] to the uppercase primitive name
-/// `infer_expression_primitive` returns. `Blob` collapses to `None` because
-/// SQLite's "no determined affinity" sentinel isn't a usable wire type.
-fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'static str> {
-    match affinity {
-        crate::vdbe::affinity::Affinity::Integer => Some("INTEGER"),
-        crate::vdbe::affinity::Affinity::Real => Some("REAL"),
-        crate::vdbe::affinity::Affinity::Text => Some("TEXT"),
-        crate::vdbe::affinity::Affinity::Numeric => Some("NUMERIC"),
-        crate::vdbe::affinity::Affinity::Blob | crate::vdbe::affinity::Affinity::None => None,
-    }
-}
-
-/// Pick the widening primitive for an arithmetic binary op given each
-/// operand's inferred primitive. `INTEGER + INTEGER -> INTEGER`,
-/// `INTEGER + REAL -> REAL`, everything else collapses to `NUMERIC` (the
-/// safe wire default for a mixed-affinity numeric result).
-fn combine_arithmetic_primitive(
-    left: Option<&'static str>,
-    right: Option<&'static str>,
-) -> &'static str {
-    match (left, right) {
-        (Some("INTEGER"), Some("INTEGER")) => "INTEGER",
-        (Some("INTEGER"), Some("REAL"))
-        | (Some("REAL"), Some("INTEGER"))
-        | (Some("REAL"), Some("REAL")) => "REAL",
-        _ => "NUMERIC",
-    }
-}
-
 pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
@@ -1357,9 +1180,9 @@ impl Statement {
     /// This is Turso's single entry point for "what is the type of this
     /// column?" — covering both **direct table-column references** (where the
     /// schema carries declared name, array depth, custom-type kind, and the
-    /// resolved primitive) and **computed expressions** (where the SQLite-
-    /// style affinity machinery infers a primitive type from the expression
-    /// shape). One call, one shape, regardless of which path applies.
+    /// resolved primitive) and **computed expressions** (which report the
+    /// primitive behind the expression's type). The answer is worked out
+    /// when the statement is compiled.
     ///
     /// ### Return value
     ///
@@ -1370,8 +1193,9 @@ impl Statement {
     ///   before they can rely on it.
     /// - `Ok(None)` when the statement is in EXPLAIN mode, when `idx` is out
     ///   of bounds, when the result column has no schema column behind it
-    ///   AND the affinity machinery returns `BLOB` (i.e. "no determined
-    ///   affinity"), or when a join/CTE reference can't be resolved.
+    ///   and its value may be a blob or anything (including arithmetic on a
+    ///   custom type, whose operator decides the result), or when a join/CTE
+    ///   reference can't be resolved.
     /// - `Ok(Some(info))` otherwise. For a table-column reference, `info`
     ///   carries the declared name verbatim; for an expression, `declared_name`
     ///   is the inferred-affinity primitive (`"INTEGER"`, `"TEXT"`, `"REAL"`,
@@ -1389,85 +1213,7 @@ impl Statement {
         if self.query_mode != QueryMode::Normal {
             return Ok(None);
         }
-        let Some(column) = self.program.result_columns.get(idx) else {
-            return Ok(None);
-        };
-        // Direct table-column reference: pull declared name, array depth, and
-        // any registered CREATE TYPE / CREATE DOMAIN resolution out of the
-        // schema. Anything else falls through to the expression-affinity
-        // inference path below.
-        if let turso_parser::ast::Expr::Column {
-            table,
-            column: column_idx,
-            ..
-        } = &column.expr
-        {
-            let Some((_, table_ref)) = self
-                .program
-                .table_references
-                .find_table_by_internal_id(*table)
-            else {
-                return Ok(None);
-            };
-            let Some(table_column) = table_ref.get_column_at(*column_idx) else {
-                return Ok(None);
-            };
-            let declared_name = table_column.ty_str.clone();
-            let array_dimensions = table_column.array_dimensions();
-            let schema = self.program.connection.schema.read();
-            let resolved = schema
-                .resolve_type(&declared_name, table_ref.is_strict())
-                .ok()
-                .flatten();
-            // `kind` is computed from the leaf TypeDef in the resolution chain:
-            // STRUCT and UNION are tagged on `TypeDefKind`, DOMAIN is tagged
-            // separately on `TypeDef.is_domain`, and anything else registered
-            // through CREATE TYPE is a Custom. A column whose declared name
-            // does not appear in the type registry is a Builtin.
-            let (base_type, kind) = match resolved {
-                Some(resolved) => {
-                    let leaf = resolved.leaf();
-                    let kind = if leaf.is_struct() {
-                        ColumnTypeKind::Struct
-                    } else if leaf.is_union() {
-                        ColumnTypeKind::Union
-                    } else if leaf.is_domain {
-                        ColumnTypeKind::Domain
-                    } else {
-                        ColumnTypeKind::Custom
-                    };
-                    (Some(resolved.primitive.to_uppercase()), kind)
-                }
-                None => (None, ColumnTypeKind::Builtin),
-            };
-            drop(schema);
-            return Ok(Some(ColumnTypeInfo {
-                declared_name,
-                array_dimensions,
-                base_type,
-                kind,
-            }));
-        }
-        // Not a table column: infer the result primitive from the
-        // expression's shape (literal value type, operand types of a binary
-        // op, the CAST target, etc.).
-        let Some(name) =
-            infer_expression_primitive(&column.expr, Some(&self.program.table_references))
-        else {
-            return Ok(None);
-        };
-        Ok(Some(ColumnTypeInfo {
-            declared_name: name.to_string(),
-            array_dimensions: match &column.expr {
-                turso_parser::ast::Expr::Cast {
-                    type_name: Some(ty),
-                    ..
-                } => ty.array_dimensions,
-                _ => 0,
-            },
-            base_type: None,
-            kind: ColumnTypeKind::Builtin,
-        }))
+        Ok(self.program.result_column_types.get(idx).cloned().flatten())
     }
 
     /// Returns the type affinity name of a result column (e.g., "INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC").
@@ -1927,6 +1673,22 @@ impl Drop for Statement {
             self.program.connection.end_nested();
             self.nested_guard_active = false;
         }
+    }
+}
+
+/// The uppercase primitive name (`"INTEGER"`, `"REAL"`, `"NUMERIC"`, `"TEXT"`) that
+/// [`Statement::get_column_type_info`] reports for an expression of this type, or
+/// None when there is no single one. A custom type reports the primitive its name
+/// implies under SQLite's affinity rules.
+/// `Blob` gives None because it is SQLite's "no affinity", not a usable wire type.
+fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'static str> {
+    use crate::vdbe::affinity::Affinity;
+    match affinity {
+        Affinity::Integer => Some("INTEGER"),
+        Affinity::Real => Some("REAL"),
+        Affinity::Numeric => Some("NUMERIC"),
+        Affinity::Text => Some("TEXT"),
+        Affinity::Blob | Affinity::None => None,
     }
 }
 

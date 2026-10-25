@@ -408,6 +408,8 @@ mod tests {
             ("CASE WHEN x = 1 THEN label ELSE 0 END", None),
             ("CASE WHEN x = 1 THEN NULL END", None),
             ("coalesce(x, randomblob(8))", None),
+            ("iif(x = 1, x, 2)", Some("INTEGER")),
+            ("iif(x = 1, label, 'other')", Some("TEXT")),
         ];
 
         let mut mismatches = Vec::new();
@@ -430,6 +432,53 @@ mod tests {
             "CASE and function result types are wrong:\n{}",
             mismatches.join("\n")
         );
+    }
+
+    /// Aggregates that return one of their input values have that value's type.
+    #[test]
+    fn type_info_for_aggregates_that_return_an_input_value() {
+        let db = fresh_db_with_custom_types("type_info_aggregates.db");
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER, ratio REAL) STRICT")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT max(x), min(ratio), array_agg(x) FROM t")
+            .unwrap();
+        assert_eq!(expect_info(&stmt, 0).declared_name, "INTEGER");
+        assert_eq!(expect_info(&stmt, 1).declared_name, "REAL");
+        let array_agg = expect_info(&stmt, 2);
+        assert_eq!(array_agg.declared_name, "INTEGER");
+        assert_eq!(array_agg.array_dimensions, 1);
+    }
+
+    /// An expression of a custom type that isn't a column reports the primitive
+    /// the type is stored as, not one guessed from the type's name. Arithmetic on
+    /// a custom type reports nothing, because the type's operator decides the
+    /// result.
+    #[test]
+    fn type_info_for_custom_type_expressions() {
+        let db = fresh_db_with_custom_types("type_info_custom_expressions.db");
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+            .unwrap();
+        conn.execute("CREATE TYPE rev BASE text ENCODE value DECODE value")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE accounts(id INTEGER PRIMARY KEY, amount cents, code rev) STRICT",
+        )
+        .unwrap();
+
+        let stmt = conn
+            .prepare(
+                "SELECT CAST(id AS cents), CAST(id AS rev), coalesce(code, code), amount + 1 \
+                 FROM accounts",
+            )
+            .unwrap();
+        assert_eq!(expect_info(&stmt, 0).declared_name, "INTEGER");
+        assert_eq!(expect_info(&stmt, 1).declared_name, "TEXT");
+        assert_eq!(expect_info(&stmt, 2).declared_name, "TEXT");
+        assert!(stmt.get_column_type_info(3).unwrap().is_none());
     }
 
     /// Expressions whose primitive can't be determined statically — function

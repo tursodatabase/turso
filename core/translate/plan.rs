@@ -38,6 +38,7 @@ use turso_parser::ast::{
 use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
+use super::expr::expr_type::{type_of, TypeEnv};
 
 /// Infer the affinity of a subquery result column from its expression.
 ///
@@ -3018,6 +3019,7 @@ impl Operation {
 pub(super) fn query_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
+    resolver: &Resolver,
 ) -> Result<alloc::Vec<Column>> {
     let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
         Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
@@ -3078,11 +3080,10 @@ pub(super) fn query_output_columns(
         })
         .try_collect::<alloc::Vec<_>>()?;
 
+    let env = TypeEnv::new(Some(table_references), resolver);
     for (column_index, column) in columns.iter_mut().enumerate() {
         let result_expr = &result_columns[column_index].expr;
-        if super::expr::expr_is_array(result_expr, Some(table_references)) {
-            column.set_array_dimensions(1);
-        }
+        column.set_array_dimensions(type_of(result_expr, &env).array_dimensions());
         column.set_collation(get_collseq_from_expr(result_expr, table_references)?);
     }
     Ok(columns)
@@ -3091,8 +3092,9 @@ pub(super) fn query_output_columns(
 fn subquery_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
+    resolver: &Resolver,
 ) -> Result<alloc::Vec<Column>> {
-    let mut columns = query_output_columns(plan, explicit_columns)?;
+    let mut columns = query_output_columns(plan, explicit_columns, resolver)?;
     make_column_names_unique(&mut columns);
     Ok(columns)
 }
@@ -3149,9 +3151,10 @@ impl JoinedTable {
         plan: SelectPlan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
+        resolver: &Resolver,
     ) -> Result<Self> {
         let plan = Plan::Select(Box::new(plan));
-        let columns = subquery_output_columns(&plan, None)?;
+        let columns = subquery_output_columns(&plan, None, resolver)?;
 
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
@@ -3183,6 +3186,7 @@ impl JoinedTable {
     /// If `cte_id` is provided, this subquery is a CTE reference that can share materialized data.
     /// If `materialize_hint` is true, the CTE was declared with AS MATERIALIZED and should always
     /// be materialized regardless of reference count.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_subquery_from_plan(
         identifier: String,
         plan: Plan,
@@ -3191,8 +3195,9 @@ impl JoinedTable {
         explicit_columns: Option<&[String]>,
         cte_id: Option<usize>,
         materialize_hint: bool,
+        resolver: &Resolver,
     ) -> Result<Self> {
-        let columns = subquery_output_columns(&plan, explicit_columns)?;
+        let columns = subquery_output_columns(&plan, explicit_columns, resolver)?;
         // Get result columns and table references from the plan
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
@@ -3232,8 +3237,9 @@ impl JoinedTable {
         query: &Plan,
         internal_id: TableInternalId,
         explicit_columns: Option<&[String]>,
+        resolver: &Resolver,
     ) -> Result<Self> {
-        let mut columns = subquery_output_columns(query, explicit_columns)?;
+        let mut columns = subquery_output_columns(query, explicit_columns, resolver)?;
         // The recursive self-reference reads SQLite's queue table, whose
         // columns have no declared type: comparisons in the recursive term
         // see the stored value without the anchor query's affinity. Only the

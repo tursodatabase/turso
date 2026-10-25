@@ -67,7 +67,7 @@ fn encode_seek_keys_for_custom_types(
                     encode_expr,
                     reg,
                     reg,
-                    table_col,
+                    &table_col.ty_params,
                     td,
                     resolver,
                 )?;

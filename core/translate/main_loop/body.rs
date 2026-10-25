@@ -265,7 +265,7 @@ fn emit_loop_source<'a>(
                 let comparator = custom_type_comparator(
                     &min_max.argument,
                     &plan.table_references,
-                    t_ctx.resolver.schema(),
+                    &t_ctx.resolver,
                 );
                 program.emit_insn(Insn::AggStep {
                     data: Box::new(AggStepData {

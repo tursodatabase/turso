@@ -30,6 +30,7 @@ pub(crate) mod plan;
 pub(crate) mod planner;
 pub(crate) mod pragma;
 pub(crate) mod recursive_cte;
+pub(crate) mod result_column_types;
 pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
@@ -547,6 +548,14 @@ pub fn translate_inner(
             program.emit_result_row(reg, 1);
             program.add_pragma_result_column(column_name.to_string());
         }
+    }
+
+    if connection.experimental_custom_types_enabled() {
+        program.result_column_types = result_column_types::result_column_types(
+            &program.result_columns,
+            &program.table_references,
+            resolver,
+        );
     }
 
     Ok(())

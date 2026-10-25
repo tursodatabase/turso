@@ -2079,6 +2079,7 @@ pub struct PreparedProgram {
     /// mirrors: <https://sqlite.org/c3ref/stmt_readonly.html>.
     pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
+    pub result_column_types: Vec<Option<crate::statement::ColumnTypeInfo>>,
     pub table_references: TableReferences,
     pub sql: String,
     /// The statement is ANALYZE, so its completion refreshes the in-memory
