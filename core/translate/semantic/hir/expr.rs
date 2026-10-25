@@ -503,6 +503,7 @@ impl ExprArena {
 
     /// Copy the expression at `id` and everything it owns into new nodes,
     /// and return the copy's root.
+    #[cfg(test)]
     pub fn deep_copy(&mut self, id: ExprId) -> ExprId {
         let mut order = Vec::new();
         let mut pending = vec![id];

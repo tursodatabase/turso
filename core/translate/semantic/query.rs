@@ -8,7 +8,7 @@ use super::{
     expr::{build_using_column, ExprPolicies, ExprPolicy},
     hir::{self, CatalogObject, DeclaredType, SourceOwner, TypeFact},
     schema_program::TypeTransform,
-    scope::{resolve_source_column, ResolvedScopeExpr, SavedGroupColumn, Scope},
+    scope::{resolve_source_column, ResolvedScopeExpr, SavedGroupColumn, Scope, ScopeValue},
 };
 use crate::{
     schema::Table, sync::Arc, translate::expr::StorageClassMask, vdbe::affinity::Affinity,
@@ -322,7 +322,6 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 column.name,
                 hir::OutputNameKind::StarExpansion,
                 resolved,
-                &mut self.exprs,
             ));
         }
 
@@ -450,12 +449,6 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                             let right = resolve_source_column(definition, &name, &self.exprs)?;
                             let left =
                                 scope.resolve_using_left(&name, natural, has_right_or_full_join)?;
-                            // The columns compare as `left = right` written
-                            // in an ON clause would: a table column without
-                            // a declared collation decides the comparison
-                            // as BINARY, like any column decides it.
-                            let right = self.using_operand(right, &scope)?;
-                            let left = self.using_operand(left, &scope)?;
                             Ok((name, left, right))
                         })
                         .collect::<Result<Vec<_>>>()
@@ -467,6 +460,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     columns
                         .into_iter()
                         .map(|(name, left, right)| {
+                            // The columns compare as `left = right` written
+                            // in an ON clause would: a table column without
+                            // a declared collation decides the comparison
+                            // as BINARY, like any column decides it.
+                            let right = self.using_operand(right, &scope)?;
+                            let left = self.using_operand(left, &scope)?;
                             let mut column = build_using_column(
                                 name,
                                 left.clone(),
@@ -887,8 +886,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                             hir::OutputId::query(block_id, index),
                             def.name.clone(),
                             hir::OutputNameKind::ExplicitAlias,
-                            def.value.clone(),
-                            &mut self.exprs,
+                            def.value.clone().push_into(&mut self.exprs),
                         )
                     })
                     .collect();
@@ -1004,14 +1002,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             // included, so a NULL argument matches no row. Unary plus keeps
             // the hidden column's affinity from converting the argument.
             let argument = ResolvedScopeExpr {
-                expr: hir::Expr::Unary {
+                expr: self.exprs.push(hir::Expr::Unary {
                     operator: ast::UnaryOperator::Positive,
-                    expr: self.exprs.push(argument.expr),
-                },
+                    expr: argument.expr,
+                }),
                 has_affinity: false,
                 ..argument
             };
-            let mut predicate = self
+            let predicate = self
                 .build_binary_expr_of_operands(hidden, ast::Operator::Equals, argument)?
                 .expr;
             // The table receives the argument's value as is, so an array
@@ -1019,13 +1017,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             if let hir::Expr::Binary {
                 comparison: Some(comparison),
                 ..
-            } = &mut predicate
+            } = self.exprs.get_mut(predicate)
             {
                 for component in &mut comparison.components {
                     component.array = false;
                 }
             }
-            argument_predicates.push(self.exprs.push(predicate));
+            argument_predicates.push(predicate);
         }
         let source = self.source_mut(source).ok_or_else(|| {
             crate::LimboError::InternalError(format!(
@@ -1112,14 +1110,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
 
     /// A USING operand with the collation its table column supplies, as a
     /// column reference written in an expression has.
-    fn using_operand(
-        &self,
-        operand: ResolvedScopeExpr,
-        scope: &Scope,
-    ) -> Result<ResolvedScopeExpr> {
+    fn using_operand(&mut self, operand: ScopeValue, scope: &Scope) -> Result<ResolvedScopeExpr> {
         match operand.expr {
             hir::Expr::Column(_) => self.resolve_atomic_expr(operand.expr, scope),
-            _ => Ok(operand),
+            _ => Ok(operand.push_into(&mut self.exprs)),
         }
     }
 
@@ -1133,7 +1127,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let expression = self
             .analyze_source_scalar_expr_with_facts(syntax, scope, policy, parent)?
             .expr;
-        Ok(self.exprs.push(expression))
+        Ok(expression)
     }
 
     fn analyze_source_scalar_expr_with_facts(

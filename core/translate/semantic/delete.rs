@@ -85,7 +85,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let predicate = where_clause
             .map(|syntax| {
                 self.analyze_root_expr(syntax, &scope, expressions.policies.where_clause())
-                    .map(|resolved| self.exprs.push(resolved.expr))
+                    .map(|resolved| resolved.expr)
             })
             .transpose()?;
         let returning =

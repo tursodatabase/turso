@@ -459,8 +459,7 @@ fn expression_shape(expression: hir::ExprRef<'_>, rename: &dyn Fn(&mut hir::Expr
     })
 }
 
-/// Replace every use of the value of `query` in `block` with a copy of
-/// `replacement`.
+/// Replace every use of the value of `query` in `block` with `replacement`.
 fn replace_scalar_subquery(
     document: &mut HirDocument,
     block: QueryBlockId,
@@ -473,7 +472,7 @@ fn replace_scalar_subquery(
             hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query: found, output: 0 })
                 if *found == query
         )
-        .then(|| exprs.deep_copy(replacement))
+        .then_some(replacement)
     })
 }
 

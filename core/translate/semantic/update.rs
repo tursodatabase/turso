@@ -132,7 +132,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             .predicate
             .map(|syntax| {
                 self.analyze_root_expr(syntax, &scope, expressions.policies.where_clause())
-                    .map(|resolved| self.exprs.push(resolved.expr))
+                    .map(|resolved| resolved.expr)
             })
             .transpose()?;
 
@@ -375,15 +375,13 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 let value = if matches!(syntax, ast::Expr::Default) {
                     self.analyze_write_default(new_source, table, column)?
                 } else {
-                    let value = self
-                        .analyze_root_expr_with_expected_type(
-                            syntax,
-                            scope,
-                            policies.update(),
-                            self.write_target_type(new_source, table, column)?,
-                        )?
-                        .expr;
-                    self.exprs.push(value)
+                    self.analyze_root_expr_with_expected_type(
+                        syntax,
+                        scope,
+                        policies.update(),
+                        self.write_target_type(new_source, table, column)?,
+                    )?
+                    .expr
                 };
                 merge_update_assignment(
                     &mut assignments,

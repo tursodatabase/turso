@@ -249,7 +249,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         name,
                         name_kind,
                         resolved,
-                        &mut self.exprs,
                     ));
                 }
                 ast::ResultColumn::Star => {
@@ -278,7 +277,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 column.name,
                 hir::OutputNameKind::StarExpansion,
                 resolved,
-                &mut self.exprs,
             ));
         }
         Ok(())

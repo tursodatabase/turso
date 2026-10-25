@@ -158,7 +158,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 ExprPolicies::trigger(self.context().dqs_dml(), environment).where_clause(),
             )?
             .expr;
-        Ok(self.exprs.push(predicate))
+        Ok(predicate)
     }
 
     fn analyze_trigger_select_in(

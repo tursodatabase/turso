@@ -1103,7 +1103,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     policies.where_clause(),
                     &mut functions,
                 )?;
-                let filter = self.exprs.push(resolved.expr);
+                let filter = resolved.expr;
                 reject_clause_alias_functions(self.exprs.at(filter), block_id, &outputs, false)?;
                 Some(filter)
             }
@@ -1239,23 +1239,20 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let mut descriptor = resolved.clone();
                 // VALUES rows own runtime expressions. This placeholder only
                 // identifies the result position, matching the old planner.
-                descriptor.expr = Expr::Literal(ast::Literal::Numeric(index.to_string()));
+                descriptor.expr = self
+                    .exprs
+                    .push(Expr::Literal(ast::Literal::Numeric(index.to_string())));
                 output_from_resolved(
                     OutputId::query(block, index),
                     format!("column{}", index + 1),
                     OutputNameKind::Inferred,
                     descriptor,
-                    &mut self.exprs,
                 )
             })
             .collect();
         let rows = resolved_rows
             .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(|resolved| self.exprs.push(resolved.expr))
-                    .collect()
-            })
+            .map(|row| row.into_iter().map(|resolved| resolved.expr).collect())
             .collect();
         let aggregate_count = self.aggregate_count(functions.block());
         let window_function_count = functions.window_function_count();
@@ -1297,7 +1294,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         functions,
                     )?,
                 };
-            let key = self.exprs.push(resolved.expr);
+            let key = resolved.expr;
             reject_clause_alias_functions(self.exprs.at(key), block, outputs, false)?;
             key_type_facts.push(resolved.type_fact);
             key_collations.push(resolved.collation.value().cloned());
@@ -1310,7 +1307,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 having_scope.set_outputs(outputs);
                 let resolved =
                     self.analyze_query_expr(syntax, &having_scope, policies.having(), functions)?;
-                let having = self.exprs.push(resolved.expr);
+                let having = resolved.expr;
                 reject_clause_alias_functions(self.exprs.at(having), block, outputs, true)?;
                 reject_aliased_aggregates(self.exprs.at(having), block, outputs)?;
                 Some(having)
@@ -1395,7 +1392,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                             functions,
                         )
                         .and_then(|resolved| {
-                            let term = self.exprs.push(resolved.expr);
+                            let term = resolved.expr;
                             reject_aliased_aggregates(self.exprs.at(term), block, outputs)
                         })
                         .and_then(|()| {
@@ -1432,7 +1429,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     functions,
                 )?,
             };
-            let term = order_term(syntax, resolved, &mut self.exprs);
+            let term = order_term(syntax, resolved);
             reject_aliased_aggregates(self.exprs.at(term.expr), block, outputs)?;
             terms.push(term);
         }
@@ -1523,8 +1520,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .map(|offset| self.analyze_query_scalar_expr(offset, &scope, policy, parent))
             .transpose()?;
         Ok(Limit {
-            limit: self.exprs.push(limit.expr),
-            offset: offset.map(|offset| self.exprs.push(offset.expr)),
+            limit: limit.expr,
+            offset: offset.map(|offset| offset.expr),
         })
     }
 
@@ -1558,7 +1555,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 )?;
                 let resolved =
                     self.compound_order_by_output(output_arms[0], position, &collations)?;
-                Ok(order_term(syntax, resolved, &mut self.exprs))
+                Ok(order_term(syntax, resolved))
             })
             .collect()
     }
@@ -1586,7 +1583,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         else {
             return Ok(None);
         };
-        let candidate = self.exprs.push(resolved.expr);
+        let candidate = resolved.expr;
         Ok(block.outputs.iter().position(|output| {
             self.exprs
                 .at(output.expr)
@@ -1601,13 +1598,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         position: usize,
         collations: &[&ast::Name],
     ) -> Result<ResolvedScopeExpr> {
-        let mut resolved = resolved_output(&outputs[position]);
+        let mut resolved = resolved_output(&outputs[position], &mut self.exprs);
         for name in collations.iter().rev() {
             let collation = self.resolve_collation(name)?;
-            resolved.expr = Expr::Collate {
-                expr: self.exprs.push(resolved.expr),
+            resolved.expr = self.exprs.push(Expr::Collate {
+                expr: resolved.expr,
                 collation: collation.clone(),
-            };
+            });
             resolved.collation = ExprCollation::Explicit(collation);
         }
         Ok(resolved)
@@ -1658,7 +1655,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 }
             }
         }
-        Ok(Some(resolved))
+        Ok(Some(resolved.push_into(&mut self.exprs)))
     }
 
     fn analyze_outputs(
@@ -1726,7 +1723,6 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 name,
                 OutputNameKind::StarExpansion,
                 resolved,
-                &mut self.exprs,
             ));
         }
         Ok(())
@@ -1771,7 +1767,6 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             name,
             name_kind,
             resolved,
-            &mut self.exprs,
         ))
     }
 }
@@ -1781,13 +1776,12 @@ pub(super) fn output_from_resolved(
     name: String,
     name_kind: OutputNameKind,
     resolved: ResolvedScopeExpr,
-    exprs: &mut ExprArena,
 ) -> Output {
     let (collation, collation_is_explicit) = resolved.collation.into_output();
     Output {
         id,
         name,
-        expr: exprs.push(resolved.expr),
+        expr: resolved.expr,
         type_fact: resolved.type_fact,
         affinity: resolved.affinity,
         schema_affinity: resolved.affinity,
@@ -2022,9 +2016,9 @@ fn reject_aliased_aggregates(
     error.map_or(Ok(()), Err)
 }
 
-fn resolved_output(output: &Output) -> ResolvedScopeExpr {
+fn resolved_output(output: &Output, exprs: &mut ExprArena) -> ResolvedScopeExpr {
     ResolvedScopeExpr {
-        expr: Expr::Output(output.id),
+        expr: exprs.push(Expr::Output(output.id)),
         type_fact: output.type_fact.clone(),
         affinity: output.affinity,
         has_affinity: output.has_affinity,
@@ -2032,13 +2026,9 @@ fn resolved_output(output: &Output) -> ResolvedScopeExpr {
     }
 }
 
-fn order_term(
-    syntax: &ast::SortedColumn,
-    resolved: ResolvedScopeExpr,
-    exprs: &mut ExprArena,
-) -> OrderTerm {
+fn order_term(syntax: &ast::SortedColumn, resolved: ResolvedScopeExpr) -> OrderTerm {
     OrderTerm {
-        expr: exprs.push(resolved.expr),
+        expr: resolved.expr,
         order: syntax.order.unwrap_or(ast::SortOrder::Asc),
         nulls: syntax.nulls,
         type_fact: resolved.type_fact,

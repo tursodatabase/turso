@@ -84,13 +84,38 @@ impl ExprCollation {
     }
 }
 
+/// An analyzed expression: its node in the document's expression arena,
+/// with the facts the expressions around it need.
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedScopeExpr {
+    pub(crate) expr: hir::ExprId,
+    pub(crate) type_fact: TypeFact,
+    pub(crate) affinity: Affinity,
+    pub(crate) has_affinity: bool,
+    pub(crate) collation: ExprCollation,
+}
+
+/// A value a name in the scope finds. The scope does not own the
+/// expression arena, so it keeps the node itself.
+#[derive(Clone, Debug)]
+pub(crate) struct ScopeValue {
     pub(crate) expr: hir::Expr,
     pub(crate) type_fact: TypeFact,
     pub(crate) affinity: Affinity,
     pub(crate) has_affinity: bool,
     pub(crate) collation: ExprCollation,
+}
+
+impl ScopeValue {
+    pub(crate) fn push_into(self, exprs: &mut hir::ExprArena) -> ResolvedScopeExpr {
+        ResolvedScopeExpr {
+            expr: exprs.push(self.expr),
+            type_fact: self.type_fact,
+            affinity: self.affinity,
+            has_affinity: self.has_affinity,
+            collation: self.collation,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -106,7 +131,7 @@ struct ColumnBinding {
     source: SourceId,
     display_name: Arc<str>,
     lookup_name: ColumnName,
-    resolved: ResolvedScopeExpr,
+    resolved: ScopeValue,
     hidden: bool,
     /// The implicit rowid a parenthesized join group saved for one of its
     /// tables: a bare `rowid`, `oid` or `_rowid_` finds it.
@@ -174,7 +199,7 @@ impl ColumnBinding {
             source,
             display_name: name.clone(),
             lookup_name: ColumnName(name.clone()),
-            resolved: ResolvedScopeExpr {
+            resolved: ScopeValue {
                 expr,
                 type_fact: column.type_fact().into_owned(),
                 affinity: column.affinity(),
@@ -187,7 +212,7 @@ impl ColumnBinding {
         }
     }
 
-    fn resolved(&self) -> ResolvedScopeExpr {
+    fn resolved(&self) -> ScopeValue {
         self.resolved.clone()
     }
 }
@@ -196,7 +221,7 @@ pub(crate) fn resolve_source_column(
     source: &hir::Source,
     name: &str,
     exprs: &hir::ExprArena,
-) -> Result<ResolvedScopeExpr> {
+) -> Result<ScopeValue> {
     let normalized = crate::util::normalize_ident(name);
     source
         .columns
@@ -286,11 +311,11 @@ impl<'a> ColumnView<'a> {
         }
     }
 
-    fn resolved(self) -> ResolvedScopeExpr {
+    fn resolved(self) -> ScopeValue {
         match self {
             Self::Source { source, index } => {
                 let column = source.columns.column(index);
-                ResolvedScopeExpr {
+                ScopeValue {
                     expr: self.expr().into_owned(),
                     type_fact: column.type_fact().into_owned(),
                     affinity: column.affinity(),
@@ -423,7 +448,7 @@ impl SavedGroupColumnKind {
 
 /// What a qualified name found among one scope's own sources.
 enum QualifiedLookup {
-    Found(Box<ResolvedScopeExpr>),
+    Found(Box<ScopeValue>),
     /// A source of that name exists here, but none has the column.
     NoSuchColumn,
     /// No source of that name exists here.
@@ -440,7 +465,7 @@ pub(crate) struct SavedGroupColumn {
 pub(crate) struct GroupColumnDef {
     /// The column's name in the group, unique among the group's columns.
     pub(crate) name: String,
-    pub(crate) value: ResolvedScopeExpr,
+    pub(crate) value: ScopeValue,
     pub(crate) saved: SavedGroupColumn,
 }
 
@@ -794,7 +819,7 @@ impl Scope {
         &self,
         ordinal: usize,
         clause: &str,
-    ) -> Result<ResolvedScopeExpr> {
+    ) -> Result<ScopeValue> {
         let Some(output) = ordinal
             .checked_sub(1)
             .and_then(|index| self.outputs.get(index))
@@ -836,7 +861,7 @@ impl Scope {
         &self,
         name: &str,
         precedence: NamePrecedence,
-    ) -> Result<Option<ResolvedScopeExpr>> {
+    ) -> Result<Option<ScopeValue>> {
         let normalized = crate::util::normalize_ident(name);
         let current = match precedence {
             NamePrecedence::SourcesOnly => self.resolve_source_column(&normalized)?,
@@ -869,7 +894,7 @@ impl Scope {
         &self,
         qualifier: &str,
         column: &str,
-    ) -> Result<Option<ResolvedScopeExpr>> {
+    ) -> Result<Option<ScopeValue>> {
         let normalized_qualifier = crate::util::normalize_ident(qualifier);
         let normalized_column = crate::util::normalize_ident(column);
         let lookup =
@@ -926,13 +951,13 @@ impl Scope {
         column: &str,
         written: impl Fn() -> String,
     ) -> Result<QualifiedLookup> {
-        let mut found: Option<ResolvedScopeExpr> = None;
+        let mut found: Option<ScopeValue> = None;
         let mut table_seen = false;
         // Like SQLite's `lookupName`: of the copies of a USING column that
         // the name matches, a LEFT or inner join reads the left one, a
         // RIGHT JOIN the right one, and a FULL JOIN the coalesced value.
         let mut add =
-            |candidate: ResolvedScopeExpr, merged: Option<hir::MergedColumnValue>| -> Result<()> {
+            |candidate: ScopeValue, merged: Option<hir::MergedColumnValue>| -> Result<()> {
                 match (merged, &found) {
                     (Some(hir::MergedColumnValue::Right), _) | (_, None) => found = Some(candidate),
                     (Some(hir::MergedColumnValue::Coalesce), Some(_)) => {
@@ -1058,7 +1083,7 @@ impl Scope {
         database: hir::DatabaseId,
         table: &str,
         column: &str,
-    ) -> Result<Option<ResolvedScopeExpr>> {
+    ) -> Result<Option<ScopeValue>> {
         let normalized_table = crate::util::normalize_ident(table);
         let normalized_column = crate::util::normalize_ident(column);
         let written = || {
@@ -1330,7 +1355,7 @@ impl Scope {
 
     /// The value `table.*` reads for a column a later USING merged: the one
     /// visible column of that name, as an unqualified reference would find.
-    fn merged_star_column(&self, column: ColumnView<'_>) -> Result<ResolvedScopeExpr> {
+    fn merged_star_column(&self, column: ColumnView<'_>) -> Result<ScopeValue> {
         self.merged_star_column_named(column.lookup_name(), column.display_name())
     }
 
@@ -1338,7 +1363,7 @@ impl Scope {
         &self,
         lookup_name: &str,
         display_name: &str,
-    ) -> Result<ResolvedScopeExpr> {
+    ) -> Result<ScopeValue> {
         let mut matches = self
             .visible_columns()
             .filter(|visible| visible.lookup_matches(lookup_name));
@@ -1369,7 +1394,7 @@ impl Scope {
         name: &str,
         natural: bool,
         has_right_or_full_join: bool,
-    ) -> Result<ResolvedScopeExpr> {
+    ) -> Result<ScopeValue> {
         let normalized = crate::util::normalize_ident(name);
         // One copy per source: a join group is one source with one column
         // of each name.
@@ -1467,7 +1492,7 @@ impl Scope {
             let VisibleColumn::Binding(left) = &mut visible[left_position] else {
                 unreachable!("owned visible columns are bindings");
             };
-            left.resolved = ResolvedScopeExpr {
+            left.resolved = ScopeValue {
                 expr: merged,
                 type_fact: using.type_fact.clone(),
                 affinity: using.affinity,
@@ -1502,7 +1527,7 @@ impl Scope {
         Ok(())
     }
 
-    fn resolve_source_column(&self, name: &str) -> Result<Option<ResolvedScopeExpr>> {
+    fn resolve_source_column(&self, name: &str) -> Result<Option<ScopeValue>> {
         let mut found = None;
         for column in self
             .visible_columns()
@@ -1541,7 +1566,7 @@ impl Scope {
         Ok(found)
     }
 
-    fn resolve_output(&self, name: &str) -> Option<ResolvedScopeExpr> {
+    fn resolve_output(&self, name: &str) -> Option<ScopeValue> {
         self.outputs
             .iter()
             .find(|output| {
@@ -1602,8 +1627,8 @@ impl ScopeOutput {
         ExprCollation::output(self.collation.clone(), self.collation_is_explicit)
     }
 
-    fn resolved(&self) -> ResolvedScopeExpr {
-        ResolvedScopeExpr {
+    fn resolved(&self) -> ScopeValue {
+        ScopeValue {
             expr: hir::Expr::Output(self.id),
             type_fact: self.type_fact.clone(),
             affinity: self.affinity,
@@ -1625,8 +1650,8 @@ fn same_join_column(left: &hir::Expr, right: &hir::Expr, exprs: &hir::ExprArena)
     }
 }
 
-fn resolved_rowid(source: SourceId) -> ResolvedScopeExpr {
-    ResolvedScopeExpr {
+fn resolved_rowid(source: SourceId) -> ScopeValue {
+    ScopeValue {
         expr: hir::Expr::RowId(source),
         type_fact: TypeFact::known(Type::Integer),
         affinity: Affinity::Integer,
@@ -1772,7 +1797,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn expect_column(resolved: ResolvedScopeExpr, source: SourceId, column: usize) {
+    fn expect_column(resolved: ScopeValue, source: SourceId, column: usize) {
         assert!(resolved.has_affinity);
         assert_eq!(resolved.affinity, Affinity::Text);
         assert_eq!(resolved.type_fact.storage, Some(Type::Text));
@@ -1786,7 +1811,7 @@ pub(crate) mod tests {
         ));
     }
 
-    fn expect_output(resolved: ResolvedScopeExpr, output: OutputId) {
+    fn expect_output(resolved: ScopeValue, output: OutputId) {
         assert!(matches!(resolved.expr, Expr::Output(actual) if actual == output));
         assert_eq!(resolved.type_fact.storage, Some(Type::Integer));
         assert_eq!(resolved.affinity, Affinity::Integer);

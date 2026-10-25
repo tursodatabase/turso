@@ -533,7 +533,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 self.write_target_type(target, table, column)?,
             )?
             .expr;
-        Ok(self.exprs.push(value))
+        Ok(value)
     }
 
     fn analyze_insert_defaults(
@@ -721,7 +721,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                                     | ExprCollation::Inherited(_)
                                     | ExprCollation::InheritedBinary(_) => None,
                                 },
-                                expr: self.exprs.push(resolved.expr),
+                                expr: resolved.expr,
                             })
                         })
                         .collect::<Result<Vec<_>>>()?;
