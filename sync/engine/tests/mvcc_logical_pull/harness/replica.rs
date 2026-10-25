@@ -76,6 +76,12 @@ impl Replica {
         })
     }
 
+    pub fn execute(&self, sql: &str) -> Result<()> {
+        let conn = drive(&self.io, async |coro| self.engine.connect_rw(coro).await)?;
+        conn.execute(sql)?;
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> Result<Snapshot> {
         let conn = drive(&self.io, async |coro| self.engine.connect_rw(coro).await)?;
         Snapshot::capture(&conn)
