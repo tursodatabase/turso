@@ -1729,18 +1729,21 @@ pub fn translate_alter_table(
             };
 
             let old_column = &btree.columns()[column_index];
-            let is_primary_key = old_column.primary_key()
-                || old_column.is_rowid_alias()
-                || btree
-                    .primary_key_columns
-                    .iter()
-                    .any(|(col_name, _)| col_name.eq_ignore_ascii_case(from))
+            let has_primary_key_autoindex = (old_column.primary_key()
+                && !old_column.is_rowid_alias())
+                || btree.unique_sets.iter().any(|set| {
+                    set.is_primary_key
+                        && set
+                            .columns
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(from))
+                })
                 || definition
                     .constraints
                     .iter()
                     .any(|c| matches!(c.constraint, ast::ColumnConstraint::PrimaryKey { .. }));
 
-            if !rename && is_primary_key {
+            if !rename && has_primary_key_autoindex {
                 return Err(LimboError::ParseError(
                     "PRIMARY KEY constraint cannot be altered".to_string(),
                 ));
