@@ -4,6 +4,7 @@ use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::sequence::bind_sequence_names_in_select;
+use crate::translate::trigger_exec::rewrite_select_expressions;
 use crate::translate::{
     emitter::Resolver,
     schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
@@ -93,6 +94,14 @@ pub fn translate_create_materialized_view(
     // Check for cross-database table references first
     crate::util::validate_select_for_views(select_stmt, resolver, database_id)?;
 
+    let mut select_stmt = select_stmt.clone();
+    if resolver.dialect.binds_names_at_create() {
+        bind_table_names_in_select(&mut select_stmt, resolver)?;
+    }
+    if reads_a_stored_namespace(&mut select_stmt, resolver)? {
+        bail_parse_error!("materialized views over tables of a schema are not supported");
+    }
+    let select_stmt = &select_stmt;
     let mut view_column_schema = resolver.with_schema(database_id, |s| {
         extract_view_columns(namespace.id, select_stmt, s)
     })?;
@@ -406,6 +415,7 @@ pub fn translate_create_view(
 
     let mut select_stmt = select_stmt.clone();
     if resolver.dialect.binds_names_at_create() {
+        bind_table_names_in_select(&mut select_stmt, resolver)?;
         bind_sequence_names_in_select(&mut select_stmt, resolver)?;
     }
     let stored_view_name = resolver.stored_name(namespace, &normalized_view_name);
@@ -458,6 +468,122 @@ pub fn translate_create_view(
     });
 
     Ok(())
+}
+
+/// Qualifies each table name of the view body that names no namespace
+/// with the namespace the table is found in, so that the view reads the
+/// tables it was created over whatever the search path is later. A CTE, a
+/// table of temp and a table that is not found are left as written.
+pub(crate) fn bind_table_names_in_select(
+    select: &mut ast::Select,
+    resolver: &Resolver,
+) -> Result<()> {
+    for_each_table_name(select, &mut Vec::new(), &mut |name, cte_names| {
+        if name.namespace.is_some() || cte_names.contains(&normalize_ident(name.name.as_str())) {
+            return Ok(());
+        }
+        let Some(namespace) = resolver.find_existing_table(name)? else {
+            return Ok(());
+        };
+        if namespace.database_id == crate::TEMP_DB_ID {
+            return Ok(());
+        }
+        let Some(namespace_name) = resolver.name_of_namespace(namespace) else {
+            return Ok(());
+        };
+        name.namespace = Some(ast::Name::exact(namespace_name));
+        Ok(())
+    })
+}
+
+/// Whether the body reads a table of a stored namespace. The maintenance
+/// of a materialized view records and finds the tables it reads by name in
+/// the root namespace, so it cannot follow such a table.
+fn reads_a_stored_namespace(select: &mut ast::Select, resolver: &Resolver) -> Result<bool> {
+    let mut reads = false;
+    for_each_table_name(select, &mut Vec::new(), &mut |name, cte_names| {
+        if name.namespace.is_none() && cte_names.contains(&normalize_ident(name.name.as_str())) {
+            return Ok(());
+        }
+        if let Some(namespace) = resolver.find_existing_table(name)? {
+            reads |= !namespace.id.is_root();
+        }
+        Ok(())
+    })?;
+    Ok(reads)
+}
+
+/// Calls `f` with each table name of the body, including those of its CTEs
+/// and subqueries, together with the names of the CTEs in scope there.
+fn for_each_table_name(
+    select: &mut ast::Select,
+    cte_names: &mut Vec<String>,
+    f: &mut dyn FnMut(&mut ast::QualifiedName, &[String]) -> Result<()>,
+) -> Result<()> {
+    let outer_cte_count = cte_names.len();
+    if let Some(with) = &mut select.with {
+        for cte in &mut with.ctes {
+            if with.recursive {
+                cte_names.push(normalize_ident(cte.tbl_name.as_str()));
+            }
+            for_each_table_name(&mut cte.select, cte_names, f)?;
+            if !with.recursive {
+                cte_names.push(normalize_ident(cte.tbl_name.as_str()));
+            }
+        }
+    }
+    for_each_table_name_in_one_select(&mut select.body.select, cte_names, f)?;
+    for compound in &mut select.body.compounds {
+        for_each_table_name_in_one_select(&mut compound.select, cte_names, f)?;
+    }
+    rewrite_select_expressions(select, &mut |expr| match expr {
+        ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
+            for_each_table_name(select, cte_names, f)
+        }
+        ast::Expr::InSelect { rhs, .. } => for_each_table_name(rhs, cte_names, f),
+        _ => Ok(()),
+    })?;
+    cte_names.truncate(outer_cte_count);
+    Ok(())
+}
+
+fn for_each_table_name_in_one_select(
+    one_select: &mut ast::OneSelect,
+    cte_names: &mut Vec<String>,
+    f: &mut dyn FnMut(&mut ast::QualifiedName, &[String]) -> Result<()>,
+) -> Result<()> {
+    if let ast::OneSelect::Select {
+        from: Some(from), ..
+    } = one_select
+    {
+        for_each_table_name_in_from(from, cte_names, f)?;
+    }
+    Ok(())
+}
+
+fn for_each_table_name_in_from(
+    from: &mut ast::FromClause,
+    cte_names: &mut Vec<String>,
+    f: &mut dyn FnMut(&mut ast::QualifiedName, &[String]) -> Result<()>,
+) -> Result<()> {
+    for_each_table_name_in_source(&mut from.select, cte_names, f)?;
+    for join in &mut from.joins {
+        for_each_table_name_in_source(&mut join.table, cte_names, f)?;
+    }
+    Ok(())
+}
+
+fn for_each_table_name_in_source(
+    source: &mut ast::SelectTable,
+    cte_names: &mut Vec<String>,
+    f: &mut dyn FnMut(&mut ast::QualifiedName, &[String]) -> Result<()>,
+) -> Result<()> {
+    match source {
+        ast::SelectTable::Table(name, _, _) => f(name, cte_names),
+        ast::SelectTable::TableCall(..) => Ok(()),
+        ast::SelectTable::Select { select, .. } => for_each_table_name(select, cte_names, f),
+        ast::SelectTable::Sub(from, _) => for_each_table_name_in_from(from, cte_names, f),
+    }
 }
 
 fn create_view_to_str(
