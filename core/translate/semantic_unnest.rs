@@ -41,7 +41,7 @@ pub(crate) fn unnest_correlated_subqueries(
     params: &CostModelParams,
     mode: crate::SubqueryUnnestingMode,
 ) -> Result<(Arc<HirDocument>, Vec<hir::Parameter>)> {
-    if mode == crate::SubqueryUnnestingMode::Disabled {
+    if mode == crate::SubqueryUnnestingMode::Disabled || document.queries.len() < 2 {
         return Ok((document, Vec::new()));
     }
     let candidates = queries_innermost_first(&document)

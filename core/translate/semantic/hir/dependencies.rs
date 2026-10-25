@@ -69,14 +69,18 @@ impl HirDocument {
             })
         };
         let mut counts = ColumnUsageCollector::default();
-        for usage in owner.direct_column_usage(|source| self.source(source), &self.exprs) {
-            counts.add(usage);
-        }
+        owner.record_direct_column_reads(|source| self.source(source), &self.exprs, &mut counts);
+        let mut nested_reads = Vec::new();
         for nested in self.queries.iter().filter(|nested| nested.id != query) {
-            for usage in nested.direct_column_usage(|source| self.source(source), &self.exprs) {
-                if owns(usage.reference.source) {
-                    counts.add(usage);
-                }
+            nested.direct_column_reads(
+                |source| self.source(source),
+                &self.exprs,
+                &mut nested_reads,
+            );
+        }
+        for reference in nested_reads {
+            if owns(reference.source) {
+                counts.record(reference);
             }
         }
         counts.into_usage()
