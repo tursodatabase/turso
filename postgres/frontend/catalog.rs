@@ -3534,7 +3534,7 @@ fn index_definition(table_schema: &str, table_name: &str, index_name: &str, idx:
 }
 
 const PG_TYPE_SQLS: &[&str] = &[
-    "CREATE TYPE boolean(value any) BASE integer ENCODE bool_in(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'",
+    "CREATE TYPE boolean(value any) BASE integer ENCODE bool_in(value) DECODE CASE WHEN value THEN 1 WHEN NOT value THEN 0 END OPERATOR '<'",
     "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE varchar_in(value, maxlen) DECODE value OPERATOR '<'",
 ];
 

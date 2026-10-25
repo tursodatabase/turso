@@ -183,6 +183,19 @@ expect {
     null|null
 }
 
+test boolean-array-keeps-null-elements {
+    CREATE TABLE t (b boolean[]);
+    INSERT INTO t VALUES (ARRAY[NULL, true, false]);
+    SELECT CASE WHEN (ARRAY[NULL, true]::boolean[])[1] IS NULL THEN 'null' END,
+        CASE WHEN b[1] IS NULL THEN 'null' END,
+        CASE WHEN b[2] THEN 'yes' END,
+        CASE WHEN NOT b[3] THEN 'no' END
+    FROM t;
+}
+expect {
+    null|null|yes|no
+}
+
 test boolean-cast-in-index-expression {
     CREATE TABLE t (i int, b boolean);
     CREATE INDEX t_i ON t ((i::boolean));
