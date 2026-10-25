@@ -86,6 +86,9 @@ impl StressConn {
     ) -> turso::connection::Result<u64> {
         let result = self.conn.execute(sql, params).await;
         self.sql_logger.log_result(&self.thread, sql, &result);
+        if let Err(error) = &result {
+            assert_not_engine_bug(&self.thread, sql, error);
+        }
         result
     }
 
@@ -114,5 +117,55 @@ impl StressConn {
         params: impl IntoParams,
     ) -> turso::connection::Result<Rows> {
         self.conn.query(sql, params).await
+    }
+}
+
+/// Fail the run on errors that only a broken engine returns. Busy, constraint,
+/// conflict and I/O errors are normal under this workload and pass through.
+pub fn assert_not_engine_bug(thread: &ThreadId, sql: &str, error: &turso::Error) {
+    if is_engine_bug(error) {
+        turso_macros::turso_assert_unreachable!("statement failed with an engine bug error", { "thread": thread, "sql": sql, "error": error });
+    }
+}
+
+fn is_engine_bug(error: &turso::Error) -> bool {
+    match error {
+        turso::Error::Corrupt(_) | turso::Error::NotAdb(_) => true,
+        turso::Error::Error(message) => message.starts_with("Internal error:"),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_engine_bug;
+
+    #[test]
+    fn internal_and_corruption_errors_are_engine_bugs() {
+        assert!(is_engine_bug(&turso::Error::Error(
+            "Internal error: page not loaded".into()
+        )));
+        assert!(is_engine_bug(&turso::Error::Corrupt(
+            "Invalid page type: 0".into()
+        )));
+        assert!(is_engine_bug(&turso::Error::NotAdb(
+            "file is not a database".into()
+        )));
+    }
+
+    #[test]
+    fn errors_the_workload_expects_are_not_engine_bugs() {
+        assert!(!is_engine_bug(&turso::Error::Busy(
+            "database is locked".into()
+        )));
+        assert!(!is_engine_bug(&turso::Error::Constraint(
+            "UNIQUE constraint failed".into()
+        )));
+        assert!(!is_engine_bug(&turso::Error::Error(
+            "Write-write conflict".into()
+        )));
+        assert!(!is_engine_bug(&turso::Error::Error(
+            "Transaction error: cannot start a transaction within a transaction".into()
+        )));
     }
 }

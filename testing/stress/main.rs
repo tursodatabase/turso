@@ -745,9 +745,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         .await;
                     } else {
                         let sql = generate_random_statement(&mut rng, &schema_for_task);
-                        if let Err(turso::Error::Corrupt(e)) = conn.execute(&sql, ()).await {
-                            turso_macros::turso_assert_unreachable!("corrupt error executing query", { "thread": thread, "error": e, "sql": sql });
-                        }
+                        let _ = conn.execute(&sql, ()).await;
                     }
 
                     // When inside a transaction, 30% chance to exercise savepoints.
@@ -773,11 +771,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                                 .await;
                             } else {
                                 let sp_sql = generate_random_statement(&mut rng, &schema_for_task);
-                                if let Err(turso::Error::Corrupt(e)) =
-                                    conn.execute(&sp_sql, ()).await
-                                {
-                                    turso_macros::turso_assert_unreachable!("corrupt error in savepoint", { "thread": thread, "error": e, "sql": sp_sql });
-                                }
+                                let _ = conn.execute(&sp_sql, ()).await;
                             }
                         }
 
