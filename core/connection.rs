@@ -2553,7 +2553,8 @@ impl Connection {
     }
 
     /// Enable or disable writing portable logical-change metadata into MVCC
-    /// logical-log frames.
+    /// logical-log frames. An MVCC transaction uses the setting that the
+    /// connection had when the transaction began.
     pub fn set_portable_logical_changes_enabled(&self, enabled: bool) {
         #[cfg(feature = "conn_raw_api")]
         {
