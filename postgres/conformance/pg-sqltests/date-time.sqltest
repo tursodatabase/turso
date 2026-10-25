@@ -278,6 +278,26 @@ expect {
     01:00:00|23:30:00|-20:30:00|22:30:00
 }
 
+test interval-column-holding-a-time-of-day-is-an-interval {
+    CREATE TABLE t (i interval);
+    INSERT INTO t VALUES ('01:00:00');
+    SELECT interval '1 day' + i, i + interval '30 minutes' FROM t;
+    SELECT count(*) FROM t WHERE now() - i < now();
+}
+expect {
+    1 day 01:00:00|01:30:00
+    1
+}
+
+test time-column-plus-interval-column {
+    CREATE TABLE t (a time, i interval);
+    INSERT INTO t VALUES ('23:00', '02:00:00');
+    SELECT a + i, i + a, a - i FROM t;
+}
+expect {
+    01:00:00|01:00:00|21:00:00
+}
+
 test time-plus-integer-is-an-error {
     SELECT '12:00'::time + 1;
 }

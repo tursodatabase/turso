@@ -180,9 +180,8 @@ pub(crate) fn timestamptz_text(micros: i64) -> String {
 }
 
 /// `+` written in SQL. `lhs_type` and `rhs_type` are the operand types the
-/// query names (`date`, `time`, `timestamp`, `timestamptz`, `interval`),
-/// `column` for a column, whose value is a time when it has the stored form of
-/// a time, or "" when only the stored value can tell.
+/// query names (`date`, `time`, `timestamp`, `timestamptz`, `interval`), or
+/// "" when only the stored value can tell.
 pub(crate) fn exec_typed_datetime_pl(
     lhs: &Value,
     rhs: &Value,
@@ -202,7 +201,9 @@ pub(crate) fn exec_typed_datetime_pl(
     )
 }
 
-/// `+` for a `time` column. See [exec_typed_datetime_pl].
+/// `+` for a `time` column whose other operand has no known type, so an
+/// operand whose stored text is a time is read as a time. See
+/// [exec_typed_datetime_pl].
 pub(crate) fn exec_time_pl(lhs: &Value, rhs: &Value) -> Result<Value> {
     exec_typed_datetime_pl(lhs, rhs, COLUMN, COLUMN)
 }
