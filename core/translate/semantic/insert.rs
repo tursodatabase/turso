@@ -149,12 +149,19 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 }
                 let columns = resolve_insert_targets(table.value(), column_names)?;
                 let expected = columns.len();
+                let expected_types = columns
+                    .iter()
+                    .map(|target_column| {
+                        self.write_target_type(target, table.value(), target_column.column)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let source = match &select.body.select {
                     ast::OneSelect::Values(rows) if is_simple_values(select) => {
                         if rows.is_empty() {
                             crate::bail_parse_error!("no values to insert");
                         }
                         let mut bound_rows = Vec::with_capacity(rows.len());
+                        self.exprs.reserve(rows.len() * expected);
                         for row in rows {
                             if row.len() != expected {
                                 crate::bail_parse_error!(
@@ -164,12 +171,15 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                                 );
                             }
                             let mut bound = Vec::with_capacity(row.len());
-                            for (syntax, target_column) in row.iter().zip(&columns) {
+                            for ((syntax, target_column), expected_type) in
+                                row.iter().zip(&columns).zip(&expected_types)
+                            {
                                 bound.push(self.analyze_insert_value(
                                     syntax,
                                     target,
                                     table.value(),
                                     target_column.column,
+                                    expected_type.clone(),
                                     expressions,
                                 )?);
                             }
@@ -178,14 +188,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         hir::InsertSource::Values(bound_rows)
                     }
                     ast::OneSelect::Select { .. } | ast::OneSelect::Values(_) => {
-                        let expected_outputs = columns
-                            .iter()
-                            .map(|target_column| {
-                                self.write_target_type(target, table.value(), target_column.column)
-                            })
-                            .collect::<Result<Vec<_>>>()?;
                         let query =
-                            self.analyze_insert_select(select, &expected_outputs, expressions)?;
+                            self.analyze_insert_select(select, &expected_types, expressions)?;
                         let actual = self
                             .query(query)
                             .ok_or_else(|| {
@@ -520,6 +524,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         target: hir::SourceId,
         table: &Table,
         column: hir::TargetColumn,
+        expected_type: Option<Arc<TypeDef>>,
         expressions: InsertExprContext<'_>,
     ) -> Result<hir::ExprId> {
         if matches!(syntax, ast::Expr::Default) {
@@ -531,7 +536,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 syntax,
                 expressions.outer_scope,
                 policy,
-                self.write_target_type(target, table, column)?,
+                expected_type,
             )?
             .expr;
         Ok(value)
