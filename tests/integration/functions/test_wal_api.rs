@@ -1072,3 +1072,42 @@ fn wal_insert_end_syncs_committed_frames() {
         );
     }
 }
+
+#[test]
+fn wal_insert_end_drops_frames_of_concurrent_writer() {
+    let db = TempDatabase::new_empty();
+    let setup = db.connect_limbo();
+    setup.execute("CREATE TABLE big(x BLOB)").unwrap();
+    setup
+        .execute("CREATE TABLE w(v INTEGER, pad BLOB)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO big SELECT randomblob(3000) FROM generate_series(1, 20000)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO w SELECT 0, randomblob(3000) FROM generate_series(1, 1000)")
+        .unwrap();
+    let session = db.connect_limbo();
+    session.execute("PRAGMA cache_size = 100000").unwrap();
+    let writer = db.connect_limbo();
+    writer.execute("PRAGMA cache_size = 100").unwrap();
+    let updates = std::thread::spawn(move || {
+        for _ in 0..10 {
+            loop {
+                match writer.execute("UPDATE w SET v = v + 1") {
+                    Err(LimboError::Busy) => continue,
+                    result => break result.unwrap(),
+                }
+            }
+        }
+    });
+    while !updates.is_finished() {
+        if session.wal_insert_begin().is_ok() {
+            let _: Vec<(i64,)> = session.exec_rows("SELECT count(*) FROM big WHERE length(x) > 0");
+            session.wal_insert_end(false).unwrap();
+        }
+    }
+    updates.join().unwrap();
+    let lagging: Vec<(i64,)> = setup.exec_rows("SELECT count(*) FROM w WHERE v != 10");
+    assert_eq!(lagging, [(0,)], "rows that miss committed updates");
+}
