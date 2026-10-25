@@ -1100,3 +1100,41 @@ expect {
     <null>|"x"
     {"y":2}|"z"
 }
+
+test mod-of-integers-is-integer {
+    SELECT mod(67, 100), mod(-7, 3), mod(7::bigint, 2::smallint), mod(-9223372036854775808, -1);
+}
+expect {
+    67|-1|1|0
+}
+
+test mod-of-integer-columns-is-integer {
+    SELECT x, mod(x, 3) FROM (VALUES (10), (-11)) AS v(x) ORDER BY x;
+}
+expect {
+    -11|-2
+    10|1
+}
+
+test mod-in-check-constraint {
+    CREATE TABLE even_numbers (x int CHECK (mod(x, 2) = 0), y int, CHECK (mod(y, 3) = 1));
+    INSERT INTO even_numbers VALUES (4, 7);
+    SELECT x, y, mod(x, 3) FROM even_numbers;
+}
+expect {
+    4|7|1
+}
+
+test mod-of-fractions-keeps-the-fraction {
+    SELECT mod(7.5, 2), mod(-7.5, 2);
+}
+expect {
+    1.5|-1.5
+}
+
+test mod-with-null-is-null {
+    SELECT coalesce(mod(NULL, 0)::text, '<null>'), coalesce(mod(1, NULL)::text, '<null>');
+}
+expect {
+    <null>|<null>
+}

@@ -185,6 +185,10 @@ impl Dialect for PostgresDialect {
     fn errors_on_zero_divisor(&self) -> bool {
         true
     }
+
+    fn mod_of_integers_is_integer(&self) -> bool {
+        true
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
