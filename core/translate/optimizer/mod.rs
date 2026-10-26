@@ -10,6 +10,7 @@ use super::{
     },
 };
 use crate::alloc::TursoIteratorExt;
+use crate::namespace::NamespaceId;
 use crate::schema::GeneratedType;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::{table_mask_from_expr, TableMask};
@@ -105,9 +106,15 @@ impl AvailableIndexes {
             .filter(|jt| matches!(jt.table, Table::BTree(_) | Table::Virtual(_))) // only b-tree tables can have indexes
             .filter(|jt| jt.btree().is_none_or(|btree| btree.has_rowid))
             .filter_map(|jt| {
-                let indexes = resolver.with_schema(jt.database_id, |schema| {
-                    schema.indexes.get(jt.table.get_name()).cloned()
-                })?;
+                let indexes: VecDeque<_> = resolver.with_schema(jt.database_id, |schema| {
+                    schema
+                        .indices_including_backing(NamespaceId::ROOT, jt.table.get_name())
+                        .cloned()
+                        .collect()
+                });
+                if indexes.is_empty() {
+                    return None;
+                }
                 Some((jt.internal_id, indexes))
             })
             .collect();
@@ -371,8 +378,8 @@ fn try_match_index_method_pattern(
     let pattern_has_order_by = !pattern.order_by.is_empty();
     let pattern_has_limit = pattern.limit.is_some();
 
-    // If pattern has ORDER BY, it must match exactly
-    if pattern_has_order_by && order_by.len() != pattern.order_by.len() {
+    // If pattern has ORDER BY or LIMIT, ORDER BY must match exactly
+    if (pattern_has_order_by || pattern_has_limit) && order_by.len() != pattern.order_by.len() {
         return None;
     }
 
@@ -786,10 +793,9 @@ fn transform_match_to_fts_match(
             .find(|t| t.internal_id == table_id)
             .and_then(|t| {
                 if let Table::BTree(btree) = &t.table {
-                    Some(
-                        resolver
-                            .with_schema(t.database_id, |schema| schema.has_fts_index(&btree.name)),
-                    )
+                    Some(resolver.with_schema(t.database_id, |schema| {
+                        schema.has_fts_index(NamespaceId::ROOT, &btree.name)
+                    }))
                 } else {
                     None
                 }
@@ -871,6 +877,7 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
         || plan.group_by.is_some()
         || plan.contains_constant_false_condition
         || plan.aggregates.first().unwrap().filter_expr.is_some()
+        || !plan.aggregates.first().unwrap().order_by().is_empty()
     {
         return None;
     }
@@ -1113,7 +1120,7 @@ fn find_select_plan_form(
     }
 
     plan.simple_aggregate = detect_simple_aggregate(plan);
-    let table_plan = find_table_access_plan(
+    let mut table_plan = find_table_access_plan(
         schema,
         resolver,
         &mut plan.result_columns,
@@ -1185,6 +1192,20 @@ fn find_select_plan_form(
     }
 
     plan_correlated_subqueries(plan, resolver, &subquery_calls, cache, save_subquery_plans)?;
+    // The unmatched-right-row plans copied the WHERE subqueries before the
+    // correlated ones were planned. Copy the planned subqueries instead.
+    if let Some(table_plan) = table_plan.as_mut() {
+        for unmatched_plan in table_plan.unmatched_right_rows_plans.iter_mut().flatten() {
+            for copied_subquery in &mut unmatched_plan.subqueries {
+                *copied_subquery = plan
+                    .non_from_clause_subqueries
+                    .iter()
+                    .find(|subquery| subquery.internal_id == copied_subquery.internal_id)
+                    .expect("a copied WHERE subquery must still be in the query")
+                    .clone();
+            }
+        }
+    }
 
     let table_cost = table_cost.or_else(|| {
         plan.table_references
@@ -1450,7 +1471,7 @@ fn update_write_set_reason(
         // target during the scan. Materialize target rowids first to keep
         // the write set stable. (See issue #6460.)
         let referencing_fks = resolver.with_schema(database_id, |s| {
-            s.resolved_fks_referencing(&btree_table.name)
+            s.resolved_fks_referencing(NamespaceId::ROOT, &btree_table.name)
         })?;
         for fk in &referencing_fks {
             if matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict) {
@@ -2156,7 +2177,7 @@ fn group_count_from_analyze(plan: &SelectPlan, group_by: &GroupBy, schema: &Sche
         .index_stats
         .iter()
         .filter_map(|(index_name, index_stats)| {
-            let index = schema.get_index(&btree.name, index_name)?;
+            let index = schema.get_index(NamespaceId::ROOT, &btree.name, index_name)?;
             if index.where_clause.is_some() || index.columns.len() < columns.len() {
                 return None;
             }
@@ -4335,6 +4356,7 @@ fn ephemeral_index_build(
             .is_some_and(|btree| btree.has_rowid),
         index_method: None,
         on_conflict: None,
+        constraint_name: None,
     };
 
     Ok(ephemeral_index)

@@ -59,7 +59,6 @@ fn default_db_opts() -> DatabaseOpts {
     let mut opts = DatabaseOpts::new();
     if EXPERIMENTAL_ENABLED.load(Ordering::Acquire) {
         opts = opts
-            .with_generated_columns(true)
             .with_vacuum(true)
             .with_without_rowid(true)
             .with_attach(true)
@@ -3842,7 +3841,9 @@ fn limbo_err_code(err: &LimboError) -> i32 {
     match err {
         LimboError::Corrupt(..) => SQLITE_CORRUPT,
         LimboError::NotADB => SQLITE_NOTADB,
-        LimboError::Constraint(_) | LimboError::ForeignKeyConstraint(_) => SQLITE_CONSTRAINT,
+        LimboError::Constraint(_)
+        | LimboError::ConstraintViolation(_)
+        | LimboError::ForeignKeyConstraint(_) => SQLITE_CONSTRAINT,
         LimboError::DatabaseFull | LimboError::SequenceExhausted { .. } => SQLITE_FULL,
         LimboError::TableLocked => SQLITE_LOCKED,
         LimboError::ReadOnly => SQLITE_READONLY,
@@ -3883,6 +3884,27 @@ unsafe fn set_db_err_msg(db: &mut sqlite3Inner, code: i32, err_msg: &str) -> i32
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn structured_constraint_errors_keep_sqlite_codes() {
+        for kind in [
+            turso_core::ConstraintKind::PrimaryKey,
+            turso_core::ConstraintKind::Unique,
+            turso_core::ConstraintKind::ForeignKey,
+            turso_core::ConstraintKind::NotNull,
+            turso_core::ConstraintKind::Check,
+            turso_core::ConstraintKind::Other,
+        ] {
+            let error = turso_core::LimboError::ConstraintViolation(Box::new(
+                turso_core::ConstraintViolation::new(kind, "constraint message".to_string()),
+            ));
+            assert_eq!(
+                super::limbo_err_code(&error),
+                super::SQLITE_CONSTRAINT,
+                "{kind:?}"
+            );
+        }
+    }
     use super::*;
     use std::ptr;
 

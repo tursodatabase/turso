@@ -2542,26 +2542,27 @@ fn translate_column_expr(
                 match table_column.generated_type() {
                     // if we're reading from an index that contains this virtual column,
                     // the index already has the computed value, so read it from the index
-                    GeneratedType::Virtual { expr, .. } if !read_from_index => {
-                        resolver.with_self_table_context(
+                    GeneratedType::Virtual { .. } if !read_from_index => {
+                        let row_cursor_id = if is_btree_index {
+                            index_cursor_id.expect("index cursor should be opened")
+                        } else {
+                            table_cursor_id
+                                .or(index_cursor_id)
+                                .expect("cursor should be opened")
+                        };
+                        do_emit_table_column(
                             program,
-                            Some(&SelfTableContext::ForSelect {
+                            row_cursor_id,
+                            &SelfTableContext::ForSelect {
                                 table_ref_id: *table_ref_id,
                                 referenced_tables: referenced_tables.unwrap().clone(),
-                            }),
-                            |program, _| {
-                                translate_expr(
-                                    program,
-                                    referenced_tables,
-                                    expr,
-                                    target_register,
-                                    resolver,
-                                )?;
-                                Ok(())
                             },
+                            referenced_tables,
+                            table_column,
+                            *column,
+                            target_register,
+                            resolver,
                         )?;
-
-                        program.emit_column_affinity(target_register, table_column.affinity());
                         // The virtual column's declared collation must override
                         // whatever collation the inner expression resolved to.
                         program.set_collation(Some((table_column.collation(), false)));
@@ -3118,6 +3119,7 @@ fn translate_raise_expr(
             }
             // RAISE(IGNORE): halt the trigger subprogram and skip the triggering row
             program.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: 0,
                 description: String::new(),
                 on_error: Some(ResolveType::Ignore),
@@ -3137,6 +3139,7 @@ fn translate_raise_expr(
                 Some(e) => match e.as_ref() {
                     ast::Expr::Literal(ast::Literal::String(s)) => {
                         program.emit_insn(Insn::Halt {
+                            constraint_info: None,
                             err_code,
                             description: sanitize_string(s),
                             on_error: Some(*resolve_type),
@@ -3148,6 +3151,7 @@ fn translate_raise_expr(
                         let reg = program.alloc_register();
                         translate_expr(program, referenced_tables, e, reg, resolver)?;
                         program.emit_insn(Insn::Halt {
+                            constraint_info: None,
                             err_code,
                             description: String::new(),
                             on_error: Some(*resolve_type),

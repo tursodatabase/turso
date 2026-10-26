@@ -3147,6 +3147,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
         available_indexes.insert_for_table_name(
             table_references.joined_tables(),
@@ -3238,6 +3239,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
         available_indexes.insert_for_table_name(&joined_tables, "table1", VecDeque::from([index1]));
 
@@ -3375,6 +3377,7 @@ mod tests {
                     has_rowid: true,
                     index_method: None,
                     on_conflict: None,
+                    constraint_name: None,
                 });
                 available_indexes.insert_for_table_name(
                     &joined_tables,
@@ -3393,6 +3396,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
         let order_id_idx = Arc::new(Index {
             name: "order_items_order_id_idx".to_string(),
@@ -3405,6 +3409,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
 
         available_indexes.push_front_for_table_name(&joined_tables, "orders", customer_id_idx);
@@ -3907,6 +3912,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
 
         let mut available_indexes = AvailableIndexes::default();
@@ -3918,6 +3924,7 @@ mod tests {
             table,
             internal_id: table_id_counter.next(),
             identifier: "t1".to_string(),
+            has_alias: false,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
@@ -4008,6 +4015,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
@@ -4016,6 +4024,7 @@ mod tests {
             table,
             internal_id: table_id_counter.next(),
             identifier: "t1".to_string(),
+            has_alias: false,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
@@ -4123,6 +4132,7 @@ mod tests {
             unique: false,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
@@ -4131,6 +4141,7 @@ mod tests {
             table,
             internal_id: table_id_counter.next(),
             identifier: "t1".to_string(),
+            has_alias: false,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
@@ -4308,6 +4319,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         })
     }
 
@@ -4324,6 +4336,7 @@ mod tests {
             unmatched_right_rows_plan: None,
             table,
             identifier: name,
+            has_alias: false,
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
@@ -4453,6 +4466,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
         available_indexes.insert_for_table_name(&joined_tables, "t2", VecDeque::from([index_t2_a]));
 

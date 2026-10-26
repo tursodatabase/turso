@@ -41,6 +41,7 @@ pub(super) fn emit_array_element_loop(
         collation: None,
     });
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: SQLITE_CONSTRAINT,
         description: format!(
             "array exceeds maximum element count for custom type transform ({MAX_ARRAY_LOOP_ELEMENTS})"
@@ -196,7 +197,9 @@ pub(crate) fn emit_array_decode(
     }
 
     // Convert record blob to JSON text for display
-    program.emit_insn(Insn::ArrayDecode { reg });
+    if !program.flags.keep_array_results_as_blobs() {
+        program.emit_insn(Insn::ArrayDecode { reg });
+    }
     Ok(())
 }
 

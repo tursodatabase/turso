@@ -18,6 +18,7 @@
 //! <https://www.sqlite.org/opcode.html>
 
 use crate::alloc::{TryReserveError, TursoFromIterator};
+use crate::namespace::NamespaceId;
 use crate::translate::plan::BitSet;
 use crate::types::IOResultOr;
 use crate::types::{Extendable, Text, ValueBlob};
@@ -162,10 +163,13 @@ pub(crate) fn step_view_delta_batch(
 
                 let schema = connection.schema.read();
                 let views = schema.materialized_view_maintenance_order(
+                    NamespaceId::ROOT,
                     connection.transaction_changes.get_view_names()?,
                 )?;
                 for view_name in &views {
-                    if let Some(view_mutex) = schema.get_materialized_view(view_name) {
+                    if let Some(view_mutex) =
+                        schema.get_materialized_view(NamespaceId::ROOT, view_name)
+                    {
                         let view = view_mutex.lock();
                         turso_assert_ne!(
                             view.get_root_page(),
@@ -208,7 +212,9 @@ pub(crate) fn step_view_delta_batch(
                     }
 
                     let schema = connection.schema.read();
-                    let Some(view_mutex) = schema.get_materialized_view(view_name) else {
+                    let Some(view_mutex) =
+                        schema.get_materialized_view(NamespaceId::ROOT, view_name)
+                    else {
                         *current_index += 1;
                         continue;
                     };
@@ -1168,6 +1174,7 @@ pub struct ProgramState {
     /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
     /// the statement subtransactionwill roll back.
     fk_immediate_violations_during_stmt: AtomicIsize,
+    fk_immediate_violation: Option<LimboError>,
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
@@ -1264,6 +1271,7 @@ impl ProgramState {
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
+            fk_immediate_violation: None,
             rowsets: HashMap::default(),
             spare_agg_payloads: Vec::new(),
             bloom_filters: HashMap::default(),
@@ -1427,6 +1435,7 @@ impl ProgramState {
         self.populate_matviews_state = None;
         self.auto_txn_cleanup = TxnCleanup::None;
         *self.fk_immediate_violations_during_stmt.get_mut() = 0;
+        self.fk_immediate_violation = None;
         *self.fk_deferred_violations_when_stmt_started.get_mut() = 0;
         if !self.rowsets.is_empty() {
             self.rowsets.clear();
@@ -1744,6 +1753,7 @@ impl ProgramState {
         // Reset the immediate foreign key violations counter to 0. If this is nonzero when the statement completes, the statement subtransaction will roll back.
         self.fk_immediate_violations_during_stmt
             .store(0, Ordering::Release);
+        self.fk_immediate_violation = None;
         Ok(IOResult::Done(()))
     }
 
@@ -1942,6 +1952,12 @@ impl ProgramState {
     pub fn get_fk_immediate_violations_during_stmt(&self) -> isize {
         self.fk_immediate_violations_during_stmt
             .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn immediate_foreign_key_error(&self) -> LimboError {
+        self.fk_immediate_violation.clone().unwrap_or_else(|| {
+            LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string())
+        })
     }
 
     pub fn increment_fk_immediate_violations_during_stmt(&self, v: isize) {
@@ -2895,7 +2911,7 @@ impl Program {
         pager: &Arc<Pager>,
         err: LimboError,
     ) -> Option<ProgramStep> {
-        match err {
+        match err.into_structured_constraint() {
             LimboError::Busy => Some(ProgramStep::Busy),
             LimboError::BusySnapshot
                 if matches!(
@@ -2905,7 +2921,9 @@ impl Program {
             {
                 Some(ProgramStep::Busy)
             }
-            err if (matches!(err, LimboError::Constraint(_))
+            err if ((matches!(err, LimboError::Constraint(_))
+                || matches!(err, LimboError::ConstraintViolation(_)))
+                && !err.is_foreign_key_constraint()
                 && self.resolve_type == ResolveType::Fail)
                 || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
             {
@@ -3533,7 +3551,9 @@ impl Program {
         let keeps_prior_changes = match err {
             Some(LimboError::RaiseIgnore) => true,
             Some(LimboError::Raise(ResolveType::Fail, _)) => true,
-            Some(LimboError::Constraint(_)) => self.resolve_type == ResolveType::Fail,
+            Some(error @ (LimboError::Constraint(_) | LimboError::ConstraintViolation(_))) => {
+                !error.is_foreign_key_constraint() && self.resolve_type == ResolveType::Fail
+            }
             _ => false,
         };
         if (err.is_some() || state.execution_state.is_running()) && !keeps_prior_changes {
@@ -3629,7 +3649,9 @@ impl Program {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
                 // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
-                let is_fail_constraint = (matches!(err, Some(LimboError::Constraint(_)))
+                let is_fail_constraint = ((matches!(err, Some(LimboError::Constraint(_)))
+                    || matches!(err, Some(LimboError::ConstraintViolation(_))))
+                    && !err.is_some_and(LimboError::is_foreign_key_constraint)
                     && self.resolve_type == ResolveType::Fail)
                     || matches!(err, Some(LimboError::Raise(ResolveType::Fail, _)));
                 if !is_fail_constraint {
@@ -3684,7 +3706,7 @@ impl Program {
                 // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.
                 // FK errors always behave like ABORT: rollback statement,
                 // rollback transaction in autocommit mode.
-                Some(LimboError::ForeignKeyConstraint(_)) => {
+                Some(error) if error.is_foreign_key_constraint() => {
                     if must_rollback_tx_if_needed {
                         self.rollback_current_txn(pager);
                     }
@@ -3696,7 +3718,9 @@ impl Program {
                 // - ROLLBACK: rollback the entire transaction regardless of autocommit mode
                 // - FAIL: don't rollback anything - changes persist, transaction stays active
                 // - ABORT (default): rollback statement, rollback txn if autocommit
-                Some(LimboError::Constraint(_)) | Some(LimboError::Raise(_, _)) => {
+                Some(LimboError::Constraint(_))
+                | Some(LimboError::ConstraintViolation(_))
+                | Some(LimboError::Raise(_, _)) => {
                     let effective_resolve = match err {
                         Some(LimboError::Raise(rt, _)) => *rt,
                         _ => self.resolve_type,
@@ -3779,8 +3803,11 @@ impl Program {
                                 // delivered it before returning the error;
                                 // only the trigger RAISE(FAIL) shape reaches
                                 // the commit through this arm.
-                                let halt_already_delivered =
-                                    matches!(err, Some(LimboError::Constraint(_)));
+                                let halt_already_delivered = matches!(
+                                    err,
+                                    Some(LimboError::Constraint(_))
+                                        | Some(LimboError::ConstraintViolation(_))
+                                );
                                 if committed && !halt_already_delivered {
                                     execute::index_method_on_transaction_committed_all(
                                         state,

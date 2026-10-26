@@ -67,6 +67,16 @@ expect error {
     CHECK constraint failed: pos_0
 }
 
+test alter-column-to-domain-checks-existing-rows {
+    CREATE DOMAIN pos AS integer CHECK (value > 0);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER) STRICT;
+    INSERT INTO t VALUES (1, -1);
+    ALTER TABLE t ALTER COLUMN v TO v2 pos;
+}
+expect error {
+    CHECK constraint failed: pos_0
+}
+
 test alter-column-to-domain-enforces-domain-not-null {
     CREATE DOMAIN nn AS integer NOT NULL;
     CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER) STRICT;

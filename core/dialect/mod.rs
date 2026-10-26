@@ -33,6 +33,10 @@ pub trait Dialect: Send + Sync + 'static {
     /// reject an open whose dialect differs from the already-open instance.
     fn name(&self) -> &'static str;
 
+    fn format_error(&self, error: crate::LimboError) -> crate::LimboError {
+        error.into_sqlite_error()
+    }
+
     /// Parse the first statement in `sql` into the engine AST.
     ///
     /// Returns the parsed command, if any, and the number of input bytes
@@ -128,6 +132,10 @@ pub trait Dialect: Send + Sync + 'static {
         options
     }
 
+    fn random_value(&self, bits: i64) -> crate::Value {
+        crate::Value::from_i64(bits) // SQLite default
+    }
+
     /// Resolve a function name in user SQL to the engine's function IR.
     ///
     /// The dialect owns its scalar function surface: the SQLite dialect
@@ -183,6 +191,29 @@ pub trait Dialect: Send + Sync + 'static {
     /// sequence after the search path changes. SQLite looks the name up
     /// each time the default or view runs.
     fn binds_names_at_create(&self) -> bool {
+        false
+    }
+
+    /// Whether `INSERT ... ON CONFLICT DO UPDATE` fails when the conflicting
+    /// row was already inserted or updated by the same statement.
+    ///
+    /// PostgreSQL raises an error so that the result does not depend on the
+    /// order of the proposed rows. SQLite updates the row again.
+    fn upsert_rejects_row_written_by_same_statement(&self) -> bool {
+        false
+    }
+
+    /// Whether integer division by zero raises an error.
+    ///
+    /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.
+    fn errors_on_zero_divisor(&self) -> bool {
+        false
+    }
+
+    /// Whether `mod` of two integers returns an integer.
+    ///
+    /// PostgreSQL returns an integer. SQLite always returns a REAL.
+    fn mod_of_integers_is_integer(&self) -> bool {
         false
     }
 }

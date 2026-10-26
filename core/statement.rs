@@ -589,8 +589,12 @@ impl Statement {
         self.state.query_deadline = Some(self.pager.io.current_time_monotonic() + timeout);
     }
 
-    fn release_active_root_if_counted(&mut self) {
+    fn release_active_root_if_counted(&mut self, statement_failed: bool) {
         if self.counted_as_active_root {
+            let conn = &self.program.connection;
+            if let Some(hooks) = conn.hooks() {
+                hooks.root_statement_ended(conn, statement_failed);
+            }
             // Blob count drops before the root count so a concurrent
             // checkpoint-guard read never sees fewer non-blob statements
             // than are really active (a stale-high read only causes a
@@ -713,7 +717,7 @@ impl Statement {
                 .matches_connection(&self.program.connection)
             {
                 if let Err(err) = self.reprepare() {
-                    self.release_active_root_if_counted();
+                    self.release_active_root_if_counted(true);
                     return Err(err);
                 }
             }
@@ -770,7 +774,7 @@ impl Statement {
                 .rollback_autocommit_txn()
                 .and_then(|()| self.reprepare())
             {
-                self.release_active_root_if_counted();
+                self.release_active_root_if_counted(true);
                 return Err(err);
             }
             res = self
@@ -792,7 +796,7 @@ impl Statement {
                 // The stats refresh runs a SELECT on this same connection. At
                 // this point ANALYZE is already Done, so it must not count as a
                 // sibling root statement for that internal SELECT.
-                self.release_active_root_if_counted();
+                self.release_active_root_if_counted(false);
                 // Drive the refresh as a state machine instead of pumping
                 // `io.step()` here: its `sqlite_stat1` scan can have to wait
                 // for another transaction, and only the caller's scheduler can
@@ -838,7 +842,7 @@ impl Statement {
         if self.counted_as_active_root
             && (matches!(res, Ok(StepResult::Done | StepResult::Interrupt)) || res.is_err())
         {
-            self.release_active_root_if_counted();
+            self.release_active_root_if_counted(!matches!(res, Ok(StepResult::Done)));
         }
 
         // If the bytecode aborted between SequenceBeginInnerTx and
@@ -890,17 +894,18 @@ impl Statement {
 
         // The interpreter chain carries a boxed error to keep per-row returns
         // register-sized; unbox once at the public boundary.
-        res.map_err(|err| *err)
+        res.map_err(|err| (*err).into_structured_constraint())
     }
 
     #[inline]
     pub fn step(&mut self) -> Result<StepResult> {
-        self._step(None)
+        self._step(None).map_err(|error| self.format_error(error))
     }
 
     #[inline]
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
         self._step(Some(waker))
+            .map_err(|error| self.format_error(error))
     }
 
     /// Fast step for trigger/FK subprograms: skips reprepare checks, timeout
@@ -911,6 +916,10 @@ impl Statement {
         self.program
             .step(&mut self.state, &self.pager, self.query_mode, None)
             .map_err(|err| *err)
+    }
+
+    fn format_error(&self, error: LimboError) -> LimboError {
+        self.program.connection.dialect().format_error(error)
     }
 
     /// Makes a trigger or foreign key action see the same current time as
@@ -1591,6 +1600,7 @@ impl Statement {
 
     pub fn reset(&mut self) -> Result<()> {
         self.reset_internal(None, None, false)
+            .map_err(|error| self.format_error(error))
     }
 
     /// If `Insn::SequenceBeginInnerTx` swapped the connection's mv_tx to
@@ -1709,6 +1719,7 @@ impl Statement {
             }
         }
 
+        let mut statement_failed = false;
         if self.state.execution_state.is_running() {
             if self.query_mode == QueryMode::Normal
                 && self.program.change_cnt_on
@@ -1726,6 +1737,7 @@ impl Statement {
                         &self.pager,
                         0,
                         "",
+                        None,
                         None,
                     ) {
                         Ok(vdbe::execute::InsnFunctionStepResult::Done) => {
@@ -1768,6 +1780,7 @@ impl Statement {
                     }
                 }
 
+                statement_failed = !halt_completed;
                 if !halt_completed {
                     if let Err(abort_err) = self.program.abort(
                         &self.pager,
@@ -1787,6 +1800,7 @@ impl Statement {
                 // yielded a Row (DML still in progress or hit Busy/error), or a
                 // write statement without RETURNING. Rollback to avoid committing
                 // partial DML or silently retrying after transient errors (Busy).
+                statement_failed = self.state.is_active_write;
                 if let Err(abort_err) = self.program.abort(
                     &self.pager,
                     None,
@@ -1831,7 +1845,7 @@ impl Statement {
             self.state.is_active_write = false;
         }
         if self.counted_as_active_root && !preserve_active_root_count {
-            self.release_active_root_if_counted();
+            self.release_active_root_if_counted(statement_failed);
         }
         self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(max_registers, max_cursors);
@@ -1922,6 +1936,272 @@ mod tests {
     use crate::SqliteDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
 
+    #[test]
+    fn cloned_halt_retains_constraint_context() {
+        assert_cloned_constraint_context(
+            "INSERT INTO parent VALUES (1, 'b', 1)",
+            crate::ConstraintKind::PrimaryKey,
+            "parent",
+            "id",
+        );
+    }
+
+    #[test]
+    fn cloned_halt_if_null_retains_constraint_context() {
+        assert_cloned_constraint_context(
+            "INSERT INTO parent VALUES (2, NULL, 1)",
+            crate::ConstraintKind::NotNull,
+            "parent",
+            "code",
+        );
+    }
+
+    #[test]
+    fn cloned_fk_counter_retains_constraint_context() {
+        assert_cloned_constraint_context(
+            "UPDATE child SET pid = 99",
+            crate::ConstraintKind::ForeignKey,
+            "child",
+            "pid",
+        );
+    }
+
+    fn assert_cloned_constraint_context(
+        sql: &str,
+        kind: crate::ConstraintKind,
+        table: &str,
+        column: &str,
+    ) {
+        use crate::vdbe::{execute, insn::Insn};
+
+        let conn = constraint_test_connection();
+        let mut stmt = conn.prepare(sql).unwrap();
+        let insn = stmt
+            .program
+            .insns
+            .iter()
+            .find_map(|(insn, _)| {
+                let matches = match kind {
+                    crate::ConstraintKind::PrimaryKey => matches!(
+                        insn,
+                        Insn::Halt {
+                            err_code: crate::error::SQLITE_CONSTRAINT_PRIMARYKEY,
+                            ..
+                        }
+                    ),
+                    crate::ConstraintKind::NotNull => matches!(insn, Insn::HaltIfNull { .. }),
+                    crate::ConstraintKind::ForeignKey => matches!(
+                        insn,
+                        Insn::FkCounter {
+                            increment_value: 1,
+                            deferred: false,
+                            ..
+                        }
+                    ),
+                    _ => unreachable!(),
+                };
+                matches.then(|| insn.clone())
+            })
+            .expect("constraint instruction");
+        for index in 0..stmt.state.column_count() {
+            stmt.state
+                .set_register(index, vdbe::Register::Value(Value::from_i64(99)));
+        }
+        let error = match &insn {
+            Insn::Halt { .. } => {
+                execute::op_halt(&stmt.program, &mut stmt.state, &insn, &stmt.pager)
+                    .err()
+                    .expect("constraint error")
+            }
+            Insn::HaltIfNull { target_reg, .. } => {
+                stmt.state
+                    .set_register(*target_reg, vdbe::Register::Value(Value::Null));
+                execute::op_halt_if_null(&stmt.program, &mut stmt.state, &insn, &stmt.pager)
+                    .err()
+                    .expect("constraint error")
+            }
+            Insn::FkCounter { .. } => {
+                execute::op_fk_counter(&stmt.program, &mut stmt.state, &insn, &stmt.pager).unwrap();
+                Box::new(stmt.state.immediate_foreign_key_error())
+            }
+            _ => unreachable!(),
+        };
+        let LimboError::ConstraintViolation(violation) = *error else {
+            panic!("expected structured constraint: {error:?}");
+        };
+        assert_eq!(violation.kind, kind);
+        assert_eq!(violation.table_name.as_deref(), Some(table));
+        assert_eq!(violation.column_names, vec![column]);
+        assert!(!violation.values.is_empty());
+    }
+
+    #[test]
+    fn internal_constraint_errors_are_structured() {
+        for (sql, kind, message, foreign_key) in constraint_error_cases() {
+            let conn = constraint_test_connection();
+            let mut stmt = conn.prepare(sql).unwrap();
+            let error = loop {
+                match stmt._step(None) {
+                    Err(error) => break error,
+                    Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
+                        stmt.pager.io.step().unwrap();
+                    }
+                    Ok(result) => panic!("expected constraint error, got {result:?}: {sql}"),
+                }
+            };
+            let LimboError::ConstraintViolation(violation) = &error else {
+                panic!("{sql}: {error:?}");
+            };
+            assert_eq!(violation.kind, kind, "{sql}");
+            assert_eq!(error.to_string(), message, "{sql}");
+            assert_eq!(error.is_foreign_key_constraint(), foreign_key, "{sql}");
+            assert_eq!(error.sqlite_result_code(), 19, "{sql}");
+        }
+    }
+
+    #[test]
+    fn public_constraint_errors_preserve_sqlite_variants() {
+        for (sql, _, message, foreign_key) in constraint_error_cases() {
+            for with_waker in [false, true] {
+                let conn = constraint_test_connection();
+                let mut stmt = conn.prepare(sql).unwrap();
+                let error = loop {
+                    let result = if with_waker {
+                        stmt.step_with_waker(Waker::noop())
+                    } else {
+                        stmt.step()
+                    };
+                    match result {
+                        Err(error) => break error,
+                        Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
+                            stmt.pager.io.step().unwrap();
+                        }
+                        Ok(result) => panic!("expected constraint error, got {result:?}: {sql}"),
+                    }
+                };
+                if foreign_key {
+                    assert!(
+                        matches!(error, LimboError::ForeignKeyConstraint(_)),
+                        "{sql}: {error:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(error, LimboError::Constraint(_)),
+                        "{sql}: {error:?}"
+                    );
+                }
+                assert_eq!(error.to_string(), message, "{sql}");
+                assert_eq!(error.sqlite_result_code(), 19, "{sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn public_helper_statement_errors_preserve_sqlite_variants() {
+        let conn = constraint_test_connection();
+        let mut stmt = conn
+            .prepare_internal("INSERT INTO parent VALUES (1, 'b', 1)")
+            .unwrap();
+        let error = stmt.run_ignore_rows().unwrap_err();
+        assert!(matches!(error, LimboError::Constraint(_)), "{error:?}");
+        assert_eq!(error.to_string(), "UNIQUE constraint failed: parent.id");
+        assert_eq!(error.sqlite_result_code(), 19);
+    }
+
+    #[test]
+    fn public_reset_preserves_sqlite_foreign_key_error() {
+        let conn = constraint_test_connection();
+        let mut stmt = conn
+            .prepare("INSERT INTO deferred_child VALUES (99) RETURNING pid")
+            .unwrap();
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => break,
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    stmt.pager.io.step().unwrap();
+                }
+                result => panic!("expected RETURNING row, got {result:?}"),
+            }
+        }
+        let error = stmt.reset().unwrap_err();
+        assert!(
+            matches!(error, LimboError::ForeignKeyConstraint(_)),
+            "{error:?}"
+        );
+        assert_eq!(error.to_string(), "FOREIGN KEY constraint failed");
+        assert_eq!(error.sqlite_result_code(), 19);
+    }
+
+    fn constraint_error_cases() -> [(&'static str, crate::ConstraintKind, &'static str, bool); 8] {
+        [
+            (
+                "INSERT INTO parent VALUES (1, 'b', 1)",
+                crate::ConstraintKind::PrimaryKey,
+                "UNIQUE constraint failed: parent.id",
+                false,
+            ),
+            (
+                "INSERT INTO parent VALUES (2, 'a', 1)",
+                crate::ConstraintKind::Unique,
+                "UNIQUE constraint failed: parent.code",
+                false,
+            ),
+            (
+                "INSERT INTO parent VALUES (2, NULL, 1)",
+                crate::ConstraintKind::NotNull,
+                "NOT NULL constraint failed: parent.code",
+                false,
+            ),
+            (
+                "INSERT INTO parent VALUES (2, 'b', -1)",
+                crate::ConstraintKind::Check,
+                "CHECK constraint failed: positive",
+                false,
+            ),
+            (
+                "INSERT INTO child VALUES (99)",
+                crate::ConstraintKind::ForeignKey,
+                "FOREIGN KEY constraint failed",
+                true,
+            ),
+            (
+                "DELETE FROM parent",
+                crate::ConstraintKind::ForeignKey,
+                "FOREIGN KEY constraint failed",
+                true,
+            ),
+            (
+                "INSERT INTO deferred_child VALUES (99)",
+                crate::ConstraintKind::ForeignKey,
+                "FOREIGN KEY constraint failed",
+                true,
+            ),
+            (
+                "INSERT INTO trigger_source VALUES (1)",
+                crate::ConstraintKind::PrimaryKey,
+                "UNIQUE constraint failed: parent.id",
+                false,
+            ),
+        ]
+    }
+
+    fn constraint_test_connection() -> Arc<crate::Connection> {
+        let conn = open_test_connection().unwrap();
+        conn.set_foreign_keys_enabled(true);
+        for sql in [
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, score INTEGER CONSTRAINT positive CHECK (score > 0))",
+            "CREATE TABLE child (pid INTEGER REFERENCES parent(id))",
+            "CREATE TABLE deferred_child (pid INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
+            "CREATE TABLE trigger_source (id INTEGER)",
+            "CREATE TRIGGER duplicate_parent AFTER INSERT ON trigger_source BEGIN INSERT INTO parent VALUES (NEW.id, 'b', 1); END",
+            "INSERT INTO parent VALUES (1, 'a', 1)",
+            "INSERT INTO child VALUES (1)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        conn
+    }
+
     fn open_test_connection() -> crate::Result<Arc<crate::Connection>> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file_with_flags(
@@ -1933,6 +2213,52 @@ mod tests {
             Arc::new(SqliteDialect),
         )?;
         db.connect(ConnectOpts::new())
+    }
+
+    /// A hash join inside a correlated subquery is built once and probed once per
+    /// outer row. The budget is forced down so the build spills in every build
+    /// profile; the second and third passes then go through the grace phase and
+    /// must count the same rows as the first (#9774).
+    #[test]
+    fn test_spilled_hash_join_counts_the_same_on_every_probe_pass() {
+        let conn = open_test_connection().unwrap();
+        for sql in [
+            "CREATE TABLE a(x INTEGER PRIMARY KEY, y INT)",
+            "CREATE TABLE c(k INT, v INT)",
+            "CREATE TABLE d(k INT, w INT)",
+            "INSERT INTO a VALUES (1, 0), (2, 1000000), (3, 1000000)",
+            "INSERT INTO c SELECT value % 50, value FROM generate_series(1, 1000)",
+            "INSERT INTO d SELECT value % 70, value FROM generate_series(1, 1000)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT a.x, (SELECT count(*) FROM c JOIN d ON c.k = d.k AND d.w < a.y) FROM a",
+            )
+            .unwrap();
+        let mut hash_builds = 0;
+        for (insn, _) in &mut Arc::make_mut(&mut stmt.program.prepared).insns {
+            if let vdbe::insn::Insn::HashBuild { data } = insn {
+                data.mem_budget = 32 * 1024;
+                hash_builds += 1;
+            }
+        }
+        assert_eq!(hash_builds, 1, "the join must be built once and reused");
+
+        let rows = stmt.run_collect_rows().unwrap();
+        let expected: Vec<Vec<Value>> = [[1, 0], [2, 14400], [3, 14400]]
+            .iter()
+            .map(|row| row.iter().copied().map(Value::from_i64).collect())
+            .collect();
+        assert_eq!(rows, expected);
+
+        let metrics = stmt.metrics().hash_join;
+        assert!(metrics.spill_chunks > 0, "build did not spill: {metrics:?}");
+        assert!(
+            metrics.grace_partitions_processed > 0,
+            "no pass went through grace: {metrics:?}"
+        );
     }
 
     #[test]

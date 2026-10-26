@@ -1,4 +1,5 @@
 use super::*;
+use crate::namespace::NamespaceRef;
 use crate::translate::sequence::emit_sequence_descriptor_literals;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{to_u32, InsertFlags, RegisterOrLiteral};
@@ -192,26 +193,27 @@ pub(super) fn translate_sequence_function(
     let is_nextval = matches!(&func_ctx.func, Func::Scalar(ScalarFunc::NextVal));
 
     let seq_name_raw = extract_string_literal(&args[0])?;
-    let (database_id, normalized_name) = if let Some((schema, name)) = seq_name_raw.split_once('.')
-    {
+    let (namespace, normalized_name) = if let Some((schema, name)) = seq_name_raw.split_once('.') {
         let schema_norm = normalize_ident(schema);
         let db_id = resolver
             .namespace_database_id(&schema_norm)
             .ok_or_else(|| {
-                LimboError::InvalidArgument(format!("no such database: {schema_norm}"))
+                LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist"))
             })?;
-        (db_id, normalize_ident(name))
+        (NamespaceRef::root_of(db_id), normalize_ident(name))
     } else {
         let name = normalize_ident(&seq_name_raw);
-        (resolver.resolve_existing_sequence_database_id(&name)?, name)
+        (resolver.resolve_existing_sequence(&name)?, name)
     };
+    let database_id = namespace.database_id;
     let runtime_args = qualify_sequence_argument(args, resolver);
     let args = runtime_args.as_deref().unwrap_or(args);
 
     let backing_table_name =
         crate::translate::sequence::sequence_backing_table_name(&normalized_name);
-    let backing_table =
-        resolver.with_schema(database_id, |s| s.get_btree_table(&backing_table_name));
+    let backing_table = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(namespace.id, &backing_table_name)
+    });
     if backing_table.is_none() {
         crate::bail_parse_error!("sequence \"{}\" does not exist", seq_name_raw);
     }
@@ -220,7 +222,9 @@ pub(super) fn translate_sequence_function(
     // baked into the bytecode as literal Integers since they never change
     // for a given sequence object.
     let seq_arc = resolver
-        .with_schema(database_id, |s| s.get_sequence(&normalized_name).cloned())
+        .with_schema(database_id, |s| {
+            s.get_sequence(namespace.id, &normalized_name).cloned()
+        })
         .ok_or_else(|| {
             LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist"))
         })?;
@@ -363,8 +367,8 @@ pub(crate) fn qualify_sequence_argument(
         return None;
     }
     let name = normalize_ident(&seq_name_raw);
-    let database_id = resolver.find_existing_sequence_database_id(&name)?;
-    let runtime_name = resolver.runtime_sequence_name(database_id, &name);
+    let namespace = resolver.find_existing_sequence(&name)?;
+    let runtime_name = resolver.runtime_sequence_name(namespace, &name);
     let mut args = args.to_vec();
     args[0] = Box::new(ast::Expr::Literal(ast::Literal::String(format!(
         "'{}'",

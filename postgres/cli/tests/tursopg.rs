@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Output, Stdio};
@@ -65,6 +66,26 @@ fn create_table_then_select() {
     let out = stdout(&output);
     assert!(out.contains("hello"), "expected 'hello' in: {out}");
     assert!(out.contains("42"), "expected '42' in: {out}");
+}
+
+#[test]
+fn repl_reports_errors_like_psql() {
+    let output = run_tursopg(
+        b"CREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (1);\nINSERT INTO t VALUES (1);\nSELECT 1/0;\n",
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains("ERROR:  duplicate key value violates unique constraint \"t_pkey\""),
+        "expected psql-style unique violation, got: {out}"
+    );
+    assert!(
+        out.contains("DETAIL:  Key (id)=(1) already exists."),
+        "expected DETAIL line, got: {out}"
+    );
+    assert!(
+        out.contains("ERROR:  division by zero"),
+        "expected psql-style division by zero, got: {out}"
+    );
 }
 
 #[test]
@@ -935,6 +956,28 @@ impl PgTestClient {
         self.stream.flush().unwrap();
     }
 
+    fn send_message(&mut self, tag: u8, payload: &[u8]) {
+        self.stream.write_all(&[tag]).unwrap();
+        self.stream
+            .write_all(&((payload.len() + 4) as i32).to_be_bytes())
+            .unwrap();
+        self.stream.write_all(payload).unwrap();
+        self.stream.flush().unwrap();
+    }
+
+    fn send_extended(&mut self, sql: &str, describe: bool) {
+        let mut parse = vec![0];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        self.send_message(b'P', &parse);
+        if describe {
+            self.send_message(b'D', &[b'S', 0]);
+        } else {
+            self.send_message(b'B', &[0; 8]);
+            self.send_message(b'E', &[0; 5]);
+        }
+    }
+
     /// Read all messages until ReadyForQuery ('Z'), return raw bytes.
     fn read_until_ready(&mut self) -> Vec<u8> {
         let mut all_bytes = Vec::new();
@@ -984,6 +1027,14 @@ impl PgTestClient {
         self.send_query(sql);
         let response = self.read_until_ready();
         extract_first_data_row_text(&response).expect("query returned no rows")
+    }
+
+    /// Send query and return the fields from the first ErrorResponse ('E') message.
+    /// Returns an empty map if the response contains no error.
+    fn query_error_fields(&mut self, sql: &str) -> HashMap<u8, String> {
+        self.send_query(sql);
+        let response = self.read_until_ready();
+        extract_error_fields(&response).unwrap_or_default()
     }
 }
 
@@ -1114,6 +1165,57 @@ fn extract_row_description_oids(data: &[u8]) -> Vec<u32> {
 const OID_INT4: u32 = 23;
 const OID_TEXT: u32 = 25;
 const OID_FLOAT8: u32 = 701;
+
+/// Walk raw PG wire bytes, find the first ErrorResponse ('E') message, and
+/// return its fields as a map from the one-byte field type to the value string.
+///
+/// Field type bytes (from the PG protocol docs):
+///   b'C' = SQLSTATE code
+///   b'M' = human-readable message
+///   b'D' = detail
+///   b't' = table name
+///   b'n' = constraint name
+///   b's' = schema name
+///   b'c' = column name
+fn extract_error_fields(data: &[u8]) -> Option<HashMap<u8, String>> {
+    let mut pos = 0;
+    while pos < data.len() {
+        let tag = data[pos];
+        pos += 1;
+        if pos + 4 > data.len() {
+            break;
+        }
+        let len =
+            i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        let body_end = pos + (len - 4);
+        if body_end > data.len() {
+            break;
+        }
+        if tag == b'E' {
+            let body = &data[pos..body_end];
+            let mut fields = HashMap::new();
+            let mut p = 0;
+            while p < body.len() {
+                let field_type = body[p];
+                p += 1;
+                if field_type == 0 {
+                    break;
+                }
+                let nul = body[p..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(body.len() - p);
+                let value = String::from_utf8(body[p..p + nul].to_vec()).unwrap_or_default();
+                p += nul + 1;
+                fields.insert(field_type, value);
+            }
+            return Some(fields);
+        }
+        pos = body_end;
+    }
+    None
+}
 
 /// Extract CommandComplete ('C') tag strings from raw PG wire bytes.
 fn extract_command_tags(data: &[u8]) -> Vec<String> {
@@ -1559,4 +1661,577 @@ fn rewritten_table_definitions_survive_reopen() {
     }
 
     std::fs::remove_dir_all(&test_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Wire protocol: constraint violation error fields
+//
+// PostgreSQL sends structured error information for constraint violations:
+//   b'C' SQLSTATE:         23505 (unique), 23503 (fk), 23514 (check), 23502 (not null)
+//   b'M' message:          human-readable description
+//   b'D' detail:           which key/row violated the constraint
+//   b't' table:            table where the violation occurred
+//   b'n' constraint name:  name of the violated constraint
+//
+// These tests assert that Turso sends the same structured fields. They are
+// derived from real PostgreSQL 17 behavior, not inferred.
+// ---------------------------------------------------------------------------
+
+/// Unit test for extract_error_fields with hardcoded bytes to verify the parser.
+#[test]
+fn extract_error_fields_parses_pg_error_response() {
+    let body: &[u8] = b"SERROR\x00CXX000\x00Mtest error\x00\x00";
+    let len = (4 + body.len()) as i32;
+    let mut data = vec![b'E'];
+    data.extend_from_slice(&len.to_be_bytes());
+    data.extend_from_slice(body);
+    data.push(b'Z');
+    data.extend_from_slice(&5i32.to_be_bytes());
+    data.push(b'I');
+
+    let fields = extract_error_fields(&data).expect("must find ErrorResponse");
+    assert_eq!(fields.get(&b'S').map(String::as_str), Some("ERROR"));
+    assert_eq!(fields.get(&b'C').map(String::as_str), Some("XX000"));
+    assert_eq!(fields.get(&b'M').map(String::as_str), Some("test error"));
+}
+
+/// Diagnostic test: dump the raw wire response for a PK violation so we can
+/// see what the server actually sends. Used to debug why extract_error_fields
+/// returns empty.
+#[test]
+fn debug_wire_pk_violation_response() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE t_dbg (id INT PRIMARY KEY)");
+        c.query_command_tags("INSERT INTO t_dbg VALUES (1)");
+        c.send_query("INSERT INTO t_dbg VALUES (1)");
+        let response = c.read_until_ready();
+        let fields = extract_error_fields(&response);
+        // Print for debugging (test always passes, used to observe behavior)
+        eprintln!(
+            "response bytes ({} total): {:?}",
+            response.len(),
+            &response[..response.len().min(80)]
+        );
+        eprintln!("error fields: {fields:?}");
+        // At minimum, there must be SOME response (non-empty)
+        assert!(
+            !response.is_empty(),
+            "response should not be empty for PK violation"
+        );
+        // And the server should send an ErrorResponse (tag 0x45 = 'E')
+        assert!(
+            response.contains(&b'E'),
+            "response should contain ErrorResponse ('E') tag byte, got: {:?}",
+            &response[..response.len().min(20)]
+        );
+    });
+}
+
+/// Named UNIQUE constraint: duplicate value in a column with an explicit
+/// CONSTRAINT name.
+///
+/// PostgreSQL 17:
+///   SQLSTATE  23505
+///   message   duplicate key value violates unique constraint "t_u_code_uq"
+///   detail    Key (code)=(a) already exists.
+///   table     t_u
+///   constraint t_u_code_uq
+#[test]
+fn wire_error_unique_named_constraint() {
+    with_pg_client(|c| {
+        c.query_command_tags(
+            "CREATE TABLE t_u (id INT PRIMARY KEY, code TEXT CONSTRAINT t_u_code_uq UNIQUE)",
+        );
+        c.query_command_tags("INSERT INTO t_u VALUES (1, 'a')");
+        let fields = c.query_error_fields("INSERT INTO t_u VALUES (2, 'a')");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("23505"),
+            "SQLSTATE must be 23505 for unique violation, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'M').map(String::as_str),
+            Some("duplicate key value violates unique constraint \"t_u_code_uq\""),
+            "message must use PostgreSQL wording, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'n').map(String::as_str),
+            Some("t_u_code_uq"),
+            "constraint name must be t_u_code_uq, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b't').map(String::as_str),
+            Some("t_u"),
+            "table name must be t_u, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'D').map(String::as_str),
+            Some("Key (code)=(a) already exists."),
+            "detail must identify the duplicate key value, got: {fields:?}"
+        );
+    });
+}
+
+/// Primary key constraint: duplicate value in the PK column. PostgreSQL
+/// auto-names the constraint <table>_pkey.
+///
+/// PostgreSQL 17:
+///   SQLSTATE  23505
+///   message   duplicate key value violates unique constraint "t_pk_pkey"
+///   detail    Key (id)=(1) already exists.
+///   table     t_pk
+///   constraint t_pk_pkey
+#[test]
+fn wire_error_primary_key_violation() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE t_pk (id INT PRIMARY KEY, name TEXT)");
+        c.query_command_tags("INSERT INTO t_pk VALUES (1, 'alice')");
+        let fields = c.query_error_fields("INSERT INTO t_pk VALUES (1, 'bob')");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("23505"),
+            "SQLSTATE must be 23505 for PK violation, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'n').map(String::as_str),
+            Some("t_pk_pkey"),
+            "constraint name must be t_pk_pkey, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b't').map(String::as_str),
+            Some("t_pk"),
+            "table name must be t_pk, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'D').map(String::as_str),
+            Some("Key (id)=(1) already exists."),
+            "detail must identify the duplicate key value, got: {fields:?}"
+        );
+    });
+}
+
+/// Named CHECK constraint: insert a row that fails the check expression.
+///
+/// PostgreSQL 17:
+///   SQLSTATE  23514
+///   message   new row for relation "t_ck" violates check constraint "t_ck_score_ck"
+///   detail    Failing row contains (1, -1).
+///   table     t_ck
+///   constraint t_ck_score_ck
+#[test]
+fn wire_error_check_constraint_violation() {
+    with_pg_client(|c| {
+        c.query_command_tags(
+            "CREATE TABLE t_ck (id INT PRIMARY KEY, score INT CONSTRAINT t_ck_score_ck CHECK (score >= 0))",
+        );
+        let fields = c.query_error_fields("INSERT INTO t_ck VALUES (1, -1)");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("23514"),
+            "SQLSTATE must be 23514 for CHECK violation, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'n').map(String::as_str),
+            Some("t_ck_score_ck"),
+            "constraint name must be t_ck_score_ck, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b't').map(String::as_str),
+            Some("t_ck"),
+            "table name must be t_ck, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'D').map(String::as_str),
+            Some("Failing row contains (1, -1)."),
+            "detail must show the failing row values, got: {fields:?}"
+        );
+    });
+}
+
+/// NOT NULL constraint: insert NULL into a NOT NULL column.
+///
+/// PostgreSQL 17:
+///   SQLSTATE  23502
+///   message   null value in column "code" of relation "t_nn" violates not-null constraint
+///   detail    Failing row contains (1, null).
+///   table     t_nn
+///   column    code
+#[test]
+fn wire_error_not_null_violation() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE t_nn (id INT PRIMARY KEY, code TEXT NOT NULL)");
+        let fields = c.query_error_fields("INSERT INTO t_nn VALUES (1, NULL)");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("23502"),
+            "SQLSTATE must be 23502 for NOT NULL violation, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b't').map(String::as_str),
+            Some("t_nn"),
+            "table name must be t_nn, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'c').map(String::as_str),
+            Some("code"),
+            "column name must be code, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'D').map(String::as_str),
+            Some("Failing row contains (1, null)."),
+            "detail must show the failing row values, got: {fields:?}"
+        );
+    });
+}
+
+/// Unnamed UNIQUE constraint: PostgreSQL auto-names it <table>_<col>_key.
+///
+/// PostgreSQL 17:
+///   SQLSTATE  23505
+///   message   duplicate key value violates unique constraint "t_uu_code_key"
+///   detail    Key (code)=(a) already exists.
+///   table     t_uu
+///   constraint t_uu_code_key
+#[test]
+fn wire_error_unique_unnamed_constraint() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE t_uu (id INT PRIMARY KEY, code TEXT UNIQUE)");
+        c.query_command_tags("INSERT INTO t_uu VALUES (1, 'a')");
+        let fields = c.query_error_fields("INSERT INTO t_uu VALUES (2, 'a')");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("23505"),
+            "SQLSTATE must be 23505 for unique violation, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'n').map(String::as_str),
+            Some("t_uu_code_key"),
+            "constraint name must be t_uu_code_key, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b't').map(String::as_str),
+            Some("t_uu"),
+            "table name must be t_uu, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'D').map(String::as_str),
+            Some("Key (code)=(a) already exists."),
+            "detail must identify the duplicate key value, got: {fields:?}"
+        );
+    });
+}
+
+/// Multi-column unnamed UNIQUE constraint: PostgreSQL auto-names it
+/// <table>_<col1>_<col2>_key.
+///
+/// PostgreSQL 17:
+///   SQLSTATE  23505
+///   message   duplicate key value violates unique constraint "t_mc_a_b_key"
+///   detail    Key (a, b)=(1, 2) already exists.
+///   table     t_mc
+///   constraint t_mc_a_b_key
+#[test]
+fn wire_error_unique_multi_column_constraint() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE t_mc (id INT PRIMARY KEY, a INT, b INT, UNIQUE(a, b))");
+        c.query_command_tags("INSERT INTO t_mc VALUES (1, 1, 2)");
+        let fields = c.query_error_fields("INSERT INTO t_mc VALUES (2, 1, 2)");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("23505"),
+            "SQLSTATE must be 23505 for unique violation, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'n').map(String::as_str),
+            Some("t_mc_a_b_key"),
+            "constraint name must be t_mc_a_b_key, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b't').map(String::as_str),
+            Some("t_mc"),
+            "table name must be t_mc, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'D').map(String::as_str),
+            Some("Key (a, b)=(1, 2) already exists."),
+            "detail must identify the duplicate key values, got: {fields:?}"
+        );
+    });
+}
+
+/// UPDATE to a value that duplicates a UNIQUE constraint.
+///
+/// PostgreSQL 17:
+///   SQLSTATE  23505
+///   message   duplicate key value violates unique constraint "t_upd_uq_code_key"
+///   detail    Key (code)=(a) already exists.
+///   table     t_upd_uq
+///   constraint t_upd_uq_code_key
+#[test]
+fn wire_error_update_unique_violation() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE t_upd_uq (id INT PRIMARY KEY, code TEXT UNIQUE)");
+        c.query_command_tags("INSERT INTO t_upd_uq VALUES (1, 'a')");
+        c.query_command_tags("INSERT INTO t_upd_uq VALUES (2, 'b')");
+        let fields = c.query_error_fields("UPDATE t_upd_uq SET code = 'a' WHERE id = 2");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("23505"),
+            "SQLSTATE must be 23505 for UPDATE unique violation, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'n').map(String::as_str),
+            Some("t_upd_uq_code_key"),
+            "constraint name must be t_upd_uq_code_key, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b't').map(String::as_str),
+            Some("t_upd_uq"),
+            "table name must be t_upd_uq, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'D').map(String::as_str),
+            Some("Key (code)=(a) already exists."),
+            "detail must identify the duplicate key value, got: {fields:?}"
+        );
+    });
+}
+
+/// UPDATE to set a NOT NULL column to NULL.
+///
+/// PostgreSQL 17:
+///   SQLSTATE  23502
+///   message   null value in column "code" of relation "t_upd_nn" violates not-null constraint
+///   detail    Failing row contains (1, null).
+///   table     t_upd_nn
+///   column    code
+#[test]
+fn wire_error_update_not_null_violation() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE t_upd_nn (id INT PRIMARY KEY, code TEXT NOT NULL)");
+        c.query_command_tags("INSERT INTO t_upd_nn VALUES (1, 'hello')");
+        let fields = c.query_error_fields("UPDATE t_upd_nn SET code = NULL WHERE id = 1");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("23502"),
+            "SQLSTATE must be 23502 for UPDATE NOT NULL violation, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b't').map(String::as_str),
+            Some("t_upd_nn"),
+            "table name must be t_upd_nn, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'c').map(String::as_str),
+            Some("code"),
+            "column name must be code, got: {fields:?}"
+        );
+    });
+}
+
+/// UPDATE to violate a CHECK constraint.
+///
+/// PostgreSQL 17:
+///   SQLSTATE  23514
+///   message   new row for relation "t_upd_ck" violates check constraint "t_upd_ck_score_ck"
+///   detail    Failing row contains (1, -5).
+///   table     t_upd_ck
+///   constraint t_upd_ck_score_ck
+#[test]
+fn wire_error_update_check_violation() {
+    with_pg_client(|c| {
+        c.query_command_tags(
+            "CREATE TABLE t_upd_ck (id INT PRIMARY KEY, score INT CONSTRAINT t_upd_ck_score_ck CHECK (score >= 0))",
+        );
+        c.query_command_tags("INSERT INTO t_upd_ck VALUES (1, 10)");
+        let fields = c.query_error_fields("UPDATE t_upd_ck SET score = -5 WHERE id = 1");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("23514"),
+            "SQLSTATE must be 23514 for UPDATE CHECK violation, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'n').map(String::as_str),
+            Some("t_upd_ck_score_ck"),
+            "constraint name must be t_upd_ck_score_ck, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b't').map(String::as_str),
+            Some("t_upd_ck"),
+            "table name must be t_upd_ck, got: {fields:?}"
+        );
+    });
+}
+
+/// Invalid SQL syntax → SQLSTATE 42601 (syntax_error).
+///
+/// PostgreSQL 18.3: ERROR 42601 "syntax error at or near ..."
+#[test]
+fn wire_error_syntax_error() {
+    with_pg_client(|c| {
+        let fields = c.query_error_fields("SELECTT 1");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("42601"),
+            "SQLSTATE must be 42601 for syntax error, got: {fields:?}"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// SQLSTATE coverage: Class 25 (Invalid Transaction State)
+// ---------------------------------------------------------------------------
+
+/// BEGIN inside an already-active transaction → SQLSTATE 25001
+/// (active_sql_transaction).
+///
+/// Verified against real PostgreSQL (probed 2026-10-21): PostgreSQL emits a
+/// WARNING with code 25001, not an error. Turso diverges by returning an ERROR
+/// with the same code. The 25001 code itself is correct for this condition;
+/// the severity is the divergence. Tracked for future alignment.
+#[test]
+fn wire_error_nested_begin() {
+    with_pg_client(|c| {
+        c.query_command_tags("BEGIN");
+        let fields = c.query_error_fields("BEGIN");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("25001"),
+            "SQLSTATE must be 25001 for nested BEGIN, got: {fields:?}"
+        );
+        c.query_command_tags("ROLLBACK");
+    });
+}
+
+/// PostgreSQL raises SQLSTATE 22012 (division_by_zero) for `SELECT 1/0`.
+/// Turso's postgres mode matches this behavior.
+#[test]
+fn wire_error_division_by_zero() {
+    with_pg_client(|c| {
+        let fields = c.query_error_fields("SELECT 1/0");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("22012"),
+            "division by zero must be SQLSTATE 22012, got: {fields:?}"
+        );
+    });
+}
+
+/// `SELECT NULL / 0` returns NULL (not an error) in both PostgreSQL and Turso.
+#[test]
+fn null_divided_by_zero_is_null() {
+    with_pg_client(|c| {
+        let fields = c.query_error_fields("SELECT NULL / 0");
+        assert!(
+            fields.is_empty(),
+            "NULL / 0 should return NULL (no error), got: {fields:?}"
+        );
+    });
+}
+
+#[test]
+fn wire_frontend_errors_preserve_extended_query_sync() {
+    with_pg_client(|client| {
+        client.query_command_tags("CREATE TABLE t (id INT PRIMARY KEY)");
+        client.query_command_tags("INSERT INTO t VALUES (1)");
+        for (sql, describe, code) in [
+            ("INSERT INTO t VALUES (1)", false, "23505"),
+            ("SELECT * FROM missing_table", true, "42P01"),
+        ] {
+            client.send_extended(sql, describe);
+            client.send_extended("INSERT INTO t VALUES (2)", false);
+            client.send_message(b'S', &[]);
+            let response = client.read_until_ready();
+            let fields = extract_error_fields(&response).expect("expected ErrorResponse");
+            assert_eq!(fields.get(&b'C').map(String::as_str), Some(code));
+            if code == "23505" {
+                assert_eq!(fields.get(&b't').map(String::as_str), Some("t"));
+                assert_eq!(fields.get(&b'n').map(String::as_str), Some("t_pkey"));
+                assert_eq!(
+                    fields.get(&b'D').map(String::as_str),
+                    Some("Key (id)=(1) already exists.")
+                );
+            }
+            assert_eq!(message_count(&response, b'E'), 1);
+            assert_eq!(message_count(&response, b'Z'), 1);
+            assert!(response.ends_with(&[b'Z', 0, 0, 0, 5, b'I']));
+            assert_eq!(client.query_single_text("SELECT count(*) FROM t"), "1");
+        }
+        let fields = client.query_error_fields("INSERT INTO t VALUES (1)");
+        assert_eq!(fields.get(&b'C').map(String::as_str), Some("23505"));
+        assert_eq!(client.query_single_text("SELECT 7"), "7");
+    });
+
+    fn message_count(bytes: &[u8], tag: u8) -> usize {
+        let mut position = 0;
+        let mut count = 0;
+        while position < bytes.len() {
+            count += usize::from(bytes[position] == tag);
+            let length =
+                u32::from_be_bytes(bytes[position + 1..position + 5].try_into().unwrap()) as usize;
+            position += length + 1;
+        }
+        assert_eq!(position, bytes.len());
+        count
+    }
+}
+
+#[test]
+fn failed_create_table_serial_leaves_no_orphan_sequence_cli() {
+    let test_dir = std::env::temp_dir().join(format!("tursopg_repro_8110_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).expect("failed to create temp test directory");
+    let db_path = test_dir.join("repro_8110.db");
+
+    let out1 = run_tursopg_with_db(&db_path, b"CREATE TABLE c (id SERIAL);\n");
+    assert_eq!(out1.status.code(), Some(0));
+
+    let out2 = run_tursopg_with_db(&db_path, b"CREATE TABLE c (should_fail SERIAL);\n");
+    let combined2 = format!("{}{}", stdout(&out2), String::from_utf8_lossy(&out2.stderr));
+    assert!(
+        combined2.contains("already exists"),
+        "expected table-exists error, got: {combined2}"
+    );
+
+    let out3 = run_tursopg_with_db(
+        &db_path,
+        b"SELECT sequencename FROM pg_sequences ORDER BY sequencename;\n",
+    );
+    assert_eq!(out3.status.code(), Some(0));
+    let seq_out = stdout(&out3);
+    assert!(
+        seq_out.contains("c_id_seq"),
+        "expected c_id_seq in pg_sequences output: {seq_out}"
+    );
+    assert!(
+        !seq_out.contains("c_should_fail_seq"),
+        "failed CREATE TABLE leaked c_should_fail_seq: {seq_out}"
+    );
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn wire_describe_ddl_and_schema_commands_perform_no_writes() {
+    with_pg_client(|client| {
+        client.send_extended("CREATE TABLE described_tbl (id SERIAL)", true);
+        client.send_message(b'S', &[]);
+        let _ = client.read_until_ready();
+
+        client.send_extended("CREATE SCHEMA described_schema", true);
+        client.send_message(b'S', &[]);
+        let _ = client.read_until_ready();
+
+        assert_eq!(
+            client.query_single_text(
+                "SELECT count(*) FROM pg_sequences WHERE sequencename = 'described_tbl_id_seq'"
+            ),
+            "0"
+        );
+        assert_eq!(
+            client.query_single_text(
+                "SELECT count(*) FROM pg_namespace WHERE nspname = 'described_schema'"
+            ),
+            "0"
+        );
+    });
 }

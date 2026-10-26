@@ -338,6 +338,47 @@ expect {
     5|5
 }
 
+# A multi-row INSERT checks an immediate FK at the end of the statement, so a
+# later row can insert the parent of an earlier row.
+@cross-check-integrity
+test fk-self-ipk-multi-row-later-row-inserts-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE n(id INTEGER PRIMARY KEY, parent_id REFERENCES n(id));
+    INSERT INTO n VALUES (1, 2), (2, NULL);
+    SELECT id, parent_id FROM n ORDER BY id;
+}
+expect {
+    1|2
+    2|
+}
+
+@cross-check-integrity
+test fk-self-unique-multi-row-later-row-inserts-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE k(a, b, pa, pb, UNIQUE(a, b), FOREIGN KEY(pa, pb) REFERENCES k(a, b));
+    INSERT INTO k VALUES (1, 1, 2, 2), (2, 2, NULL, NULL);
+    INSERT INTO k SELECT 3, 3, 4, 4 UNION ALL SELECT 4, 4, NULL, NULL;
+    SELECT a, b, pa, pb FROM k ORDER BY a;
+}
+expect {
+    1|1|2|2
+    2|2||
+    3|3|4|4
+    4|4||
+}
+
+# A parent that no later row inserts still fails the statement.
+@cross-check-integrity
+test fk-self-ipk-multi-row-orphan-rolls-back-statement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE n(id INTEGER PRIMARY KEY, parent_id REFERENCES n(id));
+    BEGIN;
+    INSERT INTO n VALUES (10, NULL);
+    INSERT INTO n VALUES (1, 3), (2, NULL);
+}
+expect error {
+}
+
 # Self-reference with mismatched value: should fail immediately (no counter semantics used)
 @cross-check-integrity
 test fk-self-ipk-single-mismatch {
@@ -947,6 +988,77 @@ test fk-deferred-update-fixes-parent-before-commit {
 }
 expect {
     1|50
+}
+
+# The child FK column is the rowid alias, so it is not stored in the record.
+@cross-check-integrity
+test fk-deferred-insert-parent-fixes-rowid-alias-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER PRIMARY KEY REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c(pid) VALUES(1);
+    INSERT INTO p(id) VALUES(1);
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test fk-deferred-update-parent-fixes-rowid-alias-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER PRIMARY KEY REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(5);
+    BEGIN;
+    INSERT INTO c(pid) VALUES(2);
+    UPDATE p SET id=2 WHERE id=5;
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test fk-update-parent-referenced-by-rowid-alias-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER PRIMARY KEY REFERENCES p(id));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    UPDATE p SET id=3;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-delete-parent-referenced-by-rowid-alias-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER PRIMARY KEY REFERENCES p(id));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-drop-parent-referenced-by-rowid-alias-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER PRIMARY KEY REFERENCES p(id));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    DROP TABLE p;
+}
+expect error {
+    FOREIGN KEY constraint failed
 }
 
 # Self-referential: row referencing itself should succeed

@@ -1315,6 +1315,7 @@ mod tests {
             unmatched_right_rows_plan: None,
             table,
             identifier: name,
+            has_alias: false,
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
@@ -1420,6 +1421,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             })]),
         );
 
@@ -1564,6 +1566,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             })]),
         );
 
@@ -1673,6 +1676,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             })]),
         );
 
@@ -1855,6 +1859,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             })]),
         );
 

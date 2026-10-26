@@ -43,8 +43,8 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use turso_core::{DatabaseOpts, LimboError, OpenFlags, Statement, Value};
-use turso_pg::Connection;
+use turso_core::{DatabaseOpts, OpenFlags, Value};
+use turso_pg::{Connection, Error, Statement};
 use turso_pg_server::TursoPgServer;
 
 // ---------------------------------------------------------------------------
@@ -108,8 +108,7 @@ fn open_database(
         .with_encryption(true)
         .with_index_method(true)
         .with_autovacuum(true)
-        .with_attach(true)
-        .with_generated_columns(true);
+        .with_attach(true);
     let db_opts = if enable_load_extension {
         db_opts.turso_cli()
     } else {
@@ -129,7 +128,7 @@ fn open_database(
 
 /// Discover and attach existing PG schema database files in the same directory.
 fn auto_attach_pg_schemas(conn: &Connection, db_file: &str) {
-    if db_file == ":memory:" {
+    if turso_core::is_memory_like(db_file) {
         return;
     }
     let dir = Path::new(db_file)
@@ -225,7 +224,7 @@ fn cmd_list_tables(conn: &Connection, w: &mut dyn Write) {
             let _ = writeln!(w, "No tables found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            write_pg_error(w, &e);
         }
     }
 }
@@ -278,7 +277,7 @@ fn cmd_describe_table(conn: &Connection, table_name: &str, w: &mut dyn Write) {
             let _ = writeln!(w, "Table '{table_name}' not found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            write_pg_error(w, &e);
         }
     }
 }
@@ -299,7 +298,7 @@ fn cmd_list_databases(conn: &Connection, w: &mut dyn Write) {
         }
         Ok(None) => {}
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            write_pg_error(w, &e);
         }
     }
 }
@@ -339,7 +338,7 @@ fn cmd_list_indexes(conn: &Connection, w: &mut dyn Write) {
             let _ = writeln!(w, "No indexes found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            write_pg_error(w, &e);
         }
     }
 }
@@ -366,7 +365,7 @@ fn cmd_list_views(conn: &Connection, w: &mut dyn Write) {
             let _ = writeln!(w, "No views found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            write_pg_error(w, &e);
         }
     }
 }
@@ -400,7 +399,7 @@ fn cmd_list_schemas(conn: &Connection, w: &mut dyn Write) {
             let _ = writeln!(w, "No schemas found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            write_pg_error(w, &e);
         }
     }
 }
@@ -431,7 +430,7 @@ fn cmd_list_types(conn: &Connection, w: &mut dyn Write) {
             let _ = writeln!(w, "No types found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            write_pg_error(w, &e);
         }
     }
 }
@@ -463,7 +462,7 @@ fn cmd_list_roles(conn: &Connection, w: &mut dyn Write) {
             let _ = writeln!(w, "No roles found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            write_pg_error(w, &e);
         }
     }
 }
@@ -499,7 +498,7 @@ fn cmd_list_functions(conn: &Connection, w: &mut dyn Write) {
             let _ = writeln!(w, "No functions found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            write_pg_error(w, &e);
         }
     }
 }
@@ -595,7 +594,7 @@ fn cmd_list_tables_extended(conn: &Connection, w: &mut dyn Write) {
             let _ = writeln!(w, "No tables found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            write_pg_error(w, &e);
         }
     }
 }
@@ -692,14 +691,14 @@ fn execute_sql(
                     print_result_set(stmt, table_config, w)
                 };
                 if let Err(e) = result {
-                    let _ = writeln!(w, "Error: {e}");
+                    write_pg_error(w, &e);
                     had_error = true;
                     break;
                 }
             }
             Ok(None) => {}
             Err(ref e) => {
-                let _ = writeln!(w, "Error: {e}");
+                write_pg_error(w, e);
                 had_error = true;
                 break;
             }
@@ -708,11 +707,18 @@ fn execute_sql(
     had_error
 }
 
+fn write_pg_error(w: &mut dyn Write, error: &Error) {
+    let _ = writeln!(w, "ERROR:  {}", error.message);
+    if let Some(detail) = &error.detail {
+        let _ = writeln!(w, "DETAIL:  {detail}");
+    }
+}
+
 fn print_result_set(
     stmt: &mut Statement,
     table_config: &TableConfig,
     w: &mut dyn Write,
-) -> Result<(), LimboError> {
+) -> Result<(), Error> {
     let num_columns = stmt.num_columns();
     if num_columns == 0 {
         stmt.run_with_row_callback(|_| Ok(()))?;
@@ -771,7 +777,7 @@ fn print_result_set(
     Ok(())
 }
 
-fn print_result_set_expanded(stmt: &mut Statement, w: &mut dyn Write) -> Result<(), LimboError> {
+fn print_result_set_expanded(stmt: &mut Statement, w: &mut dyn Write) -> Result<(), Error> {
     let num_columns = stmt.num_columns();
     if num_columns == 0 {
         stmt.run_with_row_callback(|_| Ok(()))?;

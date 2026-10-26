@@ -5,12 +5,12 @@ SQLite rewrite in Rust. 40+ crate workspace.
 ## Quick Reference
 
 ```bash
-cargo build                    # build. never build with --release
+cargo build                    # build (debug; release builds are slow and double the target dir)
 cargo check                    # type check. prefer to `cargo build`
 cargo test                     # rust unit/integration tests
 cargo fmt                      # format (required)
 cargo clippy --workspace --all-features --all-targets -- --deny=warnings  # lint
-cargo run -q --bin tursodb -- -q # run the interactive cli. never run with --release
+cargo run -q --bin tursodb -- -q # run the interactive cli (debug build)
 
 make test                      # TCL compat + sqlite3 + extensions + MVCC
 make test-single TEST=foo.test # single TCL test
@@ -29,6 +29,7 @@ scripts/diff.sh "SQL" [label]  # compare sqlite3 vs tursodb output
 - `make test-single TEST=foo.test` - single legacy TCL test
 - `make -C sqlite/conformance run-rust ARGS='--snapshot-filter __never__'` - preferred `.sqltest` runner for new coverage
 - `CI=1 make -C sqlite/conformance run-rust` - only when snapshot tests are required
+- `make -C postgres/conformance run` - run the PostgreSQL `.sqltest` corpus against tursopg
 - `make -C postgres/conformance run-postgres` - run the PostgreSQL `.sqltest` corpus against a real PostgreSQL server (needs Docker, or a server at `PG_DSN`)
 
 ### Test Organization
@@ -37,17 +38,17 @@ Default: add coverage to the narrowest existing test harness that can express th
 
 - `sqlite/conformance/sqlite-sqltests/` - preferred for SQL conformance coverage. These tests run the same scenario against both Turso and SQLite, so use them first for parser, planner, executor, and SQL semantics work that fits the `.sqltest` DSL.
 - `tests/integration/` - primary fallback when the behavior cannot be expressed cleanly in `.sqltest`. Put API-level regressions, multi-connection orchestration, storage assertions, injected failures, timeout behavior, and other Rust-driven scenarios here.
-- `sqlite/conformance/upstream/` - imported upstream SQLite golden tests. Do not modify these for Turso behavior changes; use them as fixed compatibility coverage, and only touch them for intentional upstream sync or harness maintenance.
-- `postgres/conformance/pg-sqltests/` - `.sqltest` coverage for the PostgreSQL frontend.
+- `sqlite/conformance/upstream/` - imported upstream SQLite golden tests. They are fixed compatibility coverage, so a Turso behavior change should be fixed in Turso rather than by editing them; edits here are for upstream syncs or harness maintenance.
+- `postgres/conformance/pg-sqltests/` - `.sqltest` coverage for the PostgreSQL frontend. Tests are meant to pass on both tursopg (`run`) and real PostgreSQL (`run-postgres`).
 - `testing/cli_tests/` - CLI-focused Python coverage for shell behavior and end-to-end command workflows.
 - `tests/fuzz/` - minimized fuzz regressions and targeted edge cases that are easier to keep as Rust tests.
 - `testing/simulator/` and `testing/concurrent-simulator/` - deterministic concurrency, scheduling, and failure-injection coverage for state-machine and I/O correctness.
 - `testing/differential-oracle/` and `testing/stress/` - differential and long-running stress tooling. Use these for deeper investigation or specialized validation, not as the first stop for a focused regression test.
 
-### Differential-Fuzzer Regression Rule
+### Differential-Fuzzer Regressions
 
-Every differential-fuzzer failure that is successfully minimized must become a
-permanent `*.sqltest` regression case before its fix is considered complete.
+A minimized differential-fuzzer failure should end up as a permanent
+`*.sqltest` regression case as part of its fix.
 The seed and minimized fuzzer artifact are debugging aids, not substitutes for
 the focused SQL regression.
 
@@ -122,23 +123,25 @@ Before opening a PR, read the "PR Workflow" document linked above.
 
 ## Benchmark Naming
 
-- Criterion benchmark functions must use `#[turso_macros::codspeed_criterion_benchmark]` so stable and nightly CodSpeed runs get distinct benchmark names.
-- Divan benchmark functions must use `#[turso_macros::divan_bench]` for the same stable/nightly naming behavior.
+- Criterion benchmark functions use `#[turso_macros::codspeed_criterion_benchmark]` so stable and nightly CodSpeed runs get distinct benchmark names.
+- Divan benchmark functions use `#[turso_macros::divan_bench]` for the same stable/nightly naming behavior.
 
 ## Core Principles
 
 1. **Correctness paramount.** Production DB, not a toy. Crash > corrupt
 2. **SQLite compatibility.** Compare bytecode with `EXPLAIN`
-3. **MANDATORY: Every change MUST have a test. NO EXCEPTIONS.** Add or update a test that fails without the change and passes with it. You MUST run the test in both cases and make sure that it produces those results. Never skip this requirement or treat it as optional. Do not declare a change complete without evidence of both results. If you cannot run the test, report the blocker and leave the change incomplete.
-4. **Assert invariants.** Don't silently fail. Don't hedge with if-statements
-5. **Own your regressions.** If tests fail after your change, they are your regressions. Debug them directly. Never stash/revert to "check if they fail on main" — that wastes time and is categorically banned.
-6. **Validate your hypotheses.** If you suspect a given cause for a bug, validate it and provide incontrovertible evidence. NEVER make unearned assumptions.
+3. **Prove changes with tests.** A fix is only believable when a test fails without it and passes with it, so add or update such a test and run it both ways. A change that looks right but was never seen failing is how bugs slip through. If a test isn't practical (docs, pure refactors) or you can't run it, say so plainly rather than calling the change done.
+4. **Assert invariants.** Surface failures loudly. For states that should be impossible, an assertion is better than a defensive if-statement that hides the problem.
+5. **Own your regressions.** Tests that fail after your change are most likely caused by it, so start by debugging them directly. Stashing or reverting to check whether they also fail on main usually costs more time than it saves.
+6. **Validate your hypotheses.** If you suspect a given cause for a bug, confirm it with concrete evidence (a repro, a log, a flip test) before building on it.
 7. **Fix root causes, not symptoms** When designing a fix, ask yourself: is this a symptom of a deeper root cause? would my fix hide a problem that's created upstream?
 8. **Driver API parity** Embedded (`bindings/rust`) and serverless (`serverless/rust`) drivers expose the same public API; add features to both in the same change. Spec: `serverless/conformance/differential/README.md`.
-9. **Backward compatibility** No breaking changes. New versions of Turso must work with databases and sidecar files that were created from previous versions.  
+9. **Backward compatibility** Users' existing databases and sidecar files created by earlier Turso versions need to keep working with new versions. If a change can't preserve that, raise it before going further.
 10. **Keep user docs current.** If a change adds, removes, or changes user-visible SQL behavior (syntax, functions, pragmas, data types, CLI commands, errors), update the matching page in `docs/sql-reference/` in the same change. For example, a new `JOIN` type goes in `docs/sql-reference/statements/select.mdx`.
+11. **Dialect-specific behavior belongs on the `Dialect` trait.** If a behavior differs between the SQLite and PostgreSQL frontends (error handling, type semantics, name resolution, etc.), add a method to `core/dialect/mod.rs` with a default that matches SQLite and override it in `PostgresDialect`. `DatabaseOpts` is a poor fit because it is client-public API and clients shouldn't control dialect behavior; CLI flags and wire-protocol fields are a poor fit because they don't reach embedded databases.
+12. **Keep PostgreSQL code out of `core/`.** PostgreSQL behavior and state belong in `postgres/`, so `core/` stays a SQLite engine with generic hooks. Unsure where something fits? Ask.
 
-## Always use plain language instead of complex jargon
+## Use plain language instead of complex jargon
 
 OOGA BOOGA! Programming already complex! Use simple word! Say what you mean! Examples:
 
@@ -152,10 +155,10 @@ OOGA BOOGA! Programming already complex! Use simple word! Say what you mean! Exa
 +    fn empty_schema_never_chooses_a_statement_that_needs_a_table() {
 ```
 
-No-one knows what the hell a bootstrap-safe statement is. Everyone knows what "a statement that needs a table" is. Do
-not use metaphorical language, such as the following terms: load-bearing, pin, bite, sharp, arm, guard, bless, wedge,
-retire, retarget, answer, settle, carry, land, honor, rebase, hold.
-Do not make up terms if they have equivalents that are commonly used in the domain.
+No-one knows what the hell a bootstrap-safe statement is. Everyone knows what "a statement that needs a table" is.
+Prefer literal words over metaphors. Words like load-bearing, pin, bite, sharp, arm, guard, bless, wedge, retire,
+retarget, answer, settle, carry, land, honor, rebase, and hold usually hide what is actually happening; say the plain
+thing instead. Prefer the domain's established terms over invented ones.
 
 ## Code flows from top to bottom
 
@@ -172,9 +175,10 @@ fn sync_wal()           // called by write_frames
 When adding a helper, put it below the functions that call it, not at the
 end of the file or wherever the cursor happened to be.
 
-## Do not add comments
+## Prefer expressive code over comments
 
-- Do not add comments. Instead, focus on making your code expressive.
+Good names and structure should explain most code, and comments that restate the code go stale. Where the code
+alone can't explain why something is done, a short plain comment is welcome.
 
 ## CI Note
 

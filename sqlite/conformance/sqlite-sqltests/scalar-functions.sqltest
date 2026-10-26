@@ -1751,6 +1751,39 @@ expect {
     text
 }
 
+# Regression: infinite REAL must quote as a reloadable numeric literal, not Inf.
+# SQLite emits 9.0e+999 so both engines can parse the dump back.
+# Keep these SELECT-only: the sqltest harness opens the DB read-only.
+test quote-positive-infinity {
+    SELECT quote(1e400);
+}
+expect {
+    9.0e+999
+}
+
+test quote-negative-infinity {
+    SELECT quote(-1e400);
+}
+expect {
+    -9.0e+999
+}
+
+test quote-infinity-reload {
+    SELECT quote(CAST(quote(1e400) AS REAL));
+    SELECT quote(CAST(quote(-1e400) AS REAL));
+}
+expect {
+    9.0e+999
+    -9.0e+999
+}
+
+test quote-blob {
+    SELECT quote(X'89504E47');
+}
+expect {
+    X'89504E47'
+}
+
 test sign-positive-integer {
     SELECT sign(42);
 }
@@ -2403,10 +2436,37 @@ expect error {
 	wrong number of arguments to function uuid7_timestamp_ms()
 }
 
-# TODO: sqlite seems not enable soundex() by default unless build it with SQLITE_SOUNDEX enabled.
-# do_execsql_test soundex-text {
-#  select soundex('Pfister'), soundex('husobee'), soundex('Tymczak'), soundex('Ashcraft'), soundex('Robert'), soundex('Rupert'), soundex('Rubin'), soundex('Kant'), soundex('Knuth'), soundex('x'), soundex('');
-# } {P236|H210|T522|A261|R163|R163|R150|K530|K530|X000|0000}
+@skip-if sqlite "soundex() requires a SQLite build with SQLITE_SOUNDEX"
+test soundex-text {
+    select soundex('Pfister'), soundex('husobee'), soundex('Tymczak'), soundex('Ashcraft'), soundex('Robert'), soundex('Rupert'), soundex('Rubin'), soundex('Kant'), soundex('Knuth'), soundex('x'), soundex('');
+}
+expect {
+    P236|H210|T522|A226|R163|R163|R150|K530|K530|X000|?000
+}
+
+@skip-if sqlite "soundex() requires a SQLite build with SQLITE_SOUNDEX"
+test soundex-non-letters {
+    select soundex(' Robert'), soundex('O''Brien'), soundex('Ab-bc'), soundex('1abc'), soundex('123'), soundex(NULL), soundex('a' || char(0) || 'bc');
+}
+expect {
+    R163|O165|A112|A120|?000|?000|A000
+}
+
+@skip-if sqlite "soundex() requires a SQLite build with SQLITE_SOUNDEX"
+test soundex-non-text {
+    select soundex(x'41'), soundex(4.5e-10), soundex(12), soundex(x'41E2'), soundex(x'41C2'), soundex(x'41F0'), soundex(x'61626364E2'), soundex(x'4100E2'), soundex(x'E2C2');
+}
+expect {
+    A000|E000|?000|A100|A100|A100|A123|A000|?000
+}
+
+@skip-if sqlite "soundex() requires a SQLite build with SQLITE_SOUNDEX"
+test soundex-non-ascii {
+    select soundex('aé'), soundex('闪电五连鞭');
+}
+expect {
+    A200|?000
+}
 
 @skip-if sqlite "unistr not available in CI SQLite build"
 test unistr-u-escape {

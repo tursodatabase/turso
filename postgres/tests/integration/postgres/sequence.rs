@@ -49,7 +49,7 @@ fn pg_query_text(conn: &PgConnection, sql: &str) -> String {
 /// non-Done terminal states. Used after reading a single expected row to
 /// make sure the program reaches `Halt` and any sequence side-effects
 /// commit.
-fn drain_to_done(rows: &mut turso_core::Statement, sql: &str) {
+fn drain_to_done(rows: &mut turso_pg::Statement, sql: &str) {
     loop {
         match rows.step().unwrap() {
             StepResult::Done => return,
@@ -813,4 +813,216 @@ fn test_sequence_passes_integrity_check(db: TempDatabase) {
         other => panic!("unexpected integrity_check result: {other:?}"),
     };
     assert_eq!(result, "ok", "integrity check failed: {result}");
+}
+
+// ============================================================
+// Prepare-time side-effect isolation (#8110)
+// ============================================================
+
+fn pg_sequence_names(conn: &PgConnection) -> Vec<String> {
+    let rows = conn
+        .prepare("SELECT sequencename FROM pg_sequences ORDER BY sequencename")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    rows.into_iter()
+        .map(|row| match row.first() {
+            Some(Value::Text(name)) => name.as_str().to_string(),
+            other => panic!("expected text sequencename, got {other:?}"),
+        })
+        .collect()
+}
+
+#[turso_macros::test(mvcc)]
+fn test_failed_create_table_serial_does_not_leak_sequence(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    pg_execute(&conn, "CREATE TABLE c (id SERIAL)");
+    let err = pg_execute_err(&conn, "CREATE TABLE c (should_fail SERIAL)");
+    assert!(err.contains("already exists"), "unexpected error: {err}");
+    assert_eq!(pg_sequence_names(&conn), vec!["c_id_seq".to_string()]);
+
+    let path = db.path.clone();
+    drop(conn);
+    drop(db);
+
+    let db2 = TempDatabase::builder()
+        .with_db_name(path.to_str().unwrap())
+        .build();
+    let conn2 = db2.connect_postgres();
+    assert_eq!(pg_sequence_names(&conn2), vec!["c_id_seq".to_string()]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_prepare_without_execute_performs_no_writes(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    pg_execute(&conn, "CREATE TABLE copy_dst (v INTEGER)");
+
+    let dir = tempfile::tempdir().unwrap();
+    let tsv = dir.path().join("rows.tsv");
+    std::fs::write(&tsv, "42\n99\n").unwrap();
+    let copy_sql = format!("COPY copy_dst FROM '{}'", tsv.display());
+
+    // Prepare statements with write / prerequisite side effects and drop them unexecuted.
+    let unexecuted_serial = conn.prepare("CREATE TABLE p_tbl (id SERIAL)").unwrap();
+    drop(unexecuted_serial);
+    assert!(pg_sequence_names(&conn).is_empty());
+    assert!(conn.prepare("SELECT * FROM p_tbl").is_err());
+
+    let unexecuted_schema = conn.prepare("CREATE SCHEMA p_schema").unwrap();
+    drop(unexecuted_schema);
+    pg_assert_no_rows(
+        &conn,
+        "SELECT 1 FROM pg_namespace WHERE nspname = 'p_schema'",
+    );
+
+    let unexecuted_copy = conn.prepare(&copy_sql).unwrap();
+    drop(unexecuted_copy);
+    assert_eq!(pg_query_int(&conn, "SELECT count(*) FROM copy_dst"), 0);
+
+    // Preparing and executing them afterwards applies the expected mutations.
+    conn.prepare("CREATE SCHEMA p_schema")
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+    let unexecuted_drop = conn.prepare("DROP SCHEMA p_schema").unwrap();
+    drop(unexecuted_drop);
+    assert_eq!(
+        pg_query_int(
+            &conn,
+            "SELECT count(*) FROM pg_namespace WHERE nspname = 'p_schema'"
+        ),
+        1
+    );
+
+    let mut copy_stmt = conn.prepare(&copy_sql).unwrap();
+    copy_stmt.run_ignore_rows().unwrap();
+    assert_eq!(copy_stmt.n_change(), 2);
+    assert_eq!(pg_query_int(&conn, "SELECT count(*) FROM copy_dst"), 2);
+
+    conn.prepare("DROP SCHEMA p_schema")
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+    pg_assert_no_rows(
+        &conn,
+        "SELECT 1 FROM pg_namespace WHERE nspname = 'p_schema'",
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_create_table_if_not_exists_serial_on_existing_table_leaves_no_sequence(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    pg_execute(&conn, "CREATE TABLE c (id SERIAL)");
+    pg_execute(&conn, "CREATE TABLE IF NOT EXISTS c (extra SERIAL)");
+    assert_eq!(pg_sequence_names(&conn), vec!["c_id_seq".to_string()]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_prepared_serial_table_rolls_back_sequence_on_execution_conflict(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    // Autocommit: prepare while table does not exist, create conflicting table, then execute.
+    let mut prepared = conn.prepare("CREATE TABLE race_tbl (a SERIAL)").unwrap();
+    assert!(pg_sequence_names(&conn).is_empty());
+    pg_execute(&conn, "CREATE TABLE race_tbl (x INTEGER)");
+    let err = prepared.run_ignore_rows().unwrap_err().to_string();
+    assert!(err.contains("already exists"), "unexpected error: {err}");
+    assert!(pg_sequence_names(&conn).is_empty());
+
+    // Explicit transaction: failed execution rolls back only the failed statement's sequence.
+    pg_execute(&conn, "BEGIN");
+    pg_execute(&conn, "CREATE TABLE kept_tx (k SERIAL)");
+    let mut prepared_tx = conn.prepare("CREATE TABLE conflict_tx (b SERIAL)").unwrap();
+    pg_execute(&conn, "CREATE TABLE conflict_tx (y INTEGER)");
+    assert!(prepared_tx.run_ignore_rows().is_err());
+    pg_execute(&conn, "COMMIT");
+    assert_eq!(pg_sequence_names(&conn), vec!["kept_tx_k_seq".to_string()]);
+}
+
+#[test]
+fn test_pg_prepare_and_serial_ddl_dst_fuzz() {
+    use rand::Rng;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use turso_core::{DatabaseOpts, MemoryIO, OpenFlags};
+
+    for seed in 0..16u64 {
+        let mut rng = ChaCha8Rng::seed_from_u64(0x8110_0000 + seed);
+        let io: Arc<dyn turso_core::IO> = Arc::new(MemoryIO::new());
+        let db = turso_pg::open_database_with_io(
+            io.clone(),
+            "pg_prepare_dst.db",
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
+
+        let mut expected_seqs: BTreeSet<String> = BTreeSet::new();
+        let mut live_tables: BTreeSet<String> = BTreeSet::new();
+
+        for step in 0..40usize {
+            let slot = rng.random_range(0..4usize);
+            let tbl = format!("t{slot}");
+            let col = format!("c{step}");
+            let seq = format!("{tbl}_{col}_seq");
+
+            match rng.random_range(0..5u8) {
+                0 => {
+                    // Prepare only (unexecuted): must never mutate catalog state.
+                    let sql = format!("CREATE TABLE {tbl} ({col} SERIAL)");
+                    let _ = conn.prepare(&sql);
+                }
+                1 => {
+                    // Execute CREATE TABLE without IF NOT EXISTS.
+                    let sql = format!("CREATE TABLE {tbl} ({col} SERIAL)");
+                    let res = conn.execute(&sql);
+                    if live_tables.contains(&tbl) {
+                        assert!(res.is_err(), "seed={seed} step={step}: expected conflict");
+                    } else {
+                        res.unwrap();
+                        live_tables.insert(tbl);
+                        expected_seqs.insert(seq);
+                    }
+                }
+                2 => {
+                    // Execute CREATE TABLE IF NOT EXISTS: only creates sequence when table is new.
+                    let sql = format!("CREATE TABLE IF NOT EXISTS {tbl} ({col} SERIAL)");
+                    conn.execute(&sql).unwrap();
+                    if live_tables.insert(tbl) {
+                        expected_seqs.insert(seq);
+                    }
+                }
+                3 => {
+                    // Prepare while missing, race with plain table create, then execute.
+                    if !live_tables.contains(&tbl) {
+                        let sql = format!("CREATE TABLE {tbl} ({col} SERIAL)");
+                        let mut stmt = conn.prepare(&sql).unwrap();
+                        conn.execute(format!("CREATE TABLE {tbl} (plain_id INT)"))
+                            .unwrap();
+                        live_tables.insert(tbl);
+                        assert!(stmt.run_ignore_rows().is_err());
+                    }
+                }
+                _ => {
+                    // Explicit transaction that rolls back after creating a new table + sequence.
+                    let tmp_tbl = format!("tx_roll_{step}");
+                    conn.execute("BEGIN").unwrap();
+                    conn.execute(format!("CREATE TABLE {tmp_tbl} (id SERIAL)"))
+                        .unwrap();
+                    conn.execute("ROLLBACK").unwrap();
+                }
+            }
+
+            let actual: BTreeSet<String> = pg_sequence_names(&conn).into_iter().collect();
+            assert_eq!(
+                actual, expected_seqs,
+                "seed={seed} step={step}: sequence catalog diverged"
+            );
+        }
+    }
 }

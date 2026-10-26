@@ -503,6 +503,7 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             (10, Box::new(AutoincInsertWorkload)),
             (5, Box::new(AutoincUpdateRowidWorkload)),
             (3, Box::new(AutoincDeleteWorkload)),
+            (8, Box::new(UpsertRowidWorkload)),
             (12, Box::new(FtsInsertWorkload)),
             (8, Box::new(FtsUpdateWorkload)),
             (6, Box::new(FtsDeleteWorkload)),
@@ -524,7 +525,9 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             Box::new(RolledBackInsertsNotVisible::new()),
         ];
 
-        (w, p, fts_sim_schema(), vec![])
+        let mut extra_schema = fts_sim_schema();
+        extra_schema.extend(upsert_sim_schema());
+        (w, p, extra_schema, vec![])
     }
 }
 

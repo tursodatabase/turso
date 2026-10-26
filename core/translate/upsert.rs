@@ -6,7 +6,8 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::compute_virtual_columns;
 use crate::alloc::TursoIteratorExt;
-use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
+use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR};
+use crate::namespace::NamespaceId;
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
@@ -14,14 +15,16 @@ use crate::translate::fkeys::{
     affected_parent_fks_for_update, emit_fk_child_update_counters, emit_fk_update_parent_actions,
     fire_fk_update_actions, ParentKeyNewProbeMode,
 };
-use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
+use crate::translate::insert::{
+    emit_remember_written_rowid, format_unique_violation_desc, InsertEmitCtx,
+};
 use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
     fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
 };
 use crate::translate::update::rowid_name_column_index;
-use crate::vdbe::insn::{to_u32, CmpInsFlags};
+use crate::vdbe::insn::{to_u32, CmpInsFlags, ConstraintInfo};
 use crate::{
     bail_parse_error,
     error::SQLITE_CONSTRAINT_NOTNULL,
@@ -426,6 +429,7 @@ pub enum ResolvedUpsertTarget {
 
 pub fn resolve_upsert_target(
     schema: &Schema,
+    namespace: NamespaceId,
     table: &Table,
     upsert: &Upsert,
 ) -> crate::Result<ResolvedUpsertTarget> {
@@ -443,7 +447,7 @@ pub fn resolve_upsert_target(
     }
 
     // Otherwise match a UNIQUE index, also covering non-rowid PRIMARY KEYs
-    for idx in schema.get_indices(table.get_name()) {
+    for idx in schema.get_indices(namespace, table.get_name()) {
         if idx.unique && upsert_matches_index(upsert, idx, table) {
             return Ok(ResolvedUpsertTarget::Index(Arc::clone(idx)));
         }
@@ -497,6 +501,23 @@ pub fn emit_upsert(
         src_reg: ctx.conflict_rowid_reg,
         target_pc: ctx.loop_labels.row_done,
     });
+    if let Some(written_rowids_cursor_id) = ctx.written_rowids_cursor_id {
+        let row_not_written = program.allocate_label();
+        program.emit_insn(Insn::NotExists {
+            cursor: written_rowids_cursor_id,
+            rowid_reg: ctx.conflict_rowid_reg,
+            target_pc: row_not_written,
+        });
+        program.emit_insn(Insn::Halt {
+            constraint_info: None,
+            err_code: SQLITE_ERROR,
+            description: "ON CONFLICT DO UPDATE command cannot affect row a second time"
+                .to_string(),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(row_not_written);
+    }
     let num_cols = ctx.table.columns().len();
     let layout = ctx.table.column_layout()?;
 
@@ -713,6 +734,7 @@ pub fn emit_upsert(
         translate_result?;
         if col.notnull() && !col.is_rowid_alias() {
             program.emit_insn(Insn::HaltIfNull {
+                constraint_info: None,
                 target_reg: layout.to_register(new_start, *col_idx),
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
@@ -1015,7 +1037,9 @@ pub fn emit_upsert(
             let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
 
             // Child-side checks
-            if resolver.with_schema(upsert_database_id, |s| s.has_child_fks(bt.name.as_str())) {
+            if resolver.with_schema(upsert_database_id, |s| {
+                s.has_child_fks(ctx.namespace.id, bt.name.as_str())
+            }) {
                 emit_fk_child_update_counters(
                     program,
                     &bt,
@@ -1031,7 +1055,9 @@ pub fn emit_upsert(
                 )?;
             }
             let upsert_indices: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
-                s.get_indices(table.get_name()).cloned().collect()
+                s.get_indices(ctx.namespace.id, table.get_name())
+                    .cloned()
+                    .collect()
             });
             let affected_upsert_indices: Vec<_> = upsert_indices
                 .iter()
@@ -1089,6 +1115,7 @@ pub fn emit_upsert(
             target_pc: ok,
         });
         program.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
             description: format!(
                 "{}.{}",
@@ -1123,7 +1150,8 @@ pub fn emit_upsert(
         for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
             let idx_meta = resolver
                 .with_schema(ctx.database_id, |s| {
-                    s.get_index(table.get_name(), idx_name).cloned()
+                    s.get_index(ctx.namespace.id, table.get_name(), idx_name)
+                        .cloned()
                 })
                 .expect("index exists");
 
@@ -1241,8 +1269,45 @@ pub fn emit_upsert(
                     collation: program.curr_collation(),
                 });
                 let description = format_unique_violation_desc(table.get_name(), &idx_meta);
+                let regs: Vec<usize> = (0..k).map(|i| ins + i).collect();
+                let idx_col_names: Vec<&str> =
+                    idx_meta.columns.iter().map(|c| c.name.as_str()).collect();
+                let (pk_col_names, pk_constraint_name) = table
+                    .btree()
+                    .map(|bt| {
+                        let cols: Vec<String> = bt
+                            .primary_key_columns
+                            .iter()
+                            .map(|(n, _)| n.clone())
+                            .collect();
+                        (cols, bt.primary_key_constraint_name.clone())
+                    })
+                    .unwrap_or_default();
+                let is_pk = !pk_col_names.is_empty()
+                    && idx_col_names == pk_col_names.iter().map(String::as_str).collect::<Vec<_>>();
+                let (constraint_info, err_code) = if is_pk {
+                    (
+                        Some(Box::new(ConstraintInfo::primary_key(
+                            table.get_name(),
+                            pk_constraint_name,
+                            pk_col_names,
+                            regs,
+                        ))),
+                        SQLITE_CONSTRAINT_PRIMARYKEY,
+                    )
+                } else {
+                    (
+                        Some(Box::new(ConstraintInfo::unique_index(
+                            table.get_name(),
+                            &idx_meta,
+                            regs,
+                        ))),
+                        SQLITE_CONSTRAINT_UNIQUE,
+                    )
+                };
                 program.emit_insn(Insn::Halt {
-                    err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                    constraint_info,
+                    err_code,
                     description,
                     on_error: None,
                     description_reg: None,
@@ -1406,7 +1471,9 @@ pub fn emit_upsert(
         {
             let seq_name = crate::schema::autoincrement_sequence_name(table.get_name());
             let seq = resolver
-                .with_schema(upsert_database_id, |s| s.get_sequence(&seq_name).cloned())
+                .with_schema(upsert_database_id, |s| {
+                    s.get_sequence(ctx.namespace.id, &seq_name).cloned()
+                })
                 .ok_or_else(|| {
                     crate::LimboError::InternalError(format!(
                         "missing implicit sequence for AUTOINCREMENT table \"{}\"",
@@ -1446,6 +1513,11 @@ pub fn emit_upsert(
         });
         cdc_before_rec
     };
+    emit_remember_written_rowid(
+        program,
+        ctx,
+        new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+    );
 
     // CDC must capture the row right after the write above, before any FK action or AFTER
     // trigger this UPSERT fires can write further CDC rows of their own.

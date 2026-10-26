@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -5,7 +6,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use futures::stream;
+use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::Value;
@@ -19,9 +20,16 @@ use pgwire::api::results::{
     QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
-use pgwire::api::{ClientInfo, NoopHandler, PgWireServerHandlers, Type};
+use pgwire::api::store::PortalStore;
+use pgwire::api::{
+    ClientInfo, ClientPortalStore, NoopHandler, PgWireConnectionState, PgWireServerHandlers, Type,
+};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
+use pgwire::messages::extendedquery::{Describe, Execute};
+use pgwire::messages::response::{ErrorResponse, ReadyForQuery};
+use pgwire::messages::simplequery::Query;
+use pgwire::messages::PgWireBackendMessage;
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
 
@@ -112,7 +120,7 @@ impl TursoPgHandler {
     /// After a DROP SCHEMA query succeeds, delete the schema's database file.
     /// Uses simple string matching to detect DROP SCHEMA statements.
     fn cleanup_dropped_schema_file(&self, query: &str) {
-        if self.db_file == ":memory:" {
+        if turso_core::is_memory_like(&self.db_file) {
             return;
         }
         // Simple detection: look for DROP SCHEMA pattern
@@ -174,6 +182,16 @@ impl PgWireServerHandlers for TursoPgFactory {
 
 #[async_trait]
 impl SimpleQueryHandler for TursoPgHandler {
+    async fn on_query<C>(&self, client: &mut C, query: Query) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let result = self._on_query(client, query).await;
+        finish_query(client, result, false).await
+    }
+
     async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + Unpin + Send + Sync,
@@ -182,19 +200,16 @@ impl SimpleQueryHandler for TursoPgHandler {
 
         // Per the PostgreSQL simple query protocol, a query string may contain
         // multiple semicolon-separated statements. Split and execute each one.
-        let statements = split_statements(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let statements = split_statements(query).map_err(pg_error)?;
 
         let mut responses = Vec::new();
         for sql in &statements {
-            let mut stmt = conn
-                .prepare(sql)
-                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
-
-            self.cleanup_dropped_schema_file(sql);
+            let mut stmt = conn.prepare(sql).map_err(pg_error)?;
 
             if stmt.num_columns() == 0 || is_pg_non_query(sql) {
-                responses.push(execute_non_query(&mut stmt, sql)?);
+                let response = execute_non_query(&mut stmt, sql)?;
+                self.cleanup_dropped_schema_file(sql);
+                responses.push(response);
             } else {
                 let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
                 responses.push(execute_query(&mut stmt, header)?);
@@ -209,6 +224,28 @@ impl SimpleQueryHandler for TursoPgHandler {
 impl ExtendedQueryHandler for TursoPgHandler {
     type Statement = String;
     type QueryParser = NoopQueryParser;
+
+    async fn on_execute<C>(&self, client: &mut C, message: Execute) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let result = self._on_execute(client, message).await;
+        finish_query(client, result, true).await
+    }
+
+    async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let result = self._on_describe(client, message).await;
+        finish_query(client, result, true).await
+    }
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
         self.query_parser.clone()
@@ -226,18 +263,16 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let conn = self.conn.lock().unwrap().clone();
         let query = &portal.statement.statement;
 
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
-
-        // Clean up schema file after successful DROP SCHEMA
-        self.cleanup_dropped_schema_file(query);
+        let mut stmt = conn.prepare(query).map_err(pg_error)?;
 
         // Bind parameters from the portal
         bind_portal_parameters(&mut stmt, portal)?;
 
         if stmt.num_columns() == 0 || is_pg_non_query(query) {
-            return execute_non_query(&mut stmt, query);
+            let response = execute_non_query(&mut stmt, query)?;
+            // Clean up schema file after successful DROP SCHEMA execution
+            self.cleanup_dropped_schema_file(query);
+            return Ok(response);
         }
 
         let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
@@ -253,9 +288,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = self.conn.lock().unwrap().clone();
-        let stmt = conn
-            .prepare(&target.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let stmt = conn.prepare(&target.statement).map_err(pg_error)?;
 
         let param_types: Vec<Type> = target
             .parameter_types
@@ -278,7 +311,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let conn = self.conn.lock().unwrap().clone();
         let stmt = conn
             .prepare(&portal.statement.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            .map_err(pg_error)?;
 
         let fields = build_field_info(&stmt, &portal.result_column_format);
         Ok(DescribePortalResponse::new(fields))
@@ -286,7 +319,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
 }
 
 /// Build FieldInfo metadata from a prepared statement's column information.
-fn build_field_info(stmt: &turso_core::Statement, format: &Format) -> Vec<FieldInfo> {
+fn build_field_info(stmt: &turso_pg::Statement, format: &Format) -> Vec<FieldInfo> {
     if is_pg_non_query(stmt.get_sql()) {
         return vec![];
     }
@@ -308,7 +341,7 @@ fn build_field_info(stmt: &turso_core::Statement, format: &Format) -> Vec<FieldI
 /// or `Err` (custom types not enabled — won't happen in PG mode, but the wire
 /// layer shouldn't panic if it does), the safe default is TEXT;
 /// `encode_value` already handles per-value type mismatches.
-fn resolve_pg_type_for_column(stmt: &turso_core::Statement, idx: usize) -> Type {
+fn resolve_pg_type_for_column(stmt: &turso_pg::Statement, idx: usize) -> Type {
     use turso_core::ColumnTypeKind;
 
     let Some(info) = stmt.get_column_type_info(idx).ok().flatten() else {
@@ -387,7 +420,7 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
 
 /// Execute a query that returns rows and build a Query response.
 fn execute_query(
-    stmt: &mut turso_core::Statement,
+    stmt: &mut turso_pg::Statement,
     header: Arc<Vec<FieldInfo>>,
 ) -> PgWireResult<Response> {
     let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
@@ -405,16 +438,15 @@ fn execute_query(
         rows.push(encoder.finish());
         Ok(())
     })
-    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+    .map_err(pg_error)?;
 
     let data_stream = stream::iter(rows);
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
 }
 
 /// Execute a non-SELECT statement and build an Execution response.
-fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireResult<Response> {
-    stmt.run_ignore_rows()
-        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+fn execute_non_query(stmt: &mut turso_pg::Statement, query: &str) -> PgWireResult<Response> {
+    stmt.run_ignore_rows().map_err(pg_error)?;
 
     let affected = stmt.n_change();
     let tag = command_tag(query, affected as usize);
@@ -428,7 +460,7 @@ fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireRes
 /// order than the $N numbering (e.g. if $2 appears before $1 in the SQL), so we
 /// look up each parameter's internal index by name.
 fn bind_portal_parameters(
-    stmt: &mut turso_core::Statement,
+    stmt: &mut turso_pg::Statement,
     portal: &Portal<String>,
 ) -> PgWireResult<()> {
     for i in 0..portal.parameter_len() {
@@ -530,13 +562,25 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
     if hex.len() % 2 != 0 {
         return Err("odd-length hex string".to_owned());
     }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2], 16)
-                .map_err(|e| format!("invalid hex at position {i}: {e}"))
+    hex.as_bytes()
+        .chunks_exact(2)
+        .enumerate()
+        .map(|(pair_index, pair)| {
+            let position = 2 * pair_index;
+            let high = decode_hex_digit(pair[0], position)?;
+            let low = decode_hex_digit(pair[1], position + 1)?;
+            Ok((high << 4) | low)
         })
         .collect()
+}
+
+fn decode_hex_digit(byte: u8, position: usize) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(format!("invalid hex at position {position}")),
+    }
 }
 
 fn encode_value(
@@ -767,6 +811,63 @@ fn error_info(message: &str) -> ErrorInfo {
     ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), message.to_owned())
 }
 
+fn pg_error(error: turso_pg::Error) -> PgWireError {
+    PgWireError::ApiError(Box::new(error))
+}
+
+async fn finish_query<C>(
+    client: &mut C,
+    result: PgWireResult<()>,
+    wait_for_sync: bool,
+) -> PgWireResult<()>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    let Err(PgWireError::ApiError(error)) = result else {
+        return result;
+    };
+    let error = match error.downcast::<turso_pg::Error>() {
+        Ok(error) => error,
+        Err(error) => return Err(PgWireError::ApiError(error)),
+    };
+    let mut fields = vec![
+        (b'S', "ERROR".to_string()),
+        (b'C', error.sqlstate.to_string()),
+        (b'M', error.message.clone()),
+    ];
+    for (tag, value) in [
+        (b'D', &error.detail),
+        (b't', &error.table_name),
+        (b'c', &error.column_name),
+        (b'n', &error.constraint_name),
+    ] {
+        if let Some(value) = value {
+            fields.push((tag, value.clone()));
+        }
+    }
+    client
+        .send(PgWireBackendMessage::ErrorResponse(ErrorResponse::new(
+            fields,
+        )))
+        .await?;
+    let status = client.transaction_status().to_error_state();
+    client.set_transaction_status(status);
+    if wait_for_sync {
+        client.set_state(PgWireConnectionState::AwaitingSync);
+    } else {
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        client
+            .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                status,
+            )))
+            .await?;
+    }
+    client.flush().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -934,6 +1035,16 @@ mod tests {
     }
 
     #[test]
+    fn test_pg_bytes_to_value_bytea_rejects_multi_byte_character() {
+        let result = pg_bytes_to_value("\\x\u{20ac}a".as_bytes(), &Type::BYTEA);
+        assert!(matches!(
+            result,
+            Err(PgWireError::UserError(info))
+                if info.message == "invalid bytea hex parameter: invalid hex at position 0"
+        ));
+    }
+
+    #[test]
     fn test_pg_bytes_to_value_unknown_type_as_text() {
         // Unknown types should be treated as text
         let val = pg_bytes_to_value(b"some-uuid-value", &Type::UUID).unwrap();
@@ -965,9 +1076,28 @@ mod tests {
             vec![0xDE, 0xAD, 0xBE, 0xEF]
         );
         assert_eq!(decode_hex("00ff").unwrap(), vec![0x00, 0xFF]);
+        assert_eq!(decode_hex("0aff").unwrap(), vec![0x0A, 0xFF]);
+        assert_eq!(
+            decode_hex("0123456789abcdefABCDEF").unwrap(),
+            vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xAB, 0xCD, 0xEF]
+        );
         assert_eq!(decode_hex("").unwrap(), Vec::<u8>::new());
         assert!(decode_hex("0").is_err()); // odd length
         assert!(decode_hex("GG").is_err()); // invalid hex
+        assert!(decode_hex("zz").is_err());
+        assert!(decode_hex("+f").is_err());
+    }
+
+    #[test]
+    fn test_decode_hex_rejects_multi_byte_character() {
+        assert_eq!(
+            decode_hex("\u{20ac}a"),
+            Err("invalid hex at position 0".to_owned())
+        );
+        assert_eq!(
+            decode_hex("a\u{20ac}"),
+            Err("invalid hex at position 1".to_owned())
+        );
     }
 
     #[test]

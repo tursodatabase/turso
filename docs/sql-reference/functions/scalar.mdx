@@ -17,7 +17,7 @@ Scalar functions accept one or more arguments and return a single value. They ca
 | `abs(X)` | Absolute value of X. Returns INTEGER if X is INTEGER, REAL if X is REAL, NULL if X is NULL |
 | `max(X, Y, ...)` | Returns the argument with the maximum value |
 | `min(X, Y, ...)` | Returns the argument with the minimum value |
-| `random()` | Returns a random 64-bit signed integer |
+| `random()` | Returns a random 64-bit signed integer in SQLite; returns a `double precision` value in `[0, 1)` in PostgreSQL |
 | `round(X)` | Rounds X to the nearest integer |
 | `round(X, Y)` | Rounds X to Y decimal places |
 | `sign(X)` | Returns -1, 0, or 1 for negative, zero, or positive X |
@@ -350,6 +350,8 @@ SELECT quote(x'CAFE');       -- 'X''CAFE'''
 
 `random` returns a pseudo-random 64-bit signed integer. Each call is evaluated independently, including multiple calls in the same expression. `randomblob` returns a blob of N pseudo-random bytes.
 
+In the PostgreSQL dialect, `random()` returns a `double precision` value in the range `[0, 1)`.
+
 ```sql
 SELECT random();           -- e.g., -4520312828827489743
 SELECT hex(randomblob(4)); -- e.g., 'A1B2C3D4' (4 random bytes)
@@ -477,11 +479,15 @@ SELECT unicode('Hello'); -- 72 (code point of 'H')
 
 Returns the Soundex encoding of string X as a four-character code. Soundex encodes a string based on how it sounds in English, which is useful for fuzzy name matching.
 
+Non-text arguments are converted to text first. Leading characters that are not ASCII letters are skipped, and `'?000'` is returned when X is NULL or contains no ASCII letter.
+
 ```sql
 SELECT soundex('Robert');    -- 'R163'
 SELECT soundex('Rupert');    -- 'R163'
 SELECT soundex('Smith');     -- 'S530'
 SELECT soundex('Smythe');    -- 'S530'
+SELECT soundex('O''Brien');  -- 'O165'
+SELECT soundex('123');       -- '?000'
 ```
 
 ### zeroblob(N)

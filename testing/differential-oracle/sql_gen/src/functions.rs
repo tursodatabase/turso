@@ -399,6 +399,11 @@ pub static AGGREGATE_FUNCTIONS: &[FunctionDef] = &[
         .returns(DataType::Text)
         .category(FunctionCategory::Aggregate)
         .aggregate(),
+    FunctionDef::new("JSON_GROUP_ARRAY")
+        .args(&[ANY])
+        .returns(DataType::Text)
+        .category(FunctionCategory::Aggregate)
+        .aggregate(),
     FunctionDef::new("ARRAY_AGG")
         .args(&[ANY])
         .category(FunctionCategory::Array)

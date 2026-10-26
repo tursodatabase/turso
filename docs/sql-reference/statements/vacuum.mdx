@@ -18,7 +18,7 @@ VACUUM [schema-name] INTO filename;
 | Parameter | Description |
 |-----------|-------------|
 | `schema-name` | The database to vacuum. For in-place `VACUUM` only `main` is supported. For `VACUUM INTO` any attached schema is accepted; `temp` is a no-op and produces no file. Defaults to `main`. |
-| `filename` | A string literal giving the destination file path for `VACUUM INTO`. Bind parameters are not accepted. |
+| `filename` | An expression giving the destination file path for `VACUUM INTO`, for example a string literal, a bind parameter, or a scalar subquery. It must evaluate to text, otherwise the statement fails with `non-text filename`. |
 
 ## Common Requirements
 
@@ -73,7 +73,8 @@ When the database uses MVCC (`PRAGMA journal_mode = mvcc`), additional rules app
 - Indexes, triggers, and views are recreated after the data is copied so that triggers do not fire during the copy.
 - Custom index methods (for example FTS and vector) rebuild their backing structures from the copied data.
 - `sqlite_sequence` counters used by `AUTOINCREMENT` columns are preserved.
-- Page size, reserved space, text encoding, user version, and application ID are copied from the source.
+- Reserved space, text encoding, user version, and application ID are copied from the source.
+- The page size is copied from the source, unless a valid `PRAGMA page_size = N` ran earlier on the same connection. Then the destination uses `N` and the source keeps its own page size. An in-memory source always uses its own page size. A requested size of 512 becomes 1024 when the source has more than 32 reserved bytes per page. An in-place `VACUUM` drops the requested size.
 - If the source uses MVCC, the destination is created with MVCC enabled but with fresh state. The source's MVCC metadata table is not copied across.
 - The file is fully synced and a TRUNCATE checkpoint is performed before the statement returns, so the destination is durable without further action.
 
@@ -85,9 +86,8 @@ When the database uses MVCC (`PRAGMA journal_mode = mvcc`), additional rules app
 
 In addition to the [common requirements](#common-requirements):
 
-- The destination file must not already exist. Delete or move it first if you want to overwrite.
-- The path must be provided as a string literal in the SQL statement.
-- `VACUUM temp INTO filename` is a no-op and does not create a file, matching SQLite's behavior.
+- The destination file must not already exist, unless it is empty. Delete or move a non-empty file first if you want to overwrite it.
+- `VACUUM temp INTO filename` is a no-op and does not create a file, matching SQLite's behavior. The `filename` expression is not evaluated.
 - The destination is opened the way `ATTACH` opens a file name, so a `file:` URI such as `'file:backup.db'` writes `backup.db`. URI parameters other than `mode` are ignored, and `cipher` and `hexkey` are rejected.
 - `VACUUM INTO ':memory:'`, `VACUUM INTO ''`, `VACUUM INTO 'file::memory:'`, `VACUUM INTO 'file:'`, and any URI with `mode=memory` build the copy in an in-memory database that is discarded when the statement finishes, so no file is created. Other names, such as `':memory:backup'`, are used as file names.
 
@@ -155,10 +155,10 @@ VACUUM;
 | `ReadOnly` | In-place `VACUUM` on a read-only database. |
 | `cannot VACUUM while experimental multiprocess WAL is active in another process` | In-place `VACUUM` while another process holds the multi-process WAL. |
 | `cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first` | In-place `VACUUM` on an MVCC database with pending log entries. |
-| `output file already exists: <path>` | The destination for `VACUUM INTO` already exists. |
+| `output file already exists: <path>` | The destination for `VACUUM INTO` already exists and is not empty. |
 | `unable to open database: <path>` | The `VACUUM INTO` URI has `mode=ro` or `mode=rw`, which cannot create the destination. |
 | `VACUUM INTO does not support the cipher and hexkey URI parameters` | The `VACUUM INTO` URI asks for an encrypted destination. |
-| `VACUUM INTO requires a string literal path` | A non-literal expression (for example a bind parameter) was used for the destination. |
+| `non-text filename` | The `VACUUM INTO` destination expression did not evaluate to text, for example `NULL`, a number, or a blob. |
 | `no such database: <name>` | `VACUUM <schema> INTO` referenced an unknown schema. |
 
 ## See Also

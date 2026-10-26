@@ -266,6 +266,7 @@ expect {
 test current-setting-unknown-parameter-errors {
     SELECT current_setting('no_such_setting');
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "no_such_setting"
 }
@@ -273,6 +274,7 @@ expect error {
 test current-setting-unknown-parameter-without-missing-ok-errors {
     SELECT current_setting('no_such_setting', false);
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "no_such_setting"
 }
@@ -280,6 +282,7 @@ expect error {
 test current-setting-does-not-trim-the-parameter-name {
     SELECT current_setting('search_path ');
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "search_path "
 }
@@ -287,22 +290,394 @@ expect error {
 test current-setting-integer-parameter-name-errors {
     SELECT current_setting(5);
 }
+@sqlstate 42883
 expect error {}
 
 test current-setting-text-missing-ok-errors {
     SELECT current_setting('search_path', 'x');
 }
+@sqlstate 22P02
 expect error {}
+
+test current-setting-missing-ok-accepts-boolean-text {
+    SELECT coalesce(current_setting('no_such_setting', 'yes'), '<null>');
+    SELECT coalesce(current_setting('no_such_setting', ' TRUE '), '<null>');
+}
+expect {
+    <null>
+    <null>
+}
+
+test current-setting-missing-ok-false-text-errors {
+    SELECT current_setting('no_such_setting', ' Off ');
+}
+@sqlstate 42704
+expect error {
+    unrecognized configuration parameter "no_such_setting"
+}
+
+test current-setting-missing-ok-accepts-the-start-of-a-boolean-word {
+    SELECT coalesce(current_setting('no_such_setting', 'tr'), '<null>');
+    SELECT coalesce(current_setting('no_such_setting', 'Y'), '<null>');
+    SELECT coalesce(current_setting('no_such_setting', 'tRu'), '<null>');
+}
+expect {
+    <null>
+    <null>
+    <null>
+}
+
+test current-setting-missing-ok-of-is-false {
+    SELECT current_setting('no_such_setting', 'of');
+}
+@sqlstate 42704
+expect error {
+    unrecognized configuration parameter "no_such_setting"
+}
+
+test current-setting-missing-ok-o-is-not-a-boolean {
+    SELECT current_setting('no_such_setting', 'o');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type boolean: "o"
+}
+
+test current-setting-missing-ok-longer-than-a-boolean-word-errors {
+    SELECT current_setting('no_such_setting', 'truee');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type boolean: "truee"
+}
+
+test pg-input-is-valid-accepts-the-start-of-a-boolean-word {
+    SELECT CASE WHEN pg_input_is_valid('tr', 'bool') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid(' on ', 'bool') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('o', 'bool') THEN 'valid' ELSE 'invalid' END;
+}
+expect {
+    valid
+    valid
+    invalid
+}
+
+test current-setting-numeric-parameter-name-errors {
+    SELECT current_setting(5.5);
+}
+@sqlstate 42883
+expect error {
+    function current_setting\(numeric\) does not exist
+}
 
 test current-setting-without-arguments-errors {
     SELECT current_setting();
 }
+@sqlstate 42883
 expect error {}
 
 test current-setting-with-three-arguments-errors {
     SELECT current_setting('search_path', true, true);
 }
+@sqlstate 42883
 expect error {}
+
+test set-config-custom-parameter {
+    SELECT set_config('app.user_id', '42', false);
+    SELECT current_setting('app.user_id');
+    SELECT current_setting('APP.User_Id');
+    SELECT current_setting('app.user_id', true);
+}
+expect {
+    42
+    42
+    42
+    42
+}
+
+test set-config-custom-parameter-names {
+    SELECT set_config('a.b.c', 'three parts', false);
+    SELECT set_config('_a._b', 'underscores', false);
+    SELECT set_config('app.x1$', 'digit and dollar', false);
+    SELECT set_config('é.ü', 'not ASCII', false);
+    SELECT current_setting('A.B.C'), current_setting('_A._B'), current_setting('APP.X1$'), current_setting('é.ü');
+}
+expect {
+    three parts
+    underscores
+    digit and dollar
+    not ASCII
+    three parts|underscores|digit and dollar|not ASCII
+}
+
+test set-config-custom-parameter-name-is-not-case-sensitive-when-set {
+    SELECT set_config('APP.Mixed_Case', 'v', false);
+    SELECT current_setting('app.mixed_case');
+}
+expect {
+    v
+    v
+}
+
+test custom-parameter-name-ignores-only-the-case-of-ascii-letters {
+    SELECT set_config('app.é', 'lower', false);
+    SELECT current_setting('APP.é');
+    SELECT coalesce(current_setting('app.É', true), '<null>');
+}
+expect {
+    lower
+    lower
+    <null>
+}
+
+test current-setting-undefined-custom-parameter-errors {
+    SELECT current_setting('app.never_set');
+}
+@sqlstate 42704
+expect error {
+    unrecognized configuration parameter "app\.never_set"
+}
+
+test set-config-custom-parameter-null-value-resets-it {
+    SELECT set_config('app.reset_me', 'v', false);
+    SELECT quote_literal(set_config('app.reset_me', NULL, false));
+    SELECT quote_literal(current_setting('app.reset_me'));
+    SELECT quote_literal(current_setting('app.reset_me', true));
+}
+expect {
+    v
+    ''
+    ''
+    ''
+}
+
+test set-config-custom-parameter-name-with-an-empty-part-errors {
+    SELECT set_config('app..user_id', 'v', false);
+}
+@sqlstate 42602
+expect error {
+    invalid configuration parameter name "app\.\.user_id"
+}
+
+test set-config-custom-parameter-name-with-a-trailing-dot-errors {
+    SELECT set_config('app.', 'v', false);
+}
+@sqlstate 42602
+expect error {
+    invalid configuration parameter name "app\."
+}
+
+test set-config-custom-parameter-name-with-a-leading-digit-errors {
+    SELECT set_config('app.1user', 'v', false);
+}
+@sqlstate 42602
+expect error {
+    invalid configuration parameter name "app\.1user"
+}
+
+test set-config-custom-parameter-name-with-a-space-errors {
+    SELECT set_config('app.user id', 'v', false);
+}
+@sqlstate 42602
+expect error {
+    invalid configuration parameter name "app\.user id"
+}
+
+test set-config-unknown-parameter-without-a-dot-errors {
+    SELECT set_config('no_such_setting', 'v', false);
+}
+@sqlstate 42704
+expect error {
+    unrecognized configuration parameter "no_such_setting"
+}
+
+test set-config-local-custom-parameter-in-one-statement {
+    SELECT set_config('app.tx_value', 'local', true), current_setting('app.tx_value');
+}
+expect {
+    local|local
+}
+
+test set-config-local-custom-parameter-ends-with-its-statement-outside-a-transaction {
+    SELECT set_config('app.autocommit_local', 'local', true);
+    SELECT quote_literal(current_setting('app.autocommit_local'));
+}
+expect {
+    local
+    ''
+}
+
+test set-config-local-custom-parameter-ends-at-commit {
+    BEGIN;
+    SELECT set_config('app.tx_value', 'local', true);
+    SELECT current_setting('app.tx_value');
+    COMMIT;
+    SELECT quote_literal(current_setting('app.tx_value'));
+    SELECT quote_literal(current_setting('app.tx_value', true));
+}
+expect {
+    local
+    local
+    ''
+    ''
+}
+
+test set-config-local-custom-parameter-ends-at-rollback {
+    BEGIN;
+    SELECT set_config('app.tx_value', 'local', true);
+    ROLLBACK;
+    SELECT quote_literal(current_setting('app.tx_value'));
+}
+expect {
+    local
+    ''
+}
+
+test set-config-local-custom-parameter-hides-the-session-value {
+    BEGIN;
+    SELECT set_config('app.mode', 'session', false);
+    COMMIT;
+    BEGIN;
+    SELECT set_config('app.mode', 'local', true);
+    SELECT current_setting('app.mode');
+    COMMIT;
+    SELECT current_setting('app.mode');
+    BEGIN;
+    SELECT set_config('app.mode', 'local', true);
+    ROLLBACK;
+    SELECT current_setting('app.mode');
+}
+expect {
+    session
+    local
+    local
+    session
+    local
+    session
+}
+
+test set-config-session-value-stays-after-a-later-local-value-ends {
+    BEGIN;
+    SELECT set_config('app.mode', 'session', false);
+    SELECT set_config('app.mode', 'local', true);
+    SELECT current_setting('app.mode');
+    COMMIT;
+    SELECT current_setting('app.mode');
+}
+expect {
+    session
+    local
+    local
+    session
+}
+
+test set-config-session-value-replaces-a-local-value {
+    BEGIN;
+    SELECT set_config('app.mode', 'local', true);
+    SELECT set_config('app.mode', 'session', false);
+    COMMIT;
+    SELECT current_setting('app.mode');
+}
+expect {
+    local
+    session
+    session
+}
+
+test set-config-rollback-undoes-a-session-value {
+    BEGIN;
+    SELECT set_config('app.rb_value', 'before', false);
+    COMMIT;
+    BEGIN;
+    SELECT set_config('app.rb_value', 'in transaction', false);
+    ROLLBACK;
+    SELECT current_setting('app.rb_value');
+}
+expect {
+    before
+    in transaction
+    before
+}
+
+test set-config-custom-parameter-stays-defined-after-rollback {
+    BEGIN;
+    SELECT set_config('app.rb_new', 'x', false);
+    ROLLBACK;
+    SELECT quote_literal(current_setting('app.rb_new'));
+}
+expect {
+    x
+    ''
+}
+
+test set-config-rollback-to-savepoint-undoes-later-values {
+    BEGIN;
+    SELECT set_config('app.sp_value', 'before savepoint', false);
+    SAVEPOINT s;
+    SELECT set_config('app.sp_value', 'after savepoint', false);
+    SELECT set_config('app.sp_local', 'local', true);
+    ROLLBACK TO SAVEPOINT s;
+    SELECT current_setting('app.sp_value'), quote_literal(current_setting('app.sp_local'));
+    COMMIT;
+    SELECT current_setting('app.sp_value');
+}
+expect {
+    before savepoint
+    after savepoint
+    local
+    before savepoint|''
+    before savepoint
+}
+
+test set-config-release-savepoint-keeps-values {
+    BEGIN;
+    SAVEPOINT s;
+    SELECT set_config('app.rel_session', 'session', false);
+    SELECT set_config('app.rel_local', 'local', true);
+    RELEASE SAVEPOINT s;
+    SELECT current_setting('app.rel_session'), current_setting('app.rel_local');
+    COMMIT;
+    SELECT current_setting('app.rel_session'), quote_literal(current_setting('app.rel_local'));
+}
+expect {
+    session
+    local
+    session|local
+    session|''
+}
+
+test set-config-rollback-undoes-values-of-a-released-savepoint {
+    BEGIN;
+    SAVEPOINT s;
+    SELECT set_config('app.rel_rb', 'released', false);
+    RELEASE SAVEPOINT s;
+    ROLLBACK;
+    SELECT quote_literal(current_setting('app.rel_rb'));
+}
+expect {
+    released
+    ''
+}
+
+test set-config-rollback-to-an-outer-savepoint {
+    BEGIN;
+    SELECT set_config('app.nested', 'outer', false);
+    SAVEPOINT a;
+    SELECT set_config('app.nested', 'a', false);
+    SAVEPOINT b;
+    SELECT set_config('app.nested', 'b', true);
+    ROLLBACK TO SAVEPOINT a;
+    SELECT current_setting('app.nested');
+    COMMIT;
+    SELECT current_setting('app.nested');
+}
+expect {
+    outer
+    a
+    b
+    outer
+    outer
+}
 
 test obj-description-unknown-oid-is-null {
     SELECT obj_description(0, 'pg_class');
@@ -319,11 +694,13 @@ expect {
 test version-wrong-arity-errors {
     SELECT version(1);
 }
+@sqlstate 42883
 expect error {}
 
 test quote-ident-wrong-arity-errors {
     SELECT quote_ident();
 }
+@sqlstate 42883
 expect error {}
 
 test pg-get-expr-default-two-args {
@@ -353,11 +730,13 @@ test pg-get-expr-non-text-expression-errors {
     CREATE TABLE demo (id int DEFAULT 7, label text);
     SELECT pg_get_expr(42, 1::oid) FROM pg_attrdef;
 }
+@sqlstate 42883
 expect error {}
 
 test pg-get-expr-null-oid-does-not-hide-invalid-expression {
     SELECT pg_get_expr(42, NULL::oid);
 }
+@sqlstate 42883
 expect error {}
 
 @skip-if postgres "PostgreSQL prints (val > 0), and also lists the CHECK constraints of the information_schema domains"
@@ -467,26 +846,31 @@ expect {
 test acldefault-unknown-object-kind-errors {
     SELECT acldefault('?', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test acldefault-empty-object-kind-errors {
     SELECT acldefault('', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test acldefault-leading-space-object-kind-errors {
     SELECT acldefault(' r', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test acldefault-uppercase-object-kind-errors {
     SELECT acldefault('R', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test acldefault-non-ascii-object-kind-errors {
     SELECT acldefault('é', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test format-type-expanded {
@@ -593,6 +977,7 @@ expect {
 test pg-options-to-table-null-element {
     SELECT * FROM pg_options_to_table(ARRAY['a=b', NULL]);
 }
+@sqlstate 22004
 expect error {
     null array element not allowed in this context
 }
@@ -727,6 +1112,7 @@ expect {
 test json-to-record-requires-column-list {
     SELECT * FROM json_to_record('{"id":1}') AS _;
 }
+@sqlstate 42601
 expect error {
     a column definition list is required for functions returning "record"
 }
@@ -756,6 +1142,7 @@ expect {
 test json-to-recordset-object-errors {
     SELECT * FROM json_to_recordset('{"a":1}') AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call json_to_recordset on an object
 }
@@ -763,6 +1150,7 @@ expect error {
 test json-to-recordset-scalar-errors {
     SELECT * FROM jsonb_to_recordset('5'::jsonb) AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call jsonb_to_recordset on a non-array
 }
@@ -770,6 +1158,7 @@ expect error {
 test json-to-recordset-json-scalar-errors {
     SELECT * FROM json_to_recordset('5') AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call json_to_recordset on a scalar
 }
@@ -777,6 +1166,7 @@ expect error {
 test json-to-recordset-non-object-element-errors {
     SELECT * FROM json_to_recordset('[{"a":1},5]') AS _(a int);
 }
+@sqlstate 22023
 expect error {
     argument of json_to_recordset must be an array of objects
 }
@@ -784,6 +1174,7 @@ expect error {
 test json-to-recordset-null-element-errors {
     SELECT * FROM jsonb_to_recordset('[null]'::jsonb) AS _(a int);
 }
+@sqlstate 22023
 expect error {
     argument of jsonb_to_recordset must be an array of objects
 }
@@ -791,6 +1182,7 @@ expect error {
 test json-to-record-array-errors {
     SELECT * FROM json_to_record('[{"a":1}]') AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call populate_composite on an array
 }
@@ -798,6 +1190,7 @@ expect error {
 test json-to-record-scalar-errors {
     SELECT * FROM jsonb_to_record('null'::jsonb) AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call populate_composite on a scalar
 }
@@ -819,4 +1212,52 @@ expect {
     <null>|<null>|<null>|-1
     <null>|"x"
     {"y":2}|"z"
+}
+
+test function-whose-name-starts-with-a-bracket-does-not-exist {
+    SELECT "[x"();
+}
+expect error {
+    function \[x\(\) does not exist
+}
+expect @tursopg error {
+    no such function: \[x
+}
+
+test mod-of-integers-is-integer {
+    SELECT mod(67, 100), mod(-7, 3), mod(7::bigint, 2::smallint), mod(-9223372036854775808, -1);
+}
+expect {
+    67|-1|1|0
+}
+
+test mod-of-integer-columns-is-integer {
+    SELECT x, mod(x, 3) FROM (VALUES (10), (-11)) AS v(x) ORDER BY x;
+}
+expect {
+    -11|-2
+    10|1
+}
+
+test mod-in-check-constraint {
+    CREATE TABLE even_numbers (x int CHECK (mod(x, 2) = 0), y int, CHECK (mod(y, 3) = 1));
+    INSERT INTO even_numbers VALUES (4, 7);
+    SELECT x, y, mod(x, 3) FROM even_numbers;
+}
+expect {
+    4|7|1
+}
+
+test mod-of-fractions-keeps-the-fraction {
+    SELECT mod(7.5, 2), mod(-7.5, 2);
+}
+expect {
+    1.5|-1.5
+}
+
+test mod-with-null-is-null {
+    SELECT coalesce(mod(NULL, 0)::text, '<null>'), coalesce(mod(1, NULL)::text, '<null>');
+}
+expect {
+    <null>|<null>
 }

@@ -26,6 +26,7 @@
 //! writes made before it remain part of the handle's transaction and commit at
 //! close, exactly as `sqlite3_blob_write` documents.
 
+use crate::namespace::NamespaceId;
 use std::num::NonZero;
 use std::sync::Arc;
 
@@ -225,16 +226,19 @@ fn check_column_writable(
         )));
     }
     let col_name = col.name.as_deref().unwrap_or("");
-    let indexed = schema.get_indices(&table.name).any(|index| {
-        index
-            .columns
+    let indexed = schema
+        .get_indices(NamespaceId::ROOT, &table.name)
+        .any(|index| {
+            index
+                .columns
+                .iter()
+                .any(|ic| ic.pos_in_table == col_idx || ic.expr.is_some())
+                || index.where_clause.is_some()
+        })
+        || table
+            .primary_key_columns
             .iter()
-            .any(|ic| ic.pos_in_table == col_idx || ic.expr.is_some())
-            || index.where_clause.is_some()
-    }) || table
-        .primary_key_columns
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case(col_name))
+            .any(|(name, _)| name.eq_ignore_ascii_case(col_name))
         || table.unique_sets.iter().any(|set| {
             set.columns
                 .iter()
@@ -256,10 +260,9 @@ fn check_column_writable(
             "cannot open foreign key column for writing".to_string(),
         ));
     }
-    if schema
-        .table_to_materialized_views
-        .get(&table.name)
-        .is_some_and(|views| !views.is_empty())
+    if !schema
+        .get_dependent_materialized_views(NamespaceId::ROOT, &table.name)
+        .is_empty()
     {
         return Err(LimboError::InternalError(format!(
             "cannot open column of table {} for writing: materialized views depend on it",
@@ -279,15 +282,22 @@ impl Connection {
         rowid: i64,
         read_write: bool,
     ) -> Result<Blob> {
+        if self.mvcc_enabled() {
+            return Err(LimboError::InternalError(
+                "incremental blob I/O is not supported in MVCC mode".to_string(),
+            ));
+        }
         let fk_enforced = self.foreign_keys_enabled();
         let (table_ref, record_column) = self.with_schema_mut(|schema| {
-            if schema.is_materialized_view(table) || schema.get_view(table).is_some() {
+            if schema.is_materialized_view(NamespaceId::ROOT, table)
+                || schema.get_view(NamespaceId::ROOT, table).is_some()
+            {
                 return Err(LimboError::InternalError(format!(
                     "cannot open view: {table}"
                 )));
             }
             if matches!(
-                schema.get_table(table).as_deref(),
+                schema.get_table(NamespaceId::ROOT, table).as_deref(),
                 Some(crate::schema::Table::Virtual(_))
             ) {
                 return Err(LimboError::InternalError(format!(
@@ -295,7 +305,7 @@ impl Connection {
                 )));
             }
             let tbl = schema
-                .get_btree_table(table)
+                .get_btree_table(NamespaceId::ROOT, table)
                 .ok_or_else(|| LimboError::InternalError(format!("no such table: {table}")))?;
             if !tbl.has_rowid {
                 return Err(LimboError::InternalError(format!(

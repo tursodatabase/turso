@@ -1020,6 +1020,7 @@ pub fn insn_to_row(
                 description,
                 on_error,
                 description_reg,
+                ..
             } => {
                 let p3 = description_reg.unwrap_or(0) as i64;
                 (
@@ -1037,6 +1038,7 @@ pub fn insn_to_row(
                 target_reg,
                 description,
                 on_error,
+                ..
             } => (
                 "HaltIfNull",
                 *err_code as i64,
@@ -2601,7 +2603,7 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::FkCounter{increment_value, deferred } => (
+        Insn::FkCounter{increment_value, deferred, .. } => (
         "FkCounter",
             *increment_value as i64,
             *deferred as i64,
@@ -2721,8 +2723,8 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashResetMatched { hash_table_id } => (
-            "HashResetMatched",
+        Insn::HashProbeInit { hash_table_id } => (
+            "HashProbeInit",
             *hash_table_id as i64,
             0,
             0,
@@ -2806,14 +2808,14 @@ pub fn insn_to_row(
                 format!("hash_table_id={hash_table_id}"),
             )
         },
-        Insn::VacuumInto { schema_name, dest_path } => (
+        Insn::VacuumInto { schema_name, dest_reg } => (
             "VacuumInto",
             0,
+            *dest_reg as i64,
             0,
+            Value::build_text(""),
             0,
-            Value::build_text(dest_path.to_string()),
-            0,
-            format!("schema={schema_name}, dest={dest_path}"),
+            format!("schema={schema_name}, dest=r[{dest_reg}]"),
         ),
         Insn::Vacuum { db } => (
             "Vacuum",

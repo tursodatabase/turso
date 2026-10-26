@@ -1,11 +1,18 @@
 //! Translation of VACUUM statements to VDBE bytecode.
 
-use crate::translate::expr::sanitize_string;
+use crate::translate::emitter::Resolver;
+use crate::translate::expr::{
+    bind_and_rewrite_expr, expr_vector_size, translate_expr, BindingBehavior,
+};
+use crate::translate::plan::{EvalAt, TableReferences};
+use crate::translate::subquery::{
+    emit_non_from_clause_subquery, plan_subqueries_in_expr_without_from_clause,
+};
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::Insn;
-use crate::{bail_parse_error, Connection, Result};
+use crate::{bail_parse_error, Connection, Result, TEMP_DB_ID};
 use crate::{sync::Arc, LimboError};
-use turso_parser::ast::{Expr, Literal, Name};
+use turso_parser::ast::{Expr, Name, SubqueryType};
 
 /// Translate a VACUUM statement into VDBE bytecode.
 ///
@@ -14,6 +21,7 @@ use turso_parser::ast::{Expr, Literal, Name};
 ///
 /// # Arguments
 /// * `program` - The program builder to emit instructions to
+/// * `resolver` - Resolves names in the VACUUM INTO path expression
 /// * `schema_name` - Optional schema/database name to vacuum (defaults to "main" if None)
 /// * `into` - Optional destination path for VACUUM INTO
 ///
@@ -21,6 +29,7 @@ use turso_parser::ast::{Expr, Literal, Name};
 /// The modified program builder on success
 pub fn translate_vacuum(
     program: &mut ProgramBuilder,
+    resolver: &Resolver,
     schema_name: Option<&Name>,
     into: Option<&Expr>,
     connection: Arc<Connection>,
@@ -28,11 +37,52 @@ pub fn translate_vacuum(
     let schema_name = schema_name.map_or_else(|| "main".to_string(), |n| n.as_str().to_string());
     match into {
         Some(dest_expr) => {
-            // VACUUM INTO 'path' - create compacted copy at destination
-            let dest_path = extract_path_from_expr(dest_expr)?;
+            if connection.get_database_id_by_name(&schema_name)? == TEMP_DB_ID {
+                return Ok(());
+            }
+            let mut dest_expr = dest_expr.clone();
+            bind_and_rewrite_expr(
+                &mut dest_expr,
+                Some(&mut TableReferences::new(vec![], vec![])),
+                None,
+                resolver,
+                BindingBehavior::ResultColumnsNotAllowed,
+            )?;
+            let mut subqueries = Vec::new();
+            plan_subqueries_in_expr_without_from_clause(
+                program,
+                &mut subqueries,
+                &mut dest_expr,
+                resolver,
+                &connection,
+            )?;
+            match &dest_expr {
+                Expr::SubqueryResult {
+                    query_type: SubqueryType::RowValue { num_regs, .. },
+                    ..
+                } if *num_regs != 1 => {
+                    bail_parse_error!("sub-select returns {num_regs} columns - expected 1");
+                }
+                _ if expr_vector_size(&dest_expr)? != 1 => {
+                    bail_parse_error!("row value misused");
+                }
+                _ => {}
+            }
+            for subquery in &mut subqueries {
+                let plan = subquery.consume_plan(EvalAt::BeforeLoop);
+                emit_non_from_clause_subquery(
+                    program,
+                    resolver,
+                    *plan,
+                    &subquery.query_type,
+                    false,
+                )?;
+            }
+            let dest_reg = program.alloc_register();
+            translate_expr(program, None, &dest_expr, dest_reg, resolver)?;
             program.emit_insn(Insn::VacuumInto {
                 schema_name,
-                dest_path,
+                dest_reg,
             });
             Ok(())
         }
@@ -61,54 +111,5 @@ pub fn translate_vacuum(
             });
             Ok(())
         }
-    }
-}
-
-/// Extract a file path string from an expression.
-///
-/// The expression can be either:
-/// - A string literal: `VACUUM INTO 'path/to/file.db'`
-/// - An identifier (variable name, though not commonly used)
-fn extract_path_from_expr(expr: &Expr) -> Result<String> {
-    match expr {
-        Expr::Literal(Literal::String(s)) => Ok(sanitize_string(s)),
-        Expr::Id(name) => {
-            // Allow identifier as path (unusual but valid)
-            Ok(name.as_str().to_string())
-        }
-        _ => {
-            bail_parse_error!("VACUUM INTO requires a string literal path");
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_extract_path_from_string_literal() {
-        let expr = Expr::Literal(Literal::String("'test.db'".to_string()));
-        let path = extract_path_from_expr(&expr).unwrap();
-        assert_eq!(path, "test.db");
-    }
-
-    #[test]
-    fn test_extract_path_from_string_literal_keeps_quote_characters() {
-        for (literal, path) in [
-            ("''''", "'"),
-            ("'\"\"'", "\"\""),
-            ("''':memory:'''", "':memory:'"),
-        ] {
-            let expr = Expr::Literal(Literal::String(literal.to_string()));
-            assert_eq!(extract_path_from_expr(&expr).unwrap(), path);
-        }
-    }
-
-    #[test]
-    fn test_extract_path_from_identifier() {
-        let expr = Expr::Id(Name::exact("myfile".to_string()));
-        let path = extract_path_from_expr(&expr).unwrap();
-        assert_eq!(path, "myfile");
     }
 }

@@ -1932,6 +1932,9 @@ mod immutable_record {
 
             let header_size = Record::calc_header_size(size_header);
             let total_size = header_size + size_values;
+            if total_size > Value::MAX_BLOB_LENGTH as usize {
+                return Err(LimboError::TooBig);
+            }
             buf.try_reserve_exact(total_size)?;
             buf.resize(total_size, 0);
 
@@ -3935,6 +3938,22 @@ mod tests {
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
     use asserting::prelude::*;
+
+    #[test]
+    fn text_subtype_integer_conversion() {
+        assert_eq!(i64::from(TextSubtype::Text), 0);
+        assert_eq!(TextSubtype::try_from(0_i64), Ok(TextSubtype::Text));
+        #[cfg(feature = "json")]
+        {
+            assert_eq!(i64::from(TextSubtype::Json), 74);
+            assert_eq!(TextSubtype::try_from(74_i64), Ok(TextSubtype::Json));
+        }
+        #[cfg(not(feature = "json"))]
+        assert_eq!(TextSubtype::try_from(74_i64), Err(74));
+        for value in [-1, 1, 73, 75, 256, i64::MAX] {
+            assert_eq!(TextSubtype::try_from(value), Err(value));
+        }
+    }
 
     #[test]
     fn is_ascii_checks_every_byte_of_every_length() {
