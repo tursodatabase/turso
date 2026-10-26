@@ -33,6 +33,27 @@ fn test_postgres_ctes_ignore_search_path(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_insert_target_alias_is_visible_in_returning(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (a INT, b INT)").unwrap();
+
+    assert_eq!(
+        conn.prepare("INSERT INTO t AS x VALUES (9,9) RETURNING x.a")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(9)]]
+    );
+    assert_eq!(
+        conn.prepare("INSERT INTO t AS x VALUES (9,9) RETURNING x.a + x.b")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(18)]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_access_share_lock_is_noop(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE lock_items (v INTEGER)").unwrap();
