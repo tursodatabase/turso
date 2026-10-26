@@ -407,6 +407,31 @@ expect error {
 }
 
 @setup data
+test update-from-subquery-cannot-see-the-target-table-in-its-lateral-item {
+    UPDATE t4 SET v = s.x FROM (SELECT * FROM t1, LATERAL (SELECT t4.a AS x) AS q) AS s;
+}
+@sqlstate 42P01
+expect error {}
+
+@setup data
+test update-from-function-without-lateral-cannot-read-the-target-table {
+    UPDATE t4 SET v = s.x FROM generate_series(1, t4.a) AS s(x);
+}
+@sqlstate 42P10
+expect error {
+    invalid reference to FROM-clause entry for table "t4"
+}
+
+@setup data
+test update-from-join-with-lateral-cannot-read-the-target-table {
+    UPDATE t4 SET v = s.x FROM t1 JOIN LATERAL (SELECT t4.a AS x) AS s ON true;
+}
+@sqlstate 42P10
+expect error {
+    invalid reference to FROM-clause entry for table "t4"
+}
+
+@setup data
 test update-from-lateral-reads-its-own-table-with-the-name-of-the-target {
     UPDATE t4 SET v = s.x FROM LATERAL (SELECT max(t4.a) AS x FROM t4) AS s;
     SELECT a, v FROM t4 ORDER BY 1;

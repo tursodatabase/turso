@@ -493,7 +493,7 @@ fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
         ast::Stmt::Update { .. } => "update",
         _ => unreachable!(),
     };
-    if is_catalog_view_name(table_name) {
+    if catalog::is_catalog_view_name(table_name) {
         return Err(sqlstate_error(
             SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE,
             format!("cannot {verb} view \"{table_name}\""),
@@ -503,16 +503,6 @@ fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
         SQLSTATE_INSUFFICIENT_PRIVILEGE,
         format!("cannot {verb} pg_catalog table \"{table_name}\""),
     ))
-}
-
-/// Whether the catalog relation `name` is a view in PostgreSQL. PostgreSQL
-/// rejects DML on these views because they do not read a single table, and
-/// it does so before it checks privileges.
-fn is_catalog_view_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "pg_roles" | "pg_seclabels" | "pg_sequences" | "pg_settings" | "pg_tables" | "pg_indexes"
-    )
 }
 
 fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
@@ -601,26 +591,18 @@ fn translation_error(conn: &Arc<Connection>, error: ParseError) -> LimboError {
     match error {
         ParseError::ParseError(message) => LimboError::ParseError(message),
         ParseError::Sqlstate { sqlstate, message } => sqlstate_error(sqlstate, message),
-        ParseError::SchemaQualifiedName { ref schema, .. } => {
-            match pg_schema_exists(conn, schema) {
-                Ok(true) => sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string()),
-                Ok(false) => sqlstate_error(
-                    SQLSTATE_INVALID_SCHEMA_NAME,
-                    format!("schema \"{schema}\" does not exist"),
-                ),
-                Err(error) => error,
-            }
+        ParseError::SchemaQualifiedName { ref schema, .. }
+            if !catalog::namespace_exists(conn, schema) =>
+        {
+            sqlstate_error(
+                SQLSTATE_INVALID_SCHEMA_NAME,
+                format!("schema \"{schema}\" does not exist"),
+            )
+        }
+        ParseError::SchemaQualifiedName { .. } => {
+            sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string())
         }
     }
-}
-
-/// Whether PostgreSQL schema `schema` exists: one of the schemas that
-/// PostgreSQL always has, or a schema that CREATE SCHEMA created.
-fn pg_schema_exists(conn: &Arc<Connection>, schema: &str) -> Result<bool> {
-    if matches!(schema, "public" | "pg_catalog" | "information_schema") {
-        return Ok(true);
-    }
-    schema_exists(conn, schema)
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {

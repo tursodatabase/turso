@@ -1145,6 +1145,14 @@ test cast-to-type-in-unknown-schema-errors {
 expect error {
 }
 
+test function-in-schema-main-errors {
+    SELECT main.lower('A');
+}
+@sqlstate 3F000
+expect error {
+    schema "main" does not exist
+}
+
 test recursive-cte-reference-inside-same-operator-group {
     WITH RECURSIVE r(n) AS (SELECT 1 UNION (SELECT 2 UNION SELECT n + 1 FROM r WHERE n < 3)) SELECT n FROM r ORDER BY 1;
 }
