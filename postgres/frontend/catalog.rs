@@ -6,7 +6,7 @@ use std::sync::Arc;
 use turso_core::{
     dialect::POSTGRES_TABLE_SQL_PREFIX,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
-    schema::{BTreeTable, Index, Schema, Table},
+    schema::{BTreeTable, Index, Schema, Table, AUTOINCREMENT_SEQ_PREFIX},
     Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions, Result, Statement,
     Value,
 };
@@ -284,6 +284,8 @@ enum RelationKind {
     Table,
     #[strum(serialize = "i")]
     Index,
+    #[strum(serialize = "S")]
+    Sequence,
 }
 
 /// Virtual table implementation for pg_catalog.pg_class
@@ -444,6 +446,51 @@ impl SnapshotRows for PgClassTable {
                 ]);
                 index_oid += 1;
             }
+        }
+
+        let mut sequence_names: Vec<_> = schema
+            .sequences_by_name(NamespaceId::ROOT)
+            .keys()
+            .filter(|name| !name.starts_with(AUTOINCREMENT_SEQ_PREFIX))
+            .collect();
+        sequence_names.sort();
+        let relkind: &'static str = RelationKind::Sequence.into();
+        for (i, name) in sequence_names.into_iter().enumerate() {
+            rows.push(vec![
+                Value::from_i64(index_oid + i as i64),
+                Value::build_text(name.clone()),
+                Value::from_i64(2200),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(10),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::from_f64(1.0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::build_text("p"),
+                Value::build_text(relkind),
+                Value::from_i64(3),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::build_text("n"),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]);
         }
 
         rows

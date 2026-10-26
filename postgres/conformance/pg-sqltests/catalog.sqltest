@@ -1060,3 +1060,48 @@ test pg-seclabels-columns-are-selectable {
     FROM pg_seclabels;
 }
 expect {}
+
+setup catalog_sequences {
+    CREATE SEQUENCE catalog_explicit_seq;
+    CREATE SEQUENCE "catalog quoted seq";
+    CREATE TABLE catalog_serial (id SERIAL, value TEXT);
+    CREATE INDEX catalog_serial_value_idx ON catalog_serial(value);
+}
+
+@setup catalog_sequences
+test pg-class-lists-sequences {
+    SELECT c.relname, c.relkind, n.nspname, c.relnatts, c.relam,
+           c.relpersistence, c.relreplident, c.tableoid,
+           CASE WHEN c.relhasindex THEN 1 ELSE 0 END
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'S' AND n.nspname = 'public'
+    ORDER BY c.relname;
+}
+expect {
+    catalog quoted seq|S|public|3|0|p|n|1259|0
+    catalog_explicit_seq|S|public|3|0|p|n|1259|0
+    catalog_serial_id_seq|S|public|3|0|p|n|1259|0
+}
+
+@setup catalog_sequences
+test pg-class-sequence-oids-do-not-collide {
+    SELECT COUNT(*), COUNT(DISTINCT c.oid)
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind IN ('r', 'i', 'S');
+}
+expect {
+    5|5
+}
+
+@setup catalog_sequences
+test pg-class-removes-dropped-sequences {
+    DROP SEQUENCE catalog_explicit_seq;
+    SELECT relname FROM pg_catalog.pg_class
+    WHERE relkind = 'S' AND relnamespace = 2200 ORDER BY relname;
+}
+expect {
+    catalog quoted seq
+    catalog_serial_id_seq
+}
