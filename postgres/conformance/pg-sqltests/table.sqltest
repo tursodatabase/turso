@@ -234,6 +234,25 @@ expect {
     0
 }
 
+test table-numeric-column-compared-with-expression {
+    CREATE TABLE nm (v numeric(10,2));
+    INSERT INTO nm VALUES (1.50);
+    SELECT count(*) FROM nm WHERE v = 1.5 + 0;
+    SELECT count(*) FROM nm WHERE v = (SELECT 1.5);
+    SELECT count(*) FROM nm WHERE (SELECT 1.5) = v;
+    SELECT count(*) FROM nm WHERE v < 1 + 1;
+    SELECT count(*) FROM nm WHERE v <> 1.5 + 0;
+    SELECT count(*) FROM nm WHERE v = 1.504 + 0;
+}
+expect {
+    1
+    1
+    1
+    1
+    0
+    0
+}
+
 test table-uuid-column-omitted-from-insert-is-null {
     CREATE TABLE t (id int PRIMARY KEY, u uuid);
     INSERT INTO t (id) VALUES (1);
