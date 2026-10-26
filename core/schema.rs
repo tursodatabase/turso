@@ -346,7 +346,7 @@ fn builtin_arithmetic(type_name: &str) -> std::vec::Vec<ArithmeticSignature> {
                 .map(|args| call(op, args, func, Some("numeric")))
         })
         .collect(),
-        "date" => vec![
+        "date" => std::vec![
             call("+", [Value, Integer], "date_plus", Some("date")),
             call("+", [Integer, Value], "date_plus", Some("date")),
             call("-", [Value, Value], "date_diff", Some("integer")),
