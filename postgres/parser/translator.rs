@@ -6312,6 +6312,26 @@ pub fn is_commit_or_rollback(parse_result: &ParseResult) -> bool {
     )
 }
 
+/// The name that PostgreSQL gives COMMIT AND CHAIN or ROLLBACK AND CHAIN in
+/// its errors, also when the statement is END or ABORT. None for other
+/// statements.
+pub fn and_chain_statement_name(parse_result: &ParseResult) -> Option<&'static str> {
+    use pg_query::{protobuf::TransactionStmtKind, NodeRef};
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some(NodeRef::TransactionStmt(txn)) = nodes.first().map(|n| &n.0) else {
+        return None;
+    };
+    if !txn.chain {
+        return None;
+    }
+    match TransactionStmtKind::try_from(txn.kind) {
+        Ok(TransactionStmtKind::TransStmtCommit) => Some("COMMIT AND CHAIN"),
+        Ok(TransactionStmtKind::TransStmtRollback) => Some("ROLLBACK AND CHAIN"),
+        _ => None,
+    }
+}
+
 /// The access mode a SET TRANSACTION statement names: Some(true) for READ
 /// ONLY, Some(false) for READ WRITE, None when the statement is not SET
 /// TRANSACTION or names no access mode.
@@ -10539,6 +10559,22 @@ mod tests {
         assert!(!is_commit_or_rollback(&rollback_to));
         assert!(!is_commit_or_rollback(&begin));
         assert!(!is_commit_or_rollback(&select));
+    }
+
+    #[test]
+    fn and_chain_statement_name_names_the_statement_as_postgresql_does() {
+        for (sql, name) in [
+            ("COMMIT AND CHAIN", Some("COMMIT AND CHAIN")),
+            ("END AND CHAIN", Some("COMMIT AND CHAIN")),
+            ("ROLLBACK AND CHAIN", Some("ROLLBACK AND CHAIN")),
+            ("ABORT AND CHAIN", Some("ROLLBACK AND CHAIN")),
+            ("COMMIT AND NO CHAIN", None),
+            ("COMMIT", None),
+            ("SELECT 1", None),
+        ] {
+            let parse_result = crate::parse(sql).unwrap();
+            assert_eq!(and_chain_statement_name(&parse_result), name, "{sql}");
+        }
     }
 
     #[test]

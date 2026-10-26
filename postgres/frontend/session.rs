@@ -14,14 +14,15 @@ use turso_parser::ast::{self};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST, SQLSTATE_FEATURE_NOT_SUPPORTED,
     SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_SCHEMA_NAME,
-    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_NO_ACTIVE_SQL_TRANSACTION, SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+    SQLSTATE_RESERVED_NAME, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
-    begin_access_mode, check_set_transaction, is_begin, is_comment_on, is_commit_or_rollback,
-    is_drop_matview, is_refresh_matview, set_transaction_access_mode, try_extract_copy_from,
-    try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-    unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
+    and_chain_statement_name, begin_access_mode, check_set_transaction, is_begin, is_comment_on,
+    is_commit_or_rollback, is_drop_matview, is_refresh_matview, set_transaction_access_mode,
+    try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
+    try_extract_show, unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt,
+    PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
 };
 use turso_pg_parser::ParseError;
 
@@ -206,6 +207,17 @@ fn prepare_tx_terminal(
     sql: &str,
     parse_result: &turso_pg_parser::ParseResult,
 ) -> crate::Result<crate::Statement> {
+    // Inside a transaction block the translator rejects AND CHAIN, which
+    // tursopg does not support.
+    if let Some(statement) = and_chain_statement_name(parse_result) {
+        if pg_conn.conn.get_auto_commit() {
+            return Err(sqlstate_error(
+                SQLSTATE_NO_ACTIVE_SQL_TRANSACTION,
+                format!("{statement} can only be used in transaction blocks"),
+            )
+            .into());
+        }
+    }
     let translator = PostgreSQLTranslator::new();
     let translated = translator
         .translate_with_prereqs(parse_result)
