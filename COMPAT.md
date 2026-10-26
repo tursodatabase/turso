@@ -931,6 +931,7 @@ Modifiers:
 | If             | ✅ Yes    |         |
 | IfNeg          | ✅ Yes     |         |
 | IfNot          | ✅ Yes    |         |
+| IfNullRow      | ✅ Yes    |         |
 | IfPos          | ✅ Yes    |         |
 | IfZero         | ❌ No     |         |
 | IncrVacuum     | ❌ No     |         |
