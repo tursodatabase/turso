@@ -83,6 +83,15 @@ PRAGMA schema_version;
 -- 5
 ```
 
+### data_version
+
+Returns a number that changes when another connection, in this process or another one, commits to the database. The connection's own commits do not change it, so polling it tells you cheaply whether someone else changed the data. Only changes are meaningful; compare the values from two calls on the same connection. Not yet supported in MVCC mode.
+
+```sql
+PRAGMA data_version;
+-- 1
+```
+
 ### application_id
 
 Returns or sets the application ID stored in the database header. Applications can use this 32-bit integer to identify the database file format.

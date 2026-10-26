@@ -344,6 +344,86 @@ fn test_pragma_wal_autocheckpoint_is_per_connection(db: TempDatabase) {
         .is_equal_to(vec![row![1000]]);
 }
 
+fn data_version(conn: &std::sync::Arc<turso_core::Connection>) -> i64 {
+    match limbo_exec_rows(conn, "PRAGMA data_version")[..] {
+        [ref row] => match row[..] {
+            [RValue::Integer(version)] => version,
+            _ => panic!("PRAGMA data_version returned {row:?}"),
+        },
+        ref rows => panic!("PRAGMA data_version returned {rows:?}"),
+    }
+}
+
+#[turso_macros::test]
+fn test_pragma_data_version_changes_only_for_other_connections_commits(db: TempDatabase) {
+    let conn1 = db.connect_limbo();
+    let conn2 = db.connect_limbo();
+    let (v1, v2) = (data_version(&conn1), data_version(&conn2));
+
+    conn1.execute("CREATE TABLE t(x)").unwrap();
+    conn1.execute("INSERT INTO t VALUES (1)").unwrap();
+    assert_that!(data_version(&conn1))
+        .named("data_version after the connection's own commits")
+        .is_equal_to(v1);
+    let v2_after = data_version(&conn2);
+    assert_that!(v2_after)
+        .named("data_version after another connection's commits")
+        .is_not_equal_to(v2);
+
+    conn2.execute("INSERT INTO t VALUES (2)").unwrap();
+    assert_that!(data_version(&conn2)).is_equal_to(v2_after);
+    assert_that!(data_version(&conn1)).is_not_equal_to(v1);
+}
+
+#[turso_macros::test]
+fn test_pragma_data_version_ignores_rollbacks_and_passive_checkpoints(db: TempDatabase) {
+    let conn1 = db.connect_limbo();
+    let conn2 = db.connect_limbo();
+    conn1.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+    conn1.execute("CREATE TABLE t(x)").unwrap();
+    let (v1, v2) = (data_version(&conn1), data_version(&conn2));
+
+    conn1.execute("BEGIN").unwrap();
+    conn1.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn1.execute("ROLLBACK").unwrap();
+    assert_that!(data_version(&conn2))
+        .named("data_version after another connection's rollback")
+        .is_equal_to(v2);
+
+    // A passive checkpoint copies pages into the database file but changes no
+    // content, so SQLite keeps data_version; a TRUNCATE checkpoint resets the
+    // WAL, which SQLite reports as a change.
+    limbo_exec_rows(&conn1, "PRAGMA wal_checkpoint(PASSIVE)");
+    assert_that!(data_version(&conn2))
+        .named("data_version after another connection's passive checkpoint")
+        .is_equal_to(v2);
+    limbo_exec_rows(&conn1, "PRAGMA wal_checkpoint(TRUNCATE)");
+    assert_that!(data_version(&conn2))
+        .named("data_version after another connection's truncate checkpoint")
+        .is_not_equal_to(v2);
+    assert_that!(data_version(&conn1))
+        .named("data_version after the connection's own checkpoints")
+        .is_equal_to(v1);
+}
+
+#[turso_macros::test]
+fn test_pragma_data_version_is_stable_inside_a_read_transaction(db: TempDatabase) {
+    let conn1 = db.connect_limbo();
+    let conn2 = db.connect_limbo();
+    conn1.execute("CREATE TABLE t(x)").unwrap();
+
+    conn2.execute("BEGIN").unwrap();
+    let v2 = data_version(&conn2);
+    conn1.execute("INSERT INTO t VALUES (1)").unwrap();
+    assert_that!(data_version(&conn2))
+        .named("data_version inside the read transaction")
+        .is_equal_to(v2);
+    conn2.execute("COMMIT").unwrap();
+    assert_that!(data_version(&conn2))
+        .named("data_version once the read transaction ends")
+        .is_not_equal_to(v2);
+}
+
 // Regression tests for https://github.com/tursodatabase/turso/issues/7466:
 // querying a pragma virtual table (pragma_table_info, pragma_function_list, ...)
 // left the connection's implicit read transaction open, so every subsequent

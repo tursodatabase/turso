@@ -630,6 +630,9 @@ pub trait Wal: Debug + Send + Sync {
     fn begin_read_tx(&self) -> Result<bool>;
     /// MVCC helper: check if WAL state changed without starting a read tx.
     fn mvcc_refresh_if_db_changed(&self) -> bool;
+    /// The connection's `PRAGMA data_version`: it changes when a read transaction finds
+    /// content another connection committed, and never for the connection's own commits.
+    fn data_version(&self) -> u64;
 
     /// Begin a write transaction.
     ///
@@ -2832,6 +2835,9 @@ pub struct WalFile {
     last_checksum: AtomicU64,
     checkpoint_seq: AtomicU32,
     transaction_count: AtomicU64,
+    /// Read transactions that found content committed by another connection
+    /// (SQLite's `Pager::iDataVersion`), see [`Wal::data_version`].
+    data_version: AtomicU64,
 
     /// Manages locks needed for checkpointing
     checkpoint_guard: RwLock<Option<CheckpointLocks>>,
@@ -3327,6 +3333,16 @@ impl WalFile {
         snapshot != local_state.snapshot
     }
 
+    /// Like [`Self::db_changed_against`], but a checkpoint that only backfilled frames
+    /// into the database file doesn't count: the content is the same. This is what
+    /// SQLite compares for `PRAGMA data_version`.
+    fn content_changed_against(snapshot: WalSnapshot, local_state: WalConnectionState) -> bool {
+        let local = local_state.snapshot;
+        snapshot.max_frame != local.max_frame
+            || snapshot.last_checksum != local.last_checksum
+            || snapshot.checkpoint_seq != local.checkpoint_seq
+    }
+
     fn has_vacuum_read_lock_guard(&self) -> bool {
         self.vacuum_lock_guard
             .read()
@@ -3433,7 +3449,9 @@ impl WalFile {
 
         // Check if database changed since this connection's last read transaction.
         // If it has, the connection will invalidate its page cache.
-        let db_changed = self.db_changed_against(shared_snapshot, self.connection_state());
+        let local_state = self.connection_state();
+        let db_changed = self.db_changed_against(shared_snapshot, local_state);
+        let content_changed = Self::content_changed_against(shared_snapshot, local_state);
 
         tracing::debug!("try_begin_read_tx: db_changed={}", db_changed);
 
@@ -3452,6 +3470,9 @@ impl WalFile {
         };
         self.install_vacuum_lock_guard(vacuum_lock_guard);
         self.install_connection_state(WalConnectionState::new(shared_snapshot, read_guard));
+        if content_changed {
+            self.data_version.fetch_add(1, Ordering::AcqRel);
+        }
         tracing::debug!(
             "begin_read_tx(min={}, max={}, slot={}, max_frame_in_wal={})",
             self.min_frame.load(Ordering::Acquire),
@@ -3503,6 +3524,10 @@ impl Wal for WalFile {
 
     fn mvcc_refresh_if_db_changed(&self) -> bool {
         WalFile::mvcc_refresh_if_db_changed(self)
+    }
+
+    fn data_version(&self) -> u64 {
+        self.data_version.load(Ordering::Acquire)
     }
 
     /// End a read transaction.
@@ -4876,6 +4901,7 @@ impl WalFile {
             vacuum_lock_guard: RwLock::new(None),
             min_frame: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
+            data_version: AtomicU64::new(0),
             max_frame_read_lock_index: AtomicUsize::new(NO_LOCK_HELD),
             last_checksum: AtomicU64::new(pack_checksum(last_checksum)),
             checkpoint_guard: RwLock::new(None),
@@ -5530,6 +5556,9 @@ impl WalFile {
         let changed = self.db_changed_against(snapshot, local_state);
         if changed {
             self.install_connection_state(local_state.with_snapshot(snapshot));
+            if Self::content_changed_against(snapshot, local_state) {
+                self.data_version.fetch_add(1, Ordering::AcqRel);
+            }
         }
         changed
     }
