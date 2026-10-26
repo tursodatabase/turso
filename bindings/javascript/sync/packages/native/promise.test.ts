@@ -360,6 +360,20 @@ test('experimental features are propagated to the synced database', async ({ ser
     await dbExperimental.close();
 })
 
+test('generated columns sync without an experimental option', async ({ server }) => {
+    const writer = await connect({ path: ':memory:', url: server.dbUrl() });
+    await writer.exec("CREATE TABLE g(x INTEGER, y INTEGER AS (x * 2))");
+    await writer.exec("INSERT INTO g(x) VALUES (1), (2), (3)");
+    expect(await (await writer.prepare("SELECT y FROM g ORDER BY x")).all()).toEqual([{ y: 2 }, { y: 4 }, { y: 6 }]);
+    await writer.push();
+    await writer.close();
+
+    // A fresh client bootstraps the generated-columns schema from the remote.
+    const reader = await connect({ path: ':memory:', url: server.dbUrl() });
+    expect(await (await reader.prepare("SELECT y FROM g ORDER BY x")).all()).toEqual([{ y: 2 }, { y: 4 }, { y: 6 }]);
+    await reader.close();
+})
+
 test('implicit connect', async ({ server }) => {
     const db = new Database({ path: ':memory:', url: server.dbUrl() });
     const defer = await db.prepare("SELECT * FROM not_found");

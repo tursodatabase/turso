@@ -32,6 +32,7 @@ DEFAULT expression
 CHECK (expression)
 REFERENCES foreign-table [(column-name)] [foreign-key-actions]
 COLLATE collation-name
+[GENERATED ALWAYS] AS (expression) [VIRTUAL]
 ```
 
 ### Table Constraints
@@ -205,6 +206,22 @@ CREATE TABLE contacts (
     code TEXT COLLATE RTRIM
 );
 ```
+
+### GENERATED ALWAYS AS
+
+A generated column gets its value from an expression over the other columns of the same row. Turso calculates the value each time a query reads the column, so the value is not stored in the row.
+
+```sql
+CREATE TABLE order_lines (
+    price REAL,
+    qty INTEGER,
+    total REAL GENERATED ALWAYS AS (price * qty) VIRTUAL
+);
+```
+
+The `GENERATED ALWAYS` and `VIRTUAL` keywords are optional, so `total REAL AS (price * qty)` defines the same column. `INSERT` and `UPDATE` cannot write a generated column. You can create an index on a generated column. `PRAGMA table_info` does not show generated columns, but `PRAGMA table_xinfo` does.
+
+Turso supports only virtual generated columns. A `STORED` generated column gives an error.
 
 ## Table Constraints
 
@@ -392,6 +409,7 @@ The following CREATE TABLE features are not yet supported:
 | `CREATE TEMPORARY TABLE` | Temporary tables are not supported |
 | `CREATE TABLE ... AS SELECT` | Creating a table from a query result is not supported |
 | `ON CONFLICT` clause on column constraints | The column-level ON CONFLICT clause (e.g., `NOT NULL ON CONFLICT REPLACE`) is not supported. Use the [INSERT ... ON CONFLICT](/docs/sql-reference/statements/upsert) syntax instead |
+| `GENERATED ALWAYS AS (...) STORED` | Stored generated columns are not supported. Use [virtual generated columns](#generated-always-as) instead |
 
 ### Experimental Features
 
@@ -400,7 +418,6 @@ The following are available behind [experimental feature flags](/docs/sql-refere
 | Feature | Flag | Notes |
 |---------|------|-------|
 | `WITHOUT ROWID` | `--experimental-without-rowid` | WITHOUT ROWID tables have limitations; see the experimental features page |
-| `GENERATED ALWAYS AS` | `--experimental-generated-columns` | Virtual generated (computed) columns only; stored columns are not yet supported |
 
 ## Examples
 

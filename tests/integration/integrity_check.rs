@@ -55,9 +55,7 @@ fn test_integrity_check_strict_generated_types() {
 
 #[test]
 fn test_integrity_check_healthy_strict_table() {
-    let db = TempDatabase::builder()
-        .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
-        .build();
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a ANY, b INT AS(a) NOT NULL, c REAL, d TEXT, e BLOB) STRICT").unwrap();
     conn.execute(
@@ -172,8 +170,7 @@ fn test_delete_reports_missing_partial_index_entry() {
 }
 
 fn check_strict_column(schema: &str, ty: &str, value: &str, generated: bool, expected: &str) {
-    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
-    let db = TempDatabase::builder().with_opts(opts).build();
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
     conn.execute(schema).unwrap();
     let insert = if generated {
@@ -197,7 +194,7 @@ fn check_strict_column(schema: &str, ty: &str, value: &str, generated: bool, exp
     drop(conn);
     drop(db);
 
-    let reopened = TempDatabase::new_with_existent_with_opts(&path, opts);
+    let reopened = TempDatabase::new_with_existent(&path);
     let conn = reopened.connect_limbo();
     assert_eq!(run_integrity_check(&conn), expected, "{ty}, {value}");
     assert_eq!(run_quick_check(&conn), expected, "{ty}, {value}");

@@ -74,7 +74,5 @@ impl Remote {
 /// Options for remotes and replicas. Custom types are on so that a test can
 /// use a schema that a replica opened with `DatabaseOpts::new()` cannot replay.
 pub fn database_opts() -> DatabaseOpts {
-    DatabaseOpts::new()
-        .with_generated_columns(true)
-        .with_custom_types(true)
+    DatabaseOpts::new().with_custom_types(true)
 }

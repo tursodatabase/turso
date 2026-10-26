@@ -1657,6 +1657,39 @@ async fn test_strict_tables() {
     assert_eq!(row.get::<String>(1).unwrap(), "Alice");
 }
 
+#[tokio::test]
+async fn test_generated_columns_work_without_a_flag() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_file = temp_dir.path().join("generated-columns.db");
+    let db_file = db_file.to_str().unwrap();
+
+    {
+        let db = Builder::new_local(db_file).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE t (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2))",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN c AS (a + 1)", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t (a) VALUES (21)", ())
+            .await
+            .unwrap();
+    }
+
+    // Loading a schema that has generated columns does not need a flag either.
+    let db = Builder::new_local(db_file).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn.query("SELECT a, b, c FROM t", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 21);
+    assert_eq!(row.get::<i64>(1).unwrap(), 42);
+    assert_eq!(row.get::<i64>(2).unwrap(), 22);
+}
+
 // Helper to collect all integer values from a single-column query.
 async fn collect_ids(conn: &turso::Connection, sql: &str) -> Vec<i64> {
     let mut rows = conn.query(sql, ()).await.unwrap();

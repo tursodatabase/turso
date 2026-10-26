@@ -33,10 +33,6 @@ fn fresh_db_with_opts(opts: DatabaseOpts) -> Arc<Connection> {
     db.connect(ConnectOpts::new()).unwrap()
 }
 
-fn fresh_db_with_generated_columns() -> Arc<Connection> {
-    fresh_db_with_opts(DatabaseOpts::new().with_generated_columns(true))
-}
-
 fn exec(conn: &Arc<Connection>, sql: &str) {
     conn.execute(sql).unwrap();
 }
@@ -636,7 +632,7 @@ fn blob_open_rejects_views() {
 
 #[test]
 fn blob_open_maps_around_virtual_generated_columns() {
-    let conn = fresh_db_with_generated_columns();
+    let conn = fresh_db();
     // The virtual column `g` occupies schema position 1 but has no record slot, so
     // `data` is schema position 2 yet record position 1.
     exec(

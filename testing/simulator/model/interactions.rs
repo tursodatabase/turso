@@ -961,8 +961,7 @@ fn reopen_database(env: &mut SimulatorEnv, power_loss: bool) -> Result<()> {
                 turso_core::OpenFlags::default(),
                 turso_core::DatabaseOpts::new()
                     .with_autovacuum(true)
-                    .with_attach(true)
-                    .with_generated_columns(true),
+                    .with_attach(true),
                 None,
                 Arc::new(SqliteDialect),
             ) {
