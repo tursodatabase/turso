@@ -754,6 +754,10 @@ fn update_pragma(
             connection.set_mvcc_group_commit(parse_pragma_enabled(&value))?;
             Ok(TransactionMode::None)
         }
+        PragmaName::MvccUpdateDeltas => {
+            connection.set_mvcc_update_deltas(parse_pragma_enabled(&value))?;
+            Ok(TransactionMode::None)
+        }
         PragmaName::FtsMergeThreshold => {
             let threshold = match parse_signed_number(&value)? {
                 Value::Numeric(Numeric::Integer(size)) if size >= 0 => size,
@@ -1739,6 +1743,14 @@ fn query_pragma(
         }
         PragmaName::MvccGroupCommit => {
             let enabled = connection.mvcc_group_commit()?;
+            let register = program.alloc_register();
+            program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::MvccUpdateDeltas => {
+            let enabled = connection.mvcc_update_deltas()?;
             let register = program.alloc_register();
             program.emit_int(enabled as i64, register);
             program.emit_result_row(register, 1);

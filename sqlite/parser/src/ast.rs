@@ -2010,6 +2010,9 @@ pub enum PragmaName {
     /// Sets or queries whether concurrent MVCC commits batch their logical-log
     /// appends behind a single fsync.
     MvccGroupCommit,
+    /// Sets or queries whether MVCC commits write an UPDATE of a table row to the
+    /// logical log as one column patch.
+    MvccUpdateDeltas,
     /// Sets or queries the number of visible FTS index segments a statement
     /// flush may leave behind before the write path merges them. 0 disables
     /// write-path merging.

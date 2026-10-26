@@ -6,7 +6,7 @@ use crate::types::IOResultOr;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     create_seek_range, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey, RowVersions,
-    SortableIndexKey,
+    SortableIndexKey, UpdateBase, SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -574,6 +574,10 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     dual_peek: DualCursorPeek<A>,
     /// Forward scan over `index_rows`; see [`IndexShadowScan`].
     index_shadow_scan: IndexShadowScan<A>,
+    /// The record that the last delete of this cursor ended. An UPDATE is a
+    /// delete and then an insert of the same rowid, and the insert makes the
+    /// update patch of the logical log from this record.
+    update_base: Option<UpdateBase>,
 }
 
 pub enum NextRowidResult {
@@ -642,6 +646,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             btree_advance_state: None,
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
+            update_base: None,
         })
     }
 
@@ -1826,6 +1831,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     /// Insert a row into the table or index.
     /// Sets the cursor to the inserted row.
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
+        let update_base = self.update_base.take();
         let row_id = match key {
             BTreeKey::TableRowId((rowid, _)) => RowID::new(self.table_id, RowKey::Int(*rowid)),
             BTreeKey::IndexKey(record) => {
@@ -1895,7 +1901,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             MvccCursorType::Table => None,
         };
         // FIXME: set btree to somewhere close to this rowid?
-        if self
+        let new_version_id = if self
             .db
             .read_from_table_or_index(self.tx_id, &row.id, maybe_index_id)?
             .is_some()
@@ -1910,20 +1916,38 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 updated,
                 "read found a visible version but update could not supersede it"
             );
+            None
         } else if was_btree_resident {
             // The row exists in B-tree but not in MvStore - mark it as B-tree resident
             // so that checkpoint knows to write deletes to the B-tree file.
-            self.db
-                .insert_btree_resident_to_table_or_index(self.tx_id, row, maybe_index_id)
-                .inspect_err(|_| {
-                    self.current_pos = CursorPosition::BeforeFirst;
-                })?;
+            Some(
+                self.db
+                    .insert_btree_resident_to_table_or_index(self.tx_id, row, maybe_index_id)
+                    .inspect_err(|_| {
+                        self.current_pos = CursorPosition::BeforeFirst;
+                    })?,
+            )
         } else {
-            self.db
-                .insert_to_table_or_index(self.tx_id, row, maybe_index_id)
-                .inspect_err(|_| {
-                    self.current_pos = CursorPosition::BeforeFirst;
-                })?;
+            Some(
+                self.db
+                    .insert_to_table_or_index(self.tx_id, row, maybe_index_id)
+                    .inspect_err(|_| {
+                        self.current_pos = CursorPosition::BeforeFirst;
+                    })?,
+            )
+        };
+        if let (Some(base), Some(new_version_id), BTreeKey::TableRowId((rowid, Some(record)))) =
+            (update_base, new_version_id, key)
+        {
+            if base.rowid() == *rowid {
+                self.db.record_update_delta(
+                    self.tx_id,
+                    self.table_id,
+                    base,
+                    new_version_id,
+                    record.get_payload(),
+                )?;
+            }
         }
         self.invalidate_record();
         Ok(IOResult::Done(()))
@@ -1962,12 +1986,22 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         } else {
             None
         };
-        self.db.delete_from_table_or_index(
-            self.tx_id,
-            rowid,
-            maybe_index_id,
-            btree_record.as_ref(),
-        )?;
+        let makes_update_deltas = matches!(self.mv_cursor_type, MvccCursorType::Table)
+            && self.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID
+            && self.db.update_deltas_enabled();
+        self.update_base = None;
+        if makes_update_deltas {
+            self.update_base =
+                self.db
+                    .delete_table_row_for_update(self.tx_id, rowid, btree_record)?;
+        } else {
+            self.db.delete_from_table_or_index(
+                self.tx_id,
+                rowid,
+                maybe_index_id,
+                btree_record.as_ref(),
+            )?;
+        }
         self.invalidate_record();
         Ok(IOResult::Done(()))
     }

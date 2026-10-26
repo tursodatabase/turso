@@ -1525,6 +1525,23 @@ mod tests {
         }
     }
 
+    /// A database with `PRAGMA mvcc_update_deltas` on writes a version 4 log.
+    /// Clients cannot decode its update ops, so the server sends pages for it.
+    #[test]
+    fn version_4_log_is_not_served_as_raw_log_ranges() {
+        let mut header = [0u8; MVCC_LOG_HEADER_SIZE];
+        header[0..4].copy_from_slice(&MVCC_LOG_MAGIC.to_le_bytes());
+        header[4] = 4;
+        header[6..8].copy_from_slice(&(MVCC_LOG_HEADER_SIZE as u16).to_le_bytes());
+        let crc = crc32c::crc32c(&header);
+        header[MVCC_LOG_HEADER_CRC_START..].copy_from_slice(&crc.to_le_bytes());
+
+        let Err(err) = scan_mvcc_log(&header) else {
+            panic!("a version 4 log must not be served as raw log ranges");
+        };
+        assert!(is_nonportable_mvcc_log_error(&err), "{err}");
+    }
+
     #[test]
     fn rejects_content_length_that_overflows() {
         assert!(request_end(0, usize::MAX).is_err());

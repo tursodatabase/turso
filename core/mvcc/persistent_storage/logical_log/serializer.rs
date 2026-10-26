@@ -373,6 +373,55 @@ impl<'a, B: LogBufferExt + ?Sized> LogSerializer<'a, B> {
         Ok(())
     }
 
+    /// Serialize one `OP_UPDATE_TABLE` op for `new_version`, the committed image
+    /// of an updated table row.
+    ///
+    /// Layout: tag(1) | flags(1) | table_id(4) | payload_len(varint) |
+    /// rowid(varint) | base_crc32c(4) | patch.
+    pub(crate) fn serialize_update_table_entry(
+        &mut self,
+        new_version: &RowVersion,
+        base_crc32c: u32,
+        patch: &[u8],
+    ) -> Result<()> {
+        let RowKey::Int(rowid) = new_version.row.id.row_id else {
+            return Err(LimboError::InternalError(
+                "OP_UPDATE_TABLE needs a table row".to_string(),
+            ));
+        };
+        turso_assert!(
+            new_version.end().is_none(),
+            "OP_UPDATE_TABLE logs the new version of a row"
+        );
+        let table_id_i64: i64 = new_version.row.id.table_id.into();
+        turso_assert!(
+            (i32::MIN as i64..0).contains(&table_id_i64),
+            "table_id_i64 must be a negative i32, but got {table_id_i64}"
+        );
+        let flags = if new_version.btree_resident {
+            OP_FLAG_BTREE_RESIDENT
+        } else {
+            0
+        };
+        let rowid = rowid as u64;
+        let payload_len = varint_len(rowid)
+            .checked_add(4)
+            .and_then(|len| len.checked_add(patch.len()))
+            .ok_or_else(log_buffer_len_overflow)?;
+        log_write!(
+            self,
+            [
+                OP_UPDATE_TABLE,
+                flags,
+                (table_id_i64 as i32).to_le_bytes(),
+                SqliteVarint(payload_len as u64),
+                SqliteVarint(rowid),
+                base_crc32c.to_le_bytes(),
+                patch,
+            ]
+        )
+    }
+
     #[inline(always)]
     pub(crate) fn serialize_header_entry(&mut self, header: &DatabaseHeader) -> Result<()> {
         // Header operations use tag-only addressing (table_id=0, flags=0).
@@ -610,6 +659,26 @@ impl LogBufferWrite for &[u8] {
     fn into_chunks(self) -> impl LogChunkStream {
         BorrowedLogChunk(self)
     }
+}
+
+/// Bytes of the `OP_UPDATE_TABLE` op of row `rowid` with a patch of `patch_len`
+/// bytes.
+pub(crate) fn update_table_op_len(rowid: i64, patch_len: usize) -> usize {
+    const OP_PREFIX_LEN: usize = 6;
+    const BASE_CRC32C_LEN: usize = 4;
+    let payload_len = varint_len(rowid as u64) + BASE_CRC32C_LEN + patch_len;
+    OP_PREFIX_LEN + varint_len(payload_len as u64) + payload_len
+}
+
+/// Bytes of the `OP_DELETE_TABLE` op and the `OP_UPSERT_TABLE` op that log an
+/// update of row `rowid` to a record of `record_len` bytes.
+pub(crate) fn delete_and_upsert_table_ops_len(rowid: i64, record_len: usize) -> usize {
+    const OP_PREFIX_LEN: usize = 6;
+    let rowid_len = varint_len(rowid as u64);
+    let delete_len = OP_PREFIX_LEN + varint_len(rowid_len as u64) + rowid_len;
+    let upsert_payload_len = rowid_len + record_len;
+    let upsert_len = OP_PREFIX_LEN + varint_len(upsert_payload_len as u64) + upsert_payload_len;
+    delete_len + upsert_len
 }
 
 fn log_buffer_len_overflow() -> LimboError {

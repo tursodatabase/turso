@@ -85,6 +85,48 @@ the WAL remains the authoritative recovery source.
 8. Logical clock is reseeded to `max(persistent_tx_ts_max, max_replayed_log_commit_ts) + 1`.
 9. After interrupted-checkpoint reconciliation, WAL is truncated.
 
+## Update Ops
+
+With `PRAGMA mvcc_update_deltas = on`, a commit can log an UPDATE of a table row
+as one `OP_UPDATE_TABLE` op. Only logs with header version 4 can contain it. The
+op has the rowid, the CRC32C of the base record, and a column patch that turns the
+base record into the new record. The base is the last committed record of the row
+before the transaction.
+
+Recovery finds the base in one of two places:
+- If the row has a current version that began before the frame, that version is
+  the base. A frame that recovery replayed earlier made it.
+- Else the B-tree row is the base. Recovery reads it before it replays the frame.
+
+One of the two is always the base, for these reasons:
+1. The frame of the base comes before the frame of the update op. The
+   transaction ended a version that it could see. If the creator of that version
+   was `Preparing`, the transaction took a commit dependency, and it builds its
+   log record only after the creator commits. A transaction commits only after
+   its frame is in the log.
+2. If the `commit_ts` of the base is more than `persistent_tx_ts_max`, recovery
+   replays the frame of the base, so the base is in the version store.
+3. Else the last checkpoint wrote the base to the B-tree. A checkpoint writes, for
+   each changed row, the newest version that committed at or before its boundary.
+   No other version of the row committed after the base and before the update,
+   because then the update would get a write-write conflict. Thus the newest
+   version at or before the boundary is the base. This is also true for the
+   passive checkpoint: its boundary is below all `Preparing` transactions, and
+   the log keeps all frames above the boundary.
+4. The writer uses update ops only in frames that do not write `sqlite_schema`,
+   and a frame has at most one op for each table row. Thus the ops of one frame do
+   not change the base of another op in the same frame.
+
+Recovery compares the CRC32C of the base that it found with the CRC32C in the op.
+A difference is `Corrupt`.
+
+The automatic checkpoint counts the bytes that update ops save, so that it starts
+as often as without update ops. After a restart, recovery restores this count only
+for the frames that it replays. A frame at or below `persistent_tx_ts_max` (for
+example, a frame that a passive checkpoint wrote but did not remove from the log)
+counts with its size in the log, because recovery has no base for its ops. Thus
+after such a restart, the next automatic checkpoint can start a little later.
+
 ## SyncMode::Off
 
 `SyncMode::Off` skips fsync calls. This weakens durability but does not change

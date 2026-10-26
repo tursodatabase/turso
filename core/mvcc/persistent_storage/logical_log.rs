@@ -62,7 +62,7 @@
 //!
 //! ### Header fields (56 bytes, little-endian)
 //! - `magic: u32` (`LOG_MAGIC`)
-//! - `version: u8` (`LOG_VERSION`)
+//! - `version: u8` (`LOG_VERSION_V2`, `LOG_VERSION`, or `LOG_VERSION_V4`)
 //! - `flags: u8` (bits 1..7 must be zero; bit 0 is currently reserved/ignored)
 //! - `hdr_len: u16` (`>= 56`)
 //! - `salt: u64` (random salt, regenerated on each log truncation)
@@ -112,6 +112,17 @@
 //! - `OP_DELETE_TABLE`: `rowid_varint`
 //! - `OP_UPSERT_INDEX`: serialized index key record
 //! - `OP_DELETE_INDEX`: serialized index key record
+//! - `OP_UPDATE_TABLE`: `rowid_varint || base_crc32c(4, le u32) || column_patch`
+//!
+//! `OP_UPDATE_TABLE` replaces the `OP_DELETE_TABLE` and `OP_UPSERT_TABLE` pair of one
+//! updated table row. The column patch (see `crate::mvcc::column_delta`) turns the
+//! base record into the new record. The base is the last committed record of the row
+//! before the transaction. Recovery finds it in the version that an earlier replayed
+//! frame made, or else in the B-tree row, which has the state of the last checkpoint.
+//! `base_crc32c` is the CRC32C of the base record, and recovery compares it with the
+//! base that it found. Only `LOG_VERSION_V4` logs can contain this op. The writer uses
+//! it only when `PRAGMA mvcc_update_deltas` is on. Version 2 and 3 readers reject a
+//! version 4 header, so they cannot read the op as a torn tail by mistake.
 //!
 //! `OP_FLAG_BTREE_RESIDENT` means the row existed in the B-tree before MVCC started tracking it.
 //! Recovery preserves this bit because checkpoint/GC logic depends on it.
@@ -255,11 +266,14 @@ use crate::File;
 
 mod serializer;
 use serializer::EncryptedPayload;
+pub(crate) use serializer::{
+    delete_and_upsert_table_ops_len, log_write, update_table_op_len, LogBufferWrite,
+    LogChunkStream, LogSerializer,
+};
 #[cfg(feature = "conn_raw_api")]
 use serializer::{
     extension_record_len, ExtensionRecord, PortableChangePayload, PortableEndOffsetCtx,
 };
-pub(crate) use serializer::{log_write, LogBufferWrite, LogChunkStream, LogSerializer};
 #[cfg(feature = "conn_raw_api")]
 pub(crate) use serializer::{
     ProtoKey, ProtoSint64, ProtoVarint, PROTO_WIRE_LENGTH_DELIMITED, PROTO_WIRE_VARINT,
@@ -296,6 +310,8 @@ pub type OnSerializationComplete<'a> =
 const LOG_MAGIC: u32 = 0x4C4D4C32; // "LML2" in LE
 const LOG_VERSION_V2: u8 = 2;
 const LOG_VERSION: u8 = 3;
+/// Version 3 plus `OP_UPDATE_TABLE`.
+const LOG_VERSION_V4: u8 = 4;
 pub const LOG_HDR_SIZE: usize = 56;
 const LOG_HDR_SALT_START: usize = 8;
 const LOG_HDR_SALT_SIZE: usize = 8;
@@ -318,6 +334,8 @@ const OP_UPSERT_INDEX: u8 = 2;
 const OP_DELETE_INDEX: u8 = 3;
 /// Frame-local database-header mutation (payload = serialized `DatabaseHeader`).
 const OP_UPDATE_HEADER: u8 = 4;
+/// Update of a table row as a column patch. Only in `LOG_VERSION_V4` logs.
+const OP_UPDATE_TABLE: u8 = 5;
 
 const OP_FLAG_BTREE_RESIDENT: u8 = 1 << 0;
 const OP_FLAG_PORTABLE_EXTENSION: u8 = 1 << 1;
@@ -464,7 +482,7 @@ impl LogHeader {
 
     fn new_with_version(io: &Arc<dyn crate::IO>, version: u8) -> Self {
         turso_assert!(
-            version == LOG_VERSION_V2 || version == LOG_VERSION,
+            version == LOG_VERSION_V2 || version == LOG_VERSION || version == LOG_VERSION_V4,
             "unsupported logical log header version: {version}"
         );
         Self {
@@ -503,7 +521,7 @@ impl LogHeader {
             return Err(LimboError::Corrupt("Invalid logical log magic".to_string()));
         }
         let version = buf[4];
-        if version != LOG_VERSION && version != LOG_VERSION_V2 {
+        if version != LOG_VERSION && version != LOG_VERSION_V2 && version != LOG_VERSION_V4 {
             return Err(LimboError::Corrupt(format!(
                 "Unsupported logical log version {version}"
             )));
@@ -593,7 +611,14 @@ pub struct LogicalLog {
     /// doesn't corrupt the chain.
     #[cfg_attr(feature = "aristo-instr", inspect(name = "pending_running_crc"))]
     pending_running_crc: Option<u32>,
+    /// `LogRecord::update_ops_bytes_saved` of the deferred write that is not
+    /// confirmed yet.
+    pending_update_ops_bytes_saved: u64,
     pending_header_upgrade: Option<(LogHeader, Completion)>,
+    /// The header version before the first `OP_UPDATE_TABLE` changed it to
+    /// `LOG_VERSION_V4`. A truncation of the log goes back to this version, so a
+    /// log has version 4 only while it can contain an `OP_UPDATE_TABLE`.
+    version_before_update_ops: u8,
     encryption_ctx: Option<EncryptionContext>,
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
@@ -626,7 +651,9 @@ impl LogicalLog {
             header: None,
             running_crc: 0,
             pending_running_crc: None,
+            pending_update_ops_bytes_saved: 0,
             pending_header_upgrade: None,
+            version_before_update_ops: LOG_VERSION_V2,
             encryption_ctx,
             encrypted_payload_chunk_size,
             max_appended_commit_ts: 0,
@@ -680,6 +707,7 @@ impl LogicalLog {
     ) -> Result<(Completion, u64)> {
         let op_count = tx.op_count;
         let commit_ts = tx.tx_timestamp;
+        let update_ops_bytes_saved = tx.update_ops_bytes_saved;
         self.max_appended_commit_ts = self.max_appended_commit_ts.max(commit_ts);
         // `tx.buf` is laid out as:
         //   [LOG_HDR slot (56B, zeros)] [TX_HEADER slot (24B, zeros)] [payload]
@@ -736,6 +764,30 @@ impl LogicalLog {
                 header.version = LOG_VERSION;
             }
         }
+        if tx.has_update_ops {
+            let header = self
+                .header
+                .as_mut()
+                .expect("log header must be set before writing");
+            if header.version != LOG_VERSION_V4 {
+                if !is_first_write {
+                    return Err(LimboError::InternalError(
+                        "update ops require logical log header upgrade before append".to_string(),
+                    ));
+                }
+                let version_before_update_ops = header.version;
+                header.version = LOG_VERSION_V4;
+                self.version_before_update_ops = version_before_update_ops;
+            }
+        }
+        turso_assert!(
+            !tx.has_update_ops
+                || self
+                    .header
+                    .as_ref()
+                    .is_some_and(|header| header.version == LOG_VERSION_V4),
+            "OP_UPDATE_TABLE must never be written to a version 2 or 3 logical log"
+        );
         if has_portable_changes {
             LogSerializer::new(&mut tx.buf).insert(
                 LOG_RECORD_PREFIX_SIZE,
@@ -892,6 +944,7 @@ impl LogicalLog {
             self.running_crc = crc;
         } else {
             self.pending_running_crc = Some(crc);
+            self.pending_update_ops_bytes_saved = update_ops_bytes_saved;
         }
         Ok((c, buffer_len as u64))
     }
@@ -908,12 +961,16 @@ impl LogicalLog {
         let portable_changes_enabled =
             tx.portable_changes_enabled || !tx.portable_changes.is_empty();
         #[cfg(not(feature = "conn_raw_api"))]
-        let portable_changes_enabled = {
-            let _ = tx;
-            false
-        };
+        let portable_changes_enabled = false;
 
-        if !portable_changes_enabled || self.offset == 0 {
+        let required_version = if tx.has_update_ops {
+            LOG_VERSION_V4
+        } else if portable_changes_enabled {
+            LOG_VERSION
+        } else {
+            return Ok(None);
+        };
+        if self.offset == 0 {
             return Ok(None);
         }
 
@@ -923,25 +980,34 @@ impl LogicalLog {
                 return Ok(Some(c));
             }
             if c.succeeded() {
-                self.header = Some(header);
-                return Ok(None);
+                self.set_upgraded_header(header);
             }
         }
 
         let header = self.header.as_ref().ok_or_else(|| {
             LimboError::InternalError(
-                "Logical log header not initialized before portable upgrade".to_string(),
+                "Logical log header not initialized before upgrade".to_string(),
             )
         })?;
-        if header.version != LOG_VERSION_V2 {
+        if header.version >= required_version {
             return Ok(None);
         }
         let mut upgraded_header = header.clone();
-        upgraded_header.version = LOG_VERSION;
+        upgraded_header.version = required_version;
 
         let (upgraded_header, c) = self.write_header(upgraded_header, None)?;
         self.pending_header_upgrade = Some((upgraded_header, c.clone()));
         Ok(Some(c))
+    }
+
+    fn set_upgraded_header(&mut self, header: LogHeader) {
+        let current_version = self.header.as_ref().map(|current| current.version);
+        if header.version == LOG_VERSION_V4 {
+            if let Some(current_version) = current_version.filter(|v| *v != LOG_VERSION_V4) {
+                self.version_before_update_ops = current_version;
+            }
+        }
+        self.header = Some(header);
     }
 
     /// Writes a transaction to the log but does NOT advance the writer offset.
@@ -959,8 +1025,9 @@ impl LogicalLog {
         self.frame_and_pwrite_tx(tx, false, on_serialization_complete)
     }
 
+    /// Returns the `update_ops_bytes_saved` of the confirmed write.
     #[aristo::intent("the in-memory log offset advances only after the corresponding frame pwrite has completed durably", id = "aristos:logical_log_inmemory_offset_advances_after_durable_write", verify = "full")]
-    pub fn advance_offset_after_success(&mut self, bytes: u64) {
+    pub fn advance_offset_after_success(&mut self, bytes: u64) -> u64 {
         self.offset = self
             .offset
             .checked_add(bytes)
@@ -969,6 +1036,7 @@ impl LogicalLog {
             .pending_running_crc
             .take()
             .expect("advance_offset_after_success called without pending deferred write");
+        std::mem::take(&mut self.pending_update_ops_bytes_saved)
     }
 
     /// Discard the pending running CRC staged by a deferred write whose
@@ -978,6 +1046,7 @@ impl LogicalLog {
     /// running CRC from a value staged for a write that never confirmed.
     pub fn discard_pending_write(&mut self) {
         self.pending_running_crc = None;
+        self.pending_update_ops_bytes_saved = 0;
     }
 
     pub fn sync(&mut self, sync_type: FileSyncType) -> Result<Completion> {
@@ -1052,8 +1121,12 @@ impl LogicalLog {
         self.pending_header_upgrade = None;
         let mut header = self.current_or_new_header()?;
         header.salt = self.io.generate_random_number() as u64;
+        if header.version == LOG_VERSION_V4 {
+            header.version = self.version_before_update_ops;
+        }
         self.running_crc = derive_initial_crc(header.salt);
         self.pending_running_crc = None;
+        self.pending_update_ops_bytes_saved = 0;
         self.header = Some(header);
 
         let completion = Completion::new_trunc(move |result| {
@@ -1098,8 +1171,12 @@ impl LogicalLog {
         self.discard_pending_header_upgrade();
         let mut header = self.current_or_new_header()?;
         header.salt = self.io.generate_random_number() as u64;
+        if header.version == LOG_VERSION_V4 {
+            header.version = self.version_before_update_ops;
+        }
         self.running_crc = derive_initial_crc(header.salt);
         self.pending_running_crc = None;
+        self.pending_update_ops_bytes_saved = 0;
 
         let mut group = CompletionGroup::new(|_| {});
         let (header, _header_c) = self.write_header(header, Some(&mut group))?;
@@ -1299,6 +1376,7 @@ pub(crate) fn parse_ops_from_plaintext(
     payload_size: usize,
     op_count: u32,
     commit_ts: u64,
+    update_ops_allowed: bool,
 ) -> Result<Vec<ParsedOp>> {
     if plaintext.len() != payload_size {
         return Err(LimboError::Corrupt(format!(
@@ -1309,7 +1387,7 @@ pub(crate) fn parse_ops_from_plaintext(
     let mut ops = Vec::with_capacity((op_count as usize).min(1024));
     let mut cursor = 0usize;
     for _ in 0..op_count {
-        match try_parse_one_op_from_buf(&plaintext[cursor..], commit_ts)? {
+        match try_parse_one_op_from_buf(&plaintext[cursor..], commit_ts, update_ops_allowed)? {
             Some((op, consumed)) => {
                 cursor += consumed;
                 ops.push(op);
@@ -1335,7 +1413,14 @@ pub(crate) fn parse_ops_from_plaintext(
 /// `Ok(None)` when not enough bytes, or `Err` on structural corruption.
 ///
 /// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
-fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(ParsedOp, usize)>> {
+///
+/// `update_ops_allowed` is true only for a version 4 log, the only log that can
+/// contain `OP_UPDATE_TABLE`.
+fn try_parse_one_op_from_buf(
+    buf: &[u8],
+    commit_ts: u64,
+    update_ops_allowed: bool,
+) -> Result<Option<(ParsedOp, usize)>> {
     if buf.len() < 6 {
         return Ok(None);
     }
@@ -1349,6 +1434,14 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
             if flags & !OP_ALLOWED_FLAGS != 0 || table_id_i32 >= 0 {
                 return Err(LimboError::Corrupt(
                     "Invalid op flags or non-negative table_id".into(),
+                ));
+            }
+            Some(MVTableId::from(table_id_i32 as i64))
+        }
+        OP_UPDATE_TABLE if update_ops_allowed => {
+            if flags & !OP_FLAG_BTREE_RESIDENT != 0 || table_id_i32 >= 0 {
+                return Err(LimboError::Corrupt(
+                    "Invalid UPDATE_TABLE flags or non-negative table_id".into(),
                 ));
             }
             Some(MVTableId::from(table_id_i32 as i64))
@@ -1444,6 +1537,18 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
                 btree_resident,
             }
         }
+        OP_UPDATE_TABLE => {
+            let table_id = table_id.expect("table op must have table_id");
+            let (rowid_u64, base_crc32c, patch) = split_update_table_payload(payload)?;
+            ParsedOp::UpdateTable {
+                table_id,
+                rowid: RowID::new(table_id, RowKey::Int(rowid_u64 as i64)),
+                base_crc32c,
+                patch: crate::types::value_blob_from_slice(patch)?,
+                commit_ts,
+                btree_resident,
+            }
+        }
         OP_UPSERT_INDEX => ParsedOp::UpsertIndex {
             table_id: table_id.expect("index op must have table_id"),
             payload: crate::types::value_blob_from_slice(payload)?,
@@ -1476,6 +1581,23 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
     Ok(Some((parsed_op, total)))
 }
 
+/// Splits the payload of an `OP_UPDATE_TABLE` op into the rowid, the CRC32C of
+/// the base record, and the column patch.
+fn split_update_table_payload(payload: &[u8]) -> Result<(u64, u32, &[u8])> {
+    let (rowid, rowid_len) = read_varint(payload)
+        .map_err(|_| LimboError::Corrupt("Bad rowid varint in UPDATE_TABLE".into()))?;
+    let patch_start = rowid_len
+        .checked_add(4)
+        .filter(|patch_start| *patch_start <= payload.len())
+        .ok_or_else(|| LimboError::Corrupt("UPDATE_TABLE payload is too short".into()))?;
+    let base_crc32c = u32::from_le_bytes(
+        payload[rowid_len..patch_start]
+            .try_into()
+            .expect("slice has 4 bytes"),
+    );
+    Ok((rowid, base_crc32c, &payload[patch_start..]))
+}
+
 #[derive(Debug)]
 pub enum StreamingResult {
     UpsertTableRow {
@@ -1486,6 +1608,15 @@ pub enum StreamingResult {
     },
     DeleteTableRow {
         rowid: RowID,
+        commit_ts: u64,
+        btree_resident: bool,
+    },
+    /// An update of a table row as a column patch from the base record, the last
+    /// committed record of the row. Recovery finds the base and applies the patch.
+    UpdateTableRow {
+        rowid: RowID,
+        base_crc32c: u32,
+        patch: crate::ValueBlob,
         commit_ts: u64,
         btree_resident: bool,
     },
@@ -1761,6 +1892,13 @@ impl StreamingLogicalLogReader {
         self.running_crc
     }
 
+    /// True when the log can contain `OP_UPDATE_TABLE`.
+    fn update_ops_allowed(&self) -> bool {
+        self.header
+            .as_ref()
+            .is_some_and(|header| header.version == LOG_VERSION_V4)
+    }
+
     fn tx_min_frame_size(&self) -> usize {
         match self.header.as_ref().map(|header| header.version) {
             Some(LOG_VERSION_V2) => TX_MIN_FRAME_SIZE_V2,
@@ -1979,10 +2117,15 @@ impl StreamingLogicalLogReader {
         parsed_ops: &mut Vec<ParsedOp>,
         op_count: u32,
         commit_ts: u64,
+        update_ops_allowed: bool,
     ) -> Result<usize> {
         let mut consumed = 0usize;
         while parsed_ops.len() < op_count as usize {
-            match try_parse_one_op_from_buf(&plaintext[start + consumed..], commit_ts)? {
+            match try_parse_one_op_from_buf(
+                &plaintext[start + consumed..],
+                commit_ts,
+                update_ops_allowed,
+            )? {
                 Some((op, bytes_consumed)) => {
                     consumed += bytes_consumed;
                     parsed_ops.push(op);
@@ -1993,7 +2136,10 @@ impl StreamingLogicalLogReader {
         Ok(consumed)
     }
 
-    fn carried_op_total_len_if_known(buf: &[u8]) -> Result<Option<usize>> {
+    fn carried_op_total_len_if_known(
+        buf: &[u8],
+        update_ops_allowed: bool,
+    ) -> Result<Option<usize>> {
         // we need minimum of 6 bytes to read the length field
         // 1 byte op tag + 1 byte flags + 4 bytes table id
         if buf.len() < 6 {
@@ -2003,6 +2149,7 @@ impl StreamingLogicalLogReader {
         match buf[0] {
             OP_UPSERT_TABLE | OP_DELETE_TABLE | OP_UPSERT_INDEX | OP_DELETE_INDEX
             | OP_UPDATE_HEADER => {}
+            OP_UPDATE_TABLE if update_ops_allowed => {}
             tag => return Err(LimboError::Corrupt(format!("Unknown op tag: {tag}"))),
         }
 
@@ -2105,9 +2252,11 @@ impl StreamingLogicalLogReader {
         carry: &mut Vec<u8>,
         plaintext: &[u8],
         plaintext_start: &mut usize,
+        update_ops_allowed: bool,
     ) -> Result<Option<usize>> {
         loop {
-            if let Some(total_len) = Self::carried_op_total_len_if_known(carry)? {
+            if let Some(total_len) = Self::carried_op_total_len_if_known(carry, update_ops_allowed)?
+            {
                 return Ok(Some(total_len));
             }
 
@@ -2139,13 +2288,18 @@ impl StreamingLogicalLogReader {
         parsed_ops: &mut Vec<ParsedOp>,
         op_count: u32,
         commit_ts: u64,
+        update_ops_allowed: bool,
     ) -> Result<bool> {
         turso_assert!(!carry.is_empty());
         turso_assert!(parsed_ops.len() < op_count as usize);
 
         // lets try to parse the length of this op
-        let Some(carried_op_total_len) =
-            Self::try_resolve_carried_encrypted_op_total_len(carry, plaintext, plaintext_start)?
+        let Some(carried_op_total_len) = Self::try_resolve_carried_encrypted_op_total_len(
+            carry,
+            plaintext,
+            plaintext_start,
+            update_ops_allowed,
+        )?
         else {
             return Ok(false);
         };
@@ -2177,7 +2331,7 @@ impl StreamingLogicalLogReader {
 
         // carry must have the total data now and then we can parse
         turso_assert!(carry.len() == carried_op_total_len);
-        match try_parse_one_op_from_buf(carry, commit_ts)? {
+        match try_parse_one_op_from_buf(carry, commit_ts, update_ops_allowed)? {
             Some((op, bytes_consumed)) if bytes_consumed == carry.len() => {
                 parsed_ops.push(op);
                 carry.clear();
@@ -2211,6 +2365,7 @@ impl StreamingLogicalLogReader {
                 .expect("encryption_ctx must be set for encrypted payload");
             (enc.nonce_size(), enc.tag_size())
         };
+        let update_ops_allowed = self.update_ops_allowed();
         let salt = self
             .header
             .as_ref()
@@ -2273,6 +2428,7 @@ impl StreamingLogicalLogReader {
                     &mut parsed_ops,
                     op_count,
                     commit_ts,
+                    update_ops_allowed,
                 ) {
                     Ok(true) => {}
                     Ok(false) => continue,
@@ -2297,6 +2453,7 @@ impl StreamingLogicalLogReader {
                 &mut parsed_ops,
                 op_count,
                 commit_ts,
+                update_ops_allowed,
             )?;
             plaintext_start += consumed;
             if plaintext_start < plaintext.len() {
@@ -2452,6 +2609,15 @@ impl StreamingLogicalLogReader {
                     }
                     Some(MVTableId::from(table_id_i32 as i64))
                 }
+                OP_UPDATE_TABLE if self.update_ops_allowed() => {
+                    if flags & !OP_FLAG_BTREE_RESIDENT != 0 || table_id_i32 >= 0 {
+                        return Err(LimboError::Corrupt(format!(
+                            "invalid op flags={flags:#x} or table_id={table_id_i32} for tag={tag}"
+                        ))
+                        .into());
+                    }
+                    Some(MVTableId::from(table_id_i32 as i64))
+                }
                 OP_UPDATE_HEADER => {
                     if flags != 0 || table_id_i32 != 0 {
                         return Err(LimboError::Corrupt(format!(
@@ -2568,6 +2734,19 @@ impl StreamingLogicalLogReader {
                         rowid,
                         record_bytes,
                         pk_record_bytes,
+                        commit_ts,
+                        btree_resident,
+                    }
+                }
+                OP_UPDATE_TABLE => {
+                    let table_id = table_id.expect("table op must carry table id");
+                    let (rowid_u64, base_crc32c, patch) = split_update_table_payload(&payload)?;
+                    let patch = crate::types::value_blob_from_slice(patch)?;
+                    ParsedOp::UpdateTable {
+                        table_id,
+                        rowid: RowID::new(table_id, RowKey::Int(rowid_u64 as i64)),
+                        base_crc32c,
+                        patch,
                         commit_ts,
                         btree_resident,
                     }
@@ -2966,6 +3145,7 @@ impl StreamingLogicalLogReader {
                 payload_size,
                 op_count,
                 commit_ts,
+                self.update_ops_allowed(),
             )?;
             let fip = self.frame_in_progress.as_mut().expect("frame in progress");
             fip.parsed_ops = parsed_ops;
@@ -3390,6 +3570,20 @@ impl StreamingLogicalLogReader {
                 commit_ts,
                 btree_resident,
             }),
+            ParsedOp::UpdateTable {
+                table_id: _,
+                rowid,
+                base_crc32c,
+                patch,
+                commit_ts,
+                btree_resident,
+            } => Ok(StreamingResult::UpdateTableRow {
+                rowid,
+                base_crc32c,
+                patch,
+                commit_ts,
+                btree_resident,
+            }),
             ParsedOp::UpsertIndex {
                 table_id,
                 payload,
@@ -3765,6 +3959,14 @@ pub(crate) enum ParsedOp {
         commit_ts: u64,
         btree_resident: bool,
     },
+    UpdateTable {
+        table_id: MVTableId,
+        rowid: RowID,
+        base_crc32c: u32,
+        patch: crate::ValueBlob,
+        commit_ts: u64,
+        btree_resident: bool,
+    },
     UpsertIndex {
         table_id: MVTableId,
         payload: crate::ValueBlob,
@@ -3826,8 +4028,8 @@ mod tests {
         HeaderReadResult, LogHeader, LogSerializer, LogTxFrameInfo, LogicalLog, ParseResult,
         ParsedOp, StreamingLogicalLogReader, ENCRYPTED_CHUNK_AAD_SIZE,
         ENCRYPTED_PAYLOAD_CHUNK_SIZE, END_MAGIC, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_CRC_START,
-        LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION, LOG_VERSION_V2, TX_EXT_HEADER_SIZE,
-        TX_HEADER_SIZE, TX_HEADER_SIZE_V2, TX_TRAILER_SIZE,
+        LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION, LOG_VERSION_V2, LOG_VERSION_V4,
+        OP_UPDATE_TABLE, TX_EXT_HEADER_SIZE, TX_HEADER_SIZE, TX_HEADER_SIZE_V2, TX_TRAILER_SIZE,
     };
     #[cfg(feature = "conn_raw_api")]
     use super::{EXTENSION_RECORD_HEADER_SIZE, EXTENSION_TYPE_PORTABLE_CHANGES, OP_UPSERT_TABLE};
@@ -7156,6 +7358,8 @@ mod tests {
     fn test_encrypted_log_format_assumptions_are_pinned() {
         assert_eq!(LOG_VERSION_V2, 2);
         assert_eq!(LOG_VERSION, 3);
+        assert_eq!(LOG_VERSION_V4, 4);
+        assert_eq!(OP_UPDATE_TABLE, 5);
         assert_eq!(LOG_HDR_SIZE, 56);
         assert_eq!(ENCRYPTED_PAYLOAD_CHUNK_SIZE, 32 * 1024);
         assert_eq!(ENCRYPTED_CHUNK_AAD_SIZE, 32);
@@ -8328,5 +8532,323 @@ mod tests {
 
         // Keep the last chunk variable used so the compiler notices if the range math changes.
         assert!(last_chunk.end > last_chunk.start);
+    }
+
+    /// A log record with one `OP_UPDATE_TABLE` op for row `rowid` of table -2.
+    fn update_table_tx(
+        commit_ts: u64,
+        rowid: i64,
+        base_crc32c: u32,
+        patch: &[u8],
+        btree_resident: bool,
+    ) -> crate::mvcc::database::LogRecord {
+        let mut tx =
+            crate::mvcc::database::LogRecord::new(commit_ts, crate::alloc::DynAllocator::default())
+                .unwrap();
+        let mut new_version = make_test_row_version((-2).into(), rowid, "new", commit_ts);
+        new_version.btree_resident = btree_resident;
+        LogSerializer::new(&mut tx.buf)
+            .serialize_update_table_entry(&new_version, base_crc32c, patch)
+            .unwrap();
+        tx.op_count += 1;
+        tx.has_update_ops = true;
+        tx
+    }
+
+    fn assert_update_table_op(
+        op: &ParsedOp,
+        expected_rowid: i64,
+        expected_base_crc32c: u32,
+        expected_patch: &[u8],
+        expected_commit_ts: u64,
+        expected_btree_resident: bool,
+    ) {
+        match op {
+            ParsedOp::UpdateTable {
+                table_id,
+                rowid,
+                base_crc32c,
+                patch,
+                commit_ts,
+                btree_resident,
+            } => {
+                assert_eq!(*table_id, MVTableId::from(-2));
+                assert_eq!(rowid.row_id, RowKey::Int(expected_rowid));
+                assert_eq!(*base_crc32c, expected_base_crc32c);
+                assert_eq!(patch, expected_patch);
+                assert_eq!(*commit_ts, expected_commit_ts);
+                assert_eq!(*btree_resident, expected_btree_resident);
+            }
+            other => panic!("expected UpdateTable, got {other:?}"),
+        }
+    }
+
+    fn read_all_frames(
+        file: Arc<dyn crate::File>,
+        io: &Arc<dyn crate::IO>,
+        enc_ctx: Option<&crate::storage::encryption::EncryptionContext>,
+    ) -> (Vec<Vec<ParsedOp>>, usize) {
+        let mut reader = StreamingLogicalLogReader::new(file, enc_ctx.cloned());
+        reader.read_header(io).unwrap();
+        let mut frames = Vec::new();
+        while let Some(frame) = reader.next_frame_blocking(io).unwrap() {
+            frames.push(frame);
+        }
+        (frames, reader.last_valid_offset())
+    }
+
+    fn log_header_version(file: &Arc<dyn crate::File>, io: &Arc<dyn crate::IO>) -> u8 {
+        let bytes = read_file_bytes(file.clone(), io);
+        LogHeader::decode(&bytes[..LOG_HDR_SIZE]).unwrap().version
+    }
+
+    /// Rewrites the version in the header of the log file, with a valid header CRC.
+    fn rewrite_log_header_version(
+        file: &Arc<dyn crate::File>,
+        io: &Arc<dyn crate::IO>,
+        version: u8,
+    ) {
+        let mut bytes = read_file_bytes(file.clone(), io);
+        let mut header = LogHeader::decode(&bytes[..LOG_HDR_SIZE]).unwrap();
+        header.version = version;
+        bytes[..LOG_HDR_SIZE].copy_from_slice(&header.encode());
+        overwrite_file_bytes(file.clone(), io, &bytes);
+    }
+
+    #[test]
+    fn test_update_table_op_round_trip() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let enc_ctx = test_enc_ctx();
+        for encrypted in [false, true] {
+            let file = open_test_file(&io, &format!("update-op-round-trip-{encrypted}.db-log"));
+            let mut log =
+                LogicalLog::new(file.clone(), io.clone(), encrypted.then(|| enc_ctx.clone()));
+            let patch = [3u8, 1, 2, 1, 42];
+            for (commit_ts, rowid, btree_resident) in
+                [(10, 1, false), (20, i64::MAX, true), (30, -5, false)]
+            {
+                let tx = update_table_tx(commit_ts, rowid, 0xDEAD_BEEF, &patch, btree_resident);
+                let c = log.log_tx(tx).unwrap();
+                io.wait_for_completion(c).unwrap();
+            }
+            assert_eq!(log_header_version(&file, &io), LOG_VERSION_V4);
+            let (frames, _) = read_all_frames(file, &io, encrypted.then_some(&enc_ctx));
+            assert_eq!(frames.len(), 3);
+            assert_update_table_op(&frames[0][0], 1, 0xDEAD_BEEF, &patch, 10, false);
+            assert_update_table_op(&frames[1][0], i64::MAX, 0xDEAD_BEEF, &patch, 20, true);
+            assert_update_table_op(&frames[2][0], -5, 0xDEAD_BEEF, &patch, 30, false);
+        }
+    }
+
+    #[test]
+    fn test_encrypted_update_table_ops_cross_chunk_boundaries() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let enc_ctx = test_enc_ctx();
+        let large_patch: Vec<u8> = (0..ENCRYPTED_PAYLOAD_CHUNK_SIZE + 100)
+            .map(|i| i as u8)
+            .collect();
+        // The upsert ends a few bytes before the first chunk boundary, so the
+        // prefix of the small update op that follows it crosses the boundary.
+        // The large update op crosses the second boundary.
+        for bytes_before_boundary in [1, 3, 7] {
+            let text_len = text_len_for_single_upsert_table_op_size(
+                ENCRYPTED_PAYLOAD_CHUNK_SIZE - bytes_before_boundary,
+            );
+            let upsert = make_test_row_version((-2).into(), 1, &"x".repeat(text_len), 40);
+            let expected_record = upsert.row.payload().to_vec();
+            let mut tx = crate::mvcc::database::LogRecord::for_test(40, &[upsert], None);
+            for (rowid, patch) in [(2, &[2u8, 1, 0, 1, 7][..]), (3, &large_patch[..])] {
+                let mut new_version = make_test_row_version((-2).into(), rowid, "new", 40);
+                new_version.btree_resident = true;
+                LogSerializer::new(&mut tx.buf)
+                    .serialize_update_table_entry(&new_version, 7, patch)
+                    .unwrap();
+                tx.op_count += 1;
+            }
+            tx.has_update_ops = true;
+            let file = write_single_encrypted_tx(
+                &io,
+                &format!("update-op-chunks-{bytes_before_boundary}.db-log"),
+                &enc_ctx,
+                tx,
+            );
+            let ops = parse_only_encrypted_tx_ops(file, &io, &enc_ctx);
+            assert_eq!(ops.len(), 3);
+            assert_upsert_table_op(&ops[0], (-2).into(), 1, &expected_record, 40);
+            assert_update_table_op(&ops[1], 2, 7, &[2, 1, 0, 1, 7], 40, true);
+            assert_update_table_op(&ops[2], 3, 7, &large_patch, 40, true);
+        }
+    }
+
+    /// Readers of version 2 and 3 logs do not know `OP_UPDATE_TABLE`, so a frame
+    /// with it is invalid there, and the reader stops before it like at a torn tail.
+    #[test]
+    fn test_update_table_op_in_version_2_or_3_log_is_invalid() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let enc_ctx = test_enc_ctx();
+        for encrypted in [false, true] {
+            for version in [LOG_VERSION_V2, LOG_VERSION] {
+                let file =
+                    open_test_file(&io, &format!("update-op-in-v{version}-{encrypted}.db-log"));
+                let mut log =
+                    LogicalLog::new(file.clone(), io.clone(), encrypted.then(|| enc_ctx.clone()));
+                let upsert = make_test_row_version((-2).into(), 1, "first", 10);
+                let expected_record = upsert.row.payload().to_vec();
+                let tx = crate::mvcc::database::LogRecord::for_test(10, &[upsert], None);
+                let c = log.log_tx(tx).unwrap();
+                io.wait_for_completion(c).unwrap();
+                let first_frame_end = log.offset as usize;
+                let tx = update_table_tx(20, 1, 0, &[2, 0], false);
+                let c = log.upgrade_header_for_log_tx(&tx).unwrap().unwrap();
+                io.wait_for_completion(c).unwrap();
+                assert!(log.upgrade_header_for_log_tx(&tx).unwrap().is_none());
+                let c = log.log_tx(tx).unwrap();
+                io.wait_for_completion(c).unwrap();
+
+                let (frames, last_valid_offset) =
+                    read_all_frames(file.clone(), &io, encrypted.then_some(&enc_ctx));
+                assert_eq!(frames.len(), 2);
+
+                rewrite_log_header_version(&file, &io, version);
+                let (frames, last_valid_offset_without_v4) =
+                    read_all_frames(file, &io, encrypted.then_some(&enc_ctx));
+                assert_eq!(frames.len(), 1);
+                assert_upsert_table_op(&frames[0][0], (-2).into(), 1, &expected_record, 10);
+                assert_eq!(last_valid_offset_without_v4, first_frame_end);
+                assert!(last_valid_offset > first_frame_end);
+            }
+        }
+    }
+
+    #[test]
+    fn test_writer_never_appends_update_op_to_version_2_or_3_log() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = open_test_file(&io, "update-op-without-upgrade.db-log");
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let tx = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[make_test_row_version((-2).into(), 1, "first", 10)],
+            None,
+        );
+        let c = log.log_tx(tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+        let file_size = file.size().unwrap();
+
+        let result = log.log_tx(update_table_tx(20, 1, 0, &[2, 0], false));
+        assert!(matches!(result, Err(crate::LimboError::InternalError(_))));
+        assert_eq!(file.size().unwrap(), file_size);
+        assert_eq!(log_header_version(&file, &io), LOG_VERSION_V2);
+    }
+
+    #[test]
+    fn test_header_changes_to_version_4_in_the_middle_of_a_log() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = open_test_file(&io, "update-op-upgrade.db-log");
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let upsert = make_test_row_version((-2).into(), 1, "first", 10);
+        let expected_record = upsert.row.payload().to_vec();
+        let c = log
+            .log_tx(crate::mvcc::database::LogRecord::for_test(
+                10,
+                &[upsert],
+                None,
+            ))
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        assert_eq!(log_header_version(&file, &io), LOG_VERSION_V2);
+
+        let tx = update_table_tx(20, 1, 9, &[2, 0], false);
+        let c = log.upgrade_header_for_log_tx(&tx).unwrap().unwrap();
+        io.wait_for_completion(c).unwrap();
+        assert!(log.upgrade_header_for_log_tx(&tx).unwrap().is_none());
+        let c = log.log_tx(tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+        assert_eq!(log_header_version(&file, &io), LOG_VERSION_V4);
+
+        // A record without update ops needs no other upgrade.
+        let tx = crate::mvcc::database::LogRecord::for_test(
+            30,
+            &[make_test_row_version((-2).into(), 3, "third", 30)],
+            None,
+        );
+        assert!(log.upgrade_header_for_log_tx(&tx).unwrap().is_none());
+        let c = log.log_tx(tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let (frames, _) = read_all_frames(file, &io, None);
+        assert_eq!(frames.len(), 3);
+        assert_upsert_table_op(&frames[0][0], (-2).into(), 1, &expected_record, 10);
+        assert_update_table_op(&frames[1][0], 1, 9, &[2, 0], 20, false);
+    }
+
+    /// After a truncation, the log goes back to the version that it had before
+    /// the first update op, until the next update op.
+    #[test]
+    fn test_truncated_log_goes_back_to_the_version_before_update_ops() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = open_test_file(&io, "update-op-truncate.db-log");
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let c = log
+            .log_tx(update_table_tx(10, 1, 9, &[2, 0], false))
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        assert_eq!(log_header_version(&file, &io), LOG_VERSION_V4);
+
+        let (c, _) = log.truncate(u64::MAX).unwrap();
+        io.wait_for_completion(c).unwrap();
+        let c = log
+            .log_tx(crate::mvcc::database::LogRecord::for_test(
+                20,
+                &[make_test_row_version((-2).into(), 1, "plain", 20)],
+                None,
+            ))
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        assert_eq!(log_header_version(&file, &io), LOG_VERSION_V2);
+
+        let (c, _) = log.truncate(u64::MAX).unwrap();
+        io.wait_for_completion(c).unwrap();
+        let c = log
+            .log_tx(update_table_tx(30, 1, 9, &[2, 0], false))
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        assert_eq!(log_header_version(&file, &io), LOG_VERSION_V4);
+    }
+
+    #[test]
+    fn test_torn_tail_inside_frame_with_update_ops() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let enc_ctx = test_enc_ctx();
+        for encrypted in [false, true] {
+            let file = open_test_file(&io, &format!("update-op-torn-{encrypted}.db-log"));
+            let mut log =
+                LogicalLog::new(file.clone(), io.clone(), encrypted.then(|| enc_ctx.clone()));
+            let c = log
+                .log_tx(update_table_tx(10, 1, 5, &[2, 1, 1, 1, 9], false))
+                .unwrap();
+            io.wait_for_completion(c).unwrap();
+            let first_frame_end = log.offset as usize;
+            let c = log
+                .log_tx(update_table_tx(20, 2, 6, &[2, 1, 0, 1, 8], true))
+                .unwrap();
+            io.wait_for_completion(c).unwrap();
+            let full = read_file_bytes(file.clone(), &io);
+
+            for cut in first_frame_end..full.len() {
+                overwrite_file_bytes(file.clone(), &io, &full[..cut]);
+                let (frames, last_valid_offset) =
+                    read_all_frames(file.clone(), &io, encrypted.then_some(&enc_ctx));
+                assert_eq!(frames.len(), 1, "cut at {cut}");
+                assert_update_table_op(&frames[0][0], 1, 5, &[2, 1, 1, 1, 9], 10, false);
+                assert_eq!(last_valid_offset, first_frame_end, "cut at {cut}");
+            }
+        }
     }
 }

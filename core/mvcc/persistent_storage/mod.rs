@@ -12,7 +12,8 @@ mod discard_pending_tests;
 pub mod logical_log;
 use crate::mvcc::database::{LogRecord, RowVersion};
 use crate::mvcc::persistent_storage::logical_log::{
-    LogSerializer, LogicalLog, OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
+    delete_and_upsert_table_ops_len, update_table_op_len, LogSerializer, LogicalLog,
+    OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
 };
 use crate::{CheckpointResult, Completion, File, LimboError, Result};
 
@@ -38,6 +39,28 @@ pub trait DurableStorage: Send + Sync + Debug {
         log_record: &mut LogRecord,
         header: &DatabaseHeader,
     ) -> Result<()>;
+
+    /// True when this storage can write `OP_UPDATE_TABLE` ops and recover them.
+    /// A storage that keeps the default never gets a call to
+    /// [`DurableStorage::serialize_table_update`].
+    fn supports_update_ops(&self) -> bool {
+        false
+    }
+
+    /// Append one `OP_UPDATE_TABLE` op to `log_record`'s payload buffer. The op
+    /// logs `new_version`, the committed image of an updated table row, as the
+    /// column patch `patch` from a base record with CRC32C `base_crc32c`.
+    fn serialize_table_update(
+        &self,
+        _log_record: &mut LogRecord,
+        _new_version: &RowVersion,
+        _base_crc32c: u32,
+        _patch: &[u8],
+    ) -> Result<()> {
+        Err(LimboError::InternalError(
+            "durable storage does not support OP_UPDATE_TABLE".to_string(),
+        ))
+    }
 
     /// Write a transaction to the logical log without advancing the writer offset.
     ///
@@ -107,6 +130,10 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn discard_pending_log_write(&self) -> Result<()>;
     fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32);
 
+    /// Called after recovery with the bytes that the replayed `OP_UPDATE_TABLE`
+    /// ops save, so the automatic checkpoint counts them as before the restart.
+    fn restore_update_ops_bytes_saved_after_recovery(&self, _bytes: u64) {}
+
     /// Set the in-memory log header from a previously-read on-disk header.
     ///
     /// Called during recovery to seed the CRC state from the header's salt.
@@ -134,6 +161,10 @@ pub struct Storage {
     pub logical_log: RwLock<LogicalLog>,
     /// Shadowed from LogicalLog::offset for lock-free should_checkpoint() reads.
     log_offset: AtomicU64,
+    /// The bytes that the `OP_UPDATE_TABLE` ops in the log save. should_checkpoint()
+    /// adds them to the log offset, so the checkpoint frequency does not depend on
+    /// `PRAGMA mvcc_update_deltas`.
+    update_ops_bytes_saved: AtomicU64,
     checkpoint_threshold: AtomicI64,
 }
 
@@ -146,6 +177,7 @@ impl Storage {
         Self {
             logical_log: RwLock::new(LogicalLog::new(file, io, encryption_ctx)),
             log_offset: AtomicU64::new(0),
+            update_ops_bytes_saved: AtomicU64::new(0),
             checkpoint_threshold: AtomicI64::new(DEFAULT_LOG_CHECKPOINT_THRESHOLD),
         }
     }
@@ -195,6 +227,33 @@ impl DurableStorage for Storage {
         Ok(())
     }
 
+    fn supports_update_ops(&self) -> bool {
+        true
+    }
+
+    fn serialize_table_update(
+        &self,
+        log_record: &mut LogRecord,
+        new_version: &RowVersion,
+        base_crc32c: u32,
+        patch: &[u8],
+    ) -> Result<()> {
+        LogSerializer::new(&mut log_record.buf).serialize_update_table_entry(
+            new_version,
+            base_crc32c,
+            patch,
+        )?;
+        log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
+            LimboError::InternalError("logical log op_count exceeds u32".to_string())
+        })?;
+        log_record.has_update_ops = true;
+        let rowid = new_version.row.id.row_id.to_int_or_panic();
+        let full_ops_len = delete_and_upsert_table_ops_len(rowid, new_version.row.payload().len());
+        let op_len = update_table_op_len(rowid, patch.len());
+        log_record.update_ops_bytes_saved += full_ops_len.saturating_sub(op_len) as u64;
+        Ok(())
+    }
+
     fn log_tx(
         &self,
         m: LogRecord,
@@ -230,12 +289,16 @@ impl DurableStorage for Storage {
         let new_offset = log.offset;
         drop(log);
         self.shadow_offset_store(new_offset);
+        if outcome == LogicalLogTruncateOutcome::Truncated {
+            self.update_ops_bytes_saved.store(0, Ordering::Relaxed);
+        }
         Ok((c, outcome))
     }
 
     fn reset_to_fresh_header(&self) -> Result<Completion> {
         let c = self.logical_log.write().reset_to_fresh_header()?;
         self.shadow_offset_store(0);
+        self.update_ops_bytes_saved.store(0, Ordering::Relaxed);
         Ok(c)
     }
 
@@ -257,7 +320,9 @@ impl DurableStorage for Storage {
         if threshold < 0 {
             return false;
         }
-        self.log_offset.load(Ordering::Relaxed) >= threshold as u64
+        let counted_bytes = self.log_offset.load(Ordering::Relaxed)
+            + self.update_ops_bytes_saved.load(Ordering::Relaxed);
+        counted_bytes >= threshold as u64
     }
 
     fn set_checkpoint_threshold(&self, threshold: i64) {
@@ -270,8 +335,12 @@ impl DurableStorage for Storage {
     }
 
     fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()> {
-        self.logical_log.write().advance_offset_after_success(bytes);
+        let update_ops_bytes_saved = self.logical_log.write().advance_offset_after_success(bytes);
         self.shadow_offset_advance(bytes);
+        if update_ops_bytes_saved > 0 {
+            self.update_ops_bytes_saved
+                .fetch_add(update_ops_bytes_saved, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -285,6 +354,10 @@ impl DurableStorage for Storage {
         log.offset = offset;
         log.running_crc = running_crc;
         self.shadow_offset_store(offset);
+    }
+
+    fn restore_update_ops_bytes_saved_after_recovery(&self, bytes: u64) {
+        self.update_ops_bytes_saved.store(bytes, Ordering::Relaxed);
     }
 
     fn set_header(&self, header: logical_log::LogHeader) {

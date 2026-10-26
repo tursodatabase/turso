@@ -13,7 +13,6 @@ use crate::mvcc::database::{CommitYieldPoint, ExclusiveTxYieldPoint};
 use crate::mvcc::persistent_storage::logical_log::{
     LogicalLog, ENCRYPTED_PAYLOAD_CHUNK_SIZE, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE,
 };
-#[cfg(feature = "conn_raw_api")]
 use crate::mvcc::persistent_storage::logical_log::{ParsedOp, StreamingLogicalLogReader};
 #[cfg(feature = "conn_raw_api")]
 use crate::mvcc::portable_logical::{PortableLogicalBuilder, PortableObjectMapEntry};
@@ -8014,6 +8013,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
+        update_deltas: Mutex::new(UpdateDeltas::default()),
     }
 }
 
@@ -9806,6 +9806,7 @@ fn transaction_display() {
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
+        update_deltas: Mutex::new(UpdateDeltas::default()),
     };
 
     let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }] }";
@@ -24444,4 +24445,712 @@ fn step_until_busy_then_release(
             other => panic!("unexpected step result: {other:?}"),
         }
     }
+}
+
+/// Reads every op of the logical log of `db`.
+fn read_logical_log_ops(db: &MvccTestDbNoConn) -> Vec<ParsedOp> {
+    let mvcc_store = db.get_mvcc_store();
+    let io = db.get_db().io.clone();
+    let mut reader = StreamingLogicalLogReader::new(
+        mvcc_store.get_logical_log_file(),
+        mvcc_store.storage.encryption_ctx(),
+    );
+    reader.read_header(&io).unwrap();
+    let mut ops = Vec::new();
+    while let Some(frame) = reader.next_frame_blocking(&io).unwrap() {
+        ops.extend(frame);
+    }
+    ops
+}
+
+/// Counts of the table-row ops in a logical log, without the sqlite_schema ops.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TableOpCounts {
+    upserts: usize,
+    deletes: usize,
+    updates: usize,
+}
+
+fn table_op_counts(ops: &[ParsedOp]) -> TableOpCounts {
+    let mut counts = TableOpCounts::default();
+    for op in ops {
+        match op {
+            ParsedOp::UpsertTable { table_id, .. } if *table_id != SQLITE_SCHEMA_MVCC_TABLE_ID => {
+                counts.upserts += 1
+            }
+            ParsedOp::DeleteTable { rowid, .. }
+                if rowid.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID =>
+            {
+                counts.deletes += 1
+            }
+            ParsedOp::UpdateTable { .. } => counts.updates += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+fn logical_log_version(db: &MvccTestDbNoConn) -> u8 {
+    let db_path = std::path::Path::new(db.path.as_ref().unwrap());
+    let log = std::fs::read(db_path.with_extension("db-log")).unwrap();
+    log[4]
+}
+
+/// Updates with the base in the B-tree, with the base in an earlier frame, and
+/// three updates of one row in one transaction go to the log as update ops, and
+/// recovery rebuilds the same rows.
+#[turso_macros::test(encryption)]
+fn test_update_deltas_recover_btree_and_frame_bases() {
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c BLOB)")
+            .unwrap();
+        for id in 1..=20 {
+            conn.execute(format!(
+                "INSERT INTO t VALUES ({id}, {id}, 'row-{id}-' || hex(randomblob(40)), randomblob(50))"
+            ))
+            .unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    db.restart();
+    let expected = {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_update_deltas = on").unwrap();
+        // The rows are only in the B-tree.
+        conn.execute("UPDATE t SET a = a + 100 WHERE id <= 10")
+            .unwrap();
+        // The rows have versions from the previous transaction.
+        conn.execute("UPDATE t SET a = a + 1000 WHERE id <= 5")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("UPDATE t SET a = 1 WHERE id = 15").unwrap();
+        conn.execute("UPDATE t SET b = 'short' WHERE id = 15")
+            .unwrap();
+        conn.execute("UPDATE t SET a = 3 WHERE id = 15").unwrap();
+        conn.execute("COMMIT").unwrap();
+        let expected = get_rows(&conn, "SELECT * FROM t ORDER BY id");
+        conn.close().unwrap();
+        expected
+    };
+    assert_eq!(logical_log_version(&db), 4);
+    assert_eq!(
+        table_op_counts(&read_logical_log_ops(&db)),
+        TableOpCounts {
+            upserts: 0,
+            deletes: 0,
+            updates: 16,
+        }
+    );
+
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(get_rows(&conn, "SELECT * FROM t ORDER BY id"), expected);
+    assert_eq!(
+        get_rows(&conn, "SELECT a, b FROM t WHERE id = 15"),
+        vec![vec![Value::from_i64(3), Value::build_text("short")]]
+    );
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.close().unwrap();
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(get_rows(&conn, "SELECT * FROM t ORDER BY id"), expected);
+    assert_eq!(
+        get_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+}
+
+#[test]
+fn test_update_deltas_are_off_by_default() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    assert_eq!(
+        get_rows(&conn, "PRAGMA mvcc_update_deltas"),
+        vec![vec![Value::from_i64(0)]]
+    );
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1, 'a long enough text value')")
+        .unwrap();
+    conn.execute("UPDATE t SET a = 2 WHERE id = 1").unwrap();
+    conn.close().unwrap();
+    assert_eq!(logical_log_version(&db), 2);
+    assert_eq!(
+        table_op_counts(&read_logical_log_ops(&db)),
+        TableOpCounts {
+            upserts: 2,
+            deletes: 1,
+            updates: 0,
+        }
+    );
+}
+
+/// A rollback to a savepoint removes the version that the last patch of the row
+/// makes, so the commit does not use the patch. It logs a delete op and an
+/// upsert op, and recovery gives the committed value.
+#[test]
+fn test_update_deltas_ignore_patch_of_rolled_back_savepoint() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_update_deltas = on").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1, 'a long enough text value')")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("UPDATE t SET a = 2 WHERE id = 1").unwrap();
+        conn.execute("SAVEPOINT sp").unwrap();
+        conn.execute("UPDATE t SET a = 3 WHERE id = 1").unwrap();
+        conn.execute("ROLLBACK TO sp").unwrap();
+        conn.execute("RELEASE sp").unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+    assert_eq!(
+        table_op_counts(&read_logical_log_ops(&db)),
+        TableOpCounts {
+            upserts: 2,
+            deletes: 1,
+            updates: 0,
+        }
+    );
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        get_rows(&conn, "SELECT a FROM t"),
+        vec![vec![Value::from_i64(2)]]
+    );
+}
+
+/// A row that the transaction inserts has no committed base, so its updates in
+/// the same transaction go to the log as one upsert op.
+#[test]
+fn test_update_deltas_insert_then_update_logs_one_upsert() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_update_deltas = on").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1, 'a long enough text value')")
+            .unwrap();
+        conn.execute("UPDATE t SET a = 2 WHERE id = 1").unwrap();
+        conn.execute("UPDATE t SET a = 3 WHERE id = 1").unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+    assert_eq!(
+        table_op_counts(&read_logical_log_ops(&db)),
+        TableOpCounts {
+            upserts: 1,
+            deletes: 0,
+            updates: 0,
+        }
+    );
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        get_rows(&conn, "SELECT a FROM t"),
+        vec![vec![Value::from_i64(3)]]
+    );
+}
+
+/// These updates go to the log as a delete op and an upsert op: an update that
+/// changes the rowid, an update whose patch is more than half of the record, and
+/// an update in a transaction that writes sqlite_schema.
+#[test]
+fn test_update_deltas_fall_back_to_delete_and_upsert_ops() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let expected = {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_update_deltas = on").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)")
+            .unwrap();
+        for id in 1..=3 {
+            conn.execute(format!(
+                "INSERT INTO t VALUES ({id}, {id}, 'a long enough text value')"
+            ))
+            .unwrap();
+        }
+        let ops_before = table_op_counts(&read_logical_log_ops(&db));
+        conn.execute("UPDATE t SET id = 10 WHERE id = 1").unwrap();
+        conn.execute("UPDATE t SET b = 'a different text value!!' WHERE id = 2")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("UPDATE t SET a = 30 WHERE id = 3").unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 7")
+            .unwrap();
+        conn.execute("COMMIT").unwrap();
+        let ops_after = table_op_counts(&read_logical_log_ops(&db));
+        assert_eq!(ops_after.updates, 0);
+        assert_eq!(ops_after.deletes - ops_before.deletes, 3);
+        assert_eq!(ops_after.upserts - ops_before.upserts, 3);
+        // After the schema change, an update is an update op again.
+        conn.execute("UPDATE t SET c = 8 WHERE id = 2").unwrap();
+        assert_eq!(table_op_counts(&read_logical_log_ops(&db)).updates, 1);
+        let expected = get_rows(&conn, "SELECT * FROM t ORDER BY id");
+        conn.close().unwrap();
+        expected
+    };
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(get_rows(&conn, "SELECT * FROM t ORDER BY id"), expected);
+}
+
+/// A transaction that updates more rows than one chunk of the log record build
+/// writes one update op for each row.
+#[test]
+fn test_update_deltas_many_rows_in_one_transaction() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let row_count = MVCC_COMMIT_BATCH_SIZE * 2 + 10;
+    let expected = {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)")
+            .unwrap();
+        conn.execute(format!(
+            "INSERT INTO t SELECT value, value, 'text of row ' || value FROM generate_series(1, {row_count})"
+        ))
+        .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("PRAGMA mvcc_update_deltas = on").unwrap();
+        conn.execute("UPDATE t SET a = a * 2").unwrap();
+        let expected = get_rows(&conn, "SELECT * FROM t ORDER BY id");
+        conn.close().unwrap();
+        expected
+    };
+    assert_eq!(
+        table_op_counts(&read_logical_log_ops(&db)),
+        TableOpCounts {
+            upserts: 0,
+            deletes: 0,
+            updates: row_count,
+        }
+    );
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(get_rows(&conn, "SELECT * FROM t ORDER BY id"), expected);
+}
+
+/// The automatic checkpoint counts the bytes that update ops save, so it starts
+/// at the same log content as without update ops, also after a restart.
+#[test]
+fn test_update_deltas_checkpoint_threshold_counts_full_ops() {
+    fn run(db: &MvccTestDbNoConn, update_deltas: bool) {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        if update_deltas {
+            conn.execute("PRAGMA mvcc_update_deltas = on").unwrap();
+        }
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)")
+            .unwrap();
+        for id in 1..=50 {
+            conn.execute(format!(
+                "INSERT INTO t VALUES ({id}, {id}, 'text value of row number {id}')"
+            ))
+            .unwrap();
+        }
+        for round in 1..=3 {
+            conn.execute(format!("UPDATE t SET a = a + {round}"))
+                .unwrap();
+        }
+        conn.close().unwrap();
+    }
+    fn should_checkpoint_at(db: &MvccTestDbNoConn, threshold: u64) -> bool {
+        let mvcc_store = db.get_mvcc_store();
+        mvcc_store
+            .storage
+            .set_checkpoint_threshold(threshold as i64);
+        mvcc_store.storage.should_checkpoint()
+    }
+
+    let without_deltas = MvccTestDbNoConn::new_with_random_db();
+    run(&without_deltas, false);
+    let full_log_len = without_deltas.get_mvcc_store().storage.logical_log_offset();
+
+    let mut with_deltas = MvccTestDbNoConn::new_with_random_db();
+    run(&with_deltas, true);
+    assert_eq!(
+        table_op_counts(&read_logical_log_ops(&with_deltas)).updates,
+        150
+    );
+    let log_len = with_deltas.get_mvcc_store().storage.logical_log_offset();
+    assert!(
+        log_len < full_log_len,
+        "{log_len} must be less than {full_log_len}"
+    );
+    assert!(should_checkpoint_at(&with_deltas, full_log_len));
+    assert!(!should_checkpoint_at(&with_deltas, full_log_len + 1));
+
+    with_deltas.restart();
+    assert!(should_checkpoint_at(&with_deltas, full_log_len));
+    assert!(!should_checkpoint_at(&with_deltas, full_log_len + 1));
+}
+
+/// Transaction B updates the new version of transaction A while A is in the
+/// Preparing state (a Hekaton speculative update). The base of the update op of
+/// B is the record of A, which is in an earlier frame.
+#[test]
+fn test_update_deltas_speculative_update_of_preparing_version() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_update_deltas = on").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1, 'a long enough text value')")
+            .unwrap();
+        conn.close().unwrap();
+    }
+    {
+        let conn_a = db.connect();
+        let conn_b = db.connect();
+        conn_a.execute("BEGIN CONCURRENT").unwrap();
+        conn_a.execute("UPDATE t SET a = 2 WHERE id = 1").unwrap();
+        conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+            CommitYieldPoint::CommitValidation.point(),
+        ])));
+        let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+        let mut yielded = false;
+        for _ in 0..100 {
+            match commit_a.step().unwrap() {
+                StepResult::Yield => {
+                    yielded = true;
+                    break;
+                }
+                StepResult::Done => break,
+                _ => {}
+            }
+        }
+        assert!(yielded, "the commit of A must yield while A is Preparing");
+
+        conn_b.execute("BEGIN CONCURRENT").unwrap();
+        conn_b.execute("UPDATE t SET a = 3 WHERE id = 1").unwrap();
+        commit_a.run_collect_rows().unwrap();
+        drop(commit_a);
+        conn_b.execute("COMMIT").unwrap();
+        conn_a.close().unwrap();
+        conn_b.close().unwrap();
+    }
+    assert_eq!(
+        table_op_counts(&read_logical_log_ops(&db)),
+        TableOpCounts {
+            upserts: 1,
+            deletes: 0,
+            updates: 2,
+        }
+    );
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        get_rows(&conn, "SELECT a FROM t"),
+        vec![vec![Value::from_i64(3)]]
+    );
+}
+
+/// The transactions of a small TPC-C-style workload: New-Order, Payment, and
+/// Delivery, with an occasional delete and an occasional update of many columns.
+/// Each item is one transaction. The first items create and fill the tables.
+fn tpcc_style_transactions(rng: &mut ChaCha8Rng, transaction_count: usize) -> Vec<Vec<String>> {
+    const DISTRICTS: i64 = 10;
+    const CUSTOMERS: i64 = 200;
+    const ITEMS: i64 = 300;
+    let text = |rng: &mut ChaCha8Rng, len: usize| -> String {
+        (0..len)
+            .map(|_| char::from(b'a' + rng.random_range(0..26u8)))
+            .collect()
+    };
+    let mut transactions = vec![
+        vec!["CREATE TABLE district(d_id INTEGER PRIMARY KEY, d_ytd REAL, d_next_o_id INTEGER, d_name TEXT, d_street TEXT)".to_string()],
+        vec!["CREATE TABLE customer(c_id INTEGER PRIMARY KEY, c_d_id INTEGER, c_balance REAL, c_ytd_payment REAL, c_payment_cnt INTEGER, c_delivery_cnt INTEGER, c_data TEXT)".to_string()],
+        vec!["CREATE INDEX customer_district ON customer(c_d_id)".to_string()],
+        vec!["CREATE TABLE stock(s_i_id INTEGER PRIMARY KEY, s_quantity INTEGER, s_ytd INTEGER, s_order_cnt INTEGER, s_dist TEXT, s_data TEXT)".to_string()],
+        vec!["CREATE TABLE orders(o_id INTEGER PRIMARY KEY, o_d_id INTEGER, o_c_id INTEGER, o_carrier_id INTEGER, o_ol_cnt INTEGER)".to_string()],
+        vec!["CREATE TABLE order_line(ol_id INTEGER PRIMARY KEY, ol_o_id INTEGER, ol_i_id INTEGER, ol_quantity INTEGER, ol_amount REAL, ol_delivery_d TEXT)".to_string()],
+        vec!["CREATE INDEX order_line_order ON order_line(ol_o_id)".to_string()],
+    ];
+    transactions.push(
+        (1..=DISTRICTS)
+            .map(|d| {
+                format!(
+                    "INSERT INTO district VALUES ({d}, 30000.0, 1, '{}', '{}')",
+                    text(rng, 10),
+                    text(rng, 20)
+                )
+            })
+            .collect(),
+    );
+    transactions.push(
+        (1..=CUSTOMERS)
+            .map(|c| {
+                format!(
+                    "INSERT INTO customer VALUES ({c}, {}, -10.0, 10.0, 1, 0, '{}')",
+                    c % DISTRICTS + 1,
+                    text(rng, 300)
+                )
+            })
+            .collect(),
+    );
+    transactions.push(
+        (1..=ITEMS)
+            .map(|i| {
+                format!(
+                    "INSERT INTO stock VALUES ({i}, {}, 0, 0, '{}', '{}')",
+                    rng.random_range(10..100),
+                    text(rng, 24 * 10),
+                    text(rng, 40)
+                )
+            })
+            .collect(),
+    );
+    let mut next_order_id = 1i64;
+    let mut next_order_line_id = 1i64;
+    let mut order_lines = Vec::new();
+    let mut undelivered = std::collections::VecDeque::new();
+    while transactions.len() < transaction_count {
+        let mut statements = Vec::new();
+        match rng.random_range(0..100) {
+            0..45 => {
+                let d = rng.random_range(1..=DISTRICTS);
+                let c = rng.random_range(1..=CUSTOMERS);
+                let order_id = next_order_id;
+                next_order_id += 1;
+                let line_count = rng.random_range(3..8);
+                statements.push(format!(
+                    "UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_id = {d}"
+                ));
+                statements.push(format!(
+                    "INSERT INTO orders VALUES ({order_id}, {d}, {c}, NULL, {line_count})"
+                ));
+                for _ in 0..line_count {
+                    let item = rng.random_range(1..=ITEMS);
+                    let quantity = rng.random_range(1..10);
+                    statements.push(format!(
+                        "UPDATE stock SET s_quantity = CASE WHEN s_quantity - {quantity} >= 10 THEN s_quantity - {quantity} ELSE s_quantity - {quantity} + 91 END, s_ytd = s_ytd + {quantity}, s_order_cnt = s_order_cnt + 1 WHERE s_i_id = {item}"
+                    ));
+                    statements.push(format!(
+                        "INSERT INTO order_line VALUES ({next_order_line_id}, {order_id}, {item}, {quantity}, {}.25, NULL)",
+                        quantity * 3
+                    ));
+                    order_lines.push(next_order_line_id);
+                    next_order_line_id += 1;
+                }
+                undelivered.push_back((order_id, c));
+            }
+            45..88 => {
+                let d = rng.random_range(1..=DISTRICTS);
+                let c = rng.random_range(1..=CUSTOMERS);
+                let amount = rng.random_range(1..5000);
+                statements.push(format!(
+                    "UPDATE district SET d_ytd = d_ytd + {amount} WHERE d_id = {d}"
+                ));
+                statements.push(format!(
+                    "UPDATE customer SET c_balance = c_balance - {amount}, c_ytd_payment = c_ytd_payment + {amount}, c_payment_cnt = c_payment_cnt + 1 WHERE c_id = {c}"
+                ));
+                if rng.random_bool(0.2) {
+                    statements.push(format!(
+                        "UPDATE customer SET c_data = substr('{c} {d} {amount} | ' || c_data, 1, 300) WHERE c_id = {c}"
+                    ));
+                }
+            }
+            88..96 => {
+                for _ in 0..rng.random_range(1..4) {
+                    let Some((order_id, c)) = undelivered.pop_front() else {
+                        break;
+                    };
+                    statements.push(format!(
+                        "UPDATE orders SET o_carrier_id = {} WHERE o_id = {order_id}",
+                        rng.random_range(1..10)
+                    ));
+                    statements.push(format!(
+                        "UPDATE order_line SET ol_delivery_d = '2026-10-26 13:00:00' WHERE ol_o_id = {order_id}"
+                    ));
+                    statements.push(format!(
+                        "UPDATE customer SET c_balance = c_balance + 100, c_delivery_cnt = c_delivery_cnt + 1 WHERE c_id = {c}"
+                    ));
+                }
+                if statements.is_empty() {
+                    continue;
+                }
+            }
+            96..98 => {
+                let item = rng.random_range(1..=ITEMS);
+                statements.push(format!(
+                    "UPDATE stock SET s_dist = '{}', s_data = '{}', s_ytd = 0 WHERE s_i_id = {item}",
+                    text(rng, 24 * 10),
+                    text(rng, 40)
+                ));
+            }
+            _ => {
+                // Every transaction must change a row, so that it writes one frame.
+                if order_lines.is_empty() {
+                    continue;
+                }
+                let order_line = order_lines.swap_remove(rng.random_range(0..order_lines.len()));
+                statements.push(format!("DELETE FROM order_line WHERE ol_id = {order_line}"));
+            }
+        }
+        transactions.push(statements);
+    }
+    transactions
+}
+
+fn run_transaction(conn: &Arc<Connection>, statements: &[String]) {
+    if let [statement] = statements {
+        conn.execute(statement).unwrap();
+        return;
+    }
+    conn.execute("BEGIN").unwrap();
+    for statement in statements {
+        conn.execute(statement).unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+}
+
+/// The name and the rows of each table, in name order.
+fn tpcc_style_tables(conn: &Arc<Connection>) -> Vec<(Value, Vec<Vec<Value>>)> {
+    get_rows(
+        conn,
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE '__turso_internal%' ORDER BY name",
+    )
+    .into_iter()
+    .map(|row| {
+        let name = row[0].clone();
+        let rows = get_rows(conn, &format!("SELECT * FROM {name} ORDER BY 1"));
+        (name, rows)
+    })
+    .collect()
+}
+
+/// Runs a TPC-C-style workload with update deltas on. At random points between
+/// transactions, it copies the database files, cuts the copy of the logical log at
+/// a random byte, and opens the copy. Each recovered database must have the tables
+/// of a run with update deltas off, after the transactions whose frames remain.
+#[test]
+fn test_update_deltas_crash_recovery_matches_run_without_deltas() {
+    const TRANSACTIONS: usize = 400;
+    const CHECKPOINT_EVERY: usize = 150;
+    let seed = std::env::var("SEED")
+        .map(|seed| seed.parse().unwrap())
+        .unwrap_or_else(|_| rand::rng().random());
+    println!("seed: {seed}");
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let transactions = tpcc_style_transactions(&mut rng, TRANSACTIONS);
+
+    // Item `n` has the tables after the first `n` transactions.
+    let tables_after_transactions = {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let conn = db.connect();
+        let mut tables = vec![tpcc_style_tables(&conn)];
+        for (i, statements) in transactions.iter().enumerate() {
+            run_transaction(&conn, statements);
+            if i % CHECKPOINT_EVERY == CHECKPOINT_EVERY - 1 {
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            }
+            tables.push(tpcc_style_tables(&conn));
+        }
+        tables
+    };
+
+    /// The byte offset after each frame of the log of `db`, and its update ops.
+    fn frame_ends_and_update_ops(db: &MvccTestDbNoConn) -> (Vec<usize>, usize) {
+        let mvcc_store = db.get_mvcc_store();
+        let io = db.get_db().io.clone();
+        let mut frame_ends = Vec::new();
+        let mut update_ops = 0;
+        if mvcc_store.get_logical_log_file().size().unwrap() >= LOG_HDR_SIZE as u64 {
+            let mut reader = StreamingLogicalLogReader::new(
+                mvcc_store.get_logical_log_file(),
+                mvcc_store.storage.encryption_ctx(),
+            );
+            reader.read_header(&io).unwrap();
+            while let Some(frame) = reader.next_frame_blocking(&io).unwrap() {
+                update_ops += table_op_counts(&frame).updates;
+                frame_ends.push(reader.last_valid_offset());
+            }
+        }
+        (frame_ends, update_ops)
+    }
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = std::path::PathBuf::from(db.path.as_ref().unwrap());
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_update_deltas = on").unwrap();
+    // The log can start with frames that create the MVCC metadata table. They
+    // are not transactions of the workload, so a cut stays after them.
+    let mut first_workload_frame_start = frame_ends_and_update_ops(&db)
+        .0
+        .last()
+        .copied()
+        .unwrap_or(LOG_HDR_SIZE);
+    let crash_dir = tempfile::TempDir::new().unwrap();
+    let mut update_ops = 0;
+    for (i, statements) in transactions.iter().enumerate() {
+        let log_len_before = db.get_mvcc_store().storage.logical_log_offset();
+        run_transaction(&conn, statements);
+        assert!(
+            db.get_mvcc_store().storage.logical_log_offset() > log_len_before,
+            "seed {seed}: transaction {i} must write one frame: {statements:?}"
+        );
+        if i % CHECKPOINT_EVERY == CHECKPOINT_EVERY - 1 {
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            first_workload_frame_start = LOG_HDR_SIZE;
+        }
+        if i < 10 || !rng.random_bool(0.08) {
+            continue;
+        }
+        let (frame_ends, frame_update_ops) = frame_ends_and_update_ops(&db);
+        update_ops += frame_update_ops;
+
+        let copy_path = crash_dir.path().join(format!("crash_{i}.db"));
+        let file_name = db_path.file_name().unwrap().to_str().unwrap();
+        for entry in std::fs::read_dir(db_path.parent().unwrap()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            if let Some(suffix) = name.strip_prefix(file_name) {
+                let suffix = if suffix == ".db-log" { "-log" } else { suffix };
+                std::fs::copy(
+                    entry.path(),
+                    format!("{}{suffix}", copy_path.to_str().unwrap()),
+                )
+                .unwrap();
+            }
+        }
+        let copy_log = copy_path.with_extension("db-log");
+        let log_len = std::fs::metadata(&copy_log).map_or(0, |m| m.len() as usize);
+        let cut = if log_len > first_workload_frame_start {
+            rng.random_range(first_workload_frame_start..=log_len)
+        } else {
+            log_len
+        };
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&copy_log)
+            .and_then(|file| file.set_len(cut as u64))
+            .ok();
+        let frames_cut = frame_ends.iter().filter(|end| **end > cut).count();
+
+        let copy_db = Database::open_file_with_flags(
+            Arc::new(PlatformIO::new().unwrap()),
+            copy_path.to_str().unwrap(),
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let copy_conn = copy_db.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(
+            tpcc_style_tables(&copy_conn),
+            tables_after_transactions[i + 1 - frames_cut],
+            "seed {seed}: crash after transaction {i}, log cut at byte {cut} of {log_len}, {frames_cut} frames cut"
+        );
+        copy_conn.close().unwrap();
+    }
+    assert!(update_ops > 0, "seed {seed}: the run must write update ops");
 }

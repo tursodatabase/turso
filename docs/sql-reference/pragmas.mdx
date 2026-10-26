@@ -640,6 +640,41 @@ connection on the store.
 PRAGMA mvcc_group_commit = on;
 ```
 
+### mvcc_update_deltas
+
+Writes each `UPDATE` of a table row to the logical log as a patch of the changed
+columns, instead of the full row. Off by default. The setting applies to every
+connection on the store. It does not persist, so it is off again when the
+database opens.
+
+```sql
+PRAGMA mvcc_update_deltas = on;
+```
+
+When the setting is on, each update adds fewer bytes to the logical log. Recovery
+gets the old row from an earlier transaction in the log or from the database file,
+and applies the patch to it. The automatic checkpoint counts the full size of each
+updated row, so checkpoints start as often as when the setting is off.
+
+Turso writes the full row, as when the setting is off, for these updates:
+
+- An update that changes the rowid.
+- An update whose patch is more than half the size of the row.
+- An update of a row that the same transaction inserted.
+- An update in a transaction that also changes the schema.
+- An update in a transaction that writes portable logical changes.
+
+<Warning>
+After the first patch, the logical log has format version 4. Older versions of
+Turso cannot open a database that has a version 4 logical log. To open the
+database with an older version, turn the setting off. Then run
+`PRAGMA wal_checkpoint(TRUNCATE)` while no other connection writes.
+
+A sync server sends pages, not logical-log changes, for a database that has a
+version 4 logical log. Keep the setting off for a database that sync clients pull
+from.
+</Warning>
+
 ## Change Data Capture
 
 <Info>
