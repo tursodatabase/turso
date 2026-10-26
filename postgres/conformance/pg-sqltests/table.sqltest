@@ -419,6 +419,43 @@ expect {
     1|2|3|4
 }
 
+test table-serial-column-of-a-table-whose-name-has-double-quotes {
+    CREATE TABLE """t""" (id serial, v int);
+    INSERT INTO """t""" (v) VALUES (5);
+    INSERT INTO """t""" (v) VALUES (6);
+    SELECT id, v FROM """t""" ORDER BY id;
+}
+expect {
+    1|5
+    2|6
+}
+
+test table-serial-column-whose-name-has-double-quotes {
+    CREATE TABLE t ("""id""" serial, v int);
+    INSERT INTO t (v) VALUES (5);
+    SELECT """id""", v FROM t;
+}
+expect {
+    1|5
+}
+
+test table-serial-column-of-a-table-whose-name-has-a-double-quote-inside {
+    CREATE TABLE "a""b" (id serial, v int);
+    INSERT INTO "a""b" (v) VALUES (5);
+    SELECT id, v FROM "a""b";
+}
+expect {
+    1|5
+}
+
+test table-sequence-whose-name-has-double-quotes {
+    CREATE SEQUENCE """s""";
+    SELECT sequencename FROM pg_sequences;
+}
+expect {
+    "s"
+}
+
 test drop-materialized-view-on-a-view-errors {
     CREATE TABLE t (a int);
     CREATE VIEW v AS SELECT * FROM t;
