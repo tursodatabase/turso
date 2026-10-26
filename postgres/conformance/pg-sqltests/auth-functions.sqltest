@@ -1,5 +1,4 @@
 # The functions auth.uid(), auth.email() and auth.jwt().
-# tursopg has them only when it is built with the test_helper feature.
 
 @database :memory:
 
@@ -367,6 +366,16 @@ expect {
 }
 
 @setup auth_functions
+test auth-jwt-prints-numbers-as-jsonb {
+    SELECT set_config('request.jwt.claims', '[-0, -0.0, 0e-5, 1.5e-3, 1.2345e2, -1e-5, 10e-1, 1E+2, 0.0001e4]', false);
+    SELECT auth.jwt();
+}
+expect {
+    [-0, -0.0, 0e-5, 1.5e-3, 1.2345e2, -1e-5, 10e-1, 1E+2, 0.0001e4]
+    [0, 0.0, 0.00000, 0.0015, 123.45, -0.00001, 1.0, 100, 1]
+}
+
+@setup auth_functions
 test auth-email-uses-the-last-of-two-claims-with-the-same-name {
     SELECT set_config('request.jwt.claims', '{"email": "first@example.com", "email": "last@example.com"}', false);
     SELECT auth.email();
@@ -384,6 +393,16 @@ test auth-email-decodes-escapes {
 expect {
     {"email": "caf\u00e9 \"q\" \/"}
     café "q" /
+}
+
+@setup auth_functions
+test auth-email-decodes-a-surrogate-pair {
+    SELECT set_config('request.jwt.claims', '{"email": "\ud83d\ude00@example.com"}', false);
+    SELECT auth.email();
+}
+expect {
+    {"email": "\ud83d\ude00@example.com"}
+    😀@example.com
 }
 
 @setup auth_functions
@@ -489,6 +508,24 @@ expect error {
 }
 
 @setup auth_functions
+test auth-email-of-claims-with-a-nul-escape-before-a-syntax-error-reports-the-escape {
+    SELECT set_config('request.jwt.claims', '{"a": "\u0000", "email": }', false);
+    SELECT auth.email();
+}
+expect error {
+    unsupported Unicode escape sequence
+}
+
+@setup auth_functions
+test auth-email-of-claims-with-a-lone-surrogate-errors {
+    SELECT set_config('request.jwt.claims', '{"email": "\ud800@example.com"}', false);
+    SELECT auth.email();
+}
+expect error {
+    invalid input syntax for type json
+}
+
+@setup auth_functions
 test auth-email-of-claims-with-a-number-outside-the-range-of-a-double {
     SELECT set_config('request.jwt.claims', '{"n": 1e400, "email": "user@example.com"}', false);
     SELECT auth.email();
@@ -499,6 +536,52 @@ expect {
 }
 
 @setup auth_functions
+test auth-functions-of-claims-with-numbers-at-the-limits-of-numeric {
+    SELECT set_config('request.jwt.claims', '{"a": 1e131071, "b": 1e-16383, "email": "user@example.com"}', false);
+    SELECT auth.email(), length(auth.jwt()::text);
+}
+expect {
+    {"a": 1e131071, "b": 1e-16383, "email": "user@example.com"}
+    user@example.com|147500
+}
+
+@setup auth_functions
+test auth-email-of-claims-with-a-number-too-large-for-numeric-errors {
+    SELECT set_config('request.jwt.claims', '{"n": 1e131072, "email": "user@example.com"}', false);
+    SELECT auth.email();
+}
+expect error {
+    value overflows numeric format
+}
+
+@setup auth_functions
+test auth-email-of-claims-with-a-number-too-small-for-numeric-errors {
+    SELECT set_config('request.jwt.claims', '{"n": 1e-16384, "email": "user@example.com"}', false);
+    SELECT auth.email();
+}
+expect error {
+    value overflows numeric format
+}
+
+@setup auth_functions
+test auth-email-of-claims-with-an-exponent-too-large-for-numeric-errors {
+    SELECT set_config('request.jwt.claims', '{"n": 0e1073741824, "email": "user@example.com"}', false);
+    SELECT auth.email();
+}
+expect error {
+    value overflows numeric format
+}
+
+@setup auth_functions
+test auth-email-checks-the-token-after-a-number-before-the-size-of-the-number {
+    SELECT set_config('request.jwt.claims', '{"n": 1e131072 "\u0000", "email": "user@example.com"}', false);
+    SELECT auth.email();
+}
+expect error {
+    unsupported Unicode escape sequence
+}
+
+@setup auth_functions
 test auth-email-of-claims-nested-200-levels-deep {
     SELECT set_config('request.jwt.claims', '{"x": {{repeat:200:[}}{{repeat:200:]}}, "email": "user@example.com"}', false);
     SELECT auth.email();
@@ -506,6 +589,16 @@ test auth-email-of-claims-nested-200-levels-deep {
 expect {
     {"x": {{repeat:200:[}}{{repeat:200:]}}, "email": "user@example.com"}
     user@example.com
+}
+
+@setup auth_functions
+test auth-functions-of-claims-nested-5000-levels-deep {
+    SELECT length(set_config('request.jwt.claims', '{"x": {{repeat:5000:[}}{{repeat:5000:]}}, "email": "user@example.com"}', false));
+    SELECT auth.email(), length(auth.jwt()::text);
+}
+expect {
+    10036
+    user@example.com|10036
 }
 
 @setup auth_functions
@@ -664,13 +757,22 @@ expect error {
     auth\.uid
 }
 
-@skip-if postgres "PostgreSQL prints a jsonb value with its own key order and spacing"
 @setup auth_functions
-test auth-jwt-returns-the-claims-as-they-were-set {
-    SELECT set_config('request.jwt.claims', '{"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"user@example.com"}', false);
+test auth-jwt-prints-the-claims-as-jsonb {
+    SELECT set_config('request.jwt.claims', '{"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"user@example.com","aud":"authenticated","n":1.50,"n":1e2}', false);
     SELECT auth.jwt();
 }
 expect {
-    {"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"user@example.com"}
-    {"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"user@example.com"}
+    {"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"user@example.com","aud":"authenticated","n":1.50,"n":1e2}
+    {"n": 100, "aud": "authenticated", "sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "email": "user@example.com"}
+}
+
+@setup auth_functions
+test auth-jwt-prints-escapes-as-jsonb {
+    SELECT set_config('request.jwt.claims', '{"a": "x\ny\u0001\"\/\u00e9\t"}', false);
+    SELECT auth.jwt();
+}
+expect {
+    {"a": "x\ny\u0001\"\/\u00e9\t"}
+    {"a": "x\ny\u0001\"/é\t"}
 }

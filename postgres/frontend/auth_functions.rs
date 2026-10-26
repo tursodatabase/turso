@@ -6,11 +6,17 @@ use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, OpenOptions, Register, Result, Value,
 };
 
+use crate::jsonb::Jsonb;
+
 pub(crate) fn register_functions(mut options: OpenOptions) -> OpenOptions {
-    for function in [AuthFunction::Uid, AuthFunction::Email, AuthFunction::Jwt] {
+    for (name, function) in [
+        ("auth.uid", AuthFunction::Uid),
+        ("auth.email", AuthFunction::Email),
+        ("auth.jwt", AuthFunction::Jwt),
+    ] {
         options = options.extension_function(
             ExternalFunc::new_native_scalar(
-                function.name().to_string(),
+                name.to_string(),
                 FunctionArity::Exact(0),
                 false,
                 function,
@@ -26,16 +32,6 @@ enum AuthFunction {
     Uid,
     Email,
     Jwt,
-}
-
-impl AuthFunction {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Uid => "auth.uid",
-            Self::Email => "auth.email",
-            Self::Jwt => "auth.jwt",
-        }
-    }
 }
 
 impl ScalarFunction for AuthFunction {
@@ -66,11 +62,7 @@ fn claim(conn: &Connection, setting_name: &str, claim_name: &str) -> Result<Opti
     let Some(claims) = setting(conn, "request.jwt.claims") else {
         return Ok(None);
     };
-    Ok(match parse_claims(&claims)?.get(claim_name) {
-        None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(value)) => Some(value.clone()),
-        Some(value) => Some(value.to_string()),
-    })
+    Ok(Jsonb::parse(&claims)?.object_field_text(claim_name))
 }
 
 fn canonical_uuid(text: &str) -> Result<String> {
@@ -87,35 +79,9 @@ fn jwt(conn: &Connection) -> Result<Option<String>> {
     else {
         return Ok(None);
     };
-    parse_claims(&claims)?;
-    Ok(Some(claims))
+    Ok(Some(Jsonb::parse(&claims)?.text()))
 }
 
 fn setting(conn: &Connection, name: &str) -> Option<String> {
     crate::session::custom_parameter(conn, name).filter(|value| !value.is_empty())
-}
-
-fn parse_claims(claims: &str) -> Result<serde_json::Value> {
-    let claims = serde_json::from_str(claims).map_err(|_| {
-        LimboError::InvalidArgument("invalid input syntax for type json".to_string())
-    })?;
-    if has_nul_character(&claims) {
-        return Err(LimboError::InvalidArgument(
-            "unsupported Unicode escape sequence".to_string(),
-        ));
-    }
-    Ok(claims)
-}
-
-fn has_nul_character(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::String(text) => text.contains('\0'),
-        serde_json::Value::Array(items) => items.iter().any(has_nul_character),
-        serde_json::Value::Object(members) => members
-            .iter()
-            .any(|(name, value)| name.contains('\0') || has_nul_character(value)),
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            false
-        }
-    }
 }
