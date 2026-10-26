@@ -7,6 +7,7 @@
 
 use turso_parser::ast;
 
+use super::custom_type_operators::find_arithmetic_call;
 use super::get_expr_affinity;
 use crate::function::{AggFunc, Func, ScalarFunc};
 use crate::schema::{Column, Schema, TypeDef};
@@ -105,8 +106,16 @@ impl<'a> TypeEnv<'a> {
         Self { tables, resolver }
     }
 
-    fn schema(&self) -> &Schema {
+    pub(crate) fn schema(&self) -> &Schema {
         self.resolver.schema()
+    }
+
+    pub(crate) fn resolver(&self) -> &Resolver<'a> {
+        self.resolver
+    }
+
+    pub(crate) fn tables(&self) -> Option<&'a TableReferences> {
+        self.tables
     }
 }
 
@@ -143,11 +152,6 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             ast::UnaryOperator::Positive => type_of(inner, env),
         },
         ast::Expr::Binary(lhs, op, rhs) => binary_type(lhs, op, rhs, expr, env),
-        ast::Expr::TypedCall { result, .. } => match result {
-            Some(result) => call_result_type(result, env.schema()),
-            None => ExprType::Unknown,
-        },
-        ast::Expr::Convert { to, .. } => cast_type(to, env.schema()),
         ast::Expr::Case {
             when_then_pairs,
             else_expr,
@@ -177,6 +181,11 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
 /// `type_of` is enough and this goes away.
 pub(crate) fn column_custom_type(expr: &ast::Expr, env: &TypeEnv) -> Option<ColumnCustomType> {
     match expr {
+        // These emit their operand's value unchanged.
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => column_custom_type(&exprs[0], env),
+        ast::Expr::Collate(inner, _) | ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
+            column_custom_type(inner, env)
+        }
         ast::Expr::Column { table, column, .. } => {
             match column_reference_type(*table, *column, env)? {
                 ExprType::Custom { type_def, params } => {
@@ -368,10 +377,7 @@ fn binary_type(
         | Operator::Subtract
         | Operator::Multiply
         | Operator::Divide
-        | Operator::Modulus => arithmetic_type(
-            &sqlite_operand_type(type_of(lhs, env), env.schema()),
-            &sqlite_operand_type(type_of(rhs, env), env.schema()),
-        ),
+        | Operator::Modulus => arithmetic_result_type(lhs, op, rhs, env),
         Operator::BitwiseAnd
         | Operator::BitwiseOr
         | Operator::BitwiseNot
@@ -405,11 +411,34 @@ fn binary_type(
     }
 }
 
-/// The type an operand has for SQLite's own arithmetic. Arithmetic that a custom
-/// type has a function for is a `TypedCall` by now, so a custom value here goes to
-/// SQLite's operator as a value of the type it is stored as: `smallint * 2` is an
-/// integer.
-fn sqlite_operand_type(ty: ExprType, schema: &Schema) -> ExprType {
+/// The type of `lhs op rhs`: what the custom type's function returns, if one
+/// runs it, or else what SQLite's operator returns. An operator that does not
+/// exist, such as `date * 2`, has no type: emitting it fails.
+fn arithmetic_result_type(
+    lhs: &ast::Expr,
+    op: &ast::Operator,
+    rhs: &ast::Expr,
+    env: &TypeEnv,
+) -> ExprType {
+    let lhs_type = type_of(lhs, env);
+    let rhs_type = type_of(rhs, env);
+    match find_arithmetic_call(lhs, op, rhs, [&lhs_type, &rhs_type], env) {
+        Ok(Some(call)) => match &call.result {
+            Some(result) => call_result_type(result, env.schema()),
+            None => ExprType::Unknown,
+        },
+        Ok(None) => arithmetic_type(
+            &sqlite_operand_type(lhs_type, env.schema()),
+            &sqlite_operand_type(rhs_type, env.schema()),
+        ),
+        Err(_) => ExprType::Unknown,
+    }
+}
+
+/// The type an operand has for SQLite's own arithmetic. A custom value that no
+/// function of its type runs goes to SQLite's operator as a value of the type it
+/// is stored as: `smallint * 2` is an integer.
+pub(super) fn sqlite_operand_type(ty: ExprType, schema: &Schema) -> ExprType {
     match &ty {
         ExprType::Custom { type_def, .. } => stored_type(type_def, schema),
         _ => ty,
@@ -684,8 +713,8 @@ mod tests {
             ("1 + 2.5", builtin(BuiltinType::Real)),
             ("1 + 'a'", builtin(BuiltinType::Numeric)),
             ("-CAST(1 AS REAL)", builtin(BuiltinType::Real)),
-            // cents declares no `+`, so SQLite's operator runs on its stored value.
-            ("CAST(1 AS cents) + 1", builtin(BuiltinType::Integer)),
+            // cents declares no `+`, so the statement fails with "operator does not exist".
+            ("CAST(1 AS cents) + 1", ExprType::Unknown),
             ("abs(CAST(1 AS cents))", builtin(BuiltinType::Integer)),
             ("1 || 2", builtin(BuiltinType::Text)),
         ]);

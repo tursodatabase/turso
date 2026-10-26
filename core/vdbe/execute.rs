@@ -85,8 +85,8 @@ use crate::{
     function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
         datetime::{
-            exec_date, exec_date_minus, exec_date_plus, exec_datetime_full, exec_julianday,
-            exec_strftime, exec_time, exec_unixepoch,
+            exec_date, exec_date_diff, exec_date_minus, exec_date_plus, exec_datetime_full,
+            exec_julianday, exec_strftime, exec_time, exec_unixepoch,
         },
         printf::exec_printf,
     },
@@ -11682,7 +11682,7 @@ pub fn op_function(
                     }
                 };
             }
-            ScalarFunc::DatePlus | ScalarFunc::DateMinus => {
+            ScalarFunc::DatePlus | ScalarFunc::DateMinus | ScalarFunc::DateDiff => {
                 check_arg_count!(arg_count, 2);
                 let lhs = state.registers[*start_reg].get_value();
                 let rhs = state.registers[*start_reg + 1].get_value();
@@ -11690,6 +11690,7 @@ pub fn op_function(
                 let result = match scalar_func {
                     ScalarFunc::DatePlus => exec_date_plus(&clock, lhs, rhs)?,
                     ScalarFunc::DateMinus => exec_date_minus(&clock, lhs, rhs)?,
+                    ScalarFunc::DateDiff => exec_date_diff(&clock, lhs, rhs)?,
                     _ => unreachable!(),
                 };
                 state.registers[*dest].set_value(result);

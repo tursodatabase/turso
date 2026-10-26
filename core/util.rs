@@ -1000,33 +1000,6 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                 column: col_2,
             },
         ) => tbl_1 == tbl_2 && col_1 == col_2 && db1 == db2 && r1 == r2,
-        // Arguments are compared in order: a type's function need not be commutative.
-        (
-            Expr::TypedCall {
-                operator: op1,
-                func: func1,
-                args: args1,
-                result: result1,
-            },
-            Expr::TypedCall {
-                operator: op2,
-                func: func2,
-                args: args2,
-                result: result2,
-            },
-        ) => {
-            op1 == op2
-                && func1 == func2
-                && result1 == result2
-                && args1.len() == args2.len()
-                && args1
-                    .iter()
-                    .zip(args2)
-                    .all(|(a1, a2)| exprs_are_equivalent(a1, a2))
-        }
-        (Expr::Convert { expr: e1, to: to1 }, Expr::Convert { expr: e2, to: to2 }) => {
-            to1 == to2 && exprs_are_equivalent(e1, e2)
-        }
         // fall back to naive equality check
         _ => expr1 == expr2,
     }

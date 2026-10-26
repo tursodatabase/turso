@@ -160,17 +160,6 @@ fn translate_expr_by_kind(
         ast::Expr::Binary(..) => {
             translate_binary_expr(program, referenced_tables, expr, target_register, resolver)
         }
-        ast::Expr::TypedCall { .. } => {
-            translate_typed_call_expr(program, referenced_tables, expr, target_register, resolver)
-        }
-        ast::Expr::Convert { expr, to } => emit_convert(
-            program,
-            referenced_tables,
-            expr,
-            to,
-            target_register,
-            resolver,
-        ),
         ast::Expr::Case { .. } => {
             translate_case_expr(program, referenced_tables, expr, target_register, resolver)
         }
@@ -571,18 +560,18 @@ fn translate_binary_expr(
         }
     }
 
-    if try_translate_custom_comparison(
-        program,
-        referenced_tables,
-        e1,
-        op,
-        e2,
-        target_register,
-        resolver,
-    )? {
+    if let Some(result_reg) =
+        emit_custom_type_operator(program, referenced_tables, e1, op, e2, resolver)?
+    {
+        if result_reg != target_register {
+            program.emit_insn(Insn::Copy {
+                src_reg: result_reg,
+                dst_reg: target_register,
+                extra_amount: 0,
+            });
+        }
         return Ok(target_register);
     }
-    assert_custom_type_arithmetic_resolved(e1, op, e2, referenced_tables, resolver)?;
 
     binary_expr_shared(
         program,
@@ -618,53 +607,6 @@ fn translate_truth_test_expr(
         invert: is_not == is_true_literal,
     });
     Ok(target_register)
-}
-
-/// Translates a comparison with the function of a custom type, if either
-/// operand has a custom type that defines one. Returns false otherwise.
-#[inline(never)]
-fn try_translate_custom_comparison(
-    program: &mut ProgramBuilder,
-    referenced_tables: Option<&TableReferences>,
-    e1: &ast::Expr,
-    op: &ast::Operator,
-    e2: &ast::Expr,
-    target_register: usize,
-    resolver: &Resolver,
-) -> Result<bool> {
-    let Some(resolved) = find_custom_comparison(e1, e2, op, referenced_tables, resolver) else {
-        return Ok(false);
-    };
-    let result_reg =
-        emit_custom_comparison(program, referenced_tables, e1, e2, &resolved, resolver)?;
-    copy_to_target(program, result_reg, target_register);
-    Ok(true)
-}
-
-#[inline(never)]
-fn translate_typed_call_expr(
-    program: &mut ProgramBuilder,
-    referenced_tables: Option<&TableReferences>,
-    expr: &ast::Expr,
-    target_register: usize,
-    resolver: &Resolver,
-) -> Result<usize> {
-    let ast::Expr::TypedCall { func, args, .. } = expr else {
-        unreachable!("translate_typed_call_expr expects Expr::TypedCall");
-    };
-    let result_reg = emit_typed_call(program, referenced_tables, func, args, resolver)?;
-    copy_to_target(program, result_reg, target_register);
-    Ok(target_register)
-}
-
-fn copy_to_target(program: &mut ProgramBuilder, result_reg: usize, target_register: usize) {
-    if result_reg != target_register {
-        program.emit_insn(Insn::Copy {
-            src_reg: result_reg,
-            dst_reg: target_register,
-            extra_amount: 0,
-        });
-    }
 }
 
 #[inline(never)]
@@ -1951,7 +1893,8 @@ fn translate_function_call_expr(
                 | ScalarFunc::NumericLt
                 | ScalarFunc::NumericEq
                 | ScalarFunc::DatePlus
-                | ScalarFunc::DateMinus => translate_function(
+                | ScalarFunc::DateMinus
+                | ScalarFunc::DateDiff => translate_function(
                     program,
                     args,
                     referenced_tables,

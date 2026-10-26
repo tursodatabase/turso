@@ -35,8 +35,7 @@ use crate::{
         },
         expr::{
             emit_returning_results, emit_table_column, expr_type::column_custom_type_names,
-            resolve_custom_type_operators, translate_expr, translate_expr_no_constant_opt,
-            walk_expr_mut, NoConstantOptReason,
+            translate_expr, translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
         },
         insert::Insertion,
         plan::{ResultSetColumn, TableReferences},
@@ -681,7 +680,6 @@ pub fn emit_upsert(
             decoded_column_types.as_deref(),
             &layout,
         )?;
-        resolve_custom_type_operators(pred, None, resolver)?;
         let pr = program.alloc_register();
         translate_expr(program, None, pred, pr, resolver)?;
         program.emit_insn(Insn::IfNot {
@@ -707,7 +705,6 @@ pub fn emit_upsert(
             decoded_column_types.as_deref(),
             &layout,
         )?;
-        resolve_custom_type_operators(expr, None, resolver)?;
         if *col_idx == ROWID_SENTINEL {
             let r = program.alloc_register();
             translate_expr_no_constant_opt(
@@ -1181,10 +1178,10 @@ pub fn emit_upsert(
                 ctx.conflict_rowid_reg,
                 resolver,
                 &layout,
-            );
+            )?;
             let new_pred_reg = eval_partial_pred_for_row_image(
                 program, table, &idx_meta, new_start, new_rowid, resolver, &layout,
-            );
+            )?;
 
             // Skip key computation and probe if NEW predicate false/NULL:
             // a key that fails the partial-index predicate is never inserted,
@@ -1775,13 +1772,13 @@ fn eval_partial_pred_for_row_image(
     rowid_reg: usize, // rowid for that image
     resolver: &Resolver,
     layout: &ColumnLayout,
-) -> Option<usize> {
+) -> crate::Result<Option<usize>> {
     let Some(where_expr) = &idx.where_clause else {
-        return None;
+        return Ok(None);
     };
     let expr = where_expr.as_ref().clone();
     let columns = table.columns();
-    let bt = table.require_btree().ok()?;
+    let bt = table.require_btree()?;
 
     let mut column_regs: Vec<usize> = columns
         .iter()
@@ -1804,10 +1801,8 @@ fn eval_partial_pred_for_row_image(
         &mut column_regs,
         &bt,
         r,
-        true,
-    )
-    .ok()?;
-    Some(r)
+    )?;
+    Ok(Some(r))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1845,7 +1840,6 @@ fn emit_upsert_expr_index_value(
         &mut column_regs,
         &bt,
         dest_reg,
-        idx_col.pos_in_table == EXPR_INDEX_SENTINEL,
     )?;
     Ok(())
 }

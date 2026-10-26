@@ -504,27 +504,11 @@ fn translate_leaf_condition_expr(
             }
         }
         ast::Expr::Binary(e1, op, e2) => {
-            // Check if either operand has a custom type with a matching operator
-            if let Some(resolved) =
-                find_custom_comparison(e1, e2, op, Some(referenced_tables), resolver)
+            if let Some(result_reg) =
+                emit_custom_type_operator(program, Some(referenced_tables), e1, op, e2, resolver)?
             {
-                let result_reg = emit_custom_comparison(
-                    program,
-                    Some(referenced_tables),
-                    e1,
-                    e2,
-                    &resolved,
-                    resolver,
-                )?;
                 emit_cond_jump(program, condition_metadata, result_reg);
             } else {
-                assert_custom_type_arithmetic_resolved(
-                    e1,
-                    op,
-                    e2,
-                    Some(referenced_tables),
-                    resolver,
-                )?;
                 let result_reg = program.alloc_register();
                 binary_expr_shared(
                     program,
@@ -538,13 +522,7 @@ fn translate_leaf_condition_expr(
                 )?;
             }
         }
-        ast::Expr::TypedCall { func, args, .. } => {
-            let result_reg =
-                emit_typed_call(program, Some(referenced_tables), func, args, resolver)?;
-            emit_cond_jump(program, condition_metadata, result_reg);
-        }
         ast::Expr::Literal(_)
-        | ast::Expr::Convert { .. }
         | ast::Expr::Cast { .. }
         | ast::Expr::FunctionCall { .. }
         | ast::Expr::MergedColumn(_)

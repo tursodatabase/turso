@@ -25,7 +25,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             }
             1
         }
-        Expr::Register { .. } | Expr::TypedCall { .. } | Expr::Convert { .. } => 1,
+        Expr::Register { .. } => 1,
         Expr::Case {
             base,
             when_then_pairs,

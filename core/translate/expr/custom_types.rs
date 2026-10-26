@@ -191,8 +191,7 @@ pub(super) struct ResolvedOperator {
 /// its type.
 ///
 /// Comparisons are decided here, while emitting, because index seeks look for a
-/// plain comparison in the tree. Arithmetic is decided before emission, see
-/// `custom_type_operators.rs`.
+/// plain comparison in the tree. Arithmetic is decided by `custom_arithmetic_call`.
 pub(super) fn find_custom_comparison(
     e1: &ast::Expr,
     e2: &ast::Expr,
@@ -205,8 +204,8 @@ pub(super) fn find_custom_comparison(
     }
     let op_str = operator_to_str(op)?;
     let env = TypeEnv::new(referenced_tables, resolver);
-    let lhs_info = operand_custom_type(e1, &env, resolver);
-    let rhs_info = operand_custom_type(e2, &env, resolver);
+    let lhs_info = column_custom_type(e1, &env);
+    let rhs_info = column_custom_type(e2, &env);
 
     // Try to find a direct or derived operator match on a type definition.
     let find_in_type_def = |type_def: &TypeDef| -> Option<(String, bool, bool)> {
@@ -286,19 +285,39 @@ pub(super) fn find_custom_comparison(
     }
 }
 
-/// The custom type whose operators apply to an operand. Generated column
-/// expressions use the standard operators, see `SelfTableContext::ForDML`.
-pub(super) fn operand_custom_type(
-    expr: &ast::Expr,
+/// Whether a custom type's function runs `lhs op rhs`. An operator that does not
+/// exist, such as `date * 2`, counts too: emitting it fails.
+pub(crate) fn runs_custom_type_function(
+    lhs: &ast::Expr,
+    op: &ast::Operator,
+    rhs: &ast::Expr,
     env: &TypeEnv,
+) -> bool {
+    find_custom_comparison(lhs, rhs, op, env.tables(), env.resolver()).is_some()
+        || !matches!(custom_arithmetic_call(lhs, op, rhs, env), Ok(None))
+}
+
+/// Emits `lhs op rhs` with a custom type's function, if one runs it, and returns
+/// the register holding the result. `None` means SQLite's operator runs.
+pub(super) fn emit_custom_type_operator(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    lhs: &ast::Expr,
+    op: &ast::Operator,
+    rhs: &ast::Expr,
     resolver: &Resolver,
-) -> Option<ColumnCustomType> {
-    if let ast::Expr::Column { table, .. } = expr {
-        if table.is_self_table() && resolver.self_table_with_custom_type_operators().is_none() {
-            return None;
-        }
+) -> Result<Option<usize>> {
+    if let Some(comparison) = find_custom_comparison(lhs, rhs, op, referenced_tables, resolver) {
+        let result_reg =
+            emit_custom_comparison(program, referenced_tables, lhs, rhs, &comparison, resolver)?;
+        return Ok(Some(result_reg));
     }
-    column_custom_type(expr, env)
+    let env = TypeEnv::new(referenced_tables, resolver);
+    let Some(call) = custom_arithmetic_call(lhs, op, rhs, &env)? else {
+        return Ok(None);
+    };
+    let result_reg = emit_arithmetic_call(program, referenced_tables, lhs, rhs, &call, resolver)?;
+    Ok(Some(result_reg))
 }
 
 /// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).
@@ -313,9 +332,6 @@ pub(super) fn operand_custom_type(
 ///
 /// The expression is resolved via `resolve_gencol_expr_columns` and custom-type
 /// columns are decoded in-place in `column_regs`.
-///
-/// `uses_custom_type_operators` must be false when `expr` is the expression of a
-/// virtual generated column, see `SelfTableContext::ForDML`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_dml_expr_index_value(
     program: &mut ProgramBuilder,
@@ -325,7 +341,6 @@ pub(crate) fn emit_dml_expr_index_value(
     column_regs: &mut [usize],
     table: &Arc<BTreeTable>,
     dest_reg: usize,
-    uses_custom_type_operators: bool,
 ) -> Result<()> {
     crate::schema::resolve_gencol_expr_columns(&mut expr, columns)?;
 
@@ -348,10 +363,8 @@ pub(crate) fn emit_dml_expr_index_value(
     let ctx = SelfTableContext::ForDML {
         dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs),
         table: Arc::clone(table),
-        uses_custom_type_operators,
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {
-        resolve_custom_type_operators(&mut expr, None, resolver)?;
         translate_expr(program, None, &expr, dest_reg, resolver)?;
         Ok(())
     })?;

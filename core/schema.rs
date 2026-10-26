@@ -275,18 +275,25 @@ pub enum ArithmeticArg {
     /// A value SQLite can compute with: anything without a custom type, or a
     /// value of a type whose own arithmetic is SQLite's operator.
     PlainValue,
+    /// A `PlainValue` that is an integer, or whose type is not known before the
+    /// statement runs, such as a parameter. The function rejects anything else.
+    Integer,
 }
 
 const ARITHMETIC_OPERATORS: [&str; 5] = ["+", "-", "*", "/", "%"];
 
 /// `CREATE TYPE ... OPERATOR '+' f` runs f for two values of the type, or for a
-/// value of the type and a literal its ENCODE accepts.
+/// value of the type and a literal its ENCODE accepts. `OPERATOR '+'` without a
+/// function runs SQLite's operator on the stored value.
 fn declared_arithmetic(operators: &[TypeOperator]) -> std::vec::Vec<ArithmeticSignature> {
     use ArithmeticArg::{Column, EncodableLiteral};
     let mut signatures = std::vec::Vec::new();
     for op in ARITHMETIC_OPERATORS {
-        let declared = operators.iter().find(|o| o.op == op);
-        let Some(func) = declared.and_then(|o| o.func_name.as_ref()) else {
+        let Some(declared) = operators.iter().find(|o| o.op == op) else {
+            continue;
+        };
+        let Some(func) = &declared.func_name else {
+            signatures.extend(sqlite_arithmetic(op));
             continue;
         };
         for args in [
@@ -310,15 +317,16 @@ fn declared_arithmetic(operators: &[TypeOperator]) -> std::vec::Vec<ArithmeticSi
 /// - `numeric op x` and `x op numeric` for `+ - * /` compute exactly, and the
 ///   result is a numeric. Encoding a literal to the column's type would round it
 ///   to the column's scale first (`n * 0.005` would be `n * 0.01`).
-/// - `date + x`, `x + date` and `date - x` add or subtract a whole number of days
-///   and give a date; `date - date` gives the number of days between them, and
-///   so does `x - date` when `x` is a date string. The function rejects anything
-///   else, so `d + 1.5` is an error, not SQLite's `+`.
+/// - `date + integer`, `integer + date` and `date - integer` add or subtract
+///   days and give a date. `date - date` gives the number of days between them;
+///   a text literal on either side is encoded to a date first. Each signature
+///   has its own function, so its result type is known before the statement
+///   runs.
 /// - `smallint` and `bigint` store plain integers, so SQLite's operators run.
 ///
 /// Other built-in types have no arithmetic.
 fn builtin_arithmetic(type_name: &str) -> std::vec::Vec<ArithmeticSignature> {
-    use ArithmeticArg::{PlainValue, Value};
+    use ArithmeticArg::{EncodableLiteral, Integer, PlainValue, Value};
     let call = |op, args, func: &str, result| ArithmeticSignature {
         op,
         args,
@@ -339,34 +347,30 @@ fn builtin_arithmetic(type_name: &str) -> std::vec::Vec<ArithmeticSignature> {
         })
         .collect(),
         "date" => vec![
-            call("+", [Value, PlainValue], "date_plus", Some("date")),
-            call("+", [PlainValue, Value], "date_plus", Some("date")),
-            call("-", [Value, Value], "date_minus", Some("integer")),
-            // A date or a number of days: the function decides which.
-            call("-", [Value, PlainValue], "date_minus", None),
-            call("-", [PlainValue, Value], "date_minus", None),
-        ]
-        .into_iter()
-        .collect(),
-        "smallint" | "bigint" => sqlite_arithmetic(),
+            call("+", [Value, Integer], "date_plus", Some("date")),
+            call("+", [Integer, Value], "date_plus", Some("date")),
+            call("-", [Value, Value], "date_diff", Some("integer")),
+            call("-", [Value, EncodableLiteral], "date_diff", Some("integer")),
+            call("-", [EncodableLiteral, Value], "date_diff", Some("integer")),
+            call("-", [Value, Integer], "date_minus", Some("date")),
+        ],
+        "smallint" | "bigint" => ARITHMETIC_OPERATORS
+            .into_iter()
+            .flat_map(sqlite_arithmetic)
+            .collect(),
         _ => std::vec::Vec::new(),
     }
 }
 
-/// SQLite's operators, for every arithmetic operator.
-fn sqlite_arithmetic() -> std::vec::Vec<ArithmeticSignature> {
+/// SQLite's operator `op` on a value of the type and a plain value.
+fn sqlite_arithmetic(op: &'static str) -> [ArithmeticSignature; 2] {
     use ArithmeticArg::{PlainValue, Value};
-    ARITHMETIC_OPERATORS
-        .into_iter()
-        .flat_map(|op| {
-            [[Value, PlainValue], [PlainValue, Value]].map(|args| ArithmeticSignature {
-                op,
-                args,
-                func: None,
-                result: None,
-            })
-        })
-        .collect()
+    [[Value, PlainValue], [PlainValue, Value]].map(|args| ArithmeticSignature {
+        op,
+        args,
+        func: None,
+        result: None,
+    })
 }
 
 /// Custom type definition, loaded from sqlite_turso_types

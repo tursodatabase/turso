@@ -109,18 +109,20 @@ OPERATOR 'op' function-name
 | Component | Description |
 |-----------|-------------|
 | `'op'` | The operator symbol as a string literal: `'+'`, `'-'`, `'*'`, `'/'`, `'<'`, `'='`, etc. |
-| `function-name` | The name of a SQL function to call when this operator is used. Omit to use the base type's native comparison. |
+| `function-name` | The name of a SQL function to call when this operator is used. Omit to use SQLite's own operator on the stored value. |
 
-When an operator is defined, expressions like `column + 1` are rewritten into `function_name(column, 1)`.
+When an operator is defined, an expression like `column + 1` runs `function_name(column, 1)`. This holds everywhere an expression can appear, including generated columns and index expressions.
 
 #### Which arithmetic operator runs
 
 For `+`, `-`, `*`, `/` and `%`, the operator is chosen once, when the statement is compiled:
 
 - `OPERATOR '+' f` runs `f` when both operands are columns of the type, or when one is a column of the type and the other is a literal its ENCODE accepts. The literal is encoded first.
+- `OPERATOR '+'` without a function runs SQLite's `+` on the stored value.
 - If either operand has a custom type and no operator fits, the statement fails with `operator does not exist`. Turso does not fall back to SQLite's `+`.
 - If neither operand has a custom type, or one is the literal `NULL`, SQLite's operator runs.
 - A domain uses the operators of its base type.
+- The function must be deterministic. `OPERATOR '+' random_fn` fails with `operator + on type t must be deterministic` when a statement uses the operator.
 - A column of a subquery, view or CTE does not keep the custom type of the value it selects yet, so SQLite's operator runs on it. In `SELECT x * 2 FROM (SELECT d AS x FROM t)`, `x` is treated as plain text.
 
 ```sql
@@ -130,7 +132,7 @@ SELECT c + 1 FROM t;
 -- Parse error: operator does not exist: cents + integer
 ```
 
-The result of a type's operator function has no known type, so it can't be the operand of another custom operator: `(a + b) + c` fails with `operator does not exist: value + uint`.
+The result of a type's operator function has no known type, so it can't be the operand of another custom operator: `(a + b) + c` fails with `operator does not exist: value + uint`. The built-in `date` operators do give a typed result, so `(d - 5) + 1` is a date.
 
 #### Ordering with OPERATOR '<'
 
@@ -284,11 +286,11 @@ Turso provides the following built-in custom types in STRICT tables:
 | `smallint` | integer | -- | Integer constrained to -32768 through 32767. Aliases: `int2`. |
 | `bigint` | integer | -- | Integer (no range constraint). Aliases: `int8`. |
 | `varchar(N)` | text | `maxlen` | Text with a maximum length of N characters. |
-| `date` | text | -- | ISO 8601 date (YYYY-MM-DD), validated on insert. `date + n`, `n + date` and `date - n` add or subtract whole days and give a date; `date - date` gives the number of days between them. |
+| `date` | text | -- | ISO 8601 date (YYYY-MM-DD), validated on insert. `date + n`, `n + date` and `date - n` add or subtract whole days and give a date; `date - date` gives the number of days between them. In `date - x`, a value `x` of unknown type, such as a parameter, is taken as a number of days, and anything other than an integer fails when the statement runs. `x - date` fails with `operator does not exist`; cast `x` to `date` first. |
 | `time` | text | -- | ISO 8601 time (HH:MM:SS), validated on insert. |
 | `timestamp` | text | -- | ISO 8601 datetime, validated on insert. |
 | `timestamptz` | text | -- | ISO 8601 datetime with the same validation and normalization as `timestamp`. PostgreSQL-compatible name; the stored text carries no offset. |
-| `numeric(P,S)` | blob | `precision`, `scale` | Fixed-point decimal with P total digits and S decimal places. `+ - * /` with another numeric, an integer, a real or a numeric literal compute exactly (`n * 0.005` is not rounded to S places first) and give a numeric. |
+| `numeric(P,S)` | blob | `precision`, `scale` | Fixed-point decimal with P total digits and S decimal places. `+ - * /` with another numeric, an integer, a real or a numeric literal compute exactly (`n * 0.005` is not rounded to S places first) and give a numeric. `%` is not defined for numeric. |
 | `uuid` | blob | -- | UUID stored as 16-byte blob, displayed as string. Default: `uuid4_str()`. |
 | `inet` | text | -- | Validated IP address (IPv4 or IPv6). |
 | `cidr` | text | -- | Network address in CIDR notation. Stored as given; no validation yet. |

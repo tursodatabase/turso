@@ -118,10 +118,6 @@ pub enum SelfTableContext {
     ForDML {
         dml_ctx: DmlColumnContext,
         table: Arc<BTreeTable>,
-        /// False for generated column expressions: they use the standard operators on
-        /// custom-type columns, and indexes on virtual generated columns already store
-        /// keys computed that way.
-        uses_custom_type_operators: bool,
     },
 }
 

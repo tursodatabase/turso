@@ -622,29 +622,6 @@ pub enum Expr {
         /// The type of subquery.
         query_type: SubqueryType,
     },
-    /// An operator on a custom type, after the compiler chose the function that
-    /// runs it. Not SQL syntax: written by the compiler's type resolution. It
-    /// prints as the operator it came from.
-    TypedCall {
-        /// The operator as written, e.g. `+` in `amount + 1`.
-        operator: Operator,
-        /// The function that runs it, e.g. `numeric_add`.
-        func: Name,
-        /// The operands, in the order written, which is also the order the
-        /// function takes them.
-        args: Vec<Box<Expr>>,
-        /// The type of the result, or `None` when the function decides it.
-        result: Option<Box<Type>>,
-    },
-    /// A value converted to a custom type's stored form (its ENCODE), e.g. the
-    /// literal in `amount + '1.50'`. Not SQL syntax: written by the compiler's
-    /// type resolution. It prints as the value.
-    Convert {
-        /// The value being converted.
-        expr: Box<Expr>,
-        /// The custom type, with its parameters.
-        to: Box<Type>,
-    },
     /// `DEFAULT` keyword in INSERT VALUES
     Default,
     /// `ARRAY[expr, ...]` array literal

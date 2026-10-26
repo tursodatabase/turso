@@ -33,10 +33,6 @@ pub fn selected_expression_index<'a>(
 ///
 /// After normalization, both sides look like `Expr::Id('a') + Expr::Id('b')`, allowing an
 /// equality check to spot the match.
-///
-/// The index stores the expression as written, so a custom-type operator that the
-/// query has already turned into a function call is turned back into the operator.
-/// The same expression on the same columns always gets the same function.
 pub fn normalize_expr_for_index_matching(
     expr: &ast::Expr,
     table_reference: &JoinedTable,
@@ -59,36 +55,12 @@ pub fn normalize_expr_for_index_matching(
             ast::Expr::RowId { .. } => {
                 *e = ast::Expr::Id(ast::Name::exact(ROWID_STRS[0].to_string()));
             }
-            ast::Expr::TypedCall { .. } | ast::Expr::Convert { .. } => {
-                *e = as_written(std::mem::take(e));
-            }
             _ => {}
         }
         Ok(WalkControl::Continue)
     };
     let _ = walk_expr_mut(&mut expr, &mut normalize);
     expr
-}
-
-/// The operator a `TypedCall` came from, or the value a `Convert` converts.
-/// Only the top node is changed; the walk above reaches the operands.
-fn as_written(expr: ast::Expr) -> ast::Expr {
-    match expr {
-        ast::Expr::TypedCall {
-            operator, mut args, ..
-        } => {
-            assert_eq!(
-                args.len(),
-                2,
-                "a typed call made from an operator has two operands"
-            );
-            let rhs = args.pop().expect("two operands");
-            let lhs = args.pop().expect("two operands");
-            ast::Expr::Binary(lhs, operator, rhs)
-        }
-        ast::Expr::Convert { expr, .. } => *expr,
-        other => other,
-    }
 }
 
 /// Determine whether an expression references columns from exactly one table

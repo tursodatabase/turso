@@ -945,10 +945,22 @@ expect {
 test op-date-minus-date-value {
     CREATE TABLE t1(d date) STRICT;
     INSERT INTO t1 VALUES ('2024-01-05');
-    SELECT '2024-01-10' - d, date('2024-02-01') - d, CAST(d AS date) - d FROM t1;
+    SELECT '2024-01-10' - d, CAST(date('2024-02-01') AS date) - d, CAST(d AS date) - d FROM t1;
 }
 expect {
     5|27|0
+}
+
+@requires strict "uses STRICT tables"
+test op-date-minus-value-of-unknown-type-error {
+    -- date() may return any value, so date() - d could be a date minus days or
+    -- a date minus a date. Casting it says which.
+    CREATE TABLE t1(d date) STRICT;
+    INSERT INTO t1 VALUES ('2024-01-05');
+    SELECT date('2024-02-01') - d FROM t1;
+}
+expect error {
+    operator does not exist: value - date
 }
 
 @requires strict "uses STRICT tables"
@@ -1072,4 +1084,104 @@ test op-expression-index-on-custom-arithmetic-is-used {
 expect {
     1|0|0|SEARCH t USING INDEX i (d + 1=?)
     1
+}
+
+@requires strict "uses STRICT tables"
+test op-generated-column-uses-type-operators {
+    CREATE TABLE t(d date, next_day ANY AS (d + 1)) STRICT;
+    INSERT INTO t(d) VALUES ('2024-01-01');
+    SELECT next_day FROM t;
+}
+expect {
+    2024-01-02
+}
+
+@requires strict "uses STRICT tables"
+test op-date-arithmetic-on-arithmetic-result {
+    -- d - 5 is a date, so adding 1 adds a day; (d + 5) - d is a number of days.
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('2024-01-01');
+    SELECT (d - 5) + 1, (d + 5) - d FROM t;
+}
+expect {
+    2023-12-28|5
+}
+
+@requires strict "uses STRICT tables"
+test op-partial-index-on-custom-arithmetic-is-used {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT;
+    CREATE INDEX i ON t(d) WHERE d + 1 = '2024-01-02';
+    INSERT INTO t VALUES (1, '2024-01-01'), (2, '2024-03-01');
+    EXPLAIN QUERY PLAN SELECT d FROM t WHERE d + 1 = '2024-01-02';
+    SELECT d FROM t WHERE d + 1 = '2024-01-02';
+}
+expect {
+    1|0|0|SCAN t USING COVERING INDEX i
+    2024-01-01
+}
+
+@requires strict "uses STRICT tables"
+test op-date-minus-value-of-unknown-type-subtracts-days {
+    -- x may hold anything, so d - x subtracts days and rejects anything else
+    -- when it runs.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, x ANY) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-05', 3), (2, '2024-01-05', '2024-01-01');
+    SELECT d - x FROM t WHERE id = 1;
+    SELECT d - x FROM t WHERE id = 2;
+}
+expect error {
+    only an integer number of days can be subtracted from a date
+}
+
+@requires strict "uses STRICT tables"
+test op-function-must-be-deterministic {
+    CREATE TYPE stamp(value text) BASE text OPERATOR '+' datetime;
+    CREATE TABLE t(a stamp, b stamp) STRICT;
+    SELECT a + b FROM t;
+}
+expect error {
+    operator \+ on type stamp must be deterministic
+}
+
+@requires strict "uses STRICT tables"
+test op-in-subquery-runs-failing-arithmetic-on-every-row {
+    -- IN runs its subquery to the end, so the second row's d + 1 fails even
+    -- though the first row already matched.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-01'), (2, '9999-12-31');
+    CREATE TABLE o(k INTEGER, v INTEGER) STRICT;
+    INSERT INTO o VALUES (0, 1);
+    SELECT v FROM o WHERE v IN (SELECT id FROM t WHERE d + 1 > '2000-01-01' AND t.id > o.k);
+}
+expect error {
+    date out of range
+}
+
+@requires strict "uses STRICT tables"
+test op-parenthesized-column-uses-type-operator {
+    -- (a), +a and a COLLATE x give a's value unchanged, so they run the same
+    -- operator as a.
+    CREATE TYPE test_uint(value any) BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value)
+        OPERATOR '+' test_uint_add
+        OPERATOR '<' test_uint_lt
+        OPERATOR '=' test_uint_eq;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a test_uint, b test_uint) STRICT;
+    INSERT INTO t1 VALUES (1, 10, 5);
+    SELECT a + b, (a) + b, +a + (b), a COLLATE BINARY + b FROM t1;
+}
+expect {
+    15|15|15|15
+}
+
+@requires strict "uses STRICT tables"
+test op-without-function-runs-sqlite-operator {
+    CREATE TYPE u(value integer) BASE integer OPERATOR '+' OPERATOR '<';
+    CREATE TABLE t(a u, b u) STRICT;
+    INSERT INTO t VALUES (1, 2);
+    SELECT a + b, a + 1, 1 + b FROM t;
+}
+expect {
+    3|2|3
 }

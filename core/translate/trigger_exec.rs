@@ -7,10 +7,7 @@ use crate::translate::subquery::{
 };
 use crate::translate::{
     emitter::Resolver,
-    expr::{
-        self, expr_type::column_custom_type_names, resolve_custom_type_operators, translate_expr,
-        walk_expr_mut,
-    },
+    expr::{self, expr_type::column_custom_type_names, translate_expr, walk_expr_mut},
     planner::ROWID_STRS,
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
@@ -911,7 +908,6 @@ pub fn fire_trigger(
                 resolver.schema(),
             );
             rewrite_trigger_expr_for_when_clause(&mut when_expr, ctx, &column_types)?;
-            resolve_custom_type_operators(&mut when_expr, None, resolver)?;
 
             // Plan and emit any subqueries in the WHEN clause (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
             // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
