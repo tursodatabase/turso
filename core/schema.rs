@@ -280,16 +280,9 @@ pub enum ArithmeticArg {
 const ARITHMETIC_OPERATORS: [&str; 5] = ["+", "-", "*", "/", "%"];
 
 /// `CREATE TYPE ... OPERATOR '+' f` runs f for two values of the type, or for a
-/// value of the type and a literal its ENCODE accepts. A type that declares
-/// no arithmetic operator computes with SQLite's operators, like `smallint`.
+/// value of the type and a literal its ENCODE accepts.
 fn declared_arithmetic(operators: &[TypeOperator]) -> std::vec::Vec<ArithmeticSignature> {
     use ArithmeticArg::{Column, EncodableLiteral};
-    let declares_arithmetic = operators
-        .iter()
-        .any(|o| ARITHMETIC_OPERATORS.contains(&o.op.as_str()) && o.func_name.is_some());
-    if !declares_arithmetic {
-        return sqlite_arithmetic();
-    }
     let mut signatures = std::vec::Vec::new();
     for op in ARITHMETIC_OPERATORS {
         let declared = operators.iter().find(|o| o.op == op);

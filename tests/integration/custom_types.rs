@@ -423,11 +423,12 @@ mod tests {
             "WHERE clause should block update when decoded value 99 >= 20"
         );
 
-        // Complex expression: excluded.amount + t1.amount
+        // Complex expression over excluded.amount and t1.amount. cents declares
+        // no '+', so the values are cast to integers first.
         conn.execute("DELETE FROM t1").unwrap();
         conn.execute("INSERT INTO t1 VALUES (1, 42)").unwrap();
         conn.execute(
-            "INSERT INTO t1 VALUES (1, 8) ON CONFLICT(id) DO UPDATE SET amount = excluded.amount + t1.amount",
+            "INSERT INTO t1 VALUES (1, 8) ON CONFLICT(id) DO UPDATE SET amount = CAST(excluded.amount AS INTEGER) + CAST(t1.amount AS INTEGER)",
         )
         .unwrap();
         let rows: Vec<(i64,)> = conn.exec_rows("SELECT amount FROM t1 WHERE id = 1");
