@@ -202,6 +202,10 @@ pub struct Parser<'a> {
     /// brackets, function call, CAST or CASE. A `NOT NULL` found there is the
     /// domain's NOT NULL clause, so it ends the expression
     domain_default_ends_at_not_null: bool,
+    column_default_sources: Vec<(String, String)>,
+    source_names: Option<Vec<&'a [u8]>>,
+    last_token_end: usize,
+    statement_end: usize,
 }
 
 /// Maximum query expression depth, our equivalent of SQLite's
@@ -236,7 +240,47 @@ impl<'a> Parser<'a> {
             expr_nesting_depth: 0,
             last_expr_height: 0,
             domain_default_ends_at_not_null: false,
+            column_default_sources: Vec::new(),
+            source_names: None,
+            last_token_end: 0,
+            statement_end: 0,
         }
+    }
+
+    /// Parse schema text while retaining identifier-token provenance.
+    pub fn with_source(input: &'a [u8]) -> Self {
+        let mut parser = Self::new(input);
+        parser.source_names = Some(Vec::new());
+        parser
+    }
+
+    pub fn source_names(&self) -> Option<&[&'a [u8]]> {
+        self.source_names.as_deref()
+    }
+
+    /// End of the last statement, excluding its terminating semicolon and trivia.
+    pub fn statement_end(&self) -> usize {
+        self.statement_end
+    }
+
+    fn source_name(&mut self, raw: &'a [u8]) -> Name {
+        self.record_source_name(Name::from_bytes(raw), raw)
+    }
+
+    fn record_source_name(&mut self, name: Name, raw: &'a [u8]) -> Name {
+        match &mut self.source_names {
+            None => name,
+            Some(names) => {
+                let index = names.len();
+                names.push(raw);
+                name.with_source_token(index)
+            }
+        }
+    }
+
+    /// Original DEFAULT expressions from column definitions parsed so far.
+    pub fn column_default_sources(&self) -> &[(String, String)] {
+        &self.column_default_sources
     }
 
     fn create_variable(&mut self, token: &'a [u8]) -> Result<Expr> {
@@ -333,6 +377,7 @@ impl<'a> Parser<'a> {
             },
         };
 
+        self.statement_end = self.last_token_end;
         let mut found_semi = false;
         loop {
             match self.peek()? {
@@ -692,8 +737,14 @@ impl<'a> Parser<'a> {
         let old_peekable = self.peekable;
         let old_current_token = self.current_token.clone();
         let start_offset = self.lexer.offset;
+        let old_token_end = self.last_token_end;
+        let old_statement_end = self.statement_end;
+        let old_defaults = self.column_default_sources.len();
         let result = exc(self);
         if result.is_err() {
+            self.last_token_end = old_token_end;
+            self.statement_end = old_statement_end;
+            self.column_default_sources.truncate(old_defaults);
             self.peekable = old_peekable;
             self.current_token = old_current_token;
             self.lexer.offset = start_offset;
@@ -708,9 +759,15 @@ impl<'a> Parser<'a> {
     {
         debug_assert!(!self.peekable);
         let start_offset = self.lexer.offset;
+        let old_token_end = self.last_token_end;
+        let old_statement_end = self.statement_end;
+        let old_defaults = self.column_default_sources.len();
         let result = exc(self);
         self.peekable = false;
         self.lexer.offset = start_offset;
+        self.last_token_end = old_token_end;
+        self.statement_end = old_statement_end;
+        self.column_default_sources.truncate(old_defaults);
         result
     }
 
@@ -722,6 +779,7 @@ impl<'a> Parser<'a> {
             Some(tok) => {
                 let result = tok.clone();
                 self.peekable = false; // Clear the peek mark after consuming
+                self.last_token_end = self.lexer.offset;
                 Ok(Some(result))
             }
         }
@@ -814,7 +872,7 @@ impl<'a> Parser<'a> {
             }
         }
         let tok = eat_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW);
-        Ok(Name::from_bytes(tok.as_bytes()))
+        Ok(self.source_name(tok.value))
     }
 
     /// After `peek()` returned `TK_LBRACKET`, report whether the brackets are
@@ -838,7 +896,9 @@ impl<'a> Parser<'a> {
         let name = String::from_utf8_lossy(raw).into_owned();
         // Advance lexer past the closing `]`
         self.lexer.offset = start + end_pos + 1;
-        Ok(Name::bracketed(name))
+        self.last_token_end = self.lexer.offset;
+        let input = self.lexer.input;
+        Ok(self.record_source_name(Name::bracketed(name), &input[start - 1..self.lexer.offset]))
     }
 
     fn parse_transopt(&mut self) -> Result<Option<Name>> {
@@ -2079,7 +2139,7 @@ impl<'a> Parser<'a> {
                         // height into this node's height.
                         self.last_expr_height += 1;
                         return Ok(Box::new(Expr::FunctionCallStar {
-                            name: Name::from_bytes(name),
+                            name: self.source_name(name),
                             filter_over,
                         }));
                     }
@@ -2099,7 +2159,7 @@ impl<'a> Parser<'a> {
                         clause_height = clause_height.max(self.last_expr_height);
                         self.last_expr_height = 1 + clause_height;
                         return Ok(Box::new(Expr::FunctionCall {
-                            name: Name::from_bytes(name),
+                            name: self.source_name(name),
                             distinctness: distinct,
                             args: exprs,
                             order_by,
@@ -2130,13 +2190,13 @@ impl<'a> Parser<'a> {
         if let Some(second_name) = second_name {
             if let Some(third_name) = third_name {
                 Ok(Box::new(Expr::DoublyQualified(
-                    Name::from_bytes(name),
+                    self.source_name(name),
                     second_name,
                     third_name,
                 )))
             } else {
                 Ok(Box::new(Expr::Qualified(
-                    Name::from_bytes(name),
+                    self.source_name(name),
                     second_name,
                 )))
             }
@@ -2150,7 +2210,7 @@ impl<'a> Parser<'a> {
                 b"false" => {
                     Ok(Box::new(Expr::Literal(Literal::False)))
                 }
-                _ => Ok(Box::new(Expr::Id(Name::from_bytes(name)))),
+                _ => Ok(Box::new(Expr::Id(self.source_name(name)))),
             })
         }
     }
@@ -2619,7 +2679,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(self.parse_bracket_quoted_name()?));
         }
         let tok = eat_expect!(self, TK_ID, TK_STRING);
-        Ok(Some(Name::from_bytes(tok.as_bytes())))
+        Ok(Some(self.source_name(tok.value)))
     }
 
     fn parse_sort_order(&mut self) -> Result<Option<SortOrder>> {
@@ -3927,7 +3987,7 @@ impl<'a> Parser<'a> {
         self.parse_expr_operand()
     }
 
-    fn parse_default_column_constraint(&mut self) -> Result<ColumnConstraint> {
+    fn parse_default_column_constraint(&mut self) -> Result<(ColumnConstraint, String)> {
         eat_assert!(self, TK_DEFAULT);
         let tok = peek_expect!(
             self,
@@ -3944,8 +4004,11 @@ impl<'a> Parser<'a> {
             TK_INDEXED,
             TK_LBRACKET,
         );
+        let token_type = tok.token_type;
+        let start = self.offset();
+        let parenthesized = token_type == TK_LP;
 
-        match tok.token_type {
+        let parsed: Result<ColumnConstraint> = match token_type {
             TK_LP => {
                 eat_assert!(self, TK_LP);
                 let expr = self.parse_expr(0)?;
@@ -3982,7 +4045,15 @@ impl<'a> Parser<'a> {
                 };
                 Ok(ColumnConstraint::Default(Box::new(expr)))
             }
-        }
+        };
+        let constraint = parsed?;
+        let raw = String::from_utf8_lossy(&self.lexer.input[start..self.offset()]);
+        let source = if parenthesized {
+            raw[1..raw.len() - 1].trim().to_owned()
+        } else {
+            raw.trim().to_owned()
+        };
+        Ok((constraint, source))
     }
 
     fn parse_resolve_type(&mut self) -> Result<ResolveType> {
@@ -4307,10 +4378,10 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         has_default = true;
-                        result.push(NamedColumnConstraint {
-                            name,
-                            constraint: self.parse_default_column_constraint()?,
-                        });
+                        let (constraint, source) = self.parse_default_column_constraint()?;
+                        self.column_default_sources
+                            .push((col_name.as_str().to_owned(), source));
+                        result.push(NamedColumnConstraint { name, constraint });
                     }
                     TK_NOT | TK_NULL => {
                         result.push(NamedColumnConstraint {
@@ -5672,6 +5743,27 @@ mod tests {
         assert_eq!(index(":::g"), 3);
         assert_eq!(index("@a::b::"), 4);
         assert_eq!(p.named_variables.len(), 4);
+    }
+
+    #[test]
+    fn test_column_default_sources_preserve_lexemes() {
+        let mut parser = Parser::new(b"CREATE TABLE defaults_source(a DEFAULT (   1  +  2  ), b DEFAULT - /* neg */5 /* trailing */, c DEFAULT ((-5)), d DEFAULT 'it''s', e DEFAULT nUlL)");
+        parser.next_cmd().unwrap();
+        let sources: Vec<_> = parser
+            .column_default_sources()
+            .iter()
+            .map(|(name, source)| (name.as_str(), source.as_str()))
+            .collect();
+        assert_eq!(
+            sources,
+            vec![
+                ("a", "1  +  2"),
+                ("b", "- /* neg */5"),
+                ("c", "(-5)"),
+                ("d", "'it''s'"),
+                ("e", "nUlL")
+            ]
+        );
     }
 
     #[test]

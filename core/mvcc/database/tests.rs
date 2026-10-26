@@ -16143,7 +16143,7 @@ fn test_schema_frame_recovery_same_name_partial_index_redefinition() {
     assert_eq!(sql_rows.len(), 1);
     let index_sql = sql_rows[0][0].to_string();
     assert!(
-        index_sql.contains("ON t (b)") && index_sql.contains("WHERE b >= 250"),
+        index_sql.contains("ON t(b)") && index_sql.contains("WHERE b >= 250"),
         "idx_common should be recreated on b with the partial predicate; got {index_sql}"
     );
     let rows = get_rows(
@@ -16315,7 +16315,7 @@ fn test_schema_frame_recovery_rename_column_then_drop_index_checkpoints_after_re
     assert_eq!(schema_rows[0][2].to_string(), "t");
     assert_eq!(
         schema_rows[0][3].to_string(),
-        "CREATE TABLE t (a INTEGER PRIMARY KEY, bb TEXT)"
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, bb TEXT)"
     );
     let rows = get_rows(&conn, "PRAGMA integrity_check");
     assert_eq!(rows.len(), 1);

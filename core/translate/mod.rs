@@ -238,6 +238,15 @@ pub fn translate_inner(
         None
     };
 
+    let source_schema_sql = if matches!(
+        &stmt,
+        ast::Stmt::CreateIndex { .. } | ast::Stmt::CreateTrigger { .. }
+    ) {
+        crate::schema_sql::original_create_sql(input, &stmt)
+    } else {
+        None
+    };
+
     match stmt {
         ast::Stmt::AlterTable(alter) => {
             translate_alter_table(alter, resolver, program, connection, input)?;
@@ -258,7 +267,7 @@ pub fn translate_inner(
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, resolver, stmt)?;
+            translate_create_index(program, connection, resolver, stmt, source_schema_sql)?;
         }
         ast::Stmt::CreateTable {
             temporary,
@@ -287,17 +296,19 @@ pub fn translate_inner(
             commands,
         } => {
             // Reconstruct SQL for storage
-            let sql = trigger::create_trigger_to_sql(
-                temporary,
-                if_not_exists,
-                &trigger_name,
-                time,
-                &event,
-                &tbl_name,
-                for_each_row,
-                when_clause.as_deref(),
-                &commands,
-            );
+            let sql = source_schema_sql.unwrap_or_else(|| {
+                trigger::create_trigger_to_sql(
+                    temporary,
+                    if_not_exists,
+                    &trigger_name,
+                    time,
+                    &event,
+                    &tbl_name,
+                    for_each_row,
+                    when_clause.as_deref(),
+                    &commands,
+                )
+            });
             trigger::translate_create_trigger(
                 trigger_name,
                 resolver,
@@ -325,6 +336,7 @@ pub fn translate_inner(
             temporary,
             if_not_exists,
             program,
+            input,
         )?,
         ast::Stmt::CreateMaterializedView {
             view_name,

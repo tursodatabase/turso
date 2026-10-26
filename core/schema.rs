@@ -4525,7 +4525,18 @@ impl BTreeTable {
         let cmd = parser.next_cmd()?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
-                Self::from_create_table_ast(&tbl_name, &body, root_page)
+                let mut table = Self::from_create_table_ast(&tbl_name, &body, root_page)?;
+                for (name, source) in parser.column_default_sources() {
+                    if let Some(column) = table.columns_mut().iter_mut().find(|column| {
+                        column
+                            .name
+                            .as_deref()
+                            .is_some_and(|value| value.eq_ignore_ascii_case(name))
+                    }) {
+                        column.default_source = Some(source.clone());
+                    }
+                }
+                Ok(table)
             }
             Some(Cmd::Stmt(Stmt::CreateVirtualTable(vtab))) => Err(LimboError::Corrupt(format!(
                 "sqlite_schema root_page must be 0 for virtual table {}, got {root_page}",
@@ -6436,6 +6447,8 @@ pub struct Column {
     pub written_ty_str: Option<String>,
     pub ty_params: std::vec::Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
+    /// The stored DEFAULT expression without its optional outer parentheses.
+    pub default_source: Option<String>,
     generated_type: GeneratedType,
     generated_always: bool,
     info: ColumnInfo,
@@ -6592,6 +6605,7 @@ impl Column {
             written_ty_str: None,
             ty_params: std::vec::Vec::new(),
             default,
+            default_source: None,
             generated_type,
             generated_always: false,
             info,

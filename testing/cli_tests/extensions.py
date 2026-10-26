@@ -841,7 +841,7 @@ def test_sqlite_vfs_compat():
     )
     sqlite.run_test_fn(
         ".schema",
-        lambda res: "CREATE TABLE test (id integer PRIMARY KEY, value float);" in res,
+        lambda res: "CREATE TABLE test (id integer primary key, value float);" in res,
         "Tables created by vfs extension exist in db file",
     )
     sqlite.run_test_fn(

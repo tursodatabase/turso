@@ -17,14 +17,14 @@ test schema-roundtrip-all-variants {
     SELECT sql FROM sqlite_schema WHERE type='index' AND sql IS NOT NULL ORDER BY name;
 }
 expect {
-    CREATE INDEX i1 ON t (a NULLS LAST)
-    CREATE INDEX i2 ON t (a ASC NULLS LAST)
-    CREATE INDEX i3 ON t (a DESC NULLS FIRST)
-    CREATE INDEX i4 ON t (a NULLS FIRST)
-    CREATE INDEX i5 ON t (a DESC NULLS LAST)
-    CREATE INDEX i6 ON t (a NULLS LAST, b DESC NULLS FIRST, c)
-    CREATE UNIQUE INDEX i7 ON t (b NULLS LAST)
-    CREATE INDEX i8 ON t (a COLLATE NOCASE NULLS LAST)
+    CREATE INDEX i1 ON t(a NULLS LAST)
+    CREATE INDEX i2 ON t(a ASC NULLS LAST)
+    CREATE INDEX i3 ON t(a DESC NULLS FIRST)
+    CREATE INDEX i4 ON t(a NULLS FIRST)
+    CREATE INDEX i5 ON t(a DESC NULLS LAST)
+    CREATE INDEX i6 ON t(a NULLS LAST, b DESC NULLS FIRST, c)
+    CREATE UNIQUE INDEX i7 ON t(b NULLS LAST)
+    CREATE INDEX i8 ON t(a COLLATE NOCASE NULLS LAST)
 }
 
 test index-xinfo-unaffected-by-nulls {
@@ -654,8 +654,8 @@ test pk-schema-roundtrip {
     SELECT sql FROM sqlite_schema WHERE type='table' ORDER BY name;
 }
 expect {
-    CREATE TABLE t (a INT, b, PRIMARY KEY (a NULLS LAST))
-    CREATE TABLE t2 (a INT, b, PRIMARY KEY (a DESC NULLS FIRST, b NULLS LAST))
+    CREATE TABLE t(a INT, b, PRIMARY KEY(a NULLS LAST))
+    CREATE TABLE t2(a INT, b, PRIMARY KEY(a DESC NULLS FIRST, b NULLS LAST))
 }
 
 @setup pk_data
@@ -802,7 +802,7 @@ test unique-constraint-schema-roundtrip {
     SELECT sql FROM sqlite_schema WHERE type='table';
 }
 expect {
-    CREATE TABLE t (a INT, b, UNIQUE (a NULLS LAST), UNIQUE (b DESC NULLS FIRST))
+    CREATE TABLE t(a INT, b, UNIQUE(a NULLS LAST), UNIQUE(b DESC NULLS FIRST))
 }
 
 test unique-constraint-nulls-last-ordering-elided {

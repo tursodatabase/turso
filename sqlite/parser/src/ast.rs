@@ -1192,10 +1192,21 @@ pub struct GroupBy {
 ///
 /// Two Names are equal if they refer to the same identifier, regardless of
 /// quoting style (e.g. `ABORT` and `"ABORT"` are the same identifier).
-#[derive(Clone, Debug, Eq)]
+#[derive(Clone, Eq)]
 pub struct Name {
     quote: Option<char>,
     value: String,
+    source_token: Option<std::num::NonZeroUsize>,
+    source_rewritten: bool,
+}
+
+impl std::fmt::Debug for Name {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Name")
+            .field("quote", &self.quote)
+            .field("value", &self.value)
+            .finish()
+    }
 }
 
 impl PartialEq for Name {
@@ -1252,6 +1263,8 @@ impl Name {
         Self {
             value: s,
             quote: None,
+            source_token: None,
+            source_rewritten: false,
         }
     }
     /// Parse name from the bytes (e.g. handle quoting and handle escaped quotes)
@@ -1262,6 +1275,8 @@ impl Name {
         Self {
             value: String::new(),
             quote: None,
+            source_token: None,
+            source_rewritten: false,
         }
     }
     /// Create a name parsed from a bracket-quoted identifier (`[name]`),
@@ -1270,6 +1285,8 @@ impl Name {
         Self {
             value: s,
             quote: Some('['),
+            source_token: None,
+            source_rewritten: false,
         }
     }
     /// Parse name from the string (e.g. handle quoting and handle escaped quotes)
@@ -1293,6 +1310,8 @@ impl Name {
             Name {
                 value: s,
                 quote: Some(bytes[0] as char),
+                source_token: None,
+                source_rewritten: false,
             }
         } else if bytes[0] == b'[' {
             assert!(s.len() >= 2);
@@ -1301,6 +1320,27 @@ impl Name {
         } else {
             Name::exact(s.to_string())
         }
+    }
+
+    /// Token index in the source-enabled parser that produced this name.
+    pub fn source_token(&self) -> Option<usize> {
+        self.source_token.map(|token| token.get() - 1)
+    }
+
+    pub fn source_was_rewritten(&self) -> bool {
+        self.source_rewritten
+    }
+
+    pub(crate) fn with_source_token(mut self, index: usize) -> Self {
+        self.source_token = std::num::NonZeroUsize::new(index + 1);
+        self
+    }
+
+    /// Preserve lexical identity when a schema rewriter changes an identifier.
+    pub fn with_replacement(&self, mut replacement: Name) -> Self {
+        replacement.source_token = self.source_token;
+        replacement.source_rewritten = self.source_token.is_some();
+        replacement
     }
 
     /// Return string value of the name

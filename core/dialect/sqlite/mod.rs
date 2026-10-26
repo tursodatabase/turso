@@ -63,10 +63,18 @@ impl super::Dialect for SqliteDialect {
 
     fn format_table_sql(
         &self,
-        _input: &str,
+        input: &str,
         tbl_name: &turso_parser::ast::QualifiedName,
         body: &turso_parser::ast::CreateTableBody,
     ) -> crate::Result<String> {
+        if matches!(
+            body,
+            turso_parser::ast::CreateTableBody::ColumnsAndConstraints { .. }
+        ) {
+            if let Some(sql) = crate::schema_sql::original_table_sql(input, tbl_name, body) {
+                return Ok(sql);
+            }
+        }
         match body {
             turso_parser::ast::CreateTableBody::ColumnsAndConstraints { .. } => Ok(format!(
                 "CREATE TABLE {} {}",
@@ -76,6 +84,34 @@ impl super::Dialect for SqliteDialect {
             turso_parser::ast::CreateTableBody::AsSelect(_) => {
                 crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
             }
+        }
+    }
+
+    fn parse_schema_sql_for_rename(
+        &self,
+        sql: &str,
+        is_table: bool,
+    ) -> crate::Result<Option<turso_parser::ast::Cmd>> {
+        if is_table {
+            reject_postgres_table_sql(sql)?;
+        }
+        turso_parser::parser::Parser::with_source(sql.as_bytes())
+            .next_cmd()
+            .map_err(Into::into)
+    }
+
+    fn format_renamed_schema_sql(
+        &self,
+        input: &str,
+        stmt: &turso_parser::ast::Stmt,
+        new_name: &turso_parser::ast::Name,
+    ) -> crate::Result<String> {
+        if let Some(sql) = crate::schema_sql::renamed_sql(input, stmt, new_name) {
+            Ok(sql)
+        } else if matches!(stmt, turso_parser::ast::Stmt::CreateTable { .. }) {
+            self.format_rewritten_table_sql(stmt)
+        } else {
+            Ok(stmt.to_string())
         }
     }
 

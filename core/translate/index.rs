@@ -88,8 +88,9 @@ pub fn translate_create_index(
     connection: &Arc<crate::Connection>,
     resolver: &Resolver,
     stmt: ast::Stmt,
+    source_sql: Option<String>,
 ) -> crate::Result<()> {
-    let sql = canonical_create_index_sql(&stmt);
+    let sql = source_sql.unwrap_or_else(|| canonical_create_index_sql(&stmt));
     let ast::Stmt::CreateIndex {
         unique,
         if_not_exists,
