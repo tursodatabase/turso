@@ -1,4 +1,5 @@
 use std::num::NonZero;
+use std::sync::Arc;
 use std::task::Waker;
 use std::time::Duration;
 
@@ -16,9 +17,15 @@ struct DeferredState {
     completed: bool,
 }
 
+struct TransactionEnd {
+    conn: Arc<turso_core::Connection>,
+    idle_at_start: Option<bool>,
+}
+
 pub struct Statement {
     inner: turso_core::Statement,
     deferred: Option<DeferredState>,
+    transaction_end: Option<TransactionEnd>,
 }
 
 impl Statement {
@@ -26,6 +33,7 @@ impl Statement {
         Self {
             inner,
             deferred: None,
+            transaction_end: None,
         }
     }
 
@@ -36,7 +44,29 @@ impl Statement {
                 exec,
                 completed: false,
             }),
+            transaction_end: None,
         }
+    }
+
+    pub(crate) fn with_transaction_end(
+        inner: turso_core::Statement,
+        conn: Arc<turso_core::Connection>,
+    ) -> Self {
+        let mut stmt = Self::new(inner);
+        stmt.transaction_end = Some(TransactionEnd {
+            conn,
+            idle_at_start: None,
+        });
+        stmt
+    }
+
+    fn skip_idle_transaction_end(&mut self) -> bool {
+        let Some(end) = &mut self.transaction_end else {
+            return false;
+        };
+        // Latch once per execution, not between asynchronous commit I/O steps.
+        *end.idle_at_start
+            .get_or_insert_with(|| end.conn.get_auto_commit())
     }
 
     fn execute_deferred(&mut self) -> Result<()> {
@@ -51,6 +81,9 @@ impl Statement {
     }
 
     pub fn step(&mut self) -> Result<StepResult> {
+        if self.skip_idle_transaction_end() {
+            return Ok(StepResult::Done);
+        }
         if self.deferred.is_some() {
             self.execute_deferred()?;
             return Ok(StepResult::Done);
@@ -59,6 +92,9 @@ impl Statement {
     }
 
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
+        if self.skip_idle_transaction_end() {
+            return Ok(StepResult::Done);
+        }
         if self.deferred.is_some() {
             self.execute_deferred()?;
             return Ok(StepResult::Done);
@@ -67,6 +103,9 @@ impl Statement {
     }
 
     pub fn reset(&mut self) -> Result<()> {
+        if let Some(end) = &mut self.transaction_end {
+            end.idle_at_start = None;
+        }
         if let Some(deferred) = self.deferred.as_mut() {
             deferred.completed = false;
         }
@@ -82,6 +121,9 @@ impl Statement {
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
+        if self.skip_idle_transaction_end() {
+            return Ok(());
+        }
         if self.deferred.is_some() {
             return self.execute_deferred();
         }
@@ -89,6 +131,9 @@ impl Statement {
     }
 
     pub fn run_collect_rows(&mut self) -> Result<Vec<Vec<Value>>> {
+        if self.skip_idle_transaction_end() {
+            return Ok(Vec::new());
+        }
         if self.deferred.is_some() {
             self.execute_deferred()?;
             return Ok(Vec::new());
@@ -114,6 +159,9 @@ impl Statement {
     }
 
     pub fn run_ignore_rows_nonblock(&mut self) -> Result<IOResult<()>> {
+        if self.skip_idle_transaction_end() {
+            return Ok(IOResult::Done(()));
+        }
         if self.deferred.is_some() {
             self.execute_deferred()?;
             return Ok(IOResult::Done(()));
@@ -188,6 +236,9 @@ impl Statement {
     }
 
     pub fn reset_best_effort(&mut self) {
+        if let Some(end) = &mut self.transaction_end {
+            end.idle_at_start = None;
+        }
         if let Some(deferred) = self.deferred.as_mut() {
             deferred.completed = false;
         }

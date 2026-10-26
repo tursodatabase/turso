@@ -55,6 +55,18 @@ impl TursoPgServer {
         }
     }
 
+    fn client_factory(&self) -> anyhow::Result<TursoPgFactory> {
+        let conn = self.conn.lock().unwrap().new_session()?;
+        auto_attach_pg_schemas(&conn, &self.db_file);
+        Ok(TursoPgFactory {
+            handler: Arc::new(TursoPgHandler {
+                conn: Arc::new(Mutex::new(conn)),
+                db_file: self.db_file.clone(),
+                query_parser: Arc::new(NoopQueryParser::new()),
+            }),
+        })
+    }
+
     pub fn run(&self) -> anyhow::Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(self.run_async())
@@ -68,21 +80,19 @@ impl TursoPgServer {
             self.db_file
         );
 
-        let factory = Arc::new(TursoPgFactory {
-            handler: Arc::new(TursoPgHandler {
-                conn: self.conn.clone(),
-                db_file: self.db_file.clone(),
-                query_parser: Arc::new(NoopQueryParser::new()),
-            }),
-        });
-
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
                         Ok((socket, addr)) => {
                             info!("PostgreSQL client connected from {}", addr);
-                            let factory_ref = factory.clone();
+                            let factory_ref = match self.client_factory() {
+                                Ok(factory) => Arc::new(factory),
+                                Err(e) => {
+                                    error!("Error opening session for {}: {}", addr, e);
+                                    continue;
+                                }
+                            };
                             tokio::spawn(async move {
                                 if let Err(e) = process_socket(socket, None, factory_ref).await {
                                     error!("Error processing connection from {}: {}", addr, e);
@@ -107,6 +117,38 @@ impl TursoPgServer {
         }
 
         Ok(())
+    }
+}
+
+/// Discover and attach existing PG schema database files in the same directory.
+pub fn auto_attach_pg_schemas(conn: &Connection, db_file: &str) {
+    if db_file == ":memory:" {
+        return;
+    }
+    let dir = std::path::Path::new(db_file)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(schema) = name
+            .strip_prefix("turso-postgres-schema-")
+            .and_then(|s| s.strip_suffix(".db"))
+        else {
+            continue;
+        };
+        let path = entry.path().to_string_lossy().to_string();
+        let sql = format!("ATTACH '{path}' AS \"{schema}\"");
+        tracing::info!("Auto-attaching PG schema '{}' from {}", schema, path);
+        if let Err(e) = conn.inner().execute(&sql) {
+            tracing::warn!("Failed to attach schema '{}': {}", schema, e);
+        }
     }
 }
 
@@ -859,6 +901,253 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session_pair() -> (PgConnection, PgConnection) {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let server = TursoPgServer::new(
+            "127.0.0.1:0".to_owned(),
+            ":memory:".to_owned(),
+            Connection::connect(&db).unwrap(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let first = server.client_factory().unwrap();
+        let second = server.client_factory().unwrap();
+        let first_conn = first.handler.conn.lock().unwrap().clone();
+        let second_conn = second.handler.conn.lock().unwrap().clone();
+        (first_conn, second_conn)
+    }
+
+    fn count(conn: &PgConnection, table: &str) -> i64 {
+        let rows = conn
+            .prepare(format!("SELECT COUNT(*) FROM {table}"))
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        rows[0][0].as_int().unwrap()
+    }
+
+    #[test]
+    fn test_client_sessions_keep_transactions_separate() {
+        let (first, second) = session_pair();
+        first.execute("CREATE TABLE shared_session(x INT)").unwrap();
+        first
+            .execute("BEGIN; INSERT INTO shared_session VALUES (1)")
+            .unwrap();
+        assert_eq!(count(&first, "shared_session"), 1);
+        assert_eq!(count(&second, "shared_session"), 0);
+        second.execute("ROLLBACK").unwrap();
+        assert_eq!(count(&first, "shared_session"), 1);
+        first.execute("COMMIT").unwrap();
+        assert_eq!(count(&second, "shared_session"), 1);
+
+        second
+            .execute("BEGIN; INSERT INTO shared_session VALUES (2)")
+            .unwrap();
+        first.execute("COMMIT").unwrap();
+        assert_eq!(count(&first, "shared_session"), 1);
+        assert_eq!(count(&second, "shared_session"), 2);
+        second.execute("ROLLBACK").unwrap();
+        assert_eq!(count(&first, "shared_session"), 1);
+    }
+
+    #[test]
+    fn test_client_sessions_keep_settings_separate() {
+        let (first, second) = session_pair();
+        first
+            .execute("SELECT set_config('app.client', 'first', false)")
+            .unwrap();
+        let rows = second
+            .prepare("SELECT current_setting('app.client', true)")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows[0][0], Value::Null);
+        let first_rows = first
+            .prepare("SELECT current_setting('app.client', true)")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(first_rows[0][0].to_text().unwrap(), "first");
+    }
+
+    #[test]
+    fn test_dropping_client_session_rolls_back_its_transaction() {
+        let (first, second) = session_pair();
+        first.execute("CREATE TABLE shared_session(x INT)").unwrap();
+        first
+            .execute("BEGIN; INSERT INTO shared_session VALUES (1)")
+            .unwrap();
+        drop(first);
+        assert_eq!(count(&second, "shared_session"), 0);
+        second
+            .execute("INSERT INTO shared_session VALUES (2)")
+            .unwrap();
+        assert_eq!(count(&second, "shared_session"), 1);
+    }
+
+    #[test]
+    fn test_idle_transaction_end_checks_state_at_execution() {
+        let (first, second) = session_pair();
+        first.execute("CREATE TABLE shared_session(x INT)").unwrap();
+        let mut rollback = first.prepare("ROLLBACK").unwrap();
+        assert!(matches!(
+            rollback.run_ignore_rows_nonblock().unwrap(),
+            turso_core::IOResult::Done(())
+        ));
+        assert_eq!(rollback.num_columns(), 0);
+        rollback.reset().unwrap();
+        first
+            .execute("BEGIN; INSERT INTO shared_session VALUES (1)")
+            .unwrap();
+        rollback.run_ignore_rows().unwrap();
+        assert_eq!(count(&second, "shared_session"), 0);
+        rollback.reset_best_effort();
+        rollback.run_ignore_rows().unwrap();
+        rollback.reset_best_effort();
+        first
+            .execute("BEGIN; INSERT INTO shared_session VALUES (2)")
+            .unwrap();
+        loop {
+            match rollback
+                .step_with_waker(futures::task::noop_waker_ref())
+                .unwrap()
+            {
+                turso_core::StepResult::Done => break,
+                turso_core::StepResult::IO
+                | turso_core::StepResult::Yield
+                | turso_core::StepResult::Sleep { .. } => rollback._io().step().unwrap(),
+                result => panic!("unexpected rollback result: {result:?}"),
+            }
+        }
+        assert_eq!(count(&second, "shared_session"), 0);
+        assert!(first.execute("ROLLBACK TO absent").is_err());
+        assert!(first.prepare("ROLLBACK AND CHAIN").is_err());
+        assert!(first.prepare("COMMIT AND CHAIN").is_err());
+    }
+
+    fn wire_send(socket: &mut std::net::TcpStream, kind: u8, body: &[u8]) {
+        use std::io::Write;
+        socket.write_all(&[kind]).unwrap();
+        socket
+            .write_all(&((body.len() + 4) as u32).to_be_bytes())
+            .unwrap();
+        socket.write_all(body).unwrap();
+    }
+
+    fn wire_rows(socket: &mut std::net::TcpStream) -> Vec<Vec<String>> {
+        use std::io::Read;
+        let mut rows = Vec::new();
+        loop {
+            let mut kind = [0];
+            let mut length = [0; 4];
+            socket.read_exact(&mut kind).unwrap();
+            socket.read_exact(&mut length).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(length) as usize - 4];
+            socket.read_exact(&mut body).unwrap();
+            match kind[0] {
+                b'E' => panic!("wire error: {}", String::from_utf8_lossy(&body)),
+                b'D' => {
+                    let columns = u16::from_be_bytes(body[..2].try_into().unwrap());
+                    let mut pos = 2;
+                    let mut row = Vec::new();
+                    for _ in 0..columns {
+                        let size = i32::from_be_bytes(body[pos..pos + 4].try_into().unwrap());
+                        pos += 4;
+                        assert!(size >= 0);
+                        let end = pos + size as usize;
+                        row.push(String::from_utf8(body[pos..end].to_vec()).unwrap());
+                        pos = end;
+                    }
+                    rows.push(row);
+                }
+                b'Z' => return rows,
+                _ => {}
+            }
+        }
+    }
+
+    fn wire_simple(socket: &mut std::net::TcpStream, sql: &str) -> Vec<Vec<String>> {
+        let mut body = sql.as_bytes().to_vec();
+        body.push(0);
+        wire_send(socket, b'Q', &body);
+        wire_rows(socket)
+    }
+
+    fn wire_extended(socket: &mut std::net::TcpStream, sql: &str) -> Vec<Vec<String>> {
+        let mut parse = vec![0];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        wire_send(socket, b'P', &parse);
+        wire_send(socket, b'B', &[0; 8]);
+        wire_send(socket, b'E', &[0; 5]);
+        wire_send(socket, b'S', &[]);
+        wire_rows(socket)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_wire_protocols_share_only_their_client_session() {
+        use std::io::Write;
+        use std::time::Duration;
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let server = TursoPgServer::new(
+            "127.0.0.1:0".to_owned(),
+            ":memory:".to_owned(),
+            Connection::connect(&db).unwrap(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            process_socket(socket, None, Arc::new(server.client_factory().unwrap()))
+                .await
+                .unwrap();
+        });
+        let mut socket = std::net::TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut startup = 196608u32.to_be_bytes().to_vec();
+        startup.extend_from_slice(b"user\0repostew\0database\0postgres\0\0");
+        socket
+            .write_all(&((startup.len() + 4) as u32).to_be_bytes())
+            .unwrap();
+        socket.write_all(&startup).unwrap();
+        wire_rows(&mut socket);
+        wire_simple(
+            &mut socket,
+            "CREATE TABLE session_wire(x INT); BEGIN; INSERT INTO session_wire VALUES (1)",
+        );
+        assert_eq!(
+            wire_extended(&mut socket, "SELECT COUNT(*) FROM session_wire"),
+            vec![vec!["1"]]
+        );
+        wire_extended(&mut socket, "INSERT INTO session_wire VALUES (2)");
+        assert_eq!(
+            wire_simple(&mut socket, "SELECT COUNT(*) FROM session_wire"),
+            vec![vec!["2"]]
+        );
+        wire_simple(&mut socket, "ROLLBACK");
+        assert_eq!(
+            wire_simple(&mut socket, "SELECT COUNT(*) FROM session_wire"),
+            vec![vec!["0"]]
+        );
+        wire_send(&mut socket, b'X', &[]);
+        drop(socket);
+        task.await.unwrap();
+    }
 
     #[test]
     fn test_pg_is_in_recovery_returns_true_text_on_wire() {
