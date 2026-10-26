@@ -414,6 +414,7 @@ fn mv_store_skiplist_allocations_are_fallible() {
         data: Row::new_table_row(row_id.clone(), &[]).unwrap().data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
     };
     let result = store.insert_version(row_id, row_version);
     assert!(matches!(result, Err(crate::alloc::TryReserveError)));
@@ -2457,6 +2458,7 @@ fn test_recovery_replays_schema_op_after_data_op_in_frame() {
         data: generate_simple_string_row(table_id, 1, "data").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
     };
     let schema_record = ImmutableRecord::from_values(
         &[
@@ -2481,6 +2483,7 @@ fn test_recovery_replays_schema_op_after_data_op_in_frame() {
         .data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
     };
     let tx = LogRecord::for_test(
         commit_ts,
@@ -8052,6 +8055,7 @@ fn test_snapshot_isolation_tx_visible1() {
             data: generate_simple_string_row((-2).into(), 1, "testme").data,
             btree_resident: false,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+            payload_kind: crate::mvcc::database::PayloadKind::Record,
         };
         tracing::debug!("Testing visibility of {row_version:?}");
         row_version.is_visible_to(&current_tx, &txs, &finalized_tx_states)
@@ -8153,6 +8157,7 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
         data: generate_simple_string_row((-2).into(), 1, "x").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
     };
     assert!(
         inserted_row.is_visible_to(&reader, &txs, &finalized_tx_states),
@@ -8166,6 +8171,7 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
         data: generate_simple_string_row((-2).into(), 2, "y").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
     };
     assert!(
         !deleted_row.is_visible_to(&reader, &txs, &finalized_tx_states),
@@ -8274,6 +8280,7 @@ fn test_commit_dependency_speculative_read() {
         data: generate_simple_string_row((-2).into(), 1, "test").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
     };
 
     assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 0);
@@ -8307,6 +8314,7 @@ fn test_commit_dependency_cascade_abort() {
         data: generate_simple_string_row((-2).into(), 1, "test").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
     };
 
     // Speculative read registers dependency
@@ -8383,6 +8391,7 @@ fn test_commit_dependency_speculative_ignore() {
         data: generate_simple_string_row((-2).into(), 1, "test").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
     };
 
     // is_end_visible: Preparing(5), begin_ts(10) < 5 = false → deletion visible
@@ -8465,6 +8474,7 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
         data: Row::new_index_row(row_id).data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
     };
     let mut tombstone_versions =
         <RowVersionChain<crate::alloc::DynAllocator> as crate::alloc::TursoVecInExt<
@@ -8520,6 +8530,7 @@ fn test_commit_dependency_multiple_reads_dedup() {
         data: generate_simple_string_row((-2).into(), row_id, "test").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
     };
 
     // Read 3 rows from the same preparing tx — dependency is deduplicated
@@ -11229,6 +11240,7 @@ fn make_rv(begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>) -> RowV
         data: generate_simple_string_row((-2).into(), 1, "gc_test").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
     }
 }
 
@@ -12119,6 +12131,7 @@ fn test_gc_shrinks_version_chain_capacity() {
         data: generate_simple_string_row((-2).into(), 1, "shrink").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
     };
 
     // One committed current version that survives GC (b=1 > ckpt_max=0, so
@@ -13893,6 +13906,7 @@ fn arbitrary_row_version(g: &mut Gen) -> RowVersion {
         data: generate_simple_string_row((-2).into(), 1, "qc").data,
         btree_resident: bool::arbitrary(g),
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
     }
 }
 
@@ -23986,6 +24000,7 @@ fn commit_validation_reports_conflict_for_evicted_tombstone_writer() {
         data: generate_simple_string_row((-2).into(), 1, "original").data,
         btree_resident: true,
         materialized_at: WalPos::ORIGIN,
+        payload_kind: PayloadKind::Record,
     });
     drop(entry);
 
@@ -24823,4 +24838,448 @@ fn empty_version_chain() -> RowVersionChain<TursoAllocator> {
     <RowVersionChain<TursoAllocator> as TursoVecInExt<RowVersion, TursoAllocator>>::new_in(
         TursoAllocator,
     )
+}
+
+/// Column `b` of the rows of the delta tests. With it, a record has about 310
+/// bytes, and an update of column `a` changes a few of them.
+fn wide_text() -> String {
+    "x".repeat(300)
+}
+
+/// Creates `t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)` with the rows
+/// `(id, 0, wide_text())` for `id` from 1 to `rows`.
+fn create_wide_rows(conn: &Arc<Connection>, rows: i64) {
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)")
+        .unwrap();
+    conn.execute(format!(
+        "INSERT INTO t SELECT value, 0, '{}' FROM generate_series(1, {rows})",
+        wide_text()
+    ))
+    .unwrap();
+}
+
+/// The version chain of row `rowid` of table `t`.
+fn chain_of_t_row(conn: &Arc<Connection>, mv: &crate::MvStore, rowid: i64) -> RowVersions {
+    let root_page = get_rows(conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = mv.get_table_id_from_root_page(root_page);
+    mv.rows
+        .get(&RowID::new(table_id, RowKey::Int(rowid)))
+        .expect("the row has a version chain")
+        .value()
+        .clone()
+}
+
+/// Column `a` of each version of the chain that holds a record or a delta.
+fn column_a_of_versions(versions: &[RowVersion]) -> Vec<i64> {
+    (0..versions.len())
+        .filter(|&i| versions[i].begin().is_some())
+        .filter(|&i| versions[i].payload_kind != PayloadKind::Removed)
+        .map(|i| {
+            let record = version_record(versions, i);
+            ImmutableRecordRef::from_bin_record(&record)
+                .get_values_owned()
+                .unwrap()[1]
+                .as_int()
+                .unwrap()
+        })
+        .collect()
+}
+
+fn longest_delta_run(versions: &[RowVersion]) -> usize {
+    let mut longest = 0;
+    let mut run = 0;
+    for version in versions {
+        run = if version.is_delta() { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    longest
+}
+
+#[test]
+fn old_snapshots_read_their_versions_after_1000_updates_stored_as_deltas() {
+    for deltas_on in [false, true] {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let mv = db.get_mvcc_store();
+        mv.set_old_versions_as_deltas(deltas_on);
+        let writer = db.connect();
+        create_wide_rows(&writer, 1);
+        let readers: Vec<_> = (0..4).map(|_| db.connect()).collect();
+        for reader in &readers {
+            reader.execute("BEGIN CONCURRENT").unwrap();
+            get_rows(reader, "SELECT a FROM t");
+            for _ in 0..250 {
+                writer
+                    .execute("UPDATE t SET a = a + 1 WHERE id = 1")
+                    .unwrap();
+            }
+        }
+
+        let chain = chain_of_t_row(&writer, &mv, 1);
+        {
+            let versions = chain.read();
+            assert_eq!(
+                column_a_of_versions(&versions),
+                (0..=1000).collect::<Vec<_>>()
+            );
+            let deltas = versions.iter().filter(|v| v.is_delta()).count();
+            if deltas_on {
+                assert!(
+                    deltas >= 900,
+                    "only {deltas} of 1000 old versions are deltas"
+                );
+                assert_eq!(
+                    longest_delta_run(&versions),
+                    version_deltas::DEFAULT_MAX_DELTA_RUN
+                );
+            } else {
+                assert_eq!(deltas, 0);
+            }
+        }
+
+        for (i, reader) in readers.iter().enumerate() {
+            let expected = vec![vec![
+                Value::from_i64(1),
+                Value::from_i64(250 * i as i64),
+                Value::build_text(wide_text()),
+            ]];
+            assert_eq!(
+                get_rows(reader, "SELECT id, a, b FROM t WHERE id = 1"),
+                expected
+            );
+            assert_eq!(get_rows(reader, "SELECT id, a, b FROM t"), expected);
+            reader.execute("COMMIT").unwrap();
+        }
+        assert_eq!(
+            get_rows(&writer, "SELECT a FROM t"),
+            vec![vec![Value::from_i64(1000)]]
+        );
+    }
+}
+
+#[test]
+fn rollbacks_keep_delta_versions_readable() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mv = db.get_mvcc_store();
+    let writer = db.connect();
+    create_wide_rows(&writer, 1);
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    get_rows(&reader, "SELECT a FROM t");
+    for _ in 0..20 {
+        writer
+            .execute("UPDATE t SET a = a + 1 WHERE id = 1")
+            .unwrap();
+    }
+
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("UPDATE t SET a = 100 WHERE id = 1").unwrap();
+    writer.execute("UPDATE t SET a = 200 WHERE id = 1").unwrap();
+    writer.execute("ROLLBACK").unwrap();
+
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("UPDATE t SET a = 300 WHERE id = 1").unwrap();
+    writer.execute("SAVEPOINT s").unwrap();
+    writer.execute("UPDATE t SET a = 400 WHERE id = 1").unwrap();
+    writer.execute("ROLLBACK TO s").unwrap();
+    writer.execute("COMMIT").unwrap();
+
+    let chain = chain_of_t_row(&writer, &mv, 1);
+    {
+        let versions = chain.read();
+        let mut expected: Vec<i64> = (0..=20).collect();
+        expected.push(300);
+        assert_eq!(column_a_of_versions(&versions), expected);
+        // The versions a = 0..=15 and a = 17..=20 are deltas. The version
+        // a = 16 keeps its record, because a run has at most 16 deltas.
+        assert_eq!(versions.iter().filter(|v| v.is_delta()).count(), 20);
+        assert!(!versions[16].is_delta());
+    }
+    assert_eq!(
+        get_rows(&reader, "SELECT a FROM t"),
+        vec![vec![Value::from_i64(0)]]
+    );
+    reader.execute("COMMIT").unwrap();
+    assert_eq!(
+        get_rows(&writer, "SELECT a FROM t"),
+        vec![vec![Value::from_i64(300)]]
+    );
+}
+
+#[test]
+fn gc_removes_the_payload_of_a_delta_version_whose_base_it_removes() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let mv = db.get_mvcc_store();
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("PRAGMA mvcc_gc_threshold = -1").unwrap();
+        create_wide_rows(&conn, 1);
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        for _ in 0..3 {
+            conn.execute("UPDATE t SET a = a + 1 WHERE id = 1").unwrap();
+        }
+
+        // The tombstone of the B-tree row, then the versions a = 1, 2, 3.
+        let chain = chain_of_t_row(&conn, &mv, 1);
+        {
+            let versions = chain.read();
+            assert_eq!(versions.len(), 4);
+            assert!(versions[0].begin().is_none());
+            assert!(versions[1].btree_resident && versions[1].is_delta());
+            assert!(!versions[2].btree_resident && versions[2].is_delta());
+        }
+
+        // GC keeps the version a = 1 until a checkpoint writes over its B-tree
+        // row. It removes the version a = 2, which is the base of a = 1.
+        mv.drop_unused_row_versions();
+        {
+            let versions = chain.read();
+            assert_eq!(versions.len(), 3);
+            assert_eq!(versions[1].payload_kind, PayloadKind::Removed);
+            assert!(versions[1].data.is_none());
+            assert_eq!(column_a_of_versions(&versions), vec![3]);
+        }
+        assert_eq!(
+            get_rows(&conn, "SELECT a FROM t"),
+            vec![vec![Value::from_i64(3)]]
+        );
+
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        assert_eq!(
+            get_rows(&conn, "SELECT a FROM t"),
+            vec![vec![Value::from_i64(3)]]
+        );
+    }
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        get_rows(&conn, "SELECT a, b FROM t"),
+        vec![vec![Value::from_i64(3), Value::build_text(wide_text())]]
+    );
+}
+
+#[test]
+fn an_update_of_a_preparing_version_stores_both_old_versions_as_deltas() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mv = db.get_mvcc_store();
+    let setup = db.connect();
+    create_wide_rows(&setup, 1);
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    get_rows(&reader, "SELECT a FROM t");
+
+    // T1 sets a = 1 and stops after it takes its commit timestamp.
+    let conn_1 = db.connect();
+    conn_1.execute("BEGIN CONCURRENT").unwrap();
+    conn_1.execute("UPDATE t SET a = 1 WHERE id = 1").unwrap();
+    let prepared = FixedYieldInjector::new([CommitYieldPoint::LogRecordPrepared.point()]);
+    conn_1.set_yield_injector(Some(prepared.clone()));
+    let mut commit_1 = conn_1.prepare("COMMIT").unwrap();
+    while !prepared.is_empty() {
+        assert!(matches!(
+            commit_1.step().unwrap(),
+            StepResult::Yield | StepResult::IO
+        ));
+    }
+    conn_1.set_yield_injector(None);
+
+    // T2 begins after the commit timestamp of T1. Thus it reads the version of
+    // T1 speculatively and ends it with a = 2.
+    let conn_2 = db.connect();
+    conn_2.execute("BEGIN CONCURRENT").unwrap();
+    conn_2
+        .execute("UPDATE t SET a = a + 1 WHERE id = 1")
+        .unwrap();
+    commit_1.run_ignore_rows().unwrap();
+    conn_2.execute("COMMIT").unwrap();
+
+    let chain = chain_of_t_row(&setup, &mv, 1);
+    {
+        let versions = chain.read();
+        assert_eq!(column_a_of_versions(&versions), vec![0, 1, 2]);
+        assert!(versions[0].is_delta() && versions[1].is_delta());
+    }
+    assert_eq!(
+        get_rows(&reader, "SELECT a FROM t"),
+        vec![vec![Value::from_i64(0)]]
+    );
+    reader.execute("COMMIT").unwrap();
+}
+
+/// A speculative updater waits for the transaction that it read, so it
+/// rewrites its versions after that transaction. The deltas must stay correct
+/// in the other order too.
+#[test]
+fn deltas_are_correct_when_a_speculative_updater_rewrites_first() {
+    let db = MvccTestDb::new();
+    let id = RowID::new(MVTableId::new(-2), RowKey::Int(1));
+    let version = |version_id: u64, begin, end, a: i64| {
+        let record = ImmutableRecord::from_values(
+            &[
+                Value::Null,
+                Value::from_i64(a),
+                Value::build_text(wide_text()),
+            ],
+            3,
+        )
+        .unwrap();
+        let data = crate::alloc::try_arc_slice_from_slice(record.get_payload()).unwrap();
+        RowVersion::new(version_id, begin, end, Some(data), false)
+    };
+    let (t1, t2) = (101, 102);
+    let mut versions = vec![
+        version(
+            1,
+            Some(TxTimestampOrID::Timestamp(10)),
+            Some(TxTimestampOrID::TxID(t1)),
+            0,
+        ),
+        version(
+            2,
+            Some(TxTimestampOrID::TxID(t1)),
+            Some(TxTimestampOrID::TxID(t2)),
+            1,
+        ),
+        version(3, Some(TxTimestampOrID::TxID(t2)), None, 2),
+    ];
+    db.mvcc_store
+        .rewrite_chain_for_commit(&id, &mut versions, t2, 30);
+    assert!(!versions[0].is_delta());
+    assert!(versions[1].is_delta(), "a = 1 is a delta while it names T1");
+
+    db.mvcc_store
+        .rewrite_chain_for_commit(&id, &mut versions, t1, 20);
+    assert!(
+        versions[0].is_delta(),
+        "a = 0 is a delta of the delta a = 1"
+    );
+    assert_eq!(column_a_of_versions(&versions), vec![0, 1, 2]);
+}
+
+#[test]
+fn a_commit_dropped_during_its_rewrite_stores_the_rest_of_its_old_versions_as_deltas() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mv = db.get_mvcc_store();
+    let setup = db.connect();
+    let rows = MVCC_COMMIT_BATCH_SIZE as i64 + 100;
+    create_wide_rows(&setup, rows);
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let old_rows = vec![vec![Value::from_i64(rows), Value::from_i64(0)]];
+    assert_eq!(
+        get_rows(&reader, "SELECT count(*), sum(a) FROM t"),
+        old_rows
+    );
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("UPDATE t SET a = 1").unwrap();
+    let log_written = FixedYieldInjector::new([CommitYieldPoint::LogRecordMarkedWritten.point()]);
+    writer.set_yield_injector(Some(log_written.clone()));
+    let mut commit = writer.prepare("COMMIT").unwrap();
+    while !log_written.is_empty() {
+        assert!(matches!(
+            commit.step().unwrap(),
+            StepResult::IO | StepResult::Yield
+        ));
+    }
+    writer.set_yield_injector(None);
+    // The next step rewrites the first MVCC_COMMIT_BATCH_SIZE chains and yields.
+    assert!(matches!(
+        commit.step().unwrap(),
+        StepResult::IO | StepResult::Yield
+    ));
+    assert!(chain_of_t_row(&setup, &mv, 1).read()[0].is_delta());
+    assert!(!chain_of_t_row(&setup, &mv, rows).read()[0].is_delta());
+    assert_eq!(
+        get_rows(&reader, "SELECT count(*), sum(a) FROM t"),
+        old_rows
+    );
+
+    // The dropped COMMIT finishes the rewrite of the other chains.
+    drop(commit);
+    assert!(chain_of_t_row(&setup, &mv, rows).read()[0].is_delta());
+    assert_eq!(
+        get_rows(&reader, "SELECT count(*), sum(a) FROM t"),
+        old_rows
+    );
+    reader.execute("COMMIT").unwrap();
+    assert_eq!(
+        get_rows(&setup, "SELECT count(*), sum(a) FROM t"),
+        vec![vec![Value::from_i64(rows), Value::from_i64(rows)]]
+    );
+}
+
+#[test]
+fn passive_checkpoint_writes_the_record_of_a_version_that_became_a_delta_during_it() {
+    use crate::StepResult;
+
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+    {
+        let mv = db.get_mvcc_store();
+        let setup = db.connect();
+        setup
+            .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        create_wide_rows(&setup, 1);
+        setup
+            .execute("CREATE TABLE driver(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        setup.execute("UPDATE t SET a = 1 WHERE id = 1").unwrap();
+
+        let checkpoint_conn = db.connect();
+        checkpoint_conn
+            .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+        let injector =
+            FixedYieldInjector::new([CheckpointYieldPoint::BeforeCollectTableRows.point()]);
+        checkpoint_conn.set_yield_injector(Some(injector.clone()));
+        let mut checkpoint = checkpoint_conn
+            .prepare("INSERT INTO driver VALUES (1)")
+            .unwrap();
+        let pager_io = checkpoint_conn.pager.load().io.clone();
+        let mut parked = false;
+        for _ in 0..200_000 {
+            match checkpoint.step().unwrap() {
+                StepResult::IO | StepResult::Yield => {
+                    if injector.remaining_len() == 0 {
+                        parked = true;
+                        break;
+                    }
+                    pager_io.step().unwrap();
+                }
+                StepResult::Done => break,
+                other => panic!("unexpected checkpoint step: {other:?}"),
+            }
+        }
+        assert!(parked, "checkpoint must park before collecting table rows");
+
+        // This update commits after the checkpoint snapshot. It makes the
+        // version a = 1, which the checkpoint writes, a delta.
+        let writer = db.connect();
+        writer.execute("UPDATE t SET a = 2 WHERE id = 1").unwrap();
+        {
+            let chain = chain_of_t_row(&writer, &mv, 1);
+            let versions = chain.read();
+            let a_is_1 = versions.len() - 2;
+            assert!(versions[a_is_1].is_delta());
+        }
+
+        drive_statement_to_done(&mut checkpoint, &pager_io);
+        checkpoint_conn.set_yield_injector(None);
+        drop(checkpoint);
+        assert_eq!(
+            get_rows(&writer, "SELECT a FROM t"),
+            vec![vec![Value::from_i64(2)]]
+        );
+    }
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        get_rows(&conn, "SELECT a, b FROM t"),
+        vec![vec![Value::from_i64(2), Value::build_text(wide_text())]]
+    );
 }

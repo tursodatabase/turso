@@ -61,11 +61,14 @@ use tracing::instrument;
 use tracing::Level;
 
 pub mod checkpoint_state_machine;
+mod record_delta;
 #[cfg(not(nightly))]
 mod version_chain;
+mod version_deltas;
 pub use checkpoint_state_machine::{
     sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
 };
+pub(crate) use version_deltas::version_record;
 
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
@@ -468,15 +471,18 @@ pub struct RowVersion {
     /// `PackedTs::pack`).
     pub(crate) begin: PackedTs,
     pub(crate) end: PackedTs,
-    /// The record of a table row. `None` for an index row, because the key of
-    /// its chain is the record. A version does not store its `RowID`: every
-    /// version in a chain has the `RowID` of the chain.
+    /// The record of a table row, or a delta of it (see `payload_kind`). `None`
+    /// for an index row, because the key of its chain is the record. A version
+    /// does not store its `RowID`: every version in a chain has the `RowID` of
+    /// the chain.
     pub data: Option<crate::alloc::ArcSlice<u8>>,
     /// Indicates this version was created for a row that existed in B-tree before
     /// MVCC was enabled (e.g., after switching from WAL to MVCC journal mode).
     /// This flag helps the checkpoint logic determine if a delete should be
     /// checkpointed to the B-tree file.
     pub btree_resident: bool,
+    /// What `data` holds. It uses the padding next to `btree_resident`.
+    pub(crate) payload_kind: PayloadKind,
     /// The WAL position at which this version's *current* (begin, end) state was last
     /// materialized to the B-tree by a checkpoint. [`WalPos::ORIGIN`] means "not yet in the
     /// B-tree" — either never checkpointed, or its state changed (e.g. a delete set `end`) and
@@ -487,6 +493,24 @@ pub struct RowVersion {
     /// ([`MvStore::stamp_materialized`]); reset to ORIGIN when a delete supersedes the row.
     pub(crate) materialized_at: WalPos,
 }
+
+/// What [`RowVersion::data`] holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PayloadKind {
+    /// The record of the row.
+    Record,
+    /// A delta that rebuilds the record from the record of the next newer
+    /// version in the chain, the one that began when this version ended. Only
+    /// old versions of user-table rows hold a delta. See [`version_record`].
+    Delta,
+    /// Nothing: `data` is `None`. GC removed the base of the delta that this
+    /// version held, and no reader can see this version.
+    Removed,
+}
+
+/// The copy of the row that an eq-only seek takes under the chain lock, or the
+/// allocation error of that copy.
+pub(crate) type SeekRowCopy = Result<Row, TryReserveError>;
 
 #[derive(Debug)]
 pub enum RowVersionState {
@@ -3046,11 +3070,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         }
         let mut iterations = 0;
         while ctx.cursor < write_set_len && iterations < MVCC_COMMIT_BATCH_SIZE {
-            let (_id, row_versions) = &write_set.entries[ctx.cursor];
+            let (id, row_versions) = &write_set.entries[ctx.cursor];
             let mut row_versions = row_versions.write();
-            for row_version in row_versions.iter_mut() {
-                row_version.rewrite_txid_to_timestamp(tx_id, end_ts);
-            }
+            mvcc_store.rewrite_chain_for_commit(id, &mut row_versions, tx_id, end_ts);
             ctx.cursor += 1;
             iterations += 1;
         }
@@ -4544,6 +4566,12 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// checkpoint's full sweep.
     gc_last_lwm: AtomicU64,
     experimental_mvcc_passive_checkpoint: bool,
+    /// When true, a commit stores the old versions of the user-table rows that
+    /// it updated as deltas. On by default. Tests and benchmarks turn it off to
+    /// compare both modes.
+    old_versions_as_deltas: AtomicBool,
+    /// The most delta versions that one read applies to rebuild a record.
+    max_delta_run: AtomicUsize,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -4673,7 +4701,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             gc_in_progress: AtomicBool::new(false),
             gc_last_lwm: AtomicU64::new(u64::MAX),
             experimental_mvcc_passive_checkpoint,
+            old_versions_as_deltas: AtomicBool::new(true),
+            max_delta_run: AtomicUsize::new(version_deltas::DEFAULT_MAX_DELTA_RUN),
         })
+    }
+
+    /// Turns on or off the storage of old row versions as deltas for later
+    /// commits. Versions that are deltas already stay deltas.
+    pub fn set_old_versions_as_deltas(&self, enabled: bool) {
+        self.old_versions_as_deltas
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_max_delta_run(&self, max_run: usize) {
+        self.max_delta_run.store(max_run, Ordering::Relaxed);
     }
 
     /// Get the table ID from the root page, resolving against the current (live) mapping.
@@ -5446,6 +5488,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     data: row.data.clone(),
                     btree_resident: false,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                    payload_kind: crate::mvcc::database::PayloadKind::Record,
                 };
                 let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
@@ -5479,6 +5522,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     data: row.data,
                     btree_resident: false,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                    payload_kind: crate::mvcc::database::PayloadKind::Record,
                 };
                 let (row_versions, chain_in_write_set) =
                     self.insert_version(id.clone(), row_version)?;
@@ -5527,6 +5571,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     data: row.data.clone(),
                     btree_resident: true,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                    payload_kind: crate::mvcc::database::PayloadKind::Record,
                 };
                 let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
@@ -5552,6 +5597,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     data: row.data,
                     btree_resident: true,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                    payload_kind: crate::mvcc::database::PayloadKind::Record,
                 };
                 let (row_versions, chain_in_write_set) =
                     self.insert_version(id.clone(), row_version)?;
@@ -5859,9 +5905,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             None => {
                 if let Some(row_versions) = self.rows.get(id) {
                     let row_versions = row_versions.value().read();
-                    if let Some(row) = self.skipmap_row_while_uncovered(tx, id, &row_versions) {
-                        return Ok(Some(row));
-                    }
+                    return self.skipmap_row_while_uncovered(tx, id, &row_versions);
                 }
                 Ok(None)
             }
@@ -5874,18 +5918,41 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tx: &Transaction<A>,
         id: &RowID,
         versions: &[RowVersion],
-    ) -> Option<Row> {
+    ) -> Result<Option<Row>> {
         if versions.is_empty() {
-            return None;
+            return Ok(None);
         }
         if self.btree_covers_chain_for_tx(tx, id.table_id, versions) {
-            return None;
+            return Ok(None);
         }
-        versions
+        let Some(index) = versions
             .iter()
-            .rev()
-            .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-            .map(|rv| rv.row(id))
+            .rposition(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.version_row(id, versions, index)?))
+    }
+
+    /// The row of the version at `index`. A delta version gets a copy of its
+    /// rebuilt record.
+    fn version_row(
+        &self,
+        id: &RowID,
+        versions: &[RowVersion],
+        index: usize,
+    ) -> Result<Row, TryReserveError> {
+        if !versions[index].is_delta() {
+            return Ok(versions[index].row(id));
+        }
+        let record = version_record(versions, index);
+        Ok(Row {
+            id: id.clone(),
+            data: Some(crate::with_mv_store_allocation_site!(
+                RowPayload,
+                crate::alloc::try_arc_slice_from_slice_in(&record, self.allocator())
+            )?),
+        })
     }
 
     /// Like the table branch of [`read_from_table_or_index`], but reads from an
@@ -5899,8 +5966,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         versions: &RowVersions<A>,
     ) -> Result<Option<Row>> {
         let versions = versions.read();
-        if let Some(rv) = self.find_visible_version(snapshot, &versions)? {
-            return Ok(Some(rv.row(id)));
+        if let Some(index) = self.find_visible_version(snapshot, &versions)? {
+            return Ok(Some(self.version_row(id, &versions, index)?));
         }
         Ok(None)
     }
@@ -5918,9 +5985,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         record: &mut ImmutableRecord,
     ) -> Result<bool> {
         let versions = versions.read();
-        if let Some(rv) = self.find_visible_version(snapshot, &versions)? {
+        if let Some(index) = self.find_visible_version(snapshot, &versions)? {
             record.invalidate();
-            record.start_serialization(rv.payload(id))?;
+            if versions[index].is_delta() {
+                record.start_serialization(&version_record(&versions, index))?;
+            } else {
+                record.start_serialization(versions[index].payload(id))?;
+            }
             return Ok(true);
         }
         Ok(false)
@@ -6173,14 +6244,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(!btree_is_invalid)
     }
 
-    fn find_visible_version<'a>(
+    /// The index of the version of `versions` that `snapshot` sees.
+    fn find_visible_version(
         &self,
         snapshot: MvccReadSnapshot,
-        versions: &'a [RowVersion],
-    ) -> Result<Option<&'a RowVersion>> {
-        for version in versions.iter().rev() {
+        versions: &[RowVersion],
+    ) -> Result<Option<usize>> {
+        for (index, version) in versions.iter().enumerate().rev() {
             match version.is_visible_at(snapshot.begin_ts) {
-                Some(true) => return Ok(Some(version)),
+                Some(true) => return Ok(Some(index)),
                 Some(false) => {}
                 None => {
                     let tx = self.txs.get(&snapshot.tx_id).ok_or_else(|| {
@@ -6188,7 +6260,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     })?;
                     let tx = tx.value();
                     turso_assert_eq!(tx.state, TransactionState::Active);
-                    return Ok(versions.iter().rev().find(|version| {
+                    return Ok(versions.iter().rposition(|version| {
                         version.is_visible_to(tx, &self.txs, &self.finalized_tx_states)
                     }));
                 }
@@ -6202,7 +6274,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         snapshot: MvccReadSnapshot,
         row: &TableRowEntry<'_, A>,
         take_payload: bool,
-    ) -> Option<(RowID, RowVersions<A>, Option<Row>)> {
+    ) -> Option<(RowID, RowVersions<A>, Option<SeekRowCopy>)> {
         let versions_arc = row.value();
         let payload = {
             let versions = versions_arc.read();
@@ -6212,7 +6284,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let occupying = self
                 .find_visible_version(snapshot, &versions)
                 .expect("transaction should exist while its cursor is active")?;
-            take_payload.then(|| occupying.row(row.key()))
+            take_payload.then(|| self.version_row(row.key(), &versions, occupying))
         };
         Some((row.key().clone(), versions_arc.clone(), payload))
     }
@@ -6257,7 +6329,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         mut rows: I,
         table_id: MVTableId,
         take_payload: bool,
-    ) -> Option<(RowID, RowVersions<A>, Option<Row>)>
+    ) -> Option<(RowID, RowVersions<A>, Option<SeekRowCopy>)>
     where
         I: Iterator<Item = TableRowEntry<'a, A>>,
     {
@@ -6283,7 +6355,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         direction: IterationDirection,
         snapshot: MvccReadSnapshot,
         table_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
-    ) -> Option<(RowID, RowVersions<A>, Option<Row>)> {
+    ) -> Option<(RowID, RowVersions<A>, Option<SeekRowCopy>)> {
         let table_id = start.table_id;
         let iter_box = {
             let range = if eq_only {
@@ -7260,10 +7332,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 return false;
             }
             if version.end() == Some(TxTimestampOrID::TxID(tx_id)) {
+                assert_ended_version_holds_record(version);
                 version.set_end(None);
             }
             true
         });
+        // The removed versions began in this transaction, and the base of a
+        // delta began in a committed one.
+        version_deltas::assert_deltas_have_bases(versions);
         (before - versions.len(), restores_rowid)
     }
 
@@ -7358,12 +7434,46 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             "rewrite_live_versions_for_committed_tx requires a committed transaction state"
         );
         let write_set = tx_entry.value().write_set.lock();
-        for (_id, row_versions) in write_set.iter() {
+        for (id, row_versions) in write_set.iter() {
             let mut row_versions = row_versions.write();
-            for row_version in row_versions.iter_mut() {
-                row_version.rewrite_txid_to_timestamp(tx_id, end_ts);
+            self.rewrite_chain_for_commit(id, &mut row_versions, tx_id, end_ts);
+        }
+    }
+
+    /// Rewrites the versions of one chain that `tx_id` began or ended to its
+    /// commit timestamp `end_ts`. Then it stores the old versions that the
+    /// transaction ended as deltas, where this saves memory.
+    fn rewrite_chain_for_commit(
+        &self,
+        id: &RowID,
+        versions: &mut [RowVersion],
+        tx_id: TxID,
+        end_ts: u64,
+    ) {
+        let mut ended_a_version = false;
+        for version in versions.iter_mut() {
+            ended_a_version |= version.end() == Some(TxTimestampOrID::TxID(tx_id));
+            version.rewrite_txid_to_timestamp(tx_id, end_ts);
+        }
+        if !ended_a_version || !self.stores_old_versions_as_deltas(id) {
+            return;
+        }
+        let max_run = self.max_delta_run.load(Ordering::Relaxed);
+        let ended_at_commit = Some(TxTimestampOrID::Timestamp(end_ts));
+        for index in 0..versions.len() {
+            if versions[index].end() == ended_at_commit {
+                version_deltas::store_as_delta(versions, index, max_run, self.allocator());
             }
         }
+    }
+
+    /// Old versions of `sqlite_schema` rows keep their records, because the
+    /// checkpoint reads them to find the B-trees to create and destroy. Index
+    /// versions have no record.
+    fn stores_old_versions_as_deltas(&self, id: &RowID) -> bool {
+        self.old_versions_as_deltas.load(Ordering::Relaxed)
+            && id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID
+            && id.row_id.is_int_key()
     }
 
     fn unlock_commit_lock_if_held(&self, tx: &Transaction<A>) {
@@ -7497,6 +7607,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .iter()
                     .any(|rv| rv.id == version_id && rollback_restores_rowid(tx_id, rv));
                 versions.retain(|rv| rv.id != version_id);
+                version_deltas::assert_deltas_have_bases(&versions);
                 self.dec_live_version_count_approx(before - versions.len());
                 tracing::debug!(
                     "rollback_savepoint: removed table version(table_id={}, row_id={}, version_id={})",
@@ -7533,6 +7644,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 for rv in versions.iter_mut() {
                     if rv.id == version_id {
                         restored_rowid = rollback_restores_rowid(tx_id, rv);
+                        assert_ended_version_holds_record(rv);
                         rv.set_end(None);
                         tracing::debug!(
                             "rollback_savepoint: restored table version(table_id={}, row_id={}, version_id={})",
@@ -8543,7 +8655,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         };
 
         // Rule 2: superseded version (end=Timestamp(e)) no reader can see (e <= lwm).
-        versions.retain(|rv| match &rv.end() {
+        Self::retain_versions(versions, lwm, |rv| match &rv.end() {
             Some(TxTimestampOrID::Timestamp(e)) if *e <= lwm => {
                 if passive {
                     // Keep until this delete is in the B-tree and reachable by every reader.
@@ -8583,6 +8695,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Self::shrink_version_chain_allocation(versions);
 
         before - versions.len()
+    }
+
+    /// Removes the versions that `keep` rejects. A delta version that stays
+    /// while its base goes loses its payload; see
+    /// [`version_deltas::remove_payloads_without_base`].
+    fn retain_versions(
+        versions: &mut RowVersionChain<A>,
+        lwm: u64,
+        keep: impl Fn(&RowVersion) -> bool,
+    ) {
+        if !versions.iter().any(RowVersion::is_delta) {
+            versions.retain(keep);
+            return;
+        }
+        let kept: smallvec::SmallVec<[bool; 16]> = versions.iter().map(&keep).collect();
+        version_deltas::remove_payloads_without_base(versions, &kept, lwm);
+        let mut index = 0;
+        versions.retain(|_| {
+            index += 1;
+            kept[index - 1]
+        });
     }
 
     /// Stamp each version this checkpoint materialized with the WAL `frame` it became durable at.
@@ -8838,6 +8971,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         Some(TxTimestampOrID::Timestamp(new))
                     ) if existing == new
                 ) {
+                    // Only recovery and the checkpoint of sqlite_schema rows
+                    // replace a version, and their chains hold no deltas. A
+                    // replaced base would make its delta rebuild a wrong record.
+                    turso_assert!(
+                        !versions.iter().any(RowVersion::is_delta),
+                        "insert_version_raw replaces a version in a chain with deltas"
+                    );
                     versions[i] = row_version;
                     return Ok(());
                 }
@@ -8968,6 +9108,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     data: Some(data),
                     btree_resident: true,
                     materialized_at: WalPos::ORIGIN,
+                    payload_kind: PayloadKind::Record,
                 },
             );
             return true;
@@ -10107,6 +10248,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 data: row.data.clone(),
                                 btree_resident,
                                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                                payload_kind: crate::mvcc::database::PayloadKind::Record,
                             };
                             {
                                 let versions =
@@ -10179,6 +10321,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                         // though the logged flag predates the row becoming durable.
                                         btree_resident: true,
                                         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                                        payload_kind: crate::mvcc::database::PayloadKind::Record,
                                     };
                                     self.insert_version_raw(&mut versions, row_version)?;
                                 }
@@ -10195,6 +10338,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     // deleted row is already durable in the DB file.
                                     btree_resident: true,
                                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                                    payload_kind: crate::mvcc::database::PayloadKind::Record,
                                 };
                                 let versions =
                                     self.get_or_create_table_row_versions(rowid.clone())?;
@@ -10251,6 +10395,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 data: row.data.clone(),
                                 btree_resident,
                                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                                payload_kind: crate::mvcc::database::PayloadKind::Record,
                             };
                             let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
                                 panic!("Index writes must be to a record");
@@ -10300,6 +10445,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 // failed after its pager commit).
                                 btree_resident: true,
                                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                                payload_kind: crate::mvcc::database::PayloadKind::Record,
                             };
                             self.insert_index_version(rowid.table_id, sortable_key, row_version)?;
                         }
@@ -10571,6 +10717,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 }
 
+/// A commit stores as a delta only a version that the committing transaction
+/// ended, after the commit. Thus a version that an active transaction ended
+/// still holds its record.
+fn assert_ended_version_holds_record(version: &RowVersion) {
+    turso_assert!(
+        version.payload_kind == PayloadKind::Record,
+        "a version that an active transaction ended holds its record"
+    );
+}
+
 fn rollback_restores_rowid(tx_id: u64, rv: &RowVersion) -> bool {
     let created_by_tx = rv.begin() == Some(TxTimestampOrID::TxID(tx_id));
     let deleted_by_tx = rv.end() == Some(TxTimestampOrID::TxID(tx_id));
@@ -10747,12 +10903,24 @@ impl RowVersion {
             data,
             btree_resident,
             materialized_at: WalPos::ORIGIN,
+            payload_kind: PayloadKind::Record,
         }
+    }
+
+    /// True if `data` holds a delta instead of the record. Read the record of
+    /// such a version with [`version_record`].
+    #[inline]
+    pub fn is_delta(&self) -> bool {
+        self.payload_kind == PayloadKind::Delta
     }
 
     /// The record of this version. `id` is the `RowID` of its chain, because the
     /// key of an index row is its record.
     pub fn payload<'a>(&'a self, id: &'a RowID) -> &'a [u8] {
+        turso_assert!(
+            self.payload_kind == PayloadKind::Record,
+            "the version holds a delta or nothing; read a delta version with version_record"
+        );
         match &id.row_id {
             RowKey::Int(_) => self.data.as_deref().expect("table rows should have data"),
             RowKey::Record(sortable_key) => sortable_key.key.get_payload(),
@@ -10768,6 +10936,10 @@ impl RowVersion {
 
     /// The row of this version in the chain of `id`.
     pub fn row(&self, id: &RowID) -> Row {
+        turso_assert!(
+            self.payload_kind == PayloadKind::Record,
+            "the version holds a delta or nothing; read a delta version with version_record"
+        );
         Row {
             id: id.clone(),
             data: self.data.clone(),
@@ -10815,9 +10987,10 @@ impl RowVersion {
     }
 
     /// Replace `begin`/`end` references to `tx_id` with the committed
-    /// timestamp `end_ts`. Shared by the chunked commit step
-    /// (`step_rewrite_live_versions`) and the dropped-statement cleanup path
-    /// (`rewrite_live_versions_for_committed_tx`) so the two cannot drift.
+    /// timestamp `end_ts`. Called through `rewrite_chain_for_commit`, which the
+    /// chunked commit step (`step_rewrite_live_versions`) and the
+    /// dropped-statement cleanup path (`rewrite_live_versions_for_committed_tx`)
+    /// share so the two cannot drift.
     #[inline]
     fn rewrite_txid_to_timestamp(&mut self, tx_id: TxID, end_ts: u64) {
         if let Some(TxTimestampOrID::TxID(rv_id)) = self.begin() {

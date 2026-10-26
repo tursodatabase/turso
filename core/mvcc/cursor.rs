@@ -1690,7 +1690,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                             {
                                 self.dual_peek.mvcc_peek = match mvcc_rowid {
                                     Some((rid, versions, payload)) => {
-                                        self.eq_seek_row = payload;
+                                        self.eq_seek_row = payload.transpose()?;
                                         CursorPeek::Row {
                                             key: rid.row_id,
                                             versions: Some(versions),

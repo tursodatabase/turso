@@ -4,9 +4,9 @@ use crate::alloc::{
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    DeleteRowStateMachine, MVTableId, MvStore, RowID, RowKey, RowVersion, SortableIndexKey,
-    TxTimestampOrID, WalPos, WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
-    MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
+    version_record, DeleteRowStateMachine, MVTableId, MvStore, PayloadKind, RowID, RowKey,
+    RowVersion, SortableIndexKey, TxTimestampOrID, WalPos, WriteRowStateMachine,
+    MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use crate::mvcc::database::{IndexRowsEntry, RowVersions};
 #[cfg(any(test, injected_yields))]
@@ -563,6 +563,10 @@ pub fn sqlite_schema_btree_identity(
     // Recovery can synthesize payload-less sqlite_schema tombstones when the
     // pre-delete record is no longer available. Those versions do not carry
     // enough information to recover B-tree identity.
+    turso_assert!(
+        version.payload_kind == PayloadKind::Record,
+        "sqlite_schema versions always hold their records"
+    );
     let payload = version
         .data
         .as_deref()
@@ -1077,12 +1081,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         &self,
         versions: &[RowVersion],
         table_id: MVTableId,
-    ) -> smallvec::SmallVec<[RowVersion; 1]> {
-        let mut versions_to_checkpoint: smallvec::SmallVec<[_; 1]> =
+    ) -> Result<smallvec::SmallVec<[RowVersion; 1]>> {
+        self.checkpointable_versions(versions, table_id)
+            .into_iter()
+            .map(|(index, version)| self.with_rebuilt_record(versions, index, version))
+            .collect()
+    }
+
+    /// The versions that [`Self::maybe_get_checkpointable_versions`] returns,
+    /// each with its index in `versions`.
+    fn checkpointable_versions(
+        &self,
+        versions: &[RowVersion],
+        table_id: MVTableId,
+    ) -> smallvec::SmallVec<[(usize, RowVersion); 1]> {
+        let mut versions_to_checkpoint: smallvec::SmallVec<[(usize, RowVersion); 1]> =
             smallvec::SmallVec::with_capacity(1);
         let mut exists_in_db_file = false;
         // Iterate versions from oldest-to-newest to determine if the row exists in the database file and whether the newest version should be checkpointed.
-        for version in versions.iter() {
+        for (index, version) in versions.iter().enumerate() {
             // A row is in the database file if:
             // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
             // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
@@ -1169,14 +1186,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 };
                 if table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
                     if versions_to_checkpoint.is_empty() {
-                        versions_to_checkpoint.push(checkpoint_version)
+                        versions_to_checkpoint.push((index, checkpoint_version))
                     } else {
-                        versions_to_checkpoint[0] = checkpoint_version
+                        versions_to_checkpoint[0] = (index, checkpoint_version)
                     }
                     continue;
                 }
 
-                if let Some(previous_version) = versions_to_checkpoint.last() {
+                if let Some((_, previous_version)) = versions_to_checkpoint.last() {
                     let should_drop_previous = previous_version.end().is_some()
                         && !is_schema_metadata_only_rewrite(previous_version, Some(version));
                     if should_drop_previous {
@@ -1184,11 +1201,35 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     }
                 }
 
-                versions_to_checkpoint.push(checkpoint_version);
+                versions_to_checkpoint.push((index, checkpoint_version));
             }
         }
 
         versions_to_checkpoint
+    }
+
+    /// The version that the checkpoint writes can be a delta version, when its
+    /// base committed after the checkpoint snapshot. The checkpoint writes the
+    /// rebuilt record.
+    fn with_rebuilt_record(
+        &self,
+        versions: &[RowVersion],
+        index: usize,
+        mut version: RowVersion,
+    ) -> Result<RowVersion> {
+        turso_assert!(
+            version.payload_kind != PayloadKind::Removed,
+            "GC removes the payload only of a version that the checkpoint does not write"
+        );
+        if version.is_delta() {
+            let record = version_record(versions, index);
+            version.data = Some(with_mvcc_checkpoint_allocation_site!(
+                CheckpointWriteSet,
+                crate::alloc::try_arc_slice_from_slice_in(&record, self.mvstore.allocator())
+            )?);
+            version.payload_kind = PayloadKind::Record;
+        }
+        Ok(version)
     }
 
     /// Resolve the table/index id whose B-tree binding owned `root_page` at the moment of the
@@ -1367,7 +1408,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             return Ok(());
         }
         let write_set_len_before = self.write_set.len();
-        for version in self.maybe_get_checkpointable_versions(row_versions, key.table_id) {
+        for version in self.maybe_get_checkpointable_versions(row_versions, key.table_id)? {
             let is_delete = version.end().is_some();
 
             let mut special_write = None;
@@ -1700,7 +1741,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let index_destroyed = self.destroyed_indexes.contains(&index_id);
         let index_write_set_len_before = self.index_write_set.len();
         if !index_destroyed {
-            for version in self.maybe_get_checkpointable_versions(versions, index_id) {
+            for version in self.maybe_get_checkpointable_versions(versions, index_id)? {
                 let is_delete = version.end().is_some();
                 if is_delete && !self.table_exists_for_snapshot(index_id) {
                     continue;
@@ -1769,7 +1810,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
             let versions = entry.value().read();
             if self
-                .maybe_get_checkpointable_versions(&versions, key.table_id)
+                .checkpointable_versions(&versions, key.table_id)
                 .is_empty()
             {
                 continue;
@@ -1793,10 +1834,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
             for entry in index.value().iter() {
                 let versions = entry.value().read();
-                if self
-                    .maybe_get_checkpointable_versions(&versions, index_id)
-                    .is_empty()
-                {
+                if self.checkpointable_versions(&versions, index_id).is_empty() {
                     continue;
                 }
                 let key = RowID::new(index_id, RowKey::Record(entry.key().clone()));
@@ -2465,6 +2503,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     data: Some(data),
                     btree_resident: true,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                    payload_kind: crate::mvcc::database::PayloadKind::Record,
                 },
                 None,
             ))?;
@@ -3902,6 +3941,7 @@ mod tests {
             .data,
             btree_resident: false,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+            payload_kind: crate::mvcc::database::PayloadKind::Record,
         }
     }
 
@@ -3989,6 +4029,7 @@ mod tests {
                 .data,
             btree_resident: false,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+            payload_kind: crate::mvcc::database::PayloadKind::Record,
         };
 
         assert_eq!(
@@ -4044,6 +4085,7 @@ mod tests {
             data: None,
             btree_resident,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+            payload_kind: crate::mvcc::database::PayloadKind::Record,
         };
         (key_arc, row_version)
     }
@@ -4117,6 +4159,7 @@ mod tests {
             data: row.data,
             btree_resident,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+            payload_kind: crate::mvcc::database::PayloadKind::Record,
         };
         (row.id, version)
     }
@@ -4143,14 +4186,76 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_writes_the_record_of_a_delta_version() {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        let mvstore = db.get_mvcc_store();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)")
+            .unwrap();
+        conn.execute(format!(
+            "INSERT INTO t VALUES (1, 0, '{}')",
+            "x".repeat(300)
+        ))
+        .unwrap();
+        conn.execute("UPDATE t SET a = 1 WHERE id = 1").unwrap();
+        conn.execute("UPDATE t SET a = 2 WHERE id = 1").unwrap();
+        let root_page = conn
+            .schema
+            .read()
+            .get_btree_table(NamespaceId::ROOT, "t")
+            .unwrap()
+            .root_page;
+        let table_id = mvstore.get_table_id_from_root_page(root_page);
+        let row_id = RowID::new(table_id, RowKey::Int(1));
+        let chain = mvstore.rows.get(&row_id).unwrap().value().clone();
+        let versions = chain.read();
+        assert!(
+            versions[1].is_delta(),
+            "the update to a = 2 made a = 1 a delta"
+        );
+        let Some(TxTimestampOrID::Timestamp(first_update_ts)) = versions[1].begin() else {
+            panic!("the version a = 1 is committed");
+        };
+
+        let mut checkpoint = CheckpointStateMachine::new(
+            conn.pager.load().clone(),
+            mvstore,
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+        );
+        // A snapshot between the two updates, as when the update to a = 2
+        // commits while a passive checkpoint runs.
+        checkpoint.snapshot_ts = first_update_ts;
+        let checkpointable = checkpoint
+            .maybe_get_checkpointable_versions(&versions, table_id)
+            .unwrap();
+
+        assert_eq!(checkpointable.len(), 1);
+        assert_eq!(checkpointable[0].id, versions[1].id);
+        assert_eq!(checkpointable[0].end(), None);
+        assert_eq!(
+            checkpointable[0].payload(&row_id),
+            version_record(&versions, 1).as_ref()
+        );
+        let record = ImmutableRecordRef::from_bin_record(checkpointable[0].payload(&row_id));
+        assert_eq!(record.get_values_owned().unwrap()[1], Value::from_i64(1));
+    }
+
+    #[test]
     fn checkpoint_collection_uses_btree_marker_for_existence_but_writes_surviving_replacement() {
         let checkpoint = checkpoint_for_collect_tests();
         let table_id = MVTableId::from(-2);
         let (_, btree_tombstone) = table_row_version(table_id, 1, 1, None, Some(5), true);
         let (_, replacement) = table_row_version(table_id, 1, 2, Some(5), None, false);
 
-        let checkpointable =
-            checkpoint.maybe_get_checkpointable_versions(&[btree_tombstone, replacement], table_id);
+        let checkpointable = checkpoint
+            .maybe_get_checkpointable_versions(&[btree_tombstone, replacement], table_id)
+            .unwrap();
 
         assert_eq!(checkpointable.len(), 1);
         assert_eq!(checkpointable[0].id, 2);
@@ -4165,7 +4270,8 @@ mod tests {
         let (_, deleted_replacement) = table_row_version(table_id, 1, 2, Some(5), Some(6), false);
 
         let checkpointable = checkpoint
-            .maybe_get_checkpointable_versions(&[btree_tombstone, deleted_replacement], table_id);
+            .maybe_get_checkpointable_versions(&[btree_tombstone, deleted_replacement], table_id)
+            .unwrap();
 
         assert_eq!(checkpointable.len(), 1);
         assert_eq!(checkpointable[0].id, 2);
@@ -4178,8 +4284,9 @@ mod tests {
         let table_id = MVTableId::from(-2);
         let (_, deleted_replacement) = table_row_version(table_id, 1, 2, Some(5), Some(6), false);
 
-        let checkpointable =
-            checkpoint.maybe_get_checkpointable_versions(&[deleted_replacement], table_id);
+        let checkpointable = checkpoint
+            .maybe_get_checkpointable_versions(&[deleted_replacement], table_id)
+            .unwrap();
 
         assert!(checkpointable.is_empty());
     }
