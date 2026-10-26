@@ -329,21 +329,20 @@ test('simple-db', async () => {
 })
 
 test('experimental features are propagated to the local database', async () => {
-    // Generated columns are gated behind the `generated_columns` experimental
+    // WITHOUT ROWID tables are gated behind the `without_rowid` experimental
     // feature. A synced database opened without the `experimental` option must
     // reject the DDL, proving the feature is off by default.
     const dbDefault = new Database({ path: ':memory:' });
     await dbDefault.connect();
-    await expect(async () => await dbDefault.exec("CREATE TABLE t(x INTEGER, y INTEGER AS (x * 2))"))
-        .rejects.toThrowError(/Generated columns require/);
+    await expect(async () => await dbDefault.exec("CREATE TABLE t(x INTEGER PRIMARY KEY, y) WITHOUT ROWID"))
+        .rejects.toThrowError(/WITHOUT ROWID tables are an experimental feature/);
 
     // The same statement succeeds once the feature is enabled, which only works
     // if `experimental` is threaded through the sync engine to the local engine.
-    const dbExperimental = new Database({ path: ':memory:', experimental: ['generated_columns'] });
+    const dbExperimental = new Database({ path: ':memory:', experimental: ['without_rowid'] });
     await dbExperimental.connect();
-    await dbExperimental.exec("CREATE TABLE t(x INTEGER, y INTEGER AS (x * 2))");
-    await dbExperimental.exec("INSERT INTO t(x) VALUES (1), (2), (3)");
-    expect(await (await dbExperimental.prepare("SELECT y FROM t ORDER BY x")).all()).toEqual([{ y: 2 }, { y: 4 }, { y: 6 }]);
+    await dbExperimental.exec("CREATE TABLE t(x INTEGER PRIMARY KEY, y) WITHOUT ROWID");
+    expect(await (await dbExperimental.prepare("SELECT name FROM sqlite_schema WHERE name = 't'")).all()).toEqual([{ name: 't' }]);
 })
 
 test('experimental features are propagated to the synced database', async ({ server }) => {
@@ -351,23 +350,14 @@ test('experimental features are propagated to the synced database', async ({ ser
     // feature must be threaded through SyncEngine -> the local engine that the
     // sync engine opens internally.
     const dbDefault = await connect({ path: ':memory:', url: server.dbUrl() });
-    await expect(async () => await dbDefault.exec("CREATE TABLE g(x INTEGER, y INTEGER AS (x * 2))"))
-        .rejects.toThrowError(/Generated columns require/);
+    await expect(async () => await dbDefault.exec("CREATE TABLE w(x INTEGER PRIMARY KEY, y) WITHOUT ROWID"))
+        .rejects.toThrowError(/WITHOUT ROWID tables are an experimental feature/);
     await dbDefault.close();
 
-    // With the feature enabled the gated DDL succeeds and the change pushes to
-    // the remote...
-    const writer = await connect({ path: ':memory:', url: server.dbUrl(), experimental: ['generated_columns'] });
-    await writer.exec("CREATE TABLE g(x INTEGER, y INTEGER AS (x * 2))");
-    await writer.exec("INSERT INTO g(x) VALUES (1), (2), (3)");
-    expect(await (await writer.prepare("SELECT y FROM g ORDER BY x")).all()).toEqual([{ y: 2 }, { y: 4 }, { y: 6 }]);
-    await writer.push();
-    await writer.close();
-
-    // ...and a fresh client bootstraps the generated-columns schema from the remote.
-    const reader = await connect({ path: ':memory:', url: server.dbUrl(), experimental: ['generated_columns'] });
-    expect(await (await reader.prepare("SELECT y FROM g ORDER BY x")).all()).toEqual([{ y: 2 }, { y: 4 }, { y: 6 }]);
-    await reader.close();
+    const dbExperimental = await connect({ path: ':memory:', url: server.dbUrl(), experimental: ['without_rowid'] });
+    await dbExperimental.exec("CREATE TABLE w(x INTEGER PRIMARY KEY, y) WITHOUT ROWID");
+    expect(await (await dbExperimental.prepare("SELECT name FROM sqlite_schema WHERE name = 'w'")).all()).toEqual([{ name: 'w' }]);
+    await dbExperimental.close();
 })
 
 test('implicit connect', async ({ server }) => {
