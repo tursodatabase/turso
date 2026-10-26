@@ -392,6 +392,80 @@ expect {
     2|2|1
 }
 
+test table-named-with-a-bracket-at-the-start {
+    CREATE TABLE "[t" (a int);
+    INSERT INTO "[t" VALUES (1);
+    SELECT a FROM "[t";
+}
+expect {
+    1
+}
+
+test table-column-aliases-that-start-with-a-quote-character {
+    CREATE TABLE t (a int);
+    INSERT INTO t VALUES (1);
+    SELECT a AS "[x", a AS """x" FROM t;
+}
+expect {
+    1|1
+}
+
+test table-names-in-brackets-and-without-brackets-are-different-tables {
+    CREATE TABLE "[t]" (a int);
+    CREATE TABLE t (a int);
+    INSERT INTO "[t]" VALUES (1);
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+test table-column-names-keep-their-quote-characters {
+    CREATE TABLE t (x int, "'x'" int, "`x`" int, "[x]" int);
+    INSERT INTO t VALUES (1, 2, 3, 4);
+    SELECT x, "'x'", "`x`", "[x]" FROM t;
+}
+expect {
+    1|2|3|4
+}
+
+test table-serial-column-of-a-table-whose-name-has-double-quotes {
+    CREATE TABLE """t""" (id serial, v int);
+    INSERT INTO """t""" (v) VALUES (5);
+    INSERT INTO """t""" (v) VALUES (6);
+    SELECT id, v FROM """t""" ORDER BY id;
+}
+expect {
+    1|5
+    2|6
+}
+
+test table-serial-column-whose-name-has-double-quotes {
+    CREATE TABLE t ("""id""" serial, v int);
+    INSERT INTO t (v) VALUES (5);
+    SELECT """id""", v FROM t;
+}
+expect {
+    1|5
+}
+
+test table-serial-column-of-a-table-whose-name-has-a-double-quote-inside {
+    CREATE TABLE "a""b" (id serial, v int);
+    INSERT INTO "a""b" (v) VALUES (5);
+    SELECT id, v FROM "a""b";
+}
+expect {
+    1|5
+}
+
+test table-sequence-whose-name-has-double-quotes {
+    CREATE SEQUENCE """s""";
+    SELECT sequencename FROM pg_sequences;
+}
+expect {
+    "s"
+}
+
 test drop-materialized-view-on-a-view-errors {
     CREATE TABLE t (a int);
     CREATE VIEW v AS SELECT * FROM t;
