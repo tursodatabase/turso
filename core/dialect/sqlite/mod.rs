@@ -9,6 +9,7 @@
 //! SQLite one namespace per database, are in [`attach`].
 
 pub mod attach;
+use crate::namespace::NamespaceId;
 use crate::pragma::PragmaVirtualTable;
 use crate::schema::{BTreeTable, Schema, Table};
 use crate::sync::Arc;
@@ -163,7 +164,8 @@ pub fn register_builtin_catalog(
     enable_custom_types: bool,
 ) -> crate::Result<()> {
     for vtab in pragma_vtabs() {
-        schema.tables.insert(
+        schema.insert_table(
+            NamespaceId::ROOT,
             vtab.name.to_owned(),
             Arc::new(Table::Virtual(Arc::new((*vtab).clone()))),
         );
@@ -234,7 +236,6 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         }
         "group_concat" => {
             if arg_count != 1 && arg_count != 2 {
-                println!("{arg_count}");
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)
             }
             Ok(Some(Func::Agg(AggFunc::GroupConcat)))

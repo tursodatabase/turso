@@ -225,28 +225,37 @@ mod tests {
         assert_eq!(rowid_col.kind, ColumnTypeKind::Builtin);
     }
 
-    /// A CAST to a type registered through CREATE TYPE reports that type the
-    /// same way a column declared with it is reported, so wire-protocol
-    /// layers can tell `CAST(x AS float8)` from a plain REAL.
+    /// A CAST to a type registered through CREATE TYPE reports the primitive the
+    /// value is stored as, plus the type's name in `custom_type_name`, so
+    /// wire-protocol layers can tell `CAST(x AS float8)` from a plain REAL.
     #[test]
     fn type_info_for_cast_to_custom_type() {
         let db = fresh_db_with_custom_types("type_info_custom_cast.db");
         let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, f float8) STRICT")
+            .unwrap();
 
         let stmt = conn
-            .prepare("SELECT CAST(1 AS float8), CAST(1 AS float4)")
+            .prepare("SELECT CAST(1 AS float8), CAST(1 AS float4), CAST(1 AS REAL), f FROM t")
             .unwrap();
 
         let float8 = expect_info(&stmt, 0);
-        assert_eq!(float8.declared_name, "float8");
-        assert_eq!(float8.base_type, Some("REAL".to_string()));
-        assert_eq!(float8.kind, ColumnTypeKind::Custom);
-        assert_eq!(float8.array_dimensions, 0);
+        assert_eq!(float8.declared_name, "REAL");
+        assert_eq!(float8.custom_type_name.as_deref(), Some("float8"));
 
+        // float4 is an alias of float8.
         let float4 = expect_info(&stmt, 1);
-        assert_eq!(float4.declared_name, "float4");
-        assert_eq!(float4.base_type, Some("REAL".to_string()));
-        assert_eq!(float4.kind, ColumnTypeKind::Custom);
+        assert_eq!(float4.declared_name, "REAL");
+        assert_eq!(float4.custom_type_name.as_deref(), Some("float8"));
+
+        let real = expect_info(&stmt, 2);
+        assert_eq!(real.declared_name, "REAL");
+        assert_eq!(real.custom_type_name, None);
+
+        let column = expect_info(&stmt, 3);
+        assert_eq!(column.declared_name, "float8");
+        assert_eq!(column.kind, ColumnTypeKind::Custom);
+        assert_eq!(column.custom_type_name, None);
     }
 
     /// Bare literals carry a concrete primitive that the wire-protocol layer
@@ -432,6 +441,8 @@ mod tests {
             ("CASE WHEN x = 1 THEN label ELSE 0 END", None),
             ("CASE WHEN x = 1 THEN NULL END", None),
             ("coalesce(x, randomblob(8))", None),
+            ("iif(x = 1, x, 2)", Some("INTEGER")),
+            ("iif(x = 1, label, 'other')", Some("TEXT")),
         ];
 
         let mut mismatches = Vec::new();
@@ -454,6 +465,83 @@ mod tests {
             "CASE and function result types are wrong:\n{}",
             mismatches.join("\n")
         );
+    }
+
+    /// Aggregates that return one of their input values have that value's type.
+    #[test]
+    fn type_info_for_aggregates_that_return_an_input_value() {
+        let db = fresh_db_with_custom_types("type_info_aggregates.db");
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER, ratio REAL) STRICT")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT max(x), min(ratio), array_agg(x) FROM t")
+            .unwrap();
+        assert_eq!(expect_info(&stmt, 0).declared_name, "INTEGER");
+        assert_eq!(expect_info(&stmt, 1).declared_name, "REAL");
+        let array_agg = expect_info(&stmt, 2);
+        assert_eq!(array_agg.declared_name, "INTEGER");
+        assert_eq!(array_agg.array_dimensions, 1);
+    }
+
+    /// An expression of a custom type that isn't a column reports the primitive
+    /// the type is stored as, not one guessed from the type's name. A type's own
+    /// operator function reports nothing, because the function decides the result.
+    #[test]
+    fn type_info_for_custom_type_expressions() {
+        let db = fresh_db_with_custom_types("type_info_custom_expressions.db");
+        let conn = db.connect_limbo();
+        conn.execute(
+            "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 \
+             OPERATOR '+' max",
+        )
+        .unwrap();
+        conn.execute("CREATE TYPE rev BASE text ENCODE value DECODE value")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE accounts(id INTEGER PRIMARY KEY, amount cents, code rev) STRICT",
+        )
+        .unwrap();
+
+        let stmt = conn
+            .prepare(
+                "SELECT CAST(id AS cents), CAST(id AS rev), coalesce(code, code), amount + 1 \
+                 FROM accounts",
+            )
+            .unwrap();
+        assert_eq!(expect_info(&stmt, 0).declared_name, "INTEGER");
+        assert_eq!(expect_info(&stmt, 1).declared_name, "TEXT");
+        assert_eq!(expect_info(&stmt, 2).declared_name, "TEXT");
+        assert!(stmt.get_column_type_info(3).unwrap().is_none());
+    }
+
+    /// A custom type with no function for an operator goes to SQLite's operator as
+    /// the type it is stored as, so `si * 2` on a smallint is an integer. A value
+    /// that comes from two different custom types, as in `coalesce(si, bi)`, is a
+    /// value of their common stored type.
+    #[test]
+    fn type_info_for_sqlite_operators_on_custom_types() {
+        let db = fresh_db_with_custom_types("type_info_sqlite_operators.db");
+        let conn = db.connect_limbo();
+        conn.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, si smallint, bi bigint, b boolean) STRICT",
+        )
+        .unwrap();
+
+        let stmt = conn
+            .prepare(
+                "SELECT si * 2, bi + 1, -si, abs(bi), coalesce(si, 0), coalesce(b, 0), \
+                 coalesce(si, bi), CASE WHEN id = 1 THEN si ELSE bi END, max(si, bi) FROM t",
+            )
+            .unwrap();
+        for idx in 0..9 {
+            assert_eq!(
+                expect_info(&stmt, idx).declared_name,
+                "INTEGER",
+                "column {idx}"
+            );
+        }
     }
 
     /// Expressions whose primitive can't be determined statically — function

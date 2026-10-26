@@ -108,8 +108,7 @@ fn open_database(
         .with_encryption(true)
         .with_index_method(true)
         .with_autovacuum(true)
-        .with_attach(true)
-        .with_generated_columns(true);
+        .with_attach(true);
     let db_opts = if enable_load_extension {
         db_opts.turso_cli()
     } else {
@@ -129,7 +128,7 @@ fn open_database(
 
 /// Discover and attach existing PG schema database files in the same directory.
 fn auto_attach_pg_schemas(conn: &Connection, db_file: &str) {
-    if db_file == ":memory:" {
+    if turso_core::is_memory_like(db_file) {
         return;
     }
     let dir = Path::new(db_file)

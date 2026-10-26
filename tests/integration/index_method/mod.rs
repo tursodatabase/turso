@@ -1,5 +1,6 @@
 use crate::assertions::{AssertColumn, AssertQueryPlan, Cell, NULL};
 use turso_core::ConnectOpts;
+use turso_core::NamespaceId;
 
 fn is_fts_lookup(detail: &rusqlite::types::Value) -> bool {
     matches!(detail, rusqlite::types::Value::Text(d)
@@ -84,7 +85,7 @@ fn fts_attachment_test_stats(
     let attachment = conn
         .with_schema_mut(|schema| {
             schema
-                .get_index(table_name, index_name)
+                .get_index(NamespaceId::ROOT, table_name, index_name)
                 .and_then(|index| index.index_method.clone())
         })
         .unwrap()

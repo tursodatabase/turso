@@ -94,6 +94,27 @@ expect {
 
 
 @requires custom_types "uses CREATE DOMAIN"
+test domain-default-followed-by-not-null {
+    CREATE DOMAIN defnn AS integer DEFAULT 42 NOT NULL;
+    CREATE TABLE t1(a defnn) STRICT;
+    INSERT INTO t1(rowid) VALUES (1);
+    SELECT a FROM t1;
+}
+expect {
+    42
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-default-followed-by-not-null-rejects-null {
+    CREATE DOMAIN defnn AS integer DEFAULT 42 NOT NULL;
+    CREATE TABLE t1(a defnn) STRICT;
+    INSERT INTO t1 VALUES (NULL);
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
 test domain-default-column-override {
     CREATE DOMAIN defint2 AS integer DEFAULT 10;
     CREATE TABLE t1(a defint2 DEFAULT 99) STRICT;

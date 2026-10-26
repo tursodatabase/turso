@@ -420,6 +420,14 @@ expect {
     -1
 }
 
+# Result column types are worked out before argument counts are checked.
+test abs-without-arguments-in-subquery-errors {
+    SELECT * FROM (SELECT abs())
+}
+expect error {
+    abs function with no arguments|wrong number of arguments to function abs\(\)
+}
+
 test replace-wrong-arg-count-0 {
     select replace()
 }
@@ -1749,6 +1757,39 @@ test quote-float-typeof {
 }
 expect {
     text
+}
+
+# Regression: infinite REAL must quote as a reloadable numeric literal, not Inf.
+# SQLite emits 9.0e+999 so both engines can parse the dump back.
+# Keep these SELECT-only: the sqltest harness opens the DB read-only.
+test quote-positive-infinity {
+    SELECT quote(1e400);
+}
+expect {
+    9.0e+999
+}
+
+test quote-negative-infinity {
+    SELECT quote(-1e400);
+}
+expect {
+    -9.0e+999
+}
+
+test quote-infinity-reload {
+    SELECT quote(CAST(quote(1e400) AS REAL));
+    SELECT quote(CAST(quote(-1e400) AS REAL));
+}
+expect {
+    9.0e+999
+    -9.0e+999
+}
+
+test quote-blob {
+    SELECT quote(X'89504E47');
+}
+expect {
+    X'89504E47'
 }
 
 test sign-positive-integer {

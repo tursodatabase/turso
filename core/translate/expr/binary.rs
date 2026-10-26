@@ -80,7 +80,7 @@ fn emit_row_valued_binary_expr(
         e1,
         e2,
         referenced_tables,
-        Some(resolver),
+        resolver,
     )?;
 
     if let BinaryEmitMode::Condition(metadata) = emit_mode {
@@ -117,7 +117,7 @@ pub(super) fn emit_binary_expr_scalar(
                 e1,
                 e2,
                 referenced_tables,
-                Some(resolver),
+                resolver,
             )?,
             BinaryEmitMode::Condition(metadata) => emit_binary_condition_insn(
                 program,
@@ -129,7 +129,7 @@ pub(super) fn emit_binary_expr_scalar(
                 e2,
                 referenced_tables,
                 metadata,
-                Some(resolver),
+                resolver,
             )?,
         }
         if op.is_comparison() {
@@ -186,7 +186,7 @@ pub(super) fn emit_binary_expr_scalar(
                 e1,
                 e2,
                 referenced_tables,
-                Some(resolver),
+                resolver,
             )?,
             BinaryEmitMode::Condition(metadata) => emit_binary_condition_insn(
                 program,
@@ -198,7 +198,7 @@ pub(super) fn emit_binary_expr_scalar(
                 e2,
                 referenced_tables,
                 metadata,
-                Some(resolver),
+                resolver,
             )?,
         }
         // Only reset collation for comparison operators, which consume it.
@@ -224,7 +224,7 @@ pub(super) fn emit_binary_expr_row_valued(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,
-    resolver: Option<&Resolver>,
+    resolver: &Resolver,
 ) -> Result<()> {
     enum RowOrderingOp {
         Less,
@@ -251,7 +251,7 @@ pub(super) fn emit_binary_expr_row_valued(
                 rhs_expr,
                 i,
                 referenced_tables,
-                resolver,
+                Some(resolver),
             )?;
             program.emit_insn(Insn::Eq {
                 lhs: lhs_start + i,
@@ -329,7 +329,7 @@ pub(super) fn emit_binary_expr_row_valued(
                     rhs_expr,
                     i,
                     referenced_tables,
-                    resolver,
+                    Some(resolver),
                 )?;
                 let lhs = lhs_start + i;
                 let rhs = rhs_start + i;
@@ -477,14 +477,14 @@ pub(super) fn emit_binary_insn(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,
-    resolver: Option<&Resolver>,
+    resolver: &Resolver,
 ) -> Result<()> {
     let mut affinity = Affinity::Blob;
     if op.is_comparison() {
-        affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables, resolver);
+        affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables, Some(resolver));
     }
-    let is_array_cmp =
-        expr_is_array(lhs_expr, referenced_tables) && expr_is_array(rhs_expr, referenced_tables);
+    let is_array_cmp = is_array(lhs_expr, referenced_tables, resolver)
+        && is_array(rhs_expr, referenced_tables, resolver);
     let cmp_flags = || {
         let f = CmpInsFlags::default().with_affinity(affinity);
         if is_array_cmp {
@@ -723,8 +723,8 @@ pub(super) fn emit_binary_insn(
             })
         }
         ast::Operator::Concat => {
-            if expr_is_array(lhs_expr, referenced_tables)
-                || expr_is_array(rhs_expr, referenced_tables)
+            if is_array(lhs_expr, referenced_tables, resolver)
+                || is_array(rhs_expr, referenced_tables, resolver)
             {
                 program.emit_insn(Insn::ArrayConcat {
                     lhs,
@@ -740,9 +740,7 @@ pub(super) fn emit_binary_insn(
             }
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
-            if let Some(r) = resolver {
-                r.require_custom_types("Array features")?;
-            }
+            resolver.require_custom_types("Array features")?;
             // Function instructions read contiguous registers start_reg..start_reg+arg_count.
             // When both operands are equivalent the compiler reuses a single shared register,
             // so we must copy it into a contiguous pair.
@@ -783,107 +781,6 @@ pub(super) fn emit_binary_insn(
     Ok(())
 }
 
-/// Check if an expression is known to produce an array value.
-pub(crate) fn expr_is_array(expr: &Expr, referenced_tables: Option<&TableReferences>) -> bool {
-    match expr {
-        Expr::Cast { type_name, .. } => {
-            type_name.as_ref().is_some_and(|ty| ty.array_dimensions > 0)
-        }
-        Expr::Column { table, column, .. } => {
-            if let Some(tables) = referenced_tables {
-                tables
-                    .find_table_by_internal_id(*table)
-                    .map(|(_, t)| t)
-                    .and_then(|t| t.get_column_at(*column))
-                    .is_some_and(|col| col.is_array())
-            } else {
-                false
-            }
-        }
-        Expr::FunctionCall { name, args, .. } => {
-            if let Ok(Some(f)) = Func::resolve_function(name.as_str(), args.len()) {
-                match &f {
-                    Func::Scalar(sf) if sf.returns_array_blob() => return true,
-                    Func::Agg(AggFunc::ArrayAgg) => return true,
-                    _ => {}
-                }
-            }
-            // Wrapper functions that pass through an array value
-            match name.as_str().to_lowercase().as_str() {
-                "coalesce" | "ifnull" | "min" | "max" => {
-                    args.iter().any(|a| expr_is_array(a, referenced_tables))
-                }
-                "iif" => {
-                    // args: condition, then_val, else_val
-                    args.get(1)
-                        .is_some_and(|a| expr_is_array(a, referenced_tables))
-                        || args
-                            .get(2)
-                            .is_some_and(|a| expr_is_array(a, referenced_tables))
-                }
-                "nullif" => args
-                    .first()
-                    .is_some_and(|a| expr_is_array(a, referenced_tables)),
-                "array_element" => {
-                    // Subscripting a multi-dim array yields a lower-dim array
-                    if let Some(tables) = referenced_tables {
-                        args.first()
-                            .is_some_and(|a| expr_array_dimensions(a, tables) > 1)
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
-            }
-        }
-        Expr::Array { .. } | Expr::Subscript { .. } => {
-            unreachable!("Array and Subscript are desugared into function calls by the parser")
-        }
-        Expr::Binary(lhs, ast::Operator::Concat, rhs) => {
-            expr_is_array(lhs, referenced_tables) || expr_is_array(rhs, referenced_tables)
-        }
-        Expr::Case {
-            when_then_pairs,
-            else_expr,
-            ..
-        } => {
-            when_then_pairs
-                .iter()
-                .any(|(_, then_expr)| expr_is_array(then_expr, referenced_tables))
-                || else_expr
-                    .as_ref()
-                    .is_some_and(|e| expr_is_array(e, referenced_tables))
-        }
-        _ => false,
-    }
-}
-
-/// Return the number of array dimensions for an expression, or 0 for non-array.
-pub(super) fn expr_array_dimensions(expr: &Expr, tables: &TableReferences) -> u32 {
-    match expr {
-        Expr::Column { table, column, .. } => tables
-            .find_table_by_internal_id(*table)
-            .map(|(_, t)| t)
-            .and_then(|t| t.get_column_at(*column))
-            .map(|col| col.array_dimensions())
-            .unwrap_or(0),
-        Expr::FunctionCall { name, args, .. }
-            if name.as_str().eq_ignore_ascii_case("array_element") =>
-        {
-            let d = args
-                .first()
-                .map(|a| expr_array_dimensions(a, tables))
-                .unwrap_or(0);
-            d.saturating_sub(1)
-        }
-        Expr::FunctionCall { name, .. } if name.as_str().eq_ignore_ascii_case("array") => 1,
-        Expr::Subscript { .. } | Expr::Array { .. } => {
-            unreachable!("Array and Subscript are desugared into function calls by the parser")
-        }
-        _ => 0,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_binary_condition_insn(
     program: &mut ProgramBuilder,
@@ -895,11 +792,11 @@ pub(super) fn emit_binary_condition_insn(
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,
     condition_metadata: ConditionMetadata,
-    resolver: Option<&Resolver>,
+    resolver: &Resolver,
 ) -> Result<()> {
     let mut affinity = Affinity::Blob;
     if op.is_comparison() {
-        affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables, resolver);
+        affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables, Some(resolver));
     }
 
     let opposite_op = match op {
@@ -931,7 +828,9 @@ pub(super) fn emit_binary_condition_insn(
     // When jump_if_condition_is_true: we jump on true, so set jump_if_null when NULL should also jump (e.g. CHECK constraints in integrity_check).
     // When !jump_if_condition_is_true: we jump on false, so set jump_if_null when NULL should also jump (standard SQL 3-valued logic).
     let mut flags = CmpInsFlags::default().with_affinity(affinity);
-    if expr_is_array(lhs_expr, referenced_tables) && expr_is_array(rhs_expr, referenced_tables) {
+    if is_array(lhs_expr, referenced_tables, resolver)
+        && is_array(rhs_expr, referenced_tables, resolver)
+    {
         flags = flags.array_cmp();
     }
     if condition_metadata.jump_if_condition_is_true {
@@ -1148,8 +1047,8 @@ pub(super) fn emit_binary_condition_insn(
             eval_result(program, target_register);
         }
         ast::Operator::Concat => {
-            if expr_is_array(lhs_expr, referenced_tables)
-                || expr_is_array(rhs_expr, referenced_tables)
+            if is_array(lhs_expr, referenced_tables, resolver)
+                || is_array(rhs_expr, referenced_tables, resolver)
             {
                 program.emit_insn(Insn::ArrayConcat {
                     lhs,
@@ -1166,9 +1065,7 @@ pub(super) fn emit_binary_condition_insn(
             eval_result(program, target_register);
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
-            if let Some(r) = resolver {
-                r.require_custom_types("Array features")?;
-            }
+            resolver.require_custom_types("Array features")?;
             let start = if lhs == rhs {
                 let regs = program.alloc_registers(2);
                 program.emit_insn(Insn::Copy {
@@ -1205,4 +1102,8 @@ pub(super) fn emit_binary_condition_insn(
     }
 
     Ok(())
+}
+
+fn is_array(expr: &Expr, referenced_tables: Option<&TableReferences>, resolver: &Resolver) -> bool {
+    type_of(expr, &TypeEnv::new(referenced_tables, resolver)).is_array()
 }

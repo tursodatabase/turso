@@ -1,13 +1,19 @@
 use crate::statement::Statement;
 
-/// Whether result column `idx` is a float8 or float4 column, so its values
-/// print the way PostgreSQL prints floats. Other float values, such as plain
-/// NUMERIC columns and decimal literals, keep SQLite's format.
+/// Whether result column `idx` holds float8 or float4 values, so they print
+/// the way PostgreSQL prints floats. Other float values, such as plain NUMERIC
+/// columns and decimal literals, keep SQLite's format.
 pub fn is_float_column(stmt: &Statement, idx: usize) -> bool {
     stmt.get_column_type_info(idx)
         .ok()
         .flatten()
-        .is_some_and(|info| info.array_dimensions == 0 && is_float_type(&info.declared_name))
+        .is_some_and(|info| {
+            let type_name = info
+                .custom_type_name
+                .as_deref()
+                .unwrap_or(&info.declared_name);
+            info.array_dimensions == 0 && is_float_type(type_name)
+        })
 }
 
 /// Whether `type_name` is a Turso type that PostgreSQL floats map to.

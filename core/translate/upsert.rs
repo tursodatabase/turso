@@ -7,6 +7,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 use super::emitter::gencol::compute_virtual_columns;
 use crate::alloc::TursoIteratorExt;
 use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR};
+use crate::namespace::NamespaceId;
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
@@ -428,6 +429,7 @@ pub enum ResolvedUpsertTarget {
 
 pub fn resolve_upsert_target(
     schema: &Schema,
+    namespace: NamespaceId,
     table: &Table,
     upsert: &Upsert,
 ) -> crate::Result<ResolvedUpsertTarget> {
@@ -445,7 +447,7 @@ pub fn resolve_upsert_target(
     }
 
     // Otherwise match a UNIQUE index, also covering non-rowid PRIMARY KEYs
-    for idx in schema.get_indices(table.get_name()) {
+    for idx in schema.get_indices(namespace, table.get_name()) {
         if idx.unique && upsert_matches_index(upsert, idx, table) {
             return Ok(ResolvedUpsertTarget::Index(Arc::clone(idx)));
         }
@@ -1035,7 +1037,9 @@ pub fn emit_upsert(
             let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
 
             // Child-side checks
-            if resolver.with_schema(upsert_database_id, |s| s.has_child_fks(bt.name.as_str())) {
+            if resolver.with_schema(upsert_database_id, |s| {
+                s.has_child_fks(ctx.namespace.id, bt.name.as_str())
+            }) {
                 emit_fk_child_update_counters(
                     program,
                     &bt,
@@ -1051,7 +1055,9 @@ pub fn emit_upsert(
                 )?;
             }
             let upsert_indices: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
-                s.get_indices(table.get_name()).cloned().collect()
+                s.get_indices(ctx.namespace.id, table.get_name())
+                    .cloned()
+                    .collect()
             });
             let affected_upsert_indices: Vec<_> = upsert_indices
                 .iter()
@@ -1144,7 +1150,8 @@ pub fn emit_upsert(
         for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
             let idx_meta = resolver
                 .with_schema(ctx.database_id, |s| {
-                    s.get_index(table.get_name(), idx_name).cloned()
+                    s.get_index(ctx.namespace.id, table.get_name(), idx_name)
+                        .cloned()
                 })
                 .expect("index exists");
 
@@ -1464,7 +1471,9 @@ pub fn emit_upsert(
         {
             let seq_name = crate::schema::autoincrement_sequence_name(table.get_name());
             let seq = resolver
-                .with_schema(upsert_database_id, |s| s.get_sequence(&seq_name).cloned())
+                .with_schema(upsert_database_id, |s| {
+                    s.get_sequence(ctx.namespace.id, &seq_name).cloned()
+                })
                 .ok_or_else(|| {
                     crate::LimboError::InternalError(format!(
                         "missing implicit sequence for AUTOINCREMENT table \"{}\"",

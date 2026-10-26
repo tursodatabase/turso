@@ -12,7 +12,7 @@ use super::plan::TableReferences;
 use crate::function::FtsFunc;
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
-use crate::function::{AggFunc, Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
+use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::schema::{
     BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, ParenthesizedJoinColumn,
     ParenthesizedJoinColumnVisibility, Table, Type, TypeDef,
@@ -43,6 +43,7 @@ mod columns;
 mod condition;
 mod custom_types;
 mod emission;
+pub(crate) mod expr_type;
 pub(crate) mod functions;
 mod translator;
 mod utils;
@@ -66,6 +67,8 @@ use custom_types::*;
 #[allow(unused_imports)]
 use emission::*;
 #[allow(unused_imports)]
+use expr_type::*;
+#[allow(unused_imports)]
 use functions::*;
 #[allow(unused_imports)]
 use metadata::*;
@@ -84,7 +87,6 @@ pub(crate) use affinity::{
 pub(crate) use arrays::{
     emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,
 };
-pub(crate) use binary::expr_is_array;
 pub use binding::{bind_and_rewrite_expr, BindingBehavior};
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub use columns::{emit_stored_column, emit_table_column, emit_table_column_for_dml};

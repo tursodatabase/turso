@@ -184,3 +184,55 @@ test array-custom-type-decode-next-to-literal {
 expect {
     l|{1,2,3}
 }
+
+@requires strict "uses STRICT tables"
+test array-custom-type-columns-compare-as-arrays {
+    -- The element type's operators must not be applied to whole arrays.
+    CREATE TYPE test_uint(value any) BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value)
+        OPERATOR '+' test_uint_add
+        OPERATOR '<' test_uint_lt
+        OPERATOR '=' test_uint_eq;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a test_uint[], b test_uint[]) STRICT;
+    INSERT INTO t VALUES (1, '{1,2}', '{1}'), (2, '{3}', '{3}'), (3, '{2}', '{3}');
+    SELECT id, a = b, a < b FROM t ORDER BY id;
+}
+expect {
+    1|0|0
+    2|1|0
+    3|0|1
+}
+
+test array-generated-column-concat-joins-arrays {
+    CREATE TABLE g(id INTEGER PRIMARY KEY, a integer[], b integer[], c integer[] GENERATED ALWAYS AS (a || b)) STRICT;
+    INSERT INTO g(id, a, b) VALUES (1, '{1,2}', '{3}'), (2, '{5}', '{5}');
+    SELECT id, c FROM g ORDER BY id;
+}
+expect {
+    1|{1,2,3}
+    2|{5,5}
+}
+
+# A column stores its number of array dimensions in three bits, so array types
+# have at most 7 dimensions.
+test array-type-with-8-dimensions-rejected-in-create-table {
+    CREATE TABLE d8(a integer[][][][][][][][]) STRICT;
+}
+expect error {
+    array type integer has 8 dimensions, but arrays have at most 7
+}
+
+test array-type-with-8-dimensions-rejected-in-cast {
+    SELECT CAST(1 AS integer[][][][][][][][]);
+}
+expect error {
+    array type integer has 8 dimensions, but arrays have at most 7
+}
+
+test array-agg-over-7-dimensions-rejected-in-subquery {
+    SELECT * FROM (SELECT array_agg(CAST('{1}' AS integer[][][][][][][])));
+}
+expect error {
+    result column 1 is an array with 8 dimensions, but arrays have at most 7
+}

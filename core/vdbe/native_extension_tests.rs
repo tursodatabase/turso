@@ -1,5 +1,6 @@
 use crate::alloc::TryClone;
 use crate::function::ExternalFunc;
+use crate::namespace::NamespaceId;
 use crate::native_ext::*;
 use crate::sync::{Arc, Mutex};
 use crate::types::{AggContext, ExternalAggState, IOCompletions, IOResultOr};
@@ -1088,7 +1089,10 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
         )
         .unwrap();
     assert!(matches!(
-        schema.get_table("reloaded").unwrap().as_ref(),
+        schema
+            .get_table(NamespaceId::ROOT, "reloaded")
+            .unwrap()
+            .as_ref(),
         crate::schema::Table::Virtual(_)
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 5);
@@ -1325,7 +1329,10 @@ fn native_modules_require_trigger_permission_for_both_table_kinds() {
         } else {
             [("restricted_rows", false), ("allowed_rows", true)]
         } {
-            let table = conn.current_schema().get_table(name).unwrap();
+            let table = conn
+                .current_schema()
+                .get_table(NamespaceId::ROOT, name)
+                .unwrap();
             let crate::schema::Table::Virtual(table) = table.as_ref() else {
                 panic!("expected virtual table {name}");
             };

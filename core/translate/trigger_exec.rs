@@ -1,3 +1,4 @@
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
 use crate::translate::expr::WalkControl;
@@ -585,16 +586,16 @@ fn execute_trigger_commands(
     }
     // Restrict table resolution to the trigger's database during subprogram compilation.
     // Temp triggers live in TEMP_DB_ID, regardless of which database the target table is in.
-    let trigger_database_id = if trigger.temporary {
-        crate::TEMP_DB_ID
+    let trigger_namespace = if trigger.temporary {
+        NamespaceRef::root_of(crate::TEMP_DB_ID)
     } else {
-        database_id
+        NamespaceRef::root_of(database_id)
     };
     // `resolver` is reborrowed as `&mut Resolver` on every trigger command
     // below (`translate_inner` needs it), so the scope closure takes
     // `resolver` as a parameter rather than capturing the outer binding -
     // see `Resolver::with_database_scope_mut`.
-    resolver.with_trigger_scope(trigger_database_id, trigger.name.clone(), |resolver| {
+    resolver.with_trigger_scope(trigger_namespace, trigger.name.clone(), |resolver| {
         for command in trigger.commands.iter() {
             let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
             subprogram_builder.prologue();
@@ -689,7 +690,7 @@ pub fn has_relevant_triggers_type_only(
     updated_column_names: Option<&[ast::Name]>,
     table: &BTreeTable,
 ) -> bool {
-    let mut triggers = schema.get_triggers_for_table(table.name.as_str());
+    let mut triggers = schema.get_triggers_for_table(NamespaceId::ROOT, table.name.as_str());
 
     // Filter triggers by event
     triggers.any(|trigger| {
@@ -719,7 +720,7 @@ pub fn get_relevant_triggers_type_and_time<'a>(
     updated_column_names: Option<&'a [ast::Name]>,
     table: &'a BTreeTable,
 ) -> impl Iterator<Item = Arc<Trigger>> + 'a + Clone {
-    let triggers = schema.get_triggers_for_table(table.name.as_str());
+    let triggers = schema.get_triggers_for_table(NamespaceId::ROOT, table.name.as_str());
 
     // Filter triggers by event
     triggers
@@ -794,7 +795,9 @@ pub fn get_triggers_including_temp(
                     // Unqualified: the trigger targets the temp schema's table if one
                     // exists, otherwise it targets main/attached. Include it only when
                     // no temp table with that name shadows it.
-                    None => s.get_table(&trigger.table_name).is_none(),
+                    None => s
+                        .get_table(NamespaceId::ROOT, &trigger.table_name)
+                        .is_none(),
                 })
                 .collect()
         });
@@ -832,10 +835,12 @@ pub fn has_triggers_including_temp(
     if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
         // Check temp schema for triggers that target this database.
         let has_temp = resolver.with_schema(crate::TEMP_DB_ID, |s| {
-            s.get_triggers_for_table(table.name.as_str())
+            s.get_triggers_for_table(NamespaceId::ROOT, table.name.as_str())
                 .any(|trigger| match trigger.target_database_id {
                     Some(target_db) => target_db == database_id,
-                    None => s.get_table(&trigger.table_name).is_none(),
+                    None => s
+                        .get_table(NamespaceId::ROOT, &trigger.table_name)
+                        .is_none(),
                 })
         });
         if has_temp {

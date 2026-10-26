@@ -1932,6 +1932,9 @@ mod immutable_record {
 
             let header_size = Record::calc_header_size(size_header);
             let total_size = header_size + size_values;
+            if total_size > Value::MAX_BLOB_LENGTH as usize {
+                return Err(LimboError::TooBig);
+            }
             buf.try_reserve_exact(total_size)?;
             buf.resize(total_size, 0);
 

@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use crate::bail_parse_error;
+use crate::namespace::NamespaceId;
 use crate::schema::{
     BTreeTable, Sequence, AUTOINCREMENT_SEQ_PREFIX, SEQ_BACKING_TABLE_PREFIX,
     SQLITE_SEQUENCE_TABLE_NAME,
@@ -37,13 +38,13 @@ pub fn sequence_backing_table_name(seq_name: &str) -> String {
 }
 
 pub fn sequence_backing_table_sql(seq_name: &str) -> String {
-    let table_name = sequence_backing_table_name(seq_name);
+    let escaped_table_name = sequence_backing_table_name(seq_name).replace('"', "\"\"");
     // INTEGER PRIMARY KEY makes `value` the rowid alias: nextval inserts are
     // keyed by the sequence value itself (no synthetic rowid) and the inline
     // compaction emitted by `emit_backing_table_compaction` collapses each
     // backing table down to a single watermark row via DELETE-all + INSERT.
     format!(
-        "CREATE TABLE \"{table_name}\"(\
+        "CREATE TABLE \"{escaped_table_name}\"(\
          value INTEGER PRIMARY KEY,\
          is_called INTEGER,\
          start INTEGER,\
@@ -189,7 +190,9 @@ pub fn emit_disk_read_nextval(
 ) -> Result<()> {
     let backing_table_name = sequence_backing_table_name(seq_name);
     let backing_table = resolver
-        .with_schema(database_id, |s| s.get_btree_table(&backing_table_name))
+        .with_schema(database_id, |s| {
+            s.get_btree_table(NamespaceId::ROOT, &backing_table_name)
+        })
         .ok_or_else(|| {
             crate::LimboError::InternalError(format!(
                 "missing backing table for sequence \"{seq_name}\""
@@ -432,7 +435,9 @@ pub fn emit_disk_advance_past(
 ) -> Result<()> {
     let backing_table_name = sequence_backing_table_name(seq_name);
     let backing_table = resolver
-        .with_schema(database_id, |s| s.get_btree_table(&backing_table_name))
+        .with_schema(database_id, |s| {
+            s.get_btree_table(NamespaceId::ROOT, &backing_table_name)
+        })
         .ok_or_else(|| {
             crate::LimboError::InternalError(format!(
                 "missing backing table for sequence \"{seq_name}\""
@@ -706,7 +711,7 @@ pub(crate) fn emit_sqlite_sequence_sync(
     value_reg: usize,
 ) -> Result<bool> {
     let Some(sseq_table) = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+        s.get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
     }) else {
         return Ok(false);
     };
@@ -860,7 +865,8 @@ pub fn translate_create_sequence(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id_for_create(seq_name)?;
+    let namespace = resolver.resolve_namespace_for_create(seq_name)?;
+    let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
@@ -886,7 +892,9 @@ pub fn translate_create_sequence(
     }
 
     // Check if sequence already exists
-    let exists = resolver.with_schema(database_id, |s| s.get_sequence(&normalized_name).is_some());
+    let exists = resolver.with_schema(database_id, |s| {
+        s.get_sequence(namespace.id, &normalized_name).is_some()
+    });
     if exists {
         if if_not_exists {
             return Ok(());
@@ -905,7 +913,10 @@ pub fn translate_create_sequence(
     )?;
 
     // Open cursor to sqlite_schema (in the target database)
-    let table = resolver.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let table = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+            .unwrap()
+    });
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -968,16 +979,21 @@ pub(crate) fn emit_drop_sequence_cleanup(
 ) -> Result<bool> {
     let backing_table_name = sequence_backing_table_name(seq_name);
     let root_page = resolver.with_schema(database_id, |s| {
-        s.get_sequence(seq_name)?;
-        Some(s.get_btree_table(&backing_table_name)?.root_page)
+        s.get_sequence(NamespaceId::ROOT, seq_name)?;
+        Some(
+            s.get_btree_table(NamespaceId::ROOT, &backing_table_name)?
+                .root_page,
+        )
     });
     let Some(root_page) = root_page else {
         return Ok(false);
     };
 
     // Open sqlite_schema for writing (in the target database)
-    let schema_table =
-        resolver.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let schema_table = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+            .unwrap()
+    });
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -1062,15 +1078,16 @@ pub fn translate_drop_sequence(
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let normalized_name = normalize_ident(seq_name.name.as_str());
-    let database_id = if seq_name.namespace.is_some() {
-        resolver.resolve_database_id(seq_name)?
+    let namespace = if seq_name.namespace.is_some() {
+        resolver.resolve_namespace(seq_name)?
     } else {
-        match resolver.find_existing_sequence_database_id(&normalized_name) {
-            Some(database_id) => database_id,
+        match resolver.find_existing_sequence(&normalized_name) {
+            Some(namespace) => namespace,
             None if if_exists => return Ok(()),
             None => bail_parse_error!("sequence \"{}\" does not exist", normalized_name),
         }
     };
+    let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
