@@ -137,7 +137,9 @@ pub use database::{
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 pub use dialect::{Dialect, SqliteDialect};
-pub use error::{io_error, CompletionError, ConstraintKind, ConstraintViolation, LimboError};
+pub use error::{
+    io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
+};
 pub use function::ContextCollationFunction;
 #[cfg(feature = "io_memory_yield")]
 pub use io::MemoryYieldIO;

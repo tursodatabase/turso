@@ -6,16 +6,23 @@ use std::str;
 use std::sync::Arc;
 
 use crate::catalog::{self, PostgresDialect};
+use crate::error::sqlstate_error;
 use crate::functions::ConfigParameter;
 use crate::settings::{PgSessionState, SettingScope};
 use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST, SQLSTATE_FEATURE_NOT_SUPPORTED,
+    SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_SCHEMA_NAME,
+    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_WRONG_OBJECT_TYPE,
+};
 use turso_pg_parser::translator::{
     check_set_transaction, is_comment_on, is_drop_matview, is_refresh_matview,
     try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
     try_extract_show, unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt,
     PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
 };
+use turso_pg_parser::ParseError;
 
 use crate::copy::parse_copy_text_format;
 
@@ -203,7 +210,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
     let translator = PostgreSQLTranslator::new();
     let translated = translator
         .translate_with_prereqs(&parse_result)
-        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+        .map_err(|e| translation_error(&pg_conn.conn, e))?;
     reject_catalog_dml(translated.cmd.stmt())?;
     if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
         reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
@@ -333,7 +340,10 @@ fn create_table_schema_from_search_path(
         return Ok(None);
     };
     let schema = current_schema(&pg_conn.conn).ok_or_else(|| {
-        LimboError::ParseError("no schema has been selected to create in".to_string())
+        sqlstate_error(
+            SQLSTATE_INVALID_SCHEMA_NAME,
+            "no schema has been selected to create in",
+        )
     })?;
     if schema.eq_ignore_ascii_case("public") {
         return Ok(None);
@@ -412,10 +422,10 @@ fn reject_drop_of_other_view_kind(
             continue;
         };
         if row[0] != Value::build_text(expected_kind) {
-            return Err(LimboError::ParseError(format!(
-                "\"{}\" is not a {expected_kind}",
-                view_name.name.as_str()
-            )));
+            return Err(sqlstate_error(
+                SQLSTATE_WRONG_OBJECT_TYPE,
+                format!("\"{}\" is not a {expected_kind}", view_name.name.as_str()),
+            ));
         }
         return Ok(());
     }
@@ -483,9 +493,26 @@ fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
         ast::Stmt::Update { .. } => "update",
         _ => unreachable!(),
     };
-    Err(LimboError::ParseError(format!(
-        "cannot {verb} pg_catalog table \"{table_name}\""
-    )))
+    if is_catalog_view_name(table_name) {
+        return Err(sqlstate_error(
+            SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+            format!("cannot {verb} view \"{table_name}\""),
+        ));
+    }
+    Err(sqlstate_error(
+        SQLSTATE_INSUFFICIENT_PRIVILEGE,
+        format!("cannot {verb} pg_catalog table \"{table_name}\""),
+    ))
+}
+
+/// Whether the catalog relation `name` is a view in PostgreSQL. PostgreSQL
+/// rejects DML on these views because they do not read a single table, and
+/// it does so before it checks privileges.
+fn is_catalog_view_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "pg_roles" | "pg_seclabels" | "pg_sequences" | "pg_settings" | "pg_tables" | "pg_indexes"
+    )
 }
 
 fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
@@ -514,7 +541,7 @@ fn try_prepare_special(
         return Ok(Some(crate::Statement::new(stmt)));
     }
 
-    if check_set_transaction(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))? {
+    if check_set_transaction(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))? {
         return Ok(Some(crate::Statement::new(noop_statement(&pg_conn.conn)?)));
     }
 
@@ -523,8 +550,8 @@ fn try_prepare_special(
         return Ok(Some(crate::Statement::new(stmt)));
     }
 
-    if let Some(stmt) = try_extract_create_schema(&parse_result)
-        .map_err(|e| LimboError::ParseError(e.to_string()))?
+    if let Some(stmt) =
+        try_extract_create_schema(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
     {
         let inner = noop_statement(&pg_conn.conn)?;
         let pg_conn = Arc::clone(pg_conn);
@@ -543,7 +570,7 @@ fn try_prepare_special(
         )));
     }
 
-    if is_refresh_matview(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))? {
+    if is_refresh_matview(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))? {
         return Ok(Some(crate::Statement::new(noop_statement(&pg_conn.conn)?)));
     }
 
@@ -552,7 +579,7 @@ fn try_prepare_special(
     }
 
     if let Some(stmt) =
-        try_extract_copy_from(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))?
+        try_extract_copy_from(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
     {
         let inner = noop_statement(&pg_conn.conn)?;
         let conn = Arc::clone(&pg_conn.conn);
@@ -567,6 +594,33 @@ fn try_prepare_special(
     }
 
     Ok(None)
+}
+
+/// The engine error for an error of the translator.
+fn translation_error(conn: &Arc<Connection>, error: ParseError) -> LimboError {
+    match error {
+        ParseError::ParseError(message) => LimboError::ParseError(message),
+        ParseError::Sqlstate { sqlstate, message } => sqlstate_error(sqlstate, message),
+        ParseError::SchemaQualifiedName { ref schema, .. } => {
+            match pg_schema_exists(conn, schema) {
+                Ok(true) => sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string()),
+                Ok(false) => sqlstate_error(
+                    SQLSTATE_INVALID_SCHEMA_NAME,
+                    format!("schema \"{schema}\" does not exist"),
+                ),
+                Err(error) => error,
+            }
+        }
+    }
+}
+
+/// Whether PostgreSQL schema `schema` exists: one of the schemas that
+/// PostgreSQL always has, or a schema that CREATE SCHEMA created.
+fn pg_schema_exists(conn: &Arc<Connection>, schema: &str) -> Result<bool> {
+    if matches!(schema, "public" | "pg_catalog" | "information_schema") {
+        return Ok(true);
+    }
+    schema_exists(conn, schema)
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
@@ -707,9 +761,10 @@ pub(crate) fn set_custom_parameter(
     scope: SettingScope,
 ) -> Result<Value> {
     if !is_valid_custom_parameter_name(name) {
-        return Err(LimboError::InvalidArgument(format!(
-            "invalid configuration parameter name \"{name}\""
-        )));
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_NAME,
+            format!("invalid configuration parameter name \"{name}\""),
+        ));
     }
     session_state(conn)?.mutate(conn, |settings| {
         settings.set(&name.to_ascii_lowercase(), value.map(str::to_owned), scope)
@@ -803,9 +858,12 @@ fn handle_pg_create_schema(
         )));
     }
     if name.starts_with("pg_") {
-        return Err(LimboError::ParseError(format!(
-            "unacceptable schema name \"{name}\": the prefix \"pg_\" is reserved for system schemas"
-        )));
+        return Err(sqlstate_error(
+            SQLSTATE_RESERVED_NAME,
+            format!(
+                "unacceptable schema name \"{name}\": the prefix \"pg_\" is reserved for system schemas"
+            ),
+        ));
     }
 
     // A failed element is undone by dropping the schema, and DETACH cannot
@@ -878,9 +936,10 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
     let database = if name == "public" { "main" } else { &name };
     let objects = schema_objects(conn, database)?;
     if !stmt.cascade && !objects.is_empty() {
-        return Err(LimboError::ParseError(format!(
-            "cannot drop schema \"{name}\" because other objects depend on it"
-        )));
+        return Err(sqlstate_error(
+            SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+            format!("cannot drop schema \"{name}\" because other objects depend on it"),
+        ));
     }
 
     without_foreign_keys(conn, || {
@@ -1115,11 +1174,9 @@ mod tests {
             ("DROP VIEW IF EXISTS public.m", "\"m\" is not a view"),
             ("DROP VIEW t", "\"t\" is not a view"),
         ] {
-            assert_eq!(
-                conn.execute(sql).unwrap_err().to_string(),
-                format!("Parse error: {error}"),
-                "{sql}"
-            );
+            let err = conn.execute(sql).unwrap_err();
+            assert_eq!(err.to_string(), error, "{sql}");
+            assert_eq!(err.sqlstate, "42809", "{sql}");
         }
         conn.execute("SELECT * FROM v; SELECT * FROM m; SELECT * FROM t;")
             .unwrap();

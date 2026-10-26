@@ -288,6 +288,31 @@ test current-setting-text-missing-ok-errors {
 @sqlstate 22P02
 expect error {}
 
+test current-setting-missing-ok-accepts-boolean-text {
+    SELECT coalesce(current_setting('no_such_setting', 'yes'), '<null>');
+    SELECT coalesce(current_setting('no_such_setting', ' TRUE '), '<null>');
+}
+expect {
+    <null>
+    <null>
+}
+
+test current-setting-missing-ok-false-text-errors {
+    SELECT current_setting('no_such_setting', ' Off ');
+}
+@sqlstate 42704
+expect error {
+    unrecognized configuration parameter "no_such_setting"
+}
+
+test current-setting-numeric-parameter-name-errors {
+    SELECT current_setting(5.5);
+}
+@sqlstate 42883
+expect error {
+    function current_setting\(numeric\) does not exist
+}
+
 test current-setting-without-arguments-errors {
     SELECT current_setting();
 }

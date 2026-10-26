@@ -3,6 +3,10 @@
 // This module translates pg_query's PostgreSQL AST into Turso's SQL AST
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
+use crate::sqlstate::{
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
+    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_UNDEFINED_TABLE,
+};
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
@@ -1618,7 +1622,7 @@ impl PostgreSQLTranslator {
             (ast::InsertBody::Select(select, upsert), columns)
         };
 
-        let returning = self.translate_returning(&insert.returning_list, relation)?;
+        let returning = self.translate_returning(&insert.returning_list, relation, true)?;
         let with = self.translate_with_clause(&insert.with_clause)?;
 
         Ok(ast::Stmt::Insert {
@@ -1751,6 +1755,9 @@ impl PostgreSQLTranslator {
 
         // Translate FROM clause (PG extension: UPDATE ... FROM ...)
         let from = if !update.from_clause.is_empty() {
+            if let Some(error) = lateral_reference_to_update_target(&update.from_clause, relation) {
+                return Err(error);
+            }
             Some(self.translate_from_items(&update.from_clause)?)
         } else {
             None
@@ -1759,7 +1766,11 @@ impl PostgreSQLTranslator {
         if !update.from_clause.is_empty() && update.returning_list.iter().any(is_bare_star) {
             return Err(not_supported("RETURNING * on UPDATE ... FROM"));
         }
-        let returning = self.translate_returning(&update.returning_list, relation)?;
+        let returning = self.translate_returning(
+            &update.returning_list,
+            relation,
+            update.from_clause.is_empty(),
+        )?;
         let with = self.translate_with_clause(&update.with_clause)?;
 
         Ok(ast::Stmt::Update(ast::Update {
@@ -1796,7 +1807,7 @@ impl PostgreSQLTranslator {
             None
         };
 
-        let returning = self.translate_returning(&delete.returning_list, relation)?;
+        let returning = self.translate_returning(&delete.returning_list, relation, true)?;
         let with = self.translate_with_clause(&delete.with_clause)?;
 
         Ok(ast::Stmt::Delete {
@@ -2427,11 +2438,14 @@ impl PostgreSQLTranslator {
                 Some(range_alias) => {
                     let names = alias_column_names(range_alias)?;
                     if names.len() > 1 {
-                        return Err(ParseError::ParseError(format!(
-                            "table \"{}\" has 1 columns available but {} columns specified",
-                            range_alias.aliasname,
-                            names.len()
-                        )));
+                        return Err(ParseError::Sqlstate {
+                            sqlstate: SQLSTATE_INVALID_COLUMN_REFERENCE,
+                            message: format!(
+                                "table \"{}\" has 1 columns available but {} columns specified",
+                                range_alias.aliasname,
+                                names.len()
+                            ),
+                        });
                     }
                     names
                         .into_iter()
@@ -4525,10 +4539,13 @@ impl PostgreSQLTranslator {
         ))))
     }
 
+    /// `only_target_in_scope` is false when the FROM clause of an UPDATE adds
+    /// tables that RETURNING can name.
     fn translate_returning(
         &self,
         returning_list: &[pg_query::protobuf::Node],
         target: &pg_query::protobuf::RangeVar,
+        only_target_in_scope: bool,
     ) -> Result<Vec<ast::ResultColumn>, ParseError> {
         if returning_list.is_empty() {
             return Ok(vec![]);
@@ -4542,9 +4559,14 @@ impl PostgreSQLTranslator {
         for node in returning_list {
             if is_star_qualified_by(node, target_qualifiers) {
                 columns.push(ast::ResultColumn::Star);
-            } else {
-                columns.extend(self.translate_target_list(std::slice::from_ref(node))?);
+                continue;
             }
+            if only_target_in_scope {
+                if let Some(error) = star_qualified_by_other_table(node, target) {
+                    return Err(error);
+                }
+            }
+            columns.extend(self.translate_target_list(std::slice::from_ref(node))?);
         }
         Ok(columns)
     }
@@ -5136,11 +5158,14 @@ fn rename_result_columns(
     }
     if let Some(columns) = result_column_names(select) {
         if names.len() > columns.len() {
-            return Err(ParseError::ParseError(format!(
-                "table \"{alias}\" has {} columns available but {} columns specified",
-                columns.len(),
-                names.len()
-            )));
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_INVALID_COLUMN_REFERENCE,
+                message: format!(
+                    "table \"{alias}\" has {} columns available but {} columns specified",
+                    columns.len(),
+                    names.len()
+                ),
+            });
         }
         for column in columns.into_iter().skip(names.len()) {
             names.push(column.ok_or_else(|| {
@@ -5491,6 +5516,141 @@ fn is_star_qualified_by(node: &pg_query::protobuf::Node, target_qualifiers: &[&s
     qualifier.iter().rev().zip(target_qualifiers).all(
         |(field, expected)| matches!(&field.node, Some(Node::String(s)) if s.sval == *expected),
     )
+}
+
+/// The error of PostgreSQL for `qualifier.*` that cannot name the target,
+/// when the target is the only table in scope. None when the node is not
+/// such a star, or when only the schema that the target resolves to decides
+/// it, which the translator does not know.
+fn star_qualified_by_other_table(
+    node: &pg_query::protobuf::Node,
+    target: &pg_query::protobuf::RangeVar,
+) -> Option<ParseError> {
+    use pg_query::protobuf::node::Node;
+    let Some(Node::ResTarget(res_target)) = &node.node else {
+        return None;
+    };
+    let Some(Node::ColumnRef(col_ref)) = res_target.val.as_ref().and_then(|v| v.node.as_ref())
+    else {
+        return None;
+    };
+    let (last, qualifier) = col_ref.fields.split_last()?;
+    if !matches!(last.node, Some(Node::AStar(_))) {
+        return None;
+    }
+    let names = qualifier
+        .iter()
+        .map(|field| match &field.node {
+            Some(Node::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let (table, schema_qualified) = match names.as_slice() {
+        [table] => (*table, false),
+        [_, table] => (*table, true),
+        _ => return None,
+    };
+    if table != target.relname {
+        return Some(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_UNDEFINED_TABLE,
+            message: format!("missing FROM-clause entry for table \"{table}\""),
+        });
+    }
+    let aliased = target
+        .alias
+        .as_ref()
+        .is_some_and(|alias| !alias.aliasname.is_empty());
+    if schema_qualified && !aliased && target.schemaname.is_empty() {
+        return None;
+    }
+    Some(ParseError::Sqlstate {
+        sqlstate: SQLSTATE_UNDEFINED_TABLE,
+        message: format!("invalid reference to FROM-clause entry for table \"{table}\""),
+    })
+}
+
+/// The error of PostgreSQL for a LATERAL item in the FROM clause of an UPDATE
+/// that reads a column of the target table. The target is in scope there, but
+/// PostgreSQL does not let the item read it. None when no LATERAL item names
+/// the target as the table of a column, or when some FROM item has the name
+/// of the target too, because then the name can be a reference to that item.
+fn lateral_reference_to_update_target(
+    from_clause: &[pg_query::protobuf::Node],
+    target: &pg_query::protobuf::RangeVar,
+) -> Option<ParseError> {
+    use pg_query::NodeRef;
+    let refname = target
+        .alias
+        .as_ref()
+        .map(|alias| alias.aliasname.as_str())
+        .filter(|alias| !alias.is_empty())
+        .unwrap_or(&target.relname);
+    let target_names = [refname, target.relname.as_str()];
+    let from_nodes = from_clause
+        .iter()
+        .filter_map(|item| item.node.as_ref())
+        .flat_map(|item| item.nodes())
+        .map(|(node, ..)| node)
+        .collect::<Vec<_>>();
+    if from_nodes
+        .iter()
+        .flat_map(range_names)
+        .any(|name| target_names.contains(&name))
+    {
+        return None;
+    }
+    let lateral_items = from_nodes.iter().flat_map(|node| match node {
+        NodeRef::RangeSubselect(item) if item.lateral => {
+            item.subquery.as_deref().into_iter().collect()
+        }
+        NodeRef::RangeFunction(item) if item.lateral => item.functions.iter().collect(),
+        _ => Vec::new(),
+    });
+    let reads_target = lateral_items
+        .filter_map(|item| item.node.as_ref())
+        .flat_map(|item| item.nodes())
+        .filter_map(|(node, ..)| column_qualifier(&node))
+        .any(|qualifier| target_names.contains(&qualifier));
+    reads_target.then(|| ParseError::Sqlstate {
+        sqlstate: SQLSTATE_INVALID_COLUMN_REFERENCE,
+        message: format!("invalid reference to FROM-clause entry for table \"{refname}\""),
+    })
+}
+
+/// The names that a FROM item, a join or a CTE gives to its rows. For a
+/// table, the name of the table too, also when the table has an alias.
+fn range_names<'a>(node: &pg_query::NodeRef<'a>) -> Vec<&'a str> {
+    use pg_query::NodeRef;
+    let alias = |alias: &'a Option<pg_query::protobuf::Alias>| {
+        alias.iter().map(|alias| alias.aliasname.as_str()).collect()
+    };
+    match node {
+        NodeRef::RangeVar(table) => {
+            let mut names: Vec<_> = alias(&table.alias);
+            names.push(table.relname.as_str());
+            names
+        }
+        NodeRef::RangeSubselect(item) => alias(&item.alias),
+        NodeRef::RangeFunction(item) => alias(&item.alias),
+        NodeRef::JoinExpr(join) => alias(&join.alias),
+        NodeRef::CommonTableExpr(cte) => vec![cte.ctename.as_str()],
+        _ => Vec::new(),
+    }
+}
+
+/// The table name of a column reference `table.column`.
+fn column_qualifier<'a>(node: &pg_query::NodeRef<'a>) -> Option<&'a str> {
+    use pg_query::protobuf::node::Node;
+    let pg_query::NodeRef::ColumnRef(column_ref) = node else {
+        return None;
+    };
+    let [qualifier, _] = column_ref.fields.as_slice() else {
+        return None;
+    };
+    match &qualifier.node {
+        Some(Node::String(name)) => Some(name.sval.as_str()),
+        _ => None,
+    }
 }
 
 fn last_string(names: &[pg_query::protobuf::Node]) -> Option<String> {
@@ -6321,10 +6481,13 @@ fn create_schema_elements(
                 if relation.schemaname.is_empty() {
                     relation.schemaname = schema.to_string();
                 } else if relation.schemaname != schema {
-                    return Err(ParseError::ParseError(format!(
-                        "CREATE specifies a schema ({}) different from the one being created ({schema})",
-                        relation.schemaname
-                    )));
+                    return Err(ParseError::Sqlstate {
+                        sqlstate: SQLSTATE_INVALID_SCHEMA_DEFINITION,
+                        message: format!(
+                            "CREATE specifies a schema ({}) different from the one being created ({schema})",
+                            relation.schemaname
+                        ),
+                    });
                 }
             }
             let sql = element
@@ -6823,7 +6986,10 @@ fn drop_object_type_name(obj_type: pg_query::protobuf::ObjectType) -> String {
 }
 
 fn not_supported(what: impl std::fmt::Display) -> ParseError {
-    ParseError::ParseError(format!("{what} is not supported"))
+    ParseError::Sqlstate {
+        sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+        message: format!("{what} is not supported"),
+    }
 }
 
 fn reject_constraint_attributes(
@@ -7088,7 +7254,13 @@ fn object_name(
     }
     unqualified_name(&names, allowed_schema)
         .cloned()
-        .ok_or_else(|| not_supported(format!("a schema-qualified {kind} name")))
+        .ok_or_else(|| match names.as_slice() {
+            [schema, _] => ParseError::SchemaQualifiedName {
+                kind: kind.to_string(),
+                schema: schema.clone(),
+            },
+            _ => not_supported(format!("a schema-qualified {kind} name")),
+        })
 }
 
 fn unqualified_name(names: &[String], allowed_schema: fn(&str) -> bool) -> Option<&String> {

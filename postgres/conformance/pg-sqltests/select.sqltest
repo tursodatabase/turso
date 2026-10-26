@@ -1296,3 +1296,11 @@ test limit-out-of-bigint-range-is-an-error {
 expect error {
     bigint out of range
 }
+
+test limit-text-that-is-not-a-number-is-an-error {
+    SELECT * FROM generate_series(1, 3) LIMIT 'abc';
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bigint: "abc"
+}

@@ -1,3 +1,4 @@
+use crate::error::sqlstate_error;
 use crate::settings::SettingScope;
 use chrono::Utc;
 use std::{fmt, sync::Arc};
@@ -5,6 +6,12 @@ use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
 use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
+};
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+    SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
 };
 
 pub(crate) fn register_functions(mut options: OpenOptions) -> OpenOptions {
@@ -183,10 +190,12 @@ fn exec_acl_default(args: &[Register]) -> Result<Value> {
         .get(..1)
         .unwrap_or("")
         .parse::<AclObjectKind>()
+        // PostgreSQL raises this error with elog(), which gives SQLSTATE XX000.
         .map_err(|_| {
-            LimboError::InvalidArgument(format!(
-                "unrecognized object type abbreviation: {kind_code}"
-            ))
+            sqlstate_error(
+                SQLSTATE_INTERNAL_ERROR,
+                format!("unrecognized object type abbreviation: {kind_code}"),
+            )
         })?;
     let (public_privileges, owner_privileges) = kind.default_privileges();
 
@@ -360,9 +369,7 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
             ));
         }
     };
-    let parameter = find_parameter(name).ok_or_else(|| {
-        LimboError::InvalidArgument(format!("unrecognized configuration parameter \"{name}\""))
-    })?;
+    let parameter = find_parameter(name).ok_or_else(|| unrecognized_parameter(name))?;
     let value = match args[1].get_value() {
         Value::Text(value) => Some(value.as_str()),
         Value::Null => None,
@@ -400,13 +407,22 @@ fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Value> {
         return Ok(Value::Null);
     }
     let Value::Text(name) = args[0].get_value() else {
-        return Err(LimboError::InvalidArgument(
-            "current_setting requires a text parameter name".to_string(),
-        ));
+        let mut arg_types = vec![pg_type_name(args[0].get_value())];
+        arg_types.extend(args[1..].iter().map(|_| "boolean"));
+        return Err(undefined_function("current_setting", &arg_types));
     };
     let name = name.as_str();
     let missing_ok = match args.get(1).map(Register::get_value) {
         None => false,
+        Some(Value::Text(text)) => parse_pg_bool(text.as_str()).ok_or_else(|| {
+            sqlstate_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!(
+                    "invalid input syntax for type boolean: \"{}\"",
+                    text.as_str()
+                ),
+            )
+        })?,
         Some(value) => match value.as_int() {
             Some(0) => false,
             Some(1) => true,
@@ -428,10 +444,15 @@ fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Value> {
     match setting {
         Some(setting) => Ok(Value::build_text(setting)),
         None if missing_ok => Ok(Value::Null),
-        None => Err(LimboError::InvalidArgument(format!(
-            "unrecognized configuration parameter \"{name}\""
-        ))),
+        None => Err(unrecognized_parameter(name)),
     }
+}
+
+fn unrecognized_parameter(name: &str) -> LimboError {
+    sqlstate_error(
+        SQLSTATE_UNDEFINED_OBJECT,
+        format!("unrecognized configuration parameter \"{name}\""),
+    )
 }
 
 fn find_parameter(name: &str) -> Option<Parameter<'_>> {
@@ -451,25 +472,35 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Value> {
         Value::Numeric(Numeric::Float(value)) => {
             let rounded = f64::from(*value).round();
             if !(i64::MIN as f64..i64::MAX as f64).contains(&rounded) {
-                return Err(LimboError::InvalidArgument(
-                    "bigint out of range".to_string(),
+                return Err(sqlstate_error(
+                    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                    "bigint out of range",
                 ));
             }
             rounded as i64
         }
         Value::Text(text) => text.as_str().trim().parse().map_err(|_| {
-            LimboError::InvalidArgument(format!(
-                "invalid input syntax for type bigint: \"{}\"",
-                text.as_str()
-            ))
+            sqlstate_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!(
+                    "invalid input syntax for type bigint: \"{}\"",
+                    text.as_str()
+                ),
+            )
         })?,
         Value::Blob(_) => return Err(LimboError::InvalidArgument("datatype mismatch".to_string())),
     };
     if value < 0 {
-        return Err(LimboError::InvalidArgument(format!(
-            "{} must not be negative",
-            text_arg(args, 1)
-        )));
+        let clause = text_arg(args, 1);
+        let sqlstate = if clause == "OFFSET" {
+            SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE
+        } else {
+            SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE
+        };
+        return Err(sqlstate_error(
+            sqlstate,
+            format!("{clause} must not be negative"),
+        ));
     }
     Ok(Value::from_i64(value))
 }
@@ -545,8 +576,9 @@ fn like_matches(text: &[char], pattern: &[char]) -> Result<bool> {
             Some('\\') => match pattern.get(p + 1) {
                 Some(&c) => (c == text[t]).then_some(2),
                 None => {
-                    return Err(LimboError::InvalidArgument(
-                        "LIKE pattern must not end with escape character".to_string(),
+                    return Err(sqlstate_error(
+                        SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+                        "LIKE pattern must not end with escape character",
                     ));
                 }
             },
@@ -602,8 +634,9 @@ fn exec_like_escape(args: &[Register]) -> Result<Value> {
             result
         }
         _ => {
-            return Err(LimboError::InvalidArgument(
-                "invalid escape string: Escape string must be empty or one character.".to_string(),
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+                "invalid escape string: Escape string must be empty or one character.",
             ));
         }
     };
@@ -732,9 +765,31 @@ fn exec_pg_get_expr(args: &[Register]) -> Result<Value> {
             Ok(Value::Text(expression.clone()))
         }
         Some(Value::Null) => Ok(Value::Null),
-        Some(_) | None => Err(LimboError::ConversionError(
-            "Expected text value".to_string(),
-        )),
+        Some(expression) => {
+            let arg_types = [pg_type_name(expression), "oid", "boolean"];
+            Err(undefined_function("pg_get_expr", &arg_types[..args.len()]))
+        }
+        None => unreachable!("pg_get_expr takes 2 or 3 arguments"),
+    }
+}
+
+/// The error of PostgreSQL for a call with arguments of types that no
+/// function of this name accepts.
+fn undefined_function(name: &str, arg_types: &[&str]) -> LimboError {
+    sqlstate_error(
+        SQLSTATE_UNDEFINED_FUNCTION,
+        format!("function {name}({}) does not exist", arg_types.join(", ")),
+    )
+}
+
+/// The PostgreSQL type that a value of the engine has, for error messages.
+fn pg_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "unknown",
+        Value::Numeric(Numeric::Integer(_)) => "integer",
+        Value::Numeric(Numeric::Float(_)) => "numeric",
+        Value::Text(_) => "text",
+        Value::Blob(_) => "bytea",
     }
 }
 
@@ -758,12 +813,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
 
     match base_type.as_str() {
         "bool" | "boolean" => {
-            let lower = trimmed.to_lowercase();
-            let valid = matches!(
-                lower.as_str(),
-                "t" | "true" | "y" | "yes" | "on" | "1" | "f" | "false" | "n" | "no" | "off" | "0"
-            );
-            if valid {
+            if parse_pg_bool(trimmed).is_some() {
                 None
             } else {
                 Some((
@@ -1021,6 +1071,16 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             format!("type \"{type_name}\" does not exist"),
             "42704".to_string(),
         )),
+    }
+}
+
+/// The value of a PostgreSQL boolean literal such as 'yes' or 'off'. None
+/// when the text is not a boolean literal.
+fn parse_pg_bool(text: &str) -> Option<bool> {
+    match text.trim().to_lowercase().as_str() {
+        "t" | "true" | "y" | "yes" | "on" | "1" => Some(true),
+        "f" | "false" | "n" | "no" | "off" | "0" => Some(false),
+        _ => None,
     }
 }
 
