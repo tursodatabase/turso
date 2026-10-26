@@ -39,8 +39,9 @@ use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
     rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
     rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
-    rewrite_inline_col_fk_target_if_needed, rewrite_trigger_cmd_table_refs,
-    rewrite_view_sql_for_column_rename, trim_ascii_whitespace, RewrittenView,
+    rewrite_inline_col_fk_target_if_needed, rewrite_select_table_refs,
+    rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
+    rewrite_view_sql_for_table_rename, trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -12267,6 +12268,29 @@ pub fn op_function(
                                     .to_string(),
                                 )
                             }
+                            ast::Stmt::CreateView {
+                                temporary,
+                                if_not_exists,
+                                view_name,
+                                columns,
+                                mut select,
+                            } => {
+                                rewrite_select_table_refs(
+                                    &mut select,
+                                    &rename_from,
+                                    original_rename_to.as_str(),
+                                );
+                                Some(
+                                    ast::Stmt::CreateView {
+                                        temporary,
+                                        if_not_exists,
+                                        view_name,
+                                        columns,
+                                        select,
+                                    }
+                                    .to_string(),
+                                )
+                            }
                             _ => None,
                         }
                     };
@@ -17832,6 +17856,41 @@ pub fn op_rename_table(
             rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
         }
 
+        Ok(())
+    })??;
+
+    // A view that reads from the renamed table keeps the old name in its
+    // parsed select, which the query planner reads directly, so selecting from
+    // the view would fail with "no such table" until the next schema reparse.
+    // The stored sqlite_schema row is rewritten by the
+    // Func::AlterTable::RenameTable sweep; mirror that in the in-memory view.
+    let dialect = conn.dialect();
+    conn.with_database_schema_mut(*db, |schema| -> crate::Result<()> {
+        let view_names: Vec<String> = schema
+            .views(NamespaceId::ROOT)
+            .filter(|(_, view)| sql_might_reference_identifier(&view.sql, &normalized_from))
+            .map(|(view_name, _)| view_name.to_string())
+            .collect();
+        for view_name in view_names {
+            let Some((new_sql, new_select)) = schema
+                .get_view(NamespaceId::ROOT, &view_name)
+                .and_then(|view| {
+                    rewrite_view_sql_for_table_rename(
+                        dialect.as_ref(),
+                        &view.sql,
+                        &normalized_from,
+                        &normalized_to,
+                    )
+                })
+            else {
+                continue;
+            };
+            if let Some(view_arc) = schema.view_mut(NamespaceId::ROOT, &view_name) {
+                let view = Arc::make_mut(view_arc);
+                view.sql = new_sql;
+                view.select_stmt = new_select;
+            }
+        }
         Ok(())
     })??;
 

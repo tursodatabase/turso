@@ -3468,3 +3468,28 @@ test alter-table-drop-view-column-rejected {
 expect error {
     cannot drop column from view "v"
 }
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-table-updates-view {
+    CREATE TABLE t (x INT);
+    INSERT INTO t VALUES (1), (2);
+    CREATE VIEW v AS SELECT x FROM t;
+    ALTER TABLE t RENAME TO t2;
+    SELECT x FROM v ORDER BY x;
+}
+expect {
+    1
+    2
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-table-updates-view-qualified {
+    CREATE TABLE t (x INT);
+    INSERT INTO t VALUES (5);
+    CREATE VIEW v AS SELECT t.x FROM t WHERE t.x > 0;
+    ALTER TABLE t RENAME TO t2;
+    SELECT x FROM v;
+}
+expect {
+    5
+}

@@ -4049,7 +4049,40 @@ fn one_select_has_explicit_alias(one_select: &ast::OneSelect, name: &str) -> boo
     })
 }
 
-fn rewrite_select_table_refs(select: &mut ast::Select, old_tbl: &str, new_tbl: &str) {
+/// Rewrite a stored `CREATE VIEW` statement so table references that name
+/// `old_tbl` point at `new_tbl`, returning the new SQL text and the rewritten
+/// select. Renaming a table does not change the view's output columns, so the
+/// caller keeps the view's existing columns.
+pub fn rewrite_view_sql_for_table_rename(
+    dialect: &dyn crate::Dialect,
+    view_sql: &str,
+    old_tbl: &str,
+    new_tbl: &str,
+) -> Option<(String, ast::Select)> {
+    let cmd = dialect.parse(view_sql).ok().and_then(|(cmd, _)| cmd);
+    let Some(ast::Cmd::Stmt(ast::Stmt::CreateView {
+        temporary,
+        if_not_exists,
+        view_name,
+        columns,
+        mut select,
+    })) = cmd
+    else {
+        return None;
+    };
+    rewrite_select_table_refs(&mut select, old_tbl, new_tbl);
+    let new_sql = ast::Stmt::CreateView {
+        temporary,
+        if_not_exists,
+        view_name,
+        columns,
+        select: select.clone(),
+    }
+    .to_string();
+    Some((new_sql, select))
+}
+
+pub fn rewrite_select_table_refs(select: &mut ast::Select, old_tbl: &str, new_tbl: &str) {
     if let Some(with_clause) = &mut select.with {
         for cte in &mut with_clause.ctes {
             rewrite_select_table_refs(&mut cte.select, old_tbl, new_tbl);
