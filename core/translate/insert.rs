@@ -733,6 +733,32 @@ pub fn translate_insert(
         emit_write_sqlite_sequence(program, resolver, ctx.database_id, meta)?;
     }
 
+    // Build a list of upsert constraints/indexes we need to run preflight
+    // checks against, in the proper order of evaluation.
+    let mut constraints = build_constraints_to_check(
+        table_name.as_str(),
+        &upsert_actions,
+        ctx.table.has_rowid,
+        has_user_provided_rowid,
+        resolver,
+        ctx.database_id,
+        ctx.table.rowid_alias_conflict_clause,
+        ctx.statement_on_conflict.is_some(),
+    );
+
+    let has_ddl_replace = ctx.statement_on_conflict.is_none()
+        && upsert_actions.is_empty()
+        && resolver.with_schema(ctx.database_id, |schema| {
+            any_index_or_ipk_has_replace(
+                ctx.table.rowid_alias_conflict_clause,
+                schema
+                    .get_indices(ctx.namespace.id, ctx.table.name.as_str())
+                    .map(|idx| idx.on_conflict),
+            )
+        });
+    let on_replace = (matches!(ctx.on_conflict, ResolveType::Replace) && upsert_actions.is_empty())
+        || has_ddl_replace;
+
     // We need to emit NOT NULL constraints (and their actions) a first time for stored columns,
     // then compute virtual columns, and then emit constraints+actions again for virtual columns
     // only. For example, when running this:
@@ -754,17 +780,63 @@ pub fn translate_insert(
         .table
         .is_strict
         .then(|| BTreeTable::type_check_table_ref(ctx.table, resolver.schema()));
-    let has_custom_type = |column: &Column| {
+    let has_custom_columns = ctx.table.columns().iter().any(|c| {
         resolver
             .schema()
-            .column_has_custom_type(column, ctx.table.is_strict)
-    };
+            .column_has_custom_type(c, ctx.table.is_strict)
+    });
     let types_checked_first = has_before_triggers || insertion.has_virtual_columns();
-    if !types_checked_first {
+    let types_checked_early =
+        types_checked_first || !ctx.table.check_constraints.is_empty() || has_custom_columns;
+
+    if !types_checked_early {
+        let is_strict = ctx.table.is_strict;
         emit_notnulls(program, &ctx, &insertion, resolver, |column| {
-            !column.is_virtual_generated() && !has_custom_type(column)
+            !column.is_virtual_generated()
+                && !resolver.schema().column_has_custom_type(column, is_strict)
         })?;
     }
+
+    let early_pk_check = !types_checked_early
+        && ctx.table.has_rowid
+        && has_user_provided_rowid
+        && constraints
+            .constraints_to_check
+            .first()
+            .is_some_and(|(c, _)| matches!(c, ResolvedUpsertTarget::PrimaryKey));
+
+    if early_pk_check {
+        let (_, pk_upsert_position) = constraints.constraints_to_check.remove(0);
+        constraints.early_pk_upsert_position = Some(pk_upsert_position);
+
+        let effective = if ctx.statement_on_conflict.is_some() {
+            ctx.on_conflict
+        } else {
+            ctx.table
+                .rowid_alias_conflict_clause
+                .unwrap_or(ResolveType::Abort)
+        };
+        let effective_on_replace =
+            matches!(effective, ResolveType::Replace) && upsert_actions.is_empty();
+        let mut early_preflight_ctx = PreflightCtx {
+            upsert_actions: &upsert_actions,
+            on_replace: effective_on_replace,
+            effective_on_conflict: effective,
+            connection,
+            table_references: &mut table_references,
+        };
+
+        emit_pk_uniqueness_check(
+            program,
+            &mut ctx,
+            resolver,
+            &insertion,
+            pk_upsert_position,
+            constraints.upsert_catch_all_position,
+            &mut early_preflight_ctx,
+        )?;
+    }
+
     if let Some(type_check_table) = &maybe_type_check_table {
         // Pre-encoding TypeCheck: validate input types match the custom type's declared value type
         // to catch things like a TEXT value inserted into an INTEGER-based custom type.
@@ -792,8 +864,10 @@ pub fn translate_insert(
             table_reference: Arc::clone(type_check_table),
         });
     }
+    let is_strict = ctx.table.is_strict;
     emit_notnulls(program, &ctx, &insertion, resolver, |column| {
-        !column.is_virtual_generated() && (types_checked_first || has_custom_type(column))
+        !column.is_virtual_generated()
+            && (types_checked_early || resolver.schema().column_has_custom_type(column, is_strict))
     })?;
 
     if insertion.has_virtual_columns() {
@@ -851,52 +925,6 @@ pub fn translate_insert(
         Some(&table_references),
     )?;
 
-    // Build a list of upsert constraints/indexes we need to run preflight
-    // checks against, in the proper order of evaluation,
-    let constraints = build_constraints_to_check(
-        table_name.as_str(),
-        &upsert_actions,
-        ctx.table.has_rowid,
-        has_user_provided_rowid,
-        resolver,
-        ctx.database_id,
-        ctx.table.rowid_alias_conflict_clause,
-        ctx.statement_on_conflict.is_some(),
-    );
-
-    // We need to separate index handling and insertion into a `preflight` and a
-    // `commit` phase, because in UPSERT mode we might need to skip the actual insertion, as we can
-    // have a naked ON CONFLICT DO NOTHING, so if we eagerly insert any indexes, we could insert
-    // invalid index entries before we hit a conflict down the line.
-    //
-    // REPLACE (whether statement-level OR REPLACE or constraint-level ON CONFLICT REPLACE)
-    // inserts eagerly in preflight because it needs to delete-then-insert per index.
-    // When there's no statement-level override (e.g. INSERT OR ...) and no UPSERT,
-    // individual constraints keep their DDL modes. If some use REPLACE and others
-    // don't, the preflight eagerly handles REPLACE indexes (delete+reinsert) while
-    // deferring non-REPLACE indexes to the commit phase (skip_replace_indexes).
-    // This mixed-mode detection is unnecessary when a statement override exists,
-    // because the override applies uniformly to all constraints.
-    let has_ddl_replace = ctx.statement_on_conflict.is_none()
-        && upsert_actions.is_empty()
-        && resolver.with_schema(ctx.database_id, |schema| {
-            any_index_or_ipk_has_replace(
-                ctx.table.rowid_alias_conflict_clause,
-                schema
-                    .get_indices(ctx.namespace.id, ctx.table.name.as_str())
-                    .map(|idx| idx.on_conflict),
-            )
-        });
-    let on_replace = (matches!(ctx.on_conflict, ResolveType::Replace) && upsert_actions.is_empty())
-        || has_ddl_replace;
-    let mut preflight_ctx = PreflightCtx {
-        upsert_actions: &upsert_actions,
-        on_replace,
-        effective_on_conflict: ctx.on_conflict,
-        connection,
-        table_references: &mut table_references,
-    };
-
     // Populate register-to-affinity map so partial index WHERE clauses get
     // correct column affinity during INSERT.
     //
@@ -918,6 +946,14 @@ pub fn translate_insert(
     resolver
         .register_affinities
         .insert(insertion.key_register(), Affinity::Integer);
+
+    let mut preflight_ctx = PreflightCtx {
+        upsert_actions: &upsert_actions,
+        on_replace,
+        effective_on_conflict: ctx.on_conflict,
+        connection,
+        table_references: &mut table_references,
+    };
 
     emit_preflight_constraint_checks(
         program,
@@ -1175,7 +1211,8 @@ pub fn translate_insert(
             .col_mappings
             .iter()
             .any(|m| m.column.notnull() && !m.column.is_rowid_alias());
-        let has_unique = !constraints.constraints_to_check.is_empty();
+        let has_unique = !constraints.constraints_to_check.is_empty()
+            || constraints.early_pk_upsert_position.is_some();
         let has_triggers = has_before_triggers || has_after_triggers;
         let has_upsert_do_update = upsert_actions
             .iter()
@@ -1666,9 +1703,12 @@ fn resolve_upserts(
         // Like SQLite, only compile an action that some constraint check can
         // jump to, so its SET clause and UPDATE triggers are never resolved
         // when the INSERT cannot conflict.
-        let reachable = constraints.constraints_to_check.iter().any(|(_, handler)| {
-            handler.or(constraints.upsert_catch_all_position) == Some(position)
-        });
+        let reachable = constraints
+            .early_pk_upsert_position
+            .is_some_and(|h| h.or(constraints.upsert_catch_all_position) == Some(position))
+            || constraints.constraints_to_check.iter().any(|(_, handler)| {
+                handler.or(constraints.upsert_catch_all_position) == Some(position)
+            });
         if !reachable {
             continue;
         }
@@ -3620,6 +3660,7 @@ fn emit_index_column_value_for_insert(
 struct ConstraintsToCheck {
     constraints_to_check: Vec<(ResolvedUpsertTarget, Option<usize>)>,
     upsert_catch_all_position: Option<usize>,
+    early_pk_upsert_position: Option<Option<usize>>,
 }
 
 /// Context for preflight constraint checks
@@ -3734,6 +3775,7 @@ fn build_constraints_to_check(
     ConstraintsToCheck {
         constraints_to_check,
         upsert_catch_all_position,
+        early_pk_upsert_position: None,
     }
 }
 
