@@ -10823,7 +10823,9 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Random => {
-                state.registers[*dest].set_int(pager.io.generate_random_number());
+                let bits = pager.io.generate_random_number();
+                let value = program.connection.dialect().random_value(bits);
+                state.registers[*dest].set_value(value);
             }
             #[cfg(feature = "test_helper")]
             ScalarFunc::TestNondetCounter => {

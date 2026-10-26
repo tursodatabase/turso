@@ -17,7 +17,7 @@ Scalar functions accept one or more arguments and return a single value. They ca
 | `abs(X)` | Absolute value of X. Returns INTEGER if X is INTEGER, REAL if X is REAL, NULL if X is NULL |
 | `max(X, Y, ...)` | Returns the argument with the maximum value |
 | `min(X, Y, ...)` | Returns the argument with the minimum value |
-| `random()` | Returns a random 64-bit signed integer |
+| `random()` | Returns a random 64-bit signed integer in SQLite; returns a `double precision` value in `[0, 1)` in PostgreSQL |
 | `round(X)` | Rounds X to the nearest integer |
 | `round(X, Y)` | Rounds X to Y decimal places |
 | `sign(X)` | Returns -1, 0, or 1 for negative, zero, or positive X |
@@ -349,6 +349,8 @@ SELECT quote(x'CAFE');       -- 'X''CAFE'''
 ### random() and randomblob(N)
 
 `random` returns a pseudo-random 64-bit signed integer. Each call is evaluated independently, including multiple calls in the same expression. `randomblob` returns a blob of N pseudo-random bytes.
+
+In the PostgreSQL dialect, `random()` returns a `double precision` value in the range `[0, 1)`.
 
 ```sql
 SELECT random();           -- e.g., -4520312828827489743
