@@ -665,7 +665,9 @@ const HIR_EXHAUSTIVE_JOIN_LIMIT: usize = 8;
 
 /// A left-deep HIR join of some sources, ending with one of them.
 struct HirPartialJoin {
-    steps: Vec<(usize, AccessMethod)>,
+    /// Each step's source and how it is read. Plans that extend this one
+    /// share its access methods instead of copying them.
+    steps: Vec<(usize, std::rc::Rc<AccessMethod>)>,
     output_cardinality: f64,
     /// The estimated number of rows after each step, in order.
     prefix_cardinalities: Vec<f64>,
@@ -726,11 +728,11 @@ pub(crate) fn compute_hir_join_order(
     let predicate_work = build_hir_predicate_work(document, &layout, where_clause)?;
     let step = |position: usize,
                 lhs_mask: &TableMask,
-                lhs_steps: &[(usize, AccessMethod)],
+                lhs_steps: &[(usize, std::rc::Rc<AccessMethod>)],
                 input_cardinality: f64| {
         let lhs_steps = lhs_steps
             .iter()
-            .map(|(position, method)| (*position, method))
+            .map(|(position, method)| (*position, &**method))
             .collect::<Vec<_>>();
         hir_join_step(
             document,
@@ -803,7 +805,7 @@ pub(crate) fn compute_hir_join_order(
         memo.entry(mask).or_default().insert(
             position,
             HirPartialJoin {
-                steps: vec![(position, first.access_method)],
+                steps: vec![(position, std::rc::Rc::new(first.access_method))],
                 output_cardinality,
                 prefix_cardinalities: vec![output_cardinality],
                 cost,
@@ -845,19 +847,18 @@ pub(crate) fn compute_hir_join_order(
             where_clause,
             params,
         );
-        let mut steps = lhs
-            .steps
-            .iter()
-            .map(|(position, method)| (*position, method.clone()))
-            .collect::<Vec<_>>();
-        steps.push((rhs, method.clone()));
-        let mut prefix_cardinalities = lhs.prefix_cardinalities.clone();
+        let cost = lhs.cost + method.cost;
+        let mut steps = Vec::with_capacity(lhs.steps.len() + 1);
+        steps.extend(lhs.steps.iter().cloned());
+        steps.push((rhs, std::rc::Rc::new(method)));
+        let mut prefix_cardinalities = Vec::with_capacity(lhs.prefix_cardinalities.len() + 1);
+        prefix_cardinalities.extend_from_slice(&lhs.prefix_cardinalities);
         prefix_cardinalities.push(output_cardinality);
         Ok(Some(HirPartialJoin {
             steps,
             output_cardinality,
             prefix_cardinalities,
-            cost: lhs.cost + method.cost,
+            cost,
         }))
     };
 
@@ -959,7 +960,7 @@ pub(crate) fn compute_hir_join_order(
             .steps
             .into_iter()
             .map(|(position, method)| {
-                arena.push(method);
+                arena.push(std::rc::Rc::unwrap_or_clone(method));
                 (position, arena.len() - 1)
             })
             .collect(),
