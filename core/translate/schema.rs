@@ -36,7 +36,7 @@ use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
     column_declared_type, dequote, escape_sql_string_literal, is_builtin_strict_type,
     normalize_ident, quote_identifier, walk_expr_with_subqueries, walk_schema_expressions,
-    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+    walk_select_expressions, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
@@ -709,7 +709,12 @@ fn validate(
                     ast::ColumnConstraint::Check { expr, .. } => {
                         validate_check_expr(expr, table_name, &column_names, resolver)?;
                     }
-                    ast::ColumnConstraint::Default(expr) => validate_default_expr(expr, col_i)?,
+                    ast::ColumnConstraint::Default(expr) => {
+                        validate_default_expr(expr, col_i)?;
+                        if resolver.dialect.checks_functions_exist_at_create() {
+                            check_functions_exist(expr, resolver)?;
+                        }
+                    }
                     ast::ColumnConstraint::Generated { expr, .. } => {
                         validate_generated_function_calls(expr, resolver)?;
                     }
@@ -896,6 +901,34 @@ pub(crate) fn validate_generated_function_calls(
         Ok(WalkControl::Continue)
     })?;
     Ok(())
+}
+
+/// Fails with "no such function" when `expr` calls a function that does not exist.
+pub(crate) fn check_functions_exist(expr: &ast::Expr, resolver: &CatalogContext) -> Result<()> {
+    walk_expr_with_subqueries(expr, &mut |e| check_function_exists(e, resolver))
+}
+
+/// [`check_functions_exist`] for every expression of a SELECT.
+pub(crate) fn check_functions_exist_in_select(
+    select: &ast::Select,
+    resolver: &CatalogContext,
+) -> Result<()> {
+    walk_select_expressions(select, &mut |e| check_function_exists(e, resolver))
+}
+
+fn check_function_exists(expr: &ast::Expr, resolver: &CatalogContext) -> Result<WalkControl> {
+    let (name, arg_count) = match expr {
+        ast::Expr::FunctionCall { name, args, .. } => (name, args.len()),
+        ast::Expr::FunctionCallStar { name, .. } => (name, 0),
+        _ => return Ok(WalkControl::Continue),
+    };
+    if resolver
+        .resolve_function(name.as_str(), arg_count)?
+        .is_none()
+    {
+        bail_parse_error!("no such function: {}", name.as_str());
+    }
+    Ok(WalkControl::Continue)
 }
 
 /// Schema information derived from a CTAS SELECT.
@@ -2953,6 +2986,8 @@ fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &CatalogContext) -
                             name.as_str()
                         );
                     }
+                } else if resolver.dialect.checks_functions_exist_at_create() {
+                    bail_parse_error!("no such function: {}", name.as_str());
                 }
             }
             ast::Expr::FunctionCallStar { name, .. } => {
