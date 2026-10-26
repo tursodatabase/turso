@@ -2435,7 +2435,7 @@ impl PostgreSQLTranslator {
                 }
                 None => func_name.to_string(),
             };
-            let alias = alias.unwrap_or_else(|| ast::As::Elided(ast::Name::from_string(func_name)));
+            let alias = alias.unwrap_or_else(|| ast::As::Elided(exact_name(func_name)));
             // Evaluate the arguments in their own VALUES row so that names like `value` or
             // `start` resolve to columns on the left, not to generate_series's own columns.
             // VALUES, unlike a SELECT, still rejects aggregate and window functions.
@@ -5074,8 +5074,8 @@ fn function_arguments_subquery(
     let arg_refs = (1..=args.len())
         .map(|i| {
             Box::new(ast::Expr::Qualified(
-                ast::Name::from_string("arg"),
-                ast::Name::from_string(format!("column{i}")),
+                exact_name("arg"),
+                exact_name(format!("column{i}")),
             ))
         })
         .collect();
@@ -5089,7 +5089,7 @@ fn function_arguments_subquery(
             order_by: vec![],
             limit: None,
         },
-        alias: Some(ast::As::Elided(ast::Name::from_string("arg"))),
+        alias: Some(ast::As::Elided(exact_name("arg"))),
         lateral: false,
     };
     (subquery, arg_refs)
