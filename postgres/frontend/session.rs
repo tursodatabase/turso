@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::num::NonZero;
 use std::str;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::catalog::{self, PostgresDialect};
@@ -26,6 +27,7 @@ pub struct PgConnection {
 
 struct PgConnectionInner {
     conn: Arc<Connection>,
+    tx_aborted: Arc<AtomicBool>,
 }
 
 const SEARCH_PATH_SETTING: &str = "search_path";
@@ -75,7 +77,10 @@ impl PgConnection {
         conn.add_namespace("public", turso_core::MAIN_DB_ID);
         set_search_path(&conn, None, SettingScope::Session)?;
         Ok(Self {
-            inner: Arc::new(PgConnectionInner { conn }),
+            inner: Arc::new(PgConnectionInner {
+                conn,
+                tx_aborted: Arc::new(AtomicBool::new(false)),
+            }),
         })
     }
 
@@ -84,8 +89,10 @@ impl PgConnection {
     }
 
     pub fn prepare(&self, sql: impl AsRef<str>) -> crate::Result<crate::Statement> {
+        let conn = self.inner.conn.clone();
+        let tx_aborted = self.inner.tx_aborted.clone();
         prepare_statement(&self.inner, sql.as_ref())
-            .map(crate::Statement::new)
+            .map(|inner| crate::Statement::new(inner, conn, tx_aborted))
             .map_err(Into::into)
     }
 
@@ -151,9 +158,11 @@ impl Iterator for PgQueryRunner<'_> {
 
         let sql = &self.stmts[self.index];
         self.index += 1;
+        let conn = self.conn.conn.clone();
+        let tx_aborted = self.conn.tx_aborted.clone();
         Some(
             prepare_statement(self.conn, sql)
-                .map(crate::Statement::new)
+                .map(|inner| crate::Statement::new(inner, conn, tx_aborted))
                 .map(Some)
                 .map_err(Into::into),
         )
@@ -177,6 +186,10 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     }
 
     reject_sqlite_catalog_access(sql)?;
+
+    if pg_conn.tx_aborted.load(Ordering::Relaxed) {
+        return prepare_while_aborted(pg_conn, sql);
+    }
 
     if let Some(stmt) = try_prepare_special(pg_conn, sql)? {
         return Ok(stmt);
@@ -217,6 +230,34 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     }
 
     pg_conn.conn.prepare_translated_cmd(translated.cmd, &sql)
+}
+
+fn prepare_while_aborted(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Statement> {
+    if is_tx_end(sql) {
+        pg_conn.tx_aborted.store(false, Ordering::Relaxed);
+        return noop_statement(&pg_conn.conn);
+    }
+    Err(LimboError::TxError(
+        "current transaction is aborted, commands ignored until end of transaction block"
+            .to_string(),
+    ))
+}
+
+fn is_tx_end(sql: &str) -> bool {
+    let Ok(parse_result) = turso_pg_parser::parse(sql) else {
+        return false;
+    };
+    let Ok(translated) = PostgreSQLTranslator::new().translate_with_prereqs(&parse_result) else {
+        return false;
+    };
+    matches!(
+        translated.cmd.stmt(),
+        ast::Stmt::Commit { .. }
+            | ast::Stmt::Rollback {
+                savepoint_name: None,
+                ..
+            }
+    )
 }
 
 /// The schema that a CREATE TABLE statement naming its table without a
@@ -910,6 +951,58 @@ fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
 mod tests {
     use super::search_path_parser;
     use chumsky::Parser;
+
+    fn test_connection() -> super::PgConnection {
+        let (io, db) = super::open_database(
+            ":memory:",
+            None,
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+        )
+        .unwrap();
+        drop(io);
+        super::PgConnection::connect(&db).unwrap()
+    }
+
+    #[test]
+    fn runtime_error_in_explicit_transaction_aborts_it() {
+        let conn = test_connection();
+        conn.execute("CREATE TABLE t (a int)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("SELECT abs(-9223372036854775808)")
+            .unwrap_err();
+        let err = conn.execute("SELECT 1").expect_err(
+            "statements after an error in an explicit transaction must be rejected with 25P02",
+        );
+        assert_eq!(err.sqlstate, "25P02");
+        conn.execute("ROLLBACK").unwrap();
+        let mut stmt = conn.query("SELECT count(*) FROM t").unwrap().unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![turso_core::Value::from_i64(0)]],
+            "ROLLBACK after aborted transaction must leave no inserted rows"
+        );
+    }
+
+    #[test]
+    fn commit_of_aborted_transaction_rolls_back() {
+        let conn = test_connection();
+        conn.execute("CREATE TABLE t (a int)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("SELECT abs(-9223372036854775808)")
+            .unwrap_err();
+        conn.execute("COMMIT").unwrap();
+        let mut stmt = conn.query("SELECT count(*) FROM t").unwrap().unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![turso_core::Value::from_i64(0)]],
+            "COMMIT of an aborted transaction must roll back, not commit"
+        );
+    }
 
     #[test]
     fn search_path_parser_accepts_identifier_lists() {

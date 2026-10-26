@@ -204,6 +204,7 @@ const SQLSTATE_INVALID_TRANSACTION_STATE: &str = "25000";
 const SQLSTATE_ACTIVE_SQL_TRANSACTION: &str = "25001";
 const SQLSTATE_READ_ONLY_SQL_TRANSACTION: &str = "25006";
 const SQLSTATE_NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
+const SQLSTATE_IN_FAILED_SQL_TRANSACTION: &str = "25P02";
 const SQLSTATE_INVALID_SAVEPOINT_SPECIFICATION: &str = "3B001";
 const SQLSTATE_SERIALIZATION_FAILURE: &str = "40001";
 const SQLSTATE_DISK_FULL: &str = "53100";
@@ -292,6 +293,8 @@ fn tx_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_NO_ACTIVE_SQL_TRANSACTION
     } else if msg.contains("no such savepoint") {
         SQLSTATE_INVALID_SAVEPOINT_SPECIFICATION
+    } else if msg.contains("current transaction is aborted") {
+        SQLSTATE_IN_FAILED_SQL_TRANSACTION
     } else {
         SQLSTATE_INVALID_TRANSACTION_STATE
     }

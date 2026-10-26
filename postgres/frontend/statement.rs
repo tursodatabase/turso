@@ -1,28 +1,59 @@
 use std::num::NonZero;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::task::Waker;
 use std::time::Duration;
 
 use turso_core::{
-    ColumnTypeInfo, IOResult, LimboError, Row, StatementStatusCounter, StepResult, Value,
+    ColumnTypeInfo, Connection, IOResult, LimboError, Row, StatementStatusCounter, StepResult,
+    Value,
 };
 
 use crate::Result;
 
 pub struct Statement {
     inner: turso_core::Statement,
+    conn: Arc<Connection>,
+    tx_aborted: Arc<AtomicBool>,
 }
 
 impl Statement {
-    pub(crate) fn new(inner: turso_core::Statement) -> Self {
-        Self { inner }
+    pub(crate) fn new(
+        inner: turso_core::Statement,
+        conn: Arc<Connection>,
+        tx_aborted: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            inner,
+            conn,
+            tx_aborted,
+        }
     }
 
     pub fn step(&mut self) -> Result<StepResult> {
-        self.inner.step().map_err(Into::into)
+        let in_explicit_tx = !self.conn.get_auto_commit();
+        match self.inner.step().map_err(Into::into) {
+            Err(e) => {
+                if in_explicit_tx {
+                    self.tx_aborted.store(true, Ordering::Relaxed);
+                }
+                Err(e)
+            }
+            other => other,
+        }
     }
 
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
-        self.inner.step_with_waker(waker).map_err(Into::into)
+        let in_explicit_tx = !self.conn.get_auto_commit();
+        match self.inner.step_with_waker(waker).map_err(Into::into) {
+            Err(e) => {
+                if in_explicit_tx {
+                    self.tx_aborted.store(true, Ordering::Relaxed);
+                }
+                Err(e)
+            }
+            other => other,
+        }
     }
 
     pub fn reset(&mut self) -> Result<()> {
@@ -38,11 +69,29 @@ impl Statement {
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
-        self.inner.run_ignore_rows().map_err(Into::into)
+        let in_explicit_tx = !self.conn.get_auto_commit();
+        match self.inner.run_ignore_rows().map_err(Into::into) {
+            Err(e) => {
+                if in_explicit_tx {
+                    self.tx_aborted.store(true, Ordering::Relaxed);
+                }
+                Err(e)
+            }
+            ok => ok,
+        }
     }
 
     pub fn run_collect_rows(&mut self) -> Result<Vec<Vec<Value>>> {
-        self.inner.run_collect_rows().map_err(Into::into)
+        let in_explicit_tx = !self.conn.get_auto_commit();
+        match self.inner.run_collect_rows().map_err(Into::into) {
+            Err(e) => {
+                if in_explicit_tx {
+                    self.tx_aborted.store(true, Ordering::Relaxed);
+                }
+                Err(e)
+            }
+            ok => ok,
+        }
     }
 
     pub fn run_with_row_callback(
@@ -63,9 +112,20 @@ impl Statement {
     }
 
     pub fn run_ignore_rows_nonblock(&mut self) -> Result<IOResult<()>> {
-        self.inner
+        let in_explicit_tx = !self.conn.get_auto_commit();
+        match self
+            .inner
             .run_ignore_rows_nonblock()
             .map_err(|error| (*error).into())
+        {
+            Err(e) => {
+                if in_explicit_tx {
+                    self.tx_aborted.store(true, Ordering::Relaxed);
+                }
+                Err(e)
+            }
+            ok => ok,
+        }
     }
 
     pub fn run_with_row_callback_nonblock(
@@ -148,7 +208,6 @@ impl std::ops::Deref for Statement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use turso_core::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, IO};
 
     #[test]
@@ -171,9 +230,12 @@ mod tests {
             "CREATE TABLE child (pid INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
         )
         .unwrap();
+        let tx_aborted = Arc::new(AtomicBool::new(false));
         let mut stmt = Statement::new(
             conn.prepare("INSERT INTO child VALUES (99) RETURNING pid")
                 .unwrap(),
+            conn.clone(),
+            tx_aborted,
         );
         loop {
             match stmt.step().unwrap() {
