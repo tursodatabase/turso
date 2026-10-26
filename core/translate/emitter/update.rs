@@ -172,6 +172,7 @@ pub fn emit_program_for_update(
             vec![JoinedTable {
                 table: Table::BTree(scratch_table),
                 identifier: "ephemeral_scratch".to_string(),
+                has_alias: false,
                 internal_id: scratch_table_internal_id,
                 op: Operation::Scan(Scan::BTreeTable {
                     iter_dir: IterationDirection::Forwards,
@@ -190,6 +191,7 @@ pub fn emit_program_for_update(
         );
         write_phase_tables.add_outer_query_reference(OuterQueryReference {
             identifier: target_table.identifier.clone(),
+            has_alias: target_table.has_alias,
             internal_id: target_table.internal_id,
             table: target_table.table.clone(),
             database_id: target_table.database_id,

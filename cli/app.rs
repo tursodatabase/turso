@@ -109,8 +109,6 @@ pub struct Opts {
     pub experimental_vacuum: bool,
     #[clap(long, help = "Enable experimental attach feature")]
     pub experimental_attach: bool,
-    #[clap(long, help = "Enable experimental generated columns feature")]
-    pub experimental_generated_columns: bool,
     #[clap(long, help = "Enable experimental WITHOUT ROWID tables feature")]
     pub experimental_without_rowid: bool,
     #[clap(
@@ -263,7 +261,6 @@ impl Limbo {
             .with_autovacuum(opts.experimental_autovacuum)
             .with_vacuum(opts.experimental_vacuum)
             .with_attach(opts.experimental_attach)
-            .with_generated_columns(opts.experimental_generated_columns)
             .with_without_rowid(opts.experimental_without_rowid)
             .with_multiprocess_wal(opts.experimental_multiprocess_wal)
             .with_experimental_mvcc_passive_checkpoint(opts.experimental_mvcc_passive_checkpoint)

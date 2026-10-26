@@ -1,7 +1,7 @@
 use crate::alloc::TursoIteratorExt;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
-use crate::{bail_parse_error, turso_assert_eq, turso_assert_ne};
+use crate::{turso_assert_eq, turso_assert_ne};
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,
@@ -664,6 +664,7 @@ fn emit_column_constraints_validation(
                 unmatched_right_rows_plan: None,
                 table,
                 identifier: resolved_table.name.clone(),
+                has_alias: false,
                 internal_id: program.table_reference_counter.next(),
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
@@ -871,6 +872,7 @@ pub fn translate_alter_table(
                         vec![],
                         vec![OuterQueryReference {
                             identifier: table_name.to_string(),
+                            has_alias: false,
                             internal_id: TableInternalId::from(0),
                             table: Table::BTree(Arc::new(btree.clone())),
                             database_id,
@@ -1133,11 +1135,6 @@ pub fn translate_alter_table(
                 return Err(LimboError::ParseError(
                     "cannot add a STORED column".to_string(),
                 ));
-            }
-            if is_generated && !connection.experimental_generated_columns_enabled() {
-                bail_parse_error!(
-                    "Generated columns require --experimental-generated-columns flag"
-                );
             }
             if is_generated {
                 for c in &col_def.constraints {

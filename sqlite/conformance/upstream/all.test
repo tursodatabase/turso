@@ -212,7 +212,7 @@ set test_files {
   e_fkey               fail
   e_insert             fail
   e_reindex            fail
-  e_resolve            fail
+  e_resolve            pass
   e_select             fail
   e_select2            pass
   e_totalchanges       fail

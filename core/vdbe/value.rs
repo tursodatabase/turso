@@ -330,6 +330,18 @@ impl Value {
     /// SQLite default max blob/string size (1GB)
     pub const MAX_BLOB_LENGTH: i64 = 1_000_000_000;
 
+    pub fn check_length_limit(&self) -> Result<()> {
+        let len = match self {
+            Value::Text(text) => text.as_str().len(),
+            Value::Blob(blob) => blob.len(),
+            _ => 0,
+        };
+        if len > Self::MAX_BLOB_LENGTH as usize {
+            return Err(LimboError::TooBig);
+        }
+        Ok(())
+    }
+
     pub fn exec_randomblob<F>(&self, fill_bytes: F) -> Result<Value>
     where
         F: Fn(&mut [u8]),
@@ -1278,11 +1290,11 @@ impl Value {
     }
 
     #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::Concat)]
-    pub fn exec_concat(
-        &self,
-        rhs: &Value,
-    ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
+    pub fn exec_concat(&self, rhs: &Value) -> Result<Value> {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
+            if lhs.len() + rhs.len() > Self::MAX_BLOB_LENGTH as usize {
+                return Err(LimboError::TooBig);
+            }
             let mut blob =
                 <crate::ValueBlob as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
                     lhs.len() + rhs.len(),
@@ -1300,6 +1312,9 @@ impl Value {
             return Ok(Value::Null);
         };
 
+        if lhs.len() + rhs.len() > Self::MAX_BLOB_LENGTH as usize {
+            return Err(LimboError::TooBig);
+        }
         let mut joined = String::with_capacity(lhs.len() + rhs.len());
         joined.push_str(&lhs);
         joined.push_str(&rhs);
