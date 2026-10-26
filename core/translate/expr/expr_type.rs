@@ -590,7 +590,11 @@ mod tests {
                 "coalesce(CAST(1 AS numeric(10, 2)), CAST(2 AS numeric(5, 1)))",
                 custom("numeric", &[]),
             ),
-            ("coalesce(CAST(1 AS cents), 1)", builtin(BuiltinType::Any)),
+            // A custom value and a plain one have the custom type's stored type.
+            (
+                "coalesce(CAST(1 AS cents), 1)",
+                builtin(BuiltinType::Integer),
+            ),
             ("iif(1, NULL, 2)", builtin(BuiltinType::Integer)),
         ]);
     }
@@ -602,8 +606,9 @@ mod tests {
             ("1 + 2.5", builtin(BuiltinType::Real)),
             ("1 + 'a'", builtin(BuiltinType::Numeric)),
             ("-CAST(1 AS REAL)", builtin(BuiltinType::Real)),
-            ("CAST(1 AS cents) + 1", ExprType::Unknown),
-            ("abs(CAST(1 AS cents))", ExprType::Unknown),
+            // cents declares no `+`, so SQLite's operator runs on its stored value.
+            ("CAST(1 AS cents) + 1", builtin(BuiltinType::Integer)),
+            ("abs(CAST(1 AS cents))", builtin(BuiltinType::Integer)),
             ("1 || 2", builtin(BuiltinType::Text)),
         ]);
     }
