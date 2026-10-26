@@ -841,6 +841,12 @@ impl SnapshotRows for PgProcTable {
 
         // Extension functions
         for (name, is_agg, argc, deterministic) in conn.get_syms_functions() {
+            // A built-in function such as `auth.uid` has its schema in its
+            // name. PostgreSQL lists it as `uid` in the schema `auth`, which
+            // tursopg does not have, so this table leaves it out.
+            if name.contains('.') {
+                continue;
+            }
             let prokind = if is_agg { "a" } else { "f" };
             let provolatile = if deterministic { "i" } else { "v" };
 

@@ -120,6 +120,7 @@ and a `\u0000` escape before a syntax error gives the syntax error.
 `auth.uid()` checks the uuid with `Uuid::parse_str`, which refuses a hyphen
 after every four digits and 32 digits in braces, and accepts a `urn:uuid:`
 prefix. `pg_get_expr()` shows a default `auth.uid()` as `"auth.uid" ()`.
+`pg_proc` does not list the functions, because tursopg has no schema `auth`.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
