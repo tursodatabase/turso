@@ -24626,6 +24626,98 @@ fn test_update_deltas_ignore_patch_of_rolled_back_savepoint() {
     );
 }
 
+/// UPSERT, a trigger, INSERT OR REPLACE, a statement that fails after it changed
+/// a row, and an UPDATE that changes the rowid, on rows that are in the B-tree.
+/// Recovery gives the same rows.
+#[test]
+fn test_update_deltas_with_upsert_trigger_replace_and_statement_rollback() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT UNIQUE, c BLOB)")
+            .unwrap();
+        conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, n INTEGER, note TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO audit VALUES (1, 0, 'a long enough note for the audit row')")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_au AFTER UPDATE ON t BEGIN \
+             UPDATE audit SET n = n + 1 WHERE id = 1; END",
+        )
+        .unwrap();
+        for id in 1..=20 {
+            conn.execute(format!(
+                "INSERT INTO t VALUES ({id}, {id}, 'row-{id}', randomblob(60))"
+            ))
+            .unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    db.restart();
+    let rows = |conn: &Arc<Connection>| {
+        (
+            get_rows(conn, "SELECT * FROM t ORDER BY id"),
+            get_rows(conn, "SELECT * FROM audit"),
+        )
+    };
+    let expected = {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_update_deltas = on").unwrap();
+        conn.execute(
+            "INSERT INTO t VALUES (1, 0, 'row-1', NULL), (2, 0, 'row-2', NULL) \
+             ON CONFLICT(id) DO UPDATE SET a = a + 100",
+        )
+        .unwrap();
+        conn.execute("UPDATE t SET a = a + 1 WHERE id BETWEEN 3 AND 6")
+            .unwrap();
+        conn.execute("INSERT OR REPLACE INTO t SELECT id, 700, b, c FROM t WHERE id = 7")
+            .unwrap();
+        // Replaces row 8 and removes row 9, which has the same `b`.
+        conn.execute("INSERT OR REPLACE INTO t SELECT id, 800, 'row-9', c FROM t WHERE id = 8")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("UPDATE t SET a = a + 5 WHERE id = 10")
+            .unwrap();
+        // Row 10 changes, then row 11 fails the UNIQUE constraint on `b`, so the
+        // statement rolls back the change of row 10.
+        assert!(conn
+            .execute(
+                "UPDATE t SET b = CASE id WHEN 10 THEN 'new-10' ELSE 'row-12' END \
+                 WHERE id IN (10, 11)"
+            )
+            .is_err());
+        conn.execute("COMMIT").unwrap();
+        conn.execute("UPDATE t SET id = id + 100 WHERE id = 12")
+            .unwrap();
+        let expected = rows(&conn);
+        conn.close().unwrap();
+        expected
+    };
+    // Update ops: rows 3 to 6, row 7, and the audit row in three transactions.
+    // UPSERT changes rows 1 and 2 without a delete, so it logs upserts. The insert
+    // of row 8 comes after the delete of row 9 on the same cursor, so it has no
+    // base. The failed statement replaced the patches of row 10 and of the audit
+    // row, and then removed its versions, so the commit logs these rows in full.
+    // Row 112 is a new rowid.
+    assert_eq!(
+        table_op_counts(&read_logical_log_ops(&db)),
+        TableOpCounts {
+            upserts: 6,
+            deletes: 5,
+            updates: 8,
+        }
+    );
+
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(rows(&conn), expected);
+    assert_eq!(
+        get_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+}
+
 /// A row that the transaction inserts has no committed base, so its updates in
 /// the same transaction go to the log as one upsert op.
 #[test]
