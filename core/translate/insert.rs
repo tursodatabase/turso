@@ -1178,6 +1178,7 @@ pub fn translate_insert(
         let has_upsert_do_update = upsert_actions
             .iter()
             .any(|(_, _, upsert)| matches!(upsert.do_clause, UpsertDo::Set { .. }));
+        let has_returning = !result_columns.is_empty();
         set_insert_stmt_journal_flags(
             program,
             resolver,
@@ -1187,6 +1188,7 @@ pub fn translate_insert(
             ctx.on_conflict,
             inserting_multiple_rows,
             has_triggers,
+            has_returning,
             has_fks,
             has_upsert,
             has_upsert_do_update,

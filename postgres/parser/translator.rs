@@ -777,6 +777,12 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::Stmt, ParseError> {
         use pg_query::protobuf::TransactionStmtKind;
 
+        // Implementing AND CHAIN requires more than translation: on an
+        // aborted block PostgreSQL still starts the chained transaction, and
+        // the frontend's aborted-state redirect (tx_gate in
+        // postgres/frontend/statement.rs) ends the block without chaining.
+        // The and_chain_is_rejected_in_every_transaction_state test pins the
+        // rejection and says what must change.
         if txn.chain {
             return Err(not_supported("COMMIT/ROLLBACK AND CHAIN"));
         }
@@ -6235,6 +6241,30 @@ impl PgSetValue {
 /// Extracted SHOW statement: `SHOW name`
 pub struct PgShowStmt {
     pub name: String,
+}
+
+/// Whether a parsed statement is one PostgreSQL still accepts inside an
+/// aborted transaction block: COMMIT/END, ROLLBACK/ABORT, or ROLLBACK TO
+/// SAVEPOINT (`IsTransactionExitStmt` in PostgreSQL's postgres.c).
+/// PostgreSQL's list also has PREPARE TRANSACTION; it is left out here
+/// deliberately while two-phase commit is unsupported.
+pub fn is_tx_exit_stmt(parse_result: &ParseResult) -> bool {
+    use pg_query::protobuf::TransactionStmtKind;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some(node) = nodes.first() else {
+        return false;
+    };
+    let NodeRef::TransactionStmt(txn) = &node.0 else {
+        return false;
+    };
+    matches!(
+        TransactionStmtKind::try_from(txn.kind),
+        Ok(TransactionStmtKind::TransStmtCommit
+            | TransactionStmtKind::TransStmtRollback
+            | TransactionStmtKind::TransStmtRollbackTo)
+    )
 }
 
 /// Try to extract a SET, SET ... TO DEFAULT, SET ... FROM CURRENT or RESET
