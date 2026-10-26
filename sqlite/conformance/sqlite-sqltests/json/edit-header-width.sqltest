@@ -1,0 +1,109 @@
+@database :memory:
+
+test jsonb-edit-short-shrink {
+    SELECT hex(jsonb_patch('{"a":"xy"}','{"a":"x"}')),
+        hex(jsonb_replace('{"a":"xy"}','$.a','x')),
+        hex(jsonb_set('{"a":[1]}','$.a',1));
+}
+expect {
+    5C1761C70178|5C1761CA0178|5C1761C30131
+}
+
+test jsonb-edit-inline-header-expansion-widths {
+    WITH t1(a) AS (VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9),(10))
+    SELECT a,hex(jsonb_replace(json_quote(replace(hex(zeroblob(a)),'00','x')),'$',json('"x"')))
+    FROM t1 ORDER BY a;
+}
+expect {
+    0|1778
+    1|1778
+    2|C70178
+    3|D7000178
+    4|1778
+    5|E70000000178
+    6|1778
+    7|1778
+    8|1778
+    9|F7000000000000000178
+    10|1778
+}
+
+test jsonb-edit-wide-header-expansion-widths {
+    WITH t1(a) AS (VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9),(10))
+    SELECT a,hex(jsonb_replace(json_quote(replace(hex(zeroblob(a)),'00','x')),'$',x'C70178'))
+    FROM t1 ORDER BY a;
+}
+expect {
+    0|C70178
+    1|C70178
+    2|C70178
+    3|D7000178
+    4|C70178
+    5|E70000000178
+    6|C70178
+    7|C70178
+    8|C70178
+    9|F7000000000000000178
+    10|C70178
+}
+
+test jsonb-edit-null-boolean-and-empty-text {
+    SELECT hex(jsonb_replace('["x"]','$[0]',NULL)),
+        hex(jsonb_replace('["x"]','$[0]',json('true'))),
+        hex(jsonb_replace('["x"]','$[0]',json('false'))),
+        hex(jsonb_replace('"x"','$',''));
+}
+expect {
+    1B00|1B01|1B02|CA00
+}
+
+test jsonb-edit-sql-text-versus-json-text {
+    SELECT hex(jsonb_replace('"x"','$','x')),
+        hex(jsonb_replace('"x"','$',json('"x"')));
+}
+expect {
+    1A78|1778
+}
+
+test jsonb-edit-raw-text-escapes {
+    SELECT hex(jsonb_replace('{"a":"long"}','$.a',char(10)||'"'||char(92))),
+        json_extract(jsonb_replace('{"a":"long"}','$.a',char(10)||'"'||char(92)),'$.a')
+            = (char(10)||'"'||char(92));
+}
+expect {
+    7C1761CA030A225C|1
+}
+
+test jsonb-edit-unchanged-parent-header {
+    SELECT hex(jsonb_replace(x'CC0417611331','$.a',2)),
+        hex(jsonb_replace(x'CB021331','$[0]',2));
+}
+expect {
+    CC0417611332|CB021332
+}
+
+test jsonb-edit-sequential-sibling-offsets {
+    SELECT hex(jsonb_set('{"a":"xy","b":[1]}','$.a','x','$.b[0]',2)),
+        json(jsonb_set('{"a":"xy","b":[1]}','$.a','x','$.b[0]',2));
+}
+expect {
+    AC1761CA017817622B1332|{"a":"x","b":[2]}
+}
+
+test jsonb-edit-nine-byte-header {
+    SELECT hex(jsonb_replace(x'F7000000000000000178','$',1)),
+        json_valid(jsonb_replace(x'F7000000000000000178','$',1),8);
+}
+expect {
+    F3000000000000000131|1
+}
+
+test jsonb-edit-minimal-and-wide-inputs-remain-valid {
+    WITH t1(a) AS (VALUES(x'4C17611778'),(x'5C1761C70178'),(x'5C1761CA0178'))
+    SELECT json(a),json_valid(a,8) FROM t1;
+}
+expect {
+    {"a":"x"}|1
+    {"a":"x"}|1
+    {"a":"x"}|1
+}

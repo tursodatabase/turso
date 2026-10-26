@@ -364,12 +364,8 @@ impl PathOperation for SetOperation {
             let (JsonbHeader(_, array_value_size), array_value_header_size) =
                 json.read_header(array_value_idx)?;
 
-            let delta =
-                value.len() as isize - (array_value_size + array_value_header_size) as isize;
-
             let end_pos = array_value_idx + array_value_size + array_value_header_size;
-            json.data
-                .splice(array_value_idx..end_pos, value.iter().copied());
+            let delta = json.replace_element(array_value_idx, end_pos, value)?;
 
             // update parent
             let h_delta = if matches!(
@@ -382,7 +378,7 @@ impl PathOperation for SetOperation {
                     (obj_value_size as isize + delta) as usize,
                     true,
                 )?;
-                (new_h_delta - obj_value_header_size) as isize
+                new_h_delta as isize - obj_value_header_size as isize
             } else {
                 0
             };
@@ -392,12 +388,8 @@ impl PathOperation for SetOperation {
             let old_value_idx = target.field_value_index;
             let (JsonbHeader(_, old_value_size), old_value_header_size) =
                 json.read_header(old_value_idx)?;
-            let delta = value.len() as isize - (old_value_header_size + old_value_size) as isize;
-
             let end_pos = old_value_idx + old_value_header_size + old_value_size;
-
-            json.data
-                .splice(old_value_idx..end_pos, value.iter().copied());
+            let delta = json.replace_element(old_value_idx, end_pos, value)?;
 
             json.update_parent_references(stack, delta + target.delta)?;
         }
@@ -529,12 +521,8 @@ impl PathOperation for ReplaceOperation {
             let (JsonbHeader(_, array_value_size), array_value_header_size) =
                 json.read_header(array_value_idx)?;
 
-            let delta =
-                value.len() as isize - (array_value_size + array_value_header_size) as isize;
-
             let end_pos = array_value_idx + array_value_size + array_value_header_size;
-            json.data
-                .splice(array_value_idx..end_pos, value.iter().copied());
+            let delta = json.replace_element(array_value_idx, end_pos, value)?;
 
             // update parent
             let h_delta = if matches!(
@@ -547,7 +535,7 @@ impl PathOperation for ReplaceOperation {
                     (obj_value_size as isize + delta) as usize,
                     true,
                 )?;
-                (new_h_delta - obj_value_header_size) as isize
+                new_h_delta as isize - obj_value_header_size as isize
             } else {
                 0
             };
@@ -557,12 +545,8 @@ impl PathOperation for ReplaceOperation {
             let old_value_idx = target.field_value_index;
             let (JsonbHeader(_, old_value_size), old_value_header_size) =
                 json.read_header(old_value_idx)?;
-            let delta = value.len() as isize - (old_value_header_size + old_value_size) as isize;
-
             let end_pos = old_value_idx + old_value_header_size + old_value_size;
-
-            json.data
-                .splice(old_value_idx..end_pos, value.iter().copied());
+            let delta = json.replace_element(old_value_idx, end_pos, value)?;
 
             json.update_parent_references(stack, delta + target.delta)?;
         }
@@ -610,12 +594,8 @@ impl PathOperation for InsertOperation {
             let (JsonbHeader(_, array_value_size), array_value_header_size) =
                 json.read_header(array_value_idx)?;
 
-            let delta =
-                value.len() as isize - (array_value_size + array_value_header_size) as isize;
-
             let end_pos = array_value_idx + array_value_size + array_value_header_size;
-            json.data
-                .splice(array_value_idx..end_pos, value.iter().copied());
+            let delta = json.replace_element(array_value_idx, end_pos, value)?;
 
             // update parent
             let h_delta = if matches!(
@@ -628,7 +608,7 @@ impl PathOperation for InsertOperation {
                     (obj_value_size as isize + delta) as usize,
                     true,
                 )?;
-                (new_h_delta - obj_value_header_size) as isize
+                new_h_delta as isize - obj_value_header_size as isize
             } else {
                 0
             };
@@ -638,12 +618,8 @@ impl PathOperation for InsertOperation {
             let old_value_idx = target.field_value_index;
             let (JsonbHeader(_, old_value_size), old_value_header_size) =
                 json.read_header(old_value_idx)?;
-            let delta = value.len() as isize - (old_value_header_size + old_value_size) as isize;
-
             let end_pos = old_value_idx + old_value_header_size + old_value_size;
-
-            json.data
-                .splice(old_value_idx..end_pos, value.iter().copied());
+            let delta = json.replace_element(old_value_idx, end_pos, value)?;
 
             json.update_parent_references(stack, delta + target.delta)?;
         }
@@ -963,6 +939,13 @@ impl Jsonb {
         Ok(Self {
             data: <ValueBlob as TursoTryWithCapacityExt>::try_with_capacity_ext(capacity)?,
         })
+    }
+
+    pub(super) fn from_raw_text(text: &str) -> Result<Self> {
+        let mut json = Self::new(text.len() + 1)?;
+        json.write_element_header(0, ElementType::TEXTRAW, text.len(), false)?;
+        json.data.try_extend(text.as_bytes().iter().copied())?;
+        Ok(json)
     }
 
     pub fn len(&self) -> usize {
@@ -2438,6 +2421,39 @@ impl Jsonb {
         })
     }
 
+    fn replace_element(&mut self, start: usize, end: usize, value: &[u8]) -> Result<isize> {
+        let old_size = end - start;
+        if old_size > value.len() && old_size - value.len() <= 8 {
+            let (header, header_size) = JsonbHeader::from_slice(0, value)?;
+            let expanded_size = header_size + old_size - value.len();
+            let marker = if matches!(
+                header.0,
+                ElementType::NULL | ElementType::TRUE | ElementType::FALSE
+            ) {
+                None
+            } else {
+                match expanded_size {
+                    2 => Some(SIZE_MARKER_8BIT),
+                    3 => Some(SIZE_MARKER_16BIT),
+                    5 => Some(SIZE_MARKER_32BIT),
+                    9 => Some(15),
+                    _ => None,
+                }
+            };
+            if let Some(marker) = marker {
+                // Match SQLite's short-shrink overwrite without moving the following bytes.
+                self.data[start] = header.0 as u8 | marker << 4;
+                let size_bytes = (header.1 as u64).to_be_bytes();
+                self.data[start + 1..start + expanded_size]
+                    .copy_from_slice(&size_bytes[9 - expanded_size..]);
+                self.data[start + expanded_size..end].copy_from_slice(&value[header_size..]);
+                return Ok(0);
+            }
+        }
+        self.data.splice(start..end, value.iter().copied());
+        Ok(value.len() as isize - old_size as isize)
+    }
+
     fn write_element_header(
         &mut self,
         cursor: usize,
@@ -2445,6 +2461,12 @@ impl Jsonb {
         payload_size: usize,
         size_might_change: bool,
     ) -> Result<usize> {
+        if size_might_change {
+            let (old_header, old_width) = self.read_header(cursor)?;
+            if old_header.0 == element_type && old_header.1 == payload_size {
+                return Ok(old_width);
+            }
+        }
         if payload_size <= 11 && !size_might_change {
             let header_byte = (element_type as u8) | ((payload_size as u8) << 4);
             if cursor == self.len() {
@@ -3245,11 +3267,7 @@ impl Jsonb {
         let (patch_header, patch_header_size) = patch.read_header(patch_idx)?;
 
         if patch_header.0 != ElementType::OBJECT {
-            self.data.splice(
-                target..target_end,
-                patch.data[patch_idx..patch_end].iter().copied(),
-            );
-            return Ok((patch_end - patch_idx) as isize - (target_end - target) as isize);
+            return self.replace_element(target, target_end, &patch.data[patch_idx..patch_end]);
         }
 
         let (target_header, _) = self.read_header(target)?;

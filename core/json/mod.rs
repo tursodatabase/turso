@@ -203,6 +203,9 @@ fn looks_like_jsonb_blob(slice: &[u8]) -> bool {
 pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Result<Jsonb> {
     match val {
         ValueRef::Text(text) => {
+            if matches!(strict, Conv::SetValue) && text.subtype != TextSubtype::Json {
+                return Jsonb::from_raw_text(text.as_str());
+            }
             let res = if text.subtype == TextSubtype::Json || matches!(strict, Conv::Strict) {
                 // Like SQLite, text parsed as a JSON document stops at
                 // the first NUL; a text value converted to a string
