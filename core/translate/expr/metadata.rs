@@ -1,5 +1,4 @@
 use super::*;
-use crate::translate::collate::get_expr_collation_ctx_with_symbols;
 use crate::translate::expression_index::normalize_expr_for_index_matching;
 
 #[derive(Debug, Clone, Copy)]
@@ -265,11 +264,9 @@ macro_rules! translate_fixed_insn {
 /// over NULL inputs does not always produce NULL.
 ///
 /// A comparison takes the collation of its operands from the program builder.
-/// Translation of `x COLLATE c` sets `c` there, but a read from the index does
-/// not translate the expression, so this function sets the COLLATE of the
-/// expression. As in SQLite, the leftmost COLLATE is used, so a COLLATE that an
-/// earlier part of the parent expression set stays. This function does not set
-/// a collation for an expression without a COLLATE.
+/// Translation of the expression sets its COLLATE there, so a read from the
+/// index sets it too. A read of an expression without a COLLATE does not
+/// change the collation.
 ///
 /// We mut do this check early in translate_expr so downstream translation does
 /// not build redundant bytecode.
@@ -301,18 +298,9 @@ pub(super) fn try_emit_expression_index_value(
     else {
         return Ok(false);
     };
-    let earlier_collate = program
-        .curr_collation_ctx()
-        .filter(|&(_, explicit)| explicit);
-    let collate =
-        get_expr_collation_ctx_with_symbols(expr, referenced_tables, Some(resolver.symbol_table))?
-            .filter(|&(_, explicit)| explicit)
-            .map(|collate| earlier_collate.unwrap_or(collate));
     if !referenced_tables.index_cursor_may_be_null_row(table.internal_id) {
         program.emit_column_or_rowid(index_cursor, expression_position, target_register);
-        if collate.is_some() {
-            program.set_collation(collate);
-        }
+        set_leftmost_collate(program, expr, resolver)?;
         return Ok(true);
     }
 
@@ -343,9 +331,6 @@ pub(super) fn try_emit_expression_index_value(
         .set_skip_expression_index_values(skipped_index_values);
     result?;
     program.preassign_label_to_next_insn(expression_done);
-    if collate.is_some() {
-        program.set_collation(collate);
-    }
     Ok(true)
 }
 

@@ -1778,9 +1778,8 @@ expect {
     4
 }
 
-# Inside a larger expression, SQLite uses the leftmost COLLATE. The COLLATE of
-# the value from the index goes through a function, but a COLLATE before the
-# value stays.
+# Inside a larger expression, SQLite uses the leftmost COLLATE. A value read
+# from an index must compare the same way as the computed value.
 setup expression_index_nested {
     CREATE TABLE expr_nested(a TEXT, b TEXT);
     INSERT INTO expr_nested VALUES (NULL, 'ABC'), ('abc', 'ABC');
@@ -1799,9 +1798,11 @@ expect {
 }
 
 @setup expression_index_nested
-test expression-index-value-keeps-earlier-collate {
+test expression-index-value-in-function-uses-leftmost-collate {
     SELECT coalesce(a COLLATE NOCASE, (b || '') COLLATE RTRIM) = 'abc'
     FROM expr_nested INDEXED BY expr_nested_rtrim ORDER BY rowid;
+    SELECT coalesce(a COLLATE NOCASE, (b || '') COLLATE RTRIM) = 'abc'
+    FROM expr_nested NOT INDEXED ORDER BY rowid;
     SELECT coalesce(a COLLATE NOCASE, lower(b)) = 'ABC'
     FROM expr_nested INDEXED BY expr_nested_lower ORDER BY rowid;
 }
@@ -1810,6 +1811,48 @@ expect {
     1
     1
     1
+    1
+    1
+}
+
+# The COLLATE of the value replaces the collation that an earlier result
+# column left behind.
+@setup expression_index_nested
+test expression-index-value-collate-after-other-result-column {
+    SELECT a COLLATE BINARY, CASE (b || '') COLLATE RTRIM WHEN 'ABC ' THEN 1 ELSE 0 END
+    FROM expr_nested INDEXED BY expr_nested_rtrim ORDER BY rowid;
+}
+expect {
+    |1
+    abc|1
+}
+
+# A function call or a CASE uses the leftmost COLLATE among its parts, also
+# when a later part has another COLLATE or is a column.
+test function-uses-leftmost-collate {
+    CREATE TABLE leftmost_func(a TEXT, b TEXT);
+    INSERT INTO leftmost_func VALUES (NULL, 'ABC'), ('abc', 'ABC');
+    SELECT coalesce(a COLLATE NOCASE, b COLLATE RTRIM) = 'abc',
+        ifnull(a COLLATE NOCASE, b) = 'abc',
+        iif(a IS NULL, b COLLATE NOCASE, a) = 'abc'
+    FROM leftmost_func ORDER BY rowid;
+}
+expect {
+    1|1|1
+    1|1|1
+}
+
+test case-uses-leftmost-collate {
+    CREATE TABLE leftmost_case(a TEXT);
+    INSERT INTO leftmost_case VALUES ('[m'), ('[O'), ('[Z');
+    SELECT CASE WHEN 1 THEN a COLLATE NOCASE ELSE a COLLATE BINARY END > '[m',
+        CASE WHEN 0 THEN a ELSE a COLLATE NOCASE END > '[m'
+    FROM leftmost_case ORDER BY rowid;
+}
+expect {
+    0|0
+    1|1
+    1|1
 }
 
 # A function hides the column, so the value has no collation. The comparison
@@ -1872,7 +1915,7 @@ expect {
 }
 
 @setup expression_index_outer_join
-test expression-index-value-in-outer-join-keeps-earlier-collate {
+test expression-index-value-in-outer-join-uses-leftmost-collate {
     SELECT l.id, coalesce(l.x COLLATE BINARY, (r.y || '') COLLATE NOCASE) = 'alpha'
     FROM expr_left l LEFT JOIN expr_right r INDEXED BY expr_right_collate ON r.id = l.id
     ORDER BY l.id;

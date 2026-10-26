@@ -161,7 +161,10 @@ fn translate_expr_by_kind(
             translate_binary_expr(program, referenced_tables, expr, target_register, resolver)
         }
         ast::Expr::Case { .. } => {
-            translate_case_expr(program, referenced_tables, expr, target_register, resolver)
+            let reg =
+                translate_case_expr(program, referenced_tables, expr, target_register, resolver)?;
+            set_leftmost_collate(program, expr, resolver)?;
+            Ok(reg)
         }
         ast::Expr::Cast { .. } => {
             translate_cast_expr(program, referenced_tables, expr, target_register, resolver)
@@ -178,13 +181,17 @@ fn translate_expr_by_kind(
         ast::Expr::MergedColumn(_) => {
             translate_merged_column(program, referenced_tables, expr, target_register, resolver)
         }
-        ast::Expr::FunctionCall { .. } => translate_function_call_expr(
-            program,
-            referenced_tables,
-            expr,
-            target_register,
-            resolver,
-        ),
+        ast::Expr::FunctionCall { .. } => {
+            let reg = translate_function_call_expr(
+                program,
+                referenced_tables,
+                expr,
+                target_register,
+                resolver,
+            )?;
+            set_leftmost_collate(program, expr, resolver)?;
+            Ok(reg)
+        }
         ast::Expr::FunctionCallStar { .. } => translate_function_call_star_expr(
             program,
             referenced_tables,
@@ -255,6 +262,33 @@ fn translate_expr_by_kind(
             unreachable!("Array and Subscript are desugared into function calls by the parser")
         }
     }
+}
+
+/// SQLite gives an expression the leftmost COLLATE among its parts, so
+/// `coalesce(a COLLATE NOCASE, b COLLATE RTRIM)` compares as NOCASE. Each part
+/// sets its collation in the program builder when it is translated, so without
+/// this the last part sets the collation of a function call or a CASE.
+#[inline(never)]
+pub(super) fn set_leftmost_collate(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    resolver: &Resolver,
+) -> Result<()> {
+    let mut leftmost = None;
+    walk_expr(expr, &mut |part: &ast::Expr| -> Result<WalkControl> {
+        if leftmost.is_some() {
+            return Ok(WalkControl::SkipChildren);
+        }
+        if let ast::Expr::Collate(_, name) = part {
+            leftmost = Some(resolver.resolve_collation(name.as_str())?);
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    if let Some(collation) = leftmost {
+        program.set_collation(Some((collation, true)));
+    }
+    Ok(())
 }
 
 #[inline(never)]
