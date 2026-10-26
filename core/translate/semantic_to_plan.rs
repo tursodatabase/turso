@@ -2839,12 +2839,27 @@ impl<'a> HirPlanContext<'a> {
         for query in &input.subqueries {
             subquery_reads.extend(self.document.planning.outer_sources(*query).iter().copied());
         }
+        let hash_allowed = self.hash_joins_allowed(&input);
+        let plain_rowid_tables = input
+            .sources
+            .iter()
+            .filter(|_| hash_allowed)
+            .filter(|source| {
+                crate::translate::optimizer::join::hir_plain_rowid_table(
+                    self.document,
+                    source,
+                    schema,
+                )
+            })
+            .filter_map(|source| source.btree().map(|table| table.internal_id))
+            .collect::<Vec<_>>();
         let hash = crate::translate::optimizer::join::HirHashJoins {
-            allowed: self.hash_joins_allowed(&input),
+            allowed: hash_allowed,
             // A materialized build input is filled once per statement, so
             // the block must not read an outer row.
             materialize: !self.document.planning.reads_outer_sources(block.id.query),
             subquery_reads: &subquery_reads,
+            plain_rowid_tables: &plain_rowid_tables,
         };
         let access = self
             .plan_source_access(
