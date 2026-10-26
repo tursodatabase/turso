@@ -2740,7 +2740,7 @@ pub fn op_column_has_field(
 }
 
 pub fn op_type_check(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -2784,14 +2784,21 @@ pub fn op_type_check(
                 let _applied = apply_affinity_char(reg, col.affinity());
                 let value_type = reg.get_value().value_type();
                 if value_type != expected_type {
-                    bail_constraint_error!(
-                        "cannot store {} value in {} column {}.{} ({})",
-                        value_type,
-                        col.ty_str,
-                        &table_reference.name,
-                        col.name.as_deref().unwrap_or(""),
-                        SQLITE_CONSTRAINT
-                    );
+                    match program
+                        .connection
+                        .dialect()
+                        .assignment_cast(reg.get_value(), expected_type)
+                    {
+                        Some(coerced) => reg.set_value(coerced),
+                        None => bail_constraint_error!(
+                            "cannot store {} value in {} column {}.{} ({})",
+                            value_type,
+                            col.ty_str,
+                            &table_reference.name,
+                            col.name.as_deref().unwrap_or(""),
+                            SQLITE_CONSTRAINT
+                        ),
+                    }
                 }
             }
             Ok(())

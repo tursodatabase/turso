@@ -7,8 +7,9 @@ use turso_core::{
     dialect::POSTGRES_TABLE_SQL_PREFIX,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX},
-    Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions, Result, Statement,
-    Value,
+    types::ValueType,
+    Connection, Dialect, Func, IOResult, LimboError, NamespaceId, Numeric, OpenOptions, Result,
+    Statement, Value,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::RefAct;
@@ -208,6 +209,17 @@ impl Dialect for PostgresDialect {
 
     fn add_column_computes_default_for_existing_rows(&self) -> bool {
         true
+    }
+
+    fn assignment_cast(&self, value: &Value, target: ValueType) -> Option<Value> {
+        match (value, target) {
+            (Value::Numeric(Numeric::Float(f)), ValueType::Integer) => {
+                let rounded = f64::from(*f).round_ties_even();
+                (rounded >= i64::MIN as f64 && rounded <= i64::MAX as f64)
+                    .then(|| Value::from_i64(rounded as i64))
+            }
+            _ => None,
+        }
     }
 }
 
