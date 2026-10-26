@@ -920,6 +920,36 @@ mod tests {
     }
 
     #[test]
+    fn test_string_literal_coalesce_and_case_use_common_type_on_wire() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        conn.execute("CREATE TABLE t(id int PRIMARY KEY, x int)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+
+        for sql in [
+            "SELECT coalesce(x, '2') FROM t",
+            "SELECT coalesce('2', x) FROM t",
+            "SELECT CASE WHEN x = 1 THEN x ELSE '2' END FROM t",
+            "SELECT CASE WHEN x = 1 THEN '2' ELSE x END FROM t",
+        ] {
+            let stmt = conn.prepare(sql).unwrap();
+            let fields = build_field_info(&stmt, &Format::UnifiedText);
+            assert_eq!(*fields[0].datatype(), Type::INT4, "{sql}");
+        }
+
+        let stmt = conn.prepare("SELECT coalesce('1', '2')").unwrap();
+        let fields = build_field_info(&stmt, &Format::UnifiedText);
+        assert_eq!(*fields[0].datatype(), Type::TEXT);
+    }
+
+    #[test]
     fn test_set_transaction_is_non_query() {
         assert!(is_pg_non_query(
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
