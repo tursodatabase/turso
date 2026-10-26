@@ -9,6 +9,7 @@ This document is a quick helper to get you going.
   - [Getting Started](#getting-started)
     - [Configuring `mold` Linker](#configuring-mold-linker)
     - [Running Tests On Linux](#running-tests-on-linux)
+  - [Developing on memory-constrained machines](#developing-on-memory-constrained-machines)
   - [Developing with AI coding agents](#developing-with-ai-coding-agents)
   - [Debugging bugs](#debugging-bugs)
     - [Query execution debugging](#query-execution-debugging)
@@ -141,6 +142,86 @@ Run benchmarks and generate flamegraphs:
 ```console
 echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 cargo bench --profile bench-profile --bench benchmark -- --profile-time=5
+```
+
+## Developing on memory-constrained machines
+
+The workspace's default package list includes bindings, simulators, and test tools.
+Start with the package and test relevant to your change. Run heavyweight Cargo
+commands sequentially, including checks started by your editor. Avoid `make -j`
+for broad verification: its test prerequisites can run concurrently. A job limit applies
+to each Cargo invocation; it does not limit total memory across several processes.
+
+For example (choose a filter that matches your tests):
+
+```shell
+CARGO_BUILD_JOBS=2 cargo check --locked -p turso_parser --lib
+CARGO_BUILD_JOBS=2 cargo test --locked -p turso_parser --lib tests::test_offset -- --test-threads=1
+CARGO_BUILD_JOBS=2 cargo clippy --locked -p turso_parser --lib -- --deny=warnings
+```
+
+`--test-threads=1` limits the standard Rust test runner, separately from build jobs.
+Use one build job if two still cause memory pressure. Even a single compiler or
+linker can exceed available memory; these settings provide no fixed memory limit.
+
+For library work, an optional sequential helper runs formatting, library checking,
+filtered library tests, and library Clippy, stopping at the first failure:
+
+```shell
+bash scripts/dev-check.sh turso_parser tests::test_offset
+CARGO_BUILD_JOBS=1 bash scripts/dev-check.sh turso_parser tests::test_offset serde
+```
+
+The optional third argument is a Cargo feature list. Default features remain enabled.
+The helper defaults to two build jobs and `line-tables-only` debug information for
+dev and test builds, following the existing CI debug-info choice. It preserves
+explicit environment overrides. Set `CARGO_PROFILE_DEV_DEBUG=2` and
+`CARGO_PROFILE_TEST_DEBUG=2` when you need variables in a debugger. See the
+[Cargo profile reference](https://doc.rust-lang.org/cargo/reference/profiles.html#debug).
+No workspace profile or normal build default is changed.
+
+The helper only covers library targets. Review the reported test count: Cargo can
+succeed when a filter matches no tests. Run relevant binary, integration, SQL, and
+feature tests separately. These focused checks do not replace CI's full coverage.
+For a Rust integration test, select both package and target, then a test name:
+`CARGO_BUILD_JOBS=2 cargo test --locked -p core_tester --test integration_tests TEST_NAME -- --test-threads=1`.
+Confirm the target and filter in the package before running it.
+
+Avoid `--all-features` unless your change needs that combination. For example,
+`turso_core`'s optional `fts` feature adds Tantivy; it is not enabled by default.
+CI also checks `turso_core --no-default-features --features fs`, but that combination
+omits default behavior and is not a substitute for testing the affected features.
+
+Keep the same target directory, toolchain, features, debug settings, and rustflags
+between commands where possible so Cargo can reuse compatible artifacts. Changing
+these may rebuild dependencies. Do not routinely delete `target/` to resolve memory
+pressure. Preserve the repository's platform rustflags when configuring a linker.
+
+rust-analyzer may start its own Cargo checks while you run terminal commands.
+During manual verification, consider temporarily disabling check-on-save in your
+editor and restoring it afterward. Avoid enabling workspace-wide all-feature checks
+in the editor unless needed. Its analysis memory is separate from Cargo's build
+jobs. Consult your installed version's
+[rust-analyzer settings](https://rust-analyzer.github.io/book/configuration.html).
+
+On WSL2, inspect available RAM and swap with `free -h`. Review Windows WSL Settings
+or `%UserProfile%\.wslconfig` for VM `memory`, `processors`, and `swap` limits;
+leave enough RAM for Windows and other applications. Save work before using
+`wsl --shutdown` to apply changes: it stops all running distributions. See
+[Microsoft's WSL configuration guide](https://learn.microsoft.com/windows/wsl/wsl-config).
+Increasing swap is not a substitute for reducing concurrent work.
+
+If a compiler or editor exits with `SIGKILL`, inspect existing kernel logs with
+`journalctl -k` or `dmesg` where permitted for an OOM-killer record. Record the
+command, package, features, toolchain, job limit, available memory, and editor
+activity. A killed process alone does not establish a database runtime leak.
+Do not reproduce an OOM to collect this information.
+
+The helper's tests use a mock Cargo executable and do not compile Turso:
+
+```shell
+python3 -m unittest discover -s scripts/tests -p test_dev_check.py
+bash -n scripts/dev-check.sh
 ```
 
 ## Developing with AI coding agents
