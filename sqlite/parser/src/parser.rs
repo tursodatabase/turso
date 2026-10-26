@@ -198,6 +198,10 @@ pub struct Parser<'a> {
     /// Height of the most recently parsed expression (`1 + max(child heights)`,
     /// like SQLite's `Expr.nHeight`), bounded by [`MAX_EXPR_DEPTH`]
     last_expr_height: usize,
+    /// Set while parsing a domain's `DEFAULT expr` outside any parentheses,
+    /// brackets, function call, CAST or CASE. A `NOT NULL` found there is the
+    /// domain's NOT NULL clause, so it ends the expression
+    domain_default_ends_at_not_null: bool,
 }
 
 /// Maximum query expression depth, our equivalent of SQLite's
@@ -231,6 +235,7 @@ impl<'a> Parser<'a> {
             type_nesting_depth: 0,
             expr_nesting_depth: 0,
             last_expr_height: 0,
+            domain_default_ends_at_not_null: false,
         }
     }
 
@@ -1754,7 +1759,14 @@ impl<'a> Parser<'a> {
             TK_DEFAULT,
         );
 
-        match tok.token_type {
+        let token_type = tok.token_type;
+        if self.domain_default_ends_at_not_null
+            && !matches!(token_type, TK_NOT | TK_BITNOT | TK_PLUS | TK_MINUS)
+        {
+            return self.with_domain_default_rule_off(|p| p.parse_expr_operand());
+        }
+
+        match token_type {
             TK_DEFAULT => {
                 eat_assert!(self, TK_DEFAULT);
                 Ok(Box::new(Expr::Default))
@@ -2206,6 +2218,11 @@ impl<'a> Parser<'a> {
             // instead of wrapping it, so its height resets to 1.
             let mut leaf = false;
             if tok.token_type == TK_NOT {
+                if self.domain_default_ends_at_not_null
+                    && self.peeked_token_is_followed_by(TK_NULL)?
+                {
+                    break;
+                }
                 eat_assert!(self, TK_NOT);
                 tok = peek_expect!(
                     self, TK_BETWEEN, TK_IN, TK_MATCH, TK_LIKE_KW, TK_NULL, // `NOT NULL`
@@ -2223,7 +2240,8 @@ impl<'a> Parser<'a> {
                 TK_IS => self.parse_is_expr(result, pre)?,
                 TK_BETWEEN => self.parse_between_expr(result, not, pre)?,
                 TK_IN => {
-                    let (in_expr, in_expr_is_leaf) = self.parse_in_expr(result, not)?;
+                    let (in_expr, in_expr_is_leaf) =
+                        self.with_domain_default_rule_off(|p| p.parse_in_expr(result, not))?;
                     leaf = in_expr_is_leaf;
                     in_expr
                 }
@@ -2248,7 +2266,9 @@ impl<'a> Parser<'a> {
                     Box::new(Expr::Binary(result, op, self.parse_expr(pre + 1)?))
                 }
                 TK_COLLATE => Box::new(Expr::Collate(result, self.parse_collate()?.unwrap())),
-                TK_LBRACKET => self.parse_subscript_expr(result)?,
+                TK_LBRACKET => {
+                    self.with_domain_default_rule_off(|p| p.parse_subscript_expr(result))?
+                }
                 tt @ (TK_OR | TK_AND | TK_EQ | TK_NE | TK_LT | TK_GT | TK_LE | TK_GE
                 | TK_BITAND | TK_BITOR | TK_LSHIFT | TK_RSHIFT | TK_PLUS | TK_MINUS
                 | TK_STAR | TK_SLASH | TK_REM | TK_ARRAY_CONTAINS | TK_ARRAY_OVERLAP
@@ -2299,6 +2319,27 @@ impl<'a> Parser<'a> {
 
         self.last_expr_height = result_height;
         Ok(result)
+    }
+
+    fn with_domain_default_rule_off<R>(&mut self, parse: impl FnOnce(&mut Self) -> R) -> R {
+        let ends_at_not_null = std::mem::replace(&mut self.domain_default_ends_at_not_null, false);
+        let result = parse(self);
+        self.domain_default_ends_at_not_null = ends_at_not_null;
+        result
+    }
+
+    fn peeked_token_is_followed_by(&mut self, token_type: TokenType) -> Result<bool> {
+        debug_assert!(self.peekable);
+        self.peekable = false;
+        let followed =
+            self.try_parse(
+                |p| match p.consume_lexer_without_whitespaces_or_comments() {
+                    None => Ok(false),
+                    Some(tok) => Ok(tok?.token_type == token_type),
+                },
+            );
+        self.peekable = true;
+        followed
     }
 
     /// The operator of a binary expression whose operator is a single token
@@ -5136,8 +5177,10 @@ impl<'a> Parser<'a> {
                             "multiple DEFAULT clauses in domain definition".to_owned(),
                         ));
                     }
-                    let expr = self.parse_expr(0)?;
-                    default = Some(expr);
+                    self.domain_default_ends_at_not_null = true;
+                    let expr = self.parse_expr(0);
+                    self.domain_default_ends_at_not_null = false;
+                    default = Some(expr?);
                     has_default = true;
                 }
                 Some(tok) if tok.token_type == TK_NOT => {
@@ -13392,6 +13435,71 @@ mod tests {
             }
         } else {
             panic!("expected CreateType");
+        }
+    }
+
+    #[test]
+    fn test_create_domain_not_null_after_default_is_not_part_of_default() {
+        for (sql, expected_default, expected_not_null) in [
+            ("CREATE DOMAIN n AS int DEFAULT 3 NOT NULL", "3", true),
+            ("CREATE DOMAIN n AS int DEFAULT (3) NOT NULL", "(3)", true),
+            (
+                "CREATE DOMAIN n AS int DEFAULT 1 + 2 NOT NULL CHECK (value > 0)",
+                "1 + 2",
+                true,
+            ),
+            ("CREATE DOMAIN n AS text DEFAULT 'x' NOT NULL", "'x'", true),
+            (
+                "CREATE DOMAIN n AS int DEFAULT 1 OR 0 NOT NULL",
+                "1 OR 0",
+                true,
+            ),
+            (
+                "CREATE DOMAIN n AS int DEFAULT 1 AND 1 NOT NULL",
+                "1 AND 1",
+                true,
+            ),
+            (
+                "CREATE DOMAIN n AS int DEFAULT NOT 0 NOT NULL",
+                "NOT 0",
+                true,
+            ),
+            ("CREATE DOMAIN n AS int DEFAULT -x NOT NULL", "- x", true),
+            (
+                "CREATE DOMAIN n AS int DEFAULT coalesce(x NOT NULL, 1) NOT NULL",
+                "coalesce (x NOTNULL, 1)",
+                true,
+            ),
+            (
+                "CREATE DOMAIN n AS int DEFAULT CASE WHEN x NOT NULL THEN 1 END NOT NULL",
+                "CASE WHEN x NOTNULL THEN 1 END",
+                true,
+            ),
+            (
+                "CREATE DOMAIN n AS int DEFAULT 1 IN (x NOT NULL) NOT NULL",
+                "1 IN (x NOTNULL)",
+                true,
+            ),
+            (
+                "CREATE DOMAIN n AS int DEFAULT (3 NOT NULL)",
+                "(3 NOTNULL)",
+                false,
+            ),
+            (
+                "CREATE DOMAIN n AS int DEFAULT 3 NOTNULL",
+                "3 NOTNULL",
+                false,
+            ),
+        ] {
+            let cmd = Parser::new(sql.as_bytes()).next().unwrap().unwrap();
+            let Cmd::Stmt(Stmt::CreateDomain {
+                default, not_null, ..
+            }) = cmd
+            else {
+                panic!("expected CreateDomain for {sql}");
+            };
+            assert_eq!(default.unwrap().to_string(), expected_default, "{sql}");
+            assert_eq!(not_null, expected_not_null, "{sql}");
         }
     }
 

@@ -108,8 +108,7 @@ fn open_database(
         .with_encryption(true)
         .with_index_method(true)
         .with_autovacuum(true)
-        .with_attach(true)
-        .with_generated_columns(true);
+        .with_attach(true);
     let db_opts = if enable_load_extension {
         db_opts.turso_cli()
     } else {

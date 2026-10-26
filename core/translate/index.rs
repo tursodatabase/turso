@@ -372,6 +372,7 @@ pub(crate) fn emit_refill_index(
             unmatched_right_rows_plan: None,
             table: Table::BTree(tbl.clone()),
             identifier: tbl_name.clone(),
+            has_alias: false,
             internal_id: table_ref,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),

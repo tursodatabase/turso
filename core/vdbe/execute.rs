@@ -714,13 +714,6 @@ pub fn op_checkpoint(
         },
         insn
     );
-    if !program.connection.auto_commit.load(Ordering::SeqCst) {
-        // TODO: sqlite returns "Runtime error: database table is locked (6)" when a table is in use
-        // when a checkpoint is attempted. We don't have table locks, so return TableLocked for any
-        // attempt to checkpoint in an interactive transaction. This does not end the transaction,
-        // however.
-        return Err(LimboError::TableLocked.into());
-    }
     if *database == crate::TEMP_DB_ID && program.connection.temp.database.read().is_none() {
         set_not_in_wal_result(state, *dest);
         state.pc += 1;
@@ -728,6 +721,16 @@ pub fn op_checkpoint(
     }
 
     let pager = program.get_pager_from_database_index(database)?;
+    // Like SQLite, refuse only when this connection's open transaction has already
+    // read or written the database. After a plain BEGIN nothing is held yet, so the
+    // checkpoint runs. The error does not end the transaction.
+    if !program.connection.auto_commit.load(Ordering::SeqCst)
+        && (pager.holds_read_lock()
+            || pager.holds_write_lock()
+            || program.connection.get_mv_tx_for_db(*database).is_some())
+    {
+        return Err(LimboError::TableLocked.into());
+    }
     if !pager.has_wal() {
         set_not_in_wal_result(state, *dest);
         state.pc += 1;
@@ -9695,6 +9698,7 @@ pub fn op_agg_final(
             state,
             ext_func.finalize_aggregate(&mut state.registers[acc_reg])
         );
+        value.check_length_limit()?;
         state.registers[dest_reg].set_value(value);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -9716,6 +9720,7 @@ pub fn op_agg_final(
                     _ => finalize_agg_payload(func, payload)?,
                 },
             };
+            value.check_length_limit()?;
             if acc_reg == dest_reg {
                 let accumulator =
                     std::mem::replace(&mut state.registers[acc_reg], Register::Value(value));
@@ -12628,6 +12633,7 @@ pub fn op_function(
             unreachable!("Window functions should not be handled here")
         }
     }
+    state.registers[*dest].get_value().check_length_limit()?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -20392,6 +20398,21 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     pager
                         .io
                         .block(|| pager.with_header(|header| header.reserved_space))?
+                };
+                // Like SQLite, a valid size from the last PRAGMA page_size wins over the
+                // source's, except when the source is in memory. A 512-byte page has too
+                // little usable space for more than 32 reserved bytes, so SQLite uses 1024.
+                let next_page_size = program.connection.next_page_size.load(Ordering::SeqCst);
+                let page_size =
+                    if PageSize::new(next_page_size).is_some() && !source_db.is_in_memory_db() {
+                        next_page_size
+                    } else {
+                        page_size
+                    };
+                let page_size = if reserved_space > 32 && page_size == 512 {
+                    1024
+                } else {
+                    page_size
                 };
 
                 // Mirror source feature flags to the output so schema replay

@@ -236,7 +236,6 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         }
         "group_concat" => {
             if arg_count != 1 && arg_count != 2 {
-                println!("{arg_count}");
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)
             }
             Ok(Some(Func::Agg(AggFunc::GroupConcat)))

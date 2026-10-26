@@ -249,9 +249,8 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::InvalidDate(_)
         | LimboError::InvalidTime(_)
         | LimboError::InvalidModifier(_) => SQLSTATE_INVALID_DATETIME_FORMAT,
-        LimboError::ConversionError(_)
-        | LimboError::InvalidArgument(_)
-        | LimboError::InvalidFormatter(_) => SQLSTATE_DATA_EXCEPTION,
+        LimboError::InvalidArgument(msg) => invalid_argument_sqlstate(msg),
+        LimboError::ConversionError(_) | LimboError::InvalidFormatter(_) => SQLSTATE_DATA_EXCEPTION,
         LimboError::ParseIntError(_) | LimboError::ParseFloatError(_) => {
             SQLSTATE_INVALID_TEXT_REPRESENTATION
         }
@@ -318,10 +317,24 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_WINDOWING_ERROR
     } else if msg.starts_with("invalid reference to FROM-clause entry") {
         SQLSTATE_INVALID_COLUMN_REFERENCE
-    } else if msg.starts_with("no schema has been selected to create in") {
+    } else if msg == "malformed JSON" {
+        SQLSTATE_INVALID_TEXT_REPRESENTATION
+    } else if msg.starts_with("sequence \"") && msg.ends_with("\" does not exist") {
+        SQLSTATE_UNDEFINED_TABLE
+    } else if (msg.starts_with("schema \"") && msg.ends_with("\" does not exist"))
+        || msg == "no schema has been selected to create in"
+    {
         SQLSTATE_INVALID_SCHEMA_NAME
     } else {
         SQLSTATE_SYNTAX_ERROR
+    }
+}
+
+fn invalid_argument_sqlstate(msg: &str) -> &'static str {
+    if msg.starts_with("no such database") {
+        SQLSTATE_INVALID_SCHEMA_NAME
+    } else {
+        SQLSTATE_DATA_EXCEPTION
     }
 }
 
@@ -424,6 +437,17 @@ mod tests {
             ("no such column: c", SQLSTATE_UNDEFINED_COLUMN),
             ("no such function: f", SQLSTATE_UNDEFINED_FUNCTION),
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
+            ("malformed JSON", SQLSTATE_INVALID_TEXT_REPRESENTATION),
+            ("sequence \"s.q\" does not exist", SQLSTATE_UNDEFINED_TABLE),
+            ("schema \"s\" does not exist", SQLSTATE_INVALID_SCHEMA_NAME),
+            (
+                "no schema has been selected to create in",
+                SQLSTATE_INVALID_SCHEMA_NAME,
+            ),
+            (
+                "Invalid statement: syntax error at or near \"'malformed JSON'\"",
+                SQLSTATE_SYNTAX_ERROR,
+            ),
             ("unexpected token", SQLSTATE_SYNTAX_ERROR),
             (
                 "Cannot execute write statement in query_only mode",
