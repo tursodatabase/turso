@@ -1704,3 +1704,147 @@ test compound-chain-leftmost-collation {
 expect {
     0
 }
+
+# A value read from an expression index has the collation of its expression.
+# '[O' and '[Z' come after '[m' with NOCASE, but before it with BINARY.
+setup expression_index_nocase {
+    CREATE TABLE expr_nocase(id INTEGER PRIMARY KEY, a TEXT);
+    INSERT INTO expr_nocase VALUES (1, '[m'), (2, '[O'), (3, '[Z'), (4, '[a');
+    CREATE INDEX expr_nocase_a ON expr_nocase((a || '') COLLATE NOCASE);
+}
+
+# The index seek uses one of the two bounds. The other bound is compared with
+# the value from the index. (#9484)
+@setup expression_index_nocase
+test expression-index-value-keeps-collate-in-where {
+    SELECT id FROM expr_nocase
+    WHERE (a || '') COLLATE NOCASE >= '[m' AND (a || '') COLLATE NOCASE > '[m'
+    ORDER BY (a || '') COLLATE NOCASE;
+}
+expect {
+    2
+    3
+}
+
+@setup expression_index_nocase
+test expression-index-value-keeps-collate-in-keyset-pagination {
+    SELECT id FROM expr_nocase
+    WHERE (a || '') COLLATE NOCASE >= '[m'
+      AND ((a || '') COLLATE NOCASE > '[m' OR id < 1)
+    ORDER BY (a || '') COLLATE NOCASE, id;
+}
+expect {
+    2
+    3
+}
+
+@setup expression_index_nocase
+test expression-index-value-keeps-collate-in-not-equal-keyset-pagination {
+    SELECT id FROM expr_nocase
+    WHERE (a || '') COLLATE NOCASE >= '[o'
+      AND NOT ((a || '') COLLATE NOCASE = '[o' AND id >= 2)
+    ORDER BY (a || '') COLLATE NOCASE, id;
+}
+expect {
+    3
+}
+
+@setup expression_index_nocase
+test expression-index-value-keeps-collate-in-result-columns {
+    SELECT id,
+        (a || '') COLLATE NOCASE > '[m',
+        '[m' < (a || '') COLLATE NOCASE,
+        (a || '') COLLATE NOCASE BETWEEN '[n' AND '[z',
+        CASE (a || '') COLLATE NOCASE WHEN '[o' THEN 'o' ELSE '-' END
+    FROM expr_nocase INDEXED BY expr_nocase_a
+    ORDER BY (a || '') COLLATE NOCASE;
+}
+expect {
+    4|0|0|0|-
+    1|0|0|0|-
+    2|1|1|1|o
+    3|1|1|1|-
+}
+
+@setup expression_index_nocase
+@cross-check-integrity
+test expression-index-value-keeps-collate-in-delete {
+    DELETE FROM expr_nocase
+    WHERE (a || '') COLLATE NOCASE >= '[m' AND (a || '') COLLATE NOCASE > '[m';
+    SELECT id FROM expr_nocase ORDER BY id;
+}
+expect {
+    1
+    4
+}
+
+# Unary "+" does not hide the column, so the value has the collation of y.
+test expression-index-value-keeps-column-collation-through-unary-plus {
+    CREATE TABLE expr_plus(x TEXT, y TEXT COLLATE NOCASE);
+    INSERT INTO expr_plus VALUES ('alpha', 'ALPHA'), ('bravo', 'charlie');
+    CREATE INDEX expr_plus_y ON expr_plus(+y);
+    SELECT x FROM expr_plus INDEXED BY expr_plus_y WHERE +y = x;
+}
+expect {
+    alpha
+}
+
+# A function hides the column, so the value has no collation. The comparison
+# uses the collation of the other operand.
+test expression-index-value-of-function-uses-collation-of-other-operand {
+    CREATE TABLE expr_trim(x TEXT COLLATE NOCASE, y TEXT);
+    INSERT INTO expr_trim VALUES ('alpha', 'ALPHA'), ('bravo', 'charlie');
+    CREATE INDEX expr_trim_y ON expr_trim(trim(y));
+    SELECT x FROM expr_trim INDEXED BY expr_trim_y WHERE trim(y) = x;
+}
+expect {
+    alpha
+}
+
+# The NOCASE of a does not go through lower(a), so the comparison is BINARY.
+test expression-index-value-of-function-has-no-collation {
+    CREATE TABLE expr_lower(a TEXT COLLATE NOCASE);
+    INSERT INTO expr_lower VALUES ('A'), ('a'), ('b');
+    CREATE INDEX expr_lower_a ON expr_lower(lower(a));
+    SELECT a, lower(a) = 'A' FROM expr_lower INDEXED BY expr_lower_a ORDER BY lower(a), rowid;
+}
+expect {
+    A|0
+    a|0
+    b|0
+}
+
+# For the NULL row of an outer join, the expression is computed instead of read
+# from the index. The comparison has one collation for the two cases.
+setup expression_index_outer_join {
+    CREATE TABLE expr_left(id INTEGER PRIMARY KEY, x TEXT COLLATE NOCASE);
+    CREATE TABLE expr_right(id INTEGER PRIMARY KEY, y TEXT);
+    CREATE INDEX expr_right_collate ON expr_right(id, (y || '') COLLATE NOCASE);
+    CREATE INDEX expr_right_trim ON expr_right(id, trim(y));
+    INSERT INTO expr_left VALUES (1, 'alpha'), (2, 'bravo'), (3, 'x');
+    INSERT INTO expr_right VALUES (1, 'ALPHA'), (2, 'charlie');
+}
+
+@setup expression_index_outer_join
+test expression-index-value-in-outer-join-keeps-collate {
+    SELECT l.id, (r.y || '') COLLATE NOCASE = 'alpha'
+    FROM expr_left l LEFT JOIN expr_right r INDEXED BY expr_right_collate ON r.id = l.id
+    ORDER BY l.id;
+}
+expect {
+    1|1
+    2|0
+    3|
+}
+
+@setup expression_index_outer_join
+test expression-index-value-in-outer-join-of-function-uses-collation-of-other-operand {
+    SELECT l.id, trim(r.y) = l.x
+    FROM expr_left l LEFT JOIN expr_right r INDEXED BY expr_right_trim ON r.id = l.id
+    ORDER BY l.id;
+}
+expect {
+    1|1
+    2|0
+    3|
+}

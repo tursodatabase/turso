@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::collate::comparison_operand_collation_ctx;
 use crate::translate::expression_index::normalize_expr_for_index_matching;
 
 #[derive(Debug, Clone, Copy)]
@@ -263,6 +264,10 @@ macro_rules! translate_fixed_insn {
 /// expression is computed for that row instead, as in SQLite: an expression
 /// over NULL inputs does not always produce NULL.
 ///
+/// A comparison takes the collation of its operands from the program builder.
+/// A read from the index does not set it, so this function sets the collation
+/// that SQLite gives the expression, also when the null row is possible.
+///
 /// We mut do this check early in translate_expr so downstream translation does
 /// not build redundant bytecode.
 pub(super) fn try_emit_expression_index_value(
@@ -293,8 +298,10 @@ pub(super) fn try_emit_expression_index_value(
     else {
         return Ok(false);
     };
+    let collation = comparison_operand_collation_ctx(expr, referenced_tables, resolver)?;
     if !referenced_tables.index_cursor_may_be_null_row(table.internal_id) {
         program.emit_column_or_rowid(index_cursor, expression_position, target_register);
+        program.set_collation(collation);
         return Ok(true);
     }
 
@@ -325,6 +332,7 @@ pub(super) fn try_emit_expression_index_value(
         .set_skip_expression_index_values(skipped_index_values);
     result?;
     program.preassign_label_to_next_insn(expression_done);
+    program.set_collation(collation);
     Ok(true)
 }
 

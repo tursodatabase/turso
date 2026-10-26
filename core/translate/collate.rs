@@ -494,6 +494,31 @@ pub fn get_expr_collation_ctx_with_symbols(
         .or_else(|| maybe_column_collseq.map(|collation| (collation, false))))
 }
 
+/// The collation that a comparison takes from one of its operands, with the
+/// SQLite rules: the leftmost explicit COLLATE anywhere in the operand, else
+/// the collation of the column that the operand is (behind unary "+", CAST or
+/// parentheses), else none. The bool is true for an explicit COLLATE.
+///
+/// Unlike [get_expr_collation_ctx_with_symbols()], a column inside a larger
+/// expression, such as `a` in `lower(a)` or `a || ''`, gives no collation.
+pub fn comparison_operand_collation_ctx(
+    operand: &Expr,
+    referenced_tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<Option<(CollationSeq, bool)>> {
+    let (explicit, _) = get_collseq_parts_from_expr_with_symbols(
+        operand,
+        referenced_tables,
+        Some(resolver.symbol_table),
+        Some(resolver),
+    )?;
+    if let Some(collation) = explicit {
+        return Ok(Some((collation, true)));
+    }
+    let column = comparison_operand_column_collseq(operand, referenced_tables)?;
+    Ok(column.map(|collation| (collation, false)))
+}
+
 /// Resolve the collation for a binary comparison (=, <, >, etc.) per SQLite rules:
 /// 1. Explicit COLLATE operator on either side wins (LHS takes precedence)
 /// 2. Column on either side wins (LHS takes precedence), BINARY when the
