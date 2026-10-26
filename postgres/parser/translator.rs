@@ -3918,7 +3918,8 @@ impl PostgreSQLTranslator {
         // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
             "FLOAT8" | "FLOAT4" => Some("REAL"),
-            "INT4" | "INT2" | "INT8" => Some("INTEGER"),
+            "INT4" | "INT2" => Some("INTEGER"),
+            "INT8" => Some("BIGINT"),
             "BOOL" => Some("BOOLEAN"),
             "TEXT" => Some("TEXT"),
             _ => None,
@@ -5780,8 +5781,9 @@ fn pg_type_name_to_ast_type(
     let pg_type = object_name(&type_name.names, is_default_schema, "type")?;
 
     let name = match pg_type.to_uppercase().as_str() {
-        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "BIGINT" | "INT8" | "SERIAL"
-        | "BIGSERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
+        "BIGINT" | "INT8" | "BIGSERIAL" => "BIGINT",
+        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" | "OID"
+        | "REGCLASS" | "REGTYPE" => "INTEGER",
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
             "REAL"
         }

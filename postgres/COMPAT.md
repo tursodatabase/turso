@@ -138,6 +138,11 @@ including char(n), timestamp(p) and bit(n), are rejected. interval, xml, tsvecto
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
 
+BIGINT operands retain eight-byte integer (`int8`) result metadata through
+scalar arithmetic, supported bitwise operations, and common-result expressions
+such as COALESCE and CASE. BIGINT/INT8 casts retain that width as well; ordinary
+integer scalar expressions keep their existing representation.
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |
