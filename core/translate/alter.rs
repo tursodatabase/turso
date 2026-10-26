@@ -664,6 +664,7 @@ fn emit_column_constraints_validation(
                 unmatched_right_rows_plan: None,
                 table,
                 identifier: resolved_table.name.clone(),
+                has_alias: false,
                 internal_id: program.table_reference_counter.next(),
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
@@ -871,6 +872,7 @@ pub fn translate_alter_table(
                         vec![],
                         vec![OuterQueryReference {
                             identifier: table_name.to_string(),
+                            has_alias: false,
                             internal_id: TableInternalId::from(0),
                             table: Table::BTree(Arc::new(btree.clone())),
                             database_id,

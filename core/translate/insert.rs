@@ -358,6 +358,7 @@ pub fn translate_insert(
                     .expect("we shouldn't have got here without a BTree table"),
             ),
             identifier: normalize_ident(table_name.as_str()),
+            has_alias: false,
             internal_id: program.table_reference_counter.next(),
             op: Operation::default_scan_for(&table),
             unmatched_right_rows_plan: None,

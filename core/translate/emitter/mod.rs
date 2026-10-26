@@ -2515,6 +2515,7 @@ fn emit_check_constraint_bytecode(
                 // CHECK expressions come from schema SQL and may use the base table name
                 // even when the query references the table through an alias.
                 joined_table.identifier = table_name.to_string();
+                joined_table.has_alias = false;
             }
             bind_and_rewrite_expr(
                 &mut rewritten_expr,
