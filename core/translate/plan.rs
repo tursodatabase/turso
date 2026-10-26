@@ -5,7 +5,7 @@ use crate::{
     schema::{
         BTreeTable, ColDef, Column, FromClauseSubquery, Index, ParenthesizedJoinColumnSource,
         ParenthesizedJoinColumnVisibility, PseudoCursorType, RecursiveCteInput, Table,
-        ROWID_SENTINEL,
+        ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
     },
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
@@ -26,7 +26,7 @@ use crate::{
         insn::{HashDistinctData, Insn},
         BranchOffset, CursorID,
     },
-    Result, VirtualTable, MAIN_DB_ID,
+    Result, VirtualTable, MAIN_DB_ID, TEMP_DB_ID,
 };
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
@@ -1192,7 +1192,8 @@ pub(super) fn expand_table_star(
     let tables = table_references.joined_tables();
 
     let mut direct_matches = tables.iter().enumerate().filter(|(_, table)| {
-        table.table.parenthesized_join_columns().is_none() && table.identifier == normalized_name
+        table.table.parenthesized_join_columns().is_none()
+            && alias_or_stored_name(table) == normalized_name
     });
     let first_direct_match = direct_matches.next();
     if let (Some((_, first_table)), Some(_)) = (first_direct_match, direct_matches.next()) {
@@ -1234,7 +1235,7 @@ pub(super) fn expand_table_star(
                     })
                     .map(|(column_index, _)| (table_index, column_index)),
             );
-        } else if table.identifier == normalized_name {
+        } else if alias_or_stored_name(table) == normalized_name {
             matching_columns.extend(
                 table
                     .columns_for_star()
@@ -1283,6 +1284,25 @@ pub(super) fn expand_table_star(
         table_references.mark_column_used(table_id, column_index);
     }
     Ok(())
+}
+
+/// The name SQLite gives the FROM item `table` in `<tbl>.*` and in the saved
+/// columns of a parenthesized join: the alias, or else the name the table is
+/// stored under. For the schema table that is `sqlite_master`
+/// (`sqlite_temp_master` in temp), whichever name FROM used.
+pub(crate) fn alias_or_stored_name(table: &JoinedTable) -> &str {
+    if table.has_alias || !is_schema_table(&table.table) {
+        return &table.identifier;
+    }
+    if table.database_id == TEMP_DB_ID {
+        TEMP_SCHEMA_TABLE_NAME_ALT
+    } else {
+        SCHEMA_TABLE_NAME_ALT
+    }
+}
+
+pub(crate) fn is_schema_table(table: &Table) -> bool {
+    matches!(table, Table::BTree(btree) if btree.root_page == 1)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1744,6 +1764,9 @@ pub struct JoinedTable {
     pub table: Table,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
     pub identifier: String,
+    /// Whether FROM gave this table an alias. Then `identifier` is the alias,
+    /// and only the alias can qualify the table's columns.
+    pub has_alias: bool,
     /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
     pub internal_id: TableInternalId,
     /// The join info for this table reference, if it is the right side of a join (which all except the first table reference have)
@@ -1792,6 +1815,9 @@ pub struct TablePlanEstimate {
 pub struct OuterQueryReference {
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
     pub identifier: String,
+    /// Whether FROM gave this table an alias. Then `identifier` is the alias,
+    /// and only the alias can qualify the table's columns.
+    pub has_alias: bool,
     /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
@@ -3170,6 +3196,7 @@ impl JoinedTable {
             unmatched_right_rows_plan: None,
             table,
             identifier,
+            has_alias: false,
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
@@ -3221,6 +3248,7 @@ impl JoinedTable {
             unmatched_right_rows_plan: None,
             table,
             identifier,
+            has_alias: false,
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
@@ -3256,6 +3284,7 @@ impl JoinedTable {
             unmatched_right_rows_plan: None,
             table,
             identifier,
+            has_alias: false,
             internal_id,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),

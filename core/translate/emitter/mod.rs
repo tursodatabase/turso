@@ -870,6 +870,27 @@ impl<'a> Resolver<'a> {
         })
     }
 
+    /// Like `resolve_existing_table`, for a table that a statement reads or
+    /// writes. A table in a database that does not exist is a missing table
+    /// here, as in SQLite's sqlite3LocateTable.
+    pub(crate) fn resolve_queried_table(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<NamespaceRef> {
+        if let Some(db_name) = &qualified_name.namespace {
+            if self
+                .namespace_database_id(&normalize_ident(db_name.as_str()))
+                .is_none()
+            {
+                return Err(LimboError::ParseError(format!(
+                    "no such table: {}",
+                    crate::util::table_name_for_error(qualified_name)
+                )));
+            }
+        }
+        self.resolve_existing_table(qualified_name)
+    }
+
     pub(crate) fn resolve_existing_table_named(&self, table_name: &str) -> Result<NamespaceRef> {
         self.find_existing_table_named(table_name)
             .ok_or_else(|| LimboError::ParseError(format!("no such object: {table_name}")))
@@ -2497,6 +2518,7 @@ fn emit_check_constraint_bytecode(
                 // CHECK expressions come from schema SQL and may use the base table name
                 // even when the query references the table through an alias.
                 joined_table.identifier = table_name.to_string();
+                joined_table.has_alias = false;
             }
             bind_and_rewrite_expr(
                 &mut rewritten_expr,

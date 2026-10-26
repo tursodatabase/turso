@@ -73,7 +73,8 @@ When the database uses MVCC (`PRAGMA journal_mode = mvcc`), additional rules app
 - Indexes, triggers, and views are recreated after the data is copied so that triggers do not fire during the copy.
 - Custom index methods (for example FTS and vector) rebuild their backing structures from the copied data.
 - `sqlite_sequence` counters used by `AUTOINCREMENT` columns are preserved.
-- Page size, reserved space, text encoding, user version, and application ID are copied from the source.
+- Reserved space, text encoding, user version, and application ID are copied from the source.
+- The page size is copied from the source, unless a valid `PRAGMA page_size = N` ran earlier on the same connection. Then the destination uses `N` and the source keeps its own page size. An in-memory source always uses its own page size. A requested size of 512 becomes 1024 when the source has more than 32 reserved bytes per page. An in-place `VACUUM` drops the requested size.
 - If the source uses MVCC, the destination is created with MVCC enabled but with fresh state. The source's MVCC metadata table is not copied across.
 - The file is fully synced and a TRUNCATE checkpoint is performed before the statement returns, so the destination is durable without further action.
 

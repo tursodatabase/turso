@@ -14389,6 +14389,235 @@ fn test_desc_index_scan_respects_mvcc_snapshot_for_concurrent_insert() {
     );
 }
 
+/// An index scan must return a row that its own transaction inserts ahead of
+/// the scan position, whether the other index entries are in the B-tree (after
+/// a checkpoint) or in MVCC versions, and in both scan directions. A row that
+/// another connection inserts and commits there must stay hidden.
+#[test]
+fn test_index_scan_sees_its_own_insert_ahead_of_the_scan() {
+    for checkpoint in [true, false] {
+        for update in [false, true] {
+            for begin in ["BEGIN", "BEGIN CONCURRENT"] {
+                for (insert_from_other_connection, asc, desc) in [
+                    (false, "a,b,c,d,e,f,g,h,i", "i,h,g,f,e,d,c,b,a"),
+                    (true, "a,b,c,d,f,g,h,i", "i,h,g,f,d,c,b,a"),
+                ] {
+                    let case = format!(
+                        "checkpoint={checkpoint} update={update} {begin} \
+                         other_connection={insert_from_other_connection}"
+                    );
+                    for (scan_sql, expected) in [
+                        ("SELECT v FROM t WHERE v > ''", asc),
+                        ("SELECT v FROM t WHERE v < 'z' ORDER BY v DESC", desc),
+                    ] {
+                        let db = MvccTestDb::new();
+                        let conn = &db.conn;
+                        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                            .unwrap();
+                        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                            .unwrap();
+                        conn.execute("CREATE INDEX i ON t(v)").unwrap();
+                        conn.execute(
+                            "INSERT INTO t VALUES \
+                             (1,'a'),(2,'b'),(3,'c'),(4,'d'),(6,'f'),(7,'g'),(8,'h'),(9,'i')",
+                        )
+                        .unwrap();
+                        if checkpoint {
+                            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                        }
+                        if update {
+                            // Puts 'b' and 'h' in MVCC versions, so the MVCC peek is not exhausted.
+                            conn.execute("UPDATE t SET v = v WHERE id IN (2, 8)")
+                                .unwrap();
+                        }
+                        conn.execute(begin).unwrap();
+                        let writer = if insert_from_other_connection {
+                            db.db.connect(ConnectOpts::new()).unwrap()
+                        } else {
+                            conn.clone()
+                        };
+                        assert_eq!(
+                            scan_with_write_after_rows(
+                                conn,
+                                scan_sql,
+                                3,
+                                &writer,
+                                "INSERT INTO t VALUES (5, 'e')"
+                            ),
+                            expected,
+                            "{case} {scan_sql}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// An index scan must not return a row that its own transaction deletes ahead
+/// of the scan position, after a checkpoint, while the scan holds that row as
+/// its next MVCC index entry.
+#[test]
+fn test_index_scan_skips_its_own_delete_ahead_of_the_scan() {
+    for begin in ["BEGIN", "BEGIN CONCURRENT"] {
+        // How the deleted row gets its MVCC versions, if at all.
+        for deleted_row_versions in ["none", "update", "insert in transaction"] {
+            for (scan_sql, (deleted_id, deleted_v), expected) in [
+                (
+                    "SELECT quote(v), id FROM t WHERE v > ''",
+                    (3, "c"),
+                    "'a'|1,'b'|2,'d'|4",
+                ),
+                (
+                    "SELECT quote(w), id FROM t WHERE v > ''",
+                    (3, "c"),
+                    "'aa'|1,'bb'|2,'dd'|4",
+                ),
+                (
+                    "SELECT quote(v), id FROM t WHERE v < 'z' ORDER BY v DESC",
+                    (2, "b"),
+                    "'d'|4,'c'|3,'a'|1",
+                ),
+                (
+                    "SELECT quote(w), id FROM t WHERE v < 'z' ORDER BY v DESC",
+                    (2, "b"),
+                    "'dd'|4,'cc'|3,'aa'|1",
+                ),
+            ] {
+                let db = MvccTestDb::new();
+                let conn = &db.conn;
+                conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                    .unwrap();
+                conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, w TEXT)")
+                    .unwrap();
+                conn.execute("CREATE INDEX i ON t(v)").unwrap();
+                let insert_deleted_row = format!(
+                    "INSERT INTO t VALUES ({deleted_id}, '{deleted_v}', '{deleted_v}{deleted_v}')"
+                );
+                for (id, v) in [(1, "a"), (2, "b"), (3, "c"), (4, "d")] {
+                    if id != deleted_id {
+                        conn.execute(format!("INSERT INTO t VALUES ({id}, '{v}', '{v}{v}')"))
+                            .unwrap();
+                    }
+                }
+                if deleted_row_versions != "insert in transaction" {
+                    conn.execute(&insert_deleted_row).unwrap();
+                }
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                if deleted_row_versions == "update" {
+                    conn.execute(format!("UPDATE t SET v = v WHERE id = {deleted_id}"))
+                        .unwrap();
+                }
+                conn.execute(begin).unwrap();
+                if deleted_row_versions == "insert in transaction" {
+                    conn.execute(&insert_deleted_row).unwrap();
+                }
+                assert_eq!(
+                    scan_with_write_after_rows(
+                        conn,
+                        scan_sql,
+                        1,
+                        conn,
+                        &format!("DELETE FROM t WHERE id = {deleted_id}")
+                    ),
+                    expected,
+                    "{begin} deleted_row_versions={deleted_row_versions} {scan_sql}"
+                );
+            }
+        }
+    }
+}
+
+/// An index scan must follow `ROLLBACK TO` of its own transaction's writes
+/// ahead of the scan position, after a checkpoint: a rolled-back insert is not
+/// returned, and a row whose delete was rolled back is returned.
+#[test]
+fn test_index_scan_follows_rollback_to_savepoint_ahead_of_the_scan() {
+    for begin in ["BEGIN", "BEGIN CONCURRENT"] {
+        for (write_in_savepoint, asc, desc) in [
+            (
+                "INSERT INTO t VALUES (3, 'c')",
+                "'a'|1,'b'|2,'d'|4,'e'|5",
+                "'e'|5,'d'|4,'b'|2,'a'|1",
+            ),
+            (
+                "DELETE FROM t WHERE id = 3",
+                "'a'|1,'b'|2,'c'|3,'d'|4,'e'|5",
+                "'e'|5,'d'|4,'c'|3,'b'|2,'a'|1",
+            ),
+        ] {
+            // MVCC versions on 'c' and on the row after it in scan order, so the
+            // scan's first row comes from the B-tree and the next MVCC entry it
+            // holds is 'c' or past it.
+            for (scan_sql, rows_with_versions, expected) in [
+                ("SELECT quote(v), id FROM t WHERE v > ''", "3, 5", asc),
+                (
+                    "SELECT quote(v), id FROM t WHERE v < 'z' ORDER BY v DESC",
+                    "1, 3",
+                    desc,
+                ),
+            ] {
+                let db = MvccTestDb::new();
+                let conn = &db.conn;
+                conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                    .unwrap();
+                conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                    .unwrap();
+                conn.execute("CREATE INDEX i ON t(v)").unwrap();
+                conn.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(4,'d'),(5,'e')")
+                    .unwrap();
+                if write_in_savepoint.starts_with("DELETE") {
+                    conn.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+                }
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                conn.execute(format!(
+                    "UPDATE t SET v = v WHERE id IN ({rows_with_versions})"
+                ))
+                .unwrap();
+                conn.execute(begin).unwrap();
+                conn.execute("SAVEPOINT s").unwrap();
+                conn.execute(write_in_savepoint).unwrap();
+                assert_eq!(
+                    scan_with_write_after_rows(conn, scan_sql, 1, conn, "ROLLBACK TO s"),
+                    expected,
+                    "{begin} {write_in_savepoint} {scan_sql}"
+                );
+            }
+        }
+    }
+}
+
+/// Steps `scan_sql` on `conn` and runs `write_sql` on `writer` once the scan has
+/// returned `rows_before_write` rows. Returns the rows, with columns joined by `|`.
+fn scan_with_write_after_rows(
+    conn: &Arc<Connection>,
+    scan_sql: &str,
+    rows_before_write: usize,
+    writer: &Arc<Connection>,
+    write_sql: &str,
+) -> String {
+    let mut scan = conn.prepare(scan_sql).unwrap();
+    let mut rows: Vec<String> = Vec::new();
+    let mut written = false;
+    loop {
+        if !written && rows.len() == rows_before_write {
+            writer.execute(write_sql).unwrap();
+            written = true;
+        }
+        match scan.step().unwrap() {
+            StepResult::Row => {
+                let row = scan.row().unwrap();
+                let columns: Vec<String> = row.get_values().map(|v| v.to_string()).collect();
+                rows.push(columns.join("|"));
+            }
+            StepResult::IO => scan.get_pager().io.step().unwrap(),
+            StepResult::Done => break,
+            other => panic!("unexpected step result {other:?}"),
+        }
+    }
+    rows.join(",")
+}
+
 /// Test DELETE all B-tree rows and re-insert with same IDs in MVCC.
 /// Verifies tombstones correctly shadow B-tree and new rows are visible.
 ///

@@ -31,6 +31,7 @@ pub(super) fn make_joined_table(
         unmatched_right_rows_plan: None,
         table: crate::schema::Table::BTree(table.clone()),
         identifier: identifier.to_string(),
+        has_alias: false,
         internal_id: id,
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),

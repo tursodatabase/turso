@@ -198,7 +198,7 @@ pub(super) fn translate_sequence_function(
         let db_id = resolver
             .namespace_database_id(&schema_norm)
             .ok_or_else(|| {
-                LimboError::InvalidArgument(format!("no such database: {schema_norm}"))
+                LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist"))
             })?;
         (NamespaceRef::root_of(db_id), normalize_ident(name))
     } else {

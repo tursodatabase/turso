@@ -284,7 +284,7 @@ pub fn translate_insert(
         // for RETURNING clause subqueries - handled below via with_for_returning.
     }
 
-    let namespace = resolver.resolve_existing_table(&tbl_name)?;
+    let namespace = resolver.resolve_queried_table(&tbl_name)?;
     let database_id = namespace.database_id;
     let table_name = &tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| {
@@ -358,6 +358,7 @@ pub fn translate_insert(
                     .expect("we shouldn't have got here without a BTree table"),
             ),
             identifier: normalize_ident(table_name.as_str()),
+            has_alias: false,
             internal_id: program.table_reference_counter.next(),
             op: Operation::default_scan_for(&table),
             unmatched_right_rows_plan: None,

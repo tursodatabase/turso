@@ -94,7 +94,7 @@ pub fn translate_delete(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let namespace = resolver.resolve_existing_table(tbl_name)?;
+    let namespace = resolver.resolve_queried_table(tbl_name)?;
     let database_id = namespace.database_id;
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
     let table = validate_delete(
@@ -223,6 +223,7 @@ pub fn prepare_delete_plan(
         unmatched_right_rows_plan: None,
         table,
         identifier: qualified_name.identifier(),
+        has_alias: qualified_name.alias.is_some(),
         internal_id: program.table_reference_counter.next(),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),

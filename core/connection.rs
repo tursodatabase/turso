@@ -382,6 +382,9 @@ pub struct Connection {
     pub(crate) syms: parking_lot::RwLock<SymbolTable>,
     pub(super) _shared_cache: bool,
     pub(super) cache_size: AtomicI32,
+    /// Page size from the last `PRAGMA page_size` on any database of this connection, or 0.
+    /// Like SQLite's `db->nextPagesize`, `VACUUM INTO` uses it for the output database.
+    pub(super) next_page_size: AtomicU32,
     /// Allowed automatic WAL maintenance actions for this connection.
     /// Stored as the `bits()` of a `WalAutoActions`. Default is
     /// `WalAutoActions::all_enabled()`. `wal_auto_actions_disable` clears
@@ -657,7 +660,6 @@ impl Connection {
             self.db.dialect().as_ref(),
         )
         .expect("built-in type definitions are malformed");
-        schema.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         schema.copy_table_valued_functions(&self.db.clone_schema());
         Arc::new(schema)
     }
@@ -668,7 +670,6 @@ impl Connection {
             .with_custom_types(self.db.experimental_custom_types_enabled())
             .with_index_method(self.db.experimental_index_method_enabled())
             .with_vacuum(self.db.experimental_vacuum_enabled())
-            .with_generated_columns(self.db.experimental_generated_columns_enabled())
             .with_without_rowid(self.db.experimental_without_rowid_enabled())
     }
 
@@ -1434,7 +1435,6 @@ impl Connection {
             self.experimental_custom_types_enabled(),
             self.db.dialect().as_ref(),
         )?;
-        fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
 
         fresh.copy_table_valued_functions(&self.schema.read());
@@ -2745,7 +2745,9 @@ impl Connection {
     /// Instead, the new page size is remembered and is used to set the page size when the database
     /// is first created, if it does not already exist when the page_size pragma is issued,
     /// or at the next VACUUM command that is run on the same database connection while not in WAL mode.
+    /// `VACUUM INTO` uses it for the output database even in WAL mode.
     pub fn reset_page_size(&self, database_id: usize, size: u32) -> Result<()> {
+        self.next_page_size.store(size, Ordering::SeqCst);
         if self.get_source_database(database_id).initialized() {
             return Ok(());
         }
@@ -3002,10 +3004,6 @@ impl Connection {
 
     pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
         self.db.experimental_multiprocess_wal_enabled()
-    }
-
-    pub fn experimental_generated_columns_enabled(&self) -> bool {
-        self.db.experimental_generated_columns_enabled()
     }
 
     pub fn experimental_without_rowid_enabled(&self) -> bool {
@@ -3617,7 +3615,10 @@ impl Connection {
             .map(|sequence| (db_id, sequence))
         };
         if let Some((schema, seq)) = name.split_once('.') {
-            let db_id = self.get_database_id_by_name(schema)?;
+            let db_id = self
+                .namespaces
+                .database_id(&crate::util::normalize_ident(schema))
+                .ok_or_else(|| not_found(name))?;
             let seq_name = crate::util::normalize_ident(seq);
             return get(db_id, &seq_name).ok_or_else(|| not_found(&seq_name));
         }

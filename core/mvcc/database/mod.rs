@@ -4414,12 +4414,12 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// because operations like last() on an index are much easier when we don't have to take the
     /// table identifier into account.
     pub index_rows: SkipMap<MVTableId, IndexRowsMap<A>, BasicComparator, A>,
-    /// Bumped whenever the key set of `index_rows` may change (every
-    /// [`Self::insert_index_version`], which is the single funnel through which
-    /// new index keys are created). Forward-scan cursors snapshot this inside
-    /// [`crate::mvcc::cursor::IndexShadowScan`] and reseed on a mismatch, since
-    /// a key inserted at or behind an already-positioned scan would otherwise
-    /// be skipped (#7578).
+    /// Bumped whenever an index version is inserted or deleted (including the
+    /// undo at `ROLLBACK TO`), or a key is removed from `index_rows`. Index
+    /// cursors compare it on each step to find out whether a key they already
+    /// looked at may have changed: forward scans reseed
+    /// [`crate::mvcc::cursor::IndexShadowScan`] on a mismatch (#7578), and
+    /// `MvccLazyCursor` seeks its next MVCC index entry again.
     index_rows_epoch: AtomicU64,
     txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     /// Final state for removed transactions. Readers may still race with stale TxID
@@ -5702,6 +5702,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         let version_id = rv.id;
                         rv.set_end(Some(TxTimestampOrID::TxID(tx_id)));
                         drop(locked_row_versions);
+                        self.bump_index_rows_epoch();
                         tx.insert_to_write_set(id, row_versions);
                         tx.record_deleted_index_version((index_id, arc_key), version_id);
                         return Ok(true);
@@ -7460,6 +7461,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         );
 
         let mut touched_rowids = BTreeSet::new();
+        let undoes_index_versions =
+            !created_index_versions.is_empty() || !deleted_index_versions.is_empty();
 
         for (rowid, version_id) in created_table_versions {
             touched_rowids.insert(rowid.clone());
@@ -7541,6 +7544,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     }
                 }
             }
+        }
+        if undoes_index_versions {
+            self.bump_index_rows_epoch();
         }
 
         touched_rowids.extend(newly_added_to_write_set.into_iter().map(|(id, _)| id));
@@ -8757,7 +8763,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.index_rows_epoch.load(Ordering::SeqCst)
     }
 
-    /// Key-set mutation of `index_rows` (insert or empty-slot remove); see field docs.
+    /// An index version was inserted, deleted or rolled back, or a key removed; see field docs.
     pub(crate) fn bump_index_rows_epoch(&self) {
         self.index_rows_epoch.fetch_add(1, Ordering::SeqCst);
         #[cfg(shuttle)]
@@ -9405,7 +9411,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             connection.db.experimental_custom_types_enabled(),
             connection.db.dialect().as_ref(),
         )?;
-        fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
         Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
         let mut from_sql_indexes = crate::alloc::vec![];
@@ -10349,7 +10354,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             connection.db.experimental_custom_types_enabled(),
             connection.db.dialect().as_ref(),
         )?;
-        fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
         Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
         let mut from_sql_indexes =
