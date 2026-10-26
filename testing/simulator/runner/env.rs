@@ -39,9 +39,7 @@ fn enable_mvcc_on_attached_dbs(io: &Arc<dyn SimIO>, aux_paths: impl Iterator<Ite
             io.clone(),
             aux_path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new()
-                .with_attach(true)
-                .with_generated_columns(true),
+            turso_core::DatabaseOpts::new().with_attach(true),
             None,
             Arc::new(SqliteDialect),
         )
@@ -1441,8 +1439,7 @@ impl SimulatorEnv {
             turso_core::OpenFlags::default(),
             turso_core::DatabaseOpts::new()
                 .with_autovacuum(true)
-                .with_attach(true)
-                .with_generated_columns(true),
+                .with_attach(true),
             None,
             Arc::new(SqliteDialect),
         ) {
@@ -1676,8 +1673,7 @@ impl SimulatorEnv {
             turso_core::OpenFlags::default(),
             turso_core::DatabaseOpts::new()
                 .with_autovacuum(true)
-                .with_attach(true)
-                .with_generated_columns(true),
+                .with_attach(true),
             None,
             Arc::new(SqliteDialect),
         ) {

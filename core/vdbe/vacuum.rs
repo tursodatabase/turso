@@ -209,7 +209,6 @@ pub(crate) fn vacuum_target_opts_from_source(source_db: &Database) -> DatabaseOp
         .with_encryption(source_db.experimental_encryption_enabled())
         .with_autovacuum(source_db.experimental_autovacuum_enabled())
         .with_attach(source_db.experimental_attach_enabled())
-        .with_generated_columns(source_db.experimental_generated_columns_enabled())
         .with_without_rowid(source_db.experimental_without_rowid_enabled())
 }
 
@@ -2846,13 +2845,13 @@ mod tests {
         })?;
 
         let mut replacement = Schema::new();
-        replacement.generated_columns_enabled = true;
         replacement.schema_version = 0;
-        replace_shared_schema_after_vacuum(db.as_ref(), Arc::new(replacement));
+        let replacement = Arc::new(replacement);
+        replace_shared_schema_after_vacuum(db.as_ref(), replacement.clone());
 
         let schema = db.clone_schema();
         assert_eq!(schema.schema_version, 0);
-        assert!(schema.generated_columns_enabled);
+        assert!(Arc::ptr_eq(&schema, &replacement));
 
         Ok(())
     }
@@ -2874,20 +2873,20 @@ mod tests {
         let mut header = DatabaseHeader::default();
         header.schema_cookie = 42.into();
         let mut schema = Schema::new();
-        schema.generated_columns_enabled = true;
         schema.schema_version = 42;
+        let schema = Arc::new(schema);
         let committed = VacuumCommittedImageMeta {
             header,
-            schema: Arc::new(schema),
+            schema: schema.clone(),
         };
 
         install_committed_vacuum_image(&conn, crate::MAIN_DB_ID, &committed);
 
         assert_eq!(conn.schema.read().schema_version, 42);
-        assert!(conn.schema.read().generated_columns_enabled);
+        assert!(Arc::ptr_eq(&*conn.schema.read(), &schema));
         let shared = db.clone_schema();
         assert_eq!(shared.schema_version, 42);
-        assert!(shared.generated_columns_enabled);
+        assert!(Arc::ptr_eq(&shared, &schema));
 
         Ok(())
     }
@@ -2909,11 +2908,11 @@ mod tests {
         let mut header = DatabaseHeader::default();
         header.schema_cookie = 43.into();
         let mut schema = Schema::new();
-        schema.generated_columns_enabled = true;
         schema.schema_version = 43;
+        let schema = Arc::new(schema);
         let committed = VacuumCommittedImageMeta {
             header,
-            schema: Arc::new(schema),
+            schema: schema.clone(),
         };
 
         vacuum_in_place_cleanup(
@@ -2926,10 +2925,10 @@ mod tests {
         )?;
 
         assert_eq!(conn.schema.read().schema_version, 43);
-        assert!(conn.schema.read().generated_columns_enabled);
+        assert!(Arc::ptr_eq(&*conn.schema.read(), &schema));
         let shared = db.clone_schema();
         assert_eq!(shared.schema_version, 43);
-        assert!(shared.generated_columns_enabled);
+        assert!(Arc::ptr_eq(&shared, &schema));
 
         Ok(())
     }

@@ -123,7 +123,6 @@ pub struct Builder {
     enable_index_method: bool,
     enable_materialized_views: bool,
     enable_vacuum: bool,
-    enable_generated_columns: bool,
     enable_multiprocess_wal: bool,
     enable_without_rowid: bool,
 }
@@ -147,7 +146,6 @@ impl Builder {
             enable_index_method: false,
             enable_materialized_views: false,
             enable_vacuum: false,
-            enable_generated_columns: false,
             enable_multiprocess_wal: false,
             enable_without_rowid: false,
         }
@@ -192,11 +190,8 @@ impl Builder {
         self
     }
 
-    /// Enable the experimental `generated_columns` engine feature for the
-    /// synced database. Mirrors the local
-    /// [`crate::Builder::experimental_generated_columns`].
-    pub fn experimental_generated_columns(mut self, enable: bool) -> Self {
-        self.enable_generated_columns = enable;
+    /// Kept for backwards compatibility. Generated columns are now always enabled.
+    pub fn experimental_generated_columns(self, _enable: bool) -> Self {
         self
     }
 
@@ -327,9 +322,6 @@ impl Builder {
         }
         if self.enable_vacuum {
             features.push("vacuum");
-        }
-        if self.enable_generated_columns {
-            features.push("generated_columns");
         }
         if self.enable_multiprocess_wal {
             features.push("multiprocess_wal");
@@ -1067,6 +1059,14 @@ mod tests {
             None
         );
 
+        // Generated columns are always enabled, so the method adds nothing.
+        assert_eq!(
+            Builder::new_remote(":memory:")
+                .experimental_generated_columns(true)
+                .experimental_features_string(),
+            None
+        );
+
         // A single feature.
         assert_eq!(
             Builder::new_remote(":memory:")
@@ -1085,14 +1085,11 @@ mod tests {
                 .experimental_index_method(true)
                 .experimental_materialized_views(true)
                 .experimental_vacuum(true)
-                .experimental_generated_columns(true)
                 .experimental_multiprocess_wal(true)
                 .experimental_without_rowid(true)
                 .experimental_features_string()
                 .as_deref(),
-            Some(
-                "attach,custom_types,index_method,views,vacuum,generated_columns,multiprocess_wal,without_rowid"
-            )
+            Some("attach,custom_types,index_method,views,vacuum,multiprocess_wal,without_rowid")
         );
     }
 

@@ -1,7 +1,7 @@
 use crate::alloc::TursoIteratorExt;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
-use crate::{bail_parse_error, turso_assert_eq, turso_assert_ne};
+use crate::{turso_assert_eq, turso_assert_ne};
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,
@@ -1133,11 +1133,6 @@ pub fn translate_alter_table(
                 return Err(LimboError::ParseError(
                     "cannot add a STORED column".to_string(),
                 ));
-            }
-            if is_generated && !connection.experimental_generated_columns_enabled() {
-                bail_parse_error!(
-                    "Generated columns require --experimental-generated-columns flag"
-                );
             }
             if is_generated {
                 for c in &col_def.constraints {

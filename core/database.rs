@@ -78,7 +78,6 @@ pub struct DatabaseOpts {
     pub enable_autovacuum: bool,
     pub enable_vacuum: bool,
     pub enable_attach: bool,
-    pub enable_generated_columns: bool,
     pub enable_multiprocess_wal: bool,
     pub enable_without_rowid: bool,
     /// Open the database in MVCC mode. A database that is not in MVCC mode
@@ -143,11 +142,6 @@ impl DatabaseOpts {
 
     pub fn with_attach(mut self, enable: bool) -> Self {
         self.enable_attach = enable;
-        self
-    }
-
-    pub fn with_generated_columns(mut self, enable: bool) -> Self {
-        self.enable_generated_columns = enable;
         self
     }
 
@@ -846,11 +840,10 @@ impl Database {
             allocators,
             path,
             wal_path,
-            schema: Arc::new(Mutex::new(Arc::new({
-                let mut s = Schema::with_options(enable_custom_types, dialect.as_ref())?;
-                s.generated_columns_enabled = opts.enable_generated_columns;
-                s
-            }))),
+            schema: Arc::new(Mutex::new(Arc::new(Schema::with_options(
+                enable_custom_types,
+                dialect.as_ref(),
+            )?))),
             _shared_page_cache: shared_page_cache,
             shared_wal,
             #[cfg(host_shared_wal)]
@@ -3567,10 +3560,6 @@ impl Database {
 
     pub fn experimental_attach_enabled(&self) -> bool {
         self.opts.enable_attach
-    }
-
-    pub fn experimental_generated_columns_enabled(&self) -> bool {
-        self.opts.enable_generated_columns
     }
 
     pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
