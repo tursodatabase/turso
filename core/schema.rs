@@ -2785,6 +2785,8 @@ impl Schema {
             let cols = incremental_view.column_schema.flat_columns()?;
             let logical_to_physical_map =
                 BTreeTable::build_logical_to_physical_map(&cols, &[], true);
+            let has_column_defaults = BTreeTable::any_column_default(&cols);
+            let has_unnamed_or_collated_columns = BTreeTable::any_unnamed_or_collated_column(&cols);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
                 root_page: main_root,
@@ -2800,6 +2802,8 @@ impl Schema {
                 primary_key_constraint_name: None,
                 unique_sets: vec![],
                 has_virtual_columns: false,
+                has_column_defaults,
+                has_unnamed_or_collated_columns,
                 logical_to_physical_map,
                 column_dependencies: Default::default(),
             })));
@@ -3674,6 +3678,8 @@ impl TryClone for BTreeTable {
             rowid_alias_conflict_clause: self.rowid_alias_conflict_clause,
             primary_key_constraint_name: self.primary_key_constraint_name.clone(),
             has_virtual_columns: self.has_virtual_columns,
+            has_column_defaults: self.has_column_defaults,
+            has_unnamed_or_collated_columns: self.has_unnamed_or_collated_columns,
             logical_to_physical_map: self.logical_to_physical_map.try_clone()?,
             column_dependencies: Default::default(),
         })
@@ -4009,6 +4015,34 @@ impl Table {
         }
     }
 
+    pub fn has_generated_columns(&self) -> bool {
+        match self {
+            Self::BTree(table) => table.has_virtual_columns,
+            Self::Virtual(_) | Self::RecursiveCteInput(_) => self
+                .columns()
+                .iter()
+                .any(|column| column.generated_expr().is_some()),
+        }
+    }
+
+    pub fn has_column_defaults(&self) -> bool {
+        match self {
+            Self::BTree(table) => table.has_column_defaults,
+            Self::Virtual(_) | Self::RecursiveCteInput(_) => {
+                BTreeTable::any_column_default(self.columns())
+            }
+        }
+    }
+
+    pub fn has_unnamed_or_collated_columns(&self) -> bool {
+        match self {
+            Self::BTree(table) => table.has_unnamed_or_collated_columns,
+            Self::Virtual(_) | Self::RecursiveCteInput(_) => {
+                BTreeTable::any_unnamed_or_collated_column(self.columns())
+            }
+        }
+    }
+
     pub fn is_strict(&self) -> bool {
         match self {
             Self::BTree(table) => table.is_strict,
@@ -4269,6 +4303,8 @@ pub struct BTreeTable {
     pub rowid_alias_conflict_clause: Option<ResolveType>,
     pub primary_key_constraint_name: Option<String>,
     pub has_virtual_columns: bool,
+    has_column_defaults: bool,
+    has_unnamed_or_collated_columns: bool,
     pub logical_to_physical_map: Vec<usize>,
     column_dependencies: ResetOnClone<OnceLock<GeneratedColGraph>>,
 }
@@ -4295,6 +4331,9 @@ impl Drop for ColumnsMut<'_> {
         self.table.column_dependencies.0 = OnceLock::new();
         self.table.has_virtual_columns =
             self.table.columns.iter().any(|c| c.is_virtual_generated());
+        self.table.has_column_defaults = BTreeTable::any_column_default(&self.table.columns);
+        self.table.has_unnamed_or_collated_columns =
+            BTreeTable::any_unnamed_or_collated_column(&self.table.columns);
         self.table.logical_to_physical_map = BTreeTable::build_logical_to_physical_map(
             &self.table.columns,
             &self.table.primary_key_columns,
@@ -4317,6 +4356,8 @@ impl BTreeTable {
         rowid_alias_conflict_clause: Option<ResolveType>,
     ) -> Self {
         let has_virtual_columns = columns.iter().any(|c| c.is_virtual_generated());
+        let has_column_defaults = Self::any_column_default(&columns);
+        let has_unnamed_or_collated_columns = Self::any_unnamed_or_collated_column(&columns);
         let has_rowid = characteristics.contains(BTreeCharacteristics::HAS_ROWID);
         let logical_to_physical_map =
             Self::build_logical_to_physical_map(&columns, &primary_key_columns, has_rowid);
@@ -4346,9 +4387,21 @@ impl BTreeTable {
             rowid_alias_conflict_clause,
             primary_key_constraint_name,
             has_virtual_columns,
+            has_column_defaults,
+            has_unnamed_or_collated_columns,
             logical_to_physical_map,
             column_dependencies: Default::default(),
         }
+    }
+
+    fn any_column_default(columns: &[Column]) -> bool {
+        columns.iter().any(|column| column.default.is_some())
+    }
+
+    fn any_unnamed_or_collated_column(columns: &[Column]) -> bool {
+        columns
+            .iter()
+            .any(|column| column.name.is_none() || column.has_explicit_collation())
     }
 
     pub fn columns(&self) -> &[Column] {
@@ -4473,6 +4526,14 @@ impl BTreeTable {
 
     pub fn has_virtual_columns(&self) -> bool {
         self.has_virtual_columns
+    }
+
+    pub fn has_column_defaults(&self) -> bool {
+        self.has_column_defaults
+    }
+
+    pub fn has_unnamed_or_collated_columns(&self) -> bool {
+        self.has_unnamed_or_collated_columns
     }
 
     /// Build a `ColumnLayout` for this table's register mapping.
@@ -5979,6 +6040,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         }
     }
 
+    let has_column_defaults = BTreeTable::any_column_default(&cols);
+    let has_unnamed_or_collated_columns = BTreeTable::any_unnamed_or_collated_column(&cols);
     let mut table = BTreeTable {
         root_page,
         name: table_name,
@@ -6034,6 +6097,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         rowid_alias_conflict_clause,
         primary_key_constraint_name,
         has_virtual_columns: false,
+        has_column_defaults,
+        has_unnamed_or_collated_columns,
         logical_to_physical_map: vec![],
         column_dependencies: Default::default(),
     };
@@ -6733,6 +6798,8 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
     ]?;
     let logical_to_physical_map =
         BTreeTable::try_build_logical_to_physical_map(&columns, &[], true)?;
+    let has_column_defaults = BTreeTable::any_column_default(&columns);
+    let has_unnamed_or_collated_columns = BTreeTable::any_unnamed_or_collated_column(&columns);
     Ok(BTreeTable {
         root_page: 1,
         name: "sqlite_schema".to_string(),
@@ -6748,6 +6815,8 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
         primary_key_constraint_name: None,
         unique_sets: try_vec![]?,
         has_virtual_columns: false,
+        has_column_defaults,
+        has_unnamed_or_collated_columns,
         logical_to_physical_map,
         column_dependencies: Default::default(),
     })
@@ -8001,6 +8070,8 @@ mod tests {
         )];
         let logical_to_physical_map =
             BTreeTable::build_logical_to_physical_map(&columns, &[], true);
+        let has_column_defaults = BTreeTable::any_column_default(&columns);
+        let has_unnamed_or_collated_columns = BTreeTable::any_unnamed_or_collated_column(&columns);
         let table = BTreeTable {
             root_page: 0,
             name: "t1".to_string(),
@@ -8016,6 +8087,8 @@ mod tests {
             rowid_alias_conflict_clause: None,
             primary_key_constraint_name: None,
             has_virtual_columns: false,
+            has_column_defaults,
+            has_unnamed_or_collated_columns,
             logical_to_physical_map,
             column_dependencies: Default::default(),
         };
@@ -8742,6 +8815,33 @@ mod tests {
         // Any access through columns_mut() wipes the cache, even if we don't mutate.
         let _ = t.columns_mut();
         assert!(t.peek_column_dependencies().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn column_default_and_collation_flags_follow_column_changes() -> Result<()> {
+        let mut t = BTreeTable::from_sql("CREATE TABLE t(a, b TEXT)", 0)?;
+        assert!(!t.has_column_defaults());
+        assert!(!t.has_unnamed_or_collated_columns());
+
+        let added = BTreeTable::from_sql("CREATE TABLE u(c DEFAULT 7)", 0)?.columns()[0].clone();
+        t.columns_mut().push(added);
+        assert!(t.has_column_defaults());
+        assert!(!t.has_unnamed_or_collated_columns());
+
+        let collated =
+            BTreeTable::from_sql("CREATE TABLE u(c TEXT COLLATE NOCASE)", 0)?.columns()[0].clone();
+        t.columns_mut()[1] = collated;
+        assert!(t.has_column_defaults());
+        assert!(t.has_unnamed_or_collated_columns());
+
+        t.columns_mut().truncate(1);
+        assert!(!t.has_column_defaults());
+        assert!(!t.has_unnamed_or_collated_columns());
+
+        let created = BTreeTable::from_sql("CREATE TABLE t(a DEFAULT 1, b COLLATE RTRIM)", 0)?;
+        assert!(created.has_column_defaults());
+        assert!(created.has_unnamed_or_collated_columns());
         Ok(())
     }
 

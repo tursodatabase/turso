@@ -1649,10 +1649,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             (columns.into(), column_type_programs.into())
         };
         let schema_columns = table.value().columns();
-        let generated_expressions = if schema_columns
-            .iter()
-            .any(|column| column.generated_expr().is_some())
-        {
+        let generated_expressions = if table.value().has_generated_columns() {
             schema_columns
                 .iter()
                 .map(|column| {
@@ -1669,21 +1666,20 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         // A DEFAULT fills a column missing from a short B-tree record. A
         // virtual table returns every column itself.
         let reads_defaults = table.value().btree().is_some();
-        let default_expressions =
-            if reads_defaults && schema_columns.iter().any(|column| column.default.is_some()) {
-                schema_columns
-                    .iter()
-                    .map(|column| {
-                        if column.default.is_some() {
-                            hir::ColumnReadExpression::NotRequired
-                        } else {
-                            hir::ColumnReadExpression::Absent
-                        }
-                    })
-                    .collect()
-            } else {
-                hir::ColumnSlots::empty(schema_columns.len())
-            };
+        let default_expressions = if reads_defaults && table.value().has_column_defaults() {
+            schema_columns
+                .iter()
+                .map(|column| {
+                    if column.default.is_some() {
+                        hir::ColumnReadExpression::NotRequired
+                    } else {
+                        hir::ColumnReadExpression::Absent
+                    }
+                })
+                .collect()
+        } else {
+            hir::ColumnSlots::empty(schema_columns.len())
+        };
         let index_hint = match indexed {
             None => hir::IndexHint::None,
             Some(ast::Indexed::NotIndexed) => hir::IndexHint::NotIndexed,
@@ -1745,14 +1741,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         {
             // Only an index expression or a partial index predicate reads
             // the table's columns; a plain index needs no scope of them.
-            let indexes_read_columns = self
+            let indexes = self
                 .context()
-                .table_indexes(database, table.value().get_name())?
-                .iter()
-                .any(|index| {
-                    index.where_clause.is_some()
-                        || index.columns.iter().any(|column| column.expr.is_some())
-                });
+                .table_indexes(database, table.value().get_name())?;
+            let indexes_read_columns = indexes.iter().any(|index| {
+                index.where_clause.is_some()
+                    || index.columns.iter().any(|column| column.expr.is_some())
+            });
             let mut scope = Scope::default();
             if indexes_read_columns {
                 let definition = self.source(source).ok_or_else(|| {
@@ -1762,9 +1757,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 })?;
                 scope.add_schema_source(definition);
             }
-            self.analyze_btree_index_metadata(
+            self.analyze_index_metadata(
                 source,
                 &table,
+                indexes,
                 &scope,
                 ExprPolicy::schema_expression().with_self_source(source),
             )?;
@@ -1777,12 +1773,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let database = table.database().ok_or_else(|| {
             LimboError::InternalError("table source has no owning database".to_string())
         })?;
+        if table.value().has_unnamed_or_collated_columns() {
+            return Ok(false);
+        }
+        if !is_strict {
+            return Ok(true);
+        }
         let schema = self.context().schema(database)?;
         for column in table.value().columns() {
-            if column.name.is_none()
-                || column.has_explicit_collation()
-                || (is_strict && schema.resolve_type(&column.ty_str, true)?.is_some())
-            {
+            if schema.resolve_type(&column.ty_str, true)?.is_some() {
                 return Ok(false);
             }
         }
