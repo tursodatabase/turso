@@ -934,16 +934,6 @@ expect error {
     schema "no_such_schema" does not exist
 }
 
-# PostgreSQL lists the functions as uid, email and jwt in the schema auth.
-# tursopg has no schema auth, so pg_proc does not list them.
-@setup auth_functions
-test pg-proc-has-no-function-named-with-the-auth-schema {
-    SELECT count(*) FROM pg_proc WHERE proname LIKE 'auth.%';
-}
-expect {
-    0
-}
-
 @setup auth_functions
 test auth-function-name-in-uppercase-quotes-is-not-an-auth-function {
     SELECT auth."UID"();

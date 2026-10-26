@@ -110,10 +110,6 @@ fn parse_claims(claims: &str) -> Result<serde_json::Value> {
     Ok(parsed_claims)
 }
 
-/// Whether valid JSON text has an escape of the character U+0000. This reads
-/// the text, because the parsed value does not keep a member that a later
-/// member with the same name replaces. In valid JSON, a backslash always
-/// starts an escape in a string.
 fn has_nul_escape(json: &str) -> bool {
     let mut bytes = json.bytes();
     while let Some(byte) = bytes.next() {

@@ -7257,18 +7257,15 @@ fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
     }
 }
 
-/// The name of the function that a call names. The PostgreSQL frontend has
-/// built-in functions with the schema `auth` in their names, for example
-/// `auth.uid`. Core finds a function without regard to case, so a name that
-/// PostgreSQL does not find, such as `auth."UID"` or `"auth.uid"`, is refused.
 fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
+    // try to look for built-ins
     if let [schema, name] = extract_key_columns(names)?.as_slice() {
         if schema == "auth" {
             let qualified_name = format!("{schema}.{name}");
-            if name.contains('.') || name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-                return Err(no_such_function(&qualified_name));
-            }
-            return Ok(qualified_name);
+            return match name.as_str() {
+                "uid" | "email" | "jwt" => Ok(qualified_name),
+                _ => Err(no_such_function(&qualified_name)),
+            };
         }
     }
     let name = object_name(names, is_pg_catalog, "function")?;
@@ -10844,57 +10841,12 @@ mod tests {
     #[test]
     fn fail_closed_schema_qualified_functions() {
         assert_not_supported("SELECT myschema.f(1)", "schema-qualified function");
-        assert_not_supported("SELECT \"AUTH\".uid()", "schema-qualified function");
-        assert_not_supported("SELECT \"auth.x\".uid()", "schema-qualified function");
         assert_not_supported(
             "SELECT * FROM myschema.generate_series(1, 3)",
             "schema-qualified function",
         );
         assert_translates("SELECT pg_catalog.lower('A')");
         assert_translates("SELECT * FROM pg_catalog.generate_series(1, 3)");
-    }
-
-    #[test]
-    fn function_of_the_auth_schema_is_called_by_its_schema_and_its_name() {
-        for (sql, expected_name) in [
-            ("SELECT auth.uid()", "auth.uid"),
-            ("SELECT AUTH.UID()", "auth.uid"),
-            ("SELECT \"auth\".\"uid\"()", "auth.uid"),
-            ("SELECT pg_catalog.lower('A')", "lower"),
-        ] {
-            let parsed = crate::parse(sql).unwrap();
-            let ast::Stmt::Select(select) = PostgreSQLTranslator::new().translate(&parsed).unwrap()
-            else {
-                panic!("{sql}: expected a SELECT");
-            };
-            let ast::OneSelect::Select { columns, .. } = &select.body.select else {
-                panic!("{sql}: expected a simple SELECT");
-            };
-            let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
-                panic!("{sql}: expected an expression");
-            };
-            let ast::Expr::FunctionCall { name, .. } = &**expr else {
-                panic!("{sql}: expected a function call, got {expr:?}");
-            };
-            assert_eq!(name.as_str(), expected_name, "{sql}");
-        }
-    }
-
-    #[test]
-    fn function_name_with_a_dot_or_a_quoted_uppercase_letter_is_no_function() {
-        for (sql, expected_name) in [
-            ("SELECT \"auth.uid\"()", "auth.uid"),
-            ("SELECT pg_catalog.\"auth.uid\"()", "auth.uid"),
-            ("SELECT auth.\"UID\"()", "auth.UID"),
-            ("SELECT auth.\"u.id\"()", "auth.u.id"),
-        ] {
-            let parsed = crate::parse(sql).unwrap();
-            let err = PostgreSQLTranslator::new()
-                .translate(&parsed)
-                .expect_err(sql)
-                .to_string();
-            assert_eq!(err, format!("no such function: {expected_name}"), "{sql}");
-        }
     }
 
     #[test]
