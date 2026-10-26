@@ -13,7 +13,7 @@ use turso_core::{
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::RefAct;
 
-pub use turso_pg_parser::translator::is_catalog_table_name;
+pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
 
 /// PostgreSQL uses OID zero when no object is referenced.
 const PG_INVALID_OID: i64 = 0;
@@ -522,27 +522,17 @@ impl SnapshotRows for PgNamespaceTable {
     const ESTIMATED_ROWS: u32 = 5;
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
-        // PostgreSQL standard namespaces
-        let mut rows = vec![
-            vec![
-                Value::from_i64(11),              // oid
-                Value::Text("pg_catalog".into()), // nspname
-                Value::from_i64(10),              // nspowner
-                Value::Null,                      // nspacl
-            ],
-            vec![
-                Value::from_i64(2200),        // oid
-                Value::Text("public".into()), // nspname
-                Value::from_i64(10),          // nspowner
-                Value::Null,                  // nspacl
-            ],
-            vec![
-                Value::from_i64(11394),                   // oid
-                Value::Text("information_schema".into()), // nspname
-                Value::from_i64(10),                      // nspowner
-                Value::Null,                              // nspacl
-            ],
-        ];
+        let mut rows: Vec<_> = BUILTIN_SCHEMAS
+            .iter()
+            .map(|(oid, name)| {
+                vec![
+                    Value::from_i64(*oid),
+                    Value::Text((*name).into()),
+                    Value::from_i64(10), // nspowner (bootstrap superuser)
+                    Value::Null,         // nspacl
+                ]
+            })
+            .collect();
 
         // Add attached schemas (CREATE SCHEMA creates attached databases)
         let schema_names = conn.attached_database_names();
@@ -558,6 +548,23 @@ impl SnapshotRows for PgNamespaceTable {
         }
         rows
     }
+}
+
+/// The schemas that PostgreSQL always has, with their fixed OIDs.
+const BUILTIN_SCHEMAS: [(i64, &str); 3] = [
+    (11, "pg_catalog"),
+    (2200, "public"),
+    (11394, "information_schema"),
+];
+
+/// Whether pg_namespace lists schema `name`: one of the schemas that
+/// PostgreSQL always has, or a schema that CREATE SCHEMA created.
+pub(crate) fn namespace_exists(conn: &Connection, name: &str) -> bool {
+    BUILTIN_SCHEMAS.iter().any(|(_, schema)| *schema == name)
+        || conn
+            .attached_database_names()
+            .iter()
+            .any(|schema| schema == name)
 }
 
 /// Virtual table implementation for information_schema.schemata

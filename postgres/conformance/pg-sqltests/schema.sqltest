@@ -5,6 +5,7 @@
 test create-schema-rejects-names-that-start-with-pg {
     CREATE SCHEMA pg_app;
 }
+@sqlstate 42939
 expect error {
     unacceptable schema name "pg_app"
 }
@@ -16,6 +17,7 @@ test drop-schema-with-objects-errors {
     CREATE TABLE drop_needs_cascade.t (x int);
     DROP SCHEMA drop_needs_cascade;
 }
+@sqlstate 2BP01
 expect error {
     because other objects depend on it
 }
@@ -24,6 +26,7 @@ test drop-schema-public-with-only-views-errors {
     CREATE VIEW v AS SELECT 1 AS x;
     DROP SCHEMA public;
 }
+@sqlstate 2BP01
 expect error {
     because other objects depend on it
 }
@@ -81,6 +84,7 @@ expect {
 test create-schema-rejects-elements-in-another-schema {
     CREATE SCHEMA create_elsewhere CREATE TABLE public.t (a int);
 }
+@sqlstate 42P15
 expect error {
     different from the one being created
 }
