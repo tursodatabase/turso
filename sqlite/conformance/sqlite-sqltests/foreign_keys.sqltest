@@ -4770,8 +4770,8 @@ expect error {
     FOREIGN KEY constraint failed
 }
 
-# The scan compares the values as a probe of the partial index does. Here it
-# applies the TEXT affinity of the index to the integer key 1.
+# The scan that replaces the partial index compares the values like SQLite:
+# with numeric affinity, so the TEXT value '1' matches the integer key 1.
 @cross-check-integrity
 test fk-delete-parent-text-child-outside-partial-index {
     PRAGMA foreign_keys=ON;
@@ -4831,6 +4831,38 @@ test fk-deferred-update-parent-key-repairs-child-outside-partial-index {
 }
 expect {
     2
+}
+
+# The scan uses the collation of the parent key, not the NOCASE collation of
+# the partial index, so the child value 'A' does not reference the key 'a'.
+@cross-check-integrity
+test fk-delete-parent-nocase-partial-index-uses-parent-collation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a TEXT PRIMARY KEY);
+    CREATE TABLE t2(b REFERENCES t1(a), c);
+    CREATE INDEX i2 ON t2(b COLLATE NOCASE) WHERE c IS NULL;
+    INSERT INTO t1 VALUES('a'), ('A');
+    INSERT INTO t2 VALUES('A', 'x');
+    DELETE FROM t1 WHERE a = 'a';
+    SELECT a FROM t1;
+}
+expect {
+    A
+}
+
+@cross-check-integrity
+test fk-deferred-insert-parent-nocase-partial-index-does-not-repair {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a TEXT PRIMARY KEY);
+    CREATE TABLE t2(b REFERENCES t1(a) DEFERRABLE INITIALLY DEFERRED, c);
+    CREATE INDEX i2 ON t2(b COLLATE NOCASE) WHERE c IS NULL;
+    BEGIN;
+    INSERT INTO t2 VALUES('A', 'x');
+    INSERT INTO t1 VALUES('a');
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
 }
 
 # UPDATE and UPSERT only emit parent-side foreign-key bytecode when the

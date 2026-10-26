@@ -4362,12 +4362,12 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                     },
                 )?;
             }
-            ChildRowLookup::Scan { partial_index } => {
+            ChildRowLookup::Scan(comparison) => {
                 table_scan_match_any(
                     program,
                     &pref,
                     new_pk_start,
-                    partial_index.as_deref(),
+                    comparison,
                     self_exclude_rowid,
                     database_id,
                     resolver,
