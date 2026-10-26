@@ -205,6 +205,15 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a column default or a view body that calls a function that
+    /// does not exist fails when the table or view is created.
+    ///
+    /// PostgreSQL looks the function up at create time. SQLite accepts the
+    /// default or view and fails each time it runs.
+    fn checks_functions_exist_at_create(&self) -> bool {
+        false
+    }
+
     /// Whether `INSERT ... ON CONFLICT DO UPDATE` fails when the conflicting
     /// row was already inserted or updated by the same statement.
     ///

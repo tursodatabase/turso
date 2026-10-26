@@ -202,6 +202,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn checks_functions_exist_at_create(&self) -> bool {
+        true
+    }
+
     fn upsert_rejects_row_written_by_same_statement(&self) -> bool {
         true
     }
