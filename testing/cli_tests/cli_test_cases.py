@@ -397,6 +397,11 @@ def test_parse_error():
         lambda res: "Parse error: " in res,
         "Try to LIMIT using an identifier should trigger a Parse error",
     )
+    turso.run_test_fn(
+        "SELECT group_concat('a', 'b', 'c');",
+        lambda res: res == "× Parse error: wrong number of arguments to function group_concat()",
+        "Wrong argument count for group_concat prints only the error",
+    )
     turso.quit()
 
 
