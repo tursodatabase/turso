@@ -9,7 +9,8 @@ use crate::translate::collate::CollationSeq;
 use crate::translate::{
     emitter::Resolver,
     schema::{
-        self, emit_drop_view_row, emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType,
+        self, check_functions_exist_in_select, emit_drop_view_row, emit_schema_entry,
+        open_sqlite_schema_for_write, SchemaEntryType,
     },
 };
 use crate::util::{
@@ -435,6 +436,9 @@ pub fn translate_create_view(
     }
 
     crate::util::validate_select_for_views(select_stmt, resolver, database_id)?;
+    if resolver.catalog.dialect.checks_functions_exist_at_create() {
+        check_functions_exist_in_select(select_stmt, &resolver.catalog)?;
+    }
 
     let stored_view_name = resolver.mangle_name(namespace, &normalized_view_name);
     let sql = create_view_to_str(
