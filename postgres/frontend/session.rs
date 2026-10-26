@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::catalog::{self, PostgresDialect};
 use crate::functions::ConfigParameter;
 use crate::settings::{PgSessionState, SettingScope};
-use turso_core::{Connection, LimboError, Result, Statement, Value};
+use turso_core::{is_memory_like, Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     check_set_transaction, is_comment_on, is_drop_matview, is_refresh_matview,
@@ -854,8 +854,10 @@ fn handle_pg_create_schema(
 fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
     let main_path = conn.db_file_path();
     let filename = format!("turso-postgres-schema-{schema_name}.db");
-    if main_path == ":memory:" {
-        filename
+    if is_memory_like(main_path) {
+        // Each `ATTACH ':memory:'` opens a new empty database, so schemas of
+        // an in-memory server start empty and leave no files behind.
+        ":memory:".to_string()
     } else {
         let parent = std::path::Path::new(&main_path)
             .parent()
@@ -1080,7 +1082,7 @@ mod tests {
     use crate::PostgresDialect;
     use chumsky::Parser;
     use std::sync::Arc;
-    use turso_core::{Database, DatabaseOpts, MemoryIO, OpenOptions};
+    use turso_core::{Database, DatabaseOpts, MemoryIO, OpenOptions, Value};
 
     #[test]
     fn drop_view_refuses_a_relation_of_another_kind() {
@@ -1127,6 +1129,31 @@ mod tests {
             .unwrap();
         for sql in ["SELECT * FROM v", "SELECT * FROM m"] {
             assert!(conn.execute(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn create_schema_on_an_in_memory_database_attaches_an_in_memory_database() {
+        for path in [":memory:", ":memory:named", "file::memory:"] {
+            let db = Database::open(
+                Arc::new(MemoryIO::new()),
+                path,
+                OpenOptions::new(Arc::new(PostgresDialect))
+                    .db_opts(DatabaseOpts::new().with_attach(true)),
+            )
+            .unwrap();
+            let conn = PgConnection::connect(&db).unwrap();
+            conn.execute("CREATE SCHEMA s").unwrap();
+            let mut stmt = conn
+                .inner()
+                .prepare_internal("SELECT file FROM pragma_database_list WHERE name = 's'")
+                .unwrap();
+            // pragma_database_list shows an empty file name for in-memory databases.
+            assert_eq!(
+                stmt.run_collect_rows().unwrap(),
+                vec![vec![Value::build_text("")]],
+                "{path}"
+            );
         }
     }
 
