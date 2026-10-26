@@ -378,9 +378,44 @@ test update-from-lateral-cannot-read-the-target-table {
 expect error {
     invalid reference to FROM-clause entry for table "t4"
 }
+
+@setup data
+test update-from-lateral-cannot-read-the-target-table-by-its-alias {
+    UPDATE t4 AS z SET v = s.x FROM LATERAL (SELECT z.a * 2 AS x) AS s;
+}
 @sqlstate 42P10
-expect @tursopg error {
-    no such table: t4
+expect error {
+    invalid reference to FROM-clause entry for table "z"
+}
+
+@setup data
+test update-from-lateral-function-cannot-read-the-target-table {
+    UPDATE t4 SET v = s.x FROM t1, LATERAL generate_series(1, t4.a) AS s(x) WHERE t1.a = t4.a;
+}
+@sqlstate 42P10
+expect error {
+    invalid reference to FROM-clause entry for table "t4"
+}
+
+@setup data
+test update-from-lateral-cannot-read-the-target-table-in-a-nested-subquery {
+    UPDATE t4 SET v = s.x FROM LATERAL (SELECT * FROM (SELECT t4.a AS x) AS q) AS s;
+}
+@sqlstate 42P10
+expect error {
+    invalid reference to FROM-clause entry for table "t4"
+}
+
+@setup data
+test update-from-lateral-reads-its-own-table-with-the-name-of-the-target {
+    UPDATE t4 SET v = s.x FROM LATERAL (SELECT max(t4.a) AS x FROM t4) AS s;
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|4
+    2|4
+    3|4
+    4|4
 }
 
 @setup data
