@@ -46,6 +46,7 @@ fn emit_correlated_subqueries(
                     join_order,
                     subqueries,
                     Some(table_references),
+                    resolver,
                 )
             }) {
                 subqueries_to_emit.push(subquery_index);
@@ -111,7 +112,13 @@ fn emit_conditions(
         .map(|(_, cond)| cond)
         .filter(|cond| cond.origin.is_outer_join() == from_outer_join)
         .filter(|cond| {
-            cond.should_eval_at_loop(join_index, join_order, subqueries, Some(table_references))
+            cond.should_eval_at_loop(
+                join_index,
+                join_order,
+                subqueries,
+                Some(table_references),
+                &t_ctx.resolver,
+            )
         })
         .filter(|cond| match subquery_ref_filter {
             SubqueryRefFilter::WithoutSubqueryRefs => {

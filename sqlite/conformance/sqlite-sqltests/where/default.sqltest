@@ -840,3 +840,20 @@ expect {
     10000
 }
 
+# A WHERE term that calls random() must run once per row, not once per query.
+# With 10000 rows, a per-row coin flip keeps some rows and drops others.
+test where-random-runs-per-row {
+    select count(*) between 1 and 9999 from users where random() < 0;
+}
+expect {
+    1
+}
+
+# In a join, SQLite runs the term once per row of the outermost loop.
+test where-random-runs-per-row-in-join {
+    select count(*) between 1 and 9999 from users u join users v on v.id = u.id where random() < 0;
+}
+expect {
+    1
+}
+

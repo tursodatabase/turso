@@ -2702,9 +2702,15 @@ pub fn determine_where_to_eval_term(
     join_order: &[JoinOrderMember],
     subqueries: &[NonFromClauseSubquery],
     table_references: Option<&TableReferences>,
+    resolver: &Resolver,
 ) -> Result<EvalAt> {
-    let mut eval_at =
-        determine_where_to_eval_expr(&term.expr, join_order, subqueries, table_references)?;
+    let mut eval_at = determine_where_to_eval_expr(
+        &term.expr,
+        join_order,
+        subqueries,
+        table_references,
+        resolver,
+    )?;
     if let Some(origin) = term.origin.join_origin() {
         // A materialized hash input can remove an inner join's right table.
         // The ON term then runs when all of its remaining tables are ready.
@@ -2904,9 +2910,18 @@ pub fn determine_where_to_eval_expr(
     join_order: &[JoinOrderMember],
     subqueries: &[NonFromClauseSubquery],
     table_references: Option<&TableReferences>,
+    resolver: &Resolver,
 ) -> Result<EvalAt> {
     // If the expression references no tables, it can be evaluated before any table loops are opened.
-    let mut eval_at: EvalAt = EvalAt::BeforeLoop;
+    // An expression like `random() < 0` gives a different answer each time, so like SQLite we run it
+    // once per row of the outermost loop instead.
+    let mut eval_at = if !join_order.is_empty()
+        && expr_contains_nondeterministic_scalar_function(top_level_expr, resolver)?
+    {
+        EvalAt::Loop(0)
+    } else {
+        EvalAt::BeforeLoop
+    };
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
         match expr {
             Expr::Column { table, .. } | Expr::RowId { table, .. } => {

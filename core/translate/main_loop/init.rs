@@ -556,10 +556,9 @@ impl InitLoop {
             });
         }
 
-        for cond in where_clause
-            .iter()
-            .filter(|c| c.should_eval_before_loop(join_order, subqueries, Some(tables)))
-        {
+        for cond in where_clause.iter().filter(|c| {
+            c.should_eval_before_loop(join_order, subqueries, Some(tables), &t_ctx.resolver)
+        }) {
             let jump_target = program.allocate_label();
             let meta = ConditionMetadata {
                 jump_if_condition_is_true: false,
