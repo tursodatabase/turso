@@ -427,8 +427,9 @@ impl Row {
 /// What the `data` of a table-row version holds.
 ///
 /// A version of a row that is in the B-tree can store its record as a patch
-/// of the B-tree record of the row. See `docs/internals/mvcc/BTREE_PATCHES.md`
-/// for when the B-tree record that a reader sees is the right base.
+/// of the B-tree record of the row, or store nothing when the two records are
+/// equal. See `docs/internals/mvcc/BTREE_PATCHES.md` for when the B-tree
+/// record that a reader sees is the right base.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PayloadKind {
     /// `data` is the record of the row. An index row has no `data`, because
@@ -438,6 +439,8 @@ pub enum PayloadKind {
     /// `data` is a patch (see `row_patch.rs`) that makes the record from the
     /// B-tree record of the row.
     BtreePatch,
+    /// There is no `data`. The record is the B-tree record of the row.
+    BtreeRecord,
 }
 
 /// The record of a table-row version, or what the version stores of it.
@@ -445,6 +448,7 @@ pub enum PayloadKind {
 pub enum StoredRecord<'a> {
     Record(&'a [u8]),
     BtreePatch(&'a [u8]),
+    BtreeRecord,
 }
 
 impl<'a> StoredRecord<'a> {
@@ -456,13 +460,20 @@ impl<'a> StoredRecord<'a> {
             PayloadKind::BtreePatch => {
                 StoredRecord::BtreePatch(data.expect("a B-tree patch version must have data"))
             }
+            PayloadKind::BtreeRecord => {
+                turso_assert!(
+                    data.is_none(),
+                    "a version that uses the B-tree record must have no data"
+                );
+                StoredRecord::BtreeRecord
+            }
         }
     }
 
     pub fn expect_record(self) -> &'a [u8] {
         match self {
             StoredRecord::Record(record) => record,
-            StoredRecord::BtreePatch(_) => {
+            StoredRecord::BtreePatch(_) | StoredRecord::BtreeRecord => {
                 panic!("the record of this version needs the B-tree record of its row: read it through a cursor")
             }
         }
@@ -476,8 +487,9 @@ pub(crate) enum VisibleRecord {
     None,
     /// The record is in the reusable record of the cursor.
     InRecord,
-    /// The record is the B-tree record of the row with this patch applied.
-    InBtree(crate::alloc::ArcSlice<u8>),
+    /// The record is the B-tree record of the row, with this patch applied if
+    /// there is one.
+    InBtree(Option<crate::alloc::ArcSlice<u8>>),
 }
 
 /// What a new version can use as the base of its B-tree patch.
@@ -485,11 +497,11 @@ pub(crate) enum VisibleRecord {
 pub(crate) enum PatchBase {
     /// The new version keeps its record.
     None,
-    /// The replaced version stores the patch `also_set` of the B-tree record
-    /// of the row. The patch of the new version goes from the B-tree record,
-    /// and also sets each column that `also_set` sets.
+    /// The replaced version uses the B-tree record of the row. The patch of
+    /// the new version goes from the B-tree record, and also sets each column
+    /// that `also_set` sets.
     BtreeRecord {
-        also_set: crate::alloc::ArcSlice<u8>,
+        also_set: Option<crate::alloc::ArcSlice<u8>>,
     },
     /// The replaced version is an earlier version of the same transaction:
     /// `record` with its future B-tree patch `patch`. The patch of the new
@@ -518,9 +530,8 @@ fn copy_record_into(
             record.start_serialization(bytes)?;
             Ok(VisibleRecord::InRecord)
         }
-        StoredRecord::BtreePatch(_) => Ok(VisibleRecord::InBtree(
-            data.clone().expect("a B-tree patch version has data"),
-        )),
+        StoredRecord::BtreePatch(_) => Ok(VisibleRecord::InBtree(data.clone())),
+        StoredRecord::BtreeRecord => Ok(VisibleRecord::InBtree(None)),
     }
 }
 
@@ -3971,6 +3982,11 @@ impl StateTransition for WriteRowStateMachine {
                             self.state = WriteRowState::Seek;
                             return Ok(TransitionResult::Continue);
                         }
+                        StoredRecord::BtreeRecord => {
+                            unreachable!(
+                                "the checkpoint does not write a version that uses its B-tree record, because that record is already in the B-tree"
+                            )
+                        }
                     }
                 };
                 // `requires_seek == false` is a write_set-level *candidate* for the
@@ -4737,10 +4753,9 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     gc_last_lwm: AtomicU64,
     experimental_mvcc_passive_checkpoint: bool,
     /// Whether a version of a row that is in the B-tree stores a patch of the
-    /// B-tree record of the row in place of its record. See
-    /// `docs/internals/mvcc/BTREE_PATCHES.md`. On by default, but the passive
-    /// checkpoint does not use patches yet. Tests turn it off to compare both
-    /// modes.
+    /// B-tree record of the row, or nothing, in place of its record. See
+    /// `docs/internals/mvcc/BTREE_PATCHES.md`. On by default. Tests turn it
+    /// off to compare both modes.
     btree_patches_enabled: AtomicBool,
 }
 
@@ -4878,11 +4893,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// See the field doc of `btree_patches_enabled`.
     pub(crate) fn btree_patches_enabled(&self) -> bool {
         self.btree_patches_enabled.load(Ordering::Relaxed)
-            && !self.experimental_mvcc_passive_checkpoint
     }
 
-    /// Turns B-tree patches on or off for later writes. Versions that already
-    /// store a patch keep it.
+    /// Turns B-tree patches on or off for later writes and checkpoints.
+    /// Versions that already store a patch keep it.
     #[cfg(test)]
     pub(crate) fn set_btree_patches_enabled(&self, enabled: bool) {
         self.btree_patches_enabled.store(enabled, Ordering::Relaxed);
@@ -6185,11 +6199,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(match replaced.stored_record() {
             StoredRecord::Record(_) => PatchBase::None,
             StoredRecord::BtreePatch(_) => PatchBase::BtreeRecord {
-                also_set: replaced
-                    .data
-                    .clone()
-                    .expect("a B-tree patch version has data"),
+                also_set: replaced.data.clone(),
             },
+            StoredRecord::BtreeRecord => PatchBase::BtreeRecord { also_set: None },
         })
     }
 
@@ -6216,7 +6228,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Stores `record` in the version of table row `id` that `tx_id` ended
     /// last, if that version does not store its record. `record` must be the
     /// record of the version. Once a transaction ends a version,
-    /// `RewriteLiveVersions` no longer replaces its record with a patch.
+    /// `RewriteLiveVersions` no longer replaces its record with a patch, and
+    /// GC Rule 4 no longer frees it.
     pub(crate) fn store_record_of_ended_version(
         &self,
         tx_id: TxID,
@@ -8435,6 +8448,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// without holding that lock. An `lwm` of `u64::MAX` is checked again
     /// against the open transactions, because a reader may have begun after
     /// the sample.
+    ///
+    /// `free_btree_records` lets the pass free the record of a current version
+    /// that every reader sees in the B-tree (Rule 4). Pass it only for a chain
+    /// of a user table, and only from a pass whose `min_reader_mark` also
+    /// covers readers that hold a WAL read mark but have no MVCC transaction
+    /// yet.
     pub(crate) fn gc_chain_now(
         &self,
         versions: &mut RowVersionChain<A>,
@@ -8442,6 +8461,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         ckpt_max: u64,
         min_reader_mark: WalPos,
         drop_current_if_in_btree: bool,
+        free_btree_records: bool,
     ) -> usize {
         let lwm = if lwm == u64::MAX {
             self.compute_lwm()
@@ -8455,7 +8475,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             self.experimental_mvcc_passive_checkpoint,
             min_reader_mark,
             drop_current_if_in_btree,
+            free_btree_records && self.btree_patches_enabled(),
         )
+    }
+
+    /// Whether a GC pass with a complete reader-mark floor can free the B-tree
+    /// records of the chains of table `table_id`.
+    pub(crate) fn frees_btree_records_of(&self, table_id: MVTableId) -> bool {
+        table_id != SQLITE_SCHEMA_MVCC_TABLE_ID
     }
 
     /// Garbage-collects row versions that are invisible to all active transactions.
@@ -8463,21 +8490,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Covers both table rows (`self.rows`) and index rows (`self.index_rows`).
     /// Returns the number of removed versions.
     pub fn drop_unused_row_versions(&self) -> usize {
-        self.drop_unused_row_versions_inner(false, true, WalPos::STAGED)
+        self.drop_unused_row_versions_inner(false, true, WalPos::STAGED, false)
     }
 
     /// Like [`Self::drop_unused_row_versions`], and remove emptied SkipMap slots.
     /// Also drops last currents already in the B-tree (Truncate Finalize).
     /// Writers retry if GC unlinks their Arc (`insert_version` / `insert_index_version`).
+    ///
+    /// Call it only while no reader can exist, as under the blocking
+    /// checkpoint lock, because it frees B-tree records without a reader-mark
+    /// floor for readers that have no MVCC transaction yet.
     pub fn drop_unused_row_versions_and_slots(&self) -> usize {
-        self.drop_unused_row_versions_inner(true, true, WalPos::STAGED)
+        self.drop_unused_row_versions_inner(true, true, WalPos::STAGED, true)
     }
 
     /// Drop old versions and empty SkipMap slots, including the latest copy of each
     /// row once the B-tree has it (Rule 3). Passive Finalize uses this.
     /// `reader_mark_floor` should include pager-held readers, not only `txs`.
     pub fn drop_unused_row_versions_unlink_empty_at(&self, reader_mark_floor: WalPos) -> usize {
-        self.drop_unused_row_versions_inner(true, true, reader_mark_floor)
+        self.drop_unused_row_versions_inner(true, true, reader_mark_floor, true)
     }
 
     /// Incremental GC on the commit path: reclaim up to `max_chains` table chains
@@ -8571,6 +8602,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     ckpt_max,
                     min_reader_mark,
                     drop_current_if_in_btree,
+                    false,
                 );
                 if !passive && versions.is_empty() {
                     entry.remove();
@@ -8673,6 +8705,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     ckpt_max,
                     min_reader_mark,
                     drop_current_if_in_btree,
+                    false,
                 );
                 if !passive && versions.is_empty() {
                     self.bump_index_rows_epoch();
@@ -8694,6 +8727,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         remove_empty_slots: bool,
         drop_current_if_in_btree: bool,
         reader_mark_floor: WalPos,
+        free_btree_records: bool,
     ) -> usize {
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
         let lwm = self.sample_gc_lwm();
@@ -8706,6 +8740,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             remove_empty_slots,
             drop_current_if_in_btree,
             reader_mark_floor,
+            free_btree_records,
         ) + self.gc_index_row_versions(
             lwm,
             ckpt_max,
@@ -8726,6 +8761,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         dropped
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn gc_table_row_versions(
         &self,
         lwm: u64,
@@ -8734,6 +8770,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         remove_empty_slots: bool,
         drop_current_if_in_btree: bool,
         reader_mark_floor: WalPos,
+        free_btree_records: bool,
     ) -> usize {
         let mut dropped = 0;
         // Bound by the backfill boundary: never reclaim a version materialized in un-backfilled
@@ -8757,6 +8794,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 ckpt_max,
                 min_reader_mark,
                 drop_current_if_in_btree,
+                free_btree_records && self.frees_btree_records_of(entry.key().table_id),
             );
             Self::collect_referenced_txids(&versions, referenced_tx_ids);
             if remove_empty_slots && versions.is_empty() {
@@ -8800,6 +8838,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     ckpt_max,
                     min_reader_mark,
                     drop_current_if_in_btree,
+                    false,
                 );
                 Self::collect_referenced_txids(&versions, referenced_tx_ids);
                 if remove_empty_slots && versions.is_empty() {
@@ -8858,6 +8897,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ///         `lwm == u64::MAX`. Idle-only on both Passive and Truncate: a
     ///         dual-cursor can lose the row if the SkipMap empties mid-scan.
     ///
+    /// Rule 4: a current version that every reader sees in the B-tree, by the
+    ///         same test as Rule 3 but under load too, frees its record and
+    ///         uses the B-tree record of the row (`free_btree_records`).
+    ///
     /// Passive gates Rule 2 on `materialized_at` + `min_reader_mark`. Blocking
     /// Truncate uses `ckpt_max` instead. Both require `materialized_at` before
     /// dropping a live copy: a `ckpt_max` above this version's begin says a
@@ -8869,6 +8912,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         passive: bool,
         min_reader_mark: WalPos,
         drop_current_if_in_btree: bool,
+        free_btree_records: bool,
     ) -> usize {
         let before = versions.len();
 
@@ -8919,6 +8963,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let removable = lwm == u64::MAX && stamped_for_readers && in_durable_bound;
                 if removable {
                     versions.clear();
+                }
+            }
+        }
+
+        // Rule 4: the chain stays, so a cursor at this row still finds its
+        // version. The version only stops keeping a copy of the B-tree record.
+        if free_btree_records {
+            for rv in versions.iter_mut() {
+                let in_durable_bound = match rv.begin() {
+                    Some(TxTimestampOrID::Timestamp(b)) => passive || b <= ckpt_max,
+                    _ => false,
+                };
+                if rv.end().is_none()
+                    && in_durable_bound
+                    && rv.payload_kind != PayloadKind::BtreeRecord
+                    && materialized_for_readers(rv)
+                {
+                    rv.use_btree_record();
                 }
             }
         }
@@ -11127,19 +11189,21 @@ impl RowVersion {
 
     /// The number of columns in the record of this version. A tombstone with an
     /// empty payload has none. A version stores its record or a patch, so it
-    /// does not also store this number.
-    pub fn column_count(&self, id: &RowID) -> usize {
+    /// does not also store this number. `None` when only the B-tree record of
+    /// the row has it.
+    pub fn column_count(&self, id: &RowID) -> Option<usize> {
         match &id.row_id {
             RowKey::Int(_) => match self.stored_record() {
                 StoredRecord::Record(record) => {
-                    ImmutableRecordRef::from_bin_record(record).column_count()
+                    Some(ImmutableRecordRef::from_bin_record(record).column_count())
                 }
-                StoredRecord::BtreePatch(patch) => {
-                    row_patch::column_count(patch).expect("a B-tree patch in memory must be valid")
-                }
+                StoredRecord::BtreePatch(patch) => Some(
+                    row_patch::column_count(patch).expect("a B-tree patch in memory must be valid"),
+                ),
+                StoredRecord::BtreeRecord => None,
             },
             RowKey::Record(_) => {
-                ImmutableRecordRef::from_bin_record(self.payload(id)).column_count()
+                Some(ImmutableRecordRef::from_bin_record(self.payload(id)).column_count())
             }
         }
     }
@@ -11161,8 +11225,19 @@ impl RowVersion {
         self.payload_kind = PayloadKind::BtreePatch;
     }
 
-    /// Stores `record` in this table-row version again, in place of its patch
-    /// of the B-tree record.
+    /// Frees the record of this table-row version, which is equal to the
+    /// B-tree record of its row.
+    fn use_btree_record(&mut self) {
+        turso_assert!(
+            self.data.is_some(),
+            "an index row version has no record to free"
+        );
+        self.data = None;
+        self.payload_kind = PayloadKind::BtreeRecord;
+    }
+
+    /// Stores `record` in this table-row version again, in place of what it
+    /// stores of the B-tree record.
     fn store_record(&mut self, record: crate::alloc::ArcSlice<u8>) {
         self.data = Some(record);
         self.payload_kind = PayloadKind::Record;

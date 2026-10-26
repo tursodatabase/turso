@@ -1456,7 +1456,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 special_write = Some(SpecialWrite::BTreeDestroy {
                                     table_id,
                                     root_page: root_page as u64,
-                                    num_columns: version.column_count(key),
+                                    num_columns: version
+                                        .column_count(key)
+                                        .expect("a sqlite_schema row stores its record"),
                                 });
                             }
                         } else if root_page < 0 {
@@ -2297,6 +2299,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     ckpt_max,
                     min_reader_mark,
                     drop_current_if_in_btree,
+                    self.mvstore.frees_btree_records_of(row_id.table_id),
                 );
                 self.mvstore.dec_live_version_count_approx(dropped);
             } else {
@@ -2381,6 +2384,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     ckpt_max,
                     min_reader_mark,
                     drop_current_if_in_btree,
+                    false,
                 );
                 self.mvstore.dec_live_version_count_approx(dropped);
             }
@@ -2720,7 +2724,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         _ => None,
                     };
                     (
-                        row_version.column_count(row_id),
+                        // Only a deleted version can use its B-tree record here. The
+                        // table cursor that the count goes to does not use it.
+                        row_version.column_count(row_id).unwrap_or(0),
                         row_id.table_id,
                         *special_write,
                         drop_ts,
