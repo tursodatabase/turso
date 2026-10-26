@@ -26,6 +26,7 @@ pub struct PgConnection {
 
 struct PgConnectionInner {
     conn: Arc<Connection>,
+    db: Arc<turso_core::Database>,
 }
 
 const SEARCH_PATH_SETTING: &str = "search_path";
@@ -75,8 +76,17 @@ impl PgConnection {
         conn.add_namespace("public", turso_core::MAIN_DB_ID);
         set_search_path(&conn, None, SettingScope::Session)?;
         Ok(Self {
-            inner: Arc::new(PgConnectionInner { conn }),
+            inner: Arc::new(PgConnectionInner {
+                conn,
+                db: db.clone(),
+            }),
         })
+    }
+
+    /// Start an independent session on the same database with default settings.
+    /// Unlike cloning this handle, this does not share transaction or session state.
+    pub fn new_session(&self) -> crate::Result<Self> {
+        Self::connect(&self.inner.db)
     }
 
     pub fn inner(&self) -> &Arc<Connection> {
@@ -207,6 +217,21 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
     reject_catalog_dml(translated.cmd.stmt())?;
     if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
         reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
+    }
+
+    if matches!(
+        translated.cmd.stmt(),
+        ast::Stmt::Commit { .. }
+            | ast::Stmt::Rollback {
+                savepoint_name: None,
+                ..
+            }
+    ) {
+        let inner = pg_conn.conn.prepare_translated_cmd(translated.cmd, &sql)?;
+        return Ok(crate::Statement::with_transaction_end(
+            inner,
+            Arc::clone(&pg_conn.conn),
+        ));
     }
 
     if translated.prereqs.is_empty() {

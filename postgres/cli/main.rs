@@ -35,7 +35,7 @@ use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::Editor;
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -45,7 +45,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use turso_core::{DatabaseOpts, OpenFlags, Value};
 use turso_pg::{Connection, Error, Statement};
-use turso_pg_server::TursoPgServer;
+use turso_pg_server::{auto_attach_pg_schemas, TursoPgServer};
 
 // ---------------------------------------------------------------------------
 // Statics
@@ -125,38 +125,6 @@ fn open_database(
     let (io, db) = turso_pg::open_database(db_path, vfs.map(|v| v.as_str()), flags, db_opts)?;
     let conn = Connection::connect(&db)?;
     Ok((io, conn))
-}
-
-/// Discover and attach existing PG schema database files in the same directory.
-fn auto_attach_pg_schemas(conn: &Connection, db_file: &str) {
-    if db_file == ":memory:" {
-        return;
-    }
-    let dir = Path::new(db_file)
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        let Some(schema) = name
-            .strip_prefix("turso-postgres-schema-")
-            .and_then(|s| s.strip_suffix(".db"))
-        else {
-            continue;
-        };
-        let path = entry.path().to_string_lossy().to_string();
-        let sql = format!("ATTACH '{path}' AS \"{schema}\"");
-        tracing::info!("Auto-attaching PG schema '{}' from {}", schema, path);
-        if let Err(e) = conn.inner().execute(&sql) {
-            tracing::warn!("Failed to attach schema '{}': {}", schema, e);
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
