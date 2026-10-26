@@ -1,6 +1,132 @@
 use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 
+#[turso_macros::test]
+fn test_int4_write_bounds(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    for (i, ty) in ["int", "integer", "int4", "serial", "serial4"]
+        .iter()
+        .enumerate()
+    {
+        let table = format!("int4_bounds_{i}");
+        conn.execute(format!("CREATE TABLE {table}(a {ty})"))
+            .unwrap();
+        conn.execute(format!(
+            "INSERT INTO {table} VALUES (-2147483648), (2147483647)"
+        ))
+        .unwrap();
+        for value in ["2147483648", "-2147483649", "3000000000", "'3000000000'"] {
+            let error = conn
+                .execute(format!("INSERT INTO {table} VALUES ({value})"))
+                .unwrap_err();
+            assert_eq!(error.sqlstate, "22003", "{ty}: {value}: {error}");
+        }
+        let error = conn
+            .execute(format!("UPDATE {table} SET a = 3000000000"))
+            .unwrap_err();
+        assert_eq!(error.sqlstate, "22003");
+        let rows = conn
+            .prepare(format!("SELECT a FROM {table} ORDER BY a"))
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::from_i64(-2147483648)],
+                vec![Value::from_i64(2147483647)]
+            ]
+        );
+    }
+    conn.execute("CREATE TABLE int4_nullable(a int); INSERT INTO int4_nullable VALUES (NULL)")
+        .unwrap();
+    conn.execute("CREATE TABLE int4_wide(a bigint, b bigserial, c serial8)")
+        .unwrap();
+    conn.execute("INSERT INTO int4_wide VALUES (3000000000, 3000000000, 3000000000)")
+        .unwrap();
+}
+
+#[turso_macros::test]
+fn test_int4_write_bounds_do_not_restrict_lookups_or_expose_checks(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE int4_meta(a int CHECK (a >= 0)); CREATE INDEX int4_meta_idx ON int4_meta(a); INSERT INTO int4_meta VALUES (1)").unwrap();
+    for sql in [
+        "SELECT COUNT(*) FROM int4_meta WHERE a = 3000000000",
+        "SELECT COUNT(*) FROM int4_meta WHERE a > 3000000000",
+    ] {
+        let rows = conn.prepare(sql).unwrap().run_collect_rows().unwrap();
+        assert_eq!(rows, vec![vec![Value::from_i64(0)]]);
+    }
+    let mut insert = conn.prepare("INSERT INTO int4_meta VALUES ($1)").unwrap();
+    insert
+        .bind_at(
+            std::num::NonZero::new(1).unwrap(),
+            Value::from_i64(3000000000),
+        )
+        .unwrap();
+    assert_eq!(insert.run_ignore_rows().unwrap_err().sqlstate, "22003");
+    let rows = conn.prepare("SELECT COUNT(*) FROM pg_constraint WHERE contype = 'c' AND conrelid IN (SELECT oid FROM pg_class WHERE relname = 'int4_meta')").unwrap().run_collect_rows().unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
+}
+
+#[turso_macros::test]
+fn test_int4_write_bounds_survive_alter_and_reopen(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE int4_ddl(id bigint, a int DEFAULT 7); INSERT INTO int4_ddl(id) VALUES (3000000000)").unwrap();
+    conn.execute("ALTER TABLE int4_ddl ADD COLUMN b int DEFAULT 8")
+        .unwrap();
+    assert_eq!(
+        conn.execute("UPDATE int4_ddl SET b = 3000000000")
+            .unwrap_err()
+            .sqlstate,
+        "22003"
+    );
+    conn.execute("ALTER TABLE int4_ddl RENAME COLUMN b TO renamed")
+        .unwrap();
+    assert_eq!(
+        conn.execute("INSERT INTO int4_ddl(a) VALUES (9), (3000000000)")
+            .unwrap_err()
+            .sqlstate,
+        "22003"
+    );
+    conn.execute("CREATE TABLE int4_default(id bigint, a int DEFAULT (random() * 0 + 3000000000))")
+        .unwrap();
+    let default_error = conn
+        .execute("INSERT INTO int4_default(id) VALUES (1)")
+        .unwrap_err();
+    assert_eq!(default_error.sqlstate, "22003", "{default_error}");
+    let path = db.path.clone();
+    drop(conn);
+    drop(db);
+    let (_io, reopened) = turso_pg::open_database(
+        path.to_str().unwrap(),
+        None,
+        turso_pg::OpenFlags::default(),
+        turso_pg::DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = turso_pg::Connection::connect(&reopened).unwrap();
+    assert_eq!(
+        conn.execute("UPDATE int4_ddl SET renamed = 3000000000")
+            .unwrap_err()
+            .sqlstate,
+        "22003"
+    );
+    let rows = conn
+        .prepare("SELECT id, a, renamed FROM int4_ddl")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::from_i64(3000000000),
+            Value::from_i64(7),
+            Value::from_i64(8)
+        ]]
+    );
+}
+
 /// serial2 is a PostgreSQL alias for smallserial (auto-incrementing smallint).
 /// We test that the type is accepted and maps to INTEGER storage.
 /// No mvcc variant: serial implies AUTOINCREMENT which is unsupported in MVCC mode.

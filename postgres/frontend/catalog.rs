@@ -15,6 +15,15 @@ use turso_parser::ast::RefAct;
 
 pub use turso_pg_parser::translator::is_catalog_table_name;
 
+fn is_implicit_int4_check(check: &turso_core::schema::CheckConstraint) -> bool {
+    check.name.is_none()
+        && matches!(
+            &check.expr,
+            turso_parser::ast::Expr::FunctionCall { name, args, .. }
+                if name.as_str().eq_ignore_ascii_case("pg_int4_range") && args.len() == 1
+        )
+}
+
 /// PostgreSQL uses OID zero when no object is referenced.
 const PG_INVALID_OID: i64 = 0;
 /// pg_depend uses column zero for a whole object; table columns are numbered from one.
@@ -359,7 +368,11 @@ impl SnapshotRows for PgClassTable {
             } else {
                 0
             };
-            let relchecks = btree.check_constraints.len() as i64;
+            let relchecks = btree
+                .check_constraints
+                .iter()
+                .filter(|check| !is_implicit_int4_check(check))
+                .count() as i64;
 
             rows.push(vec![
                 Value::from_i64(table_oid),                    // oid
@@ -1860,7 +1873,11 @@ impl SnapshotRows for PgConstraintTable {
             }
 
             // CHECK constraints from check_constraints
-            for chk in &btree.check_constraints {
+            for chk in btree
+                .check_constraints
+                .iter()
+                .filter(|check| !is_implicit_int4_check(check))
+            {
                 let conname = chk
                     .name
                     .clone()
@@ -3439,7 +3456,11 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
         }
 
         // CHECK constraints
-        for chk in &btree.check_constraints {
+        for chk in btree
+            .check_constraints
+            .iter()
+            .filter(|check| !is_implicit_int4_check(check))
+        {
             if constraint_oid == target_oid {
                 return Some(format!("CHECK ({})", chk.expr));
             }

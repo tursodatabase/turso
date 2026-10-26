@@ -138,6 +138,10 @@ including char(n), timestamp(p) and bit(n), are rejected. interval, xml, tsvecto
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
 
+Scalar int/integer/int4 and serial/serial4 columns enforce the signed 32-bit
+range on writes, including UPDATE and omitted-column defaults. bigint and
+bigserial retain their 64-bit range. Array element range validation is unchanged.
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |

@@ -64,7 +64,11 @@ impl From<&LimboError> for ErrorReport {
     fn from(error: &LimboError) -> Self {
         let mut report = Self {
             sqlstate: sqlstate(error),
-            message: error.to_string(),
+            message: if matches!(error, LimboError::IntegerOverflow) {
+                "integer out of range".to_owned()
+            } else {
+                error.to_string()
+            },
             detail: None,
             table_name: None,
             constraint_name: None,
