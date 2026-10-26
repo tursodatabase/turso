@@ -284,7 +284,7 @@ pub fn translate_insert(
         // for RETURNING clause subqueries - handled below via with_for_returning.
     }
 
-    let namespace = resolver.resolve_existing_table(&tbl_name)?;
+    let namespace = resolver.resolve_queried_table(&tbl_name)?;
     let database_id = namespace.database_id;
     let table_name = &tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| {
