@@ -71,13 +71,7 @@ impl super::Dialect for SqliteDialect {
             body,
             turso_parser::ast::CreateTableBody::ColumnsAndConstraints { .. }
         ) {
-            let stmt = turso_parser::ast::Stmt::CreateTable {
-                temporary: false,
-                if_not_exists: false,
-                tbl_name: tbl_name.clone(),
-                body: body.clone(),
-            };
-            if let Some(sql) = crate::schema_sql::original_create_sql(input, &stmt) {
+            if let Some(sql) = crate::schema_sql::original_table_sql(input, tbl_name, body) {
                 return Ok(sql);
             }
         }
