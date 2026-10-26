@@ -115,3 +115,37 @@ expect {
     0|0|id|0|BINARY|1
     1|1|v|0|BINARY|0
 }
+
+@cross-check-integrity
+test pragma-index-xinfo-expression-column {
+    CREATE TABLE t(a, b, c, d);
+    CREATE INDEX i_expr ON t(substr(b,1,1), a);
+    SELECT seqno, cid, quote(name), key FROM pragma_index_xinfo('i_expr');
+    ALTER TABLE t DROP COLUMN d;
+    SELECT seqno, cid, quote(name), key FROM pragma_index_xinfo('i_expr');
+    ALTER TABLE t RENAME COLUMN a TO z;
+    PRAGMA index_xinfo('i_expr');
+}
+expect {
+    0|-2|NULL|1
+    1|0|'a'|1
+    2|-1|NULL|0
+    0|-2|NULL|1
+    1|0|'a'|1
+    2|-1|NULL|0
+    0|-2||0|BINARY|1
+    1|0|z|0|BINARY|1
+    2|-1||0|BINARY|0
+}
+
+@cross-check-integrity
+test pragma-index-xinfo-virtual-generated-column {
+    CREATE TABLE t(a, b, g AS (a*2));
+    CREATE INDEX i ON t(g COLLATE NOCASE DESC, g*2);
+    SELECT seqno, cid, quote(name), desc, coll, key FROM pragma_index_xinfo('i');
+}
+expect {
+    0|2|'g'|1|NOCASE|1
+    1|-2|NULL|0|BINARY|1
+    2|-1|NULL|0|BINARY|0
+}
