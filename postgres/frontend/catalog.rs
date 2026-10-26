@@ -175,6 +175,11 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn random_value(&self, bits: i64) -> Value {
+        let mantissa = (bits as u64) >> 11;
+        Value::from_f64(mantissa as f64 / (1_u64 << 53) as f64)
+    }
+
     fn binds_names_at_create(&self) -> bool {
         true
     }
