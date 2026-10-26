@@ -7257,27 +7257,25 @@ fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
     }
 }
 
+/// The name of the function that a call names. The PostgreSQL frontend has
+/// built-in functions with the schema `auth` in their names, for example
+/// `auth.uid`. Core finds a function without regard to case, so a name that
+/// PostgreSQL does not find, such as `auth."UID"` or `"auth.uid"`, is refused.
 fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
-    match extract_key_columns(names)?.as_slice() {
-        [schema, name] if !is_default_schema(schema) => {
+    if let [schema, name] = extract_key_columns(names)?.as_slice() {
+        if schema == "auth" {
             let qualified_name = format!("{schema}.{name}");
-            if !is_lowercase_name_without_dot(schema) || !is_lowercase_name_without_dot(name) {
+            if name.contains('.') || name.bytes().any(|byte| byte.is_ascii_uppercase()) {
                 return Err(no_such_function(&qualified_name));
             }
-            Ok(qualified_name)
-        }
-        _ => {
-            let name = object_name(names, is_pg_catalog, "function")?;
-            if name.contains('.') {
-                return Err(no_such_function(&name));
-            }
-            Ok(name)
+            return Ok(qualified_name);
         }
     }
-}
-
-fn is_lowercase_name_without_dot(name: &str) -> bool {
-    !name.contains('.') && !name.bytes().any(|byte| byte.is_ascii_uppercase())
+    let name = object_name(names, is_pg_catalog, "function")?;
+    if name.contains('.') {
+        return Err(no_such_function(&name));
+    }
+    Ok(name)
 }
 
 fn no_such_function(name: &str) -> ParseError {
@@ -10845,7 +10843,9 @@ mod tests {
 
     #[test]
     fn fail_closed_schema_qualified_functions() {
-        assert_not_supported("SELECT public.lower('A')", "schema-qualified function");
+        assert_not_supported("SELECT myschema.f(1)", "schema-qualified function");
+        assert_not_supported("SELECT \"AUTH\".uid()", "schema-qualified function");
+        assert_not_supported("SELECT \"auth.x\".uid()", "schema-qualified function");
         assert_not_supported(
             "SELECT * FROM myschema.generate_series(1, 3)",
             "schema-qualified function",
@@ -10855,12 +10855,11 @@ mod tests {
     }
 
     #[test]
-    fn function_of_a_schema_is_called_by_its_schema_and_its_name() {
+    fn function_of_the_auth_schema_is_called_by_its_schema_and_its_name() {
         for (sql, expected_name) in [
             ("SELECT auth.uid()", "auth.uid"),
             ("SELECT AUTH.UID()", "auth.uid"),
             ("SELECT \"auth\".\"uid\"()", "auth.uid"),
-            ("SELECT myschema.f(1)", "myschema.f"),
             ("SELECT pg_catalog.lower('A')", "lower"),
         ] {
             let parsed = crate::parse(sql).unwrap();
@@ -10886,9 +10885,8 @@ mod tests {
         for (sql, expected_name) in [
             ("SELECT \"auth.uid\"()", "auth.uid"),
             ("SELECT pg_catalog.\"auth.uid\"()", "auth.uid"),
-            ("SELECT \"AUTH\".uid()", "AUTH.uid"),
             ("SELECT auth.\"UID\"()", "auth.UID"),
-            ("SELECT \"auth.x\".uid()", "auth.x.uid"),
+            ("SELECT auth.\"u.id\"()", "auth.u.id"),
         ] {
             let parsed = crate::parse(sql).unwrap();
             let err = PostgreSQLTranslator::new()

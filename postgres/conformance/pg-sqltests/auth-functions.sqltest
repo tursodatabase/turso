@@ -894,9 +894,14 @@ test auth-schema-name-in-uppercase-quotes-is-not-the-auth-schema {
 expect error {
     schema "AUTH" does not exist
 }
-@sqlstate 42883
-expect @tursopg error {
-    no such function: AUTH\.uid
+
+@setup auth_functions
+test auth-function-name-in-a-schema-that-does-not-exist-errors {
+    SELECT no_such_schema.uid();
+}
+@sqlstate 3F000
+expect error {
+    schema "no_such_schema" does not exist
 }
 
 @setup auth_functions
