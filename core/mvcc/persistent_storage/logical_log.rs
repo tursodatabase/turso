@@ -3857,6 +3857,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             data: row.data.clone(),
             btree_resident: false,
+            payload_kind: crate::mvcc::database::PayloadKind::Record,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         tx.push_row_version_for_test(&row.id, &version);
@@ -3963,6 +3964,7 @@ mod tests {
             }),
             data: row.data,
             btree_resident,
+            payload_kind: crate::mvcc::database::PayloadKind::Record,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         let tx =
@@ -4142,6 +4144,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 data: row.data,
                 btree_resident: false,
+                payload_kind: crate::mvcc::database::PayloadKind::Record,
                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             },
         )
@@ -4755,6 +4758,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 data: row.data.clone(),
                 btree_resident: false,
+                payload_kind: crate::mvcc::database::PayloadKind::Record,
                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             },
         );
@@ -4774,6 +4778,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 data: row.data,
                 btree_resident: false,
+                payload_kind: crate::mvcc::database::PayloadKind::Record,
                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             },
         );
@@ -4935,6 +4940,7 @@ mod tests {
                     end: crate::mvcc::database::PackedTs::pack(None),
                     data: row3.data,
                     btree_resident: false,
+                    payload_kind: crate::mvcc::database::PayloadKind::Record,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 },
             )],
@@ -5001,6 +5007,7 @@ mod tests {
                     end: crate::mvcc::database::PackedTs::pack(None),
                     data: row1.data,
                     btree_resident: false,
+                    payload_kind: crate::mvcc::database::PayloadKind::Record,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 },
             )],
@@ -5023,6 +5030,7 @@ mod tests {
                     end: crate::mvcc::database::PackedTs::pack(None),
                     data: row2.data,
                     btree_resident: false,
+                    payload_kind: crate::mvcc::database::PayloadKind::Record,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 },
             )],
@@ -5099,6 +5107,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             data: row.data,
             btree_resident: false,
+            payload_kind: crate::mvcc::database::PayloadKind::Record,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         tx.push_row_version_for_test(&row.id, &version);
@@ -5581,6 +5590,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 data: row.data.clone(),
                 btree_resident: false,
+                payload_kind: crate::mvcc::database::PayloadKind::Record,
                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             },
         );
@@ -5668,6 +5678,7 @@ mod tests {
                             )),
                             data: row.data.clone(),
                             btree_resident,
+                            payload_kind: crate::mvcc::database::PayloadKind::Record,
                             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                         },
                     );
@@ -5689,6 +5700,7 @@ mod tests {
                             end: crate::mvcc::database::PackedTs::pack(None),
                             data: row.data.clone(),
                             btree_resident,
+                            payload_kind: crate::mvcc::database::PayloadKind::Record,
                             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                         },
                     );
@@ -5734,6 +5746,7 @@ mod tests {
                     end: crate::mvcc::database::PackedTs::pack(None),
                     data: row.data,
                     btree_resident: false,
+                    payload_kind: crate::mvcc::database::PayloadKind::Record,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 },
             );
@@ -5776,6 +5789,7 @@ mod tests {
                 }),
                 data: row.data.clone(),
                 btree_resident,
+                payload_kind: crate::mvcc::database::PayloadKind::Record,
                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             };
             expected.push(if is_delete {
@@ -5887,6 +5901,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             data: row.data,
             btree_resident: true,
+            payload_kind: crate::mvcc::database::PayloadKind::Record,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         tx.push_row_version_for_test(&row.id, &version);
@@ -5951,6 +5966,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             data: row.data,
             btree_resident: false,
+            payload_kind: crate::mvcc::database::PayloadKind::Record,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         tx.push_row_version_for_test(&row.id, &version);
@@ -6280,6 +6296,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 data: row.data,
                 btree_resident: false,
+                payload_kind: crate::mvcc::database::PayloadKind::Record,
                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             },
         )
@@ -6317,6 +6334,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 data: row.data,
                 btree_resident: false,
+                payload_kind: crate::mvcc::database::PayloadKind::Record,
                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             },
         )
@@ -6370,6 +6388,7 @@ mod tests {
                 }),
                 data: row.data,
                 btree_resident: false,
+                payload_kind: crate::mvcc::database::PayloadKind::Record,
                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             },
         )
@@ -6406,6 +6425,7 @@ mod tests {
                 }),
                 data: row.data,
                 btree_resident: false,
+                payload_kind: crate::mvcc::database::PayloadKind::Record,
                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             },
         )

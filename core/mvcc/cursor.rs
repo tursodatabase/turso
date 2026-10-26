@@ -5,8 +5,9 @@ use crate::types::IOResultOr;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey, RowVersions,
-    SortableIndexKey,
+    create_seek_range, row_patch, MVTableId, MvStore, MvccReadSnapshot, PatchBase, PayloadKind,
+    Row, RowID, RowKey, RowVersions, SortableIndexKey, StoredRecord, VisibleRecord,
+    SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -564,6 +565,14 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     /// readable for the cursor's lifetime.
     btree_readable: bool,
     btree_cursor: Box<dyn CursorTrait>,
+    /// Reads the B-tree record of a row whose visible version stores a patch
+    /// of it. It is a cursor of its own, so that a read does not move the
+    /// B-tree side of the dual cursor.
+    btree_record_reader: Option<Box<BTreeCursor>>,
+    /// The rowid at which `btree_record_reader` is after its last seek.
+    btree_record_reader_rowid: Option<i64>,
+    /// Reused buffer for the record that a B-tree patch makes.
+    patched_record: Vec<u8>,
     null_flag: bool,
     creating_new_rowid: bool,
     state: Option<MvccLazyCursorState>,
@@ -635,6 +644,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             eq_seek_row: None,
             btree_readable: false,
             btree_cursor,
+            btree_record_reader: None,
+            btree_record_reader_rowid: None,
+            patched_record: Vec::new(),
             null_flag: false,
             creating_new_rowid: false,
             state: None,
@@ -690,7 +702,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
                 let record = self.reusable_immutable_record.as_mut().unwrap();
 
-                let found = if let Some(versions) = versions {
+                let mut visible = if let Some(versions) = versions {
                     // Fast path: serialize the visible version straight into our
                     // reusable record — like the btree cursor does with a cell —
                     // instead of cloning a `Row` first.
@@ -707,16 +719,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                         .db
                         .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
                     {
-                        Some(row) => {
-                            record.invalidate();
-                            record.start_serialization(row.payload())?;
-                            true
-                        }
-                        None => false,
+                        Some(row) => row.copy_record_into(record)?,
+                        None => VisibleRecord::None,
                     }
                 };
 
-                if !found {
+                if matches!(visible, VisibleRecord::None) {
                     let Some(row) = self.eq_seek_row.as_ref().filter(|row| row.id == *row_id)
                     else {
                         if self.db.tx_should_abort(self.tx_id) {
@@ -724,10 +732,19 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                         }
                         return Ok(IOResult::Done(None));
                     };
-                    record.invalidate();
-                    record.start_serialization(row.payload())?;
+                    visible = row.copy_record_into(record)?;
                 }
-                Ok(IOResult::Done(Some(record)))
+                match visible {
+                    VisibleRecord::None => unreachable!("a visible version was found above"),
+                    VisibleRecord::InRecord => {}
+                    VisibleRecord::InBtree(patch) => {
+                        let RowKey::Int(rowid) = row_id.row_id else {
+                            unreachable!("an index row always stores its record");
+                        };
+                        return_if_io!(self.read_record_from_btree(rowid, &patch));
+                    }
+                }
+                Ok(IOResult::Done(self.reusable_immutable_record.as_ref()))
             }
             CursorPosition::BeforeFirst => {
                 // Before first is not a valid position, so we return none.
@@ -735,6 +752,129 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             }
             CursorPosition::End => Ok(IOResult::Done(None)),
         }
+    }
+
+    /// Writes into the reusable record the record that table row `rowid` gets
+    /// from its B-tree record: the B-tree record with `patch` applied.
+    fn read_record_from_btree(&mut self, rowid: i64, patch: &[u8]) -> IOResultOr<()> {
+        self.ensure_btree_record_reader(rowid);
+        let btree_record = return_if_io!(btree_record_of(
+            &mut self.btree_record_reader,
+            &mut self.btree_record_reader_rowid,
+            rowid
+        ));
+        let record = self
+            .reusable_immutable_record
+            .as_mut()
+            .expect("current_row creates the reusable record");
+        record.invalidate();
+        row_patch::apply(btree_record.get_payload(), patch, &mut self.patched_record)?;
+        record.start_serialization(&self.patched_record)?;
+        Ok(IOResult::Done(()))
+    }
+
+    /// Creates the cursor that reads B-tree records for versions that store a
+    /// patch of one.
+    fn ensure_btree_record_reader(&mut self, rowid: i64) {
+        turso_assert!(
+            self.is_btree_allocated(),
+            "a version that uses its B-tree record needs a readable B-tree",
+            { "rowid": rowid }
+        );
+        if self.btree_record_reader.is_none() {
+            self.btree_record_reader = Some(Box::new(BTreeCursor::new_table(
+                self.btree_cursor.get_pager(),
+                self.btree_cursor.root_page(),
+                0,
+            )));
+        }
+    }
+
+    /// A B-tree patch for `record`, the record of the new version of table row
+    /// `row_id`, when the version can store the patch in place of its record.
+    /// `replaces_btree_row` tells that the new version replaces the B-tree row
+    /// at which the dual cursor is.
+    fn btree_patch_for_new_version(
+        &mut self,
+        row_id: &RowID,
+        record: &[u8],
+        replaces_btree_row: bool,
+    ) -> IOResultOr<Option<Vec<u8>>> {
+        let RowKey::Int(rowid) = row_id.row_id else {
+            return Ok(IOResult::Done(None));
+        };
+        if !self.db.btree_patches_enabled() || row_id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+            return Ok(IOResult::Done(None));
+        }
+        let mut patch = Vec::new();
+        let made = if replaces_btree_row {
+            let Some(btree_record) = return_if_io!(self.btree_cursor.record()) else {
+                return Ok(IOResult::Done(None));
+            };
+            row_patch::diff(btree_record.get_payload(), record, None, &mut patch)?
+        } else {
+            match self.db.patch_base_for_new_version(self.tx_id, row_id)? {
+                PatchBase::None => return Ok(IOResult::Done(None)),
+                PatchBase::EarlierVersion {
+                    record: earlier_record,
+                    patch: earlier_patch,
+                } => row_patch::diff(&earlier_record, record, Some(&earlier_patch), &mut patch)?,
+                PatchBase::BtreeRecord { also_set } => {
+                    self.ensure_btree_record_reader(rowid);
+                    let btree_record = return_if_io!(btree_record_of(
+                        &mut self.btree_record_reader,
+                        &mut self.btree_record_reader_rowid,
+                        rowid
+                    ));
+                    row_patch::diff(
+                        btree_record.get_payload(),
+                        record,
+                        Some(&also_set),
+                        &mut patch,
+                    )?
+                }
+            }
+        };
+        let saves_memory = patch.len() * 2 <= record.len();
+        Ok(IOResult::Done((made && saves_memory).then_some(patch)))
+    }
+
+    /// The record of the version of table row `row_id` that this transaction
+    /// sees and is going to end, if the commit needs it (see
+    /// `MvStore::version_to_end_that_needs_its_record`). Reads the B-tree
+    /// record when the version stores a patch of it.
+    fn record_of_version_to_end(
+        &mut self,
+        row_id: &RowID,
+    ) -> IOResultOr<Option<crate::alloc::ArcSlice<u8>>> {
+        let Some(row) = self
+            .db
+            .version_to_end_that_needs_its_record(self.tx_id, row_id)?
+        else {
+            return Ok(IOResult::Done(None));
+        };
+        if row.payload_kind == PayloadKind::Record {
+            return Ok(IOResult::Done(row.data));
+        }
+        let RowKey::Int(rowid) = row_id.row_id else {
+            unreachable!("an index row always stores its record");
+        };
+        let StoredRecord::BtreePatch(patch) = row.stored_record() else {
+            unreachable!("a version that does not store its record stores a patch");
+        };
+        self.ensure_btree_record_reader(rowid);
+        let btree_record = return_if_io!(btree_record_of(
+            &mut self.btree_record_reader,
+            &mut self.btree_record_reader_rowid,
+            rowid
+        ));
+        let mut record = Vec::new();
+        row_patch::apply(btree_record.get_payload(), patch, &mut record)?;
+        let record = crate::with_mv_store_allocation_site!(
+            RowPayload,
+            crate::alloc::try_arc_slice_from_slice_in(&record, self.db.allocator())
+        )?;
+        Ok(IOResult::Done(Some(record)))
     }
 
     pub fn read_mvcc_current_row(&self) -> Result<Option<Row>> {
@@ -1268,6 +1408,37 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         }
         Ok(())
     }
+}
+
+/// The B-tree record of table row `rowid`, which a version of the row uses as
+/// the base of its patch. `reader_rowid` is the rowid at which `reader` is.
+fn btree_record_of<'a>(
+    reader: &'a mut Option<Box<BTreeCursor>>,
+    reader_rowid: &mut Option<i64>,
+    rowid: i64,
+) -> IOResultOr<&'a ImmutableRecord> {
+    let reader = reader
+        .as_mut()
+        .expect("ensure_btree_record_reader creates the reader");
+    if *reader_rowid != Some(rowid) {
+        *reader_rowid = None;
+        let seek =
+            return_if_io!(reader.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
+        if !matches!(seek, SeekResult::Found) {
+            return Err(LimboError::Corrupt(format!(
+                "the B-tree has no row {rowid}, but an MVCC version of the row uses its B-tree record"
+            ))
+            .into());
+        }
+        *reader_rowid = Some(rowid);
+    }
+    let Some(btree_record) = return_if_io!(reader.record()) else {
+        return Err(LimboError::Corrupt(format!(
+            "the B-tree cursor has no record for row {rowid}"
+        ))
+        .into());
+    };
+    Ok(IOResult::Done(btree_record))
 }
 
 impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Drop for MvccLazyCursor<Clock, A> {
@@ -1881,6 +2052,17 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             } => *in_btree && *current_row_id == row.id,
             _ => false,
         };
+        // Any I/O happens here, before the store changes.
+        let btree_patch = match key {
+            BTreeKey::TableRowId((_, Some(record))) => return_if_io!(
+                self.btree_patch_for_new_version(&row.id, record.get_payload(), was_btree_resident)
+            ),
+            _ => None,
+        };
+        let record_of_ended_version = match key {
+            BTreeKey::TableRowId(_) => return_if_io!(self.record_of_version_to_end(&row.id)),
+            BTreeKey::IndexKey(_) => None,
+        };
 
         self.current_pos = CursorPosition::Loaded {
             row_id: row.id.clone(),
@@ -1891,6 +2073,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             MvccCursorType::Index(_) => Some(self.table_id),
             MvccCursorType::Table => None,
         };
+        let new_row_id = row.id.clone();
         // FIXME: set btree to somewhere close to this rowid?
         if self
             .db
@@ -1907,6 +2090,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 updated,
                 "read found a visible version but update could not supersede it"
             );
+            if let Some(record) = record_of_ended_version {
+                self.db
+                    .store_record_of_ended_version(self.tx_id, &new_row_id, record);
+            }
         } else if was_btree_resident {
             // The row exists in B-tree but not in MvStore - mark it as B-tree resident
             // so that checkpoint knows to write deletes to the B-tree file.
@@ -1921,6 +2108,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
+        }
+        if let Some(patch) = btree_patch {
+            let patch = crate::with_mv_store_allocation_site!(
+                RowPayload,
+                crate::alloc::try_arc_slice_from_slice_in(&patch, self.db.allocator())
+            )?;
+            self.db
+                .keep_btree_patch_of_new_version(self.tx_id, &new_row_id, patch)?;
         }
         self.invalidate_record();
         Ok(IOResult::Done(()))
@@ -1959,12 +2154,18 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         } else {
             None
         };
+        let ended_version = return_if_io!(self.record_of_version_to_end(&rowid))
+            .map(|record| (rowid.clone(), record));
         self.db.delete_from_table_or_index(
             self.tx_id,
             rowid,
             maybe_index_id,
             btree_record.as_ref(),
         )?;
+        if let Some((rowid, record)) = ended_version {
+            self.db
+                .store_record_of_ended_version(self.tx_id, &rowid, record);
+        }
         self.invalidate_record();
         Ok(IOResult::Done(()))
     }

@@ -61,6 +61,7 @@ use tracing::instrument;
 use tracing::Level;
 
 pub mod checkpoint_state_machine;
+pub(crate) mod row_patch;
 #[cfg(not(nightly))]
 mod version_chain;
 pub use checkpoint_state_machine::{
@@ -366,6 +367,8 @@ pub struct Row {
     pub id: RowID,
     /// Data is None for index rows because the key holds all the data.
     pub data: Option<crate::alloc::ArcSlice<u8>>,
+    /// What `data` holds for a table row.
+    pub payload_kind: PayloadKind,
 }
 
 impl Row {
@@ -381,22 +384,143 @@ impl Row {
         Ok(Self {
             id,
             data: Some(crate::alloc::try_arc_slice_from_slice_in(data, alloc)?),
+            payload_kind: PayloadKind::Record,
         })
     }
 
     pub fn new_index_row(id: RowID) -> Self {
-        Self { id, data: None }
+        Self {
+            id,
+            data: None,
+            payload_kind: PayloadKind::Record,
+        }
     }
 
     pub fn is_index_row(&self) -> bool {
-        self.data.is_none()
+        matches!(self.id.row_id, RowKey::Record(_))
     }
 
+    /// The record of this row. A table row must hold its record: see
+    /// [`Self::stored_record`] for a row that can hold a B-tree patch.
     pub fn payload(&self) -> &[u8] {
         match self.id.row_id {
-            RowKey::Int(_) => self.data.as_deref().expect("table rows should have data"),
+            RowKey::Int(_) => self.stored_record().expect_record(),
             RowKey::Record(ref sortable_key) => sortable_key.key.get_payload(),
         }
+    }
+
+    /// What this table row stores of its record.
+    pub fn stored_record(&self) -> StoredRecord<'_> {
+        StoredRecord::of(self.payload_kind, self.data.as_deref())
+    }
+
+    /// Copies the record of this row into `record`, or tells where it is.
+    pub(crate) fn copy_record_into(&self, record: &mut ImmutableRecord) -> Result<VisibleRecord> {
+        let stored = match self.id.row_id {
+            RowKey::Int(_) => self.stored_record(),
+            RowKey::Record(_) => StoredRecord::Record(self.payload()),
+        };
+        copy_record_into(&self.id, stored, &self.data, record)
+    }
+}
+
+/// What the `data` of a table-row version holds.
+///
+/// A version of a row that is in the B-tree can store its record as a patch
+/// of the B-tree record of the row. See `docs/internals/mvcc/BTREE_PATCHES.md`
+/// for when the B-tree record that a reader sees is the right base.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PayloadKind {
+    /// `data` is the record of the row. An index row has no `data`, because
+    /// the key of its chain is its record.
+    #[default]
+    Record,
+    /// `data` is a patch (see `row_patch.rs`) that makes the record from the
+    /// B-tree record of the row.
+    BtreePatch,
+}
+
+/// The record of a table-row version, or what the version stores of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredRecord<'a> {
+    Record(&'a [u8]),
+    BtreePatch(&'a [u8]),
+}
+
+impl<'a> StoredRecord<'a> {
+    fn of(kind: PayloadKind, data: Option<&'a [u8]>) -> Self {
+        match kind {
+            PayloadKind::Record => {
+                StoredRecord::Record(data.expect("a table row version must have data"))
+            }
+            PayloadKind::BtreePatch => {
+                StoredRecord::BtreePatch(data.expect("a B-tree patch version must have data"))
+            }
+        }
+    }
+
+    pub fn expect_record(self) -> &'a [u8] {
+        match self {
+            StoredRecord::Record(record) => record,
+            StoredRecord::BtreePatch(_) => {
+                panic!("the record of this version needs the B-tree record of its row: read it through a cursor")
+            }
+        }
+    }
+}
+
+/// Where a cursor finds the record of the version that it reads.
+#[derive(Debug)]
+pub(crate) enum VisibleRecord {
+    /// No version is visible to the reader.
+    None,
+    /// The record is in the reusable record of the cursor.
+    InRecord,
+    /// The record is the B-tree record of the row with this patch applied.
+    InBtree(crate::alloc::ArcSlice<u8>),
+}
+
+/// What a new version can use as the base of its B-tree patch.
+#[derive(Debug)]
+pub(crate) enum PatchBase {
+    /// The new version keeps its record.
+    None,
+    /// The replaced version stores the patch `also_set` of the B-tree record
+    /// of the row. The patch of the new version goes from the B-tree record,
+    /// and also sets each column that `also_set` sets.
+    BtreeRecord {
+        also_set: crate::alloc::ArcSlice<u8>,
+    },
+    /// The replaced version is an earlier version of the same transaction:
+    /// `record` with its future B-tree patch `patch`. The patch of the new
+    /// version goes from `record`, and also sets each column that `patch` sets.
+    EarlierVersion {
+        record: crate::alloc::ArcSlice<u8>,
+        patch: crate::alloc::ArcSlice<u8>,
+    },
+}
+
+/// Copies into `record` the record of a visible version of `id` that stores
+/// `stored` and `data`, or tells where the record is.
+fn copy_record_into(
+    id: &RowID,
+    stored: StoredRecord<'_>,
+    data: &Option<crate::alloc::ArcSlice<u8>>,
+    record: &mut ImmutableRecord,
+) -> Result<VisibleRecord> {
+    turso_assert!(
+        matches!(id.row_id, RowKey::Int(_)) || matches!(stored, StoredRecord::Record(_)),
+        "an index row always stores its record"
+    );
+    match stored {
+        StoredRecord::Record(bytes) => {
+            record.invalidate();
+            record.start_serialization(bytes)?;
+            Ok(VisibleRecord::InRecord)
+        }
+        StoredRecord::BtreePatch(_) => Ok(VisibleRecord::InBtree(
+            data.clone().expect("a B-tree patch version has data"),
+        )),
     }
 }
 
@@ -477,6 +601,8 @@ pub struct RowVersion {
     /// This flag helps the checkpoint logic determine if a delete should be
     /// checkpointed to the B-tree file.
     pub btree_resident: bool,
+    /// What `data` holds for a table row.
+    pub(crate) payload_kind: PayloadKind,
     /// The WAL position at which this version's *current* (begin, end) state was last
     /// materialized to the B-tree by a checkpoint. [`WalPos::ORIGIN`] means "not yet in the
     /// B-tree" — either never checkpointed, or its state changed (e.g. a delete set `end`) and
@@ -1026,6 +1152,11 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// began. Row deletes and the commit both read this value, so they agree even
     /// if the connection changes the setting during the transaction.
     portable_logical_changes: bool,
+    /// For versions that this transaction created, by version id: a patch that
+    /// makes the record of the version from the B-tree record of its row. The
+    /// versions keep their records until the commit writes them to the logical
+    /// log. Then each version stores its patch in place of its record.
+    btree_patches: Mutex<HashMap<u64, crate::alloc::ArcSlice<u8>>>,
 }
 
 impl<A: RowVersionAllocator> Transaction<A> {
@@ -1055,6 +1186,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             commit_dep_set: Mutex::new(HashSet::default()),
             holds_blocking_checkpoint_read: AtomicBool::new(false),
             created_table_ids: Mutex::new(Vec::new()),
+            btree_patches: Mutex::new(HashMap::default()),
         }
     }
 
@@ -1549,6 +1681,9 @@ pub enum WriteRowState {
     /// After seek returns TryAdvance for an index key stored in an interior node,
     /// advance the cursor to that interior cell so insert overwrites it.
     Advance,
+    /// The row stores a patch of its B-tree record. Read the B-tree record at
+    /// the cursor and make the record from it.
+    ApplyBtreePatch,
     Insert,
     /// Move to the next record in order to leave the cursor in the next position, this is used for inserting multiple rows for optimizations.
     Next,
@@ -3044,16 +3179,33 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 "RewriteLiveVersions requires a committed transaction state"
             );
         }
+        // The log record already holds the records of the new versions, so a
+        // version that has a B-tree patch can now store it in place of its record.
+        let mut btree_patches = tx.btree_patches.lock();
         let mut iterations = 0;
         while ctx.cursor < write_set_len && iterations < MVCC_COMMIT_BATCH_SIZE {
             let (_id, row_versions) = &write_set.entries[ctx.cursor];
             let mut row_versions = row_versions.write();
             for row_version in row_versions.iter_mut() {
                 row_version.rewrite_txid_to_timestamp(tx_id, end_ts);
+                if btree_patches.is_empty()
+                    || row_version.begin() != Some(TxTimestampOrID::Timestamp(end_ts))
+                {
+                    continue;
+                }
+                let Some(patch) = btree_patches.remove(&row_version.id) else {
+                    continue;
+                };
+                // A version that a transaction already ended keeps its record,
+                // because the commit of that transaction can read it.
+                if row_version.end().is_none() {
+                    row_version.store_btree_patch(patch);
+                }
             }
             ctx.cursor += 1;
             iterations += 1;
         }
+        drop(btree_patches);
         if ctx.cursor < write_set_len {
             return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
         }
@@ -3809,10 +3961,17 @@ impl StateTransition for WriteRowStateMachine {
                 self.record = if self.row.is_index_row() {
                     None
                 } else {
-                    let row_data = self.row.data.as_ref().expect("table rows should have data");
-                    let mut record = ImmutableRecord::new(row_data.len())?;
-                    record.start_serialization(row_data)?;
-                    Some(record)
+                    match self.row.stored_record() {
+                        StoredRecord::Record(row_data) => {
+                            let mut record = ImmutableRecord::new(row_data.len())?;
+                            record.start_serialization(row_data)?;
+                            Some(record)
+                        }
+                        StoredRecord::BtreePatch(_) => {
+                            self.state = WriteRowState::Seek;
+                            return Ok(TransitionResult::Continue);
+                        }
+                    }
                 };
                 // `requires_seek == false` is a write_set-level *candidate* for the
                 // sequential-write optimization (this row's key is exactly previous
@@ -3864,12 +4023,45 @@ impl StateTransition for WriteRowStateMachine {
                             self.state = WriteRowState::Advance;
                             return Ok(TransitionResult::Continue);
                         }
+                        if self.record.is_none() && !self.row.is_index_row() {
+                            if !matches!(seek_result, SeekResult::Found) {
+                                crate::bail_corrupt_error!(
+                                    "MVCC checkpoint: row {:?} stores a patch of its B-tree record, but the B-tree has no such row",
+                                    self.row.id
+                                );
+                            }
+                            self.state = WriteRowState::ApplyBtreePatch;
+                            return Ok(TransitionResult::Continue);
+                        }
                     }
                     IOResult::IO(io) => {
                         return Ok(TransitionResult::Io(io));
                     }
                 }
                 turso_assert_eq!(self.cursor.write().valid_state, CursorValidState::Valid);
+                self.state = WriteRowState::Insert;
+                Ok(TransitionResult::Continue)
+            }
+            WriteRowState::ApplyBtreePatch => {
+                let StoredRecord::BtreePatch(patch) = self.row.stored_record() else {
+                    unreachable!("only a row that stores a B-tree patch reads its B-tree record");
+                };
+                let mut record_bytes = Vec::new();
+                {
+                    let mut cursor = self.cursor.write();
+                    let btree_record = match cursor.record()? {
+                        IOResult::Done(Some(btree_record)) => btree_record,
+                        IOResult::Done(None) => crate::bail_corrupt_error!(
+                            "MVCC checkpoint: no B-tree record at row {:?}",
+                            self.row.id
+                        ),
+                        IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
+                    };
+                    row_patch::apply(btree_record.get_payload(), patch, &mut record_bytes)?;
+                }
+                let mut record = ImmutableRecord::new(record_bytes.len())?;
+                record.start_serialization(&record_bytes)?;
+                self.record = Some(record);
                 self.state = WriteRowState::Insert;
                 Ok(TransitionResult::Continue)
             }
@@ -4544,6 +4736,12 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// checkpoint's full sweep.
     gc_last_lwm: AtomicU64,
     experimental_mvcc_passive_checkpoint: bool,
+    /// Whether a version of a row that is in the B-tree stores a patch of the
+    /// B-tree record of the row in place of its record. See
+    /// `docs/internals/mvcc/BTREE_PATCHES.md`. On by default, but the passive
+    /// checkpoint does not use patches yet. Tests turn it off to compare both
+    /// modes.
+    btree_patches_enabled: AtomicBool,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -4673,7 +4871,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             gc_in_progress: AtomicBool::new(false),
             gc_last_lwm: AtomicU64::new(u64::MAX),
             experimental_mvcc_passive_checkpoint,
+            btree_patches_enabled: AtomicBool::new(true),
         })
+    }
+
+    /// See the field doc of `btree_patches_enabled`.
+    pub(crate) fn btree_patches_enabled(&self) -> bool {
+        self.btree_patches_enabled.load(Ordering::Relaxed)
+            && !self.experimental_mvcc_passive_checkpoint
+    }
+
+    /// Turns B-tree patches on or off for later writes. Versions that already
+    /// store a patch keep it.
+    #[cfg(test)]
+    pub(crate) fn set_btree_patches_enabled(&self, enabled: bool) {
+        self.btree_patches_enabled.store(enabled, Ordering::Relaxed);
     }
 
     /// Get the table ID from the root page, resolving against the current (live) mapping.
@@ -5445,6 +5657,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     end: crate::mvcc::database::PackedTs::pack(None),
                     data: row.data.clone(),
                     btree_resident: false,
+                    payload_kind: PayloadKind::Record,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 };
                 let RowKey::Record(sortable_key) = row.id.row_id else {
@@ -5478,6 +5691,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     end: crate::mvcc::database::PackedTs::pack(None),
                     data: row.data,
                     btree_resident: false,
+                    payload_kind: PayloadKind::Record,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 };
                 let (row_versions, chain_in_write_set) =
@@ -5526,6 +5740,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     end: crate::mvcc::database::PackedTs::pack(None),
                     data: row.data.clone(),
                     btree_resident: true,
+                    payload_kind: PayloadKind::Record,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 };
                 let RowKey::Record(sortable_key) = row.id.row_id else {
@@ -5551,6 +5766,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     end: crate::mvcc::database::PackedTs::pack(None),
                     data: row.data,
                     btree_resident: true,
+                    payload_kind: PayloadKind::Record,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 };
                 let (row_versions, chain_in_write_set) =
@@ -5908,22 +6124,149 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Like [`read_visible_from_versions`] but serializes the visible row's
     /// payload directly into `record` instead of cloning a `Row`. Mirrors the
     /// btree cursor, which serializes a cell straight into its reusable record.
-    /// Returns true if a visible version was found. The version-chain read lock
-    /// is held only for the serialization copy.
+    /// The version-chain read lock is held only for the serialization copy.
     pub(crate) fn read_visible_into_record(
         &self,
         snapshot: MvccReadSnapshot,
         id: &RowID,
         versions: &RowVersions<A>,
         record: &mut ImmutableRecord,
-    ) -> Result<bool> {
+    ) -> Result<VisibleRecord> {
         let versions = versions.read();
-        if let Some(rv) = self.find_visible_version(snapshot, &versions)? {
-            record.invalidate();
-            record.start_serialization(rv.payload(id))?;
-            return Ok(true);
+        let Some(rv) = self.find_visible_version(snapshot, &versions)? else {
+            return Ok(VisibleRecord::None);
+        };
+        copy_record_into(id, rv.stored_record_or_key(id), &rv.data, record)
+    }
+
+    /// What a new version of table row `id` that `tx_id` writes can use as the
+    /// base of a B-tree patch, from the version that it replaces. Call it after
+    /// the delete that ends the replaced version, or before an insert that
+    /// replaces the visible version.
+    pub(crate) fn patch_base_for_new_version(&self, tx_id: TxID, id: &RowID) -> Result<PatchBase> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let tx = tx.value();
+        let Some(entry) = self.rows.get(id) else {
+            return Ok(PatchBase::None);
+        };
+        let versions = entry.value().read();
+        let ended_by_tx = Some(TxTimestampOrID::TxID(tx_id));
+        let replaced = versions
+            .iter()
+            .rev()
+            .find(|rv| rv.end() == ended_by_tx)
+            .or_else(|| {
+                versions
+                    .iter()
+                    .rev()
+                    .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
+            });
+        let Some(replaced) = replaced else {
+            return Ok(PatchBase::None);
+        };
+        if replaced.begin().is_none() {
+            return Ok(PatchBase::None);
         }
-        Ok(false)
+        if replaced.begin() == Some(TxTimestampOrID::TxID(tx_id)) {
+            let patches = tx.btree_patches.lock();
+            return Ok(match (&replaced.data, patches.get(&replaced.id)) {
+                (Some(record), Some(patch)) if replaced.payload_kind == PayloadKind::Record => {
+                    PatchBase::EarlierVersion {
+                        record: record.clone(),
+                        patch: patch.clone(),
+                    }
+                }
+                _ => PatchBase::None,
+            });
+        }
+        Ok(match replaced.stored_record() {
+            StoredRecord::Record(_) => PatchBase::None,
+            StoredRecord::BtreePatch(_) => PatchBase::BtreeRecord {
+                also_set: replaced
+                    .data
+                    .clone()
+                    .expect("a B-tree patch version has data"),
+            },
+        })
+    }
+
+    /// The visible version of table row `id` that `tx_id` is going to end, if
+    /// the commit of the transaction needs the record of that version. The
+    /// commit writes the primary key of each version that a transaction with
+    /// portable logical changes ends, and it reads the key from the record of
+    /// the version. See [`Self::store_record_of_ended_version`].
+    pub(crate) fn version_to_end_that_needs_its_record(
+        &self,
+        tx_id: TxID,
+        id: &RowID,
+    ) -> Result<Option<Row>> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        if !tx.value().portable_logical_changes || !matches!(id.row_id, RowKey::Int(_)) {
+            return Ok(None);
+        }
+        self.read_from_table_or_index(tx_id, id, None)
+    }
+
+    /// Stores `record` in the version of table row `id` that `tx_id` ended
+    /// last, if that version does not store its record. `record` must be the
+    /// record of the version. Once a transaction ends a version,
+    /// `RewriteLiveVersions` no longer replaces its record with a patch.
+    pub(crate) fn store_record_of_ended_version(
+        &self,
+        tx_id: TxID,
+        id: &RowID,
+        record: crate::alloc::ArcSlice<u8>,
+    ) {
+        let entry = self
+            .rows
+            .get(id)
+            .expect("the chain of a version that a transaction just ended must exist");
+        let mut versions = entry.value().write();
+        let ended_by_tx = Some(TxTimestampOrID::TxID(tx_id));
+        let ended = versions
+            .iter_mut()
+            .rev()
+            .find(|rv| rv.end() == ended_by_tx)
+            .expect("the version that a transaction just ended must be in its chain");
+        if ended.payload_kind != PayloadKind::Record {
+            ended.store_record(record);
+        }
+    }
+
+    /// Keeps `patch` for the version of table row `id` that `tx_id` just wrote.
+    /// The commit stores the patch in place of the record of the version.
+    pub(crate) fn keep_btree_patch_of_new_version(
+        &self,
+        tx_id: TxID,
+        id: &RowID,
+        patch: crate::alloc::ArcSlice<u8>,
+    ) -> Result<()> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let entry = self
+            .rows
+            .get(id)
+            .expect("the chain of a version that a transaction just wrote must exist");
+        let versions = entry.value().read();
+        let new_version = versions
+            .iter()
+            .rev()
+            .find(|rv| rv.begin() == Some(TxTimestampOrID::TxID(tx_id)) && rv.end().is_none())
+            .expect("the version that a transaction just wrote must be in its chain");
+        turso_assert_eq!(new_version.payload_kind, PayloadKind::Record);
+        tx.value()
+            .btree_patches
+            .lock()
+            .insert(new_version.id, patch);
+        Ok(())
     }
 
     /// Gets all row ids in the database.
@@ -8967,6 +9310,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     end: PackedTs::pack(Some(TxTimestampOrID::Timestamp(end_ts))),
                     data: Some(data),
                     btree_resident: true,
+                    payload_kind: PayloadKind::Record,
                     materialized_at: WalPos::ORIGIN,
                 },
             );
@@ -10106,6 +10450,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 end: crate::mvcc::database::PackedTs::pack(None),
                                 data: row.data.clone(),
                                 btree_resident,
+                                payload_kind: PayloadKind::Record,
                                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                             };
                             {
@@ -10178,6 +10523,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                         // btree-resident so checkpoint applies the delete even
                                         // though the logged flag predates the row becoming durable.
                                         btree_resident: true,
+                                        payload_kind: PayloadKind::Record,
                                         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                                     };
                                     self.insert_version_raw(&mut versions, row_version)?;
@@ -10194,6 +10540,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     // Same invariant as above: no replayed version means the
                                     // deleted row is already durable in the DB file.
                                     btree_resident: true,
+                                    payload_kind: PayloadKind::Record,
                                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                                 };
                                 let versions =
@@ -10250,6 +10597,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 end: crate::mvcc::database::PackedTs::pack(None),
                                 data: row.data.clone(),
                                 btree_resident,
+                                payload_kind: PayloadKind::Record,
                                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                             };
                             let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
@@ -10299,6 +10647,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 // predates the entry becoming durable (e.g. a checkpoint that
                                 // failed after its pager commit).
                                 btree_resident: true,
+                                payload_kind: PayloadKind::Record,
                                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                             };
                             self.insert_index_version(rowid.table_id, sortable_key, row_version)?;
@@ -10746,24 +11095,53 @@ impl RowVersion {
             end: crate::mvcc::database::PackedTs::pack(end),
             data,
             btree_resident,
+            payload_kind: PayloadKind::Record,
             materialized_at: WalPos::ORIGIN,
         }
     }
 
     /// The record of this version. `id` is the `RowID` of its chain, because the
-    /// key of an index row is its record.
+    /// key of an index row is its record. A table-row version must hold its
+    /// record: see [`Self::stored_record`] for a version that can hold a
+    /// B-tree patch.
     pub fn payload<'a>(&'a self, id: &'a RowID) -> &'a [u8] {
         match &id.row_id {
-            RowKey::Int(_) => self.data.as_deref().expect("table rows should have data"),
+            RowKey::Int(_) => self.stored_record().expect_record(),
             RowKey::Record(sortable_key) => sortable_key.key.get_payload(),
         }
     }
 
+    /// What this table-row version stores of its record.
+    pub fn stored_record(&self) -> StoredRecord<'_> {
+        StoredRecord::of(self.payload_kind, self.data.as_deref())
+    }
+
+    /// Like [`Self::stored_record`], but an index row gives its key, which is
+    /// its record.
+    fn stored_record_or_key<'a>(&'a self, id: &'a RowID) -> StoredRecord<'a> {
+        match id.row_id {
+            RowKey::Int(_) => self.stored_record(),
+            RowKey::Record(_) => StoredRecord::Record(self.payload(id)),
+        }
+    }
+
     /// The number of columns in the record of this version. A tombstone with an
-    /// empty payload has none. A version stores its record, so it does not also
-    /// store this number.
+    /// empty payload has none. A version stores its record or a patch, so it
+    /// does not also store this number.
     pub fn column_count(&self, id: &RowID) -> usize {
-        ImmutableRecordRef::from_bin_record(self.payload(id)).column_count()
+        match &id.row_id {
+            RowKey::Int(_) => match self.stored_record() {
+                StoredRecord::Record(record) => {
+                    ImmutableRecordRef::from_bin_record(record).column_count()
+                }
+                StoredRecord::BtreePatch(patch) => {
+                    row_patch::column_count(patch).expect("a B-tree patch in memory must be valid")
+                }
+            },
+            RowKey::Record(_) => {
+                ImmutableRecordRef::from_bin_record(self.payload(id)).column_count()
+            }
+        }
     }
 
     /// The row of this version in the chain of `id`.
@@ -10771,7 +11149,23 @@ impl RowVersion {
         Row {
             id: id.clone(),
             data: self.data.clone(),
+            payload_kind: self.payload_kind,
         }
+    }
+
+    /// Replaces the record of this table-row version with `patch` of the B-tree
+    /// record of its row.
+    fn store_btree_patch(&mut self, patch: crate::alloc::ArcSlice<u8>) {
+        turso_assert_eq!(self.payload_kind, PayloadKind::Record);
+        self.data = Some(patch);
+        self.payload_kind = PayloadKind::BtreePatch;
+    }
+
+    /// Stores `record` in this table-row version again, in place of its patch
+    /// of the B-tree record.
+    fn store_record(&mut self, record: crate::alloc::ArcSlice<u8>) {
+        self.data = Some(record);
+        self.payload_kind = PayloadKind::Record;
     }
 
     /// WAL position at which this version's current state is materialized in the B-tree

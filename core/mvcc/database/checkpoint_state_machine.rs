@@ -2464,6 +2464,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     end: crate::mvcc::database::PackedTs::pack(None),
                     data: Some(data),
                     btree_resident: true,
+                    payload_kind: crate::mvcc::database::PayloadKind::Record,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 },
                 None,
@@ -3901,6 +3902,7 @@ mod tests {
             .unwrap()
             .data,
             btree_resident: false,
+            payload_kind: crate::mvcc::database::PayloadKind::Record,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
     }
@@ -3988,6 +3990,7 @@ mod tests {
                 .unwrap()
                 .data,
             btree_resident: false,
+            payload_kind: crate::mvcc::database::PayloadKind::Record,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
 
@@ -4043,6 +4046,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(end.map(TxTimestampOrID::Timestamp)),
             data: None,
             btree_resident,
+            payload_kind: crate::mvcc::database::PayloadKind::Record,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         (key_arc, row_version)
@@ -4116,6 +4120,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(end.map(TxTimestampOrID::Timestamp)),
             data: row.data,
             btree_resident,
+            payload_kind: crate::mvcc::database::PayloadKind::Record,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         (row.id, version)

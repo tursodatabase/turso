@@ -413,6 +413,7 @@ fn mv_store_skiplist_allocations_are_fallible() {
         end: PackedTs::pack(None),
         data: Row::new_table_row(row_id.clone(), &[]).unwrap().data,
         btree_resident: false,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
     let result = store.insert_version(row_id, row_version);
@@ -2456,6 +2457,7 @@ fn test_recovery_replays_schema_op_after_data_op_in_frame() {
         end: crate::mvcc::database::PackedTs::pack(None),
         data: generate_simple_string_row(table_id, 1, "data").data,
         btree_resident: false,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
     let schema_record = ImmutableRecord::from_values(
@@ -2480,6 +2482,7 @@ fn test_recovery_replays_schema_op_after_data_op_in_frame() {
         .unwrap()
         .data,
         btree_resident: false,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
     let tx = LogRecord::for_test(
@@ -8023,6 +8026,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
         portable_logical_changes: false,
+        btree_patches: Mutex::new(HashMap::default()),
     }
 }
 
@@ -8051,6 +8055,7 @@ fn test_snapshot_isolation_tx_visible1() {
             end: crate::mvcc::database::PackedTs::pack(end),
             data: generate_simple_string_row((-2).into(), 1, "testme").data,
             btree_resident: false,
+            payload_kind: crate::mvcc::database::PayloadKind::Record,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         tracing::debug!("Testing visibility of {row_version:?}");
@@ -8152,6 +8157,7 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
         end: crate::mvcc::database::PackedTs::pack(None),
         data: generate_simple_string_row((-2).into(), 1, "x").data,
         btree_resident: false,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
     assert!(
@@ -8165,6 +8171,7 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
         end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(42))),
         data: generate_simple_string_row((-2).into(), 2, "y").data,
         btree_resident: false,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
     assert!(
@@ -8273,6 +8280,7 @@ fn test_commit_dependency_speculative_read() {
         end: crate::mvcc::database::PackedTs::pack(None),
         data: generate_simple_string_row((-2).into(), 1, "test").data,
         btree_resident: false,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
 
@@ -8306,6 +8314,7 @@ fn test_commit_dependency_cascade_abort() {
         end: crate::mvcc::database::PackedTs::pack(None),
         data: generate_simple_string_row((-2).into(), 1, "test").data,
         btree_resident: false,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
 
@@ -8382,6 +8391,7 @@ fn test_commit_dependency_speculative_ignore() {
         end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(3))),
         data: generate_simple_string_row((-2).into(), 1, "test").data,
         btree_resident: false,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
 
@@ -8464,6 +8474,7 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
         end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(writer_id))),
         data: Row::new_index_row(row_id).data,
         btree_resident: false,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
     let mut tombstone_versions =
@@ -8519,6 +8530,7 @@ fn test_commit_dependency_multiple_reads_dedup() {
         end: crate::mvcc::database::PackedTs::pack(None),
         data: generate_simple_string_row((-2).into(), row_id, "test").data,
         btree_resident: false,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
 
@@ -9815,6 +9827,7 @@ fn transaction_display() {
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
         portable_logical_changes: false,
+        btree_patches: Mutex::new(HashMap::default()),
     };
 
     let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }] }";
@@ -11228,6 +11241,7 @@ fn make_rv(begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>) -> RowV
         end: crate::mvcc::database::PackedTs::pack(end),
         data: generate_simple_string_row((-2).into(), 1, "gc_test").data,
         btree_resident: false,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     }
 }
@@ -12118,6 +12132,7 @@ fn test_gc_shrinks_version_chain_capacity() {
         end: crate::mvcc::database::PackedTs::pack(end),
         data: generate_simple_string_row((-2).into(), 1, "shrink").data,
         btree_resident: false,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
 
@@ -13892,6 +13907,7 @@ fn arbitrary_row_version(g: &mut Gen) -> RowVersion {
         end: crate::mvcc::database::PackedTs::pack(end),
         data: generate_simple_string_row((-2).into(), 1, "qc").data,
         btree_resident: bool::arbitrary(g),
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     }
 }
@@ -23985,6 +24001,7 @@ fn commit_validation_reports_conflict_for_evicted_tombstone_writer() {
         end: PackedTs::pack(Some(TxTimestampOrID::TxID(evicted_writer))),
         data: generate_simple_string_row((-2).into(), 1, "original").data,
         btree_resident: true,
+        payload_kind: crate::mvcc::database::PayloadKind::Record,
         materialized_at: WalPos::ORIGIN,
     });
     drop(entry);
@@ -24823,4 +24840,687 @@ fn empty_version_chain() -> RowVersionChain<TursoAllocator> {
     <RowVersionChain<TursoAllocator> as TursoVecInExt<RowVersion, TursoAllocator>>::new_in(
         TursoAllocator,
     )
+}
+
+// ─── B-tree patches (docs/internals/mvcc/BTREE_PATCHES.md) ─────────────────
+
+/// What each version of row `rowid` of table `table` stores, oldest first.
+fn payload_kinds(db: &MvccTestDb, table: &str, rowid: i64) -> Vec<PayloadKind> {
+    let root_page = get_rows(
+        &db.conn,
+        &format!("SELECT rootpage FROM sqlite_schema WHERE name = '{table}'"),
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let id = RowID::new(
+        db.mvcc_store.get_table_id_from_root_page(root_page),
+        RowKey::Int(rowid),
+    );
+    db.mvcc_store
+        .rows
+        .get(&id)
+        .map(|entry| {
+            entry
+                .value()
+                .read()
+                .iter()
+                .map(|rv| rv.payload_kind)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+const LONG_TEXT: &str = "a text that makes the record long, so that a patch of one column is small";
+
+fn btree_rows(db: &MvccTestDb, rows: i64) {
+    db.conn
+        .execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER, c INTEGER, d TEXT)")
+        .unwrap();
+    for a in 1..=rows {
+        db.conn
+            .execute(format!(
+                "INSERT INTO t VALUES ({a}, {}, {}, '{LONG_TEXT}')",
+                a * 10,
+                a * 100
+            ))
+            .unwrap();
+    }
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+}
+
+fn row_of_t(conn: &Arc<Connection>, a: i64) -> Vec<Vec<Value>> {
+    get_rows(conn, &format!("SELECT a, b, c, d FROM t WHERE a = {a}"))
+}
+
+fn t_row(a: i64, b: i64, c: i64) -> Vec<Value> {
+    vec![
+        Value::from_i64(a),
+        Value::from_i64(b),
+        Value::from_i64(c),
+        Value::build_text(LONG_TEXT),
+    ]
+}
+
+/// The commit of an UPDATE of a B-tree row stores a patch of the B-tree record
+/// in place of the record of the new version. Before the commit, the version
+/// keeps its record, because the commit writes it to the logical log.
+#[test]
+fn an_update_of_a_btree_row_stores_a_patch_after_its_commit() {
+    let db = MvccTestDb::new();
+    btree_rows(&db, 3);
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("UPDATE t SET b = 21 WHERE a = 2").unwrap();
+    assert_eq!(
+        payload_kinds(&db, "t", 2),
+        [PayloadKind::Record, PayloadKind::Record]
+    );
+    db.conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        payload_kinds(&db, "t", 2),
+        [PayloadKind::Record, PayloadKind::BtreePatch]
+    );
+    assert_eq!(row_of_t(&db.conn, 2), vec![t_row(2, 21, 200)]);
+    assert_eq!(
+        get_rows(&db.conn, "SELECT a, b, c, d FROM t"),
+        vec![t_row(1, 10, 100), t_row(2, 21, 200), t_row(3, 30, 300)]
+    );
+}
+
+#[test]
+fn an_update_keeps_its_record_when_the_switch_is_off() {
+    let db = MvccTestDb::new();
+    db.mvcc_store.set_btree_patches_enabled(false);
+    btree_rows(&db, 1);
+    db.conn.execute("UPDATE t SET b = 11 WHERE a = 1").unwrap();
+    assert_eq!(
+        payload_kinds(&db, "t", 1),
+        [PayloadKind::Record, PayloadKind::Record]
+    );
+    assert_eq!(row_of_t(&db.conn, 1), vec![t_row(1, 11, 100)]);
+}
+
+/// A patch that is more than half of the record saves little memory, so the
+/// version keeps its record.
+#[test]
+fn an_update_of_most_of_a_record_keeps_the_record() {
+    let db = MvccTestDb::new();
+    btree_rows(&db, 1);
+    db.conn
+        .execute(
+            "UPDATE t SET d = 'another text of about the same length, which changes most bytes'",
+        )
+        .unwrap();
+    assert_eq!(
+        payload_kinds(&db, "t", 1),
+        [PayloadKind::Record, PayloadKind::Record]
+    );
+}
+
+/// The second version of a row gets a patch that also sets the column of the
+/// first patch. Both patches go from the same B-tree record.
+#[test]
+fn a_second_update_keeps_the_columns_of_the_first_patch() {
+    let db = MvccTestDb::new();
+    btree_rows(&db, 2);
+    db.conn.execute("UPDATE t SET b = 11 WHERE a = 1").unwrap();
+    db.conn.execute("UPDATE t SET c = 101 WHERE a = 1").unwrap();
+    assert_eq!(
+        payload_kinds(&db, "t", 1),
+        [
+            PayloadKind::Record,
+            PayloadKind::BtreePatch,
+            PayloadKind::BtreePatch
+        ]
+    );
+    assert_eq!(row_of_t(&db.conn, 1), vec![t_row(1, 11, 101)]);
+    // The second update sets b back to its B-tree value.
+    db.conn.execute("UPDATE t SET b = 10 WHERE a = 1").unwrap();
+    assert_eq!(row_of_t(&db.conn, 1), vec![t_row(1, 10, 101)]);
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(row_of_t(&db.conn, 1), vec![t_row(1, 10, 101)]);
+    assert_eq!(
+        get_rows(&db.conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+}
+
+/// Updates in one transaction keep their records until the commit. The last
+/// version stores one patch from the B-tree record. A rolled-back savepoint
+/// leaves the patch of the version that it restores.
+#[test]
+fn updates_in_one_transaction_store_one_patch() {
+    let db = MvccTestDb::new();
+    btree_rows(&db, 2);
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("UPDATE t SET b = 11 WHERE a = 1").unwrap();
+    db.conn.execute("UPDATE t SET c = 101 WHERE a = 1").unwrap();
+    db.conn.execute("SAVEPOINT s").unwrap();
+    db.conn.execute("UPDATE t SET b = 12 WHERE a = 1").unwrap();
+    db.conn.execute("ROLLBACK TO s").unwrap();
+    db.conn.execute("RELEASE s").unwrap();
+    db.conn.execute("COMMIT").unwrap();
+    let kinds = payload_kinds(&db, "t", 1);
+    assert_eq!(kinds.last(), Some(&PayloadKind::BtreePatch), "{kinds:?}");
+    assert_eq!(row_of_t(&db.conn, 1), vec![t_row(1, 11, 101)]);
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(row_of_t(&db.conn, 1), vec![t_row(1, 11, 101)]);
+}
+
+/// A reader that began before the update reads the B-tree row. A reader that
+/// begins after it reads the B-tree row with the patch.
+#[test]
+fn readers_before_and_after_a_patched_update_see_their_snapshots() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    writer
+        .execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER, c INTEGER, d TEXT)")
+        .unwrap();
+    writer
+        .execute(format!("INSERT INTO t VALUES (1, 10, 100, '{LONG_TEXT}')"))
+        .unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let old_reader = db.connect();
+    old_reader.execute("BEGIN").unwrap();
+    assert_eq!(row_of_t(&old_reader, 1), vec![t_row(1, 10, 100)]);
+
+    writer.execute("UPDATE t SET b = 11 WHERE a = 1").unwrap();
+    assert_eq!(row_of_t(&old_reader, 1), vec![t_row(1, 10, 100)]);
+    assert_eq!(row_of_t(&writer, 1), vec![t_row(1, 11, 100)]);
+    old_reader.execute("COMMIT").unwrap();
+    assert_eq!(row_of_t(&old_reader, 1), vec![t_row(1, 11, 100)]);
+}
+
+/// The checkpoint writes the record that a patch makes, and the record
+/// survives a restart.
+#[test]
+fn the_checkpoint_writes_the_record_of_a_patched_version() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER, c INTEGER, d TEXT)")
+        .unwrap();
+    for a in 1..=20 {
+        conn.execute(format!(
+            "INSERT INTO t VALUES ({a}, {}, {}, '{LONG_TEXT}')",
+            a * 10,
+            a * 100
+        ))
+        .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("UPDATE t SET b = b + 1 WHERE a % 2 = 0")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let expected: Vec<_> = (1..=20)
+        .map(|a| t_row(a, a * 10 + i64::from(a % 2 == 0), a * 100))
+        .collect();
+    assert_eq!(get_rows(&conn, "SELECT a, b, c, d FROM t"), expected);
+    conn.close().unwrap();
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(get_rows(&conn, "SELECT a, b, c, d FROM t"), expected);
+    assert_eq!(
+        get_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+}
+
+/// Recovery replays the full records from the logical log, so the patched
+/// versions come back with their records.
+#[test]
+fn recovery_replays_the_records_of_patched_versions() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER, c INTEGER, d TEXT)")
+        .unwrap();
+    conn.execute(format!("INSERT INTO t VALUES (1, 10, 100, '{LONG_TEXT}')"))
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("UPDATE t SET b = 11 WHERE a = 1").unwrap();
+    conn.execute("UPDATE t SET c = 101 WHERE a = 1").unwrap();
+    conn.close().unwrap();
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(row_of_t(&conn, 1), vec![t_row(1, 11, 101)]);
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(row_of_t(&conn, 1), vec![t_row(1, 11, 101)]);
+}
+
+/// A delete of a patched version, and its rollback.
+#[test]
+fn a_delete_of_a_patched_version_and_its_rollback() {
+    let db = MvccTestDb::new();
+    btree_rows(&db, 3);
+    db.conn.execute("UPDATE t SET b = 21 WHERE a = 2").unwrap();
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("DELETE FROM t WHERE a = 2").unwrap();
+    assert!(row_of_t(&db.conn, 2).is_empty());
+    db.conn.execute("ROLLBACK").unwrap();
+    assert_eq!(row_of_t(&db.conn, 2), vec![t_row(2, 21, 200)]);
+    db.conn.execute("DELETE FROM t WHERE a = 2").unwrap();
+    assert_eq!(
+        get_rows(&db.conn, "SELECT a FROM t"),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(3)]]
+    );
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        get_rows(&db.conn, "SELECT a FROM t"),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(3)]]
+    );
+}
+
+/// After ADD COLUMN, the B-tree records have fewer columns than the new
+/// versions. The patch sets the new column.
+#[test]
+fn a_patch_adds_the_columns_that_the_btree_record_does_not_have() {
+    let db = MvccTestDb::new();
+    btree_rows(&db, 2);
+    db.conn
+        .execute("ALTER TABLE t ADD COLUMN e INTEGER DEFAULT 7")
+        .unwrap();
+    db.conn.execute("UPDATE t SET b = 11 WHERE a = 1").unwrap();
+    assert_eq!(
+        payload_kinds(&db, "t", 1),
+        [PayloadKind::Record, PayloadKind::BtreePatch]
+    );
+    let expected = vec![
+        vec![Value::from_i64(1), Value::from_i64(11), Value::from_i64(7)],
+        vec![Value::from_i64(2), Value::from_i64(20), Value::from_i64(7)],
+    ];
+    assert_eq!(get_rows(&db.conn, "SELECT a, b, e FROM t"), expected);
+    db.conn.execute("UPDATE t SET e = 8 WHERE a = 1").unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        get_rows(&db.conn, "SELECT a, b, e FROM t"),
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(11), Value::from_i64(8)],
+            vec![Value::from_i64(2), Value::from_i64(20), Value::from_i64(7)],
+        ]
+    );
+}
+
+/// The B-tree record of a long row is on overflow pages.
+#[test]
+fn a_patch_of_a_row_on_overflow_pages() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER, d TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO t VALUES (1, 10, printf('%.*c', 20000, 'x'))")
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    db.conn.execute("UPDATE t SET b = 11 WHERE a = 1").unwrap();
+    assert_eq!(
+        payload_kinds(&db, "t", 1),
+        [PayloadKind::Record, PayloadKind::BtreePatch]
+    );
+    assert_eq!(
+        get_rows(&db.conn, "SELECT b, length(d), substr(d, 19999) FROM t"),
+        vec![vec![
+            Value::from_i64(11),
+            Value::from_i64(20000),
+            Value::build_text("xx")
+        ]]
+    );
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        get_rows(&db.conn, "SELECT b, length(d) FROM t"),
+        vec![vec![Value::from_i64(11), Value::from_i64(20000)]]
+    );
+}
+
+/// The commit writes the primary key of each row version that a transaction
+/// with portable logical changes ends, and it reads the key from the record of
+/// the version. A delete of a patched version gives the record to the store.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_portable_delete_of_a_patched_version_logs_its_primary_key() {
+    let db = portable_db_with_a_patched_item();
+    db.conn
+        .execute("DELETE FROM items WHERE id = 'item-a'")
+        .unwrap();
+    assert_eq!(
+        last_logged_deleted_primary_key(&db.conn),
+        vec![Value::build_text("item-a")]
+    );
+}
+
+/// The DO UPDATE of an UPSERT ends the version that it replaces without a
+/// delete.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_portable_upsert_of_a_patched_version_logs_its_primary_key() {
+    let db = portable_db_with_a_patched_item();
+    db.conn
+        .execute("INSERT INTO items VALUES ('item-a', 0, 'x') ON CONFLICT(id) DO UPDATE SET n = 3")
+        .unwrap();
+    assert_eq!(
+        last_logged_deleted_primary_key(&db.conn),
+        vec![Value::build_text("item-a")]
+    );
+    assert_eq!(
+        get_rows(&db.conn, "SELECT id, n FROM items"),
+        vec![vec![Value::build_text("item-a"), Value::from_i64(3)]]
+    );
+}
+
+/// A transaction can end a version while the commit of the transaction that
+/// wrote the version still runs. That commit then keeps the record in the
+/// version, because the later commit reads the primary key from it.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_version_that_another_transaction_ended_keeps_its_record() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    writer
+        .execute("CREATE TABLE items(id TEXT PRIMARY KEY, n INTEGER, payload TEXT)")
+        .unwrap();
+    // More rows than one chunk of RewriteLiveVersions, so the commit of the
+    // update yields between two chunks.
+    writer
+        .execute(format!(
+            "INSERT INTO items SELECT 'item-' || value, 1, '{LONG_TEXT}' FROM generate_series(1, 1100)"
+        ))
+        .unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let store = db.get_mvcc_store();
+    let mut update = writer.prepare("UPDATE items SET n = 2").unwrap();
+    let tx_id = loop {
+        assert!(matches!(
+            update.step().unwrap(),
+            StepResult::Yield | StepResult::IO
+        ));
+        let Some(tx_id) = writer.get_mv_tx_id() else {
+            continue;
+        };
+        let state = store.txs.get(&tx_id).unwrap().value().state.load();
+        if matches!(state, TransactionState::Committed(_)) {
+            break tx_id;
+        }
+    };
+
+    // A row in the second chunk: its new version still holds its record, and
+    // the commit has not stored its patch yet.
+    let rowid = store
+        .rows
+        .iter()
+        .find_map(|entry| {
+            let versions = entry.value().read();
+            let RowKey::Int(rowid) = entry.key().row_id else {
+                return None;
+            };
+            versions
+                .last()
+                .is_some_and(|rv| rv.begin() == Some(TxTimestampOrID::TxID(tx_id)))
+                .then_some(rowid)
+        })
+        .expect("the commit stopped before it rewrote the second chunk");
+    let id = format!("item-{rowid}");
+
+    let other = db.connect();
+    other.set_portable_logical_changes_enabled(true);
+    other.execute("BEGIN CONCURRENT").unwrap();
+    other
+        .execute(format!(
+            "INSERT INTO items VALUES ('{id}', 0, 'x') ON CONFLICT(id) DO UPDATE SET n = 3"
+        ))
+        .unwrap();
+    update.run_ignore_rows().unwrap();
+    drop(update);
+    other.execute("COMMIT").unwrap();
+    assert_eq!(
+        last_logged_deleted_primary_key(&other),
+        vec![Value::build_text(id.clone())]
+    );
+    assert_eq!(
+        get_rows(&other, &format!("SELECT n FROM items WHERE id = '{id}'")),
+        vec![vec![Value::from_i64(3)]]
+    );
+}
+
+/// A database with portable logical changes, and a table whose primary key is
+/// not the rowid. The current version of its row stores a B-tree patch.
+#[cfg(feature = "conn_raw_api")]
+fn portable_db_with_a_patched_item() -> MvccTestDb {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id TEXT PRIMARY KEY, n INTEGER, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute(format!(
+            "INSERT INTO items VALUES ('item-a', 1, '{LONG_TEXT}')"
+        ))
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    db.conn
+        .execute("UPDATE items SET n = 2 WHERE id = 'item-a'")
+        .unwrap();
+    assert_eq!(
+        payload_kinds(&db, "items", 1).last(),
+        Some(&PayloadKind::BtreePatch)
+    );
+    db
+}
+
+/// The primary key in the last DELETE_TABLE op of a user table in the logical
+/// log.
+#[cfg(feature = "conn_raw_api")]
+fn last_logged_deleted_primary_key(conn: &Arc<Connection>) -> Vec<Value> {
+    let pk_records: Vec<_> = collect_mvcc_recovery_ops(conn)
+        .into_iter()
+        .filter_map(|op| match op {
+            ParsedOp::DeleteTable {
+                rowid,
+                pk_record_bytes,
+                ..
+            } if rowid.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID => Some(pk_record_bytes),
+            _ => None,
+        })
+        .collect();
+    ImmutableRecord::from_bin_record(
+        crate::types::value_blob_from_slice(pk_records.last().expect("a data DELETE op"))
+            .expect(crate::alloc::ALLOC_ERR_MSG),
+    )
+    .get_values_owned()
+    .unwrap()
+}
+
+/// The rows of `sql`, or the text of its error.
+fn rows_or_error(
+    conn: &Arc<Connection>,
+    sql: &str,
+) -> std::result::Result<Vec<Vec<Value>>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|err| err.to_string())?;
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })
+    .map_err(|err| err.to_string())?;
+    Ok(rows)
+}
+
+/// Runs the same random statements on a database with B-tree patches and on
+/// one without them, and compares every result. Returns whether a version of
+/// the first database stored a B-tree patch.
+fn compare_with_and_without_btree_patches(seed: u64, steps: usize) -> bool {
+    let open = |patches: bool| {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        db.get_db()
+            .get_mv_store()
+            .clone()
+            .unwrap()
+            .set_btree_patches_enabled(patches);
+        let writer = db.connect();
+        let reader = db.connect();
+        (db, writer, reader)
+    };
+    let with = open(true);
+    let without = open(false);
+    let checkpoint = "PRAGMA wal_checkpoint(TRUNCATE)";
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut setup = vec![
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER, c INTEGER, d TEXT, e BLOB)".to_string(),
+        "CREATE INDEX t_c ON t(c)".to_string(),
+    ];
+    for a in 1..=60 {
+        setup.push(format!(
+            "INSERT INTO t VALUES ({a}, {}, {}, '{LONG_TEXT} {a}', x'')",
+            a * 10,
+            a % 7
+        ));
+    }
+    setup.push(checkpoint.to_string());
+    for sql in &setup {
+        for (_, writer, _) in [&with, &without] {
+            writer.execute(sql).unwrap();
+        }
+    }
+    let with_store = with.0.get_db().get_mv_store().clone().unwrap();
+    let mut seen_patches = false;
+    let mut writer_in_tx = false;
+    let mut reader_in_tx = false;
+    let mut savepoint = false;
+    let mut next_rowid = 61;
+    for step in 0..steps {
+        for entry in with_store.rows.iter() {
+            for rv in entry.value().read().iter() {
+                seen_patches |= rv.payload_kind == PayloadKind::BtreePatch;
+            }
+        }
+        let a = rng.random_range(1..next_rowid);
+        let (on_reader, sql) = match rng.random_range(0..100) {
+            0..=24 => {
+                let set = match rng.random_range(0..5) {
+                    0 => format!("b = {}", rng.random_range(0..1000)),
+                    1 => "b = b + 1".to_string(),
+                    2 => format!("c = {}", rng.random_range(0..7)),
+                    3 => format!("d = '{LONG_TEXT} {}'", rng.random_range(0..50)),
+                    _ => "e = x'0102'".to_string(),
+                };
+                (false, format!("UPDATE t SET {set} WHERE a = {a}"))
+            }
+            25..=29 => (
+                false,
+                format!(
+                    "UPDATE t SET b = b + 3 WHERE a BETWEEN {a} AND {}",
+                    a + rng.random_range(0..10)
+                ),
+            ),
+            30..=33 => {
+                next_rowid += 1;
+                (
+                    false,
+                    format!(
+                        "INSERT INTO t VALUES ({}, 1, 2, '{LONG_TEXT}', NULL)",
+                        next_rowid - 1
+                    ),
+                )
+            }
+            34..=36 => (false, format!("DELETE FROM t WHERE a = {a}")),
+            37..=40 => (false, checkpoint.to_string()),
+            41..=44 => {
+                writer_in_tx = !writer_in_tx;
+                savepoint = false;
+                let end = if rng.random_bool(0.7) {
+                    "COMMIT"
+                } else {
+                    "ROLLBACK"
+                };
+                (false, if writer_in_tx { "BEGIN" } else { end }.to_string())
+            }
+            45..=47 if writer_in_tx => {
+                savepoint = !savepoint;
+                let end = if rng.random_bool(0.5) {
+                    "ROLLBACK TO sp"
+                } else {
+                    "RELEASE sp"
+                };
+                (
+                    false,
+                    if savepoint { "SAVEPOINT sp" } else { end }.to_string(),
+                )
+            }
+            48..=53 => {
+                reader_in_tx = !reader_in_tx;
+                (
+                    true,
+                    if reader_in_tx { "BEGIN" } else { "COMMIT" }.to_string(),
+                )
+            }
+            54..=64 => (
+                rng.random_bool(0.5),
+                format!("SELECT * FROM t WHERE a = {a}"),
+            ),
+            65..=72 => (
+                rng.random_bool(0.5),
+                "SELECT * FROM t ORDER BY a".to_string(),
+            ),
+            73..=78 => (
+                rng.random_bool(0.5),
+                "SELECT a, b FROM t ORDER BY a DESC LIMIT 7".to_string(),
+            ),
+            79..=84 => (
+                rng.random_bool(0.5),
+                format!("SELECT a, b, d FROM t WHERE c = {}", rng.random_range(0..7)),
+            ),
+            85..=89 => (
+                rng.random_bool(0.5),
+                "SELECT count(*), sum(b), sum(c), group_concat(hex(e)) FROM t".to_string(),
+            ),
+            _ => (
+                rng.random_bool(0.5),
+                format!(
+                    "SELECT * FROM t WHERE a >= {a} AND a < {} ORDER BY a",
+                    a + 5
+                ),
+            ),
+        };
+        let results: Vec<_> = [&with, &without]
+            .into_iter()
+            .map(|(_, writer, reader)| {
+                let conn = if on_reader { reader } else { writer };
+                rows_or_error(conn, &sql)
+            })
+            .collect();
+        assert_eq!(
+            results[0], results[1],
+            "seed {seed}, step {step}, on_reader {on_reader}: {sql}"
+        );
+        if results[0].is_err() && sql == "BEGIN" {
+            if on_reader {
+                reader_in_tx = false;
+            } else {
+                writer_in_tx = false;
+            }
+        }
+    }
+    for (_, writer, reader) in [&with, &without] {
+        let _ = rows_or_error(reader, "COMMIT");
+        let _ = rows_or_error(writer, "COMMIT");
+    }
+    let finals: Vec<_> = [&with, &without]
+        .into_iter()
+        .map(|(_, writer, _)| {
+            writer.execute(checkpoint).unwrap();
+            (
+                rows_or_error(writer, "SELECT * FROM t ORDER BY a"),
+                rows_or_error(writer, "PRAGMA integrity_check"),
+            )
+        })
+        .collect();
+    assert_eq!(finals[0], finals[1], "seed {seed}: final state");
+    seen_patches
+}
+
+#[test]
+fn btree_patches_give_the_same_results_with_the_truncate_checkpoint() {
+    for seed in 0..4 {
+        let seen_patches = compare_with_and_without_btree_patches(seed, 600);
+        assert!(
+            seen_patches,
+            "seed {seed}: no version stored a B-tree patch"
+        );
+    }
 }
