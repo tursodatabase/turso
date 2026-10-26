@@ -30,13 +30,15 @@ RNG seed (`profile::WORKLOAD_RNG_SEED`) so workloads are identical across runs.
 
 The `mvcc-row-memory` binary measures the heap that one MVCC transaction keeps
 for each row it writes: one `INSERT`, `UPDATE` or `DELETE` over every row of
-`t(id INTEGER PRIMARY KEY, v BLOB)`. `update` and `delete` change rows that a
-checkpoint already wrote to the B-tree. Use it to measure changes to MvStore
-data structures (version chains, write sets, tombstones).
+`t(id INTEGER PRIMARY KEY, v BLOB)`. `update`, `update-counter` and `delete`
+change rows that a checkpoint already wrote to the B-tree. `update` writes a
+new payload. `update-counter` adds one to an extra integer column `n` and keeps
+the payload, so it shows the B-tree patches of updated rows. Use it to measure
+changes to MvStore data structures (version chains, write sets, tombstones).
 
 ```bash
 cargo run -p memory-benchmark --bin mvcc-row-memory -- \
-  --statement insert|update|delete --rows 100000 --payload-bytes 100 \
+  --statement insert|update|update-counter|delete --rows 100000 --payload-bytes 100 \
   --mode mvcc|wal --dhat-file /tmp/rows.json
 python3 perf/memory/analyze-dhat.py /tmp/rows.json --sort-by eb --top 10
 ```

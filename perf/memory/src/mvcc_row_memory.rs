@@ -24,13 +24,18 @@ struct Args {
     dhat_file: PathBuf,
 }
 
-/// The statement that the measured transaction runs. `update` and `delete`
-/// change rows that a checkpoint already wrote to the B-tree.
+/// The statement that the measured transaction runs. `update`,
+/// `update-counter` and `delete` change rows that a checkpoint already wrote
+/// to the B-tree.
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum Statement {
     Insert,
+    /// Writes a new payload into each row.
     Update,
+    /// Adds one to an integer column of each row, and keeps the payload. Only
+    /// this statement gives the table the integer column.
+    UpdateCounter,
     Delete,
 }
 
@@ -67,7 +72,11 @@ async fn main() -> Result<()> {
 
 async fn prepare_table(db_path: &str, args: &Args) -> Result<()> {
     let (_db, conn) = open(db_path, args.mode).await?;
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)", ())
+    let columns = match args.statement {
+        Statement::UpdateCounter => "id INTEGER PRIMARY KEY, n INTEGER, v BLOB",
+        _ => "id INTEGER PRIMARY KEY, v BLOB",
+    };
+    conn.execute(&format!("CREATE TABLE t({columns})"), ())
         .await?;
     if !matches!(args.statement, Statement::Insert) {
         conn.execute(&insert_sql(args), ()).await?;
@@ -86,6 +95,7 @@ async fn measure(db_path: &str, args: &Args) -> Result<Report> {
     let sql = match args.statement {
         Statement::Insert => insert_sql(args),
         Statement::Update => format!("UPDATE t SET v = randomblob({})", args.payload_bytes),
+        Statement::UpdateCounter => "UPDATE t SET n = n + 1".to_string(),
         Statement::Delete => "DELETE FROM t".to_string(),
     };
 
@@ -126,8 +136,12 @@ async fn release_deferred_frees(conn: &Connection) -> Result<()> {
 }
 
 fn insert_sql(args: &Args) -> String {
+    let counter = match args.statement {
+        Statement::UpdateCounter => "0, ",
+        _ => "",
+    };
     format!(
-        "INSERT INTO t SELECT value, randomblob({}) FROM generate_series(1, {})",
+        "INSERT INTO t SELECT value, {counter}randomblob({}) FROM generate_series(1, {})",
         args.payload_bytes, args.rows
     )
 }

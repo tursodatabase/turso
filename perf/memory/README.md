@@ -247,12 +247,15 @@ Existing Criterion profiles retain their separate harness and measurement rules.
 
 `mvcc-row-memory` measures how much heap one MVCC transaction keeps for each
 row that it writes. The transaction runs one statement over every row of table
-`t(id INTEGER PRIMARY KEY, v BLOB)`. `update` and `delete` change rows that a
-checkpoint already wrote to the B-tree.
+`t(id INTEGER PRIMARY KEY, v BLOB)`. `update`, `update-counter` and `delete`
+change rows that a checkpoint already wrote to the B-tree. `update` writes a new
+payload. `update-counter` adds one to an integer column `n` and keeps the
+payload. Only `update-counter` gives the table the column `n`.
 
 ```bash
 cargo run -p memory-benchmark --bin mvcc-row-memory -- --statement insert --rows 100000
 cargo run -p memory-benchmark --bin mvcc-row-memory -- --statement update --rows 100000
+cargo run -p memory-benchmark --bin mvcc-row-memory -- --statement update-counter --rows 100000
 cargo run -p memory-benchmark --bin mvcc-row-memory -- --statement delete --rows 100000
 python3 perf/memory/analyze-dhat.py dhat-heap.json --sort-by eb --top 10
 ```
