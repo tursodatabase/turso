@@ -7,7 +7,7 @@ use crate::alloc::{TursoAllocator, TursoIteratorExt, TursoTryWithCapacityExt};
 use crate::database::remove_file_from_database_registry;
 use crate::io::{PlatformIO, IO};
 use crate::mvcc::clock::MvccClock;
-use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
+use crate::mvcc::cursor::CursorYieldPoint;
 use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
 use crate::mvcc::database::{CommitYieldPoint, ExclusiveTxYieldPoint};
 use crate::mvcc::persistent_storage::logical_log::{
@@ -1367,7 +1367,7 @@ fn mvcc_passive_auto_checkpoint_retries_publish_while_reader_pinned() {
 
 /// A passive checkpoint that publishes an UNRELATED object's physical roots must NOT invalidate
 /// an open transaction reading a different table. Invalidation is per-root and snapshot-scoped
-/// (see `MvccLazyCursor::new`): a reader is only re-prepared when the specific root it opens was
+/// (see `MvccReader::new`): a reader is only re-prepared when the specific root it opens was
 /// dropped/reused at its snapshot — not whenever any concurrent checkpoint publishes some root.
 #[test]
 fn mvcc_passive_unrelated_root_publication_does_not_invalidate_open_txn() {
@@ -7215,7 +7215,6 @@ fn test_future_row() {
     assert_eq!(row, None);
 }
 
-use crate::mvcc::cursor::MvccLazyCursor;
 use crate::mvcc::database::CommitYieldPoint::LogRecordPrepared;
 use crate::mvcc::database::{MvStore, Row, RowID};
 use crate::schema::IndexColumn;
@@ -7306,45 +7305,36 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
     (db, tx_id, table_id, btree_root_page)
 }
 
+/// Opens a B-tree cursor that reads an MVCC table in transaction `tx_id`.
+fn open_mvcc_table_cursor(
+    db: &MvccTestDb,
+    tx_id: u64,
+    table_id: MVTableId,
+    btree_root_page: i64,
+) -> BTreeCursor {
+    let mut cursor = BTreeCursor::new_table(db.conn.pager.load().clone(), btree_root_page, 1);
+    cursor.install_yield_context(&db.conn);
+    cursor
+        .read_mvcc_table(db.mvcc_store.clone(), &db.conn, tx_id, i64::from(table_id))
+        .unwrap();
+    cursor
+}
+
 #[test]
 fn test_mvcc_cursor_next_yields_with_injected_yield() {
-    let db = MvccTestDb::new();
-    db.conn
-        .execute("CREATE TABLE cursor_yield_test(x INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    let root_page = get_rows(
-        &db.conn,
-        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'cursor_yield_test'",
-    )[0][0]
-        .as_int()
-        .unwrap();
-    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
-    let tx_id = db
-        .mvcc_store
-        .begin_tx(db.conn.pager.load().clone())
-        .unwrap();
+    let (db, tx_id, table_id, btree_root_page) = setup_lazy_db(&[1, 2]);
     db.conn.set_yield_injector(Some(FixedYieldInjector::new([
         CursorYieldPoint::NextStart.point()
     ])));
-
-    let mut cursor = MvccLazyCursor::new(
-        db.mvcc_store.clone(),
-        &db.conn,
-        tx_id,
-        i64::from(table_id),
-        MvccCursorType::Table,
-        Box::new(BTreeCursor::new(
-            db.conn.pager.load().clone(),
-            root_page.abs(),
-            1,
-        )),
-    )
-    .unwrap();
+    let mut cursor = open_mvcc_table_cursor(&db, tx_id, table_id, btree_root_page);
+    assert!(matches!(cursor.rewind().unwrap(), IOResult::Done(())));
 
     let saw_yield = matches!(
         cursor.next().unwrap(),
         IOResult::IO(io) if io.is_explicit_yield()
     );
+    db.conn.set_yield_injector(None);
+    drop(cursor);
     db.mvcc_store
         .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
 
@@ -7686,30 +7676,14 @@ fn test_sequence_watermark_reader_never_skips_committed_rows_fuzz() {
 #[test]
 fn test_lazy_scan_cursor_basic() {
     let (db, tx_id, table_id, btree_root_page) = setup_lazy_db(&[1, 2, 3, 4, 5]);
+    let mut cursor = open_mvcc_table_cursor(&db, tx_id, table_id, btree_root_page);
 
-    let mut cursor = MvccLazyCursor::new(
-        db.mvcc_store.clone(),
-        &db.conn,
-        tx_id,
-        i64::from(table_id),
-        MvccCursorType::Table,
-        Box::new(BTreeCursor::new(
-            db.conn.pager.load().clone(),
-            btree_root_page,
-            1,
-        )),
-    )
-    .unwrap();
-
-    // Check first row
-    let res = cursor.next().unwrap();
+    let res = cursor.rewind().unwrap();
     assert!(matches!(res, IOResult::Done(())));
     assert!(cursor.has_record());
     assert!(!cursor.is_empty());
-    let row = cursor.read_mvcc_current_row().unwrap().unwrap();
-    assert_eq!(row.id.row_id.to_int_or_panic(), 1);
+    assert!(matches!(cursor.rowid().unwrap(), IOResult::Done(Some(1))));
 
-    // Iterate through all rows
     let mut count = 1;
     loop {
         let res = cursor.next().unwrap();
@@ -7720,14 +7694,10 @@ fn test_lazy_scan_cursor_basic() {
             break;
         }
         count += 1;
-        let row = cursor.read_mvcc_current_row().unwrap().unwrap();
-        assert_eq!(row.id.row_id.to_int_or_panic(), count);
+        assert!(matches!(cursor.rowid().unwrap(), IOResult::Done(Some(rowid)) if rowid == count));
     }
-
-    // Should have found 5 rows
     assert_eq!(count, 5);
 
-    // After the last row, is_empty should return true
     let res = cursor.next().unwrap();
     assert!(matches!(res, IOResult::Done(())));
     assert!(!cursor.has_record());
@@ -7739,111 +7709,20 @@ fn test_lazy_scan_cursor_basic() {
 #[test]
 fn test_lazy_scan_cursor_with_gaps() {
     let (db, tx_id, table_id, btree_root_page) = setup_test_db();
+    let mut cursor = open_mvcc_table_cursor(&db, tx_id, table_id, btree_root_page);
 
-    let mut cursor = MvccLazyCursor::new(
-        db.mvcc_store.clone(),
-        &db.conn,
-        tx_id,
-        i64::from(table_id),
-        MvccCursorType::Table,
-        Box::new(BTreeCursor::new(
-            db.conn.pager.load().clone(),
-            btree_root_page,
-            1,
-        )),
-    )
-    .unwrap();
-
-    // Check first row
-    let res = cursor.next().unwrap();
+    let res = cursor.rewind().unwrap();
     assert!(matches!(res, IOResult::Done(())));
-    assert!(cursor.has_record());
-    assert!(!cursor.is_empty());
-    let row = cursor.read_mvcc_current_row().unwrap().unwrap();
-    assert_eq!(row.id.row_id.to_int_or_panic(), 5);
-
-    // Test moving forward and checking IDs
-    let expected_ids = [5, 10, 15, 20, 30];
-    let mut index = 0;
-
-    let IOResult::Done(rowid) = cursor.rowid().unwrap() else {
-        unreachable!();
-    };
-    let rowid = rowid.unwrap();
-    assert_eq!(rowid, expected_ids[index]);
-
-    loop {
-        let res = cursor.next().unwrap();
-        let IOResult::Done(()) = res else {
-            panic!("unexpected next result {res:?}");
+    let mut rowids = Vec::new();
+    while cursor.has_record() {
+        let IOResult::Done(Some(rowid)) = cursor.rowid().unwrap() else {
+            panic!("a positioned cursor must have a rowid");
         };
-        if !cursor.has_record() {
-            break;
-        }
-        index += 1;
-        if index < expected_ids.len() {
-            let IOResult::Done(rowid) = cursor.rowid().unwrap() else {
-                unreachable!();
-            };
-            let rowid = rowid.unwrap();
-            assert_eq!(rowid, expected_ids[index]);
-        }
-    }
-
-    // Should have found all 5 rows
-    assert_eq!(index, expected_ids.len() - 1);
-}
-
-/// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
-/// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
-#[test]
-fn test_cursor_basic() {
-    let (db, tx_id, table_id, btree_root_page) = setup_lazy_db(&[1, 2, 3, 4, 5]);
-
-    let mut cursor = MvccLazyCursor::new(
-        db.mvcc_store.clone(),
-        &db.conn,
-        tx_id,
-        i64::from(table_id),
-        MvccCursorType::Table,
-        Box::new(BTreeCursor::new(
-            db.conn.pager.load().clone(),
-            btree_root_page,
-            1,
-        )),
-    )
-    .unwrap();
-
-    let _ = cursor.next().unwrap();
-
-    // Check first row
-    assert!(!cursor.is_empty());
-    let row = cursor.read_mvcc_current_row().unwrap().unwrap();
-    assert_eq!(row.id.row_id.to_int_or_panic(), 1);
-
-    // Iterate through all rows
-    let mut count = 1;
-    loop {
+        rowids.push(rowid);
         let res = cursor.next().unwrap();
-        let IOResult::Done(()) = res else {
-            panic!("unexpected next result {res:?}");
-        };
-        if !cursor.has_record() {
-            break;
-        }
-        count += 1;
-        let row = cursor.read_mvcc_current_row().unwrap().unwrap();
-        assert_eq!(row.id.row_id.to_int_or_panic(), count);
+        assert!(matches!(res, IOResult::Done(())));
     }
-
-    // Should have found 5 rows
-    assert_eq!(count, 5);
-
-    // After the last row, is_empty should return true
-    let res = cursor.next().unwrap();
-    assert!(matches!(res, IOResult::Done(())));
-    assert!(!cursor.has_record());
-    assert!(cursor.is_empty());
+    assert_eq!(rowids, vec![5, 10, 15, 20, 30]);
 }
 
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
@@ -7851,71 +7730,48 @@ fn test_cursor_basic() {
 #[test]
 fn test_cursor_with_empty_table() {
     let db = MvccTestDb::new();
-    {
-        // FIXME: force page 1 initialization
-        let pager = db.conn.pager.load().clone();
-        let tx_id = db.mvcc_store.begin_tx(pager).unwrap();
-        commit_tx(db.mvcc_store.clone(), &db.conn, tx_id).unwrap();
-    }
+    db.conn
+        .execute("CREATE TABLE empty_test(x INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    let root_page = get_rows(
+        &db.conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'empty_test'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
     let tx_id = db
         .mvcc_store
         .begin_tx(db.conn.pager.load().clone())
         .unwrap();
-    let table_id = -1; // Empty table
 
-    // Test LazyScanCursor with empty table
-    let mut cursor = MvccLazyCursor::new(
-        db.mvcc_store.clone(),
-        &db.conn,
-        tx_id,
-        table_id,
-        MvccCursorType::Table,
-        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), -table_id, 1)),
-    )
-    .unwrap();
+    let mut cursor = open_mvcc_table_cursor(&db, tx_id, table_id, root_page.abs());
     assert!(cursor.is_empty());
-    let rowid = cursor.rowid().unwrap();
-    assert!(matches!(rowid, IOResult::Done(None)));
+    assert!(matches!(cursor.rowid().unwrap(), IOResult::Done(None)));
+    assert!(matches!(cursor.rewind().unwrap(), IOResult::Done(())));
+    assert!(cursor.is_empty());
+    assert!(matches!(cursor.rowid().unwrap(), IOResult::Done(None)));
 }
 
-/// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
-/// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
+/// What this test checks: a cursor that inserts a row is on that row after
+/// the insert, as a B-tree cursor is, and moves on from it.
+/// Why this matters: a write cursor that moves on from its old position
+/// returns a row twice or skips the rows after the inserted one.
 #[test]
 fn test_cursor_modification_during_scan() {
-    let _ = tracing_subscriber::fmt::try_init();
     let (db, tx_id, table_id, btree_root_page) = setup_lazy_db(&[1, 2, 4, 5]);
+    let mut cursor = open_mvcc_table_cursor(&db, tx_id, table_id, btree_root_page);
 
-    let mut cursor = MvccLazyCursor::new(
-        db.mvcc_store.clone(),
-        &db.conn,
-        tx_id,
-        i64::from(table_id),
-        MvccCursorType::Table,
-        Box::new(BTreeCursor::new(
-            db.conn.pager.load().clone(),
-            btree_root_page,
-            1,
-        )),
-    )
-    .unwrap();
-
-    // Read first row
-    let res = cursor.next().unwrap();
+    let res = cursor.rewind().unwrap();
     assert!(matches!(res, IOResult::Done(())));
-    assert!(cursor.has_record());
-    let first_row = cursor.read_mvcc_current_row().unwrap().unwrap();
-    assert_eq!(first_row.id.row_id.to_int_or_panic(), 1);
+    assert!(matches!(cursor.rowid().unwrap(), IOResult::Done(Some(1))));
 
-    // Insert a new row with ID between existing rows
-    let new_row_id = RowID::new(table_id, RowKey::Int(3));
     let new_row = generate_simple_string_record("new_row");
-
-    let _ = cursor
-        .insert(&BTreeKey::TableRowId((
-            new_row_id.row_id.to_int_or_panic(),
-            Some(&new_row),
-        )))
+    let res = cursor
+        .insert(&BTreeKey::TableRowId((3, Some(&new_row))))
         .unwrap();
+    assert!(matches!(res, IOResult::Done(())));
+    assert!(matches!(cursor.rowid().unwrap(), IOResult::Done(Some(3))));
 
     let mut read_rowids = vec![];
     loop {
@@ -7926,21 +7782,23 @@ fn test_cursor_modification_during_scan() {
         if !cursor.has_record() {
             break;
         }
-        read_rowids.push(
-            cursor
-                .read_mvcc_current_row()
-                .unwrap()
-                .unwrap()
-                .id
-                .row_id
-                .to_int_or_panic(),
-        );
+        let IOResult::Done(Some(rowid)) = cursor.rowid().unwrap() else {
+            panic!("a positioned cursor must have a rowid");
+        };
+        read_rowids.push(rowid);
     }
-    assert_eq!(read_rowids, vec![2, 3, 4, 5]);
-    let res = cursor.next().unwrap();
-    assert!(matches!(res, IOResult::Done(())));
-    assert!(!cursor.has_record());
-    assert!(cursor.is_empty());
+    assert_eq!(read_rowids, vec![4, 5]);
+
+    assert!(matches!(cursor.rewind().unwrap(), IOResult::Done(())));
+    let mut all_rowids = vec![];
+    while cursor.has_record() {
+        let IOResult::Done(Some(rowid)) = cursor.rowid().unwrap() else {
+            panic!("a positioned cursor must have a rowid");
+        };
+        all_rowids.push(rowid);
+        assert!(matches!(cursor.next().unwrap(), IOResult::Done(())));
+    }
+    assert_eq!(all_rowids, vec![1, 2, 3, 4, 5]);
 }
 
 /* States described in the Hekaton paper *for serializability*:
@@ -8385,113 +8243,6 @@ fn test_commit_dependency_speculative_ignore() {
         reader.commit_dep_counter.load(Ordering::Acquire),
         1,
         "speculative ignore should register a commit dependency"
-    );
-}
-
-/// Regression: the forward-scan [`IndexShadowScan`] must NOT evaluate the
-/// shadow predicate (and thus must not fire its `register_commit_dependency`
-/// side effect) for index versions whose keys it merely *steps over*, i.e.
-/// MVCC-only keys with no matching B-tree row. The authoritative
-/// `query_btree_version_is_valid` path only ever evaluates the version chain for
-/// keys that exactly match a B-tree row (`index_rows.get(btree_key)`), so an
-/// eager scan that resolved the shadow bit on every advance would register a
-/// commit dependency on a `Preparing` writer for a row the scan never observes.
-/// That spurious dependency cascade-aborts the reader if that writer aborts.
-///
-/// Setup: B-tree keys 10 and 30 (no MVCC versions), plus a single MVCC-only
-/// tombstone at key 20 deleted by a `Preparing` writer that the reader would
-/// speculatively invalidate. A forward scan checks 10 (scan ahead → visible)
-/// then 30 (scan behind → steps over key 20). Key 20 is never an exact match,
-/// so no dependency may be registered.
-#[test]
-fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
-    use crate::mvcc::cursor::IndexShadowScan;
-
-    let db = MvccTestDb::new();
-    let store = &db.mvcc_store;
-    let table_id = MVTableId::from(-999_i64);
-
-    // Single-column ascending integer index key.
-    let info = std::sync::Arc::new(
-        crate::types::IndexInfo::new(
-            crate::alloc::vec![crate::types::KeyInfo {
-                sort_order: turso_parser::ast::SortOrder::Asc,
-                collation: crate::translate::collate::CollationSeq::Binary,
-                nulls_order: None,
-            }],
-            false,
-            1,
-            false,
-        )
-        .unwrap(),
-    );
-    let idx_key = |v: i64| {
-        let rec = crate::types::ImmutableRecord::from_values(&[Value::from_i64(v)], 1).unwrap();
-        std::sync::Arc::new(
-            SortableIndexKey::new_from_payload_in(&rec, info.clone(), crate::alloc::TursoAllocator)
-                .unwrap(),
-        )
-    };
-
-    // Reader started after the writer's prepared end_ts → speculatively
-    // invalidates the writer's tombstone (the dependency-registering path).
-    let reader_id: TxID = 9_000_100;
-    let writer_id: TxID = 9_000_050;
-    store.txs.insert(
-        writer_id,
-        new_tx_in::<crate::alloc::DynAllocator>(writer_id, 1, TransactionState::Preparing(40)),
-    );
-    store.txs.insert(
-        reader_id,
-        new_tx_in::<crate::alloc::DynAllocator>(reader_id, 100, TransactionState::Active),
-    );
-
-    // MVCC-only tombstone at key 20: committed insert (begin Timestamp) deleted
-    // by the Preparing writer (end TxID). Not present in the B-tree.
-    let key20 = idx_key(20);
-    let row_id = RowID::new(table_id, RowKey::Record(key20.clone()));
-    let tombstone = RowVersion {
-        id: 20,
-        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(5))),
-        end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(writer_id))),
-        row: Row::new_index_row(row_id, 1),
-        btree_resident: false,
-        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-    };
-    let mut tombstone_versions =
-        <RowVersionChain<crate::alloc::DynAllocator> as crate::alloc::TursoVecInExt<
-            RowVersion,
-            crate::alloc::DynAllocator,
-        >>::new_in(crate::alloc::DynAllocator::default());
-    tombstone_versions.push(tombstone);
-    store
-        .get_or_create_index_rows(table_id)
-        .unwrap()
-        .value()
-        .insert(key20, Arc::new(RwLock::new(tombstone_versions)));
-
-    let mut scan = IndexShadowScan::default();
-    // B-tree key 10: scan seeds at the first index key >= 10 (key 20), which is
-    // ahead → row visible, predicate not evaluated.
-    assert!(scan
-        .btree_row_is_valid(store, table_id, reader_id, &idx_key(10))
-        .unwrap());
-    // B-tree key 30: scan (at key 20) is behind → steps over the tombstone.
-    // It must advance past it WITHOUT evaluating the shadow predicate.
-    assert!(scan
-        .btree_row_is_valid(store, table_id, reader_id, &idx_key(30))
-        .unwrap());
-
-    let reader = store.txs.get(&reader_id).unwrap();
-    assert_eq!(
-        reader.value().commit_dep_counter.load(Ordering::Acquire),
-        0,
-        "scan registered a spurious commit dependency for a key it only stepped over"
-    );
-    let writer = store.txs.get(&writer_id).unwrap();
-    assert!(
-        writer.value().commit_dep_set.lock().is_empty(),
-        "writer's commit-dep set must stay empty: reader never observed the tombstoned row"
     );
 }
 

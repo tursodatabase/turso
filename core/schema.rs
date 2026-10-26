@@ -10,7 +10,6 @@ use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::namespace::NamespaceId;
 use crate::return_if_io;
 use crate::stats::AnalyzeStats;
-use crate::sync::RwLock;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
@@ -121,7 +120,7 @@ use crate::util::{
     type_from_name, UnparsedFromSqlIndex,
 };
 use crate::Result;
-use crate::{bail_parse_error, LimboError, MvCursor, Pager, SymbolTable, ValueRef, VirtualTable};
+use crate::{bail_parse_error, LimboError, Pager, SymbolTable, ValueRef, VirtualTable};
 use bitflags::bitflags;
 use column_info::{ColumnInfo, NewColumnInfoParams};
 use core::fmt;
@@ -2187,12 +2186,11 @@ impl Schema {
     pub fn make_from_btree(
         &mut self,
         state: &mut MakeFromBtreeState,
-        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: &Arc<Pager>,
         syms: &SymbolTable,
         dialect: &dyn crate::dialect::Dialect,
     ) -> IOResultOr<()> {
-        let result = self.make_from_btree_internal(state, mv_cursor, pager, syms, dialect);
+        let result = self.make_from_btree_internal(state, pager, syms, dialect);
         if result.is_err() {
             state.cleanup(pager);
         } else if let Ok(IOResult::Done(..)) = result {
@@ -2207,7 +2205,6 @@ impl Schema {
     fn make_from_btree_internal(
         &mut self,
         state: &mut MakeFromBtreeState,
-        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: &Arc<Pager>,
         syms: &SymbolTable,
         dialect: &dyn crate::dialect::Dialect,
@@ -2216,13 +2213,6 @@ impl Schema {
             tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
             match &state.phase {
                 MakeFromBtreePhase::Init => {
-                    if mv_cursor.is_some() {
-                        return Err(crate::LimboError::ParseError(
-                            "MVCC is not supported for make_from_btree schema recovery".to_string(),
-                        )
-                        .into());
-                    }
-
                     state.cursor = Some(BTreeCursor::new_table(Arc::clone(pager), 1, 10));
                     pager.begin_read_tx()?;
                     state.read_tx_active = true;
@@ -2359,7 +2349,7 @@ impl Schema {
                             acc.dbsp_state_index_roots,
                             acc.from_sql_indexes,
                             acc.automatic_indices,
-                            mv_cursor.is_some(),
+                            false,
                         )?;
 
                         state.phase = MakeFromBtreePhase::Done;

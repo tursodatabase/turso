@@ -1712,7 +1712,6 @@ impl Database {
                     let dialect = conn.dialect();
                     let result = schema.make_from_btree(
                         &mut state.make_from_btree_state,
-                        None,
                         pager,
                         &syms,
                         dialect.as_ref(),

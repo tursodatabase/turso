@@ -248,8 +248,6 @@ pub enum TempStore {
 
 pub(crate) type MvStore = mvcc::MvStore<mvcc::MvccClock, alloc::DynAllocator>;
 
-pub(crate) type MvCursor = mvcc::cursor::MvccLazyCursor<mvcc::MvccClock, alloc::DynAllocator>;
-
 pub struct QueryRunner<'a> {
     conn: &'a Arc<Connection>,
     statements: &'a str,
