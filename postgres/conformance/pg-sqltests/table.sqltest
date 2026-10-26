@@ -407,3 +407,20 @@ test drop-view-on-a-table-errors {
 expect error {
     "t" is not a view
 }
+
+test table-domain-not-null-default-fills-omitted-column {
+    CREATE DOMAIN nn_default AS int NOT NULL DEFAULT 3;
+    CREATE TABLE t (a nn_default, b int);
+    INSERT INTO t(b) VALUES (2);
+    SELECT a, b FROM t;
+}
+expect {
+    3|2
+}
+
+test table-domain-not-null-default-rejects-explicit-null {
+    CREATE DOMAIN nn_default AS int NOT NULL DEFAULT 3;
+    CREATE TABLE t (a nn_default, b int);
+    INSERT INTO t VALUES (NULL, 2);
+}
+expect error {}
