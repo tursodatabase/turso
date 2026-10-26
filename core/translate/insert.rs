@@ -24,10 +24,11 @@ use crate::{
             walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
-            build_index_affinity_string, child_row_lookup, emit_fk_restrict_halt,
-            emit_fk_violation, emit_guarded_fk_decrement, emit_skip_if_any_null,
-            fk_constraint_info, index_probe, index_scan_match_any, open_read_index,
-            open_read_table, table_scan_match_any, ChildRowLookup, ForeignKeyActions,
+            build_index_affinity_string, child_row_lookup, copy_with_affinity,
+            emit_fk_restrict_halt, emit_fk_violation, emit_guarded_fk_decrement,
+            emit_skip_if_any_null, fk_constraint_info, index_probe, index_scan_match_any,
+            open_read_index, open_read_table, table_scan_match_any, ChildRowLookup,
+            ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -4330,22 +4331,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         match child_row_lookup(&pref, database_id, resolver) {
             ChildRowLookup::Probe(ix) => {
                 let icur = open_read_index(program, &ix, database_id);
-                // Copy key into probe regs and apply child-index affinities
-                let probe_start = program.alloc_registers(n_cols);
-                for i in 0..n_cols {
-                    program.emit_insn(Insn::Copy {
-                        src_reg: new_pk_start + i,
-                        dst_reg: probe_start + i,
-                        extra_amount: 0,
-                    });
-                }
-                if let Some(count) = NonZeroUsize::new(n_cols) {
-                    program.emit_insn(Insn::Affinity {
-                        start_reg: probe_start,
-                        count,
-                        affinities: build_index_affinity_string(&ix, child_tbl),
-                    });
-                }
+                let probe_start = copy_with_affinity(program, new_pk_start, n_cols, &ix, child_tbl);
 
                 // Decrement once per matching child row
                 index_scan_match_any(

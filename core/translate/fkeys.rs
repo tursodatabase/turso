@@ -302,7 +302,7 @@ pub fn open_read_table(program: &mut ProgramBuilder, tbl: &Arc<BTreeTable>, db: 
 /// Copy `len` registers starting at `src_start` to a fresh block and apply index affinities.
 /// Returns the destination start register.
 #[inline]
-fn copy_with_affinity(
+pub(super) fn copy_with_affinity(
     program: &mut ProgramBuilder,
     src_start: usize,
     len: usize,
