@@ -600,7 +600,29 @@ LIMIT 20;
 `pg_catalog.pg_class` lists public-schema sequences with `relkind = 'S'`,
 including sequences created for `SERIAL` columns. Their OIDs are distinct from
 table and index OIDs in the same catalog snapshot. Internal SQLite
-AUTOINCREMENT sequences are excluded. Sequence dumping is not yet fully supported.
+AUTOINCREMENT sequences are excluded. `pg_catalog.pg_sequence` exposes each
+public-schema sequence's type, start, increment, minimum, maximum, cycle flag,
+and effective cache size (always 1). Its `seqrelid` matches `pg_class.oid`.
+The PostgreSQL frontend stores declared sequence types in its own metadata
+table. New sequences preserve `smallint`, `integer`, or `bigint` across
+database reopen without changing core sequence records. Sequences created by older versions have no
+stored type and are reported as `bigint`; their existing bounds are preserved.
+`pg_sequences.data_type` reports the same type.
+
+For sequence dumping, the PostgreSQL frontend supports a top-level, single-source
+`SELECT last_value, is_called FROM schema.sequence`. The sequence name must be
+schema-qualified; general sequence relation reads through views, CTEs, or joins
+are outside this support.
+These columns expose the persisted counter and whether its value has already
+been issued. The read does not advance the sequence and works from a connection
+that has never called `nextval`. `last_value` is a bigint and `is_called` is a
+boolean, allowing `pg_dump` to preserve both through `setval` on restore.
+Standalone sequence dumps preserve configuration and counter state. SERIAL
+ownership dependencies and complete database dump/restore remain unfinished.
+
+`current_schemas(false)` returns the existing schemas in `search_path` as an
+array literal. `current_schemas(true)` also includes `pg_catalog`, preserving
+its position when it appears explicitly in the path.
 
 Through the PostgreSQL frontend, `pg_catalog.pg_statistic_ext` exposes the
 system column `tableoid` for queries such as those sent by `pg_dump`.

@@ -650,3 +650,28 @@ test drop-view-ignores-relations-outside-the-search-path {
 expect {
     0
 }
+
+test current-schemas {
+    SELECT current_schemas(false), current_schemas(true);
+    SET search_path TO missing_schema, public;
+    SELECT current_schemas(false);
+    SET search_path TO '';
+    SELECT current_schemas(false), current_schemas(true);
+    SELECT CASE WHEN current_schemas(NULL) IS NULL THEN 'null' ELSE 'value' END;
+}
+expect {
+    {public}|{pg_catalog,public}
+    {public}
+    {}|{pg_catalog}
+    null
+}
+
+
+test current-schemas-explicit-catalog {
+    CREATE SCHEMA path_schema;
+    SET search_path TO path_schema, pg_catalog, public, path_schema;
+    SELECT current_schemas(false), current_schemas(true);
+}
+expect {
+    {path_schema,pg_catalog,public}|{path_schema,pg_catalog,public}
+}

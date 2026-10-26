@@ -26,7 +26,7 @@ PG_TESTS := pg-sqltests
 # 2 * num_cpu (arbitrary multiplier)
 POSTGRES_JOBS ?= $(shell expr 2 \* $$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2))
 
-.PHONY: all build build-tursopg build-runner check run test run-one run-postgres run-one-postgres test-pgdump run-upstream clean
+.PHONY: all build build-tursopg build-runner check run test run-one run-postgres run-one-postgres test-pgdump test-pgdump-sequences run-upstream clean
 
 # Build everything
 all: build
@@ -70,6 +70,10 @@ run-one-postgres: build-runner
 test-pgdump: build-tursopg
 	python3 -m unittest -q test_pgdump
 	./with-postgres.sh python3 pgdump.py --binary "$(TURSOPG)" $(FILE)
+
+test-pgdump-sequences: build-tursopg
+	python3 -m unittest -q test_pgdump
+	./with-postgres.sh python3 pgdump.py --binary "$(TURSOPG)" --restore-only pgdump/sequences.sql
 
 # Run the upstream PostgreSQL regress corpus with pass/fail statuses.
 # Exit 0 means every test matched its status in run.py's STATUS table;

@@ -1146,3 +1146,121 @@ expect {
     catalog quoted seq
     catalog_serial_id_seq
 }
+
+test pg-sequence-pgdump-metadata {
+    CREATE SEQUENCE dump_small AS smallint START 5 INCREMENT 2 MINVALUE 1 MAXVALUE 100 CYCLE;
+    CREATE SEQUENCE dump_integer AS integer START 5 INCREMENT 2 MINVALUE 1 MAXVALUE 100 CYCLE;
+    CREATE SEQUENCE dump_big AS bigint START 5 INCREMENT 2 MINVALUE 1 MAXVALUE 100 CYCLE;
+    SET search_path TO '';
+    SELECT c.relname, pg_catalog.format_type(s.seqtypid, NULL),
+           s.seqstart, s.seqincrement, s.seqmax, s.seqmin, s.seqcache,
+           CASE WHEN s.seqcycle THEN 1 ELSE 0 END
+    FROM pg_catalog.pg_sequence s JOIN pg_catalog.pg_class c ON c.oid = s.seqrelid
+    ORDER BY c.relname;
+}
+expect {
+    dump_big|bigint|5|2|100|1|1|1
+    dump_integer|integer|5|2|100|1|1|1
+    dump_small|smallint|5|2|100|1|1|1
+}
+
+test pg-sequence-default-and-descending {
+    CREATE SEQUENCE dump_default;
+    CREATE SEQUENCE dump_desc AS smallint INCREMENT -2;
+    SELECT c.relname, pg_catalog.format_type(s.seqtypid, NULL),
+           s.seqstart, s.seqincrement, s.seqmax, s.seqmin, s.seqcache,
+           CASE WHEN s.seqcycle THEN 1 ELSE 0 END
+    FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid ORDER BY c.relname;
+}
+expect {
+    dump_default|bigint|1|1|9223372036854775807|1|1|0
+    dump_desc|smallint|-1|-2|-1|-32768|1|0
+}
+
+test pg-sequence-serial-types {
+    CREATE TABLE serial_widths (s SMALLSERIAL, i SERIAL, b BIGSERIAL);
+    SELECT c.relname, pg_catalog.format_type(s.seqtypid, NULL), s.seqmax
+    FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid ORDER BY c.relname;
+}
+expect {
+    serial_widths_b_seq|bigint|9223372036854775807
+    serial_widths_i_seq|integer|2147483647
+    serial_widths_s_seq|smallint|32767
+}
+
+test pg-sequence-type-follows-ddl-transactions {
+    CREATE SEQUENCE metadata_lifecycle AS smallint;
+    CREATE SEQUENCE IF NOT EXISTS metadata_lifecycle AS bigint;
+    SELECT pg_catalog.format_type(s.seqtypid, NULL)
+    FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid WHERE c.relname = 'metadata_lifecycle';
+    BEGIN;
+    DROP SEQUENCE metadata_lifecycle;
+    CREATE SEQUENCE metadata_lifecycle AS integer;
+    ROLLBACK;
+    SELECT pg_catalog.format_type(s.seqtypid, NULL)
+    FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid WHERE c.relname = 'metadata_lifecycle';
+    DROP SEQUENCE metadata_lifecycle;
+    CREATE SEQUENCE metadata_lifecycle AS integer;
+    SELECT pg_catalog.format_type(s.seqtypid, NULL)
+    FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid WHERE c.relname = 'metadata_lifecycle';
+}
+expect {
+    smallint
+    smallint
+    integer
+}
+
+test pg-sequence-types-do-not-prevent-dropping-empty-schema {
+    CREATE SCHEMA sequence_metadata_schema;
+    CREATE SEQUENCE sequence_metadata_schema.typed AS smallint;
+    DROP SEQUENCE sequence_metadata_schema.typed;
+    DROP SCHEMA sequence_metadata_schema;
+    SELECT nspname FROM pg_namespace WHERE nspname = 'sequence_metadata_schema';
+}
+expect {}
+
+test pg-sequence-persisted-counter {
+    CREATE SEQUENCE dump_counter START 5 INCREMENT 2;
+    SELECT last_value, is_called FROM public.dump_counter;
+    SELECT nextval('dump_counter');
+    SELECT s.last_value, s.is_called FROM public.dump_counter AS s;
+    SELECT setval('dump_counter', 19, false);
+    SELECT last_value, is_called FROM public.dump_counter;
+    SELECT nextval('dump_counter');
+    SELECT last_value, is_called FROM public.dump_counter;
+}
+expect {
+    5|f
+    5
+    5|t
+    19
+    19|f
+    19
+    19|t
+}
+
+test pg-sequence-descending-counter {
+    CREATE SEQUENCE dump_down INCREMENT -3 START -2;
+    SELECT nextval('dump_down');
+    SELECT nextval('dump_down');
+    SELECT last_value, is_called FROM public.dump_down;
+}
+expect {
+    -2
+    -5
+    -5|t
+}
+
+test pg-sequence-read-after-cycle {
+    CREATE SEQUENCE cycle_counter MINVALUE 1 MAXVALUE 2 CYCLE;
+    SELECT nextval('cycle_counter');
+    SELECT nextval('cycle_counter');
+    SELECT nextval('cycle_counter');
+    SELECT last_value, is_called FROM public.cycle_counter;
+}
+expect {
+    1
+    2
+    1
+    1|t
+}

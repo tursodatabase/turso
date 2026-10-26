@@ -17,6 +17,7 @@ use turso_parser::ast::GroupBy;
 /// prerequisite statements (e.g., implicit CREATE SEQUENCE for serial columns).
 #[derive(Debug)]
 pub struct TranslateResult {
+    pub sequence_types: Vec<(ast::QualifiedName, i64)>,
     /// Prerequisite statements that must be executed before the main command.
     /// For example, serial columns generate implicit CREATE SEQUENCE statements.
     pub prereqs: Vec<ast::Stmt>,
@@ -143,8 +144,21 @@ impl PostgreSQLTranslator {
         if let NodeRef::CreateStmt(create) = &node.0 {
             let translated = self.translate_create_table_with_prereqs(create)?;
             return Ok(TranslateResult {
+                sequence_types: translated.sequence_types,
                 prereqs: translated.prereqs,
                 cmd: translated.cmd,
+            });
+        }
+
+        if let NodeRef::CreateSeqStmt(sequence) = &node.0 {
+            let (stmt, type_oid) = self.translate_create_sequence(sequence)?;
+            let ast::Stmt::CreateSequence { seq_name, .. } = &stmt else {
+                unreachable!("translated CREATE SEQUENCE");
+            };
+            return Ok(TranslateResult {
+                sequence_types: vec![(seq_name.clone(), type_oid)],
+                prereqs: vec![],
+                cmd: ast::Cmd::Stmt(stmt),
             });
         }
 
@@ -154,6 +168,7 @@ impl PostgreSQLTranslator {
         };
 
         Ok(TranslateResult {
+            sequence_types: vec![],
             prereqs: vec![],
             cmd,
         })
@@ -190,7 +205,7 @@ impl PostgreSQLTranslator {
                     "COPY is handled at the postgres frontend layer".to_string(),
                 ))
             }
-            NodeRef::CreateSeqStmt(seq) => self.translate_create_sequence(seq)?,
+            NodeRef::CreateSeqStmt(seq) => self.translate_create_sequence(seq)?.0,
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "{} is not supported",
@@ -268,7 +283,7 @@ impl PostgreSQLTranslator {
     fn translate_create_table(
         &self,
         create: &pg_query::protobuf::CreateStmt,
-    ) -> Result<(ast::Stmt, Vec<String>), ParseError> {
+    ) -> Result<(ast::Stmt, Vec<(String, u8)>), ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
 
@@ -311,7 +326,7 @@ impl PostgreSQLTranslator {
         let mut columns = Vec::new();
         let mut table_constraints = Vec::new();
         // Collect implicit sequence names for serial columns
-        let mut serial_sequences: Vec<String> = Vec::new();
+        let mut serial_sequences: Vec<(String, u8)> = Vec::new();
 
         // Extract table name for serial sequence naming
         let tbl_name_str = tbl_name.name.as_str().to_string();
@@ -483,9 +498,23 @@ impl PostgreSQLTranslator {
         };
         let namespace = serial_sequence_namespace(tbl_name);
 
+        let sequence_types = serial_sequences
+            .iter()
+            .map(|(name, width)| {
+                (
+                    ast::QualifiedName::fullname(exact_name(&namespace), exact_name(name)),
+                    match width {
+                        16 => 21,
+                        32 => 23,
+                        64 => 20,
+                        _ => unreachable!("serial width"),
+                    },
+                )
+            })
+            .collect();
         let prereqs = serial_sequences
             .into_iter()
-            .map(|seq_name| ast::Stmt::CreateSequence {
+            .map(|(seq_name, width)| ast::Stmt::CreateSequence {
                 if_not_exists: true,
                 seq_name: ast::QualifiedName::fullname(
                     exact_name(&namespace),
@@ -494,12 +523,18 @@ impl PostgreSQLTranslator {
                 start: None,
                 increment: None,
                 min_value: None,
-                max_value: None,
+                max_value: Some(match width {
+                    16 => i16::MAX as i64,
+                    32 => i32::MAX as i64,
+                    64 => i64::MAX,
+                    _ => unreachable!("invalid serial integer width"),
+                }),
                 cycle: false,
             })
             .collect();
 
         Ok(TranslateResult {
+            sequence_types,
             prereqs,
             cmd: ast::Cmd::Stmt(stmt),
         })
@@ -513,7 +548,7 @@ impl PostgreSQLTranslator {
         has_table_pk: bool,
         tbl_name: &ast::QualifiedName,
         table_schema: &str,
-        serial_sequences: &mut Vec<String>,
+        serial_sequences: &mut Vec<(String, u8)>,
         check_names: &mut std::collections::HashSet<String>,
     ) -> Result<ast::ColumnDefinition, ParseError> {
         use pg_query::protobuf::node::Node;
@@ -630,7 +665,13 @@ impl PostgreSQLTranslator {
                 tbl_name.name.as_str().to_lowercase(),
                 name.to_lowercase()
             );
-            serial_sequences.push(seq_name.clone());
+            let width = match pg_type.to_ascii_lowercase().as_str() {
+                "smallserial" | "serial2" => 16,
+                "serial" | "serial4" => 32,
+                "bigserial" | "serial8" => 64,
+                _ => unreachable!("serial type was checked"),
+            };
+            serial_sequences.push((seq_name.clone(), width));
             let namespace = serial_sequence_namespace(tbl_name);
             default_expr = Some(ast::Expr::FunctionCall {
                 name: exact_name("nextval"),
@@ -4811,7 +4852,7 @@ impl PostgreSQLTranslator {
     fn translate_create_sequence(
         &self,
         seq: &pg_query::protobuf::CreateSeqStmt,
-    ) -> Result<ast::Stmt, ParseError> {
+    ) -> Result<(ast::Stmt, i64), ParseError> {
         let relation = seq
             .sequence
             .as_ref()
@@ -4907,6 +4948,7 @@ impl PostgreSQLTranslator {
 
         // AS smallint/integer narrows the default bound in the sequence's
         // direction; bigint is the default range.
+        let mut type_oid = 20;
         if let Some(as_type) = as_type {
             let (type_min, type_max, type_name) = match as_type.to_lowercase().as_str() {
                 "int2" | "smallint" => (i16::MIN as i64, i16::MAX as i64, "smallint"),
@@ -4917,6 +4959,12 @@ impl PostgreSQLTranslator {
                         "CREATE SEQUENCE AS {other} is not supported"
                     )))
                 }
+            };
+            type_oid = match type_name {
+                "smallint" => 21,
+                "integer" => 23,
+                "bigint" => 20,
+                _ => unreachable!("sequence type was checked"),
             };
             for (option, value) in [("MINVALUE", min_value), ("MAXVALUE", max_value)] {
                 if let Some(value) = value.filter(|v| !(type_min..=type_max).contains(v)) {
@@ -4932,15 +4980,18 @@ impl PostgreSQLTranslator {
             }
         }
 
-        Ok(ast::Stmt::CreateSequence {
-            if_not_exists: seq.if_not_exists,
-            seq_name,
-            start,
-            increment,
-            min_value,
-            max_value,
-            cycle,
-        })
+        Ok((
+            ast::Stmt::CreateSequence {
+                if_not_exists: seq.if_not_exists,
+                seq_name,
+                start,
+                increment,
+                min_value,
+                max_value,
+                cycle,
+            },
+            type_oid,
+        ))
     }
 
     fn translate_create_domain(
@@ -5329,6 +5380,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_publication"
             | "pg_publication_namespace"
             | "pg_publication_rel"
+            | "pg_sequence"
             | "pg_sequences"
             | "pg_constraint"
             | "pg_index"

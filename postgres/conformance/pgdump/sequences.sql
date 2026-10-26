@@ -1,0 +1,16 @@
+CREATE SEQUENCE unused_sequence AS smallint START 7;
+CREATE SEQUENCE used_sequence AS integer START 5 INCREMENT 2;
+SELECT nextval('used_sequence');
+SELECT nextval('used_sequence');
+CREATE SEQUENCE descending_sequence INCREMENT -3 START -2;
+SELECT nextval('descending_sequence');
+SELECT nextval('descending_sequence');
+CREATE SEQUENCE reset_sequence;
+SELECT setval('reset_sequence', 42, false);
+CREATE SEQUENCE large_sequence START 5000000000 INCREMENT 3;
+SELECT nextval('large_sequence');
+SELECT nextval('large_sequence');
+CREATE SEQUENCE cycling_sequence MINVALUE 1 MAXVALUE 2 CYCLE;
+SELECT nextval('cycling_sequence');
+SELECT nextval('cycling_sequence');
+SELECT nextval('cycling_sequence');

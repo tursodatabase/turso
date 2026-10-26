@@ -208,15 +208,23 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
         None => (Cow::Borrowed(sql), parse_result),
     };
     let translator = PostgreSQLTranslator::new();
-    let translated = translator
+    let mut translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
+    let sql = if crate::sequence::rewrite_dump_source(&pg_conn.conn, &mut translated.cmd)? {
+        Cow::Owned(translated.cmd.stmt().to_string())
+    } else {
+        sql
+    };
     reject_catalog_dml(translated.cmd.stmt())?;
     if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
         reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
     }
 
-    if translated.prereqs.is_empty() {
+    if translated.prereqs.is_empty()
+        && translated.sequence_types.is_empty()
+        && !matches!(translated.cmd.stmt(), ast::Stmt::DropSequence { .. })
+    {
         return pg_conn
             .conn
             .prepare_translated_cmd(translated.cmd, &sql)
@@ -236,11 +244,12 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
     let inner = pg_conn.conn.prepare_translated_cmd(cmd.clone(), &sql)?;
     let pg_conn = Arc::clone(pg_conn);
     let prereqs = translated.prereqs;
+    let sequence_types = translated.sequence_types;
     let sql_owned = sql.into_owned();
     Ok(crate::Statement::with_deferred(
         inner,
         Box::new(move |inner| {
-            execute_cmd_with_prereqs(&pg_conn, &prereqs, &cmd, &sql_owned, inner)
+            execute_cmd_with_prereqs(&pg_conn, &prereqs, &sequence_types, &cmd, &sql_owned, inner)
         }),
     ))
 }
@@ -250,6 +259,7 @@ const PG_STMT_SAVEPOINT: &str = "__turso_pg_stmt";
 fn execute_cmd_with_prereqs(
     pg_conn: &Arc<PgConnectionInner>,
     prereqs: &[ast::Stmt],
+    sequence_types: &[(ast::QualifiedName, i64)],
     cmd: &ast::Cmd,
     sql: &str,
     inner: &mut Statement,
@@ -265,13 +275,51 @@ fn execute_cmd_with_prereqs(
     let release_sp = format!("RELEASE SAVEPOINT \"{PG_STMT_SAVEPOINT}\"");
     execute_sqlite(conn, begin_sp)?;
     let result = (|| {
+        let mut new_types = Vec::new();
+        for (name, oid) in sequence_types {
+            let namespace = name
+                .namespace
+                .as_ref()
+                .map(|n| n.as_str().to_string())
+                .or_else(|| current_schema(conn));
+            let database = relation_lookup_databases(conn, namespace.as_deref())
+                .into_iter()
+                .next()
+                .ok_or_else(|| LimboError::ParseError("no schema for sequence".into()))?;
+            let sequence_name = name.name.as_str().to_ascii_lowercase();
+            if !sequence_exists_in_database(conn, &database, &sequence_name)? {
+                new_types.push((database, sequence_name, *oid));
+            }
+        }
+        let dropped_sequence = if let ast::Stmt::DropSequence { seq_name, .. } = cmd.stmt() {
+            let name = seq_name.name.as_str().to_ascii_lowercase();
+            let mut found = None;
+            for database in
+                relation_lookup_databases(conn, seq_name.namespace.as_ref().map(|n| n.as_str()))
+            {
+                if sequence_exists_in_database(conn, &database, &name)? {
+                    found = Some((database, name));
+                    break;
+                }
+            }
+            found
+        } else {
+            None
+        };
         for prereq in prereqs {
             let input = prereq.to_string();
             let mut stmt = conn.prepare_translated_stmt(prereq.clone(), &input)?;
             stmt.run_ignore_rows()?;
         }
         *inner = conn.prepare_translated_cmd(cmd.clone(), sql)?;
-        inner.run_ignore_rows()
+        inner.run_ignore_rows()?;
+        for (database, name, oid) in new_types {
+            write_sequence_type(conn, &database, &name, Some(oid))?;
+        }
+        if let Some((database, name)) = dropped_sequence {
+            write_sequence_type(conn, &database, &name, None)?;
+        }
+        Ok(())
     })();
 
     match result {
@@ -287,6 +335,49 @@ fn execute_cmd_with_prereqs(
             Err(err)
         }
     }
+}
+
+fn sequence_exists_in_database(conn: &Arc<Connection>, database: &str, name: &str) -> Result<bool> {
+    let database = database.replace('"', "\"\"");
+    let mut stmt = conn.prepare_sqlite(format!(
+        "SELECT COUNT(*) FROM \"{database}\".sqlite_schema WHERE type = 'table' AND name = ?1"
+    ))?;
+    stmt.bind_at(
+        NonZero::new(1).unwrap(),
+        Value::build_text(format!("{SEQUENCE_TABLE_PREFIX}{name}")),
+    )?;
+    Ok(stmt.run_collect_rows()?[0][0] == Value::from_i64(1))
+}
+
+fn write_sequence_type(
+    conn: &Arc<Connection>,
+    database: &str,
+    name: &str,
+    oid: Option<i64>,
+) -> Result<()> {
+    let database = database.replace('"', "\"\"");
+    let table = catalog::SEQUENCE_TYPES_TABLE;
+    if oid.is_some() {
+        execute_sqlite(conn, format!("CREATE TABLE IF NOT EXISTS \"{database}\".{table} (seqname TEXT PRIMARY KEY, seqtypid INTEGER NOT NULL)"))?;
+    } else {
+        let mut exists = conn.prepare_sqlite(format!("SELECT COUNT(*) FROM \"{database}\".sqlite_schema WHERE name = '{table}' AND type = 'table'"))?;
+        if exists.run_collect_rows()?[0][0] == Value::from_i64(0) {
+            return Ok(());
+        }
+    }
+    let sql = match oid {
+        Some(_) => format!("INSERT OR REPLACE INTO \"{database}\".{table} VALUES (?1, ?2)"),
+        None => format!("DELETE FROM \"{database}\".{table} WHERE seqname = ?1"),
+    };
+    let mut stmt = conn.prepare_sqlite(sql)?;
+    stmt.bind_at(
+        NonZero::new(1).unwrap(),
+        Value::build_text(name.to_string()),
+    )?;
+    if let Some(oid) = oid {
+        stmt.bind_at(NonZero::new(2).unwrap(), Value::from_i64(oid))?;
+    }
+    stmt.run_ignore_rows()
 }
 
 fn create_table_if_not_exists_target_present(
@@ -507,7 +598,11 @@ fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
 
 fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
     let lower = sql.to_ascii_lowercase();
-    for table_name in ["sqlite_master", "sqlite_schema"] {
+    for table_name in [
+        "sqlite_master",
+        "sqlite_schema",
+        catalog::SEQUENCE_TYPES_TABLE,
+    ] {
         if lower.contains(table_name) {
             return Err(LimboError::ParseError(format!(
                 "no such table: {table_name}"
@@ -930,6 +1025,14 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
         for object in &objects {
             execute_sqlite(conn, object.drop_sql(database))?;
         }
+        let database = database.replace('"', "\"\"");
+        execute_sqlite(
+            conn,
+            format!(
+                "DROP TABLE IF EXISTS \"{database}\".{}",
+                catalog::SEQUENCE_TYPES_TABLE
+            ),
+        )?;
         Ok(())
     })?;
     // PostgreSQL drops public like any other schema, but turso keeps it,
@@ -1000,6 +1103,9 @@ fn schema_objects(conn: &Arc<Connection>, database: &str) -> Result<Vec<SchemaOb
             continue;
         };
         let name = name.as_str().to_string();
+        if name == catalog::SEQUENCE_TYPES_TABLE {
+            continue;
+        }
         if kind.as_str() == "view" {
             views.push(SchemaObject::View(name));
         } else if let Some(sequence) = name.strip_prefix(SEQUENCE_TABLE_PREFIX) {

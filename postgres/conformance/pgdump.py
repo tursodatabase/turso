@@ -16,6 +16,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Compare PostgreSQL and Turso pg_dump files byte for byte.")
     parser.add_argument("fixtures", nargs="*", type=Path)
     parser.add_argument("--binary", type=Path, default=conformance.parents[1] / "target/debug/tursopg")
+    parser.add_argument("--restore-only", action="store_true", help="restore the dump and run checks/<fixture>; omit file comparison")
     parser.add_argument("--psql", default="psql")
     parser.add_argument("--pg-dump", default="pg_dump")
     parser.add_argument("--output-dir", type=Path, default=conformance / "pgdump/results")
@@ -46,6 +47,9 @@ def main() -> int:
 
 
 def run_fixture(args, reference: str, fixture: Path, results: Path) -> bool:
+    checks = fixture.parent / "checks" / fixture.name
+    if args.restore_only and not checks.exists():
+        raise RuntimeError(f"restore checks not found: {checks}")
     database = f"pgdump_{uuid.uuid4().hex}"
     parts = urlsplit(reference)
     query = urlencode(
@@ -81,6 +85,7 @@ def run_fixture(args, reference: str, fixture: Path, results: Path) -> bool:
                             [
                                 args.pg_dump,
                                 "--no-password",
+                                *(["--no-owner", "--no-acl"] if args.restore_only else []),
                                 "--restrict-key=TursoPgdumpConformance",
                                 "--dbname",
                                 dsn,
@@ -89,6 +94,8 @@ def run_fixture(args, reference: str, fixture: Path, results: Path) -> bool:
                             ],
                             results / f"{name}-dump.log",
                         )
+                    if args.restore_only:
+                        check_restore(args, reference, postgres, checks, results)
                 finally:
                     stop_server(server)
     finally:
@@ -96,6 +103,8 @@ def run_fixture(args, reference: str, fixture: Path, results: Path) -> bool:
             [*psql, "--dbname", reference, "--command", f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'],
             results / "drop.log",
         )
+    if args.restore_only:
+        return True
     expected = (results / "postgres.sql").read_bytes()
     actual = (results / "turso.sql").read_bytes()
     if expected == actual:
@@ -114,6 +123,39 @@ def run_fixture(args, reference: str, fixture: Path, results: Path) -> bool:
     print(f"FAIL {fixture.stem}: dump files differ", flush=True)
     print(difference.decode("utf-8", errors="replace"), end="", flush=True)
     return False
+
+
+def check_restore(args, reference: str, postgres: str, checks: Path, results: Path) -> None:
+    psql = [args.psql, "-X", "--no-password", "--set", "ON_ERROR_STOP=1"]
+    run_command(
+        [*psql, "--dbname", postgres, "--tuples-only", "--no-align", "--file", str(checks)],
+        results / "restore-expected.log",
+    )
+    database = f"pgdump_restore_{uuid.uuid4().hex}"
+    restored = urlunsplit(urlsplit(postgres)._replace(path=f"/{database}"))
+    try:
+        run_command(
+            [*psql, "--dbname", reference, "--command", f'CREATE DATABASE "{database}" TEMPLATE template0'],
+            results / "restore-create.log",
+        )
+        run_command(
+            [*psql, "--dbname", restored, "--file", str(results / "turso.sql")],
+            results / "restore-load.log",
+        )
+        run_command(
+            [*psql, "--dbname", restored, "--tuples-only", "--no-align", "--file", str(checks)],
+            results / "restore-actual.log",
+        )
+        expected = (results / "restore-expected.log").read_bytes()
+        actual = (results / "restore-actual.log").read_bytes()
+        if actual != expected:
+            raise RuntimeError(f"restored values differ; see {results / 'restore-actual.log'}")
+        print(f"PASS {checks.stem}: restored values match PostgreSQL", flush=True)
+    finally:
+        run_command(
+            [*psql, "--dbname", reference, "--command", f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'],
+            results / "restore-drop.log",
+        )
 
 
 def wait_for_server(server: subprocess.Popen, log: Path) -> int:

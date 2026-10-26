@@ -1026,3 +1026,141 @@ fn test_pg_prepare_and_serial_ddl_dst_fuzz() {
         }
     }
 }
+
+#[turso_macros::test(mvcc)]
+fn test_sequence_catalog_type_survives_reopen(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    pg_execute(
+        &conn,
+        "CREATE SEQUENCE typed_seq AS smallint MINVALUE 1 MAXVALUE 100",
+    );
+    let query = "SELECT seqtypid FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid WHERE c.relname = 'typed_seq'";
+    assert_eq!(pg_query_int(&conn, query), 21);
+    assert_eq!(
+        pg_query_text(
+            &conn,
+            "SELECT data_type FROM pg_sequences WHERE sequencename = 'typed_seq'"
+        ),
+        "smallint"
+    );
+    assert_eq!(pg_query_int(&conn, "SELECT nextval('typed_seq')"), 1);
+    assert_eq!(pg_query_int(&conn, "SELECT setval('typed_seq', 20)"), 20);
+    let path = db.path.clone();
+    drop(conn);
+    drop(db);
+    let db = TempDatabase::builder()
+        .with_db_name(path.to_str().unwrap())
+        .build();
+    let conn = db.connect_postgres();
+    assert_eq!(pg_query_int(&conn, query), 21);
+    assert_eq!(
+        pg_query_text(
+            &conn,
+            "SELECT data_type FROM pg_sequences WHERE sequencename = 'typed_seq'"
+        ),
+        "smallint"
+    );
+    assert_eq!(pg_query_int(&conn, "SELECT nextval('typed_seq')"), 21);
+    assert_eq!(pg_query_int(&conn, query), 21);
+    assert_eq!(
+        pg_query_text(
+            &conn,
+            "SELECT data_type FROM pg_sequences WHERE sequencename = 'typed_seq'"
+        ),
+        "smallint"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_sequence_catalog_reads_legacy_metadata(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.prepare_internal("CREATE TABLE __turso_internal_seq_legacy_seq (value INTEGER PRIMARY KEY, is_called INTEGER, start INTEGER, inc INTEGER, min INTEGER, max INTEGER, cycle INTEGER)").unwrap().run_collect_rows().unwrap();
+    conn.prepare_internal(
+        "INSERT INTO __turso_internal_seq_legacy_seq VALUES (1, 0, 1, 1, 1, 100, 0)",
+    )
+    .unwrap()
+    .run_collect_rows()
+    .unwrap();
+    conn.execute("COMMIT").unwrap();
+    let path = db.path.clone();
+    drop(conn);
+    drop(db);
+    let db = TempDatabase::builder()
+        .with_db_name(path.to_str().unwrap())
+        .build();
+    let conn = db.connect_postgres();
+    assert_eq!(pg_query_int(&conn, "SELECT seqtypid FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid WHERE c.relname = 'legacy_seq'"), 20);
+    assert_eq!(
+        pg_query_int(&conn, "SELECT last_value FROM public.legacy_seq"),
+        1
+    );
+    assert_eq!(
+        pg_query_int(&conn, "SELECT is_called::integer FROM public.legacy_seq"),
+        0
+    );
+    assert_eq!(pg_query_int(&conn, "SELECT nextval('legacy_seq')"), 1);
+    assert_eq!(pg_query_int(&conn, "SELECT nextval('legacy_seq')"), 2);
+    let rows = db
+        .connect_limbo()
+        .prepare("PRAGMA integrity_check")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::build_text("ok")]]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_sequence_type_keeps_core_storage_unchanged(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    pg_execute(&conn, "CREATE SEQUENCE pg_only_type AS smallint");
+    let rows = db
+        .connect_limbo()
+        .prepare("SELECT COUNT(*) FROM pragma_table_info('__turso_internal_seq_pg_only_type')")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(7)]]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_sequence_read_uses_persisted_state(db: TempDatabase) {
+    let writer = db.connect_postgres();
+    pg_execute(&writer, "CREATE SEQUENCE saved_counter START 7 INCREMENT 2");
+    assert_eq!(pg_query_int(&writer, "SELECT nextval('saved_counter')"), 7);
+    assert_eq!(pg_query_int(&writer, "SELECT nextval('saved_counter')"), 9);
+    let reader = db.connect_postgres();
+    assert_eq!(
+        pg_query_int(&reader, "SELECT last_value FROM public.saved_counter"),
+        9
+    );
+    assert_eq!(
+        pg_query_int(
+            &reader,
+            "SELECT is_called::integer FROM public.saved_counter"
+        ),
+        1
+    );
+    let mut prepared = reader
+        .query("SELECT last_value FROM public.saved_counter")
+        .unwrap()
+        .unwrap();
+    pg_execute(&writer, "CREATE TABLE unrelated (id integer)");
+    assert!(matches!(prepared.step().unwrap(), StepResult::Row));
+    assert_eq!(prepared.row().unwrap().get_value(0), &Value::from_i64(9));
+    drain_to_done(&mut prepared, "prepared sequence read");
+    drop(prepared);
+    drop(reader);
+    drop(writer);
+    let path = db.path.clone();
+    drop(db);
+    let db = TempDatabase::builder()
+        .with_db_name(path.to_str().unwrap())
+        .build();
+    let reader = db.connect_postgres();
+    assert_eq!(
+        pg_query_int(&reader, "SELECT last_value FROM public.saved_counter"),
+        9
+    );
+    assert_eq!(pg_query_int(&reader, "SELECT nextval('saved_counter')"), 11);
+}

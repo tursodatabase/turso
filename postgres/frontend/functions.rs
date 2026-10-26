@@ -87,6 +87,7 @@ scalar_functions! {
     Version(FunctionArity::Exact(0), true),
     CurrentDatabase(FunctionArity::Exact(0), false),
     CurrentSchema(FunctionArity::Exact(0), true),
+    CurrentSchemas(FunctionArity::Exact(1), false),
     PgBackendPid(FunctionArity::Exact(0), true),
     PgIsInRecovery(FunctionArity::Exact(0), false),
     PgLockAccessShare(FunctionArity::Exact(0), false),
@@ -143,6 +144,7 @@ impl ScalarCall for PgScalarFunction {
                 Some(schema) => Value::build_text(schema),
                 None => Value::Null,
             },
+            Self::CurrentSchemas => exec_current_schemas(connection, args[0].get_value()),
             Self::PgBackendPid => Value::from_i64(std::process::id() as i64),
             Self::PgIsInRecovery => {
                 // Temporary pg_dump compatibility: "t" means true, not actual recovery state.
@@ -167,6 +169,52 @@ impl ScalarCall for PgScalarFunction {
         };
         Ok(IOResult::Done(value))
     }
+}
+
+fn exec_current_schemas(connection: &Connection, include_implicit: &Value) -> Value {
+    if matches!(include_implicit, Value::Null) {
+        return Value::Null;
+    }
+    let existing: Vec<_> = connection
+        .search_order()
+        .into_iter()
+        .map(|id| {
+            if id == turso_core::MAIN_DB_ID {
+                "public".to_owned()
+            } else {
+                connection
+                    .namespace_name(id)
+                    .expect("search path namespace exists")
+            }
+        })
+        .collect();
+    let path = connection.search_path().unwrap_or_else(|| existing.clone());
+    let mut schemas = Vec::new();
+    if include_implicit.as_int() == Some(1) && !path.iter().any(|name| name == "pg_catalog") {
+        schemas.push("pg_catalog".to_owned());
+    }
+    for schema in path {
+        if (schema == "pg_catalog" || schema == "information_schema" || existing.contains(&schema))
+            && !schemas.contains(&schema)
+        {
+            schemas.push(schema);
+        }
+    }
+    let elements: Vec<_> = schemas
+        .into_iter()
+        .map(|schema| {
+            if schema
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !schema.eq_ignore_ascii_case("null")
+            {
+                schema
+            } else {
+                format!("\"{}\"", schema.replace('\\', "\\\\").replace('"', "\\\""))
+            }
+        })
+        .collect();
+    Value::build_text(format!("{{{}}}", elements.join(",")))
 }
 
 fn exec_acl_default(args: &[Register]) -> Result<Value> {

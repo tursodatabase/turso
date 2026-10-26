@@ -24,6 +24,7 @@ const CATALOG_BOOLEAN_TRUE: i64 = 1;
 
 /// Starting OID for user tables (matches PostgreSQL convention)
 const USER_TABLE_OID_START: i64 = 16384;
+pub(crate) const SEQUENCE_TYPES_TABLE: &str = "pg_turso_sequence_types";
 const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 
 #[derive(Debug)]
@@ -2025,12 +2026,51 @@ impl SnapshotRows for PgAttrdefTable {
     }
 }
 
+#[derive(Debug)]
+struct PgSequenceTable;
+
+impl SequenceCatalogRows for PgSequenceTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_sequence (
+        seqrelid INTEGER, seqtypid INTEGER, seqstart INTEGER,
+        seqincrement INTEGER, seqmax INTEGER, seqmin INTEGER,
+        seqcache INTEGER, seqcycle BOOLEAN, tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2224);
+    const ESTIMATED_COST: f64 = 100.0;
+    const ESTIMATED_ROWS: u32 = 10;
+
+    fn load_rows(conn: &Connection, types: &HashMap<String, i64>) -> Vec<Vec<Value>> {
+        let schema = conn.current_schema();
+        let sequences = schema.sequences_by_name(NamespaceId::ROOT);
+        PgClassTable::load_rows(conn)
+            .iter()
+            .map(|row| RelationRow::from_row(row))
+            .filter(|relation| matches!(relation.kind, RelationKind::Sequence))
+            .map(|relation| {
+                let sequence = sequences
+                    .get(relation.name)
+                    .expect("pg_class sequence exists");
+                vec![
+                    Value::from_i64(relation.oid),
+                    Value::from_i64(types.get(relation.name).copied().unwrap_or(20)),
+                    Value::from_i64(sequence.start_value),
+                    Value::from_i64(sequence.increment_by),
+                    Value::from_i64(sequence.max_value),
+                    Value::from_i64(sequence.min_value),
+                    Value::from_i64(1),
+                    Value::from_i64(i64::from(sequence.cycle)),
+                ]
+            })
+            .collect()
+    }
+}
+
 /// Virtual table implementation for pg_catalog.pg_sequences
 /// Reads sequence metadata from Schema.sequences at scan time.
 #[derive(Debug)]
 struct PgSequencesTable;
 
-impl SnapshotRows for PgSequencesTable {
+impl SequenceCatalogRows for PgSequencesTable {
     const SCHEMA: &'static str = "CREATE TABLE pg_sequences (
             schemaname TEXT,
             sequencename TEXT,
@@ -2048,7 +2088,7 @@ impl SnapshotRows for PgSequencesTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 10;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, types: &HashMap<String, i64>) -> Vec<Vec<Value>> {
         let mut rows = Vec::new();
         let schema = conn.current_schema();
         let sequences = schema.sequences_by_name(NamespaceId::ROOT);
@@ -2063,14 +2103,19 @@ impl SnapshotRows for PgSequencesTable {
                     .get_sequence_currval(turso_core::MAIN_DB_ID, &seq_name)
                     .unwrap_or(seq.start_value);
                 rows.push(vec![
-                    Value::build_text("public"),           // schemaname
-                    Value::build_text(seq_name),           // sequencename
-                    Value::build_text("turso"),            // sequenceowner
-                    Value::build_text("bigint"),           // data_type
-                    Value::from_i64(seq.start_value),      // start_value
-                    Value::from_i64(seq.min_value),        // min_value
-                    Value::from_i64(seq.max_value),        // max_value
-                    Value::from_i64(seq.increment_by),     // increment_by
+                    Value::build_text("public"),         // schemaname
+                    Value::build_text(seq_name.clone()), // sequencename
+                    Value::build_text("turso"),          // sequenceowner
+                    Value::build_text(match types.get(&seq_name).copied().unwrap_or(20) {
+                        21 => "smallint",
+                        23 => "integer",
+                        20 => "bigint",
+                        _ => unreachable!("invalid sequence type OID"),
+                    }),
+                    Value::from_i64(seq.start_value),  // start_value
+                    Value::from_i64(seq.min_value),    // min_value
+                    Value::from_i64(seq.max_value),    // max_value
+                    Value::from_i64(seq.increment_by), // increment_by
                     Value::from_i64(i64::from(seq.cycle)), // cycle
                     Value::from_i64(1), // cache_size (PG default; Turso doesn't cache)
                     Value::from_i64(last_val), // last_value
@@ -2082,6 +2127,11 @@ impl SnapshotRows for PgSequencesTable {
 }
 
 pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions {
+    options = options.native_module(
+        "pg_turso_sequence_state",
+        VTabKind::TableValuedFunction,
+        crate::sequence::SequenceState,
+    );
     options = options.native_module(
         "unnest",
         VTabKind::TableValuedFunction,
@@ -2179,9 +2229,14 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         },
     );
     options = options.native_module(
+        "pg_sequence",
+        VTabKind::TableValuedFunction,
+        SequenceCatalog::<PgSequenceTable>(PhantomData),
+    );
+    options = options.native_module(
         "pg_sequences",
         VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgSequencesTable>(PhantomData),
+        SequenceCatalog::<PgSequencesTable>(PhantomData),
     );
     options = options.native_module(
         "pg_settings",
@@ -3036,6 +3091,147 @@ impl VirtualTableCursor for SnapshotCursor {
     }
 }
 
+trait SequenceCatalogRows: Debug + Send + Sync + 'static {
+    const SCHEMA: &'static str;
+    const TABLE_OID: Option<i64>;
+    const ESTIMATED_COST: f64;
+    const ESTIMATED_ROWS: u32;
+
+    fn load_rows(conn: &Connection, types: &HashMap<String, i64>) -> Vec<Vec<Value>>;
+}
+
+#[derive(Debug)]
+struct SequenceCatalog<T>(PhantomData<T>);
+
+impl<T: SequenceCatalogRows> VirtualTableModule for SequenceCatalog<T> {
+    type Table = Self;
+
+    fn schema(&self, _args: &[Value]) -> Result<String> {
+        Ok(T::SCHEMA.to_string())
+    }
+
+    fn create(&self, _args: &[Value]) -> Result<Self::Table> {
+        Ok(Self(PhantomData))
+    }
+
+    fn innocuous(&self) -> bool {
+        true
+    }
+}
+
+impl<T: SequenceCatalogRows> VirtualTable for SequenceCatalog<T> {
+    type Cursor = SequenceCatalogCursor;
+
+    fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(SequenceCatalogCursor {
+            conn,
+            load_rows: T::load_rows,
+            type_statement: None,
+            sequence_types: HashMap::default(),
+            table_oid: T::TABLE_OID,
+            rows: Vec::new(),
+            current_row: 0,
+        })
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: T::ESTIMATED_COST,
+            estimated_rows: T::ESTIMATED_ROWS,
+            constraint_usages,
+        })
+    }
+}
+
+struct SequenceCatalogCursor {
+    conn: Arc<Connection>,
+    load_rows: fn(&Connection, &HashMap<String, i64>) -> Vec<Vec<Value>>,
+    type_statement: Option<Statement>,
+    sequence_types: HashMap<String, i64>,
+    table_oid: Option<i64>,
+    rows: Vec<Vec<Value>>,
+    current_row: usize,
+}
+
+impl VirtualTableCursor for SequenceCatalogCursor {
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
+        self.current_row += 1;
+        Ok(IOResult::Done(self.current_row < self.rows.len()))
+    }
+
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
+        if self.current_row < self.rows.len() {
+            if column < self.rows[self.current_row].len() {
+                return Ok(IOResult::Done(self.rows[self.current_row][column].clone()));
+            }
+            if column == self.rows[self.current_row].len() {
+                if let Some(table_oid) = self.table_oid {
+                    return Ok(IOResult::Done(Value::from_i64(table_oid)));
+                }
+            }
+        }
+        Ok(IOResult::Done(Value::Null))
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<&str>,
+        _idx_num: i32,
+    ) -> turso_core::types::IOResultOr<bool> {
+        if self.type_statement.is_none() {
+            self.sequence_types.clear();
+            if self
+                .conn
+                .current_schema()
+                .get_btree_table(NamespaceId::ROOT, SEQUENCE_TYPES_TABLE)
+                .is_some()
+            {
+                self.type_statement = Some(self.conn.prepare_internal(format!(
+                    "SELECT seqname, seqtypid FROM main.{SEQUENCE_TYPES_TABLE}"
+                ))?);
+            }
+        }
+        if let Some(statement) = &mut self.type_statement {
+            match statement.run_with_row_callback_nonblock(|row| {
+                let oid = row.get::<i64>(1)?;
+                if !matches!(oid, 20 | 21 | 23) {
+                    return Err(LimboError::Corrupt(
+                        "invalid PostgreSQL sequence type".into(),
+                    ));
+                }
+                self.sequence_types.insert(row.get::<String>(0)?, oid);
+                Ok(())
+            })? {
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                IOResult::Done(()) => self.type_statement = None,
+            }
+        }
+        self.current_row = 0;
+        self.rows = (self.load_rows)(&self.conn, &self.sequence_types);
+        Ok(IOResult::Done(!self.rows.is_empty()))
+    }
+}
+
 #[derive(Debug)]
 struct CatalogModule<T> {
     schema: fn() -> String,
@@ -3565,6 +3761,108 @@ mod tests {
     use crate::{Database, Numeric, PlatformIO, StepResult};
     use tempfile::tempdir;
     use turso_core::ConnectOpts;
+
+    #[test]
+    fn sequence_catalog_cursors_refresh_declared_types() {
+        let db = crate::session::open_database_with_io(
+            Arc::new(turso_core::MemoryIO::new()),
+            "sequence-catalog-cursors.db",
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = crate::PgConnection::connect(&db).unwrap();
+        let mut sequence = SequenceCatalog::<PgSequenceTable>(PhantomData)
+            .open(conn.inner().clone())
+            .unwrap();
+        let mut sequences = SequenceCatalog::<PgSequencesTable>(PhantomData)
+            .open(conn.inner().clone())
+            .unwrap();
+        for (name, oid) in [("smallint", 21), ("integer", 23)] {
+            conn.execute(format!(
+                "CREATE SEQUENCE catalog_counter AS {name} MINVALUE 1 MAXVALUE 100"
+            ))
+            .unwrap();
+            assert!(matches!(
+                sequence.filter(&[], None, 0).unwrap(),
+                IOResult::Done(true)
+            ));
+            assert!(
+                matches!(sequence.column(1).unwrap(), IOResult::Done(value) if value == Value::from_i64(oid))
+            );
+            assert!(
+                matches!(sequence.column(8).unwrap(), IOResult::Done(value) if value == Value::from_i64(2224))
+            );
+            assert!(matches!(
+                sequences.filter(&[], None, 0).unwrap(),
+                IOResult::Done(true)
+            ));
+            assert!(
+                matches!(sequences.column(3).unwrap(), IOResult::Done(value) if value == Value::build_text(name))
+            );
+            conn.execute("DROP SEQUENCE catalog_counter").unwrap();
+        }
+        assert!(matches!(
+            sequence.filter(&[], None, 0).unwrap(),
+            IOResult::Done(false)
+        ));
+        assert!(matches!(
+            sequences.filter(&[], None, 0).unwrap(),
+            IOResult::Done(false)
+        ));
+    }
+
+    #[test]
+    fn sequence_query_table_reads_saved_state() {
+        let db = crate::session::open_database_with_io(
+            Arc::new(turso_core::MemoryIO::new()),
+            "sequence-query-table.db",
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        for (name, start, increment) in [("ascending", 5, 2), ("descending", -2, -3)] {
+            conn.execute(format!(
+                "CREATE SEQUENCE {name} START {start} INCREMENT {increment}"
+            ))
+            .unwrap();
+            conn.prepare(format!("SELECT nextval('{name}')"))
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            let mut statement = conn
+                .prepare(format!(
+                    "SELECT last_value, is_called FROM main.pg_turso_sequence_state('main.{name}')"
+                ))
+                .unwrap();
+            assert_eq!(
+                statement
+                    .get_column_type_info(0)
+                    .unwrap()
+                    .unwrap()
+                    .declared_name,
+                "BIGINT"
+            );
+            assert_eq!(
+                statement
+                    .get_column_type_info(1)
+                    .unwrap()
+                    .unwrap()
+                    .declared_name,
+                "BOOLEAN"
+            );
+            let rows = statement.run_collect_rows().unwrap();
+            assert_eq!(rows, vec![vec![Value::from_i64(start), Value::from_i64(1)]]);
+            assert_eq!(
+                conn.prepare(format!("SELECT nextval('{name}')"))
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap(),
+                vec![vec![Value::from_i64(start + increment)]]
+            );
+        }
+    }
 
     #[test]
     fn catalogs_registered_at_open_survive_schema_refresh() {
