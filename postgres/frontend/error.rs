@@ -295,11 +295,7 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
 }
 
 fn invalid_argument_sqlstate(msg: &str) -> &'static str {
-    if msg.starts_with("unrecognized configuration parameter") {
-        SQLSTATE_UNDEFINED_OBJECT
-    } else if msg.starts_with("invalid configuration parameter name") {
-        SQLSTATE_INVALID_NAME
-    } else if msg.starts_with("no such database") {
+    if msg.starts_with("no such database") {
         SQLSTATE_INVALID_SCHEMA_NAME
     } else {
         SQLSTATE_DATA_EXCEPTION
