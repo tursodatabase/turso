@@ -867,8 +867,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             None
         }
         "uuid" => {
-            let hex: String = trimmed.chars().filter(|c| *c != '-').collect();
-            if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            if turso_core::parse_uuid_bytes(input).is_none() {
                 Some((
                     format!("invalid input syntax for type uuid: \"{input}\""),
                     "22P02".to_string(),

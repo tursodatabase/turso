@@ -250,6 +250,23 @@ expect {
     1
 }
 
+test table-uuid-insert-hyphen-after-every-4-digits {
+    CREATE TABLE u (id uuid);
+    INSERT INTO u VALUES ('a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11');
+    SELECT id FROM u;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+test table-uuid-insert-invalid-syntax-fails {
+    CREATE TABLE u (id uuid);
+    INSERT INTO u VALUES ('a');
+}
+expect error {
+    invalid input syntax for type uuid
+}
+
 @setup users
 test table-insert-returning-table-star {
     INSERT INTO users VALUES (4, 'dave', 40, false) RETURNING users.*;

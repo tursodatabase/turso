@@ -507,6 +507,17 @@ expect {
     3|NULL
 }
 
+@setup nullable-uuid
+test strict-uuid-hyphen-groups-and-bare-hex {
+    INSERT INTO t1 VALUES (1, 'a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11'),
+        (2, 'a0eebc999c0b4ef8bb6d6bb9bd380a11');
+    SELECT a, quote(b) FROM t1 ORDER BY a;
+}
+expect {
+    1|'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'
+    2|'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'
+}
+
 test strict-uuid-cast-null {
     SELECT CAST(NULL AS uuid) IS NULL;
 }

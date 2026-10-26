@@ -327,6 +327,35 @@ fn non_numeric_string_divisor_raises_22p02() {
 }
 
 #[test]
+fn invalid_uuid_insert_reports_22p02() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE u (id uuid)").unwrap();
+    let e = exec_err(&conn, "INSERT INTO u VALUES ('a')");
+    assert_eq!(e.sqlstate, "22P02", "{e:?}");
+    assert!(
+        e.message.contains("invalid input syntax for type uuid"),
+        "expected invalid input syntax for type uuid, got: {}",
+        e.message
+    );
+}
+
+#[test]
+fn uuid_insert_accepts_hyphens_after_every_4_digits() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE u (id uuid)").unwrap();
+    conn.execute("INSERT INTO u VALUES ('a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11')")
+        .unwrap();
+    let mut stmt = conn.prepare("SELECT id FROM u").unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![Value::from_text(
+            "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11".to_string()
+        )]]
+    );
+}
+
+#[test]
 fn primary_key_update_reports_structured_fields() {
     let (_io, conn) = pg_connection();
     conn.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
