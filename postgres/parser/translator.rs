@@ -5402,6 +5402,16 @@ pub fn is_catalog_table_name(name: &str) -> bool {
     )
 }
 
+/// Whether the catalog relation `name` is a view in PostgreSQL. PostgreSQL
+/// rejects DML on these views because they do not read a single table, and
+/// it does so before it checks privileges.
+pub fn is_catalog_view_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "pg_roles" | "pg_seclabels" | "pg_sequences" | "pg_settings" | "pg_tables" | "pg_indexes"
+    )
+}
+
 /// PostgreSQL derives a name for result columns without an explicit alias
 /// (FigureColname in the server): function calls are named after the function
 /// and SQL value functions after their keyword. Clients read columns by these
@@ -5580,15 +5590,17 @@ fn star_qualified_by_other_table(
 }
 
 /// The error of PostgreSQL for a LATERAL item in the FROM clause of an UPDATE
-/// that reads a column of the target table. The target is in scope there, but
-/// PostgreSQL does not let the item read it. None when no LATERAL item names
-/// the target as the table of a column, or when some FROM item has the name
-/// of the target too, because then the name can be a reference to that item.
+/// that reads a column of the target table. The target is in scope in such an
+/// item, also in its subqueries, but PostgreSQL does not let the item read it.
+/// A function item counts as LATERAL, as in PostgreSQL. A FROM item that is
+/// not LATERAL cannot see the target at all, also not in a LATERAL item inside
+/// it, and the engine reports that. None when no LATERAL item names the target
+/// as the table of a column, or when some FROM item has the name of the target
+/// too, because then the name can be a reference to that item.
 fn lateral_reference_to_update_target(
     from_clause: &[pg_query::protobuf::Node],
     target: &pg_query::protobuf::RangeVar,
 ) -> Option<ParseError> {
-    use pg_query::NodeRef;
     let refname = target
         .alias
         .as_ref()
@@ -5609,14 +5621,12 @@ fn lateral_reference_to_update_target(
     {
         return None;
     }
-    let lateral_items = from_nodes.iter().flat_map(|node| match node {
-        NodeRef::RangeSubselect(item) if item.lateral => {
-            item.subquery.as_deref().into_iter().collect()
-        }
-        NodeRef::RangeFunction(item) if item.lateral => item.functions.iter().collect(),
-        _ => Vec::new(),
-    });
+    let mut lateral_items = Vec::new();
+    for item in from_clause {
+        collect_lateral_items(item, &mut lateral_items);
+    }
     let reads_target = lateral_items
+        .into_iter()
         .filter_map(|item| item.node.as_ref())
         .flat_map(|item| item.nodes())
         .filter_map(|(node, ..)| column_qualifier(&node))
@@ -5625,6 +5635,26 @@ fn lateral_reference_to_update_target(
         sqlstate: SQLSTATE_INVALID_COLUMN_REFERENCE,
         message: format!("invalid reference to FROM-clause entry for table \"{refname}\""),
     })
+}
+
+/// The LATERAL items and the function items of FROM item `item`: the item
+/// itself, or the items that its joins combine. Not the items inside a
+/// subquery, which have their own FROM clause.
+fn collect_lateral_items<'a>(
+    item: &'a pg_query::protobuf::Node,
+    out: &mut Vec<&'a pg_query::protobuf::Node>,
+) {
+    use pg_query::protobuf::node::Node;
+    match &item.node {
+        Some(Node::RangeSubselect(subselect)) if subselect.lateral => out.push(item),
+        Some(Node::RangeFunction(_)) => out.push(item),
+        Some(Node::JoinExpr(join)) => {
+            for side in [&join.larg, &join.rarg].into_iter().flatten() {
+                collect_lateral_items(side, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The names that a FROM item, a join or a CTE gives to its rows. For a

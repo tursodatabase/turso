@@ -285,9 +285,11 @@ fn sqlstate(error: &LimboError) -> &'static str {
     }
 }
 
-/// The SQLSTATE of a parse error that the engine raised. The checks for
-/// dependent objects come first, because their messages end with the error
-/// that the dependent object gives, for example "no such column".
+/// The SQLSTATE of a parse error that the engine raised. The rules that look
+/// at the start of the message cannot match a name in the message, for
+/// example a column named "no such object". The checks for dependent objects
+/// come first, because their messages end with the error that the dependent
+/// object gives, for example "no such column".
 fn parse_error_sqlstate(msg: &str) -> &'static str {
     if (msg.starts_with("cannot drop column") && msg.contains(": referenced in VIEW "))
         || msg.starts_with("cannot drop type")
@@ -295,7 +297,7 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST
     } else if msg.contains("no such table")
         || msg.contains("table not found")
-        || msg.contains("no such object")
+        || msg.starts_with("no such object")
     {
         SQLSTATE_UNDEFINED_TABLE
     } else if msg.contains("no such column") || msg.contains("column not found") {
@@ -306,17 +308,17 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_DUPLICATE_TABLE
     } else if msg.contains("query_only mode") {
         SQLSTATE_READ_ONLY_SQL_TRANSACTION
-    } else if msg.contains("ambiguous column name") {
+    } else if msg.starts_with("ambiguous column name") {
         SQLSTATE_AMBIGUOUS_COLUMN
-    } else if msg.contains("misuse of aggregate")
-        || msg.contains("aggregate functions are not allowed")
+    } else if msg.starts_with("misuse of aggregate")
+        || msg.starts_with("aggregate functions are not allowed")
     {
         SQLSTATE_GROUPING_ERROR
-    } else if msg.contains("misuse of window function") {
+    } else if msg.starts_with("misuse of window function") {
         SQLSTATE_WINDOWING_ERROR
-    } else if msg.contains("invalid reference to FROM-clause entry") {
+    } else if msg.starts_with("invalid reference to FROM-clause entry") {
         SQLSTATE_INVALID_COLUMN_REFERENCE
-    } else if msg.contains("no schema has been selected to create in") {
+    } else if msg.starts_with("no schema has been selected to create in") {
         SQLSTATE_INVALID_SCHEMA_NAME
     } else {
         SQLSTATE_SYNTAX_ERROR

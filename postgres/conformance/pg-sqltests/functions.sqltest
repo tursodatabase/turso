@@ -305,6 +305,52 @@ expect error {
     unrecognized configuration parameter "no_such_setting"
 }
 
+test current-setting-missing-ok-accepts-the-start-of-a-boolean-word {
+    SELECT coalesce(current_setting('no_such_setting', 'tr'), '<null>');
+    SELECT coalesce(current_setting('no_such_setting', 'Y'), '<null>');
+    SELECT coalesce(current_setting('no_such_setting', 'tRu'), '<null>');
+}
+expect {
+    <null>
+    <null>
+    <null>
+}
+
+test current-setting-missing-ok-of-is-false {
+    SELECT current_setting('no_such_setting', 'of');
+}
+@sqlstate 42704
+expect error {
+    unrecognized configuration parameter "no_such_setting"
+}
+
+test current-setting-missing-ok-o-is-not-a-boolean {
+    SELECT current_setting('no_such_setting', 'o');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type boolean: "o"
+}
+
+test current-setting-missing-ok-longer-than-a-boolean-word-errors {
+    SELECT current_setting('no_such_setting', 'truee');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type boolean: "truee"
+}
+
+test pg-input-is-valid-accepts-the-start-of-a-boolean-word {
+    SELECT CASE WHEN pg_input_is_valid('tr', 'bool') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid(' on ', 'bool') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('o', 'bool') THEN 'valid' ELSE 'invalid' END;
+}
+expect {
+    valid
+    valid
+    invalid
+}
+
 test current-setting-numeric-parameter-name-errors {
     SELECT current_setting(5.5);
 }

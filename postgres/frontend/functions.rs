@@ -1074,13 +1074,22 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
     }
 }
 
-/// The value of a PostgreSQL boolean literal such as 'yes' or 'off'. None
-/// when the text is not a boolean literal.
+/// The value of a PostgreSQL boolean literal such as 'yes', 'off' or 'tr',
+/// with the rules of PostgreSQL's boolean input: white space around the text
+/// and the case of the letters do not matter, and the start of true, false,
+/// yes or no is enough. For on and off, the first two letters are necessary.
+/// None when the text is not a boolean literal.
 fn parse_pg_bool(text: &str) -> Option<bool> {
-    match text.trim().to_lowercase().as_str() {
-        "t" | "true" | "y" | "yes" | "on" | "1" => Some(true),
-        "f" | "false" | "n" | "no" | "off" | "0" => Some(false),
-        _ => None,
+    let word = text
+        .trim_matches(|c: char| c.is_ascii_whitespace() || c == '\u{b}')
+        .to_ascii_lowercase();
+    let starts = |full: &str, min_len: usize| word.len() >= min_len && full.starts_with(&word);
+    if starts("true", 1) || starts("yes", 1) || starts("on", 2) || word == "1" {
+        Some(true)
+    } else if starts("false", 1) || starts("no", 1) || starts("off", 2) || word == "0" {
+        Some(false)
+    } else {
+        None
     }
 }
 

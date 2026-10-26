@@ -17,6 +17,13 @@ test error-missing-column {
 @sqlstate 42703
 expect error {}
 
+test error-missing-column-named-like-an-error-message {
+    CREATE TABLE t (a int);
+    SELECT "no such object" FROM t;
+}
+@sqlstate 42703
+expect error {}
+
 test error-syntax {
     SELEC 1;
 }
