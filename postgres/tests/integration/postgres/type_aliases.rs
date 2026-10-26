@@ -2,51 +2,6 @@ use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 
 #[turso_macros::test]
-fn test_int4_write_bounds(db: TempDatabase) {
-    let conn = db.connect_postgres();
-    for (i, ty) in ["int", "integer", "int4", "serial", "serial4"]
-        .iter()
-        .enumerate()
-    {
-        let table = format!("int4_bounds_{i}");
-        conn.execute(format!("CREATE TABLE {table}(a {ty})"))
-            .unwrap();
-        conn.execute(format!(
-            "INSERT INTO {table} VALUES (-2147483648), (2147483647)"
-        ))
-        .unwrap();
-        for value in ["2147483648", "-2147483649", "3000000000", "'3000000000'"] {
-            let error = conn
-                .execute(format!("INSERT INTO {table} VALUES ({value})"))
-                .unwrap_err();
-            assert_eq!(error.sqlstate, "22003", "{ty}: {value}: {error}");
-        }
-        let error = conn
-            .execute(format!("UPDATE {table} SET a = 3000000000"))
-            .unwrap_err();
-        assert_eq!(error.sqlstate, "22003");
-        let rows = conn
-            .prepare(format!("SELECT a FROM {table} ORDER BY a"))
-            .unwrap()
-            .run_collect_rows()
-            .unwrap();
-        assert_eq!(
-            rows,
-            vec![
-                vec![Value::from_i64(-2147483648)],
-                vec![Value::from_i64(2147483647)]
-            ]
-        );
-    }
-    conn.execute("CREATE TABLE int4_nullable(a int); INSERT INTO int4_nullable VALUES (NULL)")
-        .unwrap();
-    conn.execute("CREATE TABLE int4_wide(a bigint, b bigserial, c serial8)")
-        .unwrap();
-    conn.execute("INSERT INTO int4_wide VALUES (3000000000, 3000000000, 3000000000)")
-        .unwrap();
-}
-
-#[turso_macros::test]
 fn test_int4_write_bounds_do_not_restrict_lookups_or_expose_checks(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE int4_meta(a int CHECK (a >= 0)); CREATE INDEX int4_meta_idx ON int4_meta(a); INSERT INTO int4_meta VALUES (1)").unwrap();

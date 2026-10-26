@@ -250,7 +250,7 @@ fn prepare_update_plan(
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
 ) -> crate::Result<UpdatePlan> {
-    let namespace = resolver.resolve_existing_table(&body.tbl_name)?;
+    let namespace = resolver.resolve_queried_table(&body.tbl_name)?;
     let database_id = namespace.database_id;
     let target_name = &body.tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| {
@@ -291,6 +291,7 @@ fn prepare_update_plan(
     let target_table = JoinedTable {
         table: table.as_ref().clone(),
         identifier: body.tbl_name.identifier(),
+        has_alias: body.tbl_name.alias.is_some(),
         internal_id: program.table_reference_counter.next(),
         op: Operation::default_scan_for(&table),
         unmatched_right_rows_plan: None,
@@ -404,6 +405,7 @@ fn prepare_update_plan(
         // under its schema name so `RETURNING t.col` works while `RETURNING alias.col`
         // still fails.
         returning_target.identifier = table_name.to_string();
+        returning_target.has_alias = false;
         let mut returning_table_references = TableReferences::new(
             vec![returning_target],
             read_scope_tables.outer_query_refs().to_vec(),

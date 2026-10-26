@@ -349,6 +349,91 @@ fn test_delete_all_while_same_connection_scans_table(tmp_db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_scan_continues_after_delete_of_leaf_last_row_and_split(tmp_db: TempDatabase) {
+    let id = |id: i64| Value::from_i64(id);
+    assert_eq!(
+        scan_join_deleting_then_splitting(&tmp_db, 60),
+        vec![
+            (id(10), 1),
+            (id(10), 2),
+            (id(20), 1),
+            (id(20), 2),
+            (id(30), 1),
+            (id(30), 2),
+            (id(40), 1),
+            (id(40), 2),
+            (id(50), 1),
+            (id(50), 2),
+            (id(60), 1),
+            (Value::Null, 2),
+            (id(58), 1),
+            (id(58), 2),
+            (id(59), 1),
+            (id(59), 2),
+            (id(70), 1),
+            (id(70), 2),
+        ]
+    );
+}
+
+#[turso_macros::test]
+fn test_scan_continues_after_delete_of_leaf_middle_row_and_split(tmp_db: TempDatabase) {
+    let outer_ids: Vec<Value> = scan_join_deleting_then_splitting(&tmp_db, 30)
+        .into_iter()
+        .filter(|(_, x)| *x == 1)
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        outer_ids,
+        [10, 20, 30, 40, 50, 58, 59, 60, 70].map(Value::from_i64)
+    );
+}
+
+fn scan_join_deleting_then_splitting(tmp_db: &TempDatabase, deleted_id: i64) -> Vec<(Value, i64)> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, v BLOB)")
+        .unwrap();
+    conn.execute("CREATE TABLE t2(x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t2 VALUES (1), (2)").unwrap();
+    for id in [10, 20, 30, 40, 50, 60, 70] {
+        conn.execute(format!("INSERT INTO t1 VALUES ({id}, zeroblob(600))"))
+            .unwrap();
+    }
+
+    conn.execute("BEGIN").unwrap();
+    let mut scan = conn.prepare("SELECT t1.id, t2.x FROM t1, t2").unwrap();
+    let mut rows = Vec::new();
+    let mut deleted = false;
+    let mut inserted = false;
+    loop {
+        match scan.step().unwrap() {
+            StepResult::Row => {
+                let row = scan.row().unwrap();
+                let id = row.get_value(0).clone();
+                let x = row.get::<i64>(1).unwrap();
+                rows.push((id.clone(), x));
+                if !deleted && id == Value::from_i64(deleted_id) && x == 1 {
+                    conn.execute(format!("DELETE FROM t1 WHERE id = {deleted_id}"))
+                        .unwrap();
+                    deleted = true;
+                } else if deleted && !inserted {
+                    conn.execute("INSERT INTO t1 VALUES (58, zeroblob(600)), (59, zeroblob(600))")
+                        .unwrap();
+                    inserted = true;
+                }
+            }
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            StepResult::Done => break,
+            other => panic!("scan failed after DELETE and INSERT: {other:?}"),
+        }
+    }
+    drop(scan);
+    conn.execute("COMMIT").unwrap();
+    rows
+}
+
+#[turso_macros::test]
 /// A constraint error does not rollback the transaction, it rolls back the statement.
 fn test_constraint_error_aborts_only_stmt_not_entire_transaction(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();

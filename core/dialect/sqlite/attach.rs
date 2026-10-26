@@ -460,7 +460,6 @@ impl Connection {
                         .with_custom_types(self.db.experimental_custom_types_enabled())
                         .with_index_method(self.db.experimental_index_method_enabled())
                         .with_vacuum(self.db.experimental_vacuum_enabled())
-                        .with_generated_columns(self.db.experimental_generated_columns_enabled())
                         .with_without_rowid(self.db.experimental_without_rowid_enabled());
                     let is_memory_db = is_memory_like(path);
                     let io: Arc<dyn IO> = if is_memory_db {

@@ -453,21 +453,24 @@ impl<'a> Resolver<'a> {
     }
 
     pub(crate) fn self_table_collation(&self, column: Option<usize>) -> Option<CollationSeq> {
-        let scope = self.self_table_scope.borrow();
-        let context = &scope.as_ref()?.context;
-        let table = match context {
-            SelfTableContext::ForDML { table, .. } => Arc::clone(table),
+        let table = self.self_table()?;
+        match column {
+            Some(column) => table.columns().get(column)?.collation_opt(),
+            None => table.get_rowid_alias_column()?.1.collation_opt(),
+        }
+    }
+
+    /// The table that `SELF_TABLE` column references refer to.
+    pub(crate) fn self_table(&self) -> Option<Arc<BTreeTable>> {
+        match &self.self_table_scope.borrow().as_ref()?.context {
+            SelfTableContext::ForDML { table, .. } => Some(Arc::clone(table)),
             SelfTableContext::ForSelect {
                 table_ref_id,
                 referenced_tables,
             } => referenced_tables
                 .find_table_by_internal_id(*table_ref_id)?
                 .1
-                .btree()?,
-        };
-        match column {
-            Some(column) => table.columns().get(column)?.collation_opt(),
-            None => table.get_rowid_alias_column()?.1.collation_opt(),
+                .btree(),
         }
     }
 
@@ -865,6 +868,27 @@ impl<'a> Resolver<'a> {
         self.find_existing_table(qualified_name)?.ok_or_else(|| {
             LimboError::ParseError(format!("no such object: {}", qualified_name.name.as_str()))
         })
+    }
+
+    /// Like `resolve_existing_table`, for a table that a statement reads or
+    /// writes. A table in a database that does not exist is a missing table
+    /// here, as in SQLite's sqlite3LocateTable.
+    pub(crate) fn resolve_queried_table(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<NamespaceRef> {
+        if let Some(db_name) = &qualified_name.namespace {
+            if self
+                .namespace_database_id(&normalize_ident(db_name.as_str()))
+                .is_none()
+            {
+                return Err(LimboError::ParseError(format!(
+                    "no such table: {}",
+                    crate::util::table_name_for_error(qualified_name)
+                )));
+            }
+        }
+        self.resolve_existing_table(qualified_name)
     }
 
     pub(crate) fn resolve_existing_table_named(&self, table_name: &str) -> Result<NamespaceRef> {
@@ -2494,6 +2518,7 @@ fn emit_check_constraint_bytecode(
                 // CHECK expressions come from schema SQL and may use the base table name
                 // even when the query references the table through an alias.
                 joined_table.identifier = table_name.to_string();
+                joined_table.has_alias = false;
             }
             bind_and_rewrite_expr(
                 &mut rewritten_expr,

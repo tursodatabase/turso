@@ -39,7 +39,7 @@ PRAGMA page_count;
 
 ### page_size
 
-Returns or sets the page size of the database. The page size can only be set before any tables are created.
+Returns or sets the page size of the database. The page size can only be set before any tables are created. On an existing database, the new size is not applied to it, but later [`VACUUM INTO`](/docs/sql-reference/statements/vacuum#vacuum-into) statements on the same connection use it for the destination.
 
 ```sql
 PRAGMA page_size;

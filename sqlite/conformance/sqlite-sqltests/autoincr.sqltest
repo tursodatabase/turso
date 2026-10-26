@@ -527,3 +527,17 @@ expect {
 	3
 	blob|5a
 }
+
+# A table name with a double quote in it.
+test autoinc-table-name-with-a-double-quote {
+	CREATE TABLE "a""b"(a INTEGER PRIMARY KEY AUTOINCREMENT, v);
+	INSERT INTO "a""b"(v) VALUES('first');
+	INSERT INTO "a""b"(v) VALUES('second');
+	SELECT a, v FROM "a""b" ORDER BY a;
+	SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+	1|first
+	2|second
+	a"b|2
+}

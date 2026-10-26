@@ -913,7 +913,7 @@ fn emit_compound_order_by(
                 custom_type_comparator(
                     &rc.expr,
                     &program.table_references,
-                    right_most_ctx.resolver.schema(),
+                    &right_most_ctx.resolver,
                 )
             })
         })

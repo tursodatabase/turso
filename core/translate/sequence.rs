@@ -38,13 +38,13 @@ pub fn sequence_backing_table_name(seq_name: &str) -> String {
 }
 
 pub fn sequence_backing_table_sql(seq_name: &str) -> String {
-    let table_name = sequence_backing_table_name(seq_name);
+    let escaped_table_name = sequence_backing_table_name(seq_name).replace('"', "\"\"");
     // INTEGER PRIMARY KEY makes `value` the rowid alias: nextval inserts are
     // keyed by the sequence value itself (no synthetic rowid) and the inline
     // compaction emitted by `emit_backing_table_compaction` collapses each
     // backing table down to a single watermark row via DELETE-all + INSERT.
     format!(
-        "CREATE TABLE \"{table_name}\"(\
+        "CREATE TABLE \"{escaped_table_name}\"(\
          value INTEGER PRIMARY KEY,\
          is_called INTEGER,\
          start INTEGER,\

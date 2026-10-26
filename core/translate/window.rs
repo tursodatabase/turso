@@ -256,6 +256,7 @@ fn prepare_window_subquery(
         inner_plan,
         None,
         subquery_id,
+        resolver,
     )?;
 
     // Verify that the subquery has the expected database ID.

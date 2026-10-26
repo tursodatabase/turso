@@ -786,8 +786,6 @@ pub struct Schema {
 
     /// Custom type registry, loaded from sqlite_turso_types
     pub type_registry: HashMap<String, Arc<TypeDef>>,
-
-    pub generated_columns_enabled: bool,
 }
 
 /// The objects of one namespace, by name.
@@ -952,7 +950,6 @@ impl Schema {
             analyze_stats: AnalyzeStats::default(),
             dropped_root_pages: HashSet::default(),
             type_registry,
-            generated_columns_enabled: false,
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -3033,13 +3030,6 @@ impl Schema {
                 } else {
                     let table = dialect.parse_table_sql(sql, root_page)?;
 
-                    if table.has_virtual_columns && !self.generated_columns_enabled {
-                        return Err(LimboError::ParseError(format!(
-                            "table '{}' uses generated columns but the generated_columns feature is not enabled",
-                            table.name
-                        )));
-                    }
-
                     // Detect sequence-backing tables by name prefix.
                     // Just add the table (for B-tree access); sequences are created by
                     // AddSequence at CREATE time or initialize_sequences at open time.
@@ -3765,7 +3755,6 @@ impl TryClone for Schema {
             analyze_stats: self.analyze_stats.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
-            generated_columns_enabled: self.generated_columns_enabled,
         })
     }
 }
@@ -8615,29 +8604,29 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_loading_rejects_gencol_without_flag() {
+    fn test_schema_loading_accepts_generated_columns() {
         let mut schema = Schema::new();
-        schema.generated_columns_enabled = false;
 
-        let result = schema.handle_schema_row(
-            "table",
-            "t1",
-            "t1",
-            2,
-            Some("CREATE TABLE t1(a INTEGER, b AS (a*2))"),
-            &SymbolTable::default(),
-            &mut vec![],
-            &mut HashMap::default(),
-            &mut HashMap::default(),
-            &mut HashMap::default(),
-            &mut HashMap::default(),
-            &|_| None,
-            &crate::dialect::SqliteDialect,
-        );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("generated columns"));
+        schema
+            .handle_schema_row(
+                "table",
+                "t1",
+                "t1",
+                2,
+                Some("CREATE TABLE t1(a INTEGER, b AS (a*2))"),
+                &SymbolTable::default(),
+                &mut vec![],
+                &mut HashMap::default(),
+                &mut HashMap::default(),
+                &mut HashMap::default(),
+                &mut HashMap::default(),
+                &|_| None,
+                &crate::dialect::SqliteDialect,
+            )
+            .unwrap();
+
+        let table = schema.get_btree_table(NamespaceId::ROOT, "t1").unwrap();
+        assert!(table.has_virtual_columns);
     }
 
     #[test]
@@ -9348,7 +9337,11 @@ mod column_info {
 
         #[inline]
         pub fn set_array_dimensions(&mut self, dims: u32) {
-            assert!(dims <= 7, "array dimensions must be <= 7");
+            assert!(
+                dims <= turso_parser::ast::MAX_ARRAY_DIMENSIONS,
+                "array dimensions must be <= {}",
+                turso_parser::ast::MAX_ARRAY_DIMENSIONS
+            );
             self.0 = (self.0 & !ARRAY_DIM_MASK) | (dims << ARRAY_DIM_SHIFT);
         }
 

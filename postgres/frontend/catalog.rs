@@ -6,14 +6,14 @@ use std::sync::Arc;
 use turso_core::{
     dialect::POSTGRES_TABLE_SQL_PREFIX,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
-    schema::{BTreeTable, Index, Schema, Table},
+    schema::{BTreeTable, Index, Schema, Sequence, Table, AUTOINCREMENT_SEQ_PREFIX},
     Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions, Result, Statement,
     Value,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::RefAct;
 
-pub use turso_pg_parser::translator::is_catalog_table_name;
+pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
 
 fn is_implicit_int4_check(check: &turso_core::schema::CheckConstraint) -> bool {
     check.name.is_none()
@@ -184,6 +184,11 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn random_value(&self, bits: i64) -> Value {
+        let mantissa = (bits as u64) >> 11;
+        Value::from_f64(mantissa as f64 / (1_u64 << 53) as f64)
+    }
+
     fn binds_names_at_create(&self) -> bool {
         true
     }
@@ -293,6 +298,8 @@ enum RelationKind {
     Table,
     #[strum(serialize = "i")]
     Index,
+    #[strum(serialize = "S")]
+    Sequence,
 }
 
 /// Virtual table implementation for pg_catalog.pg_class
@@ -459,6 +466,45 @@ impl SnapshotRows for PgClassTable {
             }
         }
 
+        let relkind: &'static str = RelationKind::Sequence.into();
+        for (oid, sequence) in sequence_catalog_entries(&schema) {
+            rows.push(vec![
+                Value::from_i64(oid),
+                Value::build_text(sequence.name.clone()),
+                Value::from_i64(2200),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(10),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::from_f64(1.0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::build_text("p"),
+                Value::build_text(relkind),
+                Value::from_i64(3),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::build_text("n"),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]);
+        }
+
         rows
     }
 }
@@ -483,27 +529,17 @@ impl SnapshotRows for PgNamespaceTable {
     const ESTIMATED_ROWS: u32 = 5;
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
-        // PostgreSQL standard namespaces
-        let mut rows = vec![
-            vec![
-                Value::from_i64(11),              // oid
-                Value::Text("pg_catalog".into()), // nspname
-                Value::from_i64(10),              // nspowner
-                Value::Null,                      // nspacl
-            ],
-            vec![
-                Value::from_i64(2200),        // oid
-                Value::Text("public".into()), // nspname
-                Value::from_i64(10),          // nspowner
-                Value::Null,                  // nspacl
-            ],
-            vec![
-                Value::from_i64(11394),                   // oid
-                Value::Text("information_schema".into()), // nspname
-                Value::from_i64(10),                      // nspowner
-                Value::Null,                              // nspacl
-            ],
-        ];
+        let mut rows: Vec<_> = BUILTIN_SCHEMAS
+            .iter()
+            .map(|(oid, name)| {
+                vec![
+                    Value::from_i64(*oid),
+                    Value::Text((*name).into()),
+                    Value::from_i64(10), // nspowner (bootstrap superuser)
+                    Value::Null,         // nspacl
+                ]
+            })
+            .collect();
 
         // Add attached schemas (CREATE SCHEMA creates attached databases)
         let schema_names = conn.attached_database_names();
@@ -519,6 +555,23 @@ impl SnapshotRows for PgNamespaceTable {
         }
         rows
     }
+}
+
+/// The schemas that PostgreSQL always has, with their fixed OIDs.
+const BUILTIN_SCHEMAS: [(i64, &str); 3] = [
+    (11, "pg_catalog"),
+    (2200, "public"),
+    (11394, "information_schema"),
+];
+
+/// Whether pg_namespace lists schema `name`: one of the schemas that
+/// PostgreSQL always has, or a schema that CREATE SCHEMA created.
+pub(crate) fn namespace_exists(conn: &Connection, name: &str) -> bool {
+    BUILTIN_SCHEMAS.iter().any(|(_, schema)| *schema == name)
+        || conn
+            .attached_database_names()
+            .iter()
+            .any(|schema| schema == name)
 }
 
 /// Virtual table implementation for information_schema.schemata
@@ -1983,6 +2036,61 @@ impl SnapshotRows for PgAttrdefTable {
     }
 }
 
+#[derive(Debug)]
+struct PgSequenceTable;
+
+impl SnapshotRows for PgSequenceTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_sequence (
+        seqrelid INTEGER, seqtypid INTEGER, seqstart BIGINT, seqincrement BIGINT,
+        seqmax BIGINT, seqmin BIGINT, seqcache BIGINT, seqcycle BOOLEAN,
+        tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2224);
+    const ESTIMATED_COST: f64 = 100.0;
+    const ESTIMATED_ROWS: u32 = 10;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        sequence_catalog_entries(&conn.current_schema())
+            .map(|(oid, seq)| {
+                vec![
+                    Value::from_i64(oid),
+                    Value::from_i64(20),
+                    Value::from_i64(seq.start_value),
+                    Value::from_i64(seq.increment_by),
+                    Value::from_i64(seq.max_value),
+                    Value::from_i64(seq.min_value),
+                    Value::from_i64(1),
+                    Value::from_i64(i64::from(seq.cycle)),
+                ]
+            })
+            .collect()
+    }
+}
+
+fn sequence_catalog_entries(schema: &Schema) -> impl Iterator<Item = (i64, &Sequence)> {
+    let tables = user_tables_sorted(schema);
+    let index_count: usize = tables
+        .iter()
+        .map(|(name, _)| {
+            schema
+                .get_indices(NamespaceId::ROOT, name)
+                .filter(|index| !index.ephemeral)
+                .count()
+        })
+        .sum();
+    let first_oid = USER_TABLE_OID_START + tables.len() as i64 + index_count as i64;
+    let mut sequences: Vec<_> = schema
+        .sequences_by_name(NamespaceId::ROOT)
+        .iter()
+        .filter(|(name, _)| !name.starts_with(AUTOINCREMENT_SEQ_PREFIX))
+        .collect();
+    sequences.sort_by_key(|(name, _)| *name);
+    sequences
+        .into_iter()
+        .enumerate()
+        .map(move |(i, (_, sequence))| (first_oid + i as i64, sequence.as_ref()))
+}
+
 /// Virtual table implementation for pg_catalog.pg_sequences
 /// Reads sequence metadata from Schema.sequences at scan time.
 #[derive(Debug)]
@@ -2135,6 +2243,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             schema: PgInputErrorInfoTable::schema,
             create: PgInputErrorInfoTable::new,
         },
+    );
+    options = options.native_module(
+        "pg_sequence",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgSequenceTable>(PhantomData),
     );
     options = options.native_module(
         "pg_sequences",
@@ -3546,6 +3659,7 @@ mod tests {
             "pg_type",
             "pg_attrdef",
             "pg_input_error_info",
+            "pg_sequence",
             "pg_sequences",
             "pg_settings",
             "pg_extension",
