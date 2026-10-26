@@ -84,3 +84,24 @@ test create-schema-rejects-elements-in-another-schema {
 expect error {
     different from the one being created
 }
+
+# Both tests create the same schema: on an in-memory server each must get its
+# own empty schema, not a file left by the other test.
+test create-schema-starts-empty {
+    CREATE SCHEMA fresh;
+    CREATE TABLE fresh.t (x int);
+    INSERT INTO fresh.t VALUES (42);
+    SELECT x FROM fresh.t;
+}
+expect {
+    42
+}
+
+test create-schema-starts-empty-in-another-database {
+    CREATE SCHEMA fresh;
+    CREATE TABLE fresh.t (x int);
+    SELECT count(*) FROM fresh.t;
+}
+expect {
+    0
+}

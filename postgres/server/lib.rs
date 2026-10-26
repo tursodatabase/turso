@@ -120,7 +120,7 @@ impl TursoPgHandler {
     /// After a DROP SCHEMA query succeeds, delete the schema's database file.
     /// Uses simple string matching to detect DROP SCHEMA statements.
     fn cleanup_dropped_schema_file(&self, query: &str) {
-        if self.db_file == ":memory:" {
+        if turso_core::is_memory_like(&self.db_file) {
             return;
         }
         // Simple detection: look for DROP SCHEMA pattern
