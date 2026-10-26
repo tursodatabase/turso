@@ -74,8 +74,7 @@ fn interval_out_of_range() -> LimboError {
 }
 
 /// Converts a value to the stored form of `timestamptz`: UTC text without an
-/// offset, or `infinity` / `-infinity`. This is the form tursopg stored before
-/// it had its own timestamptz type, so older rows compare equal to new ones.
+/// offset, or `infinity` / `-infinity`.
 pub(crate) fn exec_timestamptz_in(value: &Value) -> Result<Value> {
     let Some(input) = input_text(value) else {
         return Ok(Value::Null);

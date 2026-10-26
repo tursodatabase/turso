@@ -147,7 +147,7 @@ a boolean column is an error.
 
 date, time, timestamp and timestamptz follow PostgreSQL input rules (DateStyle
 ISO, MDY; TimeZone UTC). timestamptz values are stored as UTC text without an
-offset, as in earlier versions, so they compare and sort by instant, and are
+offset, so they compare and sort by instant, and are
 read in PostgreSQL output form, such as `2026-10-08 12:00:00.123456+00`. Supported: `infinity`, `-infinity`, `epoch`, `now`,
 `today`, numeric offsets (`+02`, `+05:30`, `-0800`), microseconds, ISO 8601
 forms, `+`/`-` with interval, date `+`/`-` integer, date - date,
