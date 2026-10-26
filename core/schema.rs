@@ -112,6 +112,7 @@ use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::{BitSet, ColumnMask};
+use crate::translate::semantic::hir::TypeFact;
 use crate::util::{
     column_declared_type, is_rowid_alias_type, module_args_from_sql, module_name_from_sql,
     type_from_name, UnparsedFromSqlIndex,
@@ -2806,6 +2807,7 @@ impl Schema {
                 has_unnamed_or_collated_columns,
                 logical_to_physical_map,
                 column_dependencies: Default::default(),
+                declared_type_facts: Default::default(),
             })));
 
             self.add_materialized_view(NamespaceId::ROOT, incremental_view, table, sql);
@@ -3682,6 +3684,7 @@ impl TryClone for BTreeTable {
             has_unnamed_or_collated_columns: self.has_unnamed_or_collated_columns,
             logical_to_physical_map: self.logical_to_physical_map.try_clone()?,
             column_dependencies: Default::default(),
+            declared_type_facts: Default::default(),
         })
     }
 }
@@ -4307,6 +4310,7 @@ pub struct BTreeTable {
     has_unnamed_or_collated_columns: bool,
     pub logical_to_physical_map: Vec<usize>,
     column_dependencies: ResetOnClone<OnceLock<GeneratedColGraph>>,
+    declared_type_facts: ResetOnClone<OnceLock<Box<[TypeFact]>>>,
 }
 
 pub struct ColumnsMut<'a> {
@@ -4329,6 +4333,7 @@ impl std::ops::DerefMut for ColumnsMut<'_> {
 impl Drop for ColumnsMut<'_> {
     fn drop(&mut self) {
         self.table.column_dependencies.0 = OnceLock::new();
+        self.table.declared_type_facts.0 = OnceLock::new();
         self.table.has_virtual_columns =
             self.table.columns.iter().any(|c| c.is_virtual_generated());
         self.table.has_column_defaults = BTreeTable::any_column_default(&self.table.columns);
@@ -4391,6 +4396,7 @@ impl BTreeTable {
             has_unnamed_or_collated_columns,
             logical_to_physical_map,
             column_dependencies: Default::default(),
+            declared_type_facts: Default::default(),
         }
     }
 
@@ -4406,6 +4412,12 @@ impl BTreeTable {
 
     pub fn columns(&self) -> &[Column] {
         &self.columns
+    }
+
+    pub(crate) fn declared_type_facts(&self) -> &[TypeFact] {
+        self.declared_type_facts
+            .0
+            .get_or_init(|| crate::translate::semantic::hir::declared_type_facts(&self.columns))
     }
 
     pub fn columns_mut(&mut self) -> ColumnsMut<'_> {
@@ -4483,6 +4495,7 @@ impl BTreeTable {
         if !self.is_strict {
             return;
         }
+        self.declared_type_facts.0 = OnceLock::new();
         for col in &mut self.columns {
             if col.is_array() {
                 // Arrays are stored as record-format blobs regardless of element type.
@@ -6101,6 +6114,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         has_unnamed_or_collated_columns,
         logical_to_physical_map: vec![],
         column_dependencies: Default::default(),
+        declared_type_facts: Default::default(),
     };
     table.prepare_generated_columns()?;
     if table.is_strict {
@@ -6819,6 +6833,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
         has_unnamed_or_collated_columns,
         logical_to_physical_map,
         column_dependencies: Default::default(),
+        declared_type_facts: Default::default(),
     })
 }
 
@@ -8091,6 +8106,7 @@ mod tests {
             has_unnamed_or_collated_columns,
             logical_to_physical_map,
             column_dependencies: Default::default(),
+            declared_type_facts: Default::default(),
         };
 
         let result = Index::automatic_from_primary_key(
@@ -8815,6 +8831,17 @@ mod tests {
         // Any access through columns_mut() wipes the cache, even if we don't mutate.
         let _ = t.columns_mut();
         assert!(t.peek_column_dependencies().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn declared_type_facts_follow_column_changes() -> Result<()> {
+        let mut t = BTreeTable::from_sql("CREATE TABLE t(a INTEGER, b INTEGER)", 0)?;
+        assert_eq!(t.declared_type_facts()[1].storage, Some(Type::Integer));
+
+        let text = BTreeTable::from_sql("CREATE TABLE u(c TEXT)", 0)?.columns()[0].clone();
+        t.columns_mut()[1] = text;
+        assert_eq!(t.declared_type_facts()[1].storage, Some(Type::Text));
         Ok(())
     }
 

@@ -2875,6 +2875,37 @@ mod tests {
     }
 
     #[test]
+    fn prepares_of_one_table_share_its_declared_types() {
+        let mut schema = Schema::new();
+        let table = BTreeTable::from_sql("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)", 2)
+            .expect("table schema parses");
+        schema
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
+            .expect("table name is unique");
+        let declared_type_of_a = || {
+            let document = analyze_sql_with_schema(&schema, "SELECT a FROM t WHERE a = 1")
+                .expect("SELECT analyzes");
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let query = document.query(root.query).expect("query exists");
+            let from = query.blocks[0].from.as_ref().expect("query has FROM");
+            let source = document.source(from.first).expect("source exists");
+            source
+                .columns
+                .get(1)
+                .expect("column a exists")
+                .type_fact()
+                .declared
+                .clone()
+                .expect("column a has a declared type")
+        };
+        let first = declared_type_of_a();
+        let second = declared_type_of_a();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
     fn select_star_does_not_copy_declared_types() {
         let mut schema = Schema::new();
         let columns: Vec<String> = (0..64).map(|column| format!("c{column} INTEGER")).collect();
