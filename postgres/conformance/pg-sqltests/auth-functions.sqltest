@@ -758,6 +758,60 @@ expect error {
 }
 
 @setup auth_functions
+test auth-functions-can-be-called-with-quoted-lowercase-names {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    SELECT "auth"."uid"(), coalesce(auth."email"(), '<null>');
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|<null>
+}
+
+@setup auth_functions
+test auth-function-name-with-a-dot-in-quotes-is-not-an-auth-function {
+    SELECT "auth.uid"();
+}
+expect error {
+    function auth\.uid\(\) does not exist
+}
+expect @tursopg error {
+    no such function: auth\.uid
+}
+
+@setup auth_functions
+test auth-function-name-with-a-dot-in-pg-catalog-is-not-an-auth-function {
+    SELECT pg_catalog."auth.uid"();
+}
+expect error {
+    function pg_catalog\.auth\.uid\(\) does not exist
+}
+expect @tursopg error {
+    no such function: auth\.uid
+}
+
+@setup auth_functions
+test auth-schema-name-in-uppercase-quotes-is-not-the-auth-schema {
+    SELECT "AUTH".uid();
+}
+expect error {
+    schema "AUTH" does not exist
+}
+expect @tursopg error {
+    no such function: AUTH\.uid
+}
+
+@setup auth_functions
+test auth-function-name-in-uppercase-quotes-is-not-an-auth-function {
+    SELECT auth."UID"();
+}
+expect error {
+    function auth\.UID\(\) does not exist
+}
+expect @tursopg error {
+    no such function: auth\.UID
+}
+
+@setup auth_functions
 test auth-jwt-prints-the-claims-as-jsonb {
     SELECT set_config('request.jwt.claims', '{"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"user@example.com","aud":"authenticated","n":1.50,"n":1e2}', false);
     SELECT auth.jwt();

@@ -7259,9 +7259,29 @@ fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
 
 fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
     match extract_key_columns(names)?.as_slice() {
-        [schema, name] if !is_default_schema(schema) => Ok(format!("{schema}.{name}")),
-        _ => object_name(names, is_pg_catalog, "function"),
+        [schema, name] if !is_default_schema(schema) => {
+            let qualified_name = format!("{schema}.{name}");
+            if !is_lowercase_name_without_dot(schema) || !is_lowercase_name_without_dot(name) {
+                return Err(no_such_function(&qualified_name));
+            }
+            Ok(qualified_name)
+        }
+        _ => {
+            let name = object_name(names, is_pg_catalog, "function")?;
+            if name.contains('.') {
+                return Err(no_such_function(&name));
+            }
+            Ok(name)
+        }
     }
+}
+
+fn is_lowercase_name_without_dot(name: &str) -> bool {
+    !name.contains('.') && !name.bytes().any(|byte| byte.is_ascii_uppercase())
+}
+
+fn no_such_function(name: &str) -> ParseError {
+    ParseError::ParseError(format!("no such function: {name}"))
 }
 
 fn object_name(
@@ -10839,7 +10859,7 @@ mod tests {
         for (sql, expected_name) in [
             ("SELECT auth.uid()", "auth.uid"),
             ("SELECT AUTH.UID()", "auth.uid"),
-            ("SELECT \"Auth\".uid()", "Auth.uid"),
+            ("SELECT \"auth\".\"uid\"()", "auth.uid"),
             ("SELECT myschema.f(1)", "myschema.f"),
             ("SELECT pg_catalog.lower('A')", "lower"),
         ] {
@@ -10858,6 +10878,24 @@ mod tests {
                 panic!("{sql}: expected a function call, got {expr:?}");
             };
             assert_eq!(name.as_str(), expected_name, "{sql}");
+        }
+    }
+
+    #[test]
+    fn function_name_with_a_dot_or_a_quoted_uppercase_letter_is_no_function() {
+        for (sql, expected_name) in [
+            ("SELECT \"auth.uid\"()", "auth.uid"),
+            ("SELECT pg_catalog.\"auth.uid\"()", "auth.uid"),
+            ("SELECT \"AUTH\".uid()", "AUTH.uid"),
+            ("SELECT auth.\"UID\"()", "auth.UID"),
+            ("SELECT \"auth.x\".uid()", "auth.x.uid"),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let err = PostgreSQLTranslator::new()
+                .translate(&parsed)
+                .expect_err(sql)
+                .to_string();
+            assert_eq!(err, format!("no such function: {expected_name}"), "{sql}");
         }
     }
 
