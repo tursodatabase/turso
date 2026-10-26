@@ -714,13 +714,6 @@ pub fn op_checkpoint(
         },
         insn
     );
-    if !program.connection.auto_commit.load(Ordering::SeqCst) {
-        // TODO: sqlite returns "Runtime error: database table is locked (6)" when a table is in use
-        // when a checkpoint is attempted. We don't have table locks, so return TableLocked for any
-        // attempt to checkpoint in an interactive transaction. This does not end the transaction,
-        // however.
-        return Err(LimboError::TableLocked.into());
-    }
     if *database == crate::TEMP_DB_ID && program.connection.temp.database.read().is_none() {
         set_not_in_wal_result(state, *dest);
         state.pc += 1;
@@ -728,6 +721,16 @@ pub fn op_checkpoint(
     }
 
     let pager = program.get_pager_from_database_index(database)?;
+    // Like SQLite, refuse only when this connection's open transaction has already
+    // read or written the database. After a plain BEGIN nothing is held yet, so the
+    // checkpoint runs. The error does not end the transaction.
+    if !program.connection.auto_commit.load(Ordering::SeqCst)
+        && (pager.holds_read_lock()
+            || pager.holds_write_lock()
+            || program.connection.get_mv_tx_for_db(*database).is_some())
+    {
+        return Err(LimboError::TableLocked.into());
+    }
     if !pager.has_wal() {
         set_not_in_wal_result(state, *dest);
         state.pc += 1;

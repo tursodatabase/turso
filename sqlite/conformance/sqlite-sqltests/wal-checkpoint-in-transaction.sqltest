@@ -1,0 +1,85 @@
+@database :temp:
+
+# Like SQLite, PRAGMA wal_checkpoint inside BEGIN runs as long as the
+# transaction has not read or written the database yet.
+test wal-checkpoint-after-begin {
+    PRAGMA journal_mode=wal;
+    BEGIN;
+    PRAGMA wal_checkpoint;
+    COMMIT;
+}
+expect {
+    wal
+    0|0|0
+}
+
+@skip-if mvcc "MVCC checkpoints in TRUNCATE mode by default, so the frame counts differ"
+test wal-checkpoint-after-begin-copies-wal-frames {
+    PRAGMA journal_mode=wal;
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1);
+    BEGIN;
+    PRAGMA wal_checkpoint;
+    COMMIT;
+}
+expect {
+    wal
+    0|3|3
+}
+
+test wal-checkpoint-truncate-and-full-after-begin {
+    PRAGMA journal_mode=wal;
+    CREATE TABLE t(x);
+    BEGIN;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    PRAGMA wal_checkpoint(FULL);
+    COMMIT;
+}
+expect {
+    wal
+    0|0|0
+    0|0|0
+}
+
+test wal-checkpoint-after-begin-then-write-and-read {
+    PRAGMA journal_mode=wal;
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1);
+    BEGIN;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    INSERT INTO t VALUES (2);
+    SELECT x FROM t ORDER BY x;
+    COMMIT;
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+    wal
+    0|0|0
+    1
+    2
+    1
+    2
+}
+
+test wal-checkpoint-after-read-in-transaction-is-locked {
+    PRAGMA journal_mode=wal;
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1);
+    BEGIN;
+    SELECT x FROM t;
+    PRAGMA wal_checkpoint;
+}
+expect error {
+    database table is locked
+}
+
+test wal-checkpoint-after-write-in-transaction-is-locked {
+    PRAGMA journal_mode=wal;
+    CREATE TABLE t(x);
+    BEGIN;
+    INSERT INTO t VALUES (1);
+    PRAGMA wal_checkpoint;
+}
+expect error {
+    database table is locked
+}
