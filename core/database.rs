@@ -2658,6 +2658,7 @@ impl Database {
             syms: parking_lot::RwLock::new(SymbolTable::new()),
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
+            next_page_size: AtomicU32::new(0),
             wal_auto_actions: AtomicU8::new(WalAutoActions::all_enabled().bits()),
             wal_autocheckpoint: AtomicU32::new(1000),
             #[cfg(feature = "conn_raw_api")]

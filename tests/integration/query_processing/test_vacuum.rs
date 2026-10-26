@@ -1333,6 +1333,94 @@ fn test_vacuum_into_preserves_page_size(_tmp_db: TempDatabase) -> anyhow::Result
     Ok(())
 }
 
+/// PRAGMA page_size on an existing database leaves the source unchanged, but
+/// VACUUM INTO writes the output with the requested page size, like SQLite.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_vacuum_into_uses_pending_page_size(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+    let dest_dir = TempDir::new()?;
+
+    for page_size in [1024, 8192, 65536] {
+        conn.execute(format!("PRAGMA page_size = {page_size}"))?;
+        let dest_path = dest_dir.path().join(format!("vacuumed_{page_size}.db"));
+        conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+        let source_page_size: Vec<(i64,)> = conn.exec_rows("PRAGMA page_size");
+        assert_eq!(source_page_size, vec![(4096,)]);
+
+        let dest_db = TempDatabase::new_with_existent(&dest_path);
+        let dest_conn = dest_db.connect_limbo();
+        let dest_page_size: Vec<(i64,)> = dest_conn.exec_rows("PRAGMA page_size");
+        assert_eq!(dest_page_size, vec![(page_size,)]);
+        assert_eq!(run_integrity_check(&dest_conn), "ok");
+        let rows: Vec<(i64,)> = dest_conn.exec_rows("SELECT a FROM t ORDER BY a");
+        assert_eq!(rows, vec![(1,), (2,), (3,)]);
+    }
+
+    // An invalid size replaces the earlier request, so the output keeps the source page size.
+    // 4294968320 is 2^32 + 1024: SQLite reads it as 0, not as 1024. SQLite reads 8.192e3
+    // from its leading digits, as 8.
+    for invalid_page_size in ["1000", "4294968320", "8.192e3"] {
+        conn.execute("PRAGMA page_size = 1024")?;
+        conn.execute(format!("PRAGMA page_size = {invalid_page_size}"))?;
+        let dest_path = dest_dir
+            .path()
+            .join(format!("vacuumed_{invalid_page_size}.db"));
+        conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+        let dest_db = TempDatabase::new_with_existent(&dest_path);
+        let dest_page_size: Vec<(i64,)> = dest_db.connect_limbo().exec_rows("PRAGMA page_size");
+        assert_eq!(dest_page_size, vec![(4096,)]);
+    }
+    Ok(())
+}
+
+/// Like SQLite, VACUUM INTO uses 1024 instead of a requested 512 when the source has
+/// more than 32 reserved bytes, so the output keeps enough usable space per page.
+#[turso_macros::test]
+fn test_vacuum_into_pending_page_size_512_with_large_reserved_space(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let source_db = TempDatabase::new_empty();
+    let conn = source_db.connect_limbo();
+    conn.set_reserved_bytes(33)?;
+    conn.execute("CREATE TABLE t (a INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+
+    conn.execute("PRAGMA page_size = 512")?;
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    let dest_page_size: Vec<(i64,)> = dest_conn.exec_rows("PRAGMA page_size");
+    assert_eq!(dest_page_size, vec![(1024,)]);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    let rows: Vec<(i64,)> = dest_conn.exec_rows("SELECT a FROM t");
+    assert_eq!(rows, vec![(1,)]);
+    Ok(())
+}
+
+/// Like SQLite, an in-place VACUUM of a WAL database drops the pending page size,
+/// so a later VACUUM INTO keeps the source page size.
+#[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_vacuum_clears_pending_page_size(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    conn.execute("PRAGMA page_size = 1024")?;
+    conn.execute("VACUUM")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_page_size: Vec<(i64,)> = dest_db.connect_limbo().exec_rows("PRAGMA page_size");
+    assert_eq!(dest_page_size, vec![(4096,)]);
+    Ok(())
+}
+
 /// Test VACUUM INTO with edge cases: empty tables with indexes, completely empty database
 #[turso_macros::test(mvcc)]
 fn test_vacuum_into_empty_edge_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
