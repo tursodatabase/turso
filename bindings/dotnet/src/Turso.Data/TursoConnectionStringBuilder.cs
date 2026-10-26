@@ -25,6 +25,9 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         ["Command Timeout"] = "Default Timeout",
         ["CommandTimeout"] = "Default Timeout",
         ["Pooling"] = "Pooling",
+        ["Binary GUID"] = "Binary GUID",
+        ["BinaryGUID"] = "Binary GUID",
+        ["BinaryGuid"] = "Binary GUID",
         ["Vfs"] = "Vfs",
         ["Encryption Cipher"] = "Encryption Cipher",
         ["EncryptionCipher"] = "Encryption Cipher",
@@ -129,6 +132,16 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
     {
         get => GetBool("Pooling");
         set => this["Pooling"] = value;
+    }
+
+    /// <summary>
+    /// Binds <see cref="Guid"/> parameters as 16-byte BLOBs (<see cref="Guid.ToByteArray()"/>), like
+    /// Microsoft.Data.Sqlite, instead of 36-character TEXT. Defaults to <see langword="false"/>.
+    /// </summary>
+    public bool BinaryGuid
+    {
+        get => GetBool("Binary GUID");
+        set => this["Binary GUID"] = value;
     }
 
     public string Vfs
