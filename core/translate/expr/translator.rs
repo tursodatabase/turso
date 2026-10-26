@@ -2540,11 +2540,16 @@ fn translate_column_expr(
                     // if we're reading from an index that contains this virtual column,
                     // the index already has the computed value, so read it from the index
                     GeneratedType::Virtual { .. } if !read_from_index => {
-                        do_emit_table_column(
-                            program,
+                        let row_cursor_id = if is_btree_index {
+                            index_cursor_id.expect("index cursor should be opened")
+                        } else {
                             table_cursor_id
                                 .or(index_cursor_id)
-                                .expect("cursor should be opened"),
+                                .expect("cursor should be opened")
+                        };
+                        do_emit_table_column(
+                            program,
+                            row_cursor_id,
                             &SelfTableContext::ForSelect {
                                 table_ref_id: *table_ref_id,
                                 referenced_tables: referenced_tables.unwrap().clone(),

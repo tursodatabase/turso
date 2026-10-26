@@ -5887,6 +5887,20 @@ expect {
     5|1
 }
 
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+test gencol_issue7064_without_rowid_matched_rows_after_unmatched_row {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a PRIMARY KEY, b, g AS (b + 1), h AS (1)) WITHOUT ROWID;
+    INSERT INTO l VALUES(1), (5), (6);
+    INSERT INTO r(a, b) VALUES(5, 10), (6, 20);
+    SELECT x, a, b, g, h FROM l LEFT JOIN r ON r.a = l.x ORDER BY x;
+}
+expect {
+    1||||
+    5|5|10|11|1
+    6|6|20|21|1
+}
+
 # Issue #7058: ALTER TABLE ADD COLUMN must reject a column that has
 # both DEFAULT and a GENERATED clause.
 
