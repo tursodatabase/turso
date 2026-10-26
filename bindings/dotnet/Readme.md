@@ -209,6 +209,30 @@ connection!.ConnectionString = "Data Source=:memory:";
 connection.Open();
 ```
 
+## Page codecs
+
+A page codec transforms every page of a local database on its way to and from storage, for example to encrypt it with
+a key the application manages. Implement `Turso.Raw.Public.ITursoPageCodec` and set it on the connection before
+opening it; a connection string cannot carry it:
+
+```C#
+using var connection = new TursoConnection("Data Source=app.db") { PageCodec = codec };
+connection.Open();
+```
+
+`Mode=ReadOnly` opens the database read-only. The raw API is `TursoBindings.OpenDatabaseWithPageCodec`,
+`OpenDatabaseReadOnlyWithPageCodec` and `OpenSharedDatabase(path, codec)`.
+
+- The codec gets whole pages, the reserved tail included. Per-page metadata such as a nonce and tag goes in the last
+  `ReservedSpace` bytes; opening an existing database fails unless its header holds the same value.
+- `CodecId` must be non-zero and must change whenever encoded bytes could differ, such as with another key. A
+  process keeps one database per path and refuses a connection whose codec ID differs from the one the database was
+  opened with, instead of reading through the wrong codec.
+- Callbacks run concurrently on any thread that steps a statement, so the codec must be thread-safe and must not call
+  back into Turso. An exception thrown by the codec fails the page operation with a generic message.
+- The codec does not cover temporary files: run `PRAGMA temp_store = memory` on each connection. It cannot be combined
+  with `Encryption Cipher`, `ATTACH`, MVCC, remote URLs or embedded replicas.
+
 ## Migrating from Microsoft.Data.Sqlite
 
 For common embedded SQLite usage, the `Turso.Data.Sqlite.Provider` package exposes a SQLite-compatible `Turso.Data.Sqlite` facade over the Turso engine:

@@ -95,6 +95,98 @@ public class TursoPageCodecTests
     }
 
     [Test]
+    public void TursoConnectionRoundTripsThroughCodecWithoutPlaintext()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = directory.File("codec.db");
+        using var codec = new AesGcmTestPageCodec(AesGcmTestPageCodec.NewKey());
+
+        using (var connection = OpenTurso(path, codec))
+        {
+            WriteRows(connection);
+
+            ReadFile(path + "-wal").Length.Should().BeGreaterThan(0);
+            AssertNoPlaintext(path + "-wal");
+
+            connection.ExecuteNonQuery("PRAGMA wal_checkpoint(TRUNCATE)");
+            AssertNoPlaintext(path);
+        }
+
+        AssertNoPlaintext(path);
+
+        using var reopened = OpenTurso(path, codec);
+        CountRows(reopened).Should().Be(RowCount);
+        PageCodecTestFiles.Scalar(reopened, "PRAGMA integrity_check").Should().Be("ok");
+    }
+
+    [Test]
+    public void TursoConnectionWithWrongKeyOrNoCodecFailsCleanly()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = directory.File("codec.db");
+        using (var codec = new AesGcmTestPageCodec(AesGcmTestPageCodec.NewKey()))
+        using (var connection = OpenTurso(path, codec))
+        {
+            WriteRows(connection);
+        }
+
+        using var wrongCodec = new AesGcmTestPageCodec(AesGcmTestPageCodec.NewKey());
+        FluentActions.Invoking(() =>
+            {
+                using var connection = OpenTurso(path, wrongCodec);
+                CountRows(connection);
+            })
+            .Should().Throw<TursoException>();
+
+        FluentActions.Invoking(() =>
+            {
+                using var connection = new TursoConnection($"Data Source={path}");
+                connection.Open();
+                CountRows(connection);
+            })
+            .Should().Throw<TursoException>();
+    }
+
+    [Test]
+    public void TursoConnectionReadOnlyOpenUsesCodec()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = directory.File("codec.db");
+        using var codec = new AesGcmTestPageCodec(AesGcmTestPageCodec.NewKey());
+        using (var connection = OpenTurso(path, codec))
+            WriteRows(connection);
+
+        using var readOnly = new TursoConnection($"Data Source={path};Mode=ReadOnly") { PageCodec = codec };
+        readOnly.Open();
+
+        CountRows(readOnly).Should().Be(RowCount);
+        readOnly.Invoking(x => x.ExecuteNonQuery($"INSERT INTO items(name) VALUES ('{Marker}')"))
+            .Should().Throw<TursoException>();
+    }
+
+    [Test]
+    public void TursoConnectionRejectsPageCodecWhereItCannotApply()
+    {
+        using var codec = new AesGcmTestPageCodec(AesGcmTestPageCodec.NewKey());
+
+        using (var remote = new TursoConnection("Data Source=libsql://example.turso.io") { PageCodec = codec })
+            remote.Invoking(x => x.Open()).Should().Throw<InvalidOperationException>().WithMessage("*PageCodec*");
+
+        using (var replica = new TursoConnection("Data Source=libsql://example.turso.io;Replica Path=replica.db") { PageCodec = codec })
+        {
+            replica.Invoking(x => x.Open()).Should().Throw<InvalidOperationException>().WithMessage("*PageCodec*");
+            replica.Awaiting(x => x.OpenAsync()).Should().ThrowAsync<InvalidOperationException>().WithMessage("*PageCodec*");
+        }
+
+        using (var encrypted = new TursoConnection("Data Source=:memory:;Encryption Cipher=aegis256;Encryption Key=00") { PageCodec = codec })
+            encrypted.Invoking(x => x.Open()).Should().Throw<InvalidOperationException>().WithMessage("*PageCodec*");
+
+        using var open = new TursoConnection();
+        open.Open();
+        open.Invoking(x => x.PageCodec = codec).Should().Throw<InvalidOperationException>();
+    }
+
+    [Test]
     public void CodecIdMustBeSixteenNonZeroBytes()
     {
         FluentActions.Invoking(() => TursoPageCodecId.FromGuid(Guid.Empty)).Should().Throw<ArgumentException>();
@@ -104,6 +196,13 @@ public class TursoPageCodecTests
         var bytes = Enumerable.Range(1, 16).Select(value => (byte)value).ToArray();
         TursoPageCodecId.FromBytes(bytes).Should().Be(TursoPageCodecId.FromBytes(bytes));
         TursoPageCodecId.FromBytes(bytes).Should().NotBe(TursoPageCodecId.FromGuid(Guid.NewGuid()));
+    }
+
+    private static TursoConnection OpenTurso(string path, ITursoPageCodec codec)
+    {
+        var connection = new TursoConnection($"Data Source={path}") { PageCodec = codec };
+        connection.Open();
+        return connection;
     }
 
     private static void Execute(TursoDatabaseHandle database, string sql)
