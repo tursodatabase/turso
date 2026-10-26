@@ -12,6 +12,43 @@ use crate::common::{ExecRows, TempDatabase};
 use asserting::prelude::*;
 use tempfile::TempDir;
 
+#[test]
+fn test_rename_column_preserves_schema_source_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("schema-source.db");
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(a DEFAULT - /* neg */5, c)")
+            .unwrap();
+        conn.execute("CREATE INDEX i ON t(c)").unwrap();
+        conn.execute("CREATE VIEW v AS SELECT c FROM t").unwrap();
+        conn.execute("CREATE TRIGGER g AFTER UPDATE OF c ON t BEGIN SELECT NEW.c; END")
+            .unwrap();
+        conn.execute("INSERT INTO t(c) VALUES (9)").unwrap();
+        conn.execute("ALTER TABLE t RENAME COLUMN c TO d").unwrap();
+        conn.close().unwrap();
+    }
+    for _ in 0..2 {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        let sql: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name='t'");
+        assert_eq!(
+            sql,
+            vec![("CREATE TABLE t(a DEFAULT - /* neg */5, d)".into(),)]
+        );
+        let defaults: Vec<(String,)> =
+            conn.exec_rows("SELECT dflt_value FROM pragma_table_info('t') WHERE name='a'");
+        assert_eq!(defaults, vec![("- /* neg */5".into(),)]);
+        let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT a,d FROM t");
+        assert_eq!(rows, vec![(-5, 9)]);
+        let view: Vec<(i64,)> = conn.exec_rows("SELECT d FROM v");
+        assert_eq!(view, vec![(9,)]);
+        conn.execute("UPDATE t SET d=9").unwrap();
+        conn.close().unwrap();
+    }
+}
+
 /// After ALTER TABLE DROP COLUMN on an AUTOINCREMENT table, reopen must parse
 /// the persisted schema as AUTOINCREMENT and avoid reusing deleted rowids.
 #[test]

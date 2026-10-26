@@ -10198,7 +10198,18 @@ fn parse_schema_sql_for_alter(
     entry_type: &str,
     root_page: i64,
     sql: &str,
+    capture_source: bool,
 ) -> Result<Option<ast::Cmd>> {
+    if capture_source {
+        let is_table = entry_type == "table" && root_page != 0;
+        let cmd = dialect.parse_schema_sql_for_rename(sql, is_table)?;
+        if is_table && !matches!(&cmd, Some(ast::Cmd::Stmt(ast::Stmt::CreateTable { .. }))) {
+            return Err(LimboError::Corrupt(
+                "storage-backed table schema is not CREATE TABLE".to_owned(),
+            ));
+        }
+        return Ok(cmd);
+    }
     if entry_type == "table" && root_page != 0 {
         let stmt = dialect.parse_table_sql_ast(sql)?;
         if !matches!(stmt, ast::Stmt::CreateTable { .. }) {
@@ -12017,6 +12028,7 @@ pub fn op_function(
                             entry_type.as_str(),
                             *root_page,
                             sql.as_str(),
+                            false,
                         )?;
                         let Some(ast::Cmd::Stmt(stmt)) = cmd else {
                             return Err(LimboError::InternalError(
@@ -12309,6 +12321,7 @@ pub fn op_function(
                             entry_type.as_str(),
                             *root_page,
                             sql.as_str(),
+                            matches!(alter_func, AlterTableFunc::RenameColumn),
                         )?;
                         let Some(ast::Cmd::Stmt(stmt)) = cmd else {
                             return Err(LimboError::InternalError(
@@ -12349,19 +12362,25 @@ pub fn op_function(
                                     );
                                 }
 
-                                Some(
-                                    ast::Stmt::CreateIndex {
-                                        tbl_name,
-                                        columns,
-                                        unique,
-                                        if_not_exists,
-                                        idx_name,
-                                        where_clause,
-                                        using,
-                                        with_clause,
-                                    }
-                                    .to_string(),
-                                )
+                                let new_stmt = ast::Stmt::CreateIndex {
+                                    tbl_name,
+                                    columns,
+                                    unique,
+                                    if_not_exists,
+                                    idx_name,
+                                    where_clause,
+                                    using,
+                                    with_clause,
+                                };
+                                Some(if matches!(alter_func, AlterTableFunc::RenameColumn) {
+                                    program.connection.dialect().format_renamed_schema_sql(
+                                        sql.as_str(),
+                                        &new_stmt,
+                                        &column_def.col_name,
+                                    )?
+                                } else {
+                                    new_stmt.to_string()
+                                })
                             }
                             ast::Stmt::CreateTable {
                                 tbl_name,
@@ -12398,7 +12417,9 @@ pub fn op_function(
                                     match alter_func {
                                         AlterTableFunc::AlterColumn => *column = column_def.clone(),
                                         AlterTableFunc::RenameColumn => {
-                                            column.col_name = column_def.col_name.clone()
+                                            column.col_name = column
+                                                .col_name
+                                                .with_replacement(column_def.col_name.clone())
                                         }
                                         _ => unreachable!(),
                                     }
@@ -12440,9 +12461,14 @@ pub fn op_function(
                                                     if normalize_ident(child_col.col_name.as_str())
                                                         == rename_from
                                                     {
-                                                        child_col.col_name = Name::exact(
-                                                            column_def.col_name.as_str().to_owned(),
-                                                        );
+                                                        child_col.col_name = child_col
+                                                            .col_name
+                                                            .with_replacement(Name::exact(
+                                                                column_def
+                                                                    .col_name
+                                                                    .as_str()
+                                                                    .to_owned(),
+                                                            ));
                                                     }
                                                 }
                                                 rewrite_fk_parent_cols_if_self_ref(
@@ -12497,9 +12523,14 @@ pub fn op_function(
                                                     if normalize_ident(parent_col.col_name.as_str())
                                                         == rename_from
                                                     {
-                                                        parent_col.col_name = Name::exact(
-                                                            column_def.col_name.as_str().to_owned(),
-                                                        );
+                                                        parent_col.col_name = parent_col
+                                                            .col_name
+                                                            .with_replacement(Name::exact(
+                                                                column_def
+                                                                    .col_name
+                                                                    .as_str()
+                                                                    .to_owned(),
+                                                            ));
                                                         fk_updated = true;
                                                     }
                                                 }
@@ -12536,12 +12567,18 @@ pub fn op_function(
                                     temporary,
                                     if_not_exists,
                                 };
-                                Some(
+                                Some(if matches!(alter_func, AlterTableFunc::RenameColumn) {
+                                    program.connection.dialect().format_renamed_schema_sql(
+                                        sql.as_str(),
+                                        &new_stmt,
+                                        &column_def.col_name,
+                                    )?
+                                } else {
                                     program
                                         .connection
                                         .dialect()
-                                        .format_rewritten_table_sql(&new_stmt)?,
-                                )
+                                        .format_rewritten_table_sql(&new_stmt)?
+                                })
                             }
                             // Trigger SQL is rewritten by separate UPDATE statements
                             // generated by alter.rs (via rewrite_trigger_sql_for_column_rename),
@@ -16075,6 +16112,13 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                     conn.dialect().as_ref(),
                 )?;
                 if ty == "trigger" {
+                    // SQLite omits TEMP from stored SQL; use the containing schema.
+                    if inner.db == crate::TEMP_DB_ID {
+                        let trigger = schema
+                            .trigger_mut(NamespaceId::ROOT, name)
+                            .expect("new trigger should be loaded");
+                        Arc::make_mut(trigger).temporary = true;
+                    }
                     if let Some(target_database_id) = inner.trigger_target_database_id {
                         schema.set_trigger_target_database_id(
                             NamespaceId::ROOT,

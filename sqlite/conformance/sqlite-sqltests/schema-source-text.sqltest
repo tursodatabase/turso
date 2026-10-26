@@ -1,0 +1,105 @@
+@database :memory:
+
+test schema-source-create-text {
+    CREATE TABLE source_table(a  INT, b VARCHAR(10) DEFAULT -5, c);
+    CREATE INDEX IF NOT EXISTS source_index ON source_table(a);
+    CREATE TRIGGER source_trigger BEFORE INSERT ON source_table BEGIN SELECT RAISE(IGNORE); END;
+    CREATE VIEW source_view AS SELECT a+1 AS x FROM source_table;
+    SELECT name,sql FROM sqlite_schema WHERE name LIKE 'source_%' ORDER BY name;
+    SELECT name,dflt_value FROM pragma_table_info('source_table') WHERE dflt_value IS NOT NULL;
+}
+expect {
+    source_index|CREATE INDEX source_index ON source_table(a)
+    source_table|CREATE TABLE source_table(a  INT, b VARCHAR(10) DEFAULT -5, c)
+    source_trigger|CREATE TRIGGER source_trigger BEFORE INSERT ON source_table BEGIN SELECT RAISE(IGNORE); END
+    source_view|CREATE VIEW source_view AS SELECT a+1 AS x FROM source_table
+    b|-5
+}
+
+test schema-source-rename-column-text {
+    CREATE TABLE source_table(a  INT, b VARCHAR(10) DEFAULT -5, c);
+    CREATE INDEX IF NOT EXISTS source_index ON source_table(c);
+    CREATE TRIGGER source_trigger BEFORE UPDATE OF c ON source_table BEGIN SELECT NEW.c; END;
+    CREATE VIEW source_view AS SELECT c+1 AS x FROM source_table;
+    ALTER TABLE source_table RENAME COLUMN c TO [d];
+    SELECT name,sql FROM sqlite_schema WHERE name LIKE 'source_%' ORDER BY name;
+    SELECT name,dflt_value FROM pragma_table_info('source_table') WHERE dflt_value IS NOT NULL;
+}
+expect {
+    source_index|CREATE INDEX source_index ON source_table("d")
+    source_table|CREATE TABLE source_table(a  INT, b VARCHAR(10) DEFAULT -5, "d")
+    source_trigger|CREATE TRIGGER source_trigger BEFORE UPDATE OF "d" ON source_table BEGIN SELECT NEW."d"; END
+    source_view|CREATE VIEW source_view AS SELECT "d"+1 AS x FROM source_table
+    b|-5
+}
+
+test schema-source-prefix-and-default-lexemes {
+    CREATE /* prefix */ TEMP TABLE IF NOT EXISTS temp.[t 1](a DEFAULT (   1  +  2  ), b DEFAULT - /* neg */5 /* trailing */, c DEFAULT ((-5)), d DEFAULT 'it''s', e DEFAULT nUlL);
+    CREATE TEMP VIEW IF NOT EXISTS temp.[v 1] AS SELECT 1 AS [x y];
+    SELECT name,sql FROM sqlite_temp_schema WHERE name IN ('t 1','v 1') ORDER BY name;
+    SELECT name,dflt_value FROM pragma_table_info('t 1') ORDER BY cid;
+}
+expect {
+    t 1|CREATE TABLE [t 1](a DEFAULT (   1  +  2  ), b DEFAULT - /* neg */5 /* trailing */, c DEFAULT ((-5)), d DEFAULT 'it''s', e DEFAULT nUlL)
+    v 1|CREATE VIEW [v 1] AS SELECT 1 AS [x y]
+    a|1  +  2
+    b|- /* neg */5
+    c|(-5)
+    d|'it''s'
+    e|nUlL
+}
+
+test schema-source-scoped-quoted-renames {
+    CREATE TABLE p( [c] INTEGER PRIMARY KEY, d DEFAULT - /* neg */5, s DEFAULT 'c', CHECK(c>=0));
+    CREATE TABLE child(x REFERENCES p(c), y, FOREIGN KEY(y) REFERENCES p(c));
+    CREATE INDEX i ON p(c) WHERE c>0;
+    CREATE TRIGGER g AFTER UPDATE OF c ON p WHEN NEW.c>0 BEGIN SELECT NEW.c, 'c', c FROM p WHERE c=OLD.c; END;
+    CREATE VIEW v AS SELECT c,'c' AS s FROM p;
+    CREATE TABLE other(c);
+    CREATE VIEW v2 AS SELECT t.c, o.c AS other_c FROM p t CROSS JOIN other o;
+    ALTER TABLE p RENAME COLUMN c TO "New""Col";
+    SELECT name,sql FROM sqlite_schema WHERE name IN ('p','child','i','g','v','v2','other') ORDER BY name;
+    SELECT name,dflt_value FROM pragma_table_info('p') WHERE dflt_value IS NOT NULL ORDER BY cid;
+}
+expect {
+    child|CREATE TABLE child(x REFERENCES p("New""Col"), y, FOREIGN KEY(y) REFERENCES p("New""Col"))
+    g|CREATE TRIGGER g AFTER UPDATE OF "New""Col" ON p WHEN NEW."New""Col">0 BEGIN SELECT NEW."New""Col", 'c', "New""Col" FROM p WHERE "New""Col"=OLD."New""Col"; END
+    i|CREATE INDEX i ON p("New""Col") WHERE "New""Col">0
+    other|CREATE TABLE other(c)
+    p|CREATE TABLE p( "New""Col" INTEGER PRIMARY KEY, d DEFAULT - /* neg */5, s DEFAULT 'c', CHECK("New""Col">=0))
+    v|CREATE VIEW v AS SELECT "New""Col",'c' AS s FROM p
+    v2|CREATE VIEW v2 AS SELECT t."New""Col", o.c AS other_c FROM p t CROSS JOIN other o
+    d|- /* neg */5
+    s|'c'
+}
+
+test schema-source-case-only-rename {
+    CREATE TABLE case_t(c);
+    CREATE TRIGGER case_g AFTER UPDATE OF c ON case_t BEGIN SELECT NEW.c; END;
+    CREATE INDEX case_i ON case_t(c);
+    CREATE VIEW case_v AS SELECT c FROM case_t;
+    ALTER TABLE case_t RENAME COLUMN c TO C;
+    SELECT name,sql FROM sqlite_schema WHERE name LIKE 'case_%' ORDER BY name;
+}
+expect {
+    case_g|CREATE TRIGGER case_g AFTER UPDATE OF C ON case_t BEGIN SELECT NEW.C; END
+    case_i|CREATE INDEX case_i ON case_t(C)
+    case_t|CREATE TABLE case_t(C)
+    case_v|CREATE VIEW case_v AS SELECT C FROM case_t
+}
+
+test schema-source-temp-trigger-scope {
+    CREATE TABLE t(a);
+    CREATE TEMP TABLE audit(x);
+    CREATE TEMP TRIGGER tr AFTER INSERT ON main.t BEGIN INSERT INTO audit VALUES(NEW.a); END;
+    SELECT sql FROM temp.sqlite_schema WHERE type='trigger';
+    INSERT INTO t VALUES(3);
+    ALTER TABLE t RENAME COLUMN a TO [b];
+    INSERT INTO t(b) VALUES(4);
+    SELECT x FROM audit ORDER BY x;
+}
+expect {
+    CREATE TRIGGER tr AFTER INSERT ON main.t BEGIN INSERT INTO audit VALUES(NEW.a); END
+    3
+    4
+}

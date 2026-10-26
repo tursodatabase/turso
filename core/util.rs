@@ -2691,7 +2691,7 @@ pub fn rewrite_fk_parent_cols_if_self_ref(
     if clause.tbl_name.as_str().eq_ignore_ascii_case(table) {
         for c in &mut clause.columns {
             if c.col_name.as_str().eq_ignore_ascii_case(from) {
-                c.col_name = ast::Name::exact(to.to_owned());
+                c.col_name = c.col_name.with_replacement(ast::Name::exact(to.to_owned()));
             }
         }
     }
@@ -2739,13 +2739,14 @@ pub fn rename_identifiers(expr: &mut ast::Expr, from: &str, to: &str) {
                 ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
                     if name.as_str().eq_ignore_ascii_case(from) =>
                 {
-                    *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
+                    *e = ast::Expr::Id(name.with_replacement(ast::Name::exact(to.to_owned())));
                 }
                 ast::Expr::Qualified(ref tbl, ref col_name)
                     if col_name.as_str().eq_ignore_ascii_case(from) =>
                 {
                     let tbl = tbl.clone();
-                    *e = ast::Expr::Qualified(tbl, ast::Name::exact(to.to_owned()));
+                    let renamed = col_name.with_replacement(ast::Name::exact(to.to_owned()));
+                    *e = ast::Expr::Qualified(tbl, renamed);
                 }
                 _ => {}
             }
@@ -2772,6 +2773,24 @@ mod rename_column_view {
         old_column: &str,
         new_column: &str,
     ) -> Result<Option<RewrittenView>> {
+        rewrite_view_sql_for_column_rename_with_name(
+            view_sql,
+            schema,
+            target_table,
+            target_db_name,
+            old_column,
+            &ast::Name::exact(new_column.to_owned()),
+        )
+    }
+
+    pub fn rewrite_view_sql_for_column_rename_with_name(
+        view_sql: &str,
+        schema: &Schema,
+        target_table: &str,
+        target_db_name: &str,
+        old_column: &str,
+        new_column: &ast::Name,
+    ) -> Result<Option<RewrittenView>> {
         let mut visiting_views = HashSet::default();
         rewrite_view_sql_for_column_rename_inner(
             view_sql,
@@ -2790,10 +2809,10 @@ mod rename_column_view {
         target_table: &str,
         target_db_name: &str,
         old_column: &str,
-        new_column: &str,
+        new_column: &ast::Name,
         visiting_views: &mut HashSet<String>,
     ) -> Result<Option<RewrittenView>> {
-        let mut parser = Parser::new(view_sql.as_bytes());
+        let mut parser = Parser::with_source(view_sql.as_bytes());
         let cmd = parser
             .next_cmd()
             .map_err(|e| LimboError::ParseError(format!("failed to parse view SQL: {e}")))?;
@@ -2848,7 +2867,8 @@ mod rename_column_view {
                     columns: view_columns,
                     select: select.clone(),
                 };
-                new_stmt.to_string()
+                crate::schema_sql::renamed_sql(view_sql, &new_stmt, new_column)
+                    .unwrap_or_else(|| new_stmt.to_string())
             } else {
                 view_sql.to_string()
             };
@@ -2955,6 +2975,7 @@ mod rename_column_view {
         old_column: &'a str,
         old_column_norm: String,
         new_column: &'a str,
+        new_name: &'a ast::Name,
     }
 
     impl<'a> ViewRewriteCtx<'a> {
@@ -2963,7 +2984,7 @@ mod rename_column_view {
             target_table: &'a str,
             target_db_name: &'a str,
             old_column: &'a str,
-            new_column: &'a str,
+            new_name: &'a ast::Name,
         ) -> Self {
             Self {
                 schema,
@@ -2972,7 +2993,8 @@ mod rename_column_view {
                 target_db_norm: normalize_ident(target_db_name),
                 old_column,
                 old_column_norm: normalize_ident(old_column),
-                new_column,
+                new_column: new_name.as_str(),
+                new_name,
             }
         }
     }
@@ -3307,7 +3329,7 @@ mod rename_column_view {
                             ctx.target_table,
                             &ctx.target_db_norm,
                             ctx.old_column,
-                            ctx.new_column,
+                            ctx.new_name,
                             visiting_views,
                         )? {
                             rename_map = build_rename_map_from_columns(
@@ -3522,7 +3544,7 @@ mod rename_column_view {
                     resolve_qualified(sources, &ns_norm, target_db_norm);
                 if let Some(source) = source {
                     return apply_rename(source, &mut |name| {
-                        *col = ast::Name::exact(name);
+                        *col = col.with_replacement(ast::Name::exact(name));
                     });
                 }
                 if local_ambiguous {
@@ -3532,7 +3554,7 @@ mod rename_column_view {
                     let (source, ambiguous) = resolve_qualified(scope, &ns_norm, target_db_norm);
                     if let Some(source) = source {
                         return apply_rename(source, &mut |name| {
-                            *col = ast::Name::exact(name);
+                            *col = col.with_replacement(ast::Name::exact(name));
                         });
                     }
                     if ambiguous {
@@ -3552,7 +3574,7 @@ mod rename_column_view {
                 let (source, local_ambiguous) = resolve_qualified(sources, &ns_norm, &schema_norm);
                 if let Some(source) = source {
                     return apply_rename(source, &mut |name| {
-                        *col = ast::Name::exact(name);
+                        *col = col.with_replacement(ast::Name::exact(name));
                     });
                 }
                 if local_ambiguous {
@@ -3562,7 +3584,7 @@ mod rename_column_view {
                     let (source, ambiguous) = resolve_qualified(scope, &ns_norm, &schema_norm);
                     if let Some(source) = source {
                         return apply_rename(source, &mut |name| {
-                            *col = ast::Name::exact(name);
+                            *col = col.with_replacement(ast::Name::exact(name));
                         });
                     }
                     if ambiguous {
@@ -3574,11 +3596,12 @@ mod rename_column_view {
                 if !col.as_str().eq_ignore_ascii_case(old_column_norm) {
                     return false;
                 }
+                let original = col.clone();
                 let col_norm = normalize_ident(col.as_str());
                 let (source, local_ambiguous) = resolve_unqualified(sources, &col_norm);
                 if let Some(source) = source {
                     return apply_rename(source, &mut |name| {
-                        *expr = ast::Expr::Id(ast::Name::exact(name));
+                        *expr = ast::Expr::Id(original.with_replacement(ast::Name::exact(name)));
                     });
                 }
                 if local_ambiguous {
@@ -3588,7 +3611,8 @@ mod rename_column_view {
                     let (source, ambiguous) = resolve_unqualified(scope, &col_norm);
                     if let Some(source) = source {
                         return apply_rename(source, &mut |name| {
-                            *expr = ast::Expr::Id(ast::Name::exact(name));
+                            *expr =
+                                ast::Expr::Id(original.with_replacement(ast::Name::exact(name)));
                         });
                     }
                     if ambiguous {
@@ -3660,7 +3684,7 @@ mod rename_column_view {
 
         for col in cols {
             if col.as_str().eq_ignore_ascii_case(old_column_norm) {
-                *col = ast::Name::exact(replacement.to_string());
+                *col = col.with_replacement(ast::Name::exact(replacement.to_string()));
                 changed = true;
             }
         }
@@ -3815,7 +3839,9 @@ mod rename_column_view {
     }
 }
 
-pub use rename_column_view::{rewrite_view_sql_for_column_rename, RewrittenView};
+pub use rename_column_view::{
+    rewrite_view_sql_for_column_rename, rewrite_view_sql_for_column_rename_with_name, RewrittenView,
+};
 
 /// Rewrite table-qualified column references in a CHECK constraint expression,
 /// replacing the table name from `from` to `to`. For example, `t1.a > 0` becomes

@@ -2024,7 +2024,13 @@ fn emit_columns_for_table_info(
                 program.emit_null(base_reg + 4, None);
             }
             Some(expr) => {
-                program.emit_string8(expr.to_string(), base_reg + 4);
+                program.emit_string8(
+                    column
+                        .default_source
+                        .clone()
+                        .unwrap_or_else(|| expr.to_string()),
+                    base_reg + 4,
+                );
             }
         }
 

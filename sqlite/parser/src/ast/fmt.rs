@@ -117,6 +117,11 @@ pub trait TokenStream {
     /// Push token to this stream
     fn append(&mut self, ty: TokenType, value: Option<&str>) -> Result<(), Self::Error>;
 
+    /// Emit an identifier, retaining optional source identity for schema rewriters.
+    fn identifier(&mut self, name: &Name) -> Result<(), Self::Error> {
+        self.append(TK_ID, Some(&name.as_ident()))
+    }
+
     /// Interspace iterator with commas
     fn comma<I, C: ToSqlContext>(&mut self, items: I, context: &C) -> Result<(), Self::Error>
     where
@@ -1631,7 +1636,7 @@ impl ToTokens for Name {
         s: &mut S,
         _: &C,
     ) -> Result<(), S::Error> {
-        s.append(TK_ID, Some(&self.as_ident()))
+        s.identifier(self)
     }
 }
 

@@ -27,12 +27,11 @@ use crate::{
             ColumnMask, ColumnUsedMask, JoinedTable, Operation, OuterQueryReference,
             TableReferences,
         },
-        trigger::create_trigger_to_sql,
     },
     util::{
         check_expr_references_column, escape_sql_string_literal, is_builtin_strict_type,
         normalize_ident, parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
-        rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
+        rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename_with_name,
     },
     vdbe::{
         affinity::Affinity,
@@ -1719,7 +1718,10 @@ pub fn translate_alter_table(
                 )));
             };
 
-            if btree.get_column(col_name).is_some() {
+            if btree
+                .get_column(col_name)
+                .is_some_and(|(index, _)| !rename || index != column_index)
+            {
                 return Err(LimboError::ParseError(format!(
                     "duplicate column name: \"{col_name}\""
                 )));
@@ -1904,10 +1906,10 @@ pub fn translate_alter_table(
                         )));
                     }
                     match rewrite_trigger_sql_for_column_rename(
-                        &trigger_entry.trigger.sql,
+                        &trigger_entry.trigger,
                         table_name,
                         from,
-                        col_name,
+                        &definition.col_name,
                         trigger_entry.database_id,
                         database_id,
                         resolver,
@@ -1954,13 +1956,13 @@ pub fn translate_alter_table(
                 views_to_rewrite = resolver.with_schema(database_id, |s| -> Result<_> {
                     let mut rewrites = Vec::new();
                     for (view_name, view) in s.views(namespace.id) {
-                        if let Some(rewritten) = rewrite_view_sql_for_column_rename(
+                        if let Some(rewritten) = rewrite_view_sql_for_column_rename_with_name(
                             &view.sql,
                             s,
                             table_name,
                             &target_db_name,
                             from,
-                            col_name,
+                            &definition.col_name,
                         )? {
                             rewrites.push((database_id, view_name.to_string(), rewritten.sql));
                         }
@@ -1974,14 +1976,16 @@ pub fn translate_alter_table(
                         resolver.with_schema(crate::TEMP_DB_ID, |s| -> Result<_> {
                             let mut rewrites = Vec::new();
                             for (view_name, view) in s.views(NamespaceId::ROOT) {
-                                if let Some(rewritten) = rewrite_view_sql_for_column_rename(
-                                    &view.sql,
-                                    s,
-                                    table_name,
-                                    &target_db_name,
-                                    from,
-                                    col_name,
-                                )? {
+                                if let Some(rewritten) =
+                                    rewrite_view_sql_for_column_rename_with_name(
+                                        &view.sql,
+                                        s,
+                                        table_name,
+                                        &target_db_name,
+                                        from,
+                                        &definition.col_name,
+                                    )?
+                                {
                                     rewrites.push((
                                         crate::TEMP_DB_ID,
                                         view_name.to_string(),
@@ -2868,16 +2872,17 @@ fn rewrite_trigger_sql_for_table_rename(
 /// Rewrite trigger SQL to replace old column name with new column name.
 /// This handles old.x, new.x, and unqualified x references.
 fn rewrite_trigger_sql_for_column_rename(
-    trigger_sql: &str,
+    trigger: &crate::schema::Trigger,
     table_name: &str,
     old_column_name: &str,
-    new_column_name: &str,
+    new_column_name: &ast::Name,
     trigger_database_id: usize,
     target_database_id: usize,
     resolver: &Resolver,
 ) -> Result<String> {
+    let trigger_sql = trigger.sql.as_str();
     // Parse the trigger SQL
-    let mut parser = Parser::new(trigger_sql.as_bytes());
+    let mut parser = Parser::with_source(trigger_sql.as_bytes());
     let cmd = parser
         .next_cmd()
         .map_err(|e| LimboError::ParseError(format!("failed to parse trigger SQL: {e}")))?;
@@ -2898,14 +2903,20 @@ fn rewrite_trigger_sql_for_column_rename(
         )));
     };
 
+    let temporary = temporary || trigger.temporary;
+    let trigger_table_database_id = match trigger.target_database_id {
+        Some(db) => db,
+        None if temporary => resolver.resolve_existing_table(&tbl_name)?.database_id,
+        None => trigger_database_id,
+    };
     let old_col_norm = normalize_ident(old_column_name);
-    let new_col_norm = normalize_ident(new_column_name);
+    let new_col_norm = normalize_ident(new_column_name.as_str());
 
     // Get the trigger's owning table to check unqualified column references
     let trigger_table_name_raw = tbl_name.name.as_str();
     let trigger_table_name = normalize_ident(trigger_table_name_raw);
     let trigger_table = resolver
-        .with_schema(trigger_database_id, |schema| {
+        .with_schema(trigger_table_database_id, |schema| {
             schema.get_btree_table(NamespaceId::ROOT, &trigger_table_name)
         })
         .ok_or_else(|| {
@@ -2935,7 +2946,7 @@ fn rewrite_trigger_sql_for_column_rename(
                 for col in &mut cols {
                     let col_norm = normalize_ident(col.as_str());
                     if col_norm == old_col_norm {
-                        *col = ast::Name::from_string(new_col_norm.clone());
+                        *col = col.with_replacement(ast::Name::from_string(new_col_norm.clone()));
                     }
                 }
                 ast::TriggerEvent::UpdateOf(cols)
@@ -2967,7 +2978,7 @@ fn rewrite_trigger_sql_for_column_rename(
                             && is_renaming_trigger_table
                             && trigger_table.get_column(&col_norm).is_some()
                         {
-                            *col = ast::Name::from_string(&*new_col_norm);
+                            *col = col.with_replacement(ast::Name::from_string(&*new_col_norm));
                         }
                     }
                     Ok(WalkControl::Continue)
@@ -3016,30 +3027,36 @@ fn rewrite_trigger_sql_for_column_rename(
         new_commands.push(new_cmd);
     }
 
-    validate_trigger_after_column_rename(
-        &new_event,
-        new_when_clause.as_deref(),
-        &new_commands,
-        trigger_table.as_ref(),
-        trigger_table_name_raw,
-        &target_table_name,
-        &old_col_norm,
-        trigger_database_id,
-        resolver,
-    )?;
+    // A case-only rename does not remove the old case-insensitive binding.
+    if old_col_norm != new_col_norm {
+        validate_trigger_after_column_rename(
+            &new_event,
+            new_when_clause.as_deref(),
+            &new_commands,
+            trigger_table.as_ref(),
+            trigger_table_name_raw,
+            &target_table_name,
+            &old_col_norm,
+            trigger_database_id,
+            resolver,
+        )?;
+    }
 
-    // Reconstruct the SQL
-    let new_sql = create_trigger_to_sql(
+    let new_stmt = ast::Stmt::CreateTrigger {
         temporary,
         if_not_exists,
-        &trigger_name,
+        trigger_name: trigger_name.clone(),
         time,
-        &new_event,
-        &tbl_name,
+        event: new_event.clone(),
+        tbl_name: tbl_name.clone(),
         for_each_row,
-        new_when_clause.as_deref(),
-        &new_commands,
-    );
+        when_clause: new_when_clause.clone(),
+        commands: new_commands.clone(),
+    };
+    let new_sql =
+        resolver
+            .dialect
+            .format_renamed_schema_sql(trigger_sql, &new_stmt, new_column_name)?;
 
     // Validate the rewritten trigger against the dropped column.
     //
@@ -3060,7 +3077,10 @@ fn rewrite_trigger_sql_for_column_rename(
     // `CREATE TEMP TRIGGER tr ON main.t`); adding
     // `is_renaming_trigger_table` restores that coverage without
     // breaking cross-table body refs.
-    if trigger_database_id == crate::TEMP_DB_ID && is_renaming_trigger_table {
+    if trigger_database_id == crate::TEMP_DB_ID
+        && is_renaming_trigger_table
+        && old_col_norm != new_col_norm
+    {
         let rewritten_trigger = crate::schema::Trigger::new(
             trigger_name.name.as_str().to_string(),
             new_sql.clone(),
@@ -3259,7 +3279,7 @@ fn apply_expr_column_ref_with_context(
             if ns_norm.eq_ignore_ascii_case("new") || ns_norm.eq_ignore_ascii_case("old") {
                 if is_renaming_trigger_table && trigger_table.get_column(&col_norm).is_some() {
                     if let Some(new_col_norm) = mode.rewritten_name() {
-                        *col = ast::Name::from_string(new_col_norm);
+                        *col = col.with_replacement(ast::Name::from_string(new_col_norm));
                     } else {
                         return Err(no_such_column_error(&error_column_ref));
                     }
@@ -3274,7 +3294,7 @@ fn apply_expr_column_ref_with_context(
             {
                 let _ = (ctx_name_norm, is_renaming_ctx);
                 if let Some(new_col_norm) = mode.rewritten_name() {
-                    *col = ast::Name::from_string(new_col_norm);
+                    *col = col.with_replacement(ast::Name::from_string(new_col_norm));
                 } else {
                     return Err(no_such_column_error(&error_column_ref));
                 }
@@ -3290,13 +3310,13 @@ fn apply_expr_column_ref_with_context(
                     if ctx_is_different_table {
                         return Err(no_such_column_error(&error_column_ref));
                     }
-                    *col = ast::Name::from_string(new_col_norm);
+                    *col = col.with_replacement(ast::Name::from_string(new_col_norm));
                 } else {
                     return Err(no_such_column_error(&error_column_ref));
                 }
             } else if from_target_qualifiers.names.contains(&ns_norm) {
                 if let Some(new_col_norm) = mode.rewritten_name() {
-                    *col = ast::Name::from_string(new_col_norm);
+                    *col = col.with_replacement(ast::Name::from_string(new_col_norm));
                 } else {
                     return Err(no_such_column_error(&error_column_ref));
                 }
@@ -3312,7 +3332,9 @@ fn apply_expr_column_ref_with_context(
                 if ctx_table.get_column(&col_norm).is_some() {
                     if is_renaming_ctx {
                         if let Some(new_col_norm) = mode.rewritten_name() {
-                            *e = ast::Expr::Id(ast::Name::from_string(new_col_norm));
+                            *e = ast::Expr::Id(
+                                col.with_replacement(ast::Name::from_string(new_col_norm)),
+                            );
                         } else {
                             return Err(no_such_column_error(old_col_norm));
                         }
@@ -3336,7 +3358,7 @@ fn apply_expr_column_ref_with_context(
                     || !from_target_qualifiers.names.is_empty())
             {
                 if let Some(new_col_norm) = mode.rewritten_name() {
-                    *e = ast::Expr::Id(ast::Name::from_string(new_col_norm));
+                    *e = ast::Expr::Id(col.with_replacement(ast::Name::from_string(new_col_norm)));
                 } else {
                     return Err(no_such_column_error(old_col_norm));
                 }
@@ -3540,7 +3562,8 @@ fn apply_upsert_for_column_rename(
                 for col_name in &mut set.col_names {
                     if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
                         if let Some(new_col_norm) = mode.rewritten_name() {
-                            *col_name = ast::Name::from_string(new_col_norm);
+                            *col_name =
+                                col_name.with_replacement(ast::Name::from_string(new_col_norm));
                         } else {
                             return Err(no_such_column_error(old_col_norm));
                         }
@@ -4110,7 +4133,8 @@ fn apply_trigger_cmd_for_column_rename(
                     for col_name in &mut set.col_names {
                         if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
                             if let Some(new_col_norm) = mode.rewritten_name() {
-                                *col_name = ast::Name::from_string(new_col_norm);
+                                *col_name =
+                                    col_name.with_replacement(ast::Name::from_string(new_col_norm));
                             } else {
                                 return Err(no_such_column_error(old_col_norm));
                             }
@@ -4176,7 +4200,8 @@ fn apply_trigger_cmd_for_column_rename(
                 for col_name in col_names.iter_mut() {
                     if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
                         if let Some(new_col_norm) = mode.rewritten_name() {
-                            *col_name = ast::Name::from_string(new_col_norm);
+                            *col_name =
+                                col_name.with_replacement(ast::Name::from_string(new_col_norm));
                         } else {
                             return Err(no_such_column_error(old_col_norm));
                         }
@@ -4322,7 +4347,7 @@ fn rename_excluded_column_refs(
             if ns.as_str().eq_ignore_ascii_case("excluded")
                 && col.as_str().eq_ignore_ascii_case(old_col_norm)
             {
-                *col = ast::Name::from_string(new_col_norm);
+                *col = col.with_replacement(ast::Name::from_string(new_col_norm));
             }
         }
         Ok(WalkControl::Continue)

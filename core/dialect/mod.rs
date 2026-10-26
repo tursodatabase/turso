@@ -111,6 +111,34 @@ pub trait Dialect: Send + Sync + 'static {
         self.format_table_sql(&stmt.to_string(), tbl_name, body)
     }
 
+    /// Parse stored schema for a semantic identifier rename.
+    fn parse_schema_sql_for_rename(
+        &self,
+        sql: &str,
+        is_table: bool,
+    ) -> crate::Result<Option<turso_parser::ast::Cmd>> {
+        if is_table {
+            self.parse_table_sql_ast(sql)
+                .map(|stmt| Some(turso_parser::ast::Cmd::Stmt(stmt)))
+        } else {
+            self.parse(sql).map(|(cmd, _)| cmd)
+        }
+    }
+
+    fn format_renamed_schema_sql(
+        &self,
+        input: &str,
+        stmt: &turso_parser::ast::Stmt,
+        new_name: &turso_parser::ast::Name,
+    ) -> crate::Result<String> {
+        let _ = (input, new_name);
+        if matches!(stmt, turso_parser::ast::Stmt::CreateTable { .. }) {
+            self.format_rewritten_table_sql(stmt)
+        } else {
+            Ok(stmt.to_string())
+        }
+    }
+
     /// Install the dialect's catalog tables into a freshly constructed
     /// schema.
     ///
