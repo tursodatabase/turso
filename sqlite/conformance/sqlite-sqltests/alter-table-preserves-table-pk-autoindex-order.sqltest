@@ -1,0 +1,75 @@
+@database :memory:
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/8704
+#
+# When a table declares both UNIQUE and PRIMARY KEY at table level, SQLite
+# numbers `sqlite_autoindex_<table>_<N>` in constraint declaration order.
+# Rebuilding the stored CREATE TABLE SQL during ALTER TABLE must keep a
+# table-level PRIMARY KEY at table level and preserve the relative order of
+# UNIQUE and PRIMARY KEY constraints so reopening the database maps each
+# autoindex back to its original root page.
+
+@cross-check-integrity
+test alter-add-column-preserves-unique-before-table-pk {
+    CREATE TABLE t (a TEXT, b TEXT, UNIQUE (a), PRIMARY KEY (b));
+    INSERT INTO t VALUES ('x', 'y');
+    ALTER TABLE t ADD COLUMN d TEXT;
+    SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 't';
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE t (a TEXT, b TEXT, d TEXT, UNIQUE (a), PRIMARY KEY (b))
+    ok
+}
+
+@cross-check-integrity
+test alter-add-column-preserves-table-pk-before-unique {
+    CREATE TABLE u (a TEXT, b TEXT, PRIMARY KEY (b), UNIQUE (a));
+    INSERT INTO u VALUES ('x', 'y');
+    ALTER TABLE u ADD COLUMN d TEXT;
+    SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'u';
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE u (a TEXT, b TEXT, d TEXT, PRIMARY KEY (b), UNIQUE (a))
+    ok
+}
+
+@cross-check-integrity
+test alter-drop-column-preserves-unique-before-table-pk {
+    CREATE TABLE t (a TEXT, b TEXT, c TEXT, UNIQUE (a), PRIMARY KEY (b));
+    INSERT INTO t VALUES ('x', 'y', 'z');
+    ALTER TABLE t DROP COLUMN c;
+    SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 't';
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE t (a TEXT, b TEXT, UNIQUE (a), PRIMARY KEY (b))
+    ok
+}
+
+@cross-check-integrity
+test alter-add-column-preserves-unique-before-composite-pk {
+    CREATE TABLE v (a TEXT, b TEXT, x TEXT, UNIQUE (a), PRIMARY KEY (b, x));
+    INSERT INTO v VALUES ('p', 'q', 'r');
+    ALTER TABLE v ADD COLUMN d TEXT;
+    SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'v';
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE v (a TEXT, b TEXT, x TEXT, d TEXT, UNIQUE (a), PRIMARY KEY (b, x))
+    ok
+}
+
+@cross-check-integrity
+test alter-add-column-preserves-named-unique-and-table-pk-order {
+    CREATE TABLE n (a TEXT, b TEXT, CONSTRAINT uq_a UNIQUE (a), CONSTRAINT pk_b PRIMARY KEY (b));
+    INSERT INTO n VALUES ('x', 'y');
+    ALTER TABLE n ADD COLUMN d TEXT;
+    SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'n';
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE n (a TEXT, b TEXT, d TEXT, CONSTRAINT uq_a UNIQUE (a), CONSTRAINT pk_b PRIMARY KEY (b))
+    ok
+}

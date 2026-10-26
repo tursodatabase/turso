@@ -1,7 +1,10 @@
 use super::*;
+use crate::schema::{
+    SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME, TEMP_SCHEMA_TABLE_NAME_ALT,
+};
 use crate::translate::plan::{
-    merge_columns, resolve_unqualified_column, unqualified_column_sources, ColumnLookup,
-    OuterQueryReference, ResolvedColumn,
+    is_schema_table, merge_columns, resolve_unqualified_column, unqualified_column_sources,
+    ColumnLookup, OuterQueryReference, ResolvedColumn,
 };
 
 /// The precedence of binding identifiers to columns.
@@ -363,13 +366,13 @@ pub fn bind_and_rewrite_expr<'a>(
                         name: tbl_name_clone,
                         alias: None,
                     };
-                    let db_resolution = resolver.resolve_database_id(&qualified_name);
+                    let db_resolution = resolver.resolve_namespace(&qualified_name);
 
-                    if let Ok(database_id) = db_resolution.as_ref() {
+                    if let Ok(namespace) = db_resolution.as_ref() {
                         match resolve_qualified_name(
                             referenced_tables,
                             resolver,
-                            Some(*database_id),
+                            Some(namespace.database_id),
                             &tbl_name_str,
                             &normalized_col_name,
                         )? {
@@ -397,9 +400,10 @@ pub fn bind_and_rewrite_expr<'a>(
                     // the table+column exist, use that. Otherwise fall through to
                     // table.column.field for struct/union field access.
                     let mut resolved_as_db_table_col = false;
-                    if let Ok(database_id) = db_resolution {
-                        let table = resolver
-                            .with_schema(database_id, |schema| schema.get_table(&tbl_name_str));
+                    if let Ok(namespace) = db_resolution {
+                        let table = resolver.with_schema(namespace.database_id, |schema| {
+                            schema.get_table(namespace.id, &tbl_name_str)
+                        });
 
                         if let Some(table) = table {
                             let col_idx = table.columns().iter().position(|c| {
@@ -745,7 +749,14 @@ fn resolve_qualified_name(
         let candidate = match_qualified_name_in_table(
             &joined_table.table,
             joined_table.internal_id,
-            &joined_table.identifier,
+            qualifier_names_table(
+                &joined_table.table,
+                &joined_table.identifier,
+                joined_table.has_alias,
+                joined_table.database_id,
+                table_name,
+                database_id.is_some(),
+            ),
             database_id_to_match(&joined_table.table, joined_table.database_id, database_id),
             table_name,
             column_name,
@@ -790,7 +801,14 @@ fn resolve_qualified_name(
         let candidate = match_qualified_name_in_table(
             &outer_ref.table,
             outer_ref.internal_id,
-            &outer_ref.identifier,
+            qualifier_names_table(
+                &outer_ref.table,
+                &outer_ref.identifier,
+                outer_ref.has_alias,
+                outer_ref.database_id,
+                table_name,
+                database_id.is_some(),
+            ),
             database_id_to_match(&outer_ref.table, outer_ref.database_id, database_id),
             table_name,
             column_name,
@@ -835,6 +853,39 @@ fn resolve_qualified_name(
     }
 }
 
+/// Whether `<tbl>` in `<tbl>.<col>` names the FROM item `table_reference_name`.
+///
+/// Like SQLite's `isValidSchemaTableName()`, the schema table without an alias
+/// can be named by either `sqlite_schema` or `sqlite_master`, whichever name
+/// FROM used. The temp schema table accepts the temp names, and also the main
+/// names when the column has a database qualifier. With an alias, only the
+/// alias names the table.
+fn qualifier_names_table(
+    table: &Table,
+    table_reference_name: &str,
+    has_alias: bool,
+    table_database_id: usize,
+    table_name: &str,
+    has_database_qualifier: bool,
+) -> bool {
+    if has_alias || !is_schema_table(table) {
+        return table_reference_name.eq_ignore_ascii_case(table_name);
+    }
+    let main_names = [SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT];
+    let temp_names = [TEMP_SCHEMA_TABLE_NAME, TEMP_SCHEMA_TABLE_NAME_ALT];
+    let names_main_table = main_names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(table_name));
+    let names_temp_table = temp_names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(table_name));
+    if table_database_id == crate::TEMP_DB_ID {
+        names_temp_table || (has_database_qualifier && names_main_table)
+    } else {
+        names_main_table
+    }
+}
+
 /// A schema name that matches the table's own database is already satisfied,
 /// so the table can then be matched by its alias.
 fn database_id_to_match(
@@ -869,7 +920,7 @@ fn outer_ref_merges_column(outer_ref: &OuterQueryReference, column_index: usize)
 fn match_qualified_name_in_table(
     table: &Table,
     table_id: TableInternalId,
-    table_reference_name: &str,
+    qualifier_names_table: bool,
     database_id: Option<usize>,
     table_name: &str,
     column_name: &str,
@@ -892,12 +943,12 @@ fn match_qualified_name_in_table(
                 is_rowid_alias: table.columns()[col_idx].is_rowid_alias(),
             }));
         }
-        if table_found && !table_reference_name.eq_ignore_ascii_case(table_name) {
+        if table_found && !qualifier_names_table {
             return Ok(QualifiedTableMatch::NoColumn);
         }
     }
 
-    if database_id.is_some() || !table_reference_name.eq_ignore_ascii_case(table_name) {
+    if database_id.is_some() || !qualifier_names_table {
         return Ok(QualifiedTableMatch::NoTable);
     }
     Ok(

@@ -699,6 +699,7 @@ pub trait Wal: Debug + Send + Sync {
     ///
     /// TursoDB uses `page_no` and `size_after` from the supplied header, applies
     /// any configured page transform to the body, and overwrites the checksum.
+    /// Returns an error if this connection does not hold the WAL write lock.
     fn write_frame_raw(
         &self,
         buffer_pool: Arc<BufferPool>,
@@ -4012,6 +4013,11 @@ impl Wal for WalFile {
         page: &[u8],
         sync_type: FileSyncType,
     ) -> Result<()> {
+        if !self.holds_write_lock() {
+            return Err(LimboError::TxError(
+                "cannot write raw WAL frame without holding the WAL write lock".to_string(),
+            ));
+        }
         let Some(page_size) = PageSize::new(page.len() as u32) else {
             bail_corrupt_error!("invalid page size: {}", page.len());
         };
@@ -6550,6 +6556,8 @@ pub mod test {
         }
         let c = wal.prepare_wal_finish(FileSyncType::Fsync).unwrap();
         io.wait_for_completion(c).unwrap();
+        wal.begin_read_tx().unwrap();
+        wal.begin_write_tx(WalAutoActions::empty()).unwrap();
 
         (io, buffer_pool, wal)
     }

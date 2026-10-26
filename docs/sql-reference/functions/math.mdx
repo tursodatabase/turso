@@ -438,6 +438,8 @@ SELECT mod(10.5, 3);  -- 1.5
 SELECT mod(-10, 3);   -- -1.0
 ```
 
+Through the PostgreSQL frontend, `mod` returns an INTEGER when both X and Y are integers, as PostgreSQL does, and raises a division by zero error if Y is 0.
+
 ---
 
 ### pi()

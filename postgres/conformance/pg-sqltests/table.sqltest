@@ -381,3 +381,46 @@ expect {
     1|1|0
     2|2|1
 }
+
+test drop-materialized-view-on-a-view-errors {
+    CREATE TABLE t (a int);
+    CREATE VIEW v AS SELECT * FROM t;
+    DROP MATERIALIZED VIEW v;
+}
+expect error {
+    "v" is not a materialized view
+}
+
+test drop-materialized-view-if-exists-on-a-view-errors {
+    CREATE TABLE t (a int);
+    CREATE VIEW v AS SELECT * FROM t;
+    DROP MATERIALIZED VIEW IF EXISTS public.v;
+}
+expect error {
+    "v" is not a materialized view
+}
+
+test drop-view-on-a-table-errors {
+    CREATE TABLE t (a int);
+    DROP VIEW IF EXISTS t;
+}
+expect error {
+    "t" is not a view
+}
+
+test table-domain-not-null-default-fills-omitted-column {
+    CREATE DOMAIN nn_default AS int NOT NULL DEFAULT 3;
+    CREATE TABLE t (a nn_default, b int);
+    INSERT INTO t(b) VALUES (2);
+    SELECT a, b FROM t;
+}
+expect {
+    3|2
+}
+
+test table-domain-not-null-default-rejects-explicit-null {
+    CREATE DOMAIN nn_default AS int NOT NULL DEFAULT 3;
+    CREATE TABLE t (a nn_default, b int);
+    INSERT INTO t VALUES (NULL, 2);
+}
+expect error {}

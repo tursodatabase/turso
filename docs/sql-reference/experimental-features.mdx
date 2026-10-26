@@ -19,13 +19,16 @@ Some Turso features are still experimental and must be explicitly enabled before
 | Autovacuum | `autovacuum` | Automatic database file compaction |
 | Vacuum | `vacuum` | In-place [VACUUM](/docs/sql-reference/statements/vacuum) compaction |
 | Attach | `attach` | [ATTACH DATABASE](/docs/sql-reference/statements/attach-database) and [DETACH DATABASE](/docs/sql-reference/statements/detach-database) |
-| Generated Columns | `generated_columns` | Virtual [`GENERATED ALWAYS AS`](/docs/sql-reference/statements/create-table) columns |
 | Without Rowid | `without_rowid` | `WITHOUT ROWID` tables |
 | Multi-Process WAL | `multiprocess_wal` | [Multi-Process Access](/docs/sql-reference/multiprocess-access) — share a database file between OS processes via a shared WAL coordinator |
 | MVCC Passive Checkpoint | `mvcc_passive_checkpoint` | Passive checkpointing under MVCC (`journal_mode=mvcc`) |
 
 <Info>
 Triggers are no longer experimental as of Turso 0.7 — [CREATE TRIGGER](/docs/sql-reference/statements/create-trigger) and [DROP TRIGGER](/docs/sql-reference/statements/drop-trigger) work without any flag.
+</Info>
+
+<Info>
+Generated columns are no longer experimental. Virtual [`GENERATED ALWAYS AS`](/docs/sql-reference/statements/create-table#generated-always-as) columns work without any flag. The SDKs still accept the `generated_columns` feature name, but it has no effect.
 </Info>
 
 ## CLI

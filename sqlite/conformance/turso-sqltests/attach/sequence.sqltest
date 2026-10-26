@@ -84,12 +84,26 @@ expect {
     51
 }
 
-# Error on nonexistent schema
+# A sequence in a schema that does not exist is a missing sequence
 test sequence-nonexistent-schema-errors {
     SELECT nextval('bogus.my_seq');
 }
 expect error {
-    no such database: bogus
+    sequence "bogus.my_seq" does not exist
+}
+
+test sequence-nonexistent-schema-currval-errors {
+    SELECT currval('bogus.my_seq');
+}
+expect error {
+    sequence "bogus.my_seq" does not exist
+}
+
+test sequence-nonexistent-schema-setval-errors {
+    SELECT setval('bogus.my_seq', 1);
+}
+expect error {
+    sequence "bogus.my_seq" does not exist
 }
 
 # Error on nonexistent sequence in valid schema

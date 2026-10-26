@@ -529,7 +529,7 @@ pub(crate) fn emit_array_decode_for_results(
 
             if let Some(col) = array_col {
                 emit_array_decode(program, reg, col, resolver)?;
-            } else {
+            } else if !program.flags.keep_array_results_as_blobs() {
                 program.emit_insn(Insn::ArrayDecode { reg });
             }
 

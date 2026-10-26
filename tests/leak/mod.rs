@@ -10,13 +10,8 @@
 //! creating and dropping them one at a time. Regression caught here in
 //! the past: the `CompletionGroup` self-reference `Arc` cycle leaking
 //! every completion group ever built (one per WAL checkpoint / commit
-//! batch / sorter spill).
-//!
-//! Known, accepted retention: the process-wide database registry
-//! (`DATABASE_MANAGER`) keeps a dead entry per unique database file
-//! ever opened, and the entry's `Weak<Database>` pins the `Database`'s
-//! backing allocation. The per-cycle budget below pre-computes that
-//! cost instead of treating it as a leak.
+//! batch / sorter spill), and the database registry keeping an entry,
+//! and with it the `Database` allocation, for every file ever opened.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -141,36 +136,12 @@ fn database_lifecycle(io: &Arc<dyn turso_core::IO + Send>, path: &std::path::Pat
 
 const WARMUP_CYCLES: usize = 20;
 const MEASURED_CYCLES: usize = 100;
-/// Beyond the accepted registry retention (see [registry_allowance]), a
-/// database lifecycle should retain ~0 bytes once globals are warmed
+/// A database lifecycle should retain ~0 bytes once globals are warmed
 /// up. The budget leaves slack for allocator-internal noise (hashmap
 /// rehashes, thread-local caches) without masking real leaks: the
 /// smallest leak found so far (a single `Completion` per database,
 /// ~280 bytes/cycle) blows through it.
 const PER_CYCLE_BUDGET_BYTES: isize = 128;
-
-/// The memory the database registry is expected to retain per cycle.
-///
-/// Every cycle opens a database file with a fresh (dev, ino) identity,
-/// and `DATABASE_MANAGER` keeps its entry after the `Database` is
-/// dropped — by design (the registry tolerates dead-entry capacity).
-/// What stays allocated per entry:
-/// - the `Arc` allocation backing the `Database`, pinned by the entry's
-///   `Weak`: two refcount words plus the `Database` value itself,
-/// - the map entry (key + `Weak` pointer) and amortized hashbrown
-///   bucket growth, covered by a fixed slop.
-///
-/// The MVCC lifecycle is granted two entries' worth: on macOS (APFS) it
-/// deterministically retains a second registry-entry-sized block per
-/// cycle, presumably via the `journal_mode` switch re-registering the
-/// database under a fresh file identity. On Linux the measured MVCC
-/// retention is a single entry.
-fn registry_allowance(mvcc: bool) -> isize {
-    let arc_inner = 2 * std::mem::size_of::<usize>() + std::mem::size_of::<turso_core::Database>();
-    let map_entry_slop = 128;
-    let entries = if mvcc { 2 } else { 1 };
-    (entries * (arc_inner + map_entry_slop)) as isize
-}
 
 fn assert_no_per_database_leak(mvcc: bool) {
     let label = if mvcc { "MVCC" } else { "WAL" };
@@ -204,20 +175,16 @@ fn assert_no_per_database_leak(mvcc: bool) {
     let growth = live_bytes() as isize - baseline;
 
     let per_cycle = growth / MEASURED_CYCLES as isize;
-    let allowance = registry_allowance(mvcc);
-    let budget = PER_CYCLE_BUDGET_BYTES + allowance;
     eprintln!(
         "{label}: heap growth over {MEASURED_CYCLES} database lifecycles: \
-         {growth} bytes ({per_cycle} bytes/cycle, budget {budget} = \
-         {PER_CYCLE_BUDGET_BYTES} + {allowance} registry allowance)"
+         {growth} bytes ({per_cycle} bytes/cycle, budget {PER_CYCLE_BUDGET_BYTES})"
     );
     eprintln!("{label}: per-cycle deltas before final drain: {per_cycle_deltas:?}");
     assert!(
-        per_cycle <= budget,
+        per_cycle <= PER_CYCLE_BUDGET_BYTES,
         "{label}: heap grew by {per_cycle} bytes per database lifecycle \
          (total {growth} bytes over {MEASURED_CYCLES} cycles, budget \
-         {budget} bytes/cycle = {PER_CYCLE_BUDGET_BYTES} base + {allowance} \
-         expected registry retention) — something process-global is \
+         {PER_CYCLE_BUDGET_BYTES} bytes/cycle) — something process-global is \
          retaining per-database memory after the database is dropped"
     );
 }

@@ -1,6 +1,7 @@
 use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
+use crate::namespace::NamespaceId;
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
@@ -171,6 +172,7 @@ pub fn emit_program_for_update(
             vec![JoinedTable {
                 table: Table::BTree(scratch_table),
                 identifier: "ephemeral_scratch".to_string(),
+                has_alias: false,
                 internal_id: scratch_table_internal_id,
                 op: Operation::Scan(Scan::BTreeTable {
                     iter_dir: IterationDirection::Forwards,
@@ -189,6 +191,7 @@ pub fn emit_program_for_update(
         );
         write_phase_tables.add_outer_query_reference(OuterQueryReference {
             identifier: target_table.identifier.clone(),
+            has_alias: target_table.has_alias,
             internal_id: target_table.internal_id,
             table: target_table.table.clone(),
             database_id: target_table.database_id,
@@ -381,7 +384,9 @@ pub fn emit_program_for_update(
     let all_index_cursors = if any_replace {
         let table_name = target_table.table.get_name();
         let all_indexes: Vec<_> = resolver.with_schema(target_database_id, |s| {
-            s.get_indices(table_name).cloned().collect()
+            s.get_indices(NamespaceId::ROOT, table_name)
+                .cloned()
+                .collect()
         });
         let source_table = write_phase_tables
             .joined_tables()
@@ -687,7 +692,7 @@ fn emit_replace_delete<'a>(
     let internal_id = target_table.internal_id;
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
         let prepared = if t_ctx.resolver.with_schema(update_database_id, |s| {
-            s.any_resolved_fks_referencing(table_name)
+            s.any_resolved_fks_referencing(NamespaceId::ROOT, table_name)
         }) {
             ForeignKeyActions::prepare_fk_delete_actions(
                 program,
@@ -701,10 +706,9 @@ fn emit_replace_delete<'a>(
         } else {
             ForeignKeyActions::default()
         };
-        if t_ctx
-            .resolver
-            .with_schema(update_database_id, |s| s.has_child_fks(table_name))
-        {
+        if t_ctx.resolver.with_schema(update_database_id, |s| {
+            s.has_child_fks(NamespaceId::ROOT, table_name)
+        }) {
             emit_fk_child_decrement_on_delete(
                 program,
                 &target_table
@@ -2228,7 +2232,11 @@ fn emit_update_insns<'a>(
     // the parent-side checks above.
     if connection.foreign_keys_enabled() {
         if let Some(table_btree) = target_table.table.btree() {
-            if t_ctx.resolver.schema().has_child_fks(table_name) {
+            if t_ctx
+                .resolver
+                .schema()
+                .has_child_fks(NamespaceId::ROOT, table_name)
+            {
                 emit_fk_child_update_counters(
                     program,
                     &table_btree,
@@ -2514,7 +2522,9 @@ fn emit_update_insns<'a>(
                 let seq_name = crate::schema::autoincrement_sequence_name(&target_table.identifier);
                 let seq = t_ctx
                     .resolver
-                    .with_schema(update_database_id, |s| s.get_sequence(&seq_name).cloned())
+                    .with_schema(update_database_id, |s| {
+                        s.get_sequence(NamespaceId::ROOT, &seq_name).cloned()
+                    })
                     .ok_or_else(|| {
                         crate::LimboError::InternalError(format!(
                             "missing implicit sequence for AUTOINCREMENT table \"{}\"",

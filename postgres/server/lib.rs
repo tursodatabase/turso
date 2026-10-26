@@ -206,10 +206,10 @@ impl SimpleQueryHandler for TursoPgHandler {
         for sql in &statements {
             let mut stmt = conn.prepare(sql).map_err(pg_error)?;
 
-            self.cleanup_dropped_schema_file(sql);
-
             if stmt.num_columns() == 0 || is_pg_non_query(sql) {
-                responses.push(execute_non_query(&mut stmt, sql)?);
+                let response = execute_non_query(&mut stmt, sql)?;
+                self.cleanup_dropped_schema_file(sql);
+                responses.push(response);
             } else {
                 let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
                 responses.push(execute_query(&mut stmt, header)?);
@@ -265,14 +265,14 @@ impl ExtendedQueryHandler for TursoPgHandler {
 
         let mut stmt = conn.prepare(query).map_err(pg_error)?;
 
-        // Clean up schema file after successful DROP SCHEMA
-        self.cleanup_dropped_schema_file(query);
-
         // Bind parameters from the portal
         bind_portal_parameters(&mut stmt, portal)?;
 
         if stmt.num_columns() == 0 || is_pg_non_query(query) {
-            return execute_non_query(&mut stmt, query);
+            let response = execute_non_query(&mut stmt, query)?;
+            // Clean up schema file after successful DROP SCHEMA execution
+            self.cleanup_dropped_schema_file(query);
+            return Ok(response);
         }
 
         let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
@@ -562,13 +562,25 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
     if hex.len() % 2 != 0 {
         return Err("odd-length hex string".to_owned());
     }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2], 16)
-                .map_err(|e| format!("invalid hex at position {i}: {e}"))
+    hex.as_bytes()
+        .chunks_exact(2)
+        .enumerate()
+        .map(|(pair_index, pair)| {
+            let position = 2 * pair_index;
+            let high = decode_hex_digit(pair[0], position)?;
+            let low = decode_hex_digit(pair[1], position + 1)?;
+            Ok((high << 4) | low)
         })
         .collect()
+}
+
+fn decode_hex_digit(byte: u8, position: usize) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(format!("invalid hex at position {position}")),
+    }
 }
 
 fn encode_value(
@@ -1023,6 +1035,16 @@ mod tests {
     }
 
     #[test]
+    fn test_pg_bytes_to_value_bytea_rejects_multi_byte_character() {
+        let result = pg_bytes_to_value("\\x\u{20ac}a".as_bytes(), &Type::BYTEA);
+        assert!(matches!(
+            result,
+            Err(PgWireError::UserError(info))
+                if info.message == "invalid bytea hex parameter: invalid hex at position 0"
+        ));
+    }
+
+    #[test]
     fn test_pg_bytes_to_value_unknown_type_as_text() {
         // Unknown types should be treated as text
         let val = pg_bytes_to_value(b"some-uuid-value", &Type::UUID).unwrap();
@@ -1054,9 +1076,28 @@ mod tests {
             vec![0xDE, 0xAD, 0xBE, 0xEF]
         );
         assert_eq!(decode_hex("00ff").unwrap(), vec![0x00, 0xFF]);
+        assert_eq!(decode_hex("0aff").unwrap(), vec![0x0A, 0xFF]);
+        assert_eq!(
+            decode_hex("0123456789abcdefABCDEF").unwrap(),
+            vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xAB, 0xCD, 0xEF]
+        );
         assert_eq!(decode_hex("").unwrap(), Vec::<u8>::new());
         assert!(decode_hex("0").is_err()); // odd length
         assert!(decode_hex("GG").is_err()); // invalid hex
+        assert!(decode_hex("zz").is_err());
+        assert!(decode_hex("+f").is_err());
+    }
+
+    #[test]
+    fn test_decode_hex_rejects_multi_byte_character() {
+        assert_eq!(
+            decode_hex("\u{20ac}a"),
+            Err("invalid hex at position 0".to_owned())
+        );
+        assert_eq!(
+            decode_hex("a\u{20ac}"),
+            Err("invalid hex at position 1".to_owned())
+        );
     }
 
     #[test]

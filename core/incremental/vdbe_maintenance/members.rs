@@ -20,6 +20,7 @@
 //! [`dag::KeyColumn::ambiguous`]: crate::incremental::dag::KeyColumn::ambiguous
 
 use crate::function::{Func, FuncCtx, ScalarFunc};
+use crate::namespace::NamespaceId;
 use crate::schema::Schema;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
@@ -47,13 +48,15 @@ impl MemberTable {
         view_name: &str,
         table_name: &str,
     ) -> Result<Self> {
-        let table = schema.get_btree_table(table_name).ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "member table {table_name} of materialized view {view_name} not found"
-            ))
-        })?;
+        let table = schema
+            .get_btree_table(NamespaceId::ROOT, table_name)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "member table {table_name} of materialized view {view_name} not found"
+                ))
+            })?;
         let index = schema
-            .get_indices(table_name)
+            .get_indices(NamespaceId::ROOT, table_name)
             .next()
             .cloned()
             .ok_or_else(|| {

@@ -15,6 +15,10 @@ impl Error {
     pub fn core_error(&self) -> &LimboError {
         &self.0.source
     }
+
+    pub(crate) fn into_core_error(self) -> LimboError {
+        self.0.source
+    }
 }
 
 impl std::ops::Deref for Error {
@@ -189,6 +193,8 @@ const SQLSTATE_SYNTAX_ERROR: &str = "42601";
 const SQLSTATE_UNDEFINED_TABLE: &str = "42P01";
 const SQLSTATE_UNDEFINED_COLUMN: &str = "42703";
 const SQLSTATE_UNDEFINED_FUNCTION: &str = "42883";
+const SQLSTATE_UNDEFINED_OBJECT: &str = "42704";
+const SQLSTATE_INVALID_NAME: &str = "42602";
 const SQLSTATE_DUPLICATE_TABLE: &str = "42P07";
 const SQLSTATE_SYNTAX_OR_ACCESS_VIOLATION: &str = "42000";
 const SQLSTATE_DATATYPE_MISMATCH: &str = "42804";
@@ -205,6 +211,7 @@ const SQLSTATE_ACTIVE_SQL_TRANSACTION: &str = "25001";
 const SQLSTATE_READ_ONLY_SQL_TRANSACTION: &str = "25006";
 const SQLSTATE_NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
 const SQLSTATE_INVALID_SAVEPOINT_SPECIFICATION: &str = "3B001";
+const SQLSTATE_INVALID_SCHEMA_NAME: &str = "3F000";
 const SQLSTATE_SERIALIZATION_FAILURE: &str = "40001";
 const SQLSTATE_DISK_FULL: &str = "53100";
 const SQLSTATE_OUT_OF_MEMORY: &str = "53200";
@@ -238,9 +245,8 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::InvalidDate(_)
         | LimboError::InvalidTime(_)
         | LimboError::InvalidModifier(_) => SQLSTATE_INVALID_DATETIME_FORMAT,
-        LimboError::ConversionError(_)
-        | LimboError::InvalidArgument(_)
-        | LimboError::InvalidFormatter(_) => SQLSTATE_DATA_EXCEPTION,
+        LimboError::InvalidArgument(msg) => invalid_argument_sqlstate(msg),
+        LimboError::ConversionError(_) | LimboError::InvalidFormatter(_) => SQLSTATE_DATA_EXCEPTION,
         LimboError::ParseIntError(_) | LimboError::ParseFloatError(_) => {
             SQLSTATE_INVALID_TEXT_REPRESENTATION
         }
@@ -280,8 +286,28 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.contains("already exists") {
         SQLSTATE_DUPLICATE_TABLE
+    } else if msg == "malformed JSON" {
+        SQLSTATE_INVALID_TEXT_REPRESENTATION
+    } else if msg.starts_with("sequence \"") && msg.ends_with("\" does not exist") {
+        SQLSTATE_UNDEFINED_TABLE
+    } else if (msg.starts_with("schema \"") && msg.ends_with("\" does not exist"))
+        || msg == "no schema has been selected to create in"
+    {
+        SQLSTATE_INVALID_SCHEMA_NAME
     } else {
         SQLSTATE_SYNTAX_ERROR
+    }
+}
+
+fn invalid_argument_sqlstate(msg: &str) -> &'static str {
+    if msg.starts_with("unrecognized configuration parameter") {
+        SQLSTATE_UNDEFINED_OBJECT
+    } else if msg.starts_with("invalid configuration parameter name") {
+        SQLSTATE_INVALID_NAME
+    } else if msg.starts_with("no such database") {
+        SQLSTATE_INVALID_SCHEMA_NAME
+    } else {
+        SQLSTATE_DATA_EXCEPTION
     }
 }
 
@@ -357,6 +383,17 @@ mod tests {
             ("no such column: c", SQLSTATE_UNDEFINED_COLUMN),
             ("no such function: f", SQLSTATE_UNDEFINED_FUNCTION),
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
+            ("malformed JSON", SQLSTATE_INVALID_TEXT_REPRESENTATION),
+            ("sequence \"s.q\" does not exist", SQLSTATE_UNDEFINED_TABLE),
+            ("schema \"s\" does not exist", SQLSTATE_INVALID_SCHEMA_NAME),
+            (
+                "no schema has been selected to create in",
+                SQLSTATE_INVALID_SCHEMA_NAME,
+            ),
+            (
+                "Invalid statement: syntax error at or near \"'malformed JSON'\"",
+                SQLSTATE_SYNTAX_ERROR,
+            ),
             ("unexpected token", SQLSTATE_SYNTAX_ERROR),
         ] {
             let e = LimboError::ParseError(msg.to_string());

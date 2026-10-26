@@ -1,4 +1,5 @@
 use super::{Resolver, Result, TranslateCtx};
+use crate::namespace::NamespaceId;
 use crate::{
     emit_explain,
     schema::{BTreeTable, ColumnLayout},
@@ -171,7 +172,9 @@ fn emit_row_loop_delete(
 
             // Open all indexes for writing (needed for DELETE)
             let write_indices: Vec<_> = resolver.with_schema(table_ref.database_id, |s| {
-                s.get_indices(table_ref.table.get_name()).cloned().collect()
+                s.get_indices(NamespaceId::ROOT, table_ref.table.get_name())
+                    .cloned()
+                    .collect()
             });
             for index in &write_indices {
                 let index_cursor_id = program.alloc_cursor_index(
@@ -324,7 +327,7 @@ fn emit_clear_btree_delete(
     let table_name = table_ref.table.get_name();
     let has_dependent_views = resolver.with_schema(table_ref.database_id, |schema| {
         !schema
-            .get_dependent_materialized_views(table_name)
+            .get_dependent_materialized_views(NamespaceId::ROOT, table_name)
             .is_empty()
     });
     if has_dependent_views {
@@ -332,7 +335,8 @@ fn emit_clear_btree_delete(
     }
     if connection.foreign_keys_enabled() {
         let has_foreign_keys = resolver.with_schema(table_ref.database_id, |schema| {
-            schema.any_resolved_fks_referencing(table_name) || schema.has_child_fks(table_name)
+            schema.any_resolved_fks_referencing(NamespaceId::ROOT, table_name)
+                || schema.has_child_fks(NamespaceId::ROOT, table_name)
         });
         if has_foreign_keys {
             return Ok(false);
@@ -365,7 +369,7 @@ pub fn emit_fk_child_decrement_on_delete(
     resolver: &Resolver,
 ) -> crate::Result<()> {
     for fk_ref in resolver.with_schema(database_id, |s| {
-        s.resolved_fks_for_child(child_table_name, None)
+        s.resolved_fks_for_child(NamespaceId::ROOT, child_table_name, None)
     })? {
         if !fk_ref.fk.deferred {
             continue;
@@ -395,7 +399,9 @@ pub fn emit_fk_child_decrement_on_delete(
         if fk_ref.parent_uses_rowid {
             // Probe parent table by rowid
             let parent_tbl = resolver
-                .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
+                .with_schema(database_id, |s| {
+                    s.get_btree_table(NamespaceId::ROOT, &fk_ref.fk.parent_table)
+                })
                 .expect("parent btree");
             let pcur = open_read_table(program, &parent_tbl, database_id);
 
@@ -445,7 +451,9 @@ pub fn emit_fk_child_decrement_on_delete(
         } else {
             // Probe parent unique index
             let parent_tbl = resolver
-                .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
+                .with_schema(database_id, |s| {
+                    s.get_btree_table(NamespaceId::ROOT, &fk_ref.fk.parent_table)
+                })
                 .expect("parent btree");
             let idx = fk_ref.parent_unique_index.as_ref().expect("unique index");
             let icur = open_read_index(program, idx, database_id);
@@ -694,10 +702,9 @@ fn emit_delete_row_common(
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
         let delete_db_id = unsafe { (*table_reference).database_id };
         if let Some(table) = unsafe { &*table_reference }.btree() {
-            let prepared = if t_ctx
-                .resolver
-                .with_schema(delete_db_id, |s| s.any_resolved_fks_referencing(table_name))
-            {
+            let prepared = if t_ctx.resolver.with_schema(delete_db_id, |s| {
+                s.any_resolved_fks_referencing(NamespaceId::ROOT, table_name)
+            }) {
                 ForeignKeyActions::prepare_fk_delete_actions(
                     program,
                     &mut t_ctx.resolver,
@@ -710,10 +717,9 @@ fn emit_delete_row_common(
             } else {
                 ForeignKeyActions::default()
             };
-            if t_ctx
-                .resolver
-                .with_schema(delete_db_id, |s| s.has_child_fks(table_name))
-            {
+            if t_ctx.resolver.with_schema(delete_db_id, |s| {
+                s.has_child_fks(NamespaceId::ROOT, table_name)
+            }) {
                 emit_fk_child_decrement_on_delete(
                     program,
                     &table,
@@ -745,9 +751,11 @@ fn emit_delete_row_common(
     } else {
         // Delete from all indexes before deleting from the main table.
         let db_id = unsafe { (*table_reference).database_id };
-        let all_indices: Vec<_> = t_ctx
-            .resolver
-            .with_schema(db_id, |s| s.get_indices(table_name).cloned().collect());
+        let all_indices: Vec<_> = t_ctx.resolver.with_schema(db_id, |s| {
+            s.get_indices(NamespaceId::ROOT, table_name)
+                .cloned()
+                .collect()
+        });
 
         // Get indexes to delete from (skip the iteration index if specified)
         let indexes_to_delete = all_indices

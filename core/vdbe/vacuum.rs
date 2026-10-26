@@ -1,3 +1,4 @@
+use crate::namespace::NamespaceId;
 use crate::types::IOResultOr;
 use rustc_hash::FxHashMap;
 use std::sync::{atomic::Ordering, Arc};
@@ -208,7 +209,6 @@ pub(crate) fn vacuum_target_opts_from_source(source_db: &Database) -> DatabaseOp
         .with_encryption(source_db.experimental_encryption_enabled())
         .with_autovacuum(source_db.experimental_autovacuum_enabled())
         .with_attach(source_db.experimental_attach_enabled())
-        .with_generated_columns(source_db.experimental_generated_columns_enabled())
         .with_without_rowid(source_db.experimental_without_rowid_enabled())
 }
 
@@ -690,7 +690,11 @@ pub(crate) fn vacuum_target_build_step(
                                     .source_conn
                                     .with_schema(config.source_db_id, |schema| {
                                         schema
-                                            .get_index(&entry.tbl_name, &entry.name)
+                                            .get_index(
+                                                NamespaceId::ROOT,
+                                                &entry.tbl_name,
+                                                &entry.name,
+                                            )
                                             .is_some_and(|idx| idx.is_backing_btree_index())
                                     })
                             })
@@ -805,7 +809,10 @@ pub(crate) fn vacuum_target_build_step(
                         .target_conn
                         .schema
                         .read()
-                        .get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
+                        .get_btree_table(
+                            NamespaceId::ROOT,
+                            crate::schema::SQLITE_SEQUENCE_TABLE_NAME,
+                        )
                         .is_some();
                     if !target_has_sequence {
                         state.phase = VacuumTargetBuildPhase::StartCopyTable {
@@ -873,7 +880,7 @@ pub(crate) fn vacuum_target_build_step(
                 let source_btree_table = config
                     .source_conn
                     .with_schema(config.source_db_id, |schema| {
-                        schema.get_btree_table(table_name)
+                        schema.get_btree_table(NamespaceId::ROOT, table_name)
                     });
 
                 let (select_sql, insert_sql) = build_copy_sql(
@@ -1766,7 +1773,11 @@ fn reload_physical_schema_for_mvcc_vacuum(
     // blocking `Schema::populate_sequences` and `populate_sequences_via_sql`
     // helpers, which violate the vdbe async contract from inside the
     // VACUUM state machine.
-    let preserved_sequences = connection.schema.read().sequences.clone();
+    let preserved_sequences = connection
+        .schema
+        .read()
+        .sequences_by_name(NamespaceId::ROOT)
+        .clone();
     let reparse_result = connection.read_current_schema_cookie().and_then(|cookie| {
         connection.reparse_schema_with_cookie_keeping_sequences(cookie, preserved_sequences)
     });
@@ -1893,6 +1904,9 @@ fn vacuum_in_place_step(
                         });
                         cleanup_state.source_tx_open = true;
                         cleanup_state.vacuum_lock_held = true;
+                        // SQLite drops the pending PRAGMA page_size when it vacuums a WAL
+                        // database in place, so a later VACUUM INTO does not use it.
+                        connection.next_page_size.store(0, Ordering::SeqCst);
                         *phase = VacuumInPlacePhase::ReadSourceMetadata;
                         continue;
                     }
@@ -1978,7 +1992,11 @@ fn vacuum_in_place_step(
                 let temp_db_ref = temp_db
                     .as_ref()
                     .expect("VACUUM CaptureTargetMetadata phase requires temp db");
-                let source_sequences = connection.schema.read().sequences.clone();
+                let source_sequences = connection
+                    .schema
+                    .read()
+                    .sequences_by_name(NamespaceId::ROOT)
+                    .clone();
                 *committed_image = Some(capture_target_metadata(temp_db_ref, source_sequences)?);
                 *phase = VacuumInPlacePhase::BeginTempReadTx;
                 continue;
@@ -2826,16 +2844,14 @@ mod tests {
             Ok(())
         })?;
 
-        let replacement = Schema {
-            generated_columns_enabled: true,
-            schema_version: 0,
-            ..Default::default()
-        };
-        replace_shared_schema_after_vacuum(db.as_ref(), Arc::new(replacement));
+        let mut replacement = Schema::new();
+        replacement.schema_version = 0;
+        let replacement = Arc::new(replacement);
+        replace_shared_schema_after_vacuum(db.as_ref(), replacement.clone());
 
         let schema = db.clone_schema();
         assert_eq!(schema.schema_version, 0);
-        assert!(schema.generated_columns_enabled);
+        assert!(Arc::ptr_eq(&schema, &replacement));
 
         Ok(())
     }
@@ -2856,22 +2872,21 @@ mod tests {
 
         let mut header = DatabaseHeader::default();
         header.schema_cookie = 42.into();
+        let mut schema = Schema::new();
+        schema.schema_version = 42;
+        let schema = Arc::new(schema);
         let committed = VacuumCommittedImageMeta {
             header,
-            schema: Arc::new(Schema {
-                generated_columns_enabled: true,
-                schema_version: 42,
-                ..Default::default()
-            }),
+            schema: schema.clone(),
         };
 
         install_committed_vacuum_image(&conn, crate::MAIN_DB_ID, &committed);
 
         assert_eq!(conn.schema.read().schema_version, 42);
-        assert!(conn.schema.read().generated_columns_enabled);
+        assert!(Arc::ptr_eq(&*conn.schema.read(), &schema));
         let shared = db.clone_schema();
         assert_eq!(shared.schema_version, 42);
-        assert!(shared.generated_columns_enabled);
+        assert!(Arc::ptr_eq(&shared, &schema));
 
         Ok(())
     }
@@ -2892,13 +2907,12 @@ mod tests {
 
         let mut header = DatabaseHeader::default();
         header.schema_cookie = 43.into();
+        let mut schema = Schema::new();
+        schema.schema_version = 43;
+        let schema = Arc::new(schema);
         let committed = VacuumCommittedImageMeta {
             header,
-            schema: Arc::new(Schema {
-                generated_columns_enabled: true,
-                schema_version: 43,
-                ..Default::default()
-            }),
+            schema: schema.clone(),
         };
 
         vacuum_in_place_cleanup(
@@ -2911,10 +2925,10 @@ mod tests {
         )?;
 
         assert_eq!(conn.schema.read().schema_version, 43);
-        assert!(conn.schema.read().generated_columns_enabled);
+        assert!(Arc::ptr_eq(&*conn.schema.read(), &schema));
         let shared = db.clone_schema();
         assert_eq!(shared.schema_version, 43);
-        assert!(shared.generated_columns_enabled);
+        assert!(Arc::ptr_eq(&shared, &schema));
 
         Ok(())
     }
@@ -2973,19 +2987,25 @@ mod tests {
         assert_eq!(committed.header.write_version, mvcc_version);
         assert_eq!(committed.schema.schema_version, 42);
         assert!(
-            committed.schema.tables.contains_key("generate_series"),
+            committed
+                .schema
+                .has_table(NamespaceId::ROOT, "generate_series"),
             "captured schema must retain built-in table-valued functions"
         );
-        let table_root = match committed.schema.tables.get("t").expect("table t").as_ref() {
+        let table_root = match committed
+            .schema
+            .get_table(NamespaceId::ROOT, "t")
+            .expect("table t")
+            .as_ref()
+        {
             crate::schema::Table::BTree(btree) => btree.root_page,
             _ => panic!("expected btree table"),
         };
         assert!(table_root > 0);
         let index_root = committed
             .schema
-            .indexes
-            .get("t")
-            .and_then(|indexes| indexes.front())
+            .indices_including_backing(NamespaceId::ROOT, "t")
+            .next()
             .map(|index| index.root_page)
             .expect("index idx_t_v");
         assert!(index_root > 0);

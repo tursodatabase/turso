@@ -94,6 +94,7 @@ impl PostgreSQLTranslator {
             | "pg_collation"
             | "pg_attrdef"
             | "pg_description"
+            | "pg_seclabels"
             | "pg_publication"
             | "pg_publication_namespace"
             | "pg_publication_rel"
@@ -5319,6 +5320,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_collation"
             | "pg_attrdef"
             | "pg_description"
+            | "pg_seclabels"
             | "pg_publication"
             | "pg_publication_namespace"
             | "pg_publication_rel"
@@ -6388,6 +6390,22 @@ pub fn is_refresh_matview(parse_result: &ParseResult) -> Result<bool, ParseError
         return Err(not_supported("REFRESH MATERIALIZED VIEW ... WITH NO DATA"));
     }
     Ok(true)
+}
+
+/// Returns true if the parse result is a DROP MATERIALIZED VIEW statement.
+/// It translates to the same DROP VIEW as DROP VIEW does.
+pub fn is_drop_matview(parse_result: &ParseResult) -> bool {
+    use pg_query::protobuf::ObjectType;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return false;
+    }
+    matches!(
+        &nodes[0].0,
+        NodeRef::DropStmt(drop) if drop.remove_type == ObjectType::ObjectMatview as i32
+    )
 }
 
 /// Returns true if the parse result is a COMMENT ON statement.

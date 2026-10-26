@@ -21,6 +21,7 @@
 //! Both flags default to `true` (conservative). Each DML translate path calls
 //! into this module to set them to `false` when safe.
 
+use crate::namespace::NamespaceId;
 use crate::translate::emitter::Resolver;
 use crate::translate::plan::{ColumnMask, DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_triggers_including_temp;
@@ -62,8 +63,11 @@ fn table_has_fks(
     table_name: &str,
 ) -> bool {
     connection.foreign_keys_enabled()
-        && (resolver.with_schema(database_id, |s| s.has_child_fks(table_name))
-            || resolver.with_schema(database_id, |s| s.any_resolved_fks_referencing(table_name)))
+        && (resolver.with_schema(database_id, |s| {
+            s.has_child_fks(NamespaceId::ROOT, table_name)
+        }) || resolver.with_schema(database_id, |s| {
+            s.any_resolved_fks_referencing(NamespaceId::ROOT, table_name)
+        }))
 }
 
 /// Determine whether any constraint's effective resolution can trigger an
@@ -138,7 +142,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     has_unique: bool,
 ) {
     let index_modes: Vec<(Option<ResolveType>, bool)> = resolver.with_schema(database_id, |s| {
-        s.get_indices(&table.name)
+        s.get_indices(NamespaceId::ROOT, &table.name)
             .map(|idx| (idx.on_conflict, idx.unique))
             .collect()
     });

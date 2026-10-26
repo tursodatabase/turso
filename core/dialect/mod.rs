@@ -205,6 +205,13 @@ pub trait Dialect: Send + Sync + 'static {
     fn errors_on_zero_divisor(&self) -> bool {
         false
     }
+
+    /// Whether `mod` of two integers returns an integer.
+    ///
+    /// PostgreSQL returns an integer. SQLite always returns a REAL.
+    fn mod_of_integers_is_integer(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

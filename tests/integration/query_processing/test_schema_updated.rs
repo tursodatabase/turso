@@ -423,7 +423,6 @@ fn test_strict_generated_any_index_after_reopen() -> Result<()> {
     ] {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("generated_any.db");
-        let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
         let expected = vec![
             (1, "'00042'".to_string(), "text".to_string()),
             (2, "42".to_string(), "integer".to_string()),
@@ -431,7 +430,7 @@ fn test_strict_generated_any_index_after_reopen() -> Result<()> {
         ];
 
         {
-            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let db = TempDatabase::new_with_existent(&path);
             let conn = db.connect_limbo();
             conn.execute(create_sql)?;
             conn.execute("INSERT INTO t(id,a) VALUES(1,'00042'),(2,42)")?;
@@ -449,7 +448,7 @@ fn test_strict_generated_any_index_after_reopen() -> Result<()> {
         }
 
         {
-            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let db = TempDatabase::new_with_existent(&path);
             let conn = db.connect_limbo();
             for access in ["NOT INDEXED", "INDEXED BY t_g"] {
                 let rows: Vec<(i64, String, String)> = conn.exec_rows(&format!(
