@@ -116,6 +116,33 @@ fn single_frame_with_num_ops(num_ops: u64) -> RecoveryFixture {
     })
 }
 
+/// `num_updates` single-row UPDATE transactions on 1000 rows of about 300 bytes
+/// that a checkpoint wrote to the B-tree. Each UPDATE changes one integer
+/// column. With `update_deltas`, the log has one `OP_UPDATE_TABLE` op for each
+/// update, and recovery reads the base of the first update of each row from the
+/// B-tree.
+fn updates_of_checkpointed_rows(num_updates: u64, update_deltas: bool) -> RecoveryFixture {
+    build_mvcc_db_with_log(|conn| {
+        conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, n INTEGER, v BLOB)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO u SELECT value, 0, randomblob(300) FROM generate_series(1, 1000)",
+        )
+        .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        if update_deltas {
+            conn.execute("PRAGMA mvcc_update_deltas = on").unwrap();
+        }
+        for i in 0..num_updates {
+            conn.execute(format!(
+                "UPDATE u SET n = n + 1 WHERE id = {}",
+                i % 1000 + 1
+            ))
+            .unwrap();
+        }
+    })
+}
+
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_recovery(c: &mut Criterion) {
     {
@@ -143,6 +170,23 @@ fn bench_recovery(c: &mut Criterion) {
                 &fixture,
                 |b, fixture| b.iter(|| fixture.open_and_recover()),
             );
+        }
+        group.finish();
+    }
+
+    {
+        let mut group = c.benchmark_group("mvcc-recovery/updates");
+        for &num_updates in &[1000, 10_000] {
+            for update_deltas in [false, true] {
+                let fixture = updates_of_checkpointed_rows(num_updates, update_deltas);
+                let setting = if update_deltas { "deltas" } else { "full-rows" };
+                group.throughput(Throughput::Elements(num_updates));
+                group.bench_with_input(
+                    BenchmarkId::new(setting, num_updates),
+                    &fixture,
+                    |b, fixture| b.iter(|| fixture.open_and_recover()),
+                );
+            }
         }
         group.finish();
     }

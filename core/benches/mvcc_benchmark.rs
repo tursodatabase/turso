@@ -17,7 +17,9 @@ use turso_core::alloc::DynAllocator;
 use turso_core::mvcc::clock::MvccClock;
 use turso_core::mvcc::database::{MvStore, Row, RowID, RowKey};
 use turso_core::types::{IOResult, ImmutableRecord, Text};
-use turso_core::{ConnectOpts, Connection, Database, MemoryIO, Statement, StepResult, Value};
+use turso_core::{
+    ConnectOpts, Connection, Database, MemoryIO, PlatformIO, Statement, StepResult, Value,
+};
 
 struct BenchDb {
     _db: Arc<Database>,
@@ -426,10 +428,51 @@ fn bench_huge_multi_write_rowid(c: &mut Criterion) {
     run_huge_multi_write(c, "mvcc-huge-multi-write-rowid", GhostPlacement::RowidProbe);
 }
 
+/// One autocommit UPDATE of one integer column of a row of about 300 bytes, on a
+/// file-backed database. With `mvcc_update_deltas`, the commit writes one
+/// `OP_UPDATE_TABLE` op instead of a delete op and an upsert op with the full row.
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_sql_update(c: &mut Criterion) {
+    let idx1 = NonZeroUsize::new(1).unwrap();
+    let mut group = c.benchmark_group("mvcc-sql-update");
+    group.throughput(Throughput::Elements(1));
+    for update_deltas in [false, true] {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("update.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("PRAGMA synchronous = OFF").unwrap();
+        conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, n INTEGER, v BLOB)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO u SELECT value, 0, randomblob(300) FROM generate_series(1, 1000)",
+        )
+        .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        if update_deltas {
+            conn.execute("PRAGMA mvcc_update_deltas = on").unwrap();
+        }
+        let mut stmt = conn.prepare("UPDATE u SET n = n + 1 WHERE id = ?").unwrap();
+        let mut id = 0;
+        let name = if update_deltas { "deltas" } else { "full-rows" };
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                id = id % 1000 + 1;
+                stmt.bind_at(idx1, Value::from_i64(id)).unwrap();
+                run_to_completion(&db, &mut stmt);
+                stmt.reset().unwrap();
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench, bench_huge_multi_write, bench_huge_multi_write_rowid
+    targets = bench, bench_huge_multi_write, bench_huge_multi_write_rowid, bench_sql_update
 }
 
 criterion_main!(benches);
