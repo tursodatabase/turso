@@ -95,30 +95,31 @@ fn setting(conn: &Connection, name: &str) -> Option<String> {
 }
 
 fn parse_claims(claims: &str) -> Result<serde_json::Value> {
-    let claims = serde_json::from_str(claims).map_err(|_| {
+    let parsed_claims = serde_json::from_str(claims).map_err(|_| {
         sqlstate_error(
             SQLSTATE_INVALID_TEXT_REPRESENTATION,
             "invalid input syntax for type json",
         )
     })?;
-    if has_nul_character(&claims) {
+    if has_nul_escape(claims) {
         return Err(sqlstate_error(
             SQLSTATE_UNTRANSLATABLE_CHARACTER,
             "unsupported Unicode escape sequence",
         ));
     }
-    Ok(claims)
+    Ok(parsed_claims)
 }
 
-fn has_nul_character(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::String(text) => text.contains('\0'),
-        serde_json::Value::Array(items) => items.iter().any(has_nul_character),
-        serde_json::Value::Object(members) => members
-            .iter()
-            .any(|(name, value)| name.contains('\0') || has_nul_character(value)),
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            false
+/// Whether valid JSON text has an escape of the character U+0000. This reads
+/// the text, because the parsed value does not keep a member that a later
+/// member with the same name replaces. In valid JSON, a backslash always
+/// starts an escape in a string.
+fn has_nul_escape(json: &str) -> bool {
+    let mut bytes = json.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'\\' && bytes.next() == Some(b'u') && bytes.by_ref().take(4).eq(*b"0000") {
+            return true;
         }
     }
+    false
 }

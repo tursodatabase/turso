@@ -546,6 +546,36 @@ expect error {
 }
 
 @setup auth_functions
+test auth-email-of-claims-with-a-nul-escape-in-a-replaced-member-errors {
+    SELECT set_config('request.jwt.claims', '{"email": "\u0000", "email": "user@example.com"}', false);
+    SELECT auth.email();
+}
+@sqlstate 22P05
+expect error {
+    unsupported Unicode escape sequence
+}
+
+@setup auth_functions
+test auth-uid-of-claims-with-a-nul-escape-in-a-replaced-object-errors {
+    SELECT set_config('request.jwt.claims', '{"o": {"k": ["\u0000"]}, "o": null, "sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}', false);
+    SELECT auth.uid();
+}
+@sqlstate 22P05
+expect error {
+    unsupported Unicode escape sequence
+}
+
+@setup auth_functions
+test auth-email-of-an-escaped-backslash-before-u0000-is-not-a-nul-escape {
+    SELECT length(set_config('request.jwt.claims', '{"email": "a\\\\u0000"}', false));
+    SELECT auth.email();
+}
+expect {
+    21
+    a\u0000
+}
+
+@setup auth_functions
 test auth-email-of-claims-with-a-nul-escape-before-a-syntax-error-reports-the-escape {
     SELECT set_config('request.jwt.claims', '{"a": "\u0000", "email": }', false);
     SELECT auth.email();
