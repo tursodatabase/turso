@@ -32,6 +32,7 @@
 //! * Garbage collection
 
 pub mod clock;
+pub(crate) mod column_delta;
 pub mod cursor;
 pub mod database;
 pub mod persistent_storage;
