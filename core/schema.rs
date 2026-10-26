@@ -9337,7 +9337,11 @@ mod column_info {
 
         #[inline]
         pub fn set_array_dimensions(&mut self, dims: u32) {
-            assert!(dims <= 7, "array dimensions must be <= 7");
+            assert!(
+                dims <= turso_parser::ast::MAX_ARRAY_DIMENSIONS,
+                "array dimensions must be <= {}",
+                turso_parser::ast::MAX_ARRAY_DIMENSIONS
+            );
             self.0 = (self.0 & !ARRAY_DIM_MASK) | (dims << ARRAY_DIM_SHIFT);
         }
 

@@ -1322,6 +1322,7 @@ fn plan_cte(
                 explicit_columns,
                 Some(cte_definition.cte_id),
                 cte_definition.materialize_hint,
+                resolver,
             )
         }
         Plan::Delete(_) | Plan::Update(_) => {
@@ -1441,6 +1442,7 @@ fn prepare_recursive_cte_plan(
         &initial_query,
         program.table_reference_counter.next(),
         explicit_columns,
+        resolver,
     )?;
     let input_table_id = input_table.internal_id;
 
@@ -1701,6 +1703,7 @@ fn parse_from_clause_table(
                 None,  // No explicit columns for regular subqueries
                 None,  // Regular inline subqueries don't have a CTE identity
                 false, // No materialize hint for inline subqueries
+                resolver,
             )?;
             joined_table.has_alias = maybe_alias.is_some();
             table_references.add_joined_table(joined_table);
@@ -1774,7 +1777,7 @@ fn parse_from_clause_table(
                 .joined_tables_mut()
                 .last_mut()
                 .expect("the nested SELECT added one table");
-            keep_parenthesized_join_columns(table)
+            keep_parenthesized_join_columns(table, resolver)
         }
     }
 }
@@ -1783,7 +1786,7 @@ fn parse_from_clause_table(
 ///
 /// A normal `SELECT *` removes duplicate `USING` columns and all rowids.
 /// SQLite keeps those values because an outer query can use qualified names.
-fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
+fn keep_parenthesized_join_columns(table: &mut JoinedTable, resolver: &Resolver) -> Result<()> {
     let Table::FromClauseSubquery(subquery) = &mut table.table else {
         unreachable!("a parenthesized join must produce a subquery table");
     };
@@ -1903,7 +1906,7 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
             .mark_column_used(table_id, column_index);
     }
 
-    subquery.columns = query_output_columns(&subquery.plan, None)?;
+    subquery.columns = query_output_columns(&subquery.plan, None, resolver)?;
     assert_eq!(subquery.columns.len(), join_columns.len());
     for column_index in 0..subquery.columns.len() {
         let original_name = subquery.columns[column_index]
@@ -2104,6 +2107,7 @@ fn parse_table(
                     explicit_columns,
                     cte_id,
                     materialize_hint,
+                    resolver,
                 )?;
                 if let Some(alias) = alias {
                     joined_table.identifier = alias;
@@ -2215,6 +2219,7 @@ fn parse_table(
             (!view.explicit_columns.is_empty()).then_some(view.explicit_columns.as_slice()),
             None,
             false,
+            resolver,
         )?;
         joined_table.has_alias = has_alias;
         table_references.add_joined_table(joined_table);

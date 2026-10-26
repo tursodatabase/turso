@@ -777,15 +777,6 @@ fn translate_cast_expr(
             // on the encoded value (domain CHECK sees the stored representation).
             if resolved.is_domain() {
                 // Apply encode from parent custom types (domain itself has encode: None)
-                let cast_col = Column::new(
-                    None,
-                    cast_type_name.clone(),
-                    None,
-                    None,
-                    Type::Null,
-                    None,
-                    ColDef::default(),
-                );
                 for td in &resolved.chain {
                     if let Some(encode_expr) = td.encode() {
                         emit_type_expr(
@@ -793,7 +784,7 @@ fn translate_cast_expr(
                             encode_expr,
                             target_register,
                             target_register,
-                            &cast_col,
+                            &[],
                             td,
                             resolver,
                         )?;
@@ -811,17 +802,6 @@ fn translate_cast_expr(
             // CAST(x AS numeric(10,2))), fall through to regular CAST.
             let user_param_count = type_def.user_params().count();
             if user_param_count == 0 || ty_params.len() == user_param_count {
-                let mut cast_col = Column::new(
-                    None,
-                    cast_type_name.clone(),
-                    None,
-                    None,
-                    Type::Null,
-                    None,
-                    ColDef::default(),
-                );
-                cast_col.ty_params = ty_params;
-
                 // CAST to custom type applies only the encode function,
                 // producing the stored representation.
                 // e.g. CAST(42 AS cents) → 4200
@@ -831,7 +811,7 @@ fn translate_cast_expr(
                         encode_expr,
                         target_register,
                         target_register,
-                        &cast_col,
+                        &ty_params,
                         type_def,
                         resolver,
                     )?;

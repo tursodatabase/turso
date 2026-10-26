@@ -420,6 +420,14 @@ expect {
     -1
 }
 
+# Result column types are worked out before argument counts are checked.
+test abs-without-arguments-in-subquery-errors {
+    SELECT * FROM (SELECT abs())
+}
+expect error {
+    abs function with no arguments|wrong number of arguments to function abs\(\)
+}
+
 test replace-wrong-arg-count-0 {
     select replace()
 }

@@ -661,7 +661,7 @@ pub fn translate_aggregation_step(
             let expr = &agg_arg_source.arg_at(0);
             let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
             let comparator =
-                super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
+                super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -683,7 +683,7 @@ pub fn translate_aggregation_step(
             let expr = &agg_arg_source.arg_at(0);
             let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
             let comparator =
-                super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
+                super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,

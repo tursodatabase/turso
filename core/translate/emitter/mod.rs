@@ -453,21 +453,24 @@ impl<'a> Resolver<'a> {
     }
 
     pub(crate) fn self_table_collation(&self, column: Option<usize>) -> Option<CollationSeq> {
-        let scope = self.self_table_scope.borrow();
-        let context = &scope.as_ref()?.context;
-        let table = match context {
-            SelfTableContext::ForDML { table, .. } => Arc::clone(table),
+        let table = self.self_table()?;
+        match column {
+            Some(column) => table.columns().get(column)?.collation_opt(),
+            None => table.get_rowid_alias_column()?.1.collation_opt(),
+        }
+    }
+
+    /// The table that `SELF_TABLE` column references refer to.
+    pub(crate) fn self_table(&self) -> Option<Arc<BTreeTable>> {
+        match &self.self_table_scope.borrow().as_ref()?.context {
+            SelfTableContext::ForDML { table, .. } => Some(Arc::clone(table)),
             SelfTableContext::ForSelect {
                 table_ref_id,
                 referenced_tables,
             } => referenced_tables
                 .find_table_by_internal_id(*table_ref_id)?
                 .1
-                .btree()?,
-        };
-        match column {
-            Some(column) => table.columns().get(column)?.collation_opt(),
-            None => table.get_rowid_alias_column()?.1.collation_opt(),
+                .btree(),
         }
     }
 
