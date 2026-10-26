@@ -2607,7 +2607,7 @@ impl PostgreSQLTranslator {
                         .as_str(),
                     "json" | "jsonb"
                 );
-                let cast_type = Some(pg_type_name_to_ast_type(type_name)?);
+                let cast_type = pg_type_name_to_ast_type(type_name)?;
                 let path = Box::new(ast::Expr::Literal(ast::Literal::String(format!(
                     "'$.\"{}\"'",
                     col_def
@@ -2618,8 +2618,7 @@ impl PostgreSQLTranslator {
                 ))));
                 let extract =
                     |operator| ast::Expr::Binary(Box::new(source.clone()), operator, path.clone());
-                let reads_json_text =
-                    is_json || cast_type.as_ref().is_some_and(|t| t.name == "TEXT");
+                let reads_json_text = is_json || cast_type.name == "TEXT";
                 let value = if reads_json_text {
                     let mut when_then_pairs = vec![(
                         Box::new(ast::Expr::Literal(ast::Literal::String("'null'".into()))),
@@ -2642,10 +2641,7 @@ impl PostgreSQLTranslator {
                 } else {
                     extract(ast::Operator::ArrowRightShift)
                 };
-                let cast = ast::Expr::Cast {
-                    expr: Box::new(value),
-                    type_name: cast_type,
-                };
+                let cast = cast_expr(value, cast_type);
                 Ok(ast::ResultColumn::Expr(
                     Box::new(cast),
                     Some(ast::As::Elided(ast::Name::from_string(
@@ -2977,10 +2973,7 @@ impl PostgreSQLTranslator {
                     return Err(not_supported("a type modifier in a cast"));
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
-                Ok(ast::Expr::Cast {
-                    expr,
-                    type_name: Some(type_name),
-                })
+                Ok(cast_expr(*expr, type_name))
             }
             Some(pg_query::protobuf::node::Node::SubLink(sub_link)) => {
                 self.translate_sublink(sub_link)
@@ -3915,9 +3908,10 @@ impl PostgreSQLTranslator {
             _ => func_name,
         };
 
-        // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
+        // PG type-cast functions: float8(x) → CAST(x AS float8), int4(x) → CAST(x AS INTEGER), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
-            "FLOAT8" | "FLOAT4" => Some("REAL"),
+            "FLOAT8" => Some("float8"),
+            "FLOAT4" => Some("float4"),
             "INT4" | "INT2" | "INT8" => Some("INTEGER"),
             "BOOL" => Some("BOOLEAN"),
             "TEXT" => Some("TEXT"),
@@ -3934,14 +3928,14 @@ impl PostgreSQLTranslator {
                         "DISTINCT, ORDER BY, FILTER or OVER on {func_name}()"
                     )));
                 }
-                return Ok(ast::Expr::Cast {
-                    expr: args.into_iter().next().unwrap(),
-                    type_name: Some(ast::Type {
+                return Ok(cast_expr(
+                    *args.into_iter().next().unwrap(),
+                    ast::Type {
                         name: type_name.to_string(),
                         size: None,
                         array_dimensions: 0,
-                    }),
-                });
+                    },
+                ));
             }
         }
 
@@ -5576,8 +5570,15 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         };
         // Recursively map the base type as a scalar
         let scalar = map_pg_type(base, params)?;
+        // Arrays of floats keep REAL elements; only scalar floats use the
+        // float8 type, which exists to print them the way PostgreSQL does.
+        let type_name = if is_float_type(&scalar.type_name) {
+            "REAL".to_string()
+        } else {
+            scalar.type_name
+        };
         return Some(PgTypeMapping {
-            type_name: scalar.type_name,
+            type_name,
             array_dimensions: scalar.array_dimensions + dims,
             type_params: scalar.type_params,
         });
@@ -5616,7 +5617,8 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         // Base types (no Turso custom type needed)
         "INTEGER" | "INT" | "INT4" | "SERIAL" | "SERIAL4" | "BIGSERIAL" | "SERIAL8"
         | "SMALLSERIAL" | "SERIAL2" => "INTEGER".into(),
-        "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" => "REAL".into(),
+        "REAL" | "FLOAT4" => "float4".into(),
+        "DOUBLE PRECISION" | "FLOAT8" => "float8".into(),
         "TEXT" | "BPCHAR" | "NAME" => "TEXT".into(),
         "BLOB" => "BLOB".into(),
 
@@ -5782,6 +5784,8 @@ fn pg_type_name_to_ast_type(
     let name = match pg_type.to_uppercase().as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "BIGINT" | "INT8" | "SERIAL"
         | "BIGSERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
+        "REAL" | "FLOAT4" if type_name.array_bounds.is_empty() => "float4",
+        "DOUBLE PRECISION" | "FLOAT8" if type_name.array_bounds.is_empty() => "float8",
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
             "REAL"
         }
@@ -5805,6 +5809,32 @@ fn pg_type_name_to_ast_type(
         size: None,
         array_dimensions: type_name.array_bounds.len() as u32,
     })
+}
+
+/// Builds `CAST(expr AS type_name)`. A cast to the float8 type converts
+/// nothing by itself, so the value is first cast to REAL.
+fn cast_expr(expr: ast::Expr, type_name: ast::Type) -> ast::Expr {
+    let expr = if is_float_type(&type_name.name) {
+        ast::Expr::Cast {
+            expr: Box::new(expr),
+            type_name: Some(ast::Type {
+                name: "REAL".to_string(),
+                size: None,
+                array_dimensions: 0,
+            }),
+        }
+    } else {
+        expr
+    };
+    ast::Expr::Cast {
+        expr: Box::new(expr),
+        type_name: Some(type_name),
+    }
+}
+
+/// Whether `name` is one of the Turso types that PostgreSQL floats map to.
+fn is_float_type(name: &str) -> bool {
+    matches!(name, "float8" | "float4")
 }
 
 fn extract_type_name_from_typename(
@@ -7228,7 +7258,12 @@ mod tests {
         // Base types (no Turso custom type)
         assert_eq!(map_pg_type("INTEGER", no_params), Some(s("INTEGER")));
         assert_eq!(map_pg_type("SERIAL", no_params), Some(s("INTEGER")));
-        assert_eq!(map_pg_type("REAL", no_params), Some(s("REAL")));
+        assert_eq!(map_pg_type("REAL", no_params), Some(s("float4")));
+        assert_eq!(map_pg_type("FLOAT8", no_params), Some(s("float8")));
+        assert_eq!(
+            map_pg_type("_float8", no_params),
+            Some(PgTypeMapping::array("REAL", 1))
+        );
         assert_eq!(map_pg_type("TEXT", no_params), Some(s("TEXT")));
         assert_eq!(map_pg_type("BLOB", no_params), Some(s("BLOB")));
 

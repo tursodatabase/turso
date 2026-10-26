@@ -225,6 +225,30 @@ mod tests {
         assert_eq!(rowid_col.kind, ColumnTypeKind::Builtin);
     }
 
+    /// A CAST to a type registered through CREATE TYPE reports that type the
+    /// same way a column declared with it is reported, so wire-protocol
+    /// layers can tell `CAST(x AS float8)` from a plain REAL.
+    #[test]
+    fn type_info_for_cast_to_custom_type() {
+        let db = fresh_db_with_custom_types("type_info_custom_cast.db");
+        let conn = db.connect_limbo();
+
+        let stmt = conn
+            .prepare("SELECT CAST(1 AS float8), CAST(1 AS float4)")
+            .unwrap();
+
+        let float8 = expect_info(&stmt, 0);
+        assert_eq!(float8.declared_name, "float8");
+        assert_eq!(float8.base_type, Some("REAL".to_string()));
+        assert_eq!(float8.kind, ColumnTypeKind::Custom);
+        assert_eq!(float8.array_dimensions, 0);
+
+        let float4 = expect_info(&stmt, 1);
+        assert_eq!(float4.declared_name, "float4");
+        assert_eq!(float4.base_type, Some("REAL".to_string()));
+        assert_eq!(float4.kind, ColumnTypeKind::Custom);
+    }
+
     /// Bare literals carry a concrete primitive that the wire-protocol layer
     /// must report (a PostgreSQL client running `SELECT 42` expects INT4,
     /// not TEXT). The API deliberately departs from SQLite's "literals have

@@ -1419,34 +1419,35 @@ impl Statement {
                 .resolve_type(&declared_name, table_ref.is_strict())
                 .ok()
                 .flatten();
-            // `kind` is computed from the leaf TypeDef in the resolution chain:
-            // STRUCT and UNION are tagged on `TypeDefKind`, DOMAIN is tagged
-            // separately on `TypeDef.is_domain`, and anything else registered
-            // through CREATE TYPE is a Custom. A column whose declared name
-            // does not appear in the type registry is a Builtin.
-            let (base_type, kind) = match resolved {
-                Some(resolved) => {
-                    let leaf = resolved.leaf();
-                    let kind = if leaf.is_struct() {
-                        ColumnTypeKind::Struct
-                    } else if leaf.is_union() {
-                        ColumnTypeKind::Union
-                    } else if leaf.is_domain {
-                        ColumnTypeKind::Domain
-                    } else {
-                        ColumnTypeKind::Custom
-                    };
-                    (Some(resolved.primitive.to_uppercase()), kind)
-                }
-                None => (None, ColumnTypeKind::Builtin),
-            };
             drop(schema);
+            let (base_type, kind) = custom_type_base_and_kind(resolved);
             return Ok(Some(ColumnTypeInfo {
                 declared_name,
                 array_dimensions,
                 base_type,
                 kind,
             }));
+        }
+        // CAST to a type registered through CREATE TYPE: report that type,
+        // the same way a column declared with it is reported.
+        if let turso_parser::ast::Expr::Cast {
+            type_name: Some(ty),
+            ..
+        } = &column.expr
+        {
+            let declared_name = crate::util::dequote(&ty.name);
+            let schema = self.program.connection.schema.read();
+            let resolved = schema.resolve_type_unchecked(&declared_name).ok().flatten();
+            drop(schema);
+            if resolved.is_some() {
+                let (base_type, kind) = custom_type_base_and_kind(resolved);
+                return Ok(Some(ColumnTypeInfo {
+                    declared_name,
+                    array_dimensions: ty.array_dimensions,
+                    base_type,
+                    kind,
+                }));
+            }
         }
         // Not a table column: infer the result primitive from the
         // expression's shape (literal value type, operand types of a binary
@@ -1880,6 +1881,30 @@ impl Statement {
     pub fn _io(&self) -> &dyn crate::IO {
         self.pager.io.as_ref()
     }
+}
+
+/// The base primitive and kind of a declared type. `kind` comes from the leaf
+/// TypeDef in the resolution chain: STRUCT and UNION are tagged on
+/// `TypeDefKind`, DOMAIN is tagged separately on `TypeDef.is_domain`, and
+/// anything else registered through CREATE TYPE is a Custom. A name that does
+/// not appear in the type registry is a Builtin.
+fn custom_type_base_and_kind(
+    resolved: Option<crate::schema::ResolvedType>,
+) -> (Option<String>, ColumnTypeKind) {
+    let Some(resolved) = resolved else {
+        return (None, ColumnTypeKind::Builtin);
+    };
+    let leaf = resolved.leaf();
+    let kind = if leaf.is_struct() {
+        ColumnTypeKind::Struct
+    } else if leaf.is_union() {
+        ColumnTypeKind::Union
+    } else if leaf.is_domain {
+        ColumnTypeKind::Domain
+    } else {
+        ColumnTypeKind::Custom
+    };
+    (Some(resolved.primitive.to_uppercase()), kind)
 }
 
 /// Appends `value` to `out` as a SQL literal, the way SQLite renders bound

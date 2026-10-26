@@ -10510,12 +10510,9 @@ pub fn op_function(
                     let Value::Text(cast_type) = state.registers[*start_reg + 1].get_value() else {
                         unreachable!("Cast with non-text type");
                     };
-                    let value = state.registers[*start_reg].get_value();
-                    if matches!(Affinity::affinity(cast_type.as_str()), Affinity::Text) {
-                        cast_to_text(program, value)?
-                    } else {
-                        value.exec_cast(cast_type.as_str())?
-                    }
+                    state.registers[*start_reg]
+                        .get_value()
+                        .exec_cast(cast_type.as_str())?
                 };
                 state.registers[*dest].set_value(result);
             }
@@ -17592,7 +17589,7 @@ pub fn op_integrity_check(
     Ok(InsnFunctionStepResult::Step)
 }
 pub fn op_cast(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -17602,7 +17599,7 @@ pub fn op_cast(
     let value = state.registers[*reg].get_value().clone();
     let result = match affinity {
         Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
-        Affinity::Text => cast_to_text(program, &value),
+        Affinity::Text => value.exec_cast("TEXT"),
         Affinity::Numeric => value.exec_cast("NUMERIC"),
         Affinity::Integer => value.exec_cast("INTEGER"),
         Affinity::Real => value.exec_cast("REAL"),
@@ -17611,20 +17608,6 @@ pub fn op_cast(
     state.registers[*reg].set_value(result);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
-}
-
-/// Casts `value` to TEXT. Floats are written the way the connection's dialect
-/// prints them; every other value converts as in SQLite.
-fn cast_to_text(
-    program: &Program,
-    value: &Value,
-) -> std::result::Result<Value, crate::alloc::TryReserveError> {
-    match value {
-        Value::Numeric(Numeric::Float(f)) => Ok(Value::build_text(
-            program.connection.dialect().format_float(f64::from(*f)),
-        )),
-        _ => value.exec_cast("TEXT"),
-    }
 }
 
 /// Regenerate trigger SQL from its in-memory fields to keep trigger.sql

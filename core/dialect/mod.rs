@@ -206,12 +206,14 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// The text a floating-point value becomes when cast to TEXT.
+    /// The function that turns a value of the declared type `type_name` into
+    /// text when it is cast to TEXT, or `None` to use SQLite's conversion.
     ///
-    /// SQLite always writes a fraction (`1.0`, `1.0e+20`). PostgreSQL writes
-    /// the shortest form that reads back as the same value (`1`, `1e+20`).
-    fn format_float(&self, value: f64) -> String {
-        crate::numeric::format_float(value)
+    /// PostgreSQL prints `float8` values with the shortest digits that read
+    /// back as the same value (`1`, `1e+20`), where SQLite always writes a
+    /// fraction (`1.0`, `1.0e+20`).
+    fn text_cast_function(&self, _type_name: &str) -> Option<&'static str> {
+        None
     }
 
     /// Whether `mod` of two integers returns an integer.

@@ -3,23 +3,28 @@
 # PostgreSQL prints the shortest digits that read back as the same value:
 # no trailing ".0" on whole numbers, a signed two-digit exponent outside the
 # 1e-4 .. 1e15 range, and a sign on negative zero.
+#
+# NUMERIC is a different type: PostgreSQL prints it with its scale, so a
+# whole numeric value keeps its ".0".
 
 @database :memory:
 
 test float8-whole-number-has-no-fraction {
     SELECT 1::float8;
     SELECT 3::double precision;
-    SELECT -42::float8;
+    SELECT (-42)::float8;
+    SELECT float8(7);
 }
 expect {
     1
     3
     -42
+    7
 }
 
 test float8-fraction-uses-shortest-digits {
     SELECT 2.5::float8;
-    SELECT 0.1::float8 + 0.2::float8;
+    SELECT 0.30000000000000004::float8;
 }
 expect {
     2.5
@@ -68,9 +73,46 @@ test float8-column-values {
     CREATE TABLE float8_values(x float8);
     INSERT INTO float8_values VALUES (1), (2.5), (1e20);
     SELECT x FROM float8_values ORDER BY x;
+    SELECT x::text AS x_text FROM float8_values ORDER BY x;
 }
 expect {
     1
     2.5
     1e+20
+    1
+    2.5
+    1e+20
+}
+
+test float4-and-double-precision-columns {
+    CREATE TABLE float_columns(r real, d double precision);
+    INSERT INTO float_columns VALUES (1, 1e20);
+    SELECT r, d FROM float_columns;
+}
+expect {
+    1|1e+20
+}
+
+test numeric-whole-number-keeps-fraction {
+    SELECT 1.0::numeric;
+    SELECT 1.0::numeric::text;
+    SELECT 1.0;
+    SELECT 2.0 * 3;
+}
+expect {
+    1.0
+    1.0
+    1.0
+    6.0
+}
+
+test numeric-column-keeps-fraction {
+    CREATE TABLE numeric_values(n numeric);
+    INSERT INTO numeric_values VALUES (1.0);
+    SELECT n FROM numeric_values;
+    SELECT n::text FROM numeric_values;
+}
+expect {
+    1.0
+    1.0
 }

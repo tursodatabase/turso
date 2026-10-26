@@ -84,6 +84,7 @@ scalar_functions! {
     PgIsInRecovery(FunctionArity::Exact(0), false),
     PgLockAccessShare(FunctionArity::Exact(0), false),
     PgLimitValue(FunctionArity::Exact(2), true),
+    Float8out(FunctionArity::Exact(1), true),
     Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
 }
 
@@ -151,6 +152,7 @@ impl ScalarCall for PgScalarFunction {
                 Value::from_i64(0)
             }
             Self::PgLimitValue => exec_pg_limit_value(args)?,
+            Self::Float8out => exec_float8out(args[0].get_value())?,
             Self::Now
             | Self::ClockTimestamp
             | Self::TransactionTimestamp
@@ -500,6 +502,18 @@ fn exec_version() -> Value {
 /// in SQL, doubling embedded quotes. Backslashes force the E'' escape-string
 /// form so the result reads back identically regardless of
 /// standard_conforming_strings.
+/// `float8out(x)`: a float as PostgreSQL prints it. Other values convert to
+/// text as in SQLite.
+fn exec_float8out(value: &Value) -> Result<Value> {
+    match value {
+        Value::Null => Ok(Value::Null),
+        Value::Numeric(Numeric::Float(f)) => Ok(Value::build_text(crate::float::format_float8(
+            f64::from(*f),
+        ))),
+        _ => Ok(value.exec_cast("TEXT")?),
+    }
+}
+
 fn exec_quote_literal(value: &Value) -> Value {
     if matches!(value, Value::Null) {
         return Value::Null;

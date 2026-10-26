@@ -186,8 +186,8 @@ impl Dialect for PostgresDialect {
         true
     }
 
-    fn format_float(&self, value: f64) -> String {
-        crate::float::format_float8(value)
+    fn text_cast_function(&self, type_name: &str) -> Option<&'static str> {
+        crate::float::is_float_type(type_name).then_some("float8out")
     }
 
     fn mod_of_integers_is_integer(&self) -> bool {
