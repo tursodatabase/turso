@@ -918,7 +918,7 @@ mod tests {
 
     #[cfg(not(feature = "sqlite3"))]
     #[test]
-    fn test_sqlite3_bind_blob_negative_len_reads_to_nul() {
+    fn test_sqlite3_bind_blob_negative_len_is_misuse() {
         unsafe {
             let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
             let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
@@ -951,8 +951,14 @@ mod tests {
                 SQLITE_OK
             );
             let data = b"abc\0def";
+            // A NULL value ignores n. A pointer with n < 0 is SQLITE_MISUSE.
+            assert_eq!(sqlite3_bind_blob(stmt, 1, ptr::null(), -1, None), SQLITE_OK);
             assert_eq!(
                 sqlite3_bind_blob(stmt, 1, data.as_ptr() as *const _, -1, None),
+                SQLITE_MISUSE
+            );
+            assert_eq!(
+                sqlite3_bind_blob(stmt, 1, data.as_ptr() as *const _, 3, None),
                 SQLITE_OK
             );
             assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
@@ -970,9 +976,9 @@ mod tests {
                 SQLITE_OK
             );
             assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
-            let ptr = sqlite3_column_blob(stmt, 0);
+            let col = sqlite3_column_blob(stmt, 0);
             let n = sqlite3_column_bytes(stmt, 0);
-            let got = std::slice::from_raw_parts(ptr as *const u8, n as usize);
+            let got = std::slice::from_raw_parts(col as *const u8, n as usize);
             assert_eq!(got, b"abc");
 
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
