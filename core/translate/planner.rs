@@ -2129,7 +2129,7 @@ fn parse_table(
     }
 
     // Resolve table using connection's with_schema method
-    let namespace = resolver.resolve_existing_table(qualified_name)?;
+    let namespace = resolver.resolve_queried_table(qualified_name)?;
     let database_id = namespace.database_id;
     let table = resolver.with_schema(database_id, |schema| {
         schema.get_table(namespace.id, table_name.as_str())

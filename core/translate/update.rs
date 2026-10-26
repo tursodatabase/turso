@@ -250,7 +250,7 @@ fn prepare_update_plan(
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
 ) -> crate::Result<UpdatePlan> {
-    let namespace = resolver.resolve_existing_table(&body.tbl_name)?;
+    let namespace = resolver.resolve_queried_table(&body.tbl_name)?;
     let database_id = namespace.database_id;
     let target_name = &body.tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| {
