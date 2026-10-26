@@ -1,5 +1,5 @@
 use super::*;
-use crate::translate::collate::comparison_operand_collation_ctx;
+use crate::translate::collate::get_expr_collation_ctx_with_symbols;
 use crate::translate::expression_index::normalize_expr_for_index_matching;
 
 #[derive(Debug, Clone, Copy)]
@@ -265,8 +265,11 @@ macro_rules! translate_fixed_insn {
 /// over NULL inputs does not always produce NULL.
 ///
 /// A comparison takes the collation of its operands from the program builder.
-/// A read from the index does not set it, so this function sets the collation
-/// that SQLite gives the expression, also when the null row is possible.
+/// Translation of `x COLLATE c` sets `c` there, but a read from the index does
+/// not translate the expression, so this function sets the COLLATE of the
+/// expression. As in SQLite, the leftmost COLLATE is used, so a COLLATE that an
+/// earlier part of the parent expression set stays. This function does not set
+/// a collation for an expression without a COLLATE.
 ///
 /// We mut do this check early in translate_expr so downstream translation does
 /// not build redundant bytecode.
@@ -298,10 +301,18 @@ pub(super) fn try_emit_expression_index_value(
     else {
         return Ok(false);
     };
-    let collation = comparison_operand_collation_ctx(expr, referenced_tables, resolver)?;
+    let earlier_collate = program
+        .curr_collation_ctx()
+        .filter(|&(_, explicit)| explicit);
+    let collate =
+        get_expr_collation_ctx_with_symbols(expr, referenced_tables, Some(resolver.symbol_table))?
+            .filter(|&(_, explicit)| explicit)
+            .map(|collate| earlier_collate.unwrap_or(collate));
     if !referenced_tables.index_cursor_may_be_null_row(table.internal_id) {
         program.emit_column_or_rowid(index_cursor, expression_position, target_register);
-        program.set_collation(collation);
+        if collate.is_some() {
+            program.set_collation(collate);
+        }
         return Ok(true);
     }
 
@@ -332,7 +343,9 @@ pub(super) fn try_emit_expression_index_value(
         .set_skip_expression_index_values(skipped_index_values);
     result?;
     program.preassign_label_to_next_insn(expression_done);
-    program.set_collation(collation);
+    if collate.is_some() {
+        program.set_collation(collate);
+    }
     Ok(true)
 }
 

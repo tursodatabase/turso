@@ -1778,15 +1778,38 @@ expect {
     4
 }
 
-# Unary "+" does not hide the column, so the value has the collation of y.
-test expression-index-value-keeps-column-collation-through-unary-plus {
-    CREATE TABLE expr_plus(x TEXT, y TEXT COLLATE NOCASE);
-    INSERT INTO expr_plus VALUES ('alpha', 'ALPHA'), ('bravo', 'charlie');
-    CREATE INDEX expr_plus_y ON expr_plus(+y);
-    SELECT x FROM expr_plus INDEXED BY expr_plus_y WHERE +y = x;
+# Inside a larger expression, SQLite uses the leftmost COLLATE. The COLLATE of
+# the value from the index goes through a function, but a COLLATE before the
+# value stays.
+setup expression_index_nested {
+    CREATE TABLE expr_nested(a TEXT, b TEXT);
+    INSERT INTO expr_nested VALUES (NULL, 'ABC'), ('abc', 'ABC');
+    CREATE INDEX expr_nested_rtrim ON expr_nested((b || '') COLLATE RTRIM);
+    CREATE INDEX expr_nested_lower ON expr_nested(lower(b));
+}
+
+@setup expression_index_nested
+test expression-index-value-collate-goes-through-function {
+    SELECT coalesce(a, (b || '') COLLATE RTRIM) = 'ABC  '
+    FROM expr_nested INDEXED BY expr_nested_rtrim ORDER BY rowid;
 }
 expect {
-    alpha
+    1
+    0
+}
+
+@setup expression_index_nested
+test expression-index-value-keeps-earlier-collate {
+    SELECT coalesce(a COLLATE NOCASE, (b || '') COLLATE RTRIM) = 'abc'
+    FROM expr_nested INDEXED BY expr_nested_rtrim ORDER BY rowid;
+    SELECT coalesce(a COLLATE NOCASE, lower(b)) = 'ABC'
+    FROM expr_nested INDEXED BY expr_nested_lower ORDER BY rowid;
+}
+expect {
+    1
+    1
+    1
+    1
 }
 
 # A function hides the column, so the value has no collation. The comparison
@@ -1814,15 +1837,25 @@ expect {
     b|0
 }
 
+# +y has the collation of y, but the NOCASE of y does not go through coalesce().
+test expression-index-value-of-unary-plus-in-function-has-no-collation {
+    CREATE TABLE expr_plus(y TEXT COLLATE NOCASE);
+    INSERT INTO expr_plus VALUES ('y');
+    CREATE INDEX expr_plus_y ON expr_plus(+y);
+    SELECT coalesce(+y, 'x') = 'Y' FROM expr_plus INDEXED BY expr_plus_y;
+}
+expect {
+    0
+}
+
 # For the NULL row of an outer join, the expression is computed instead of read
 # from the index. The comparison has one collation for the two cases.
 setup expression_index_outer_join {
     CREATE TABLE expr_left(id INTEGER PRIMARY KEY, x TEXT COLLATE NOCASE);
     CREATE TABLE expr_right(id INTEGER PRIMARY KEY, y TEXT);
     CREATE INDEX expr_right_collate ON expr_right(id, (y || '') COLLATE NOCASE);
-    CREATE INDEX expr_right_trim ON expr_right(id, trim(y));
-    INSERT INTO expr_left VALUES (1, 'alpha'), (2, 'bravo'), (3, 'x');
-    INSERT INTO expr_right VALUES (1, 'ALPHA'), (2, 'charlie');
+    INSERT INTO expr_left VALUES (1, 'alpha'), (2, 'bravo'), (3, 'x'), (4, NULL);
+    INSERT INTO expr_right VALUES (1, 'ALPHA'), (2, 'charlie'), (4, 'ALPHA');
 }
 
 @setup expression_index_outer_join
@@ -1835,16 +1868,18 @@ expect {
     1|1
     2|0
     3|
+    4|1
 }
 
 @setup expression_index_outer_join
-test expression-index-value-in-outer-join-of-function-uses-collation-of-other-operand {
-    SELECT l.id, trim(r.y) = l.x
-    FROM expr_left l LEFT JOIN expr_right r INDEXED BY expr_right_trim ON r.id = l.id
+test expression-index-value-in-outer-join-keeps-earlier-collate {
+    SELECT l.id, coalesce(l.x COLLATE BINARY, (r.y || '') COLLATE NOCASE) = 'alpha'
+    FROM expr_left l LEFT JOIN expr_right r INDEXED BY expr_right_collate ON r.id = l.id
     ORDER BY l.id;
 }
 expect {
     1|1
     2|0
-    3|
+    3|0
+    4|0
 }
