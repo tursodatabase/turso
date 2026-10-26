@@ -634,4 +634,446 @@ mod tests {
             vec![("2025-01-08".to_string(), "2025-01-02".to_string())]
         );
     }
+
+    /// The fixture was written by tursodb v0.9.0-pre.1, before databases
+    /// recorded which version of the custom-type rules built their indexes:
+    ///
+    /// ```sql
+    /// CREATE TABLE t(id INTEGER PRIMARY KEY, val numeric(10,2),
+    ///                g ANY AS (val * 3) VIRTUAL) STRICT;
+    /// CREATE INDEX t_expr ON t((val * 2));
+    /// CREATE INDEX t_partial ON t(id) WHERE val * 2 > 2;
+    /// CREATE INDEX t_gen ON t(g);
+    /// CREATE INDEX t_plain ON t(val);
+    /// CREATE TABLE u(id INTEGER PRIMARY KEY);
+    /// CREATE TRIGGER u_deletes_t AFTER INSERT ON u
+    ///   BEGIN DELETE FROM t WHERE id = NEW.id; END;
+    /// INSERT INTO t(id, val) VALUES (1, 1.50), (2, 0.25), (3, 2.10);
+    /// ```
+    ///
+    /// All four indexes on `t` store values that depend on the custom-type
+    /// rules, so they must be rebuilt before use.
+    fn open_database_with_indexes_built_before_rules_version(dir: &TempDir) -> TempDatabase {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("integration/fixtures/custom_type_indexes_v0.9.0-pre.1.db");
+        let path = dir.path().join("old_indexes.db");
+        std::fs::copy(&fixture, &path).unwrap();
+        TempDatabase::builder()
+            .with_db_path(&path)
+            .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+            .build()
+    }
+
+    fn prepare_error(conn: &Arc<turso_core::Connection>, sql: &str) -> String {
+        match conn.prepare(sql) {
+            Ok(_) => panic!("{sql} must fail"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    const VERSION_TABLES: &str = "SELECT name FROM sqlite_schema \
+                                  WHERE name LIKE '__turso_internal_custom_type_rules_v%' \
+                                  ORDER BY name";
+
+    #[test]
+    fn test_index_built_before_rules_version_is_refused_until_reindex() {
+        let dir = TempDir::new().unwrap();
+        let db = open_database_with_indexes_built_before_rules_version(&dir);
+        let conn = db.connect_limbo();
+
+        // Statements that open no old index work.
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM u");
+        assert_eq!(rows, vec![(0,)]);
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t NOT INDEXED");
+        assert_eq!(rows, vec![(3,)]);
+
+        let refused = "indexes built by an older version of Turso's experimental custom types \
+                       must be rebuilt before use: t_expr, t_gen, t_partial, t_plain. Run REINDEX";
+        for sql in [
+            "SELECT id FROM t WHERE val * 2 > 1",
+            "SELECT id FROM t INDEXED BY t_gen WHERE g > 1",
+            "SELECT id FROM t INDEXED BY t_plain WHERE val > 1",
+            "DELETE FROM t WHERE id = 1",
+            "UPDATE t SET val = 5 WHERE id = 1",
+            "INSERT INTO t(id, val) VALUES (4, 1)",
+            // The trigger's DELETE opens the old indexes.
+            "INSERT INTO u VALUES (1)",
+            "PRAGMA integrity_check",
+        ] {
+            let err = prepare_error(&conn, sql);
+            assert!(err.contains(refused), "{sql}: {err}");
+        }
+
+        // An index created now is built under the current rules, but the
+        // database still holds old ones, so it waits for REINDEX with them.
+        conn.execute("CREATE INDEX t_new ON t((val + 1))").unwrap();
+        let err = prepare_error(&conn, "SELECT id FROM t INDEXED BY t_new WHERE val + 1 > 0");
+        assert!(
+            err.contains("t_gen, t_new, t_partial, t_plain. Run REINDEX"),
+            "{err}"
+        );
+        let rows: Vec<(String,)> = conn.exec_rows(VERSION_TABLES);
+        assert_eq!(rows, vec![]);
+
+        // REINDEX of one index rebuilds every old index.
+        conn.execute("REINDEX t_expr").unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows(VERSION_TABLES);
+        assert_eq!(
+            rows,
+            vec![("__turso_internal_custom_type_rules_v1".to_string(),)]
+        );
+        conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+        conn.execute("INSERT INTO u VALUES (2)").unwrap();
+        conn.execute("UPDATE t SET val = 0.75 WHERE id = 3")
+            .unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t INDEXED BY t_expr ORDER BY id");
+        assert_eq!(rows, vec![(3,)]);
+        let rows: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(rows, vec![("ok".to_string(),)]);
+        conn.close().unwrap();
+
+        let conn = db.connect_limbo();
+        conn.execute("DELETE FROM t WHERE id = 3").unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+        assert_eq!(rows, vec![(0,)]);
+    }
+
+    /// MVCC has no REINDEX, so the old indexes are dropped and created again.
+    #[test]
+    fn test_index_built_before_rules_version_can_be_created_again_in_mvcc() {
+        let dir = TempDir::new().unwrap();
+        let db = open_database_with_indexes_built_before_rules_version(&dir);
+        let conn = db.connect_limbo();
+        conn.pragma_update("journal_mode", "'mvcc'").unwrap();
+
+        let err = prepare_error(&conn, "DELETE FROM t WHERE id = 1");
+        assert!(err.contains("must be rebuilt before use"), "{err}");
+
+        for index in ["t_expr", "t_partial", "t_gen", "t_plain"] {
+            conn.execute(format!("DROP INDEX {index}")).unwrap();
+        }
+        conn.execute("CREATE INDEX t_expr ON t((val * 2))").unwrap();
+        conn.execute("CREATE INDEX t_partial ON t(id) WHERE val * 2 > 2")
+            .unwrap();
+        conn.execute("CREATE INDEX t_gen ON t(g)").unwrap();
+        conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t INDEXED BY t_expr ORDER BY id");
+        assert_eq!(rows, vec![(2,), (3,)]);
+    }
+
+    /// The statement that gives a database its first index that depends on
+    /// the rules marks it with the rules version. Plain tables and indexes
+    /// leave the schema as SQLite would have it.
+    #[test]
+    fn test_new_database_records_rules_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("new_indexes.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        let rows: Vec<(String,)> = conn.exec_rows(VERSION_TABLES);
+        assert_eq!(rows, vec![]);
+        conn.execute("CREATE TABLE p(id INTEGER PRIMARY KEY, x integer UNIQUE) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX p_x ON p(x + 1)").unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows(VERSION_TABLES);
+        assert_eq!(rows, vec![]);
+
+        conn.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, val numeric(10,2) UNIQUE, \
+             g ANY AS (val * 2) VIRTUAL) STRICT",
+        )
+        .unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows(VERSION_TABLES);
+        assert_eq!(
+            rows,
+            vec![("__turso_internal_custom_type_rules_v1".to_string(),)]
+        );
+        conn.execute("INSERT INTO t(id, val) VALUES (1, 1.5)")
+            .unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN w numeric(10,2)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_w ON t((w + 1))").unwrap();
+        conn.close().unwrap();
+
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        conn.execute("INSERT INTO t(id, val, w) VALUES (2, 2.5, 1)")
+            .unwrap();
+        conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(rows, vec![("ok".to_string(),)]);
+    }
+
+    /// Partial, expression and generated-column indexes over plain columns
+    /// store nothing the custom-type rules decide, so a database built by
+    /// SQLite is used as it is.
+    #[test]
+    fn test_plain_indexes_need_no_rules_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("plain.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b INTEGER,
+                                g AS (b * 2) VIRTUAL, UNIQUE(a, b));
+                 CREATE INDEX t_partial ON t(a) WHERE b > 1;
+                 CREATE INDEX t_expr ON t(lower(a), b + 1);
+                 CREATE INDEX t_gen ON t(g);
+                 INSERT INTO t(id, a, b) VALUES (1, 'X', 1), (2, 'Y', 2);",
+            )
+            .unwrap();
+
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t INDEXED BY t_gen WHERE g > 2");
+        assert_eq!(rows, vec![(2,)]);
+        conn.execute("DELETE FROM t WHERE lower(a) = 'x' AND b + 1 = 2")
+            .unwrap();
+        conn.execute("CREATE INDEX t_more ON t(a || 'z') WHERE g > 0")
+            .unwrap();
+        conn.execute("REINDEX").unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows(VERSION_TABLES);
+        assert_eq!(rows, vec![]);
+    }
+
+    /// Whether an index depends on the rules is read from the schema's text,
+    /// not from the types defined now: a CAST to a name that isn't one of
+    /// SQLite's own types may mean a custom type, now or after CREATE TYPE.
+    #[test]
+    fn test_cast_to_unknown_type_depends_on_rules() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cast_unknown.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE q(id INTEGER PRIMARY KEY, x);
+                 CREATE INDEX q_money ON q(CAST(x AS money));
+                 CREATE INDEX q_int ON q(CAST(x AS integer));",
+            )
+            .unwrap();
+
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        let rows: Vec<(i64,)> =
+            conn.exec_rows("SELECT id FROM q INDEXED BY q_int WHERE CAST(x AS integer) = 1");
+        assert_eq!(rows, vec![]);
+        let err = prepare_error(&conn, "INSERT INTO q VALUES (1, 1)");
+        assert!(err.contains("q_money") && !err.contains("q_int"), "{err}");
+    }
+
+    /// A connection without custom types would compute index keys with
+    /// SQLite's rules, so it doesn't touch a database whose indexes depend
+    /// on the custom-type rules, and doesn't rebuild them either.
+    #[test]
+    fn test_connection_without_custom_types_refuses_marked_database() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("flag_off.db");
+        {
+            let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TABLE p(id INTEGER PRIMARY KEY, x)")
+                .unwrap();
+            conn.execute("CREATE INDEX p_cast ON p(CAST(x AS numeric(10,2)))")
+                .unwrap();
+            conn.close().unwrap();
+        }
+
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        let refused = "depend on Turso's experimental custom types. Enable custom types";
+        for sql in [
+            "INSERT INTO p VALUES (1, 2.5)",
+            "SELECT x FROM p",
+            "REINDEX",
+        ] {
+            let err = prepare_error(&conn, sql);
+            assert!(err.contains(refused), "{sql}: {err}");
+        }
+    }
+
+    /// SQLite doesn't have string_reverse, so an index using it was built by
+    /// Turso, and Turso's own functions may follow the custom-type rules.
+    #[test]
+    fn test_index_on_turso_function_depends_on_rules() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("turso_function.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT);
+                 CREATE INDEX t_rev ON t(upper(a));
+                 PRAGMA writable_schema = ON;
+                 UPDATE sqlite_schema SET sql = replace(sql, 'upper', 'string_reverse')
+                     WHERE name = 't_rev';",
+            )
+            .unwrap();
+
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        let err = prepare_error(&conn, "INSERT INTO t VALUES (1, 'abc')");
+        assert!(err.contains("t_rev"), "{err}");
+        conn.execute("REINDEX").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'abc')").unwrap();
+        let rows: Vec<(i64,)> =
+            conn.exec_rows("SELECT id FROM t INDEXED BY t_rev WHERE string_reverse(a) = 'cba'");
+        assert_eq!(rows, vec![(1,)]);
+    }
+
+    /// REGEXP calls a function that SQLite doesn't have.
+    #[test]
+    fn test_index_on_regexp_depends_on_rules() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("regexp.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT);
+                 CREATE INDEX t_re ON t(a GLOB 'x*');
+                 PRAGMA writable_schema = ON;
+                 UPDATE sqlite_schema SET sql = replace(sql, 'GLOB', 'REGEXP')
+                     WHERE name = 't_re';",
+            )
+            .unwrap();
+
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        let err = prepare_error(&conn, "INSERT INTO t VALUES (1, 'abc')");
+        assert!(err.contains("t_re"), "{err}");
+    }
+
+    /// REINDEX can't rebuild an index on a WITHOUT ROWID table, so it says
+    /// to drop the index.
+    #[test]
+    fn test_old_index_on_without_rowid_table_must_be_dropped() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("without_rowid.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE w(k PRIMARY KEY, v) WITHOUT ROWID;
+                 CREATE INDEX w_money ON w(CAST(v AS money));",
+            )
+            .unwrap();
+
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        let err = prepare_error(&conn, "REINDEX");
+        assert!(
+            err.contains("index w_money was built")
+                && err.contains("REINDEX doesn't support WITHOUT ROWID tables. Drop the index"),
+            "{err}"
+        );
+        conn.execute("DROP INDEX w_money").unwrap();
+        conn.execute("INSERT INTO w VALUES (1, 2)").unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows(VERSION_TABLES);
+        assert_eq!(rows, vec![]);
+    }
+
+    /// ALTER TABLE changes the schema, so in a database built by SQLite it
+    /// marks the database before the rebuilt index depends on the rules.
+    #[test]
+    fn test_alter_column_to_custom_type_records_rules_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("alter.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT) STRICT;
+                 CREATE INDEX t_a ON t(a);
+                 INSERT INTO t VALUES (1, '1.5');",
+            )
+            .unwrap();
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        conn.execute("ALTER TABLE t ALTER COLUMN a TO b numeric(10,2)")
+            .unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows(VERSION_TABLES);
+        assert_eq!(
+            rows,
+            vec![("__turso_internal_custom_type_rules_v1".to_string(),)]
+        );
+        conn.execute("DELETE FROM t WHERE b = 1.5").unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t INDEXED BY t_a");
+        assert_eq!(rows, vec![(0,)]);
+    }
+
+    /// VACUUM builds every index again, under the current rules.
+    #[test]
+    fn test_vacuum_records_rules_version() {
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val numeric(10,2) UNIQUE) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1.5), (2, 2.5)")
+            .unwrap();
+        conn.execute("VACUUM").unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows(VERSION_TABLES);
+        assert_eq!(
+            rows,
+            vec![("__turso_internal_custom_type_rules_v1".to_string(),)]
+        );
+        conn.execute("DELETE FROM t WHERE val = 1.5").unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(rows, vec![("ok".to_string(),)]);
+
+        let dir = TempDir::new().unwrap();
+        let db = open_database_with_indexes_built_before_rules_version(&dir);
+        let conn = db.connect_limbo();
+        conn.execute("VACUUM").unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows(VERSION_TABLES);
+        assert_eq!(
+            rows,
+            vec![("__turso_internal_custom_type_rules_v1".to_string(),)]
+        );
+        conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t INDEXED BY t_expr ORDER BY id");
+        assert_eq!(rows, vec![(2,), (3,)]);
+    }
+
+    /// A newer version of Turso marks the database with a higher rules
+    /// version. This version can't tell which indexes follow the newer rules,
+    /// and the newer version would trust any index this one built, so every
+    /// statement that reads or changes the database fails.
+    #[test]
+    fn test_database_changed_by_newer_version_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("newer.db");
+        // With custom types, the CAST in q_cast is to the type numeric(10,2).
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, x INTEGER);
+                 CREATE TABLE q(x);
+                 CREATE INDEX q_cast ON q(CAST(x AS numeric(10,2)));
+                 CREATE TABLE __turso_internal_custom_type_rules_v2(unused);",
+            )
+            .unwrap();
+
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        let newer = "this database's indexes were built by a newer version of Turso's \
+                     experimental custom types";
+        for sql in [
+            "DELETE FROM q WHERE x = 1",
+            "CREATE INDEX p_cast ON p(CAST(x AS numeric(10,2)))",
+            "CREATE TABLE u(id INTEGER PRIMARY KEY, val numeric(10,2) UNIQUE) STRICT",
+            "CREATE INDEX p_x ON p(x)",
+            "REINDEX",
+            "INSERT INTO p VALUES (1, 1)",
+            "SELECT x FROM p",
+        ] {
+            let err = prepare_error(&conn, sql);
+            assert!(err.contains(newer), "{sql}: {err}");
+        }
+    }
 }

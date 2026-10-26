@@ -2113,6 +2113,18 @@ pub fn insn_to_row(
                 0,
                 format!("if (r[{}]==NULL) goto {}", reg, target_pc.as_debug_int()),
             ),
+            Insn::IfNoIndexDependsOnCustomTypeRules { db, target_pc } => (
+                "IfNoIndexDependsOnCustomTypeRules",
+                *db as i64,
+                target_pc.as_debug_int() as i64,
+                0,
+                Value::build_text(""),
+                0,
+                format!(
+                    "if no index of db {db} depends on custom-type rules goto {}",
+                    target_pc.as_debug_int()
+                ),
+            ),
             Insn::ParseSchema {
                 db, where_clause, ..
             } => (

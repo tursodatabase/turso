@@ -12,6 +12,7 @@ pub(crate) mod alter;
 pub(crate) mod analyze;
 pub(crate) mod collate;
 mod compound_select;
+pub(crate) mod custom_type_index_version;
 pub(crate) mod delete;
 pub(crate) mod display;
 pub(crate) mod emitter;
@@ -49,7 +50,6 @@ pub(crate) mod view;
 mod window;
 
 use crate::schema::Schema;
-use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::translate::delete::translate_delete;
 use crate::translate::emitter::Resolver;
@@ -77,7 +77,6 @@ use update::translate_update;
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,
-    pager: Arc<Pager>,
     connection: Arc<Connection>,
     syms: &SymbolTable,
     query_mode: QueryMode,
@@ -149,20 +148,7 @@ pub fn translate(
         Ok(WalkControl::Continue)
     })?;
 
-    match stmt {
-        // There can be no nesting with pragma, so lift it up here
-        ast::Stmt::Pragma { name, body } => {
-            pragma::translate_pragma(
-                &resolver,
-                &name,
-                body,
-                pager,
-                connection.clone(),
-                &mut program,
-            )?;
-        }
-        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
-    };
+    translate_inner(stmt, &mut resolver, &mut program, &connection, input)?;
 
     program.epilogue(schema);
 
@@ -206,6 +192,7 @@ pub fn translate_inner(
             | ast::Stmt::DropSequence { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
+    let is_reindex = matches!(stmt, ast::Stmt::Reindex { .. });
 
     if is_vacuum && connection.get_query_only() {
         bail_parse_error!("Cannot execute VACUUM in query_only mode")
@@ -438,8 +425,18 @@ pub fn translate_inner(
             }
             schema::translate_drop_type(&domain_name, if_exists, true, resolver, program)?
         }
-        ast::Stmt::Pragma { .. } => {
-            bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
+        ast::Stmt::Pragma { name, body } => {
+            if program.flags.is_subprogram() {
+                bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
+            }
+            pragma::translate_pragma(
+                resolver,
+                &name,
+                body,
+                connection.get_pager(),
+                connection.clone(),
+                program,
+            )?;
         }
         ast::Stmt::Reindex { name } => translate_reindex(name, resolver, program, connection)?,
         ast::Stmt::Optimize { idx_name } => {
@@ -548,6 +545,12 @@ pub fn translate_inner(
             program.emit_result_row(reg, 1);
             program.add_pragma_result_column(column_name.to_string());
         }
+    }
+
+    // REINDEX opens old indexes to rebuild them, and records the version itself.
+    custom_type_index_version::fail_on_index_built_by_other_rules(program, resolver, is_reindex)?;
+    if !is_reindex {
+        custom_type_index_version::record_rules_version_on_schema_change(program, resolver)?;
     }
 
     if connection.experimental_custom_types_enabled() {
@@ -660,7 +663,6 @@ mod tests {
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         let schema = db.schema.lock().clone();
-        let pager = conn.pager.load().clone();
 
         // Use an empty SymbolTable so regexp() is not available.
         let empty_syms = SymbolTable::new();
@@ -674,7 +676,6 @@ mod tests {
         let result = translate(
             &schema,
             stmt,
-            pager,
             conn,
             &empty_syms,
             QueryMode::Normal,
@@ -882,7 +883,6 @@ mod tests {
             Arc::new(Table::BTree(Arc::new(malformed_seq))),
         );
 
-        let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();
 
         let mut parser = turso_parser::parser::Parser::new(b"INSERT INTO t(v) VALUES('x')");
@@ -895,7 +895,6 @@ mod tests {
         let err = translate(
             &schema,
             stmt,
-            pager,
             conn,
             &syms,
             QueryMode::Normal,
@@ -925,7 +924,6 @@ mod tests {
         let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
         schema.take_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME);
 
-        let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();
 
         let mut parser = turso_parser::parser::Parser::new(b"INSERT INTO t(v) VALUES('x')");
@@ -938,7 +936,6 @@ mod tests {
         let err = translate(
             &schema,
             stmt,
-            pager,
             conn,
             &syms,
             QueryMode::Normal,

@@ -8,6 +8,8 @@ sidebarTitle: REINDEX
 
 The REINDEX statement deletes and recreates indexes from scratch. It is useful when a collation sequence definition has changed, or to rebuild an index that may have become out of date.
 
+Turso also asks for REINDEX when an index on [custom-type](/docs/sql-reference/statements/create-type#indexes-after-upgrading-turso) values was built by an older version of Turso.
+
 ## Syntax
 
 ```sql

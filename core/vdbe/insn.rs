@@ -1909,6 +1909,14 @@ pub enum Insn {
         target_pc: BranchOffset,
     },
 
+    /// Jumps to `target_pc` unless an index of the database depends on the
+    /// custom-type rules. Runs after a statement has changed the schema, so it
+    /// sees the indexes that statement built.
+    IfNoIndexDependsOnCustomTypeRules {
+        db: usize,
+        target_pc: BranchOffset,
+    },
+
     ParseSchema {
         db: usize,
         where_clause: Option<String>,
@@ -2548,6 +2556,9 @@ impl InsnVariants {
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
             InsnVariants::ParseSchema => execute::op_parse_schema,
+            InsnVariants::IfNoIndexDependsOnCustomTypeRules => {
+                execute::op_if_no_index_depends_on_custom_type_rules
+            }
             InsnVariants::PopulateMaterializedViews => execute::op_populate_materialized_views,
             InsnVariants::ShiftRight => execute::op_shift_right,
             InsnVariants::ShiftLeft => execute::op_shift_left,

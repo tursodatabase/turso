@@ -255,6 +255,20 @@ ALTER TABLE users ADD COLUMN email varchar(255);
 
 The added column follows the same STRICT type-checking rules as columns defined in the original CREATE TABLE.
 
+## Indexes After Upgrading Turso
+
+With custom types enabled, an index that involves a custom type or an array stores values decided by Turso's rules for custom types. For example: an index on a `numeric(10,2)` column of a STRICT table, a key expression such as `(price * 2)` over one, or a partial index whose `WHERE` clause uses one. So does an index with a `CAST` to any type other than `INTEGER`, `INT`, `REAL`, `TEXT` or `BLOB`, and an index that calls a function SQLite doesn't have, including `REGEXP` and `MATCH`. Indexes that SQLite itself could build with the same meaning don't depend on these rules.
+
+While custom types are experimental, a new version of Turso may compute such values differently. A database records which version of these rules built its indexes, from the moment it gets its first such index, in an empty table named `__turso_internal_custom_type_rules_v1` (the number is the version). If an older version built them, any statement that uses such an index fails:
+
+```
+indexes built by an older version of Turso's experimental custom types must be rebuilt before use: idx_price, idx_total. Run REINDEX, or drop these indexes and create them again
+```
+
+Run `REINDEX` once: in such a database, `REINDEX` with no name, or naming any index, rebuilds all of the listed indexes. [VACUUM](/docs/sql-reference/statements/vacuum) rebuilds them too. In MVCC mode, where REINDEX is not available, first drop all of the listed indexes, then create them again. An index that belongs to a `PRIMARY KEY` or `UNIQUE` constraint can't be dropped, so create its table again instead. REINDEX can't rebuild an index on a `WITHOUT ROWID` table either: drop such an index, or create its table again if the index is its primary key.
+
+A connection without custom types enabled refuses every statement on a database that has such indexes, because it would compute their keys with SQLite's rules. If a newer version of Turso has changed the database, this version refuses every statement on it and asks for the newer version, because it can't tell which indexes follow the newer rules. Versions of Turso released before this check don't look at the recorded version, so don't open a database with them after a newer version has changed it.
+
 ## Built-in Types
 
 Turso provides the following built-in custom types in STRICT tables:

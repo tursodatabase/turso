@@ -1001,16 +1001,7 @@ impl Connection {
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
         let schema = self.schema.read().clone();
-        match translate::translate(
-            &schema,
-            stmt,
-            pager.clone(),
-            self.clone(),
-            &syms,
-            mode,
-            input,
-            origin,
-        ) {
+        match translate::translate(&schema, stmt, self.clone(), &syms, mode, input, origin) {
             Ok(program) => Ok((program, pager, mode)),
             Err(err) if self.should_retry_cross_process_schema_lookup(&err)? => {
                 // Cold path: re-parse the SQL from scratch after schema refresh rather
@@ -1032,17 +1023,8 @@ impl Connection {
                 let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) =
                     cmd;
                 let schema = self.schema.read().clone();
-                translate::translate(
-                    &schema,
-                    stmt,
-                    pager.clone(),
-                    self.clone(),
-                    &syms,
-                    mode,
-                    input,
-                    origin,
-                )
-                .map(|program| (program, pager, mode))
+                translate::translate(&schema, stmt, self.clone(), &syms, mode, input, origin)
+                    .map(|program| (program, pager, mode))
             }
             Err(err) => Err(err),
         }

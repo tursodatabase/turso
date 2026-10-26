@@ -8,6 +8,10 @@ use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_
 use crate::sync::Arc;
 use crate::translate::{
     collate::CollationSeq,
+    custom_type_index_version::{
+        built_under_current_rules, is_stored_index_depending_on_rules,
+        record_rules_version_after_reindex,
+    },
     emitter::{
         emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
         OperationMode, Resolver,
@@ -672,6 +676,7 @@ pub fn translate_reindex(
     if targets.is_empty() {
         return Ok(());
     }
+    let targets = add_indexes_built_by_older_rules(targets, resolver)?;
     if connection.get_query_only() {
         bail_parse_error!("Cannot execute write statement in query_only mode");
     }
@@ -710,8 +715,50 @@ pub fn translate_reindex(
             Some(index.root_page),
         )?;
     }
+    record_rules_version_after_reindex(program, resolver, &write_databases)?;
 
     Ok(())
+}
+
+/// With custom types, the first REINDEX in a database whose indexes were
+/// built by an older version of Turso rebuilds every index that depends on
+/// the custom-type rules, whatever it names, so that the database can be
+/// marked with the current version.
+fn add_indexes_built_by_older_rules(
+    mut targets: Vec<ReindexTarget>,
+    resolver: &Resolver,
+) -> crate::Result<Vec<ReindexTarget>> {
+    if !resolver.enable_custom_types {
+        return Ok(targets);
+    }
+    let mut database_ids: Vec<usize> = targets.iter().map(|(ns, _, _)| ns.database_id).collect();
+    database_ids.sort_unstable();
+    database_ids.dedup();
+    for database_id in database_ids {
+        if resolver.with_schema(database_id, built_under_current_rules) {
+            continue;
+        }
+        for (namespace, table, index) in collect_all_reindex_targets_in_db(database_id, resolver) {
+            let depends_on_rules = resolver.with_schema(database_id, |schema| {
+                is_stored_index_depending_on_rules(schema, &index)
+            });
+            let already_named = targets.iter().any(|(ns, _, named)| {
+                ns.database_id == database_id
+                    && named.name == index.name
+                    && named.root_page == index.root_page
+            });
+            if depends_on_rules && !table.has_rowid {
+                bail_parse_error!(
+                    "index {} was built by an older version of Turso's experimental custom types and must be rebuilt, but REINDEX doesn't support WITHOUT ROWID tables. Drop the index, or the table if the index is its primary key",
+                    index.name
+                );
+            }
+            if depends_on_rules && !already_named {
+                targets.push((namespace, table, index));
+            }
+        }
+    }
+    Ok(targets)
 }
 
 /// Resolves the optional `REINDEX` target name to concrete `(namespace, table, index)` triples.

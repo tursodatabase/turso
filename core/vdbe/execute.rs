@@ -15872,6 +15872,24 @@ pub fn op_is_null(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_if_no_index_depends_on_custom_type_rules(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(IfNoIndexDependsOnCustomTypeRules { db, target_pc }, insn);
+    if crate::translate::custom_type_index_version::has_index_depending_on_rules(
+        &program.connection,
+        *db,
+    ) {
+        state.pc += 1;
+    } else {
+        state.pc = target_pc.as_offset_int();
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_page_count(
     program: &Program,
     state: &mut ProgramState,

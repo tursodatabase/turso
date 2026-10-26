@@ -975,7 +975,6 @@ impl Statement {
             translate::translate(
                 &schema,
                 stmt,
-                self.pager.clone(),
                 conn.clone(),
                 &syms,
                 mode,

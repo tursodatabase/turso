@@ -113,6 +113,12 @@ impl SchemaEntry {
     pub fn is_materialized_view_state_table(&self) -> bool {
         crate::schema::is_materialized_view_state_table(&self.name)
     }
+
+    /// The empty table that says which version of the custom-type rules the
+    /// database's indexes were built under.
+    pub fn is_custom_type_rules_version_table(&self) -> bool {
+        crate::translate::custom_type_index_version::is_rules_version_table(&self.name)
+    }
 }
 
 /// Split rowid-ordered schema entries into the replay phases used by VACUUM.
@@ -130,6 +136,9 @@ pub(crate) fn classify_schema_entries(
     for (idx, entry) in entries.iter().enumerate() {
         match entry.entry_type {
             SchemaEntryType::Table if entry.is_materialized_view_state_table() => {}
+            // VACUUM builds every index again. The replayed statement that
+            // creates the copy's first index depending on the rules marks it.
+            SchemaEntryType::Table if entry.is_custom_type_rules_version_table() => {}
             SchemaEntryType::Table if entry.is_storage_backed() => {
                 // Skip sqlite_sequence and AUTOINCREMENT implicit sequence
                 // backing tables in the schema creation phase: both are
@@ -1149,7 +1158,7 @@ fn table_sql_for_vacuum_replay(target_conn: &Arc<Connection>, sql: &str) -> Resu
 //   )
 //
 //   Output:
-//   - select_sql: SELECT rowid, "name", "salary" FROM "main"."employees"
+//   - select_sql: SELECT rowid, "name", "salary" FROM "main"."employees" NOT INDEXED
 //   - insert_sql: INSERT INTO "main"."employees" (rowid, "name", "salary") VALUES (?, ?, ?)
 pub(crate) fn build_copy_sql(
     escaped_schema_name: &str,
@@ -1265,8 +1274,11 @@ pub(crate) fn build_copy_sql(
         placeholders.push('?');
     }
 
-    let select_sql =
-        format!("SELECT {select_cols} FROM \"{escaped_schema_name}\".\"{escaped_table_name}\"");
+    // Reads the table itself, never a covering index: VACUUM must copy the
+    // stored rows even when an index is out of date.
+    let select_sql = format!(
+        "SELECT {select_cols} FROM \"{escaped_schema_name}\".\"{escaped_table_name}\" NOT INDEXED"
+    );
     let insert_sql =
         format!("INSERT INTO \"{escaped_table_name}\" ({insert_cols}) VALUES ({placeholders})");
 
