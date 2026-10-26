@@ -2557,7 +2557,21 @@ pub unsafe extern "C" fn sqlite3_value_text(value: *mut ffi::c_void) -> *const f
     if value.is_null() {
         return std::ptr::null();
     }
-    let v = &*(value as *const ExtValue);
+    let v = &mut *(value as *mut ExtValue);
+    // SQLite converts a non-text value to text in place so the returned pointer stays valid.
+    let coerced = match v.value_type() {
+        turso_ext::ValueType::Integer | turso_ext::ValueType::Float => {
+            Some(ExtValue::from_text(v.to_text_coerced().unwrap_or_default()))
+        }
+        turso_ext::ValueType::Blob => {
+            Some(ExtValue::from_text_bytes(v.to_blob().unwrap_or_default()))
+        }
+        _ => None,
+    };
+    if let Some(coerced) = coerced {
+        std::ptr::read(v as *const ExtValue).__free_internal_type();
+        std::ptr::write(v, coerced);
+    }
     match v.to_text() {
         Some(s) => s.as_ptr() as *const ffi::c_uchar,
         None => std::ptr::null(),

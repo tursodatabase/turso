@@ -193,12 +193,12 @@ impl TextValue {
     }
 
     fn new_boxed(s: String, sub: TextSubtype) -> Box<Self> {
-        let len = s.len();
-        // Store the text with a trailing NUL (len + 1 bytes) so the pointer handed to
-        // C via sqlite3_value_text is a valid NUL-terminated string, as the SQLite API
-        // contract requires (#7982). `len` still counts only the text, so as_str() /
-        // to_text() are unchanged.
-        let mut buffer = s.into_bytes();
+        Self::new_boxed_bytes(s.into_bytes(), sub)
+    }
+
+    // Allocates len + 1 bytes with a trailing NUL; `len` still counts only the text.
+    fn new_boxed_bytes(mut buffer: Vec<u8>, sub: TextSubtype) -> Box<Self> {
+        let len = buffer.len();
         buffer.push(0);
         let strbox = Box::into_raw(buffer.into_boxed_slice());
         Box::new(Self {
@@ -458,6 +458,16 @@ impl Value {
     /// Creates a new text Value from a String
     pub fn from_text(s: String) -> Self {
         let txt_value = TextValue::new_boxed(s, TextSubtype::Text);
+        let ptr = Box::into_raw(txt_value);
+        Self {
+            value_type: ValueType::Text,
+            value: ValueData { text: ptr },
+        }
+    }
+
+    /// Creates a new text Value from raw bytes, kept verbatim.
+    pub fn from_text_bytes(bytes: Vec<u8>) -> Self {
+        let txt_value = TextValue::new_boxed_bytes(bytes, TextSubtype::Text);
         let ptr = Box::into_raw(txt_value);
         Self {
             value_type: ValueType::Text,
