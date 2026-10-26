@@ -471,6 +471,22 @@ pub(crate) fn current_schema(conn: &Connection) -> Option<String> {
     conn.namespace_name(database_id)
 }
 
+pub(crate) fn current_schemas(conn: &Connection, include_implicit: bool) -> Vec<String> {
+    let mut schemas = Vec::new();
+    for name in conn
+        .search_path()
+        .unwrap_or_else(|| vec!["public".to_owned()])
+    {
+        if catalog::namespace_exists(conn, &name) && !schemas.contains(&name) {
+            schemas.push(name);
+        }
+    }
+    if include_implicit && !schemas.iter().any(|name| name == "pg_catalog") {
+        schemas.insert(0, "pg_catalog".to_owned());
+    }
+    schemas
+}
+
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
     let table_name = match stmt {
         ast::Stmt::Insert { tbl_name, .. } => Some(tbl_name.name.as_str()),
