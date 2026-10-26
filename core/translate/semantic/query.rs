@@ -1558,7 +1558,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     /// before it resolves the read. Other expressions keep their SQL text.
     fn subquery_column_name(&self, output: &hir::Output) -> String {
         if output.name_kind != hir::OutputNameKind::Inferred {
-            return output.name.clone();
+            return output.name.to_string();
         }
         let column_name = match &self.exprs[output.expr] {
             hir::Expr::Column(reference) => self
@@ -1572,7 +1572,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 .map(|written| written.trim_matches(['"', '`', '[', ']']).to_string()),
             _ => None,
         };
-        column_name.unwrap_or_else(|| output.name.clone())
+        column_name.unwrap_or_else(|| output.name.to_string())
     }
 
     pub(super) fn analyze_base_table_source(

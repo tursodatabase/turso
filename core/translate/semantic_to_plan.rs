@@ -4616,7 +4616,7 @@ pub(crate) mod tests {
         );
         block.outputs.push(Output {
             id: output_id,
-            name: "first".to_string(),
+            name: "first".into(),
             expr: document.exprs.push(hir::Expr::column(source, 0)),
             type_fact: TypeFact::known(Type::Integer),
             affinity: Affinity::Integer,
@@ -4853,7 +4853,7 @@ pub(crate) mod tests {
         });
         block.outputs.push(hir::Output {
             id: hir::OutputId::query(block_id, 0),
-            name: "sum".to_string(),
+            name: "sum".into(),
             expr: exprs.deep_copy(indexed_expression),
             type_fact: TypeFact::known(Type::Integer),
             affinity: Affinity::Integer,
@@ -5699,7 +5699,7 @@ pub(crate) mod tests {
         );
         child_block.outputs.push(Output {
             id: OutputId::query(child_block_id, 0),
-            name: "column1".to_string(),
+            name: "column1".into(),
             expr: exprs.push(hir::Expr::Literal(turso_parser::ast::Literal::Numeric(
                 "1".into(),
             ))),

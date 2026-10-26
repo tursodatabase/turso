@@ -120,7 +120,7 @@ impl ScopeValue {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExpandedColumn<'scope> {
-    pub(crate) name: String,
+    pub(crate) name: Arc<str>,
     /// The source's alias, or its table name or `(subquery-N)` without one.
     pub(crate) qualifier: Cow<'scope, str>,
     pub(crate) expr: hir::Expr,
@@ -259,6 +259,13 @@ impl<'a> ColumnView<'a> {
         match self {
             Self::Source { source, index } => source.columns.column(index).name(),
             Self::Binding(binding) => &binding.display_name,
+        }
+    }
+
+    fn shared_display_name(self) -> Arc<str> {
+        match self {
+            Self::Source { source, index } => source.columns.column(index).shared_name(),
+            Self::Binding(binding) => binding.display_name.clone(),
         }
     }
 
@@ -497,7 +504,7 @@ pub(crate) struct GroupColumnDef {
 #[derive(Clone, Debug)]
 struct ScopeOutput {
     id: OutputId,
-    name: String,
+    name: Arc<str>,
     name_kind: hir::OutputNameKind,
     type_fact: TypeFact,
     affinity: Affinity,
@@ -829,7 +836,7 @@ impl Scope {
             .iter()
             .map(|output| ScopeOutput {
                 id: output.id,
-                name: crate::util::normalize_ident(&output.name),
+                name: output.name.clone(),
                 name_kind: output.name_kind,
                 type_fact: output.type_fact.clone(),
                 affinity: output.affinity,
@@ -1249,7 +1256,7 @@ impl Scope {
                         ))
                     })?;
                 ExpandedColumn {
-                    name: column.display_name().to_string(),
+                    name: column.shared_display_name(),
                     qualifier,
                     expr: column.expr().into_owned(),
                 }
@@ -1313,7 +1320,7 @@ impl Scope {
                         .map_or_else(|| column.expr().into_owned(), |resolved| resolved.expr)
                     };
                     expanded.push(ExpandedColumn {
-                        name: column.display_name().to_string(),
+                        name: column.shared_display_name(),
                         qualifier: Cow::Borrowed(source.qualifier.as_str()),
                         expr,
                     });
@@ -1344,7 +1351,7 @@ impl Scope {
                 // which it treats as a subquery, unless the group is the
                 // one source of the FROM clause.
                 expanded.push(ExpandedColumn {
-                    name: column.display_name().to_string(),
+                    name: column.shared_display_name(),
                     qualifier: if bare {
                         Cow::Owned(normalized.clone())
                     } else {
@@ -1370,7 +1377,7 @@ impl Scope {
                     column.expr().into_owned()
                 };
                 Ok(ExpandedColumn {
-                    name: column.display_name().to_string(),
+                    name: column.shared_display_name(),
                     qualifier: Cow::Borrowed(source.qualifier.as_str()),
                     expr,
                 })
@@ -1798,7 +1805,7 @@ pub(crate) mod tests {
         let block = QueryBlockId::new(QueryId::new(0), 0);
         Output {
             id: OutputId::query(block, position),
-            name: name.to_string(),
+            name: name.into(),
             expr: exprs.push(Expr::Literal(Literal::Null)),
             type_fact: TypeFact::known(Type::Integer),
             affinity: Affinity::Integer,
@@ -2411,7 +2418,7 @@ pub(crate) mod tests {
         assert_eq!(
             expanded
                 .iter()
-                .map(|column| column.name.as_str())
+                .map(|column| &*column.name)
                 .collect::<Vec<_>>(),
             ["left_value", "id", "right_value"]
         );
@@ -2429,7 +2436,7 @@ pub(crate) mod tests {
         assert_eq!(
             qualified
                 .iter()
-                .map(|column| column.name.as_str())
+                .map(|column| &*column.name)
                 .collect::<Vec<_>>(),
             ["id", "right_value"]
         );
@@ -2518,7 +2525,7 @@ pub(crate) mod tests {
             .expect("fully merged self-join has one visible source identity");
 
         assert_eq!(expanded.len(), 1);
-        assert_eq!(expanded[0].name, "id");
+        assert_eq!(&*expanded[0].name, "id");
         assert!(matches!(&expanded[0].expr, Expr::MergedColumn(_)));
     }
 

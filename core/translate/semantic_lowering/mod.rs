@@ -898,7 +898,7 @@ fn resolved_output_columns_from(
             None => resolved_result_value(document, &document.exprs[output.expr])?,
         };
         columns.push(ResolvedResultColumn {
-            name: output.name.clone(),
+            name: output.name.to_string(),
             name_is_alias: matches!(
                 output.name_kind,
                 OutputNameKind::ExplicitAlias | OutputNameKind::StarExpansion

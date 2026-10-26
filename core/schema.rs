@@ -2808,6 +2808,7 @@ impl Schema {
                 logical_to_physical_map,
                 column_dependencies: Default::default(),
                 declared_type_facts: Default::default(),
+                column_names: Default::default(),
             })));
 
             self.add_materialized_view(NamespaceId::ROOT, incremental_view, table, sql);
@@ -3685,6 +3686,7 @@ impl TryClone for BTreeTable {
             logical_to_physical_map: self.logical_to_physical_map.try_clone()?,
             column_dependencies: Default::default(),
             declared_type_facts: Default::default(),
+            column_names: Default::default(),
         })
     }
 }
@@ -4311,6 +4313,7 @@ pub struct BTreeTable {
     pub logical_to_physical_map: Vec<usize>,
     column_dependencies: ResetOnClone<OnceLock<GeneratedColGraph>>,
     declared_type_facts: ResetOnClone<OnceLock<Box<[TypeFact]>>>,
+    column_names: ResetOnClone<OnceLock<Box<[Arc<str>]>>>,
 }
 
 pub struct ColumnsMut<'a> {
@@ -4334,6 +4337,7 @@ impl Drop for ColumnsMut<'_> {
     fn drop(&mut self) {
         self.table.column_dependencies.0 = OnceLock::new();
         self.table.declared_type_facts.0 = OnceLock::new();
+        self.table.column_names.0 = OnceLock::new();
         self.table.has_virtual_columns =
             self.table.columns.iter().any(|c| c.is_virtual_generated());
         self.table.has_column_defaults = BTreeTable::any_column_default(&self.table.columns);
@@ -4397,6 +4401,7 @@ impl BTreeTable {
             logical_to_physical_map,
             column_dependencies: Default::default(),
             declared_type_facts: Default::default(),
+            column_names: Default::default(),
         }
     }
 
@@ -4418,6 +4423,15 @@ impl BTreeTable {
         self.declared_type_facts
             .0
             .get_or_init(|| crate::translate::semantic::hir::declared_type_facts(&self.columns))
+    }
+
+    pub(crate) fn shared_column_names(&self) -> &[Arc<str>] {
+        self.column_names.0.get_or_init(|| {
+            self.columns
+                .iter()
+                .map(|column| Arc::from(column.name.as_deref().unwrap_or_default()))
+                .collect()
+        })
     }
 
     pub fn columns_mut(&mut self) -> ColumnsMut<'_> {
@@ -6115,6 +6129,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         logical_to_physical_map: vec![],
         column_dependencies: Default::default(),
         declared_type_facts: Default::default(),
+        column_names: Default::default(),
     };
     table.prepare_generated_columns()?;
     if table.is_strict {
@@ -6834,6 +6849,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
         logical_to_physical_map,
         column_dependencies: Default::default(),
         declared_type_facts: Default::default(),
+        column_names: Default::default(),
     })
 }
 
@@ -8107,6 +8123,7 @@ mod tests {
             logical_to_physical_map,
             column_dependencies: Default::default(),
             declared_type_facts: Default::default(),
+            column_names: Default::default(),
         };
 
         let result = Index::automatic_from_primary_key(
@@ -8835,13 +8852,15 @@ mod tests {
     }
 
     #[test]
-    fn declared_type_facts_follow_column_changes() -> Result<()> {
+    fn shared_column_facts_follow_column_changes() -> Result<()> {
         let mut t = BTreeTable::from_sql("CREATE TABLE t(a INTEGER, b INTEGER)", 0)?;
         assert_eq!(t.declared_type_facts()[1].storage, Some(Type::Integer));
+        assert_eq!(&*t.shared_column_names()[1], "b");
 
         let text = BTreeTable::from_sql("CREATE TABLE u(c TEXT)", 0)?.columns()[0].clone();
         t.columns_mut()[1] = text;
         assert_eq!(t.declared_type_facts()[1].storage, Some(Type::Text));
+        assert_eq!(&*t.shared_column_names()[1], "c");
         Ok(())
     }
 

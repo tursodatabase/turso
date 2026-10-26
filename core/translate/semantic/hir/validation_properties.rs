@@ -50,7 +50,7 @@ fn source(id: SourceId, owner: SourceOwner, width: usize, kind: SourceKind) -> S
 fn output(block: QueryBlockId, index: usize, expression: ExprId) -> Output {
     Output {
         id: OutputId::query(block, index),
-        name: format!("output_{index}"),
+        name: format!("output_{index}").into(),
         expr: expression,
         type_fact: TypeFact::known(Type::Integer),
         affinity: Affinity::Integer,

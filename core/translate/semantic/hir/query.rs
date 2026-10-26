@@ -100,7 +100,7 @@ pub enum QueryBlockBody {
 #[derive(Clone, Debug)]
 pub struct Output {
     pub id: OutputId,
-    pub name: String,
+    pub name: crate::sync::Arc<str>,
     pub expr: ExprId,
     pub type_fact: TypeFact,
     pub affinity: Affinity,
@@ -615,6 +615,16 @@ pub enum SourceColumnRef<'a> {
 }
 
 impl<'a> SourceColumnRef<'a> {
+    pub fn shared_name(self) -> crate::sync::Arc<str> {
+        match self {
+            Self::Table { columns, index, .. } => match columns.table.as_ref() {
+                crate::schema::Table::BTree(table) => table.shared_column_names()[index].clone(),
+                _ => self.name().into(),
+            },
+            Self::Owned(column) => crate::sync::Arc::from(&*column.name),
+        }
+    }
+
     #[inline]
     pub fn name(self) -> &'a str {
         match self {

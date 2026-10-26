@@ -1524,7 +1524,7 @@ fn try_aggregate_rewrite(
         .collect::<Vec<_>>();
     let result_name = output.name.clone();
     let result_column = hir::SourceColumn {
-        name: result_name.into(),
+        name: result_name,
         type_fact: output.type_fact.clone(),
         affinity: output.schema_affinity,
         has_affinity: output.has_affinity,
@@ -1554,7 +1554,7 @@ fn try_aggregate_rewrite(
         let id = hir::OutputId::query(inner_block_id, inner_block.outputs.len());
         inner_block.outputs.push(hir::Output {
             id,
-            name: format!("correlation_key_{index}"),
+            name: format!("correlation_key_{index}").into(),
             expr,
             type_fact: column.type_fact.clone(),
             affinity: column.affinity,

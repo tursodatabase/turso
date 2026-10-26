@@ -1719,7 +1719,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         for column in expanded {
             let resolved = self.resolve_atomic_expr(column.expr, scope)?;
             let name = if long_names {
-                format!("{}.{}", column.qualifier, column.name)
+                format!("{}.{}", column.qualifier, column.name).into()
             } else {
                 column.name
             };
@@ -1778,14 +1778,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
 
 pub(super) fn output_from_resolved(
     id: OutputId,
-    name: String,
+    name: impl Into<Arc<str>>,
     name_kind: OutputNameKind,
     resolved: ResolvedScopeExpr,
 ) -> Output {
     let (collation, collation_is_explicit) = resolved.collation.into_output();
     Output {
         id,
-        name,
+        name: name.into(),
         expr: resolved.expr,
         type_fact: resolved.type_fact,
         affinity: resolved.affinity,
@@ -2906,6 +2906,30 @@ mod tests {
     }
 
     #[test]
+    fn star_outputs_share_the_table_column_names() {
+        let mut schema = Schema::new();
+        let table = BTreeTable::from_sql("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)", 2)
+            .expect("table schema parses");
+        schema
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
+            .expect("table name is unique");
+        let star_output_name_of_a = || {
+            let document = analyze_sql_with_schema(&schema, "SELECT * FROM t ORDER BY A")
+                .expect("SELECT analyzes");
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let query = document.query(root.query).expect("query exists");
+            assert_eq!(query.order_by.len(), 1);
+            query.blocks[0].outputs[1].name.clone()
+        };
+        let first = star_output_name_of_a();
+        let second = star_output_name_of_a();
+        assert_eq!(&*first, "a");
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
     fn select_star_does_not_copy_declared_types() {
         let mut schema = Schema::new();
         let columns: Vec<String> = (0..64).map(|column| format!("c{column} INTEGER")).collect();
@@ -3384,7 +3408,7 @@ mod tests {
         assert_eq!(block.outputs.len(), 5);
         assert_eq!(block.outputs[0].type_fact.storage, Some(Type::Integer));
         assert_eq!(block.outputs[1].type_fact.storage, Some(Type::Real));
-        assert_eq!(block.outputs[1].name, "real_value");
+        assert_eq!(&*block.outputs[1].name, "real_value");
         assert_eq!(block.outputs[1].name_kind, OutputNameKind::ExplicitAlias);
         assert_eq!(block.outputs[2].type_fact.storage, Some(Type::Text));
         assert_eq!(block.outputs[3].type_fact.storage, Some(Type::Null));
@@ -4816,7 +4840,7 @@ mod tests {
             values
                 .outputs
                 .iter()
-                .map(|output| output.name.as_str())
+                .map(|output| &*output.name)
                 .collect::<Vec<_>>(),
             ["column1", "column2"]
         );
@@ -6616,7 +6640,7 @@ mod tests {
                 block
                     .outputs
                     .iter()
-                    .map(|output| output.name.as_str())
+                    .map(|output| &*output.name)
                     .collect::<Vec<_>>(),
                 ["id", "value", "score", "label"],
                 "RIGHT JOIN does not reorder lexical star columns"
@@ -9093,7 +9117,7 @@ mod tests {
             returning
                 .outputs
                 .iter()
-                .map(|output| (output.id, output.name.as_str(), output.name_kind))
+                .map(|output| (output.id, &*output.name, output.name_kind))
                 .collect::<Vec<_>>(),
             [
                 (OutputId::root(0), "id", OutputNameKind::StarExpansion),
@@ -9517,7 +9541,7 @@ mod tests {
             block
                 .outputs
                 .iter()
-                .map(|output| output.name.as_str())
+                .map(|output| &*output.name)
                 .collect::<Vec<_>>(),
             ["id", "value", "score", "score"]
         );
@@ -12221,7 +12245,7 @@ mod tests {
             returning
                 .outputs
                 .iter()
-                .map(|output| (output.id, output.name.as_str(), output.name_kind))
+                .map(|output| (output.id, &*output.name, output.name_kind))
                 .collect::<Vec<_>>(),
             [
                 (OutputId::root(0), "id", OutputNameKind::StarExpansion),
@@ -12826,7 +12850,7 @@ mod tests {
             returning
                 .outputs
                 .iter()
-                .map(|output| (output.id, output.name.as_str(), output.name_kind))
+                .map(|output| (output.id, &*output.name, output.name_kind))
                 .collect::<Vec<_>>(),
             [
                 (OutputId::root(0), "id", OutputNameKind::StarExpansion),

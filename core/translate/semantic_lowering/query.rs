@@ -849,7 +849,7 @@ pub(crate) fn prepare_subquery(
                         ))
                     })?;
                     Ok(IndexColumn {
-                        name: output.name.clone(),
+                        name: output.name.to_string(),
                         order: SortOrder::Asc,
                         nulls_order: None,
                         pos_in_table: position,
@@ -3004,7 +3004,7 @@ fn open_hir_compound_index(
     let mut columns = crate::alloc::vec![];
     for (position, left) in left.outputs.iter().enumerate() {
         columns.push(IndexColumn {
-            name: left.name.clone(),
+            name: left.name.to_string(),
             order: SortOrder::Asc,
             nulls_order: None,
             pos_in_table: position,
