@@ -104,6 +104,23 @@ Setting changes follow the transaction as in PostgreSQL: a value that
 ROLLBACK undoes the setting changes of the transaction, ROLLBACK TO
 SAVEPOINT undoes the changes after the savepoint, and a statement that
 fails undoes its own changes.
+JWT claim functions: `auth.uid()`, `auth.email()` and `auth.jwt()` are built
+in. They return what their SQL definitions on top of `current_setting()`
+return: the `request.jwt.claim.sub`, `request.jwt.claim.email` or
+`request.jwt.claim` setting first, then the claim in the JSON of
+`request.jwt.claims`. The differences from these SQL definitions: the
+functions return `text`, not `uuid` and `jsonb`, and a CHECK constraint
+cannot call them. serde_json reads the claims, not the `jsonb` input rules:
+`auth.jwt()` returns the claims text as it was set; `auth.email()` of a
+number, an object or an array gives the serde_json text (`100.0` for `1e2`,
+and object keys sorted by bytes, without spaces); claims with a number
+outside the range of a double, or with more than 128 levels of nesting, give
+an error; a number that `numeric` refuses, such as `1e-16384`, is accepted;
+and a `\u0000` escape before a syntax error gives the syntax error.
+`auth.uid()` checks the uuid with `Uuid::parse_str`, which refuses a hyphen
+after every four digits and 32 digits in braces, and accepts a `urn:uuid:`
+prefix. The errors have the SQLSTATE `22000`, and `pg_get_expr()` shows a
+default `auth.uid()` as `"auth.uid" ()`.
 
 | Feature | Status | Notes |
 |---------|--------|-------|

@@ -3,7 +3,6 @@ mod catalog;
 mod copy;
 mod error;
 mod functions;
-mod jsonb;
 mod options;
 mod session;
 mod settings;

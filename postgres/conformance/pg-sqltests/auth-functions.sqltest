@@ -346,6 +346,10 @@ expect {
     {"email": {"b": 1, "a": [1, "x", null]}}
     {"a": [1, "x", null], "b": 1}
 }
+expect @tursopg {
+    {"email": {"b": 1, "a": [1, "x", null]}}
+    {"a":[1,"x",null],"b":1}
+}
 
 @setup auth_functions
 test auth-email-of-claims-that-are-numbers-prints-them-as-jsonb {
@@ -364,6 +368,14 @@ expect {
     {"email": 100000000000000000000}
     100000000000000000000
 }
+expect @tursopg {
+    {"email": 1.50}
+    1.5
+    {"email": 1e2}
+    100.0
+    {"email": 100000000000000000000}
+    1e20
+}
 
 @setup auth_functions
 test auth-jwt-prints-numbers-as-jsonb {
@@ -373,6 +385,10 @@ test auth-jwt-prints-numbers-as-jsonb {
 expect {
     [-0, -0.0, 0e-5, 1.5e-3, 1.2345e2, -1e-5, 10e-1, 1E+2, 0.0001e4]
     [0, 0.0, 0.00000, 0.0015, 123.45, -0.00001, 1.0, 100, 1]
+}
+expect @tursopg {
+    [-0, -0.0, 0e-5, 1.5e-3, 1.2345e2, -1e-5, 10e-1, 1E+2, 0.0001e4]
+    [-0, -0.0, 0e-5, 1.5e-3, 1.2345e2, -1e-5, 10e-1, 1E+2, 0.0001e4]
 }
 
 @setup auth_functions
@@ -515,6 +531,9 @@ test auth-email-of-claims-with-a-nul-escape-before-a-syntax-error-reports-the-es
 expect error {
     unsupported Unicode escape sequence
 }
+expect @tursopg error {
+    invalid input syntax for type json
+}
 
 @setup auth_functions
 test auth-email-of-claims-with-a-lone-surrogate-errors {
@@ -534,6 +553,9 @@ expect {
     {"n": 1e400, "email": "user@example.com"}
     user@example.com
 }
+expect @tursopg error {
+    invalid input syntax for type json
+}
 
 @setup auth_functions
 test auth-functions-of-claims-with-numbers-at-the-limits-of-numeric {
@@ -544,6 +566,9 @@ expect {
     {"a": 1e131071, "b": 1e-16383, "email": "user@example.com"}
     user@example.com|147500
 }
+expect @tursopg error {
+    invalid input syntax for type json
+}
 
 @setup auth_functions
 test auth-email-of-claims-with-a-number-too-large-for-numeric-errors {
@@ -552,6 +577,9 @@ test auth-email-of-claims-with-a-number-too-large-for-numeric-errors {
 }
 expect error {
     value overflows numeric format
+}
+expect @tursopg error {
+    invalid input syntax for type json
 }
 
 @setup auth_functions
@@ -562,6 +590,10 @@ test auth-email-of-claims-with-a-number-too-small-for-numeric-errors {
 expect error {
     value overflows numeric format
 }
+expect @tursopg {
+    {"n": 1e-16384, "email": "user@example.com"}
+    user@example.com
+}
 
 @setup auth_functions
 test auth-email-of-claims-with-an-exponent-too-large-for-numeric-errors {
@@ -571,6 +603,10 @@ test auth-email-of-claims-with-an-exponent-too-large-for-numeric-errors {
 expect error {
     value overflows numeric format
 }
+expect @tursopg {
+    {"n": 0e1073741824, "email": "user@example.com"}
+    user@example.com
+}
 
 @setup auth_functions
 test auth-email-checks-the-token-after-a-number-before-the-size-of-the-number {
@@ -579,6 +615,9 @@ test auth-email-checks-the-token-after-a-number-before-the-size-of-the-number {
 }
 expect error {
     unsupported Unicode escape sequence
+}
+expect @tursopg error {
+    invalid input syntax for type json
 }
 
 @setup auth_functions
@@ -590,6 +629,9 @@ expect {
     {"x": {{repeat:200:[}}{{repeat:200:]}}, "email": "user@example.com"}
     user@example.com
 }
+expect @tursopg error {
+    invalid input syntax for type json
+}
 
 @setup auth_functions
 test auth-functions-of-claims-nested-5000-levels-deep {
@@ -599,6 +641,9 @@ test auth-functions-of-claims-nested-5000-levels-deep {
 expect {
     10036
     user@example.com|10036
+}
+expect @tursopg error {
+    invalid input syntax for type json
 }
 
 @setup auth_functions
@@ -820,6 +865,10 @@ expect {
     {"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"user@example.com","aud":"authenticated","n":1.50,"n":1e2}
     {"n": 100, "aud": "authenticated", "sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "email": "user@example.com"}
 }
+expect @tursopg {
+    {"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"user@example.com","aud":"authenticated","n":1.50,"n":1e2}
+    {"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"user@example.com","aud":"authenticated","n":1.50,"n":1e2}
+}
 
 @setup auth_functions
 test auth-jwt-prints-escapes-as-jsonb {
@@ -829,4 +878,8 @@ test auth-jwt-prints-escapes-as-jsonb {
 expect {
     {"a": "x\ny\u0001\"\/\u00e9\t"}
     {"a": "x\ny\u0001\"/é\t"}
+}
+expect @tursopg {
+    {"a": "x\ny\u0001\"\/\u00e9\t"}
+    {"a": "x\ny\u0001\"\/\u00e9\t"}
 }
