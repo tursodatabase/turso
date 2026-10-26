@@ -484,7 +484,9 @@ mod tests {
     }
 
     /// A custom type with no function for an operator goes to SQLite's operator as
-    /// the type it is stored as, so `si * 2` on a smallint is an integer.
+    /// the type it is stored as, so `si * 2` on a smallint is an integer. A value
+    /// that comes from two different custom types, as in `coalesce(si, bi)`, is a
+    /// value of their common stored type.
     #[test]
     fn type_info_for_sqlite_operators_on_custom_types() {
         let db = fresh_db_with_custom_types("type_info_sqlite_operators.db");
@@ -495,9 +497,12 @@ mod tests {
         .unwrap();
 
         let stmt = conn
-            .prepare("SELECT si * 2, bi + 1, -si, abs(bi), coalesce(si, 0), coalesce(b, 0) FROM t")
+            .prepare(
+                "SELECT si * 2, bi + 1, -si, abs(bi), coalesce(si, 0), coalesce(b, 0), \
+                 coalesce(si, bi), CASE WHEN id = 1 THEN si ELSE bi END, max(si, bi) FROM t",
+            )
             .unwrap();
-        for idx in 0..6 {
+        for idx in 0..9 {
             assert_eq!(
                 expect_info(&stmt, idx).declared_name,
                 "INTEGER",

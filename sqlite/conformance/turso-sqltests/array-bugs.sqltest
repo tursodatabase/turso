@@ -213,3 +213,26 @@ expect {
     1|{1,2,3}
     2|{5,5}
 }
+
+# A column stores its number of array dimensions in three bits, so array types
+# have at most 7 dimensions.
+test array-type-with-8-dimensions-rejected-in-create-table {
+    CREATE TABLE d8(a integer[][][][][][][][]) STRICT;
+}
+expect error {
+    array type integer has 8 dimensions, but arrays have at most 7
+}
+
+test array-type-with-8-dimensions-rejected-in-cast {
+    SELECT CAST(1 AS integer[][][][][][][][]);
+}
+expect error {
+    array type integer has 8 dimensions, but arrays have at most 7
+}
+
+test array-agg-over-7-dimensions-rejected-in-subquery {
+    SELECT * FROM (SELECT array_agg(CAST('{1}' AS integer[][][][][][][])));
+}
+expect error {
+    result column 1 is an array with 8 dimensions, but arrays have at most 7
+}

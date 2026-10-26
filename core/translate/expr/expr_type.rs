@@ -7,6 +7,7 @@
 
 use turso_parser::ast;
 
+use super::custom_types::operator_to_str;
 use super::get_expr_affinity;
 use crate::function::{AggFunc, Func, ScalarFunc};
 use crate::schema::{Column, Schema, TypeDef};
@@ -81,38 +82,6 @@ impl ExprType {
         match self {
             Self::Array { dimensions, .. } => *dimensions,
             _ => 0,
-        }
-    }
-}
-
-impl PartialEq for ExprType {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::Custom {
-                    type_def: a,
-                    params: a_params,
-                },
-                Self::Custom {
-                    type_def: b,
-                    params: b_params,
-                },
-            ) => same_type_def(a, b) && a_params == b_params,
-            (
-                Self::Array {
-                    element: a,
-                    dimensions: a_dims,
-                },
-                Self::Array {
-                    element: b,
-                    dimensions: b_dims,
-                },
-            ) => a == b && a_dims == b_dims,
-            (Self::Builtin(a), Self::Builtin(b)) => a == b,
-            (Self::Untyped, Self::Untyped)
-            | (Self::Null, Self::Null)
-            | (Self::Unknown, Self::Unknown) => true,
-            _ => false,
         }
     }
 }
@@ -306,10 +275,10 @@ fn binary_type(
         | Operator::Multiply
         | Operator::Divide
         | Operator::Modulus => {
-            let symbol = arithmetic_symbol(op);
+            let symbol = operator_to_str(op);
             arithmetic_type(
-                &sqlite_operand_type(type_of(lhs, env), Some(symbol), env.schema()),
-                &sqlite_operand_type(type_of(rhs, env), Some(symbol), env.schema()),
+                &sqlite_operand_type(type_of(lhs, env), symbol, env.schema()),
+                &sqlite_operand_type(type_of(rhs, env), symbol, env.schema()),
             )
         }
         Operator::BitwiseAnd
@@ -342,17 +311,6 @@ fn binary_type(
             ExprType::Builtin(BuiltinType::Text)
         }
         Operator::ArrowRight | Operator::ArrowRightShift => affinity_type(expr, env),
-    }
-}
-
-fn arithmetic_symbol(op: &ast::Operator) -> &'static str {
-    match op {
-        ast::Operator::Add => "+",
-        ast::Operator::Subtract => "-",
-        ast::Operator::Multiply => "*",
-        ast::Operator::Divide => "/",
-        ast::Operator::Modulus => "%",
-        _ => unreachable!("{op:?} is not an arithmetic operator"),
     }
 }
 
@@ -462,8 +420,8 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
 /// NULLs don't count. An array wins over anything else, as main has always decoded
 /// such a value as an array. Numbers widen as in arithmetic. String literals count
 /// as text. The same custom type with different parameters, such as numeric(10,2)
-/// and numeric(5,1), is that type without parameters. A custom type mixed with a
-/// built-in one counts as the type it is stored as. Any other mix is `Any`.
+/// and numeric(5,1), is that type without parameters. A custom type mixed with any
+/// other type counts as the type it is stored as. Any other mix is `Any`.
 fn common_type<'e>(exprs: impl Iterator<Item = &'e ast::Expr>, env: &TypeEnv) -> ExprType {
     let mut common: Option<ExprType> = None;
     for ty in exprs.map(|expr| type_of(expr, env)) {
@@ -509,9 +467,9 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
                 Vec::new()
             },
         },
-        // Mixed with anything else, a custom value is a value of the type it is
-        // stored as: coalesce(smallint_column, 0) is an integer.
-        (ExprType::Custom { .. }, ExprType::Custom { .. }) => ExprType::Builtin(BuiltinType::Any),
+        // Mixed with anything else, including another custom type, a custom value
+        // is a value of the type it is stored as: coalesce(smallint_column, 0) and
+        // coalesce(smallint_column, bigint_column) are integers.
         (ExprType::Custom { type_def, .. }, other) | (other, ExprType::Custom { type_def, .. }) => {
             common_scalar_type(stored_type(&type_def, schema), other, schema)
         }
@@ -543,6 +501,38 @@ mod tests {
     use rustc_hash::FxHashMap as HashMap;
     use turso_parser::ast::{Cmd, OneSelect, ResultColumn, Stmt};
     use turso_parser::parser::Parser;
+
+    impl PartialEq for ExprType {
+        fn eq(&self, other: &Self) -> bool {
+            match (self, other) {
+                (
+                    Self::Custom {
+                        type_def: a,
+                        params: a_params,
+                    },
+                    Self::Custom {
+                        type_def: b,
+                        params: b_params,
+                    },
+                ) => same_type_def(a, b) && a_params == b_params,
+                (
+                    Self::Array {
+                        element: a,
+                        dimensions: a_dims,
+                    },
+                    Self::Array {
+                        element: b,
+                        dimensions: b_dims,
+                    },
+                ) => a == b && a_dims == b_dims,
+                (Self::Builtin(a), Self::Builtin(b)) => a == b,
+                (Self::Untyped, Self::Untyped)
+                | (Self::Null, Self::Null)
+                | (Self::Unknown, Self::Unknown) => true,
+                _ => false,
+            }
+        }
+    }
 
     #[test]
     fn literals_and_casts() {
@@ -593,6 +583,11 @@ mod tests {
             // A custom value and a plain one have the custom type's stored type.
             (
                 "coalesce(CAST(1 AS cents), 1)",
+                builtin(BuiltinType::Integer),
+            ),
+            // Two different custom types have their common stored type.
+            (
+                "coalesce(CAST(1 AS cents), CAST(2 AS smallint))",
                 builtin(BuiltinType::Integer),
             ),
             ("iif(1, NULL, 2)", builtin(BuiltinType::Integer)),

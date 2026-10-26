@@ -3109,7 +3109,15 @@ pub(super) fn query_output_columns(
     let env = TypeEnv::new(Some(table_references), resolver);
     for (column_index, column) in columns.iter_mut().enumerate() {
         let result_expr = &result_columns[column_index].expr;
-        column.set_array_dimensions(type_of(result_expr, &env).array_dimensions());
+        let dimensions = type_of(result_expr, &env).array_dimensions();
+        if dimensions > ast::MAX_ARRAY_DIMENSIONS {
+            crate::bail_parse_error!(
+                "result column {} is an array with {dimensions} dimensions, but arrays have at most {}",
+                column_index + 1,
+                ast::MAX_ARRAY_DIMENSIONS
+            );
+        }
+        column.set_array_dimensions(dimensions);
         column.set_collation(get_collseq_from_expr(result_expr, table_references)?);
     }
     Ok(columns)
