@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
+use crate::error::sqlstate_error;
 use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
-use turso_core::{
-    Connection, ExternalFunc, IOResult, LimboError, OpenOptions, Register, Result, Value,
+use turso_core::{Connection, ExternalFunc, IOResult, OpenOptions, Register, Result, Value};
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 pub(crate) fn register_functions(mut options: OpenOptions) -> OpenOptions {
@@ -71,7 +73,10 @@ fn canonical_uuid(text: &str) -> Result<String> {
     uuid::Uuid::parse_str(text)
         .map(|uuid| uuid.hyphenated().to_string())
         .map_err(|_| {
-            LimboError::InvalidArgument(format!("invalid input syntax for type uuid: \"{text}\""))
+            sqlstate_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!("invalid input syntax for type uuid: \"{text}\""),
+            )
         })
 }
 
@@ -91,11 +96,15 @@ fn setting(conn: &Connection, name: &str) -> Option<String> {
 
 fn parse_claims(claims: &str) -> Result<serde_json::Value> {
     let claims = serde_json::from_str(claims).map_err(|_| {
-        LimboError::InvalidArgument("invalid input syntax for type json".to_string())
+        sqlstate_error(
+            SQLSTATE_INVALID_TEXT_REPRESENTATION,
+            "invalid input syntax for type json",
+        )
     })?;
     if has_nul_character(&claims) {
-        return Err(LimboError::InvalidArgument(
-            "unsupported Unicode escape sequence".to_string(),
+        return Err(sqlstate_error(
+            SQLSTATE_UNTRANSLATABLE_CHARACTER,
+            "unsupported Unicode escape sequence",
         ));
     }
     Ok(claims)

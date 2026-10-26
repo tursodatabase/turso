@@ -119,8 +119,7 @@ an error; a number that `numeric` refuses, such as `1e-16384`, is accepted;
 and a `\u0000` escape before a syntax error gives the syntax error.
 `auth.uid()` checks the uuid with `Uuid::parse_str`, which refuses a hyphen
 after every four digits and 32 digits in braces, and accepts a `urn:uuid:`
-prefix. The errors have the SQLSTATE `22000`, and `pg_get_expr()` shows a
-default `auth.uid()` as `"auth.uid" ()`.
+prefix. `pg_get_expr()` shows a default `auth.uid()` as `"auth.uid" ()`.
 
 | Feature | Status | Notes |
 |---------|--------|-------|

@@ -159,6 +159,7 @@ expect {
     a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
+@sqlstate 22P02
 expect @tursopg error {
     invalid input syntax for type uuid: "a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11"
 }
@@ -172,6 +173,7 @@ expect {
     {a0eebc999c0b4ef8bb6d6bb9bd380a11}
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
+@sqlstate 22P02
 expect @tursopg error {
     invalid input syntax for type uuid: ".a0eebc999c0b4ef8bb6d6bb9bd380a11."
 }
@@ -181,6 +183,7 @@ test auth-uid-of-a-urn {
     SELECT set_config('request.jwt.claim.sub', 'urn:uuid:a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
     SELECT auth.uid();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type uuid: "urn:uuid:a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
 }
@@ -194,6 +197,7 @@ test auth-uid-of-text-that-is-not-a-uuid-errors {
     SELECT set_config('request.jwt.claim.sub', 'not-a-uuid', false);
     SELECT auth.uid();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type uuid: "not-a-uuid"
 }
@@ -203,6 +207,7 @@ test auth-uid-of-a-uuid-with-a-leading-space-errors {
     SELECT set_config('request.jwt.claim.sub', ' a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
     SELECT auth.uid();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type uuid: " a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
 }
@@ -212,6 +217,7 @@ test auth-uid-of-a-uuid-with-a-trailing-hyphen-errors {
     SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11-', false);
     SELECT auth.uid();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type uuid: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11-"
 }
@@ -221,6 +227,7 @@ test auth-uid-of-a-uuid-with-two-hyphens-in-a-row-errors {
     SELECT set_config('request.jwt.claim.sub', 'a0eebc99--9c0b-4ef8-bb6d-6bb9bd380a11', false);
     SELECT auth.uid();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type uuid: "a0eebc99--9c0b-4ef8-bb6d-6bb9bd380a11"
 }
@@ -230,6 +237,7 @@ test auth-uid-of-a-uuid-with-one-brace-errors {
     SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\}', false);
     SELECT auth.uid();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type uuid: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
@@ -239,6 +247,7 @@ test auth-uid-of-a-braced-uuid-without-its-closing-brace-errors {
     SELECT set_config('request.jwt.claim.sub', '\{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
     SELECT auth.uid();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type uuid: ".a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
 }
@@ -248,6 +257,7 @@ test auth-uid-of-a-braced-uuid-with-text-after-the-closing-brace-errors {
     SELECT set_config('request.jwt.claim.sub', '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}x', false);
     SELECT auth.uid();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type uuid: ".a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11.x"
 }
@@ -257,6 +267,7 @@ test auth-uid-of-a-uuid-with-a-hyphen-after-two-digits-errors {
     SELECT set_config('request.jwt.claim.sub', 'a0-eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
     SELECT auth.uid();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type uuid: "a0-eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
 }
@@ -266,6 +277,7 @@ test auth-uid-of-a-short-uuid-errors {
     SELECT set_config('request.jwt.claims', '{"sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1"}', false);
     SELECT auth.uid();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type uuid: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1"
 }
@@ -275,6 +287,7 @@ test auth-uid-of-a-sub-claim-that-is-a-number-errors {
     SELECT set_config('request.jwt.claims', '{"sub": 123}', false);
     SELECT auth.uid();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type uuid: "123"
 }
@@ -446,6 +459,7 @@ test auth-email-of-claims-that-are-not-json-errors {
     SELECT set_config('request.jwt.claims', 'not json', false);
     SELECT auth.email();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type json
 }
@@ -455,6 +469,7 @@ test auth-uid-of-claims-that-are-not-json-errors {
     SELECT set_config('request.jwt.claims', '\{"sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"', false);
     SELECT auth.uid();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type json
 }
@@ -464,6 +479,7 @@ test auth-jwt-of-claims-that-are-not-json-errors {
     SELECT set_config('request.jwt.claims', 'not json', false);
     SELECT auth.jwt();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type json
 }
@@ -474,6 +490,7 @@ test auth-jwt-of-request-jwt-claim-that-is-not-json-errors {
     SELECT set_config('request.jwt.claim', 'not json', false);
     SELECT auth.jwt();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type json
 }
@@ -483,6 +500,7 @@ test auth-email-of-claims-in-json5-errors {
     SELECT set_config('request.jwt.claims', '{''email'': "user@example.com"}', false);
     SELECT auth.email();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type json
 }
@@ -492,6 +510,7 @@ test auth-email-of-claims-with-a-trailing-comma-errors {
     SELECT set_config('request.jwt.claims', '{"email": "user@example.com",}', false);
     SELECT auth.email();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type json
 }
@@ -501,6 +520,7 @@ test auth-email-of-claims-with-a-nul-escape-errors {
     SELECT set_config('request.jwt.claims', '{"role": "a\u0000b", "email": "user@example.com"}', false);
     SELECT auth.email();
 }
+@sqlstate 22P05
 expect error {
     unsupported Unicode escape sequence
 }
@@ -510,6 +530,7 @@ test auth-email-of-claims-with-a-nul-escape-in-a-member-name-errors {
     SELECT set_config('request.jwt.claims', '{"a\u0000": 1, "email": "user@example.com"}', false);
     SELECT auth.email();
 }
+@sqlstate 22P05
 expect error {
     unsupported Unicode escape sequence
 }
@@ -519,6 +540,7 @@ test auth-email-of-claims-with-a-nul-escape-in-an-array-errors {
     SELECT set_config('request.jwt.claims', '{"amr": ["a\u0000"], "email": "user@example.com"}', false);
     SELECT auth.email();
 }
+@sqlstate 22P05
 expect error {
     unsupported Unicode escape sequence
 }
@@ -528,9 +550,11 @@ test auth-email-of-claims-with-a-nul-escape-before-a-syntax-error-reports-the-es
     SELECT set_config('request.jwt.claims', '{"a": "\u0000", "email": }', false);
     SELECT auth.email();
 }
+@sqlstate 22P05
 expect error {
     unsupported Unicode escape sequence
 }
+@sqlstate 22P02
 expect @tursopg error {
     invalid input syntax for type json
 }
@@ -540,6 +564,7 @@ test auth-email-of-claims-with-a-lone-surrogate-errors {
     SELECT set_config('request.jwt.claims', '{"email": "\ud800@example.com"}', false);
     SELECT auth.email();
 }
+@sqlstate 22P02
 expect error {
     invalid input syntax for type json
 }
@@ -553,6 +578,7 @@ expect {
     {"n": 1e400, "email": "user@example.com"}
     user@example.com
 }
+@sqlstate 22P02
 expect @tursopg error {
     invalid input syntax for type json
 }
@@ -566,6 +592,7 @@ expect {
     {"a": 1e131071, "b": 1e-16383, "email": "user@example.com"}
     user@example.com|147500
 }
+@sqlstate 22P02
 expect @tursopg error {
     invalid input syntax for type json
 }
@@ -575,9 +602,11 @@ test auth-email-of-claims-with-a-number-too-large-for-numeric-errors {
     SELECT set_config('request.jwt.claims', '{"n": 1e131072, "email": "user@example.com"}', false);
     SELECT auth.email();
 }
+@sqlstate 22003
 expect error {
     value overflows numeric format
 }
+@sqlstate 22P02
 expect @tursopg error {
     invalid input syntax for type json
 }
@@ -587,6 +616,7 @@ test auth-email-of-claims-with-a-number-too-small-for-numeric-errors {
     SELECT set_config('request.jwt.claims', '{"n": 1e-16384, "email": "user@example.com"}', false);
     SELECT auth.email();
 }
+@sqlstate 22003
 expect error {
     value overflows numeric format
 }
@@ -600,6 +630,7 @@ test auth-email-of-claims-with-an-exponent-too-large-for-numeric-errors {
     SELECT set_config('request.jwt.claims', '{"n": 0e1073741824, "email": "user@example.com"}', false);
     SELECT auth.email();
 }
+@sqlstate 22003
 expect error {
     value overflows numeric format
 }
@@ -613,9 +644,11 @@ test auth-email-checks-the-token-after-a-number-before-the-size-of-the-number {
     SELECT set_config('request.jwt.claims', '{"n": 1e131072 "\u0000", "email": "user@example.com"}', false);
     SELECT auth.email();
 }
+@sqlstate 22P05
 expect error {
     unsupported Unicode escape sequence
 }
+@sqlstate 22P02
 expect @tursopg error {
     invalid input syntax for type json
 }
@@ -629,6 +662,7 @@ expect {
     {"x": {{repeat:200:[}}{{repeat:200:]}}, "email": "user@example.com"}
     user@example.com
 }
+@sqlstate 22P02
 expect @tursopg error {
     invalid input syntax for type json
 }
@@ -642,6 +676,7 @@ expect {
     10036
     user@example.com|10036
 }
+@sqlstate 22P02
 expect @tursopg error {
     invalid input syntax for type json
 }
@@ -768,12 +803,19 @@ expect {
     user@example.com
 }
 
+# tursopg refuses a function that is not deterministic, such as random(), in
+# CREATE INDEX with the SQLSTATE 42601, not 42P17. So the tursopg blocks of
+# the next two tests have no SQLSTATE.
 @setup auth_functions
 test auth-uid-in-an-index-expression-errors {
     CREATE TABLE notes (owner uuid);
     CREATE INDEX notes_owner ON notes ((auth.uid()));
 }
+@sqlstate 42P17
 expect error {
+    index
+}
+expect @tursopg error {
     index
 }
 
@@ -782,7 +824,11 @@ test auth-uid-in-a-partial-index-predicate-errors {
     CREATE TABLE notes (owner uuid);
     CREATE INDEX notes_owner ON notes (owner) WHERE owner = auth.uid();
 }
+@sqlstate 42P17
 expect error {
+    index
+}
+expect @tursopg error {
     index
 }
 
@@ -790,6 +836,7 @@ expect error {
 test auth-function-that-does-not-exist-errors {
     SELECT auth.no_such_function();
 }
+@sqlstate 42883
 expect error {
     auth\.no_such_function
 }
@@ -798,6 +845,7 @@ expect error {
 test auth-uid-with-an-argument-errors {
     SELECT auth.uid(1);
 }
+@sqlstate 42883
 expect error {
     auth\.uid
 }
@@ -816,9 +864,11 @@ expect {
 test auth-function-name-with-a-dot-in-quotes-is-not-an-auth-function {
     SELECT "auth.uid"();
 }
+@sqlstate 42883
 expect error {
     function auth\.uid\(\) does not exist
 }
+@sqlstate 42883
 expect @tursopg error {
     no such function: auth\.uid
 }
@@ -827,9 +877,11 @@ expect @tursopg error {
 test auth-function-name-with-a-dot-in-pg-catalog-is-not-an-auth-function {
     SELECT pg_catalog."auth.uid"();
 }
+@sqlstate 42883
 expect error {
     function pg_catalog\.auth\.uid\(\) does not exist
 }
+@sqlstate 42883
 expect @tursopg error {
     no such function: auth\.uid
 }
@@ -838,9 +890,11 @@ expect @tursopg error {
 test auth-schema-name-in-uppercase-quotes-is-not-the-auth-schema {
     SELECT "AUTH".uid();
 }
+@sqlstate 3F000
 expect error {
     schema "AUTH" does not exist
 }
+@sqlstate 42883
 expect @tursopg error {
     no such function: AUTH\.uid
 }
@@ -849,9 +903,11 @@ expect @tursopg error {
 test auth-function-name-in-uppercase-quotes-is-not-an-auth-function {
     SELECT auth."UID"();
 }
+@sqlstate 42883
 expect error {
     function auth\.UID\(\) does not exist
 }
+@sqlstate 42883
 expect @tursopg error {
     no such function: auth\.UID
 }
