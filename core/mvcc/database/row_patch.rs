@@ -16,7 +16,7 @@
 //! base that has the target's value in each column that the patch does not
 //! set.
 
-use crate::storage::sqlite3_ondisk::{read_varint, varint_len, write_varint_to_vec};
+use crate::storage::sqlite3_ondisk::{read_varint, varint_len, write_varint, write_varint_to_vec};
 use crate::types::SerialType;
 use crate::{LimboError, Result};
 use smallvec::SmallVec;
@@ -83,7 +83,11 @@ pub(crate) fn diff(
 /// Writes into `out` the record that `patch` makes from `base`.
 pub(crate) fn apply(base: &[u8], patch: &[u8], out: &mut Vec<u8>) -> Result<()> {
     let base_columns = parse_record(base)?;
-    let mut reader = PatchReader::new(patch)?;
+    let reader = PatchReader::new(patch)?;
+    if apply_in_place(base, &base_columns, reader.clone(), out)? {
+        return Ok(());
+    }
+    let mut reader = reader;
     let mut columns: Columns<'_> = SmallVec::with_capacity(reader.column_count);
     let mut next_set = reader.next_column()?;
     for index in 0..reader.column_count {
@@ -114,6 +118,54 @@ pub(crate) fn apply(base: &[u8], patch: &[u8], out: &mut Vec<u8>) -> Result<()> 
     Ok(())
 }
 
+/// Writes into `out` the record that `patch` makes from `base` by copying
+/// `base` and overwriting the bytes of each column that the patch sets. This
+/// works when the patch keeps the column count, and each column that it sets
+/// keeps the size of its value and of its serial type. Then the header keeps
+/// its size and each value keeps its offset. Returns `false` otherwise, and
+/// `out` then holds no record.
+fn apply_in_place(
+    base: &[u8],
+    base_columns: &Columns<'_>,
+    mut patch: PatchReader<'_>,
+    out: &mut Vec<u8>,
+) -> Result<bool> {
+    let Some(last) = base_columns.last() else {
+        return Ok(false);
+    };
+    let record_end = offset_in(base, last.value) + last.value.len();
+    if patch.column_count != base_columns.len() || record_end != base.len() {
+        return Ok(false);
+    }
+    out.clear();
+    out.extend_from_slice(base);
+    let (_, mut header_offset) = read_varint(base)?;
+    let mut header_index = 0;
+    while let Some(set) = patch.next_column()? {
+        while header_index < set.index {
+            header_offset += read_varint(&base[header_offset..])?.1;
+            header_index += 1;
+        }
+        let serial_type_len = read_varint(&base[header_offset..])?.1;
+        let old = base_columns[set.index];
+        if set.column.value.len() != old.value.len()
+            || varint_len(set.column.serial_type) != serial_type_len
+        {
+            out.clear();
+            return Ok(false);
+        }
+        write_varint(&mut out[header_offset..], set.column.serial_type);
+        let value_offset = offset_in(base, old.value);
+        out[value_offset..value_offset + old.value.len()].copy_from_slice(set.column.value);
+    }
+    Ok(true)
+}
+
+/// The offset of `part`, a subslice of `record`, in `record`.
+fn offset_in(record: &[u8], part: &[u8]) -> usize {
+    part.as_ptr() as usize - record.as_ptr() as usize
+}
+
 /// The column count of the record that `patch` makes.
 pub(crate) fn column_count(patch: &[u8]) -> Result<usize> {
     Ok(PatchReader::new(patch)?.column_count)
@@ -133,6 +185,7 @@ struct SetColumn<'a> {
     column: Column<'a>,
 }
 
+#[derive(Clone)]
 struct PatchReader<'a> {
     patch: &'a [u8],
     offset: usize,
@@ -278,7 +331,7 @@ fn header_size(columns: &[Column<'_>]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply, column_count, diff};
+    use super::{apply, apply_in_place, column_count, diff, parse_record, PatchReader};
     use crate::types::{ImmutableRecord, Value};
     use crate::LimboError;
     use rand::{Rng, SeedableRng};
@@ -504,6 +557,43 @@ mod tests {
         let target = [0x80, 0x03, 0x01, 0x05];
         let mut out = Vec::new();
         assert!(!diff(&base, &target, None, usize::MAX, &mut out).unwrap());
+    }
+
+    #[test]
+    fn a_patch_that_keeps_the_sizes_overwrites_a_copy_of_the_base() {
+        let base = record(&[
+            Value::from_i64(1),
+            Value::from_i64(10),
+            Value::build_text("abc"),
+        ]);
+        let same_sizes = record(&[
+            Value::from_i64(1),
+            Value::from_i64(20),
+            Value::build_text("xyz"),
+        ]);
+        let in_place = |patch: &[u8]| {
+            let mut out = Vec::new();
+            let columns = parse_record(&base).unwrap();
+            let done = apply_in_place(&base, &columns, PatchReader::new(patch).unwrap(), &mut out)
+                .unwrap();
+            done.then_some(out)
+        };
+        let same_sizes_patch = patch(&base, &same_sizes, None);
+        assert_eq!(in_place(&same_sizes_patch), Some(same_sizes));
+
+        // A value of another size, or another column count, needs a new header.
+        for target in [
+            record(&[
+                Value::from_i64(1),
+                Value::from_i64(1000),
+                Value::build_text("abc"),
+            ]),
+            record(&[Value::from_i64(1), Value::from_i64(10)]),
+        ] {
+            let other_sizes_patch = patch(&base, &target, None);
+            assert_eq!(in_place(&other_sizes_patch), None);
+            assert_eq!(rebuilt(&base, &other_sizes_patch), target);
+        }
     }
 
     #[test]
