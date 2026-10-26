@@ -48,6 +48,13 @@ test('no-native-call-overlap-with-worker-tasks', async () => {
     const origResume = (GeneratorHolder as any).prototype.resumeAsync;
     const origIoLoop = (SyncEngine as any).prototype.ioLoopAsync;
     const origExecutor = (NativeDatabase as any).prototype.executor;
+    const origPrepare = (NativeDatabase as any).prototype.prepare;
+    (NativeDatabase as any).prototype.prepare = function (this: any, ...args: any[]) {
+        if (inFlight > 0) {
+            overlaps += 1;
+        }
+        return origPrepare.apply(this, args);
+    };
     (GeneratorHolder as any).prototype.resumeAsync = trackInFlight(origResume);
     (SyncEngine as any).prototype.ioLoopAsync = trackInFlight(origIoLoop);
     (NativeDatabase as any).prototype.executor = function (this: any, ...args: any[]) {
@@ -69,7 +76,7 @@ test('no-native-call-overlap-with-worker-tasks', async () => {
         })();
         for (let i = 0; i < 50; i++) {
             try {
-                await db.exec(`INSERT INTO overlap_probe VALUES ('${i % 4}', 0) ON CONFLICT DO UPDATE SET y = y + 1`);
+                await (await db.prepare(`INSERT INTO overlap_probe VALUES ('${i % 4}', 0) ON CONFLICT DO UPDATE SET y = y + 1`)).run();
             } catch (e) {
                 // Busy conflicts with the concurrent pulls are irrelevant here;
                 // only the overlap counter matters.
@@ -80,9 +87,32 @@ test('no-native-call-overlap-with-worker-tasks', async () => {
         (GeneratorHolder as any).prototype.resumeAsync = origResume;
         (SyncEngine as any).prototype.ioLoopAsync = origIoLoop;
         (NativeDatabase as any).prototype.executor = origExecutor;
+        (NativeDatabase as any).prototype.prepare = origPrepare;
         await db.close();
     }
     expect(overlaps).toBe(0);
+})
+
+test('prepare-waits-for-sync-worker', async () => {
+    const db = await connect({ path: ':memory:' });
+    const lock = (db as any).execLock;
+    const origPrepare = (NativeDatabase as any).prototype.prepare;
+    let prepares = 0;
+    (NativeDatabase as any).prototype.prepare = function (this: any, ...args: any[]) {
+        prepares += 1;
+        return origPrepare.apply(this, args);
+    };
+    await lock.acquire();
+    const pending = db.prepare("SELECT 1 as x");
+    try {
+        await Promise.resolve();
+        expect(prepares).toBe(0);
+    } finally {
+        lock.release();
+        (NativeDatabase as any).prototype.prepare = origPrepare;
+        await pending;
+        await db.close();
+    }
 })
 
 test('open non-sync db', async () => {
