@@ -630,8 +630,8 @@ pub trait Wal: Debug + Send + Sync {
     fn begin_read_tx(&self) -> Result<bool>;
     /// MVCC helper: check if WAL state changed without starting a read tx.
     fn mvcc_refresh_if_db_changed(&self) -> bool;
-    /// The connection's `PRAGMA data_version`: it changes when a read transaction finds
-    /// content another connection committed, and never for the connection's own commits.
+    /// The connection's `PRAGMA data_version`: it changes when the connection's view of the WAL
+    /// moves to one with commits it hadn't seen, and never for its own commits or a checkpoint.
     fn data_version(&self) -> u64;
 
     /// Begin a write transaction.
@@ -2835,7 +2835,7 @@ pub struct WalFile {
     last_checksum: AtomicU64,
     checkpoint_seq: AtomicU32,
     transaction_count: AtomicU64,
-    /// Read transactions that found content committed by another connection
+    /// Times this connection's view of the WAL moved to one with commits it hadn't seen
     /// (SQLite's `Pager::iDataVersion`), see [`Wal::data_version`].
     data_version: AtomicU64,
 
@@ -3315,6 +3315,12 @@ impl WalFile {
 
     /// Persist a connection-local WAL snapshot bundle back into the legacy fields on `WalFile`.
     fn install_connection_state(&self, state: WalConnectionState) {
+        // Every commit raises the shared transaction count and a checkpoint keeps it, so a new
+        // count means commits this connection hadn't seen. Its own commits raise its local count
+        // before publishing, so they never count.
+        if state.snapshot.transaction_count != self.transaction_count.load(Ordering::Acquire) {
+            self.data_version.fetch_add(1, Ordering::AcqRel);
+        }
         self.max_frame
             .store(state.snapshot.max_frame, Ordering::Release);
         self.min_frame
@@ -3331,16 +3337,6 @@ impl WalFile {
     /// Compare a freshly loaded shared snapshot against the connection's current snapshot.
     fn db_changed_against(&self, snapshot: WalSnapshot, local_state: WalConnectionState) -> bool {
         snapshot != local_state.snapshot
-    }
-
-    /// Like [`Self::db_changed_against`], but a checkpoint that only backfilled frames
-    /// into the database file doesn't count: the content is the same. This is what
-    /// SQLite compares for `PRAGMA data_version`.
-    fn content_changed_against(snapshot: WalSnapshot, local_state: WalConnectionState) -> bool {
-        let local = local_state.snapshot;
-        snapshot.max_frame != local.max_frame
-            || snapshot.last_checksum != local.last_checksum
-            || snapshot.checkpoint_seq != local.checkpoint_seq
     }
 
     fn has_vacuum_read_lock_guard(&self) -> bool {
@@ -3449,9 +3445,7 @@ impl WalFile {
 
         // Check if database changed since this connection's last read transaction.
         // If it has, the connection will invalidate its page cache.
-        let local_state = self.connection_state();
-        let db_changed = self.db_changed_against(shared_snapshot, local_state);
-        let content_changed = Self::content_changed_against(shared_snapshot, local_state);
+        let db_changed = self.db_changed_against(shared_snapshot, self.connection_state());
 
         tracing::debug!("try_begin_read_tx: db_changed={}", db_changed);
 
@@ -3470,9 +3464,6 @@ impl WalFile {
         };
         self.install_vacuum_lock_guard(vacuum_lock_guard);
         self.install_connection_state(WalConnectionState::new(shared_snapshot, read_guard));
-        if content_changed {
-            self.data_version.fetch_add(1, Ordering::AcqRel);
-        }
         tracing::debug!(
             "begin_read_tx(min={}, max={}, slot={}, max_frame_in_wal={})",
             self.min_frame.load(Ordering::Acquire),
@@ -5556,9 +5547,6 @@ impl WalFile {
         let changed = self.db_changed_against(snapshot, local_state);
         if changed {
             self.install_connection_state(local_state.with_snapshot(snapshot));
-            if Self::content_changed_against(snapshot, local_state) {
-                self.data_version.fetch_add(1, Ordering::AcqRel);
-            }
         }
         changed
     }

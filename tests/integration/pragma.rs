@@ -1,5 +1,5 @@
 use crate::assertions::{AssertColumn, Cell};
-use crate::common::{limbo_exec_rows, TempDatabase};
+use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
 use asserting::prelude::*;
 use rusqlite::types::Value as RValue;
 use turso_core::StepResult;
@@ -376,7 +376,7 @@ fn test_pragma_data_version_changes_only_for_other_connections_commits(db: TempD
 }
 
 #[turso_macros::test]
-fn test_pragma_data_version_ignores_rollbacks_and_passive_checkpoints(db: TempDatabase) {
+fn test_pragma_data_version_ignores_rollbacks_and_checkpoints(db: TempDatabase) {
     let conn1 = db.connect_limbo();
     let conn2 = db.connect_limbo();
     conn1.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
@@ -390,20 +390,51 @@ fn test_pragma_data_version_ignores_rollbacks_and_passive_checkpoints(db: TempDa
         .named("data_version after another connection's rollback")
         .is_equal_to(v2);
 
-    // A passive checkpoint copies pages into the database file but changes no
-    // content, so SQLite keeps data_version; a TRUNCATE checkpoint resets the
-    // WAL, which SQLite reports as a change.
-    limbo_exec_rows(&conn1, "PRAGMA wal_checkpoint(PASSIVE)");
-    assert_that!(data_version(&conn2))
-        .named("data_version after another connection's passive checkpoint")
-        .is_equal_to(v2);
-    limbo_exec_rows(&conn1, "PRAGMA wal_checkpoint(TRUNCATE)");
-    assert_that!(data_version(&conn2))
-        .named("data_version after another connection's truncate checkpoint")
-        .is_not_equal_to(v2);
+    // A checkpoint moves pages into the database file without changing what a reader sees,
+    // so no mode counts, whether the WAL has frames or is already empty. (SQLite also
+    // changes data_version after a TRUNCATE checkpoint, because it rewrites its WAL header.)
+    for mode in ["PASSIVE", "RESTART", "TRUNCATE", "RESTART", "PASSIVE"] {
+        limbo_exec_rows(&conn1, &format!("PRAGMA wal_checkpoint({mode})"));
+        assert_that!(data_version(&conn2))
+            .named(format!(
+                "data_version after another connection's {mode} checkpoint"
+            ))
+            .is_equal_to(v2);
+    }
     assert_that!(data_version(&conn1))
         .named("data_version after the connection's own checkpoints")
         .is_equal_to(v1);
+}
+
+#[turso_macros::test]
+fn test_pragma_data_version_sees_a_commit_before_its_own_checkpoint(db: TempDatabase) {
+    let conn1 = db.connect_limbo();
+    let conn2 = db.connect_limbo();
+    conn1.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+    conn2.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+    conn1.execute("CREATE TABLE t(x)").unwrap();
+
+    // The checkpoint replaces the connection's view of the WAL; a commit it hadn't read yet
+    // must still change data_version.
+    for mode in ["TRUNCATE", "RESTART"] {
+        let v1 = data_version(&conn1);
+        conn2.execute("INSERT INTO t VALUES (1)").unwrap();
+        limbo_exec_rows(&conn1, &format!("PRAGMA wal_checkpoint({mode})"));
+        assert_that!(data_version(&conn1))
+            .named(format!(
+                "data_version after another connection's commit and an own {mode} checkpoint"
+            ))
+            .is_not_equal_to(v1);
+    }
+}
+
+#[test]
+fn test_pragma_data_version_is_an_error_in_mvcc_mode() {
+    // In MVCC mode commits reach the WAL only at checkpoint, so the counter would miss them.
+    let db = TempDatabase::new_with_mvcc("test_pragma_data_version_mvcc.db");
+    let conn = db.connect_limbo();
+    let err = limbo_exec_rows_fallible(&db, &conn, "PRAGMA data_version").unwrap_err();
+    assert_that!(err.to_string()).contains("MVCC");
 }
 
 #[turso_macros::test]

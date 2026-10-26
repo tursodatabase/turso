@@ -1700,6 +1700,10 @@ fn query_pragma(
         }
         PragmaName::VdbeTrace => Ok(TransactionMode::None),
         PragmaName::DataVersion => {
+            // MVCC commits reach the WAL only at checkpoint, so the count would miss them.
+            if connection.mvcc_enabled() {
+                bail_parse_error!("PRAGMA data_version is not supported in MVCC mode");
+            }
             program.emit_insn(Insn::ReadCookie {
                 db: database_id,
                 dest: register,
