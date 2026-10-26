@@ -833,7 +833,7 @@ struct SpillState {
     /// DISTINCT only, empty otherwise: where the key with each hash is. Equal keys
     /// have equal hashes, so a new key needs no disk read and a duplicate of a key
     /// on disk needs to read only that one key, not its whole partition.
-    distinct_key_places: HashMap<u64, PackedDistinctKeyPlace>,
+    distinct_key_places: Vec<HashMap<u64, PackedDistinctKeyPlace>>,
     distinct_key_read: Option<DistinctKeyRead>,
 }
 
@@ -904,7 +904,9 @@ impl SpillState {
             next_spill_offset: 0,
             temp_file: TempFile::with_temp_store(io, temp_store)?,
             partitioning,
-            distinct_key_places: HashMap::default(),
+            distinct_key_places: (0..partitioning.count)
+                .map(|_| HashMap::default())
+                .try_collect()?,
             distinct_key_read: None,
         })
     }
@@ -1368,7 +1370,7 @@ impl HashTable {
                 .spill_state
                 .as_ref()
                 .expect("spill state exists")
-                .distinct_key_places
+                .distinct_key_places[partition_idx]
                 .get(&hash)
                 .map(|place| place.get());
             let has_spilled_dup = match place {
@@ -1414,8 +1416,7 @@ impl HashTable {
                     None => DistinctKeyPlace::InBuffer,
                     Some(_) => DistinctKeyPlace::SharedByDifferentKeys,
                 };
-                spill_state
-                    .distinct_key_places
+                spill_state.distinct_key_places[partition_idx]
                     .try_insert(hash, PackedDistinctKeyPlace::new(new_place))?;
             }
             self.num_entries += 1;
@@ -1558,14 +1559,13 @@ impl HashTable {
 
     fn record_distinct_key_places(&mut self) -> Result<()> {
         let spill_state = self.spill_state.as_mut().expect("spill state must exist");
-        for buffer in &spill_state.partition_buffers {
+        for (partition_idx, buffer) in spill_state.partition_buffers.iter().enumerate() {
             for entry in &buffer.entries {
-                let place = match spill_state.distinct_key_places.get(&entry.hash) {
+                let place = match spill_state.distinct_key_places[partition_idx].get(&entry.hash) {
                     None => DistinctKeyPlace::InBuffer,
                     Some(_) => DistinctKeyPlace::SharedByDifferentKeys,
                 };
-                spill_state
-                    .distinct_key_places
+                spill_state.distinct_key_places[partition_idx]
                     .try_insert(entry.hash, PackedDistinctKeyPlace::new(place))?;
             }
         }
@@ -1684,7 +1684,7 @@ impl HashTable {
         for (entry, &entry_size) in partition.entries.iter().zip(entry_sizes.iter()) {
             offset += write_varint(&mut buf[offset..], entry_size as u64);
             record_distinct_key_on_disk(
-                &mut spill_state.distinct_key_places,
+                &mut spill_state.distinct_key_places[partition_idx],
                 entry.hash,
                 file_offset + offset as u64,
                 entry_size,
@@ -1841,7 +1841,7 @@ impl HashTable {
             for (entry, &entry_size) in partition.entries.iter().zip(meta.entry_sizes.iter()) {
                 offset += write_varint(&mut buf[offset..], entry_size as u64);
                 record_distinct_key_on_disk(
-                    &mut spill_state.distinct_key_places,
+                    &mut spill_state.distinct_key_places[meta.idx],
                     entry.hash,
                     base_file_offset + offset as u64,
                     entry_size,
@@ -3997,7 +3997,10 @@ mod hashtests {
             next_spill_offset: 0,
             temp_file,
             partitioning,
-            distinct_key_places: HashMap::default(),
+            distinct_key_places: (0..partitioning.count)
+                .map(|_| HashMap::default())
+                .try_collect()
+                .unwrap(),
             distinct_key_read: None,
         };
         ht.spill_state = Some(spill_state);
@@ -4049,7 +4052,10 @@ mod hashtests {
             next_spill_offset: truncated.len() as u64,
             temp_file,
             partitioning,
-            distinct_key_places: HashMap::default(),
+            distinct_key_places: (0..partitioning.count)
+                .map(|_| HashMap::default())
+                .try_collect()
+                .unwrap(),
             distinct_key_read: None,
         };
         ht.spill_state = Some(spill_state);
@@ -4416,14 +4422,16 @@ mod hashtests {
                 &mut metrics
             ));
         }
-        for stored_place in ht
+        for map in ht
             .spill_state
             .as_mut()
             .unwrap()
             .distinct_key_places
-            .values_mut()
+            .iter_mut()
         {
-            *stored_place = PackedDistinctKeyPlace::new(place);
+            for stored_place in map.values_mut() {
+                *stored_place = PackedDistinctKeyPlace::new(place);
+            }
         }
 
         for key in (0..2048).rev() {
