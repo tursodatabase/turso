@@ -33,7 +33,7 @@ type Rows = Vec<Vec<rusqlite::types::Value>>;
 /// A fresh database with the test tables, and a connection to it.
 fn connect() -> (TempDatabase, std::sync::Arc<turso_core::Connection>) {
     let db = TempDatabase::builder()
-        .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
+        .with_opts(turso_core::DatabaseOpts::new())
         .build();
     let conn = db.connect_limbo();
     for statement in SETUP {
@@ -1241,7 +1241,7 @@ fn hir_returning_subqueries_match_sqlite() {
 #[test]
 fn hir_generated_columns_match_sqlite() {
     let db = TempDatabase::builder()
-        .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
+        .with_opts(turso_core::DatabaseOpts::new())
         .build();
     let conn = db.connect_limbo();
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
@@ -1717,11 +1717,7 @@ fn hir_custom_type_writes_keep_their_results() {
 #[test]
 fn hir_custom_type_triggers_and_virtual_columns_read_sql_values() {
     let db = TempDatabase::builder()
-        .with_opts(
-            turso_core::DatabaseOpts::new()
-                .with_custom_types(true)
-                .with_generated_columns(true),
-        )
+        .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
         .build();
     let conn = db.connect_limbo();
     for sql in [
@@ -2020,7 +2016,10 @@ fn hir_delete_errors_name_what_is_wrong() {
             "DELETE FROM main.nosuch",
             "Parse error: no such table: main.nosuch",
         ),
-        ("DELETE FROM nosuch.t", "no such database: nosuch"),
+        (
+            "DELETE FROM nosuch.t",
+            "Parse error: no such table: nosuch.t",
+        ),
         (
             "DELETE FROM t WHERE nosuch = 1",
             "Parse error: no such column: nosuch",
@@ -2527,11 +2526,7 @@ fn hir_dml_through_an_index_method_collects_rowids_first() {
 #[test]
 fn hir_custom_typed_virtual_columns_keep_their_computed_value() {
     let db = TempDatabase::builder()
-        .with_opts(
-            turso_core::DatabaseOpts::new()
-                .with_custom_types(true)
-                .with_generated_columns(true),
-        )
+        .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
         .build();
     let conn = db.connect_limbo();
     for sql in [

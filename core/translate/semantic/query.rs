@@ -1517,11 +1517,19 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             crate::LimboError::InternalError(format!("semantic query {} has no blocks", query.id))
         })?;
         let mut names: Vec<String> = Vec::with_capacity(first.outputs.len());
-        Ok(first
+        first
             .outputs
             .iter()
             .enumerate()
             .map(|(position, output)| {
+                let dimensions = output.type_fact.array_dimensions;
+                if dimensions > turso_parser::ast::MAX_ARRAY_DIMENSIONS {
+                    crate::bail_parse_error!(
+                        "result column {} is an array with {dimensions} dimensions, but arrays have at most {}",
+                        position + 1,
+                        turso_parser::ast::MAX_ARRAY_DIMENSIONS
+                    );
+                }
                 let (affinity, has_affinity) = if query.blocks.len() > 1 {
                     self.compound_column_affinity(query, position)
                 } else {
@@ -1529,7 +1537,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 };
                 let name = unique_subquery_column_name(self.subquery_column_name(output), &names);
                 names.push(name.clone());
-                hir::SourceColumn {
+                Ok(hir::SourceColumn {
                     name: name.into(),
                     type_fact: output.type_fact.clone(),
                     affinity,
@@ -1537,9 +1545,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     collation: output.collation.clone(),
                     hidden: false,
                     rowid_alias: false,
-                }
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// The affinity of column `position` of a compound subquery, combined

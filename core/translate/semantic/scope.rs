@@ -389,6 +389,10 @@ struct ScopeSource {
     group_values: Option<Vec<hir::Expr>>,
     rowid_available: bool,
     unqualified: bool,
+    /// Whether this is the schema table without an alias, which a column
+    /// qualifier can also name by its other names, as SQLite's
+    /// `isValidSchemaTableName` allows.
+    unaliased_schema_table: bool,
     /// Lookup names of this source's columns that `table.*` reads as the
     /// merged USING value instead of the source's own column: a later USING
     /// merges the name and a later RIGHT or FULL JOIN can leave the source's
@@ -414,6 +418,36 @@ impl ScopeSource {
 
     fn column_views(&self) -> impl Iterator<Item = ColumnView<'_>> + '_ {
         (0..self.columns.len()).map(|index| self.column(index))
+    }
+
+    fn named_by_column_qualifier(&self, table: &str, database_qualified: bool) -> bool {
+        self.qualifier == table
+            || (self.unaliased_schema_table
+                && schema_table_names(self.database, database_qualified).contains(&table))
+    }
+}
+
+/// The names of the schema table of `database`. The temp schema table also
+/// takes main's names after a database name, as in `temp.sqlite_master.name`.
+fn schema_table_names(
+    database: Option<hir::DatabaseId>,
+    database_qualified: bool,
+) -> &'static [&'static str] {
+    use crate::schema::{
+        SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME,
+        TEMP_SCHEMA_TABLE_NAME_ALT,
+    };
+    if database != Some(hir::DatabaseId::new(crate::TEMP_DB_ID)) {
+        &[SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT]
+    } else if database_qualified {
+        &[
+            TEMP_SCHEMA_TABLE_NAME,
+            TEMP_SCHEMA_TABLE_NAME_ALT,
+            SCHEMA_TABLE_NAME,
+            SCHEMA_TABLE_NAME_ALT,
+        ]
+    } else {
+        &[TEMP_SCHEMA_TABLE_NAME, TEMP_SCHEMA_TABLE_NAME_ALT]
     }
 }
 
@@ -567,11 +601,24 @@ impl Scope {
         if unqualified {
             Arc::make_mut(&mut self.visible).push(VisibleColumn::AllOfSource(self.sources.len()));
         }
+        let unaliased_schema_table = source.alias.is_none()
+            && matches!(
+                &source.kind,
+                hir::SourceKind::Table(table)
+                    if matches!(table.value(), crate::schema::Table::BTree(btree) if btree.root_page == 1)
+            );
+        // Like SQLite, `<tbl>.*` and a join group name the schema table by
+        // the name it is stored under, whichever name FROM used.
+        let qualifier = if !unaliased_schema_table {
+            crate::util::normalize_ident(source.alias.as_deref().unwrap_or(&source.name))
+        } else if source.database == Some(hir::DatabaseId::new(crate::TEMP_DB_ID)) {
+            crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT.to_string()
+        } else {
+            crate::schema::SCHEMA_TABLE_NAME_ALT.to_string()
+        };
         Arc::make_mut(&mut self.sources).push(ScopeSource {
             id: source.id,
-            qualifier: crate::util::normalize_ident(
-                source.alias.as_deref().unwrap_or(&source.name),
-            ),
+            qualifier,
             table_name: crate::util::normalize_ident(&source.name),
             database: source.database,
             database_qualified: source.alias.is_none(),
@@ -579,6 +626,7 @@ impl Scope {
             group_values: None,
             rowid_available: source.rowid_available,
             unqualified,
+            unaliased_schema_table,
             star_merged: Vec::new(),
             saved: None,
             using_merged: Vec::new(),
@@ -1084,8 +1132,11 @@ impl Scope {
             // SQLite checks the database against the table's and the
             // name against the alias: `main.a.id` finds `main.t AS a`.
             let named = match database {
-                Some(database) => source.database == Some(database) && source.qualifier == table,
-                None => source.qualifier == table,
+                Some(database) => {
+                    source.database == Some(database)
+                        && source.named_by_column_qualifier(table, true)
+                }
+                None => source.named_by_column_qualifier(table, false),
             };
             if !named {
                 continue;
@@ -1654,7 +1705,7 @@ impl Scope {
     pub(crate) fn has_qualifier(&self, qualifier: &str) -> bool {
         self.sources
             .iter()
-            .any(|source| source.qualifier == qualifier)
+            .any(|source| source.named_by_column_qualifier(qualifier, false))
             || !self.saved_group_matches(qualifier, None).is_empty()
             || self
                 .outer

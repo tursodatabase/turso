@@ -19,7 +19,7 @@ mod window;
 use turso_parser::ast;
 
 use crate::{
-    function::{Func, ScalarFunc},
+    function::{AggFunc, Func, ScalarFunc},
     schema::{Schema, Type},
     sync::Arc,
     translate::{
@@ -790,6 +790,7 @@ pub(crate) struct ResolvedResultColumn {
     /// The type name `Statement::get_column_type_info` reports for a
     /// computed value, inferred by [`expression_primitive`].
     pub(crate) primitive: Option<&'static str>,
+    pub(crate) array_dimensions: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -906,6 +907,7 @@ fn resolved_output_columns_from(
             value,
             affinity: output.affinity,
             primitive: expression_primitive(document, &document.exprs[output.expr]),
+            array_dimensions: output.type_fact.array_dimensions,
         });
     }
     Ok(columns)
@@ -963,7 +965,9 @@ fn group_column_of(
 /// The type name of a computed value: a literal has its
 /// own type; arithmetic over two INTEGERs is INTEGER, over INTEGERs and REALs
 /// REAL, and NUMERIC otherwise; comparisons, logic and bitwise operators give
-/// INTEGER; `||` gives TEXT; anything else reports its affinity.
+/// INTEGER; `||` gives TEXT; an operator a custom type defines gives
+/// nothing, since its function decides the result; anything else reports
+/// its affinity.
 fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Option<&'static str> {
     use ast::{Operator, UnaryOperator};
     match expression {
@@ -987,6 +991,9 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
             )),
             UnaryOperator::Positive => expression_primitive(document, &document.exprs[*expr]),
         },
+        hir::Expr::Binary {
+            custom: Some(_), ..
+        } => None,
         hir::Expr::Binary {
             lhs, operator, rhs, ..
         } => match operator {
@@ -1035,7 +1042,11 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
                 Func::Scalar(
                     ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Max | ScalarFunc::Min,
                 ) => common_primitive(document, values.iter().copied()),
-                Func::Scalar(ScalarFunc::Nullif) => {
+                Func::Scalar(ScalarFunc::Iif) => {
+                    common_primitive(document, values.iter().skip(1).copied())
+                }
+                Func::Scalar(ScalarFunc::Nullif)
+                | Func::Agg(AggFunc::Max | AggFunc::Min | AggFunc::ArrayAgg) => {
                     expression_primitive(document, &document.exprs[*values.first()?])
                 }
                 Func::Scalar(ScalarFunc::Abs) => Some(arithmetic_primitive(

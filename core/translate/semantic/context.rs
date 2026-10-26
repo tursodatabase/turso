@@ -612,13 +612,13 @@ impl<'catalog> SemanticContext<'catalog> {
             self.database_schema(*database)
                 .is_some_and(|schema| schema.get_view(NamespaceId::ROOT, &view_name).is_some())
         };
+        // A table in a database that does not exist is a missing table, as
+        // in SQLite's sqlite3LocateTable.
         let database = match &name.namespace {
-            Some(database) => Some(self.database(database.as_str()).ok_or_else(|| {
-                LimboError::InvalidArgument(format!(
-                    "no such database: {}",
-                    normalize_ident(database.as_str())
-                ))
-            })?),
+            Some(database) => Some(
+                self.database(database.as_str())
+                    .ok_or_else(|| no_such_table(name))?,
+            ),
             None => self
                 .unqualified_databases(&view_name, view_database)
                 .into_iter()
@@ -663,12 +663,9 @@ impl<'catalog> SemanticContext<'catalog> {
         let table_name = normalize_ident(name.name.as_str());
         let found = match &name.namespace {
             Some(database) => {
-                let database = self.database(database.as_str()).ok_or_else(|| {
-                    LimboError::InvalidArgument(format!(
-                        "no such database: {}",
-                        normalize_ident(database.as_str())
-                    ))
-                })?;
+                let database = self
+                    .database(database.as_str())
+                    .ok_or_else(|| no_such_table(name))?;
                 self.schema(database)?
                     .get_table(NamespaceId::ROOT, &table_name)
                     .map(|table| (database, table))

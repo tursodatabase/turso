@@ -8773,8 +8773,10 @@ pub(super) fn prepare_hir_btree_loop<'a>(
     let (cursor, table_cursor, autoindex_source_cursor) = if let Some(index) = index {
         let index_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         let table_cursor = match table_lookup {
-            BtreeTableLookup::ScanOnly => None,
-            BtreeTableLookup::TableRequired => Some(program.alloc_cursor_id(table_cursor_type())),
+            BtreeTableLookup::TableRequired if index.has_rowid => {
+                Some(program.alloc_cursor_id(table_cursor_type()))
+            }
+            BtreeTableLookup::ScanOnly | BtreeTableLookup::TableRequired => None,
         };
         let autoindex_source_cursor =
             if index.ephemeral {

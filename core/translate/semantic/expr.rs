@@ -3790,8 +3790,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         // literal the type accepts as input. Otherwise an arithmetic operator
         // of a type whose stored values read back unchanged still gets the
         // operand as it is, so `date + 1`, `date + int_col` and `date + ?`
-        // add days; the operator function checks the operand's type. A
-        // comparison such as `int_col = '10'` keeps the standard operator.
+        // add days, and so does a comparison of a type whose `value` input
+        // type is `any`, so `numeric_col = 1.5 + 0` compares as numeric; the
+        // operator function checks the operand's type. A comparison such as
+        // `int_col = '10'` keeps the standard operator.
         let one_custom_column = |column: &CustomOperatorColumn,
                                  other: &ResolvedScopeExpr,
                                  operand: hir::BinaryOperand| {
@@ -3801,8 +3803,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             };
             let encode_other = other_is_written_literal
                 && literal_matches_custom_type(other, column.definition.value(), &self.exprs);
-            let pass_other_as_is = !operator.is_comparison()
-                && column.definition.value().decode_returns_value_unchanged();
+            let pass_other_as_is = if operator.is_comparison() {
+                column
+                    .definition
+                    .value()
+                    .value_input_type()
+                    .eq_ignore_ascii_case("any")
+            } else {
+                column.definition.value().decode_returns_value_unchanged()
+            };
             if !encode_other && !pass_other_as_is {
                 return None;
             }
@@ -3936,7 +3945,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             Some((schema, name)) => {
                 let schema = normalize_ident(schema);
                 let database = self.context().database(&schema).ok_or_else(|| {
-                    LimboError::InvalidArgument(format!("no such database: {schema}"))
+                    LimboError::ParseError(format!("sequence \"{user_name}\" does not exist"))
                 })?;
                 (database, normalize_ident(name))
             }

@@ -1275,7 +1275,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     ) -> Result<QueryBlock> {
         let block = QueryBlockId::new(query, index);
         let scope = self.new_scope(outer_scope.cloned());
-        let policy = policies.select();
+        let policy = policies.insert_values();
         let mut functions = QueryFunctionState::new(block);
         let mut resolved_rows = Vec::with_capacity(rows.len());
         for row in rows {
@@ -4990,29 +4990,18 @@ mod tests {
     }
 
     #[test]
-    fn values_keep_function_identities_and_name_rules() {
-        let document = analyze_sql("VALUES(sum(1), row_number() OVER ())")
-            .expect("VALUES allows query functions");
-        let HirRoot::Query(root) = &document.root else {
-            panic!("VALUES produces query root");
-        };
-        let block = &document.query(root.query).expect("query exists").blocks[0];
-        assert_eq!(block.aggregate_count, 1);
-        assert_eq!(block.window_function_count, 1);
-        assert_eq!(block.windows.len(), 1);
-        let QueryBlockBody::Values { rows } = &block.body else {
-            panic!("query owns VALUES rows");
-        };
-        assert!(matches!(
-            &document.exprs[rows[0][0]],
-            Expr::Function(call)
-                if matches!(call.evaluation, FunctionEvaluation::Aggregate { .. })
-        ));
-        assert!(matches!(
-            &document.exprs[rows[0][1]],
-            Expr::Function(call)
-                if matches!(call.evaluation, FunctionEvaluation::Window { .. })
-        ));
+    fn values_reject_query_functions_and_keep_name_rules() {
+        let error = analyze_sql("VALUES(sum(1))").expect_err("VALUES rejects aggregates");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: misuse of aggregate function sum()"
+        );
+        let error = analyze_sql("VALUES(row_number() OVER ())")
+            .expect_err("VALUES rejects window functions");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: misuse of window function row_number()"
+        );
 
         let error = analyze_sql("VALUES(missing)").expect_err("VALUES has no local names");
         assert_eq!(error.to_string(), "Parse error: no such column: missing");
@@ -10933,7 +10922,10 @@ mod tests {
                 "SELECT nextval('missing')",
                 "Parse error: sequence \"missing\" does not exist",
             ),
-            ("SELECT setval('aux.orders', 1)", "no such database: aux"),
+            (
+                "SELECT setval('aux.orders', 1)",
+                "Parse error: sequence \"aux.orders\" does not exist",
+            ),
         ] {
             let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid call must fail");
             assert_eq!(error.to_string(), expected);

@@ -1080,6 +1080,7 @@ impl ProgramBuilder {
                 value: crate::translate::semantic_lowering::ResolvedResultValue::Expression,
                 affinity: crate::vdbe::affinity::Affinity::None,
                 primitive: None,
+                array_dimensions: 0,
             },
         );
     }
