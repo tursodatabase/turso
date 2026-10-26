@@ -1725,21 +1725,41 @@ pub fn translate_alter_table(
                 )));
             };
 
-            if definition
-                .constraints
-                .iter()
-                .any(|c| matches!(c.constraint, ast::ColumnConstraint::PrimaryKey { .. }))
-            {
+            let old_column = &btree.columns()[column_index];
+            let has_primary_key_autoindex = (old_column.primary_key()
+                && !old_column.is_rowid_alias())
+                || btree.unique_sets.iter().any(|set| {
+                    set.is_primary_key
+                        && set
+                            .columns
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(from))
+                })
+                || definition
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c.constraint, ast::ColumnConstraint::PrimaryKey { .. }));
+
+            if !rename && has_primary_key_autoindex {
                 return Err(LimboError::ParseError(
                     "PRIMARY KEY constraint cannot be altered".to_string(),
                 ));
             }
 
-            if definition
-                .constraints
-                .iter()
-                .any(|c| matches!(c.constraint, ast::ColumnConstraint::Unique { .. }))
-            {
+            let is_unique = old_column.unique()
+                || btree.unique_sets.iter().any(|set| {
+                    !set.is_primary_key
+                        && set
+                            .columns
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(from))
+                })
+                || definition
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c.constraint, ast::ColumnConstraint::Unique { .. }));
+
+            if !rename && is_unique {
                 return Err(LimboError::ParseError(
                     "UNIQUE constraint cannot be altered".to_string(),
                 ));
