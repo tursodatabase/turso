@@ -41,24 +41,12 @@ impl ConstraintViolation {
     }
 }
 
-/// An error of a dialect, which the engine carries without change.
+/// An error that code of a dialect raised, which the engine carries without
+/// change. `code` is an error code that the dialect defines.
 #[derive(Debug, Clone)]
-pub struct DialectError(std::sync::Arc<dyn std::error::Error + Send + Sync>);
-
-impl DialectError {
-    pub fn new(error: impl std::error::Error + Send + Sync + 'static) -> Self {
-        Self(std::sync::Arc::new(error))
-    }
-
-    pub fn downcast_ref<E: std::error::Error + 'static>(&self) -> Option<&E> {
-        self.0.downcast_ref()
-    }
-}
-
-impl std::fmt::Display for DialectError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
+pub struct DialectError {
+    pub code: &'static str,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
@@ -199,10 +187,9 @@ pub enum LimboError {
     #[error("Out of memory")]
     OutOfMemory,
     /// An error that code of a dialect raised, for example one of its
-    /// functions. The frontend of the dialect reads its own error type back
-    /// with [`DialectError::downcast_ref`].
-    #[error("{0}")]
-    Dialect(DialectError),
+    /// functions. Boxed, so that it does not make every `LimboError` larger.
+    #[error("{}", .0.message)]
+    Dialect(Box<DialectError>),
 }
 
 /// `?` in functions returning boxed errors (see `InsnResult`) composes
