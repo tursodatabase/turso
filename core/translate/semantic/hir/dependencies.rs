@@ -11,6 +11,39 @@ pub(crate) struct ColumnUsage {
     pub(crate) count: usize,
 }
 
+/// The table columns each query reads directly, in query order.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct QueryColumnReads {
+    reads: Vec<ColumnRef>,
+    ends: Vec<usize>,
+}
+
+impl QueryColumnReads {
+    pub(crate) fn collect<'query, 'source>(
+        queries: impl IntoIterator<Item = &'query Query>,
+        source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
+        exprs: &ExprArena,
+    ) -> Self {
+        let mut query_reads = Self::default();
+        for query in queries {
+            query.direct_column_reads(source_by_id, exprs, &mut query_reads.reads);
+            query_reads.ends.push(query_reads.reads.len());
+        }
+        query_reads
+    }
+
+    pub(crate) fn all(&self) -> &[ColumnRef] {
+        &self.reads
+    }
+
+    fn by_query(&self) -> impl Iterator<Item = &[ColumnRef]> {
+        let starts = core::iter::once(0).chain(self.ends.iter().copied());
+        starts
+            .zip(self.ends.iter().copied())
+            .map(|(start, end)| &self.reads[start..end])
+    }
+}
+
 #[derive(Default)]
 struct ColumnUsageCollector {
     reads: Vec<ColumnUsage>,
@@ -41,8 +74,10 @@ impl ColumnUsageCollector {
     }
 
     fn into_usage(mut self) -> Vec<ColumnUsage> {
-        self.reads
-            .sort_by_key(|usage| (usage.reference.source.index(), usage.reference.column));
+        let key = |usage: &ColumnUsage| (usage.reference.source.index(), usage.reference.column);
+        if !self.reads.is_sorted_by_key(key) {
+            self.reads.sort_by_key(key);
+        }
         let mut usage: Vec<ColumnUsage> = Vec::with_capacity(self.reads.len());
         for read in self.reads {
             match usage.last_mut() {
@@ -179,7 +214,13 @@ impl HirDocument {
         self.direct_query_links(query).1
     }
 
-    pub(crate) fn query_facts(&self) -> Vec<QueryFacts> {
+    pub(crate) fn query_facts(&self, query_reads: &QueryColumnReads) -> Vec<QueryFacts> {
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            query_reads,
+            &QueryColumnReads::collect(&self.queries, |source| self.source(source), &self.exprs),
+            "shared column reads must match the reads of the finished HIR"
+        );
         let mut facts = self
             .queries
             .iter()
@@ -195,10 +236,9 @@ impl HirDocument {
         let mut usage = (0..self.queries.len())
             .map(|_| ColumnUsageCollector::default())
             .collect::<Vec<_>>();
-        let mut reads = Vec::new();
-        for query in &self.queries {
-            query.direct_column_reads(|source| self.source(source), &self.exprs, &mut reads);
-            for reference in reads.drain(..) {
+        for (query, reads) in self.queries.iter().zip(query_reads.by_query()) {
+            usage[query.id.index()].reads.reserve(reads.len());
+            for &reference in reads {
                 usage[query.id.index()].record(reference);
                 if let Some(SourceOwner::QueryBlock(block)) =
                     self.source(reference.source).map(|source| source.owner)
@@ -598,7 +638,7 @@ impl Query {
         source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
         exprs: &ExprArena,
     ) -> Vec<SourceId> {
-        let mut references = HashSet::default();
+        let mut references = Vec::new();
         for block in &self.blocks {
             if let Some(from) = &block.from {
                 collect_from_references(exprs, from, &mut references, source_by_id);
@@ -632,17 +672,15 @@ impl Query {
             collect_optional_expr_references(exprs, limit.offset, &mut references);
         }
 
-        let mut captures = references
-            .into_iter()
-            .filter(|source| {
-                !matches!(
-                    source_by_id(*source).map(|source| source.owner),
-                    Some(SourceOwner::QueryBlock(block)) if block.query == self.id
-                )
-            })
-            .collect::<Vec<_>>();
-        captures.sort_unstable();
-        captures
+        references.sort_unstable();
+        references.dedup();
+        references.retain(|source| {
+            !matches!(
+                source_by_id(*source).map(|source| source.owner),
+                Some(SourceOwner::QueryBlock(block)) if block.query == self.id
+            )
+        });
+        references
     }
 
     /// Count every table column read directly by this query. Nested queries
@@ -905,7 +943,7 @@ fn collect_window_bound_column_reads(
 fn collect_from_references<'source>(
     exprs: &ExprArena,
     from: &From,
-    references: &mut HashSet<SourceId>,
+    references: &mut Vec<SourceId>,
     source: impl Fn(SourceId) -> Option<&'source Source> + Copy,
 ) {
     collect_source_arguments(exprs, from.first, references, source);
@@ -919,7 +957,7 @@ fn collect_from_references<'source>(
             JoinConstraint::Using(columns) | JoinConstraint::Natural(columns) => {
                 for column in columns {
                     collect_expr_references(exprs, column.left, references);
-                    references.insert(column.right.source);
+                    add_reference(references, column.right.source);
                 }
             }
         }
@@ -929,7 +967,7 @@ fn collect_from_references<'source>(
 fn collect_source_arguments<'source>(
     exprs: &ExprArena,
     id: SourceId,
-    references: &mut HashSet<SourceId>,
+    references: &mut Vec<SourceId>,
     source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
 ) {
     let Some(source) = source_by_id(id) else {
@@ -950,15 +988,11 @@ fn collect_source_arguments<'source>(
     }
 }
 
-fn collect_expr_references(
-    exprs: &ExprArena,
-    expression: ExprId,
-    references: &mut HashSet<SourceId>,
-) {
+fn collect_expr_references(exprs: &ExprArena, expression: ExprId, references: &mut Vec<SourceId>) {
     match &exprs[expression] {
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Output(_) => {}
         Expr::Column(reference) => {
-            references.insert(reference.source);
+            add_reference(references, reference.source);
         }
         Expr::MergedColumn(column) => match column.value {
             MergedColumnValue::Left => collect_expr_references(exprs, column.left, references),
@@ -969,7 +1003,7 @@ fn collect_expr_references(
             }
         },
         Expr::RowId(source) => {
-            references.insert(*source);
+            add_reference(references, *source);
         }
         Expr::Unary { expr, .. }
         | Expr::IsNull(expr)
@@ -1059,10 +1093,16 @@ fn collect_expr_references(
     }
 }
 
+fn add_reference(references: &mut Vec<SourceId>, source: SourceId) {
+    if references.last() != Some(&source) {
+        references.push(source);
+    }
+}
+
 fn collect_exprs_references(
     exprs: &ExprArena,
     expressions: &[ExprId],
-    references: &mut HashSet<SourceId>,
+    references: &mut Vec<SourceId>,
 ) {
     for expression in expressions {
         collect_expr_references(exprs, *expression, references);
@@ -1072,7 +1112,7 @@ fn collect_exprs_references(
 fn collect_optional_expr_references(
     exprs: &ExprArena,
     expression: Option<ExprId>,
-    references: &mut HashSet<SourceId>,
+    references: &mut Vec<SourceId>,
 ) {
     if let Some(expression) = expression {
         collect_expr_references(exprs, expression, references);
@@ -1082,7 +1122,7 @@ fn collect_optional_expr_references(
 fn collect_order_references(
     exprs: &ExprArena,
     terms: &[OrderTerm],
-    references: &mut HashSet<SourceId>,
+    references: &mut Vec<SourceId>,
 ) {
     for term in terms {
         collect_expr_references(exprs, term.expr, references);
@@ -1092,7 +1132,7 @@ fn collect_order_references(
 fn collect_window_references(
     exprs: &ExprArena,
     window: &ResolvedWindow,
-    references: &mut HashSet<SourceId>,
+    references: &mut Vec<SourceId>,
 ) {
     for term in &window.partition_by {
         collect_expr_references(exprs, term.expr, references);
@@ -1108,7 +1148,7 @@ fn collect_window_references(
 fn collect_window_bound_references(
     exprs: &ExprArena,
     bound: &WindowFrameBound,
-    references: &mut HashSet<SourceId>,
+    references: &mut Vec<SourceId>,
 ) {
     if let WindowFrameBound::Following(expression) | WindowFrameBound::Preceding(expression) = bound
     {

@@ -18,9 +18,9 @@ use super::{
         CompoundArm, Cte, CteId, DatabaseId, Delete, DeleteTargetKind, Expr, ExprArena, ExprId,
         ExprRef, FunctionEvaluation, Grouping, HirDocument, HirRoot, IndexCoverage, IndexHint,
         Insert, InsertTargetKind, Limit, OrderTerm, Output, OutputId, OutputNameKind, OutputOwner,
-        Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SchemaExpressionRoot,
-        SchemaProgramId, Source, SourceColumn, SourceId, SourceKind, SourceOwner, TriggerBody,
-        TriggerCommand, TypeFact, Update, UpdateTargetKind,
+        Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryColumnReads, QueryId, QueryRoot,
+        SchemaExpressionRoot, SchemaProgramId, Source, SourceColumn, SourceId, SourceKind,
+        SourceOwner, TriggerBody, TriggerCommand, TypeFact, Update, UpdateTargetKind,
     },
     query::FromContext,
     scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
@@ -98,9 +98,9 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
             expressions,
         } => analyzer.analyze_register_expressions(inputs, expressions)?,
     };
-    analyzer.finish_column_reads(&root)?;
+    let query_reads = analyzer.finish_column_reads(&root)?;
     let mut document = analyzer.finish(root)?;
-    crate::translate::plan::prepare_planning_terms(&mut document);
+    crate::translate::plan::prepare_planning_terms_with_reads(&mut document, &query_reads);
     #[cfg(debug_assertions)]
     document.validate().map_err(|error| {
         LimboError::InternalError(format!("semantic analysis produced invalid HIR: {error}"))
@@ -556,11 +556,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         })
     }
 
-    fn finish_column_reads(&mut self, root: &HirRoot) -> Result<()> {
-        let mut pending = Vec::new();
-        for query in self.queries.iter().flatten() {
-            query.direct_column_reads(|source| self.source(source), &self.exprs, &mut pending);
-        }
+    fn finish_column_reads(&mut self, root: &HirRoot) -> Result<QueryColumnReads> {
+        let query_reads = QueryColumnReads::collect(
+            self.queries.iter().flatten(),
+            |source| self.source(source),
+            &self.exprs,
+        );
+        let mut pending = query_reads.all().to_vec();
         // An index expression can read a generated column, which then needs
         // its generation expression when the index is used.
         for source in self.sources.iter().flatten() {
@@ -778,7 +780,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     ColumnReadExpression::Planned(expression);
             }
         }
-        Ok(())
+        Ok(query_reads)
     }
 
     pub(super) fn analyze_select(&mut self, select: &'ast ast::Select) -> Result<QueryId> {
@@ -4030,6 +4032,33 @@ mod tests {
         let inner = document.query(*inner_id).expect("inner query exists");
         assert_eq!(inner.parent, Some(middle.id));
         assert_eq!(inner.captures, vec![outer_source]);
+    }
+
+    #[test]
+    fn subquery_reading_outer_sources_in_turns_captures_each_once() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT (SELECT b.id + inner_items.id + a.id + b.value + a.value \
+                     FROM items AS inner_items) \
+             FROM items AS a JOIN items AS b",
+        )
+        .expect("subquery reads both outer sources");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        let from = outer.blocks[0].from.as_ref().expect("outer query has FROM");
+        let mut outer_sources = vec![from.first, from.joins[0].right];
+        outer_sources.sort_unstable();
+        let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) =
+            &document.exprs[outer.blocks[0].outputs[0].expr]
+        else {
+            panic!("output is a scalar subquery");
+        };
+        let inner = document.query(*query).expect("inner query exists");
+        assert_eq!(inner.captures, outer_sources);
     }
 
     #[test]
