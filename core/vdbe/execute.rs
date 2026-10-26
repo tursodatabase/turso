@@ -12329,7 +12329,7 @@ pub fn op_function(
                                 idx_name,
                                 mut where_clause,
                                 using,
-                                with_clause,
+                                mut with_clause,
                             } => {
                                 if table != normalize_ident(tbl_name.as_str()) {
                                     break 'sql None;
@@ -12349,6 +12349,22 @@ pub fn op_function(
                                         &rename_from,
                                         column_def.col_name.as_str(),
                                     );
+                                }
+
+                                if let Some(using) = &using {
+                                    let syms = program.connection.syms.read();
+                                    let Some(index_method) = syms.index_methods.get(using.as_str())
+                                    else {
+                                        return Err(LimboError::InternalError(format!(
+                                            "index method {using} not found during ALTER TABLE RENAME COLUMN"
+                                        ))
+                                        .into());
+                                    };
+                                    index_method.rename_column_in_with_clause(
+                                        &mut with_clause,
+                                        &rename_from,
+                                        column_def.col_name.as_str(),
+                                    )?;
                                 }
 
                                 Some(
