@@ -8049,7 +8049,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
         portable_logical_changes: false,
-        btree_patches: Mutex::new(HashMap::default()),
+        btree_patches: Mutex::new(Vec::new()),
     }
 }
 
@@ -9850,7 +9850,7 @@ fn transaction_display() {
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
         portable_logical_changes: false,
-        btree_patches: Mutex::new(HashMap::default()),
+        btree_patches: Mutex::new(Vec::new()),
     };
 
     let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }] }";

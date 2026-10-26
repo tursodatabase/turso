@@ -1166,8 +1166,9 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// For versions that this transaction created, by version id: a patch that
     /// makes the record of the version from the B-tree record of its row. The
     /// versions keep their records until the commit writes them to the logical
-    /// log. Then each version stores its patch in place of its record.
-    btree_patches: Mutex<HashMap<u64, crate::alloc::ArcSlice<u8>>>,
+    /// log. Then each version stores its patch in place of its record. Sorted
+    /// by version id, because versions get increasing ids.
+    btree_patches: Mutex<Vec<(u64, crate::alloc::ArcSlice<u8>)>>,
 }
 
 impl<A: RowVersionAllocator> Transaction<A> {
@@ -1197,7 +1198,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             commit_dep_set: Mutex::new(HashSet::default()),
             holds_blocking_checkpoint_read: AtomicBool::new(false),
             created_table_ids: Mutex::new(Vec::new()),
-            btree_patches: Mutex::new(HashMap::default()),
+            btree_patches: Mutex::new(Vec::new()),
         }
     }
 
@@ -3192,7 +3193,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         }
         // The log record already holds the records of the new versions, so a
         // version that has a B-tree patch can now store it in place of its record.
-        let mut btree_patches = tx.btree_patches.lock();
+        let btree_patches = tx.btree_patches.lock();
         let mut iterations = 0;
         while ctx.cursor < write_set_len && iterations < MVCC_COMMIT_BATCH_SIZE {
             let (_id, row_versions) = &write_set.entries[ctx.cursor];
@@ -3204,13 +3205,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 {
                     continue;
                 }
-                let Some(patch) = btree_patches.remove(&row_version.id) else {
+                let Ok(index) = btree_patches.binary_search_by_key(&row_version.id, |(id, _)| *id)
+                else {
                     continue;
                 };
                 // A version that a transaction already ended keeps its record,
                 // because the commit of that transaction can read it.
                 if row_version.end().is_none() {
-                    row_version.store_btree_patch(patch);
+                    row_version.store_btree_patch(btree_patches[index].1.clone());
                 }
             }
             ctx.cursor += 1;
@@ -6186,7 +6188,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         if replaced.begin() == Some(TxTimestampOrID::TxID(tx_id)) {
             let patches = tx.btree_patches.lock();
-            return Ok(match (&replaced.data, patches.get(&replaced.id)) {
+            let patch = patches
+                .binary_search_by_key(&replaced.id, |(id, _)| *id)
+                .ok()
+                .map(|index| &patches[index].1);
+            return Ok(match (&replaced.data, patch) {
                 (Some(record), Some(patch)) if replaced.payload_kind == PayloadKind::Record => {
                     PatchBase::EarlierVersion {
                         record: record.clone(),
@@ -6205,24 +6211,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         })
     }
 
-    /// The visible version of table row `id` that `tx_id` is going to end, if
-    /// the commit of the transaction needs the record of that version. The
-    /// commit writes the primary key of each version that a transaction with
-    /// portable logical changes ends, and it reads the key from the record of
-    /// the version. See [`Self::store_record_of_ended_version`].
-    pub(crate) fn version_to_end_that_needs_its_record(
-        &self,
-        tx_id: TxID,
-        id: &RowID,
-    ) -> Result<Option<Row>> {
+    /// Whether the commit of `tx_id` reads the record of each table-row version
+    /// that the transaction ends. It does for portable logical changes: the
+    /// commit writes the primary key of each such version, and it reads the key
+    /// from the record of the version. See [`Self::store_record_of_ended_version`].
+    pub(crate) fn commit_reads_records_of_ended_versions(&self, tx_id: TxID) -> Result<bool> {
         let tx = self
             .txs
             .get(&tx_id)
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-        if !tx.value().portable_logical_changes || !matches!(id.row_id, RowKey::Int(_)) {
-            return Ok(None);
-        }
-        self.read_from_table_or_index(tx_id, id, None)
+        Ok(tx.value().portable_logical_changes)
     }
 
     /// Stores `record` in the version of table row `id` that `tx_id` ended
@@ -6275,10 +6273,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .find(|rv| rv.begin() == Some(TxTimestampOrID::TxID(tx_id)) && rv.end().is_none())
             .expect("the version that a transaction just wrote must be in its chain");
         turso_assert_eq!(new_version.payload_kind, PayloadKind::Record);
-        tx.value()
-            .btree_patches
-            .lock()
-            .insert(new_version.id, patch);
+        let mut patches = tx.value().btree_patches.lock();
+        turso_assert!(
+            patches.last().is_none_or(|(id, _)| *id < new_version.id),
+            "the versions of a transaction get increasing ids"
+        );
+        patches.push((new_version.id, patch));
         Ok(())
     }
 

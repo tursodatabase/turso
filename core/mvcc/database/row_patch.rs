@@ -25,12 +25,14 @@ use smallvec::SmallVec;
 /// each column in which the two records differ, and also each column that the
 /// patch `also_set` sets.
 ///
-/// Returns `false` when `target` does not have the encoding that [`apply`]
-/// writes. Then a patch cannot make the same bytes, and `out` is not a patch.
+/// Returns `false`, and writes nothing, when the patch would be longer than
+/// `max_len` bytes, or when `target` does not have the encoding that [`apply`]
+/// writes. In the second case a patch cannot make the same bytes.
 pub(crate) fn diff(
     base: &[u8],
     target: &[u8],
     also_set: Option<&[u8]>,
+    max_len: usize,
     out: &mut Vec<u8>,
 ) -> Result<bool> {
     let base_columns = parse_record(base)?;
@@ -44,14 +46,24 @@ pub(crate) fn diff(
     };
     let mut next_also_set = next_set_column(&mut also_set)?;
     let mut set_columns: SmallVec<[usize; 16]> = SmallVec::new();
+    let mut set_columns_len = 0;
     for (index, column) in target_columns.iter().enumerate() {
         while next_also_set.is_some_and(|set| set.index < index) {
             next_also_set = next_set_column(&mut also_set)?;
         }
         let set_by_also_set = next_also_set.is_some_and(|set| set.index == index);
         if set_by_also_set || base_columns.get(index) != Some(column) {
+            let gap = index - set_columns.last().copied().unwrap_or(0);
+            set_columns_len +=
+                varint_len(gap as u64) + varint_len(column.serial_type) + column.value.len();
             set_columns.push(index);
         }
+    }
+    let patch_len = varint_len(target_columns.len() as u64)
+        + varint_len(set_columns.len() as u64)
+        + set_columns_len;
+    if patch_len > max_len {
+        return Ok(false);
     }
 
     out.clear();
@@ -281,7 +293,7 @@ mod tests {
 
     fn patch(base: &[u8], target: &[u8], also_set: Option<&[u8]>) -> Vec<u8> {
         let mut out = Vec::new();
-        assert!(diff(base, target, also_set, &mut out).unwrap());
+        assert!(diff(base, target, also_set, usize::MAX, &mut out).unwrap());
         out
     }
 
@@ -491,7 +503,19 @@ mod tests {
         // Header size 3 in two bytes, serial type 1, value 5.
         let target = [0x80, 0x03, 0x01, 0x05];
         let mut out = Vec::new();
-        assert!(!diff(&base, &target, None, &mut out).unwrap());
+        assert!(!diff(&base, &target, None, usize::MAX, &mut out).unwrap());
+    }
+
+    #[test]
+    fn diff_refuses_a_patch_longer_than_its_limit() {
+        let base = record(&[Value::from_i64(1), Value::build_text("a")]);
+        let target = record(&[Value::from_i64(1), Value::build_text("bcd")]);
+        let full = patch(&base, &target, None);
+        let mut out = Vec::new();
+        assert!(!diff(&base, &target, None, full.len() - 1, &mut out).unwrap());
+        assert!(out.is_empty());
+        assert!(diff(&base, &target, None, full.len(), &mut out).unwrap());
+        assert_eq!(out, full);
     }
 
     #[test]
