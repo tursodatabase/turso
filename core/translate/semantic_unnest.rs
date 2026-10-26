@@ -34,15 +34,16 @@ use rustc_hash::FxHashSet as HashSet;
 /// plan. Blocks are decided from the innermost query out, so a block is
 /// costed with the forms already chosen for the queries it runs.
 /// Also return the parameters of the parts the kept rewrites dropped, such
-/// as the SELECT list of an EXISTS, which callers still bind.
+/// as the SELECT list of an EXISTS, which callers still bind, and the plan
+/// of the returned document when costing the rewrites already built it.
 pub(crate) fn unnest_correlated_subqueries(
     document: Arc<HirDocument>,
     schema: &Schema,
     params: &CostModelParams,
     mode: crate::SubqueryUnnestingMode,
-) -> Result<(Arc<HirDocument>, Vec<hir::Parameter>)> {
+) -> Result<(Arc<HirDocument>, Vec<hir::Parameter>, Option<HirPlan>)> {
     if mode == crate::SubqueryUnnestingMode::Disabled || document.queries.len() < 2 {
-        return Ok((document, Vec::new()));
+        return Ok((document, Vec::new(), None));
     }
     let candidates = queries_innermost_first(&document)
         .into_iter()
@@ -53,7 +54,7 @@ pub(crate) fn unnest_correlated_subqueries(
         .filter(|block| has_candidate(&document, *block))
         .collect::<Vec<_>>();
     if candidates.is_empty() {
-        return Ok((document, Vec::new()));
+        return Ok((document, Vec::new(), None));
     }
     let mut document = document;
     let mut dropped_parameters = Vec::new();
@@ -103,7 +104,7 @@ pub(crate) fn unnest_correlated_subqueries(
             dropped_parameters.extend(dropped);
         }
     }
-    Ok((document, dropped_parameters))
+    Ok((document, dropped_parameters, original_plan))
 }
 
 /// Whether `block` has a FULL join and no correlated subquery left.

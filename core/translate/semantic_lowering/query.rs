@@ -11216,6 +11216,26 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn unnesting_returns_the_plan_of_the_document_it_keeps() {
+        let (document, schema) = analyze_sql_with_schema(
+            indexed_items_schema(),
+            "SELECT value FROM items AS a \
+             WHERE EXISTS (SELECT 1 FROM items AS b WHERE b.extra = a.extra)",
+        );
+        let document = Arc::new(document);
+        let (unnested, _, plan) = crate::translate::semantic_unnest::unnest_correlated_subqueries(
+            document.clone(),
+            &schema,
+            &CostModelParams::default(),
+            crate::SubqueryUnnestingMode::Forced,
+        )
+        .expect("unnesting succeeds");
+        assert!(!Arc::ptr_eq(&unnested, &document));
+        let plan = plan.expect("costing the rewrite plans the kept document");
+        assert!(Arc::ptr_eq(&plan.document, &unnested));
+    }
+
+    #[test]
     fn planned_ungrouped_aggregates_use_hir_ids_and_shared_steps() {
         let plan = analyze_plan(
             indexed_items_schema(),

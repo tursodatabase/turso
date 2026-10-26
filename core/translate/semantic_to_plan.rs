@@ -425,9 +425,12 @@ impl HirPlan {
         params: &CostModelParams,
         mode: crate::SubqueryUnnestingMode,
     ) -> Result<Self> {
-        let (document, dropped_parameters) =
+        let (document, dropped_parameters, plan) =
             super::semantic_unnest::unnest_correlated_subqueries(document, schema, params, mode)?;
-        let mut plan = Self::build_without_unnesting(document, schema, params)?;
+        let mut plan = match plan {
+            Some(plan) => plan,
+            None => Self::build_without_unnesting(document, schema, params)?,
+        };
         plan.dropped_parameters = dropped_parameters;
         Ok(plan)
     }

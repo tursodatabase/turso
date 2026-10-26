@@ -1256,7 +1256,7 @@ pub(crate) fn plan_view(
     let context = catalog.scoped_to_database(hir::DatabaseId::new(crate::MAIN_DB_ID));
     let statement = ast::Stmt::Select(select.clone());
     let document = analyze_root(&context, SemanticRootInput::Statement(&statement))?;
-    let (document, _) = crate::translate::semantic_unnest::unnest_correlated_subqueries(
+    let (document, _, _) = crate::translate::semantic_unnest::unnest_correlated_subqueries(
         Arc::new(document),
         context.main_schema(),
         crate::translate::optimizer::cost_model_params(),
