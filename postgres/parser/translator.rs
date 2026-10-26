@@ -5329,6 +5329,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_publication"
             | "pg_publication_namespace"
             | "pg_publication_rel"
+            | "pg_sequence"
             | "pg_sequences"
             | "pg_constraint"
             | "pg_index"
