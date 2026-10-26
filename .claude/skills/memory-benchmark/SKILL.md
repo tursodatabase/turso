@@ -49,6 +49,25 @@ so a debug build gives the same numbers as an optimized build. The dhat file's
 "At exit" values are the live allocations at the committed measurement. See
 `perf/memory/README.md` for details.
 
+## MVCC Memory of Old Row Versions
+
+The `mvcc-version-memory` binary measures the heap of the old versions that
+updates leave in the MvStore. `t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)` has
+`--rows` checkpointed rows with `--text-bytes` of text. Then `--updates`
+transactions each add 1 to `a` in one random row. By default a reader keeps the
+snapshot from before the updates, so GC cannot remove the old versions;
+`--no-reader` runs without it. Use it to measure how old versions are stored
+(for example, as deltas of the newer version).
+
+```bash
+cargo run --profile bench-profile -p memory-benchmark --bin mvcc-version-memory -- \
+  --rows 10000 --text-bytes 300 --updates 100000 [--no-reader] --dhat-file /tmp/versions.json
+```
+
+The JSON report has `live_bytes_per_update`, `peak_bytes`, `live_bytes` and
+`allocations_per_update`, all for the update phase only. After the updates, the
+reader checks that it still sees its snapshot.
+
 ## FTS Query Allocations
 
 The `fts-memory` binary and `perf/memory/codspeed/benches/fts_queries.rs` share

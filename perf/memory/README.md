@@ -274,3 +274,34 @@ The dhat file shows the live allocations at the committed measurement as "At exi
 The values count the bytes that the code requests, so they are the same for debug
 and optimized builds. The process RSS is higher because the allocator rounds sizes.
 `--mode wal` runs the same statements in WAL mode for comparison.
+
+# MVCC memory of old row versions
+
+`mvcc-version-memory` measures how much heap MVCC keeps for the old versions of
+updated rows. Table `t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)` has `--rows`
+rows with `--text-bytes` bytes of text, which a checkpoint writes to the B-tree.
+Then `--updates` transactions each add 1 to `a` in one random row. Each update
+ends the current version of a row and begins a new one.
+
+```bash
+cargo run --profile bench-profile -p memory-benchmark --bin mvcc-version-memory -- \
+  --rows 10000 --text-bytes 300 --updates 100000
+cargo run --profile bench-profile -p memory-benchmark --bin mvcc-version-memory -- --no-reader
+python3 perf/memory/analyze-dhat.py dhat-heap.json --top 10
+```
+
+By default, a reader keeps a snapshot from before the updates, as a long
+transaction does. GC cannot remove an old version that this reader can see, so
+`live_bytes_per_update` is the heap of one old version. After the updates, the
+reader reads all rows and makes sure that it still sees its snapshot.
+`--no-reader` runs the updates with GC and without a reader.
+
+| Field | Value |
+|-------|-------|
+| `live_bytes_per_update` | Live heap that the updates added, divided by the update count |
+| `peak_bytes` | Highest live heap during the updates, above the heap before them |
+| `live_bytes` | Live heap after the updates, above the heap before them |
+| `allocations_per_update` | Heap allocations that the updates made, for each update |
+
+Setup and the read of the reader are not measured. Automatic checkpoints are off
+during the updates. The values count the bytes that the code requests.

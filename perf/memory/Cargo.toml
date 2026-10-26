@@ -18,6 +18,10 @@ name = "mvcc-row-memory"
 path = "src/mvcc_row_memory.rs"
 
 [[bin]]
+name = "mvcc-version-memory"
+path = "src/mvcc_version_memory.rs"
+
+[[bin]]
 name = "fts-memory"
 path = "src/fts_memory.rs"
 required-features = ["fts"]
