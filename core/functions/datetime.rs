@@ -1,5 +1,5 @@
 use crate::io::clock::Clock;
-use crate::numeric::Numeric;
+use crate::numeric::{format_float, format_float_g, Numeric};
 use crate::types::AsValueRef;
 use crate::types::{TextRef, TextSubtype, Value};
 use crate::vdbe::affinity::is_space;
@@ -1274,6 +1274,8 @@ where
     let fmt_str = match arg_as_text(fmt_val.as_value_ref()) {
         ValueRef::Text(s) => Cow::Borrowed(s.as_str()),
         ValueRef::Null => return Value::Null,
+        // a REAL is rendered the way the TEXT affinity renders it
+        ValueRef::Numeric(Numeric::Float(f)) => Cow::Owned(format_float(f64::from(f))),
         val => Cow::Owned(val.to_string()),
     };
 
@@ -1413,13 +1415,7 @@ where
             }
             Some('J') => {
                 let val = p.i_jd as f64 / 86400000.0;
-                if val.abs() >= 1_000_000.0 && val.abs() < 10_000_000.0 {
-                    let s = format!("{val:.9}");
-                    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-                    write!(res, "{trimmed}").unwrap();
-                } else {
-                    write!(res, "{val}").unwrap();
-                }
+                write!(res, "{}", format_float_g(val, 16)).unwrap();
             }
             Some('k') => write!(res, "{:2}", p.h).unwrap(),
             Some('l') => {
@@ -1501,6 +1497,7 @@ fn arg_as_text(value: ValueRef<'_>) -> ValueRef<'_> {
 mod tests {
     use super::*;
     use crate::io::clock::DefaultClock;
+    use crate::numeric::nonnan::NonNan;
 
     #[test]
     fn test_valid_get_date_from_time_value() {
@@ -2757,6 +2754,47 @@ mod tests {
         let date = Value::build_text("2023-01-01".to_string());
         let expected = Value::build_text("100%".to_string());
         assert_eq!(exec_strftime(&DefaultClock, &[fmt, date]), expected);
+    }
+
+    #[test]
+    fn test_strftime_julian_day_digits() {
+        // the expectations are SQLite's own printf('%.16g', strftime('%J', …))
+        let fmt = Value::build_text("%J".to_string());
+        let cases: &[(&str, &str)] = &[
+            ("2000-01-01", "2451544.5"),
+            ("2003-10-31 12:34:56.432", "2452944.024264259"),
+            ("2023-01-01 12:00:00", "2459946"),
+            ("2024-01-01", "2460310.5"),
+            ("2024-01-01 00:00:00.5", "2460310.500005787"),
+            ("2026-10-14 12:34:56.789", "2461328.024268391"),
+            ("10.609676180555555", "10.60967618055555"),
+            ("0.0", "0"),
+            ("0.0001", "0.0001"),
+            ("0.000001", "9.953703703703704e-07"),
+            ("2451630.0009765625", "2451630.000976563"),
+        ];
+
+        for (time, expected) in cases {
+            let date = Value::build_text(*time);
+            assert_eq!(
+                exec_strftime(&DefaultClock, &[fmt.clone(), date]),
+                Value::build_text(*expected),
+                "strftime('%J', '{time}')"
+            );
+        }
+    }
+
+    #[test]
+    fn test_strftime_real_format_argument() {
+        // a REAL format argument goes through the same text conversion as
+        // CAST(… AS TEXT), which is 15 significant digits, not Rust's
+        // shortest round-trip form
+        let fmt = Value::Numeric(Numeric::Float(NonNan::new(2_460_324.875_173_611).unwrap()));
+        let date = Value::Numeric(Numeric::Integer(0));
+        assert_eq!(
+            exec_strftime(&DefaultClock, &[fmt, date]),
+            Value::build_text("2460324.87517361")
+        );
     }
 
     #[test]
