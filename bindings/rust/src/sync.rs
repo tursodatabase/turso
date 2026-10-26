@@ -1848,7 +1848,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "flaky, see https://github.com/tursodatabase/turso/issues/7087"]
     pub async fn test_sync_parallel_writes_with_sync_ops() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -1946,12 +1945,24 @@ mod tests {
         // Sequential writes: 3 more large inserts
         for i in 0..after_cnt {
             let data = format!("sequential_{i}_{payload}");
-            conn.execute(
-                "INSERT INTO test_data (payload) VALUES (?)",
-                crate::params::Params::Positional(vec![Value::Text(data)]),
-            )
-            .await
-            .unwrap();
+            // A running pull or checkpoint makes inserts fail with Busy right away.
+            loop {
+                let result = conn
+                    .execute(
+                        "INSERT INTO test_data (payload) VALUES (?)",
+                        crate::params::Params::Positional(vec![Value::Text(data.clone())]),
+                    )
+                    .await;
+                match result {
+                    Err(crate::Error::Busy(_)) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await
+                    }
+                    result => {
+                        result.unwrap();
+                        break;
+                    }
+                }
+            }
         }
 
         // Signal sync task to stop and wait for it
