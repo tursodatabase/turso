@@ -728,6 +728,36 @@ test fk-deferred-self-unique-parent-affinity-does-not-coerce-same-row-child {
 expect error {
 }
 
+# The parent-side check of an INSERT runs after the new row is written. It
+# must not count the new row as a child of its own key, or a row that
+# references itself repairs a deferred violation of a different row.
+@cross-check-integrity
+test fk-deferred-self-reference-insert-does-not-repair-other-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b REFERENCES t1(a) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO t1 VALUES(1, 99);
+    INSERT INTO t1 VALUES(2, 2);
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-deferred-self-reference-insert-does-not-repair-other-row-indexed {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b REFERENCES t1(a) DEFERRABLE INITIALLY DEFERRED);
+    CREATE INDEX i1 ON t1(b);
+    BEGIN;
+    INSERT INTO t1 VALUES(1, 99);
+    INSERT INTO t1 VALUES(2, 2);
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
 @cross-check-integrity
 test fk-self-unique-same-row-stored-values-match {
     PRAGMA foreign_keys=ON;
