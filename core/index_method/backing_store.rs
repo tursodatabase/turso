@@ -5,13 +5,13 @@ use std::sync::{Arc, Weak};
 
 use crate::{
     index_method::{btree_root_page, IndexMethodContext, BACKING_BTREE_INDEX_METHOD_NAME},
-    mvcc::{cursor::MvccCursorType, database::MVTableId},
+    mvcc::database::MVTableId,
     return_if_io,
     schema::{Type, TURSO_INTERNAL_PREFIX},
     storage::btree::{BTreeCursor, CursorTrait},
     types::{IOResult, IOResultOr, IndexInfo, KeyInfo},
     util::quote_identifier,
-    Connection, LimboError, MvCursor, MvStore, Result,
+    Connection, LimboError, MvStore, Result,
 };
 
 impl IndexMethodContext {
@@ -329,17 +329,18 @@ impl BackingStore {
             self.index_info.num_cols,
         );
         cursor.index_info = Some(Arc::clone(&self.index_info));
-        let Some(binding) = &self.mvcc else {
-            return Ok(Box::new(cursor));
-        };
-        Ok(Box::new(MvCursor::new(
-            Arc::clone(&binding.mv_store),
-            &connection,
-            binding.tx_id,
-            self.root_page,
-            MvccCursorType::Index(Arc::clone(&self.index_info)),
-            Box::new(cursor),
-        )?))
+        if let Some(binding) = &self.mvcc {
+            #[cfg(any(test, injected_yields))]
+            cursor.install_yield_context(&connection);
+            cursor.read_mvcc_index(
+                Arc::clone(&binding.mv_store),
+                &connection,
+                binding.tx_id,
+                self.root_page,
+                Arc::clone(&self.index_info),
+            )?;
+        }
+        Ok(Box::new(cursor))
     }
 
     pub fn root_page(&self) -> i64 {

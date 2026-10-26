@@ -20591,9 +20591,9 @@ fn test_delete_of_btree_row_conflicts_with_active_concurrent_delete() {
 }
 
 /// Regression for #6754: dropping a Statement that paused mid-IO inside
-/// op_new_rowid leaks the per-table RowidAllocator lock. With the Drop
-/// impl on MvccLazyCursor, end_new_rowid runs on cursor teardown so the
-/// next INSERT into the same table from any connection makes progress.
+/// op_new_rowid leaks the per-table RowidAllocator lock. The cursor holds the
+/// lock in a guard that unlocks it on drop, so the next INSERT into the same
+/// table from any connection makes progress.
 #[test]
 fn rowid_allocator_lock_released_when_statement_dropped_at_seek_yield() {
     use std::time::{Duration, Instant};
@@ -20623,9 +20623,25 @@ fn rowid_allocator_lock_released_when_statement_dropped_at_seek_yield() {
         crate::StepResult::Yield => {}
         other => panic!("expected yield from injected seek_start; got {other:?}"),
     }
+    let mv_store = db.get_mvcc_store();
+    let root_page = get_rows(
+        &victim,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let allocator = mv_store.get_rowid_allocator(&mv_store.get_table_id_from_root_page(root_page));
+    let lock_was_free = allocator.lock();
+    if lock_was_free {
+        allocator.unlock();
+    }
+    assert!(
+        !lock_was_free,
+        "the statement must hold the rowid allocator lock at the yield"
+    );
 
-    // Drop the statement without advancing past the yield. The Drop impl
-    // on MvccLazyCursor must release the rowid allocator lock.
+    // Drop the statement without advancing past the yield. Dropping the
+    // cursor must release the rowid allocator lock.
     drop(leak_stmt);
     leaker.set_yield_injector(None);
 
@@ -24851,19 +24867,6 @@ fn check_reader_against_model(
         let mut cursor = open_mvcc_table_reader(db, reader, 2);
         walk_mvcc_table_reader(&mut cursor, &pager, rows, &keys, rng);
     }
-    let forward: Vec<(i64, String)> = rows.iter().map(|(id, v)| (*id, v.clone())).collect();
-    let backward: Vec<(i64, String)> = forward.iter().rev().cloned().collect();
-    assert_eq!(
-        scan_with_mvcc_lazy_cursor(db, reader, IterationDirection::Forwards),
-        forward,
-        "MvccLazyCursor, which write cursors still use, must see the rows of the reader"
-    );
-    assert_eq!(
-        scan_with_mvcc_lazy_cursor(db, reader, IterationDirection::Backwards),
-        backward,
-        "MvccLazyCursor, which write cursors still use, must see the rows of the reader"
-    );
-
     let expected: Vec<Vec<Value>> = rows
         .iter()
         .map(|(id, v)| vec![Value::from_i64(*id), Value::from_text(v.clone())])
@@ -24923,7 +24926,7 @@ fn open_mvcc_table_reader(
     reader: &Arc<Connection>,
     num_columns: usize,
 ) -> BTreeCursor {
-    use crate::storage::btree::{CursorTrait, MvccReader};
+    use crate::storage::btree::CursorTrait;
 
     let mv_store = db.get_mvcc_store();
     let tx_id = reader.get_mv_tx_id().unwrap();
@@ -24941,65 +24944,11 @@ fn open_mvcc_table_reader(
     let mut cursor =
         BTreeCursor::new_table(reader.pager.load().clone(), btree_root_page, num_columns);
     cursor.install_yield_context(reader);
-    cursor.read_mvcc_table(MvccReader::new(mv_store, reader, tx_id, root_page).unwrap());
+    cursor
+        .read_mvcc_table(mv_store, reader, tx_id, root_page)
+        .unwrap();
     assert!(cursor.is_mvcc());
     cursor
-}
-
-fn scan_with_mvcc_lazy_cursor(
-    db: &MvccTestDbNoConn,
-    reader: &Arc<Connection>,
-    direction: IterationDirection,
-) -> Vec<(i64, String)> {
-    use crate::storage::btree::CursorTrait;
-
-    let mv_store = db.get_mvcc_store();
-    let root_page = get_rows(
-        reader,
-        "SELECT rootpage FROM sqlite_schema WHERE name = 't'",
-    )[0][0]
-        .as_int()
-        .unwrap();
-    let btree_root_page = if root_page < 0 {
-        mv_store.get_real_table_id(root_page)
-    } else {
-        root_page
-    };
-    let pager = reader.pager.load().clone();
-    let mut cursor = MvccLazyCursor::new(
-        mv_store,
-        reader,
-        reader.get_mv_tx_id().unwrap(),
-        root_page,
-        MvccCursorType::Table,
-        Box::new(BTreeCursor::new_table(pager.clone(), btree_root_page, 2)),
-    )
-    .unwrap();
-    match direction {
-        IterationDirection::Forwards => drive_cursor_io(&pager, || cursor.rewind()),
-        IterationDirection::Backwards => drive_cursor_io(&pager, || cursor.last()),
-    }
-    let mut rows = Vec::new();
-    while let Some(rowid) = drive_cursor_io(&pager, || cursor.rowid()) {
-        let value = loop {
-            match cursor.record().unwrap() {
-                IOResult::Done(record) => {
-                    break record
-                        .expect("a positioned cursor must have a record")
-                        .get_value_opt(1)
-                        .and_then(|value| value.to_text().map(str::to_string))
-                        .expect("column v must be text");
-                }
-                IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
-            }
-        };
-        rows.push((rowid, value));
-        match direction {
-            IterationDirection::Forwards => drive_cursor_io(&pager, || cursor.next()),
-            IterationDirection::Backwards => drive_cursor_io(&pager, || cursor.prev()),
-        }
-    }
-    rows
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25088,7 +25037,7 @@ fn drive_cursor_io<T>(
     }
 }
 
-fn first_model_position(keys: &[i64]) -> ModelPosition {
+fn first_model_position<T>(keys: &[T]) -> ModelPosition {
     if keys.is_empty() {
         ModelPosition::AfterLast
     } else {
@@ -25096,14 +25045,14 @@ fn first_model_position(keys: &[i64]) -> ModelPosition {
     }
 }
 
-fn last_model_position(keys: &[i64]) -> ModelPosition {
+fn last_model_position<T>(keys: &[T]) -> ModelPosition {
     match keys.len().checked_sub(1) {
         Some(index) => ModelPosition::At(index),
         None => ModelPosition::BeforeFirst,
     }
 }
 
-fn next_model_position(position: ModelPosition, keys: &[i64]) -> ModelPosition {
+fn next_model_position<T>(position: ModelPosition, keys: &[T]) -> ModelPosition {
     match position {
         ModelPosition::Unpositioned => ModelPosition::Unpositioned,
         ModelPosition::BeforeFirst => first_model_position(keys),
@@ -25113,7 +25062,7 @@ fn next_model_position(position: ModelPosition, keys: &[i64]) -> ModelPosition {
     }
 }
 
-fn prev_model_position(position: ModelPosition, keys: &[i64]) -> ModelPosition {
+fn prev_model_position<T>(position: ModelPosition, keys: &[T]) -> ModelPosition {
     match position {
         ModelPosition::Unpositioned => ModelPosition::Unpositioned,
         ModelPosition::AfterLast => last_model_position(keys),
@@ -25209,8 +25158,481 @@ fn assert_cursor_row(
     }
 }
 
+const INDEX_READER_ROW_SPACE: i64 = 60;
+
+/// The columns `a` and `b` of the rows of table `t`, by rowid.
+type IndexedRows = BTreeMap<i64, (Option<i64>, String)>;
+
+/// An entry of index `i` on `t(a, b)`. Its last column is the rowid.
+#[derive(Clone, PartialEq, Eq)]
+struct IndexEntry {
+    a: Option<i64>,
+    b: String,
+    rowid: i64,
+}
+
+impl std::fmt::Debug for IndexEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let first = self.b.chars().next().map(String::from).unwrap_or_default();
+        let last = self.b.chars().last().map(String::from).unwrap_or_default();
+        write!(
+            f,
+            "({:?}, {} chars {first}..{last}, {})",
+            self.a,
+            self.b.len(),
+            self.rowid
+        )
+    }
+}
+
+/// The same scenarios as `mvcc_table_reader_matches_a_model_of_the_snapshot`,
+/// for a cursor on an index. Many entries share their first columns, and
+/// some keys do not fit in an index cell.
 #[test]
-fn mvcc_reader_and_mvcc_lazy_cursor_see_the_same_rows_when_the_btree_covers_a_chain() {
+fn mvcc_index_reader_matches_a_model_of_the_snapshot() {
+    for seed in 0..16 {
+        for passive in [false, true] {
+            for descending in [false, true] {
+                run_mvcc_index_reader_scenario(seed, passive, descending);
+            }
+        }
+    }
+}
+
+fn run_mvcc_index_reader_scenario(seed: u64, passive: bool, descending: bool) {
+    println!("seed={seed} passive={passive} descending={descending}");
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let db = if passive {
+        MvccTestDbNoConn::new_with_random_db_passive()
+    } else {
+        MvccTestDbNoConn::new_with_random_db()
+    };
+    let checkpoint = if passive {
+        "PRAGMA wal_checkpoint(PASSIVE)"
+    } else {
+        "PRAGMA wal_checkpoint(TRUNCATE)"
+    };
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    if rng.random_bool(0.5) {
+        writer.execute("PRAGMA mvcc_gc_threshold = 1").unwrap();
+    }
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)")
+        .unwrap();
+    let order = if descending { "DESC" } else { "ASC" };
+    writer
+        .execute(format!("CREATE INDEX i ON t(a {order}, b)"))
+        .unwrap();
+    let mut committed = IndexedRows::new();
+    for _ in 0..rng.random_range(1..6) {
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        for _ in 0..rng.random_range(1..40) {
+            write_random_indexed_row(&writer, &mut rng, &mut committed, 0..3);
+        }
+        writer.execute("COMMIT").unwrap();
+        if rng.random_bool(0.6) {
+            writer.execute(checkpoint).unwrap();
+        }
+    }
+
+    let unfinished = db.connect();
+    unfinished.execute("BEGIN CONCURRENT").unwrap();
+    let mut unfinished_rows = committed.clone();
+    for _ in 0..rng.random_range(0..15) {
+        write_random_indexed_row(&unfinished, &mut rng, &mut unfinished_rows, 1..2);
+    }
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    get_rows(&reader, "SELECT count(*) FROM t");
+    let mut snapshot = committed.clone();
+
+    let late = db.connect();
+    for _ in 0..rng.random_range(0..3) {
+        late.execute("BEGIN CONCURRENT").unwrap();
+        for _ in 0..rng.random_range(1..15) {
+            write_random_indexed_row(&late, &mut rng, &mut committed, 2..3);
+        }
+        late.execute("COMMIT").unwrap();
+        if passive && rng.random_bool(0.6) {
+            late.execute(checkpoint).unwrap();
+        }
+    }
+    for _ in 0..rng.random_range(0..15) {
+        write_random_indexed_row(&reader, &mut rng, &mut snapshot, 0..1);
+    }
+
+    check_index_reader_against_model(&db, &reader, &snapshot, descending, &mut rng);
+
+    reader.execute("ROLLBACK").unwrap();
+    unfinished.execute("ROLLBACK").unwrap();
+}
+
+fn write_random_indexed_row(
+    conn: &Arc<Connection>,
+    rng: &mut ChaCha8Rng,
+    rows: &mut IndexedRows,
+    residues: std::ops::Range<i64>,
+) {
+    let rowid = loop {
+        let rowid = rng.random_range(1..=INDEX_READER_ROW_SPACE);
+        if residues.contains(&(rowid % 3)) {
+            break rowid;
+        }
+    };
+    let (a, b) = random_indexed_columns(rng);
+    let a_sql = a.map_or("NULL".to_string(), |a| a.to_string());
+    match rows.entry(rowid) {
+        Entry::Vacant(entry) => {
+            conn.execute(format!("INSERT INTO t VALUES ({rowid}, {a_sql}, '{b}')"))
+                .unwrap();
+            entry.insert((a, b));
+        }
+        Entry::Occupied(mut entry) if rng.random_bool(0.5) => {
+            conn.execute(format!(
+                "UPDATE t SET a = {a_sql}, b = '{b}' WHERE id = {rowid}"
+            ))
+            .unwrap();
+            entry.insert((a, b));
+        }
+        Entry::Occupied(entry) => {
+            conn.execute(format!("DELETE FROM t WHERE id = {rowid}"))
+                .unwrap();
+            entry.remove();
+        }
+    }
+}
+
+/// The values come from small sets, so that many entries have the same
+/// first columns. The long values do not fit in an index cell, and two of
+/// them are different only after the part that fits.
+fn random_indexed_columns(rng: &mut ChaCha8Rng) -> (Option<i64>, String) {
+    let a = if rng.random_bool(0.15) {
+        None
+    } else {
+        Some(rng.random_range(0..4))
+    };
+    let b = match rng.random_range(0..6) {
+        0 => String::new(),
+        1 => "k".to_string(),
+        2 => "kk".to_string(),
+        3 => "l".repeat(2000),
+        4 => format!("{}m", "l".repeat(2000)),
+        _ => "m".repeat(6000),
+    };
+    (a, b)
+}
+
+fn check_index_reader_against_model(
+    db: &MvccTestDbNoConn,
+    reader: &Arc<Connection>,
+    rows: &IndexedRows,
+    descending: bool,
+    rng: &mut ChaCha8Rng,
+) {
+    let pager = reader.pager.load().clone();
+    let mut entries: Vec<IndexEntry> = rows
+        .iter()
+        .map(|(rowid, (a, b))| IndexEntry {
+            a: *a,
+            b: b.clone(),
+            rowid: *rowid,
+        })
+        .collect();
+    entries.sort_by(|left, right| compare_index_entries(left, right, 3, descending));
+    for _ in 0..4 {
+        let mut cursor = open_mvcc_index_reader(db, reader);
+        walk_mvcc_index_reader(&mut cursor, &pager, &entries, descending, rng);
+    }
+    let rowids = |entries: &mut dyn Iterator<Item = &IndexEntry>| -> Vec<Vec<Value>> {
+        entries
+            .map(|entry| vec![Value::from_i64(entry.rowid)])
+            .collect()
+    };
+    let order = if descending { "DESC" } else { "ASC" };
+    assert_eq!(
+        get_rows(
+            reader,
+            &format!("SELECT id FROM t ORDER BY a {order}, b, id")
+        ),
+        rowids(&mut entries.iter())
+    );
+    for a in 0..4 {
+        assert_eq!(
+            get_rows(
+                reader,
+                &format!("SELECT id FROM t WHERE a = {a} ORDER BY b, id")
+            ),
+            rowids(&mut entries.iter().filter(|entry| entry.a == Some(a)))
+        );
+        assert_eq!(
+            get_rows(
+                reader,
+                &format!("SELECT id FROM t WHERE a > {a} ORDER BY a {order}, b, id")
+            ),
+            rowids(&mut entries.iter().filter(|entry| entry.a > Some(a)))
+        );
+    }
+    assert_eq!(
+        get_rows(reader, "SELECT id FROM t WHERE a IS NULL ORDER BY b, id"),
+        rowids(&mut entries.iter().filter(|entry| entry.a.is_none()))
+    );
+}
+
+/// Compares the first `columns` columns of two entries in the order of
+/// index `i`.
+fn compare_index_entries(
+    left: &IndexEntry,
+    right: &IndexEntry,
+    columns: usize,
+    descending: bool,
+) -> std::cmp::Ordering {
+    let a = if descending {
+        right.a.cmp(&left.a)
+    } else {
+        left.a.cmp(&right.a)
+    };
+    [a, left.b.cmp(&right.b), left.rowid.cmp(&right.rowid)][..columns]
+        .iter()
+        .copied()
+        .find(|order| order.is_ne())
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+fn open_mvcc_index_reader(db: &MvccTestDbNoConn, reader: &Arc<Connection>) -> BTreeCursor {
+    use crate::storage::btree::CursorTrait;
+
+    let mv_store = db.get_mvcc_store();
+    let tx_id = reader.get_mv_tx_id().unwrap();
+    let index = reader
+        .schema
+        .read()
+        .get_index(NamespaceId::ROOT, "t", "i")
+        .expect("index i must exist")
+        .clone();
+    let btree_root_page = if index.root_page < 0 {
+        mv_store.get_real_table_id(index.root_page)
+    } else {
+        index.root_page
+    };
+    let mut cursor = BTreeCursor::new_index(
+        reader.pager.load().clone(),
+        btree_root_page,
+        &index,
+        index.columns.len(),
+    )
+    .unwrap();
+    cursor.install_yield_context(reader);
+    let index_info = Arc::new(IndexInfo::new_from_index_in(&index, mv_store.allocator()).unwrap());
+    cursor
+        .read_mvcc_index(mv_store, reader, tx_id, index.root_page, index_info)
+        .unwrap();
+    assert!(cursor.is_mvcc());
+    cursor
+}
+
+fn walk_mvcc_index_reader(
+    cursor: &mut BTreeCursor,
+    pager: &Arc<Pager>,
+    entries: &[IndexEntry],
+    descending: bool,
+    rng: &mut ChaCha8Rng,
+) {
+    use crate::storage::btree::CursorTrait;
+    use crate::vdbe::Register;
+
+    let mut position = ModelPosition::Unpositioned;
+    for _ in 0..80 {
+        position = match rng.random_range(0..11) {
+            0 => {
+                drive_cursor_io(pager, || cursor.rewind());
+                first_model_position(entries)
+            }
+            1 => {
+                drive_cursor_io(pager, || cursor.last());
+                last_model_position(entries)
+            }
+            2..=4 => {
+                drive_cursor_io(pager, || cursor.next());
+                next_model_position(position, entries)
+            }
+            5 | 6 => {
+                drive_cursor_io(pager, || cursor.prev());
+                prev_model_position(position, entries)
+            }
+            7..=9 => {
+                let (key, columns) = random_index_seek_key(rng, entries);
+                let op = [
+                    SeekOp::GE { eq_only: false },
+                    SeekOp::GE { eq_only: true },
+                    SeekOp::GT,
+                    SeekOp::LE { eq_only: false },
+                    SeekOp::LE { eq_only: true },
+                    SeekOp::LT,
+                ][rng.random_range(0..6)];
+                let values: Vec<Value> = [
+                    key.a.map_or(Value::Null, Value::from_i64),
+                    Value::from_text(key.b.clone()),
+                    Value::from_i64(key.rowid),
+                ]
+                .into_iter()
+                .take(columns)
+                .collect();
+                let result = if rng.random_bool(0.5) {
+                    let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+                    drive_cursor_io(pager, || {
+                        cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op)
+                    })
+                } else {
+                    let registers: Vec<Register> =
+                        values.into_iter().map(Register::Value).collect();
+                    drive_cursor_io(pager, || cursor.seek_unpacked(&registers, op))
+                };
+                let (expected_result, expected_position) =
+                    index_seek_model_position(op, &key, columns, entries, descending);
+                assert_eq!(
+                    result, expected_result,
+                    "seek {op:?} {key:?} on {columns} columns in {entries:?}"
+                );
+                expected_position
+            }
+            _ => {
+                assert_eq!(drive_cursor_io(pager, || cursor.count()), entries.len());
+                ModelPosition::AfterLast
+            }
+        };
+        assert_index_cursor_row(cursor, pager, position, entries);
+    }
+}
+
+/// A seek key and the number of its columns. Half of the keys come from
+/// the entries, and some values are not in any entry.
+fn random_index_seek_key(rng: &mut ChaCha8Rng, entries: &[IndexEntry]) -> (IndexEntry, usize) {
+    let key = if !entries.is_empty() && rng.random_bool(0.5) {
+        entries[rng.random_range(0..entries.len())].clone()
+    } else {
+        let (mut a, mut b) = random_indexed_columns(rng);
+        if rng.random_bool(0.2) {
+            a = Some(rng.random_range(-1..=4));
+        }
+        if rng.random_bool(0.2) {
+            b = ["j", "kz", "n"][rng.random_range(0..3)].to_string();
+        }
+        IndexEntry {
+            a,
+            b,
+            rowid: rng.random_range(0..=INDEX_READER_ROW_SPACE + 1),
+        }
+    };
+    (key, rng.random_range(1..=3))
+}
+
+/// Where a seek stops: the first columns of a key are equal to a shorter
+/// seek key, so `GE` and `LE` stop on such keys, and `GT` and `LT` pass
+/// them.
+fn index_seek_model_position(
+    op: SeekOp,
+    key: &IndexEntry,
+    columns: usize,
+    entries: &[IndexEntry],
+    descending: bool,
+) -> (SeekResult, ModelPosition) {
+    let order = |entry: &IndexEntry| compare_index_entries(entry, key, columns, descending);
+    let first_not_less = entries.partition_point(|entry| order(entry).is_lt());
+    let first_greater = entries.partition_point(|entry| order(entry).is_le());
+    let (found, past_end) = match op {
+        SeekOp::GE { .. } => (
+            (first_not_less < entries.len()).then_some(first_not_less),
+            ModelPosition::AfterLast,
+        ),
+        SeekOp::GT => (
+            (first_greater < entries.len()).then_some(first_greater),
+            ModelPosition::AfterLast,
+        ),
+        SeekOp::LE { .. } => (first_greater.checked_sub(1), ModelPosition::BeforeFirst),
+        SeekOp::LT => (first_not_less.checked_sub(1), ModelPosition::BeforeFirst),
+    };
+    match found {
+        Some(index) if op.eq_only() && order(&entries[index]).is_ne() => {
+            (SeekResult::NotFound, ModelPosition::Unpositioned)
+        }
+        None if op.eq_only() => (SeekResult::NotFound, ModelPosition::Unpositioned),
+        Some(index) => (SeekResult::Found, ModelPosition::At(index)),
+        None => (SeekResult::NotFound, past_end),
+    }
+}
+
+fn assert_index_cursor_row(
+    cursor: &mut BTreeCursor,
+    pager: &Arc<Pager>,
+    position: ModelPosition,
+    entries: &[IndexEntry],
+) {
+    use crate::storage::btree::CursorTrait;
+
+    match position {
+        ModelPosition::At(index) => {
+            let expected = &entries[index];
+            assert!(cursor.has_record(), "the cursor must be on {expected:?}");
+            assert!(!cursor.is_empty(), "the cursor must be on {expected:?}");
+            assert_eq!(
+                drive_cursor_io(pager, || cursor.rowid()),
+                Some(expected.rowid)
+            );
+            let (entry, payload) = loop {
+                match cursor.record().unwrap() {
+                    IOResult::Done(record) => {
+                        let record = record.expect("a positioned cursor must have a record");
+                        let values = record.get_values().unwrap();
+                        assert_eq!(values.len(), 3, "an entry of index i has 3 columns");
+                        let a = match values[0] {
+                            ValueRef::Null => None,
+                            value => Some(value.as_int().expect("column a must be an integer")),
+                        };
+                        let entry = IndexEntry {
+                            a,
+                            b: values[1]
+                                .to_text()
+                                .expect("column b must be text")
+                                .to_string(),
+                            rowid: values[2].as_int().expect("the rowid must be an integer"),
+                        };
+                        break (entry, record.get_payload().to_vec());
+                    }
+                    IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
+                }
+            };
+            assert_eq!(&entry, expected);
+            let (local, size) = loop {
+                match cursor.payload_fetch().unwrap() {
+                    IOResult::Done(fetched) => {
+                        let (local, size) =
+                            fetched.expect("a positioned cursor must have a payload");
+                        break (local.to_vec(), size);
+                    }
+                    IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
+                }
+            };
+            assert_eq!(size, payload.len(), "payload size of {expected:?}");
+            assert_eq!(
+                &payload[..local.len()],
+                &local[..],
+                "payload of {expected:?}"
+            );
+        }
+        ModelPosition::Unpositioned | ModelPosition::BeforeFirst | ModelPosition::AfterLast => {
+            assert!(!cursor.has_record(), "the cursor must have no entry");
+            assert!(cursor.is_empty(), "the cursor must have no entry");
+            assert_eq!(drive_cursor_io(pager, || cursor.rowid()), None);
+        }
+    }
+}
+
+#[test]
+fn mvcc_reader_returns_the_rows_of_the_snapshot_when_the_btree_covers_a_chain() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let mv_store = db.get_mvcc_store();
     let writer = db.connect();
@@ -25277,16 +25699,6 @@ fn mvcc_reader_and_mvcc_lazy_cursor_see_the_same_rows_when_the_btree_covers_a_ch
         .collect();
     assert_eq!(covered_keys, vec![1, 3, 5, 6]);
 
-    let forward: Vec<(i64, String)> = rows.iter().map(|(id, v)| (*id, v.clone())).collect();
-    let backward: Vec<(i64, String)> = forward.iter().rev().cloned().collect();
-    assert_eq!(
-        scan_with_mvcc_lazy_cursor(&db, &reader, IterationDirection::Forwards),
-        forward
-    );
-    assert_eq!(
-        scan_with_mvcc_lazy_cursor(&db, &reader, IterationDirection::Backwards),
-        backward
-    );
     let pager = reader.pager.load().clone();
     let keys: Vec<i64> = rows.keys().copied().collect();
     let mut rng = ChaCha8Rng::seed_from_u64(7);
@@ -25858,6 +26270,116 @@ fn mvcc_table_scan_sees_a_write_of_its_transaction_made_in_the_middle_of_a_step(
             wrong_scans.push(format!(
                 "{query} with `{write}` at {yield_point:?} after {rows_before_yield} rows: \
                  got {rows:?}, expected {expected:?}"
+            ));
+        }
+    }
+    assert!(wrong_scans.is_empty(), "{wrong_scans:#?}");
+}
+
+#[test]
+fn mvcc_index_scan_sees_a_write_of_its_transaction_made_in_the_middle_of_a_step() {
+    let forward = "SELECT v FROM t WHERE v > ''";
+    let backward = "SELECT v FROM t WHERE v < 'z' ORDER BY v DESC";
+    let cases = [
+        (
+            forward,
+            3,
+            CursorYieldPoint::NextBtreeAdvance,
+            "DELETE FROM t WHERE id = 4",
+            "a,b,c,f,g,h,i,j",
+        ),
+        (
+            forward,
+            2,
+            CursorYieldPoint::NextBtreeAdvance,
+            "DELETE FROM t WHERE id = 4",
+            "a,b,c,f,g,h,i,j",
+        ),
+        (
+            forward,
+            3,
+            CursorYieldPoint::NextBtreeAdvance,
+            "INSERT INTO t VALUES (5, 'e')",
+            "a,b,c,d,e,f,g,h,i,j",
+        ),
+        (
+            forward,
+            3,
+            CursorYieldPoint::NextBtreeAdvance,
+            "INSERT INTO t VALUES (5, 'bb')",
+            "a,b,c,d,f,g,h,i,j",
+        ),
+        (
+            forward,
+            3,
+            CursorYieldPoint::NextBtreeAdvance,
+            "UPDATE t SET v = 'ee' WHERE id = 4",
+            "a,b,c,ee,f,g,h,i,j",
+        ),
+        (
+            backward,
+            3,
+            CursorYieldPoint::PrevBtreeAdvance,
+            "DELETE FROM t WHERE id = 3",
+            "j,i,h,g,f,d,b,a",
+        ),
+    ];
+    let mut wrong_scans = Vec::new();
+    for (query, rows_before_yield, yield_point, write, expected) in cases {
+        let db = MvccTestDb::new();
+        let conn = &db.conn;
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX i ON t(v)").unwrap();
+        conn.execute(
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (6, 'f'), \
+             (7, 'g'), (8, 'h'), (9, 'i'), (10, 'j')",
+        )
+        .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        // Puts the keys 'b' and 'h' in version chains too.
+        conn.execute("UPDATE t SET v = v WHERE id IN (2, 8)")
+            .unwrap();
+
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.set_yield_injector(Some(NthHitYieldInjector::new(
+            yield_point.point(),
+            rows_before_yield - 1,
+        )));
+        let mut scan = conn.prepare(query).unwrap();
+        let mut rows = Vec::new();
+        let mut written = false;
+        loop {
+            match scan.step().unwrap() {
+                StepResult::Row => {
+                    let row = scan.row().unwrap();
+                    rows.push(row.get_value(0).to_text().unwrap().to_string());
+                }
+                StepResult::Yield => {
+                    assert!(!written, "{query}: the scan yielded twice");
+                    assert_eq!(rows.len(), rows_before_yield);
+                    conn.set_yield_injector(None);
+                    conn.execute(write).unwrap();
+                    written = true;
+                }
+                StepResult::IO => scan.get_pager().io.step().unwrap(),
+                StepResult::Done => break,
+                other => panic!("unexpected step result {other:?}"),
+            }
+        }
+        drop(scan);
+        conn.execute("COMMIT").unwrap();
+        assert!(
+            written,
+            "{query}: the scan never yielded at {yield_point:?}"
+        );
+        let rows = rows.join(",");
+        if rows != expected {
+            wrong_scans.push(format!(
+                "{query} with `{write}` at {yield_point:?} after {rows_before_yield} rows: \
+                 got {rows}, expected {expected}"
             ));
         }
     }

@@ -501,7 +501,7 @@ pub enum RowVersionState {
 
 pub(crate) enum VisibleRow {
     Cell,
-    Version(crate::alloc::ArcSlice<u8>),
+    Version(Row),
     NoRow,
 }
 
@@ -1062,6 +1062,10 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// Table and index ids this transaction allocated with `CreateBtree`. No other
     /// transaction can see these objects, so rollback drops their row maps whole.
     created_table_ids: Mutex<Vec<MVTableId>>,
+    /// The number of writes of this transaction to the rows of a table or
+    /// the keys of an index, in counters that `table_write_index` selects by
+    /// id. An MVCC cursor reads its count to find the writes of its own
+    /// transaction during a scan.
     table_writes: Arc<[AtomicU64; TABLE_WRITE_COUNTS]>,
 }
 
@@ -1100,9 +1104,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             TransactionState::Active,
             "write set cannot be modified unless transaction is active"
         );
-        if matches!(id.row_id, RowKey::Int(_)) {
-            self.table_writes[table_write_index(id.table_id)].fetch_add(1, Ordering::Release);
-        }
+        self.table_writes[table_write_index(id.table_id)].fetch_add(1, Ordering::Release);
         // Always record in the current savepoint's `newly_added_to_write_set`.
         // Duplicates here are harmless: `rollback_savepoint_changes` collects
         // touched rowids into a BTreeSet (dedup), and the actual write_set
@@ -5969,13 +5971,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             return Ok(VisibleRow::Cell);
         }
         Ok(match self.find_visible_version(snapshot, &versions)? {
-            Some(version) => VisibleRow::Version(
-                version
-                    .row
-                    .data
-                    .clone()
-                    .expect("a table row version must have a payload"),
-            ),
+            Some(version) => VisibleRow::Version(version.row.clone()),
             None => VisibleRow::NoRow,
         })
     }

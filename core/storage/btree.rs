@@ -67,7 +67,9 @@ use std::{
 };
 
 mod mvcc_reader;
-pub(crate) use mvcc_reader::MvccReader;
+mod mvcc_writer;
+use mvcc_reader::{IndexKeys, MvccReader, TableKeys};
+pub(crate) use mvcc_writer::NextRowidResult;
 
 /// Maximum number of key values to store on the stack when converting registers to ValueRefs
 /// during seeking. Since we use a SmallVec it'll gracefully fall back to heap allocating beyond
@@ -853,8 +855,8 @@ pub trait CursorTrait: Any + Send + Sync {
     /// share a btree (e.g. OpenDup cursors) when the btree structure is
     /// modified by another cursor (e.g. clear_btree via ResetSorter).
     fn invalidate_btree_cache(&mut self) {}
-    /// Opt into the pager's cursor_registry. Default no-op so non-BTreeCursor
-    /// impls (MvccLazyCursor) stay out. Opt-in impls must unregister in Drop.
+    /// Opt into the pager's cursor_registry. Default no-op so other impls
+    /// stay out. Opt-in impls must unregister in Drop.
     fn register_with_pager(&self) {}
     /// Drops the cursor at statement reset. BTreeCursor keeps its heap
     /// allocation in the pager's pool for the next cursor; the default is a
@@ -990,7 +992,8 @@ pub struct BTreeCursor {
     /// itself into the registry). Direct BTreeCursor::new callers (tests,
     /// internal utilities) bypass that path; their Drop skips unregister.
     did_register: crate::sync::atomic::AtomicBool,
-    mvcc_reader: Option<Box<MvccReader>>,
+    mvcc_table_reader: Option<Box<MvccReader<TableKeys>>>,
+    mvcc_index_reader: Option<Box<MvccReader<IndexKeys>>>,
     row_is_from_version_chain: bool,
     #[cfg(any(test, injected_yields))]
     yield_injector: Option<Arc<dyn crate::mvcc::yield_points::YieldInjector>>,
@@ -1343,7 +1346,8 @@ impl BTreeCursor {
             pending_peer_save: None,
             has_peers: crate::sync::atomic::AtomicBool::new(false),
             did_register: crate::sync::atomic::AtomicBool::new(false),
-            mvcc_reader: None,
+            mvcc_table_reader: None,
+            mvcc_index_reader: None,
             row_is_from_version_chain: false,
             #[cfg(any(test, injected_yields))]
             yield_injector: None,
@@ -6767,8 +6771,11 @@ impl CursorTrait for BTreeCursor {
     }
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn next(&mut self) -> IOResultOr<()> {
-        if self.mvcc_reader.is_some() {
-            return self.mvcc_next();
+        if self.mvcc_table_reader.is_some() {
+            return self.mvcc_next::<TableKeys>();
+        }
+        if self.mvcc_index_reader.is_some() {
+            return self.mvcc_next::<IndexKeys>();
         }
         self.btree_next()
     }
@@ -6779,7 +6786,7 @@ impl CursorTrait for BTreeCursor {
             self.null_flag = false;
             return CursorStep::Empty;
         }
-        if self.mvcc_reader.is_none() && self.can_advance_within_leaf() {
+        if !self.has_mvcc_reader() && self.can_advance_within_leaf() {
             self.stack.advance();
             self.invalidate_record();
             return CursorStep::Row;
@@ -6809,8 +6816,11 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn last(&mut self) -> IOResultOr<()> {
-        if self.mvcc_reader.is_some() {
-            return self.mvcc_last();
+        if self.mvcc_table_reader.is_some() {
+            return self.mvcc_last::<TableKeys>();
+        }
+        if self.mvcc_index_reader.is_some() {
+            return self.mvcc_last::<IndexKeys>();
         }
         self.set_null_flag(false);
         if self.valid_state == CursorValidState::Invalid {
@@ -6826,8 +6836,11 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn prev(&mut self) -> IOResultOr<()> {
-        if self.mvcc_reader.is_some() {
-            return self.mvcc_prev();
+        if self.mvcc_table_reader.is_some() {
+            return self.mvcc_prev::<TableKeys>();
+        }
+        if self.mvcc_index_reader.is_some() {
+            return self.mvcc_prev::<IndexKeys>();
         }
         self.btree_prev()
     }
@@ -6885,8 +6898,11 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip(self, key), level = Level::DEBUG))]
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
-        if self.mvcc_reader.is_some() {
-            return self.mvcc_seek(key, op);
+        if self.mvcc_table_reader.is_some() {
+            return self.mvcc_seek_rowid(key, op);
+        }
+        if self.mvcc_index_reader.is_some() {
+            return self.mvcc_seek_index_key(key, op);
         }
         self.skip_advance = false;
         // Empty trace to capture the span information
@@ -6907,9 +6923,12 @@ impl CursorTrait for BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip(self, registers), level = Level::DEBUG))]
     fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> IOResultOr<SeekResult> {
         turso_assert!(
-            self.mvcc_reader.is_none(),
+            self.mvcc_table_reader.is_none(),
             "an MVCC table cursor cannot seek an index key"
         );
+        if self.mvcc_index_reader.is_some() {
+            return self.mvcc_seek_index_registers(registers, op);
+        }
         self.skip_advance = false;
         // Empty trace to capture the span information
         tracing::trace!("");
@@ -6976,10 +6995,9 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
-        turso_assert!(
-            self.mvcc_reader.is_none(),
-            "an MVCC table cursor is read-only"
-        );
+        if self.has_mvcc_reader() {
+            return self.mvcc_insert(key);
+        }
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
         self.noted_payload = NotedPayload::NONE;
         // invalidateOverflowCache in sqlite3BtreeInsert and sqlite3BtreeDelete:
@@ -7009,10 +7027,9 @@ impl CursorTrait for BTreeCursor {
     /// 9. SeekAfterBalancing -> adjust the cursor to a node that is closer to the deleted value. go to Finish
     /// 10. Finish -> Delete operation is done. Return CursorResult(Ok())
     fn delete(&mut self) -> IOResultOr<()> {
-        turso_assert!(
-            self.mvcc_reader.is_none(),
-            "an MVCC table cursor is read-only"
-        );
+        if self.has_mvcc_reader() {
+            return self.mvcc_delete();
+        }
         self.noted_payload = NotedPayload::NONE;
         self.blob_cache.reset();
         if let CursorState::None = &self.state {
@@ -7428,8 +7445,8 @@ impl CursorTrait for BTreeCursor {
     /// allocated and is reset to an empty leaf page.
     fn clear_btree(&mut self) -> IOResultOr<u64> {
         turso_assert!(
-            self.mvcc_reader.is_none(),
-            "an MVCC table cursor is read-only"
+            !self.has_mvcc_reader(),
+            "an MVCC cursor cannot clear its B-tree"
         );
         // First entry only — destroy_btree_contents yields IO and resumes
         // through this method, so guard with the same state==None gate it
@@ -7457,8 +7474,8 @@ impl CursorTrait for BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn btree_destroy(&mut self) -> IOResultOr<Option<usize>> {
         turso_assert!(
-            self.mvcc_reader.is_none(),
-            "an MVCC table cursor is read-only"
+            !self.has_mvcc_reader(),
+            "an MVCC cursor cannot destroy its B-tree"
         );
         // See clear_btree for the state==None gate rationale.
         if matches!(self.state, CursorState::None) {
@@ -7475,8 +7492,11 @@ impl CursorTrait for BTreeCursor {
     ///
     /// Only supposed to be used in the context of a simple Count Select Statement
     fn count(&mut self) -> IOResultOr<usize> {
-        if self.mvcc_reader.is_some() {
-            return self.mvcc_count();
+        if self.mvcc_table_reader.is_some() {
+            return self.mvcc_count::<TableKeys>();
+        }
+        if self.mvcc_index_reader.is_some() {
+            return self.mvcc_count::<IndexKeys>();
         }
         let mut mem_page;
         let mut contents;
@@ -7641,8 +7661,11 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn rewind(&mut self) -> IOResultOr<()> {
-        if self.mvcc_reader.is_some() {
-            return self.mvcc_rewind();
+        if self.mvcc_table_reader.is_some() {
+            return self.mvcc_rewind::<TableKeys>();
+        }
+        if self.mvcc_index_reader.is_some() {
+            return self.mvcc_rewind::<IndexKeys>();
         }
         self.set_null_flag(false);
         if self.valid_state == CursorValidState::Invalid {
@@ -7726,7 +7749,7 @@ impl CursorTrait for BTreeCursor {
     }
 
     fn register_with_pager(&self) {
-        if self.mvcc_reader.is_some() {
+        if self.has_mvcc_reader() {
             return;
         }
         // Store before the push so a panic inside register_cursor still
@@ -7873,14 +7896,14 @@ impl CursorTrait for BTreeCursor {
     }
 
     fn is_mvcc(&self) -> bool {
-        self.mvcc_reader.is_some()
+        self.has_mvcc_reader()
     }
 
     fn seek_end(&mut self) -> IOResultOr<()> {
-        turso_assert!(
-            self.mvcc_reader.is_none(),
-            "an MVCC table cursor is read-only"
-        );
+        if self.has_mvcc_reader() {
+            self.mvcc_seek_end();
+            return Ok(IOResult::Done(()));
+        }
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
         }
@@ -7923,8 +7946,17 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn seek_to_last(&mut self) -> IOResultOr<()> {
-        if self.mvcc_reader.is_some() {
-            return self.mvcc_last();
+        if self.mvcc_table_reader.is_some() {
+            // `NewRowid` holds the rowid allocator lock during this call. A
+            // seek can yield at `SeekStart` also when the table has no
+            // B-tree, so yield tests can drop the statement here.
+            return_if_io!(
+                self.mvcc_seek_rowid(SeekKey::TableRowId(i64::MAX), SeekOp::LE { eq_only: false })
+            );
+            return Ok(IOResult::Done(()));
+        }
+        if self.mvcc_index_reader.is_some() {
+            return self.mvcc_last::<IndexKeys>();
         }
         loop {
             match self.seek_to_last_state {

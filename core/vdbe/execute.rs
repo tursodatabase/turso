@@ -6,7 +6,6 @@ use crate::cdc::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
-use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::{
     BootstrapState, CheckpointReadLockState, CheckpointStateMachine, TxID,
 };
@@ -73,8 +72,8 @@ use crate::{
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
     CaptureDataChangesInfo, CdcVersion, CheckpointMode, Clock, Completion, ConnectOpts, Connection,
-    Database, DatabaseStorage, IOExt, MonotonicInstant, MvCursor, NonNan, OpenFlags, QueryMode,
-    Statement, TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
+    Database, DatabaseStorage, IOExt, MonotonicInstant, NonNan, OpenFlags, QueryMode, Statement,
+    TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
 };
 use crate::{
     error::{
@@ -96,7 +95,6 @@ use crate::{
 use branches::{mark_unlikely, unlikely};
 use either::Either;
 use smallvec::SmallVec;
-use std::any::Any;
 use std::str::FromStr;
 use std::{
     borrow::BorrowMut,
@@ -108,7 +106,7 @@ use turso_macros::turso_debug_assert;
 
 use crate::pseudo::PseudoCursor;
 
-use crate::storage::btree::{BTreeCursor, BTreeKey, MvccReader};
+use crate::storage::btree::{BTreeCursor, BTreeKey, NextRowidResult};
 
 #[inline]
 fn btree_cursor_with_yield_context(
@@ -125,27 +123,6 @@ fn btree_cursor_with_yield_context(
     {
         let _ = connection;
         cursor
-    }
-}
-
-enum OpenedBTree {
-    Plain(Box<BTreeCursor>),
-    Mvcc(Box<dyn CursorTrait>),
-}
-
-impl OpenedBTree {
-    fn into_cursor(self) -> Cursor {
-        match self {
-            Self::Plain(cursor) => Cursor::new_btree(cursor),
-            Self::Mvcc(cursor) => Cursor::new_btree_dyn(cursor),
-        }
-    }
-
-    fn into_dyn(self) -> Box<dyn CursorTrait> {
-        match self {
-            Self::Plain(cursor) => cursor,
-            Self::Mvcc(cursor) => cursor,
-        }
     }
 }
 
@@ -1459,25 +1436,13 @@ pub fn op_open_read(
         _ => unreachable!("This should not have happened"),
     };
 
-    let maybe_promote_to_mvcc_cursor =
-        |btree_cursor: Box<BTreeCursor>, mv_cursor_type: MvccCursorType| -> Result<OpenedBTree> {
-            // Without an MvStore there is no MVCC transaction to look up.
-            let Some(mv_store) = mv_store.as_ref() else {
-                return Ok(OpenedBTree::Plain(btree_cursor));
-            };
-            if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
-                Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
-                    mv_store.clone(),
-                    &program.connection,
-                    tx_id,
-                    *root_page,
-                    mv_cursor_type,
-                    btree_cursor,
-                )?)))
-            } else {
-                Ok(OpenedBTree::Plain(btree_cursor))
-            }
-        };
+    let mvcc = match (
+        mv_store.as_ref(),
+        program.connection.get_mv_tx_id_for_db(*db),
+    ) {
+        (Some(mv_store), Some(tx_id)) => Some((mv_store, tx_id)),
+        _ => None,
+    };
 
     match cursor_type {
         CursorType::ViewDelta { view_name, table } => {
@@ -1506,18 +1471,26 @@ pub fn op_open_read(
             // This is a materialized view with storage
             // Create btree cursor for reading the persistent data
 
-            let btree_cursor = BTreeCursor::new_table(
+            let mut btree_cursor = BTreeCursor::new_table(
                 pager.clone(),
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 num_columns,
             )
             .into_boxed();
-            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
+            if let Some((mv_store, tx_id)) = mvcc {
+                btree_cursor = btree_cursor_with_yield_context(btree_cursor, &program.connection);
+                btree_cursor.read_mvcc_table(
+                    mv_store.clone(),
+                    &program.connection,
+                    tx_id,
+                    *root_page,
+                )?;
+            }
 
             // The cursor observes the transaction-wide change-log generation
             // for read-your-own-writes.
             let view_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
-                cursor.into_dyn(),
+                btree_cursor,
                 pager,
                 program.connection.clone(),
             );
@@ -1551,17 +1524,14 @@ pub fn op_open_read(
                 )
                 .into_boxed()
             };
-            if let (Some(mv_store), Some(tx_id)) = (
-                mv_store.as_ref(),
-                program.connection.get_mv_tx_id_for_db(*db),
-            ) {
+            if let Some((mv_store, tx_id)) = mvcc {
                 btree_cursor = btree_cursor_with_yield_context(btree_cursor, &program.connection);
-                btree_cursor.read_mvcc_table(MvccReader::new(
+                btree_cursor.read_mvcc_table(
                     mv_store.clone(),
                     &program.connection,
                     tx_id,
                     *root_page,
-                )?);
+                )?;
             }
             cursors
                 .get_mut(*cursor_id)
@@ -1569,28 +1539,26 @@ pub fn op_open_read(
                 .replace(Cursor::new_btree(btree_cursor));
         }
         CursorType::BTreeIndex(index) => {
-            let btree_cursor = BTreeCursor::new_index_boxed(
+            let mut btree_cursor = BTreeCursor::new_index_boxed(
                 pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 index.as_ref(),
                 num_columns,
             )?;
-            let index_info = match mv_store.as_ref() {
-                Some(mv_store) => {
-                    Arc::new(IndexInfo::new_from_index_in(index, mv_store.allocator())?)
-                }
-                None => btree_cursor
-                    .index_info
-                    .as_ref()
-                    .expect("a cursor opened on an index holds its key")
-                    .clone(),
-            };
-            let cursor =
-                maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
+            if let Some((mv_store, tx_id)) = mvcc {
+                btree_cursor = btree_cursor_with_yield_context(btree_cursor, &program.connection);
+                btree_cursor.read_mvcc_index(
+                    mv_store.clone(),
+                    &program.connection,
+                    tx_id,
+                    *root_page,
+                    Arc::new(IndexInfo::new_from_index_in(index, mv_store.allocator())?),
+                )?;
+            }
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(cursor.into_cursor());
+                .replace(Cursor::new_btree(btree_cursor));
         }
         CursorType::Pseudo(_) => {
             panic!("OpenRead on pseudo cursor");
@@ -13978,15 +13946,18 @@ pub fn op_new_rowid(
             },
             insn
         );
-        let mv_store = program.connection.mv_store();
-        if mv_store.is_some() {
-            let cursor = state.get_cursor(*cursor);
-            let cursor = cursor.as_btree_mut() as &mut dyn Any;
-            if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
-                mvcc_cursor.end_new_rowid();
-            }
+        if let Some(cursor) = mvcc_table_cursor(state.get_cursor(*cursor)) {
+            cursor.mvcc_end_new_rowid();
         }
     })
+}
+
+/// The cursor if it reads and writes an MVCC table.
+fn mvcc_table_cursor(cursor: &mut Cursor) -> Option<&mut BTreeCursor> {
+    match cursor {
+        Cursor::BTree(cursor, _) if cursor.has_mvcc_table_reader() => Some(cursor),
+        _ => None,
+    }
 }
 
 fn new_rowid_inner(
@@ -14012,9 +13983,8 @@ fn new_rowid_inner(
             OpNewRowidState::Start => {
                 if has_mv_store {
                     let cursor = state.get_cursor(*cursor);
-                    let cursor = cursor.as_btree_mut() as &mut dyn Any;
-                    if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
-                        match return_if_io!(state, mvcc_cursor.start_new_rowid()) {
+                    if let Some(mvcc_cursor) = mvcc_table_cursor(cursor) {
+                        match return_if_io!(state, mvcc_cursor.mvcc_start_new_rowid()) {
                             NextRowidResult::Uninitialized => {
                                 *state.active_op_state.new_rowid() =
                                     OpNewRowidState::SeekingToLast {
@@ -14026,7 +13996,7 @@ fn new_rowid_inner(
                                 prev_rowid,
                             } => {
                                 // Allocator already initialized — release lock immediately
-                                mvcc_cursor.end_new_rowid();
+                                mvcc_cursor.mvcc_end_new_rowid();
                                 state.registers[*rowid_reg].set_int(new_rowid);
                                 if *prev_largest_reg > 0 {
                                     state.registers[*prev_largest_reg]
@@ -14037,18 +14007,17 @@ fn new_rowid_inner(
                                 return Ok(InsnFunctionStepResult::Step);
                             }
                             NextRowidResult::FindRandom => {
-                                mvcc_cursor.end_new_rowid();
+                                mvcc_cursor.mvcc_end_new_rowid();
                                 *state.active_op_state.new_rowid() =
                                     OpNewRowidState::GeneratingRandom { attempts: 0 };
                             }
                         }
                     } else {
-                        // Not an MvCursor — must be an ephemeral cursor or an attached
+                        // Not an MVCC table cursor — must be an ephemeral cursor or an attached
                         // DB cursor without MVCC (e.g., :memory: attached DBs skip MVCC).
-                        // Keep the downcast check as a safety net against unexpected cursor types.
                         assert!(
-                            cursor.downcast_ref::<BTreeCursor>().is_some(),
-                            "Expected MvCursor or BTreeCursor in op_new_rowid"
+                            matches!(cursor, Cursor::BTree(..)),
+                            "Expected a BTreeCursor in op_new_rowid"
                         );
                         *state.active_op_state.new_rowid() = OpNewRowidState::SeekingToLast {
                             mvcc_already_initialized: false,
@@ -14085,14 +14054,13 @@ fn new_rowid_inner(
 
                 if has_mv_store {
                     let cursor = state.get_cursor(*cursor);
-                    let cursor = cursor.as_btree_mut() as &mut dyn Any;
-                    if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
+                    if let Some(mvcc_cursor) = mvcc_table_cursor(cursor) {
                         // Initialize the monotonic counter from the btree max.
                         // The allocator lock is held, so no other thread can
                         // race between this read and initialize.
-                        mvcc_cursor.initialize_max_rowid(current_max)?;
+                        mvcc_cursor.mvcc_initialize_max_rowid(current_max);
                         // Allocate the first rowid from the freshly initialized counter.
-                        match mvcc_cursor.allocate_next_rowid() {
+                        match mvcc_cursor.mvcc_allocate_next_rowid() {
                             Some((new_rowid, prev_rowid)) => {
                                 state.registers[*rowid_reg].set_int(new_rowid);
                                 if *prev_largest_reg > 0 {
@@ -14176,10 +14144,8 @@ fn new_rowid_inner(
                     state.pc += 1;
 
                     if has_mv_store {
-                        let cursor = state.get_cursor(*cursor);
-                        let cursor = cursor.as_btree_mut() as &mut dyn Any;
-                        if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
-                            mvcc_cursor.end_new_rowid();
+                        if let Some(mvcc_cursor) = mvcc_table_cursor(state.get_cursor(*cursor)) {
+                            mvcc_cursor.mvcc_end_new_rowid();
                         }
                     }
 
@@ -14201,10 +14167,8 @@ fn new_rowid_inner(
                 state.pc += 1;
 
                 if has_mv_store {
-                    let cursor = state.get_cursor(*cursor);
-                    let cursor = cursor.as_btree_mut() as &mut dyn Any;
-                    if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
-                        mvcc_cursor.end_new_rowid();
+                    if let Some(mvcc_cursor) = mvcc_table_cursor(state.get_cursor(*cursor)) {
+                        mvcc_cursor.mvcc_end_new_rowid();
                     }
                 }
 
@@ -14575,33 +14539,22 @@ pub fn op_open_write(
     };
 
     if !can_reuse_cursor {
-        let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<BTreeCursor>,
-                                            mv_cursor_type: MvccCursorType|
-         -> Result<OpenedBTree> {
-            if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
-                let mv_store = mv_store
-                    .as_ref()
-                    .expect("mv_store should be Some when MVCC transaction is active")
-                    .clone();
-                Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
-                    mv_store,
-                    &program.connection,
-                    tx_id,
-                    root_page,
-                    mv_cursor_type,
-                    btree_cursor,
-                )?)))
-            } else if mv_store.is_some() {
-                Err(LimboError::InternalError(
+        let mvcc = match (
+            mv_store.as_ref(),
+            program.connection.get_mv_tx_id_for_db(*db),
+        ) {
+            (Some(mv_store), Some(tx_id)) => Some((mv_store, tx_id)),
+            (Some(_), None) => {
+                return Err(LimboError::InternalError(
                     "OpenWrite requires an active MVCC transaction".to_string(),
-                ))
-            } else {
-                Ok(OpenedBTree::Plain(btree_cursor))
+                )
+                .into());
             }
+            (None, _) => None,
         };
         if let Some(index) = maybe_index {
             let num_columns = index.columns.len();
-            let btree_cursor = btree_cursor_with_yield_context(
+            let mut btree_cursor = btree_cursor_with_yield_context(
                 BTreeCursor::new_index_boxed(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
@@ -14610,17 +14563,19 @@ pub fn op_open_write(
                 )?,
                 &program.connection,
             );
-            let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
-                IndexInfo::new_from_index_in(index, mv_store.allocator())?
-            } else {
-                IndexInfo::new_from_index(index)?
-            });
-            let cursor =
-                maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
+            if let Some((mv_store, tx_id)) = mvcc {
+                btree_cursor.read_mvcc_index(
+                    mv_store.clone(),
+                    &program.connection,
+                    tx_id,
+                    root_page,
+                    Arc::new(IndexInfo::new_from_index_in(index, mv_store.allocator())?),
+                )?;
+            }
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(cursor.into_cursor());
+                .replace(Cursor::new_btree(btree_cursor));
         } else {
             if matches!(cursor_type, CursorType::BTreeTable(table_rc) if !table_rc.has_rowid)
                 && program.connection.get_mv_tx_id_for_db(*db).is_some()
@@ -14638,7 +14593,7 @@ pub fn op_open_write(
                 ),
             };
 
-            let btree_cursor: Box<BTreeCursor> = match cursor_type {
+            let mut btree_cursor: Box<BTreeCursor> = match cursor_type {
                 CursorType::BTreeTable(table_rc) if !table_rc.has_rowid => {
                     btree_cursor_with_yield_context(
                         Box::new(BTreeCursor::new_without_rowid_table(
@@ -14659,11 +14614,18 @@ pub fn op_open_write(
                     &program.connection,
                 ),
             };
-            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
+            if let Some((mv_store, tx_id)) = mvcc {
+                btree_cursor.read_mvcc_table(
+                    mv_store.clone(),
+                    &program.connection,
+                    tx_id,
+                    root_page,
+                )?;
+            }
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(cursor.into_cursor());
+                .replace(Cursor::new_btree(btree_cursor));
         }
     }
     state.pc += 1;
@@ -17155,8 +17117,8 @@ pub fn op_open_dup(
     let pager = original_cursor.get_pager();
 
     // Ephemeral tables have their own pager, so we need to check if this is an
-    // ephemeral cursor by comparing pagers. Ephemeral cursors should NOT be wrapped
-    // in MvCursor because the mv_store doesn't have mappings for ephemeral table root pages.
+    // ephemeral cursor by comparing pagers. Ephemeral cursors must NOT read the
+    // MVCC store because the mv_store doesn't have mappings for ephemeral table root pages.
     let is_ephemeral = pager.wal.is_none();
 
     let (_, cursor_type) = program
@@ -17171,7 +17133,7 @@ pub fn op_open_dup(
                 )
                 .into());
             }
-            let cursor: Box<BTreeCursor> = if table.has_rowid {
+            let mut cursor: Box<BTreeCursor> = if table.has_rowid {
                 Box::new(BTreeCursor::new_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
@@ -17185,31 +17147,21 @@ pub fn op_open_dup(
                     table.columns().len(),
                 ))
             };
-            let cursor = if !is_ephemeral {
+            if !is_ephemeral {
                 if let Some(tx_id) = program.connection.get_mv_tx_id() {
                     let mv_store = mv_store
                         .as_ref()
                         .expect("mv_store should be Some when MVCC transaction is active")
                         .clone();
-                    OpenedBTree::Mvcc(Box::new(MvCursor::new(
-                        mv_store,
-                        &program.connection,
-                        tx_id,
-                        root_page,
-                        MvccCursorType::Table,
-                        cursor,
-                    )?))
-                } else {
-                    OpenedBTree::Plain(cursor)
+                    cursor = btree_cursor_with_yield_context(cursor, &program.connection);
+                    cursor.read_mvcc_table(mv_store, &program.connection, tx_id, root_page)?;
                 }
-            } else {
-                OpenedBTree::Plain(cursor)
-            };
+            }
             let cursors = &mut state.cursors;
             cursors
                 .get_mut(*new_cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(cursor.into_cursor());
+                .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(_) => {
             return Err(LimboError::InternalError(
