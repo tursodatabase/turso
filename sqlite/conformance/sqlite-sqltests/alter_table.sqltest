@@ -3468,3 +3468,60 @@ test alter-table-drop-view-column-rejected {
 expect error {
     cannot drop column from view "v"
 }
+
+@cross-check-integrity
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-table-updates-views {
+    CREATE TABLE t(x);
+    CREATE TABLE o(y);
+    INSERT INTO t VALUES (1);
+    INSERT INTO o VALUES (1);
+    CREATE VIEW v1 AS SELECT x FROM t;
+    CREATE VIEW v2 AS SELECT t.x, o.y FROM t JOIN o ON t.x = o.y;
+    CREATE VIEW v3 AS SELECT y FROM o WHERE y IN (SELECT x FROM t);
+    ALTER TABLE t RENAME TO t2;
+    SELECT * FROM v1;
+    SELECT * FROM v2;
+    SELECT * FROM v3;
+}
+expect {
+    1
+    1|1
+    1
+}
+
+@cross-check-integrity
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-table-keeps-view-cte-and-alias-with-same-name {
+    CREATE TABLE t(x);
+    CREATE TABLE o(x);
+    INSERT INTO t VALUES (1);
+    INSERT INTO o VALUES (2);
+    CREATE VIEW v1 AS WITH t AS (SELECT 5 AS x) SELECT x FROM t;
+    CREATE VIEW v2 AS SELECT t.x FROM o AS t;
+    ALTER TABLE t RENAME TO t2;
+    SELECT * FROM v1;
+    SELECT * FROM v2;
+}
+expect {
+    5
+    2
+}
+
+@cross-check-integrity
+test alter-table-rename-table-keeps-trigger-alias-with-same-name {
+    CREATE TABLE t(x);
+    CREATE TABLE o(x);
+    CREATE TABLE log(v);
+    INSERT INTO o VALUES (2);
+    CREATE TRIGGER tr AFTER INSERT ON log WHEN new.v = 0 BEGIN
+        INSERT INTO log SELECT t.x FROM o AS t;
+    END;
+    ALTER TABLE t RENAME TO t2;
+    INSERT INTO log VALUES (0);
+    SELECT v FROM log ORDER BY v;
+}
+expect {
+    0
+    2
+}
