@@ -55,25 +55,11 @@ impl From<LimboError> for Error {
 /// `sqlstate` to the client. Use it for errors that the PostgreSQL frontend
 /// raises itself, also in the PostgreSQL functions that the engine runs.
 pub(crate) fn sqlstate_error(sqlstate: &'static str, message: impl Into<String>) -> LimboError {
-    LimboError::Dialect(DialectError::new(SqlstateError {
-        sqlstate,
+    LimboError::Dialect(Box::new(DialectError {
+        code: sqlstate,
         message: message.into(),
     }))
 }
-
-#[derive(Debug)]
-struct SqlstateError {
-    sqlstate: &'static str,
-    message: String,
-}
-
-impl std::fmt::Display for SqlstateError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for SqlstateError {}
 
 #[derive(Debug, Clone)]
 pub struct ErrorReport {
@@ -260,9 +246,7 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::Raise(_, msg) => raise_sqlstate(msg),
         LimboError::RaiseIgnore => SQLSTATE_ASSERT_FAILURE,
         LimboError::Corrupt(_) | LimboError::NotADB => SQLSTATE_DATA_CORRUPTED,
-        LimboError::Dialect(error) => error
-            .downcast_ref::<SqlstateError>()
-            .map_or(SQLSTATE_INTERNAL_ERROR, |error| error.sqlstate),
+        LimboError::Dialect(error) => error.code,
         _ => SQLSTATE_INTERNAL_ERROR,
     }
 }
