@@ -11236,6 +11236,68 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn correlated_subquery_is_planned_once_for_its_calls() {
+        let (document, schema) = analyze_sql_with_schema(
+            indexed_items_schema(),
+            "SELECT value FROM items AS a \
+             WHERE a.value > (SELECT max(b.value) FROM items AS b WHERE b.extra = a.extra)",
+        );
+        crate::translate::semantic_to_plan::QUERY_PLANS.with(|plans| plans.set(0));
+        let plan = HirPlan::build_without_unnesting(
+            Arc::new(document),
+            &schema,
+            &CostModelParams::default(),
+            None,
+        )
+        .expect("HIR query plans");
+        let crate::translate::semantic::hir::HirRoot::Query(root) = &plan.document.root else {
+            panic!("SELECT has a query root");
+        };
+        let subquery = plan
+            .queries
+            .iter()
+            .find(|query| query.query != root.query)
+            .expect("subquery is planned");
+        assert!(subquery.runs > 1.0);
+        assert_eq!(
+            crate::translate::semantic_to_plan::QUERY_PLANS.with(|plans| plans.get()),
+            2
+        );
+    }
+
+    #[test]
+    fn cost_limit_keeps_the_ordered_plan_that_saves_a_sort() {
+        let plan_with_limit = |sql: &str, limit: Option<f64>| {
+            let (document, schema) = analyze_sql_with_schema(indexed_items_schema(), sql);
+            let block = document.queries[0].blocks[0].id;
+            HirPlan::build_without_unnesting(
+                Arc::new(document),
+                &schema,
+                &CostModelParams::default(),
+                limit.map(|limit| (block, crate::translate::optimizer::cost::Cost(limit))),
+            )
+            .expect("HIR query plans")
+        };
+        let ordered_sql =
+            "SELECT a.extra FROM items AS b JOIN items AS a ON b.extra = a.extra ORDER BY a.value";
+        let ordered = plan_with_limit(ordered_sql, None);
+        let ordered = &ordered.queries[0].blocks[0];
+        let cheapest = plan_with_limit(
+            "SELECT a.extra FROM items AS b JOIN items AS a ON b.extra = a.extra",
+            None,
+        );
+        let cheapest = &cheapest.queries[0].blocks[0];
+        assert!(ordered.order_sort_elided);
+        assert!(cheapest.cost.0 < ordered.cost.0);
+        // The limit lies between the cheapest plan and the ordered plan the
+        // sort it saves makes better.
+        let limited = plan_with_limit(ordered_sql, Some((cheapest.cost.0 + ordered.cost.0) / 2.0));
+        let limited = &limited.queries[0].blocks[0];
+        assert!(limited.order_sort_elided);
+        assert_eq!(limited.cost.0, ordered.cost.0);
+    }
+
+    #[test]
     fn planned_ungrouped_aggregates_use_hir_ids_and_shared_steps() {
         let plan = analyze_plan(
             indexed_items_schema(),

@@ -22,7 +22,7 @@
 use turso_parser::ast::{Distinctness, Operator, UnaryOperator};
 
 use super::{
-    optimizer::CostModelParams,
+    optimizer::{cost::Cost, CostModelParams},
     semantic::hir::{self, HirDocument, QueryBlockId, QueryId, SourceId, SourceOwner},
     semantic_to_plan::{hir_expr_can_fail, HirPlan},
 };
@@ -79,21 +79,29 @@ pub(crate) fn unnest_correlated_subqueries(
                 document.clone(),
                 schema,
                 params,
+                None,
             )?),
         };
-        // A form the planner cannot plan is not chosen.
-        let Ok(rewritten_plan) =
-            HirPlan::build_without_unnesting(rewritten.clone(), schema, params)
-        else {
-            continue;
-        };
         let original_cost = query_cost(original, block.query, params);
-        let rewritten_cost = query_cost(&rewritten_plan, block.query, params);
         // Equal work is better without one subquery call per outer row,
         // and a block with a FULL join whose correlated
         // subqueries all became joins always keeps that form.
-        if mode == crate::SubqueryUnnestingMode::Forced
-            || complete_full_join_rewrite(&rewritten, block)
+        let keep_rewrite = mode == crate::SubqueryUnnestingMode::Forced
+            || complete_full_join_rewrite(&rewritten, block);
+        // A join order of the block that costs more than the whole original
+        // query cannot win, so the search skips it. Only a query planned
+        // once, for one run, gets the limit.
+        let cost_limit = original_cost
+            .filter(|_| !keep_rewrite && !rewritten.planning.reads_outer_sources(block.query))
+            .map(|cost| (block, Cost(cost)));
+        // A form the planner cannot plan is not chosen.
+        let Ok(rewritten_plan) =
+            HirPlan::build_without_unnesting(rewritten.clone(), schema, params, cost_limit)
+        else {
+            continue;
+        };
+        let rewritten_cost = query_cost(&rewritten_plan, block.query, params);
+        if keep_rewrite
             || matches!(
                 (original_cost, rewritten_cost),
                 (Some(original), Some(rewritten)) if rewritten <= original

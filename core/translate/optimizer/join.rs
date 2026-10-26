@@ -688,6 +688,7 @@ pub(crate) fn compute_hir_join_order(
     source_costs: &[Cost],
     order_target: Option<&HirOrderTarget>,
     initial_input_cardinality: f64,
+    cost_limit: Option<Cost>,
     access_methods_arena: &mut Vec<AccessMethod>,
     schema: &Schema,
     analyze_stats: &AnalyzeStats,
@@ -923,7 +924,9 @@ pub(crate) fn compute_hir_join_order(
                     let Some(plan) = extend(&lhs_plans[&last], &lhs_mask, rhs)? else {
                         continue;
                     };
-                    if cost_bound.is_some_and(|bound| plan.cost.0 >= bound.0) {
+                    if cost_bound.is_some_and(|bound| plan.cost.0 >= bound.0)
+                        || cost_limit.is_some_and(|limit| plan.cost.0 > limit.0)
+                    {
                         continue;
                     }
                     if best_by_last
@@ -3003,6 +3006,7 @@ mod tests {
             &[Cost(0.0)],
             None,
             1.0,
+            None,
             &mut access_methods,
             &Schema::new(),
             &AnalyzeStats::default(),
@@ -3093,6 +3097,7 @@ mod tests {
             &vec![Cost(0.0); names.len()],
             None,
             1.0,
+            None,
             &mut access_methods,
             &Schema::new(),
             &AnalyzeStats::default(),
@@ -3111,6 +3116,46 @@ mod tests {
         // Without pruning, the search tries every order of the chain:
         // thousands of steps.
         assert!(steps < 200, "the planner tried {steps} join steps");
+
+        let search_with_limit = |limit: f64| -> Result<(BestJoinOrderResult, usize)> {
+            let mut access_methods = Vec::new();
+            JOIN_STEPS.with(|steps| steps.set(0));
+            let result = compute_hir_join_order(
+                &document,
+                &sources,
+                &[],
+                &constraints,
+                &where_clause,
+                &rows,
+                &vec![Cost(0.0); names.len()],
+                None,
+                1.0,
+                Some(Cost(limit)),
+                &mut access_methods,
+                &Schema::new(),
+                &AnalyzeStats::default(),
+                &DEFAULT_PARAMS,
+                false,
+                &HirHashJoins::NONE,
+                &|_| None,
+            )?
+            .expect("eight HIR sources produce a join plan");
+            Ok((result, JOIN_STEPS.with(|steps| steps.get())))
+        };
+        // A limit equal to the cheapest plan's cost still finds that plan.
+        let (at_best, _) = search_with_limit(result.best_plan.cost.0)?;
+        assert_eq!(
+            at_best.best_plan.table_numbers().collect::<Vec<_>>(),
+            (0..names.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(at_best.best_plan.cost.0, result.best_plan.cost.0);
+        // A limit below every plan's cost skips the orders the search
+        // would otherwise extend.
+        let (_, limited_steps) = search_with_limit(result.best_plan.cost.0 / 1000.0)?;
+        assert!(
+            limited_steps < steps,
+            "the planner tried {limited_steps} join steps under the limit, {steps} without"
+        );
         Ok(())
     }
 
