@@ -53,7 +53,7 @@ Basics not enumerated by the official feature matrix.
 | CREATE VIEW | ✅ Supported | Column aliases supported when they name every select-list column; TEMP, UNLOGGED, OR REPLACE, WITH (options) and WITH CHECK OPTION rejected |
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
 | CREATE SCHEMA / DROP SCHEMA | ✅ Supported | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased; AUTHORIZATION rejected; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists; CREATE SCHEMA can contain CREATE TABLE, VIEW, INDEX and SEQUENCE statements, which create their objects in the new schema, but not inside a transaction block |
-| CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE accepted (no-op); OWNED BY a column, TEMP and other options rejected; pg_sequences view; pg_class lists public-schema sequences with relkind S (sequence dumps remain incomplete); a sequence named without a schema is looked up through `search_path`, and a column default or view binds it to the schema it is in when the table or view is created; a serial column's sequence is created in the table's schema |
+| CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE accepted (no-op); OWNED BY a column, TEMP and other options rejected; pg_sequences view; pg_sequence exposes public-schema sequence parameters (bigint, cache 1); pg_class lists public-schema sequences with relkind S (sequence dumps remain incomplete); a sequence named without a schema is looked up through `search_path`, and a column default or view binds it to the schema it is in when the table or view is created; a serial column's sequence is created in the table's schema |
 | CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced; array base types, type modifiers and non-binary COLLATE rejected |
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
 | TRUNCATE | 🟡 Partial | Lowered to DELETE of one table; several tables, CASCADE and RESTART IDENTITY rejected |
@@ -71,7 +71,7 @@ Basics not enumerated by the official feature matrix.
 
 The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 `pg_namespace`, `pg_attribute`, `pg_type` (builtin + array + enum types),
-`pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_sequences`,
+`pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_sequence`, `pg_sequences`,
 `pg_database`, `pg_roles` (single hardcoded `turso` role), `pg_proc`, `pg_am`,
 plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,

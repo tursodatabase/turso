@@ -1146,3 +1146,37 @@ expect {
     catalog quoted seq
     catalog_serial_id_seq
 }
+
+test pg-sequence-empty-pgdump-query {
+    SELECT seqrelid, format_type(seqtypid, NULL), seqstart, seqincrement,
+           seqmax, seqmin, seqcache, seqcycle, NULL, 'f'
+    FROM pg_catalog.pg_sequence ORDER BY seqrelid;
+}
+expect {}
+
+test pg-sequence-metadata-matches-pg-class {
+    CREATE TABLE seq_items (id bigint PRIMARY KEY, label text);
+    CREATE INDEX seq_items_label ON seq_items (label);
+    CREATE SEQUENCE ascending_seq START 7 INCREMENT 3 MINVALUE 1 MAXVALUE 100 CYCLE;
+    CREATE SEQUENCE descending_seq START -5 INCREMENT -2 MINVALUE -99 MAXVALUE -1;
+    SELECT c.relname, format_type(s.seqtypid, NULL), s.seqstart,
+           s.seqincrement, s.seqmax, s.seqmin, s.seqcache, s.seqcycle
+    FROM pg_catalog.pg_sequence AS s
+    JOIN pg_catalog.pg_class AS c ON c.oid = s.seqrelid
+    WHERE c.relkind = 'S' ORDER BY c.relname;
+}
+expect {
+    ascending_seq|bigint|7|3|100|1|1|t
+    descending_seq|bigint|-5|-2|-1|-99|1|f
+}
+
+test pg-sequence-reflects-drop {
+    CREATE SEQUENCE removed_seq;
+    CREATE SEQUENCE kept_seq;
+    DROP SEQUENCE removed_seq;
+    SELECT c.relname FROM pg_sequence AS s
+    JOIN pg_class AS c ON c.oid = s.seqrelid ORDER BY c.relname;
+}
+expect {
+    kept_seq
+}
