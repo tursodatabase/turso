@@ -22,7 +22,7 @@
 use turso_parser::ast::{Distinctness, Operator, UnaryOperator};
 
 use super::{
-    optimizer::CostModelParams,
+    optimizer::{cost::Cost, CostModelParams},
     semantic::hir::{self, HirDocument, QueryBlockId, QueryId, SourceId, SourceOwner},
     semantic_to_plan::{hir_expr_can_fail, HirPlan},
 };
@@ -34,15 +34,16 @@ use rustc_hash::FxHashSet as HashSet;
 /// plan. Blocks are decided from the innermost query out, so a block is
 /// costed with the forms already chosen for the queries it runs.
 /// Also return the parameters of the parts the kept rewrites dropped, such
-/// as the SELECT list of an EXISTS, which callers still bind.
+/// as the SELECT list of an EXISTS, which callers still bind, and the plan
+/// of the returned document when costing the rewrites already built it.
 pub(crate) fn unnest_correlated_subqueries(
     document: Arc<HirDocument>,
     schema: &Schema,
     params: &CostModelParams,
     mode: crate::SubqueryUnnestingMode,
-) -> Result<(Arc<HirDocument>, Vec<hir::Parameter>)> {
+) -> Result<(Arc<HirDocument>, Vec<hir::Parameter>, Option<HirPlan>)> {
     if mode == crate::SubqueryUnnestingMode::Disabled || document.queries.len() < 2 {
-        return Ok((document, Vec::new()));
+        return Ok((document, Vec::new(), None));
     }
     let candidates = queries_innermost_first(&document)
         .into_iter()
@@ -53,7 +54,7 @@ pub(crate) fn unnest_correlated_subqueries(
         .filter(|block| has_candidate(&document, *block))
         .collect::<Vec<_>>();
     if candidates.is_empty() {
-        return Ok((document, Vec::new()));
+        return Ok((document, Vec::new(), None));
     }
     let mut document = document;
     let mut dropped_parameters = Vec::new();
@@ -78,21 +79,29 @@ pub(crate) fn unnest_correlated_subqueries(
                 document.clone(),
                 schema,
                 params,
+                None,
             )?),
         };
-        // A form the planner cannot plan is not chosen.
-        let Ok(rewritten_plan) =
-            HirPlan::build_without_unnesting(rewritten.clone(), schema, params)
-        else {
-            continue;
-        };
         let original_cost = query_cost(original, block.query, params);
-        let rewritten_cost = query_cost(&rewritten_plan, block.query, params);
         // Equal work is better without one subquery call per outer row,
         // and a block with a FULL join whose correlated
         // subqueries all became joins always keeps that form.
-        if mode == crate::SubqueryUnnestingMode::Forced
-            || complete_full_join_rewrite(&rewritten, block)
+        let keep_rewrite = mode == crate::SubqueryUnnestingMode::Forced
+            || complete_full_join_rewrite(&rewritten, block);
+        // A join order of the block that costs more than the whole original
+        // query cannot win, so the search skips it. Only a query planned
+        // once, for one run, gets the limit.
+        let cost_limit = original_cost
+            .filter(|_| !keep_rewrite && !rewritten.planning.reads_outer_sources(block.query))
+            .map(|cost| (block, Cost(cost)));
+        // A form the planner cannot plan is not chosen.
+        let Ok(rewritten_plan) =
+            HirPlan::build_without_unnesting(rewritten.clone(), schema, params, cost_limit)
+        else {
+            continue;
+        };
+        let rewritten_cost = query_cost(&rewritten_plan, block.query, params);
+        if keep_rewrite
             || matches!(
                 (original_cost, rewritten_cost),
                 (Some(original), Some(rewritten)) if rewritten <= original
@@ -103,7 +112,7 @@ pub(crate) fn unnest_correlated_subqueries(
             dropped_parameters.extend(dropped);
         }
     }
-    Ok((document, dropped_parameters))
+    Ok((document, dropped_parameters, original_plan))
 }
 
 /// Whether `block` has a FULL join and no correlated subquery left.
@@ -1524,7 +1533,7 @@ fn try_aggregate_rewrite(
         .collect::<Vec<_>>();
     let result_name = output.name.clone();
     let result_column = hir::SourceColumn {
-        name: result_name.into(),
+        name: result_name,
         type_fact: output.type_fact.clone(),
         affinity: output.schema_affinity,
         has_affinity: output.has_affinity,
@@ -1554,7 +1563,7 @@ fn try_aggregate_rewrite(
         let id = hir::OutputId::query(inner_block_id, inner_block.outputs.len());
         inner_block.outputs.push(hir::Output {
             id,
-            name: format!("correlation_key_{index}"),
+            name: format!("correlation_key_{index}").into(),
             expr,
             type_fact: column.type_fact.clone(),
             affinity: column.affinity,

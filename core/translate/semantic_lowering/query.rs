@@ -849,7 +849,7 @@ pub(crate) fn prepare_subquery(
                         ))
                     })?;
                     Ok(IndexColumn {
-                        name: output.name.clone(),
+                        name: output.name.to_string(),
                         order: SortOrder::Asc,
                         nulls_order: None,
                         pos_in_table: position,
@@ -3004,7 +3004,7 @@ fn open_hir_compound_index(
     let mut columns = crate::alloc::vec![];
     for (position, left) in left.outputs.iter().enumerate() {
         columns.push(IndexColumn {
-            name: left.name.clone(),
+            name: left.name.to_string(),
             order: SortOrder::Asc,
             nulls_order: None,
             pos_in_table: position,
@@ -8773,8 +8773,10 @@ pub(super) fn prepare_hir_btree_loop<'a>(
     let (cursor, table_cursor, autoindex_source_cursor) = if let Some(index) = index {
         let index_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         let table_cursor = match table_lookup {
-            BtreeTableLookup::ScanOnly => None,
-            BtreeTableLookup::TableRequired => Some(program.alloc_cursor_id(table_cursor_type())),
+            BtreeTableLookup::TableRequired if index.has_rowid => {
+                Some(program.alloc_cursor_id(table_cursor_type()))
+            }
+            BtreeTableLookup::ScanOnly | BtreeTableLookup::TableRequired => None,
         };
         let autoindex_source_cursor =
             if index.ephemeral {
@@ -11213,6 +11215,88 @@ pub(super) mod tests {
             panic!("root filter is a subquery expression");
         };
         subquery
+    }
+
+    #[test]
+    fn unnesting_returns_the_plan_of_the_document_it_keeps() {
+        let (document, schema) = analyze_sql_with_schema(
+            indexed_items_schema(),
+            "SELECT value FROM items AS a \
+             WHERE EXISTS (SELECT 1 FROM items AS b WHERE b.extra = a.extra)",
+        );
+        let document = Arc::new(document);
+        let (unnested, _, plan) = crate::translate::semantic_unnest::unnest_correlated_subqueries(
+            document.clone(),
+            &schema,
+            &CostModelParams::default(),
+            crate::SubqueryUnnestingMode::Forced,
+        )
+        .expect("unnesting succeeds");
+        assert!(!Arc::ptr_eq(&unnested, &document));
+        let plan = plan.expect("costing the rewrite plans the kept document");
+        assert!(Arc::ptr_eq(&plan.document, &unnested));
+    }
+
+    #[test]
+    fn correlated_subquery_is_planned_once_for_its_calls() {
+        let (document, schema) = analyze_sql_with_schema(
+            indexed_items_schema(),
+            "SELECT value FROM items AS a \
+             WHERE a.value > (SELECT max(b.value) FROM items AS b WHERE b.extra = a.extra)",
+        );
+        crate::translate::semantic_to_plan::QUERY_PLANS.with(|plans| plans.set(0));
+        let plan = HirPlan::build_without_unnesting(
+            Arc::new(document),
+            &schema,
+            &CostModelParams::default(),
+            None,
+        )
+        .expect("HIR query plans");
+        let crate::translate::semantic::hir::HirRoot::Query(root) = &plan.document.root else {
+            panic!("SELECT has a query root");
+        };
+        let subquery = plan
+            .queries
+            .iter()
+            .find(|query| query.query != root.query)
+            .expect("subquery is planned");
+        assert!(subquery.runs > 1.0);
+        assert_eq!(
+            crate::translate::semantic_to_plan::QUERY_PLANS.with(|plans| plans.get()),
+            2
+        );
+    }
+
+    #[test]
+    fn cost_limit_keeps_the_ordered_plan_that_saves_a_sort() {
+        let plan_with_limit = |sql: &str, limit: Option<f64>| {
+            let (document, schema) = analyze_sql_with_schema(indexed_items_schema(), sql);
+            let block = document.queries[0].blocks[0].id;
+            HirPlan::build_without_unnesting(
+                Arc::new(document),
+                &schema,
+                &CostModelParams::default(),
+                limit.map(|limit| (block, crate::translate::optimizer::cost::Cost(limit))),
+            )
+            .expect("HIR query plans")
+        };
+        let ordered_sql =
+            "SELECT a.extra FROM items AS b JOIN items AS a ON b.extra = a.extra ORDER BY a.value";
+        let ordered = plan_with_limit(ordered_sql, None);
+        let ordered = &ordered.queries[0].blocks[0];
+        let cheapest = plan_with_limit(
+            "SELECT a.extra FROM items AS b JOIN items AS a ON b.extra = a.extra",
+            None,
+        );
+        let cheapest = &cheapest.queries[0].blocks[0];
+        assert!(ordered.order_sort_elided);
+        assert!(cheapest.cost.0 < ordered.cost.0);
+        // The limit lies between the cheapest plan and the ordered plan the
+        // sort it saves makes better.
+        let limited = plan_with_limit(ordered_sql, Some((cheapest.cost.0 + ordered.cost.0) / 2.0));
+        let limited = &limited.queries[0].blocks[0];
+        assert!(limited.order_sort_elided);
+        assert_eq!(limited.cost.0, ordered.cost.0);
     }
 
     #[test]

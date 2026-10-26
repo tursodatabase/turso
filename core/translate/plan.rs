@@ -80,7 +80,19 @@ impl From<hir::ExprId> for HirWhereTerm {
 /// already built is left alone, so this runs again after a rewrite adds
 /// predicates.
 pub(crate) fn prepare_planning_terms(document: &mut hir::HirDocument) {
-    document.planning.queries = document.query_facts();
+    let query_reads = hir::QueryColumnReads::collect(
+        &document.queries,
+        |source| document.source(source),
+        &document.exprs,
+    );
+    prepare_planning_terms_with_reads(document, &query_reads);
+}
+
+pub(crate) fn prepare_planning_terms_with_reads(
+    document: &mut hir::HirDocument,
+    query_reads: &hir::QueryColumnReads,
+) {
+    document.planning.queries = document.query_facts(query_reads);
     let mut predicates = Vec::new();
     let mut filters = Vec::new();
     for query in &document.queries {

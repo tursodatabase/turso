@@ -1259,7 +1259,7 @@ impl Statement {
         let ResolvedResultValue::Column(source) = &column.value else {
             return column.primitive.map(|name| ColumnTypeInfo {
                 declared_name: name.to_string(),
-                array_dimensions: 0,
+                array_dimensions: column.array_dimensions,
                 base_type: None,
                 kind: ColumnTypeKind::Builtin,
             });

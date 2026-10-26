@@ -1824,6 +1824,21 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         functions: &mut FunctionContext<'_, 'ast>,
         expected_type: Option<Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
+        if let ast::Expr::Id(_)
+        | ast::Expr::Name(_)
+        | ast::Expr::Qualified(..)
+        | ast::Expr::Literal(_)
+        | ast::Expr::Variable(_) = syntax
+        {
+            return self.build_expr(
+                syntax,
+                ExprChildren::new(),
+                scope,
+                policy,
+                functions,
+                expected_type.as_ref(),
+            );
+        }
         let mut frames = vec![ExprFrame::new(syntax, expected_type, 0)?];
         let mut values = Vec::<FrameValue>::new();
         reserve_in_list_values(&mut values, syntax);
@@ -2021,7 +2036,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             ast::Expr::Exists(select) => {
                 expect_no_frame_children(children)?;
-                let query = self.analyze_subquery(select, owner.query(), scope, policies)?;
+                let query = self.analyze_exists_subquery(select, owner.query(), scope, policies)?;
                 Ok(FrameValue::Scalar(computed_expr(
                     &mut self.exprs,
                     hir::Expr::Subquery(hir::SubqueryExpr::Exists(query)),
@@ -2694,8 +2709,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             ast::Expr::Id(name) | ast::Expr::Name(name) => {
                 expect_no_expr_children(children)?;
                 let expression =
-                    match scope.resolve_unqualified(name.as_str(), policy.precedence)? {
-                        Some(resolved) => resolved.expr,
+                    match scope.resolve_unqualified_expr(name.as_str(), policy.precedence)? {
+                        Some(expression) => expression,
                         None if policy.allow_dqs_fallback && name.quoted_with('"') => {
                             hir::Expr::Literal(ast::Literal::String(name.as_literal()))
                         }
@@ -3775,8 +3790,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         // literal the type accepts as input. Otherwise an arithmetic operator
         // of a type whose stored values read back unchanged still gets the
         // operand as it is, so `date + 1`, `date + int_col` and `date + ?`
-        // add days; the operator function checks the operand's type. A
-        // comparison such as `int_col = '10'` keeps the standard operator.
+        // add days, and so does a comparison of a type whose `value` input
+        // type is `any`, so `numeric_col = 1.5 + 0` compares as numeric; the
+        // operator function checks the operand's type. A comparison such as
+        // `int_col = '10'` keeps the standard operator.
         let one_custom_column = |column: &CustomOperatorColumn,
                                  other: &ResolvedScopeExpr,
                                  operand: hir::BinaryOperand| {
@@ -3786,8 +3803,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             };
             let encode_other = other_is_written_literal
                 && literal_matches_custom_type(other, column.definition.value(), &self.exprs);
-            let pass_other_as_is = !operator.is_comparison()
-                && column.definition.value().decode_returns_value_unchanged();
+            let pass_other_as_is = if operator.is_comparison() {
+                column
+                    .definition
+                    .value()
+                    .value_input_type()
+                    .eq_ignore_ascii_case("any")
+            } else {
+                column.definition.value().decode_returns_value_unchanged()
+            };
             if !encode_other && !pass_other_as_is {
                 return None;
             }
@@ -3921,7 +3945,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             Some((schema, name)) => {
                 let schema = normalize_ident(schema);
                 let database = self.context().database(&schema).ok_or_else(|| {
-                    LimboError::InvalidArgument(format!("no such database: {schema}"))
+                    LimboError::ParseError(format!("sequence \"{user_name}\" does not exist"))
                 })?;
                 (database, normalize_ident(name))
             }

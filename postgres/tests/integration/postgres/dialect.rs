@@ -3048,6 +3048,26 @@ fn test_postgres_default_now(db: TempDatabase) {
     );
 }
 
+#[turso_macros::test]
+fn test_postgres_random_returns_a_double_in_unit_interval(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    for _ in 0..8 {
+        let mut stmt = conn.prepare("SELECT random()").unwrap();
+        let StepResult::Row = stmt.step().unwrap() else {
+            panic!("expected row");
+        };
+        let row = stmt.row().unwrap();
+        match row.get_value(0) {
+            Value::Numeric(Numeric::Float(value)) => {
+                let value = f64::from(*value);
+                assert!((0.0..1.0).contains(&value), "random() returned {value}");
+            }
+            other => panic!("expected random() to return a float, got {other:?}"),
+        }
+    }
+}
+
 /// Tests DEFAULT gen_random_uuid() produces a valid UUID string.
 #[turso_macros::test]
 fn test_postgres_default_gen_random_uuid(db: TempDatabase) {

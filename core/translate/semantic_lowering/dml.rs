@@ -946,6 +946,9 @@ pub(super) fn emit_strict_generated_check(
     let checked = type_check_table(table, |_, column| {
         if !column.is_virtual_generated() {
             column.ty_str = "ANY".to_string();
+        } else if column.is_array() {
+            column.ty_str = "BLOB".to_string();
+            column.override_affinity(crate::vdbe::affinity::Affinity::Blob);
         }
     });
     program.emit_insn(Insn::TypeCheck {

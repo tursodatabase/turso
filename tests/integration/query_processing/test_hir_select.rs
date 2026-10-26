@@ -466,7 +466,7 @@ fn hir_right_and_full_joins_match_sqlite_rows() {
 #[test]
 fn hir_reads_indexes_on_generated_columns() {
     let db = TempDatabase::builder()
-        .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
+        .with_opts(turso_core::DatabaseOpts::new())
         .build();
     let (sqlite, hir) = connections(&db);
     for statement in [

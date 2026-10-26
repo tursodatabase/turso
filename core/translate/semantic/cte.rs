@@ -934,6 +934,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     outer_scope: context.outer_scope(),
                     expected_outputs: None,
                     policies: context.policies(),
+                    outputs_unread: false,
                 },
             )
         })

@@ -41,6 +41,14 @@ impl ConstraintViolation {
     }
 }
 
+/// An error that code of a dialect raised, which the engine carries without
+/// change. `code` is an error code that the dialect defines.
+#[derive(Debug, Clone)]
+pub struct DialectError {
+    pub code: &'static str,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
 pub enum LimboError {
     #[error("Corrupt database: {0}")]
@@ -174,6 +182,10 @@ pub enum LimboError {
     UnsupportedEncoding(String),
     #[error("Out of memory")]
     OutOfMemory,
+    /// An error that code of a dialect raised, for example one of its
+    /// functions. Boxed, so that it does not make every `LimboError` larger.
+    #[error("{}", .0.message)]
+    Dialect(Box<DialectError>),
 }
 
 /// `?` in functions returning boxed errors (see `InsnResult`) composes

@@ -245,6 +245,7 @@ enum ExprRegisters {
     Function(usize),
     ColumnPrograms(ColumnProgramRegisters),
     CastPrograms(CastProgramRegisters),
+    NullRowEnd(BranchOffset),
 }
 
 enum NullTest {
@@ -714,7 +715,20 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                     )));
                 };
                 match column_child {
-                    ColumnChild::Generated(_) => context.target,
+                    ColumnChild::Generated(_) => {
+                        if let Some(SourceBinding::BTree { scan_cursor, .. }) =
+                            self.program.source_binding(reference.source).copied()
+                        {
+                            let end = self.program.allocate_label();
+                            self.program.emit_insn(Insn::IfNullRow {
+                                cursor_id: scan_cursor,
+                                target_pc: end,
+                                dest: context.target,
+                            });
+                            context.registers = ExprRegisters::NullRowEnd(end);
+                        }
+                        context.target
+                    }
                     ColumnChild::Default(_) => {
                         self.begin_encoded_default(*reference, context)?;
                         context.target
@@ -1759,7 +1773,9 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
             _ => return Ok(ControlFlow::Break(())),
         };
         let mut child_context = LoweringContext::new(target);
-        child_context.in_hoisted = context.in_hoisted || context.hoisted.is_some();
+        child_context.in_hoisted = context.in_hoisted
+            || context.hoisted.is_some()
+            || matches!(context.registers, ExprRegisters::NullRowEnd(_));
         // The operands of an ordinary operator or function each have their
         // own register, which nothing else writes.
         let own_register = match parent {
@@ -3270,6 +3286,9 @@ impl ExprLowerer<'_, '_, '_> {
                 debug_assert_eq!(children[0], target);
                 if decode_children == 0 && column.has_affinity() {
                     self.program.emit_column_affinity(target, column.affinity());
+                }
+                if let ExprRegisters::NullRowEnd(end) = registers {
+                    self.program.preassign_label_to_next_insn(end);
                 }
             }
             hir::ColumnReadExpression::Absent => {}

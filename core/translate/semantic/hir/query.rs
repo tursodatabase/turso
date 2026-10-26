@@ -100,7 +100,7 @@ pub enum QueryBlockBody {
 #[derive(Clone, Debug)]
 pub struct Output {
     pub id: OutputId,
-    pub name: String,
+    pub name: crate::sync::Arc<str>,
     pub expr: ExprId,
     pub type_fact: TypeFact,
     pub affinity: Affinity,
@@ -549,29 +549,33 @@ impl std::convert::From<crate::sync::Arc<[SourceColumn]>> for SourceColumns {
 #[derive(Clone, Debug)]
 pub struct TableColumns {
     table: crate::sync::Arc<crate::schema::Table>,
-    type_facts: crate::sync::Arc<crate::sync::OnceLock<Box<[TypeFact]>>>,
+    type_facts: Option<crate::sync::Arc<crate::sync::OnceLock<Box<[TypeFact]>>>>,
 }
 
 impl TableColumns {
     pub fn new(table: crate::sync::Arc<crate::schema::Table>) -> Self {
-        Self {
-            table,
-            type_facts: crate::sync::Arc::new(crate::sync::OnceLock::new()),
-        }
+        let type_facts = match table.as_ref() {
+            crate::schema::Table::BTree(_) => None,
+            _ => Some(crate::sync::Arc::new(crate::sync::OnceLock::new())),
+        };
+        Self { table, type_facts }
     }
 
     #[inline]
     fn type_fact(&self, index: usize) -> &TypeFact {
-        &self
-            .type_facts
-            .get_or_init(|| declared_type_facts(&self.table))[index]
+        match (self.table.as_ref(), &self.type_facts) {
+            (crate::schema::Table::BTree(table), _) => &table.declared_type_facts()[index],
+            (table, Some(type_facts)) => {
+                &type_facts.get_or_init(|| declared_type_facts(table.columns()))[index]
+            }
+            (_, None) => unreachable!("only a B-tree table keeps its type facts in the schema"),
+        }
     }
 }
 
-fn declared_type_facts(table: &crate::schema::Table) -> Box<[TypeFact]> {
+pub(crate) fn declared_type_facts(columns: &[crate::schema::Column]) -> Box<[TypeFact]> {
     let mut declarations: Vec<crate::sync::Arc<super::DeclaredType>> = Vec::new();
-    table
-        .columns()
+    columns
         .iter()
         .map(|column| {
             if column.ty_str.is_empty() {
@@ -611,6 +615,16 @@ pub enum SourceColumnRef<'a> {
 }
 
 impl<'a> SourceColumnRef<'a> {
+    pub fn shared_name(self) -> crate::sync::Arc<str> {
+        match self {
+            Self::Table { columns, index, .. } => match columns.table.as_ref() {
+                crate::schema::Table::BTree(table) => table.shared_column_names()[index].clone(),
+                _ => self.name().into(),
+            },
+            Self::Owned(column) => crate::sync::Arc::from(&*column.name),
+        }
+    }
+
     #[inline]
     pub fn name(self) -> &'a str {
         match self {

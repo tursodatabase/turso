@@ -70,7 +70,9 @@ pub fn compare(actual: &QueryResult, expectation: &Expectation) -> ComparisonRes
             }
             unordered::compare(&actual.rows, expected_rows)
         }
-        Expectation::Error(expected_pattern) => compare_error(actual, expected_pattern.as_deref()),
+        Expectation::Error { sqlstate, pattern } => {
+            compare_error(actual, sqlstate.as_deref(), pattern.as_deref())
+        }
     }
 }
 
@@ -83,7 +85,26 @@ fn normalize_whitespace(s: &str) -> String {
 }
 
 /// Compare when expecting an error
-fn compare_error(actual: &QueryResult, expected_pattern: Option<&str>) -> ComparisonResult {
+fn compare_error(
+    actual: &QueryResult,
+    expected_sqlstate: Option<&str>,
+    expected_pattern: Option<&str>,
+) -> ComparisonResult {
+    if let (Some(err), Some(expected)) = (&actual.error, expected_sqlstate) {
+        match actual.sqlstate.as_deref() {
+            Some(sqlstate) if sqlstate == expected => {}
+            Some(sqlstate) => {
+                return ComparisonResult::mismatch(format!(
+                    "expected SQLSTATE {expected} but got {sqlstate}: {err}"
+                ));
+            }
+            None => {
+                return ComparisonResult::mismatch(format!(
+                    "expected SQLSTATE {expected} but the error has no SQLSTATE: {err}"
+                ));
+            }
+        }
+    }
     match (&actual.error, expected_pattern) {
         (None, _) => ComparisonResult::mismatch("expected error but query succeeded"),
         (Some(_err), None) => {
@@ -147,7 +168,10 @@ mod tests {
     #[test]
     fn test_compare_error_any() {
         let actual = QueryResult::error("no such table: users");
-        let expectation = Expectation::Error(None);
+        let expectation = Expectation::Error {
+            sqlstate: None,
+            pattern: None,
+        };
 
         assert!(compare(&actual, &expectation).is_match());
     }
@@ -155,7 +179,10 @@ mod tests {
     #[test]
     fn test_compare_error_pattern() {
         let actual = QueryResult::error("no such table: users");
-        let expectation = Expectation::Error(Some("no such table".to_string()));
+        let expectation = Expectation::Error {
+            sqlstate: None,
+            pattern: Some("no such table".to_string()),
+        };
 
         assert!(compare(&actual, &expectation).is_match());
     }
@@ -163,7 +190,10 @@ mod tests {
     #[test]
     fn test_compare_error_pattern_mismatch() {
         let actual = QueryResult::error("syntax error");
-        let expectation = Expectation::Error(Some("no such table".to_string()));
+        let expectation = Expectation::Error {
+            sqlstate: None,
+            pattern: Some("no such table".to_string()),
+        };
 
         assert!(!compare(&actual, &expectation).is_match());
     }
@@ -171,7 +201,10 @@ mod tests {
     #[test]
     fn test_compare_expected_error_got_success() {
         let actual = QueryResult::success(vec![vec!["1".to_string()]]);
-        let expectation = Expectation::Error(None);
+        let expectation = Expectation::Error {
+            sqlstate: None,
+            pattern: None,
+        };
 
         assert!(!compare(&actual, &expectation).is_match());
     }
@@ -182,5 +215,80 @@ mod tests {
         let expectation = Expectation::Exact(vec!["1".to_string()]);
 
         assert!(!compare(&actual, &expectation).is_match());
+    }
+
+    fn missing_table_error(sqlstate: Option<&str>) -> QueryResult {
+        QueryResult::error_with_sqlstate(
+            "relation \"t\" does not exist",
+            sqlstate.map(str::to_string),
+        )
+    }
+
+    fn sqlstate_expectation(sqlstate: &str, pattern: Option<&str>) -> Expectation {
+        Expectation::Error {
+            sqlstate: Some(sqlstate.to_string()),
+            pattern: pattern.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_compare_error_same_sqlstate() {
+        let actual = missing_table_error(Some("42P01"));
+
+        assert!(compare(&actual, &sqlstate_expectation("42P01", None)).is_match());
+        assert!(
+            compare(
+                &actual,
+                &sqlstate_expectation("42P01", Some("does not exist"))
+            )
+            .is_match()
+        );
+    }
+
+    #[test]
+    fn test_compare_error_different_sqlstate() {
+        let actual = missing_table_error(Some("42601"));
+
+        assert_eq!(
+            compare(&actual, &sqlstate_expectation("42P01", None)),
+            ComparisonResult::mismatch(
+                "expected SQLSTATE 42P01 but got 42601: relation \"t\" does not exist"
+            )
+        );
+    }
+
+    #[test]
+    fn test_compare_error_without_sqlstate() {
+        let actual = missing_table_error(None);
+
+        assert_eq!(
+            compare(&actual, &sqlstate_expectation("42P01", None)),
+            ComparisonResult::mismatch(
+                "expected SQLSTATE 42P01 but the error has no SQLSTATE: relation \"t\" does not exist"
+            )
+        );
+    }
+
+    #[test]
+    fn test_compare_error_same_sqlstate_but_other_message() {
+        let actual = missing_table_error(Some("42P01"));
+
+        assert!(
+            !compare(
+                &actual,
+                &sqlstate_expectation("42P01", Some("no such table"))
+            )
+            .is_match()
+        );
+    }
+
+    #[test]
+    fn test_compare_sqlstate_expected_but_query_succeeded() {
+        let actual = QueryResult::success(vec![]);
+
+        assert_eq!(
+            compare(&actual, &sqlstate_expectation("42P01", None)),
+            ComparisonResult::mismatch("expected error but query succeeded")
+        );
     }
 }

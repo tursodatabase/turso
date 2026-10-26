@@ -18,9 +18,9 @@ use super::{
         CompoundArm, Cte, CteId, DatabaseId, Delete, DeleteTargetKind, Expr, ExprArena, ExprId,
         ExprRef, FunctionEvaluation, Grouping, HirDocument, HirRoot, IndexCoverage, IndexHint,
         Insert, InsertTargetKind, Limit, OrderTerm, Output, OutputId, OutputNameKind, OutputOwner,
-        Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SchemaExpressionRoot,
-        SchemaProgramId, Source, SourceColumn, SourceId, SourceKind, SourceOwner, TriggerBody,
-        TriggerCommand, TypeFact, Update, UpdateTargetKind,
+        Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryColumnReads, QueryId, QueryRoot,
+        SchemaExpressionRoot, SchemaProgramId, Source, SourceColumn, SourceId, SourceKind,
+        SourceOwner, TriggerBody, TriggerCommand, TypeFact, Update, UpdateTargetKind,
     },
     query::FromContext,
     scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
@@ -98,9 +98,9 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
             expressions,
         } => analyzer.analyze_register_expressions(inputs, expressions)?,
     };
-    analyzer.finish_column_reads(&root)?;
+    let query_reads = analyzer.finish_column_reads(&root)?;
     let mut document = analyzer.finish(root)?;
-    crate::translate::plan::prepare_planning_terms(&mut document);
+    crate::translate::plan::prepare_planning_terms_with_reads(&mut document, &query_reads);
     #[cfg(debug_assertions)]
     document.validate().map_err(|error| {
         LimboError::InternalError(format!("semantic analysis produced invalid HIR: {error}"))
@@ -218,6 +218,8 @@ pub(super) struct SelectContext<'scope> {
     pub(super) outer_scope: Option<&'scope Scope>,
     pub(super) expected_outputs: Option<&'scope [Option<Arc<TypeDef>>]>,
     pub(super) policies: ExprPolicies,
+    /// Nothing reads the query's result columns, as for an EXISTS subquery.
+    pub(super) outputs_unread: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -247,7 +249,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             sources: Vec::new(),
             ctes: Vec::new(),
             schema_programs: Vec::new(),
-            exprs: super::hir::ExprArena::default(),
+            exprs: super::hir::ExprArena::with_capacity(32),
             schema_programs_in_progress: HashSet::default(),
             catalog_ids: HashMap::default(),
             cte_scopes: Vec::new(),
@@ -357,8 +359,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         self.context().resolve_table_in(name, self.view_database)
     }
 
-    pub(super) fn table_exists_in_scope(&self, name: &ast::QualifiedName) -> Result<bool> {
-        self.context().table_exists_in(name, self.view_database)
+    pub(super) fn find_table_in_scope(
+        &self,
+        name: &ast::QualifiedName,
+    ) -> Result<Option<(DatabaseId, Arc<crate::schema::Table>)>> {
+        self.context().find_table_in(name, self.view_database)
     }
 
     pub(super) fn resolve_view_in_scope(
@@ -553,11 +558,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         })
     }
 
-    fn finish_column_reads(&mut self, root: &HirRoot) -> Result<()> {
-        let mut pending = Vec::new();
-        for query in self.queries.iter().flatten() {
-            query.direct_column_reads(|source| self.source(source), &self.exprs, &mut pending);
-        }
+    fn finish_column_reads(&mut self, root: &HirRoot) -> Result<QueryColumnReads> {
+        let query_reads = QueryColumnReads::collect(
+            self.queries.iter().flatten(),
+            |source| self.source(source),
+            &self.exprs,
+        );
+        let mut pending = query_reads.all().to_vec();
         // An index expression can read a generated column, which then needs
         // its generation expression when the index is used.
         for source in self.sources.iter().flatten() {
@@ -775,7 +782,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     ColumnReadExpression::Planned(expression);
             }
         }
-        Ok(())
+        Ok(query_reads)
     }
 
     pub(super) fn analyze_select(&mut self, select: &'ast ast::Select) -> Result<QueryId> {
@@ -796,6 +803,32 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         policies: ExprPolicies,
     ) -> Result<QueryId> {
         self.analyze_select_with_scope(select, parent, Some(outer_scope), None, policies)
+    }
+
+    /// An EXISTS subquery, which only reports whether its query returns a
+    /// row.
+    pub(super) fn analyze_exists_subquery(
+        &mut self,
+        select: &'ast ast::Select,
+        parent: Option<QueryId>,
+        outer_scope: &Scope,
+        policies: ExprPolicies,
+    ) -> Result<QueryId> {
+        self.with_cte_scope(select.with.as_ref(), |analyzer| {
+            analyzer.analyze_select_parts(
+                &select.body.select,
+                &select.body.compounds,
+                &select.order_by,
+                select.limit.as_ref(),
+                SelectContext {
+                    parent,
+                    outer_scope: Some(outer_scope),
+                    expected_outputs: None,
+                    policies,
+                    outputs_unread: true,
+                },
+            )
+        })
     }
 
     pub(super) fn analyze_subquery_with_expected_outputs(
@@ -846,6 +879,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 outer_scope,
                 expected_outputs,
                 policies,
+                outputs_unread: false,
             },
         )
     }
@@ -863,6 +897,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             outer_scope,
             expected_outputs,
             policies,
+            outputs_unread,
         } = context;
         let rightmost = compounds
             .last()
@@ -881,6 +916,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let mut blocks = Vec::with_capacity(compounds.len() + 1);
         let ordinary_order_by =
             (compounds.is_empty() && !order_by_syntax.is_empty()).then_some(order_by_syntax);
+        // ORDER BY can name a result column by its position, and every
+        // compound arm needs as many columns as the others.
+        let outputs_unread = outputs_unread && compounds.is_empty() && order_by_syntax.is_empty();
         let (first_block, mut order_by, first_scope) = self.analyze_select_block(
             first_select,
             query_id,
@@ -888,6 +926,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             outer_scope,
             ordinary_order_by,
             expected_outputs,
+            outputs_unread,
             policies,
         )?;
         blocks.push(first_block);
@@ -900,6 +939,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 outer_scope,
                 None,
                 expected_outputs,
+                false,
                 policies,
             )?;
             debug_assert!(block_order_by.is_empty());
@@ -1005,6 +1045,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         outer_scope: Option<&Scope>,
         order_by: Option<&'ast [ast::SortedColumn]>,
         expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
+        outputs_unread: bool,
         policies: ExprPolicies,
     ) -> Result<(QueryBlock, Vec<OrderTerm>, Scope)> {
         match select {
@@ -1027,6 +1068,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 outer_scope,
                 order_by,
                 expected_outputs,
+                outputs_unread,
                 policies,
             ),
             ast::OneSelect::Values(rows) => {
@@ -1058,6 +1100,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         outer_scope: Option<&Scope>,
         order_by: Option<&'ast [ast::SortedColumn]>,
         expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
+        outputs_unread: bool,
         policies: ExprPolicies,
     ) -> Result<(QueryBlock, Vec<OrderTerm>, Scope)> {
         if from.is_none()
@@ -1085,14 +1128,39 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         };
         let mut functions = QueryFunctionState::new(block_id);
         self.analyze_named_windows(window_clause, &mut functions)?;
-        let outputs = self.analyze_outputs(
-            block_id,
-            columns,
-            &scope,
-            &mut functions,
-            expected_outputs,
-            policies,
-        )?;
+        // When nothing reads the result, a constant stands for the `*` of
+        // one table, so the table's columns are neither listed nor read.
+        let star_of_one_table = matches!(columns, [ast::ResultColumn::Star])
+            && from.as_ref().is_some_and(|from| {
+                from.joins.is_empty()
+                    && self
+                        .source(from.first)
+                        .is_some_and(|source| matches!(source.kind, SourceKind::Table(_)))
+            });
+        let outputs = if outputs_unread
+            && star_of_one_table
+            && distinctness.is_none()
+            && group_by.is_none()
+            && window_clause.is_empty()
+        {
+            let resolved =
+                self.resolve_atomic_expr(Expr::Literal(ast::Literal::Numeric("1".into())), &scope)?;
+            vec![output_from_resolved(
+                OutputId::query(block_id, 0),
+                "1",
+                OutputNameKind::Inferred,
+                resolved,
+            )]
+        } else {
+            self.analyze_outputs(
+                block_id,
+                columns,
+                &scope,
+                &mut functions,
+                expected_outputs,
+                policies,
+            )?
+        };
         let filter = match where_clause {
             Some(syntax) => {
                 let mut clause_scope = scope.clone();
@@ -1207,7 +1275,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     ) -> Result<QueryBlock> {
         let block = QueryBlockId::new(query, index);
         let scope = self.new_scope(outer_scope.cloned());
-        let policy = policies.select();
+        let policy = policies.insert_values();
         let mut functions = QueryFunctionState::new(block);
         let mut resolved_rows = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1714,7 +1782,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         for column in expanded {
             let resolved = self.resolve_atomic_expr(column.expr, scope)?;
             let name = if long_names {
-                format!("{}.{}", column.qualifier, column.name)
+                format!("{}.{}", column.qualifier, column.name).into()
             } else {
                 column.name
             };
@@ -1773,14 +1841,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
 
 pub(super) fn output_from_resolved(
     id: OutputId,
-    name: String,
+    name: impl Into<Arc<str>>,
     name_kind: OutputNameKind,
     resolved: ResolvedScopeExpr,
 ) -> Output {
     let (collation, collation_is_explicit) = resolved.collation.into_output();
     Output {
         id,
-        name,
+        name: name.into(),
         expr: resolved.expr,
         type_fact: resolved.type_fact,
         affinity: resolved.affinity,
@@ -2870,6 +2938,61 @@ mod tests {
     }
 
     #[test]
+    fn prepares_of_one_table_share_its_declared_types() {
+        let mut schema = Schema::new();
+        let table = BTreeTable::from_sql("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)", 2)
+            .expect("table schema parses");
+        schema
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
+            .expect("table name is unique");
+        let declared_type_of_a = || {
+            let document = analyze_sql_with_schema(&schema, "SELECT a FROM t WHERE a = 1")
+                .expect("SELECT analyzes");
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let query = document.query(root.query).expect("query exists");
+            let from = query.blocks[0].from.as_ref().expect("query has FROM");
+            let source = document.source(from.first).expect("source exists");
+            source
+                .columns
+                .get(1)
+                .expect("column a exists")
+                .type_fact()
+                .declared
+                .clone()
+                .expect("column a has a declared type")
+        };
+        let first = declared_type_of_a();
+        let second = declared_type_of_a();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn star_outputs_share_the_table_column_names() {
+        let mut schema = Schema::new();
+        let table = BTreeTable::from_sql("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)", 2)
+            .expect("table schema parses");
+        schema
+            .add_btree_table(NamespaceId::ROOT, Arc::new(table))
+            .expect("table name is unique");
+        let star_output_name_of_a = || {
+            let document = analyze_sql_with_schema(&schema, "SELECT * FROM t ORDER BY A")
+                .expect("SELECT analyzes");
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let query = document.query(root.query).expect("query exists");
+            assert_eq!(query.order_by.len(), 1);
+            query.blocks[0].outputs[1].name.clone()
+        };
+        let first = star_output_name_of_a();
+        let second = star_output_name_of_a();
+        assert_eq!(&*first, "a");
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
     fn select_star_does_not_copy_declared_types() {
         let mut schema = Schema::new();
         let columns: Vec<String> = (0..64).map(|column| format!("c{column} INTEGER")).collect();
@@ -3348,7 +3471,7 @@ mod tests {
         assert_eq!(block.outputs.len(), 5);
         assert_eq!(block.outputs[0].type_fact.storage, Some(Type::Integer));
         assert_eq!(block.outputs[1].type_fact.storage, Some(Type::Real));
-        assert_eq!(block.outputs[1].name, "real_value");
+        assert_eq!(&*block.outputs[1].name, "real_value");
         assert_eq!(block.outputs[1].name_kind, OutputNameKind::ExplicitAlias);
         assert_eq!(block.outputs[2].type_fact.storage, Some(Type::Text));
         assert_eq!(block.outputs[3].type_fact.storage, Some(Type::Null));
@@ -4030,6 +4153,33 @@ mod tests {
     }
 
     #[test]
+    fn subquery_reading_outer_sources_in_turns_captures_each_once() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT (SELECT b.id + inner_items.id + a.id + b.value + a.value \
+                     FROM items AS inner_items) \
+             FROM items AS a JOIN items AS b",
+        )
+        .expect("subquery reads both outer sources");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        let from = outer.blocks[0].from.as_ref().expect("outer query has FROM");
+        let mut outer_sources = vec![from.first, from.joins[0].right];
+        outer_sources.sort_unstable();
+        let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) =
+            &document.exprs[outer.blocks[0].outputs[0].expr]
+        else {
+            panic!("output is a scalar subquery");
+        };
+        let inner = document.query(*query).expect("inner query exists");
+        assert_eq!(inner.captures, outer_sources);
+    }
+
+    #[test]
     fn expression_subqueries_bind_in_join_constraints() {
         let schema = schema_with_join_tables();
         let document = analyze_sql_with_schema(
@@ -4299,6 +4449,25 @@ mod tests {
             &document.exprs[*rhs],
             Expr::Output(id) if *id == OutputId::query(block.id, 0)
         ));
+    }
+
+    #[test]
+    fn exists_star_of_one_table_lists_no_columns() {
+        let schema = schema_with_items();
+        let outputs = |sql: &str| {
+            let document = analyze_sql_with_schema(&schema, sql).expect("SQL analyzes");
+            document.queries[1].blocks[0].outputs.len()
+        };
+        assert_eq!(
+            outputs("SELECT id FROM items AS a WHERE EXISTS (SELECT * FROM items AS b WHERE b.id = a.id)"),
+            1
+        );
+        for sql in [
+            "SELECT id FROM items AS a WHERE EXISTS (SELECT DISTINCT * FROM items AS b WHERE b.id = a.id)",
+            "SELECT id FROM items AS a WHERE EXISTS (SELECT * FROM items AS b ORDER BY 3)",
+        ] {
+            assert_eq!(outputs(sql), 3, "{sql}");
+        }
     }
 
     #[test]
@@ -4753,7 +4922,7 @@ mod tests {
             values
                 .outputs
                 .iter()
-                .map(|output| output.name.as_str())
+                .map(|output| &*output.name)
                 .collect::<Vec<_>>(),
             ["column1", "column2"]
         );
@@ -4821,29 +4990,18 @@ mod tests {
     }
 
     #[test]
-    fn values_keep_function_identities_and_name_rules() {
-        let document = analyze_sql("VALUES(sum(1), row_number() OVER ())")
-            .expect("VALUES allows query functions");
-        let HirRoot::Query(root) = &document.root else {
-            panic!("VALUES produces query root");
-        };
-        let block = &document.query(root.query).expect("query exists").blocks[0];
-        assert_eq!(block.aggregate_count, 1);
-        assert_eq!(block.window_function_count, 1);
-        assert_eq!(block.windows.len(), 1);
-        let QueryBlockBody::Values { rows } = &block.body else {
-            panic!("query owns VALUES rows");
-        };
-        assert!(matches!(
-            &document.exprs[rows[0][0]],
-            Expr::Function(call)
-                if matches!(call.evaluation, FunctionEvaluation::Aggregate { .. })
-        ));
-        assert!(matches!(
-            &document.exprs[rows[0][1]],
-            Expr::Function(call)
-                if matches!(call.evaluation, FunctionEvaluation::Window { .. })
-        ));
+    fn values_reject_query_functions_and_keep_name_rules() {
+        let error = analyze_sql("VALUES(sum(1))").expect_err("VALUES rejects aggregates");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: misuse of aggregate function sum()"
+        );
+        let error = analyze_sql("VALUES(row_number() OVER ())")
+            .expect_err("VALUES rejects window functions");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: misuse of window function row_number()"
+        );
 
         let error = analyze_sql("VALUES(missing)").expect_err("VALUES has no local names");
         assert_eq!(error.to_string(), "Parse error: no such column: missing");
@@ -6553,7 +6711,7 @@ mod tests {
                 block
                     .outputs
                     .iter()
-                    .map(|output| output.name.as_str())
+                    .map(|output| &*output.name)
                     .collect::<Vec<_>>(),
                 ["id", "value", "score", "label"],
                 "RIGHT JOIN does not reorder lexical star columns"
@@ -9030,7 +9188,7 @@ mod tests {
             returning
                 .outputs
                 .iter()
-                .map(|output| (output.id, output.name.as_str(), output.name_kind))
+                .map(|output| (output.id, &*output.name, output.name_kind))
                 .collect::<Vec<_>>(),
             [
                 (OutputId::root(0), "id", OutputNameKind::StarExpansion),
@@ -9454,7 +9612,7 @@ mod tests {
             block
                 .outputs
                 .iter()
-                .map(|output| output.name.as_str())
+                .map(|output| &*output.name)
                 .collect::<Vec<_>>(),
             ["id", "value", "score", "score"]
         );
@@ -10764,7 +10922,10 @@ mod tests {
                 "SELECT nextval('missing')",
                 "Parse error: sequence \"missing\" does not exist",
             ),
-            ("SELECT setval('aux.orders', 1)", "no such database: aux"),
+            (
+                "SELECT setval('aux.orders', 1)",
+                "Parse error: sequence \"aux.orders\" does not exist",
+            ),
         ] {
             let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid call must fail");
             assert_eq!(error.to_string(), expected);
@@ -12158,7 +12319,7 @@ mod tests {
             returning
                 .outputs
                 .iter()
-                .map(|output| (output.id, output.name.as_str(), output.name_kind))
+                .map(|output| (output.id, &*output.name, output.name_kind))
                 .collect::<Vec<_>>(),
             [
                 (OutputId::root(0), "id", OutputNameKind::StarExpansion),
@@ -12763,7 +12924,7 @@ mod tests {
             returning
                 .outputs
                 .iter()
-                .map(|output| (output.id, output.name.as_str(), output.name_kind))
+                .map(|output| (output.id, &*output.name, output.name_kind))
                 .collect::<Vec<_>>(),
             [
                 (OutputId::root(0), "id", OutputNameKind::StarExpansion),

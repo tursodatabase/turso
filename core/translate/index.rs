@@ -1180,6 +1180,7 @@ pub fn translate_drop_index(
     let namespace = match catalog.resolve_existing_index(qualified_name) {
         Ok(namespace) => namespace,
         Err(_) if if_exists => return Ok(()),
+        Err(error) if qualified_name.namespace.is_some() => return Err(error),
         Err(_) => {
             return Err(crate::error::LimboError::InvalidArgument(format!(
                 "No such index: {}",

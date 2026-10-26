@@ -425,23 +425,31 @@ impl HirPlan {
         params: &CostModelParams,
         mode: crate::SubqueryUnnestingMode,
     ) -> Result<Self> {
-        let (document, dropped_parameters) =
+        let (document, dropped_parameters, plan) =
             super::semantic_unnest::unnest_correlated_subqueries(document, schema, params, mode)?;
-        let mut plan = Self::build_without_unnesting(document, schema, params)?;
+        let mut plan = match plan {
+            Some(plan) => plan,
+            None => Self::build_without_unnesting(document, schema, params, None)?,
+        };
         plan.dropped_parameters = dropped_parameters;
         Ok(plan)
     }
 
     /// Plan `document` as it is, without turning its correlated subqueries
-    /// into joins.
+    /// into joins. With `cost_limit`, the join search of that block skips
+    /// orders that cost more than the limit.
     pub(crate) fn build_without_unnesting(
         document: Arc<HirDocument>,
         schema: &Schema,
         params: &CostModelParams,
+        cost_limit: Option<(QueryBlockId, Cost)>,
     ) -> Result<Self> {
         let mut queries = Vec::new();
         let mut active = HashSet::default();
-        let context = HirPlanContext::new(&document);
+        let context = HirPlanContext {
+            document: &document,
+            cost_limit,
+        };
         for query in &document.queries {
             context.plan_query_tree(query.id, schema, params, &mut queries, &mut active)?;
         }
@@ -1104,14 +1112,28 @@ pub(crate) fn rejects_null_row(expr: hir::ExprRef<'_>, source: SourceId) -> bool
 /// SQLITE_MAX_COLUMN.
 const MAX_RESULT_COLUMNS: usize = 2000;
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread planned a query.
+    pub(crate) static QUERY_PLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// State shared while one HIR document is converted into plan nodes.
 pub(crate) struct HirPlanContext<'a> {
     document: &'a HirDocument,
+    /// A query block and the cost above which no join order for it is
+    /// worth finding, because its query would then cost more than a form
+    /// already planned.
+    cost_limit: Option<(QueryBlockId, Cost)>,
 }
 
 impl<'a> HirPlanContext<'a> {
+    #[cfg(test)]
     pub(crate) fn new(document: &'a HirDocument) -> Self {
-        Self { document }
+        Self {
+            document,
+            cost_limit: None,
+        }
     }
 
     fn definition(&self, id: SourceId) -> &'a hir::Source {
@@ -1248,6 +1270,7 @@ impl<'a> HirPlanContext<'a> {
             &crate::translate::optimizer::join::HirHashJoins::NONE,
             false,
             1.0,
+            None,
             schema,
             params,
             query_estimate,
@@ -1412,6 +1435,7 @@ impl<'a> HirPlanContext<'a> {
             &crate::translate::optimizer::join::HirHashJoins::NONE,
             false,
             1.0,
+            None,
             schema,
             params,
             query_estimate,
@@ -1423,8 +1447,7 @@ impl<'a> HirPlanContext<'a> {
 
     /// Plan query-backed dependencies before their owning query so source
     /// scans can use the child's output and work estimates. Then plan each
-    /// correlated subquery again for the number of times the chosen plan
-    /// runs it.
+    /// correlated subquery for the number of times the chosen plan runs it.
     fn plan_query_tree(
         &self,
         query_id: QueryId,
@@ -1445,6 +1468,23 @@ impl<'a> HirPlanContext<'a> {
                 "HIR query dependency cycle at {query_id}"
             )));
         }
+        self.plan_dependencies(query_id, schema, params, planned, active)?;
+        let estimate = self.plan_query(query_id, 1.0, schema, params, planned)?;
+        self.plan_correlated_subqueries(query_id, 1.0, schema, params, planned, active)?;
+        active.remove(&query_id);
+        Ok(estimate)
+    }
+
+    /// Plan the queries `query_id` reads estimates from: its FROM subqueries,
+    /// CTEs and uncorrelated subqueries.
+    fn plan_dependencies(
+        &self,
+        query_id: QueryId,
+        schema: &Schema,
+        params: &CostModelParams,
+        planned: &mut Vec<HirPlannedQuery>,
+        active: &mut HashSet<QueryId>,
+    ) -> Result<()> {
         for dependency in self
             .document
             .planning
@@ -1452,15 +1492,28 @@ impl<'a> HirPlanContext<'a> {
             .iter()
             .copied()
         {
+            if self.planned_after_owner(query_id, dependency) {
+                continue;
+            }
             self.plan_query_tree(dependency, schema, params, planned, active)?;
         }
-        let estimate = self.plan_query(query_id, 1.0, schema, params, planned)?;
-        self.plan_correlated_subqueries(query_id, 1.0, schema, params, planned)?;
-        active.remove(&query_id);
-        Ok(estimate)
+        Ok(())
     }
 
-    /// Plan the correlated expression subqueries of `query_id` again for the
+    /// Whether `dependency` is a correlated subquery of `owner` that
+    /// [`Self::plan_correlated_subqueries`] plans once the plan of `owner`
+    /// says how often it runs. Planning `owner` reads no estimate of it.
+    fn planned_after_owner(&self, owner: QueryId, dependency: QueryId) -> bool {
+        matches!(self.document.root, hir::HirRoot::Query(_))
+            && self.document.planning.reads_outer_sources(dependency)
+            && self
+                .document
+                .planning
+                .subqueries(owner)
+                .contains(&dependency)
+    }
+
+    /// Plan the correlated expression subqueries of `query_id` for the
     /// number of times its plan runs them: a subquery that reads sources of
     /// a block runs once per row reaching the step that joins them, and any
     /// other once per run of the query. A statement that writes plans its
@@ -1473,6 +1526,7 @@ impl<'a> HirPlanContext<'a> {
         schema: &Schema,
         params: &CostModelParams,
         planned: &mut Vec<HirPlannedQuery>,
+        active: &mut HashSet<QueryId>,
     ) -> Result<()> {
         if !matches!(self.document.root, hir::HirRoot::Query(_)) {
             return Ok(());
@@ -1503,8 +1557,9 @@ impl<'a> HirPlanContext<'a> {
             if planned_runs >= calls {
                 continue;
             }
+            self.plan_dependencies(subquery, schema, params, planned, active)?;
             self.plan_query(subquery, calls, schema, params, planned)?;
-            self.plan_correlated_subqueries(subquery, calls, schema, params, planned)?;
+            self.plan_correlated_subqueries(subquery, calls, schema, params, planned, active)?;
         }
         Ok(())
     }
@@ -1523,6 +1578,8 @@ impl<'a> HirPlanContext<'a> {
             .document
             .query(query_id)
             .expect("validated HIR query exists");
+        #[cfg(test)]
+        QUERY_PLANS.with(|plans| plans.set(plans.get() + 1));
         let block_order_by = if query.compounds.is_empty() {
             query.order_by.as_slice()
         } else {
@@ -2782,12 +2839,27 @@ impl<'a> HirPlanContext<'a> {
         for query in &input.subqueries {
             subquery_reads.extend(self.document.planning.outer_sources(*query).iter().copied());
         }
+        let hash_allowed = self.hash_joins_allowed(&input);
+        let plain_rowid_tables = input
+            .sources
+            .iter()
+            .filter(|_| hash_allowed)
+            .filter(|source| {
+                crate::translate::optimizer::join::hir_plain_rowid_table(
+                    self.document,
+                    source,
+                    schema,
+                )
+            })
+            .filter_map(|source| source.btree().map(|table| table.internal_id))
+            .collect::<Vec<_>>();
         let hash = crate::translate::optimizer::join::HirHashJoins {
-            allowed: self.hash_joins_allowed(&input),
+            allowed: hash_allowed,
             // A materialized build input is filled once per statement, so
             // the block must not read an outer row.
             materialize: !self.document.planning.reads_outer_sources(block.id.query),
             subquery_reads: &subquery_reads,
+            plain_rowid_tables: &plain_rowid_tables,
         };
         let access = self
             .plan_source_access(
@@ -2797,6 +2869,9 @@ impl<'a> HirPlanContext<'a> {
                 &hash,
                 simple_count,
                 initial_cardinality,
+                self.cost_limit
+                    .filter(|(limited, _)| *limited == block.id)
+                    .map(|(_, limit)| limit),
                 schema,
                 params,
                 query_estimate,
@@ -3189,6 +3264,7 @@ impl<'a> HirPlanContext<'a> {
                     &crate::translate::optimizer::join::HirHashJoins::NONE,
                     false,
                     initial_cardinality,
+                    None,
                     schema,
                     params,
                     query_estimate,
@@ -3227,6 +3303,7 @@ impl<'a> HirPlanContext<'a> {
                     &crate::translate::optimizer::join::HirHashJoins::NONE,
                     false,
                     initial_cardinality,
+                    None,
                     schema,
                     params,
                     query_estimate,
@@ -3282,6 +3359,7 @@ impl<'a> HirPlanContext<'a> {
         // Whether the block is a plain `SELECT count(*) FROM t`.
         simple_count: bool,
         initial_cardinality: f64,
+        cost_limit: Option<Cost>,
         schema: &Schema,
         params: &CostModelParams,
         query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
@@ -3366,25 +3444,46 @@ impl<'a> HirPlanContext<'a> {
                 },
             );
         }
+        const SORT_COST_PER_ROW_MULTIPLIER: f64 = 0.001;
+        let sorting_penalty = |plan: &crate::translate::optimizer::join::JoinN| {
+            Cost(plan.output_cardinality * SORT_COST_PER_ROW_MULTIPLIER)
+        };
         let mut access_methods = Vec::new();
-        let result = compute_hir_join_order(
-            self.document,
-            &input.sources,
-            &input.groups,
-            &constraints,
-            &input.predicates,
-            &base_rows,
-            &source_costs,
-            order_target,
-            initial_cardinality,
-            &mut access_methods,
-            schema,
-            &schema.analyze_stats,
-            params,
-            or_union,
-            hash,
-            &query_rows,
-        )?;
+        let search = |cost_limit,
+                      access_methods: &mut Vec<
+            crate::translate::optimizer::access_method::AccessMethod,
+        >| {
+            compute_hir_join_order(
+                self.document,
+                &input.sources,
+                &input.groups,
+                &constraints,
+                &input.predicates,
+                &base_rows,
+                &source_costs,
+                order_target,
+                initial_cardinality,
+                cost_limit,
+                access_methods,
+                schema,
+                &schema.analyze_stats,
+                params,
+                or_union,
+                hash,
+                &query_rows,
+            )
+        };
+        let mut result = search(cost_limit, &mut access_methods)?;
+        // A plan within the limit loses to a costlier ordered plan when the
+        // sort it needs costs more than the difference, and the limit may
+        // have skipped that ordered plan. Search again without the limit.
+        if let (Some(limit), Some(_), Some(found)) = (cost_limit, order_target, &result) {
+            let best = &found.best_plan;
+            if best.cost.0 <= limit.0 && (best.cost + sorting_penalty(best)).0 > limit.0 {
+                access_methods.clear();
+                result = search(None, &mut access_methods)?;
+            }
+        }
 
         let Some(mut result) = result else {
             return Ok(None);
@@ -3392,9 +3491,7 @@ impl<'a> HirPlanContext<'a> {
         // Prefer a plan that returns rows in the order target's order when
         // the sort it saves costs more than the difference.
         if let Some(ordered) = result.best_ordered_plan.take() {
-            const SORT_COST_PER_ROW_MULTIPLIER: f64 = 0.001;
-            let sorting_penalty =
-                Cost(result.best_plan.output_cardinality * SORT_COST_PER_ROW_MULTIPLIER);
+            let sorting_penalty = sorting_penalty(&result.best_plan);
             if result.best_plan.cost + sorting_penalty > ordered.cost {
                 result.best_plan = ordered;
             }
@@ -4616,7 +4713,7 @@ pub(crate) mod tests {
         );
         block.outputs.push(Output {
             id: output_id,
-            name: "first".to_string(),
+            name: "first".into(),
             expr: document.exprs.push(hir::Expr::column(source, 0)),
             type_fact: TypeFact::known(Type::Integer),
             affinity: Affinity::Integer,
@@ -4853,7 +4950,7 @@ pub(crate) mod tests {
         });
         block.outputs.push(hir::Output {
             id: hir::OutputId::query(block_id, 0),
-            name: "sum".to_string(),
+            name: "sum".into(),
             expr: exprs.deep_copy(indexed_expression),
             type_fact: TypeFact::known(Type::Integer),
             affinity: Affinity::Integer,
@@ -5699,7 +5796,7 @@ pub(crate) mod tests {
         );
         child_block.outputs.push(Output {
             id: OutputId::query(child_block_id, 0),
-            name: "column1".to_string(),
+            name: "column1".into(),
             expr: exprs.push(hir::Expr::Literal(turso_parser::ast::Literal::Numeric(
                 "1".into(),
             ))),

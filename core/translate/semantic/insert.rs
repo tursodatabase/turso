@@ -25,7 +25,7 @@ pub(super) enum InsertBodySyntax<'ast> {
     },
 }
 use crate::{
-    schema::{autoincrement_sequence_name, Table, TypeDef, SQLITE_SEQUENCE_TABLE_NAME},
+    schema::{autoincrement_sequence_name, Index, Table, TypeDef, SQLITE_SEQUENCE_TABLE_NAME},
     sync::Arc,
     translate::expr::{walk_expr, WalkControl},
     util::normalize_ident,
@@ -470,6 +470,17 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let indexes = self
             .context()
             .table_indexes(database, table.value().get_name())?;
+        self.analyze_index_metadata(target, table, indexes, scope, policy)
+    }
+
+    pub(super) fn analyze_index_metadata(
+        &mut self,
+        target: hir::SourceId,
+        table: &hir::ResolvedTable,
+        indexes: Vec<Arc<Index>>,
+        scope: &Scope,
+        policy: ExprPolicy,
+    ) -> Result<()> {
         let mut index_expressions = Vec::with_capacity(indexes.len());
         let mut index_ids = Vec::with_capacity(indexes.len());
         for index in indexes {

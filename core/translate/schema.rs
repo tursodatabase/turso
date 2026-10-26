@@ -752,7 +752,6 @@ fn validate(
     body: &ast::CreateTableBody,
     table_name: &str,
     catalog: &SemanticContext<'_>,
-    conn: &Connection,
 ) -> Result<()> {
     if let ast::CreateTableBody::ColumnsAndConstraints {
         options,
@@ -772,13 +771,6 @@ fn validate(
                 match &constraint.constraint {
                     ast::ColumnConstraint::Check { expr, .. } => {
                         validate_check_expr(expr, table_name, &column_names, catalog)?;
-                    }
-                    ast::ColumnConstraint::Generated { .. }
-                        if !conn.experimental_generated_columns_enabled() =>
-                    {
-                        bail_parse_error!(
-                            "Generated columns require --experimental-generated-columns flag"
-                        );
                     }
                     ast::ColumnConstraint::Default(expr) => {
                         let expr =
@@ -1132,7 +1124,7 @@ pub fn translate_create_table(
     let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
-    validate(&body, &normalized_tbl_name, catalog, connection)?;
+    validate(&body, &normalized_tbl_name, catalog)?;
     let bound_sequence_names = connection.dialect().binds_names_at_create()
         && bind_default_sequence_names(&mut body, catalog)?;
 
@@ -1908,6 +1900,7 @@ pub fn translate_drop_table(
     let namespace = match catalog.resolve_existing_table(&tbl_name) {
         Ok(namespace) => namespace,
         Err(_) if if_exists => return Ok(()),
+        Err(error) if tbl_name.namespace.is_some() => return Err(error),
         Err(_) => bail_parse_error!(
             "no such table: {}",
             crate::util::table_name_for_error(&tbl_name)

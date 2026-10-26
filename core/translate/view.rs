@@ -476,6 +476,7 @@ pub fn translate_drop_view(
     let namespace = match catalog.resolve_existing_table(view_name) {
         Ok(namespace) => namespace,
         Err(_) if if_exists => return Ok(()),
+        Err(error) if view_name.namespace.is_some() => return Err(error),
         Err(_) => {
             return Err(crate::LimboError::ParseError(format!(
                 "no such view: {normalized_view_name}"

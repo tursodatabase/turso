@@ -665,7 +665,9 @@ const HIR_EXHAUSTIVE_JOIN_LIMIT: usize = 8;
 
 /// A left-deep HIR join of some sources, ending with one of them.
 struct HirPartialJoin {
-    steps: Vec<(usize, AccessMethod)>,
+    /// Each step's source and how it is read. Plans that extend this one
+    /// share its access methods instead of copying them.
+    steps: Vec<(usize, std::rc::Rc<AccessMethod>)>,
     output_cardinality: f64,
     /// The estimated number of rows after each step, in order.
     prefix_cardinalities: Vec<f64>,
@@ -688,6 +690,7 @@ pub(crate) fn compute_hir_join_order(
     source_costs: &[Cost],
     order_target: Option<&HirOrderTarget>,
     initial_input_cardinality: f64,
+    cost_limit: Option<Cost>,
     access_methods_arena: &mut Vec<AccessMethod>,
     schema: &Schema,
     analyze_stats: &AnalyzeStats,
@@ -725,11 +728,11 @@ pub(crate) fn compute_hir_join_order(
     let predicate_work = build_hir_predicate_work(document, &layout, where_clause)?;
     let step = |position: usize,
                 lhs_mask: &TableMask,
-                lhs_steps: &[(usize, AccessMethod)],
+                lhs_steps: &[(usize, std::rc::Rc<AccessMethod>)],
                 input_cardinality: f64| {
         let lhs_steps = lhs_steps
             .iter()
-            .map(|(position, method)| (*position, method))
+            .map(|(position, method)| (*position, &**method))
             .collect::<Vec<_>>();
         hir_join_step(
             document,
@@ -802,7 +805,7 @@ pub(crate) fn compute_hir_join_order(
         memo.entry(mask).or_default().insert(
             position,
             HirPartialJoin {
-                steps: vec![(position, first.access_method)],
+                steps: vec![(position, std::rc::Rc::new(first.access_method))],
                 output_cardinality,
                 prefix_cardinalities: vec![output_cardinality],
                 cost,
@@ -844,19 +847,18 @@ pub(crate) fn compute_hir_join_order(
             where_clause,
             params,
         );
-        let mut steps = lhs
-            .steps
-            .iter()
-            .map(|(position, method)| (*position, method.clone()))
-            .collect::<Vec<_>>();
-        steps.push((rhs, method.clone()));
-        let mut prefix_cardinalities = lhs.prefix_cardinalities.clone();
+        let cost = lhs.cost + method.cost;
+        let mut steps = Vec::with_capacity(lhs.steps.len() + 1);
+        steps.extend(lhs.steps.iter().cloned());
+        steps.push((rhs, std::rc::Rc::new(method)));
+        let mut prefix_cardinalities = Vec::with_capacity(lhs.prefix_cardinalities.len() + 1);
+        prefix_cardinalities.extend_from_slice(&lhs.prefix_cardinalities);
         prefix_cardinalities.push(output_cardinality);
         Ok(Some(HirPartialJoin {
             steps,
             output_cardinality,
             prefix_cardinalities,
-            cost: lhs.cost + method.cost,
+            cost,
         }))
     };
 
@@ -923,7 +925,9 @@ pub(crate) fn compute_hir_join_order(
                     let Some(plan) = extend(&lhs_plans[&last], &lhs_mask, rhs)? else {
                         continue;
                     };
-                    if cost_bound.is_some_and(|bound| plan.cost.0 >= bound.0) {
+                    if cost_bound.is_some_and(|bound| plan.cost.0 >= bound.0)
+                        || cost_limit.is_some_and(|limit| plan.cost.0 > limit.0)
+                    {
                         continue;
                     }
                     if best_by_last
@@ -956,7 +960,7 @@ pub(crate) fn compute_hir_join_order(
             .steps
             .into_iter()
             .map(|(position, method)| {
-                arena.push(method);
+                arena.push(std::rc::Rc::unwrap_or_clone(method));
                 (position, arena.len() - 1)
             })
             .collect(),
@@ -1506,7 +1510,6 @@ fn hir_join_step(
         &ready_where,
         input_cardinality,
         hash,
-        schema,
         params,
     )? {
         access_method = hash_join;
@@ -1531,6 +1534,9 @@ pub(crate) struct HirHashJoins<'a> {
     /// The sources a correlated subquery of the block reads. A hash join
     /// never reads them.
     pub(crate) subquery_reads: &'a [hir::SourceId],
+    /// The sources [hir_plain_rowid_table] accepts, the only ones a hash
+    /// join builds from or probes with.
+    pub(crate) plain_rowid_tables: &'a [hir::SourceId],
 }
 
 impl HirHashJoins<'_> {
@@ -1538,6 +1544,7 @@ impl HirHashJoins<'_> {
         allowed: false,
         materialize: false,
         subquery_reads: &[],
+        plain_rowid_tables: &[],
     };
 }
 
@@ -1600,7 +1607,11 @@ fn hir_joined_with_using(document: &HirDocument, source: hir::SourceId) -> bool 
 /// Whether a HIR source is a rowid B-tree table that the hash lookup code
 /// can build from and probe with: no custom types or arrays, not a
 /// materialized view.
-fn hir_plain_rowid_table(document: &HirDocument, source: &HirPlanSource, schema: &Schema) -> bool {
+pub(crate) fn hir_plain_rowid_table(
+    document: &HirDocument,
+    source: &HirPlanSource,
+    schema: &Schema,
+) -> bool {
     let Some(planned) = source.btree() else {
         return false;
     };
@@ -1633,7 +1644,6 @@ fn hir_try_hash_join_access_method(
     probe_multiplier: f64,
     hash_can_replace_build_index: bool,
     hash: &HirHashJoins<'_>,
-    schema: &Schema,
     params: &CostModelParams,
 ) -> Option<AccessMethod> {
     use crate::translate::semantic::hir::JoinKind;
@@ -1642,8 +1652,8 @@ fn hir_try_hash_join_access_method(
         return None;
     };
     // The hash lookup code reads rowid tables only.
-    if !hir_plain_rowid_table(document, &sources[build], schema)
-        || !hir_plain_rowid_table(document, &sources[probe], schema)
+    if !hash.plain_rowid_tables.contains(&build_source.internal_id)
+        || !hash.plain_rowid_tables.contains(&probe_source.internal_id)
     {
         return None;
     }
@@ -1986,7 +1996,6 @@ fn hir_hash_join_candidate(
     ready_where: &[(usize, usize)],
     input_cardinality: f64,
     hash: &HirHashJoins<'_>,
-    schema: &Schema,
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     use crate::translate::semantic::hir::JoinKind;
@@ -2128,7 +2137,6 @@ fn hir_hash_join_candidate(
         probe_multiplier,
         hash_can_replace_build_index,
         hash,
-        schema,
         params,
     ) else {
         return Ok(None);
@@ -3003,6 +3011,7 @@ mod tests {
             &[Cost(0.0)],
             None,
             1.0,
+            None,
             &mut access_methods,
             &Schema::new(),
             &AnalyzeStats::default(),
@@ -3093,6 +3102,7 @@ mod tests {
             &vec![Cost(0.0); names.len()],
             None,
             1.0,
+            None,
             &mut access_methods,
             &Schema::new(),
             &AnalyzeStats::default(),
@@ -3111,6 +3121,46 @@ mod tests {
         // Without pruning, the search tries every order of the chain:
         // thousands of steps.
         assert!(steps < 200, "the planner tried {steps} join steps");
+
+        let search_with_limit = |limit: f64| -> Result<(BestJoinOrderResult, usize)> {
+            let mut access_methods = Vec::new();
+            JOIN_STEPS.with(|steps| steps.set(0));
+            let result = compute_hir_join_order(
+                &document,
+                &sources,
+                &[],
+                &constraints,
+                &where_clause,
+                &rows,
+                &vec![Cost(0.0); names.len()],
+                None,
+                1.0,
+                Some(Cost(limit)),
+                &mut access_methods,
+                &Schema::new(),
+                &AnalyzeStats::default(),
+                &DEFAULT_PARAMS,
+                false,
+                &HirHashJoins::NONE,
+                &|_| None,
+            )?
+            .expect("eight HIR sources produce a join plan");
+            Ok((result, JOIN_STEPS.with(|steps| steps.get())))
+        };
+        // A limit equal to the cheapest plan's cost still finds that plan.
+        let (at_best, _) = search_with_limit(result.best_plan.cost.0)?;
+        assert_eq!(
+            at_best.best_plan.table_numbers().collect::<Vec<_>>(),
+            (0..names.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(at_best.best_plan.cost.0, result.best_plan.cost.0);
+        // A limit below every plan's cost skips the orders the search
+        // would otherwise extend.
+        let (_, limited_steps) = search_with_limit(result.best_plan.cost.0 / 1000.0)?;
+        assert!(
+            limited_steps < steps,
+            "the planner tried {limited_steps} join steps under the limit, {steps} without"
+        );
         Ok(())
     }
 

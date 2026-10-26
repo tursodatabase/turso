@@ -87,7 +87,10 @@ impl PgConnection {
                         .collect::<Vec<String>>(),
                 ),
                 BackendEvent::ErrorResponse(fields) => {
-                    return Ok(QueryResult::error(error_message(&fields).to_string()));
+                    return Ok(QueryResult::error_with_sqlstate(
+                        error_message(&fields),
+                        fields.get(&b'C').cloned(),
+                    ));
                 }
                 _ => {}
             }

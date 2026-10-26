@@ -442,6 +442,53 @@ pub async fn test_execute_batch() {
 }
 
 #[tokio::test]
+async fn test_execute_discards_rows_and_runs_statement_to_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let db = Builder::new_local(path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+
+    for sql in [
+        "PRAGMA journal_mode=WAL",
+        "PRAGMA table_info(sqlite_schema)",
+        "PRAGMA user_version",
+        "SELECT 1",
+    ] {
+        conn.execute(sql, ()).await.unwrap();
+    }
+
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; CREATE TABLE t(x); PRAGMA user_version; PRAGMA user_version=3;",
+    )
+    .await
+    .unwrap();
+
+    let rows_changed = conn
+        .execute("INSERT INTO t VALUES (1), (2), (3) RETURNING x", ())
+        .await
+        .unwrap();
+    assert_eq!(rows_changed, 3);
+
+    for (sql, expected) in [
+        ("SELECT COUNT(*) FROM t", Value::Integer(3)),
+        ("PRAGMA user_version", Value::Integer(3)),
+        ("PRAGMA journal_mode", Value::Text("wal".to_string())),
+    ] {
+        let row = conn
+            .prepare(sql)
+            .await
+            .unwrap()
+            .query_row(())
+            .await
+            .unwrap();
+        assert_eq!(row.get_value(0).unwrap(), expected, "{sql}");
+    }
+}
+
+#[tokio::test]
 async fn test_query_row_returns_first_row() {
     let db = Builder::new_local(":memory:").build().await.unwrap();
     let conn = db.connect().unwrap();
@@ -1655,6 +1702,39 @@ async fn test_strict_tables() {
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 1);
     assert_eq!(row.get::<String>(1).unwrap(), "Alice");
+}
+
+#[tokio::test]
+async fn test_generated_columns_work_without_a_flag() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_file = temp_dir.path().join("generated-columns.db");
+    let db_file = db_file.to_str().unwrap();
+
+    {
+        let db = Builder::new_local(db_file).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE t (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2))",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN c AS (a + 1)", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t (a) VALUES (21)", ())
+            .await
+            .unwrap();
+    }
+
+    // Loading a schema that has generated columns does not need a flag either.
+    let db = Builder::new_local(db_file).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn.query("SELECT a, b, c FROM t", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 21);
+    assert_eq!(row.get::<i64>(1).unwrap(), 42);
+    assert_eq!(row.get::<i64>(2).unwrap(), 22);
 }
 
 // Helper to collect all integer values from a single-column query.

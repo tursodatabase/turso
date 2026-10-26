@@ -450,6 +450,13 @@ pub struct ExprArena {
 }
 
 impl ExprArena {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            nodes: Vec::with_capacity(capacity),
+            constant: Vec::with_capacity(capacity),
+        }
+    }
+
     pub fn push(&mut self, expression: Expr) -> ExprId {
         let id = ExprId(u32::try_from(self.nodes.len()).expect("expression arena fits in u32"));
         self.constant.push(self.children_constant(&expression));

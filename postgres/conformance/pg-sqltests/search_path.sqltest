@@ -45,6 +45,7 @@ test search-path-missing-schema-errors {
     SET search_path TO missing_schema_ms;
     SELECT id, label FROM demo;
 }
+@sqlstate 42P01
 expect error {}
 
 test search-path-public-resolves-to-main {
@@ -88,6 +89,7 @@ expect {
 test search-path-empty-does-not-find-stored-tables {
     SELECT a FROM t1;
 }
+@sqlstate 42P01
 expect error {}
 
 setup local_search_path_commit {
@@ -296,6 +298,7 @@ test create-table-with-no-existing-schema-in-search-path-errors {
     SET search_path TO sp_missing_ct;
     CREATE TABLE t (x int);
 }
+@sqlstate 3F000
 expect error {
     no schema has been selected to create in
 }
@@ -542,6 +545,7 @@ test drop-column-checks-the-views-of-the-table-schema {
     SET search_path TO sp_dc;
     ALTER TABLE public.t DROP COLUMN b;
 }
+@sqlstate 2BP01
 expect error {
     cannot drop column
 }
@@ -593,6 +597,7 @@ test search-path-main-does-not-select-a-schema-to-create-in {
     SET search_path TO main;
     CREATE TABLE sp_main_t (a int);
 }
+@sqlstate 3F000
 expect error {
     no schema has been selected to create in
 }
