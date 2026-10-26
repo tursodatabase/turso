@@ -2317,6 +2317,74 @@ expect {
     0
 }
 
+test alter-table-rename-table-trigger-cte-hides-table {
+    CREATE TABLE cte_src (z);
+    INSERT INTO cte_src VALUES (7);
+    CREATE TABLE cte_other (z);
+    INSERT INTO cte_other VALUES (9);
+    CREATE TABLE cte_driver (x);
+    CREATE TABLE cte_log (v);
+    CREATE TRIGGER trig_cte_hides_table AFTER INSERT ON cte_driver BEGIN
+        INSERT INTO cte_log WITH cte_src AS (SELECT 100 AS v) SELECT v FROM cte_src;
+        INSERT INTO cte_log WITH cte_src AS (SELECT 2 AS v) SELECT cte_src.v FROM cte_src;
+        INSERT INTO cte_log WITH cte_src AS (SELECT 3 AS v)
+            SELECT (SELECT v FROM cte_src) + (SELECT z FROM main.cte_src);
+        INSERT INTO cte_log WITH cte_src AS (SELECT 4 AS v)
+            SELECT v FROM cte_src UNION ALL SELECT z FROM main.cte_src;
+        INSERT INTO cte_log SELECT z FROM cte_src
+            WHERE EXISTS (WITH cte_src AS (SELECT 1 AS v) SELECT v FROM cte_src);
+        INSERT INTO cte_log WITH cte_src AS (SELECT 100 AS v) SELECT cte_src.z FROM main.cte_src;
+        INSERT INTO cte_log WITH cte_src AS (SELECT 100 AS v) SELECT cte_src.* FROM main.cte_src;
+        INSERT INTO cte_log SELECT z FROM cte_src
+            WHERE EXISTS (WITH cte_src AS (SELECT 1 AS v) SELECT cte_src.z FROM cte_other);
+        INSERT INTO cte_log WITH cte_src AS (SELECT 5 AS v) SELECT (SELECT cte_src.v) FROM cte_src;
+        INSERT INTO cte_log SELECT cte_src.z FROM cte_other AS cte_src;
+        INSERT INTO cte_log WITH cte_src AS (SELECT 6 AS v)
+            SELECT cte_src.v FROM cte_src ORDER BY cte_src.v;
+        INSERT INTO cte_log SELECT cte_src.z FROM cte_other AS cte_src ORDER BY cte_src.z;
+        INSERT INTO cte_log WITH cte_src AS (SELECT 100 AS v)
+            SELECT cte_src.z FROM main.cte_src ORDER BY cte_src.z;
+        INSERT INTO cte_log SELECT cte_src.z FROM cte_src
+            UNION ALL SELECT z FROM cte_other ORDER BY cte_src.z;
+    END;
+    ALTER TABLE cte_src RENAME TO cte_src2;
+    INSERT INTO cte_driver VALUES (1);
+    SELECT v FROM cte_log;
+}
+expect {
+    100
+    2
+    10
+    4
+    7
+    7
+    7
+    7
+    7
+    5
+    9
+    6
+    9
+    7
+    7
+    9
+}
+
+test alter-table-rename-column-trigger-cte-hides-table {
+    CREATE TABLE cte_col_src (a, b);
+    CREATE TABLE cte_col_driver (x);
+    CREATE TABLE cte_col_log (v);
+    CREATE TRIGGER trig_cte_col_hides_table AFTER INSERT ON cte_col_driver BEGIN
+        INSERT INTO cte_col_log WITH cte_col_src AS (SELECT 100 AS b) SELECT b FROM cte_col_src;
+    END;
+    ALTER TABLE cte_col_src RENAME COLUMN b TO c;
+    INSERT INTO cte_col_driver VALUES (1);
+    SELECT v FROM cte_col_log;
+}
+expect {
+    100
+}
+
 test alter-table-rename-column-temp-trigger-exists-result-expr-error {
     CREATE TEMP TABLE temp_exists_driver (n);
     CREATE TABLE src_temp_exists (c1, c2, b);
