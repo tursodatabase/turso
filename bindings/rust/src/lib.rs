@@ -400,7 +400,7 @@ impl Future for Execute {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        match self.stmt.step(None, cx)? {
+        match self.stmt.step(false, cx)? {
             Poll::Ready(_) => {
                 let n_change = self.stmt.inner.lock().unwrap().n_change();
                 Poll::Ready(Ok(n_change as u64))
@@ -411,15 +411,12 @@ impl Future for Execute {
 }
 
 impl Statement {
-    fn step(
-        &self,
-        columns: Option<usize>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Result<Option<Row>>> {
+    fn step(&self, expect_row: bool, cx: &mut std::task::Context<'_>) -> Poll<Result<Option<Row>>> {
         let mut stmt = self.inner.lock().unwrap();
         match stmt.step(Some(cx.waker()))? {
             turso_sdk_kit::rsapi::TursoStatusCode::Row => {
-                if let Some(columns) = columns {
+                if expect_row {
+                    let columns = stmt.column_count();
                     let mut values = Vec::with_capacity(columns);
                     for i in 0..columns {
                         let value = stmt.row_value(i)?;

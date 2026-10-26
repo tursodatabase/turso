@@ -46,7 +46,6 @@ impl Rows {
     /// Fetch the next row of this result set.
     pub async fn next(&mut self) -> Result<Option<Row>> {
         struct Next {
-            columns: usize,
             stmt: Statement,
         }
 
@@ -57,14 +56,13 @@ impl Rows {
                 self: std::pin::Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
             ) -> std::task::Poll<Self::Output> {
-                self.stmt.step(Some(self.columns), cx)
+                self.stmt.step(true, cx)
             }
         }
 
         assert_send_sync!(Next);
 
         let next = Next {
-            columns: self.inner.inner.lock().unwrap().column_count(),
             stmt: self.inner.clone(),
         };
 
