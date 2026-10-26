@@ -218,6 +218,8 @@ pub(super) struct SelectContext<'scope> {
     pub(super) outer_scope: Option<&'scope Scope>,
     pub(super) expected_outputs: Option<&'scope [Option<Arc<TypeDef>>]>,
     pub(super) policies: ExprPolicies,
+    /// Nothing reads the query's result columns, as for an EXISTS subquery.
+    pub(super) outputs_unread: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -803,6 +805,32 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         self.analyze_select_with_scope(select, parent, Some(outer_scope), None, policies)
     }
 
+    /// An EXISTS subquery, which only reports whether its query returns a
+    /// row.
+    pub(super) fn analyze_exists_subquery(
+        &mut self,
+        select: &'ast ast::Select,
+        parent: Option<QueryId>,
+        outer_scope: &Scope,
+        policies: ExprPolicies,
+    ) -> Result<QueryId> {
+        self.with_cte_scope(select.with.as_ref(), |analyzer| {
+            analyzer.analyze_select_parts(
+                &select.body.select,
+                &select.body.compounds,
+                &select.order_by,
+                select.limit.as_ref(),
+                SelectContext {
+                    parent,
+                    outer_scope: Some(outer_scope),
+                    expected_outputs: None,
+                    policies,
+                    outputs_unread: true,
+                },
+            )
+        })
+    }
+
     pub(super) fn analyze_subquery_with_expected_outputs(
         &mut self,
         select: &'ast ast::Select,
@@ -851,6 +879,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 outer_scope,
                 expected_outputs,
                 policies,
+                outputs_unread: false,
             },
         )
     }
@@ -868,6 +897,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             outer_scope,
             expected_outputs,
             policies,
+            outputs_unread,
         } = context;
         let rightmost = compounds
             .last()
@@ -886,6 +916,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let mut blocks = Vec::with_capacity(compounds.len() + 1);
         let ordinary_order_by =
             (compounds.is_empty() && !order_by_syntax.is_empty()).then_some(order_by_syntax);
+        // ORDER BY can name a result column by its position, and every
+        // compound arm needs as many columns as the others.
+        let outputs_unread = outputs_unread && compounds.is_empty() && order_by_syntax.is_empty();
         let (first_block, mut order_by, first_scope) = self.analyze_select_block(
             first_select,
             query_id,
@@ -893,6 +926,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             outer_scope,
             ordinary_order_by,
             expected_outputs,
+            outputs_unread,
             policies,
         )?;
         blocks.push(first_block);
@@ -905,6 +939,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 outer_scope,
                 None,
                 expected_outputs,
+                false,
                 policies,
             )?;
             debug_assert!(block_order_by.is_empty());
@@ -1010,6 +1045,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         outer_scope: Option<&Scope>,
         order_by: Option<&'ast [ast::SortedColumn]>,
         expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
+        outputs_unread: bool,
         policies: ExprPolicies,
     ) -> Result<(QueryBlock, Vec<OrderTerm>, Scope)> {
         match select {
@@ -1032,6 +1068,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 outer_scope,
                 order_by,
                 expected_outputs,
+                outputs_unread,
                 policies,
             ),
             ast::OneSelect::Values(rows) => {
@@ -1063,6 +1100,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         outer_scope: Option<&Scope>,
         order_by: Option<&'ast [ast::SortedColumn]>,
         expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
+        outputs_unread: bool,
         policies: ExprPolicies,
     ) -> Result<(QueryBlock, Vec<OrderTerm>, Scope)> {
         if from.is_none()
@@ -1090,14 +1128,39 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         };
         let mut functions = QueryFunctionState::new(block_id);
         self.analyze_named_windows(window_clause, &mut functions)?;
-        let outputs = self.analyze_outputs(
-            block_id,
-            columns,
-            &scope,
-            &mut functions,
-            expected_outputs,
-            policies,
-        )?;
+        // When nothing reads the result, a constant stands for the `*` of
+        // one table, so the table's columns are neither listed nor read.
+        let star_of_one_table = matches!(columns, [ast::ResultColumn::Star])
+            && from.as_ref().is_some_and(|from| {
+                from.joins.is_empty()
+                    && self
+                        .source(from.first)
+                        .is_some_and(|source| matches!(source.kind, SourceKind::Table(_)))
+            });
+        let outputs = if outputs_unread
+            && star_of_one_table
+            && distinctness.is_none()
+            && group_by.is_none()
+            && window_clause.is_empty()
+        {
+            let resolved =
+                self.resolve_atomic_expr(Expr::Literal(ast::Literal::Numeric("1".into())), &scope)?;
+            vec![output_from_resolved(
+                OutputId::query(block_id, 0),
+                "1",
+                OutputNameKind::Inferred,
+                resolved,
+            )]
+        } else {
+            self.analyze_outputs(
+                block_id,
+                columns,
+                &scope,
+                &mut functions,
+                expected_outputs,
+                policies,
+            )?
+        };
         let filter = match where_clause {
             Some(syntax) => {
                 let mut clause_scope = scope.clone();
@@ -4386,6 +4449,25 @@ mod tests {
             &document.exprs[*rhs],
             Expr::Output(id) if *id == OutputId::query(block.id, 0)
         ));
+    }
+
+    #[test]
+    fn exists_star_of_one_table_lists_no_columns() {
+        let schema = schema_with_items();
+        let outputs = |sql: &str| {
+            let document = analyze_sql_with_schema(&schema, sql).expect("SQL analyzes");
+            document.queries[1].blocks[0].outputs.len()
+        };
+        assert_eq!(
+            outputs("SELECT id FROM items AS a WHERE EXISTS (SELECT * FROM items AS b WHERE b.id = a.id)"),
+            1
+        );
+        for sql in [
+            "SELECT id FROM items AS a WHERE EXISTS (SELECT DISTINCT * FROM items AS b WHERE b.id = a.id)",
+            "SELECT id FROM items AS a WHERE EXISTS (SELECT * FROM items AS b ORDER BY 3)",
+        ] {
+            assert_eq!(outputs(sql), 3, "{sql}");
+        }
     }
 
     #[test]

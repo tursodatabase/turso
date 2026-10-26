@@ -2036,7 +2036,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             ast::Expr::Exists(select) => {
                 expect_no_frame_children(children)?;
-                let query = self.analyze_subquery(select, owner.query(), scope, policies)?;
+                let query = self.analyze_exists_subquery(select, owner.query(), scope, policies)?;
                 Ok(FrameValue::Scalar(computed_expr(
                     &mut self.exprs,
                     hir::Expr::Subquery(hir::SubqueryExpr::Exists(query)),
