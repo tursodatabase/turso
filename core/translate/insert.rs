@@ -24,10 +24,10 @@ use crate::{
             walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
-            build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
-            emit_guarded_fk_decrement, emit_skip_if_any_null, fk_constraint_info, index_probe,
-            index_scan_match_any, open_read_index, open_read_table, table_scan_match_any,
-            ForeignKeyActions,
+            build_index_affinity_string, child_row_lookup, emit_fk_restrict_halt,
+            emit_fk_violation, emit_guarded_fk_decrement, emit_skip_if_any_null,
+            fk_constraint_info, index_probe, index_scan_match_any, open_read_index,
+            open_read_table, table_scan_match_any, ChildRowLookup, ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -4327,69 +4327,58 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         let self_exclude_rowid = is_self_ref.then(|| insertion.key_register());
 
         let child_tbl = &pref.child_table;
-        let child_cols = &pref.fk.child_columns;
-        let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(NamespaceId::ROOT, &child_tbl.name)
-                .cloned()
-                .collect()
-        });
-        let idx = indices.iter().find(|ix| {
-            ix.columns.len() == child_cols.len()
-                && ix
-                    .columns
-                    .iter()
-                    .zip(child_cols.iter())
-                    .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-        });
+        match child_row_lookup(&pref, database_id, resolver) {
+            ChildRowLookup::Probe(ix) => {
+                let icur = open_read_index(program, &ix, database_id);
+                // Copy key into probe regs and apply child-index affinities
+                let probe_start = program.alloc_registers(n_cols);
+                for i in 0..n_cols {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: new_pk_start + i,
+                        dst_reg: probe_start + i,
+                        extra_amount: 0,
+                    });
+                }
+                if let Some(count) = NonZeroUsize::new(n_cols) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: probe_start,
+                        count,
+                        affinities: build_index_affinity_string(&ix, child_tbl),
+                    });
+                }
 
-        if let Some(ix) = idx {
-            let icur = open_read_index(program, ix, database_id);
-            // Copy key into probe regs and apply child-index affinities
-            let probe_start = program.alloc_registers(n_cols);
-            for i in 0..n_cols {
-                program.emit_insn(Insn::Copy {
-                    src_reg: new_pk_start + i,
-                    dst_reg: probe_start + i,
-                    extra_amount: 0,
-                });
+                // Decrement once per matching child row
+                index_scan_match_any(
+                    program,
+                    icur,
+                    probe_start,
+                    n_cols,
+                    self_exclude_rowid,
+                    |p| {
+                        let next = p.allocate_label();
+                        emit_guarded_fk_decrement(p, next, pref.fk.deferred);
+                        p.preassign_label_to_next_insn(next);
+                        Ok(())
+                    },
+                )?;
             }
-            if let Some(count) = NonZeroUsize::new(n_cols) {
-                program.emit_insn(Insn::Affinity {
-                    start_reg: probe_start,
-                    count,
-                    affinities: build_index_affinity_string(ix, child_tbl),
-                });
+            ChildRowLookup::Scan { partial_index } => {
+                table_scan_match_any(
+                    program,
+                    &pref,
+                    new_pk_start,
+                    partial_index.as_deref(),
+                    self_exclude_rowid,
+                    database_id,
+                    resolver,
+                    |p| {
+                        let next = p.allocate_label();
+                        emit_guarded_fk_decrement(p, next, pref.fk.deferred);
+                        p.preassign_label_to_next_insn(next);
+                        Ok(())
+                    },
+                )?;
             }
-
-            // Decrement once per matching child row
-            index_scan_match_any(
-                program,
-                icur,
-                probe_start,
-                n_cols,
-                self_exclude_rowid,
-                |p| {
-                    let next = p.allocate_label();
-                    emit_guarded_fk_decrement(p, next, pref.fk.deferred);
-                    p.preassign_label_to_next_insn(next);
-                    Ok(())
-                },
-            )?;
-        } else {
-            table_scan_match_any(
-                program,
-                &pref,
-                new_pk_start,
-                self_exclude_rowid,
-                database_id,
-                resolver,
-                |p| {
-                    let next = p.allocate_label();
-                    emit_guarded_fk_decrement(p, next, pref.fk.deferred);
-                    p.preassign_label_to_next_insn(next);
-                    Ok(())
-                },
-            )?;
         }
         program.preassign_label_to_next_insn(skip_fk);
     }
