@@ -853,12 +853,12 @@ fn handle_pg_create_schema(
 
 fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
     let main_path = conn.db_file_path();
+    let filename = format!("turso-postgres-schema-{schema_name}.db");
     if is_memory_like(main_path) {
         // Each `ATTACH ':memory:'` opens a new empty database, so schemas of
         // an in-memory server start empty and leave no files behind.
         ":memory:".to_string()
     } else {
-        let filename = format!("turso-postgres-schema-{schema_name}.db");
         let parent = std::path::Path::new(&main_path)
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
