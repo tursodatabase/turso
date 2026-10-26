@@ -29,13 +29,51 @@ public static class TursoBindings
     }
 
     /// <summary>
+    /// Opens a database whose pages go through <paramref name="pageCodec"/> on their way to and from storage.
+    /// </summary>
+    /// <remarks>
+    /// The engine keeps a reference to the codec until the last connection to the database closes.
+    /// </remarks>
+    public static TursoDatabaseHandle OpenDatabaseWithPageCodec(string path, ITursoPageCodec pageCodec)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        ArgumentNullException.ThrowIfNull(pageCodec);
+
+        return OpenDatabase(path, cipher: null, hexkey: null, pageCodec, readOnly: false);
+    }
+
+    /// <summary>
+    /// Opens a database read-only, with its pages decoded by <paramref name="pageCodec"/>.
+    /// </summary>
+    public static TursoDatabaseHandle OpenDatabaseReadOnlyWithPageCodec(string path, ITursoPageCodec pageCodec)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        ArgumentNullException.ThrowIfNull(pageCodec);
+
+        return OpenDatabase(path, cipher: null, hexkey: null, pageCodec, readOnly: true);
+    }
+
+    /// <summary>
     /// Opens a database without connecting to it, so it can be shared by several connections.
     /// </summary>
     public static TursoSharedDatabaseHandle OpenSharedDatabase(string path)
     {
         ArgumentNullException.ThrowIfNull(path);
 
-        var databasePtr = NewOpenedDatabase(path, cipher: null, hexkey: null);
+        var databasePtr = NewOpenedDatabase(path, cipher: null, hexkey: null, pageCodec: null, readOnly: false);
+        return TursoSharedDatabaseHandle.FromPtr(databasePtr);
+    }
+
+    /// <summary>
+    /// Opens a database that can be shared by several connections, with its pages going through
+    /// <paramref name="pageCodec"/> on their way to and from storage.
+    /// </summary>
+    public static TursoSharedDatabaseHandle OpenSharedDatabase(string path, ITursoPageCodec pageCodec)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        ArgumentNullException.ThrowIfNull(pageCodec);
+
+        var databasePtr = NewOpenedDatabase(path, cipher: null, hexkey: null, pageCodec, readOnly: false);
         return TursoSharedDatabaseHandle.FromPtr(databasePtr);
     }
 
@@ -352,9 +390,14 @@ public static class TursoBindings
         }
     }
 
-    private static TursoDatabaseHandle OpenDatabase(string path, string? cipher, string? hexkey)
+    private static TursoDatabaseHandle OpenDatabase(
+        string path,
+        string? cipher,
+        string? hexkey,
+        ITursoPageCodec? pageCodec = null,
+        bool readOnly = false)
     {
-        var databasePtr = NewOpenedDatabase(path, cipher, hexkey);
+        var databasePtr = NewOpenedDatabase(path, cipher, hexkey, pageCodec, readOnly);
         var connectionPtr = IntPtr.Zero;
         try
         {
@@ -372,13 +415,20 @@ public static class TursoBindings
         }
     }
 
-    private static IntPtr NewOpenedDatabase(string path, string? cipher, string? hexkey)
+    private static unsafe IntPtr NewOpenedDatabase(
+        string path,
+        string? cipher,
+        string? hexkey,
+        ITursoPageCodec? pageCodec,
+        bool readOnly)
     {
         using var pathString = NativeUtf8String.From(path);
         using var featuresString = NativeUtf8String.From(cipher is null ? null : "encryption");
         using var cipherString = NativeUtf8String.From(cipher);
         using var hexkeyString = NativeUtf8String.From(hexkey);
 
+        // turso_database_new copies the codec table, so it can live on the stack.
+        var codec = pageCodec is null ? default : TursoNativePageCodec.Create(pageCodec);
         var config = new TursoDatabaseConfig
         {
             AsyncIo = 0,
@@ -387,11 +437,32 @@ public static class TursoBindings
             Vfs = IntPtr.Zero,
             EncryptionCipher = cipherString.Pointer,
             EncryptionHexKey = hexkeyString.Pointer,
-            PageCodec = IntPtr.Zero,
-            OpenFlags = 0,
+            PageCodec = pageCodec is null ? IntPtr.Zero : (IntPtr)(&codec),
+            OpenFlags = (uint)(readOnly ? TursoDatabaseOpenFlags.ReadOnly : TursoDatabaseOpenFlags.None),
         };
 
-        var status = TursoInterop.DatabaseNew(ref config, out var databasePtr, out var errorPtr);
+        TursoStatusCode status;
+        IntPtr databasePtr;
+        IntPtr errorPtr;
+        try
+        {
+            status = TursoInterop.DatabaseNew(ref config, out databasePtr, out errorPtr);
+        }
+        catch
+        {
+            TursoNativePageCodec.Release(codec.Context);
+            throw;
+        }
+
+        if (status != TursoStatusCode.Ok)
+        {
+            // The engine only takes ownership of the codec context, and calls destroy, once
+            // turso_database_new succeeds.
+            TursoNativePageCodec.Release(codec.Context);
+            ThrowIfError(status, errorPtr);
+            throw new TursoException($"Turso native call failed with status {status}.");
+        }
+
         ThrowIfError(status, errorPtr);
 
         try
