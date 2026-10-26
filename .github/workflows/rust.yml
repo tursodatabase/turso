@@ -365,6 +365,12 @@ jobs:
           - name: Faultless
             iterations: 10
             args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --io-backend=memory"
+          - name: SavepointStress
+            iterations: 5
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile savepoint_stress --io-backend=memory"
+          - name: WriteStress
+            iterations: 4
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_stress --io-backend=memory"
           - name: IOUring InsertHeavySpill
             iterations: 5
             args: "--io-backend=io-uring --maximum-tests 1000 --profile=write_heavy_spill"
