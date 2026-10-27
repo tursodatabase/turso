@@ -1461,3 +1461,43 @@ test op-date-plus-blob-column-error {
 expect error {
     operator does not exist: date \+ blob
 }
+
+# A decimal number written in the statement is exact wherever it is written, as
+# in PostgreSQL: inside a subquery, coalesce, abs, CASE, max, a derived table or
+# a CTE it still gives a numeric result, not a REAL one.
+@requires strict "uses STRICT tables"
+test op-numeric-decimal-literal-inside-expressions-is-exact {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (0.1);
+    SELECT n + (SELECT 0.2) - 0.3, n + coalesce(0.2, 0) - 0.3, n + abs(-0.2) - 0.3, n + CASE WHEN n > 0 THEN 0.2 ELSE 0 END - 0.3, n + (SELECT max(0.2)) - 0.3, n - (-0.2) - 0.5 FROM t;
+    SELECT t.n + x.v - 0.3 FROM t, (SELECT 0.2 AS v) x;
+    WITH c(v) AS (SELECT 0.2) SELECT n + v - 0.3 FROM t, c;
+}
+expect {
+    0.00|0.00|0.00|0.00|0.00|-0.20
+    0.00
+    0.00
+}
+
+# A REAL value stays REAL wherever it comes from, as double precision does in
+# PostgreSQL. So does arithmetic on two plain values, which SQLite computes as
+# a REAL.
+@requires strict "uses STRICT tables"
+test op-numeric-real-inside-expressions-is-real {
+    CREATE TABLE t(n numeric(10,2), r real) STRICT;
+    INSERT INTO t VALUES (0.1, 0.2);
+    SELECT typeof(n + (SELECT r)), typeof(n + coalesce(r, 0)), typeof(n + (SELECT CAST(0.2 AS REAL))), typeof(n + (0.1 + 0.2)) FROM t;
+}
+expect {
+    real|real|real|real
+}
+
+@requires strict "uses STRICT tables"
+test op-date-plus-decimal-in-subquery-error {
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('2024-01-01');
+    SELECT d + (SELECT 0.5) FROM t;
+}
+expect error {
+    operator does not exist: date \+ numeric
+}

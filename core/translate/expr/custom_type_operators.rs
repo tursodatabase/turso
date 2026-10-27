@@ -113,7 +113,8 @@ struct Operand<'a> {
     /// Whether SQLite's arithmetic would see an integer, or a value whose type
     /// is not known before the statement runs.
     may_be_integer: bool,
-    /// Whether the operand is a REAL value and not a decimal literal.
+    /// Whether the operand is a REAL value. A decimal written in the statement
+    /// is not one: as in PostgreSQL, it is an exact number.
     is_real: bool,
     /// Whether the operand is a blob, which is not a number.
     is_blob: bool,
@@ -144,8 +145,8 @@ impl<'a> Operand<'a> {
             sqlite_type,
             ExprType::Builtin(BuiltinType::Integer | BuiltinType::Any)
         );
-        let is_real = !is_decimal_literal(expr)
-            && matches!(sqlite_type, ExprType::Builtin(BuiltinType::Real));
+        let is_real = matches!(sqlite_type, ExprType::Builtin(BuiltinType::Real))
+            && !matches!(expr_type, ExprType::Builtin(BuiltinType::Decimal));
         let is_blob = matches!(sqlite_type, ExprType::Builtin(BuiltinType::Blob));
         Ok(Self {
             value_type,
@@ -163,21 +164,13 @@ impl<'a> Operand<'a> {
         match (&self.value_type, self.expr_type) {
             (Some(ty), _) => ty.type_def.name.clone(),
             (None, ExprType::Builtin(BuiltinType::Any)) => "value".to_string(),
+            (None, ExprType::Builtin(BuiltinType::Decimal)) => "numeric".to_string(),
             (None, ExprType::Builtin(builtin)) => format!("{builtin:?}").to_lowercase(),
             (None, ExprType::Custom { type_def, .. }) => type_def.name.clone(),
             (None, ExprType::Untyped) => "text".to_string(),
             (None, ExprType::Null) => "null".to_string(),
             (None, _) => "value".to_string(),
         }
-    }
-}
-
-/// A number written in the statement, with any sign: `0.5`, `-0.5`, `(+1e3)`.
-fn is_decimal_literal(expr: &ast::Expr) -> bool {
-    match without_wrappers(expr) {
-        ast::Expr::Literal(ast::Literal::Numeric(_)) => true,
-        ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => is_decimal_literal(inner),
-        _ => false,
     }
 }
 

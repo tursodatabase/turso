@@ -281,9 +281,10 @@ pub enum ArithmeticArg {
     Integer,
     /// A `PlainValue` that is neither a `Real` nor a blob.
     Exact,
-    /// A REAL value: a REAL column, a CAST to REAL, a function that returns
-    /// one. A decimal literal such as `0.5` or `-0.5` is not one: as in
-    /// PostgreSQL, it is an exact number.
+    /// A REAL value: a REAL column, a CAST to REAL, arithmetic on two plain
+    /// values. A decimal written in the statement, such as `0.5`, `-0.5` or
+    /// the `0.5` of `(SELECT 0.5)`, is not one: as in PostgreSQL, it is an
+    /// exact number.
     Real,
 }
 
