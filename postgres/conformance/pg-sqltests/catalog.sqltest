@@ -1315,6 +1315,22 @@ expect {
     t||1
 }
 
+test pg-public-schema-owner-and-acl {
+    SELECT n.nspowner, r.rolname, pg_get_userbyid(n.nspowner), n.nspacl::text,
+           acldefault('n', n.nspowner)::text
+    FROM pg_namespace n JOIN pg_roles r ON r.oid = n.nspowner
+    WHERE n.nspname = 'public';
+    SELECT oid, rolname, CAST(rolsuper AS INTEGER), CAST(rolinherit AS INTEGER),
+           CAST(rolcreaterole AS INTEGER), CAST(rolcreatedb AS INTEGER),
+           CAST(rolcanlogin AS INTEGER), CAST(rolreplication AS INTEGER),
+           rolconnlimit, CAST(rolbypassrls AS INTEGER)
+    FROM pg_roles WHERE rolname = 'pg_database_owner';
+}
+expect {
+    6171|pg_database_owner|pg_database_owner|{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}|{pg_database_owner=UC/pg_database_owner}
+    6171|pg_database_owner|0|1|0|0|0|0|-1|0
+}
+
 test pg-description-public-schema-default {
     SELECT d.objoid, d.classoid, d.objsubid, d.description
     FROM pg_catalog.pg_description d

@@ -28,12 +28,17 @@ These features extend Turso beyond SQLite compatibility:
 | stddev() | Standard deviation aggregate function |
 | [DEFAULT in VALUES](/docs/sql-reference/statements/insert#default-keyword-in-values) | SQL-standard DEFAULT keyword in INSERT VALUES lists |
 
-## PostgreSQL catalog comments
+## PostgreSQL schema metadata
 
 The PostgreSQL frontend exposes the default `standard public schema` comment in
 `pg_catalog.pg_description`. This lets `pg_dump` preserve the default comment on
 `public` without emitting an empty `COMMENT ON SCHEMA` statement. User-defined
 comments are not persisted.
+
+The public schema reports `pg_database_owner` as its owner, with `CREATE` and
+`USAGE` for that role and `USAGE` for `PUBLIC`, matching PostgreSQL's defaults.
+The catalogs and role-name lookup expose this built-in role alongside `turso`.
+This metadata does not implement role management or permission enforcement.
 
 ## See Also
 
