@@ -56,7 +56,7 @@ addr  opcode           p1  p2  p3  p4                 p5  comment
   38    Affinity       21   1   0                      0  r[21..22] = D
   39    NoConflict      0  43  21  1                   0  key=r[21..21]
   40    IdxRowId        0  24   0                      0  r[24]=cursor 0.rowid
-  41    Eq              1  24  43                      0  if r[1]==r[24] goto 43
+  41    Eq              1  24  43  Binary              0  if r[1]==r[24] goto 43
   42    Halt         2067   0   0  parent.k            0
   43    Copy           16  25   0                      0  r[25]=r[16]
   44    Copy            1  26   0                      0  r[26]=r[1]
@@ -66,7 +66,7 @@ addr  opcode           p1  p2  p3  p4                 p5  comment
   48    Insert          1  27   1  parent              8  intkey=r[1] data=r[27]
   49    Copy           13  28   0                      0  r[28]=r[13]
   50    Copy           19  29   0                      0  r[29]=r[19]
-  51    Eq             28  29  54                      0  if r[28]==r[29] goto 54
+  51    Eq             28  29  54  Binary              0  if r[28]==r[29] goto 54
   52    Goto            0  53   0                      0
   53    Program        28  54   2  fk cascade update   0  subprogram=fk cascade update
   54    Goto            0  55   0                      0

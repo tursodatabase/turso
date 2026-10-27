@@ -52,7 +52,7 @@ addr  opcode             p1  p2  p3  p4                 p5  comment
   35      Insert          1  19   5  parent             11  intkey=r[5] data=r[19]
   36      Copy           12  20   0                      0  r[20]=r[12]
   37      Copy            7  21   0                      0  r[21]=r[7]
-  38      Eq             20  21  41                      0  if r[20]==r[21] goto 41
+  38      Eq             20  21  41  Binary              0  if r[20]==r[21] goto 41
   39      Goto            0  40   0                      0
   40      Program        20  41   2  fk cascade update   0  subprogram=fk cascade update
   41    Next              0  10   0                      1
