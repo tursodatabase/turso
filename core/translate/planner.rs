@@ -17,6 +17,7 @@ use crate::translate::plan::BitSet;
 use crate::translate::{
     emitter::Resolver,
     expr::{
+        expr_contains_function_that_changes_within_statement,
         expr_contains_nondeterministic_scalar_function, expr_vector_size, unwrap_parens,
         BindingBehavior, WalkControl,
     },
@@ -2702,9 +2703,19 @@ pub fn determine_where_to_eval_term(
     join_order: &[JoinOrderMember],
     subqueries: &[NonFromClauseSubquery],
     table_references: Option<&TableReferences>,
+    resolver: &Resolver,
 ) -> Result<EvalAt> {
     let mut eval_at =
         determine_where_to_eval_expr(&term.expr, join_order, subqueries, table_references)?;
+    // A term like `random() < 0` reads no tables but gives a different answer each time, so like
+    // SQLite we run it once per row of the outermost loop instead of once before the loops.
+    // A call with the wrong number of arguments fails to resolve here. Callers drop a term whose
+    // placement fails, so leave that error to the normal translation of the term instead.
+    let changes_per_call =
+        expr_contains_function_that_changes_within_statement(&term.expr, resolver).unwrap_or(false);
+    if changes_per_call && !join_order.is_empty() {
+        eval_at = eval_at.max(EvalAt::Loop(0));
+    }
     if let Some(origin) = term.origin.join_origin() {
         // A materialized hash input can remove an inner join's right table.
         // The ON term then runs when all of its remaining tables are ready.
@@ -2725,7 +2736,8 @@ pub fn determine_where_to_eval_term(
     if term.origin.join_origin().is_none() {
         // A WHERE condition that reads a table to the left of a RIGHT JOIN must
         // run in that join's row body. The unmatched scan enters the same body
-        // with every table on the left set to NULL.
+        // with every table on the left set to NULL. A term that changes per call
+        // must also run there, so that unmatched rows check it too.
         for (right_table_index, right_table) in table_references.joined_tables().iter().enumerate()
         {
             if !right_table
@@ -2735,9 +2747,10 @@ pub fn determine_where_to_eval_term(
             {
                 continue;
             }
-            let reads_left_table = referenced_tables
-                .iter()
-                .any(|table_index| table_index < right_table_index);
+            let reads_left_table = changes_per_call
+                || referenced_tables
+                    .iter()
+                    .any(|table_index| table_index < right_table_index);
             if reads_left_table {
                 let loop_index = join_order
                     .iter()

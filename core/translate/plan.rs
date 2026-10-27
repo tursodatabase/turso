@@ -298,11 +298,12 @@ impl WhereTerm {
         join_order: &[JoinOrderMember],
         subqueries: &[NonFromClauseSubquery],
         table_references: Option<&TableReferences>,
+        resolver: &Resolver,
     ) -> bool {
         if self.consumed {
             return false;
         }
-        let Ok(eval_at) = self.eval_at(join_order, subqueries, table_references) else {
+        let Ok(eval_at) = self.eval_at(join_order, subqueries, table_references, resolver) else {
             return false;
         };
         eval_at == EvalAt::BeforeLoop
@@ -314,11 +315,12 @@ impl WhereTerm {
         join_order: &[JoinOrderMember],
         subqueries: &[NonFromClauseSubquery],
         table_references: Option<&TableReferences>,
+        resolver: &Resolver,
     ) -> bool {
         if self.consumed {
             return false;
         }
-        let Ok(eval_at) = self.eval_at(join_order, subqueries, table_references) else {
+        let Ok(eval_at) = self.eval_at(join_order, subqueries, table_references, resolver) else {
             return false;
         };
         eval_at == EvalAt::Loop(loop_idx)
@@ -329,8 +331,9 @@ impl WhereTerm {
         join_order: &[JoinOrderMember],
         subqueries: &[NonFromClauseSubquery],
         table_references: Option<&TableReferences>,
+        resolver: &Resolver,
     ) -> Result<EvalAt> {
-        determine_where_to_eval_term(self, join_order, subqueries, table_references)
+        determine_where_to_eval_term(self, join_order, subqueries, table_references, resolver)
     }
 }
 
