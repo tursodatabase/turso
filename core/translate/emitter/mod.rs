@@ -1598,7 +1598,7 @@ fn emit_cdc_change_id(
     crate::translate::sequence::emit_disk_read_nextval(
         program,
         resolver,
-        crate::MAIN_DB_ID,
+        NamespaceRef::root_of(crate::MAIN_DB_ID),
         &seq_name,
         &seq,
         dest_reg,

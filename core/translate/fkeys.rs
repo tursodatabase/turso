@@ -1,7 +1,7 @@
 use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
-use crate::namespace::NamespaceId;
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::translate::emitter::emit_columns_and_dependencies;
 use crate::translate::expr::{emit_stored_column, emit_table_column_for_dml};
 use crate::translate::plan::ColumnMask;
@@ -182,10 +182,10 @@ pub fn affected_parent_fks_for_update(
     resolver: &Resolver,
     table_btree: &BTreeTable,
     updated_positions: &ColumnMask,
-    database_id: usize,
+    namespace: NamespaceRef,
 ) -> Result<crate::alloc::Vec<ResolvedFkRef>> {
-    let mut affected_fks = resolver.with_schema(database_id, |s| {
-        s.resolved_fks_referencing(NamespaceId::ROOT, &table_btree.name)
+    let mut affected_fks = resolver.with_schema(namespace.database_id, |s| {
+        s.resolved_fks_referencing(namespace.id, &table_btree.name)
     })?;
     let affected_positions = if affected_fks.iter().any(|fk| !fk.parent_uses_rowid) {
         table_btree.columns_affected_by_update(updated_positions)?
@@ -1017,7 +1017,7 @@ fn emit_fk_parent_key_probe(
     // Prefer an exact child index on (child_cols...). If the current row must
     // be excluded, scan only the matching index range so the rowid can be
     // checked before counting the match.
-    let idx = child_index_for_fk(resolver, database_id, fk_ref);
+    let idx = child_index_for_fk(resolver, database_id, NamespaceId::ROOT, fk_ref);
 
     if let Some(ix) = idx.as_ref() {
         let icur = open_read_index(program, ix, database_id);
@@ -1052,11 +1052,12 @@ fn emit_fk_parent_key_probe(
 pub(super) fn child_index_for_fk(
     resolver: &Resolver,
     database_id: usize,
+    namespace_id: NamespaceId,
     fk_ref: &ResolvedFkRef,
 ) -> Option<Arc<Index>> {
     let child_cols = &fk_ref.fk.child_columns;
     resolver.with_schema(database_id, |s| {
-        s.get_indices(NamespaceId::ROOT, &fk_ref.child_table.name)
+        s.get_indices(namespace_id, &fk_ref.child_table.name)
             .find(|ix| {
                 ix.columns.len() == child_cols.len()
                     && ix
@@ -1153,10 +1154,11 @@ pub fn emit_fk_child_update_counters(
     new_rowid_reg: usize,
     updated_cols: &ColumnMask,
     parent_key_changed: bool,
-    database_id: usize,
+    namespace: NamespaceRef,
     resolver: &Resolver,
     layout: &ColumnLayout,
 ) -> Result<()> {
+    let database_id = namespace.database_id;
     // Helper: materialize OLD FK column values.
     // Returns (dml_ctx, fk_col_positions, null_skip_label).
     // The null_skip_label is unresolved and must be resolved by the caller after the FK check
@@ -1205,7 +1207,7 @@ pub fn emit_fk_child_update_counters(
     }
 
     for fk_ref in resolver.with_schema(database_id, |s| {
-        s.resolved_fks_for_child(NamespaceId::ROOT, child_table_name, Some(updated_cols))
+        s.resolved_fks_for_child(namespace.id, child_table_name, Some(updated_cols))
     })? {
         if !fk_ref.child_key_changed(updated_cols, child_tbl) {
             continue;
@@ -1222,7 +1224,7 @@ pub fn emit_fk_child_update_counters(
                     // Parent key is rowid: probe parent table by rowid
                     let parent_tbl = resolver
                         .with_schema(database_id, |s| {
-                            s.get_btree_table(NamespaceId::ROOT, &fk_ref.fk.parent_table)
+                            s.get_btree_table(namespace.id, &fk_ref.fk.parent_table)
                         })
                         .expect("parent btree");
                     let pcur = open_read_table(program, &parent_tbl, database_id);
@@ -1263,7 +1265,7 @@ pub fn emit_fk_child_update_counters(
                     // Parent key is a unique index: use index probe
                     let parent_tbl = resolver
                         .with_schema(database_id, |s| {
-                            s.get_btree_table(NamespaceId::ROOT, &fk_ref.fk.parent_table)
+                            s.get_btree_table(namespace.id, &fk_ref.fk.parent_table)
                         })
                         .expect("parent btree");
                     let idx = fk_ref
@@ -1362,7 +1364,7 @@ pub fn emit_fk_child_update_counters(
         if fk_ref.parent_uses_rowid {
             let parent_tbl = resolver
                 .with_schema(database_id, |s| {
-                    s.get_btree_table(NamespaceId::ROOT, &fk_ref.fk.parent_table)
+                    s.get_btree_table(namespace.id, &fk_ref.fk.parent_table)
                 })
                 .expect("parent btree");
             let pcur = open_read_table(program, &parent_tbl, database_id);
@@ -1433,7 +1435,7 @@ pub fn emit_fk_child_update_counters(
         } else {
             let parent_tbl = resolver
                 .with_schema(database_id, |s| {
-                    s.get_btree_table(NamespaceId::ROOT, &fk_ref.fk.parent_table)
+                    s.get_btree_table(namespace.id, &fk_ref.fk.parent_table)
                 })
                 .expect("parent btree");
             let idx = fk_ref
@@ -1557,7 +1559,7 @@ fn emit_fk_delete_parent_existence_check_single(
     emit_skip_if_any_null(program, parent_key_start, ncols, skip_check);
 
     let child_idx = if !is_self_ref {
-        child_index_for_fk(resolver, database_id, fk_ref)
+        child_index_for_fk(resolver, database_id, NamespaceId::ROOT, fk_ref)
     } else {
         None
     };
@@ -2284,18 +2286,19 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
         parent_cursor_id: usize,
         parent_rowid_reg: usize,
         replace_new_parent_regs: Option<(usize, usize)>,
-        database_id: usize,
+        namespace: NamespaceRef,
     ) -> Result<ForeignKeyActions<PreparedFkDeleteAction>> {
+        let database_id = namespace.database_id;
         let parent_bt = resolver
             .with_schema(database_id, |s| {
-                s.get_btree_table(NamespaceId::ROOT, parent_table_name)
+                s.get_btree_table(namespace.id, parent_table_name)
             })
             .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
 
         let mut prepared = Vec::new();
 
         for fk_ref in resolver.with_schema(database_id, |s| {
-            s.resolved_fks_referencing(NamespaceId::ROOT, parent_table_name)
+            s.resolved_fks_referencing(namespace.id, parent_table_name)
         })? {
             let parent_cols: &[String] = &fk_ref.parent_cols;
             let ncols = parent_cols.len();
@@ -2464,12 +2467,13 @@ pub fn fire_fk_update_actions(
     new_values_start: usize,
     new_rowid_reg: usize,
     connection: &Arc<Connection>,
-    database_id: usize,
+    namespace: NamespaceRef,
     affected_parent_fks: &[ResolvedFkRef],
 ) -> Result<()> {
+    let database_id = namespace.database_id;
     let parent_bt = resolver
         .with_schema(database_id, |s| {
-            s.get_btree_table(NamespaceId::ROOT, parent_table_name)
+            s.get_btree_table(namespace.id, parent_table_name)
         })
         .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
 
@@ -2572,11 +2576,12 @@ pub fn emit_fk_drop_table_check(
     resolver: &mut Resolver,
     parent_table_name: &str,
     connection: &Arc<Connection>,
-    database_id: usize,
+    namespace: NamespaceRef,
 ) -> Result<()> {
+    let database_id = namespace.database_id;
     let parent_tbl = resolver
         .with_schema(database_id, |s| {
-            s.get_btree_table(NamespaceId::ROOT, parent_table_name)
+            s.get_btree_table(namespace.id, parent_table_name)
         })
         .ok_or_else(|| {
             LimboError::InternalError(format!("parent table {parent_table_name} not found"))
@@ -2584,7 +2589,7 @@ pub fn emit_fk_drop_table_check(
 
     // Get all FK references to this parent table
     let fk_refs = resolver.with_schema(database_id, |s| {
-        s.resolved_fks_referencing(NamespaceId::ROOT, parent_table_name)
+        s.resolved_fks_referencing(namespace.id, parent_table_name)
     })?;
 
     if fk_refs.is_empty() {

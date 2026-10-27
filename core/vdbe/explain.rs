@@ -1917,6 +1917,7 @@ pub fn insn_to_row(
             ),
             Insn::DropTable {
                 db,
+                namespace: _,
                 _p2,
                 _p3,
                 table_name,
@@ -1929,7 +1930,11 @@ pub fn insn_to_row(
                 0,
                 format!("DROP TABLE {table_name}"),
             ),
-            Insn::DropTrigger { db, trigger_name } => (
+            Insn::DropTrigger {
+                db,
+                namespace: _,
+                trigger_name,
+            } => (
                 "DropTrigger",
                 *db as i64,
                 0,
@@ -1956,7 +1961,11 @@ pub fn insn_to_row(
                 0,
                 format!("ADD SEQUENCE {}", data.name),
             ),
-            Insn::DropSequence { db, seq_name } => (
+            Insn::DropSequence {
+                db,
+                namespace: _,
+                seq_name,
+            } => (
                 "DropSequence",
                 *db as i64,
                 0,
@@ -1967,6 +1976,7 @@ pub fn insn_to_row(
             ),
             Insn::SequenceComputeNext {
                 db,
+                namespace: _,
                 seq_name,
                 in_value_reg,
                 in_is_called_reg,
@@ -1998,6 +2008,7 @@ pub fn insn_to_row(
             ),
             Insn::SequenceTrackAllocation {
                 db,
+                namespace: _,
                 seq_name,
                 value_reg,
             } => (
@@ -2066,7 +2077,11 @@ pub fn insn_to_row(
                 0,
                 "ADD TYPE".to_string(),
             ),
-            Insn::DropView { db, view_name } => (
+            Insn::DropView {
+                db,
+                namespace: _,
+                view_name,
+            } => (
                 "DropView",
                 *db as i64,
                 0,
@@ -2075,7 +2090,11 @@ pub fn insn_to_row(
                 0,
                 format!("DROP VIEW {view_name}"),
             ),
-            Insn::DropIndex { db: _, index } => (
+            Insn::DropIndex {
+                db: _,
+                namespace: _,
+                index,
+            } => (
                 "DropIndex",
                 0,
                 0,
@@ -2501,7 +2520,12 @@ pub fn insn_to_row(
                 0,
                 format!("affinity(r[{}]={:?})", *reg, affinity),
             ),
-            Insn::RenameTable { db: _, from, to } => (
+            Insn::RenameTable {
+                db: _,
+                namespace: _,
+                from,
+                to,
+            } => (
                 "RenameTable",
                 0,
                 0,
@@ -2510,7 +2534,12 @@ pub fn insn_to_row(
                 0,
                 format!("rename_table({from}, {to})"),
             ),
-            Insn::DropColumn { db: _, table, column_index } => (
+            Insn::DropColumn {
+                db: _,
+                namespace: _,
+                table,
+                column_index,
+            } => (
                 "DropColumn",
                 0,
                 0,

@@ -1971,7 +1971,7 @@ pub fn translate_drop_table(
             s.any_resolved_fks_referencing(namespace.id, name)
         })
     {
-        emit_fk_drop_table_check(program, resolver, name, connection, database_id)?;
+        emit_fk_drop_table_check(program, resolver, name, connection, namespace)?;
     }
     let cdc_table = prepare_cdc_if_necessary(
         program,
@@ -2595,9 +2595,10 @@ pub fn translate_drop_table(
     // Drop the in-memory structures for the table
     program.emit_insn(Insn::DropTable {
         db: database_id,
+        namespace: namespace.id,
         _p2: 0,
         _p3: 0,
-        table_name: tbl_name.name.as_str().to_string(),
+        table_name: name.to_string(),
     });
 
     // If the dropped table owned an implicit AUTOINCREMENT sequence, tear
@@ -2615,10 +2616,7 @@ pub fn translate_drop_table(
         let seq_name =
             crate::schema::autoincrement_sequence_name(&normalize_ident(tbl_name.name.as_str()));
         crate::translate::sequence::emit_drop_sequence_cleanup(
-            program,
-            resolver,
-            database_id,
-            &seq_name,
+            program, resolver, namespace, &seq_name,
         )?;
     }
 

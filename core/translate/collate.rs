@@ -656,6 +656,7 @@ fn for_each_operand<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
 #[cfg(test)]
 mod tests {
     use crate::alloc::vec;
+    use crate::namespace::NamespaceRef;
     use crate::{sync::Arc, MAIN_DB_ID};
 
     use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
@@ -1134,7 +1135,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             identifier: "foo".to_string(),
             has_alias: false,
             internal_id: TableInternalId::from(1),
@@ -1171,7 +1172,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             identifier: "t1".to_string(),
             has_alias: false,
             internal_id: TableInternalId::from(1),
@@ -1209,7 +1210,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             identifier: "t2".to_string(),
             has_alias: false,
             internal_id: TableInternalId::from(2),
@@ -1257,7 +1258,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             identifier: "bar".to_string(),
             has_alias: false,
             internal_id: TableInternalId::from(1),

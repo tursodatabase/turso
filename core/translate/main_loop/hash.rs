@@ -279,7 +279,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             planner.program.emit_insn(Insn::OpenRead {
                 cursor_id: planner.hash_build_cursor_id,
                 root_page: btree.root_page,
-                db: build_table.database_id,
+                db: build_table.namespace.database_id,
             });
         }
 
@@ -644,7 +644,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                 self.program.emit_insn(Insn::OpenRead {
                     cursor_id,
                     root_page: btree.root_page,
-                    db: build_table.database_id,
+                    db: build_table.namespace.database_id,
                 });
                 cursor_id
             })

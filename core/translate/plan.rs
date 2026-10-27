@@ -1,4 +1,4 @@
-use crate::namespace::NamespaceId;
+use crate::namespace::NamespaceRef;
 use crate::{
     alloc::{self, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
@@ -613,19 +613,19 @@ impl Plan {
 
     /// Returns true if this plan or any of its subplans read from the given table.
     /// (Not for Delete/Update plans)
-    fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+    fn reads_table(&self, namespace: NamespaceRef, table_name: &str) -> bool {
         match self {
-            Plan::Select(select_plan) => select_plan.reads_table(database_id, table_name),
+            Plan::Select(select_plan) => select_plan.reads_table(namespace, table_name),
             Plan::CompoundSelect {
                 left, right_most, ..
             } => {
                 left.iter()
-                    .any(|(select_plan, _)| select_plan.reads_table(database_id, table_name))
-                    || right_most.reads_table(database_id, table_name)
+                    .any(|(select_plan, _)| select_plan.reads_table(namespace, table_name))
+                    || right_most.reads_table(namespace, table_name)
             }
             Plan::RecursiveCte(plan) => {
-                plan.initial_query.reads_table(database_id, table_name)
-                    || plan.recursive_query.reads_table(database_id, table_name)
+                plan.initial_query.reads_table(namespace, table_name)
+                    || plan.recursive_query.reads_table(namespace, table_name)
             }
             Plan::Delete(_) | Plan::Update(_) => false,
         }
@@ -907,19 +907,19 @@ impl SelectPlan {
                 })
     }
 
-    fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+    fn reads_table(&self, namespace: NamespaceRef, table_name: &str) -> bool {
         self.table_references.joined_tables().iter().any(|table| {
-            table.matches(database_id, table_name)
+            table.matches(namespace, table_name)
                 || match &table.table {
                     Table::FromClauseSubquery(subquery) => {
-                        subquery.plan.reads_table(database_id, table_name)
+                        subquery.plan.reads_table(namespace, table_name)
                     }
                     Table::BTree(_) | Table::Virtual(_) | Table::RecursiveCteInput(_) => false,
                 }
         }) || self
             .non_from_clause_subqueries
             .iter()
-            .any(|subquery| subquery.reads_table(database_id, table_name))
+            .any(|subquery| subquery.reads_table(namespace, table_name))
     }
 }
 
@@ -1165,7 +1165,7 @@ pub(super) fn expand_star(
             {
                 if matches!(&table.table, Table::BTree(_) | Table::Virtual(_)) {
                     let database_name = resolver
-                        .namespace_name(table.database_id)
+                        .namespace_name(table.namespace.database_id)
                         .expect("the table database must exist while compiling a query");
                     crate::bail_parse_error!(
                         "ambiguous column name: {}.{}.{}",
@@ -1310,7 +1310,7 @@ pub(crate) fn alias_or_stored_name(table: &JoinedTable) -> &str {
     if table.has_alias || !is_schema_table(&table.table) {
         return &table.identifier;
     }
-    if table.database_id == TEMP_DB_ID {
+    if table.namespace.database_id == TEMP_DB_ID {
         TEMP_SCHEMA_TABLE_NAME_ALT
     } else {
         SCHEMA_TABLE_NAME_ALT
@@ -1337,7 +1337,7 @@ fn parenthesized_star_source_match(
 ) -> StarSourceMatch {
     let direct_table = &tables[direct_table_index];
     let database_id = matches!(&direct_table.table, Table::BTree(_) | Table::Virtual(_))
-        .then_some(direct_table.database_id);
+        .then_some(direct_table.namespace.database_id);
     let mut first_table_index = None;
     for (group_index, table) in tables.iter().enumerate() {
         let Some(columns) = table.table.parenthesized_join_columns() else {
@@ -1804,8 +1804,8 @@ pub struct JoinedTable {
     /// expression? If yes, all columns that *only* feed this expression can be
     /// removed from the required-column set.
     pub expression_index_usages: Vec<ExpressionIndexUsage>,
-    /// The index of the database. "main" is always zero.
-    pub database_id: usize,
+    /// The namespace the table is in.
+    pub namespace: NamespaceRef,
     /// INDEXED BY / NOT INDEXED hint from the SQL statement.
     pub indexed: Option<ast::Indexed>,
     /// Cost and row estimates for the selected table access.
@@ -1838,8 +1838,8 @@ pub struct OuterQueryReference {
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
-    /// The database the table belongs to, used to match schema-qualified names.
-    pub database_id: usize,
+    /// The namespace the table is in, used to match schema-qualified names.
+    pub namespace: NamespaceRef,
     /// The join that added this table in the outer scope's FROM list, so an
     /// unqualified name follows the same USING rules there as it does in the
     /// outer query itself (see [unqualified_column_sources]). None for the
@@ -3193,8 +3193,8 @@ impl JoinedTable {
         }
     }
 
-    fn matches(&self, database_id: usize, table_name: &str) -> bool {
-        self.database_id == database_id
+    fn matches(&self, namespace: NamespaceRef, table_name: &str) -> bool {
+        self.namespace == namespace
             && matches!(self.table, Table::BTree(_) | Table::Virtual(_))
             && self.table.get_name().eq_ignore_ascii_case(table_name)
     }
@@ -3230,7 +3230,7 @@ impl JoinedTable {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
         })
@@ -3282,7 +3282,7 @@ impl JoinedTable {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
         })
@@ -3318,7 +3318,7 @@ impl JoinedTable {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
         })
@@ -3487,8 +3487,8 @@ impl JoinedTable {
                     // schema of the table's own database: a table in an
                     // attached database can share a name with a materialized
                     // view in a different database.
-                    let cursor_type = match resolver.with_schema(self.database_id, |s| {
-                        s.get_materialized_view(NamespaceId::ROOT, &btree.name)
+                    let cursor_type = match resolver.with_schema(self.namespace.database_id, |s| {
+                        s.get_materialized_view(self.namespace.id, &btree.name)
                     }) {
                         Some(view_mutex) => CursorType::MaterializedView(btree.clone(), view_mutex),
                         None => CursorType::BTreeTable(btree.clone()),
@@ -4372,10 +4372,10 @@ impl NonFromClauseSubquery {
             && matches!(self.eval_phase, SubqueryEvalPhase::PostWriteReturning)
     }
 
-    pub fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+    pub fn reads_table(&self, namespace: NamespaceRef, table_name: &str) -> bool {
         match &self.state {
             SubqueryState::Unevaluated { plan: Some(plan) } => {
-                Plan::reads_table(plan, database_id, table_name)
+                Plan::reads_table(plan, namespace, table_name)
             }
             _ => false,
         }

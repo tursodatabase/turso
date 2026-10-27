@@ -1,4 +1,5 @@
 use crate::alloc::Arc;
+use crate::namespace::NamespaceRef;
 use crate::schema::Column;
 use crate::translate::collate::CollationSeq;
 use crate::translate::expr::{emit_stored_column, emit_table_column};
@@ -287,7 +288,10 @@ fn translate_integrity_check_for_schema(
                 col_used_mask: ColumnUsedMask::default(),
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
-                database_id,
+                namespace: NamespaceRef {
+                    database_id,
+                    id: namespace,
+                },
                 indexed: None,
                 plan_estimate: None,
             }],
