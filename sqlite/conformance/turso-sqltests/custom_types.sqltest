@@ -170,6 +170,15 @@ expect {
     4200
 }
 
+# float8 and float4 are not custom types here, so a CAST to them converts to
+# REAL as in SQLite.
+test cast-to-float8-converts-to-real {
+    SELECT CAST('1.5' AS float8), typeof(CAST('1.5' AS float8)), CAST(1 AS float4), typeof(CAST(1 AS float4));
+}
+expect {
+    1.5|real|1.0|real
+}
+
 @requires strict "uses STRICT tables"
 test cast-to-varchar {
     SELECT CAST('hello' AS varchar(3));
@@ -308,7 +317,6 @@ expect {
     bytea(value blob)|blob||||'<'
     cidr(value text)|text|value|value||
     date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END|value||'+' date_plus, '-' date_minus, '<'
-    float8(value real)|real||||'<'
     inet(value text)|text|validate_ipaddr (value)|value||
     json(value text)|text|json (value)|value||
     jsonb(value text)|blob|jsonb (value)|json (value)||
@@ -343,7 +351,6 @@ expect {
     bytea(value blob)|blob||||'<'
     cidr(value text)|text|value|value||
     date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END|value||'+' date_plus, '-' date_minus, '<'
-    float8(value real)|real||||'<'
     inet(value text)|text|validate_ipaddr (value)|value||
     json(value text)|text|json (value)|value||
     jsonb(value text)|blob|jsonb (value)|json (value)||

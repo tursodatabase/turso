@@ -156,7 +156,11 @@ impl Dialect for PostgresDialect {
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)
+        turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)?;
+        if enable_custom_types {
+            crate::float::register_float_types(schema)?;
+        }
+        Ok(())
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
@@ -193,7 +197,10 @@ impl Dialect for PostgresDialect {
     }
 
     fn text_cast_function(&self, type_name: &str) -> Option<&'static str> {
-        crate::float::is_float_type(type_name).then_some("float8out")
+        match crate::float::FloatType::from_type_name(type_name)? {
+            crate::float::FloatType::Float4 => Some("float4out"),
+            crate::float::FloatType::Float8 => Some("float8out"),
+        }
     }
 
     fn mod_of_integers_is_integer(&self) -> bool {

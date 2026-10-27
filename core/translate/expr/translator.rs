@@ -838,7 +838,7 @@ fn translate_cast_expr(
 }
 
 /// Rewrites `CAST(x AS TEXT)` into a call to the dialect's text function for
-/// `x`'s declared type, when the dialect has one.
+/// `x`'s custom type, when the dialect has one.
 fn dialect_text_cast_call(
     referenced_tables: Option<&TableReferences>,
     operand: &ast::Expr,
@@ -853,8 +853,13 @@ fn dialect_text_cast_call(
     {
         return None;
     }
-    let operand_type = declared_type_name(operand, referenced_tables)?;
-    let function = resolver.dialect.text_cast_function(&operand_type)?;
+    let super::expr_type::ExprType::Custom { type_def, .. } = super::expr_type::type_of(
+        operand,
+        &super::expr_type::TypeEnv::new(referenced_tables, resolver),
+    ) else {
+        return None;
+    };
+    let function = resolver.dialect.text_cast_function(&type_def.name)?;
     Some(ast::Expr::FunctionCall {
         name: ast::Name::exact(function.to_string()),
         distinctness: None,
@@ -866,29 +871,6 @@ fn dialect_text_cast_call(
             over_clause: None,
         },
     })
-}
-
-/// The type name an expression was declared with: a column's declared type or
-/// a CAST's target type.
-fn declared_type_name(
-    expr: &ast::Expr,
-    referenced_tables: Option<&TableReferences>,
-) -> Option<String> {
-    match expr {
-        ast::Expr::Column { table, column, .. } => {
-            let (_, table_ref) = referenced_tables?.find_table_by_internal_id(*table)?;
-            let column = table_ref.get_column_at(*column)?;
-            (column.array_dimensions() == 0).then(|| column.ty_str.clone())
-        }
-        ast::Expr::Cast {
-            type_name: Some(type_name),
-            ..
-        } => (type_name.array_dimensions == 0).then(|| crate::util::dequote(&type_name.name)),
-        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            declared_type_name(&exprs[0], referenced_tables)
-        }
-        _ => None,
-    }
 }
 
 #[inline(never)]

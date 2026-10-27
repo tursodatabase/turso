@@ -210,7 +210,7 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// The function that turns a value of the declared type `type_name` into
+    /// The function that turns a value of the custom type `type_name` into
     /// text when it is cast to TEXT, or `None` to use SQLite's conversion.
     ///
     /// PostgreSQL prints `float8` values with the shortest digits that read

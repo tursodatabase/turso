@@ -93,6 +93,36 @@ expect {
     1|1e+20
 }
 
+test float4-rounds-to-single-precision {
+    SELECT 3.14159265358979::float4, 2.5::real;
+    SELECT 1234567::float4, 1000000::float4, 1e14::float4, 100000::float4;
+    SELECT 1234567::float4::text;
+}
+expect {
+    3.1415927|2.5
+    1.234567e+06|1e+06|1e+14|100000
+    1.234567e+06
+}
+
+test float4-column-rounds-to-single-precision {
+    CREATE TABLE float4_values(r real);
+    INSERT INTO float4_values VALUES (3.14159265358979);
+    SELECT r, r::text FROM float4_values;
+}
+expect {
+    3.1415927|3.1415927
+}
+
+test domain-over-float8-accepts-integers {
+    CREATE DOMAIN float8_domain AS float8;
+    CREATE TABLE float8_domain_values(x float8_domain);
+    INSERT INTO float8_domain_values VALUES (1);
+    SELECT x + 0.5 FROM float8_domain_values;
+}
+expect {
+    1.5
+}
+
 test numeric-whole-number-keeps-fraction {
     SELECT 1.0::numeric;
     SELECT 1.0::numeric::text;

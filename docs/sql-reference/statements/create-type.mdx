@@ -264,7 +264,6 @@ Turso provides the following built-in custom types in STRICT tables:
 | `boolean` | integer | -- | Constrained to 0 or 1. Aliases: `bool`. |
 | `smallint` | integer | -- | Integer constrained to -32768 through 32767. Aliases: `int2`. |
 | `bigint` | integer | -- | Integer (no range constraint). Aliases: `int8`. |
-| `float8` | real | -- | Floating-point number, stored as REAL. Aliases: `float4`. |
 | `varchar(N)` | text | `maxlen` | Text with a maximum length of N characters. |
 | `date` | text | -- | ISO 8601 date (YYYY-MM-DD), validated on insert. Supports `+` and `-` with whole-day integers. |
 | `time` | text | -- | ISO 8601 time (HH:MM:SS), validated on insert. |

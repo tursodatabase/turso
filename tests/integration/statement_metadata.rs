@@ -227,33 +227,30 @@ mod tests {
 
     /// A CAST to a type registered through CREATE TYPE reports the primitive the
     /// value is stored as, plus the type's name in `custom_type_name`, so
-    /// wire-protocol layers can tell `CAST(x AS float8)` from a plain REAL.
+    /// wire-protocol layers can tell `CAST(x AS cents)` from a plain INTEGER.
     #[test]
     fn type_info_for_cast_to_custom_type() {
         let db = fresh_db_with_custom_types("type_info_custom_cast.db");
         let conn = db.connect_limbo();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, f float8) STRICT")
+        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT")
             .unwrap();
 
         let stmt = conn
-            .prepare("SELECT CAST(1 AS float8), CAST(1 AS float4), CAST(1 AS REAL), f FROM t")
+            .prepare("SELECT CAST(id AS cents), CAST(id AS INTEGER), amount FROM t")
             .unwrap();
 
-        let float8 = expect_info(&stmt, 0);
-        assert_eq!(float8.declared_name, "REAL");
-        assert_eq!(float8.custom_type_name.as_deref(), Some("float8"));
+        let cast_cents = expect_info(&stmt, 0);
+        assert_eq!(cast_cents.declared_name, "INTEGER");
+        assert_eq!(cast_cents.custom_type_name.as_deref(), Some("cents"));
 
-        // float4 is an alias of float8.
-        let float4 = expect_info(&stmt, 1);
-        assert_eq!(float4.declared_name, "REAL");
-        assert_eq!(float4.custom_type_name.as_deref(), Some("float8"));
+        let cast_int = expect_info(&stmt, 1);
+        assert_eq!(cast_int.declared_name, "INTEGER");
+        assert_eq!(cast_int.custom_type_name, None);
 
-        let real = expect_info(&stmt, 2);
-        assert_eq!(real.declared_name, "REAL");
-        assert_eq!(real.custom_type_name, None);
-
-        let column = expect_info(&stmt, 3);
-        assert_eq!(column.declared_name, "float8");
+        let column = expect_info(&stmt, 2);
+        assert_eq!(column.declared_name, "cents");
         assert_eq!(column.kind, ColumnTypeKind::Custom);
         assert_eq!(column.custom_type_name, None);
     }

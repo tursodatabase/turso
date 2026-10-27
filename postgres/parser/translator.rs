@@ -3906,8 +3906,8 @@ impl PostgreSQLTranslator {
 
         // PG type-cast functions: float8(x) → CAST(x AS float8), int4(x) → CAST(x AS INTEGER), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
-            "FLOAT8" => Some("float8"),
-            "FLOAT4" => Some("float4"),
+            "FLOAT8" => Some(FLOAT8_TYPE),
+            "FLOAT4" => Some(FLOAT4_TYPE),
             "INT4" | "INT2" | "INT8" => Some("INTEGER"),
             "BOOL" => Some("BOOLEAN"),
             "TEXT" => Some("TEXT"),
@@ -5787,8 +5787,8 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         // Base types (no Turso custom type needed)
         "INTEGER" | "INT" | "INT4" | "SERIAL" | "SERIAL4" | "BIGSERIAL" | "SERIAL8"
         | "SMALLSERIAL" | "SERIAL2" => "INTEGER".into(),
-        "REAL" | "FLOAT4" => "float4".into(),
-        "DOUBLE PRECISION" | "FLOAT8" => "float8".into(),
+        "REAL" | "FLOAT4" => FLOAT4_TYPE.into(),
+        "DOUBLE PRECISION" | "FLOAT8" => FLOAT8_TYPE.into(),
         "TEXT" | "BPCHAR" | "NAME" => "TEXT".into(),
         "BLOB" => "BLOB".into(),
 
@@ -5954,8 +5954,8 @@ fn pg_type_name_to_ast_type(
     let name = match pg_type.to_uppercase().as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "BIGINT" | "INT8" | "SERIAL"
         | "BIGSERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
-        "REAL" | "FLOAT4" if type_name.array_bounds.is_empty() => "float4",
-        "DOUBLE PRECISION" | "FLOAT8" if type_name.array_bounds.is_empty() => "float8",
+        "REAL" | "FLOAT4" if type_name.array_bounds.is_empty() => FLOAT4_TYPE,
+        "DOUBLE PRECISION" | "FLOAT8" if type_name.array_bounds.is_empty() => FLOAT8_TYPE,
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
             "REAL"
         }
@@ -6002,9 +6002,16 @@ fn cast_expr(expr: ast::Expr, type_name: ast::Type) -> ast::Expr {
     }
 }
 
+/// The Turso type PostgreSQL `float8` and `double precision` map to. The
+/// PostgreSQL frontend registers it as a built-in type stored as REAL.
+pub const FLOAT8_TYPE: &str = "float8";
+
+/// The Turso type PostgreSQL `float4` and `real` map to, stored as REAL.
+pub const FLOAT4_TYPE: &str = "float4";
+
 /// Whether `name` is one of the Turso types that PostgreSQL floats map to.
 fn is_float_type(name: &str) -> bool {
-    matches!(name, "float8" | "float4")
+    name.eq_ignore_ascii_case(FLOAT8_TYPE) || name.eq_ignore_ascii_case(FLOAT4_TYPE)
 }
 
 fn extract_type_name_from_typename(

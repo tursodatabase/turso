@@ -132,7 +132,11 @@ fails undoes its own changes.
 Type mapping: serial/smallserial/bigserial (and serial2/4/8) become
 `INTEGER NOT NULL DEFAULT nextval(...)` with an implicit sequence. boolean,
 smallint, bigint, uuid, date, time, timestamp[tz], bytea, json, jsonb, inet,
-cidr, macaddr, macaddr8 map to Turso custom types. varchar(n) and
+cidr, macaddr, macaddr8 map to Turso custom types. float8 (double precision)
+and float4 (real) map to built-in float8 and float4 types stored as REAL, and
+print the way PostgreSQL prints them (`1`, `1e+20`); arithmetic and aggregates
+on them, and float arrays, still print SQLite style (`1.0`). Plain numeric is
+stored as REAL and prints SQLite style. varchar(n) and
 numeric(p,s) keep their type modifiers; type modifiers on any other type,
 including char(n), timestamp(p) and bit(n), are rejected. interval, xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
