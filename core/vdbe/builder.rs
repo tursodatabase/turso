@@ -2480,6 +2480,8 @@ impl ProgramBuilder {
 
         self.parameters.list.dedup();
 
+        self.explain.build_ephemeral_cursors(&self.insns);
+
         // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
         // Statement journals are only needed when a statement writes multiple rows AND could
         // abort midway (e.g. constraint violation). Single-row writes are atomic and don't
