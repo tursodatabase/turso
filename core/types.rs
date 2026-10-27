@@ -3491,7 +3491,7 @@ impl Record {
 pub enum Cursor {
     /// A b-tree cursor
     BTree(Box<BTreeCursor>, Option<Arc<IndexInfo>>),
-    /// A cursor behind a trait object: currently, either the MVCC cursor or test doubles.
+    /// A cursor behind a trait object: currently, either a materialized view cursor or test doubles.
     /// TODO it wouldn't be too hard to get rid of `dyn CursorTrait` everywhere.
     Dyn(Box<dyn CursorTrait>, Option<Arc<IndexInfo>>),
     IndexMethod(Box<dyn IndexMethodCursor>),

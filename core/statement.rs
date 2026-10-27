@@ -2482,34 +2482,53 @@ mod tests {
     }
 
     #[test]
-    fn mvcc_table_scan_reads_through_a_btree_cursor_with_an_mvcc_reader() {
+    fn mvcc_statements_read_and_write_through_btree_cursors_with_an_mvcc_reader() {
         use crate::storage::btree::CursorTrait;
 
         let conn = open_test_connection().unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, w TEXT)")
             .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        conn.execute("CREATE INDEX i ON t(v)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a', 'x'), (2, 'b', 'y')")
             .unwrap();
-        let mut stmt = conn.prepare("SELECT v FROM t").unwrap();
-        loop {
-            match stmt.step().unwrap() {
-                StepResult::Row => break,
-                StepResult::IO | StepResult::Yield => stmt._io().step().unwrap(),
-                other => panic!("unexpected step result {other:?}"),
+        for (sql, reads_table, reads_index) in [
+            ("SELECT w FROM t", true, false),
+            ("SELECT v FROM t INDEXED BY i WHERE v > ''", false, true),
+            (
+                "INSERT INTO t VALUES (3, 'c', 'z') RETURNING id",
+                true,
+                true,
+            ),
+            ("UPDATE t SET v = 'd' WHERE id = 1 RETURNING id", true, true),
+            ("DELETE FROM t WHERE id = 2 RETURNING id", true, true),
+        ] {
+            let mut stmt = conn.prepare(sql).unwrap();
+            loop {
+                match stmt.step().unwrap() {
+                    StepResult::Row => break,
+                    StepResult::IO | StepResult::Yield => stmt._io().step().unwrap(),
+                    other => panic!("unexpected step result {other:?} for {sql}"),
+                }
             }
+            let mut table_cursors = 0;
+            let mut index_cursors = 0;
+            for cursor in stmt.state.cursors.iter().flatten() {
+                let crate::types::Cursor::BTree(cursor, _) = cursor else {
+                    continue;
+                };
+                if !cursor.is_mvcc() {
+                    continue;
+                }
+                match cursor.index_info() {
+                    Some(_) => index_cursors += 1,
+                    None => table_cursors += 1,
+                }
+            }
+            assert_eq!(table_cursors > 0, reads_table, "table cursors of {sql}");
+            assert_eq!(index_cursors > 0, reads_index, "index cursors of {sql}");
+            stmt.run_ignore_rows().unwrap();
         }
-        let cursor = stmt
-            .state
-            .cursors
-            .iter()
-            .flatten()
-            .next()
-            .expect("the scan must open a cursor");
-        let crate::types::Cursor::BTree(cursor, _) = cursor else {
-            panic!("an MVCC table scan must read through a B-tree cursor, got {cursor:?}");
-        };
-        assert!(cursor.is_mvcc());
     }
 
     #[test]

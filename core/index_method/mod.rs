@@ -8,7 +8,6 @@ use strum::EnumCount;
 use turso_parser::ast;
 
 use crate::{
-    mvcc::cursor::MvccCursorType,
     schema::IndexColumn,
     storage::{
         btree::{BTreeCursor, CursorTrait},
@@ -17,7 +16,7 @@ use crate::{
     translate::emitter::TransactionMode,
     types::IOResult,
     vdbe::Register,
-    Connection, LimboError, MvCursor, Result, Value,
+    Connection, LimboError, Result, Value,
 };
 
 pub mod backing_btree;
@@ -686,29 +685,21 @@ impl TransactionIndexMethodCursor {
     }
 }
 
-fn promote_to_mvcc_cursor(
-    connection: &Arc<Connection>,
+/// The MVCC store and transaction that a cursor of an index method reads,
+/// or `None` when the database is not in MVCC mode.
+fn mvcc_transaction(
+    connection: &Connection,
     database_id: usize,
-    root_page: i64,
-    cursor: Box<dyn CursorTrait>,
-    cursor_type: MvccCursorType,
-) -> Result<Box<dyn CursorTrait>> {
+) -> Result<Option<(Arc<crate::MvStore>, u64)>> {
     let Some(mv_store) = connection.mv_store_for_db(database_id) else {
-        return Ok(cursor);
+        return Ok(None);
     };
     let tx_id = connection.get_mv_tx_id_for_db(database_id).ok_or_else(|| {
         LimboError::InternalError(
             "index method opened an MVCC cursor without an active transaction".to_string(),
         )
     })?;
-    Ok(Box::new(MvCursor::new(
-        mv_store,
-        connection,
-        tx_id,
-        root_page,
-        cursor_type,
-        cursor,
-    )?))
+    Ok(Some((mv_store, tx_id)))
 }
 
 fn btree_root_page(connection: &Connection, database_id: usize, root_page: i64) -> i64 {
@@ -735,18 +726,17 @@ pub(crate) fn open_table_cursor(
         )));
     };
     let root_page = table.get_root_page()?;
-    let cursor = Box::new(BTreeCursor::new_table(
+    let mut cursor = Box::new(BTreeCursor::new_table(
         pager,
         btree_root_page(connection, database_id, root_page),
         table.columns().len(),
     ));
-    promote_to_mvcc_cursor(
-        connection,
-        database_id,
-        root_page,
-        cursor,
-        MvccCursorType::Table,
-    )
+    if let Some((mv_store, tx_id)) = mvcc_transaction(connection, database_id)? {
+        #[cfg(any(test, injected_yields))]
+        cursor.install_yield_context(connection);
+        cursor.read_mvcc_table(mv_store, connection, tx_id, root_page)?;
+    }
+    Ok(cursor)
 }
 
 /// helper method to parse select patterns for [IndexMethodAttachment::definition] call
