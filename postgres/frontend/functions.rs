@@ -78,6 +78,7 @@ scalar_functions! {
     PgGetExpr(FunctionArity::OneOf(&[2, 3]), true),
     ToChar(FunctionArity::Exact(2), true),
     PgInputIsValid(FunctionArity::Exact(2), true),
+    Int8OutOfRange(FunctionArity::Exact(0), false),
     Textlike(FunctionArity::Exact(2), true),
     LikeEscape(FunctionArity::Exact(2), true),
     Booleq(FunctionArity::Exact(2), true),
@@ -131,6 +132,13 @@ impl ScalarCall for PgScalarFunction {
             Self::PgGetExpr => exec_pg_get_expr(args)?,
             Self::ToChar => exec_to_char(args[0].get_value(), &text_arg(args, 1)),
             Self::PgInputIsValid => exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1)),
+            Self::Int8OutOfRange => {
+                return Err(sqlstate_error(
+                    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                    "bigint out of range",
+                )
+                .into())
+            }
             Self::Textlike => exec_textlike(args)?,
             Self::LikeEscape => exec_like_escape(args)?,
             Self::Booleq => Value::from_i64((args[0].get_value() == args[1].get_value()) as i64),
