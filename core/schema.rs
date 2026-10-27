@@ -3404,18 +3404,26 @@ impl Schema {
         let mut parent_pos: Vec<usize> = Vec::try_with_capacity_ext(parent_cols.len())?;
         let mut parent_collations: Vec<CollationSeq> =
             Vec::try_with_capacity_ext(parent_cols.len())?;
-        for pc in parent_cols.iter() {
-            let (p, collation) = match parent_tbl.get_column(pc) {
+        let mut key_affinities: Vec<Affinity> = Vec::try_with_capacity_ext(parent_cols.len())?;
+        for (pc, &cpos) in parent_cols.iter().zip(child_pos.iter()) {
+            let (p, collation, parent_affinity) = match parent_tbl.get_column(pc) {
                 Some((i, column)) => (
                     i,
                     crate::translate::collate::column_collation(column)
                         .unwrap_or(CollationSeq::Binary),
+                    column.affinity(),
                 ),
                 None if ROWID_STRS.iter().any(|r| pc.eq_ignore_ascii_case(r)) => {
-                    (0, CollationSeq::Binary)
+                    (0, CollationSeq::Binary, Affinity::Integer)
                 }
                 None => return Err(fk_mismatch_err(&child.name, &parent_tbl.name)),
             };
+            key_affinities
+                .push_within_capacity(crate::translate::expr::do_comparison_affinity(
+                    parent_affinity,
+                    child.columns[cpos].affinity(),
+                ))
+                .expect("FK key affinity vector was preallocated to parent_cols.len()");
             parent_pos
                 .push_within_capacity(p)
                 .expect("parent FK position vector was preallocated to parent_cols.len()");
@@ -3471,6 +3479,7 @@ impl Schema {
             child_pos: child_pos.into_boxed_slice(),
             parent_pos: parent_pos.into_boxed_slice(),
             parent_collations: parent_collations.into_boxed_slice(),
+            key_affinities: key_affinities.into_boxed_slice(),
             parent_uses_rowid,
             parent_unique_index,
         })
@@ -6363,6 +6372,9 @@ pub struct ResolvedFkRef {
     /// with the parent column's collation), and only an index with these
     /// collations can enforce the parent key or find the child rows.
     pub parent_collations: BoxedSlice<CollationSeq>,
+    /// The affinity applied when a child key is compared with a parent key,
+    /// as SQLite compares `parent_col = child_col`.
+    pub key_affinities: BoxedSlice<Affinity>,
 
     /// If the parent key is rowid or a rowid-alias (single-column only)
     pub parent_uses_rowid: bool,

@@ -4318,6 +4318,11 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         // never matches any child row (SQL NULL semantics)
         emit_skip_if_any_null(program, new_pk_start, n_cols, skip_fk);
 
+        // The new row is already in the table, but SQLite looks for child rows
+        // before inserting it, so a self-referencing row does not count as
+        // its own child here. Whether it references itself was checked when
+        // its child key was checked.
+        let new_row_rowid = is_self_ref.then(|| insertion.key_register());
         let child_tbl = &pref.child_table;
         if let Some(ix) = child_index_for_fk(resolver, database_id, &pref) {
             let icur = open_read_index(program, &ix, database_id);
@@ -4339,7 +4344,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             }
 
             // Decrement once per matching child row
-            index_scan_match_any(program, icur, probe_start, n_cols, None, |p| {
+            index_scan_match_any(program, icur, probe_start, n_cols, new_row_rowid, |p| {
                 let next = p.allocate_label();
                 emit_guarded_fk_decrement(p, next, pref.fk.deferred);
                 p.preassign_label_to_next_insn(next);
@@ -4350,7 +4355,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 program,
                 &pref,
                 new_pk_start,
-                None,
+                new_row_rowid,
                 database_id,
                 resolver,
                 |p| {

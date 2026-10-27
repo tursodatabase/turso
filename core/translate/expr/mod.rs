@@ -82,7 +82,8 @@ use vectors::*;
 use walk::*;
 
 pub(crate) use affinity::{
-    comparison_affinity, expr_data_type, get_expr_affinity, StorageClassMask,
+    comparison_affinity, do_comparison_affinity, expr_data_type, get_expr_affinity,
+    StorageClassMask,
 };
 pub(crate) use arrays::{
     emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,

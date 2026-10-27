@@ -178,7 +178,7 @@ pub(crate) fn expr_data_type(
     }
 }
 
-fn do_comparison_affinity(lhs: Affinity, rhs: Affinity) -> Affinity {
+pub(crate) fn do_comparison_affinity(lhs: Affinity, rhs: Affinity) -> Affinity {
     if lhs != Affinity::None && rhs != Affinity::None {
         // Both sides have affinity - use numeric if either is numeric
         if lhs.is_numeric() || rhs.is_numeric() {

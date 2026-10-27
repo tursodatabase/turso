@@ -582,7 +582,7 @@ where
             lhs: tmp,
             rhs: parent_key_start + i,
             target_pc: cont,
-            flags: CmpInsFlags::default(),
+            flags: CmpInsFlags::default().with_affinity(fk_ref.key_affinities[i]),
             collation: fk_ref.parent_collations[i],
         });
         program.emit_insn(Insn::Goto {
