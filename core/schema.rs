@@ -3402,19 +3402,26 @@ impl Schema {
         }
 
         let mut parent_pos: Vec<usize> = Vec::try_with_capacity_ext(parent_cols.len())?;
+        let mut parent_collations: Vec<CollationSeq> =
+            Vec::try_with_capacity_ext(parent_cols.len())?;
         for pc in parent_cols.iter() {
-            let pos = parent_tbl.get_column(pc).map(|(i, _)| i).or_else(|| {
-                ROWID_STRS
-                    .iter()
-                    .any(|r| pc.eq_ignore_ascii_case(r))
-                    .then_some(0)
-            });
-            let Some(p) = pos else {
-                return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+            let (p, collation) = match parent_tbl.get_column(pc) {
+                Some((i, column)) => (
+                    i,
+                    crate::translate::collate::column_collation(column)
+                        .unwrap_or(CollationSeq::Binary),
+                ),
+                None if ROWID_STRS.iter().any(|r| pc.eq_ignore_ascii_case(r)) => {
+                    (0, CollationSeq::Binary)
+                }
+                None => return Err(fk_mismatch_err(&child.name, &parent_tbl.name)),
             };
             parent_pos
                 .push_within_capacity(p)
                 .expect("parent FK position vector was preallocated to parent_cols.len()");
+            parent_collations
+                .push_within_capacity(collation)
+                .expect("parent FK collation vector was preallocated to parent_cols.len()");
         }
 
         // A single-column parent key is the rowid when it names rowid/_rowid_/oid
@@ -3444,7 +3451,10 @@ impl Schema {
                             .columns
                             .iter()
                             .zip(parent_cols.iter())
-                            .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                            .zip(parent_collations.iter())
+                            .all(|((ic, pc), collation)| {
+                                ic.name.eq_ignore_ascii_case(pc) && ic.collation == *collation
+                            })
                 })
                 .cloned();
             if require_unique && found.is_none() {
@@ -3460,6 +3470,7 @@ impl Schema {
             parent_cols,
             child_pos: child_pos.into_boxed_slice(),
             parent_pos: parent_pos.into_boxed_slice(),
+            parent_collations: parent_collations.into_boxed_slice(),
             parent_uses_rowid,
             parent_unique_index,
         })
@@ -6347,6 +6358,12 @@ pub struct ResolvedFkRef {
     /// Column positions in the child/parent tables (pos_in_table)
     pub child_pos: BoxedSlice<usize>,
     pub parent_pos: BoxedSlice<usize>,
+    /// The collation of each parent key column, BINARY for the rowid. A child
+    /// key matches a parent key when they compare equal under these
+    /// collations (SQLite's `fkScanChildren` and `fkActionTrigger` compare
+    /// with the parent column's collation), and only an index with these
+    /// collations can enforce the parent key or find the child rows.
+    pub parent_collations: BoxedSlice<CollationSeq>,
 
     /// If the parent key is rowid or a rowid-alias (single-column only)
     pub parent_uses_rowid: bool,

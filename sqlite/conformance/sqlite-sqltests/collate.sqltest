@@ -2161,6 +2161,36 @@ expect error {
     FOREIGN KEY constraint failed
 }
 
+# A BINARY index on the child key cannot find the child rows of a NOCASE
+# parent key, so the check must not use it.
+@cross-check-integrity
+test collate-fk-delete-parent-ignores-child-index-with-other-collation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, r TEXT REFERENCES p(k));
+    CREATE INDEX c_r ON c(r);
+    INSERT INTO p VALUES ('abc');
+    INSERT INTO c VALUES (1, 'ABC');
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# Only a UNIQUE index with the parent column's collation can be the parent key.
+@cross-check-integrity
+test collate-fk-parent-index-with-other-collation-is-a-mismatch {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT);
+    CREATE UNIQUE INDEX p_k ON p(k COLLATE NOCASE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, r TEXT REFERENCES p(k));
+    INSERT INTO p VALUES ('abc');
+    INSERT INTO c VALUES (1, 'ABC');
+}
+expect error {
+    foreign key mismatch
+}
+
 @cross-check-integrity
 test collate-fk-cascade-and-set-null-with-nocase-key {
     PRAGMA foreign_keys=ON;

@@ -26,10 +26,10 @@ use crate::{
             walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
-            build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
-            emit_guarded_fk_decrement, emit_skip_if_any_null, fk_constraint_info, index_probe,
-            index_scan_match_any, open_read_index, open_read_table, table_scan_match_any,
-            ForeignKeyActions,
+            build_index_affinity_string, child_index_for_fk, emit_fk_restrict_halt,
+            emit_fk_violation, emit_guarded_fk_decrement, emit_skip_if_any_null,
+            fk_constraint_info, index_probe, index_scan_match_any, open_read_index,
+            open_read_table, table_scan_match_any, ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -4319,23 +4319,8 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         emit_skip_if_any_null(program, new_pk_start, n_cols, skip_fk);
 
         let child_tbl = &pref.child_table;
-        let child_cols = &pref.fk.child_columns;
-        let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(NamespaceId::ROOT, &child_tbl.name)
-                .cloned()
-                .collect()
-        });
-        let idx = indices.iter().find(|ix| {
-            ix.columns.len() == child_cols.len()
-                && ix
-                    .columns
-                    .iter()
-                    .zip(child_cols.iter())
-                    .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-        });
-
-        if let Some(ix) = idx {
-            let icur = open_read_index(program, ix, database_id);
+        if let Some(ix) = child_index_for_fk(resolver, database_id, &pref) {
+            let icur = open_read_index(program, &ix, database_id);
             // Copy key into probe regs and apply child-index affinities
             let probe_start = program.alloc_registers(n_cols);
             for i in 0..n_cols {
@@ -4349,7 +4334,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 program.emit_insn(Insn::Affinity {
                     start_reg: probe_start,
                     count,
-                    affinities: build_index_affinity_string(ix, child_tbl),
+                    affinities: build_index_affinity_string(&ix, child_tbl),
                 });
             }
 

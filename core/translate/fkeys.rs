@@ -5,6 +5,7 @@ use crate::namespace::NamespaceId;
 use crate::translate::emitter::emit_columns_and_dependencies;
 use crate::translate::expr::{emit_stored_column, emit_table_column_for_dml};
 use crate::translate::plan::ColumnMask;
+use crate::turso_assert;
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef},
@@ -248,7 +249,25 @@ fn emit_parent_key_change_probes(
             None
         };
 
-    emit_key_change_check(program, old_key_start, new_key_start, n_cols, skip, changed);
+    let key_collations = &incoming
+        .first()
+        .expect("parent key change probes need a foreign key")
+        .parent_collations;
+    turso_assert!(
+        key_collations.len() == n_cols
+            && incoming
+                .iter()
+                .all(|fk_ref| fk_ref.parent_collations == *key_collations),
+        "foreign keys probed with one parent key must have its collations"
+    );
+    emit_key_change_check(
+        program,
+        old_key_start,
+        new_key_start,
+        key_collations,
+        skip,
+        changed,
+    );
 
     program.preassign_label_to_next_insn(changed);
     if let Some(ref plan) = deferred_new_key_probe {
@@ -564,7 +583,7 @@ where
             rhs: parent_key_start + i,
             target_pc: cont,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::Binary,
+            collation: fk_ref.parent_collations[i],
         });
         program.emit_insn(Insn::Goto {
             target_pc: next_row,
@@ -962,7 +981,6 @@ fn emit_fk_parent_key_probe(
     resolver: &Resolver,
 ) -> Result<()> {
     let child_tbl = &fk_ref.child_table;
-    let child_cols = &fk_ref.fk.child_columns;
     let is_deferred = fk_ref.fk.deferred;
     let is_restrict = matches!(fk_ref.fk.on_update, RefAct::Restrict);
     let skip_probe = program.allocate_label();
@@ -999,18 +1017,7 @@ fn emit_fk_parent_key_probe(
     // Prefer an exact child index on (child_cols...). If the current row must
     // be excluded, scan only the matching index range so the rowid can be
     // checked before counting the match.
-    let idx = resolver.with_schema(database_id, |s| {
-        s.get_indices(NamespaceId::ROOT, &child_tbl.name)
-            .find(|ix| {
-                ix.columns.len() == child_cols.len()
-                    && ix
-                        .columns
-                        .iter()
-                        .zip(child_cols.iter())
-                        .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-            })
-            .cloned()
-    });
+    let idx = child_index_for_fk(resolver, database_id, fk_ref);
 
     if let Some(ix) = idx.as_ref() {
         let icur = open_read_index(program, ix, database_id);
@@ -1037,6 +1044,32 @@ fn emit_fk_parent_key_probe(
 
     program.preassign_label_to_next_insn(skip_probe);
     Ok(())
+}
+
+/// An index on exactly the child key columns that can find the child rows of
+/// a parent key: its key columns must compare with the parent key's
+/// collations, otherwise a seek would miss or wrongly find child rows.
+pub(super) fn child_index_for_fk(
+    resolver: &Resolver,
+    database_id: usize,
+    fk_ref: &ResolvedFkRef,
+) -> Option<Arc<Index>> {
+    let child_cols = &fk_ref.fk.child_columns;
+    resolver.with_schema(database_id, |s| {
+        s.get_indices(NamespaceId::ROOT, &fk_ref.child_table.name)
+            .find(|ix| {
+                ix.columns.len() == child_cols.len()
+                    && ix
+                        .columns
+                        .iter()
+                        .zip(child_cols.iter())
+                        .zip(fk_ref.parent_collations.iter())
+                        .all(|((ic, cc), collation)| {
+                            ic.name.eq_ignore_ascii_case(cc) && ic.collation == *collation
+                        })
+            })
+            .cloned()
+    })
 }
 
 /// Build a parent key vector (in FK parent-column order) into `dest_start`.
@@ -1319,7 +1352,7 @@ pub fn emit_fk_child_update_counters(
                     rhs: parent_reg,
                     target_pc: self_mismatch,
                     flags: CmpInsFlags::default().jump_if_null(),
-                    collation: CollationSeq::Binary,
+                    collation: fk_ref.parent_collations[idx],
                 });
             }
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
@@ -1523,21 +1556,8 @@ fn emit_fk_delete_parent_existence_check_single(
     let skip_check = program.allocate_label();
     emit_skip_if_any_null(program, parent_key_start, ncols, skip_check);
 
-    let child_cols = &fk_ref.fk.child_columns;
     let child_idx = if !is_self_ref {
-        let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(NamespaceId::ROOT, &fk_ref.child_table.name)
-                .cloned()
-                .collect()
-        });
-        indices.into_iter().find(|idx| {
-            idx.columns.len() == child_cols.len()
-                && idx
-                    .columns
-                    .iter()
-                    .zip(child_cols.iter())
-                    .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-        })
+        child_index_for_fk(resolver, database_id, fk_ref)
     } else {
         None
     };
@@ -1791,17 +1811,20 @@ fn copy_key_from_values(
 }
 
 /// Emit instructions to detect if key values have changed between old and new registers.
-/// NULL values compare equal here, matching SQLite's FK action WHEN guard.
+/// NULL values compare equal here, and each key column compares with its
+/// collation, matching SQLite's FK action WHEN guard (`old.k IS new.k`, where
+/// old.k has the parent column's collation).
 /// Jumps to `skip_label` if all values are equal, falls through to `changed_label` if any differ.
 fn emit_key_change_check(
     program: &mut ProgramBuilder,
     old_key_start: usize,
     new_key_start: usize,
-    ncols: usize,
+    collations: &[CollationSeq],
     skip_label: BranchOffset,
     changed_label: BranchOffset,
 ) {
-    for i in 0..ncols {
+    let ncols = collations.len();
+    for (i, &collation) in collations.iter().enumerate() {
         let next = if i + 1 == ncols {
             None
         } else {
@@ -1812,7 +1835,7 @@ fn emit_key_change_check(
             rhs: new_key_start + i,
             target_pc: next.unwrap_or(skip_label),
             flags: CmpInsFlags::default().null_eq(),
-            collation: CollationSeq::Binary,
+            collation,
         });
         program.emit_insn(Insn::Goto {
             target_pc: changed_label,
@@ -1911,6 +1934,7 @@ fn qualified_table_name(table_name: &str, db_name: Option<&str>) -> QualifiedNam
 fn generate_cascade_delete_stmt(
     child_table: &str,
     child_cols: &[String],
+    parent_collations: &[CollationSeq],
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
@@ -1918,7 +1942,11 @@ fn generate_cascade_delete_stmt(
         with: None,
         tbl_name: qualified_table_name(child_table, db_name),
         indexed: None,
-        where_clause: Some(Box::new(build_fk_match_where_clause(child_cols, ctx))),
+        where_clause: Some(Box::new(build_fk_match_where_clause(
+            child_cols,
+            parent_collations,
+            ctx,
+        ))),
         returning: vec![],
     }
 }
@@ -1928,6 +1956,7 @@ fn generate_cascade_delete_stmt(
 fn generate_set_null_stmt(
     child_table: &str,
     child_cols: &[String],
+    parent_collations: &[CollationSeq],
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
@@ -1946,7 +1975,11 @@ fn generate_set_null_stmt(
         indexed: None,
         sets,
         from: None,
-        where_clause: Some(Box::new(build_fk_match_where_clause(child_cols, ctx))),
+        where_clause: Some(Box::new(build_fk_match_where_clause(
+            child_cols,
+            parent_collations,
+            ctx,
+        ))),
         returning: vec![],
     })
 }
@@ -1956,6 +1989,7 @@ fn generate_set_null_stmt(
 fn generate_set_default_stmt(
     child_table: &BTreeTable,
     child_cols: &[String],
+    parent_collations: &[CollationSeq],
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
@@ -1982,7 +2016,11 @@ fn generate_set_default_stmt(
         indexed: None,
         sets,
         from: None,
-        where_clause: Some(Box::new(build_fk_match_where_clause(child_cols, ctx))),
+        where_clause: Some(Box::new(build_fk_match_where_clause(
+            child_cols,
+            parent_collations,
+            ctx,
+        ))),
         returning: vec![],
     })
 }
@@ -1992,6 +2030,7 @@ fn generate_set_default_stmt(
 fn generate_cascade_update_stmt(
     child_table: &str,
     child_cols: &[String],
+    parent_collations: &[CollationSeq],
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
@@ -2015,7 +2054,7 @@ fn generate_cascade_update_stmt(
         })
         .collect();
 
-    let where_clause = build_fk_match_where_clause(child_cols, ctx);
+    let where_clause = build_fk_match_where_clause(child_cols, parent_collations, ctx);
     ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
@@ -2030,20 +2069,31 @@ fn generate_cascade_update_stmt(
 
 /// Build a WHERE clause that matches FK columns to parameter values:
 /// fk_col1 = ?1 AND fk_col2 = ?2 ...
-fn build_fk_match_where_clause(child_cols: &[String], ctx: &FkSubprogramContext) -> Expr {
+///
+/// As in SQLite's `fkActionTrigger`, the parent key value is the left operand
+/// and has the parent column's collation, so the comparison uses it.
+fn build_fk_match_where_clause(
+    child_cols: &[String],
+    parent_collations: &[CollationSeq],
+    ctx: &FkSubprogramContext,
+) -> Expr {
+    turso_assert!(child_cols.len() == parent_collations.len());
     let mut conditions: Vec<Expr> = Vec::with_capacity(child_cols.len());
 
-    for (i, col) in child_cols.iter().enumerate() {
+    for (i, (col, collation)) in child_cols.iter().zip(parent_collations).enumerate() {
         let param_idx = ctx.old_param_index(i);
+        let parent_key = ast::Variable::for_column(
+            u32::try_from(param_idx.get())
+                .ok()
+                .and_then(std::num::NonZeroU32::new)
+                .expect("fk parameter index must fit into NonZeroU32"),
+            "",
+            Some(&collation.name()),
+        );
         let cond = Expr::Binary(
-            Box::new(Expr::Id(Name::from_string(col))),
+            Box::new(Expr::Variable(parent_key)),
             ast::Operator::Equals,
-            Box::new(Expr::Variable(ast::Variable::indexed(
-                u32::try_from(param_idx.get())
-                    .ok()
-                    .and_then(std::num::NonZeroU32::new)
-                    .expect("fk parameter index must fit into NonZeroU32"),
-            ))),
+            Box::new(Expr::Id(Name::from_string(col))),
         );
         conditions.push(cond);
     }
@@ -2079,6 +2129,7 @@ fn fire_fk_cascade_delete(
     let stmt = generate_cascade_delete_stmt(
         &fk_ref.child_table.name,
         child_cols,
+        &fk_ref.parent_collations,
         &subprog_ctx,
         db_name.as_deref(),
     );
@@ -2113,6 +2164,7 @@ fn fire_fk_set_null(
     let stmt = generate_set_null_stmt(
         &fk_ref.child_table.name,
         child_cols,
+        &fk_ref.parent_collations,
         &subprog_ctx,
         db_name.as_deref(),
     );
@@ -2147,6 +2199,7 @@ fn fire_fk_set_default(
     let stmt = generate_set_default_stmt(
         &fk_ref.child_table,
         child_cols,
+        &fk_ref.parent_collations,
         &subprog_ctx,
         db_name.as_deref(),
     );
@@ -2182,6 +2235,7 @@ fn fire_fk_cascade_update(
     let stmt = generate_cascade_update_stmt(
         &fk_ref.child_table.name,
         child_cols,
+        &fk_ref.parent_collations,
         &subprog_ctx,
         db_name.as_deref(),
     );
@@ -2282,7 +2336,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                                 program,
                                 key_regs_start,
                                 new_key_start,
-                                ncols,
+                                &fk_ref.parent_collations,
                                 skip,
                                 changed,
                             );
@@ -2471,7 +2525,7 @@ pub fn fire_fk_update_actions(
             program,
             old_key_start,
             new_key_start,
-            ncols,
+            &fk_ref.parent_collations,
             skip_action,
             key_changed,
         );
@@ -2735,7 +2789,7 @@ mod tests {
         let skip = program.allocate_label();
         let changed = program.allocate_label();
 
-        emit_key_change_check(&mut program, 1, 2, 1, skip, changed);
+        emit_key_change_check(&mut program, 1, 2, &[CollationSeq::Binary], skip, changed);
 
         assert!(
             program.insns.iter().any(|(insn, _)| matches!(
