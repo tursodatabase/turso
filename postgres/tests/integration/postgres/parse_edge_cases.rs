@@ -33,6 +33,22 @@ fn pg_exec(db: &TempDatabase, sql: &str) -> Result<(), String> {
 // -------------------------------------------------------------------------
 
 #[turso_macros::test]
+fn test_pg_lateral_rejects_aggregate_of_its_own_from_query(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t(x INT)").unwrap();
+    let error = conn
+        .execute("SELECT * FROM t, LATERAL (SELECT sum(t.x)) AS s")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(
+            "aggregate functions are not allowed in FROM clause of their own query level"
+        ),
+        "{error}"
+    );
+}
+
+#[turso_macros::test]
 fn test_pg_parse_typo_errors(db: TempDatabase) {
     let cases = [
         "selecgt 1;",
