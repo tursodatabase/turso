@@ -1,4 +1,5 @@
 use crate::namespace::NamespaceId;
+use crate::return_if_io;
 use crate::types::IOResultOr;
 use rustc_hash::FxHashMap;
 use std::sync::{atomic::Ordering, Arc};
@@ -2175,6 +2176,19 @@ fn vacuum_in_place_step(
                 let page_sz = source_pager.get_page_size_unchecked();
 
                 let db_size_on_commit = if all_read { Some(*total_pages) } else { None };
+
+                // Page 1 comes from the temp database and carries its counter. The
+                // source's counter must go up from its own value instead, or other
+                // processes could see a value they have already seen.
+                if let Some(page_1) = batch_pages
+                    .first()
+                    .filter(|page| page.get().id() == DatabaseHeader::PAGE_ID)
+                {
+                    let source_change_counter = return_if_io!(
+                        source_pager.with_header(|header| header.change_counter.get())
+                    );
+                    Pager::write_change_counter(page_1, source_change_counter);
+                }
 
                 let prepared = wal.prepare_frames(
                     batch_pages,

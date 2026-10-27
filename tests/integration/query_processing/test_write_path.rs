@@ -2354,3 +2354,71 @@ fn test_backward_index_scan_does_not_repeat_rows_after_insert_between_steps(
     assert_eq!(seen, (1..=2000).rev().collect::<Vec<i64>>());
     Ok(())
 }
+
+/// A transaction that writes page 1 bumps the file change counter (offset 24)
+/// once and stores the same value as version-valid-for (offset 92), as SQLite
+/// does. A transaction that leaves page 1 alone, or rolls back, changes neither.
+#[turso_macros::test]
+fn test_file_change_counter_increments_when_page_1_is_written(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let checkpoint_and_read_counter = || -> anyhow::Result<u32> {
+        let rows: Vec<(i64, i64, i64)> = conn.exec_rows("PRAGMA wal_checkpoint(TRUNCATE)");
+        assert_eq!(
+            rows,
+            vec![(0, 0, 0)],
+            "checkpoint must backfill the whole WAL"
+        );
+        let mut header = [0u8; 100];
+        std::fs::File::open(&tmp_db.path)?.read_exact(&mut header)?;
+        let change_counter = u32::from_be_bytes(header[24..28].try_into().unwrap());
+        let version_valid_for = u32::from_be_bytes(header[92..96].try_into().unwrap());
+        assert_eq!(version_valid_for, change_counter);
+        Ok(change_counter)
+    };
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    let after_create = checkpoint_and_read_counter()?;
+
+    // Grows the file, so the in-header database size on page 1 changes.
+    conn.execute("INSERT INTO t SELECT value, hex(zeroblob(300)) FROM generate_series(0, 199)")?;
+    let after_insert = checkpoint_and_read_counter()?;
+    assert_eq!(after_insert, after_create + 1);
+
+    // Changes the schema cookie and sqlite_schema on page 1.
+    conn.execute("CREATE TABLE u(x)")?;
+    let after_create_u = checkpoint_and_read_counter()?;
+    assert_eq!(after_create_u, after_insert + 1);
+
+    // Rewrites a leaf of t in place, page 1 untouched.
+    conn.execute("UPDATE t SET payload = 'x' WHERE id = 0")?;
+    assert_eq!(checkpoint_and_read_counter()?, after_create_u);
+
+    conn.execute("BEGIN")?;
+    conn.execute("CREATE TABLE rolled_back(x)")?;
+    conn.execute("ROLLBACK")?;
+    assert_eq!(checkpoint_and_read_counter()?, after_create_u);
+
+    // A cacheflush in the middle of a transaction writes page 1 to the WAL
+    // before the commit writes it again; the counter still goes up by one.
+    conn.execute("BEGIN")?;
+    conn.execute("CREATE TABLE v(x)")?;
+    do_flush(&conn, &tmp_db)?;
+    conn.execute("CREATE TABLE w(x)")?;
+    conn.execute("COMMIT")?;
+    let after_cacheflush = checkpoint_and_read_counter()?;
+    assert_eq!(after_cacheflush, after_create_u + 1);
+
+    // Rolling back to a savepoint restores page 1 as it was before the
+    // savepoint; the commit still bumps the counter once.
+    conn.execute("BEGIN")?;
+    conn.execute("SAVEPOINT s")?;
+    conn.execute("CREATE TABLE x(x)")?;
+    conn.execute("ROLLBACK TO s")?;
+    conn.execute("CREATE TABLE y(x)")?;
+    conn.execute("COMMIT")?;
+    assert_eq!(checkpoint_and_read_counter()?, after_cacheflush + 1);
+
+    Ok(())
+}
