@@ -32,6 +32,11 @@ pub fn numeric_from_value(val: &Value) -> crate::Result<BigDecimal> {
         }
     };
     check_numeric_limits(&value)?;
+    // `0e5` parses as zero with scale -5. Zero has no digits, so its exponent
+    // is dropped, as PostgreSQL does.
+    if value.is_zero() && value.fractional_digit_count() < 0 {
+        return Ok(value.with_scale(0));
+    }
     Ok(value)
 }
 
@@ -43,10 +48,24 @@ fn parse_numeric(text: &str) -> crate::Result<BigDecimal> {
     const MAX_TEXT_LEN: usize = (MAX_INTEGER_DIGITS + MAX_FRACTION_DIGITS) as usize + 32;
     // PostgreSQL skips the whitespace C's isspace() matches around a number.
     let number = text.trim_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
-    if number.len() > MAX_TEXT_LEN {
+    // Leading zeros are not digits of the value, so they do not count.
+    let (sign, unsigned) = match number.strip_prefix(['-', '+']) {
+        Some(unsigned) => (&number[..1], unsigned),
+        None => ("", number),
+    };
+    let significant = unsigned.trim_start_matches('0');
+    if significant.len() > MAX_TEXT_LEN {
         return Err(numeric_overflow());
     }
-    BigDecimal::from_str(number).map_err(|_| {
+    // Keep one zero when the text had any, so `0`, `-0.5` and `00e3` stay
+    // valid and `-` and `e3` stay invalid.
+    let had_zeros = significant.len() < unsigned.len();
+    let number = if had_zeros && !significant.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("{sign}0{significant}")
+    } else {
+        format!("{sign}{significant}")
+    };
+    BigDecimal::from_str(&number).map_err(|_| {
         LimboError::Constraint(format!("invalid input syntax for type numeric: \"{text}\""))
     })
 }
@@ -57,7 +76,11 @@ fn parse_numeric(text: &str) -> crate::Result<BigDecimal> {
 pub fn check_numeric_limits(value: &BigDecimal) -> crate::Result<()> {
     // A scale can be any i64, so the digit counts are computed in i128.
     let fraction_digits = i128::from(value.fractional_digit_count());
-    let integer_digits = i128::from(value.digits()) - fraction_digits;
+    let integer_digits = if value.is_zero() {
+        0
+    } else {
+        i128::from(value.digits()) - fraction_digits
+    };
     if integer_digits > i128::from(MAX_INTEGER_DIGITS)
         || fraction_digits > i128::from(MAX_FRACTION_DIGITS)
     {
