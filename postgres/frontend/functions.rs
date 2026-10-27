@@ -92,6 +92,7 @@ scalar_functions! {
     PgIsInRecovery(FunctionArity::Exact(0), false),
     PgLockAccessShare(FunctionArity::Exact(0), false),
     PgLimitValue(FunctionArity::Exact(2), true),
+    PgInt4Range(FunctionArity::Exact(1), true),
     Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
 }
 
@@ -160,6 +161,16 @@ impl ScalarCall for PgScalarFunction {
                 Value::from_i64(0)
             }
             Self::PgLimitValue => exec_pg_limit_value(args)?,
+            Self::PgInt4Range => match args[0].get_value() {
+                Value::Null => Value::from_i64(1),
+                value => {
+                    let integer = value.as_int().ok_or(LimboError::InvalidColumnType)?;
+                    i32::try_from(integer).map_err(|_| {
+                        sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, "integer out of range")
+                    })?;
+                    Value::from_i64(1)
+                }
+            },
             Self::Now
             | Self::ClockTimestamp
             | Self::TransactionTimestamp

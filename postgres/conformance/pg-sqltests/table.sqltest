@@ -531,6 +531,154 @@ test table-domain-not-null-default-rejects-explicit-null {
 }
 expect error {}
 
+
+test table-int-write-boundaries {
+    CREATE TABLE t(a int);
+    INSERT INTO t VALUES (-2147483648), (2147483647);
+    SELECT a FROM t ORDER BY a;
+}
+expect {
+    -2147483648
+    2147483647
+}
+
+test table-int-write-rejects-high {
+    CREATE TABLE t(a int);
+    INSERT INTO t VALUES (2147483648);
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test table-int-write-rejects-low {
+    CREATE TABLE t(a int);
+    INSERT INTO t VALUES (-2147483649);
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test table-int-write-rejects-wide {
+    CREATE TABLE t(a int);
+    INSERT INTO t VALUES (3000000000);
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test table-int-write-rejects-text {
+    CREATE TABLE t(a int);
+    INSERT INTO t VALUES ('3000000000');
+}
+@sqlstate 22003
+expect error {}
+
+test table-int-update-rejects-wide {
+    CREATE TABLE t(a int);
+    INSERT INTO t VALUES (1);
+    UPDATE t SET a = 3000000000;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+
+
+
+test table-integer-write-rejects-wide {
+    CREATE TABLE t(a integer);
+    INSERT INTO t VALUES (3000000000);
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+
+
+
+
+
+test table-int4-write-rejects-wide {
+    CREATE TABLE t(a int4);
+    INSERT INTO t VALUES (3000000000);
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+
+
+
+
+
+test table-serial-write-rejects-wide {
+    CREATE TABLE t(a serial);
+    INSERT INTO t VALUES (3000000000);
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+
+
+
+
+
+test table-serial4-write-rejects-wide {
+    CREATE TABLE t(a serial4);
+    INSERT INTO t VALUES (3000000000);
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+
+
+test table-int4-width-check-binds-exact-name {
+    CREATE TABLE t(x bigint, """x""" int);
+    INSERT INTO t VALUES (3000000000, 1);
+    SELECT x, """x""" FROM t;
+}
+expect {
+    3000000000|1
+}
+
+test table-int4-width-check-rejects-exact-column {
+    CREATE TABLE t(x bigint, """x""" int);
+    INSERT INTO t VALUES (1, 3000000000);
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test table-int4-added-column-width-check-binds-exact-name {
+    CREATE TABLE t(x bigint);
+    ALTER TABLE t ADD COLUMN """x""" int;
+    INSERT INTO t VALUES (3000000000, 1);
+    SELECT x, """x""" FROM t;
+}
+expect {
+    3000000000|1
+}
+
+test table-int4-width-does-not-limit-bigint-or-null {
+    CREATE TABLE t(a int, b bigint, c bigserial, d serial8);
+    INSERT INTO t VALUES (NULL, 3000000000, 3000000000, 3000000000);
+    SELECT count(*) FROM t WHERE a IS NULL AND b = 3000000000 AND c = 3000000000 AND d = 3000000000;
+}
+expect {
+    1
+}
+
 test table-add-column-function-default-fills-each-existing-row {
     CREATE TABLE t (x int);
     INSERT INTO t VALUES (1), (2);
@@ -580,3 +728,24 @@ test table-add-column-not-null-default-that-is-null-errors {
     ALTER TABLE t ADD COLUMN z int NOT NULL DEFAULT nullif(1, 1);
 }
 expect error {}
+
+test table-add-column-int4-volatile-default-keeps-in-range-values {
+    CREATE TABLE t(id bigint);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN a int DEFAULT ((random() * 0 + 7)::bigint);
+    SELECT id, a FROM t ORDER BY id;
+}
+expect {
+    1|7
+    2|7
+}
+
+test table-add-column-int4-volatile-default-rejects-out-of-range-values {
+    CREATE TABLE t(id bigint);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN a int DEFAULT ((random() * 0 + 3000000000)::bigint);
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}

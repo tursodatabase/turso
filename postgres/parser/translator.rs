@@ -702,6 +702,9 @@ impl PostgreSQLTranslator {
         }
 
         constraints.extend(check_constraints);
+        if let Some(check) = int4_write_constraint(&name, &pg_type, mapping.array_dimensions) {
+            constraints.push(check);
+        }
 
         Ok(ast::ColumnDefinition {
             col_name: exact_name(name),
@@ -1060,6 +1063,11 @@ impl PostgreSQLTranslator {
             }
         }
 
+        if let Some(check) =
+            int4_write_constraint(col_name.as_str(), &pg_type, mapping.array_dimensions)
+        {
+            constraints.push(check);
+        }
         Ok(ast::ColumnDefinition {
             col_name,
             col_type,
@@ -5718,8 +5726,32 @@ impl PgTypeMapping {
     }
 }
 
-/// PostgreSQL to Turso type mapping.
-/// Returns Turso custom type names (e.g. "boolean", "varchar(100)") when a
+// Keep INTEGER storage and comparison behavior, enforcing the PostgreSQL width on writes.
+fn int4_write_constraint(
+    column: &str,
+    pg_type: &str,
+    dimensions: u32,
+) -> Option<ast::NamedColumnConstraint> {
+    if dimensions != 0
+        || !matches!(
+            pg_type.to_uppercase().as_str(),
+            "INTEGER" | "INT" | "INT4" | "SERIAL" | "SERIAL4"
+        )
+    {
+        return None;
+    }
+    Some(ast::NamedColumnConstraint {
+        name: None,
+        constraint: ast::ColumnConstraint::Check {
+            expr: Box::new(function_call(
+                "pg_int4_range",
+                vec![ast::Expr::Id(exact_name(column))],
+            )),
+            source: None,
+        },
+    })
+}
+
 /// Returns true if the given PG type name is a serial variant (auto-incrementing integer).
 /// Covers all PostgreSQL serial aliases: serial, serial2, serial4, serial8,
 /// smallserial, bigserial.
@@ -5730,6 +5762,8 @@ fn is_serial_type(pg_type: &str) -> bool {
     )
 }
 
+/// PostgreSQL to Turso type mapping.
+/// Returns Turso custom type names (e.g. "boolean", "varchar(100)") when a
 /// built-in Turso type exists, otherwise returns the base SQLite type.
 /// For array types (e.g. `INTEGER[]`, `_int4`), returns the base scalar type
 /// with `array_dimensions > 0` so native Turso arrays are used.

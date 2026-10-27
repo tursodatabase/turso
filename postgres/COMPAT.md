@@ -54,7 +54,7 @@ Basics not enumerated by the official feature matrix.
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
 | CREATE SCHEMA / DROP SCHEMA | ✅ Supported | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased; AUTHORIZATION rejected; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists; CREATE SCHEMA can contain CREATE TABLE, VIEW, INDEX and SEQUENCE statements, which create their objects in the new schema, but not inside a transaction block |
 | CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE accepted (no-op); OWNED BY a column, TEMP and other options rejected; pg_sequences view; pg_sequence exposes public-schema sequence parameters (bigint, cache 1); pg_class lists public-schema sequences with relkind S (sequence dumps remain incomplete); a sequence named without a schema is looked up through `search_path`, and a column default or view binds it to the schema it is in when the table or view is created; a serial column's sequence is created in the table's schema |
-| CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced; array base types, type modifiers and non-binary COLLATE rejected |
+| CREATE DOMAIN | 🟡 Partial | DEFAULT, NOT NULL and CHECK constraints enforced; domains over int/integer/int4 do not yet enforce their base type's 32-bit write range; array base types, type modifiers and non-binary COLLATE rejected |
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
 | TRUNCATE | 🟡 Partial | Lowered to DELETE of one table; several tables, CASCADE and RESTART IDENTITY rejected |
 | BEGIN / COMMIT / ROLLBACK | ✅ Supported | Every transaction is snapshot isolation, i.e. REPEATABLE READ; `ISOLATION LEVEL REPEATABLE READ` is accepted, every other level, DEFERRABLE, READ ONLY and AND CHAIN are rejected. SET TRANSACTION gets the same checks, except that READ ONLY is accepted there because pg_dump sends it; it is not enforced |
@@ -138,6 +138,22 @@ numeric(p,s) keep their type modifiers; type modifiers on any other type,
 including char(n), timestamp(p) and bit(n), are rejected. interval, xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
+
+Explicit scalar int/integer/int4 and serial/serial4 column declarations enforce
+the signed 32-bit range on writes, including UPDATE and omitted-column defaults.
+bigint and bigserial retain their 64-bit range. Array element range validation is
+unchanged. Domains over int/integer/int4 and columns produced by CREATE TABLE AS
+or SELECT INTO do not yet enforce the 32-bit write range. Generic engine 64-bit
+arithmetic overflow still reports `integer overflow`, rather than PostgreSQL's
+`bigint out of range`; the int4 write check has its own error message.
+
+Upgrading does not recover PostgreSQL type widths from schema text that an older
+frontend already rewrote as plain INTEGER (for example, after ALTER TABLE).
+Those legacy columns can still accept values outside the int4 range. Conversely,
+ALTER on this version can persist `CHECK(pg_int4_range(...))` in sqlite_schema;
+earlier tursopg versions that do not provide that function cannot write such
+tables (`no such function: pg_int4_range`). Downgrading after these schema
+rewrites is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|

@@ -342,6 +342,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn integer_overflow_keeps_engine_message() {
+        let generic = ErrorReport::from(&LimboError::IntegerOverflow);
+        assert_eq!(generic.sqlstate, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE);
+        assert_eq!(generic.message, "integer overflow");
+    }
+
+    #[test]
     fn sqlstate_covers_errors_that_sql_alone_cannot_trigger() {
         for (e, code) in [
             (LimboError::Interrupt, SQLSTATE_QUERY_CANCELED),

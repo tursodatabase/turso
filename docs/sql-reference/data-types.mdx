@@ -189,6 +189,19 @@ SELECT id, platform.telegram, platform.slack FROM contacts ORDER BY id;
 
 For the full composite types reference, see [CREATE TYPE — Composite Types](/docs/sql-reference/statements/create-type#composite-types-struct-and-union).
 
+## PostgreSQL Integer Ranges
+
+In the PostgreSQL frontend, explicit scalar `int`, `integer`, `int4`,
+`serial`, and `serial4` column declarations enforce the signed 32-bit range
+(-2147483648 through 2147483647) on writes. Out-of-range writes report SQLSTATE
+`22003`. This also applies to `ALTER TABLE ... ADD COLUMN`; it does not narrow
+`bigint`, `bigserial`, or indexed comparisons with wider numeric values.
+
+Domains over these integer types and columns inferred by `CREATE TABLE AS` or
+`SELECT INTO` do not yet enforce the 32-bit write range. Array element range
+validation is unchanged. These frontend checks do not change the SQLite
+frontend's 64-bit INTEGER storage.
+
 ## Array Types
 
 <Info>
