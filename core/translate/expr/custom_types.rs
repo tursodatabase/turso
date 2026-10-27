@@ -204,8 +204,8 @@ pub(super) fn find_custom_comparison(
     }
     let op_str = operator_to_str(op)?;
     let env = TypeEnv::new(referenced_tables, resolver);
-    let lhs_info = column_custom_type(e1, &env);
-    let rhs_info = column_custom_type(e2, &env);
+    let lhs_info = comparison_operand_type(e1, &env);
+    let rhs_info = comparison_operand_type(e2, &env);
 
     // Try to find a direct or derived operator match on a type definition.
     let find_in_type_def = |type_def: &TypeDef| -> Option<(String, bool, bool)> {
@@ -258,10 +258,14 @@ pub(super) fn find_custom_comparison(
 
     let resolve_one_custom_operand =
         |info: &ColumnCustomType, other: &ast::Expr, which: EncodeArg| {
-            let encode_other = literal_type_name(other).is_some_and(|lit_type| {
-                literal_compatible_with_value_type(lit_type, info.type_def.value_input_type())
-            });
+            // A type whose value is `any` reads any value itself, so the other
+            // operand is passed as it is: encoding it would round `1.504` to
+            // a numeric(10,2) column's scale before comparing.
             let pass_other_unencoded = info.type_def.value_input_type().eq_ignore_ascii_case("any");
+            let encode_other = !pass_other_unencoded
+                && literal_type_name(other).is_some_and(|lit_type| {
+                    literal_compatible_with_value_type(lit_type, info.type_def.value_input_type())
+                });
             if !encode_other && !pass_other_unencoded {
                 return None;
             }
@@ -281,6 +285,26 @@ pub(super) fn find_custom_comparison(
     match (&lhs_info, &rhs_info) {
         (Some(lhs), None) => resolve_one_custom_operand(lhs, e2, EncodeArg::Second),
         (None, Some(rhs)) => resolve_one_custom_operand(rhs, e1, EncodeArg::First),
+        _ => None,
+    }
+}
+
+/// The custom type of a comparison operand whose value the type's comparison
+/// functions read: a column, or the result of an operator on a custom type,
+/// such as `n - 1` on a numeric. Without the second, `n - 1 > 0` would compare
+/// the text `'2.50'` with the integer 0.
+fn comparison_operand_type(expr: &ast::Expr, env: &TypeEnv) -> Option<ColumnCustomType> {
+    if let Some(ty) = column_custom_type(expr, env) {
+        return Some(ty);
+    }
+    if !matches!(
+        without_wrappers(expr),
+        ast::Expr::Binary(..) | ast::Expr::Unary(..)
+    ) {
+        return None;
+    }
+    match type_of(expr, env) {
+        ExprType::Custom { type_def, params } => Some(ColumnCustomType { type_def, params }),
         _ => None,
     }
 }

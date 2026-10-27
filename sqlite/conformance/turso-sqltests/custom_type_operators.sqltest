@@ -1614,3 +1614,17 @@ test op-smallint-and-bigint-with-numeric {
 expect {
     -2.50|2.50|4.50|3.50|-1.50|7.00
 }
+
+@requires strict "uses STRICT tables"
+test op-numeric-result-compares-as-numeric {
+    -- An operator result on a numeric compares as a number, and the other
+    -- operand is not rounded to the column's scale first. From PostgreSQL.
+    CREATE TABLE t(n numeric(10,2), i integer) STRICT;
+    INSERT INTO t VALUES (3.50, 10);
+    SELECT (n - 10) > 0, -n < 0, n + 100 > 5, (n - i) > 0, n * 2 = 7, -n < i FROM t;
+    SELECT n = 3.504, n = 3.5, n - 1 = 2.5 FROM t;
+}
+expect {
+    0|1|1|0|1|1
+    0|1|1
+}
