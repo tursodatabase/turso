@@ -174,6 +174,10 @@ GROUP BY region;
 
 ### max(X) and min(X)
 
+When a query has exactly one built-in `min()` or `max()`, bare columns (columns outside aggregate calls and the `GROUP BY` clause) come from a row containing that minimum or maximum. If several rows tie, the chosen row is unspecified. With multiple `min()` or `max()` calls, which aggregate determines the row is unspecified.
+
+If no input rows match an aggregate query without `GROUP BY`, bare columns are NULL. This also applies to columns used in `HAVING`.
+
 ```sql
 max(X)
 min(X)

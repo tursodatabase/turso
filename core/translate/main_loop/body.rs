@@ -269,6 +269,7 @@ fn emit_loop_source<'a>(
                 );
                 program.emit_insn(Insn::AggStep {
                     data: Box::new(AggStepData {
+                        skip_bare_columns_reg: None,
                         acc_reg: start_reg,
                         col: expr_reg,
                         delimiter: 0,
@@ -322,6 +323,7 @@ fn emit_loop_source<'a>(
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
                     reg,
                     &t_ctx.resolver,
+                    t_ctx.reg_nonagg_emit_once_flag,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -381,12 +383,18 @@ fn emit_loop_source<'a>(
             // Columns of an outer query are not pre-read: the outer cursor does
             // not move while this loop runs, and a value read here would be stale
             // for an outer row where this loop finds no rows.
-            for rc in plan
+            for expr in plan
                 .result_columns
                 .iter()
                 .filter(|rc| rc.contains_aggregates)
+                .map(|rc| &rc.expr)
+                .chain(
+                    plan.group_by
+                        .iter()
+                        .flat_map(|group| group.having.iter().flatten()),
+                )
             {
-                walk_expr(&rc.expr, &mut |expr: &Expr| -> Result<WalkControl> {
+                walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
                     match expr {
                         Expr::Column { table, .. } | Expr::RowId { table, .. }
                             if plan

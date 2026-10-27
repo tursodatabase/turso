@@ -3207,6 +3207,7 @@ fn emit_function_step(
                         acc_reg,
                         &t_ctx.resolver,
                         None,
+                        None,
                     )?;
 
                     if let Some(label) = filter_skip_label {
@@ -3219,6 +3220,7 @@ fn emit_function_step(
                 // only reads `state.registers[col + i]` for i in 0..arity.
                 program.emit_insn(Insn::AggStep {
                     data: Box::new(AggStepData {
+                        skip_bare_columns_reg: None,
                         acc_reg,
                         col: arg_load_start.unwrap_or(0),
                         delimiter: 0,
