@@ -1877,15 +1877,15 @@ fn query_pragma(
                     } else {
                         program.emit_null(base_reg + 4, None);
                     }
-                    // The declared operators, then the built-in operators that
-                    // run a function, one entry per operator and function. A
-                    // built-in operator without a function is SQLite's own.
+                    // The declared operators, then the built-in arithmetic that
+                    // runs a function, one entry per operator and function.
+                    // Built-in arithmetic without a function is SQLite's own.
                     let declared = type_def
                         .operators()
                         .iter()
                         .map(|op| (op.op.as_str(), op.func_name.as_deref()));
                     let built_in = type_def
-                        .all_signatures()
+                        .all_arithmetic()
                         .iter()
                         .filter(|s| s.func.is_some())
                         .map(|s| (s.op, s.func.as_deref()));
