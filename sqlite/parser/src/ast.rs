@@ -2171,6 +2171,10 @@ pub struct TypeField {
     pub field_type: Type,
 }
 
+/// The most dimensions an array type can have. A column stores its number of
+/// dimensions in three bits.
+pub const MAX_ARRAY_DIMENSIONS: u32 = 7;
+
 /// Column type
 // https://sqlite.org/syntax/type-name.html
 #[derive(Clone, Debug, PartialEq, Eq)]

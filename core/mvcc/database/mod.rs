@@ -7,6 +7,7 @@ use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
+use crate::namespace::NamespaceId;
 use crate::schema::{Schema, Sequence, Table};
 use crate::skiplist::comparator::BasicComparator;
 use crate::skiplist::map::Entry;
@@ -781,7 +782,7 @@ fn portable_delete_op_extension_for_row_version<Clock: LogicalClock, A: Concurre
     }
 
     let schema = connection.schema.read();
-    let Some(table) = schema.get_btree_table(&table_name) else {
+    let Some(table) = schema.get_btree_table(NamespaceId::ROOT, &table_name) else {
         return Ok(None);
     };
 
@@ -4413,12 +4414,12 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// because operations like last() on an index are much easier when we don't have to take the
     /// table identifier into account.
     pub index_rows: SkipMap<MVTableId, IndexRowsMap<A>, BasicComparator, A>,
-    /// Bumped whenever the key set of `index_rows` may change (every
-    /// [`Self::insert_index_version`], which is the single funnel through which
-    /// new index keys are created). Forward-scan cursors snapshot this inside
-    /// [`crate::mvcc::cursor::IndexShadowScan`] and reseed on a mismatch, since
-    /// a key inserted at or behind an already-positioned scan would otherwise
-    /// be skipped (#7578).
+    /// Bumped whenever an index version is inserted or deleted (including the
+    /// undo at `ROLLBACK TO`), or a key is removed from `index_rows`. Index
+    /// cursors compare it on each step to find out whether a key they already
+    /// looked at may have changed: forward scans reseed
+    /// [`crate::mvcc::cursor::IndexShadowScan`] on a mismatch (#7578), and
+    /// `MvccLazyCursor` seeks its next MVCC index entry again.
     index_rows_epoch: AtomicU64,
     txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     /// Final state for removed transactions. Readers may still race with stale TxID
@@ -4599,8 +4600,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// don't survive schema re-parsing from sqlite_schema; we save and re-inject them.
     fn capture_table_valued_functions(schema: &Schema) -> Vec<Arc<crate::vtab::VirtualTable>> {
         schema
-            .tables
-            .values()
+            .tables(NamespaceId::ROOT)
             .filter_map(|table| match table.as_ref() {
                 Table::Virtual(vtab)
                     if matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction) =>
@@ -4618,10 +4618,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ) {
         for vtab in table_valued_functions {
             let normalized_name = crate::util::normalize_ident(&vtab.name);
-            schema
-                .tables
-                .entry(normalized_name)
-                .or_insert_with(|| Arc::new(Table::Virtual(vtab.clone())));
+            if !schema.has_table(NamespaceId::ROOT, &normalized_name) {
+                schema.insert_table(
+                    NamespaceId::ROOT,
+                    normalized_name,
+                    Arc::new(Table::Virtual(vtab.clone())),
+                );
+            }
         }
     }
 
@@ -4974,17 +4977,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.checkpoint_dirty_table_keys.clear();
         self.checkpoint_dirty_index_keys.clear();
         let root_pages = schema
-            .tables
-            .values()
+            .tables(NamespaceId::ROOT)
             .filter_map(|table| match table.as_ref() {
                 Table::BTree(btree) => Some(btree.root_page),
                 _ => None,
             })
             .chain(
                 schema
-                    .indexes
-                    .values()
-                    .flatten()
+                    .indexes(NamespaceId::ROOT)
                     .filter(|index| index.is_btree_backed())
                     .map(|index| index.root_page),
             )
@@ -5378,8 +5378,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let schema = bootstrap_conn.schema.read();
         let sqlite_schema_root_pages = {
             schema
-                .tables
-                .values()
+                .tables(NamespaceId::ROOT)
                 .filter_map(|t| {
                     if let Table::BTree(btree) = t.as_ref() {
                         Some(btree.root_page)
@@ -5389,9 +5388,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 })
                 .chain(
                     schema
-                        .indexes
-                        .values()
-                        .flatten()
+                        .indexes(NamespaceId::ROOT)
                         .filter(|index| index.is_btree_backed())
                         .map(|index| index.root_page),
                 )
@@ -5705,6 +5702,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         let version_id = rv.id;
                         rv.set_end(Some(TxTimestampOrID::TxID(tx_id)));
                         drop(locked_row_versions);
+                        self.bump_index_rows_epoch();
                         tx.insert_to_write_set(id, row_versions);
                         tx.record_deleted_index_version((index_id, arc_key), version_id);
                         return Ok(true);
@@ -7463,6 +7461,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         );
 
         let mut touched_rowids = BTreeSet::new();
+        let undoes_index_versions =
+            !created_index_versions.is_empty() || !deleted_index_versions.is_empty();
 
         for (rowid, version_id) in created_table_versions {
             touched_rowids.insert(rowid.clone());
@@ -7544,6 +7544,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     }
                 }
             }
+        }
+        if undoes_index_versions {
+            self.bump_index_rows_epoch();
         }
 
         touched_rowids.extend(newly_added_to_write_set.into_iter().map(|(id, _)| id));
@@ -8760,7 +8763,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.index_rows_epoch.load(Ordering::SeqCst)
     }
 
-    /// Key-set mutation of `index_rows` (insert or empty-slot remove); see field docs.
+    /// An index version was inserted, deleted or rolled back, or a key removed; see field docs.
     pub(crate) fn bump_index_rows_epoch(&self) {
         self.index_rows_epoch.fetch_add(1, Ordering::SeqCst);
         #[cfg(shuttle)]
@@ -9347,7 +9350,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .and_then(|e| e.value().root_page)
                 .map(|r| r as i64)
         };
-        for table in schema.tables.values_mut() {
+        for (_, table) in schema.tables_mut(NamespaceId::ROOT) {
             let needs = table
                 .btree()
                 .is_some_and(|b| resolve(b.root_page).is_some());
@@ -9362,11 +9365,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
             }
         }
-        for table_index_list in schema.indexes.values_mut() {
-            for index in table_index_list.iter_mut() {
-                if let Some(rp) = resolve(index.root_page) {
-                    Arc::make_mut(index).root_page = rp;
-                }
+        for index in schema.indexes_mut(NamespaceId::ROOT) {
+            if let Some(rp) = resolve(index.root_page) {
+                Arc::make_mut(index).root_page = rp;
             }
         }
     }
@@ -9410,7 +9411,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             connection.db.experimental_custom_types_enabled(),
             connection.db.dialect().as_ref(),
         )?;
-        fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
         Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
         let mut from_sql_indexes = crate::alloc::vec![];
@@ -9762,9 +9762,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let find_index_info =
             |schema: &Schema, root_page: i64| -> Result<Option<Arc<IndexInfo>>, TryReserveError> {
                 schema
-                    .indexes
-                    .values()
-                    .flatten()
+                    .indexes(NamespaceId::ROOT)
                     .find(|idx| idx.root_page == root_page)
                     .map(|idx| {
                         IndexInfo::new_from_index_in(idx.as_ref(), self.alloc.clone()).map(Arc::new)
@@ -9774,9 +9772,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         let schema_has_index_root = |schema: &Schema, root_page: i64| -> bool {
             schema
-                .indexes
-                .values()
-                .flatten()
+                .indexes(NamespaceId::ROOT)
                 .any(|idx| idx.root_page == root_page)
         };
 
@@ -10358,7 +10354,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             connection.db.experimental_custom_types_enabled(),
             connection.db.dialect().as_ref(),
         )?;
-        fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
         Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
         let mut from_sql_indexes =

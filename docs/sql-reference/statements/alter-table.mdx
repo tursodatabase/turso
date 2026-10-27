@@ -125,7 +125,7 @@ A new column added with ADD COLUMN must satisfy these requirements:
 | `CURRENT_TIME`, `CURRENT_DATE`, `CURRENT_TIMESTAMP` defaults require an empty table | These non-deterministic values cannot be retroactively applied to existing rows |
 | CHECK constraints require an empty table | The constraint cannot be validated against existing rows |
 | No duplicate column name | The column name must not already exist in the table |
-| No `GENERATED ALWAYS AS` | Generated columns cannot be added via ALTER TABLE |
+| No `STORED` generated column | Only virtual [generated columns](/docs/sql-reference/statements/create-table#generated-always-as) can be added |
 | STRICT tables require an explicit type | The column type must be a valid STRICT type |
 
 ### Supported Column Constraints
@@ -137,6 +137,7 @@ The following constraints are supported on added columns:
 - `CHECK (expression)`
 - `REFERENCES` (foreign key)
 - `COLLATE`
+- `GENERATED ALWAYS AS (expression)` (virtual generated columns)
 
 ### Examples
 

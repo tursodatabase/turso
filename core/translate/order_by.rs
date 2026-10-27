@@ -26,6 +26,7 @@ use super::{
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
+use super::expr::expr_type::{column_custom_type, type_of, TypeEnv};
 use crate::translate::eqp::{EqpDetail, EqpSortMethod};
 use crate::vdbe::insn::SortComparatorType;
 
@@ -41,39 +42,25 @@ fn sort_comparator_from_func_name(func_name: &str) -> Option<SortComparatorType>
     }
 }
 
-/// For an ORDER BY expression that is a column reference to a custom type,
-/// returns the SortComparatorType if the type has a `<` operator with a known
-/// comparator. Returns None otherwise, which causes the sorter to use encoded
-/// blob ordering instead of silently wrong results.
+/// Returns the comparator for sorting an expression: element by element for an
+/// array, or the function behind the `<` operator of a column's custom type when
+/// the sorter knows it. Returns None otherwise, which sorts by the stored bytes.
 pub(crate) fn custom_type_comparator(
     expr: &ast::Expr,
     referenced_tables: &TableReferences,
-    schema: &Schema,
+    resolver: &Resolver,
 ) -> Option<SortComparatorType> {
-    if let ast::Expr::Column {
-        table: table_ref_id,
-        column,
-        ..
-    } = expr
-    {
-        let (_, table) = referenced_tables.find_table_by_internal_id(*table_ref_id)?;
-        let col = table.get_column_at(*column)?;
-        // Array columns use element-wise comparison
-        if col.is_array() {
-            return Some(SortComparatorType::ArrayLt);
-        }
-        let type_def = schema.get_type_def(&col.ty_str, table.is_strict())?;
-        type_def
-            .operators()
-            .iter()
-            .find(|op| op.op == "<")
-            .and_then(|op| op.func_name.as_ref())
-            .and_then(|func_name| sort_comparator_from_func_name(func_name))
-    } else if super::expr::expr_is_array(expr, Some(referenced_tables)) {
-        Some(SortComparatorType::ArrayLt)
-    } else {
-        None
+    let env = TypeEnv::new(Some(referenced_tables), resolver);
+    if type_of(expr, &env).is_array() {
+        return Some(SortComparatorType::ArrayLt);
     }
+    column_custom_type(expr, &env)?
+        .type_def
+        .operators()
+        .iter()
+        .find(|op| op.op == "<")
+        .and_then(|op| op.func_name.as_ref())
+        .and_then(|func_name| sort_comparator_from_func_name(func_name))
 }
 
 /// For a result column expression that is a column reference to a custom type,
@@ -419,7 +406,7 @@ impl EmitOrderBy {
                             decode_expr,
                             reg,
                             reg,
-                            col,
+                            &col.ty_params,
                             &type_def,
                             &t_ctx.resolver,
                         )?;
@@ -720,7 +707,7 @@ pub(crate) fn sorter_open_data<'a>(
         data.order_collations_nulls
             .try_push((direction, Some(collation), nulls))?;
         data.comparators
-            .try_push(custom_type_comparator(expr, tables, resolver.schema()))?;
+            .try_push(custom_type_comparator(expr, tables, resolver))?;
     }
     data.columns = data.order_collations_nulls.len();
     Ok(data)

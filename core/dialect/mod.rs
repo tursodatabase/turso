@@ -132,6 +132,10 @@ pub trait Dialect: Send + Sync + 'static {
         options
     }
 
+    fn random_value(&self, bits: i64) -> crate::Value {
+        crate::Value::from_i64(bits) // SQLite default
+    }
+
     /// Resolve a function name in user SQL to the engine's function IR.
     ///
     /// The dialect owns its scalar function surface: the SQLite dialect
@@ -203,6 +207,13 @@ pub trait Dialect: Send + Sync + 'static {
     ///
     /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.
     fn errors_on_zero_divisor(&self) -> bool {
+        false
+    }
+
+    /// Whether `mod` of two integers returns an integer.
+    ///
+    /// PostgreSQL returns an integer. SQLite always returns a REAL.
+    fn mod_of_integers_is_integer(&self) -> bool {
         false
     }
 }

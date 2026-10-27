@@ -8,24 +8,68 @@ use turso_core::{
 
 use crate::Result;
 
+pub(crate) type DeferredExec =
+    Box<dyn FnMut(&mut turso_core::Statement) -> turso_core::Result<()> + Send + Sync>;
+
+struct DeferredState {
+    exec: DeferredExec,
+    completed: bool,
+}
+
 pub struct Statement {
     inner: turso_core::Statement,
+    deferred: Option<DeferredState>,
 }
 
 impl Statement {
     pub(crate) fn new(inner: turso_core::Statement) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            deferred: None,
+        }
+    }
+
+    pub(crate) fn with_deferred(inner: turso_core::Statement, exec: DeferredExec) -> Self {
+        Self {
+            inner,
+            deferred: Some(DeferredState {
+                exec,
+                completed: false,
+            }),
+        }
+    }
+
+    fn execute_deferred(&mut self) -> Result<()> {
+        let Some(deferred) = self.deferred.as_mut() else {
+            return Ok(());
+        };
+        if !deferred.completed {
+            (deferred.exec)(&mut self.inner)?;
+            deferred.completed = true;
+        }
+        Ok(())
     }
 
     pub fn step(&mut self) -> Result<StepResult> {
+        if self.deferred.is_some() {
+            self.execute_deferred()?;
+            return Ok(StepResult::Done);
+        }
         self.inner.step().map_err(Into::into)
     }
 
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
+        if self.deferred.is_some() {
+            self.execute_deferred()?;
+            return Ok(StepResult::Done);
+        }
         self.inner.step_with_waker(waker).map_err(Into::into)
     }
 
     pub fn reset(&mut self) -> Result<()> {
+        if let Some(deferred) = self.deferred.as_mut() {
+            deferred.completed = false;
+        }
         self.inner.reset().map_err(Into::into)
     }
 
@@ -38,10 +82,17 @@ impl Statement {
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
+        if self.deferred.is_some() {
+            return self.execute_deferred();
+        }
         self.inner.run_ignore_rows().map_err(Into::into)
     }
 
     pub fn run_collect_rows(&mut self) -> Result<Vec<Vec<Value>>> {
+        if self.deferred.is_some() {
+            self.execute_deferred()?;
+            return Ok(Vec::new());
+        }
         self.inner.run_collect_rows().map_err(Into::into)
     }
 
@@ -63,6 +114,10 @@ impl Statement {
     }
 
     pub fn run_ignore_rows_nonblock(&mut self) -> Result<IOResult<()>> {
+        if self.deferred.is_some() {
+            self.execute_deferred()?;
+            return Ok(IOResult::Done(()));
+        }
         self.inner
             .run_ignore_rows_nonblock()
             .map_err(|error| (*error).into())
@@ -133,6 +188,9 @@ impl Statement {
     }
 
     pub fn reset_best_effort(&mut self) {
+        if let Some(deferred) = self.deferred.as_mut() {
+            deferred.completed = false;
+        }
         self.inner.reset_best_effort();
     }
 }

@@ -7,6 +7,7 @@ use super::stream::{
 };
 use super::MaintenanceInput;
 use crate::incremental::dag;
+use crate::namespace::NamespaceId;
 use crate::schema::Schema;
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
@@ -769,11 +770,13 @@ pub(super) fn emit_semi_or_anti_join(
     }
 
     let state_name = operator_state.match_counts_table_name()?.to_string();
-    let state_table = schema.get_btree_table(&state_name).ok_or_else(|| {
-        LimboError::InternalError(format!(
-            "semi or anti join state {state_name} of materialized view {view_name} not found"
-        ))
-    })?;
+    let state_table = schema
+        .get_btree_table(NamespaceId::ROOT, &state_name)
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "semi or anti join state {state_name} of materialized view {view_name} not found"
+            ))
+        })?;
 
     let syms = connection.syms.read();
     let mut resolver = Resolver::new(

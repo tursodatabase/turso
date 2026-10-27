@@ -2178,6 +2178,46 @@ expect {
     2|NULL|NULL
 }
 
+# The unmatched-right loop must copy the correlated WHERE subquery after it is
+# planned. The unplanned copy read the FROM subquery as a coroutine, but its
+# nested subquery read the ephemeral index of the planned copy, which never
+# opened because no row matched: "cursor id 4 is None".
+@cross-check-integrity
+test right-join-copies-planned-where-subquery-with-from-subquery {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    CREATE TABLE t3(a);
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t3 VALUES (1);
+
+    SELECT * FROM t2 RIGHT JOIN t1 ON 0
+    WHERE EXISTS (
+        SELECT 1 FROM (SELECT * FROM t3) AS b
+         WHERE b.a > 0 AND t2.a IS NULL AND 1 IN (SELECT b.a FROM t1)
+    );
+}
+expect {
+    |1
+}
+
+@cross-check-integrity
+test right-join-copies-planned-where-subquery-with-empty-left-table {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    CREATE TABLE t3(a);
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t3 VALUES (1);
+
+    SELECT * FROM t2 RIGHT JOIN t1 ON t2.a = t1.a
+    WHERE EXISTS (
+        SELECT 1 FROM (SELECT * FROM t3) AS b
+         WHERE b.a > 0 AND t2.a IS NULL AND 1 IN (SELECT b.a FROM t1)
+    );
+}
+expect {
+    |1
+}
+
 # From SQLite join8-24000. The unmatched
 # pass must not reuse the CTE cursor that the left join group uses.
 @cross-check-integrity

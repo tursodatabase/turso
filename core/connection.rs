@@ -3,6 +3,7 @@ use crate::connection_hooks::{ConnectionHooks, SavepointMemo};
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
+use crate::namespace::NamespaceId;
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
@@ -381,6 +382,9 @@ pub struct Connection {
     pub(crate) syms: parking_lot::RwLock<SymbolTable>,
     pub(super) _shared_cache: bool,
     pub(super) cache_size: AtomicI32,
+    /// Page size from the last `PRAGMA page_size` on any database of this connection, or 0.
+    /// Like SQLite's `db->nextPagesize`, `VACUUM INTO` uses it for the output database.
+    pub(super) next_page_size: AtomicU32,
     /// Allowed automatic WAL maintenance actions for this connection.
     /// Stored as the `bits()` of a `WalAutoActions`. Default is
     /// `WalAutoActions::all_enabled()`. `wal_auto_actions_disable` clears
@@ -656,7 +660,6 @@ impl Connection {
             self.db.dialect().as_ref(),
         )
         .expect("built-in type definitions are malformed");
-        schema.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         schema.copy_table_valued_functions(&self.db.clone_schema());
         Arc::new(schema)
     }
@@ -667,7 +670,6 @@ impl Connection {
             .with_custom_types(self.db.experimental_custom_types_enabled())
             .with_index_method(self.db.experimental_index_method_enabled())
             .with_vacuum(self.db.experimental_vacuum_enabled())
-            .with_generated_columns(self.db.experimental_generated_columns_enabled())
             .with_without_rowid(self.db.experimental_without_rowid_enabled())
     }
 
@@ -1433,7 +1435,6 @@ impl Connection {
             self.experimental_custom_types_enabled(),
             self.db.dialect().as_ref(),
         )?;
-        fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
 
         fresh.copy_table_valued_functions(&self.schema.read());
@@ -1519,7 +1520,7 @@ impl Connection {
                     // descriptor SELECTs can resolve the backing tables.
                     if pending.is_none() {
                         if let Some(sequences) = inner.preserved_sequences.take() {
-                            inner.fresh.sequences = sequences;
+                            inner.fresh.set_sequences(NamespaceId::ROOT, sequences);
                             *pending = Some(crate::alloc::vec![]);
                         } else {
                             let work = inner.fresh.sequence_backing_table_names();
@@ -1548,7 +1549,11 @@ impl Connection {
                         };
                         let (backing_table_name, seq_name) = entry;
                         let normalized = crate::util::normalize_ident(&seq_name);
-                        if inner.fresh.sequences.contains_key(&normalized) {
+                        if inner
+                            .fresh
+                            .get_sequence(NamespaceId::ROOT, &normalized)
+                            .is_some()
+                        {
                             *idx += 1;
                             *stmt = None;
                             *meta = None;
@@ -1588,7 +1593,11 @@ impl Connection {
                             mv_store.set_sequence_watermark(&normalized, watermark);
                         }
                         let sequence = seq.take().expect("sequence set above");
-                        inner.fresh.sequences.insert(normalized, Arc::new(sequence));
+                        inner.fresh.insert_sequence(
+                            NamespaceId::ROOT,
+                            normalized,
+                            Arc::new(sequence),
+                        );
                         *idx += 1;
                         *stmt = None;
                         *meta = None;
@@ -1600,8 +1609,7 @@ impl Connection {
                     if self.experimental_custom_types_enabled()
                         && inner
                             .fresh
-                            .tables
-                            .contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+                            .has_table(NamespaceId::ROOT, crate::schema::TURSO_TYPES_TABLE_NAME)
                     {
                         // Temporarily install the schema so we can query against it.
                         self.with_schema_mut(|schema| {
@@ -1646,7 +1654,7 @@ impl Connection {
                     tracing::debug!(
                         "reparse_schema: schema_version={}, tables={:?}",
                         fresh.schema_version,
-                        fresh.tables.keys()
+                        fresh.table_names(NamespaceId::ROOT).collect::<Vec<_>>()
                     );
                     self.with_schema_mut(|schema| {
                         *schema = fresh;
@@ -1937,7 +1945,7 @@ impl Connection {
     pub(crate) fn query_stored_type_definitions(self: &Arc<Connection>) -> Result<Vec<String>> {
         let has_types_table = {
             let s = self.schema.read();
-            s.tables.contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+            s.has_table(NamespaceId::ROOT, crate::schema::TURSO_TYPES_TABLE_NAME)
         };
         if !has_types_table {
             return Ok(Vec::new());
@@ -2274,14 +2282,23 @@ impl Connection {
                         Ok(IOResult::Done(()))
                     })
                     .err()
+            } else if self.get_sync_mode() == SyncMode::Full && wal.is_dirty() {
+                let synced = wal
+                    .sync(pager.get_sync_type())
+                    .and_then(|c| pager.io.wait_for_completion(c));
+                if let Err(err) = &synced {
+                    assert!(
+                        self.get_data_sync_retry(),
+                        "fsync error (data_sync_retry=off): {err:?}"
+                    );
+                }
+                synced.err()
             } else {
                 None
             };
 
             self.auto_commit.store(true, Ordering::SeqCst);
             self.set_tx_state(TransactionState::None);
-            wal.end_write_tx();
-            wal.end_read_tx();
 
             if !force_commit {
                 // remove all non-commited changes in case if WAL session left some suffix without commit frame
@@ -2292,6 +2309,8 @@ impl Connection {
                 }
                 pager.rollback(false, self, true);
             }
+            wal.end_write_tx();
+            wal.end_read_tx();
             if let Some(err) = commit_err {
                 return Err(err);
             }
@@ -2726,7 +2745,9 @@ impl Connection {
     /// Instead, the new page size is remembered and is used to set the page size when the database
     /// is first created, if it does not already exist when the page_size pragma is issued,
     /// or at the next VACUUM command that is run on the same database connection while not in WAL mode.
+    /// `VACUUM INTO` uses it for the output database even in WAL mode.
     pub fn reset_page_size(&self, database_id: usize, size: u32) -> Result<()> {
+        self.next_page_size.store(size, Ordering::SeqCst);
         if self.get_source_database(database_id).initialized() {
             return Ok(());
         }
@@ -2983,10 +3004,6 @@ impl Connection {
 
     pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
         self.db.experimental_multiprocess_wal_enabled()
-    }
-
-    pub fn experimental_generated_columns_enabled(&self) -> bool {
-        self.db.experimental_generated_columns_enabled()
     }
 
     pub fn experimental_without_rowid_enabled(&self) -> bool {
@@ -3290,7 +3307,7 @@ impl Connection {
         let entry = attached_dbs
             .index_to_data
             .get(&database_id)
-            .expect("Database ID should be valid after resolve_database_id");
+            .expect("Database ID should be valid after resolve_namespace");
         let schema = entry.db.schema.lock().clone();
         schema
     }
@@ -3591,12 +3608,17 @@ impl Connection {
         };
         let get = |db_id: usize, seq_name: &str| {
             self.with_schema(db_id, |schema| {
-                schema.get_sequence(seq_name).map(Arc::clone)
+                schema
+                    .get_sequence(NamespaceId::ROOT, seq_name)
+                    .map(Arc::clone)
             })
             .map(|sequence| (db_id, sequence))
         };
         if let Some((schema, seq)) = name.split_once('.') {
-            let db_id = self.get_database_id_by_name(schema)?;
+            let db_id = self
+                .namespaces
+                .database_id(&crate::util::normalize_ident(schema))
+                .ok_or_else(|| not_found(name))?;
             let seq_name = crate::util::normalize_ident(seq);
             return get(db_id, &seq_name).ok_or_else(|| not_found(&seq_name));
         }
@@ -3723,8 +3745,9 @@ impl Connection {
                     };
                     let (backing_table_name, seq_name) = entry;
                     let normalized = crate::util::normalize_ident(&seq_name);
-                    let already_present =
-                        self.with_schema(MAIN_DB_ID, |s| s.get_sequence(&normalized).is_some());
+                    let already_present = self.with_schema(MAIN_DB_ID, |s| {
+                        s.get_sequence(NamespaceId::ROOT, &normalized).is_some()
+                    });
                     if already_present {
                         *idx += 1;
                         *stmt = None;
@@ -3766,9 +3789,11 @@ impl Connection {
                     }
                     let sequence = seq.take().expect("sequence set above");
                     self.with_database_schema_mut(MAIN_DB_ID, |schema| {
-                        schema
-                            .sequences
-                            .insert(normalized.clone(), Arc::new(sequence));
+                        schema.insert_sequence(
+                            NamespaceId::ROOT,
+                            normalized.clone(),
+                            Arc::new(sequence),
+                        );
                     })?;
                     *idx += 1;
                     *stmt = None;
@@ -3967,7 +3992,8 @@ impl Connection {
             match state {
                 SyncAutoincrementState::Start => {
                     let has_seq_table = self.with_schema(MAIN_DB_ID, |s| {
-                        s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME).is_some()
+                        s.get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
+                            .is_some()
                     });
                     if !has_seq_table {
                         return Ok(IOResult::Done(()));
@@ -4021,14 +4047,15 @@ impl Connection {
                             let sequence_name = autoincrement_sequence_name(&rows[*idx].0);
                             let backing_table_name = sequence_backing_table_name(&sequence_name);
                             let has_backing = self.with_schema(MAIN_DB_ID, |s| {
-                                s.get_btree_table(&backing_table_name).is_some()
+                                s.get_btree_table(NamespaceId::ROOT, &backing_table_name)
+                                    .is_some()
                             });
                             if !has_backing {
                                 *idx += 1;
                                 continue;
                             }
                             let seq = self
-                                .with_schema(MAIN_DB_ID, |s| s.get_sequence(&sequence_name).cloned())
+                                .with_schema(MAIN_DB_ID, |s| s.get_sequence(NamespaceId::ROOT, &sequence_name).cloned())
                                 .ok_or_else(|| {
                                     LimboError::InternalError(format!(
                                         "sequence \"{sequence_name}\" is not loaded although its backing table exists"

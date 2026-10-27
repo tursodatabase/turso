@@ -53,7 +53,7 @@ Basics not enumerated by the official feature matrix.
 | CREATE VIEW | ✅ Supported | Column aliases supported when they name every select-list column; TEMP, UNLOGGED, OR REPLACE, WITH (options) and WITH CHECK OPTION rejected |
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
 | CREATE SCHEMA / DROP SCHEMA | ✅ Supported | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased; AUTHORIZATION rejected; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists; CREATE SCHEMA can contain CREATE TABLE, VIEW, INDEX and SEQUENCE statements, which create their objects in the new schema, but not inside a transaction block |
-| CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE accepted (no-op); OWNED BY a column, TEMP and other options rejected; pg_sequences view; a sequence named without a schema is looked up through `search_path`, and a column default or view binds it to the schema it is in when the table or view is created; a serial column's sequence is created in the table's schema |
+| CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE accepted (no-op); OWNED BY a column, TEMP and other options rejected; pg_sequences view; pg_sequence exposes public-schema sequence parameters (bigint, cache 1); pg_class lists public-schema sequences with relkind S (sequence dumps remain incomplete); a sequence named without a schema is looked up through `search_path`, and a column default or view binds it to the schema it is in when the table or view is created; a serial column's sequence is created in the table's schema |
 | CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced; array base types, type modifiers and non-binary COLLATE rejected |
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
 | TRUNCATE | 🟡 Partial | Lowered to DELETE of one table; several tables, CASCADE and RESTART IDENTITY rejected |
@@ -63,7 +63,7 @@ Basics not enumerated by the official feature matrix.
 | Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
 | Operators: `\|\|`, `%`, bitwise, LIKE/ILIKE [ESCAPE], SIMILAR TO, `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | BETWEEN SYMMETRIC, SIMILAR TO ... ESCAPE and non-literal SIMILAR TO patterns are rejected. Regex operators lower to REGEXP; `~*`/`!~*` add the `(?i)` flag. LIKE is case-sensitive with `\` as the default escape; ILIKE applies LOWER() to both sides, then matches like LIKE. In CREATE INDEX, LIKE and ILIKE need a string-literal pattern without ESCAPE |
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
-| generate_series | ✅ Supported | In FROM and with joins; column aliases on the function (`AS g(x)`) do not resolve |
+| generate_series | ✅ Supported | In FROM and with joins; table aliases name the output column (`AS g` gives `g`), explicit column aliases take precedence (`AS g(x)` gives `x`), and without an alias the column is named `generate_series`; qualified and unqualified calls resolve even with an empty search_path |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
 | SET / SHOW | 🟡 Partial | Only search_path (`SET`, `SHOW`, `set_config`, `current_setting`). SET of a few parameters to the value Turso already behaves as (e.g. `statement_timeout = 0`, `DateStyle = ISO`, `extra_float_digits = 3`, as sent by pg_dump) is accepted as a no-op; anything else is rejected |
 
@@ -71,14 +71,18 @@ Basics not enumerated by the official feature matrix.
 
 The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 `pg_namespace`, `pg_attribute`, `pg_type` (builtin + array + enum types),
-`pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_sequences`,
+`pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_sequence`, `pg_sequences`,
 `pg_database`, `pg_roles` (single hardcoded `turso` role), `pg_proc`, `pg_am`,
 plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
 `pg_foreign_table`, `pg_partitioned_table`, `pg_collation`, `pg_description`,
-`pg_publication*`. `pg_statistic_ext` exposes the hidden system column
+`pg_publication*`, `pg_seclabels` (security labels are not supported).
+`pg_statistic_ext` exposes the hidden system column
 `tableoid` for pg_dump discovery. `pg_trigger` exposes `tgparentid` for
 parent-trigger lookup and hidden `tableoid` during dump discovery.
+`pg_rewrite` also exposes hidden `tableoid` for rule discovery, and `pg_policy`
+exposes it for policy discovery. `pg_publication`, `pg_publication_rel`, and
+`pg_publication_namespace` expose hidden `tableoid` for publication discovery.
 `pg_get_triggerdef(oid)` and `pg_get_triggerdef(oid, pretty)` return NULL:
 PostgreSQL triggers are not supported and `pg_trigger` is empty.
 Catalog introspection functions: `format_type`,

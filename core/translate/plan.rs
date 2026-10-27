@@ -1,10 +1,11 @@
+use crate::namespace::NamespaceId;
 use crate::{
     alloc::{self, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
     schema::{
         BTreeTable, ColDef, Column, FromClauseSubquery, Index, ParenthesizedJoinColumnSource,
         ParenthesizedJoinColumnVisibility, PseudoCursorType, RecursiveCteInput, Table,
-        ROWID_SENTINEL,
+        ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
     },
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
@@ -25,7 +26,7 @@ use crate::{
         insn::{HashDistinctData, Insn},
         BranchOffset, CursorID,
     },
-    Result, VirtualTable, MAIN_DB_ID,
+    Result, VirtualTable, MAIN_DB_ID, TEMP_DB_ID,
 };
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
@@ -37,6 +38,7 @@ use turso_parser::ast::{
 use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
+use super::expr::expr_type::{type_of, TypeEnv};
 
 /// Infer the affinity of a subquery result column from its expression.
 ///
@@ -398,7 +400,7 @@ pub enum SubqueryOrigin {
     DmlWhere,
     DmlSet,
     DmlReturning,
-    TriggerWhen,
+    ExprWithoutFromClause,
 }
 
 impl SubqueryOrigin {
@@ -410,7 +412,7 @@ impl SubqueryOrigin {
             | SubqueryOrigin::SelectHaving
             | SubqueryOrigin::SelectOrderBy
             | SubqueryOrigin::SelectLimitOffset
-            | SubqueryOrigin::TriggerWhen => SubqueryEvalPhase::BeforeLoop,
+            | SubqueryOrigin::ExprWithoutFromClause => SubqueryEvalPhase::BeforeLoop,
             SubqueryOrigin::DmlWhere => SubqueryEvalPhase::BeforeLoop,
             SubqueryOrigin::DmlSet => SubqueryEvalPhase::PreWrite,
             SubqueryOrigin::DmlReturning => SubqueryEvalPhase::PostWriteReturning,
@@ -1190,7 +1192,8 @@ pub(super) fn expand_table_star(
     let tables = table_references.joined_tables();
 
     let mut direct_matches = tables.iter().enumerate().filter(|(_, table)| {
-        table.table.parenthesized_join_columns().is_none() && table.identifier == normalized_name
+        table.table.parenthesized_join_columns().is_none()
+            && alias_or_stored_name(table) == normalized_name
     });
     let first_direct_match = direct_matches.next();
     if let (Some((_, first_table)), Some(_)) = (first_direct_match, direct_matches.next()) {
@@ -1232,7 +1235,7 @@ pub(super) fn expand_table_star(
                     })
                     .map(|(column_index, _)| (table_index, column_index)),
             );
-        } else if table.identifier == normalized_name {
+        } else if alias_or_stored_name(table) == normalized_name {
             matching_columns.extend(
                 table
                     .columns_for_star()
@@ -1281,6 +1284,25 @@ pub(super) fn expand_table_star(
         table_references.mark_column_used(table_id, column_index);
     }
     Ok(())
+}
+
+/// The name SQLite gives the FROM item `table` in `<tbl>.*` and in the saved
+/// columns of a parenthesized join: the alias, or else the name the table is
+/// stored under. For the schema table that is `sqlite_master`
+/// (`sqlite_temp_master` in temp), whichever name FROM used.
+pub(crate) fn alias_or_stored_name(table: &JoinedTable) -> &str {
+    if table.has_alias || !is_schema_table(&table.table) {
+        return &table.identifier;
+    }
+    if table.database_id == TEMP_DB_ID {
+        TEMP_SCHEMA_TABLE_NAME_ALT
+    } else {
+        SCHEMA_TABLE_NAME_ALT
+    }
+}
+
+pub(crate) fn is_schema_table(table: &Table) -> bool {
+    matches!(table, Table::BTree(btree) if btree.root_page == 1)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1742,6 +1764,9 @@ pub struct JoinedTable {
     pub table: Table,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
     pub identifier: String,
+    /// Whether FROM gave this table an alias. Then `identifier` is the alias,
+    /// and only the alias can qualify the table's columns.
+    pub has_alias: bool,
     /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
     pub internal_id: TableInternalId,
     /// The join info for this table reference, if it is the right side of a join (which all except the first table reference have)
@@ -1790,10 +1815,15 @@ pub struct TablePlanEstimate {
 pub struct OuterQueryReference {
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
     pub identifier: String,
+    /// Whether FROM gave this table an alias. Then `identifier` is the alias,
+    /// and only the alias can qualify the table's columns.
+    pub has_alias: bool,
     /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
+    /// The database the table belongs to, used to match schema-qualified names.
+    pub database_id: usize,
     /// The join that added this table in the outer scope's FROM list, so an
     /// unqualified name follows the same USING rules there as it does in the
     /// outer query itself (see [unqualified_column_sources]). None for the
@@ -3015,6 +3045,7 @@ impl Operation {
 pub(super) fn query_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
+    resolver: &Resolver,
 ) -> Result<alloc::Vec<Column>> {
     let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
         Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
@@ -3075,11 +3106,18 @@ pub(super) fn query_output_columns(
         })
         .try_collect::<alloc::Vec<_>>()?;
 
+    let env = TypeEnv::new(Some(table_references), resolver);
     for (column_index, column) in columns.iter_mut().enumerate() {
         let result_expr = &result_columns[column_index].expr;
-        if super::expr::expr_is_array(result_expr, Some(table_references)) {
-            column.set_array_dimensions(1);
+        let dimensions = type_of(result_expr, &env).array_dimensions();
+        if dimensions > ast::MAX_ARRAY_DIMENSIONS {
+            crate::bail_parse_error!(
+                "result column {} is an array with {dimensions} dimensions, but arrays have at most {}",
+                column_index + 1,
+                ast::MAX_ARRAY_DIMENSIONS
+            );
         }
+        column.set_array_dimensions(dimensions);
         column.set_collation(get_collseq_from_expr(result_expr, table_references)?);
     }
     Ok(columns)
@@ -3088,8 +3126,9 @@ pub(super) fn query_output_columns(
 fn subquery_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
+    resolver: &Resolver,
 ) -> Result<alloc::Vec<Column>> {
-    let mut columns = query_output_columns(plan, explicit_columns)?;
+    let mut columns = query_output_columns(plan, explicit_columns, resolver)?;
     make_column_names_unique(&mut columns);
     Ok(columns)
 }
@@ -3146,9 +3185,10 @@ impl JoinedTable {
         plan: SelectPlan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
+        resolver: &Resolver,
     ) -> Result<Self> {
         let plan = Plan::Select(Box::new(plan));
-        let columns = subquery_output_columns(&plan, None)?;
+        let columns = subquery_output_columns(&plan, None, resolver)?;
 
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
@@ -3164,6 +3204,7 @@ impl JoinedTable {
             unmatched_right_rows_plan: None,
             table,
             identifier,
+            has_alias: false,
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
@@ -3180,6 +3221,7 @@ impl JoinedTable {
     /// If `cte_id` is provided, this subquery is a CTE reference that can share materialized data.
     /// If `materialize_hint` is true, the CTE was declared with AS MATERIALIZED and should always
     /// be materialized regardless of reference count.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_subquery_from_plan(
         identifier: String,
         plan: Plan,
@@ -3188,8 +3230,9 @@ impl JoinedTable {
         explicit_columns: Option<&[String]>,
         cte_id: Option<usize>,
         materialize_hint: bool,
+        resolver: &Resolver,
     ) -> Result<Self> {
-        let columns = subquery_output_columns(&plan, explicit_columns)?;
+        let columns = subquery_output_columns(&plan, explicit_columns, resolver)?;
         // Get result columns and table references from the plan
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
@@ -3213,6 +3256,7 @@ impl JoinedTable {
             unmatched_right_rows_plan: None,
             table,
             identifier,
+            has_alias: false,
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
@@ -3229,8 +3273,9 @@ impl JoinedTable {
         query: &Plan,
         internal_id: TableInternalId,
         explicit_columns: Option<&[String]>,
+        resolver: &Resolver,
     ) -> Result<Self> {
-        let mut columns = subquery_output_columns(query, explicit_columns)?;
+        let mut columns = subquery_output_columns(query, explicit_columns, resolver)?;
         // The recursive self-reference reads SQLite's queue table, whose
         // columns have no declared type: comparisons in the recursive term
         // see the stored value without the anchor query's affinity. Only the
@@ -3247,6 +3292,7 @@ impl JoinedTable {
             unmatched_right_rows_plan: None,
             table,
             identifier,
+            has_alias: false,
             internal_id,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
@@ -3421,9 +3467,9 @@ impl JoinedTable {
                     // schema of the table's own database: a table in an
                     // attached database can share a name with a materialized
                     // view in a different database.
-                    let cursor_type = match resolver
-                        .with_schema(self.database_id, |s| s.get_materialized_view(&btree.name))
-                    {
+                    let cursor_type = match resolver.with_schema(self.database_id, |s| {
+                        s.get_materialized_view(NamespaceId::ROOT, &btree.name)
+                    }) {
                         Some(view_mutex) => CursorType::MaterializedView(btree.clone(), view_mutex),
                         None => CursorType::BTreeTable(btree.clone()),
                     };
@@ -4290,7 +4336,8 @@ pub struct NonFromClauseSubquery {
     pub correlated: bool,
     pub origin: SubqueryOrigin,
     pub eval_phase: SubqueryEvalPhase,
-    /// Run after this table when a later loop needs fewer calls.
+    /// Run after this table, either because a later loop needs fewer calls or
+    /// because this table's hash join loads columns the subquery reads.
     pub preferred_eval_after_table: Option<TableInternalId>,
 }
 

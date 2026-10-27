@@ -777,15 +777,6 @@ fn translate_cast_expr(
             // on the encoded value (domain CHECK sees the stored representation).
             if resolved.is_domain() {
                 // Apply encode from parent custom types (domain itself has encode: None)
-                let cast_col = Column::new(
-                    None,
-                    cast_type_name.clone(),
-                    None,
-                    None,
-                    Type::Null,
-                    None,
-                    ColDef::default(),
-                );
                 for td in &resolved.chain {
                     if let Some(encode_expr) = td.encode() {
                         emit_type_expr(
@@ -793,7 +784,7 @@ fn translate_cast_expr(
                             encode_expr,
                             target_register,
                             target_register,
-                            &cast_col,
+                            &[],
                             td,
                             resolver,
                         )?;
@@ -811,17 +802,6 @@ fn translate_cast_expr(
             // CAST(x AS numeric(10,2))), fall through to regular CAST.
             let user_param_count = type_def.user_params().count();
             if user_param_count == 0 || ty_params.len() == user_param_count {
-                let mut cast_col = Column::new(
-                    None,
-                    cast_type_name.clone(),
-                    None,
-                    None,
-                    Type::Null,
-                    None,
-                    ColDef::default(),
-                );
-                cast_col.ty_params = ty_params;
-
                 // CAST to custom type applies only the encode function,
                 // producing the stored representation.
                 // e.g. CAST(42 AS cents) → 4200
@@ -831,7 +811,7 @@ fn translate_cast_expr(
                         encode_expr,
                         target_register,
                         target_register,
-                        &cast_col,
+                        &ty_params,
                         type_def,
                         resolver,
                     )?;
@@ -2542,26 +2522,27 @@ fn translate_column_expr(
                 match table_column.generated_type() {
                     // if we're reading from an index that contains this virtual column,
                     // the index already has the computed value, so read it from the index
-                    GeneratedType::Virtual { expr, .. } if !read_from_index => {
-                        resolver.with_self_table_context(
+                    GeneratedType::Virtual { .. } if !read_from_index => {
+                        let row_cursor_id = if is_btree_index {
+                            index_cursor_id.expect("index cursor should be opened")
+                        } else {
+                            table_cursor_id
+                                .or(index_cursor_id)
+                                .expect("cursor should be opened")
+                        };
+                        do_emit_table_column(
                             program,
-                            Some(&SelfTableContext::ForSelect {
+                            row_cursor_id,
+                            &SelfTableContext::ForSelect {
                                 table_ref_id: *table_ref_id,
                                 referenced_tables: referenced_tables.unwrap().clone(),
-                            }),
-                            |program, _| {
-                                translate_expr(
-                                    program,
-                                    referenced_tables,
-                                    expr,
-                                    target_register,
-                                    resolver,
-                                )?;
-                                Ok(())
                             },
+                            referenced_tables,
+                            table_column,
+                            *column,
+                            target_register,
+                            resolver,
                         )?;
-
-                        program.emit_column_affinity(target_register, table_column.affinity());
                         // The virtual column's declared collation must override
                         // whatever collation the inner expression resolved to.
                         program.set_collation(Some((table_column.collation(), false)));

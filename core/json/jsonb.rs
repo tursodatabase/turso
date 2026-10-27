@@ -6,12 +6,7 @@ use crate::json::error::{Error as PError, Result as PResult};
 use crate::json::Conv;
 use crate::types::{value_blob_from_slice, ValueBlob};
 use crate::{bail_parse_error, LimboError, Result};
-use std::{
-    borrow::Cow,
-    collections::{HashMap, VecDeque},
-    fmt::Write,
-    str::from_utf8,
-};
+use std::{borrow::Cow, collections::HashMap, fmt::Write, str::from_utf8};
 
 use super::path::{JsonPath, PathElement};
 
@@ -387,7 +382,7 @@ impl PathOperation for SetOperation {
                     (obj_value_size as isize + delta) as usize,
                     true,
                 )?;
-                (new_h_delta - obj_value_header_size) as isize
+                new_h_delta as isize - obj_value_header_size as isize
             } else {
                 0
             };
@@ -552,7 +547,7 @@ impl PathOperation for ReplaceOperation {
                     (obj_value_size as isize + delta) as usize,
                     true,
                 )?;
-                (new_h_delta - obj_value_header_size) as isize
+                new_h_delta as isize - obj_value_header_size as isize
             } else {
                 0
             };
@@ -633,7 +628,7 @@ impl PathOperation for InsertOperation {
                     (obj_value_size as isize + delta) as usize,
                     true,
                 )?;
-                (new_h_delta - obj_value_header_size) as isize
+                new_h_delta as isize - obj_value_header_size as isize
             } else {
                 0
             };
@@ -660,6 +655,8 @@ impl PathOperation for InsertOperation {
 pub struct SearchOperation {
     value: Jsonb,
     mode: PathOperationMode,
+    value_offset: usize,
+    label_offset: Option<usize>,
 }
 
 impl SearchOperation {
@@ -667,7 +664,17 @@ impl SearchOperation {
         Ok(Self {
             mode: PathOperationMode::ReplaceExisting,
             value: Jsonb::new(capacity)?,
+            value_offset: 0,
+            label_offset: None,
         })
+    }
+
+    pub fn value_offset(&self) -> usize {
+        self.value_offset
+    }
+
+    pub fn label_offset(&self) -> Option<usize> {
+        self.label_offset
     }
 
     pub fn result(self) -> Jsonb {
@@ -684,14 +691,18 @@ impl PathOperation for SearchOperation {
         let target = stack.pop().ok_or_else(|| {
             LimboError::InternalError("stack should not be empty after check".to_string())
         })?;
-        let idx = if let Some(idx) = target.get_array_index() {
-            idx
-        } else {
-            target.field_value_index
+        let (idx, label_idx) = match (target.get_array_index(), target.field_key_index) {
+            (Some(idx), _) => (idx, None),
+            (None, JsonLocationKind::ObjectProperty(key_idx)) => {
+                (target.field_value_index, Some(key_idx))
+            }
+            (None, _) => (target.field_value_index, None),
         };
         let (JsonbHeader(_, size), header_size) = json.read_header(idx)?;
         let end = json.element_end(idx, &[header_size, size])?;
         self.value.data.extend_from_slice(&json.data[idx..end]);
+        self.value_offset = idx;
+        self.label_offset = label_idx;
 
         Ok(())
     }
@@ -923,6 +934,18 @@ pub struct ObjectIteratorState {
     cursor: usize,
     end: usize,
     index: usize,
+}
+
+impl ArrayIteratorState {
+    pub fn position(&self) -> usize {
+        self.cursor
+    }
+}
+
+impl ObjectIteratorState {
+    pub fn position(&self) -> usize {
+        self.cursor
+    }
 }
 
 pub type ArrayIteratorItem = ((usize, Jsonb), ArrayIteratorState);
@@ -1670,6 +1693,7 @@ impl Jsonb {
 
             pos = skip_whitespace_tracking(input, pos, info);
             if pos >= input.len() || input[pos] != b':' {
+                self.deserialize_value(input, pos, pos, depth + 1, info)?;
                 return Err(PError::Message {
                     msg: "Expected : after object key".to_string(),
                     location: Some(pos),
@@ -1891,11 +1915,9 @@ impl Jsonb {
             if quoted && c == quote {
                 closed = true;
                 break; // End of string
-            } else if !quoted && (c == b'"' || c == b'\'') {
-                return Err(PError::Message {
-                    msg: "Unexpected input".to_string(),
-                    location: Some(pos),
-                });
+            } else if !quoted && !is_unquoted_key_char(input, pos - 1) {
+                pos -= 1;
+                break;
             } else if c == b'\\' {
                 // Handle escape sequences
                 if pos >= input.len() {
@@ -1905,16 +1927,9 @@ impl Jsonb {
                     });
                 }
 
+                let esc_pos = pos;
                 let esc = input[pos];
                 pos += 1;
-
-                // SQLite allows only \uXXXX escapes in unquoted keys.
-                if !quoted && esc != b'u' {
-                    return Err(PError::Message {
-                        msg: "Invalid character in unquoted object key".to_string(),
-                        location: Some(pos),
-                    });
-                }
 
                 // A standard escape upgrades plain TEXT to TEXTJ but
                 // never demotes TEXT5: earlier JSON5 syntax keeps the
@@ -1968,7 +1983,7 @@ impl Jsonb {
                         if pos + 4 > input.len() {
                             return Err(PError::Message {
                                 msg: "Incomplete unicode escape sequence".to_string(),
-                                location: Some(pos),
+                                location: Some(esc_pos),
                             });
                         }
 
@@ -1980,7 +1995,7 @@ impl Jsonb {
                             if !is_hex_digit(h) {
                                 return Err(PError::Message {
                                     msg: "Invalid unicode escape sequence".to_string(),
-                                    location: Some(pos),
+                                    location: Some(esc_pos),
                                 });
                             }
                             escape_buffer[2 + i] = h;
@@ -2027,7 +2042,7 @@ impl Jsonb {
                         len += 2;
                         element_type = ElementType::TEXT5;
                     }
-                    b'0' => {
+                    b'0' if !input.get(pos).is_some_and(u8::is_ascii_digit) => {
                         self.data.extend_from_slice(b"\\0");
                         len += 2;
                         element_type = ElementType::TEXT5;
@@ -2042,7 +2057,7 @@ impl Jsonb {
                         if pos + 2 > input.len() {
                             return Err(PError::Message {
                                 msg: "Incopmlete hex escape sequence".to_string(),
-                                location: Some(pos),
+                                location: Some(esc_pos),
                             });
                         }
 
@@ -2054,7 +2069,7 @@ impl Jsonb {
                             if !is_hex_digit(h) {
                                 return Err(PError::Message {
                                     msg: "Invalid hex escape sequence".to_string(),
-                                    location: Some(pos),
+                                    location: Some(esc_pos),
                                 });
                             }
                             escape_buffer[2 + i] = h;
@@ -2069,26 +2084,10 @@ impl Jsonb {
                     _ => {
                         return Err(PError::Message {
                             msg: "Invalid escape sequence".to_string(),
-                            location: Some(pos),
+                            location: Some(esc_pos),
                         });
                     }
                 }
-            } else if !quoted
-                && (c == b':'
-                    || c.is_ascii_whitespace()
-                    || json5_whitespace_len(&input[pos - 1..]) != 0
-                    || (c == b'/' && matches!(input.get(pos), Some(b'/' | b'*'))))
-            {
-                // End of unquoted identifier. A comment right after the
-                // key acts as whitespace, so its opening '/' ends the
-                // key and the whitespace skipping before ':' eats it.
-                pos -= 1; // Put back the terminating character
-                break;
-            } else if !quoted && !is_json5_id_char(c, false) {
-                return Err(PError::Message {
-                    msg: "Invalid character in unquoted object key".to_string(),
-                    location: Some(pos),
-                });
             } else if c <= 0x1F {
                 // Control character
                 element_type = ElementType::TEXT5;
@@ -2180,25 +2179,19 @@ impl Jsonb {
             len += 1;
             has_digit = true;
 
-            if pos < input.len() && (input[pos] == b'x' || input[pos] == b'X') {
+            if pos + 1 < input.len()
+                && (input[pos] == b'x' || input[pos] == b'X')
+                && is_hex_digit(input[pos + 1])
+            {
                 // Hexadecimal number
                 self.data.push(input[pos]);
                 pos += 1;
                 len += 1;
 
-                let mut has_digit = false;
                 while pos < input.len() && is_hex_digit(input[pos]) {
                     self.data.push(input[pos]);
                     pos += 1;
                     len += 1;
-                    has_digit = true;
-                }
-
-                if !has_digit {
-                    return Err(PError::Message {
-                        msg: "Invalid hex digit".to_string(),
-                        location: Some(pos),
-                    });
                 }
 
                 info.has_json5 = true;
@@ -2296,6 +2289,7 @@ impl Jsonb {
                         is_json5 = true;
                     }
                 }
+                b'e' | b'E' if !has_digit => break,
                 b'e' | b'E' => {
                     // A second exponent marker is reported like a
                     // repeated dot.
@@ -2322,7 +2316,7 @@ impl Jsonb {
                     if pos >= input.len() || !input[pos].is_ascii_digit() {
                         return Err(PError::Message {
                             msg: "malformed JSON".to_string(),
-                            location: Some(pos),
+                            location: Some(pos - 1),
                         });
                     }
                 }
@@ -3240,134 +3234,113 @@ impl Jsonb {
             .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))
     }
 
-    // TODO Primitive implementation could be optimized.
     pub fn patch(&mut self, patch: &Jsonb) -> Result<()> {
-        let (patch_header, _) = patch.read_header(0)?;
+        self.merge_patch_at(0, patch, 0)?;
+        Ok(())
+    }
+
+    fn merge_patch_at(&mut self, target: usize, patch: &Jsonb, patch_idx: usize) -> Result<isize> {
+        let target_end = self.skip_element(target)?;
+        let patch_end = patch.skip_element(patch_idx)?;
+        let (patch_header, patch_header_size) = patch.read_header(patch_idx)?;
 
         if patch_header.0 != ElementType::OBJECT {
-            self.data.clear();
-            self.data.extend_from_slice(&patch.data);
-            return Ok(());
+            self.data.splice(
+                target..target_end,
+                patch.data[patch_idx..patch_end].iter().copied(),
+            );
+            return Ok((patch_end - patch_idx) as isize - (target_end - target) as isize);
         }
 
-        let result = self;
+        let (target_header, _) = self.read_header(target)?;
+        let target_was_object = target_header.0 == ElementType::OBJECT;
+        if !target_was_object {
+            let empty_obj = JsonbHeader::make_obj().into_bytes();
+            self.data
+                .splice(target..target_end, empty_obj.as_bytes().iter().copied());
+        }
 
-        let mut work_stack = VecDeque::with_capacity(10);
-        work_stack.push_back((
-            JsonPath {
-                elements: vec![PathElement::Root()],
-            },
-            0,
-        ));
+        let (target_header, target_header_size) = self.read_header(target)?;
+        let members_start = target + target_header_size;
+        let mut members_end = members_start + target_header.1;
+        let mut patch_cursor = patch_idx + patch_header_size;
 
-        while let Some((path, patch_cursor)) = work_stack.pop_front() {
-            let (patch_obj_header, patch_obj_header_size) = patch.read_header(patch_cursor)?;
-
-            if patch_obj_header.0 != ElementType::OBJECT {
-                continue;
+        while patch_cursor < patch_end {
+            let (key_header, key_header_size) = patch.read_header(patch_cursor)?;
+            if !key_header.0.is_valid_key() {
+                bail_parse_error!("Invalid key type");
             }
+            let key_text =
+                read_text_payload(&patch.data, patch_cursor + key_header_size, key_header.1)?;
+            let key_is_escaped = matches!(key_header.0, ElementType::TEXTJ | ElementType::TEXT5);
+            let value_idx = patch_cursor + key_header_size + key_header.1;
+            let value_end = patch.skip_element(value_idx)?;
+            let value_type = patch.read_header(value_idx)?.0 .0;
 
-            let patch_end = patch_cursor + patch_obj_header_size + patch_obj_header.1;
-            let mut patch_key_cursor = patch_cursor + patch_obj_header_size;
-
-            let mut key_values = Vec::new();
-
-            while patch_key_cursor < patch_end {
-                let (key_header, key_header_size) = patch.read_header(patch_key_cursor)?;
-                if !key_header.0.is_valid_key() {
-                    return Err(LimboError::ParseError("Invalid key type".to_string()));
+            match self.find_object_member(members_start, members_end, (key_text, key_is_escaped))? {
+                Some((member_start, member_value, member_end)) => {
+                    if value_type == ElementType::NULL {
+                        self.data.drain(member_start..member_end);
+                        members_end -= member_end - member_start;
+                    } else {
+                        let delta = self.merge_patch_at(member_value, patch, value_idx)?;
+                        members_end = (members_end as isize + delta) as usize;
+                    }
                 }
-
-                let key_start = patch_key_cursor + key_header_size;
-                let key_text = read_text_payload(&patch.data, key_start, key_header.1)?;
-
-                // Read the value
-                let value_cursor = key_start + key_header.1;
-                let (value_header, value_header_size) = patch.read_header(value_cursor)?;
-                let key_text = if matches!(
-                    key_header.0,
-                    ElementType::TEXT5 | ElementType::TEXTJ | ElementType::TEXTRAW
-                ) {
-                    Cow::Owned(unescape_string(key_text))
-                } else {
-                    Cow::Borrowed(key_text)
-                };
-
-                key_values.push((
-                    key_text,
-                    value_header.0,
-                    value_cursor,
-                    value_header_size,
-                    value_header.1,
-                ));
-
-                patch_key_cursor = value_cursor + value_header_size + value_header.1;
-            }
-
-            for (key_text, value_type, value_cursor, value_header_size, value_size) in key_values {
-                // Create a path to this key
-                let mut key_path = path.clone();
-
-                key_path.elements.push(PathElement::Key(key_text, false));
-
-                match value_type {
-                    ElementType::NULL => {
-                        let mut op = DeleteOperation::new();
-
-                        let _ = result.operate_on_path(&key_path, &mut op);
-                    }
-                    ElementType::OBJECT => {
-                        let value_data = &patch.data
-                            [value_cursor..value_cursor + value_header_size + value_size];
-
-                        let target_path_result =
-                            result.navigate_path(&key_path, PathOperationMode::ReplaceExisting);
-
-                        if let Ok(target_stack) = target_path_result {
-                            let target_value_idx = target_stack
-                                .last()
-                                .ok_or_else(|| {
-                                    LimboError::InternalError(
-                                        "target stack should not be empty".to_string(),
-                                    )
-                                })?
-                                .field_value_index;
-                            let (target_header, _) = result.read_header(target_value_idx)?;
-
-                            if target_header.0 == ElementType::OBJECT {
-                                work_stack.push_back((key_path, value_cursor));
-                            } else {
-                                let patch_obj = Jsonb::from_raw_data(value_data)?;
-                                let mut op = ReplaceOperation::new(patch_obj);
-                                result.operate_on_path(&key_path, &mut op)?;
-                                let _ = result.operate_on_path(&key_path, &mut op);
-
-                                work_stack.push_back((key_path, value_cursor));
-                            }
-                        } else {
-                            let empty_obj = Jsonb::from_raw_data(
-                                JsonbHeader::make_obj().into_bytes().as_bytes(),
-                            )?;
-                            let mut op = SetOperation::new(empty_obj);
-                            let _ = result.operate_on_path(&key_path, &mut op);
-
-                            work_stack.push_back((key_path, value_cursor));
-                        }
-                    }
-                    _ => {
-                        let value_data = &patch.data
-                            [value_cursor..value_cursor + value_header_size + value_size];
-                        let patch_value = Jsonb::from_raw_data(value_data)?;
-
-                        let mut op = SetOperation::new(patch_value);
-
-                        let _ = result.operate_on_path(&key_path, &mut op);
+                None if value_type == ElementType::NULL => {}
+                None => {
+                    let key_data = &patch.data[patch_cursor..value_idx];
+                    let empty_obj = JsonbHeader::make_obj().into_bytes();
+                    let value_data = if value_type == ElementType::OBJECT {
+                        empty_obj.as_bytes()
+                    } else {
+                        &patch.data[value_idx..value_end]
+                    };
+                    self.data.splice(
+                        members_end..members_end,
+                        key_data.iter().chain(value_data).copied(),
+                    );
+                    let new_value = members_end + key_data.len();
+                    members_end = new_value + value_data.len();
+                    if value_type == ElementType::OBJECT {
+                        let delta = self.merge_patch_at(new_value, patch, value_idx)?;
+                        members_end = (members_end as isize + delta) as usize;
                     }
                 }
             }
+            patch_cursor = value_end;
         }
 
-        Ok(())
+        let payload_size = members_end - members_start;
+        if !target_was_object || payload_size != target_header.1 {
+            let header = JsonbHeader::new(ElementType::OBJECT, payload_size).into_bytes();
+            self.data
+                .splice(target..members_start, header.as_bytes().iter().copied());
+        }
+        Ok(self.skip_element(target)? as isize - target_end as isize)
+    }
+
+    fn find_object_member(
+        &self,
+        members_start: usize,
+        members_end: usize,
+        patch_key: (&str, bool),
+    ) -> Result<Option<(usize, usize, usize)>> {
+        let mut cursor = members_start;
+        while cursor < members_end {
+            let (key_header, key_header_size) = self.read_header(cursor)?;
+            if !key_header.0.is_valid_key() {
+                bail_parse_error!("Invalid key type");
+            }
+            let value_idx = cursor + key_header_size + key_header.1;
+            let member_end = self.skip_element(value_idx)?;
+            let key_text = read_text_payload(&self.data, cursor + key_header_size, key_header.1)?;
+            if compare((key_text, key_header.0), patch_key) {
+                return Ok(Some((cursor, value_idx, member_end)));
+            }
+            cursor = member_end;
+        }
+        Ok(None)
     }
 
     pub fn array_iterator(&self) -> Result<ArrayIteratorState> {
@@ -4238,6 +4211,15 @@ pub fn unescape_string(input: &str) -> String {
 #[derive(Debug, Default)]
 pub struct ParseInfo {
     pub has_json5: bool,
+}
+
+fn is_unquoted_key_char(input: &[u8], pos: usize) -> bool {
+    if input[pos] == b'\\' {
+        return input.get(pos + 1) == Some(&b'u')
+            && input.len() >= pos + 6
+            && input[pos + 2..pos + 6].iter().all(|&h| is_hex_digit(h));
+    }
+    is_json5_id_char(input[pos], false) && json5_whitespace_len(&input[pos..]) == 0
 }
 
 /// Whether `b` may appear in an unquoted JSON5 object key. Like

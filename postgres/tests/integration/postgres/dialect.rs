@@ -2446,7 +2446,7 @@ fn test_postgres_generate_series(db: TempDatabase) {
 
     // Basic generate_series(start, stop)
     let mut stmt = conn
-        .prepare("SELECT value FROM generate_series(1, 5)")
+        .prepare("SELECT generate_series FROM generate_series(1, 5)")
         .unwrap();
     let mut results: Vec<i64> = Vec::new();
     loop {
@@ -2466,7 +2466,7 @@ fn test_postgres_generate_series(db: TempDatabase) {
 
     // generate_series with step
     let mut stmt = conn
-        .prepare("SELECT value FROM generate_series(0, 10, 3)")
+        .prepare("SELECT generate_series FROM generate_series(0, 10, 3)")
         .unwrap();
     let mut results: Vec<i64> = Vec::new();
     loop {
@@ -2486,7 +2486,7 @@ fn test_postgres_generate_series(db: TempDatabase) {
 
     // generate_series with alias
     let mut stmt = conn
-        .prepare("SELECT value FROM generate_series(1, 3) AS s")
+        .prepare("SELECT s FROM generate_series(1, 3) AS s")
         .unwrap();
     let mut results: Vec<i64> = Vec::new();
     loop {
@@ -2513,7 +2513,7 @@ fn test_postgres_generate_series(db: TempDatabase) {
         .unwrap();
 
     let mut stmt = conn
-        .prepare("SELECT items.name, gs.value FROM items, generate_series(1, 2) AS gs ORDER BY items.id, gs.value")
+        .prepare("SELECT items.name, gs.gs FROM items, generate_series(1, 2) AS gs ORDER BY items.id, gs.gs")
         .unwrap();
     let mut results: Vec<String> = Vec::new();
     loop {
@@ -2529,6 +2529,16 @@ fn test_postgres_generate_series(db: TempDatabase) {
         }
     }
     assert_eq!(results, vec!["alpha,1", "alpha,2", "beta,1", "beta,2"]);
+    drop(stmt);
+
+    for (sql, expected) in [
+        ("SELECT * FROM generate_series(1, 3)", "generate_series"),
+        ("SELECT * FROM generate_series(1, 3) g", "g"),
+        ("SELECT * FROM generate_series(1, 3) AS g(n)", "n"),
+    ] {
+        let stmt = conn.prepare(sql).unwrap();
+        assert_eq!(stmt.get_column_name(0), expected, "{sql}");
+    }
 }
 
 #[turso_macros::test(mvcc)]
@@ -3036,6 +3046,26 @@ fn test_postgres_default_now(db: TempDatabase) {
         "timestamp format wrong: '{}'",
         ts.value
     );
+}
+
+#[turso_macros::test]
+fn test_postgres_random_returns_a_double_in_unit_interval(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    for _ in 0..8 {
+        let mut stmt = conn.prepare("SELECT random()").unwrap();
+        let StepResult::Row = stmt.step().unwrap() else {
+            panic!("expected row");
+        };
+        let row = stmt.row().unwrap();
+        match row.get_value(0) {
+            Value::Numeric(Numeric::Float(value)) => {
+                let value = f64::from(*value);
+                assert!((0.0..1.0).contains(&value), "random() returned {value}");
+            }
+            other => panic!("expected random() to return a float, got {other:?}"),
+        }
+    }
 }
 
 /// Tests DEFAULT gen_random_uuid() produces a valid UUID string.

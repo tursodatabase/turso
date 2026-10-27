@@ -271,7 +271,9 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             logical_mvcc_pull: sync_config.logical_mvcc_pull,
         };
         let is_memory = db_config.path == ":memory:";
-        let db_io: Option<Arc<dyn IO>> = if is_memory {
+        let db_io: Option<Arc<dyn IO>> = if let Some(io) = &db_config.io {
+            Some(io.clone())
+        } else if is_memory {
             Some(Arc::new(MemoryIO::new()))
         } else {
             // persitent IO initialized later in order to read metadata first and decide if we need partial DB IO
@@ -368,7 +370,6 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                         sync_engine_opts.partial_sync_opts.is_some()
                     })?,
                 };
-                let fresh_bootstrap = metadata.is_none() && sync_engine_opts.bootstrap_if_empty;
                 let metadata = database_sync_engine::DatabaseSyncEngine::bootstrap_db(
                     &coro,
                     io.clone(),
@@ -402,15 +403,6 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_opts,
                 )
                 .await?;
-                // A fresh MVCC bootstrap only carries the last durable
-                // generation base; catch up to the retained logical log so
-                // the database is current at connect time (no-op for
-                // page-protocol replicas).
-                if fresh_bootstrap {
-                    sync_engine_opened
-                        .catch_up_after_fresh_bootstrap(&coro)
-                        .await?;
-                }
                 *sync_engine.lock() = Some(sync_engine_opened);
                 Ok(None)
             })
@@ -575,5 +567,54 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
     /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn arc_from_capi(value: *const capi::c::turso_sync_database_t) -> Arc<Self> {
         Arc::from_raw(value as *const Self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use turso_core::{MemoryIO, OpenFlags, IO};
+    use turso_sdk_kit::rsapi::{TursoDatabaseConfig, TursoStatusCode};
+
+    use super::{TursoDatabaseSync, TursoDatabaseSyncConfig};
+
+    #[test]
+    fn create_writes_sync_metadata_through_the_io_from_the_database_config() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let sync = TursoDatabaseSync::<Vec<u8>>::new(
+            TursoDatabaseConfig {
+                path: ":memory:".to_string(),
+                experimental_features: None,
+                async_io: true,
+                encryption: None,
+                vfs: Default::default(),
+                io: Some(io.clone()),
+                db_file: None,
+                page_codec: None,
+                open_flags: OpenFlags::default(),
+            },
+            TursoDatabaseSyncConfig {
+                remote_url: None,
+                path: ":memory:".to_string(),
+                client_name: "test".to_string(),
+                long_poll_timeout_ms: None,
+                bootstrap_if_empty: false,
+                reserved_bytes: None,
+                partial_sync_opts: None,
+                remote_encryption_key: None,
+                push_operations_threshold: None,
+                pull_bytes_threshold: None,
+                logical_mvcc_pull: None,
+            },
+        )
+        .unwrap();
+
+        let operation = sync.create();
+        while let TursoStatusCode::Io = operation.resume().unwrap() {}
+
+        assert!(io
+            .open_file(":memory:-info", OpenFlags::None, false)
+            .is_ok());
     }
 }

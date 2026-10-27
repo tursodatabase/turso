@@ -87,7 +87,7 @@ pub(super) fn emit_array_element_loop(
         transform_expr,
         reg_elem,
         reg_elem,
-        col,
+        &col.ty_params,
         type_def,
         resolver,
     )?;
@@ -197,7 +197,9 @@ pub(crate) fn emit_array_decode(
     }
 
     // Convert record blob to JSON text for display
-    program.emit_insn(Insn::ArrayDecode { reg });
+    if !program.flags.keep_array_results_as_blobs() {
+        program.emit_insn(Insn::ArrayDecode { reg });
+    }
     Ok(())
 }
 
@@ -263,7 +265,7 @@ pub(crate) fn emit_custom_type_encode_columns(
         // Apply encode for each type in the chain (child first, then parent)
         for td in &resolved.chain {
             if let Some(encode_expr) = td.encode() {
-                emit_type_expr(program, encode_expr, reg, reg, col, td, resolver)?;
+                emit_type_expr(program, encode_expr, reg, reg, &col.ty_params, td, resolver)?;
             }
         }
 
@@ -326,7 +328,7 @@ pub(crate) fn emit_custom_type_decode_columns(
         // Apply decode in reverse order (parent/ancestor first, then child)
         for td in resolved.chain.iter().rev() {
             if let Some(decode_expr) = td.decode() {
-                emit_type_expr(program, decode_expr, reg, reg, col, td, resolver)?;
+                emit_type_expr(program, decode_expr, reg, reg, &col.ty_params, td, resolver)?;
             }
         }
 

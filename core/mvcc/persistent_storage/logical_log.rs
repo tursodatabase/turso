@@ -3791,6 +3791,7 @@ pub(crate) enum IndexOpKind {
 
 #[cfg(test)]
 mod tests {
+    use crate::namespace::NamespaceId;
     use crate::types::IOResult;
     use crate::util::IOExt as _;
     use std::cell::RefCell;
@@ -4646,7 +4647,9 @@ mod tests {
         let pager = conn.pager.load().clone();
         let mvcc_store = db.get_mvcc_store();
         let schema = conn.schema.read();
-        let table = schema.get_table("test").expect("table test should exist");
+        let table = schema
+            .get_table(NamespaceId::ROOT, "test")
+            .expect("table test should exist");
         let Table::BTree(table) = table.as_ref() else {
             panic!("table test should be btree");
         };
@@ -4654,7 +4657,7 @@ mod tests {
 
         // Get the index from schema
         let index = schema
-            .get_index("test", "idx_data")
+            .get_index(NamespaceId::ROOT, "test", "idx_data")
             .expect("Index should exist");
         // Use get_table_id_from_root_page to get the correct index_id (handles both checkpointed and non-checkpointed)
         let index_id = mvcc_store.get_table_id_from_root_page(index.root_page);

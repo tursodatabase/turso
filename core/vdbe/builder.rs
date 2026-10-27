@@ -1,5 +1,6 @@
 use crate::{alloc, turso_assert, turso_assert_eq, Result, Value, ValueRef};
 
+use crate::namespace::NamespaceId;
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Range;
 use tracing::{instrument, Level};
@@ -250,6 +251,9 @@ pub struct ProgramBuilder {
     explain: ExplainInfo,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
+    /// What `Statement::get_column_type_info` reports for each result column. Only
+    /// filled in when custom types are enabled.
+    pub result_column_types: Vec<Option<crate::statement::ColumnTypeInfo>>,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
     /// Registry of materialized CTEs, keyed by cte_id.
@@ -358,6 +362,7 @@ impl ProgramBuilderFlags {
     const SUPPRESS_CUSTOM_TYPE_DECODE: u16 = 1 << 6;
     const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
     const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
+    const KEEP_ARRAY_RESULTS_AS_BLOBS: u16 = 1 << 9;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -462,6 +467,19 @@ impl ProgramBuilderFlags {
     #[inline]
     pub const fn set_suppress_custom_type_decode(&mut self, v: bool) {
         self.set(Self::SUPPRESS_CUSTOM_TYPE_DECODE, v)
+    }
+
+    #[inline]
+    /// When set, array result columns are returned as their stored record
+    /// blobs instead of being converted to display text. Engine-internal
+    /// statements (e.g. VACUUM's table copy) write these values back to
+    /// storage, and the text form does not keep element types.
+    pub const fn keep_array_results_as_blobs(self) -> bool {
+        self.get(Self::KEEP_ARRAY_RESULTS_AS_BLOBS)
+    }
+    #[inline]
+    pub const fn set_keep_array_results_as_blobs(&mut self, v: bool) {
+        self.set(Self::KEEP_ARRAY_RESULTS_AS_BLOBS, v)
     }
 
     #[inline]
@@ -771,6 +789,7 @@ impl ProgramBuilder {
             explain: ExplainInfo::default(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
+            result_column_types: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
             collation: None,
             nested_level: 0,
@@ -2166,7 +2185,7 @@ impl ProgramBuilder {
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
     pub fn epilogue(&mut self, schema: &Schema) {
-        self.has_materialized_views = !schema.table_to_materialized_views.is_empty();
+        self.has_materialized_views = schema.has_materialized_views(NamespaceId::ROOT);
         if self.flags.is_subprogram() {
             // Subprograms (triggers, FK actions) just emit Halt without Transaction
             let description = if self.trigger.is_some() {
@@ -2480,6 +2499,7 @@ impl ProgramBuilder {
             change_cnt_on,
             readonly: self.flags.readonly(),
             result_columns: self.result_columns,
+            result_column_types: self.result_column_types,
             table_references: self.table_references,
             sql: sql.to_string(),
             refreshes_analyze_stats: sql

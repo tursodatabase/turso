@@ -211,6 +211,7 @@ expect {
 test pg-settings-delete-errors {
     DELETE FROM pg_catalog.pg_settings;
 }
+@sqlstate 55000
 expect error {}
 
 test information-schema-schemata-lists-schemas {
@@ -264,23 +265,29 @@ test pg-function-support-catalogs-are-empty {
 }
 expect {}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-init-privs-is-read-only {
     DELETE FROM pg_init_privs;
 }
-expect error {cannot delete from pg_catalog table "pg_init_privs"}
+@sqlstate 42501
+expect error {permission denied for table pg_init_privs}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_init_privs"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-cast-is-read-only {
     DELETE FROM pg_cast;
 }
-expect error {cannot delete from pg_catalog table "pg_cast"}
+@sqlstate 42501
+expect error {permission denied for table pg_cast}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_cast"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-transform-is-read-only {
     DELETE FROM pg_transform;
 }
-expect error {cannot delete from pg_catalog table "pg_transform"}
+@sqlstate 42501
+expect error {permission denied for table pg_transform}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_transform"}
 
 test pg-dump-builtins-belong-to-pg-catalog {
     SET search_path TO '';
@@ -403,107 +410,141 @@ test pg-object-unsupported-catalogs-are-empty {
 }
 expect {}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-object-operator-is-read-only {
     DELETE FROM pg_operator;
 }
-expect error {cannot delete from pg_catalog table "pg_operator"}
+@sqlstate 42501
+expect error {permission denied for table pg_operator}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_operator"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-object-opclass-is-read-only {
     DELETE FROM pg_opclass;
 }
-expect error {cannot delete from pg_catalog table "pg_opclass"}
+@sqlstate 42501
+expect error {permission denied for table pg_opclass}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_opclass"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-object-opfamily-is-read-only {
     DELETE FROM pg_opfamily;
 }
-expect error {cannot delete from pg_catalog table "pg_opfamily"}
+@sqlstate 42501
+expect error {permission denied for table pg_opfamily}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_opfamily"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-object-ts-parser-is-read-only {
     DELETE FROM pg_ts_parser;
 }
-expect error {cannot delete from pg_catalog table "pg_ts_parser"}
+@sqlstate 42501
+expect error {permission denied for table pg_ts_parser}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_ts_parser"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-object-ts-template-is-read-only {
     DELETE FROM pg_ts_template;
 }
-expect error {cannot delete from pg_catalog table "pg_ts_template"}
+@sqlstate 42501
+expect error {permission denied for table pg_ts_template}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_ts_template"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-object-ts-dict-is-read-only {
     DELETE FROM pg_ts_dict;
 }
-expect error {cannot delete from pg_catalog table "pg_ts_dict"}
+@sqlstate 42501
+expect error {permission denied for table pg_ts_dict}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_ts_dict"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-object-ts-config-is-read-only {
     DELETE FROM pg_ts_config;
 }
-expect error {cannot delete from pg_catalog table "pg_ts_config"}
+@sqlstate 42501
+expect error {permission denied for table pg_ts_config}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_ts_config"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-object-foreign-data-wrapper-is-read-only {
     DELETE FROM pg_foreign_data_wrapper;
 }
-expect error {cannot delete from pg_catalog table "pg_foreign_data_wrapper"}
+@sqlstate 42501
+expect error {permission denied for table pg_foreign_data_wrapper}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_foreign_data_wrapper"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-object-foreign-server-is-read-only {
     DELETE FROM pg_foreign_server;
 }
-expect error {cannot delete from pg_catalog table "pg_foreign_server"}
+@sqlstate 42501
+expect error {permission denied for table pg_foreign_server}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_foreign_server"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-object-default-acl-is-read-only {
     DELETE FROM pg_default_acl;
 }
-expect error {cannot delete from pg_catalog table "pg_default_acl"}
+@sqlstate 42501
+expect error {permission denied for table pg_default_acl}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_default_acl"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-object-conversion-is-read-only {
     DELETE FROM pg_conversion;
 }
-expect error {cannot delete from pg_catalog table "pg_conversion"}
+@sqlstate 42501
+expect error {permission denied for table pg_conversion}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_conversion"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-object-range-is-read-only {
     DELETE FROM pg_range;
 }
-expect error {cannot delete from pg_catalog table "pg_range"}
+@sqlstate 42501
+expect error {permission denied for table pg_range}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_range"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-object-event-trigger-is-read-only {
     DELETE FROM pg_event_trigger;
 }
-expect error {cannot delete from pg_catalog table "pg_event_trigger"}
+@sqlstate 42501
+expect error {permission denied for table pg_event_trigger}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_event_trigger"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-object-subscription-is-read-only {
     DELETE FROM pg_subscription;
 }
-expect error {cannot delete from pg_catalog table "pg_subscription"}
+@sqlstate 42501
+expect error {permission denied for table pg_subscription}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_subscription"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-object-largeobject-metadata-is-read-only {
     DELETE FROM pg_largeobject_metadata;
 }
-expect error {cannot delete from pg_catalog table "pg_largeobject_metadata"}
+@sqlstate 42501
+expect error {permission denied for table pg_largeobject_metadata}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_largeobject_metadata"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-object-amop-is-read-only {
     DELETE FROM pg_amop;
 }
-expect error {cannot delete from pg_catalog table "pg_amop"}
+@sqlstate 42501
+expect error {permission denied for table pg_amop}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_amop"}
 
-@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
 test pg-object-amproc-is-read-only {
     DELETE FROM pg_amproc;
 }
-expect error {cannot delete from pg_catalog table "pg_amproc"}
+@sqlstate 42501
+expect error {permission denied for table pg_amproc}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_amproc"}
 
 test pg-depend-tracks-live-objects {
     CREATE TABLE dep_parent (id TEXT UNIQUE);
@@ -981,3 +1022,161 @@ test pg-trigger-dump-discovery-is-empty {
     ORDER BY t.tgrelid, t.tgname;
 }
 expect {}
+
+test pg-rewrite-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT tableoid, oid, rulename, ev_class AS ruletable, ev_type, is_instead, ev_enabled
+    FROM pg_rewrite
+    WHERE ev_class IN (
+        SELECT oid FROM pg_class
+        WHERE relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+    )
+    ORDER BY oid;
+}
+expect {}
+
+test pg-policy-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT pol.oid, pol.tableoid, pol.polrelid, pol.polname, pol.polcmd, pol.polpermissive,
+           CASE WHEN pol.polroles = '{0}' THEN NULL ELSE
+               pg_catalog.array_to_string(ARRAY(SELECT pg_catalog.quote_ident(rolname)
+                   FROM pg_catalog.pg_roles WHERE oid = ANY(pol.polroles)), ', ')
+           END AS polroles,
+           pg_catalog.pg_get_expr(pol.polqual, pol.polrelid) AS polqual,
+           pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid) AS polwithcheck
+    FROM unnest('{16384,16385}'::pg_catalog.oid[]) AS src(tbloid)
+    JOIN pg_catalog.pg_policy pol ON src.tbloid = pol.polrelid;
+}
+expect {}
+
+test pg-publication-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT p.tableoid, p.oid, p.pubname, p.pubowner, p.puballtables,
+           p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate, p.pubviaroot,
+           'n' AS pubgencols
+    FROM pg_publication p;
+}
+expect {}
+
+test pg-publication-rel-tableoid-is-selectable {
+    SET search_path TO '';
+    SELECT tableoid, oid, prpubid, prrelid,
+           pg_catalog.pg_get_expr(prqual, prrelid) AS prrelqual, prattrs
+    FROM pg_catalog.pg_publication_rel;
+}
+expect {}
+
+test pg-publication-rel-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT tableoid, oid, prpubid, prrelid,
+           pg_catalog.pg_get_expr(prqual, prrelid) AS prrelqual,
+           CASE WHEN pr.prattrs IS NOT NULL THEN
+               (SELECT array_agg(attname)
+                FROM pg_catalog.generate_series(0, pg_catalog.array_upper(pr.prattrs::pg_catalog.int2[], 1)) s,
+                     pg_catalog.pg_attribute
+                WHERE attrelid = pr.prrelid AND attnum = prattrs[s])
+           ELSE NULL END AS prattrs
+    FROM pg_catalog.pg_publication_rel pr;
+}
+expect {}
+
+test pg-publication-namespace-pgdump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT tableoid, oid, pnpubid, pnnspid
+    FROM pg_catalog.pg_publication_namespace;
+}
+expect {}
+
+test pg-seclabels-pgdump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT label, provider, classoid, objoid, objsubid
+    FROM pg_catalog.pg_seclabels
+    ORDER BY classoid, objoid, objsubid;
+}
+expect {}
+
+test pg-seclabels-columns-are-selectable {
+    SET search_path TO '';
+    SELECT objoid, classoid, objsubid, objtype, objnamespace, objname, provider, label
+    FROM pg_seclabels;
+}
+expect {}
+
+setup catalog_sequences {
+    CREATE SEQUENCE catalog_explicit_seq;
+    CREATE SEQUENCE "catalog quoted seq";
+    CREATE TABLE catalog_serial (id SERIAL, value TEXT);
+    CREATE INDEX catalog_serial_value_idx ON catalog_serial(value);
+}
+
+@setup catalog_sequences
+test pg-class-lists-sequences {
+    SELECT c.relname, c.relkind, n.nspname, c.relnatts, c.relam,
+           c.relpersistence, c.relreplident, c.tableoid,
+           CASE WHEN c.relhasindex THEN 1 ELSE 0 END
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'S' AND n.nspname = 'public'
+    ORDER BY c.relname;
+}
+expect {
+    catalog quoted seq|S|public|3|0|p|n|1259|0
+    catalog_explicit_seq|S|public|3|0|p|n|1259|0
+    catalog_serial_id_seq|S|public|3|0|p|n|1259|0
+}
+
+@setup catalog_sequences
+test pg-class-sequence-oids-do-not-collide {
+    SELECT COUNT(*), COUNT(DISTINCT c.oid)
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind IN ('r', 'i', 'S');
+}
+expect {
+    5|5
+}
+
+@setup catalog_sequences
+test pg-class-removes-dropped-sequences {
+    DROP SEQUENCE catalog_explicit_seq;
+    SELECT relname FROM pg_catalog.pg_class
+    WHERE relkind = 'S' AND relnamespace = 2200 ORDER BY relname;
+}
+expect {
+    catalog quoted seq
+    catalog_serial_id_seq
+}
+
+test pg-sequence-empty-pgdump-query {
+    SELECT seqrelid, format_type(seqtypid, NULL), seqstart, seqincrement,
+           seqmax, seqmin, seqcache, seqcycle, NULL, 'f'
+    FROM pg_catalog.pg_sequence ORDER BY seqrelid;
+}
+expect {}
+
+test pg-sequence-metadata-matches-pg-class {
+    CREATE TABLE seq_items (id bigint PRIMARY KEY, label text);
+    CREATE INDEX seq_items_label ON seq_items (label);
+    CREATE SEQUENCE ascending_seq START 7 INCREMENT 3 MINVALUE 1 MAXVALUE 100 CYCLE;
+    CREATE SEQUENCE descending_seq START -5 INCREMENT -2 MINVALUE -99 MAXVALUE -1;
+    SELECT c.relname, format_type(s.seqtypid, NULL), s.seqstart,
+           s.seqincrement, s.seqmax, s.seqmin, s.seqcache, s.seqcycle
+    FROM pg_catalog.pg_sequence AS s
+    JOIN pg_catalog.pg_class AS c ON c.oid = s.seqrelid
+    WHERE c.relkind = 'S' ORDER BY c.relname;
+}
+expect {
+    ascending_seq|bigint|7|3|100|1|1|t
+    descending_seq|bigint|-5|-2|-1|-99|1|f
+}
+
+test pg-sequence-reflects-drop {
+    CREATE SEQUENCE removed_seq;
+    CREATE SEQUENCE kept_seq;
+    DROP SEQUENCE removed_seq;
+    SELECT c.relname FROM pg_sequence AS s
+    JOIN pg_class AS c ON c.oid = s.seqrelid ORDER BY c.relname;
+}
+expect {
+    kept_seq
+}

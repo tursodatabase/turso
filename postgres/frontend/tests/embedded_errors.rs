@@ -327,6 +327,47 @@ fn non_numeric_string_divisor_raises_22p02() {
 }
 
 #[test]
+fn lookup_and_input_errors_report_postgres_sqlstates() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE t (j jsonb)").unwrap();
+    for (sql, code) in [
+        ("SELECT current_setting('nosuch.x')", "42704"),
+        ("SELECT set_config('nodot', 'x', false)", "42704"),
+        ("SELECT set_config('a..b', 'x', false)", "42602"),
+        ("SELECT current_setting('a..b')", "42704"),
+        ("INSERT INTO t VALUES ('not json')", "22P02"),
+        ("SELECT * FROM nosuchschema.t", "42P01"),
+        ("INSERT INTO nosuchschema.t VALUES ('{}')", "42P01"),
+        ("UPDATE nosuchschema.t SET j = '{}'", "42P01"),
+        ("DELETE FROM nosuchschema.t", "42P01"),
+        ("SELECT nextval('nosuchschema.q')", "42P01"),
+        ("SELECT nextval('public.q')", "42P01"),
+        ("SELECT currval('nosuchschema.q')", "42P01"),
+        ("SELECT setval('nosuchschema.q', 1)", "42P01"),
+        ("DROP VIEW nosuchschema.v", "3F000"),
+        ("CREATE VIEW nosuchschema.v AS SELECT 1", "3F000"),
+        ("CREATE SEQUENCE nosuchschema.q", "3F000"),
+        ("CREATE TABLE nosuchschema.t (a INT)", "3F000"),
+        ("DROP TABLE nosuchschema.t", "3F000"),
+        ("ALTER TABLE nosuchschema.t ADD COLUMN b INT", "3F000"),
+        ("ALTER TABLE nosuchschema.t RENAME TO u", "3F000"),
+        ("CREATE INDEX i ON nosuchschema.t (a)", "3F000"),
+        ("DROP INDEX nosuchschema.i", "3F000"),
+        ("DROP SEQUENCE nosuchschema.q", "3F000"),
+        ("DROP SCHEMA nosuchschema", "3F000"),
+        ("SELECT 1 x 'malformed JSON'", "42601"),
+    ] {
+        let e = exec_err(&conn, sql);
+        assert_eq!(e.sqlstate, code, "{sql}: {e:?}");
+    }
+    conn.execute("SET search_path = nosuchschema").unwrap();
+    for sql in ["CREATE TABLE z (a INT)", "CREATE SEQUENCE zq"] {
+        let e = exec_err(&conn, sql);
+        assert_eq!(e.sqlstate, "3F000", "{sql}: {e:?}");
+    }
+}
+
+#[test]
 fn primary_key_update_reports_structured_fields() {
     let (_io, conn) = pg_connection();
     conn.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
