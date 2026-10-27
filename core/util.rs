@@ -4145,6 +4145,12 @@ fn rewrite_select_in_scope(select: &mut ast::Select, scope: TableRenameScope) {
     for col in &mut select.order_by {
         rewrite_expr_table_refs(&mut col.expr, order_by_scope);
     }
+    if let Some(ref mut limit) = select.limit {
+        rewrite_expr_table_refs(&mut limit.expr, scope);
+        if let Some(ref mut offset) = limit.offset {
+            rewrite_expr_table_refs(offset, scope);
+        }
+    }
 }
 
 fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, scope: TableRenameScope) {
@@ -4155,10 +4161,19 @@ fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, scope: TableRenameSco
             where_clause,
             columns,
             group_by,
+            window_clause,
             ..
         } => {
             if let Some(ref mut from) = from {
                 rewrite_from_clause_table_refs(from, scope);
+            }
+            for window_def in window_clause {
+                for expr in &mut window_def.window.partition_by {
+                    rewrite_expr_table_refs(expr, inner_scope);
+                }
+                for col in &mut window_def.window.order_by {
+                    rewrite_expr_table_refs(&mut col.expr, inner_scope);
+                }
             }
             if let Some(ref mut wc) = where_clause {
                 rewrite_expr_table_refs(wc, inner_scope);
