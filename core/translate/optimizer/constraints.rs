@@ -1326,6 +1326,18 @@ pub fn constraints_from_where_clause(
                         if !constraint.satisfies_index_affinity(idx_col_aff) {
                             continue;
                         }
+                    } else {
+                        // An expression index orders its keys with the COLLATE at the top of
+                        // the indexed expression, or BINARY without one. As for a column, a
+                        // seek is valid only when the comparison uses that collation.
+                        let index_collation = index.columns[position_in_index]
+                            .collation
+                            .unwrap_or_default();
+                        if comparison_collation
+                            .is_some_and(|collation| collation != index_collation)
+                        {
+                            continue;
+                        }
                     }
                     if let Some(index_candidate) = cs.candidates.iter_mut().find_map(|candidate| {
                         if candidate.index.as_ref().is_some_and(|i| {

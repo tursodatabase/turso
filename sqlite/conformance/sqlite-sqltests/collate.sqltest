@@ -1968,3 +1968,53 @@ expect {
     3|0
     4|0
 }
+
+# An expression index orders its keys with the COLLATE at the top of the
+# indexed expression, or BINARY without one. A comparison with another
+# collation cannot use the index to seek.
+test expression-index-seek-needs-the-index-collation {
+    CREATE TABLE seek_lower(a TEXT, c INTEGER);
+    INSERT INTO seek_lower VALUES ('A', 1), ('a', 2), ('b', 3);
+    CREATE INDEX seek_lower_a ON seek_lower(lower(a));
+    SELECT c FROM seek_lower WHERE lower(a) = 'A' COLLATE NOCASE ORDER BY c;
+    SELECT c FROM seek_lower WHERE lower(a) > 'A' COLLATE NOCASE ORDER BY c;
+    DELETE FROM seek_lower WHERE lower(a) > 'A' COLLATE NOCASE;
+    SELECT c FROM seek_lower ORDER BY c;
+}
+expect {
+    1
+    2
+    3
+    1
+    2
+}
+
+# The NOCASE index cannot seek for the BINARY comparison. Another comparison
+# reads the value from the index, so it must not stand in for the BINARY one.
+test expression-index-seek-skips-comparison-with-other-collation {
+    CREATE TABLE seek_nocase(id INTEGER PRIMARY KEY, a TEXT);
+    INSERT INTO seek_nocase VALUES (1, '[m'), (2, '[O'), (3, '[Z');
+    CREATE INDEX seek_nocase_a ON seek_nocase((a || '') COLLATE NOCASE);
+    SELECT count(*) FROM seek_nocase WHERE '[m' COLLATE BINARY < (a || '') COLLATE NOCASE;
+    SELECT count(*) FROM seek_nocase
+    WHERE (a || '') COLLATE NOCASE >= '[m' AND '[m' COLLATE BINARY < (a || '') COLLATE NOCASE;
+    SELECT id FROM seek_nocase WHERE (a || '') COLLATE NOCASE > '[m' ORDER BY id;
+}
+expect {
+    0
+    0
+    2
+    3
+}
+
+# An index on +a has no COLLATE, so it is BINARY, but +a > '[m' compares
+# with the NOCASE of a.
+test expression-index-without-collate-cannot-seek-for-nocase-column {
+    CREATE TABLE seek_plus(id INTEGER PRIMARY KEY, a TEXT COLLATE NOCASE);
+    INSERT INTO seek_plus VALUES (1, '[m'), (2, '[O'), (3, '[Z'), (4, '[a');
+    CREATE INDEX seek_plus_a ON seek_plus(+a);
+    SELECT count(*) FROM seek_plus WHERE +a > '[m';
+}
+expect {
+    2
+}
