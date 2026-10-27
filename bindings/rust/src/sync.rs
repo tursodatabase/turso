@@ -197,13 +197,10 @@ impl Builder {
     pub fn experimental_autovacuum(mut self, enable: bool) -> Self {
         self.enable_autovacuum = enable;
         self
-  }
+    }
 
-    /// Enable the experimental `multiprocess_wal` engine feature for the synced
-    /// database. Mirrors the local
-    /// [`crate::Builder::experimental_multiprocess_wal`].
-    pub fn experimental_multiprocess_wal(mut self, enable: bool) -> Self {
-        self.enable_multiprocess_wal = enable;
+    /// Kept for backwards compatibility. Generated columns are now always enabled.
+    pub fn experimental_generated_columns(self, _enable: bool) -> Self {
         self
     }
 
