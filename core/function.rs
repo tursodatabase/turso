@@ -940,6 +940,7 @@ pub enum ScalarFunc {
     NumericSub,
     NumericMul,
     NumericDiv,
+    NumericMod,
     NumericLt,
     NumericEq,
     // Date type functions
@@ -1073,6 +1074,7 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::NumericSub
             | ScalarFunc::NumericMul
             | ScalarFunc::NumericDiv
+            | ScalarFunc::NumericMod
             | ScalarFunc::NumericLt
             | ScalarFunc::NumericEq
             | ScalarFunc::DatePlus
@@ -1237,6 +1239,7 @@ impl Display for ScalarFunc {
             Self::NumericSub => "numeric_sub",
             Self::NumericMul => "numeric_mul",
             Self::NumericDiv => "numeric_div",
+            Self::NumericMod => "numeric_mod",
             Self::NumericLt => "numeric_lt",
             Self::NumericEq => "numeric_eq",
             Self::DatePlus => "date_plus",
@@ -1388,6 +1391,7 @@ impl ScalarFunc {
             | Self::NumericSub
             | Self::NumericMul
             | Self::NumericDiv
+            | Self::NumericMod
             | Self::NumericLt
             | Self::NumericEq
             | Self::DatePlus

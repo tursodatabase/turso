@@ -340,6 +340,7 @@ fn builtin_arithmetic(type_name: &str) -> std::vec::Vec<ArithmeticSignature> {
             ("-", "numeric_sub"),
             ("*", "numeric_mul"),
             ("/", "numeric_div"),
+            ("%", "numeric_mod"),
         ]
         .into_iter()
         .flat_map(|(op, func)| {
