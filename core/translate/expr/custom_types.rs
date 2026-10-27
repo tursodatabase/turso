@@ -109,7 +109,7 @@ pub(super) fn emit_custom_type_operator(
         func: FuncCtx {
             func,
             arg_count: 2,
-            collation: None,
+            collation: CollationSeq::Binary,
         },
     });
     if resolved.negate {

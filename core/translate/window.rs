@@ -3238,7 +3238,7 @@ fn emit_function_step(
                         delimiter: 0,
                         func: AccumulatorFunc::Window(win_func.clone()),
                         comparator: None,
-                        collation: None,
+                        collation: CollationSeq::Binary,
                     }),
                 });
             }

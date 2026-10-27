@@ -1382,9 +1382,10 @@ pub fn insn_to_row(
                 0,
                 data.col as i64,
                 data.acc_reg as i64,
-                Value::build_text(match &data.collation {
-                    Some(collation) => format!("{}({collation})", data.func.as_str()),
-                    None => data.func.as_str().to_string(),
+                Value::build_text(if data.func.compares_values() {
+                    format!("{}({})", data.func.as_str(), data.collation)
+                } else {
+                    data.func.as_str().to_string()
                 }),
                 0,
                 format!("accum=r[{}] step(r[{}])", data.acc_reg, data.col),

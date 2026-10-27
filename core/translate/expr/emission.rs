@@ -87,7 +87,7 @@ fn emit_current_time_function(
         FuncCtx {
             func: Func::Scalar(func),
             arg_count: 0,
-            collation: None,
+            collation: CollationSeq::Binary,
         },
         &[],
         target_register,

@@ -702,6 +702,21 @@ pub enum AccumulatorFunc {
 }
 
 impl AccumulatorFunc {
+    /// Whether the aggregate compares its argument values, and so uses the
+    /// collation of its AggStep.
+    pub fn compares_values(&self) -> bool {
+        matches!(
+            self,
+            Self::Agg(
+                AggFunc::Min
+                    | AggFunc::Max
+                    | AggFunc::Mode
+                    | AggFunc::PercentileCont
+                    | AggFunc::PercentileDisc
+            )
+        )
+    }
+
     /// Extract the inner `AggFunc` when this kind is known to be an
     /// aggregate. `unreachable!`s on `Window(...)` — the only opcodes
     /// that carry an `AccumulatorFunc` are the AggStep / AggValue /
@@ -1617,9 +1632,9 @@ impl Display for Func {
 pub struct FuncCtx {
     pub func: Func,
     pub arg_count: usize,
-    /// The collation the function compares its arguments with. Set exactly
-    /// when [Func::needs_collation] is true.
-    pub collation: Option<crate::translate::collate::CollationSeq>,
+    /// The collation the function compares its arguments with when
+    /// [Func::needs_collation] is true. BINARY for the other functions.
+    pub collation: crate::translate::collate::CollationSeq,
 }
 
 impl Deterministic for Func {

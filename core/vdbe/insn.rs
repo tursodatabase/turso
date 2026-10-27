@@ -365,9 +365,9 @@ pub struct AggStepData {
     pub func: AccumulatorFunc,
     /// Optional custom type comparator for MIN/MAX aggregates.
     pub comparator: Option<SortComparatorType>,
-    /// The argument's collation. Set exactly for the aggregates that compare
-    /// values (MIN, MAX, mode and percentile); the others have none.
-    pub collation: Option<CollationSeq>,
+    /// The collation MIN, MAX, mode and percentile compare the argument with.
+    /// BINARY for the aggregates that do not compare values.
+    pub collation: CollationSeq,
 }
 
 /// Which of SUM, TOTAL, or AVG an `IvmSumFinalize` instruction computes. The

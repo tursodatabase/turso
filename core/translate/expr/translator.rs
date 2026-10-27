@@ -890,12 +890,12 @@ fn translate_function_call_expr(
 
     let func = func_type.unwrap();
     let collation = if func.needs_collation() {
-        Some(first_collation(
+        first_collation(
             args.iter().map(|arg| (arg.as_ref(), referenced_tables)),
             resolver,
-        )?)
+        )?
     } else {
-        None
+        CollationSeq::Binary
     };
     let func_ctx = FuncCtx {
         func,

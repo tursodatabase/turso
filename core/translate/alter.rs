@@ -1596,7 +1596,7 @@ pub fn translate_alter_table(
                     func: crate::function::FuncCtx {
                         func: Func::AlterTable(AlterTableFunc::RenameTable),
                         arg_count: 7,
-                        collation: None,
+                        collation: CollationSeq::Binary,
                     },
                 });
 
@@ -2098,7 +2098,7 @@ pub fn translate_alter_table(
                             AlterTableFunc::AlterColumn
                         }),
                         arg_count: 8,
-                        collation: None,
+                        collation: CollationSeq::Binary,
                     },
                 });
 
@@ -2786,7 +2786,7 @@ fn translate_rename_virtual_table(
             func: crate::function::FuncCtx {
                 func: Func::AlterTable(AlterTableFunc::RenameTable),
                 arg_count: 7,
-                collation: None,
+                collation: CollationSeq::Binary,
             },
         });
 

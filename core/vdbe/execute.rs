@@ -7576,7 +7576,7 @@ fn update_agg_payload(
     arg: &Value,                // first argument
     maybe_arg2: Option<&Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
     payload: &mut crate::alloc::Vec<Value>,
-    collation: Option<CollationSeq>,
+    collation: CollationSeq,
     comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
 ) -> Result<()> {
     match func {
@@ -7757,7 +7757,6 @@ fn update_agg_payload(
                 let payload_ref = payload[0].as_ref();
                 cmp_fn(&arg_ref, &payload_ref)?
             } else {
-                let collation = collation.expect("min and max carry a collation");
                 compare_with_collation(arg, &payload[0], collation, &comparator)?
             };
             let should_update = match func {
@@ -7893,7 +7892,6 @@ fn update_agg_payload(
         AggFunc::Mode => {
             // Record the value's collation (constant per group) for finalize-time sorting, then
             // buffer the value. Ordered-set aggregates ignore NULL inputs.
-            let collation = collation.expect("mode carries a collation");
             payload[0] = Value::from_i64(collation.to_bits() as i64);
             if !matches!(arg, Value::Null) {
                 let count = payload[1].as_int().unwrap_or(0) as usize;
@@ -7902,7 +7900,6 @@ fn update_agg_payload(
             }
         }
         AggFunc::PercentileCont | AggFunc::PercentileDisc => {
-            let collation = collation.expect("percentile carries a collation");
             payload[0] = Value::from_i64(collation.to_bits() as i64);
             // The fraction is a per-group constant; record it on every step.
             if let Some(fraction) = maybe_arg2 {
@@ -9482,7 +9479,7 @@ pub fn op_agg_step(
                 }
             }
             AggFunc::Min | AggFunc::Max
-                if data.comparator.is_none() && data.collation.is_none_or(|c| !c.is_custom()) =>
+                if data.comparator.is_none() && !data.collation.is_custom() =>
             {
                 if let Register::Value(Value::Numeric(Numeric::Integer(arg))) =
                     state.registers[data.col]
@@ -9571,7 +9568,7 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
     let comparator_factory = move || -> Result<Option<crate::vdbe::sorter::SortComparator>> {
         Ok(match (comparator.as_ref(), collation) {
             (Some(comparator), _) => Some(make_sort_comparator(comparator)?),
-            (None, Some(collation)) if collation.is_custom() => {
+            (None, collation) if collation.is_custom() => {
                 Some(program.connection.make_collation_comparator(collation)?)
             }
             (None, _) => None,
@@ -10858,7 +10855,7 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Min => {
-                let collation = func.collation.expect("min carries a collation");
+                let collation = func.collation;
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
                 let result = Value::exec_min(reg_values.iter().map(|v| v.get_value()), |a, b| {
                     compare_with_program_collation(program, a, b, collation)
@@ -10866,7 +10863,7 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Max => {
-                let collation = func.collation.expect("max carries a collation");
+                let collation = func.collation;
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
                 let result = Value::exec_max(reg_values.iter().map(|v| v.get_value()), |a, b| {
                     compare_with_program_collation(program, a, b, collation)
@@ -10874,7 +10871,7 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Nullif => {
-                let collation = func.collation.expect("nullif carries a collation");
+                let collation = func.collation;
                 let first_value = state.registers[*start_reg].get_value();
                 let second_value = state.registers[*start_reg + 1].get_value();
                 let result = first_value.exec_nullif(second_value, |a, b| {
@@ -21399,7 +21396,7 @@ mod tests {
             &Value::Null,
             None,
             &mut payload,
-            Some(CollationSeq::Binary),
+            CollationSeq::Binary,
             || Ok(None),
         )
         .unwrap();
@@ -21414,7 +21411,7 @@ mod tests {
             &Value::from_i64(42),
             None,
             &mut payload,
-            Some(CollationSeq::Binary),
+            CollationSeq::Binary,
             || Ok(None),
         )
         .unwrap();
@@ -21435,7 +21432,7 @@ mod tests {
             &Value::from_i64(10),
             None,
             &mut payload,
-            Some(CollationSeq::Binary),
+            CollationSeq::Binary,
             || Ok(None),
         )
         .unwrap();
@@ -21446,7 +21443,7 @@ mod tests {
             &Value::from_i64(5),
             None,
             &mut payload,
-            Some(CollationSeq::Binary),
+            CollationSeq::Binary,
             || Ok(None),
         )
         .unwrap();
@@ -21467,7 +21464,7 @@ mod tests {
             &Value::Null,
             None,
             &mut payload,
-            Some(CollationSeq::Binary),
+            CollationSeq::Binary,
             || Ok(None),
         )
         .unwrap();
@@ -21483,7 +21480,7 @@ mod tests {
             &Value::from_i64(5),
             None,
             &mut payload,
-            Some(CollationSeq::Binary),
+            CollationSeq::Binary,
             || Ok(None),
         )
         .unwrap();
@@ -21495,7 +21492,7 @@ mod tests {
             &Value::from_i64(3),
             None,
             &mut payload,
-            Some(CollationSeq::Binary),
+            CollationSeq::Binary,
             || Ok(None),
         )
         .unwrap();
@@ -21507,7 +21504,7 @@ mod tests {
             &Value::from_i64(10),
             None,
             &mut payload,
-            Some(CollationSeq::Binary),
+            CollationSeq::Binary,
             || Ok(None),
         )
         .unwrap();
@@ -21527,7 +21524,7 @@ mod tests {
             &Value::from_i64(10),
             None,
             &mut payload,
-            Some(CollationSeq::Binary),
+            CollationSeq::Binary,
             || Ok(None),
         )
         .unwrap();
@@ -21539,7 +21536,7 @@ mod tests {
             &Value::from_i64(20),
             None,
             &mut payload,
-            Some(CollationSeq::Binary),
+            CollationSeq::Binary,
             || Ok(None),
         )
         .unwrap();
@@ -21591,7 +21588,7 @@ mod tests {
             &Value::from_i64(9007199254740994),
             None,
             &mut payload,
-            Some(CollationSeq::Binary),
+            CollationSeq::Binary,
             || Ok(None),
         )
         .unwrap();
@@ -21600,7 +21597,7 @@ mod tests {
             &Value::from_i64(-9007199254740993),
             None,
             &mut payload,
-            Some(CollationSeq::Binary),
+            CollationSeq::Binary,
             || Ok(None),
         )
         .unwrap();
