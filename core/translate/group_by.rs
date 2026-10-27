@@ -174,7 +174,7 @@ impl EmitGroupBy {
                         expr,
                         expr,
                         &plan.table_references,
-                        Some(t_ctx.resolver.symbol_table),
+                        Some(t_ctx.resolver.catalog.symbol_table),
                     )?);
                     Ok::<_, crate::LimboError>((*ord, collation, *nulls))
                 })
@@ -717,7 +717,7 @@ pub fn group_by_process_single_group(
             &group_by.exprs[i],
             &group_by.exprs[i],
             &plan.table_references,
-            Some(t_ctx.resolver.symbol_table),
+            Some(t_ctx.resolver.catalog.symbol_table),
         )?;
         c.collation = collation;
     }

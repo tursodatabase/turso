@@ -949,6 +949,7 @@ fn first_aggregate_without_over_clause<'a>(
         {
             Ok(Some(crate::function::Func::Agg(_))) => true,
             _ => resolver
+                .catalog
                 .symbol_table
                 .resolve_function(name.as_str(), args_count)
                 .is_some_and(|f| f.func.is_aggregate()),
@@ -1866,7 +1867,7 @@ fn is_constant_or_group_by(
                     group_by_expr,
                     group_by_expr,
                     table_references,
-                    Some(resolver.symbol_table),
+                    Some(resolver.catalog.symbol_table),
                 )? == CollationSeq::Binary
             {
                 *e = Expr::Literal(ast::Literal::Null);

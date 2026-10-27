@@ -121,7 +121,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                     original_lhs,
                     original_rhs,
                     self.table_references,
-                    Some(self.t_ctx.resolver.symbol_table),
+                    Some(self.t_ctx.resolver.catalog.symbol_table),
                 )
                 .unwrap_or(CollationSeq::Binary)
             })

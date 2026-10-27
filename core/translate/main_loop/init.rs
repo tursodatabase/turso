@@ -14,7 +14,7 @@ pub fn init_distinct(
             get_collseq_from_expr_with_symbols(
                 &col.expr,
                 &plan.table_references,
-                Some(resolver.symbol_table),
+                Some(resolver.catalog.symbol_table),
             )
             .map(|c| c.unwrap_or(CollationSeq::Binary))
         })
@@ -101,7 +101,7 @@ impl InitLoop {
             let collations = vec![get_collseq_from_expr_with_symbols(
                 &agg.args[0],
                 tables,
-                Some(t_ctx.resolver.symbol_table),
+                Some(t_ctx.resolver.catalog.symbol_table),
             )?
             .unwrap_or(CollationSeq::Binary)];
             let hash_table_id = program.alloc_hash_table_id();
