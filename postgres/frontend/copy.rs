@@ -33,6 +33,7 @@ pub(crate) fn prepare_copy_to_stdout(
             })?;
             conn.search_order()
                 .into_iter()
+                .map(|namespace| namespace.database_id())
                 .find_map(|id| {
                     let name = if id == turso_core::MAIN_DB_ID {
                         "main".to_owned()
