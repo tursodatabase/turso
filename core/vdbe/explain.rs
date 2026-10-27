@@ -28,8 +28,6 @@ pub struct ExplainInfo {
     /// consumers. Empty outside `EXPLAIN QUERY PLAN` mode.
     pub cte_materializations: Vec<EqpCteMaterialization>,
     /// Cursor IDs opened as ephemeral (OpenEphemeral / OpenAutoindex / OpenDup).
-    /// Computed once at program-build time so `insn_to_row` does not scan the
-    /// full instruction list on every EXPLAIN step (which would be O(N²)).
     pub ephemeral_cursors: HashSet<usize>,
 }
 
