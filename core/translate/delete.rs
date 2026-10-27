@@ -176,13 +176,7 @@ pub fn translate_delete(
     let Plan::Delete(ref delete) = delete_plan else {
         panic!("delete_plan is not a DeletePlan");
     };
-    super::stmt_journal::set_delete_stmt_journal_flags(
-        program,
-        delete,
-        resolver,
-        connection,
-        database_id,
-    )?;
+    super::stmt_journal::set_delete_stmt_journal_flags(program, delete, resolver, connection)?;
     let opts = ProgramBuilderOpts::new(1, estimate_num_instructions(delete), 0);
     program.extend(&opts);
     emit_program(connection, resolver, program, delete_plan, |_| {})?;
@@ -229,7 +223,7 @@ pub fn prepare_delete_plan(
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
-        database_id,
+        namespace,
         indexed,
         plan_estimate: None,
     }];
@@ -285,9 +279,7 @@ pub fn prepare_delete_plan(
     // to skip the rowset materialization.
     let has_delete_triggers = btree_table_for_triggers
         .as_ref()
-        .map(|bt| {
-            has_triggers_including_temp(resolver, database_id, TriggerEvent::Delete, None, bt)
-        })
+        .map(|bt| has_triggers_including_temp(resolver, namespace, TriggerEvent::Delete, None, bt))
         .unwrap_or(false);
 
     let has_fk_actions = match btree_table_for_triggers.as_ref() {

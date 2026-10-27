@@ -303,7 +303,7 @@ pub fn translate_create_index(
     emit_refill_index(
         program,
         resolver,
-        database_id,
+        namespace,
         &tbl,
         &idx,
         index_cursor_id,
@@ -344,7 +344,7 @@ pub fn translate_create_index(
 pub(crate) fn emit_refill_index(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    database_id: usize,
+    namespace: NamespaceRef,
     tbl: &Arc<BTreeTable>,
     idx: &Arc<Index>,
     index_cursor_id: usize,
@@ -378,7 +378,7 @@ pub(crate) fn emit_refill_index(
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id,
+            namespace,
             indexed: None,
             plan_estimate: None,
         }],
@@ -394,13 +394,13 @@ pub(crate) fn emit_refill_index(
         program.emit_insn(Insn::OpenRead {
             cursor_id: table_cursor_id,
             root_page: tbl.root_page,
-            db: database_id,
+            db: namespace.database_id,
         });
 
         program.emit_insn(Insn::OpenWrite {
             cursor_id: index_cursor_id,
             root_page: index_root_page,
-            db: database_id,
+            db: namespace.database_id,
         });
 
         let loop_start_label = program.allocate_label();
@@ -501,7 +501,7 @@ pub(crate) fn emit_refill_index(
         program.emit_insn(Insn::OpenRead {
             cursor_id: table_cursor_id,
             root_page: tbl.root_page,
-            db: database_id,
+            db: namespace.database_id,
         });
 
         let loop_start_label = program.allocate_label();
@@ -575,7 +575,7 @@ pub(crate) fn emit_refill_index(
 
         if let Some(root) = clear_existing_root {
             program.emit_insn(Insn::ClearBtree {
-                db: database_id,
+                db: namespace.database_id,
                 root,
                 count: ClearBtreeCount::Nothing,
             });
@@ -583,7 +583,7 @@ pub(crate) fn emit_refill_index(
         program.emit_insn(Insn::OpenWrite {
             cursor_id: index_cursor_id,
             root_page: index_root_page,
-            db: database_id,
+            db: namespace.database_id,
         });
 
         let sorted_loop_start = program.allocate_label();
@@ -702,7 +702,7 @@ pub fn translate_reindex(
         emit_refill_index(
             program,
             resolver,
-            namespace.database_id,
+            namespace,
             &table,
             &index,
             index_cursor_id,
@@ -1458,6 +1458,7 @@ pub fn translate_drop_index(
     program.emit_insn(Insn::DropIndex {
         index: index.clone(),
         db: database_id,
+        namespace: namespace.id,
     });
 
     Ok(())

@@ -241,7 +241,7 @@ pub(super) fn translate_sequence_function(
         crate::translate::sequence::emit_disk_read_nextval(
             program,
             resolver,
-            database_id,
+            namespace,
             &normalized_name,
             &seq_arc,
             target_register,

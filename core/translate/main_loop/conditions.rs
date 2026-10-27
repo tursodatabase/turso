@@ -197,7 +197,7 @@ fn emit_index_method_predicate(
     program.emit_insn(Insn::OpenRead {
         cursor_id,
         root_page: query.index.root_page,
-        db: table.database_id,
+        db: table.namespace.database_id,
     });
     program.preassign_label_to_next_insn(opened);
 
@@ -228,7 +228,7 @@ fn emit_index_method_predicate(
         )?;
     }
     program.emit_insn(Insn::IndexMethodQuery {
-        db: table.database_id,
+        db: table.namespace.database_id,
         cursor_id,
         start_reg,
         count_reg: query.arguments.len() + 1,
