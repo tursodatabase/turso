@@ -10,7 +10,7 @@ use turso_parser::{
 use super::{
     index::emit_refill_index,
     planner::ROWID_STRS,
-    schema::{validate_check_expr, SQLITE_TABLEID},
+    schema::{validate_check_expr, validate_default_expr, SQLITE_TABLEID},
     update::translate_update_for_schema_change,
 };
 use crate::{
@@ -22,7 +22,10 @@ use crate::{
     },
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
-        expr::{emit_stored_column, walk_expr, walk_expr_mut, WalkControl},
+        expr::{
+            emit_stored_column, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
+            NoConstantOptReason, WalkControl,
+        },
         plan::{
             ColumnMask, ColumnUsedMask, JoinedTable, Operation, OuterQueryReference,
             TableReferences,
@@ -1143,6 +1146,11 @@ pub fn translate_alter_table(
                     }
                 }
             }
+            for c in &col_def.constraints {
+                if let ast::ColumnConstraint::Default(expr) = &c.constraint {
+                    validate_default_expr(expr, &col_def)?;
+                }
+            }
             let constraints = col_def.constraints.clone();
             let mut column = Column::from_definition(
                 &col_def,
@@ -1342,6 +1350,7 @@ pub fn translate_alter_table(
                 ));
             };
 
+            let mut computes_default_for_existing_rows = false;
             if !is_generated {
                 // Check if we need to verify the table is empty at runtime.
                 let type_default = resolver
@@ -1351,21 +1360,29 @@ pub fn translate_alter_table(
                     .flatten()
                     .and_then(|r| r.default_expr().cloned());
                 let effective_default = column.default.as_deref().or(type_default.as_ref());
-                let needs_notnull_check = column.notnull()
-                    && effective_default.is_none_or(crate::util::expr_contains_null);
 
                 // SQLite is very strict about what constitutes a "constant" default
                 // for ALTER TABLE ADD COLUMN: only literals, signed literals, and
                 // bare identifiers qualify. Anything else — (5 + 3), random(),
                 // CURRENT_TIMESTAMP — is permitted only if the table is empty,
                 // checked at runtime (mirroring SQLite's sqlite3ErrorIfNotEmpty).
-                let needs_nondeterministic_check = column.default.as_ref().is_some_and(|default| {
+                // PostgreSQL instead writes the default into every existing row.
+                let has_non_constant_default = column.default.as_ref().is_some_and(|default| {
                     default_requires_empty_table(default) || !is_strict_constant_default(default)
                 });
+                computes_default_for_existing_rows = has_non_constant_default
+                    && connection
+                        .dialect()
+                        .add_column_computes_default_for_existing_rows();
+                // A default computed for each row is checked for NULL row by row
+                // in emit_column_constraints_validation.
+                let needs_notnull_check = column.notnull()
+                    && !computes_default_for_existing_rows
+                    && effective_default.is_none_or(crate::util::expr_contains_null);
 
                 let (needs_empty_table_check, error_message) = if needs_notnull_check {
                     (true, "Cannot add a NOT NULL column with default value NULL")
-                } else if needs_nondeterministic_check {
+                } else if has_non_constant_default && !computes_default_for_existing_rows {
                     (true, "Cannot add a column with non-constant default")
                 } else {
                     (false, "")
@@ -1400,6 +1417,29 @@ pub fn translate_alter_table(
                 if default_type_mismatch {
                     emit_add_column_default_type_validation(program, &original_btree, database_id)?;
                 }
+            }
+
+            if computes_default_for_existing_rows {
+                let added_column = btree.columns().len() - 1;
+                let source_column_by_schema_idx: Vec<Option<usize>> = btree
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, column)| {
+                        (idx != added_column && !column.is_virtual_generated()).then_some(idx)
+                    })
+                    .collect();
+                emit_rewrite_table_rows(
+                    program,
+                    original_btree.clone(),
+                    &btree,
+                    &source_column_by_schema_idx,
+                    &btree.column_layout()?,
+                    Some(added_column),
+                    resolver,
+                    connection,
+                    database_id,
+                )?;
             }
 
             emit_column_constraints_validation(
@@ -2511,6 +2551,9 @@ fn emit_rewrite_table_indexes(
 /// `source_column_by_schema_idx` is indexed by the rewritten table's schema order. Each
 /// entry is either the physical column index to read from the old row image or `None`
 /// for virtual generated columns, which are omitted from the stored record entirely.
+///
+/// `converted_column` is checked and encoded for its type the way INSERT does it. If it
+/// has no source column (a column added by ADD COLUMN), its default is stored instead.
 #[allow(clippy::too_many_arguments)]
 fn emit_rewrite_table_rows(
     program: &mut ProgramBuilder,
@@ -2560,6 +2603,23 @@ fn emit_rewrite_table_rows(
         }
 
         if let Some(column_index) = converted_column {
+            // Computed again for each row, so that e.g. gen_random_uuid() gives
+            // each row its own value. Not hoisted because the encode below
+            // rewrites the register in place.
+            if source_column_by_schema_idx[column_index].is_none() {
+                let default = rewritten_table.columns()[column_index]
+                    .default
+                    .as_deref()
+                    .expect("a rewritten column without a source value must have a default");
+                translate_expr_no_constant_opt(
+                    program,
+                    None,
+                    default,
+                    layout.to_register(base_dest_reg, column_index),
+                    resolver,
+                    NoConstantOptReason::CustomTypeEncode,
+                )?;
+            }
             if rewritten_table.is_strict {
                 emit_strict_column_conversion(
                     program,
