@@ -819,6 +819,7 @@ pub fn translate_drop_view(
     // Remove the view from the in-memory schema
     program.emit_insn(Insn::DropView {
         db: database_id,
+        namespace: namespace.id,
         view_name: normalized_view_name,
     });
 

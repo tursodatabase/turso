@@ -3132,6 +3132,88 @@ fn test_fts_mvcc_recovery(tmp_db: TempDatabase) {
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test(mvcc)]
+fn test_fts_rename_weighted_column_keeps_weight_after_reopen(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(a, b) WITH (weights = 'a=10.0,b=1.0')")
+        .unwrap();
+    // Without the weight on column a, row 2 ranks above row 1
+    conn.execute(
+        "INSERT INTO docs VALUES \
+         (1, 'needle hay hay hay', ''), (2, '', 'needle'), (3, '', 'hay hay hay hay hay hay')",
+    )
+    .unwrap();
+    conn.execute("ALTER TABLE docs RENAME COLUMN a TO title")
+        .unwrap();
+    conn.execute("ALTER TABLE docs ALTER COLUMN b TO body TEXT")
+        .unwrap();
+
+    let path = tmp_db.path.clone();
+    let opts = tmp_db.db_opts;
+    let flags = tmp_db.db_flags;
+    let mvcc = tmp_db.enable_mvcc;
+    conn.close().unwrap();
+    drop(conn);
+    drop(tmp_db);
+    let tmp_db = TempDatabase::builder()
+        .with_db_path(&path)
+        .with_opts(opts)
+        .with_flags(flags)
+        .with_mvcc(mvcc)
+        .build();
+    let conn = tmp_db.connect_limbo();
+
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT sql FROM sqlite_schema WHERE name = 'docs_fts'"
+        ),
+        vec![vec![rusqlite::types::Value::Text(
+            "CREATE INDEX docs_fts ON docs USING fts (title, body) WITH (weights = 'title=10.0,body=1.0')"
+                .to_string()
+        )]]
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(title, body, 'needle') \
+             ORDER BY fts_score(title, body, 'needle') DESC"
+        ),
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(2)],
+        ]
+    );
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test(mvcc)]
+fn test_fts_rename_weighted_column_to_name_with_comma_fails(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(a, b) WITH (weights = 'a=10.0')")
+        .unwrap();
+    let schema = "SELECT sql FROM sqlite_schema WHERE name IN ('docs', 'docs_fts') ORDER BY name";
+    let schema_before = limbo_exec_rows(&conn, schema);
+
+    conn.execute("BEGIN").unwrap();
+    let error = conn
+        .execute(r#"ALTER TABLE docs RENAME COLUMN a TO "a,c""#)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("the name cannot be written in FTS weights"),
+        "{error}"
+    );
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(limbo_exec_rows(&conn, schema), schema_before);
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[test]
 fn fts_reopen_after_crash_shaped_drop_recovers_all_generations() {
     // Crash-shaped: the database handle is dropped without close(), so no

@@ -530,7 +530,7 @@ fn execute_trigger_commands(
     trigger: &Arc<Trigger>,
     ctx: &TriggerContext,
     connection: &Arc<crate::Connection>,
-    database_id: usize,
+    namespace: NamespaceRef,
     ignore_jump_target: BranchOffset,
 ) -> Result<bool> {
     struct TriggerCompilationGuard {
@@ -559,10 +559,14 @@ fn execute_trigger_commands(
     // Ordinary non-main triggers need unqualified DML targets rewritten into the
     // trigger's schema. Temp-backed triggers intentionally keep unqualified names
     // unresolved so they can follow SQLite's normal temp/main lookup rules.
-    let db_name = if database_id == crate::MAIN_DB_ID || database_id == crate::TEMP_DB_ID {
+    let db_name = if namespace == NamespaceRef::root_of(crate::MAIN_DB_ID)
+        || namespace == NamespaceRef::root_of(crate::TEMP_DB_ID)
+    {
         None
     } else {
-        resolver.namespace_name(database_id).map(ast::Name::exact)
+        resolver
+            .namespace_name(namespace.database_id)
+            .map(ast::Name::exact)
     };
     // Parameter indices are allocated on demand during the AST rewrite.
     // Only columns actually referenced in the trigger body get a parameter,
@@ -597,7 +601,7 @@ fn execute_trigger_commands(
     let trigger_namespace = if trigger.temporary {
         NamespaceRef::root_of(crate::TEMP_DB_ID)
     } else {
-        NamespaceRef::root_of(database_id)
+        namespace
     };
     // `resolver` is reborrowed as `&mut Resolver` on every trigger command
     // below (`translate_inner` needs it), so the scope closure takes
@@ -694,11 +698,12 @@ fn execute_trigger_commands(
 /// This is used during plan preparation to determine if materialization is needed.
 pub fn has_relevant_triggers_type_only(
     schema: &crate::schema::Schema,
+    namespace: NamespaceId,
     event: TriggerEvent,
     updated_column_names: Option<&[ast::Name]>,
     table: &BTreeTable,
 ) -> bool {
-    let mut triggers = schema.get_triggers_for_table(NamespaceId::ROOT, table.name.as_str());
+    let mut triggers = schema.get_triggers_for_table(namespace, table.name.as_str());
 
     // Filter triggers by event
     triggers.any(|trigger| {
@@ -723,12 +728,13 @@ pub fn has_relevant_triggers_type_only(
 /// This is used during plan preparation to determine if materialization is needed.
 pub fn get_relevant_triggers_type_and_time<'a>(
     schema: &'a crate::schema::Schema,
+    namespace: NamespaceId,
     event: TriggerEvent,
     time: TriggerTime,
     updated_column_names: Option<&'a [ast::Name]>,
     table: &'a BTreeTable,
 ) -> impl Iterator<Item = Arc<Trigger>> + 'a + Clone {
-    let triggers = schema.get_triggers_for_table(NamespaceId::ROOT, table.name.as_str());
+    let triggers = schema.get_triggers_for_table(namespace, table.name.as_str());
 
     // Filter triggers by event
     triggers
@@ -771,43 +777,58 @@ fn any_trigger_column_updated(trigger_cols: &[ast::Name], updated_cols: &[ast::N
 }
 
 /// Like [`get_relevant_triggers_type_and_time`], but also searches the temp
-/// schema when `database_id != TEMP_DB_ID`.  Temp triggers on a non-temp
-/// table are stored in the temp schema, so both schemas must be consulted
-/// for DML on any table.  Returns a combined, de-duplicated list.
+/// schema when the table is not in the temp database. Temp triggers on a
+/// non-temp table are stored in the temp schema, so both schemas must be
+/// consulted for DML on any table. Returns a combined, de-duplicated list.
 pub fn get_triggers_including_temp(
     resolver: &Resolver,
-    database_id: usize,
+    namespace: NamespaceRef,
     event: TriggerEvent,
     time: TriggerTime,
     updated_column_names: Option<&[ast::Name]>,
     table: &BTreeTable,
 ) -> Vec<Arc<Trigger>> {
+    let database_id = namespace.database_id;
     let mut triggers: Vec<Arc<Trigger>> = resolver.with_schema(database_id, |s| {
-        get_relevant_triggers_type_and_time(s, event.clone(), time, updated_column_names, table)
-            .filter(|trigger| {
-                // In the temp schema, triggers may target a different database.
-                // Only include triggers whose target matches this database.
-                match trigger.target_database_id {
-                    Some(target_db) => target_db == database_id,
-                    None => true, // unqualified → targets this schema's own table
-                }
-            })
-            .collect()
+        get_relevant_triggers_type_and_time(
+            s,
+            namespace.id,
+            event.clone(),
+            time,
+            updated_column_names,
+            table,
+        )
+        .filter(|trigger| {
+            // In the temp schema, triggers may target a different database.
+            // Only include triggers whose target matches this database.
+            match trigger.target_database_id {
+                Some(target_db) => target_db == database_id,
+                None => true, // unqualified → targets this schema's own table
+            }
+        })
+        .collect()
     });
     if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
         let temp_triggers: Vec<Arc<Trigger>> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
-            get_relevant_triggers_type_and_time(s, event, time, updated_column_names, table)
-                .filter(|trigger| match trigger.target_database_id {
-                    // Explicit qualifier: include if it matches this database.
-                    Some(target_db) => target_db == database_id,
-                    // Unqualified: the trigger targets the temp schema's table if one
-                    // exists, otherwise it targets main/attached. Include it only when
-                    // no temp table with that name shadows it.
-                    None => s
-                        .get_table(NamespaceId::ROOT, &trigger.table_name)
-                        .is_none(),
-                })
-                .collect()
+            get_relevant_triggers_type_and_time(
+                s,
+                NamespaceId::ROOT,
+                event,
+                time,
+                updated_column_names,
+                table,
+            )
+            .filter(|trigger| match trigger.target_database_id {
+                // Explicit qualifier: include if it matches this database.
+                Some(target_db) => target_db == database_id,
+                // Unqualified: the trigger targets the temp schema's table if one
+                // exists, otherwise it targets main/attached. Include it only when
+                // no temp table with that name shadows it.
+                None => s
+                    .get_table(NamespaceId::ROOT, &trigger.table_name)
+                    .is_none(),
+            })
+            .collect()
         });
         // TEMP triggers fire before the table's own triggers, and among
         // themselves in creation order. SQLite builds its trigger list by
@@ -829,13 +850,14 @@ pub fn get_triggers_including_temp(
 /// Like [`has_relevant_triggers_type_only`], but also checks the temp schema.
 pub fn has_triggers_including_temp(
     resolver: &Resolver,
-    database_id: usize,
+    namespace: NamespaceRef,
     event: TriggerEvent,
     updated_column_names: Option<&[ast::Name]>,
     table: &BTreeTable,
 ) -> bool {
+    let database_id = namespace.database_id;
     let found = resolver.with_schema(database_id, |s| {
-        has_relevant_triggers_type_only(s, event.clone(), updated_column_names, table)
+        has_relevant_triggers_type_only(s, namespace.id, event.clone(), updated_column_names, table)
     });
     if found {
         return true;
@@ -865,7 +887,7 @@ pub fn fire_trigger(
     trigger: Arc<Trigger>,
     ctx: &TriggerContext,
     connection: &Arc<crate::Connection>,
-    database_id: usize,
+    namespace: NamespaceRef,
     ignore_jump_target: BranchOffset,
 ) -> Result<()> {
     // Decode custom type registers so trigger bodies see user-facing values,
@@ -950,7 +972,7 @@ pub fn fire_trigger(
                 &trigger,
                 ctx,
                 connection,
-                database_id,
+                namespace,
                 ignore_jump_target,
             )?;
 
@@ -963,7 +985,7 @@ pub fn fire_trigger(
                 &trigger,
                 ctx,
                 connection,
-                database_id,
+                namespace,
                 ignore_jump_target,
             )?;
         }

@@ -11,7 +11,7 @@ use crate::mvcc::database::{
     BootstrapState, CheckpointReadLockState, CheckpointStateMachine, TxID,
 };
 use crate::mvcc::MvccClock;
-use crate::namespace::NamespaceId;
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::numeric::decimal::{numeric_from_value, MAX_FRACTION_DIGITS};
 use crate::numeric::Numeric;
 use crate::schema::{
@@ -475,7 +475,14 @@ pub fn op_drop_index(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(DropIndex { index, db }, insn);
+    load_insn!(
+        DropIndex {
+            index,
+            db,
+            namespace
+        },
+        insn
+    );
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store_for_db(*db).is_some();
     conn.with_database_schema_mut(*db, |schema| {
@@ -485,7 +492,7 @@ pub fn op_drop_index(
         if is_mvcc && index.root_page > 0 {
             schema.dropped_root_pages.insert(index.root_page);
         }
-        schema.remove_index(NamespaceId::ROOT, index);
+        schema.remove_index(*namespace, index);
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -12224,7 +12231,7 @@ pub fn op_function(
                                 idx_name,
                                 mut where_clause,
                                 using,
-                                with_clause,
+                                mut with_clause,
                             } => {
                                 if table != normalize_ident(tbl_name.as_str()) {
                                     break 'sql None;
@@ -12244,6 +12251,22 @@ pub fn op_function(
                                         &rename_from,
                                         column_def.col_name.as_str(),
                                     );
+                                }
+
+                                if let Some(using) = &using {
+                                    let syms = program.connection.syms.read();
+                                    let Some(index_method) = syms.index_methods.get(using.as_str())
+                                    else {
+                                        return Err(LimboError::InternalError(format!(
+                                            "index method {using} not found during ALTER TABLE RENAME COLUMN"
+                                        ))
+                                        .into());
+                                    };
+                                    index_method.rename_column_in_with_clause(
+                                        &mut with_clause,
+                                        &rename_from,
+                                        column_def.col_name.as_str(),
+                                    )?;
                                 }
 
                                 Some(
@@ -14982,7 +15005,15 @@ pub fn op_drop_table(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(DropTable { db, table_name, .. }, insn);
+    load_insn!(
+        DropTable {
+            db,
+            namespace,
+            table_name,
+            ..
+        },
+        insn
+    );
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store_for_db(*db).is_some();
     {
@@ -14992,7 +15023,7 @@ pub fn op_drop_table(
             // to include them to avoid "page never used" false positives.
             if is_mvcc {
                 let table = schema
-                    .get_table(NamespaceId::ROOT, table_name)
+                    .get_table(*namespace, table_name)
                     .expect("DROP TABLE: table must exist in schema");
                 if let Some(btree) = table.btree() {
                     // Only track positive root pages (checkpointed tables).
@@ -15003,7 +15034,7 @@ pub fn op_drop_table(
                 }
                 // Capture index root pages (table may not have indexes)
                 let index_root_pages: Vec<i64> = schema
-                    .indices_including_backing(NamespaceId::ROOT, table_name)
+                    .indices_including_backing(*namespace, table_name)
                     .map(|index| index.root_page)
                     .collect();
                 for root_page in index_root_pages {
@@ -15012,9 +15043,9 @@ pub fn op_drop_table(
                     }
                 }
             }
-            schema.remove_indices_for_table(NamespaceId::ROOT, table_name);
-            schema.remove_triggers_for_table(NamespaceId::ROOT, table_name);
-            schema.remove_table(NamespaceId::ROOT, table_name);
+            schema.remove_indices_for_table(*namespace, table_name);
+            schema.remove_triggers_for_table(*namespace, table_name);
+            schema.remove_table(*namespace, table_name);
         })?;
         // SQLite also removes temp triggers that target the dropped table.
         // Only needed when dropping from a non-temp database. We must
@@ -15042,11 +15073,18 @@ pub fn op_drop_view(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(DropView { db, view_name }, insn);
+    load_insn!(
+        DropView {
+            db,
+            namespace,
+            view_name
+        },
+        insn
+    );
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
-        schema.remove_view(NamespaceId::ROOT, view_name).ok();
-        schema.remove_broken_view(NamespaceId::ROOT, view_name);
+        schema.remove_view(*namespace, view_name).ok();
+        schema.remove_broken_view(*namespace, view_name);
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -15076,6 +15114,7 @@ pub fn op_add_sequence(
     load_insn!(AddSequence { data }, insn);
     let AddSequenceData {
         db,
+        namespace,
         name,
         start,
         increment,
@@ -15093,7 +15132,7 @@ pub fn op_add_sequence(
     )?;
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
-        schema.add_sequence(NamespaceId::ROOT, seq);
+        schema.add_sequence(*namespace, seq);
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -15105,7 +15144,14 @@ pub fn op_drop_sequence(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(DropSequence { db, seq_name }, insn);
+    load_insn!(
+        DropSequence {
+            db,
+            namespace,
+            seq_name
+        },
+        insn
+    );
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store_for_db(*db).is_some();
     conn.with_database_schema_mut(*db, |schema| {
@@ -15123,7 +15169,7 @@ pub fn op_drop_sequence(
                 schema.dropped_root_pages.insert(root_page);
             }
         }
-        schema.remove_sequence(NamespaceId::ROOT, seq_name);
+        schema.remove_sequence(*namespace, seq_name);
     })?;
     // Drop this connection's stale currval. Otherwise a same-session
     // DROP SEQUENCE + CREATE SEQUENCE <same name> would let currval()
@@ -15171,6 +15217,7 @@ pub fn op_sequence_compute_next(
     load_insn!(
         SequenceComputeNext {
             db,
+            namespace,
             seq_name,
             in_value_reg,
             in_is_called_reg,
@@ -15182,9 +15229,7 @@ pub fn op_sequence_compute_next(
 
     let seq = program
         .connection
-        .with_schema(*db, |s| {
-            s.get_sequence(NamespaceId::ROOT, seq_name).cloned()
-        })
+        .with_schema(*db, |s| s.get_sequence(*namespace, seq_name).cloned())
         .ok_or_else(|| {
             crate::LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
         })?;
@@ -15306,6 +15351,7 @@ pub fn op_sequence_track_allocation(
     load_insn!(
         SequenceTrackAllocation {
             db,
+            namespace,
             seq_name,
             value_reg,
         },
@@ -15324,9 +15370,7 @@ pub fn op_sequence_track_allocation(
     if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
         let seq = program
             .connection
-            .with_schema(*db, |s| {
-                s.get_sequence(NamespaceId::ROOT, seq_name).cloned()
-            })
+            .with_schema(*db, |s| s.get_sequence(*namespace, seq_name).cloned())
             .ok_or_else(|| {
                 crate::LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
             })?;
@@ -15705,11 +15749,18 @@ pub fn op_drop_trigger(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(DropTrigger { db, trigger_name }, insn);
+    load_insn!(
+        DropTrigger {
+            db,
+            namespace,
+            trigger_name
+        },
+        insn
+    );
 
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
-        schema.remove_trigger(NamespaceId::ROOT, trigger_name).ok();
+        schema.remove_trigger(*namespace, trigger_name).ok();
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -17591,7 +17642,15 @@ pub fn op_rename_table(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(RenameTable { db, from, to }, insn);
+    load_insn!(
+        RenameTable {
+            db,
+            namespace,
+            from,
+            to
+        },
+        insn
+    );
 
     let normalized_from = normalize_ident(from.as_str());
     let normalized_to = normalize_ident(to.as_str());
@@ -17599,7 +17658,7 @@ pub fn op_rename_table(
     let conn = program.connection.clone();
 
     conn.with_database_schema_mut(*db, |schema| -> crate::Result<()> {
-        if let Some(mut indexes) = schema.take_indices(NamespaceId::ROOT, &normalized_from) {
+        if let Some(mut indexes) = schema.take_indices(*namespace, &normalized_from) {
             let autoindex_prefix = format!("sqlite_autoindex_{normalized_from}_");
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
@@ -17610,11 +17669,11 @@ pub fn op_rename_table(
                 }
             });
 
-            schema.insert_indices(NamespaceId::ROOT, normalized_to.to_owned(), indexes);
+            schema.insert_indices(*namespace, normalized_to.to_owned(), indexes);
         };
 
         let mut table = schema
-            .take_table(NamespaceId::ROOT, &normalized_from)
+            .take_table(*namespace, &normalized_from)
             .expect("table being renamed should be in schema");
         #[cfg(feature = "conn_raw_api")]
         schema.unregister_table_root_page(table.as_ref());
@@ -17651,9 +17710,9 @@ pub fn op_rename_table(
 
         #[cfg(feature = "conn_raw_api")]
         schema.register_table_root_page(&normalized_to, table.as_ref());
-        schema.insert_table(NamespaceId::ROOT, normalized_to.to_owned(), table);
+        schema.insert_table(*namespace, normalized_to.to_owned(), table);
 
-        for (tname, t_arc) in schema.tables_mut(NamespaceId::ROOT) {
+        for (tname, t_arc) in schema.tables_mut(*namespace) {
             // skip the table we just renamed
             if normalize_ident(tname) == normalized_to {
                 continue;
@@ -17671,13 +17730,13 @@ pub fn op_rename_table(
 
         // Update triggers: move from old table name key to new, and update
         // each trigger's table_name field and body commands.
-        if let Some(mut triggers) = schema.take_triggers(NamespaceId::ROOT, &normalized_from) {
+        if let Some(mut triggers) = schema.take_triggers(*namespace, &normalized_from) {
             for trigger_arc in &mut triggers {
                 let trigger = Arc::make_mut(trigger_arc);
                 normalized_to.clone_into(&mut trigger.table_name);
                 rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
             }
-            schema.insert_triggers(NamespaceId::ROOT, normalized_to.to_owned(), triggers);
+            schema.insert_triggers(*namespace, normalized_to.to_owned(), triggers);
         }
 
         // If the renamed table owned an implicit AUTOINCREMENT sequence,
@@ -17693,7 +17752,7 @@ pub fn op_rename_table(
         // implicit sequence for AUTOINCREMENT table" until the next
         // schema reparse.
         let old_seq_name = crate::schema::autoincrement_sequence_name(&normalized_from);
-        if let Some(mut seq_arc) = schema.take_sequence(NamespaceId::ROOT, &old_seq_name) {
+        if let Some(mut seq_arc) = schema.take_sequence(*namespace, &old_seq_name) {
             let new_seq_name = crate::schema::autoincrement_sequence_name(&normalized_to);
             // Mutate the Sequence's `name` field so its internal identity
             // tracks the new table. `seq.name` is used by the exhaustion
@@ -17719,7 +17778,7 @@ pub fn op_rename_table(
 
         // Also update triggers on OTHER tables that reference the renamed table
         // in their body commands (e.g., INSERT INTO old_name in a trigger on another table)
-        for trigger_arc in schema.triggers_mut(NamespaceId::ROOT) {
+        for trigger_arc in schema.triggers_mut(*namespace) {
             if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {
                 continue;
             }
@@ -17793,6 +17852,7 @@ pub fn op_drop_column(
     load_insn!(
         DropColumn {
             db,
+            namespace,
             table,
             column_index
         },
@@ -17805,7 +17865,7 @@ pub fn op_drop_column(
 
     let column_name = conn.with_schema(*db, |schema| {
         let table = schema
-            .get_table(NamespaceId::ROOT, &normalized_table_name)
+            .get_table(*namespace, &normalized_table_name)
             .expect("table being ALTERed should be in schema");
         table
             .get_column_at(*column_index)
@@ -17818,7 +17878,7 @@ pub fn op_drop_column(
 
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let table = schema
-            .table_mut(NamespaceId::ROOT, &normalized_table_name)
+            .table_mut(*namespace, &normalized_table_name)
             .expect("table being renamed should be in schema");
 
         let table = Arc::get_mut(table).expect("this should be the only strong reference");
@@ -17842,7 +17902,7 @@ pub fn op_drop_column(
     })??;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
-        for index in schema.indices_including_backing(NamespaceId::ROOT, &normalized_table_name) {
+        for index in schema.indices_including_backing(*namespace, &normalized_table_name) {
             if index
                 .columns
                 .iter()
@@ -17860,7 +17920,7 @@ pub fn op_drop_column(
     // expressions, to account for the dropped column. For example, if the dropped column had index
     // 2, then anything that was indexed on column 3 or higher should be decremented by 1.
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
-        for index in schema.indices_of_table_mut(NamespaceId::ROOT, &normalized_table_name) {
+        for index in schema.indices_of_table_mut(*namespace, &normalized_table_name) {
             let index = Arc::make_mut(index);
             for index_column in index.columns.iter_mut() {
                 if index_column.pos_in_table != EXPR_INDEX_SENTINEL
@@ -17887,7 +17947,7 @@ pub fn op_drop_column(
     })??;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
-        for (view_name, view) in schema.views(NamespaceId::ROOT) {
+        for (view_name, view) in schema.views(*namespace) {
             let view_select_sql = select_from_view_sql(&conn, *db, view_name);
             let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                 LimboError::ParseError(format!(
@@ -17931,7 +17991,7 @@ pub fn op_add_column(
 
     conn.with_database_schema_mut(data.db, |schema| -> Result<()> {
         let table_ref = schema
-            .table_mut(NamespaceId::ROOT, &normalized_table_name)
+            .table_mut(data.namespace, &normalized_table_name)
             .expect("table being altered should be in schema");
 
         let table_ref = Arc::make_mut(table_ref);
@@ -17965,6 +18025,7 @@ pub fn op_alter_column(
     load_insn!(AlterColumn { data }, insn);
     let AlterColumnData {
         db,
+        namespace,
         table: table_name,
         column_index,
         definition,
@@ -17977,7 +18038,7 @@ pub fn op_alter_column(
     let normalized_table_name = normalize_ident(table_name.as_str());
     let (old_column_name, is_strict) = conn.with_schema(*db, |schema| {
         let table = schema
-            .get_table(NamespaceId::ROOT, &normalized_table_name)
+            .get_table(*namespace, &normalized_table_name)
             .expect("table being ALTERed should be in schema");
         let old_column_name = table
             .get_column_at(*column_index)
@@ -17999,15 +18060,15 @@ pub fn op_alter_column(
         (false, crate::alloc::vec![])
     };
 
-    let view_rewrites: Vec<(usize, String, RewrittenView)> = if *rename {
+    let view_rewrites: Vec<(NamespaceRef, String, RewrittenView)> = if *rename {
         let target_db_name = conn.namespace_name(*db).ok_or_else(|| {
             LimboError::InternalError(format!("unknown database id {} during ALTER TABLE", *db))
         })?;
         let mut all_rewrites = conn.with_schema(
             *db,
-            |schema| -> crate::Result<Vec<(usize, String, RewrittenView)>> {
+            |schema| -> crate::Result<Vec<(NamespaceRef, String, RewrittenView)>> {
                 let mut rewrites = Vec::new();
-                for (view_name, view) in schema.views(NamespaceId::ROOT) {
+                for (view_name, view) in schema.views(*namespace) {
                     if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                         &view.sql,
                         schema,
@@ -18016,7 +18077,14 @@ pub fn op_alter_column(
                         &old_column_name,
                         &new_name,
                     )? {
-                        rewrites.push((*db, view_name.to_string(), rewritten));
+                        rewrites.push((
+                            NamespaceRef {
+                                database_id: *db,
+                                id: *namespace,
+                            },
+                            view_name.to_string(),
+                            rewritten,
+                        ));
                     }
                 }
                 Ok(rewrites)
@@ -18026,7 +18094,7 @@ pub fn op_alter_column(
         if *db != crate::TEMP_DB_ID {
             let temp_rewrites = conn.with_schema(
                 crate::TEMP_DB_ID,
-                |schema| -> crate::Result<Vec<(usize, String, RewrittenView)>> {
+                |schema| -> crate::Result<Vec<(NamespaceRef, String, RewrittenView)>> {
                     let mut rewrites = Vec::new();
                     for (view_name, view) in schema.views(NamespaceId::ROOT) {
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename(
@@ -18037,7 +18105,11 @@ pub fn op_alter_column(
                             &old_column_name,
                             &new_name,
                         )? {
-                            rewrites.push((crate::TEMP_DB_ID, view_name.to_string(), rewritten));
+                            rewrites.push((
+                                NamespaceRef::root_of(crate::TEMP_DB_ID),
+                                view_name.to_string(),
+                                rewritten,
+                            ));
                         }
                     }
                     Ok(rewrites)
@@ -18052,7 +18124,7 @@ pub fn op_alter_column(
 
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let (table_arc, indexes) = schema
-            .table_with_indices_mut(NamespaceId::ROOT, &normalized_table_name)
+            .table_with_indices_mut(*namespace, &normalized_table_name)
             .expect("table being ALTERed should be in schema");
         let table = Arc::make_mut(table_arc);
 
@@ -18199,7 +18271,7 @@ pub fn op_alter_column(
         }
 
         // fix OTHER tables that reference this table as parent
-        for (tname, t_arc) in schema.tables_mut(NamespaceId::ROOT) {
+        for (tname, t_arc) in schema.tables_mut(*namespace) {
             if normalize_ident(tname) == normalized_table_name {
                 continue;
             }
@@ -18222,28 +18294,31 @@ pub fn op_alter_column(
     })??;
 
     if *rename {
-        for (trigger_db, trigger_name, sql) in rewritten_triggers {
-            conn.with_database_schema_mut(*trigger_db, |schema| {
-                replace_trigger_sql(schema, trigger_name, sql)
+        for (trigger_namespace, trigger_name, sql) in rewritten_triggers {
+            conn.with_database_schema_mut(trigger_namespace.database_id, |schema| {
+                replace_trigger_sql(schema, trigger_namespace.id, trigger_name, sql)
             })??;
         }
 
-        for (view_db, view_name, rewritten) in view_rewrites {
-            conn.with_database_schema_mut(view_db, move |schema| -> crate::Result<()> {
-                if let Some(view_arc) = schema.view_mut(NamespaceId::ROOT, &view_name) {
-                    let view = Arc::make_mut(view_arc);
-                    view.sql = rewritten.sql;
-                    view.select_stmt = rewritten.select_stmt;
-                    view.columns = rewritten.columns;
-                }
-                Ok(())
-            })??;
+        for (view_namespace, view_name, rewritten) in view_rewrites {
+            conn.with_database_schema_mut(
+                view_namespace.database_id,
+                move |schema| -> crate::Result<()> {
+                    if let Some(view_arc) = schema.view_mut(view_namespace.id, &view_name) {
+                        let view = Arc::make_mut(view_arc);
+                        view.sql = rewritten.sql;
+                        view.select_stmt = rewritten.select_stmt;
+                        view.columns = rewritten.columns;
+                    }
+                    Ok(())
+                },
+            )??;
         }
 
         if *db != crate::MAIN_DB_ID {
             conn.with_schema(*db, |schema| -> crate::Result<()> {
                 let table = schema
-                    .get_table(NamespaceId::ROOT, &normalized_table_name)
+                    .get_table(*namespace, &normalized_table_name)
                     .expect("table being ALTERed should be in schema");
                 let _column = table
                     .get_column_at(*column_index)
@@ -18266,7 +18341,12 @@ pub fn op_alter_column(
     Ok(InsnFunctionStepResult::Step)
 }
 
-fn replace_trigger_sql(schema: &mut Schema, trigger_name: &str, sql: &str) -> Result<()> {
+fn replace_trigger_sql(
+    schema: &mut Schema,
+    namespace: NamespaceId,
+    trigger_name: &str,
+    sql: &str,
+) -> Result<()> {
     let mut parser = Parser::new(sql.as_bytes());
     let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
         event,
@@ -18280,7 +18360,7 @@ fn replace_trigger_sql(schema: &mut Schema, trigger_name: &str, sql: &str) -> Re
         )));
     };
     let trigger = schema
-        .trigger_mut(NamespaceId::ROOT, trigger_name)
+        .trigger_mut(namespace, trigger_name)
         .expect("rewritten trigger should be in schema");
     let trigger = Arc::make_mut(trigger);
     trigger.sql = sql.to_string();

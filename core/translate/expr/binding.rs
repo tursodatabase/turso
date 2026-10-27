@@ -1,4 +1,5 @@
 use super::*;
+use crate::namespace::NamespaceRef;
 use crate::schema::{
     SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME, TEMP_SCHEMA_TABLE_NAME_ALT,
 };
@@ -372,7 +373,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         match resolve_qualified_name(
                             referenced_tables,
                             resolver,
-                            Some(namespace.database_id),
+                            Some(*namespace),
                             &tbl_name_str,
                             &normalized_col_name,
                         )? {
@@ -738,7 +739,7 @@ pub(in crate::translate) fn lookup_unqualified_column(
 fn resolve_qualified_name(
     table_references: &TableReferences,
     resolver: &Resolver<'_>,
-    database_id: Option<usize>,
+    namespace: Option<NamespaceRef>,
     table_name: &str,
     column_name: &str,
 ) -> Result<QualifiedNameMatch> {
@@ -753,11 +754,11 @@ fn resolve_qualified_name(
                 &joined_table.table,
                 &joined_table.identifier,
                 joined_table.has_alias,
-                joined_table.database_id,
+                joined_table.namespace.database_id,
                 table_name,
-                database_id.is_some(),
+                namespace.is_some(),
             ),
-            database_id_to_match(&joined_table.table, joined_table.database_id, database_id),
+            database_id_to_match(&joined_table.table, joined_table.namespace, namespace),
             table_name,
             column_name,
         )?;
@@ -805,11 +806,11 @@ fn resolve_qualified_name(
                 &outer_ref.table,
                 &outer_ref.identifier,
                 outer_ref.has_alias,
-                outer_ref.database_id,
+                outer_ref.namespace.database_id,
                 table_name,
-                database_id.is_some(),
+                namespace.is_some(),
             ),
-            database_id_to_match(&outer_ref.table, outer_ref.database_id, database_id),
+            database_id_to_match(&outer_ref.table, outer_ref.namespace, namespace),
             table_name,
             column_name,
         )?;
@@ -890,15 +891,13 @@ fn qualifier_names_table(
 /// so the table can then be matched by its alias.
 fn database_id_to_match(
     table: &Table,
-    table_database_id: usize,
-    database_id: Option<usize>,
+    table_namespace: NamespaceRef,
+    namespace: Option<NamespaceRef>,
 ) -> Option<usize> {
-    if database_id == Some(table_database_id)
-        && matches!(table, Table::BTree(_) | Table::Virtual(_))
-    {
+    if namespace == Some(table_namespace) && matches!(table, Table::BTree(_) | Table::Virtual(_)) {
         None
     } else {
-        database_id
+        namespace.map(|namespace| namespace.database_id)
     }
 }
 
