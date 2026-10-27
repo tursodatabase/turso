@@ -13,14 +13,7 @@ pub fn init_distinct(
         .iter()
         .map(|col| expr_collation(&col.expr, Some(&plan.table_references), resolver))
         .collect::<Result<Vec<_>>>()?;
-    let hash_table_id = program.alloc_hash_table_id();
-    let ctx = DistinctCtx {
-        hash_table_id,
-        collations,
-        label_on_conflict: program.allocate_label(),
-    };
-
-    Ok(ctx)
+    DistinctCtx::new(program, collations)
 }
 
 /// First step of Loop emission, opens cursors for all tables and initializes distinct aggregate
@@ -93,14 +86,9 @@ impl InitLoop {
                 "DISTINCT aggregate functions must have exactly one argument"
             );
             let collations = vec![expr_collation(&agg.args[0], Some(tables), &t_ctx.resolver)?];
-            let hash_table_id = program.alloc_hash_table_id();
-            agg.distinctness = Distinctness::Distinct {
-                ctx: Some(DistinctCtx {
-                    hash_table_id,
-                    collations,
-                    label_on_conflict: program.allocate_label(),
-                }),
-            };
+            let ctx = DistinctCtx::new(program, collations)?;
+            let hash_table_id = ctx.hash_table_id;
+            agg.distinctness = Distinctness::Distinct { ctx: Some(ctx) };
             // DISTINCT aggregate hash tables live in ProgramState, so a correlated
             // subquery can re-enter with rows from the previous invocation still
             // recorded unless we clear the seen-set here.

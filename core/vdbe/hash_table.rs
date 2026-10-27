@@ -1044,13 +1044,12 @@ enum ParseChunkResult {
 impl HashTable {
     /// Create a new hash table.
     pub fn new(config: HashTableConfig, io: Arc<dyn IO>) -> Result<Self> {
-        if config
+        if !config
             .collations
             .iter()
-            .any(|collation| collation.is_custom())
+            .all(|collation| collation.can_hash())
         {
-            // Custom collation equality is a connection-owned callback. Hash tables do
-            // not carry connection context, so hash/equality cannot be made consistent here.
+            // The planner does not hash values of such a collation.
             return Err(LimboError::InternalError(
                 "custom collations are not supported by hash tables".to_string(),
             ));
@@ -3440,9 +3439,20 @@ mod hashtests {
 
     #[test]
     fn test_hash_table_rejects_custom_collations() {
+        unsafe extern "C" fn equal(
+            _: usize,
+            _: *const u8,
+            _: usize,
+            _: *const u8,
+            _: usize,
+        ) -> i32 {
+            0
+        }
         let io = Arc::new(MemoryIO::new());
+        let custom =
+            crate::function::ExternalCollation::new("hash_table_custom".into(), 0, equal, None);
         let config = HashTableConfig {
-            collations: vec![CollationSeq::custom("hash_table_custom")],
+            collations: vec![custom.collation],
             ..Default::default()
         };
         let err = match HashTable::new(config, io) {

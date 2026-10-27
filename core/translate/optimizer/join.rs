@@ -22,8 +22,8 @@ use crate::{
         expr::expr_references_subquery_id,
         optimizer::{
             access_method::{
-                estimate_hash_join_cost, tables_in_equal_test, try_hash_join_access_method,
-                AccessMethodParams,
+                estimate_hash_join_cost, tables_in_hashable_equal_test,
+                try_hash_join_access_method, AccessMethodParams,
             },
             cost::{
                 estimate_rows_per_seek, index_access_is_unique_point_lookup,
@@ -1304,7 +1304,12 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // The DP algorithm has O(2^n) complexity which becomes prohibitively slow
     // beyond ~12 tables. The greedy algorithm is O(n²) and produces good
     // (though not always optimal) plans.
-    let where_terms = build_where_term_info(where_clause, table_references, subqueries)?;
+    let where_terms = build_where_term_info(
+        where_clause,
+        table_references,
+        subqueries,
+        planning_context.resolver,
+    )?;
     if num_tables > GREEDY_JOIN_THRESHOLD {
         return compute_greedy_join_order(
             joined_tables,
@@ -2284,25 +2289,28 @@ fn build_where_term_info(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
+    resolver: &Resolver,
 ) -> Result<Vec<WhereTermInfo>> {
     where_clause
         .iter()
         .map(|term| {
+            let equal_tables = if term.consumed {
+                None
+            } else {
+                tables_in_hashable_equal_test(&term.expr, table_references, resolver)?
+            };
             Ok(WhereTermInfo {
                 table_mask: table_mask_from_expr(&term.expr, table_references, subqueries)?,
                 // FIXME: The row cost also includes one simple condition. Give row work
                 // and condition work separate costs so this does not need to subtract one.
                 extra_steps: where_expr_steps(&term.expr).saturating_sub(1),
-                equal_tables: (!term.consumed)
-                    .then(|| tables_in_equal_test(&term.expr))
-                    .flatten()
-                    .map(|(left, right)| {
-                        (
-                            left,
-                            right,
-                            term.origin.join_origin().and_then(JoinOrigin::outer_table),
-                        )
-                    }),
+                equal_tables: equal_tables.map(|(left, right)| {
+                    (
+                        left,
+                        right,
+                        term.origin.join_origin().and_then(JoinOrigin::outer_table),
+                    )
+                }),
             })
         })
         .collect()
@@ -2586,7 +2594,12 @@ mod tests {
             Operator::Or,
             Box::new(check(second_id)),
         ))];
-        let where_terms = build_where_term_info(&two_table_where, &table_references, &[])?;
+        let where_terms = build_where_term_info(
+            &two_table_where,
+            &table_references,
+            &[],
+            &Resolver::empty_for_tests(),
+        )?;
 
         let mut joined_mask = TableMask::default();
         joined_mask.set(0)?;
@@ -2604,7 +2617,12 @@ mod tests {
         ));
         term.origin = WhereTermOrigin::Join(JoinOrigin::Outer(second_id));
         let outer_join_where = vec![term];
-        let where_terms = build_where_term_info(&outer_join_where, &table_references, &[])?;
+        let where_terms = build_where_term_info(
+            &outer_join_where,
+            &table_references,
+            &[],
+            &Resolver::empty_for_tests(),
+        )?;
 
         let mut joined_mask = TableMask::default();
         joined_mask.set(0)?;

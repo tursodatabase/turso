@@ -1192,6 +1192,76 @@ fn derived_columns_keep_a_custom_collation(tmp_db: TempDatabase) -> anyhow::Resu
     Ok(())
 }
 
+#[turso_macros::test]
+#[serial]
+fn grouping_in_union_and_joins_compare_with_a_custom_collation(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_external_collation(
+        "dotnet_nocase".to_string(),
+        0,
+        dotnet_nocase_collation,
+        None,
+    );
+    conn.execute("CREATE TABLE names(value TEXT)")?;
+    conn.execute("INSERT INTO names VALUES ('beta'), ('ALPHA'), ('alpha'), ('Gamma')")?;
+
+    let int_rows = |values: &[i64]| -> Vec<Vec<SqliteValue>> {
+        values
+            .iter()
+            .map(|v| vec![SqliteValue::Integer(*v)])
+            .collect()
+    };
+    let text_rows = |values: &[&str]| -> Vec<Vec<SqliteValue>> {
+        values
+            .iter()
+            .map(|v| vec![SqliteValue::Text((*v).into())])
+            .collect()
+    };
+    for (sql, expected) in [
+        (
+            "SELECT count(*) FROM (SELECT value COLLATE dotnet_nocase AS x FROM names) GROUP BY x ORDER BY 1",
+            int_rows(&[1, 1, 2]),
+        ),
+        (
+            "SELECT count(*) FROM (SELECT value COLLATE dotnet_nocase FROM names UNION SELECT 'BETA')",
+            int_rows(&[3]),
+        ),
+        (
+            "SELECT count(*) FROM (SELECT value COLLATE dotnet_nocase AS x FROM names) AS a \
+             JOIN names AS b ON a.x = b.value",
+            int_rows(&[6]),
+        ),
+        (
+            "SELECT value FROM names WHERE value COLLATE dotnet_nocase IN (SELECT 'Alpha') ORDER BY 1",
+            text_rows(&["ALPHA", "alpha"]),
+        ),
+        (
+            "SELECT value FROM names WHERE value IN (SELECT 'Alpha' COLLATE dotnet_nocase) ORDER BY 1",
+            text_rows(&["ALPHA", "alpha"]),
+        ),
+    ] {
+        assert_eq!(limbo_exec_rows(&conn, sql), expected, "{sql}");
+    }
+
+    // DISTINCT finds duplicates with a hash table, which cannot hash values
+    // so that the callback's equal values get equal hashes.
+    for sql in [
+        "SELECT DISTINCT value COLLATE dotnet_nocase FROM names",
+        "SELECT count(DISTINCT value COLLATE dotnet_nocase) FROM names",
+    ] {
+        let err = conn.execute(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("DISTINCT does not support the custom collation dotnet_nocase"),
+            "{sql}: {err}"
+        );
+    }
+    conn.unregister_external_collation("dotnet_nocase");
+    Ok(())
+}
+
 static TRACKED_DOUBLE_DESTROYS: AtomicUsize = AtomicUsize::new(0);
 static TRACKED_CALLS_AFTER_DESTROY: AtomicUsize = AtomicUsize::new(0);
 

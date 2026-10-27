@@ -9,11 +9,12 @@ use turso_parser::ast::{self, SortOrder, TableInternalId};
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
+use crate::translate::collate::comparison_collation;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{as_binary_components, comparison_affinity, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
-    convert_to_vtab_constraint, expr_uses_custom_collation, ordered_ephemeral_key_columns,
-    partial_index, partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
+    convert_to_vtab_constraint, ordered_ephemeral_key_columns, partial_index,
+    partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
     RangeConstraintRef,
 };
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
@@ -1245,14 +1246,27 @@ fn one_table_in_expr(expr: &ast::Expr) -> Option<TableInternalId> {
 }
 
 /// Return the two tables used by one equal test.
-pub(super) fn tables_in_equal_test(expr: &ast::Expr) -> Option<(TableInternalId, TableInternalId)> {
+/// The two tables of an equal test that a hash join can use: each side reads
+/// one table, and the test compares with a collation that can be hashed.
+pub(super) fn tables_in_hashable_equal_test(
+    expr: &ast::Expr,
+    tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<Option<(TableInternalId, TableInternalId)>> {
     let Ok(Some((left, operator, right))) = as_binary_components(expr) else {
-        return None;
+        return Ok(None);
     };
     if !matches!(operator.as_ast_operator(), Some(ast::Operator::Equals)) {
-        return None;
+        return Ok(None);
     }
-    Some((one_table_in_expr(left)?, one_table_in_expr(right)?))
+    let (Some(left_table), Some(right_table)) = (one_table_in_expr(left), one_table_in_expr(right))
+    else {
+        return Ok(None);
+    };
+    if !comparison_collation(left, right, Some(tables), resolver)?.can_hash() {
+        return Ok(None);
+    }
+    Ok(Some((left_table, right_table)))
 }
 
 /// Find equal tests that a hash join can use.
@@ -1398,15 +1412,6 @@ pub fn try_hash_join_access_method(
     if join_keys.is_empty() {
         return Ok(None);
     }
-    // Custom-collated equality depends on a connection-owned callback, so the
-    // hash join planner cannot derive a stable hash/equality pair here.
-    if join_keys.iter().any(|join_key| {
-        expr_uses_custom_collation(join_key.get_build_expr(where_clause))
-            || expr_uses_custom_collation(join_key.get_probe_expr(where_clause))
-    }) {
-        return Ok(None);
-    }
-
     // Prefer nested loops when an index can read the join columns.
     for join_key in &join_keys {
         let probe_expr = join_key.get_probe_expr(where_clause);

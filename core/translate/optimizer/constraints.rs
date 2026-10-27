@@ -6,8 +6,8 @@ use crate::{
     translate::{
         collate::{comparison_collation, expr_collation, CollationSeq},
         expr::{
-            as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr,
-            walk_expr_mut, WalkControl,
+            as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr_mut,
+            WalkControl,
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
@@ -356,22 +356,6 @@ pub(super) fn automatic_index_terms(
         .collect();
     terms.sort_by_key(|term| term.index_col_pos);
     terms
-}
-
-/// Return true when an expression names a custom text order.
-pub(super) fn expr_uses_custom_collation(expr: &ast::Expr) -> bool {
-    let mut uses_custom = false;
-    walk_expr(expr, &mut |expr| -> Result<WalkControl> {
-        if let ast::Expr::Collate(_, collation_name) = expr {
-            uses_custom = CollationSeq::known_custom(collation_name.as_str()).is_some();
-            if uses_custom {
-                return Ok(WalkControl::SkipChildren);
-            }
-        }
-        Ok(WalkControl::Continue)
-    })
-    .expect("reading a constraint cannot fail");
-    uses_custom
 }
 
 /// Estimate selectivity for IN expressions given the number of values and table row count.
@@ -1370,14 +1354,7 @@ pub fn constraints_from_where_clause(
             }
             true
         });
-        cs.temporary_index_terms = automatic_index_terms(table_reference, &cs, schema)
-            .into_iter()
-            .filter(|term| {
-                let constraint = &cs.constraints[term.constraint_vec_pos];
-                let where_term = &where_clause[constraint.where_clause_pos.0];
-                !expr_uses_custom_collation(&where_term.expr)
-            })
-            .collect();
+        cs.temporary_index_terms = automatic_index_terms(table_reference, &cs, schema);
         constraints.push(cs);
     }
 

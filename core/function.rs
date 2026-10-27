@@ -7,6 +7,7 @@ use turso_ext::{
     ValueDestructor,
 };
 
+use crate::translate::collate::CollationSeq;
 use crate::LimboError;
 
 pub type ContextCollationFunction = unsafe extern "C" fn(
@@ -26,7 +27,11 @@ pub struct ExternalFunc {
     pub func: ExtFunc,
 }
 
+/// A collation that an application registered on a connection: a callback
+/// that orders two texts.
 pub struct ExternalCollation {
+    /// The collation that calls this callback.
+    pub collation: CollationSeq,
     pub name: String,
     pub context: usize,
     pub callback: ContextCollationFunction,
@@ -39,18 +44,33 @@ impl ExternalCollation {
         context: usize,
         callback: ContextCollationFunction,
         context_destructor: Option<ContextDestructor>,
-    ) -> Self {
-        Self {
+    ) -> Arc<Self> {
+        CollationSeq::new_custom(|collation| Self {
+            collation,
             name,
             context,
             callback,
             context_destructor,
-        }
+        })
+    }
+
+    pub fn compare(&self, left: &str, right: &str) -> std::cmp::Ordering {
+        let result = unsafe {
+            (self.callback)(
+                self.context,
+                left.as_ptr(),
+                left.len(),
+                right.as_ptr(),
+                right.len(),
+            )
+        };
+        result.cmp(&0)
     }
 }
 
 impl Drop for ExternalCollation {
     fn drop(&mut self) {
+        self.collation.remove_custom();
         if let Some(destructor) = self.context_destructor {
             unsafe { destructor(self.context) };
         }
@@ -1634,7 +1654,7 @@ pub struct FuncCtx {
     pub arg_count: usize,
     /// The collation the function compares its arguments with when
     /// [Func::needs_collation] is true. BINARY for the other functions.
-    pub collation: crate::translate::collate::CollationSeq,
+    pub collation: CollationSeq,
 }
 
 impl Deterministic for Func {

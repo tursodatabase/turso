@@ -776,6 +776,19 @@ pub struct DistinctCtx {
 }
 
 impl DistinctCtx {
+    /// A DISTINCT that finds duplicates with a hash table. The values are
+    /// compared with `collations`, so each must be one that can be hashed.
+    pub fn new(program: &mut ProgramBuilder, collations: Vec<CollationSeq>) -> Result<Self> {
+        if let Some(collation) = collations.iter().find(|collation| !collation.can_hash()) {
+            crate::bail_parse_error!("DISTINCT does not support the custom collation {collation}");
+        }
+        Ok(Self {
+            hash_table_id: program.alloc_hash_table_id(),
+            collations,
+            label_on_conflict: program.allocate_label(),
+        })
+    }
+
     pub fn emit_deduplication_insns(
         &self,
         program: &mut ProgramBuilder,

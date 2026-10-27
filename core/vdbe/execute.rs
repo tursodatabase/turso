@@ -413,30 +413,6 @@ fn compare_with_collation(
     }
 }
 
-fn compare_with_program_collation<V1, V2>(
-    program: &Program,
-    lhs: V1,
-    rhs: V2,
-    collation: CollationSeq,
-) -> Result<std::cmp::Ordering>
-where
-    V1: AsValueRef,
-    V2: AsValueRef,
-{
-    let lhs = lhs.as_value_ref();
-    let rhs = rhs.as_value_ref();
-    if collation.is_custom() {
-        if let (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) = (lhs, rhs) {
-            return program.connection.compare_external_collation(
-                collation,
-                lhs_text.as_str(),
-                rhs_text.as_str(),
-            );
-        }
-    }
-    Ok(collation.compare(lhs, rhs))
-}
-
 fn comparison_matches_order(op: ComparisonOp, order: std::cmp::Ordering) -> bool {
     match op {
         ComparisonOp::Eq => order.is_eq(),
@@ -1120,7 +1096,7 @@ macro_rules! comparison_opcode {
     ($name:ident, $variant:ident, $op:expr, $jumps:expr) => {
         #[inline(always)]
         pub fn $name(
-            program: &Program,
+            _program: &Program,
             state: &mut ProgramState,
             insn: &Insn,
             _pager: &Arc<Pager>,
@@ -1167,9 +1143,7 @@ macro_rules! comparison_opcode {
                     return Ok(InsnFunctionStepResult::Step);
                 }
             }
-            op_comparison_slow(
-                program, state, *lhs, *rhs, target_pc, *flags, *collation, $op,
-            )
+            op_comparison_slow(state, *lhs, *rhs, target_pc, *flags, *collation, $op)
         }
     };
 }
@@ -1202,7 +1176,6 @@ fn texts_compare_as_bytes(
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn op_comparison_slow(
-    program: &Program,
     state: &mut ProgramState,
     lhs: usize,
     rhs: usize,
@@ -1273,13 +1246,7 @@ fn op_comparison_slow(
     let rhs_for_compare = new_rhs
         .as_ref()
         .map_or(Either::Left(rhs_value), Either::Right);
-    let should_jump = if collation.is_custom() {
-        let order =
-            compare_with_program_collation(program, lhs_for_compare, rhs_for_compare, collation)?;
-        comparison_matches_order(op, order)
-    } else {
-        op.compare(lhs_for_compare, rhs_for_compare, collation)
-    };
+    let should_jump = op.compare(lhs_for_compare, rhs_for_compare, collation);
 
     match (new_lhs, new_rhs) {
         (Some(new_lhs), None) => {
@@ -9364,7 +9331,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
 }
 
 pub fn op_agg_step(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -9478,9 +9445,7 @@ pub fn op_agg_step(
                     }
                 }
             }
-            AggFunc::Min | AggFunc::Max
-                if data.comparator.is_none() && !data.collation.is_custom() =>
-            {
+            AggFunc::Min | AggFunc::Max if data.comparator.is_none() => {
                 if let Register::Value(Value::Numeric(Numeric::Integer(arg))) =
                     state.registers[data.col]
                 {
@@ -9504,11 +9469,11 @@ pub fn op_agg_step(
             _ => {}
         }
     }
-    op_agg_step_slow(program, state, data)
+    op_agg_step_slow(state, data)
 }
 
 #[inline(never)]
-fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepData) -> InsnResult {
+fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult {
     let AggStepData {
         acc_reg,
         col,
@@ -9566,13 +9531,7 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
 
     let collation = *collation;
     let comparator_factory = move || -> Result<Option<crate::vdbe::sorter::SortComparator>> {
-        Ok(match (comparator.as_ref(), collation) {
-            (Some(comparator), _) => Some(make_sort_comparator(comparator)?),
-            (None, collation) if collation.is_custom() => {
-                Some(program.connection.make_collation_comparator(collation)?)
-            }
-            (None, _) => None,
-        })
+        comparator.as_ref().map(make_sort_comparator).transpose()
     };
 
     // Step the aggregate
@@ -9791,12 +9750,12 @@ pub fn op_sorter_open(
     }
     let mut sort_comparators =
         crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())?;
-    for (idx, (_, coll, _)) in order_collations_nulls.iter().enumerate() {
-        let comparator = match comparators.get(idx).and_then(|c| c.as_ref()) {
-            Some(comparator) => Some(make_sort_comparator(comparator)?),
-            None if coll.is_custom() => Some(program.connection.make_collation_comparator(*coll)?),
-            None => None,
-        };
+    for idx in 0..order_collations_nulls.len() {
+        let comparator = comparators
+            .get(idx)
+            .and_then(|c| c.as_ref())
+            .map(make_sort_comparator)
+            .transpose()?;
         // Preallocated for every ORDER BY term above, so this push cannot grow the vector.
         sort_comparators.push(comparator);
     }
@@ -10858,7 +10817,7 @@ pub fn op_function(
                 let collation = func.collation;
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
                 let result = Value::exec_min(reg_values.iter().map(|v| v.get_value()), |a, b| {
-                    compare_with_program_collation(program, a, b, collation)
+                    Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
                 })?;
                 state.registers[*dest].set_value(result);
             }
@@ -10866,7 +10825,7 @@ pub fn op_function(
                 let collation = func.collation;
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
                 let result = Value::exec_max(reg_values.iter().map(|v| v.get_value()), |a, b| {
-                    compare_with_program_collation(program, a, b, collation)
+                    Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
                 })?;
                 state.registers[*dest].set_value(result);
             }
@@ -10875,7 +10834,7 @@ pub fn op_function(
                 let first_value = state.registers[*start_reg].get_value();
                 let second_value = state.registers[*start_reg + 1].get_value();
                 let result = first_value.exec_nullif(second_value, |a, b| {
-                    compare_with_program_collation(program, a, b, collation)
+                    Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
                 })?;
                 state.registers[*dest].set_value(result);
             }

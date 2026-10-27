@@ -2434,6 +2434,7 @@ impl ProgramBuilder {
     pub fn build_prepared_program(
         mut self,
         prepare_context: PrepareContext,
+        custom_collations: Vec<Arc<crate::function::ExternalCollation>>,
         change_cnt_on: bool,
         sql: &str,
     ) -> crate::Result<PreparedProgram> {
@@ -2495,6 +2496,7 @@ impl ProgramBuilder {
             has_materialized_views: self.has_materialized_views,
             resolve_type: self.resolve_type,
             prepare_context,
+            custom_collations,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
         };
@@ -2509,7 +2511,12 @@ impl ProgramBuilder {
         sql: &str,
     ) -> crate::Result<Program> {
         let prepare_context = PrepareContext::from_connection(&connection);
-        let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
+        let prepared = self.build_prepared_program(
+            prepare_context,
+            connection.custom_collations(),
+            change_cnt_on,
+            sql,
+        )?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
     }
 }

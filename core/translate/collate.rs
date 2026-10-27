@@ -1,16 +1,12 @@
-use std::{
-    cmp::Ordering,
-    collections::HashMap,
-    hash::{Hash, Hasher},
-    str::FromStr as _,
-};
+use std::{cmp::Ordering, collections::HashMap, hash::Hasher, str::FromStr as _};
 
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
 use turso_parser::ast::{Expr, TableInternalId, UnaryOperator};
 
 use crate::{
-    sync::{LazyLock, Mutex, RwLock},
+    function::ExternalCollation,
+    sync::{Arc, LazyLock, RwLock, Weak},
     translate::{emitter::Resolver, plan::TableReferences},
     types::ValueRef,
     vdbe::hash_table::normalized_f64_bits,
@@ -26,22 +22,28 @@ pub enum CollationSeq {
     NoCase,
     Rtrim,
     Locale(LocaleCollationId),
-    /// Name/id token for a connection-owned callback. The comparison itself
-    /// must be resolved through `Connection` at runtime.
+    /// A collation that an application registered on a connection, by its
+    /// number in [CUSTOM_COLLATIONS]. Two registrations of the same name get
+    /// different numbers.
     Custom(u32),
 }
 
-#[derive(Default)]
-struct CustomCollationNames {
-    // Custom collation callbacks are connection-local. This process-wide table
-    // only interns names so bytecode can carry compact `CollationSeq::Custom`
-    // tokens and resolve the callback through the active connection at runtime.
-    by_name: HashMap<String, u32>,
-    by_id: HashMap<u32, String>,
-}
+/// Every registered custom collation, by its number in [CollationSeq::Custom].
+/// Comparing with a custom collation looks up its callback here, so the
+/// comparison works without a connection.
+///
+/// An entry is removed when its [ExternalCollation] is dropped. A connection
+/// keeps its custom collations alive while they are registered, and a program
+/// keeps the ones of its connection alive while it exists, so every
+/// `CollationSeq::Custom` that a plan or a program holds has an entry.
+static CUSTOM_COLLATIONS: LazyLock<RwLock<CustomCollations>> =
+    LazyLock::new(|| RwLock::new(CustomCollations::default()));
 
-static CUSTOM_COLLATION_NAMES: LazyLock<Mutex<CustomCollationNames>> =
-    LazyLock::new(|| Mutex::new(CustomCollationNames::default()));
+#[derive(Default)]
+struct CustomCollations {
+    next_number: u32,
+    by_number: HashMap<u32, Weak<ExternalCollation>>,
+}
 
 impl CollationSeq {
     pub fn new(collation: &str) -> crate::Result<Self> {
@@ -104,43 +106,54 @@ impl CollationSeq {
     }
 
     #[inline]
-    pub const fn id(self) -> u32 {
-        match self {
-            Self::Custom(id) => id,
-            _ => self.to_bits() as u32,
-        }
-    }
-
-    #[inline]
     pub const fn is_custom(self) -> bool {
         matches!(self, Self::Custom(_))
     }
 
-    pub fn custom(collation: &str) -> Self {
-        let normalized = crate::util::normalize_ident(collation);
-        let mut registry = CUSTOM_COLLATION_NAMES.lock();
-        if let Some(id) = registry.by_name.get(&normalized) {
-            return Self::Custom(*id);
-        }
-
-        let mut id = custom_collation_id(&normalized);
-        while id <= 3 || registry.by_id.contains_key(&id) {
-            id = id.wrapping_add(1).max(4);
-        }
-
-        registry.by_name.insert(normalized, id);
-        registry.by_id.insert(id, collation.to_string());
-        Self::Custom(id)
+    /// Whether values can be hashed so that values this collation calls equal
+    /// get the same hash. A custom collation is an arbitrary callback, so
+    /// queries that compare with one must not use a hash table.
+    #[inline]
+    pub const fn can_hash(self) -> bool {
+        !self.is_custom()
     }
 
-    pub(crate) fn known_custom(collation: &str) -> Option<Self> {
-        let normalized = crate::util::normalize_ident(collation);
-        CUSTOM_COLLATION_NAMES
-            .lock()
-            .by_name
-            .get(&normalized)
-            .copied()
-            .map(Self::Custom)
+    /// Gives a new custom collation a number and returns the
+    /// [ExternalCollation] that `new_external` makes for it. Comparisons with
+    /// the collation call that ExternalCollation's callback.
+    pub(crate) fn new_custom(
+        new_external: impl FnOnce(Self) -> ExternalCollation,
+    ) -> Arc<ExternalCollation> {
+        let mut registry = CUSTOM_COLLATIONS.write();
+        let number = registry.next_number;
+        registry.next_number = number
+            .checked_add(1)
+            .expect("a process registers fewer than 2^32 custom collations");
+        let external = Arc::new(new_external(Self::Custom(number)));
+        registry.by_number.insert(number, Arc::downgrade(&external));
+        external
+    }
+
+    /// Removes a custom collation whose [ExternalCollation] is being dropped.
+    pub(crate) fn remove_custom(self) {
+        let Self::Custom(number) = self else {
+            panic!("{self:?} is not a custom collation");
+        };
+        CUSTOM_COLLATIONS.write().by_number.remove(&number);
+    }
+
+    fn external(self) -> Arc<ExternalCollation> {
+        let Self::Custom(number) = self else {
+            panic!("{self:?} is not a custom collation");
+        };
+        // The read lock is released before the returned Arc can be dropped,
+        // because dropping the last Arc takes the write lock.
+        CUSTOM_COLLATIONS
+            .read()
+            .by_number
+            .get(&number)
+            .and_then(Weak::upgrade)
+            .expect("a plan or program keeps its custom collations alive")
     }
 
     pub fn name(self) -> String {
@@ -149,22 +162,12 @@ impl CollationSeq {
             Self::NoCase => "NoCase".to_string(),
             Self::Rtrim => "RTrim".to_string(),
             Self::Locale(id) => LocaleCollationRegistry::global().name(id),
-            Self::Custom(id) => CUSTOM_COLLATION_NAMES
-                .lock()
-                .by_id
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| format!("collation_{id}")),
+            Self::Custom(_) => self.external().name.clone(),
         }
     }
 
     /// Orders two values. Values of different kinds order as NULL, numbers,
     /// text, blobs; two texts compare with this collation.
-    ///
-    /// A custom collation is a connection callback, which is not reachable
-    /// from here, so two texts under a custom collation compare as BINARY.
-    /// The VDBE resolves custom collations through `Connection` before it
-    /// gets here, and schema objects reject them.
     #[inline(always)]
     pub fn compare(self, lhs: ValueRef, rhs: ValueRef) -> Ordering {
         match (lhs, rhs) {
@@ -228,7 +231,7 @@ impl CollationSeq {
             Self::Rtrim => hasher.write(text.trim_end_matches(' ').as_bytes()),
             Self::Locale(id) => hasher.write(&LocaleCollationRegistry::global().sort_key(id, text)),
             Self::Custom(_) => {
-                unreachable!("custom collations are rejected before values are hashed")
+                unreachable!("hash tables reject collations that cannot hash (see can_hash)")
             }
         }
     }
@@ -240,10 +243,7 @@ impl CollationSeq {
             Self::NoCase => Self::nocase_cmp(lhs, rhs),
             Self::Rtrim => Self::rtrim_cmp(lhs, rhs),
             Self::Locale(id) => LocaleCollationRegistry::global().compare(id, lhs, rhs),
-            // Immutable comparison paths have no connection to fetch the external
-            // callback from. Runtime VDBE paths dispatch custom collations via
-            // `Connection`; schema/index paths reject them before storage.
-            Self::Custom(_) => Self::binary_cmp(lhs, rhs),
+            Self::Custom(_) => self.external().compare(lhs, rhs),
         }
     }
 
@@ -389,12 +389,6 @@ impl LocaleCollationRegistry {
             .expect("locale collation id should be registered");
         f(collation)
     }
-}
-
-fn custom_collation_id(name: &str) -> u32 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    name.hash(&mut hasher);
-    ((hasher.finish() as u32) & 0x7fff_fffc).max(4)
 }
 
 /// The collation a comparison between `lhs` and `rhs` uses. This and
@@ -710,10 +704,6 @@ mod tests {
         }
         assert!(CollationSeq::from_bits(CollationSeq::NO_COLLATION_BITS).is_err());
         assert!(CollationSeq::from_bits(u16::MAX).is_err());
-        assert_eq!(
-            CollationSeq::custom("my_custom_collation").to_bits(),
-            CollationSeq::NO_COLLATION_BITS
-        );
     }
 
     #[test]
