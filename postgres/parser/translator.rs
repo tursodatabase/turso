@@ -4261,30 +4261,59 @@ impl PostgreSQLTranslator {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
             SubLinkType::ExprSublink => Ok(ast::Expr::Subquery(select)),
             SubLinkType::ArraySublink => Ok(Self::translate_array_subquery(*select)),
-            SubLinkType::AnySublink => {
-                let op = extract_key_columns(&sub_link.oper_name)?;
-                let is_equality =
-                    op.is_empty() || unqualified_name(&op, is_pg_catalog).is_some_and(|o| o == "=");
-                if !is_equality {
-                    return Err(not_supported(format!(
-                        "{} ANY/SOME (subquery)",
-                        op.last().map(String::as_str).unwrap_or_default()
-                    )));
-                }
-                // ANY/IN subquery: testexpr IN (SELECT ...)
-                let test_node = sub_link.testexpr.as_ref().ok_or_else(|| {
-                    ParseError::ParseError("ANY SubLink missing testexpr".to_string())
-                })?;
-                let lhs = self.translate_operand(test_node)?;
-                Ok(ast::Expr::InSelect {
-                    lhs: Box::new(lhs),
-                    not: false,
-                    rhs: select,
-                })
-            }
+            SubLinkType::AnySublink => self.translate_any_all_sublink(sub_link, select, false),
+            SubLinkType::AllSublink => self.translate_any_all_sublink(sub_link, select, true),
             other => Err(ParseError::ParseError(format!(
                 "Unsupported SubLink type: {other:?}",
             ))),
+        }
+    }
+
+    /// Translate `<lhs> <op> ANY/SOME (<subquery>)` and `<lhs> <op> ALL
+    /// (<subquery>)`. `= ANY` is `IN` and `<> ALL` is `NOT IN`; both already
+    /// carry PostgreSQL's three-valued result, so they lower straight to
+    /// InSelect. Every other comparison operator lowers to the scalar subquery
+    /// built by `any_all_subquery`, which keeps the same NULL behavior.
+    fn translate_any_all_sublink(
+        &self,
+        sub_link: &pg_query::protobuf::SubLink,
+        select: Box<ast::Select>,
+        is_all: bool,
+    ) -> Result<ast::Expr, ParseError> {
+        let kw = if is_all { "ALL" } else { "ANY/SOME" };
+        let op = extract_key_columns(&sub_link.oper_name)?;
+        let op_name: &str = if op.is_empty() {
+            "="
+        } else {
+            unqualified_name(&op, is_pg_catalog)
+                .map(String::as_str)
+                .ok_or_else(|| {
+                    not_supported(format!("a schema-qualified operator in {kw} (subquery)"))
+                })?
+        };
+
+        let test_node = sub_link
+            .testexpr
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError(format!("{kw} SubLink missing testexpr")))?;
+        let lhs = self.translate_operand(test_node)?;
+
+        match (op_name, is_all) {
+            ("=", false) => Ok(ast::Expr::InSelect {
+                lhs: Box::new(lhs),
+                not: false,
+                rhs: select,
+            }),
+            ("<>", true) => Ok(ast::Expr::InSelect {
+                lhs: Box::new(lhs),
+                not: true,
+                rhs: select,
+            }),
+            _ => {
+                let operator = Self::comparison_operator(op_name)
+                    .ok_or_else(|| not_supported(format!("{op_name} {kw} (subquery)")))?;
+                Ok(Self::any_all_subquery(lhs, select, operator, is_all))
+            }
         }
     }
 
@@ -4353,6 +4382,153 @@ impl PostgreSQLTranslator {
                         )),
                         joins: vec![],
                     }),
+                    where_clause: None,
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }))
+    }
+
+    /// Maps a PostgreSQL comparison operator name to the Turso AST operator.
+    /// Returns None for anything that is not a simple comparison.
+    fn comparison_operator(name: &str) -> Option<ast::Operator> {
+        Some(match name {
+            "=" => ast::Operator::Equals,
+            "<>" => ast::Operator::NotEquals,
+            "<" => ast::Operator::Less,
+            "<=" => ast::Operator::LessEquals,
+            ">" => ast::Operator::Greater,
+            ">=" => ast::Operator::GreaterEquals,
+            _ => return None,
+        })
+    }
+
+    /// Build the scalar subquery for `lhs <op> ANY (select)` / `lhs <op> ALL
+    /// (select)` when `op` is a comparison other than the `=`/`<>` membership
+    /// forms. The rows are materialized once, then a CASE returns 1, 0 or NULL
+    /// so the result keeps PostgreSQL's three-valued logic: ANY is NULL when no
+    /// row compares true but some comparison is NULL, and ALL is NULL when no
+    /// row compares false but some comparison is NULL. An empty subquery makes
+    /// ANY false and ALL true.
+    //
+    //   (
+    //       WITH _turso_anyall_rows(_turso_anyall_value) AS MATERIALIZED (select)
+    //       SELECT CASE
+    //           -- ANY:
+    //           WHEN EXISTS (SELECT 1 FROM rows WHERE lhs op value) THEN 1
+    //           WHEN EXISTS (SELECT 1 FROM rows WHERE (lhs op value) IS NULL) THEN NULL
+    //           ELSE 0
+    //           -- ALL:
+    //           WHEN EXISTS (SELECT 1 FROM rows WHERE NOT (lhs op value)) THEN 0
+    //           WHEN EXISTS (SELECT 1 FROM rows WHERE (lhs op value) IS NULL) THEN NULL
+    //           ELSE 1
+    //       END
+    //   )
+    fn any_all_subquery(
+        lhs: ast::Expr,
+        select: Box<ast::Select>,
+        operator: ast::Operator,
+        is_all: bool,
+    ) -> ast::Expr {
+        let query = select.to_string().to_ascii_lowercase();
+        let mut table_name = "_turso_anyall_rows".to_owned();
+        while query.contains(&table_name) {
+            table_name.push('_');
+        }
+        let table = exact_name(table_name);
+        let column = exact_name("_turso_anyall_value");
+
+        let numeric = |n: &str| Box::new(ast::Expr::Literal(ast::Literal::Numeric(n.to_owned())));
+        let null_lit = || Box::new(ast::Expr::Literal(ast::Literal::Null));
+        let comparison = || {
+            ast::Expr::Binary(
+                Box::new(lhs.clone()),
+                operator,
+                Box::new(ast::Expr::Id(column.clone())),
+            )
+        };
+        let exists_where = |cond: ast::Expr| {
+            ast::Expr::Exists(Box::new(ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns: vec![ast::ResultColumn::Expr(numeric("1"), None)],
+                        from: Some(ast::FromClause {
+                            select: Box::new(ast::SelectTable::Table(
+                                ast::QualifiedName::single(table.clone()),
+                                None,
+                                None,
+                            )),
+                            joins: vec![],
+                        }),
+                        where_clause: Some(Box::new(cond)),
+                        group_by: None,
+                        window_clause: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            }))
+        };
+
+        let compares_null = ast::Expr::Binary(
+            Box::new(comparison()),
+            ast::Operator::Is,
+            Box::new(ast::Expr::Literal(ast::Literal::Null)),
+        );
+        let (when_then_pairs, else_result) = if is_all {
+            let has_false = exists_where(ast::Expr::Unary(
+                ast::UnaryOperator::Not,
+                Box::new(comparison()),
+            ));
+            (
+                vec![
+                    (Box::new(has_false), numeric("0")),
+                    (Box::new(exists_where(compares_null)), null_lit()),
+                ],
+                numeric("1"),
+            )
+        } else {
+            (
+                vec![
+                    (Box::new(exists_where(comparison())), numeric("1")),
+                    (Box::new(exists_where(compares_null)), null_lit()),
+                ],
+                numeric("0"),
+            )
+        };
+
+        let case = ast::Expr::Case {
+            base: None,
+            when_then_pairs,
+            else_expr: Some(else_result),
+        };
+
+        ast::Expr::Subquery(Box::new(ast::Select {
+            with: Some(ast::With {
+                recursive: false,
+                ctes: vec![ast::CommonTableExpr {
+                    tbl_name: table,
+                    columns: vec![ast::IndexedColumn {
+                        col_name: column,
+                        collation_name: None,
+                        order: None,
+                    }],
+                    materialized: ast::Materialized::Yes,
+                    select: *select,
+                }],
+            }),
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ast::ResultColumn::Expr(Box::new(case), None)],
+                    from: None,
                     where_clause: None,
                     group_by: None,
                     window_clause: vec![],
@@ -10987,10 +11163,12 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_any_sublink_operators() {
-        assert_not_supported("SELECT 1 > ANY (SELECT a FROM t)", "> ANY/SOME");
-        assert_not_supported("SELECT 1 <> SOME (SELECT a FROM t)", "<> ANY/SOME");
-        assert_translates("SELECT 1 = ANY (SELECT a FROM t)");
+    fn any_all_sublink_comparison_operators_translate() {
+        for op in ["=", "<>", "<", "<=", ">", ">="] {
+            assert_translates(&format!("SELECT 1 {op} ANY (SELECT a FROM t)"));
+            assert_translates(&format!("SELECT 1 {op} ALL (SELECT a FROM t)"));
+        }
+        assert_translates("SELECT 1 <> SOME (SELECT a FROM t)");
         assert_translates("SELECT 1 IN (SELECT a FROM t)");
         assert_translates("SELECT 1 NOT IN (SELECT a FROM t)");
     }
