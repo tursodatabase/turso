@@ -781,7 +781,7 @@ pub fn translate_aggregation_step(
             let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             // Activate the value's collation so finalize can sort text correctly.
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = expr_collation(expr, Some(referenced_tables), resolver)?;
+            let arg_collation = ordered_set_collation(func, expr, referenced_tables, resolver)?;
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -806,7 +806,7 @@ pub fn translate_aggregation_step(
             let fraction_reg =
                 fraction_reg.expect("percentile fraction register must be set by InitLoop::emit");
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = expr_collation(expr, Some(referenced_tables), resolver)?;
+            let arg_collation = ordered_set_collation(func, expr, referenced_tables, resolver)?;
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -863,6 +863,26 @@ pub fn translate_aggregation_step(
         }
     };
     Ok(dest)
+}
+
+/// The collation an ordered-set aggregate (mode, percentile) sorts its values
+/// with. The aggregate keeps it in its state as [CollationSeq::to_bits] until
+/// it sorts at finalize, and a custom collation has no bits.
+fn ordered_set_collation(
+    func: &AggFunc,
+    expr: &ast::Expr,
+    referenced_tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<CollationSeq> {
+    let collation = expr_collation(expr, Some(referenced_tables), resolver)?;
+    if collation.is_custom() {
+        crate::bail_parse_error!(
+            "{}() does not support the custom collation {}",
+            func.as_str(),
+            collation.name()
+        );
+    }
+    Ok(collation)
 }
 
 fn translate_const_arg(

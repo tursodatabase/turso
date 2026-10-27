@@ -8325,8 +8325,7 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
         }
         AggFunc::Mode => {
             // payload: [0]=collation bits, [1]=count, [2..]=buffered values.
-            let collation =
-                CollationSeq::from_storage_bits(payload[0].as_int().unwrap_or(0) as u16);
+            let collation = CollationSeq::from_bits(payload[0].as_int().unwrap_or(0) as u16)?;
             let count = payload[1].as_int().unwrap_or(0) as usize;
             if count == 0 || 2 + count > payload.len() {
                 Value::Null
@@ -8341,8 +8340,7 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
             if matches!(payload[2], Value::Null) {
                 return Ok(Value::Null);
             }
-            let collation =
-                CollationSeq::from_storage_bits(payload[0].as_int().unwrap_or(0) as u16);
+            let collation = CollationSeq::from_bits(payload[0].as_int().unwrap_or(0) as u16)?;
             let count = payload[1].as_int().unwrap_or(0) as usize;
             let fraction = payload[2].as_float();
             if count == 0 {

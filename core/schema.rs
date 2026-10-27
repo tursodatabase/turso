@@ -5065,8 +5065,7 @@ fn push_collation(sql: &mut String, collation: Option<CollationSeq>) {
             sql.push_str(" COLLATE ");
             sql.push_str(&quote_ident(&collation.name()));
         }
-        CollationSeq::Unset | CollationSeq::Custom(_) => {
-            // Unset should not be reachable -- ignore it
+        CollationSeq::Custom(_) => {
             // Custom collation is not allowed in schema definitions
         }
     };
@@ -9377,17 +9376,17 @@ mod column_info {
         #[inline]
         pub fn collation(&self) -> CollationSeq {
             let v = ((self.0 & COLL_MASK) >> COLL_SHIFT) as u16;
-            if v == CollationSeq::Unset.to_bits() {
+            if v == CollationSeq::NO_COLLATION_BITS {
                 CollationSeq::Binary
             } else {
-                CollationSeq::from_storage_bits(v)
+                CollationSeq::from_bits(v).expect("column flags hold the bits of a collation")
             }
         }
 
         #[inline]
         pub fn has_explicit_collation(&self) -> bool {
             let v = ((self.0 & COLL_MASK) >> COLL_SHIFT) as u16;
-            v != CollationSeq::Unset.to_bits()
+            v != CollationSeq::NO_COLLATION_BITS
         }
 
         #[inline]

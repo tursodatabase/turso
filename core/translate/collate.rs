@@ -22,7 +22,6 @@ use crate::{
 /// Numeric values are always compared numerically, and BLOBs are always compared byte-by-byte using memcmp().
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub enum CollationSeq {
-    Unset,
     Binary,
     NoCase,
     Rtrim,
@@ -58,36 +57,40 @@ impl CollationSeq {
             .map(Self::Locale)
     }
 
-    #[inline]
-    /// Returns the collation, defaulting to BINARY if unset
-    pub const fn from_bits(bits: u8) -> Self {
-        match bits {
-            2 => Self::NoCase,
-            3 => Self::Rtrim,
-            _ => Self::Binary,
-        }
-    }
+    /// The value [Self::to_bits] never returns for a built-in or locale
+    /// collation, so stored bits can use it for "no collation".
+    pub const NO_COLLATION_BITS: u16 = 0;
 
+    /// A compact number for the collation, for storing it in column flags and
+    /// aggregate state. A custom collation has none and gets
+    /// [Self::NO_COLLATION_BITS].
     #[inline]
     pub const fn to_bits(self) -> u16 {
         match self {
-            Self::Unset => 0,
             Self::Binary => 1,
             Self::NoCase => 2,
             Self::Rtrim => 3,
             Self::Locale(id) => id.to_bits(),
-            Self::Custom(_) => 0,
+            Self::Custom(_) => Self::NO_COLLATION_BITS,
         }
     }
 
-    #[inline]
-    pub const fn from_storage_bits(bits: u16) -> Self {
+    /// The collation [Self::to_bits] turned into `bits`. Any other value,
+    /// including [Self::NO_COLLATION_BITS], is an error.
+    pub fn from_bits(bits: u16) -> Result<Self> {
         match bits {
-            0 => Self::Unset,
-            1 => Self::Binary,
-            2 => Self::NoCase,
-            3 => Self::Rtrim,
-            bits => Self::Locale(LocaleCollationId::from_bits(bits)),
+            1 => Ok(Self::Binary),
+            2 => Ok(Self::NoCase),
+            3 => Ok(Self::Rtrim),
+            bits if bits >= LocaleCollationId::FIRST_STORAGE_BIT
+                && LocaleCollationRegistry::global()
+                    .is_registered(LocaleCollationId::from_bits(bits)) =>
+            {
+                Ok(Self::Locale(LocaleCollationId::from_bits(bits)))
+            }
+            bits => Err(LimboError::InternalError(format!(
+                "no collation has the number {bits}"
+            ))),
         }
     }
 
@@ -133,7 +136,6 @@ impl CollationSeq {
 
     pub fn name(self) -> String {
         match self {
-            Self::Unset => "Unset".to_string(),
             Self::Binary => "Binary".to_string(),
             Self::NoCase => "NoCase".to_string(),
             Self::Rtrim => "RTrim".to_string(),
@@ -203,7 +205,7 @@ impl CollationSeq {
 
     fn hash_text(self, text: &str, hasher: &mut impl Hasher) {
         match self {
-            Self::Unset | Self::Binary => hasher.write(text.as_bytes()),
+            Self::Binary => hasher.write(text.as_bytes()),
             Self::NoCase => {
                 // Stops at the first NUL like the comparison does.
                 hasher.write_usize(text.len());
@@ -225,7 +227,7 @@ impl CollationSeq {
     #[inline(always)]
     fn compare_strings(&self, lhs: &str, rhs: &str) -> Ordering {
         match *self {
-            Self::Unset | Self::Binary => Self::binary_cmp(lhs, rhs),
+            Self::Binary => Self::binary_cmp(lhs, rhs),
             Self::NoCase => Self::nocase_cmp(lhs, rhs),
             Self::Rtrim => Self::rtrim_cmp(lhs, rhs),
             Self::Locale(id) => LocaleCollationRegistry::global().compare(id, lhs, rhs),
@@ -361,6 +363,10 @@ impl LocaleCollationRegistry {
                 .expect("Vec collation key sink should be infallible");
             key
         })
+    }
+
+    fn is_registered(&self, id: LocaleCollationId) -> bool {
+        (id.0 as usize) < self.collations.read().len()
     }
 
     fn name(&self, id: LocaleCollationId) -> String {
@@ -677,6 +683,28 @@ mod tests {
             CollationSeq::Locale(_)
         ));
         assert!(CollationSeq::new("compile_options").is_err());
+    }
+
+    #[test]
+    fn collation_bits_round_trip_and_unknown_bits_are_an_error() {
+        let locale = CollationSeq::new("fr-FR").unwrap();
+        for collation in [
+            CollationSeq::Binary,
+            CollationSeq::NoCase,
+            CollationSeq::Rtrim,
+            locale,
+        ] {
+            assert_eq!(
+                CollationSeq::from_bits(collation.to_bits()).unwrap(),
+                collation
+            );
+        }
+        assert!(CollationSeq::from_bits(CollationSeq::NO_COLLATION_BITS).is_err());
+        assert!(CollationSeq::from_bits(u16::MAX).is_err());
+        assert_eq!(
+            CollationSeq::custom("my_custom_collation").to_bits(),
+            CollationSeq::NO_COLLATION_BITS
+        );
     }
 
     #[test]

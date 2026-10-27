@@ -99,7 +99,7 @@ fn normalized_first_key(
             ((1u64 << NORM_CLASS_SHIFT) | (monotone >> 3), exact)
         }
         ValueRef::Text(t) => {
-            if !matches!(key.collation, CollationSeq::Unset | CollationSeq::Binary) {
+            if key.collation != CollationSeq::Binary {
                 // Non-binary collation: constant key, always full comparison.
                 (2u64 << NORM_CLASS_SHIFT, false)
             } else {

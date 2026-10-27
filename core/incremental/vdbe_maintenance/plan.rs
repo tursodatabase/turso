@@ -1925,7 +1925,7 @@ fn match_counts_table_sql(table_name: &str, payload_width: usize) -> String {
 /// collations (which do not) are rejected at classify time.
 fn collate_clause(collation: CollationSeq) -> String {
     match collation {
-        CollationSeq::Binary | CollationSeq::Unset => String::new(),
+        CollationSeq::Binary => String::new(),
         other => format!(" COLLATE \"{}\"", other.name()),
     }
 }

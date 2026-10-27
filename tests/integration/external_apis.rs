@@ -1113,6 +1113,33 @@ fn custom_collations_cover_dotnet_create_collation_cases(
     Ok(())
 }
 
+#[turso_macros::test]
+#[serial]
+fn ordered_set_aggregates_reject_custom_collations(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_external_collation(
+        "dotnet_nocase".to_string(),
+        0,
+        dotnet_nocase_collation,
+        None,
+    );
+    conn.execute("CREATE TABLE names(value TEXT)")?;
+    conn.execute("INSERT INTO names VALUES ('b'), ('A'), ('a')")?;
+    for sql in [
+        "SELECT mode() WITHIN GROUP (ORDER BY value COLLATE dotnet_nocase) FROM names",
+        "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY value COLLATE dotnet_nocase) FROM names",
+    ] {
+        let err = conn.execute(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not support the custom collation dotnet_nocase"),
+            "{sql}: {err}"
+        );
+    }
+    conn.unregister_external_collation("dotnet_nocase");
+    Ok(())
+}
+
 static TRACKED_DOUBLE_DESTROYS: AtomicUsize = AtomicUsize::new(0);
 static TRACKED_CALLS_AFTER_DESTROY: AtomicUsize = AtomicUsize::new(0);
 
