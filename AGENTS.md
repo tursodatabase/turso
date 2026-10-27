@@ -178,7 +178,23 @@ end of the file or wherever the cursor happened to be.
 ## Prefer expressive code over comments
 
 Good names and structure should explain most code, and comments that restate the code go stale. Where the code
-alone can't explain why something is done, a short plain comment is welcome.
+alone can't explain why something is done, a short plain comment is welcome. A comment on a field or function should
+describe that item. Who updates it, in what order, when it is computed, and how the code used to work are facts about
+other code or about the past and are not relevant to the identifier. For example, instead of:
+
+```rs
+/// Cursor IDs opened as ephemeral (OpenEphemeral / OpenAutoindex / OpenDup).
+/// Computed once at program-build time so `insn_to_row` does not scan the
+/// full instruction list on every EXPLAIN step (which would be O(N²)).
+pub ephemeral_cursors: HashSet<usize>,
+```
+
+write:
+
+```rs
+/// Cursor IDs opened as ephemeral (OpenEphemeral / OpenAutoindex / OpenDup).
+pub ephemeral_cursors: HashSet<usize>,
+```
 
 ## CI Note
 
