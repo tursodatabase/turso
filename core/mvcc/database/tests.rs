@@ -24621,7 +24621,9 @@ unsafe impl crate::alloc::ApiAllocator for OneShotFaultAlloc {
 /// outer tx's writes survived a later ROLLBACK.
 #[test]
 fn test_busy_autoincrement_inner_commit_keeps_outer_tx() {
-    for use_trigger in [false, true] {
+    for (use_trigger, same_autoincrement_table) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
         let db = MvccTestDbNoConn::new_with_random_db();
         let conn_a = db.connect();
         let conn_b = db.connect();
@@ -24637,10 +24639,17 @@ fn test_busy_autoincrement_inner_commit_keeps_outer_tx() {
             .unwrap();
 
         conn_b.execute("BEGIN IMMEDIATE").unwrap();
-        conn_b.execute("INSERT INTO p VALUES ('b')").unwrap();
+        conn_b
+            .execute(if same_autoincrement_table {
+                "INSERT INTO s (v) VALUES (100)"
+            } else {
+                "INSERT INTO p VALUES ('b')"
+            })
+            .unwrap();
 
         conn_a.execute("BEGIN CONCURRENT").unwrap();
         conn_a.execute("INSERT INTO p VALUES ('a')").unwrap();
+        let outer_tx = conn_a.get_mv_tx_id().expect("outer transaction is active");
         let sql = if use_trigger {
             "INSERT INTO q VALUES (1)"
         } else {
@@ -24649,19 +24658,119 @@ fn test_busy_autoincrement_inner_commit_keeps_outer_tx() {
         let mut insert = conn_a.prepare(sql).unwrap();
         step_until_busy_then_release(&mut insert, &conn_b).unwrap();
         drop(insert);
+        assert_eq!(conn_a.get_mv_tx_id(), Some(outer_tx));
+        assert!(!conn_a.get_auto_commit());
 
         assert_eq!(
-            get_rows(&conn_a, "SELECT v FROM s"),
-            vec![vec![Value::from_i64(if use_trigger { 2 } else { 1 })]]
+            get_rows(&conn_a, "SELECT id, v FROM s"),
+            vec![vec![
+                Value::from_i64(if same_autoincrement_table { 2 } else { 1 }),
+                Value::from_i64(if use_trigger { 2 } else { 1 }),
+            ]]
         );
         conn_a.execute("ROLLBACK").unwrap();
 
         let conn_c = db.connect();
         assert_eq!(
             get_rows(&conn_c, "SELECT v FROM p"),
-            vec![vec![Value::build_text("b")]]
+            if same_autoincrement_table {
+                vec![]
+            } else {
+                vec![vec![Value::build_text("b")]]
+            }
         );
-        assert!(get_rows(&conn_c, "SELECT v FROM s").is_empty());
+        assert_eq!(
+            get_rows(&conn_c, "SELECT v FROM s"),
+            if same_autoincrement_table {
+                vec![vec![Value::from_i64(100)]]
+            } else {
+                vec![]
+            }
+        );
+    }
+}
+
+#[test]
+fn test_autoincrement_wait_keeps_outer_transaction_committable() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    conn_a
+        .execute("CREATE TABLE s(id INTEGER PRIMARY KEY AUTOINCREMENT, v)")
+        .unwrap();
+    conn_a.execute("CREATE TABLE p(v)").unwrap();
+    conn_b.execute("BEGIN IMMEDIATE").unwrap();
+    conn_b.execute("INSERT INTO s(v) VALUES(100)").unwrap();
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("INSERT INTO p VALUES('a')").unwrap();
+    let mut insert = conn_a.prepare("INSERT INTO s(v) VALUES(1)").unwrap();
+    step_until_busy_then_release(&mut insert, &conn_b).unwrap();
+    drop(insert);
+    conn_a.execute("COMMIT").unwrap();
+    let reader = db.connect();
+    assert_eq!(
+        get_rows(&reader, "SELECT v FROM p"),
+        vec![vec![Value::build_text("a")]]
+    );
+    assert_eq!(
+        get_rows(&reader, "SELECT id,v FROM s ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(100)],
+            vec![Value::from_i64(2), Value::from_i64(1)],
+        ]
+    );
+}
+
+#[test]
+fn test_busy_autoincrement_begin_can_be_cancelled_without_aborting_outer_tx() {
+    for use_trigger in [false, true] {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let conn_a = db.connect();
+        let conn_b = db.connect();
+        conn_a
+            .execute("CREATE TABLE s(id INTEGER PRIMARY KEY AUTOINCREMENT, v)")
+            .unwrap();
+        conn_a.execute("CREATE TABLE p(v)").unwrap();
+        conn_a.execute("CREATE TABLE q(v)").unwrap();
+        conn_a
+            .execute("CREATE TRIGGER q_ins AFTER INSERT ON q BEGIN INSERT INTO s(v) VALUES(2); END")
+            .unwrap();
+        conn_b.execute("BEGIN IMMEDIATE").unwrap();
+        conn_b.execute("INSERT INTO s(v) VALUES(100)").unwrap();
+        conn_a.execute("BEGIN CONCURRENT").unwrap();
+        conn_a.execute("INSERT INTO p VALUES('a')").unwrap();
+        let outer_tx = conn_a.get_mv_tx_id().unwrap();
+        let mut insert = conn_a
+            .prepare(if use_trigger {
+                "INSERT INTO q VALUES(1)"
+            } else {
+                "INSERT INTO s(v) VALUES(1)"
+            })
+            .unwrap();
+        loop {
+            match insert.step().unwrap() {
+                StepResult::IO | StepResult::Yield => insert._io().step().unwrap(),
+                StepResult::Busy => break,
+                other => panic!("expected allocator contention, got {other:?}"),
+            }
+        }
+        drop(insert);
+        assert_eq!(conn_a.get_mv_tx_id(), Some(outer_tx));
+        assert!(!conn_a.get_auto_commit());
+        assert_eq!(
+            get_rows(&conn_a, "SELECT v FROM p"),
+            vec![vec![Value::build_text("a")]]
+        );
+        assert!(get_rows(&conn_a, "SELECT v FROM q").is_empty());
+        conn_a.execute("ROLLBACK").unwrap();
+        conn_b.execute("COMMIT").unwrap();
+        conn_b.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let reader = db.connect();
+        assert!(get_rows(&reader, "SELECT v FROM p").is_empty());
+        assert_eq!(
+            get_rows(&reader, "SELECT id,v FROM s"),
+            vec![vec![Value::from_i64(1), Value::from_i64(100)]]
+        );
     }
 }
 
