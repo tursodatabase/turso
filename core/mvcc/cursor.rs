@@ -1261,6 +1261,21 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
                 SeekBtreeState::CheckRow => {
                     let key = self.get_btree_current_key()?;
+                    // An exact rowid seek has at most one B-tree match: once that row is shadowed,
+                    // or the row reached is past it, the B-tree holds no visible match, and
+                    // advancing would walk every shadowed row after it.
+                    if let (true, SeekKey::TableRowId(target)) = (op.eq_only(), &seek_key) {
+                        let visible = match &key {
+                            Some(k @ RowKey::Int(id)) if id == target => {
+                                self.query_btree_version_is_valid(k)?
+                            }
+                            _ => false,
+                        };
+                        if !visible {
+                            self.dual_peek.btree_peek = CursorPeek::Exhausted;
+                            return Ok(IOResult::Done(()));
+                        }
+                    }
                     match key {
                         Some(k) if self.query_btree_version_is_valid(&k)? => {
                             self.dual_peek.btree_peek = CursorPeek::Row {

@@ -10309,6 +10309,64 @@ fn test_cursor_with_btree_and_mvcc_seek_after_checkpoint() {
     assert_eq!(res[0][0].as_int().unwrap(), 2);
 }
 
+/// Counts the B-tree steps MVCC cursors take to seek and to advance forward, and never yields.
+#[derive(Debug, Default)]
+struct SeekBtreeSteps(AtomicU64);
+
+impl YieldInjector for SeekBtreeSteps {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        if point == CursorYieldPoint::SeekBtreeProgress.point()
+            || point == CursorYieldPoint::AdvanceBtreeForwardProgress.point()
+        {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        false
+    }
+}
+
+/// What this test checks: An exact rowid seek over checkpointed rows that newer versions shadow
+/// returns each row's newest version, or nothing for a deleted or missing row, in a few B-tree
+/// steps however many shadowed rows follow its target.
+/// Why this matters: A seek that steps through the shadowed rows after its target makes point
+/// lookups over an updated table quadratic.
+#[test]
+fn test_exact_rowid_seek_over_shadowed_btree_rows() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    for i in 1..=200 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, {i})"))
+            .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    // Newer versions shadow the first 150 B-tree rows and every deleted one.
+    conn.execute("UPDATE t SET v = v + 1000 WHERE id <= 150")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE id % 3 = 0").unwrap();
+
+    let steps = Arc::new(SeekBtreeSteps::default());
+    conn.set_yield_injector(Some(steps.clone()));
+    for i in 1..=201 {
+        steps.0.store(0, Ordering::Relaxed);
+        let rows = get_rows(&conn, &format!("SELECT v FROM t WHERE id = {i}"));
+        let expected = if i > 200 || i % 3 == 0 {
+            None
+        } else if i <= 150 {
+            Some(i + 1000)
+        } else {
+            Some(i)
+        };
+        assert_eq!(
+            rows.first().map(|row| row[0].as_int().unwrap()),
+            expected,
+            "id {i}"
+        );
+        let taken = steps.0.load(Ordering::Relaxed);
+        assert!(taken <= 2, "the seek for id {i} took {taken} B-tree steps");
+    }
+}
+
 /// What this test checks: Checkpoint transitions preserve DB/WAL/log ordering and watermark updates for the tested edge case.
 /// Why this matters: Incorrect ordering breaks crash safety, replay boundaries, or durability guarantees.
 #[test]
