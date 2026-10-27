@@ -188,6 +188,22 @@ fn select_star_wide_table(bencher: Bencher, cols: usize) {
     });
 }
 
+#[turso_macros::divan_bench(args = [1, 100, 1000])]
+fn select_one_column_wide_table(bencher: Bencher, cols: usize) {
+    let (db, conn) = setup();
+    let mut ddl = String::from("CREATE TABLE wide (c0 INTEGER");
+    for c in 1..cols {
+        ddl.push_str(&format!(", c{c} INTEGER"));
+    }
+    ddl.push(')');
+    execute(&db, &conn, &ddl);
+    let sql = "SELECT c0 FROM wide WHERE c0 = ?";
+    let _warmup = conn.prepare(sql).unwrap();
+    bencher.bench_local(|| {
+        black_box(conn.prepare(black_box(sql)).unwrap());
+    });
+}
+
 // --- Joins -----------------------------------------------------------------
 
 #[turso_macros::divan_bench]

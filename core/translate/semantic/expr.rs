@@ -4036,6 +4036,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }))
     }
 
+    #[inline]
     pub(super) fn resolve_atomic_expr(
         &mut self,
         expression: hir::Expr,

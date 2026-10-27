@@ -1295,20 +1295,26 @@ pub(super) struct ConstraintRow<'a> {
 
 impl ConstraintRow<'_> {
     pub(super) fn named_columns(&self, with_virtual: bool) -> (Vec<usize>, Vec<String>) {
-        self.table
+        let mut registers = Vec::with_capacity(self.table.columns().len());
+        let mut names = Vec::with_capacity(self.table.columns().len());
+        for (position, column) in self
+            .table
             .columns()
             .iter()
             .enumerate()
             .filter(|(_, column)| with_virtual || !column.is_virtual_generated())
-            .filter_map(|(position, column)| {
+        {
+            if let Some(name) = &column.name {
                 let register = if column.is_rowid_alias() {
                     self.rowid
                 } else {
                     self.start + position
                 };
-                column.name.clone().map(|name| (register, name))
-            })
-            .unzip()
+                registers.push(register);
+                names.push(name.clone());
+            }
+        }
+        (registers, names)
     }
 
     pub(super) fn not_null(&self, column: &Column) -> Option<Box<ConstraintInfo>> {
