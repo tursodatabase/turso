@@ -1877,17 +1877,31 @@ fn query_pragma(
                     } else {
                         program.emit_null(base_reg + 4, None);
                     }
-                    if type_def.operators().is_empty() {
+                    // The declared operators, then the built-in operators that
+                    // run a function, one entry per operator and function. A
+                    // built-in operator without a function is SQLite's own.
+                    let declared = type_def
+                        .operators()
+                        .iter()
+                        .map(|op| (op.op.as_str(), op.func_name.as_deref()));
+                    let built_in = type_def
+                        .all_signatures()
+                        .iter()
+                        .filter(|s| s.func.is_some())
+                        .map(|s| (s.op, s.func.as_deref()));
+                    let mut ops: Vec<String> = Vec::new();
+                    for (op, func) in declared.chain(built_in) {
+                        let op = match func {
+                            Some(f) => format!("'{op}' {f}"),
+                            None => format!("'{op}'"),
+                        };
+                        if !ops.contains(&op) {
+                            ops.push(op);
+                        }
+                    }
+                    if ops.is_empty() {
                         program.emit_null(base_reg + 5, None);
                     } else {
-                        let ops: Vec<String> = type_def
-                            .operators()
-                            .iter()
-                            .map(|op| match &op.func_name {
-                                Some(f) => format!("'{}' {}", op.op, f),
-                                None => format!("'{}'", op.op),
-                            })
-                            .collect();
                         program.emit_string8(ops.join(", "), base_reg + 5);
                     }
                     program.emit_result_row(base_reg, 6);

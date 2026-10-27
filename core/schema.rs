@@ -501,11 +501,15 @@ impl TypeDef {
 
     /// How `op` can run on a value of this type, most specific first.
     pub fn arithmetic<'a>(&'a self, op: &'a str) -> impl Iterator<Item = &'a ArithmeticSignature> {
-        let signatures: &[ArithmeticSignature] = match &self.kind {
+        self.all_arithmetic().iter().filter(move |s| s.op == op)
+    }
+
+    /// Every arithmetic signature of the type, declared or built in.
+    pub fn all_arithmetic(&self) -> &[ArithmeticSignature] {
+        match &self.kind {
             TypeDefKind::Custom { arithmetic, .. } => arithmetic,
             _ => &[],
-        };
-        signatures.iter().filter(move |s| s.op == op)
+        }
     }
 
     /// Returns the default expression (Custom types only).

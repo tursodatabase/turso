@@ -270,7 +270,7 @@ pub(super) fn find_custom_comparison(
                 func_name,
                 swap_args,
                 negate,
-                encode_info: Some(OperatorEncodeInfo {
+                encode_info: encode_other.then(|| OperatorEncodeInfo {
                     type_def: info.type_def.clone(),
                     type_params: info.params.clone(),
                     which,
