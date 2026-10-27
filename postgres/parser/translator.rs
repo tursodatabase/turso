@@ -3844,7 +3844,7 @@ impl PostgreSQLTranslator {
         &self,
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
-        let func_name = object_name(&func_call.funcname, is_pg_catalog, "function")?;
+        let func_name = function_name(&func_call.funcname)?;
         if func_name.eq_ignore_ascii_case("substring")
             && func_call.args.get(1).is_some_and(is_text_pattern)
         {
@@ -7256,6 +7256,28 @@ fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
             .any(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "||")),
         _ => false,
     }
+}
+
+fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
+    // try to look for built-ins
+    if let [schema, name] = extract_key_columns(names)?.as_slice() {
+        if schema == "auth" {
+            let qualified_name = format!("{schema}.{name}");
+            return match name.as_str() {
+                "uid" | "email" | "jwt" => Ok(qualified_name),
+                _ => Err(no_such_function(&qualified_name)),
+            };
+        }
+    }
+    let name = object_name(names, is_pg_catalog, "function")?;
+    if name.contains('.') {
+        return Err(no_such_function(&name));
+    }
+    Ok(name)
+}
+
+fn no_such_function(name: &str) -> ParseError {
+    ParseError::ParseError(format!("no such function: {name}"))
 }
 
 fn object_name(

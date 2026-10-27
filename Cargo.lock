@@ -7279,12 +7279,14 @@ dependencies = [
  "chumsky",
  "parking_lot",
  "rustc-hash 2.1.1",
+ "serde_json",
  "strum",
  "tempfile",
  "turso_core",
  "turso_ext",
  "turso_parser",
  "turso_pg_parser",
+ "uuid",
 ]
 
 [[package]]

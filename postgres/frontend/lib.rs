@@ -1,3 +1,4 @@
+mod auth_functions;
 mod catalog;
 mod copy;
 mod error;
