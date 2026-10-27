@@ -39,6 +39,7 @@ pub mod schema;
 pub mod skiplist;
 pub mod state_machine;
 pub mod storage;
+pub mod type_ordering;
 pub mod types;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod vdbe;

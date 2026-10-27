@@ -905,8 +905,8 @@ fn emit_compound_order_by(
 
     let sort_cursor = program.alloc_cursor_id(CursorType::Sorter);
     // Resolve custom type comparators for ORDER BY columns (e.g. numeric(10,2) needs
-    // NumericLt to sort correctly instead of default blob/text comparison).
-    let comparators: crate::alloc::Vec<Option<crate::vdbe::insn::SortComparatorType>> = order_by
+    // numeric to sort correctly instead of default blob/text comparison).
+    let comparators: crate::alloc::Vec<Option<crate::type_ordering::TypeOrdering>> = order_by
         .iter()
         .map(|(col_idx, _, _, _)| {
             program.result_columns.get(*col_idx).and_then(|rc| {

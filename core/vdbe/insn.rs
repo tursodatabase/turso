@@ -11,6 +11,7 @@ pub fn to_u32(v: usize) -> u32 {
 
 use super::{execute, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::function::AccumulatorFunc;
+use crate::type_ordering::TypeOrdering;
 use crate::{
     schema::{BTreeTable, CheckConstraint, Column, ForeignKey, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
@@ -62,16 +63,6 @@ impl Subprogram {
             }),
         }
     }
-}
-
-/// Known custom type comparator functions for sorting and MIN/MAX aggregates.
-/// These replace heap-allocated String names with a compact enum.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SortComparatorType {
-    NumericLt,
-    StringReverse,
-    TestUintLt,
-    ArrayLt,
 }
 
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
@@ -353,7 +344,7 @@ pub struct SorterOpenData {
     )>,
     /// Per-column custom type comparators for ORDER BY sorting.
     /// When present, the comparator is used instead of standard value comparison.
-    pub comparators: crate::alloc::Vec<Option<SortComparatorType>>,
+    pub comparators: crate::alloc::Vec<Option<TypeOrdering>>,
 }
 
 /// Data for AggStep instruction (boxed to keep Insn small).
@@ -364,7 +355,7 @@ pub struct AggStepData {
     pub delimiter: usize,
     pub func: AccumulatorFunc,
     /// Optional custom type comparator for MIN/MAX aggregates.
-    pub comparator: Option<SortComparatorType>,
+    pub comparator: Option<TypeOrdering>,
     /// Collation for comparison-based aggregates (MIN/MAX), resolved at
     /// translation time from the argument expression.
     pub collation: Option<CollationSeq>,
@@ -1410,7 +1401,7 @@ pub enum Insn {
         col: usize,
         delimiter: usize,
         func: AccumulatorFunc,
-        comparator: Option<SortComparatorType>,
+        comparator: Option<TypeOrdering>,
     },
 
     AggFinal {

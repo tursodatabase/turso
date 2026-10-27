@@ -422,3 +422,43 @@ test custom-comparator-roundtrips-through-sql {
 expect {
     CREATE TYPE rt_type2 BASE text ENCODE string_reverse (value) DECODE string_reverse (value) OPERATOR '<' string_reverse
 }
+
+# --- A sort never fails: values that are not of the type still get a place ---
+
+@requires strict "uses STRICT tables"
+test numeric-order-puts-text-that-is-not-a-number-after-numbers {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (2), (1);
+    SELECT n FROM t UNION ALL SELECT 'x' UNION ALL SELECT '1e100000000' ORDER BY 1;
+}
+expect {
+    1.00
+    2.00
+    1e100000000
+    x
+}
+
+@requires strict "uses STRICT tables"
+test numeric-order-puts-text-that-is-not-a-number-after-numbers-desc {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (2), (1);
+    SELECT n FROM t UNION ALL SELECT 'x' ORDER BY 1 DESC;
+}
+expect {
+    x
+    2.00
+    1.00
+}
+
+@requires strict "uses STRICT tables"
+test array-order-puts-text-that-is-not-an-array-after-arrays {
+    CREATE TABLE t(a integer[]) STRICT;
+    INSERT INTO t VALUES ('{2}'), ('{1,2}'), (NULL);
+    SELECT a FROM t UNION ALL SELECT 'x' ORDER BY 1;
+}
+expect {
+
+    {1,2}
+    {2}
+    x
+}

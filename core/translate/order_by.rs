@@ -28,19 +28,7 @@ use super::{
 
 use super::expr::expr_type::{column_custom_type, type_of, TypeEnv};
 use crate::translate::eqp::{EqpDetail, EqpSortMethod};
-use crate::vdbe::insn::SortComparatorType;
-
-/// Maps a custom type `<` operator function name to a SortComparatorType.
-/// Returns None if the function name is not recognized.
-fn sort_comparator_from_func_name(func_name: &str) -> Option<SortComparatorType> {
-    match func_name {
-        "numeric_lt" => Some(SortComparatorType::NumericLt),
-        "test_uint_lt" => Some(SortComparatorType::TestUintLt),
-        "string_reverse" => Some(SortComparatorType::StringReverse),
-        "array_lt" => Some(SortComparatorType::ArrayLt),
-        _ => None,
-    }
-}
+use crate::type_ordering::TypeOrdering;
 
 /// Returns the comparator for sorting an expression: element by element for an
 /// array, or the function behind the `<` operator of a column's custom type when
@@ -49,10 +37,10 @@ pub(crate) fn custom_type_comparator(
     expr: &ast::Expr,
     referenced_tables: &TableReferences,
     resolver: &Resolver,
-) -> Option<SortComparatorType> {
+) -> Option<TypeOrdering> {
     let env = TypeEnv::new(Some(referenced_tables), resolver);
     if type_of(expr, &env).is_array() {
-        return Some(SortComparatorType::ArrayLt);
+        return Some(TypeOrdering::Array);
     }
     column_custom_type(expr, &env)?
         .type_def
@@ -60,7 +48,7 @@ pub(crate) fn custom_type_comparator(
         .iter()
         .find(|op| op.op == "<")
         .and_then(|op| op.func_name.as_ref())
-        .and_then(|func_name| sort_comparator_from_func_name(func_name))
+        .and_then(|func_name| TypeOrdering::from_less_than_function(func_name))
 }
 
 /// For a result column expression that is a column reference to a custom type,

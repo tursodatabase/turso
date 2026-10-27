@@ -4282,13 +4282,11 @@ impl Connection {
     pub(crate) fn external_collation_comparator(
         external: Arc<function::ExternalCollation>,
     ) -> crate::vdbe::sorter::SortComparator {
-        Arc::new(move |left, right| {
-            Ok(match (left, right) {
-                (crate::ValueRef::Text(left), crate::ValueRef::Text(right)) => {
-                    Self::custom_collation_compare(&external, left.as_str(), right.as_str())
-                }
-                _ => left.partial_cmp(right).unwrap_or(CmpOrdering::Equal),
-            })
+        Arc::new(move |left, right| match (left, right) {
+            (crate::ValueRef::Text(left), crate::ValueRef::Text(right)) => {
+                Self::custom_collation_compare(&external, left.as_str(), right.as_str())
+            }
+            _ => left.partial_cmp(right).unwrap_or(CmpOrdering::Equal),
         })
     }
 

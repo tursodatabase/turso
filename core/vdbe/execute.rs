@@ -31,6 +31,7 @@ use crate::storage::pager::{
 };
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
+use crate::type_ordering::TypeOrdering;
 use crate::types::IOResultOr;
 use crate::types::{
     compare_immutable, compare_immutable_single, compare_record, AsValueRef, Extendable,
@@ -160,7 +161,7 @@ use super::{
     },
     insn::{
         AddSequenceData, AggStepData, ArrayEncodeData, ClearBtreeCount, Cookie, IntegrityCkData,
-        IvmSumKind, RegisterOrLiteral, SortComparatorType, SorterOpenData,
+        IvmSumKind, RegisterOrLiteral, SorterOpenData,
     },
     CommitState,
 };
@@ -275,106 +276,8 @@ impl<T> OrOverflow<T> for Option<T> {
     }
 }
 
-/// Create a sort comparator closure from a SortComparatorType enum.
-fn make_sort_comparator(
-    cmp_type: &SortComparatorType,
-) -> Result<crate::vdbe::sorter::SortComparator> {
-    use std::cmp::Ordering;
-    let cmp: crate::vdbe::sorter::SortComparator = match cmp_type {
-        SortComparatorType::NumericLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
-                let res = match (a, b) {
-                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
-                    (ValueRef::Null, _) => Ordering::Less,
-                    (_, ValueRef::Null) => Ordering::Greater,
-                    _ => {
-                        let a = numeric_from_value(&a.to_owned()?)?;
-                        let b = numeric_from_value(&b.to_owned()?)?;
-                        a.cmp(&b)
-                    }
-                };
-                Ok(res)
-            })
-        }
-        SortComparatorType::StringReverse => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
-                fn reverse_str(v: &ValueRef) -> String {
-                    match v {
-                        ValueRef::Text(t) => t.to_string().chars().rev().collect(),
-                        _ => String::new(),
-                    }
-                }
-                let res = match (a, b) {
-                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
-                    (ValueRef::Null, _) => Ordering::Less,
-                    (_, ValueRef::Null) => Ordering::Greater,
-                    _ => reverse_str(a).cmp(&reverse_str(b)),
-                };
-                Ok(res)
-            })
-        }
-        SortComparatorType::TestUintLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
-                fn to_u64(v: &ValueRef) -> Option<u64> {
-                    match v {
-                        ValueRef::Null => None,
-                        ValueRef::Numeric(Numeric::Integer(i)) => {
-                            if *i >= 0 {
-                                Some(*i as u64)
-                            } else {
-                                None
-                            }
-                        }
-                        ValueRef::Text(t) => t.to_string().parse::<u64>().ok(),
-                        _ => None,
-                    }
-                }
-                let res = match (a, b) {
-                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
-                    (ValueRef::Null, _) => Ordering::Less,
-                    (_, ValueRef::Null) => Ordering::Greater,
-                    _ => match (to_u64(a), to_u64(b)) {
-                        (Some(a), Some(b)) => a.cmp(&b),
-                        _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                    },
-                };
-                Ok(res)
-            })
-        }
-        SortComparatorType::ArrayLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
-                let res = match (a, b) {
-                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
-                    (ValueRef::Null, _) => Ordering::Less,
-                    (_, ValueRef::Null) => Ordering::Greater,
-                    (ValueRef::Blob(a_blob), ValueRef::Blob(b_blob)) => {
-                        crate::vdbe::array::compare_arrays(a_blob, b_blob)
-                            .unwrap_or(Ordering::Equal)
-                    }
-                    (ValueRef::Text(a_text), ValueRef::Text(b_text)) => {
-                        let a_vals = crate::vdbe::array::parse_text_array(a_text);
-                        let b_vals = crate::vdbe::array::parse_text_array(b_text);
-                        match (a_vals, b_vals) {
-                            (Some(av), Some(bv)) => {
-                                let a_blob = crate::vdbe::array::values_to_record_blob(&av)?;
-                                let b_blob = crate::vdbe::array::values_to_record_blob(&bv)?;
-                                if let (Value::Blob(ab), Value::Blob(bb)) = (&a_blob, &b_blob) {
-                                    crate::vdbe::array::compare_arrays(ab, bb)
-                                        .unwrap_or(Ordering::Equal)
-                                } else {
-                                    Ordering::Equal
-                                }
-                            }
-                            _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                        }
-                    }
-                    _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                };
-                Ok(res)
-            })
-        }
-    };
-    Ok(cmp)
+fn make_sort_comparator(ordering: TypeOrdering) -> crate::vdbe::sorter::SortComparator {
+    std::sync::Arc::new(move |a: &ValueRef, b: &ValueRef| ordering.compare(*a, *b))
 }
 
 /// Compare two values using the specified collation for text values.
@@ -388,7 +291,7 @@ fn compare_with_collation(
     Ok(match (lhs, rhs) {
         (Value::Text(lhs_text), Value::Text(rhs_text)) => {
             if let Some(comparator) = collation_comparator {
-                comparator(&lhs.as_ref(), &rhs.as_ref())?
+                comparator(&lhs.as_ref(), &rhs.as_ref())
             } else if let Some(coll) = collation {
                 coll.compare_strings(lhs_text.as_str(), rhs_text.as_str())
             } else {
@@ -7751,7 +7654,7 @@ fn update_agg_payload(
             let cmp = if let Some(ref cmp_fn) = comparator {
                 let arg_ref = arg.as_ref();
                 let payload_ref = payload[0].as_ref();
-                cmp_fn(&arg_ref, &payload_ref)?
+                cmp_fn(&arg_ref, &payload_ref)
             } else {
                 compare_with_collation(arg, &payload[0], Some(collation), &comparator)?
             };
@@ -9576,7 +9479,7 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
     let current_collation = collation.unwrap_or(CollationSeq::Binary);
     let comparator_factory = move || -> Result<Option<crate::vdbe::sorter::SortComparator>> {
         Ok(match comparator.as_ref() {
-            Some(comparator) => Some(make_sort_comparator(comparator)?),
+            Some(comparator) => Some(make_sort_comparator(*comparator)),
             None if current_collation.is_custom() => Some(
                 program
                     .connection
@@ -9804,7 +9707,7 @@ pub fn op_sorter_open(
         crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())?;
     for (idx, (_, coll, _)) in order_collations_nulls.iter().enumerate() {
         let comparator = match comparators.get(idx).and_then(|c| c.as_ref()) {
-            Some(comparator) => Some(make_sort_comparator(comparator)?),
+            Some(comparator) => Some(make_sort_comparator(*comparator)),
             None => match coll {
                 Some(collation) if collation.is_custom() => {
                     Some(program.connection.make_collation_comparator(*collation)?)
