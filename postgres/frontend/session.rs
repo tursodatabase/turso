@@ -14,7 +14,8 @@ use turso_parser::ast::{self};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST, SQLSTATE_FEATURE_NOT_SUPPORTED,
     SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_SCHEMA_NAME,
-    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_NO_ACTIVE_SQL_TRANSACTION, SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+    SQLSTATE_RESERVED_NAME, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
     check_set_transaction, is_comment_on, is_drop_matview, is_refresh_matview,
@@ -217,10 +218,26 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
     }
 
     if translated.prereqs.is_empty() {
-        return pg_conn
-            .conn
-            .prepare_translated_cmd(translated.cmd, &sql)
-            .map(crate::Statement::new);
+        let savepoint_command = savepoint_command_name(translated.cmd.stmt());
+        let inner = pg_conn.conn.prepare_translated_cmd(translated.cmd, &sql)?;
+        let Some(command) = savepoint_command else {
+            return Ok(crate::Statement::new(inner));
+        };
+        // Core's savepoint statements start a transaction when none is open,
+        // like SQLite, so the check runs when the statement runs.
+        let conn = Arc::clone(&pg_conn.conn);
+        return Ok(crate::Statement::with_deferred(
+            inner,
+            Box::new(move |inner| {
+                if conn.get_auto_commit() {
+                    return Err(sqlstate_error(
+                        SQLSTATE_NO_ACTIVE_SQL_TRANSACTION,
+                        format!("{command} can only be used in transaction blocks"),
+                    ));
+                }
+                inner.run_ignore_rows()
+            }),
+        ));
     }
 
     // Validate prerequisites and the target command during prepare without
@@ -243,6 +260,20 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
             execute_cmd_with_prereqs(&pg_conn, &prereqs, &cmd, &sql_owned, inner)
         }),
     ))
+}
+
+/// The PostgreSQL name of a savepoint statement, which PostgreSQL runs only
+/// inside a transaction block.
+fn savepoint_command_name(stmt: &ast::Stmt) -> Option<&'static str> {
+    match stmt {
+        ast::Stmt::Savepoint { .. } => Some("SAVEPOINT"),
+        ast::Stmt::Release { .. } => Some("RELEASE SAVEPOINT"),
+        ast::Stmt::Rollback {
+            savepoint_name: Some(_),
+            ..
+        } => Some("ROLLBACK TO SAVEPOINT"),
+        _ => None,
+    }
 }
 
 const PG_STMT_SAVEPOINT: &str = "__turso_pg_stmt";

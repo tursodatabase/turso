@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::num::NonZero;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
@@ -27,7 +27,7 @@ use pgwire::api::{
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
 use pgwire::messages::extendedquery::{Describe, Execute};
-use pgwire::messages::response::{ErrorResponse, ReadyForQuery};
+use pgwire::messages::response::{ErrorResponse, ReadyForQuery, TransactionStatus};
 use pgwire::messages::simplequery::Query;
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::tokio::process_socket;
@@ -71,6 +71,7 @@ impl TursoPgServer {
         let factory = Arc::new(TursoPgFactory {
             handler: Arc::new(TursoPgHandler {
                 conn: self.conn.clone(),
+                transaction_failed: AtomicBool::new(false),
                 db_file: self.db_file.clone(),
                 query_parser: Arc::new(NoopQueryParser::new()),
             }),
@@ -112,11 +113,69 @@ impl TursoPgServer {
 
 struct TursoPgHandler {
     conn: Arc<Mutex<PgConnection>>,
+    /// Whether a statement of the open transaction failed. PostgreSQL then
+    /// runs no more statements until the transaction ends.
+    transaction_failed: AtomicBool,
     db_file: String,
     query_parser: Arc<NoopQueryParser>,
 }
 
 impl TursoPgHandler {
+    /// pgwire reports the status that the client had before the query, changed
+    /// by the TransactionStart and TransactionEnd responses of the query. Set
+    /// it from the connection, without the failed state: a ROLLBACK TO
+    /// SAVEPOINT that succeeds in a failed transaction leaves it in progress.
+    fn start_query<C: ClientInfo>(&self, client: &mut C) {
+        let conn = self.conn.lock().unwrap().clone();
+        client.set_transaction_status(if conn.inner().get_auto_commit() {
+            TransactionStatus::Idle
+        } else {
+            TransactionStatus::Transaction
+        });
+    }
+
+    /// The statement to run for `sql`. In a failed transaction PostgreSQL
+    /// refuses every statement but ROLLBACK, ROLLBACK TO SAVEPOINT and
+    /// COMMIT, which rolls back.
+    fn statement_to_run<'a>(&self, conn: &PgConnection, sql: &'a str) -> PgWireResult<&'a str> {
+        if conn.inner().get_auto_commit() || !self.transaction_failed.load(Ordering::SeqCst) {
+            return Ok(sql);
+        }
+        let upper = sql.trim_start().to_uppercase();
+        let sql = if upper.starts_with("ROLLBACK") || upper.starts_with("ABORT") {
+            sql
+        } else if upper.starts_with("COMMIT") || upper.starts_with("END") {
+            "ROLLBACK"
+        } else {
+            return Err(pg_error(
+                turso_core::LimboError::Dialect(Box::new(turso_core::DialectError {
+                    code: turso_pg::sqlstate::SQLSTATE_IN_FAILED_SQL_TRANSACTION,
+                    message: "current transaction is aborted, commands ignored until end of transaction block".to_owned(),
+                }))
+                .into(),
+            ));
+        };
+        self.transaction_failed.store(false, Ordering::SeqCst);
+        Ok(sql)
+    }
+
+    /// An error inside a transaction makes the transaction failed, like in
+    /// PostgreSQL.
+    fn end_query<C: ClientInfo>(&self, client: &mut C, result: &PgWireResult<()>) {
+        if result.is_ok() {
+            return;
+        }
+        let conn = self.conn.lock().unwrap().clone();
+        let in_transaction = !conn.inner().get_auto_commit();
+        self.transaction_failed
+            .store(in_transaction, Ordering::SeqCst);
+        client.set_transaction_status(if in_transaction {
+            TransactionStatus::Error
+        } else {
+            TransactionStatus::Idle
+        });
+    }
+
     /// After a DROP SCHEMA query succeeds, delete the schema's database file.
     /// Uses simple string matching to detect DROP SCHEMA statements.
     fn cleanup_dropped_schema_file(&self, query: &str) {
@@ -188,7 +247,9 @@ impl SimpleQueryHandler for TursoPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.start_query(client);
         let result = self._on_query(client, query).await;
+        self.end_query(client, &result);
         finish_query(client, result, false).await
     }
 
@@ -204,10 +265,11 @@ impl SimpleQueryHandler for TursoPgHandler {
 
         let mut responses = Vec::new();
         for sql in &statements {
+            let sql = self.statement_to_run(&conn, sql)?;
             let mut stmt = conn.prepare(sql).map_err(pg_error)?;
 
             if stmt.num_columns() == 0 || is_pg_non_query(sql) {
-                let response = execute_non_query(&mut stmt, sql)?;
+                let response = execute_non_query(&conn, &mut stmt, sql)?;
                 self.cleanup_dropped_schema_file(sql);
                 responses.push(response);
             } else {
@@ -232,7 +294,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.start_query(client);
         let result = self._on_execute(client, message).await;
+        self.end_query(client, &result);
         finish_query(client, result, true).await
     }
 
@@ -244,6 +308,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let result = self._on_describe(client, message).await;
+        self.end_query(client, &result);
         finish_query(client, result, true).await
     }
 
@@ -261,7 +326,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = self.conn.lock().unwrap().clone();
-        let query = &portal.statement.statement;
+        let query = self.statement_to_run(&conn, &portal.statement.statement)?;
 
         let mut stmt = conn.prepare(query).map_err(pg_error)?;
 
@@ -269,7 +334,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         bind_portal_parameters(&mut stmt, portal)?;
 
         if stmt.num_columns() == 0 || is_pg_non_query(query) {
-            let response = execute_non_query(&mut stmt, query)?;
+            let response = execute_non_query(&conn, &mut stmt, query)?;
             // Clean up schema file after successful DROP SCHEMA execution
             self.cleanup_dropped_schema_file(query);
             return Ok(response);
@@ -444,13 +509,25 @@ fn execute_query(
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
 }
 
-/// Execute a non-SELECT statement and build an Execution response.
-fn execute_non_query(stmt: &mut turso_pg::Statement, query: &str) -> PgWireResult<Response> {
+/// Execute a non-SELECT statement and build its response. pgwire changes the
+/// transaction status of the client only for a TransactionStart or
+/// TransactionEnd response.
+fn execute_non_query(
+    conn: &PgConnection,
+    stmt: &mut turso_pg::Statement,
+    query: &str,
+) -> PgWireResult<Response> {
+    let was_in_transaction = !conn.inner().get_auto_commit();
     stmt.run_ignore_rows().map_err(pg_error)?;
 
     let affected = stmt.n_change();
     let tag = command_tag(query, affected as usize);
-    Ok(Response::Execution(tag))
+    let in_transaction = !conn.inner().get_auto_commit();
+    Ok(match (was_in_transaction, in_transaction) {
+        (false, true) => Response::TransactionStart(tag),
+        (true, false) => Response::TransactionEnd(tag),
+        _ => Response::Execution(tag),
+    })
 }
 
 /// Extract parameters from a Portal and bind them to a prepared statement.
@@ -852,8 +929,7 @@ where
             fields,
         )))
         .await?;
-    let status = client.transaction_status().to_error_state();
-    client.set_transaction_status(status);
+    let status = client.transaction_status();
     if wait_for_sync {
         client.set_state(PgWireConnectionState::AwaitingSync);
     } else {
