@@ -18,6 +18,7 @@ pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_nam
 
 /// PostgreSQL uses OID zero when no object is referenced.
 const PG_INVALID_OID: i64 = 0;
+pub(crate) const PG_DATABASE_OWNER_OID: i64 = 6171;
 /// pg_depend uses column zero for a whole object; table columns are numbered from one.
 const WHOLE_OBJECT_COLUMN_NUMBER: i64 = 0;
 /// Catalog BOOLEAN values are stored as integers; one means true.
@@ -517,11 +518,21 @@ impl SnapshotRows for PgNamespaceTable {
         let mut rows: Vec<_> = BUILTIN_SCHEMAS
             .iter()
             .map(|(oid, name)| {
+                let (owner, acl) = if *name == "public" {
+                    (
+                        PG_DATABASE_OWNER_OID,
+                        Value::build_text(
+                            "{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}",
+                        ),
+                    )
+                } else {
+                    (10, Value::Null)
+                };
                 vec![
                     Value::from_i64(*oid),
                     Value::Text((*name).into()),
-                    Value::from_i64(10), // nspowner (bootstrap superuser)
-                    Value::Null,         // nspacl
+                    Value::from_i64(owner),
+                    acl,
                 ]
             })
             .collect();
@@ -716,7 +727,7 @@ impl SnapshotRows for PgAttributeTable {
 }
 
 /// Virtual table implementation for pg_catalog.pg_roles
-/// Stub: returns a single hardcoded "turso" superuser role.
+/// Stub: returns the "turso" superuser and the built-in database owner role.
 /// TODO: replace with real role data when authentication is implemented.
 #[derive(Debug)]
 struct PgRolesTable;
@@ -739,26 +750,41 @@ impl SnapshotRows for PgRolesTable {
         )";
     const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 10.0;
-    const ESTIMATED_ROWS: u32 = 1;
+    const ESTIMATED_ROWS: u32 = 2;
 
-    /// Stub: returns a single default superuser role.
-    /// Replace this method with real role lookup when auth is implemented.
     fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        vec![vec![
-            Value::from_i64(10),        // oid
-            Value::build_text("turso"), // rolname
-            Value::from_i64(1),         // rolsuper
-            Value::from_i64(1),         // rolinherit
-            Value::from_i64(1),         // rolcreaterole
-            Value::from_i64(1),         // rolcreatedb
-            Value::from_i64(1),         // rolcanlogin
-            Value::from_i64(1),         // rolreplication
-            Value::from_i64(-1),        // rolconnlimit (-1 = no limit)
-            Value::Null,                // rolpassword (never exposed)
-            Value::Null,                // rolvaliduntil
-            Value::from_i64(1),         // rolbypassrls
-            Value::Null,                // rolconfig
-        ]]
+        vec![
+            vec![
+                Value::from_i64(10),        // oid
+                Value::build_text("turso"), // rolname
+                Value::from_i64(1),         // rolsuper
+                Value::from_i64(1),         // rolinherit
+                Value::from_i64(1),         // rolcreaterole
+                Value::from_i64(1),         // rolcreatedb
+                Value::from_i64(1),         // rolcanlogin
+                Value::from_i64(1),         // rolreplication
+                Value::from_i64(-1),        // rolconnlimit (-1 = no limit)
+                Value::Null,                // rolpassword (never exposed)
+                Value::Null,                // rolvaliduntil
+                Value::from_i64(1),         // rolbypassrls
+                Value::Null,                // rolconfig
+            ],
+            vec![
+                Value::from_i64(PG_DATABASE_OWNER_OID),
+                Value::build_text("pg_database_owner"),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(-1),
+                Value::Null,
+                Value::Null,
+                Value::from_i64(0),
+                Value::Null,
+            ],
+        ]
     }
 }
 
