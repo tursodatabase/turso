@@ -799,6 +799,18 @@ impl FtsIndexAttachment {
             HashMap::default()
         };
 
+        // Tantivy panics on these names, so refuse them here
+        for col in &cfg.columns {
+            if !tantivy::schema::is_valid_field_name(&col.name)
+                || [ROWID_FIELD, IDENTITY_HI_FIELD, IDENTITY_LO_FIELD].contains(&col.name.as_str())
+            {
+                return Err(LimboError::ParseError(format!(
+                    "FTS cannot index a column named \"{}\": the name must not be empty, start with '-', or be one of {ROWID_FIELD}, {IDENTITY_HI_FIELD}, {IDENTITY_LO_FIELD}",
+                    col.name
+                )));
+            }
+        }
+
         // Build Tantivy schema (no Directory or Index creation yet)
         let mut schema_builder = Schema::builder();
 
@@ -845,45 +857,35 @@ impl FtsIndexAttachment {
         let cols = cfg
             .columns
             .iter()
-            .map(|c| c.name.as_str())
+            .map(|c| crate::util::quote_identifier(&c.name))
             .collect::<Vec<_>>()
             .join(", ");
+        let table = crate::util::quote_identifier(&cfg.table_name);
 
         // Pattern 0: score with ORDER BY DESC LIMIT
         let score_pattern = format!(
-            "SELECT fts_score({}, ?) as score FROM {} ORDER BY score DESC LIMIT ?",
-            cols, cfg.table_name
+            "SELECT fts_score({cols}, ?) as score FROM {table} ORDER BY score DESC LIMIT ?"
         );
         // Pattern 1: combined + ORDER BY DESC + LIMIT (most specific)
         let combined_ordered_limit = format!(
-            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1) ORDER BY score DESC LIMIT ?",
-            cols, cfg.table_name, cols
+            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) ORDER BY score DESC LIMIT ?"
         );
         // Pattern 2: combined + ORDER BY DESC (no LIMIT)
         let combined_ordered = format!(
-            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1) ORDER BY score DESC",
-            cols, cfg.table_name, cols
+            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) ORDER BY score DESC"
         );
         // Pattern 3: combined + LIMIT (no ORDER BY)
         let combined_limit = format!(
-            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1) LIMIT ?",
-            cols, cfg.table_name, cols
+            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) LIMIT ?"
         );
         // Pattern 4: combined (no ORDER BY, no LIMIT)
         let combined = format!(
-            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1)",
-            cols, cfg.table_name, cols
+            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1)"
         );
         // Pattern 5: match + LIMIT
-        let match_limit = format!(
-            "SELECT * FROM {} WHERE fts_match({}, ?) LIMIT ?",
-            cfg.table_name, cols
-        );
+        let match_limit = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?) LIMIT ?");
         // Pattern 6: match (no LIMIT)
-        let match_pattern = format!(
-            "SELECT * FROM {} WHERE fts_match({}, ?)",
-            cfg.table_name, cols
-        );
+        let match_pattern = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?)");
         let patterns = parse_patterns(&[
             &score_pattern,          // 0
             &combined_ordered_limit, // 1

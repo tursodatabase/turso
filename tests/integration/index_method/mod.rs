@@ -3140,7 +3140,7 @@ fn test_fts_mvcc_recovery(tmp_db: TempDatabase) {
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test(mvcc)]
-fn test_fts_rename_weighted_column_keeps_weight_after_reopen(tmp_db: TempDatabase) {
+fn test_fts_renames_keep_weights_and_queries_working_after_reopen(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
     conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
         .unwrap();
@@ -3152,9 +3152,11 @@ fn test_fts_rename_weighted_column_keeps_weight_after_reopen(tmp_db: TempDatabas
          (1, 'needle hay hay hay', ''), (2, '', 'needle'), (3, '', 'hay hay hay hay hay hay')",
     )
     .unwrap();
-    conn.execute("ALTER TABLE docs RENAME COLUMN a TO title")
+    conn.execute(r#"ALTER TABLE docs RENAME COLUMN a TO "my col""#)
         .unwrap();
     conn.execute("ALTER TABLE docs ALTER COLUMN b TO body TEXT")
+        .unwrap();
+    conn.execute(r#"ALTER TABLE docs RENAME TO "my docs""#)
         .unwrap();
 
     let path = tmp_db.path.clone();
@@ -3178,15 +3180,14 @@ fn test_fts_rename_weighted_column_keeps_weight_after_reopen(tmp_db: TempDatabas
             "SELECT sql FROM sqlite_schema WHERE name = 'docs_fts'"
         ),
         vec![vec![rusqlite::types::Value::Text(
-            "CREATE INDEX docs_fts ON docs USING fts (title, body) WITH (weights = 'title=10.0,body=1.0')"
+            r#"CREATE INDEX docs_fts ON "my docs" USING fts ("my col", body) WITH (weights = 'my col=10.0,body=1.0')"#
                 .to_string()
         )]]
     );
     assert_eq!(
         limbo_exec_rows(
             &conn,
-            "SELECT id FROM docs WHERE fts_match(title, body, 'needle') \
-             ORDER BY fts_score(title, body, 'needle') DESC"
+            r#"SELECT id FROM "my docs" WHERE fts_match("my col", body, 'needle') ORDER BY fts_score("my col", body, 'needle') DESC"#
         ),
         vec![
             vec![rusqlite::types::Value::Integer(1)],
