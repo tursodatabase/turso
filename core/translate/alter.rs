@@ -1996,6 +1996,7 @@ pub fn translate_alter_table(
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                             &view.sql,
                             s,
+                            namespace.id,
                             table_name,
                             &target_db_name,
                             from,
@@ -2016,6 +2017,7 @@ pub fn translate_alter_table(
                                 if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                                     &view.sql,
                                     s,
+                                    NamespaceId::ROOT,
                                     table_name,
                                     &target_db_name,
                                     from,
@@ -3218,7 +3220,12 @@ impl TargetQualifiers {
                 _ => {
                     other_table_has_column |= resolver
                         .with_schema(database_id, |schema| {
-                            crate::util::select_table_column_names(select_table, schema, &self.ctes)
+                            crate::util::select_table_column_names(
+                                NamespaceId::ROOT,
+                                select_table,
+                                schema,
+                                &self.ctes,
+                            )
                         })?
                         .iter()
                         .any(|column| column == old_col_norm);
@@ -3681,7 +3688,12 @@ fn apply_select_for_column_rename(
 ) -> Result<()> {
     let outer_target_qualifiers = &TargetQualifiers {
         ctes: resolver.with_schema(database_id, |schema| {
-            crate::util::extract_cte_columns(&select.with, schema, &outer_target_qualifiers.ctes)
+            crate::util::extract_cte_columns(
+                NamespaceId::ROOT,
+                &select.with,
+                schema,
+                &outer_target_qualifiers.ctes,
+            )
         })?,
         ..outer_target_qualifiers.clone()
     };

@@ -18181,6 +18181,7 @@ pub fn op_alter_column(
                     if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                         &view.sql,
                         schema,
+                        *namespace,
                         table_name.as_str(),
                         &target_db_name,
                         &old_column_name,
@@ -18209,6 +18210,7 @@ pub fn op_alter_column(
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                             &view.sql,
                             schema,
+                            NamespaceId::ROOT,
                             table_name.as_str(),
                             &target_db_name,
                             &old_column_name,

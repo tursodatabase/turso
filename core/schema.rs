@@ -2813,7 +2813,8 @@ impl Schema {
             }
 
             // Create the IncrementalView with all root pages
-            let incremental_view = IncrementalView::from_sql(&sql, self, main_root)?;
+            let incremental_view =
+                IncrementalView::from_sql(&sql, self, main_root, NamespaceId::ROOT)?;
 
             // Create a BTreeTable for the materialized view
             let cols = incremental_view.column_schema.flat_columns()?;
@@ -3225,8 +3226,11 @@ impl Schema {
                             select,
                             ..
                         } => {
-                            let mut view_column_schema =
-                                crate::util::extract_view_columns(&select, self)?;
+                            let mut view_column_schema = crate::util::extract_view_columns(
+                                NamespaceId::ROOT,
+                                &select,
+                                self,
+                            )?;
                             view_column_schema.rename_columns(&column_names);
                             let view = View::new(
                                 name.to_string(),
