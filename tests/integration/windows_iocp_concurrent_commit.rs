@@ -81,7 +81,7 @@ struct Shape {
 
 fn assert_concurrent_commits_succeed(shape: Shape) -> anyhow::Result<()> {
     let (encrypted, database_per_thread) = (shape.encrypted, shape.database_per_thread);
-    let (threads, rounds) = (env_usize(THREADS_ENV, 8), env_usize(ROUNDS_ENV, 100));
+    let (threads, rounds) = (env_usize(THREADS_ENV, 16), env_usize(ROUNDS_ENV, 500));
     let dir = tempfile::tempdir()?;
     let path = dir
         .path()
