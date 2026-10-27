@@ -554,6 +554,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     mv_cursor_type: MvccCursorType,
     table_id: MVTableId,
     tx_id: u64,
+    portable_logical_changes_enabled: bool,
     snapshot: MvccReadSnapshot,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: Option<ImmutableRecord>,
@@ -628,6 +629,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             #[cfg(any(test, injected_yields))]
             connection: Arc::downgrade(connection),
             tx_id,
+            portable_logical_changes_enabled: connection.portable_logical_changes_enabled(),
             snapshot,
             table_iterator: None,
             index_iterator: None,
@@ -2021,6 +2023,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             rowid,
             maybe_index_id,
             btree_record.as_ref(),
+            self.portable_logical_changes_enabled,
         )?;
         self.invalidate_record();
         Ok(IOResult::Done(()))

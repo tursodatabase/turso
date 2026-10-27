@@ -2553,10 +2553,14 @@ impl Connection {
     }
 
     /// Enable or disable writing portable logical-change metadata into MVCC
-    /// logical-log frames.
+    /// logical-log frames. The connection must have no open MVCC transaction.
     pub fn set_portable_logical_changes_enabled(&self, enabled: bool) {
         #[cfg(feature = "conn_raw_api")]
         {
+            turso_assert!(
+                self.get_mv_tx().is_none() && self.attached_mv_txs.read().is_empty(),
+                "portable logical changes cannot be changed during an MVCC transaction"
+            );
             self.portable_logical_changes_enabled
                 .store(enabled, Ordering::Release);
         }

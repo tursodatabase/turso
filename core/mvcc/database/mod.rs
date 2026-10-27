@@ -1055,9 +1055,6 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// Table and index ids this transaction allocated with `CreateBtree`. No other
     /// transaction can see these objects, so rollback drops their row maps whole.
     created_table_ids: Mutex<Vec<MVTableId>>,
-    /// The portable logical-change setting of the connection when this transaction
-    /// began.
-    portable_logical_changes: bool,
 }
 
 impl<A: RowVersionAllocator> Transaction<A> {
@@ -1067,7 +1064,6 @@ impl<A: RowVersionAllocator> Transaction<A> {
         header: DatabaseHeader,
         read_mark: WalPos,
         schema_generation_at_begin: u64,
-        portable_logical_changes: bool,
     ) -> Transaction<A> {
         Transaction {
             state: TransactionState::Active.into(),
@@ -1075,7 +1071,6 @@ impl<A: RowVersionAllocator> Transaction<A> {
             begin_ts,
             read_mark,
             schema_generation_at_begin,
-            portable_logical_changes,
             write_set: Mutex::new(WriteSet::new()),
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
@@ -5609,7 +5604,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         maybe_index_id: Option<MVTableId>,
     ) -> Result<bool> {
         tracing::trace!("update(tx_id={}, row.id={:?})", tx_id, row.id);
-        if !self.delete_from_table_or_index(tx_id, row.id.clone(), maybe_index_id, None)? {
+        if !self.delete_from_table_or_index(tx_id, row.id.clone(), maybe_index_id, None, false)? {
             return Ok(false);
         }
         self.insert_to_table_or_index(tx_id, row, maybe_index_id)?;
@@ -5630,7 +5625,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         maybe_index_id: Option<MVTableId>,
     ) -> Result<()> {
         tracing::trace!("upsert(tx_id={}, row.id={:?})", tx_id, row.id);
-        self.delete_from_table_or_index(tx_id, row.id.clone(), maybe_index_id, None)?;
+        self.delete_from_table_or_index(tx_id, row.id.clone(), maybe_index_id, None, false)?;
         self.insert_to_table_or_index(tx_id, row, maybe_index_id)?;
         Ok(())
     }
@@ -5650,7 +5645,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Returns `true` if the row was successfully deleted, and `false` otherwise.
     ///
     pub fn delete(&self, tx_id: TxID, id: RowID) -> Result<bool> {
-        self.delete_from_table_or_index(tx_id, id, None, None)
+        self.delete_from_table_or_index(tx_id, id, None, None, false)
     }
 
     /// Same as delete() but can delete from a table or an index, indicated by the `maybe_index_id` argument.
@@ -5660,6 +5655,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         id: RowID,
         maybe_index_id: Option<MVTableId>,
         btree_record: Option<&ImmutableRecord>,
+        portable_logical_changes_enabled: bool,
     ) -> Result<bool> {
         tracing::trace!("delete(tx_id={}, id={:?})", tx_id, id);
         let tx = self
@@ -5761,8 +5757,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let Some(record) = btree_record else {
                     return Ok(false);
                 };
-                let (payload, column_count) = if Self::tombstone_keeps_deleted_row(tx, id.table_id)
-                {
+                let (payload, column_count) = if Self::tombstone_keeps_deleted_row(
+                    id.table_id,
+                    portable_logical_changes_enabled,
+                ) {
                     (record.get_payload(), record.column_count())
                 } else {
                     (&[][..], 0)
@@ -5784,8 +5782,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// to find the B-tree that a `sqlite_schema` row names, and the commit, to
     /// write the primary key into portable logical changes. Other tombstones
     /// keep an empty payload, just like tombstones created by recovery.
-    fn tombstone_keeps_deleted_row(tx: &Transaction<A>, table_id: MVTableId) -> bool {
-        table_id == SQLITE_SCHEMA_MVCC_TABLE_ID || tx.portable_logical_changes
+    fn tombstone_keeps_deleted_row(
+        table_id: MVTableId,
+        portable_logical_changes_enabled: bool,
+    ) -> bool {
+        table_id == SQLITE_SCHEMA_MVCC_TABLE_ID || portable_logical_changes_enabled
     }
 
     fn insert_tombstone(
@@ -6451,7 +6452,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         expected_schema_generation: Option<u64>,
         checkpoint_read_guard: CheckpointReadLockState,
     ) -> Result<TxID> {
-        let portable_logical_changes = connection.portable_logical_changes_enabled();
+        #[cfg(not(any(test, injected_yields)))]
+        let _ = connection;
         turso_assert!(
             maybe_existing_tx_id.is_none() || !checkpoint_read_guard.is_held(),
             "checkpoint read guard is only passed for fresh MVCC begins"
@@ -6526,14 +6528,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .expect("global_header initialized above");
                 self.txs.insert(
                     tx_id,
-                    Transaction::new(
-                        tx_id,
-                        ts,
-                        header,
-                        read_mark,
-                        schema_generation,
-                        portable_logical_changes,
-                    ),
+                    Transaction::new(tx_id, ts, header, read_mark, schema_generation),
                 );
             });
             if schema_stale {
@@ -6689,7 +6684,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             pager,
             expected_schema_generation,
             CheckpointReadLockState::NotHeld,
-            false,
         )
     }
 
@@ -6708,7 +6702,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         pager: Arc<Pager>,
         expected_schema_generation: Option<u64>,
         checkpoint_read_guard: CheckpointReadLockState,
-        portable_logical_changes: bool,
     ) -> Result<TxID> {
         turso_assert!(
             !checkpoint_read_guard.is_held() || !self.experimental_mvcc_passive_checkpoint,
@@ -6775,14 +6768,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
             self.txs.insert(
                 tx_id,
-                Transaction::new(
-                    tx_id,
-                    ts,
-                    header,
-                    read_mark,
-                    schema_generation,
-                    portable_logical_changes,
-                ),
+                Transaction::new(tx_id, ts, header, read_mark, schema_generation),
             );
         });
         if schema_stale || schema_change_unpublished {
