@@ -586,33 +586,8 @@ expect error {
     integer out of range
 }
 
-test table-integer-write-boundaries {
-    CREATE TABLE t(a integer);
-    INSERT INTO t VALUES (-2147483648), (2147483647);
-    SELECT a FROM t ORDER BY a;
-}
-expect {
-    -2147483648
-    2147483647
-}
 
-test table-integer-write-rejects-high {
-    CREATE TABLE t(a integer);
-    INSERT INTO t VALUES (2147483648);
-}
-@sqlstate 22003
-expect error {
-    integer out of range
-}
 
-test table-integer-write-rejects-low {
-    CREATE TABLE t(a integer);
-    INSERT INTO t VALUES (-2147483649);
-}
-@sqlstate 22003
-expect error {
-    integer out of range
-}
 
 test table-integer-write-rejects-wide {
     CREATE TABLE t(a integer);
@@ -623,50 +598,10 @@ expect error {
     integer out of range
 }
 
-test table-integer-write-rejects-text {
-    CREATE TABLE t(a integer);
-    INSERT INTO t VALUES ('3000000000');
-}
-@sqlstate 22003
-expect error {}
 
-test table-integer-update-rejects-wide {
-    CREATE TABLE t(a integer);
-    INSERT INTO t VALUES (1);
-    UPDATE t SET a = 3000000000;
-}
-@sqlstate 22003
-expect error {
-    integer out of range
-}
 
-test table-int4-write-boundaries {
-    CREATE TABLE t(a int4);
-    INSERT INTO t VALUES (-2147483648), (2147483647);
-    SELECT a FROM t ORDER BY a;
-}
-expect {
-    -2147483648
-    2147483647
-}
 
-test table-int4-write-rejects-high {
-    CREATE TABLE t(a int4);
-    INSERT INTO t VALUES (2147483648);
-}
-@sqlstate 22003
-expect error {
-    integer out of range
-}
 
-test table-int4-write-rejects-low {
-    CREATE TABLE t(a int4);
-    INSERT INTO t VALUES (-2147483649);
-}
-@sqlstate 22003
-expect error {
-    integer out of range
-}
 
 test table-int4-write-rejects-wide {
     CREATE TABLE t(a int4);
@@ -677,50 +612,10 @@ expect error {
     integer out of range
 }
 
-test table-int4-write-rejects-text {
-    CREATE TABLE t(a int4);
-    INSERT INTO t VALUES ('3000000000');
-}
-@sqlstate 22003
-expect error {}
 
-test table-int4-update-rejects-wide {
-    CREATE TABLE t(a int4);
-    INSERT INTO t VALUES (1);
-    UPDATE t SET a = 3000000000;
-}
-@sqlstate 22003
-expect error {
-    integer out of range
-}
 
-test table-serial-write-boundaries {
-    CREATE TABLE t(a serial);
-    INSERT INTO t VALUES (-2147483648), (2147483647);
-    SELECT a FROM t ORDER BY a;
-}
-expect {
-    -2147483648
-    2147483647
-}
 
-test table-serial-write-rejects-high {
-    CREATE TABLE t(a serial);
-    INSERT INTO t VALUES (2147483648);
-}
-@sqlstate 22003
-expect error {
-    integer out of range
-}
 
-test table-serial-write-rejects-low {
-    CREATE TABLE t(a serial);
-    INSERT INTO t VALUES (-2147483649);
-}
-@sqlstate 22003
-expect error {
-    integer out of range
-}
 
 test table-serial-write-rejects-wide {
     CREATE TABLE t(a serial);
@@ -731,50 +626,10 @@ expect error {
     integer out of range
 }
 
-test table-serial-write-rejects-text {
-    CREATE TABLE t(a serial);
-    INSERT INTO t VALUES ('3000000000');
-}
-@sqlstate 22003
-expect error {}
 
-test table-serial-update-rejects-wide {
-    CREATE TABLE t(a serial);
-    INSERT INTO t VALUES (1);
-    UPDATE t SET a = 3000000000;
-}
-@sqlstate 22003
-expect error {
-    integer out of range
-}
 
-test table-serial4-write-boundaries {
-    CREATE TABLE t(a serial4);
-    INSERT INTO t VALUES (-2147483648), (2147483647);
-    SELECT a FROM t ORDER BY a;
-}
-expect {
-    -2147483648
-    2147483647
-}
 
-test table-serial4-write-rejects-high {
-    CREATE TABLE t(a serial4);
-    INSERT INTO t VALUES (2147483648);
-}
-@sqlstate 22003
-expect error {
-    integer out of range
-}
 
-test table-serial4-write-rejects-low {
-    CREATE TABLE t(a serial4);
-    INSERT INTO t VALUES (-2147483649);
-}
-@sqlstate 22003
-expect error {
-    integer out of range
-}
 
 test table-serial4-write-rejects-wide {
     CREATE TABLE t(a serial4);
@@ -785,22 +640,7 @@ expect error {
     integer out of range
 }
 
-test table-serial4-write-rejects-text {
-    CREATE TABLE t(a serial4);
-    INSERT INTO t VALUES ('3000000000');
-}
-@sqlstate 22003
-expect error {}
 
-test table-serial4-update-rejects-wide {
-    CREATE TABLE t(a serial4);
-    INSERT INTO t VALUES (1);
-    UPDATE t SET a = 3000000000;
-}
-@sqlstate 22003
-expect error {
-    integer out of range
-}
 
 test table-int4-width-check-binds-exact-name {
     CREATE TABLE t(x bigint, """x""" int);

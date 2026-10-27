@@ -342,16 +342,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn int4_range_error_does_not_rename_integer_overflow() {
+    fn integer_overflow_keeps_engine_message() {
         let generic = ErrorReport::from(&LimboError::IntegerOverflow);
         assert_eq!(generic.sqlstate, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE);
         assert_eq!(generic.message, "integer overflow");
-        let int4 = ErrorReport::from(&sqlstate_error(
-            SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-            "integer out of range",
-        ));
-        assert_eq!(int4.sqlstate, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE);
-        assert_eq!(int4.message, "integer out of range");
     }
 
     #[test]

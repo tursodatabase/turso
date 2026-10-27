@@ -5743,17 +5743,10 @@ fn int4_write_constraint(
     Some(ast::NamedColumnConstraint {
         name: None,
         constraint: ast::ColumnConstraint::Check {
-            expr: Box::new(ast::Expr::FunctionCall {
-                name: ast::Name::from_string("pg_int4_range"),
-                distinctness: None,
-                args: vec![Box::new(ast::Expr::Id(exact_name(column)))],
-                order_by: vec![],
-                within_group: vec![],
-                filter_over: ast::FunctionTail {
-                    filter_clause: None,
-                    over_clause: None,
-                },
-            }),
+            expr: Box::new(function_call(
+                "pg_int4_range",
+                vec![ast::Expr::Id(exact_name(column))],
+            )),
             source: None,
         },
     })

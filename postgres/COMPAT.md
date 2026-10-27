@@ -146,6 +146,14 @@ or SELECT INTO do not yet enforce the 32-bit write range. Generic engine 64-bit
 arithmetic overflow still reports `integer overflow`, rather than PostgreSQL's
 `bigint out of range`; the int4 write check has its own error message.
 
+Upgrading does not recover PostgreSQL type widths from schema text that an older
+frontend already rewrote as plain INTEGER (for example, after ALTER TABLE).
+Those legacy columns can still accept values outside the int4 range. Conversely,
+ALTER on this version can persist `CHECK(pg_int4_range(...))` in sqlite_schema;
+earlier tursopg versions that do not provide that function cannot write such
+tables (`no such function: pg_int4_range`). Downgrading after these schema
+rewrites is not supported.
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |
