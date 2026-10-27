@@ -5,7 +5,7 @@
 
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
-    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_UNDEFINED_TABLE,
+    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -2292,7 +2292,7 @@ impl PostgreSQLTranslator {
             }
         };
 
-        let func_name = object_name(&func_call.funcname, is_pg_catalog, "function")?;
+        let func_name = function_name(&func_call.funcname)?;
         let func_name = func_name.as_str();
         if func_call.func_variadic
             || func_call.agg_star
@@ -7298,6 +7298,23 @@ fn object_name(
             },
             _ => not_supported(format!("a schema-qualified {kind} name")),
         })
+}
+
+/// The name of a function call, in the FROM clause or in an expression.
+fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
+    let name = object_name(names, is_pg_catalog, "function")?;
+    // libpg_query lowercases unquoted names, so an uppercase letter means the
+    // name was quoted. PostgreSQL matches function names exactly and every
+    // function tursopg provides has a lowercase name, so a quoted name like
+    // "LOWER" names no function. Reject it here because core, like SQLite,
+    // matches function names without regard to case.
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Err(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
+            message: format!("no such function: {name}"),
+        });
+    }
+    Ok(name)
 }
 
 fn unqualified_name(names: &[String], allowed_schema: fn(&str) -> bool) -> Option<&String> {

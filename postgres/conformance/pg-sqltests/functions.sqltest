@@ -1250,3 +1250,78 @@ test mod-with-null-is-null {
 expect {
     <null>|<null>
 }
+
+test quoted-function-name-keeps-its-case {
+    SELECT "lower"('A');
+}
+expect {
+    a
+}
+
+test quoted-uppercase-scalar-function-name-errors {
+    SELECT "LOWER"('A');
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-mixed-case-version-errors {
+    SELECT "Version"() IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-uppercase-current-setting-errors {
+    SELECT "CURRENT_SETTING"('search_path');
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-uppercase-count-star-errors {
+    SELECT "COUNT"(*);
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-uppercase-aggregate-errors {
+    SELECT "SUM"(1);
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-mixed-case-window-function-errors {
+    SELECT "Row_Number"() OVER ();
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-uppercase-type-cast-function-errors {
+    SELECT "FLOAT8"(1);
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-schema-qualified-mixed-case-function-errors {
+    SELECT pg_catalog."Lower"('A');
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-uppercase-table-function-in-from-errors {
+    SELECT * FROM "GENERATE_SERIES"(1, 2);
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-mixed-case-json-table-function-in-from-errors {
+    SELECT * FROM "Json_Each"('[1]');
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-lowercase-table-function-in-from {
+    SELECT * FROM "generate_series"(1, 2);
+}
+expect {
+    1
+    2
+}
