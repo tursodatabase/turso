@@ -1140,8 +1140,12 @@ impl Jsonb {
             .ok_or_else(|| LimboError::ParseError("Invalid JSONB: payload size overflow".into()))?;
         let mut current_cursor = cursor;
         depth += 1;
+        // An empty container stays on one line, the way SQLite's json_pretty()
+        // prints it, so the break after the opening bracket is only for the
+        // members that follow.
+        let has_members = cursor < end_cursor;
         string.push('{');
-        if indent.is_pretty() {
+        if indent.is_pretty() && has_members {
             string.push('\n');
         };
         while current_cursor < end_cursor {
@@ -1177,11 +1181,13 @@ impl Jsonb {
                 string.push('\n');
             };
         }
-        if let JsonIndentation::Indentation(value) = indent {
-            for _ in 0..depth - 1 {
-                string.push_str(value);
-            }
-        };
+        if has_members {
+            if let JsonIndentation::Indentation(value) = indent {
+                for _ in 0..depth - 1 {
+                    string.push_str(value);
+                }
+            };
+        }
         string.push('}');
 
         Ok(current_cursor)
@@ -1200,8 +1206,9 @@ impl Jsonb {
             .ok_or_else(|| LimboError::ParseError("Invalid JSONB: payload size overflow".into()))?;
         let mut current_cursor = cursor;
         depth += 1;
+        let has_members = cursor < end_cursor;
         string.push('[');
-        if indent.is_pretty() {
+        if indent.is_pretty() && has_members {
             string.push('\n');
         };
         while current_cursor < end_cursor {
@@ -1218,11 +1225,13 @@ impl Jsonb {
                 string.push('\n');
             };
         }
-        if let JsonIndentation::Indentation(value) = indent {
-            for _ in 0..depth - 1 {
-                string.push_str(value);
-            }
-        };
+        if has_members {
+            if let JsonIndentation::Indentation(value) = indent {
+                for _ in 0..depth - 1 {
+                    string.push_str(value);
+                }
+            };
+        }
         string.push(']');
 
         Ok(current_cursor)
