@@ -838,7 +838,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn refresh_schema_metadata(&mut self) {
         let schema = self.connection.clone_shared_schema(self.database_id);
         self.index_id_to_index = schema
-            .indexes(NamespaceId::ROOT)
+            .all_indexes()
             .filter(|index| index.is_btree_backed())
             .map(|index| {
                 turso_assert!(index.root_page != 0, "index root_page must be non-zero");
@@ -897,7 +897,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             HashMap::default()
         } else {
             schema
-                .indexes(NamespaceId::ROOT)
+                .all_indexes()
                 .filter(|index| index.is_btree_backed())
                 .map(|index| {
                     turso_assert!(index.root_page != 0, "index root_page must be non-zero");
@@ -1990,12 +1990,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     .and_then(|entry| entry.value().root_page)
                     .is_some()
         };
-        schema.tables(NamespaceId::ROOT).any(|table| {
+        schema.all_tables().any(|table| {
             table
                 .btree()
                 .is_some_and(|btree| owned_negative(btree.root_page))
         }) || schema
-            .indexes(NamespaceId::ROOT)
+            .all_indexes()
             .any(|index| owned_negative(index.root_page))
     }
 
@@ -2059,7 +2059,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let schema = Schema::try_make_mut(&mut schema_ref)?;
         #[cfg(feature = "conn_raw_api")]
         let mut moved_root_pages = Vec::new();
-        for (name, table) in schema.tables_mut(NamespaceId::ROOT) {
+        for (_, name, table) in schema.all_tables_mut() {
             #[cfg(not(feature = "conn_raw_api"))]
             let _ = name;
             let table = Arc::get_mut(table).expect("this should be the only reference");
@@ -2090,7 +2090,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             schema.table_names_by_root_page.remove(&old_root_page);
             schema.table_names_by_root_page.insert(new_root_page, name);
         }
-        for index in schema.indexes_mut(NamespaceId::ROOT) {
+        for index in schema.all_indexes_mut() {
             if index.root_page < 0 {
                 let table_id = MVTableId::from(index.root_page);
                 // Same as tables: skip indexes not materialized by this pass.
@@ -2568,7 +2568,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         // entries ("row N missing from index"). filter_map: an index whose root has
                         // no binding covering the snapshot is not part of this snapshot.
                         self.index_id_to_index = local
-                            .indexes(NamespaceId::ROOT)
+                            .all_indexes()
                             .filter(|index| index.is_btree_backed())
                             .filter_map(|index| {
                                 turso_assert!(
