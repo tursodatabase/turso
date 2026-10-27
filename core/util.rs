@@ -4089,25 +4089,25 @@ impl<'a> TableRenameScope<'a> {
 
     fn qualifier_target(&self, table: &ast::SelectTable) -> Option<bool> {
         match table {
-            ast::SelectTable::Table(name, alias, _)
-            | ast::SelectTable::TableCall(name, _, alias) => {
-                let visible_name = alias.as_ref().map_or(&name.name, |alias| alias.name());
-                self.is_old_name(visible_name)
-                    .then(|| self.renames_table(&name.name))
-            }
-            ast::SelectTable::Select {
+            ast::SelectTable::Table(_, Some(alias), _)
+            | ast::SelectTable::TableCall(_, _, Some(alias))
+            | ast::SelectTable::Select {
                 alias: Some(alias), ..
             }
             | ast::SelectTable::Sub(_, Some(alias)) => {
                 self.is_old_name(alias.name()).then_some(false)
+            }
+            ast::SelectTable::Table(name, None, _) | ast::SelectTable::TableCall(name, _, None) => {
+                self.is_old_name(&name.name)
+                    .then(|| self.renames_table(name))
             }
             ast::SelectTable::Select { alias: None, .. } => None,
             ast::SelectTable::Sub(from, None) => self.qualifier_target_in_from_clause(from),
         }
     }
 
-    fn renames_table(&self, name: &ast::Name) -> bool {
-        self.table_is_visible && self.is_old_name(name)
+    fn renames_table(&self, name: &ast::QualifiedName) -> bool {
+        (self.table_is_visible || name.namespace.is_some()) && self.is_old_name(&name.name)
     }
 
     fn renames_qualifier(&self, name: &ast::Name) -> bool {
@@ -4196,33 +4196,41 @@ fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, scope: TableRenameSco
 }
 
 fn rewrite_from_clause_table_refs(from: &mut ast::FromClause, scope: TableRenameScope) {
-    let on_scope = scope.inside_from_clause(from);
-    rewrite_select_table_entry_table_refs(&mut from.select, scope);
+    let from_scope = scope.inside_from_clause(from);
+    rewrite_select_table_entry_table_refs(&mut from.select, scope, from_scope);
     for join in &mut from.joins {
-        rewrite_select_table_entry_table_refs(&mut join.table, scope);
+        rewrite_select_table_entry_table_refs(&mut join.table, scope, from_scope);
         if let Some(ast::JoinConstraint::On(ref mut expr)) = join.constraint {
-            rewrite_expr_table_refs(expr, on_scope);
+            rewrite_expr_table_refs(expr, from_scope);
         }
     }
 }
 
-fn rewrite_select_table_entry_table_refs(st: &mut ast::SelectTable, scope: TableRenameScope) {
+fn rewrite_select_table_entry_table_refs(
+    st: &mut ast::SelectTable,
+    scope: TableRenameScope,
+    from_scope: TableRenameScope,
+) {
     match st {
         ast::SelectTable::Table(ref mut name, _, _) => {
-            if scope.renames_table(&name.name) {
+            if scope.renames_table(name) {
                 name.name = scope.new_name();
             }
         }
         ast::SelectTable::TableCall(ref mut name, ref mut args, _) => {
-            if scope.renames_table(&name.name) {
+            if scope.renames_table(name) {
                 name.name = scope.new_name();
             }
             for arg in args {
-                rewrite_expr_table_refs(arg, scope);
+                rewrite_expr_table_refs(arg, from_scope);
             }
         }
-        ast::SelectTable::Select { ref mut select, .. } => {
-            rewrite_select_in_scope(select, scope);
+        ast::SelectTable::Select {
+            ref mut select,
+            lateral,
+            ..
+        } => {
+            rewrite_select_in_scope(select, if *lateral { from_scope } else { scope });
         }
         ast::SelectTable::Sub(ref mut from, _) => {
             rewrite_from_clause_table_refs(from, scope);
@@ -4248,7 +4256,7 @@ fn rewrite_expr_table_refs(expr: &mut ast::Expr, scope: TableRenameScope) {
                     rewrite_select_in_scope(rhs, scope);
                 }
                 ast::Expr::InTable { rhs, .. } => {
-                    if scope.renames_table(&rhs.name) {
+                    if scope.renames_table(rhs) {
                         rhs.name = scope.new_name();
                     }
                 }
