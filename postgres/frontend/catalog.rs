@@ -542,6 +542,25 @@ impl SnapshotRows for PgNamespaceTable {
     }
 }
 
+#[derive(Debug)]
+struct PgDescriptionTable;
+
+impl SnapshotRows for PgDescriptionTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_description (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)";
+    const TABLE_OID: Option<i64> = None;
+    const ESTIMATED_COST: f64 = 1.0;
+    const ESTIMATED_ROWS: u32 = 1;
+
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        vec![vec![
+            Value::from_i64(2200),
+            Value::from_i64(PgNamespaceTable::TABLE_OID.unwrap()),
+            Value::from_i64(0),
+            Value::build_text("standard public schema"),
+        ]]
+    }
+}
+
 /// The schemas that PostgreSQL always has, with their fixed OIDs.
 const BUILTIN_SCHEMAS: [(i64, &str); 3] = [
     (11, "pg_catalog"),
@@ -2308,7 +2327,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_description",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_description (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)".to_string() },
+        SnapshotCatalog::<PgDescriptionTable>(PhantomData),
     );
     options = options.native_module(
         "pg_seclabels",
