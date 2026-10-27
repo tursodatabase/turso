@@ -1125,3 +1125,39 @@ test upsert-or-ignore-do-update-without-target {
 expect {
     1|10
 }
+
+@cross-check-integrity
+test upsert-or-ignore-do-update-conflict-on-other-unique-index-is-ignored {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b UNIQUE, c UNIQUE);
+    INSERT INTO t VALUES(1,1,1);
+    INSERT OR IGNORE INTO t VALUES(2,2,1),(3,3,3) ON CONFLICT(b) DO UPDATE SET a=a;
+    SELECT * FROM t;
+}
+expect {
+    1|1|1
+    3|3|3
+}
+
+@cross-check-integrity
+test upsert-or-ignore-do-nothing-conflict-on-other-unique-index-is-ignored {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b UNIQUE, c UNIQUE);
+    INSERT INTO t VALUES(1,1,1);
+    INSERT OR IGNORE INTO t VALUES(2,2,1),(3,3,3) ON CONFLICT(b) DO NOTHING;
+    SELECT * FROM t;
+}
+expect {
+    1|1|1
+    3|3|3
+}
+
+@cross-check-integrity
+test upsert-conflict-on-column-level-ignore-index-is-ignored {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b UNIQUE, c UNIQUE ON CONFLICT IGNORE);
+    INSERT INTO t VALUES(1,1,1);
+    INSERT INTO t VALUES(2,2,1),(3,3,3) ON CONFLICT(b) DO UPDATE SET a=a;
+    SELECT * FROM t;
+}
+expect {
+    1|1|1
+    3|3|3
+}
