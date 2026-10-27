@@ -241,21 +241,21 @@ pub enum TypeDefKind {
         encode: Option<Box<ast::Expr>>,
         decode: Option<Box<ast::Expr>>,
         operators: std::vec::Vec<TypeOperator>,
-        /// How arithmetic and comparison operators run on values of this type.
-        signatures: std::vec::Vec<OperatorSignature>,
+        /// How arithmetic operators run on values of this type.
+        arithmetic: std::vec::Vec<ArithmeticSignature>,
         default: Option<Box<ast::Expr>>,
     },
     Struct(StructDef),
     Union(UnionDef),
 }
 
-/// One way an operator runs when an operand has a custom type:
+/// One way an arithmetic operator runs when an operand has a custom type:
 /// `args[0] op args[1]` runs `func`, or SQLite's operator when `func` is `None`.
 #[derive(Debug, Clone)]
-pub struct OperatorSignature {
-    /// `+`, `-`, `*`, `/`, `%`, or a comparison: `<`, `<=`, `>`, `>=`, `=`, `!=`.
+pub struct ArithmeticSignature {
+    /// `+`, `-`, `*`, `/` or `%`.
     pub op: &'static str,
-    pub args: [OperatorArg; 2],
+    pub args: [ArithmeticArg; 2],
     pub func: Option<String>,
     /// The result's type, or `None` when the function decides it.
     pub result: Option<&'static str>,
@@ -264,7 +264,7 @@ pub struct OperatorSignature {
 /// An operand that a signature accepts. "This type" is the type that declares
 /// the signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OperatorArg {
+pub enum ArithmeticArg {
     /// A column of this type. A user type's function is only given columns: a
     /// CAST gives the stored form, a column the value its DECODE returns, and
     /// the function can't tell them apart.
@@ -274,7 +274,7 @@ pub enum OperatorArg {
     /// Any value of this type.
     Value,
     /// A value SQLite can compute with: anything without a custom type, or a
-    /// value of a type whose own `op` is SQLite's operator.
+    /// value of a type whose own arithmetic is SQLite's operator.
     PlainValue,
     /// A `PlainValue` that is an integer, or whose type is not known before the
     /// statement runs, such as a parameter. The function rejects anything else.
@@ -282,30 +282,19 @@ pub enum OperatorArg {
 }
 
 const ARITHMETIC_OPERATORS: [&str; 5] = ["+", "-", "*", "/", "%"];
-pub(crate) const COMPARISON_OPERATORS: [&str; 6] = ["<", "<=", ">", ">=", "=", "!="];
-
-/// The signatures of a type made by CREATE TYPE.
-fn declared_signatures(
-    operators: &[TypeOperator],
-    value_input_type: &str,
-) -> std::vec::Vec<OperatorSignature> {
-    let mut signatures = declared_arithmetic(operators);
-    signatures.extend(declared_comparisons(operators, value_input_type));
-    signatures
-}
 
 /// `CREATE TYPE ... OPERATOR '+' f` runs f for two values of the type, or for a
 /// value of the type and a literal its ENCODE accepts. `OPERATOR '+'` without a
 /// function runs SQLite's operator on the stored value.
-fn declared_arithmetic(operators: &[TypeOperator]) -> std::vec::Vec<OperatorSignature> {
-    use OperatorArg::{Column, EncodableLiteral};
+fn declared_arithmetic(operators: &[TypeOperator]) -> std::vec::Vec<ArithmeticSignature> {
+    use ArithmeticArg::{Column, EncodableLiteral};
     let mut signatures = std::vec::Vec::new();
     for op in ARITHMETIC_OPERATORS {
         let Some(declared) = operators.iter().find(|o| o.op == op) else {
             continue;
         };
         let Some(func) = &declared.func_name else {
-            signatures.extend(sqlite_operator(op));
+            signatures.extend(sqlite_arithmetic(op));
             continue;
         };
         for args in [
@@ -313,7 +302,7 @@ fn declared_arithmetic(operators: &[TypeOperator]) -> std::vec::Vec<OperatorSign
             [Column, EncodableLiteral],
             [EncodableLiteral, Column],
         ] {
-            signatures.push(OperatorSignature {
+            signatures.push(ArithmeticSignature {
                 op,
                 args,
                 func: Some(func.clone()),
@@ -321,53 +310,6 @@ fn declared_arithmetic(operators: &[TypeOperator]) -> std::vec::Vec<OperatorSign
             });
         }
     }
-    signatures
-}
-
-/// `CREATE TYPE ... OPERATOR '<' f` runs f for two values of the type, or for a
-/// value of the type and a literal its ENCODE accepts. A type whose `value` is
-/// `any` also runs f for a value of the type and any plain value, passed as it
-/// is. A comparison the type does not declare is made from `<` and `=` when the
-/// comparison runs. An operator declared without a function, like `OPERATOR '>'`,
-/// is SQLite's comparison.
-fn declared_comparisons(
-    operators: &[TypeOperator],
-    value_input_type: &str,
-) -> std::vec::Vec<OperatorSignature> {
-    use OperatorArg::{Column, EncodableLiteral, PlainValue};
-    let mut arg_pairs = std::vec![
-        [Column, Column],
-        [Column, EncodableLiteral],
-        [EncodableLiteral, Column],
-    ];
-    if value_input_type.eq_ignore_ascii_case("any") {
-        arg_pairs.extend([[Column, PlainValue], [PlainValue, Column]]);
-    }
-    let mut signatures = std::vec::Vec::new();
-    for op in COMPARISON_OPERATORS {
-        let Some(declared) = operators.iter().find(|o| o.op == op) else {
-            continue;
-        };
-        let Some(func) = &declared.func_name else {
-            signatures.extend(sqlite_operator(op));
-            continue;
-        };
-        for args in &arg_pairs {
-            signatures.push(OperatorSignature {
-                op,
-                args: *args,
-                func: Some(func.clone()),
-                result: Some("integer"),
-            });
-        }
-    }
-    signatures
-}
-
-/// The signatures of a built-in type.
-fn builtin_signatures(type_name: &str) -> std::vec::Vec<OperatorSignature> {
-    let mut signatures = builtin_arithmetic(type_name);
-    signatures.extend(builtin_comparisons(type_name));
     signatures
 }
 
@@ -384,9 +326,9 @@ fn builtin_signatures(type_name: &str) -> std::vec::Vec<OperatorSignature> {
 /// - `smallint` and `bigint` store plain integers, so SQLite's operators run.
 ///
 /// Other built-in types have no arithmetic.
-fn builtin_arithmetic(type_name: &str) -> std::vec::Vec<OperatorSignature> {
-    use OperatorArg::{EncodableLiteral, Integer, PlainValue, Value};
-    let call = |op, args, func: &str, result| OperatorSignature {
+fn builtin_arithmetic(type_name: &str) -> std::vec::Vec<ArithmeticSignature> {
+    use ArithmeticArg::{EncodableLiteral, Integer, PlainValue, Value};
+    let call = |op, args, func: &str, result| ArithmeticSignature {
         op,
         args,
         func: Some(func.to_string()),
@@ -415,46 +357,16 @@ fn builtin_arithmetic(type_name: &str) -> std::vec::Vec<OperatorSignature> {
         ],
         "smallint" | "bigint" => ARITHMETIC_OPERATORS
             .into_iter()
-            .flat_map(sqlite_operator)
-            .collect(),
-        _ => std::vec::Vec::new(),
-    }
-}
-
-/// `numeric_lt` and `numeric_eq` compare any value of a numeric with any number,
-/// as numbers: `n * 2 = 9` is true for 4.5, and `ORDER BY n * 2` sorts 9.00
-/// before 10.00. A literal is not encoded first: that would round it to the
-/// column's scale (`n = 1.504` would be true for 1.50). The other built-in types
-/// compare their values with SQLite's comparison; for `smallint` and `bigint`
-/// that is said explicitly, so they compare with a numeric as numbers do.
-fn builtin_comparisons(type_name: &str) -> std::vec::Vec<OperatorSignature> {
-    use OperatorArg::{PlainValue, Value};
-    match type_name {
-        "numeric" => [("<", "numeric_lt"), ("=", "numeric_eq")]
-            .into_iter()
-            .flat_map(|(op, func)| {
-                [[Value, Value], [Value, PlainValue], [PlainValue, Value]].map(|args| {
-                    OperatorSignature {
-                        op,
-                        args,
-                        func: Some(func.to_string()),
-                        result: Some("integer"),
-                    }
-                })
-            })
-            .collect(),
-        "smallint" | "bigint" => COMPARISON_OPERATORS
-            .into_iter()
-            .flat_map(sqlite_operator)
+            .flat_map(sqlite_arithmetic)
             .collect(),
         _ => std::vec::Vec::new(),
     }
 }
 
 /// SQLite's operator `op` on a value of the type and a plain value.
-fn sqlite_operator(op: &'static str) -> [OperatorSignature; 2] {
-    use OperatorArg::{PlainValue, Value};
-    [[Value, PlainValue], [PlainValue, Value]].map(|args| OperatorSignature {
+fn sqlite_arithmetic(op: &'static str) -> [ArithmeticSignature; 2] {
+    use ArithmeticArg::{PlainValue, Value};
+    [[Value, PlainValue], [PlainValue, Value]].map(|args| ArithmeticSignature {
         op,
         args,
         func: None,
@@ -588,9 +500,9 @@ impl TypeDef {
     }
 
     /// How `op` can run on a value of this type, most specific first.
-    pub fn signatures<'a>(&'a self, op: &'a str) -> impl Iterator<Item = &'a OperatorSignature> {
-        let signatures: &[OperatorSignature] = match &self.kind {
-            TypeDefKind::Custom { signatures, .. } => signatures,
+    pub fn arithmetic<'a>(&'a self, op: &'a str) -> impl Iterator<Item = &'a ArithmeticSignature> {
+        let signatures: &[ArithmeticSignature] = match &self.kind {
+            TypeDefKind::Custom { arithmetic, .. } => arithmetic,
             _ => &[],
         };
         signatures.iter().filter(move |s| s.op == op)
@@ -658,10 +570,10 @@ impl TypeDef {
                     encode: encode.clone(),
                     decode: decode.clone(),
                     operators: operators.clone(),
-                    signatures: if is_builtin {
-                        builtin_signatures(type_name)
+                    arithmetic: if is_builtin {
+                        builtin_arithmetic(type_name)
                     } else {
-                        declared_signatures(operators, value_input_type(params, base))
+                        declared_arithmetic(operators)
                     },
                     default: default.clone(),
                 },
@@ -751,8 +663,8 @@ impl TypeDef {
                 encode: None,
                 decode: None,
                 operators: std::vec::Vec::new(),
-                // A domain has the operators of the type it is based on.
-                signatures: std::vec::Vec::new(),
+                // A domain has the arithmetic of the type it is based on.
+                arithmetic: std::vec::Vec::new(),
                 default,
             },
         }
@@ -762,7 +674,12 @@ impl TypeDef {
     /// Looks for a `value` parameter with a type annotation.
     /// Falls back to base type if `value` is not declared.
     pub fn value_input_type(&self) -> &str {
-        value_input_type(self.params(), self.base())
+        for p in self.params() {
+            if p.name.eq_ignore_ascii_case("value") {
+                return p.ty.as_deref().unwrap_or_else(|| self.base());
+            }
+        }
+        self.base()
     }
 
     /// The non-value params (user-provided at column declaration time).
@@ -776,15 +693,6 @@ impl TypeDef {
     pub fn to_sql(&self) -> &str {
         &self.sql
     }
-}
-
-/// The type a custom type's `value` parameter accepts: its declared type, or the
-/// base type when it has none.
-fn value_input_type<'a>(params: &'a [ast::TypeParam], base: &'a str) -> &'a str {
-    params
-        .iter()
-        .find(|p| p.name.eq_ignore_ascii_case("value"))
-        .map_or(base, |p| p.ty.as_deref().unwrap_or(base))
 }
 
 /// Accumulators for schema loading - kept separate to avoid moving through state variants

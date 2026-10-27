@@ -4,8 +4,6 @@ use crate::{
     schema::{FromClauseSubquery, Index, Schema},
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
-        emitter::Resolver,
-        expr::expr_type::{type_of, ExprType, TypeEnv},
         expression_index::normalize_expr_for_index_matching,
         optimizer::access_method::AccessMethodParams,
         optimizer::constraints::{
@@ -90,7 +88,6 @@ impl OrderTarget {
     fn maybe_from_iterator<'a>(
         list: impl Iterator<Item = (&'a ast::Expr, SortOrder, Option<ast::NullsOrder>)> + Clone,
         tables: &crate::translate::plan::TableReferences,
-        resolver: &Resolver,
         purpose: OrderTargetPurpose,
     ) -> Option<Self> {
         if list.clone().count() == 0 {
@@ -98,9 +95,6 @@ impl OrderTarget {
         }
         let mut cols = Vec::new();
         for (expr, order, nulls) in list {
-            if has_custom_type(expr, tables, resolver) {
-                return None;
-            }
             let col = expr_to_column_order(expr, order, nulls, tables)?;
             cols.push(col);
         }
@@ -119,7 +113,6 @@ impl OrderTarget {
 pub fn simple_aggregate_order_target(
     simple_aggregate: &SimpleAggregate,
     tables: &TableReferences,
-    resolver: &Resolver,
 ) -> Option<OrderTarget> {
     let SimpleAggregate::MinMax(min_max) = simple_aggregate else {
         return None;
@@ -128,7 +121,6 @@ pub fn simple_aggregate_order_target(
     let mut target = OrderTarget::maybe_from_iterator(
         std::iter::once((&min_max.argument, min_max.order, None)),
         tables,
-        resolver,
         OrderTargetPurpose::Extremum,
     )?;
     if let Some(coll) = min_max.collation {
@@ -148,7 +140,6 @@ pub fn compute_order_target(
     order_by: &mut Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
     group_by_opt: Option<&mut GroupBy>,
     tables: &TableReferences,
-    resolver: &Resolver,
 ) -> Option<OrderTarget> {
     match (order_by.is_empty(), group_by_opt) {
         // No ordering demands - we don't care what order the joined result rows are in
@@ -159,7 +150,6 @@ pub fn compute_order_target(
                 .iter()
                 .map(|(expr, order, nulls)| (expr.as_ref(), *order, *nulls)),
             tables,
-            resolver,
             OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
         ),
         // Only GROUP BY - we would like the joined result rows to be in the order specified by the GROUP BY
@@ -169,7 +159,6 @@ pub fn compute_order_target(
                 .iter()
                 .map(|expr| (expr, SortOrder::Asc, None)),
             tables,
-            resolver,
             OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group),
         ),
         // Both ORDER BY and GROUP BY:
@@ -197,7 +186,6 @@ pub fn compute_order_target(
                         .iter()
                         .map(|expr| (expr, SortOrder::Asc, None)),
                     tables,
-                    resolver,
                     OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group),
                 );
             }
@@ -238,7 +226,6 @@ pub fn compute_order_target(
                     .zip(group_by.nulls_order.iter())
                     .map(|((expr, dir), nulls)| (expr, *dir, *nulls)),
                 tables,
-                resolver,
                 OrderTargetPurpose::EliminatesSort(EliminatesSortBy::GroupByAndOrder),
             )
         }
@@ -343,6 +330,7 @@ pub fn plan_satisfies_order_target(
                         &constraint_refs,
                         order_target,
                         target_col_idx,
+                        schema,
                     )
                 } else {
                     btree_access_order_consumed(
@@ -352,6 +340,7 @@ pub fn plan_satisfies_order_target(
                         constraint_refs,
                         order_target,
                         target_col_idx,
+                        schema,
                         EqualityPrefixScope::ConstantEquality,
                     )
                 }
@@ -367,6 +356,7 @@ pub fn plan_satisfies_order_target(
                 constraint_refs,
                 order_target,
                 target_col_idx,
+                schema,
                 EqualityPrefixScope::ConstantEquality,
             ),
             AccessMethodParams::Subquery { iter_dir } => {
@@ -682,6 +672,7 @@ fn finalized_scan_subquery_order_consumed(
                     purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
                 },
                 0,
+                schema,
                 EqualityPrefixScope::ConstantEquality,
             )
             .consumed
@@ -774,16 +765,6 @@ fn expr_to_column_order(
     })
 }
 
-/// Whether `expr` has a custom type or is an array. An index or the rowid gives
-/// rows in the order of the stored bytes, and such a value may sort otherwise:
-/// a numeric's text `10.00` sorts before `9.00`.
-fn has_custom_type(expr: &ast::Expr, tables: &TableReferences, resolver: &Resolver) -> bool {
-    matches!(
-        type_of(expr, &TypeEnv::new(Some(tables), resolver)),
-        ExprType::Custom { .. } | ExprType::Array { .. }
-    )
-}
-
 /// The index column values needed to check its row order.
 #[derive(Clone, Copy)]
 struct IndexOrderColumn<'a> {
@@ -871,6 +852,7 @@ pub(super) fn btree_access_order_consumed(
     constraint_refs: &[RangeConstraintRef],
     order_target: &OrderTarget,
     start_col: usize,
+    schema: &Schema,
     equality_prefix_scope: EqualityPrefixScope,
 ) -> OrderConsumption {
     let target_columns = &order_target.columns[start_col..];
@@ -918,6 +900,7 @@ pub(super) fn btree_access_order_consumed(
             constraint_refs,
             order_target,
             target_columns,
+            schema,
             equality_prefix_scope,
             index.columns.iter().map(|column| IndexOrderColumn {
                 pos_in_table: column.pos_in_table,
@@ -940,6 +923,7 @@ fn temporary_index_order_consumed(
     constraint_refs: &[RangeConstraintRef],
     order_target: &OrderTarget,
     start_col: usize,
+    schema: &Schema,
 ) -> OrderConsumption {
     let target_columns = &order_target.columns[start_col..];
     if target_columns.is_empty() {
@@ -984,6 +968,7 @@ fn temporary_index_order_consumed(
         constraint_refs,
         order_target,
         target_columns,
+        schema,
         EqualityPrefixScope::ConstantEquality,
         index_columns,
         column_count,
@@ -1000,6 +985,7 @@ fn index_columns_order_consumed<'a>(
     constraint_refs: &[RangeConstraintRef],
     order_target: &OrderTarget,
     target_columns: &[ColumnOrder],
+    schema: &Schema,
     equality_prefix_scope: EqualityPrefixScope,
     index_columns: impl Iterator<Item = IndexOrderColumn<'a>>,
     column_count: usize,
@@ -1042,6 +1028,19 @@ fn index_columns_order_consumed<'a>(
 
         if !target_matches_order_column(target_col, idx_col, table_ref) {
             break;
+        }
+
+        // Custom type columns store encoded blobs. The B-tree's byte order
+        // does not match the custom type's order.
+        if let ColumnTarget::Column(col_no) = &target_col.target {
+            if let Some(col) = table_ref.table.columns().get(*col_no) {
+                if schema
+                    .get_type_def(&col.ty_str, table_ref.table.is_strict())
+                    .is_some()
+                {
+                    break;
+                }
+            }
         }
 
         if target_col.collation != idx_col.collation.unwrap_or_default() {

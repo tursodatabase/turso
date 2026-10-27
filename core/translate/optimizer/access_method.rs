@@ -303,6 +303,7 @@ pub(super) fn choose_best_btree_candidate(
                     &usable_constraint_refs,
                     order_target,
                     0,
+                    schema,
                     EqualityPrefixScope::AnyEquality,
                 )
                 .consumed
@@ -314,6 +315,7 @@ pub(super) fn choose_best_btree_candidate(
                     &usable_constraint_refs,
                     order_target,
                     0,
+                    schema,
                     EqualityPrefixScope::AnyEquality,
                 )
                 .consumed
@@ -1972,6 +1974,7 @@ fn find_best_access_method_for_subquery(
             &ephemeral_index,
             &usable_constraint_refs,
             maybe_order_target,
+            schema,
             base_row_count,
             params,
         );
@@ -2150,6 +2153,7 @@ fn materialized_subquery_order_properties(
     index: &Arc<Index>,
     constraint_refs: &[RangeConstraintRef],
     maybe_order_target: Option<&OrderTarget>,
+    schema: &Schema,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
 ) -> (IterationDirection, bool, Cost) {
@@ -2166,6 +2170,7 @@ fn materialized_subquery_order_properties(
         constraint_refs,
         order_target,
         0,
+        schema,
         EqualityPrefixScope::AnyEquality,
     )
     .consumed
@@ -2177,6 +2182,7 @@ fn materialized_subquery_order_properties(
         constraint_refs,
         order_target,
         0,
+        schema,
         EqualityPrefixScope::AnyEquality,
     )
     .consumed

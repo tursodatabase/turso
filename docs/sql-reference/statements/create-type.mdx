@@ -162,12 +162,6 @@ CREATE TYPE uint BASE integer
 
 The `=` operator, when defined, is also used to derive `!=`. The `<` operator is used to derive `>`, `>=`, and `<=` automatically by swapping arguments or negating the result.
 
-Like arithmetic, the comparison is chosen once, when the statement is compiled, from the types of the operands rather than from whether they are bare columns:
-
-- `OPERATOR '<' f` and `OPERATOR '=' f` run `f` when both operands are columns of the type, or when one is a column of the type and the other is a literal its ENCODE accepts. If the type's value parameter is `any`, they also run when the other operand has no custom type.
-- Otherwise SQLite's comparison runs on the two values.
-- A virtual generated column declared `ANY` or with no type has the type of its expression, so `doubled ANY AS (n * 2) VIRTUAL` compares and sorts like `n * 2`.
-
 ### DEFAULT
 
 The DEFAULT clause sets a type-level default value. When a column of this type does not specify its own DEFAULT, this value is used.
@@ -296,7 +290,7 @@ Turso provides the following built-in custom types in STRICT tables:
 | `time` | text | -- | ISO 8601 time (HH:MM:SS), validated on insert. |
 | `timestamp` | text | -- | ISO 8601 datetime, validated on insert. |
 | `timestamptz` | text | -- | ISO 8601 datetime with the same validation and normalization as `timestamp`. PostgreSQL-compatible name; the stored text carries no offset. |
-| `numeric(P,S)` | blob | `precision`, `scale` | Fixed-point decimal with P total digits and S decimal places. `+ - * /` with another numeric, an integer, a real or a numeric literal compute exactly (`n * 0.005` is not rounded to S places first) and give a numeric. A product keeps the decimal places of both operands and a sum or difference those of the operand with more, as in PostgreSQL (`1.00 * 3` is `3.00`). `%` is not defined for numeric. Comparisons and sorting treat any numeric value as a number, including results such as `n * 2` and generated columns built from them: `n * 2 = 9` is true for 4.50, and `ORDER BY n * 2` puts 9.00 before 10.00. A numeric compares with integers, reals, `smallint` and `bigint` as numbers. A literal is compared as written, not rounded to S places, so `n = 1.504` is false for 1.50. |
+| `numeric(P,S)` | blob | `precision`, `scale` | Fixed-point decimal with P total digits and S decimal places. `+ - * /` with another numeric, an integer, a real or a numeric literal compute exactly (`n * 0.005` is not rounded to S places first) and give a numeric. A product keeps the decimal places of both operands and a sum or difference those of the operand with more, as in PostgreSQL (`1.00 * 3` is `3.00`). `%` is not defined for numeric. |
 | `uuid` | blob | -- | UUID stored as 16-byte blob, displayed as string. Default: `uuid4_str()`. |
 | `inet` | text | -- | Validated IP address (IPv4 or IPv6). |
 | `cidr` | text | -- | Network address in CIDR notation. Stored as given; no validation yet. |

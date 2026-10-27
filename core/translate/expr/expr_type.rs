@@ -10,7 +10,7 @@ use turso_parser::ast;
 use super::custom_type_operators::find_arithmetic_call;
 use super::get_expr_affinity;
 use crate::function::{AggFunc, Func, ScalarFunc};
-use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
+use crate::schema::{Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::translate::plan::{Plan, SelectPlan, TableReferences};
@@ -99,43 +99,23 @@ pub(crate) fn same_type_def(a: &TypeDef, b: &TypeDef) -> bool {
 pub(crate) struct TypeEnv<'a> {
     tables: Option<&'a TableReferences>,
     resolver: &'a Resolver<'a>,
-    /// The table `SELF_TABLE` refers to while typing an expression stored in
-    /// that table's schema, such as a generated column. Otherwise the resolver's.
-    stored_expression_table: Option<Arc<BTreeTable>>,
 }
 
 impl<'a> TypeEnv<'a> {
     pub(crate) fn new(tables: Option<&'a TableReferences>, resolver: &'a Resolver<'a>) -> Self {
-        Self {
-            tables,
-            resolver,
-            stored_expression_table: None,
-        }
-    }
-
-    /// For typing an expression stored in `table`'s schema, whose column
-    /// references are `SELF_TABLE` references to `table`.
-    fn for_stored_expression(table: Arc<BTreeTable>, resolver: &'a Resolver<'a>) -> Self {
-        Self {
-            tables: None,
-            resolver,
-            stored_expression_table: Some(table),
-        }
+        Self { tables, resolver }
     }
 
     pub(crate) fn schema(&self) -> &Schema {
         self.resolver.schema()
     }
 
-    fn self_table(&self) -> Option<Arc<BTreeTable>> {
-        match &self.stored_expression_table {
-            Some(table) => Some(Arc::clone(table)),
-            None => self.resolver.self_table(),
-        }
-    }
-
     pub(crate) fn resolver(&self) -> &Resolver<'a> {
         self.resolver
+    }
+
+    pub(crate) fn tables(&self) -> Option<&'a TableReferences> {
+        self.tables
     }
 }
 
@@ -387,41 +367,8 @@ fn column_reference_type(
             Some(query_column_type(&subquery.plan, column, env.resolver))
         }
         Some((_, Table::RecursiveCteInput(input))) => input.column_types.get(column).cloned(),
-        _ => generated_column_type(table, column, env)
-            .or_else(|| base_table_column_type(table, column, env)),
+        _ => base_table_column_type(table, column, env),
     }
-}
-
-/// A virtual generated column whose declared type converts nothing (`ANY`, or
-/// no type at all) holds its expression's value, so it has that expression's
-/// type, as a view column does: `g ANY AS (n * 2)` is a numeric. Like a derived
-/// table's column, [column_custom_type] leaves it out: its form is not known.
-fn generated_column_type(
-    table: ast::TableInternalId,
-    column: usize,
-    env: &TypeEnv,
-) -> Option<ExprType> {
-    let btree = match env
-        .tables
-        .and_then(|tables| tables.find_table_by_internal_id(table))
-    {
-        Some((_, table)) => table.btree()?,
-        None if table.is_self_table() => env.self_table()?,
-        None => return None,
-    };
-    let col = btree.columns().get(column)?;
-    let expr = col.generated_expr()?;
-    if !matches!(
-        column_type(col, btree.is_strict, env.schema()),
-        ExprType::Builtin(BuiltinType::Any)
-    ) {
-        return None;
-    }
-    let expr = expr.clone();
-    Some(type_of(
-        &expr,
-        &TypeEnv::for_stored_expression(btree, env.resolver),
-    ))
 }
 
 /// The type of column `column` of a query's result. In a compound SELECT it is
@@ -481,7 +428,7 @@ fn base_table_column_type(
         ));
     }
     if table.is_self_table() {
-        let table = env.self_table()?;
+        let table = env.resolver.self_table()?;
         return Some(column_type(
             table.columns().get(column)?,
             table.is_strict,
