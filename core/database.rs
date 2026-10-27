@@ -3508,7 +3508,7 @@ impl Database {
         schema.clone()
     }
 
-    pub(crate) fn update_schema_if_newer(&self, another: Arc<Schema>) {
+    pub(crate) fn update_schema_if_newer(&self, mut another: Arc<Schema>) {
         let mut schema = self.schema.lock();
         if schema.schema_version < another.schema_version {
             tracing::debug!(
@@ -3516,6 +3516,9 @@ impl Database {
                 schema.schema_version,
                 another.schema_version
             );
+            if let Some(mv_store) = self.get_mv_store().as_ref() {
+                Self::reconcile_mvcc_published_schema(&schema, &mut another, mv_store);
+            }
             *schema = another;
         } else {
             tracing::debug!(
@@ -3524,6 +3527,77 @@ impl Database {
                 another.schema_version
             );
         }
+    }
+
+    /// Reconcile a committing `Schema` with physical roots published into `current` by a
+    /// concurrent MVCC passive checkpoint while the DDL transaction was in flight (#8004).
+    fn reconcile_mvcc_published_schema(
+        current: &Schema,
+        another: &mut Arc<Schema>,
+        mv_store: &MvStore,
+    ) {
+        let has_published_negative =
+            |root_page: i64| root_page < 0 && mv_store.resolve_root_page(root_page) > 0;
+        let needs_root_refresh = another.namespace_ids().any(|ns| {
+            another.tables(ns).any(|table| {
+                table
+                    .btree()
+                    .is_some_and(|btree| has_published_negative(btree.root_page))
+            }) || another
+                .indexes(ns)
+                .any(|index| has_published_negative(index.root_page))
+        });
+        let current_has_positive_roots = !current.dropped_root_pages.is_empty()
+            || current.namespace_ids().any(|ns| {
+                current
+                    .tables(ns)
+                    .any(|table| table.btree().is_some_and(|btree| btree.root_page > 0))
+                    || current.indexes(ns).any(|index| index.root_page > 0)
+            });
+        if !needs_root_refresh && !current_has_positive_roots {
+            return;
+        }
+
+        crate::without_allocation_faults!({
+            let next = Schema::try_make_mut(another).expect(crate::alloc::ALLOC_ERR_MSG);
+            mv_store.resolve_schema_negative_roots(next);
+
+            let mut live_positive_roots = HashSet::default();
+            for ns in next.namespace_ids() {
+                for table in next.tables(ns) {
+                    if let Some(btree) = table.btree() {
+                        if btree.root_page > 0 {
+                            live_positive_roots.insert(btree.root_page);
+                        }
+                    }
+                }
+                for index in next.indexes(ns) {
+                    if index.root_page > 0 {
+                        live_positive_roots.insert(index.root_page);
+                    }
+                }
+            }
+
+            for &dropped_root in &current.dropped_root_pages {
+                if !live_positive_roots.contains(&dropped_root) {
+                    next.dropped_root_pages.insert(dropped_root);
+                }
+            }
+            for ns in current.namespace_ids() {
+                for table in current.tables(ns) {
+                    if let Some(btree) = table.btree() {
+                        if btree.root_page > 0 && !live_positive_roots.contains(&btree.root_page) {
+                            next.dropped_root_pages.insert(btree.root_page);
+                        }
+                    }
+                }
+                for index in current.indexes(ns) {
+                    if index.root_page > 0 && !live_positive_roots.contains(&index.root_page) {
+                        next.dropped_root_pages.insert(index.root_page);
+                    }
+                }
+            }
+        });
     }
 
     pub fn get_mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
