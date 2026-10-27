@@ -84,6 +84,14 @@ public class GuidBindingTests
             reader.GetGuid(0).Should().Be(Value);
         }
 
+        using (var connection = new TursoConnection("Data Source=:memory:;BinaryGuid=True"))
+        {
+            connection.Open();
+            using var command = new TursoCommand(connection, "SELECT typeof(@g)");
+            command.Parameters.Add(new TursoParameter("@g", DbType.Guid, Value));
+            command.ExecuteScalar().Should().Be("text");
+        }
+
         using (var connection = new TursoConnection("Data Source=:memory:"))
         {
             connection.Open();

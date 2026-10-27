@@ -87,7 +87,9 @@ public class TursoParameter : DbParameter
 
     /// <summary>
     /// Converts the parameter to a native value. A <see cref="Guid"/> becomes 36-character TEXT unless
-    /// <see cref="DbType"/> is <see cref="System.Data.DbType.Binary"/>, which makes it a 16-byte BLOB.
+    /// <see cref="DbType"/> is <see cref="System.Data.DbType.Binary"/>, which makes it a 16-byte BLOB. With the
+    /// connection's Binary GUID option, a <see cref="Guid"/> also becomes a BLOB unless <see cref="DbType"/> is
+    /// <see cref="System.Data.DbType.Guid"/>.
     /// </summary>
     public TursoValue ToValue() => ToValue(binaryGuid: false);
 
@@ -97,7 +99,7 @@ public class TursoParameter : DbParameter
             return new TursoValue { ValueType = TursoValueType.Null };
 
         var value = Value;
-        if (value is Guid guid && (binaryGuid || DbType == DbType.Binary))
+        if (value is Guid guid && ((binaryGuid && DbType != DbType.Guid) || DbType == DbType.Binary))
             return TursoValue.Blob(guid.ToByteArray());
 
         var valueType = value.GetType();
