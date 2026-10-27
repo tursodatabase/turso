@@ -1,6 +1,6 @@
 use super::{
     convert_dbtype_to_jsonb, curry_convert_dbtype_to_jsonb, json_document_to_db_type,
-    json_edit_path, json_path_from_db_value,
+    json_edit_path, json_path_from_db_value, json_path_text,
     jsonb::{DeleteOperation, InsertOperation, ReplaceOperation},
     Conv, JsonCacheCell, OutputVariant,
 };
@@ -85,19 +85,14 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
-    // A SQL NULL document is SQL NULL, whatever the paths are.
     if matches!(first_arg.as_value_ref(), ValueRef::Null) {
         return Ok(Value::Null);
     }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     for arg in args {
-        if let ValueRef::Text(s) = arg.as_value_ref() {
-            if s.as_str() == "$" {
-                return Ok(Value::Null);
-            }
+        if json_path_text(arg.as_value_ref()).as_deref() == Some("$") {
+            return Ok(Value::Null);
         }
-        // Unlike json_set() and friends, which drop a pair with a SQL NULL
-        // path, json_remove() makes the whole result SQL NULL.
         let Some(path) = json_path_from_db_value(&arg, true)? else {
             return Ok(Value::Null);
         };
@@ -125,19 +120,14 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
-    // A SQL NULL document is SQL NULL, whatever the paths are.
     if matches!(first_arg.as_value_ref(), ValueRef::Null) {
         return Ok(Value::Null);
     }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     for arg in args {
-        if let ValueRef::Text(s) = arg.as_value_ref() {
-            if s.as_str() == "$" {
-                return Ok(Value::Null);
-            }
+        if json_path_text(arg.as_value_ref()).as_deref() == Some("$") {
+            return Ok(Value::Null);
         }
-        // Unlike json_set() and friends, which drop a pair with a SQL NULL
-        // path, json_remove() makes the whole result SQL NULL.
         let Some(path) = json_path_from_db_value(&arg, true)? else {
             return Ok(Value::Null);
         };
@@ -163,7 +153,6 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
-    // A SQL NULL document is SQL NULL, whatever the paths are.
     if matches!(first_arg.as_value_ref(), ValueRef::Null) {
         return Ok(Value::Null);
     }
@@ -206,7 +195,6 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
-    // A SQL NULL document is SQL NULL, whatever the paths are.
     if matches!(first_arg.as_value_ref(), ValueRef::Null) {
         return Ok(Value::Null);
     }
@@ -249,7 +237,6 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
-    // A SQL NULL document is SQL NULL, whatever the paths are.
     if matches!(first_arg.as_value_ref(), ValueRef::Null) {
         return Ok(Value::Null);
     }
@@ -293,7 +280,6 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
-    // A SQL NULL document is SQL NULL, whatever the paths are.
     if matches!(first_arg.as_value_ref(), ValueRef::Null) {
         return Ok(Value::Null);
     }
@@ -758,5 +744,21 @@ mod tests {
             let cache = JsonCacheCell::new();
             assert_eq!(jsonb_remove(&args, &cache).unwrap(), Value::Null);
         }
+    }
+
+    #[test]
+    fn test_blob_root_path_makes_json_remove_null() {
+        let root =
+            Value::Blob(crate::types::value_blob_from_slice(b"$").expect("test blob allocation"));
+        let cache = JsonCacheCell::new();
+        assert_eq!(
+            json_remove(&[create_json("[1]"), root.clone()], &cache).unwrap(),
+            Value::Null
+        );
+        let cache = JsonCacheCell::new();
+        assert_eq!(
+            jsonb_remove(&[create_json("[1]"), root], &cache).unwrap(),
+            Value::Null
+        );
     }
 }

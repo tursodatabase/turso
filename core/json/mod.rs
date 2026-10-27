@@ -416,8 +416,6 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
-    // A SQL NULL document is SQL NULL for SQLite, and it decides the result
-    // before any path or value is looked at.
     if matches!(first_arg.as_value_ref(), ValueRef::Null) {
         return Ok(Value::Null);
     }
@@ -462,7 +460,6 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
-    // A SQL NULL document is SQL NULL, before any path or value is looked at.
     if matches!(first_arg.as_value_ref(), ValueRef::Null) {
         return Ok(Value::Null);
     }
@@ -851,14 +848,6 @@ fn json_edit_path<'a>(
     json_path_from_db_value(path, true)
 }
 
-/// Converts the result of a document edit (`json_patch`, `json_remove`,
-/// `json_insert`, `json_replace`, `json_set` and the `jsonb_` variants) to a db
-/// value.
-///
-/// A document that is JSON `null` is still a document, so SQLite returns the
-/// text `null`, or the JSONB null header for the `jsonb_` variants.
-/// `json_string_to_db_type()` maps `null` to SQL NULL because that is what
-/// extraction has to do, so the document case has to be handled first.
 pub fn json_document_to_db_type(
     json: Jsonb,
     element_type: ElementType,
