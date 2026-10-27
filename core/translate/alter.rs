@@ -1253,6 +1253,7 @@ pub fn translate_alter_table(
                                 .as_ref()
                                 .map(|n| normalize_ident(n.as_str())),
                             parent_table: normalize_ident(clause.tbl_name.as_str()),
+                            parent_namespace: namespace.id,
                             parent_columns: clause
                                 .columns
                                 .iter()
