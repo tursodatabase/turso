@@ -61,6 +61,34 @@ pub fn emit_ungrouped_aggregation<'a>(
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
 
+    let mut cached_columns = t_ctx
+        .resolver
+        .expr_to_reg_cache
+        .iter()
+        .filter(|cached| {
+            matches!(cached.expr.as_ref(), ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. }
+                if plan.table_references.find_joined_table_by_internal_id(*table).is_some())
+        })
+        .peekable();
+    if let Some(once_flag) = t_ctx
+        .reg_nonagg_emit_once_flag
+        .filter(|_| cached_columns.peek().is_some())
+    {
+        let skip_null_columns = program.allocate_label();
+        program.emit_insn(Insn::If {
+            reg: once_flag,
+            target_pc: skip_null_columns,
+            jump_if_null: false,
+        });
+        for cached in cached_columns {
+            program.emit_insn(Insn::Null {
+                dest: cached.reg,
+                dest_end: None,
+            });
+        }
+        program.preassign_label_to_next_insn(skip_null_columns);
+    }
+
     // Subqueries that read an aggregate this query computes need the
     // aggregate's finalized register, so they must be emitted now — after
     // AggFinal and the cache population above, and before the result row that

@@ -1330,6 +1330,38 @@ expect {
     1|0
 }
 
+@cross-check-integrity
+test correlated-aggregate-clears-saved-columns-on-empty-input {
+    create table t(g, label, v);
+    insert into t values (1, 'a', 5), (2, NULL, 9);
+    create table o(g);
+    insert into o values (4), (1), (4), (2), (4), (1);
+
+    select g, (select count(*) from t where t.g = o.g having label is null) from o;
+    select g, (select coalesce(max(v), 0) from t where t.g = o.g having label is null) from o;
+    select g, (select count(*) || ':' || coalesce(label, 'empty') from t where t.g = o.g) from o;
+}
+expect {
+    4|0
+    1|
+    4|0
+    2|1
+    4|0
+    1|
+    4|0
+    1|
+    4|0
+    2|9
+    4|0
+    1|
+    4|0:empty
+    1|1:a
+    4|0:empty
+    2|1:empty
+    4|0:empty
+    1|1:a
+}
+
 # EXISTS subquery in ungrouped aggregate query with data
 # The EXISTS subquery is non-correlated and should be evaluated before the loop,
 # returning 1 when the subquery table has data.

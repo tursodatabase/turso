@@ -124,13 +124,8 @@ pub fn emit_query<'a>(
     // It also tells whether any row reached the aggregate, which a correlated
     // subquery in the result columns needs even when every column contains an
     // aggregate: if no row did, the subquery runs again against the NULL row.
-    let mut has_minmax_bare_column = false;
-    if plan.aggregates.iter().any(|agg| {
-        matches!(
-            agg.func,
-            crate::function::AggFunc::Min | crate::function::AggFunc::Max
-        )
-    }) {
+    let mut has_bare_column = false;
+    if !plan.aggregates.is_empty() {
         for expr in plan.result_columns.iter().map(|column| &column.expr).chain(
             plan.group_by
                 .iter()
@@ -141,7 +136,7 @@ pub fn emit_query<'a>(
                     return Ok(WalkControl::SkipChildren);
                 }
                 if matches!(expr, Expr::Column { .. } | Expr::RowId { .. }) {
-                    has_minmax_bare_column = true;
+                    has_bare_column = true;
                 }
                 Ok(WalkControl::Continue)
             })?;
@@ -152,7 +147,7 @@ pub fn emit_query<'a>(
             .group_by
             .as_ref()
             .is_none_or(|group| group.exprs.is_empty())
-        && (has_minmax_bare_column
+        && (has_bare_column
             || plan.result_columns.iter().any(|c| !c.contains_aggregates)
             || plan
                 .non_from_clause_subqueries
