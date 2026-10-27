@@ -4936,7 +4936,9 @@ impl BTreeTable {
 
     fn primary_key_implies_not_null(&self, column: &Column) -> bool {
         column.primary_key()
-            && (self.is_strict || (!self.has_rowid && self.primary_key_columns.len() == 1))
+            && (column.is_rowid_alias()
+                || self.is_strict
+                || (!self.has_rowid && self.primary_key_columns.len() == 1))
     }
 
     pub fn column_collations(&self) -> Result<Vec<CollationSeq>> {
@@ -6774,7 +6776,7 @@ impl Column {
     }
     #[inline]
     pub fn notnull(&self) -> bool {
-        self.info.notnull()
+        self.info.notnull() || self.is_rowid_alias()
     }
     #[inline]
     pub fn set_notnull(&mut self, v: bool) {
@@ -7681,13 +7683,17 @@ mod tests {
             for (actual, flag) in [
                 (column.primary_key(), ColDefFlags::PrimaryKey),
                 (column.is_rowid_alias(), ColDefFlags::RowIdAlias),
-                (column.notnull(), ColDefFlags::NotNull),
                 (column.explicit_notnull(), ColDefFlags::ExplicitNotNull),
                 (column.unique(), ColDefFlags::Unique),
                 (column.hidden(), ColDefFlags::Hidden),
             ] {
                 assert_eq!(actual, flags.contains(flag), "{flags:?}: {flag:?}");
             }
+            assert_eq!(
+                column.notnull(),
+                flags.intersects(ColDefFlags::NotNull | ColDefFlags::RowIdAlias),
+                "{flags:?}"
+            );
             assert_eq!(column.ty(), Type::Numeric, "{flags:?}");
             assert_eq!(
                 column.collation_opt(),
@@ -8078,6 +8084,21 @@ mod tests {
         let column = table.get_column("a").unwrap().1;
         assert!(column.notnull());
         Ok(())
+    }
+
+    #[test]
+    fn rowid_alias_is_not_nullable() {
+        for sql in [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE t(id INTEGER, PRIMARY KEY(id))",
+        ] {
+            let table = BTreeTable::from_sql(sql, 2).unwrap();
+            let column = table.get_column("id").unwrap().1;
+            assert!(column.notnull(), "{sql}");
+            assert!(!column.explicit_notnull(), "{sql}");
+        }
+        let table = BTreeTable::from_sql("CREATE TABLE t(id INTEGER PRIMARY KEY DESC)", 2).unwrap();
+        assert!(!table.get_column("id").unwrap().1.notnull());
     }
 
     #[test]

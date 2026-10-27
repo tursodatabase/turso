@@ -120,6 +120,8 @@ Note also that MVCC autoincrement does **not** un-burn rolled-back rowids — a 
 
 ### NOT NULL
 
+The PostgreSQL catalogs report `INTEGER PRIMARY KEY` columns as non-nullable, along with explicitly declared `NOT NULL` columns, so `pg_dump` preserves those constraints.
+
 Prevents the column from containing NULL values. Any INSERT or UPDATE that would set the column to NULL raises a constraint error.
 
 ```sql

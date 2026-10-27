@@ -930,7 +930,7 @@ fn derive_ctas_schema(
 ) -> Result<(CtasInfo, Vec<ColumnDefinition>)> {
     let select =
         crate::translate::semantic_lowering::PlannedSelect::new(select, catalog, connection)?;
-    let columns = select.columns()?;
+    let columns = select.columns(catalog.dialect().as_ref())?;
     Ok(ctas_schema(select, table_name, columns))
 }
 

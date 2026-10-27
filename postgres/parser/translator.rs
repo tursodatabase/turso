@@ -3282,12 +3282,16 @@ impl PostgreSQLTranslator {
                 pg_query::protobuf::a_const::Val::Fval(f) => {
                     Ok(ast::Expr::Literal(ast::Literal::Numeric(f.fval.clone())))
                 }
-                pg_query::protobuf::a_const::Val::Boolval(b) => {
-                    // SQLite uses 0/1 for booleans
-                    Ok(ast::Expr::Literal(ast::Literal::Numeric(
+                pg_query::protobuf::a_const::Val::Boolval(b) => Ok(ast::Expr::Cast {
+                    expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
                         if b.boolval { "1" } else { "0" }.to_string(),
-                    )))
-                }
+                    ))),
+                    type_name: Some(ast::Type {
+                        name: "boolean".to_string(),
+                        size: None,
+                        array_dimensions: 0,
+                    }),
+                }),
                 _ => Err(ParseError::ParseError(
                     "Unsupported constant type".to_string(),
                 )),
@@ -8610,7 +8614,7 @@ mod tests {
             ),
             (
                 "SELECT * FROM t1 LEFT JOIN LATERAL (SELECT t1.a) s ON true",
-                "SELECT * FROM t1 LEFT OUTER JOIN LATERAL (SELECT t1.a) s ON 1",
+                "SELECT * FROM t1 LEFT OUTER JOIN LATERAL (SELECT t1.a) s ON CAST (1 AS boolean)",
             ),
             (
                 "SELECT * FROM t1, (SELECT 1) s",

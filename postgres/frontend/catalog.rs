@@ -206,6 +206,12 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn declared_result_type(&self, name: &str, array_dimensions: u32) -> Option<&'static str> {
+        (array_dimensions == 0
+            && (name.eq_ignore_ascii_case("boolean") || name.eq_ignore_ascii_case("bool")))
+        .then_some("BOOLEAN")
+    }
+
     fn add_column_computes_default_for_existing_rows(&self) -> bool {
         true
     }
@@ -653,7 +659,7 @@ impl SnapshotRows for PgAttributeTable {
                     _ => sqlite_type_to_pg_oid(&col.ty_str),
                 };
                 let attnum = (i + 1) as i64; // 1-based
-                let notnull = if col.notnull() { 1i64 } else { 0i64 };
+                let notnull = i64::from(col.notnull());
                 let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
 
                 rows.push(vec![

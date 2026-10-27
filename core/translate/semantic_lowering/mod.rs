@@ -18,6 +18,7 @@ mod window;
 use turso_parser::ast;
 
 use crate::{
+    dialect::Dialect,
     function::{AggFunc, Func, ScalarFunc},
     schema::Type,
     sync::Arc,
@@ -58,7 +59,8 @@ pub(crate) fn translate_select(
     };
     program.set_hir_plan(plan.clone());
     query::emit_planned_query_body(program, &plan, root.query, &QueryDestination::ResultRows)?;
-    program.resolved_result_columns = resolved_result_columns(&plan.document, root.query)?;
+    program.resolved_result_columns =
+        resolved_result_columns(&plan.document, root.query, context.dialect().as_ref())?;
     Ok(())
 }
 
@@ -270,12 +272,12 @@ impl PlannedSelect {
 
     /// Each column of the new table: the SELECT's output name, and the type
     /// SQLite derives from the output's affinity.
-    pub(crate) fn columns(&self) -> Result<Vec<(String, &'static str)>> {
+    pub(crate) fn columns(&self, dialect: &dyn Dialect) -> Result<Vec<(String, &'static str)>> {
         let document = &self.plan.document;
         let query = document
             .query(self.query)
             .ok_or_else(|| LimboError::InternalError("HIR CTAS query is missing".into()))?;
-        let names = resolved_result_columns(document, self.query)?;
+        let names = resolved_result_columns(document, self.query, dialect)?;
         query
             .output
             .iter()
@@ -486,8 +488,11 @@ pub(crate) fn translate_delete(
     program.set_hir_plan(plan.clone());
     delete::emit_delete(program, &plan, delete, access, &subprograms)?;
     if let Some(returning) = &delete.returning {
-        program.resolved_result_columns =
-            resolved_output_columns(&plan.document, &returning.outputs)?;
+        program.resolved_result_columns = resolved_output_columns(
+            &plan.document,
+            &returning.outputs,
+            context.dialect().as_ref(),
+        )?;
     }
     Ok(())
 }
@@ -551,8 +556,11 @@ fn translate_update_with(
         schema_change,
     )?;
     if let Some(returning) = &update.returning {
-        program.resolved_result_columns =
-            resolved_output_columns(&plan.document, &returning.outputs)?;
+        program.resolved_result_columns = resolved_output_columns(
+            &plan.document,
+            &returning.outputs,
+            context.dialect().as_ref(),
+        )?;
     }
     Ok(())
 }
@@ -591,8 +599,11 @@ pub(crate) fn translate_insert(
             .upsert_rejects_row_written_by_same_statement(),
     )?;
     if let Some(returning) = &insert.returning {
-        program.resolved_result_columns =
-            resolved_output_columns(&plan.document, &returning.outputs)?;
+        program.resolved_result_columns = resolved_output_columns(
+            &plan.document,
+            &returning.outputs,
+            context.dialect().as_ref(),
+        )?;
     }
     Ok(())
 }
@@ -854,6 +865,7 @@ impl ResolvedResultSourceColumn {
 fn resolved_result_columns(
     document: &HirDocument,
     query: hir::QueryId,
+    dialect: &dyn Dialect,
 ) -> Result<Vec<ResolvedResultColumn>> {
     let query = document.query(query).ok_or_else(|| {
         LimboError::InternalError(format!("HIR result references missing query {query}"))
@@ -861,7 +873,7 @@ fn resolved_result_columns(
     let block = query.blocks.first().ok_or_else(|| {
         LimboError::InternalError(format!("HIR query {} has no blocks", query.id))
     })?;
-    resolved_output_columns_from(document, &block.outputs, block.from.as_ref())
+    resolved_output_columns_from(document, &block.outputs, block.from.as_ref(), dialect)
 }
 
 /// Result-column metadata for a list of outputs, such as a SELECT block's
@@ -869,14 +881,16 @@ fn resolved_result_columns(
 fn resolved_output_columns(
     document: &HirDocument,
     outputs: &[hir::Output],
+    dialect: &dyn Dialect,
 ) -> Result<Vec<ResolvedResultColumn>> {
-    resolved_output_columns_from(document, outputs, None)
+    resolved_output_columns_from(document, outputs, None, dialect)
 }
 
 fn resolved_output_columns_from(
     document: &HirDocument,
     outputs: &[hir::Output],
     from: Option<&hir::From>,
+    dialect: &dyn Dialect,
 ) -> Result<Vec<ResolvedResultColumn>> {
     let mut columns = Vec::with_capacity(outputs.len());
     for output in outputs {
@@ -892,7 +906,7 @@ fn resolved_output_columns_from(
             ),
             value,
             affinity: output.affinity,
-            primitive: expression_primitive(document, &document.exprs[output.expr]),
+            primitive: expression_primitive(document, &document.exprs[output.expr], dialect),
             array_dimensions: output.type_fact.array_dimensions,
         });
     }
@@ -954,8 +968,30 @@ fn group_column_of(
 /// INTEGER; `||` gives TEXT; an operator a custom type defines gives
 /// nothing, since its function decides the result; anything else reports
 /// its affinity.
-fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Option<&'static str> {
+fn expression_primitive(
+    document: &HirDocument,
+    expression: &hir::Expr,
+    dialect: &dyn Dialect,
+) -> Option<&'static str> {
     use ast::{Operator, UnaryOperator};
+    let declared = match expression {
+        hir::Expr::Cast { target, .. } => {
+            dialect.declared_result_type(&target.name, target.array_dimensions)
+        }
+        hir::Expr::Column(reference) => document
+            .source(reference.source)
+            .and_then(|source| source.columns.get(reference.column))
+            .and_then(|column| {
+                let fact = column.type_fact();
+                fact.declared.as_ref().and_then(|declared| {
+                    dialect.declared_result_type(&declared.name, fact.array_dimensions)
+                })
+            }),
+        _ => None,
+    };
+    if declared.is_some() {
+        return declared;
+    }
     match expression {
         hir::Expr::Literal(literal) => {
             match crate::translate::alter::literal_default_value(literal)
@@ -968,14 +1004,18 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
                 _ => None,
             }
         }
-        hir::Expr::Collate { expr, .. } => expression_primitive(document, &document.exprs[*expr]),
+        hir::Expr::Collate { expr, .. } => {
+            expression_primitive(document, &document.exprs[*expr], dialect)
+        }
         hir::Expr::Unary { operator, expr } => match operator {
             UnaryOperator::Not | UnaryOperator::BitwiseNot => Some("INTEGER"),
             UnaryOperator::Negative => Some(arithmetic_primitive(
                 Some("INTEGER"),
-                expression_primitive(document, &document.exprs[*expr]),
+                expression_primitive(document, &document.exprs[*expr], dialect),
             )),
-            UnaryOperator::Positive => expression_primitive(document, &document.exprs[*expr]),
+            UnaryOperator::Positive => {
+                expression_primitive(document, &document.exprs[*expr], dialect)
+            }
         },
         hir::Expr::Binary {
             custom: Some(_), ..
@@ -988,8 +1028,8 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
             | Operator::Multiply
             | Operator::Divide
             | Operator::Modulus => Some(arithmetic_primitive(
-                expression_primitive(document, &document.exprs[*lhs]),
-                expression_primitive(document, &document.exprs[*rhs]),
+                expression_primitive(document, &document.exprs[*lhs], dialect),
+                expression_primitive(document, &document.exprs[*rhs], dialect),
             )),
             Operator::BitwiseAnd
             | Operator::BitwiseOr
@@ -1019,6 +1059,7 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
         } => common_primitive(
             document,
             when_then.iter().map(|(_, then)| *then).chain(*else_expr),
+            dialect,
         ),
         hir::Expr::Function(call) => {
             let hir::FunctionArguments::Expressions { values, .. } = &call.arguments else {
@@ -1027,17 +1068,17 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
             match call.function.value() {
                 Func::Scalar(
                     ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Max | ScalarFunc::Min,
-                ) => common_primitive(document, values.iter().copied()),
+                ) => common_primitive(document, values.iter().copied(), dialect),
                 Func::Scalar(ScalarFunc::Iif) => {
-                    common_primitive(document, values.iter().skip(1).copied())
+                    common_primitive(document, values.iter().skip(1).copied(), dialect)
                 }
                 Func::Scalar(ScalarFunc::Nullif)
                 | Func::Agg(AggFunc::Max | AggFunc::Min | AggFunc::ArrayAgg) => {
-                    expression_primitive(document, &document.exprs[*values.first()?])
+                    expression_primitive(document, &document.exprs[*values.first()?], dialect)
                 }
                 Func::Scalar(ScalarFunc::Abs) => Some(arithmetic_primitive(
                     Some("INTEGER"),
-                    expression_primitive(document, &document.exprs[*values.first()?]),
+                    expression_primitive(document, &document.exprs[*values.first()?], dialect),
                 )),
                 _ => None,
             }
@@ -1058,6 +1099,7 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
 fn common_primitive(
     document: &HirDocument,
     expressions: impl Iterator<Item = hir::ExprId>,
+    dialect: &dyn Dialect,
 ) -> Option<&'static str> {
     let is_numeric = |primitive| matches!(primitive, "INTEGER" | "REAL" | "NUMERIC");
     let mut common = None;
@@ -1065,7 +1107,7 @@ fn common_primitive(
         .map(|expression| &document.exprs[expression])
         .filter(|expression| !matches!(expression, hir::Expr::Literal(ast::Literal::Null)))
     {
-        let primitive = expression_primitive(document, expression)?;
+        let primitive = expression_primitive(document, expression, dialect)?;
         common = match common {
             None => Some(primitive),
             Some(common) if common == primitive => Some(common),
