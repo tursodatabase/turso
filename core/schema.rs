@@ -370,7 +370,15 @@ fn builtin_signatures(type_name: &str) -> std::vec::Vec<OperatorSignature> {
                     signatures.extend(sqlite_operator(op, Real));
                 }
             }
-            signatures.push(call("-", &[Value], "numeric_neg", Some("numeric")));
+            // TODO: run numeric_neg once every comparison uses numeric's
+            // order. Until then its text result would compare as text in IN,
+            // CASE, min/max and index seeks, where SQLite's REAL compares right.
+            signatures.push(OperatorSignature {
+                op: "-",
+                args: std::vec![Value],
+                func: None,
+                result: None,
+            });
             signatures
         }
         "date" => std::vec![

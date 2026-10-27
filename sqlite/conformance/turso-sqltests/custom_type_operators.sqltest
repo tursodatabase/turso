@@ -1503,8 +1503,11 @@ expect error {
 }
 
 # Unary minus, ~, &, |, << and >> on a custom type are decided like + - * / %:
-# the type's function runs them, or they are an error. numeric negates
-# exactly, as in PostgreSQL; smallint uses SQLite's operators.
+# the type's function runs them, or they are an error. numeric and smallint
+# declare SQLite's operators for them, so -n is the REAL -3.5, as on main.
+# TODO: -n gives the numeric -3.50, as in PostgreSQL, once every comparison
+# uses numeric's order; a numeric text result compares as text in IN, CASE,
+# min/max and index seeks today.
 @requires strict "uses STRICT tables"
 test op-numeric-and-smallint-unary-and-bitwise {
     CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), s smallint) STRICT;
@@ -1512,9 +1515,9 @@ test op-numeric-and-smallint-unary-and-bitwise {
     SELECT -n, -n % 2, -n * 2, -(-n), - -n, +n, -s, ~s, s & 3, s | 4, s << 2, s >> 1 FROM t ORDER BY id;
 }
 expect {
-    -3.50|-1.50|-7.00|3.50|3.50|3.50|-5|-6|1|5|20|2
+    -3.5|-1.0|-7.0|3.5|3.5|3.50|-5|-6|1|5|20|2
     |||||||||||
-    0.25|0.25|0.50|-0.25|-0.25|-0.25|1|0|3|-1|-4|-1
+    0.25|0.0|0.5|-0.25|-0.25|-0.25|1|0|3|-1|-4|-1
 }
 
 @requires strict "uses STRICT tables"
@@ -1617,14 +1620,32 @@ expect {
 
 @requires strict "uses STRICT tables"
 test op-numeric-result-compares-as-numeric {
-    -- An operator result on a numeric compares as a number, and the other
-    -- operand is not rounded to the column's scale first. From PostgreSQL.
+    -- An operator result on a numeric compares as a number, and the literal
+    -- is not rounded to a scale the result does not have. From PostgreSQL.
     CREATE TABLE t(n numeric(10,2), i integer) STRICT;
     INSERT INTO t VALUES (3.50, 10);
     SELECT (n - 10) > 0, -n < 0, n + 100 > 5, (n - i) > 0, n * 2 = 7, -n < i FROM t;
-    SELECT n = 3.504, n = 3.5, n - 1 = 2.5 FROM t;
+    SELECT n = 3.5, n - 1 = 2.5, n - 1 = 2.504 FROM t;
 }
 expect {
     0|1|1|0|1|1
-    0|1|1
+    1|1|0
+}
+
+# -n compares as a number wherever values are compared, with and without an
+# index. From PostgreSQL.
+@requires strict "uses STRICT tables"
+test op-numeric-negation-compares-as-number {
+    CREATE TABLE t(n numeric(10,2), i integer) STRICT;
+    INSERT INTO t VALUES (3.50, 10), (0.50, 1);
+    SELECT -n IN (-3.5), CASE -n WHEN -3.5 THEN 'y' ELSE 'n' END, nullif(-n, -3.5) IS NULL FROM t ORDER BY i DESC;
+    SELECT max(-n) = -0.5, min(-n) = -3.5 FROM t;
+    CREATE INDEX t_neg ON t(-n);
+    SELECT i FROM t WHERE -n = -3.5;
+}
+expect {
+    1|y|1
+    0|n|0
+    1|1
+    10
 }

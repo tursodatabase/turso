@@ -204,8 +204,10 @@ pub(super) fn find_custom_comparison(
     }
     let op_str = operator_to_str(op)?;
     let env = TypeEnv::new(referenced_tables, resolver);
-    let lhs_info = comparison_operand_type(e1, &env);
-    let rhs_info = comparison_operand_type(e2, &env);
+    let lhs = comparison_operand_type(e1, &env);
+    let rhs = comparison_operand_type(e2, &env);
+    let lhs_info = lhs.as_ref().map(|operand| &operand.ty);
+    let rhs_info = rhs.as_ref().map(|operand| &operand.ty);
 
     // Try to find a direct or derived operator match on a type definition.
     let find_in_type_def = |type_def: &TypeDef| -> Option<(String, bool, bool)> {
@@ -241,7 +243,7 @@ pub(super) fn find_custom_comparison(
     };
 
     // Case 1: Both operands are custom type columns of the SAME type.
-    if let (Some(ref lhs), Some(ref rhs)) = (&lhs_info, &rhs_info) {
+    if let (Some(lhs), Some(rhs)) = (lhs_info, rhs_info) {
         if same_type_def(&lhs.type_def, &rhs.type_def) {
             if let Some((func_name, swap_args, negate)) = find_in_type_def(&lhs.type_def) {
                 return Some(ResolvedOperator {
@@ -257,15 +259,21 @@ pub(super) fn find_custom_comparison(
     }
 
     let resolve_one_custom_operand =
-        |info: &ColumnCustomType, other: &ast::Expr, which: EncodeArg| {
-            // A type whose value is `any` reads any value itself, so the other
-            // operand is passed as it is: encoding it would round `1.504` to
-            // a numeric(10,2) column's scale before comparing.
-            let pass_other_unencoded = info.type_def.value_input_type().eq_ignore_ascii_case("any");
-            let encode_other = !pass_other_unencoded
+        |operand: &ComparisonOperand, other: &ast::Expr, which: EncodeArg| {
+            let info = &operand.ty;
+            // A literal is encoded to the operand's type, as an index seek on a
+            // column encodes it. An operator result, such as `n - 1`, has no
+            // type parameters to encode with, so the literal is passed as it
+            // is; only a type whose value is `any` accepts that.
+            // TODO: rounding the literal to the column's scale is wrong
+            // (`n = 3.504` is true for 3.50); comparing with the type's
+            // ordering and converting the literal without the column's
+            // parameters, in comparisons and seeks alike, fixes it.
+            let encode_other = operand.is_column
                 && literal_type_name(other).is_some_and(|lit_type| {
                     literal_compatible_with_value_type(lit_type, info.type_def.value_input_type())
                 });
+            let pass_other_unencoded = info.type_def.value_input_type().eq_ignore_ascii_case("any");
             if !encode_other && !pass_other_unencoded {
                 return None;
             }
@@ -282,7 +290,7 @@ pub(super) fn find_custom_comparison(
             })
         };
 
-    match (&lhs_info, &rhs_info) {
+    match (&lhs, &rhs) {
         (Some(lhs), None) => resolve_one_custom_operand(lhs, e2, EncodeArg::Second),
         (None, Some(rhs)) => resolve_one_custom_operand(rhs, e1, EncodeArg::First),
         _ => None,
@@ -293,9 +301,12 @@ pub(super) fn find_custom_comparison(
 /// functions read: a column, or the result of an operator on a custom type,
 /// such as `n - 1` on a numeric. Without the second, `n - 1 > 0` would compare
 /// the text `'2.50'` with the integer 0.
-fn comparison_operand_type(expr: &ast::Expr, env: &TypeEnv) -> Option<ColumnCustomType> {
+fn comparison_operand_type(expr: &ast::Expr, env: &TypeEnv) -> Option<ComparisonOperand> {
     if let Some(ty) = column_custom_type(expr, env) {
-        return Some(ty);
+        return Some(ComparisonOperand {
+            ty,
+            is_column: true,
+        });
     }
     if !matches!(
         without_wrappers(expr),
@@ -304,9 +315,17 @@ fn comparison_operand_type(expr: &ast::Expr, env: &TypeEnv) -> Option<ColumnCust
         return None;
     }
     match type_of(expr, env) {
-        ExprType::Custom { type_def, params } => Some(ColumnCustomType { type_def, params }),
+        ExprType::Custom { type_def, params } => Some(ComparisonOperand {
+            ty: ColumnCustomType { type_def, params },
+            is_column: false,
+        }),
         _ => None,
     }
+}
+
+struct ComparisonOperand {
+    ty: ColumnCustomType,
+    is_column: bool,
 }
 
 /// Whether a custom type's function runs the operator expression `expr`, such
