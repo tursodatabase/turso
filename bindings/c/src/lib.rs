@@ -2290,6 +2290,11 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
         let result = stmt_ref.stmt.bind_at(index, Value::Null);
         return sqlite3_bind_result(stmt_ref, result);
     }
+    // Negative n is undefined. SQLITE_ENABLE_API_ARMOR returns SQLITE_MISUSE.
+    // Casting the signed length to usize builds a huge slice.
+    if len < 0 {
+        return SQLITE_MISUSE;
+    }
 
     let slice_blob = std::slice::from_raw_parts(blob as *const u8, len as usize).to_vec();
 

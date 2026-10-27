@@ -6,7 +6,7 @@ use std::sync::Arc;
 use turso_core::{
     dialect::POSTGRES_TABLE_SQL_PREFIX,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
-    schema::{BTreeTable, Index, Schema, Table, AUTOINCREMENT_SEQ_PREFIX},
+    schema::{BTreeTable, Index, Schema, Sequence, Table, AUTOINCREMENT_SEQ_PREFIX},
     Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions, Result, Statement,
     Value,
 };
@@ -464,17 +464,11 @@ impl SnapshotRows for PgClassTable {
             }
         }
 
-        let mut sequence_names: Vec<_> = schema
-            .sequences_by_name(NamespaceId::ROOT)
-            .keys()
-            .filter(|name| !name.starts_with(AUTOINCREMENT_SEQ_PREFIX))
-            .collect();
-        sequence_names.sort();
         let relkind: &'static str = RelationKind::Sequence.into();
-        for (i, name) in sequence_names.into_iter().enumerate() {
+        for (oid, sequence) in sequence_catalog_entries(&schema) {
             rows.push(vec![
-                Value::from_i64(index_oid + i as i64),
-                Value::build_text(name.clone()),
+                Value::from_i64(oid),
+                Value::build_text(sequence.name.clone()),
                 Value::from_i64(2200),
                 Value::from_i64(0),
                 Value::from_i64(0),
@@ -2036,6 +2030,61 @@ impl SnapshotRows for PgAttrdefTable {
     }
 }
 
+#[derive(Debug)]
+struct PgSequenceTable;
+
+impl SnapshotRows for PgSequenceTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_sequence (
+        seqrelid INTEGER, seqtypid INTEGER, seqstart BIGINT, seqincrement BIGINT,
+        seqmax BIGINT, seqmin BIGINT, seqcache BIGINT, seqcycle BOOLEAN,
+        tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2224);
+    const ESTIMATED_COST: f64 = 100.0;
+    const ESTIMATED_ROWS: u32 = 10;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        sequence_catalog_entries(&conn.current_schema())
+            .map(|(oid, seq)| {
+                vec![
+                    Value::from_i64(oid),
+                    Value::from_i64(20),
+                    Value::from_i64(seq.start_value),
+                    Value::from_i64(seq.increment_by),
+                    Value::from_i64(seq.max_value),
+                    Value::from_i64(seq.min_value),
+                    Value::from_i64(1),
+                    Value::from_i64(i64::from(seq.cycle)),
+                ]
+            })
+            .collect()
+    }
+}
+
+fn sequence_catalog_entries(schema: &Schema) -> impl Iterator<Item = (i64, &Sequence)> {
+    let tables = user_tables_sorted(schema);
+    let index_count: usize = tables
+        .iter()
+        .map(|(name, _)| {
+            schema
+                .get_indices(NamespaceId::ROOT, name)
+                .filter(|index| !index.ephemeral)
+                .count()
+        })
+        .sum();
+    let first_oid = USER_TABLE_OID_START + tables.len() as i64 + index_count as i64;
+    let mut sequences: Vec<_> = schema
+        .sequences_by_name(NamespaceId::ROOT)
+        .iter()
+        .filter(|(name, _)| !name.starts_with(AUTOINCREMENT_SEQ_PREFIX))
+        .collect();
+    sequences.sort_by_key(|(name, _)| *name);
+    sequences
+        .into_iter()
+        .enumerate()
+        .map(move |(i, (_, sequence))| (first_oid + i as i64, sequence.as_ref()))
+}
+
 /// Virtual table implementation for pg_catalog.pg_sequences
 /// Reads sequence metadata from Schema.sequences at scan time.
 #[derive(Debug)]
@@ -2188,6 +2237,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             schema: PgInputErrorInfoTable::schema,
             create: PgInputErrorInfoTable::new,
         },
+    );
+    options = options.native_module(
+        "pg_sequence",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgSequenceTable>(PhantomData),
     );
     options = options.native_module(
         "pg_sequences",
@@ -3595,6 +3649,7 @@ mod tests {
             "pg_type",
             "pg_attrdef",
             "pg_input_error_info",
+            "pg_sequence",
             "pg_sequences",
             "pg_settings",
             "pg_extension",

@@ -206,13 +206,17 @@ pub trait File: Send + Sync {
     /// If there is a single byte which is allocated within a given range - method must return false in this case
     // todo: need to add custom completion type?
     fn has_hole(&self, _pos: usize, _len: usize) -> Result<bool> {
-        panic!("has_hole is not supported for the given IO implementation")
+        Err(crate::LimboError::InternalError(
+            "has_hole is not supported for the given IO implementation".into(),
+        ))
     }
     /// Optional method implemented by the IO which supports "partial" files (e.g. file with "holes")
     /// This method is used in sync engine only for now (in partial sync mode) and never used in the core database code
     // todo: need to add custom completion type?
     fn punch_hole(&self, _pos: usize, _len: usize) -> Result<()> {
-        panic!("punch_hole is not supported for the given IO implementation")
+        Err(crate::LimboError::InternalError(
+            "punch_hole is not supported for the given IO implementation".into(),
+        ))
     }
 
     fn shared_wal_lock_byte(
