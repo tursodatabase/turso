@@ -652,6 +652,11 @@ impl SnapshotRows for PgAttributeTable {
                     Some(td) if !td.is_builtin => user_type_oid(&td.name),
                     _ => sqlite_type_to_pg_oid(&col.ty_str),
                 };
+                let storage = if col.is_array() {
+                    "x"
+                } else {
+                    type_storage(&schema, &col.ty_str)
+                };
                 let attnum = (i + 1) as i64; // 1-based
                 let notnull = i64::from(col.notnull());
                 let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
@@ -667,7 +672,7 @@ impl SnapshotRows for PgAttributeTable {
                     Value::from_i64(-1),          // attcacheoff
                     Value::from_i64(-1),          // atttypmod
                     Value::from_i64(1),           // attbyval
-                    Value::Text("p".into()),      // attstorage (plain)
+                    Value::build_text(storage),   // attstorage
                     Value::Text("i".into()),      // attalign (int)
                     Value::Text("".into()),
                     Value::from_i64(notnull), // attnotnull
@@ -1471,6 +1476,7 @@ impl SnapshotRows for PgTypeTable {
                 ("e", "E", 0)
             };
             let oid = user_type_oid(&td.name);
+            let storage = type_storage(&schema, &td.name);
             rows.push(vec![
                 Value::from_i64(oid),             // oid
                 Value::Text(name.clone().into()), // typname
@@ -1495,7 +1501,7 @@ impl SnapshotRows for PgTypeTable {
                 Value::Null,                      // typmodout
                 Value::Null,                      // typanalyze
                 Value::build_text("i"),           // typalign
-                Value::build_text("p"),           // typstorage
+                Value::build_text(storage),       // typstorage
                 Value::from_i64(0),               // typnotnull
                 Value::from_i64(typbasetype),     // typbasetype
                 Value::from_i64(-1),              // typtypmod
@@ -1517,6 +1523,24 @@ fn user_type_oid(name: &str) -> i64 {
             .iter()
             .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64))
             % 10000) as i64
+}
+
+fn type_storage<'a>(schema: &'a Schema, mut name: &'a str) -> &'static str {
+    while let Some(ty) = schema.get_type_def_unchecked(name) {
+        if ty.is_builtin {
+            break;
+        }
+        if !ty.is_domain {
+            return "p";
+        }
+        name = ty.base();
+    }
+    let oid = sqlite_type_to_pg_oid(name);
+    PG_BASE_TYPES
+        .iter()
+        .find(|ty| ty.oid == oid)
+        .expect("column type OIDs refer to PostgreSQL base types")
+        .typstorage
 }
 
 fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {

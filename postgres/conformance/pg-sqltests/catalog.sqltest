@@ -1314,3 +1314,43 @@ expect {
     t
     t||1
 }
+
+test pg-attribute-default-storage {
+    CREATE TABLE storage_types (
+        id INTEGER PRIMARY KEY, body TEXT, label VARCHAR(40), data BYTEA,
+        amount NUMERIC(10,2), enabled BOOLEAN, identifier UUID, document JSONB,
+        numbers INTEGER[]
+    );
+    SELECT a.attname, a.attstorage
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'storage_types' AND a.attnum > 0 ORDER BY a.attnum;
+}
+expect {
+    id|p
+    body|x
+    label|x
+    data|x
+    amount|m
+    enabled|p
+    identifier|p
+    document|x
+    numbers|x
+}
+
+test pg-attribute-domain-storage {
+    CREATE DOMAIN text_value AS TEXT;
+    CREATE DOMAIN nested_text_value AS text_value;
+    CREATE DOMAIN number_value AS INTEGER;
+    CREATE TYPE mood_storage AS ENUM ('happy', 'sad');
+    CREATE TABLE domain_storage (a text_value, b nested_text_value, c number_value, d mood_storage);
+    SELECT a.attname, a.attstorage, t.typstorage
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    JOIN pg_type t ON t.oid = a.atttypid
+    WHERE c.relname = 'domain_storage' AND a.attnum > 0 ORDER BY a.attnum;
+}
+expect {
+    a|x|x
+    b|x|x
+    c|p|p
+    d|p|p
+}
