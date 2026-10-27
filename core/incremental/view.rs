@@ -141,6 +141,7 @@ pub(crate) struct ChangeEvent {
     pub(crate) table_id: TableChangeId,
     pub(crate) rowid: i64,
     pub(crate) values: crate::alloc::Vec<Value>,
+    pub(crate) physical_width: usize,
     pub(crate) weight: isize,
 }
 
@@ -265,9 +266,10 @@ impl SharedChangeLog {
         table_id: TableChangeId,
         key: i64,
         values: crate::alloc::Vec<Value>,
+        physical_width: usize,
         temp_store: TempStore,
     ) -> Result<bool> {
-        self.record_change(table_id, key, values, 1, temp_store)
+        self.record_change(table_id, key, values, physical_width, 1, temp_store)
     }
 
     fn record_delete(
@@ -275,9 +277,10 @@ impl SharedChangeLog {
         table_id: TableChangeId,
         key: i64,
         values: crate::alloc::Vec<Value>,
+        physical_width: usize,
         temp_store: TempStore,
     ) -> Result<bool> {
-        self.record_change(table_id, key, values, -1, temp_store)
+        self.record_change(table_id, key, values, physical_width, -1, temp_store)
     }
 
     /// Append one change event to the log. Returns `true` when the in-memory
@@ -291,6 +294,7 @@ impl SharedChangeLog {
         table_id: TableChangeId,
         key: i64,
         values: crate::alloc::Vec<Value>,
+        physical_width: usize,
         weight: isize,
         temp_store: TempStore,
     ) -> Result<bool> {
@@ -298,13 +302,14 @@ impl SharedChangeLog {
             self.pending_spill.lock().is_none(),
             "a change cannot be recorded while a change-log spill is in flight"
         );
-        let record_bytes = serialized_change_size(&table_id, key, weight, &values)?;
+        let record_bytes = serialized_change_size(&table_id, key, weight, physical_width, &values)?;
         {
             let mut changes = self.changes.lock();
             Arc::make_mut(&mut changes.tail).push(ChangeEvent {
                 table_id,
                 rowid: key,
                 values,
+                physical_width,
                 weight,
             });
             changes.in_memory_bytes = changes.in_memory_bytes.saturating_add(record_bytes);
@@ -423,12 +428,14 @@ fn serialized_change_size(
     table_id: &TableChangeId,
     key: i64,
     weight: isize,
+    physical_width: usize,
     values: &[Value],
 ) -> Result<usize> {
-    let mut record_values = crate::alloc::Vec::try_with_capacity_ext(values.len() + 3)?;
+    let mut record_values = crate::alloc::Vec::try_with_capacity_ext(values.len() + 4)?;
     record_values.push(table_id_value(table_id));
     record_values.push(Value::from_i64(key));
     record_values.push(Value::from_i64(weight as i64));
+    record_values.push(Value::from_i64(physical_width as i64));
     record_values.extend_from_slice(values);
     Ok(
         8 + ImmutableRecord::from_values(&record_values, record_values.len())?
@@ -440,10 +447,11 @@ fn serialized_change_size(
 fn serialize_change_events(events: &[ChangeEvent]) -> Result<std::vec::Vec<u8>> {
     let mut output = std::vec::Vec::new();
     for event in events {
-        let mut values = std::vec::Vec::with_capacity(event.values.len() + 3);
+        let mut values = std::vec::Vec::with_capacity(event.values.len() + 4);
         values.push(table_id_value(&event.table_id));
         values.push(Value::from_i64(event.rowid));
         values.push(Value::from_i64(event.weight as i64));
+        values.push(Value::from_i64(event.physical_width as i64));
         values.extend_from_slice(&event.values);
         let record = ImmutableRecord::from_values(&values, values.len())?;
         let payload = record.get_payload();
@@ -482,10 +490,12 @@ impl ViewChangeSubscription {
         self.change_log
             .subscribe_views(std::slice::from_ref(&self.view_name), &table_id);
         let mut changes = self.change_log.changes.lock();
+        let physical_width = values.len();
         Arc::make_mut(&mut changes.tail).push(ChangeEvent {
             table_id,
             rowid: key,
             values,
+            physical_width,
             weight: 1,
         });
         self.change_log.event_appended();
@@ -497,10 +507,12 @@ impl ViewChangeSubscription {
         self.change_log
             .subscribe_views(std::slice::from_ref(&self.view_name), &table_id);
         let mut changes = self.change_log.changes.lock();
+        let physical_width = values.len();
         Arc::make_mut(&mut changes.tail).push(ChangeEvent {
             table_id,
             rowid: key,
             values,
+            physical_width,
             weight: -1,
         });
         self.change_log.event_appended();
@@ -614,6 +626,7 @@ impl TransactionChanges {
             .try_collect()?)
     }
 
+    #[cfg(test)]
     /// Record an insertion once and subscribe every dependent view. Returns
     /// `true` when this started a change-log spill the caller must wait for
     /// (`finish_spill`) before recording anything else.
@@ -625,12 +638,26 @@ impl TransactionChanges {
         values: crate::alloc::Vec<Value>,
         temp_store: TempStore,
     ) -> Result<bool> {
+        let physical_width = values.len();
+        self.insert_with_physical_width(table, view_names, key, values, physical_width, temp_store)
+    }
+
+    pub fn insert_with_physical_width(
+        &self,
+        table: &BTreeTable,
+        view_names: &[String],
+        key: i64,
+        values: crate::alloc::Vec<Value>,
+        physical_width: usize,
+        temp_store: TempStore,
+    ) -> Result<bool> {
         let table_id = TableChangeId::RootPage(table.root_page);
         self.change_log.subscribe_views(view_names, &table_id);
         self.change_log
-            .record_insert(table_id, key, values, temp_store)
+            .record_insert(table_id, key, values, physical_width, temp_store)
     }
 
+    #[cfg(test)]
     /// Record a deletion once and subscribe every dependent view. See
     /// `insert` for the return value.
     pub fn delete(
@@ -641,16 +668,28 @@ impl TransactionChanges {
         values: crate::alloc::Vec<Value>,
         temp_store: TempStore,
     ) -> Result<bool> {
+        let physical_width = values.len();
+        self.delete_with_physical_width(table, view_names, key, values, physical_width, temp_store)
+    }
+
+    pub fn delete_with_physical_width(
+        &self,
+        table: &BTreeTable,
+        view_names: &[String],
+        key: i64,
+        values: crate::alloc::Vec<Value>,
+        physical_width: usize,
+        temp_store: TempStore,
+    ) -> Result<bool> {
         let table_id = TableChangeId::RootPage(table.root_page);
         self.change_log.subscribe_views(view_names, &table_id);
         self.change_log
-            .record_delete(table_id, key, values, temp_store)
+            .record_delete(table_id, key, values, physical_width, temp_store)
     }
 
     /// Record an arbitrary signed contribution once and subscribe every
     /// dependent view. Materialized-view records use their trailing physical
-    /// multiplicity as this logical weight. See `insert` for the return
-    /// value.
+    /// multiplicity as this logical weight.
     pub fn change(
         &self,
         table: &BTreeTable,
@@ -663,14 +702,13 @@ impl TransactionChanges {
         if weight == 0 {
             return Ok(false);
         }
+        let physical_width = values.len();
         let table_id = TableChangeId::RootPage(table.root_page);
         self.change_log.subscribe_views(view_names, &table_id);
         self.change_log
-            .record_change(table_id, key, values, weight, temp_store)
+            .record_change(table_id, key, values, physical_width, weight, temp_store)
     }
 
-    /// Wait for a spill that `insert`/`delete`/`change` started. The caller
-    /// must not record another change until this returns `Done`.
     pub fn finish_spill(&self) -> Result<IOResult<()>> {
         self.change_log.finish_pending_spill()
     }

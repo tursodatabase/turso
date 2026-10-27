@@ -398,7 +398,7 @@ fn emit_join_phase(
                 _ => program.emit_column_or_rowid(cursor_ids[pos], physical_column, value_reg),
             }
             let bound = remap_bound_expr(expr, &binding_remap)?;
-            cache_stream_expr_reg(&mut *resolver, bound, value_reg, &table_references)?;
+            cache_stream_expr_reg(&mut *resolver, bound, value_reg, &table_references, false)?;
         }
         for (binding_index, binding) in input.schema.bindings.iter().enumerate() {
             let rowid_reg = program.alloc_register();

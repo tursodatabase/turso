@@ -297,8 +297,15 @@ fn emit_plan_nodes(
                         "filter DAG node {node_id} input {upstream} was not compiled"
                     ))
                 })?;
-                let upstream =
-                    materialize_node_output(program, view_name, upstream_id, upstream, input)?;
+                let upstream = materialize_node_output(
+                    program,
+                    view_name,
+                    upstream_id,
+                    upstream,
+                    input,
+                    schema,
+                    connection,
+                )?;
                 emit_filter(
                     program,
                     view_name,
@@ -326,6 +333,8 @@ fn emit_plan_nodes(
                     upstream_id,
                     upstream_output,
                     input,
+                    schema,
+                    connection,
                 )?;
                 emit_project(
                     program,
@@ -334,6 +343,10 @@ fn emit_plan_nodes(
                     &upstream,
                     projections,
                     output_contract,
+                    matches!(
+                        upstream_output.delta(),
+                        output::DeltaSource::BaseTable { .. }
+                    ),
                     schema,
                     connection,
                 )?
@@ -353,6 +366,8 @@ fn emit_plan_nodes(
                     upstream_id,
                     upstream_output,
                     input,
+                    schema,
+                    connection,
                 )?;
                 emit_alias(program, view_name, node_id, &upstream, output_contract)?
             }
@@ -408,6 +423,8 @@ fn emit_plan_nodes(
                     upstream_id,
                     upstream_output,
                     input,
+                    schema,
+                    connection,
                 )?;
                 emit_pad(
                     program,
@@ -438,6 +455,8 @@ fn emit_plan_nodes(
                         *upstream_id,
                         upstream,
                         input,
+                        schema,
+                        connection,
                     )?);
                 }
                 emit_set_op(
@@ -468,8 +487,15 @@ fn emit_plan_nodes(
                         "aggregate DAG node {node_id} input {upstream} was not compiled"
                     ))
                 })?;
-                let upstream =
-                    materialize_node_output(program, view_name, upstream_id, upstream, input)?;
+                let upstream = materialize_node_output(
+                    program,
+                    view_name,
+                    upstream_id,
+                    upstream,
+                    input,
+                    schema,
+                    connection,
+                )?;
                 emit_group_aggregate(
                     program,
                     view_name,
@@ -496,6 +522,7 @@ fn emit_plan_nodes(
             input,
             operator_state,
             schema,
+            connection,
         )?;
         outputs[node_id] = Some(output);
     }
@@ -519,7 +546,15 @@ fn emit_plan_to_sink(
 ) -> Result<()> {
     let node_output = emit_plan_nodes(program, view_name, plan, input, schema, connection)?;
     let root = plan.dag().root;
-    let stream = materialize_node_output(program, view_name, root, &node_output, input)?;
+    let stream = materialize_node_output(
+        program,
+        view_name,
+        root,
+        &node_output,
+        input,
+        schema,
+        connection,
+    )?;
     let stream = consolidate_delta(program, &format!("{view_name}_sink_input"), &stream)?;
     emit_terminal_delta(program, view_name, &stream, sink)
 }

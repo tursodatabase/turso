@@ -5,10 +5,12 @@ use crate::incremental::dag;
 use crate::namespace::NamespaceId;
 use crate::schema::{BTreeTable, Schema};
 use crate::sync::Arc;
+use crate::translate::emitter::Resolver;
+use crate::translate::expr::emit_stored_column_from_table;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, InsertFlags, Insn};
-use crate::{LimboError, Result};
+use crate::{Connection, LimboError, Result};
 
 pub(super) fn scan_node_output(
     dag: &dag::MaintenanceDag,
@@ -41,6 +43,8 @@ pub(super) fn materialize_node_output(
     source_node: dag::NodeId,
     output: &NodeOutput,
     input: MaintenanceInput,
+    schema: &Schema,
+    connection: &Arc<Connection>,
 ) -> Result<EphemeralDelta> {
     materialize_delta_source(
         program,
@@ -49,6 +53,8 @@ pub(super) fn materialize_node_output(
         output.delta(),
         output.contract(),
         input,
+        schema,
+        connection,
     )
 }
 
@@ -60,6 +66,8 @@ pub(super) fn materialize_delta_source(
     source: &DeltaSource,
     source_contract: &NodeOutputContract,
     input: MaintenanceInput,
+    schema: &Schema,
+    connection: &Arc<Connection>,
 ) -> Result<EphemeralDelta> {
     let DeltaSource::BaseTable {
         table,
@@ -78,6 +86,19 @@ pub(super) fn materialize_delta_source(
         source_contract.emitted_identity,
         source_contract.binding_rowids.clone(),
     )?;
+    let syms = connection.syms.read();
+    let resolver = Resolver::new(
+        schema,
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        connection.namespaces(),
+        &syms,
+        connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
+        Arc::new(crate::dialect::SqliteDialect),
+        &None,
+    );
     emit_base_scan_delta(
         program,
         view_name,
@@ -85,6 +106,7 @@ pub(super) fn materialize_delta_source(
         *stored_weight_column,
         input,
         &channel,
+        &resolver,
     )?;
     Ok(channel)
 }
@@ -97,6 +119,7 @@ fn emit_base_scan_delta(
     stored_weight_column: Option<usize>,
     input: MaintenanceInput,
     output: &EphemeralDelta,
+    resolver: &Resolver,
 ) -> Result<()> {
     turso_assert!(
         output.identity == DeltaIdentity::BindingRowids(1)
@@ -145,11 +168,15 @@ fn emit_base_scan_delta(
         dest: record_start,
     });
     for column in 0..output.width {
-        program.emit_column_or_rowid(
+        let dest = record_start + output.value_start + column;
+        emit_stored_column_from_table(
+            program,
             input_cursor_id,
+            base_table,
             column,
-            record_start + output.value_start + column,
-        );
+            dest,
+            resolver,
+        )?;
     }
     match input {
         MaintenanceInput::TransactionDelta => {

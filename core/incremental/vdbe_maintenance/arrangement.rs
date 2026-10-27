@@ -11,12 +11,13 @@ use super::MaintenanceInput;
 use crate::incremental::dag;
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
+use crate::sync::Arc;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
     to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral,
 };
-use crate::{LimboError, Result};
+use crate::{Connection, LimboError, Result};
 
 /// Integrate one node's declared delta into its persistent output arrangement.
 ///
@@ -472,6 +473,7 @@ pub(super) fn publish_node_output(
     maintenance_input: MaintenanceInput,
     operator_state: &OperatorStateDef,
     schema: &Schema,
+    connection: &Arc<Connection>,
 ) -> Result<NodeOutput> {
     let (delta, native_arrangement) = output.into_parts();
     let Some(arrangement_def) = &operator_state.arrangement_table else {
@@ -489,6 +491,8 @@ pub(super) fn publish_node_output(
         &delta,
         &operator_state.output,
         maintenance_input,
+        schema,
+        connection,
     )?;
     let expected_identity = operator_state.output.emitted_identity;
     if input.identity != expected_identity {

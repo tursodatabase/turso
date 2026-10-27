@@ -1,0 +1,19 @@
+@database :memory:
+@requires-file materialized_views ""
+@requires-file custom_types "uses custom types"
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
+
+test matview-add-column-custom-type-default {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
+    INSERT INTO t VALUES(1,10);
+    ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
+    INSERT INTO t VALUES(2,20,5);
+    CREATE MATERIALIZED VIEW v AS SELECT id, c FROM t;
+    SELECT * FROM v ORDER BY id;
+}
+expect {
+    1|5
+    2|5
+}
