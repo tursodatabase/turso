@@ -1,0 +1,89 @@
+@database database/unknown_collation.db readonly
+
+# The fixture was created with Python's sqlite3 module after registering a collation named
+# `reverse`:
+#
+#   create table t1(a collate reverse, b);
+#   create index i1 on t1(a);
+#   create table t2(a, b);
+#   create index i2 on t2(a collate reverse);
+#   create table t3(a, unique(a collate reverse));
+#   insert into t1 values('a', 1), ('b', 2);
+#   insert into t2 values('a', 1), ('b', 2);
+#   insert into t3 values('a'), ('b');
+#
+# Without that collation the database still opens. Only statements that compare or sort with it
+# fail. Writes and ALTER TABLE need a writable copy of the fixture and are tested in
+# tests/integration/query_processing/test_ddl.rs.
+
+test column-with-unknown-collation-is-readable {
+    SELECT a FROM t1;
+}
+expect unordered {
+    a
+    b
+}
+
+test column-with-unknown-collation-cannot-be-sorted {
+    SELECT a FROM t1 ORDER BY a;
+}
+expect error {
+    no such collation sequence: reverse
+}
+
+test column-with-unknown-collation-cannot-be-compared {
+    SELECT a FROM t1 WHERE a = 'a';
+}
+expect error {
+    no such collation sequence: reverse
+}
+
+test index-with-unknown-collation-is-not-used-for-comparison {
+    SELECT a FROM t2 WHERE a = 'a';
+}
+expect {
+    a
+}
+
+test index-with-unknown-collation-is-not-used-for-sorting {
+    SELECT a FROM t2 ORDER BY a;
+}
+expect {
+    a
+    b
+}
+
+test unique-constraint-with-unknown-collation-is-not-used-for-comparison {
+    SELECT a FROM t3 WHERE a = 'a';
+}
+expect {
+    a
+}
+
+test column-with-unknown-collation-cannot-be-compared-without-matching-rows {
+    SELECT a FROM t1 WHERE b = 3 AND a = 'a';
+}
+expect error {
+    no such collation sequence: reverse
+}
+
+test column-with-unknown-collation-cannot-be-distinct {
+    SELECT DISTINCT a FROM t1;
+}
+expect error {
+    no such collation sequence: reverse
+}
+
+test index-with-unknown-collation-cannot-be-forced {
+    SELECT a FROM t2 INDEXED BY i2 WHERE a = 'a';
+}
+expect error {
+    no query solution
+}
+
+test missing-index-cannot-be-forced {
+    SELECT a FROM t2 INDEXED BY nope;
+}
+expect error {
+    no such index: nope
+}

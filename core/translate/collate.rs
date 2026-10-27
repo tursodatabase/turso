@@ -61,6 +61,10 @@ impl CollationSeq {
             .map(Self::Locale)
     }
 
+    pub(crate) fn from_schema(collation: &str) -> Self {
+        Self::new(collation).unwrap_or_else(|_| Self::custom(collation))
+    }
+
     #[inline]
     /// Returns the collation, defaulting to BINARY if unset
     pub const fn from_bits(bits: u8) -> Self {
