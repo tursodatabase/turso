@@ -274,21 +274,46 @@ pub(super) fn set_leftmost_collate(
     expr: &ast::Expr,
     resolver: &Resolver,
 ) -> Result<()> {
-    let mut leftmost = None;
-    walk_expr(expr, &mut |part: &ast::Expr| -> Result<WalkControl> {
-        if leftmost.is_some() {
-            return Ok(WalkControl::SkipChildren);
-        }
-        if let ast::Expr::Collate(_, name) = part {
-            leftmost = Some(resolver.resolve_collation(name.as_str())?);
-            return Ok(WalkControl::SkipChildren);
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    if let Some(collation) = leftmost {
+    if let Some(name) = leftmost_collate(expr) {
+        let collation = resolver.resolve_collation(name.as_str())?;
         program.set_collation(Some((collation, true)));
     }
     Ok(())
+}
+
+/// The leftmost COLLATE among the parts of an expression, in the order of the
+/// SQLite parse tree:
+/// - The parts of a function call are its arguments. A COLLATE in its ORDER BY,
+///   WITHIN GROUP, FILTER or OVER clause does not count, so
+///   `max(a) FILTER (WHERE b COLLATE NOCASE = 'x')` has no COLLATE.
+/// - SQLite parses `x LIKE y ESCAPE z` as `like(y, x, z)`, so the pattern comes
+///   before the string.
+fn leftmost_collate(expr: &ast::Expr) -> Option<&ast::Name> {
+    let mut leftmost = None;
+    walk_expr(expr, &mut |part| {
+        if leftmost.is_some() {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match part {
+            ast::Expr::Collate(_, name) => leftmost = Some(name),
+            ast::Expr::FunctionCall { args, .. } => {
+                leftmost = args.iter().find_map(|arg| leftmost_collate(arg));
+            }
+            ast::Expr::FunctionCallStar { .. } => {}
+            ast::Expr::Like {
+                lhs, rhs, escape, ..
+            } => {
+                leftmost = [Some(rhs), Some(lhs), escape.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|operand| leftmost_collate(operand));
+            }
+            _ => return Ok(WalkControl::Continue),
+        }
+        Ok(WalkControl::SkipChildren)
+    })
+    .expect("walking an expression cannot fail");
+    leftmost
 }
 
 #[inline(never)]

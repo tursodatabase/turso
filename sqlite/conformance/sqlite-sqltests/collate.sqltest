@@ -1855,6 +1855,48 @@ expect {
     1|1
 }
 
+# The parts of an aggregate are its arguments. A COLLATE in its FILTER or
+# ORDER BY clause does not give a collation to a function or a CASE around it.
+test collate-in-aggregate-filter-or-order-by-does-not-count {
+    CREATE TABLE agg_filter(a TEXT, b TEXT);
+    INSERT INTO agg_filter VALUES ('abc', 'x'), ('abd', 'y');
+    SELECT coalesce(max(a) FILTER (WHERE b COLLATE NOCASE = 'X'), 'q') = 'ABC',
+        coalesce(group_concat(a, ',' ORDER BY b COLLATE NOCASE), 'q') = 'ABC,ABD',
+        CASE WHEN count(*) FILTER (WHERE b COLLATE NOCASE = 'X') > 0 THEN max(a) END = 'ABD',
+        upper(max(a) FILTER (WHERE b COLLATE NOCASE = 'X')) = 'abc',
+        coalesce(max(a COLLATE NOCASE) FILTER (WHERE b COLLATE RTRIM = 'x'), 'q') = 'ABC'
+    FROM agg_filter;
+}
+expect {
+    0|0|0|0|1
+}
+
+test collate-in-aggregate-filter-does-not-count-in-having {
+    CREATE TABLE having_filter(a TEXT, b TEXT);
+    INSERT INTO having_filter VALUES ('abc', 'x'), ('abd', 'y');
+    SELECT b FROM having_filter GROUP BY b
+    HAVING coalesce(max(a) FILTER (WHERE b COLLATE NOCASE = 'X'), 'q') <> 'ABC'
+    ORDER BY b;
+}
+expect {
+    x
+    y
+}
+
+# SQLite parses `x LIKE y` as `like(y, x)`, so the COLLATE of the pattern comes
+# before the COLLATE of the string.
+test like-pattern-collate-comes-before-string-collate {
+    CREATE TABLE like_order(a TEXT, b TEXT);
+    INSERT INTO like_order VALUES (NULL, 'abc');
+    SELECT coalesce(a COLLATE NOCASE LIKE b COLLATE RTRIM, 'q') = 'Q',
+        coalesce(a COLLATE RTRIM LIKE b COLLATE NOCASE, 'q') = 'Q',
+        coalesce(a COLLATE NOCASE GLOB b COLLATE RTRIM, 'q') = 'Q'
+    FROM like_order;
+}
+expect {
+    0|1|0
+}
+
 # A function hides the column, so the value has no collation. The comparison
 # uses the collation of the other operand.
 test expression-index-value-of-function-uses-collation-of-other-operand {
