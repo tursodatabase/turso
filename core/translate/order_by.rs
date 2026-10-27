@@ -26,7 +26,8 @@ use super::{
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
-use super::expr::expr_type::{column_custom_type, type_of, TypeEnv};
+use super::expr::custom_comparison_call;
+use super::expr::expr_type::{type_of, TypeEnv};
 use crate::translate::eqp::{EqpDetail, EqpSortMethod};
 use crate::vdbe::insn::SortComparatorType;
 
@@ -43,8 +44,8 @@ fn sort_comparator_from_func_name(func_name: &str) -> Option<SortComparatorType>
 }
 
 /// Returns the comparator for sorting an expression: element by element for an
-/// array, or the function behind the `<` operator of a column's custom type when
-/// the sorter knows it. Returns None otherwise, which sorts by the stored bytes.
+/// array, or the function that `x < x` runs, when the sorter knows it. Returns
+/// None otherwise, which sorts by the stored bytes.
 pub(crate) fn custom_type_comparator(
     expr: &ast::Expr,
     referenced_tables: &TableReferences,
@@ -54,13 +55,8 @@ pub(crate) fn custom_type_comparator(
     if type_of(expr, &env).is_array() {
         return Some(SortComparatorType::ArrayLt);
     }
-    column_custom_type(expr, &env)?
-        .type_def
-        .operators()
-        .iter()
-        .find(|op| op.op == "<")
-        .and_then(|op| op.func_name.as_ref())
-        .and_then(|func_name| sort_comparator_from_func_name(func_name))
+    let call = custom_comparison_call(expr, &ast::Operator::Less, expr, &env).ok()??;
+    sort_comparator_from_func_name(call.less_than_function()?)
 }
 
 /// For a result column expression that is a column reference to a custom type,

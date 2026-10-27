@@ -2667,8 +2667,8 @@ fn find_table_access_plan(
         Vec::new()
     };
     let maybe_order_target = simple_aggregate
-        .and_then(|sa| simple_aggregate_order_target(sa, table_references))
-        .or_else(|| compute_order_target(order_by, group_by.as_mut(), table_references));
+        .and_then(|sa| simple_aggregate_order_target(sa, table_references, resolver))
+        .or_else(|| compute_order_target(order_by, group_by.as_mut(), table_references, resolver));
 
     add_implied_column_equalities(where_clause, table_references)?;
     let mut constraints_per_table = constraints_from_where_clause(

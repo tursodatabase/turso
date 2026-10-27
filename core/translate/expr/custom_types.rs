@@ -18,105 +18,6 @@ pub(super) fn operator_to_str(op: &ast::Operator) -> Option<&'static str> {
     }
 }
 
-/// Emit bytecode for a comparison found by [find_custom_comparison].
-/// Handles argument swapping, literal encoding, and result negation.
-pub(super) fn emit_custom_comparison(
-    program: &mut ProgramBuilder,
-    referenced_tables: Option<&TableReferences>,
-    e1: &ast::Expr,
-    e2: &ast::Expr,
-    resolved: &ResolvedOperator,
-    resolver: &Resolver,
-) -> Result<usize> {
-    let func = resolver
-        .resolve_function(&resolved.func_name, 2)?
-        .ok_or_else(|| {
-            LimboError::InternalError(format!("function not found: {}", resolved.func_name))
-        })?;
-    let (first, second) = if resolved.swap_args {
-        (e2, e1)
-    } else {
-        (e1, e2)
-    };
-
-    // When encoding a literal operand, we must use separate registers for the
-    // function call arguments. translate_expr may place literals in preamble
-    // registers (constant optimization), and encoding in-place would clobber
-    // that register — breaking subsequent loop iterations.
-    let func_start = if let Some(ref encode_info) = resolved.encode_info {
-        if let Some(encode_expr) = encode_info.type_def.encode() {
-            // Translate operands into temporary registers first.
-            let tmp1 = program.alloc_register();
-            let tmp2 = program.alloc_register();
-            translate_expr(program, referenced_tables, first, tmp1, resolver)?;
-            translate_expr(program, referenced_tables, second, tmp2, resolver)?;
-
-            // Determine which tmp holds the literal and which holds the column.
-            let (lit_tmp, col_tmp) = match encode_info.which {
-                EncodeArg::First if resolved.swap_args => (tmp2, tmp1),
-                EncodeArg::First => (tmp1, tmp2),
-                EncodeArg::Second if resolved.swap_args => (tmp1, tmp2),
-                EncodeArg::Second => (tmp2, tmp1),
-            };
-
-            // Allocate fresh contiguous registers for the function call.
-            let func_args = program.alloc_registers(2);
-            // The literal goes in the same position it occupied in arg layout.
-            let (lit_dst, col_dst) = match encode_info.which {
-                EncodeArg::First if resolved.swap_args => (func_args + 1, func_args),
-                EncodeArg::First => (func_args, func_args + 1),
-                EncodeArg::Second if resolved.swap_args => (func_args, func_args + 1),
-                EncodeArg::Second => (func_args + 1, func_args),
-            };
-
-            // Copy column value as-is.
-            program.emit_insn(Insn::Copy {
-                src_reg: col_tmp,
-                dst_reg: col_dst,
-                extra_amount: 0,
-            });
-            // Encode the literal into the fresh function arg slot.
-            emit_type_expr(
-                program,
-                encode_expr,
-                lit_tmp,
-                lit_dst,
-                &encode_info.type_params,
-                &encode_info.type_def,
-                resolver,
-            )?;
-            func_args
-        } else {
-            // Type has no encode expression; translate directly into arg slots.
-            let arg_reg = program.alloc_registers(2);
-            translate_expr(program, referenced_tables, first, arg_reg, resolver)?;
-            translate_expr(program, referenced_tables, second, arg_reg + 1, resolver)?;
-            arg_reg
-        }
-    } else {
-        // No encoding needed; translate directly into arg slots.
-        let arg_reg = program.alloc_registers(2);
-        translate_expr(program, referenced_tables, first, arg_reg, resolver)?;
-        translate_expr(program, referenced_tables, second, arg_reg + 1, resolver)?;
-        arg_reg
-    };
-
-    let result_reg = program.alloc_register();
-    program.emit_insn(Insn::Function {
-        constant_mask: 0,
-        start_reg: func_start,
-        dest: result_reg,
-        func: FuncCtx { func, arg_count: 2 },
-    });
-    if resolved.negate {
-        program.emit_insn(Insn::Not {
-            reg: result_reg,
-            dest: result_reg,
-        });
-    }
-    Ok(result_reg)
-}
-
 /// Get the effective type name of a literal expression.
 pub(super) fn literal_type_name(expr: &ast::Expr) -> Option<&'static str> {
     match expr {
@@ -147,144 +48,6 @@ pub(super) fn literal_compatible_with_value_type(
         || literal_type.eq_ignore_ascii_case(value_input_type)
 }
 
-/// Which operand of a binary expression needs encoding before the operator call.
-pub(super) enum EncodeArg {
-    /// Encode the first argument (e1 is a literal, e2 is the custom type column)
-    First,
-    /// Encode the second argument (e1 is the custom type column, e2 is a literal)
-    Second,
-}
-
-/// Info needed to encode a literal argument for an operator call.
-#[allow(clippy::vec_box)]
-pub(super) struct OperatorEncodeInfo {
-    type_def: Arc<TypeDef>,
-    type_params: Vec<Box<ast::Expr>>,
-    which: EncodeArg,
-}
-
-/// Result of resolving a custom type comparison. May be a direct match or derived
-/// from `<` and `=` operators (e.g. `>` is derived as swap_args + `<`).
-pub(super) struct ResolvedOperator {
-    func_name: String,
-    swap_args: bool,
-    negate: bool,
-    /// If a literal operand needs encoding before the operator call.
-    encode_info: Option<OperatorEncodeInfo>,
-}
-
-/// Find the function a custom type declares for a comparison.
-///
-/// It fires when:
-/// 1. Both operands are columns of the same custom type, OR
-/// 2. One operand is a custom type column and the other is a literal whose type
-///    is compatible with the custom type's `value` input type, OR
-/// 3. The type's `value` input type is `any`, one operand is a column of the
-///    type and the other is anything except a column of a different custom
-///    type. This lets `numeric_col = 1.5 + 0` compare as numeric, while
-///    `int_col = '10'` still uses the standard operator.
-///
-/// In case 2 the literal is encoded before being passed to the function so both
-/// arguments are in the same (encoded) representation. In case 3 the column is
-/// passed decoded, so both arguments are values as the user sees them, and the
-/// value is not rounded to the column's type parameters. The function checks
-/// its type.
-///
-/// Comparisons are decided here, while emitting, because index seeks look for a
-/// plain comparison in the tree. Arithmetic is decided by `custom_arithmetic_call`.
-pub(super) fn find_custom_comparison(
-    e1: &ast::Expr,
-    e2: &ast::Expr,
-    op: &ast::Operator,
-    referenced_tables: Option<&TableReferences>,
-    resolver: &Resolver,
-) -> Option<ResolvedOperator> {
-    if !op.is_comparison() {
-        return None;
-    }
-    let op_str = operator_to_str(op)?;
-    let env = TypeEnv::new(referenced_tables, resolver);
-    let lhs_info = column_custom_type(e1, &env);
-    let rhs_info = column_custom_type(e2, &env);
-
-    // Try to find a direct or derived operator match on a type definition.
-    let find_in_type_def = |type_def: &TypeDef| -> Option<(String, bool, bool)> {
-        // Direct match: just check op symbol (no right_type constraint)
-        for op_def in type_def.operators() {
-            if op_def.op == op_str {
-                // Naked operator (func_name = None): fall through to standard comparison
-                let func_name = op_def.func_name.as_ref()?;
-                return Some((func_name.clone(), false, false));
-            }
-        }
-
-        // Derive missing operators from < and =
-        let find_op = |sym: &str| -> Option<String> {
-            type_def
-                .operators()
-                .iter()
-                .find(|o| o.op == sym)
-                .and_then(|o| o.func_name.clone())
-        };
-
-        match *op {
-            // a > b  →  lt(b, a)
-            ast::Operator::Greater => find_op("<").map(|f| (f, true, false)),
-            // a >= b  →  NOT lt(a, b)
-            ast::Operator::GreaterEquals => find_op("<").map(|f| (f, false, true)),
-            // a <= b  →  NOT lt(b, a)
-            ast::Operator::LessEquals => find_op("<").map(|f| (f, true, true)),
-            // a != b  →  NOT eq(a, b)
-            ast::Operator::NotEquals => find_op("=").map(|f| (f, false, true)),
-            _ => None,
-        }
-    };
-
-    // Case 1: Both operands are custom type columns of the SAME type.
-    if let (Some(ref lhs), Some(ref rhs)) = (&lhs_info, &rhs_info) {
-        if same_type_def(&lhs.type_def, &rhs.type_def) {
-            if let Some((func_name, swap_args, negate)) = find_in_type_def(&lhs.type_def) {
-                return Some(ResolvedOperator {
-                    func_name,
-                    swap_args,
-                    negate,
-                    encode_info: None,
-                });
-            }
-        }
-        // Different custom types: fall through to standard operator.
-        return None;
-    }
-
-    let resolve_one_custom_operand =
-        |info: &ColumnCustomType, other: &ast::Expr, which: EncodeArg| {
-            let encode_other = literal_type_name(other).is_some_and(|lit_type| {
-                literal_compatible_with_value_type(lit_type, info.type_def.value_input_type())
-            });
-            let pass_other_unencoded = info.type_def.value_input_type().eq_ignore_ascii_case("any");
-            if !encode_other && !pass_other_unencoded {
-                return None;
-            }
-            let (func_name, swap_args, negate) = find_in_type_def(&info.type_def)?;
-            Some(ResolvedOperator {
-                func_name,
-                swap_args,
-                negate,
-                encode_info: Some(OperatorEncodeInfo {
-                    type_def: info.type_def.clone(),
-                    type_params: info.params.clone(),
-                    which,
-                }),
-            })
-        };
-
-    match (&lhs_info, &rhs_info) {
-        (Some(lhs), None) => resolve_one_custom_operand(lhs, e2, EncodeArg::Second),
-        (None, Some(rhs)) => resolve_one_custom_operand(rhs, e1, EncodeArg::First),
-        _ => None,
-    }
-}
-
 /// Whether a custom type's function runs `lhs op rhs`. An operator that does not
 /// exist, such as `date * 2`, counts too: emitting it fails.
 pub(crate) fn runs_custom_type_function(
@@ -293,7 +56,7 @@ pub(crate) fn runs_custom_type_function(
     rhs: &ast::Expr,
     env: &TypeEnv,
 ) -> bool {
-    find_custom_comparison(lhs, rhs, op, env.tables(), env.resolver()).is_some()
+    !matches!(custom_comparison_call(lhs, op, rhs, env), Ok(None))
         || !matches!(custom_arithmetic_call(lhs, op, rhs, env), Ok(None))
 }
 
@@ -307,16 +70,15 @@ pub(super) fn emit_custom_type_operator(
     rhs: &ast::Expr,
     resolver: &Resolver,
 ) -> Result<Option<usize>> {
-    if let Some(comparison) = find_custom_comparison(lhs, rhs, op, referenced_tables, resolver) {
-        let result_reg =
-            emit_custom_comparison(program, referenced_tables, lhs, rhs, &comparison, resolver)?;
-        return Ok(Some(result_reg));
-    }
     let env = TypeEnv::new(referenced_tables, resolver);
-    let Some(call) = custom_arithmetic_call(lhs, op, rhs, &env)? else {
-        return Ok(None);
+    let call = match custom_comparison_call(lhs, op, rhs, &env)? {
+        Some(call) => call,
+        None => match custom_arithmetic_call(lhs, op, rhs, &env)? {
+            Some(call) => call,
+            None => return Ok(None),
+        },
     };
-    let result_reg = emit_arithmetic_call(program, referenced_tables, lhs, rhs, &call, resolver)?;
+    let result_reg = emit_operator_call(program, referenced_tables, lhs, rhs, &call, resolver)?;
     Ok(Some(result_reg))
 }
 

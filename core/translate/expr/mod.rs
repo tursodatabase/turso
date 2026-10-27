@@ -94,6 +94,7 @@ pub use binding::{bind_and_rewrite_expr, BindingBehavior};
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub use columns::{emit_stored_column, emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;
+pub(crate) use custom_type_operators::custom_comparison_call;
 pub(crate) use custom_types::runs_custom_type_function;
 pub(crate) use custom_types::{
     emit_dml_expr_index_value, emit_trigger_decode_registers, emit_type_expr,
