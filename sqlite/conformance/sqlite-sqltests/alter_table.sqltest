@@ -3563,3 +3563,19 @@ expect {
     0
     1
 }
+
+@cross-check-integrity
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-table-updates-view-limit-and-window {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1);
+    CREATE VIEW v1 AS SELECT 1 LIMIT (SELECT count(*) FROM t) OFFSET (SELECT count(*) - 1 FROM t);
+    CREATE VIEW v2 AS SELECT sum(x) OVER w FROM t WINDOW w AS (PARTITION BY t.x ORDER BY t.x);
+    ALTER TABLE t RENAME TO t2;
+    SELECT * FROM v1;
+    SELECT * FROM v2;
+}
+expect {
+    1
+    1
+}
