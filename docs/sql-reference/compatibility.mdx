@@ -28,6 +28,13 @@ These features extend Turso beyond SQLite compatibility:
 | stddev() | Standard deviation aggregate function |
 | [DEFAULT in VALUES](/docs/sql-reference/statements/insert#default-keyword-in-values) | SQL-standard DEFAULT keyword in INSERT VALUES lists |
 
+## PostgreSQL catalog comments
+
+The PostgreSQL frontend exposes the default `standard public schema` comment in
+`pg_catalog.pg_description`. This lets `pg_dump` preserve the default comment on
+`public` without emitting an empty `COMMENT ON SCHEMA` statement. User-defined
+comments are not persisted.
+
 ## See Also
 
 - [Experimental Features](/docs/sql-reference/experimental-features) for how to enable experimental features

@@ -1315,6 +1315,16 @@ expect {
     t||1
 }
 
+test pg-description-public-schema-default {
+    SELECT d.objoid, d.classoid, d.objsubid, d.description
+    FROM pg_catalog.pg_description d
+    JOIN pg_catalog.pg_namespace n ON n.oid = d.objoid
+    WHERE n.nspname = 'public' AND d.classoid = 2615 AND d.objsubid = 0;
+}
+expect {
+    2200|2615|0|standard public schema
+}
+
 test pg-attribute-default-storage {
     CREATE TABLE storage_types (
         id INTEGER PRIMARY KEY, body TEXT, label VARCHAR(40), data BYTEA,
