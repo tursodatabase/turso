@@ -7709,6 +7709,8 @@ impl CursorTrait for BTreeCursor {
     /// next; next/prev land on `current_page == -1` and return Done(false).
     fn invalidate_btree_cache(&mut self) {
         self.stack.clear();
+        self.balance_state.sub_state = BalanceSubState::Start;
+        self.balance_state.balance_info = None;
         self.has_record = false;
         self.noted_payload = NotedPayload::NONE;
         self.move_to_right_state.1 = None;
