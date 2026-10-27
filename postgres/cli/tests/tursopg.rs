@@ -2130,9 +2130,8 @@ fn null_divided_by_zero_is_null() {
 }
 
 /// The status byte of ReadyForQuery follows the transaction like in
-/// PostgreSQL: `T` inside a transaction, `E` once a statement of the
-/// transaction failed, and every statement but ROLLBACK, ROLLBACK TO
-/// SAVEPOINT and COMMIT, which rolls back, fails with 25P02 until then.
+/// PostgreSQL: `T` inside a transaction and `E` after a statement of the
+/// transaction failed.
 #[test]
 fn wire_ready_for_query_reports_transaction_status() {
     with_pg_client(|client| {
@@ -2141,8 +2140,6 @@ fn wire_ready_for_query_reports_transaction_status() {
             ("BEGIN", "BEGIN", b'T'),
             ("INSERT INTO t VALUES (1)", "INSERT 0 1", b'T'),
             ("INSERT INTO t VALUES (1)", "23505", b'E'),
-            ("SELECT 1", "25P02", b'E'),
-            ("SAVEPOINT s", "25P02", b'E'),
             ("ROLLBACK", "ROLLBACK", b'I'),
             ("SAVEPOINT s", "25P01", b'I'),
             ("RELEASE s", "25P01", b'I'),
@@ -2153,10 +2150,6 @@ fn wire_ready_for_query_reports_transaction_status() {
             ("ROLLBACK TO SAVEPOINT s", "ROLLBACK", b'T'),
             ("INSERT INTO t VALUES (3)", "INSERT 0 1", b'T'),
             ("COMMIT", "COMMIT", b'I'),
-            ("BEGIN", "BEGIN", b'T'),
-            ("INSERT INTO t VALUES (4)", "INSERT 0 1", b'T'),
-            ("SELEC 1", "42601", b'E'),
-            ("COMMIT", "ROLLBACK", b'I'),
             ("SELECT count(*) FROM t", "SELECT 1", b'I'),
         ] {
             client.send_query(sql);
@@ -2174,12 +2167,6 @@ fn wire_ready_for_query_reports_transaction_status() {
         client.send_extended("INSERT INTO t VALUES (2)", false);
         client.send_message(b'S', &[]);
         assert_eq!(client.read_until_ready().last(), Some(&b'E'));
-        client.send_extended("SELECT 1", false);
-        client.send_message(b'S', &[]);
-        let response = client.read_until_ready();
-        let fields = extract_error_fields(&response).expect("expected ErrorResponse");
-        assert_eq!(fields.get(&b'C').map(String::as_str), Some("25P02"));
-        assert_eq!(response.last(), Some(&b'E'));
         client.send_extended("ROLLBACK", false);
         client.send_message(b'S', &[]);
         assert_eq!(client.read_until_ready().last(), Some(&b'I'));

@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::num::NonZero;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
@@ -71,7 +71,6 @@ impl TursoPgServer {
         let factory = Arc::new(TursoPgFactory {
             handler: Arc::new(TursoPgHandler {
                 conn: self.conn.clone(),
-                transaction_failed: AtomicBool::new(false),
                 db_file: self.db_file.clone(),
                 query_parser: Arc::new(NoopQueryParser::new()),
             }),
@@ -113,9 +112,6 @@ impl TursoPgServer {
 
 struct TursoPgHandler {
     conn: Arc<Mutex<PgConnection>>,
-    /// Whether a statement of the open transaction failed. PostgreSQL then
-    /// runs no more statements until the transaction ends.
-    transaction_failed: AtomicBool,
     db_file: String,
     query_parser: Arc<NoopQueryParser>,
 }
@@ -123,56 +119,15 @@ struct TursoPgHandler {
 impl TursoPgHandler {
     /// pgwire reports the status that the client had before the query, changed
     /// by the TransactionStart and TransactionEnd responses of the query. Set
-    /// it from the connection, without the failed state: a ROLLBACK TO
-    /// SAVEPOINT that succeeds in a failed transaction leaves it in progress.
-    fn start_query<C: ClientInfo>(&self, client: &mut C) {
+    /// it from the connection before the query, and again after a failed one.
+    fn set_transaction_status<C: ClientInfo>(&self, client: &mut C, failed: bool) {
         let conn = self.conn.lock().unwrap().clone();
         client.set_transaction_status(if conn.inner().get_auto_commit() {
             TransactionStatus::Idle
-        } else {
-            TransactionStatus::Transaction
-        });
-    }
-
-    /// The statement to run for `sql`. In a failed transaction PostgreSQL
-    /// refuses every statement but ROLLBACK, ROLLBACK TO SAVEPOINT and
-    /// COMMIT, which rolls back.
-    fn statement_to_run<'a>(&self, conn: &PgConnection, sql: &'a str) -> PgWireResult<&'a str> {
-        if conn.inner().get_auto_commit() || !self.transaction_failed.load(Ordering::SeqCst) {
-            return Ok(sql);
-        }
-        let upper = sql.trim_start().to_uppercase();
-        let sql = if upper.starts_with("ROLLBACK") || upper.starts_with("ABORT") {
-            sql
-        } else if upper.starts_with("COMMIT") || upper.starts_with("END") {
-            "ROLLBACK"
-        } else {
-            return Err(pg_error(
-                turso_core::LimboError::Dialect(Box::new(turso_core::DialectError {
-                    code: turso_pg::sqlstate::SQLSTATE_IN_FAILED_SQL_TRANSACTION,
-                    message: "current transaction is aborted, commands ignored until end of transaction block".to_owned(),
-                }))
-                .into(),
-            ));
-        };
-        self.transaction_failed.store(false, Ordering::SeqCst);
-        Ok(sql)
-    }
-
-    /// An error inside a transaction makes the transaction failed, like in
-    /// PostgreSQL.
-    fn end_query<C: ClientInfo>(&self, client: &mut C, result: &PgWireResult<()>) {
-        if result.is_ok() {
-            return;
-        }
-        let conn = self.conn.lock().unwrap().clone();
-        let in_transaction = !conn.inner().get_auto_commit();
-        self.transaction_failed
-            .store(in_transaction, Ordering::SeqCst);
-        client.set_transaction_status(if in_transaction {
+        } else if failed {
             TransactionStatus::Error
         } else {
-            TransactionStatus::Idle
+            TransactionStatus::Transaction
         });
     }
 
@@ -247,9 +202,11 @@ impl SimpleQueryHandler for TursoPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        self.start_query(client);
+        self.set_transaction_status(client, false);
         let result = self._on_query(client, query).await;
-        self.end_query(client, &result);
+        if result.is_err() {
+            self.set_transaction_status(client, true);
+        }
         finish_query(client, result, false).await
     }
 
@@ -265,7 +222,6 @@ impl SimpleQueryHandler for TursoPgHandler {
 
         let mut responses = Vec::new();
         for sql in &statements {
-            let sql = self.statement_to_run(&conn, sql)?;
             let mut stmt = conn.prepare(sql).map_err(pg_error)?;
 
             if stmt.num_columns() == 0 || is_pg_non_query(sql) {
@@ -294,9 +250,11 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        self.start_query(client);
+        self.set_transaction_status(client, false);
         let result = self._on_execute(client, message).await;
-        self.end_query(client, &result);
+        if result.is_err() {
+            self.set_transaction_status(client, true);
+        }
         finish_query(client, result, true).await
     }
 
@@ -308,7 +266,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let result = self._on_describe(client, message).await;
-        self.end_query(client, &result);
+        if result.is_err() {
+            self.set_transaction_status(client, true);
+        }
         finish_query(client, result, true).await
     }
 
@@ -326,7 +286,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = self.conn.lock().unwrap().clone();
-        let query = self.statement_to_run(&conn, &portal.statement.statement)?;
+        let query = &portal.statement.statement;
 
         let mut stmt = conn.prepare(query).map_err(pg_error)?;
 
