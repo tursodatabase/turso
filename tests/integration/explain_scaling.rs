@@ -4,7 +4,7 @@ use turso_core::vdbe::StepResult;
 
 fn count_explain_instructions(conn: &Arc<turso_core::Connection>, n: usize) -> usize {
     let values: String = (1..=n)
-        .map(|i| format!("({})", i))
+        .map(|i| format!("({i})"))
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!("EXPLAIN SELECT (VALUES {values});");
