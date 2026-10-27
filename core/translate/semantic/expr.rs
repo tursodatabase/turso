@@ -3877,6 +3877,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let hir::Expr::Column(reference) = &self.exprs[expression.expr] else {
             return Ok(None);
         };
+        if expression.type_fact.array_dimensions > 0 {
+            return Ok(None);
+        }
         let Some(declared) = expression.type_fact.declared.as_ref() else {
             return Ok(None);
         };
