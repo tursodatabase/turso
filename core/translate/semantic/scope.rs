@@ -374,7 +374,7 @@ impl NameMatch<'_> {
 #[derive(Clone, Debug)]
 enum VisibleColumn {
     AllOfSource(usize),
-    Binding(ColumnBinding),
+    Binding(Box<ColumnBinding>),
 }
 
 #[derive(Clone, Debug)]
@@ -672,7 +672,7 @@ impl Scope {
                     visible.hidden = true;
                 }
             }
-            Arc::make_mut(&mut self.visible).push(VisibleColumn::Binding(visible));
+            Arc::make_mut(&mut self.visible).push(VisibleColumn::Binding(Box::new(visible)));
         }
         added.saved = Some(saved);
     }
@@ -1658,7 +1658,7 @@ impl Scope {
                             crate::util::normalize_ident(name)
                         );
                     }
-                    found = Some(NameMatch::Column(ColumnView::Binding(binding)));
+                    found = Some(NameMatch::Column(ColumnView::Binding(binding.as_ref())));
                 }
                 VisibleColumn::Binding(_) => {}
             }
@@ -1733,7 +1733,9 @@ impl Scope {
         self.visible.iter().flat_map(|visible| {
             let (source, binding) = match visible {
                 VisibleColumn::AllOfSource(source) => (Some(&self.sources[*source]), None),
-                VisibleColumn::Binding(binding) => (None, Some(ColumnView::Binding(binding))),
+                VisibleColumn::Binding(binding) => {
+                    (None, Some(ColumnView::Binding(binding.as_ref())))
+                }
             };
             source
                 .into_iter()
@@ -1750,7 +1752,7 @@ impl Scope {
         {
             let owned = self
                 .visible_columns()
-                .map(|column| VisibleColumn::Binding(column.to_binding()))
+                .map(|column| VisibleColumn::Binding(Box::new(column.to_binding())))
                 .collect();
             self.visible = Arc::new(owned);
         }
