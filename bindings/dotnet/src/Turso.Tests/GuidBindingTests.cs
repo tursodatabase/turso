@@ -1,4 +1,7 @@
 using System.Data;
+using System.Net;
+using System.Text;
+using System.Text.Json;
 using AwesomeAssertions;
 using Microsoft.EntityFrameworkCore;
 using Turso.Data.Sqlite;
@@ -102,6 +105,48 @@ public class GuidBindingTests
     }
 
     [Test]
+    public void RemoteCommandsHonorBinaryGuid()
+    {
+        var base64 = Convert.ToBase64String(Value.ToByteArray());
+        using var handler = new RecordingPipelineHandler();
+        TursoConnection.RemoteMessageHandlerFactory = () => handler;
+        try
+        {
+            using (var connection = new TursoConnection("Data Source=https://example.test"))
+            {
+                connection.Open();
+                ExecuteRemote(connection, new TursoParameter { ParameterName = "@g", Value = Value });
+            }
+
+            using (var connection = new TursoConnection("Data Source=https://example.test;BinaryGUID=True"))
+            {
+                connection.Open();
+                ExecuteRemote(connection, new TursoParameter { ParameterName = "@g", Value = Value });
+                ExecuteRemote(connection, new TursoParameter("@g", DbType.Guid, Value));
+            }
+
+            using (var connection = new SqliteConnection("Data Source=https://example.test;BinaryGUID=True"))
+            {
+                connection.Open();
+                using var command = connection.CreateCommand();
+                command.CommandText = "SELECT @g";
+                command.Parameters.AddWithValue("@g", Value);
+                command.ExecuteNonQuery();
+            }
+        }
+        finally
+        {
+            TursoConnection.RemoteMessageHandlerFactory = null;
+        }
+
+        handler.Arguments.Should().Equal(
+            $"text:{Value}",
+            $"blob:{base64}",
+            $"text:{Value}",
+            $"blob:{base64}");
+    }
+
+    [Test]
     public async Task EfCoreStoresGuidAsTextEvenWithBinaryGuid()
     {
         var path = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName() + ".db");
@@ -152,5 +197,55 @@ public class GuidBindingTests
         public Guid Id { get; set; }
 
         public string Text { get; set; } = "";
+    }
+
+    private static void ExecuteRemote(TursoConnection connection, TursoParameter parameter)
+    {
+        using var command = new TursoCommand(connection, "SELECT @g");
+        command.Parameters.Add(parameter);
+        command.ExecuteNonQuery();
+    }
+
+    private sealed class RecordingPipelineHandler : HttpMessageHandler
+    {
+        public List<string> Arguments { get; } = [];
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            using var document = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellationToken));
+            var results = new List<string>();
+            foreach (var item in document.RootElement.GetProperty("requests").EnumerateArray())
+            {
+                if (item.GetProperty("type").GetString() == "close")
+                {
+                    results.Add("""{"type":"ok","response":{"type":"close"}}""");
+                    continue;
+                }
+
+                if (item.TryGetProperty("stmt", out var stmt) && stmt.TryGetProperty("named_args", out var namedArgs))
+                {
+                    foreach (var arg in namedArgs.EnumerateArray())
+                    {
+                        var value = arg.GetProperty("value");
+                        var type = value.GetProperty("type").GetString();
+                        Arguments.Add(type == "blob"
+                            ? $"blob:{value.GetProperty("base64").GetString()}"
+                            : $"{type}:{value.GetProperty("value").GetString()}");
+                    }
+                }
+
+                results.Add("""{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0}}}""");
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    $$"""{"baton":null,"results":[{{string.Join(",", results)}}]}""",
+                    Encoding.UTF8,
+                    "application/json"),
+            };
+        }
     }
 }
