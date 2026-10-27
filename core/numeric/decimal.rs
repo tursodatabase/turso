@@ -2,11 +2,68 @@ use bigdecimal::BigDecimal;
 use num_bigint::{BigInt, Sign};
 
 use crate::alloc::TursoVecExt;
-use crate::{LimboError, ValueBlob};
+use crate::{LimboError, Numeric, Value, ValueBlob};
 
 const NUMERIC_BLOB_VERSION: u8 = 0x01;
 const FLAG_NEGATIVE: u8 = 0x01;
 const MAX_SCALE_MAGNITUDE: i64 = 1_000_000;
+
+/// PostgreSQL's limits on a numeric value: the most digits it may have before
+/// the decimal point, and after it.
+const MAX_INTEGER_DIGITS: i64 = 131_072;
+const MAX_FRACTION_DIGITS: i64 = 16_383;
+
+/// The numeric value of `val`: an integer, a real, text such as `1.5` or `1e5`,
+/// or a stored numeric blob. Every numeric function reads its arguments with
+/// this, so they all accept the same values within the same limits.
+pub fn numeric_from_value(val: &Value) -> crate::Result<BigDecimal> {
+    let value = match val {
+        Value::Numeric(Numeric::Integer(i)) => return Ok(BigDecimal::from(*i)),
+        Value::Numeric(Numeric::Float(f)) => parse_numeric(&f.to_string())?,
+        Value::Text(t) => parse_numeric(t.as_str())?,
+        Value::Blob(b) => blob_to_bigdecimal(b)?,
+        _ => {
+            return Err(LimboError::Constraint(format!(
+                "invalid input syntax for type numeric: \"{val}\""
+            )))
+        }
+    };
+    check_numeric_limits(&value)?;
+    Ok(value)
+}
+
+fn parse_numeric(text: &str) -> crate::Result<BigDecimal> {
+    use std::str::FromStr;
+    // Parsing takes time quadratic in the number of digits, so text longer
+    // than any value within the limits is refused before it is parsed. The
+    // allowance covers a sign, a decimal point and an exponent.
+    const MAX_TEXT_LEN: usize = (MAX_INTEGER_DIGITS + MAX_FRACTION_DIGITS) as usize + 32;
+    if text.trim().len() > MAX_TEXT_LEN {
+        return Err(numeric_overflow());
+    }
+    BigDecimal::from_str(text).map_err(|_| {
+        LimboError::Constraint(format!("invalid input syntax for type numeric: \"{text}\""))
+    })
+}
+
+/// An error when `value` has more digits than PostgreSQL allows. Text such as
+/// `1e100000000` parses into a small value, but rounding it or adding to it
+/// writes out all hundred million digits.
+pub fn check_numeric_limits(value: &BigDecimal) -> crate::Result<()> {
+    // A scale can be any i64, so the digit counts are computed in i128.
+    let fraction_digits = i128::from(value.fractional_digit_count());
+    let integer_digits = i128::from(value.digits()) - fraction_digits;
+    if integer_digits > i128::from(MAX_INTEGER_DIGITS)
+        || fraction_digits > i128::from(MAX_FRACTION_DIGITS)
+    {
+        return Err(numeric_overflow());
+    }
+    Ok(())
+}
+
+fn numeric_overflow() -> LimboError {
+    LimboError::Constraint("value overflows numeric format".to_string())
+}
 
 /// Serialize a BigDecimal to our portable blob format.
 ///

@@ -1297,3 +1297,66 @@ test op-date-struct-field {
 expect {
     2024-01-04
 }
+
+
+@requires strict "uses STRICT tables"
+test op-numeric-huge-exponent-in-arithmetic-errors {
+    -- '1e100000000' parses into a small value, but adding it would write out
+    -- a hundred million digits. PostgreSQL allows 131072 digits before the
+    -- decimal point.
+    CREATE TABLE t(n numeric(10,2), x text) STRICT;
+    INSERT INTO t VALUES (1, '1e100000000');
+    SELECT n + x FROM t;
+}
+expect error {
+    value overflows numeric format
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-tiny-exponent-in-arithmetic-errors {
+    CREATE TABLE t(n numeric(10,2), x text) STRICT;
+    INSERT INTO t VALUES (1, '1e-100000000');
+    SELECT n * x FROM t;
+}
+expect error {
+    value overflows numeric format
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-largest-exponent-errors {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1);
+    SELECT n + '1e9223372036854775807' FROM t;
+}
+expect error {
+    value overflows numeric format
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-very-long-text-errors-without-parsing {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1);
+    SELECT n + replace(hex(zeroblob(800000)), '0', '1') FROM t;
+}
+expect error {
+    value overflows numeric format
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-huge-exponent-on-insert-errors {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES ('1e100000000');
+}
+expect error {
+    value overflows numeric format
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-text-that-is-not-a-number-errors {
+    CREATE TABLE t(n numeric(10,2), x text) STRICT;
+    INSERT INTO t VALUES (1, 'abc');
+    SELECT n + x FROM t;
+}
+expect error {
+    invalid input syntax for type numeric: "abc"
+}
