@@ -1602,3 +1602,15 @@ test op-user-type-negate-error {
 expect error {
     operator does not exist: - test_uint
 }
+
+# smallint and bigint run SQLite's operators, but not on a numeric: the
+# numeric's function runs, whichever side the numeric is on.
+@requires strict "uses STRICT tables"
+test op-smallint-and-bigint-with-numeric {
+    CREATE TABLE t(s smallint, b bigint, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 2, 3.50);
+    SELECT s - n, n - s, s + n, s * n, b - n, b * n FROM t;
+}
+expect {
+    -2.50|2.50|4.50|3.50|-1.50|7.00
+}

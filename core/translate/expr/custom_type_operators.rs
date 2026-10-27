@@ -283,12 +283,14 @@ fn is_plain_value(signature: &OperatorSignature, operand: &Operand) -> bool {
         .is_none_or(|t| has_sqlite_operator(&t.type_def, signature))
 }
 
-/// A type whose own way to run the operator of `signature` is SQLite's, such
-/// as `smallint`.
+/// A type whose only way to run the operator of `signature` is SQLite's, such
+/// as `smallint`. numeric runs SQLite's `+` with a REAL, but its own function
+/// otherwise, so `smallint + numeric` must not run SQLite's `+`.
 fn has_sqlite_operator(type_def: &TypeDef, signature: &OperatorSignature) -> bool {
-    type_def
+    let mut signatures = type_def
         .operator_signatures(signature.op, signature.args.len())
-        .any(|s| s.func.is_none())
+        .peekable();
+    signatures.peek().is_some() && signatures.all(|s| s.func.is_none())
 }
 
 /// The call that `signature` makes, or `None` for SQLite's operator. The
