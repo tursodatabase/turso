@@ -93,7 +93,8 @@ stored SQL; relation oid and pretty printing do not change the output),
 `transaction_timestamp`/`statement_timestamp`.
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
-forms; the first schema of `search_path` that exists), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
+forms; the first schema of `search_path` that exists), `current_schemas(boolean)`
+(existing schemas in search order, optionally including implicit `pg_catalog`), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
 `obj_description()`/`col_description()` always return NULL because COMMENT ON
 is not persisted. DML against pg_catalog is rejected. `pg_typeof` is not
 implemented.
