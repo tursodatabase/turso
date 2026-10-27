@@ -363,6 +363,14 @@ expect {
     5
 }
 
+test exists-subquery-with-empty-select-list {
+    SELECT a FROM (VALUES (1), (2)) AS t1(a)
+    WHERE EXISTS (SELECT FROM (VALUES (2)) AS t2(b) WHERE t2.b > t1.a);
+}
+expect {
+    1
+}
+
 test select-current-data-and-time {
     SELECT 'ok'
     WHERE CURRENT_DATE IS NOT NULL

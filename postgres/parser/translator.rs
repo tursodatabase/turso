@@ -4251,7 +4251,10 @@ impl PostgreSQLTranslator {
                 ));
             }
         };
-        let select = Box::new(self.translate_select(select_stmt)?);
+        let select = Box::new(match sub_link.sub_link_type() {
+            SubLinkType::ExistsSublink => self.translate_exists_subquery(select_stmt)?,
+            _ => self.translate_select(select_stmt)?,
+        });
 
         match sub_link.sub_link_type() {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
@@ -4282,6 +4285,38 @@ impl PostgreSQLTranslator {
                 "Unsupported SubLink type: {other:?}",
             ))),
         }
+    }
+
+    /// EXISTS only checks whether its subquery returns a row, and PostgreSQL
+    /// lets that subquery select no columns: `EXISTS (SELECT FROM t)`. A Turso
+    /// SELECT needs a column, so such a subquery selects the constant 1.
+    fn translate_exists_subquery(
+        &self,
+        select: &pg_query::protobuf::SelectStmt,
+    ) -> Result<ast::Select, ParseError> {
+        use pg_query::protobuf::{a_const, node::Node, AConst, Integer, ResTarget};
+
+        if !select.target_list.is_empty()
+            || !select.values_lists.is_empty()
+            || is_set_operation(select)
+        {
+            return self.translate_select(select);
+        }
+        let one = AConst {
+            val: Some(a_const::Val::Ival(Integer { ival: 1 })),
+            ..Default::default()
+        };
+        let target = ResTarget {
+            val: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(Node::AConst(one)),
+            })),
+            ..Default::default()
+        };
+        let mut select = select.clone();
+        select.target_list.push(pg_query::protobuf::Node {
+            node: Some(Node::ResTarget(Box::new(target))),
+        });
+        self.translate_select(&select)
     }
 
     fn translate_array_subquery(select: ast::Select) -> ast::Expr {
