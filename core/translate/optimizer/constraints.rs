@@ -2,7 +2,7 @@ use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
 use crate::{
-    schema::{Column, Index, Schema},
+    schema::{Column, Index, IndexColumn, Schema},
     translate::{
         collate::{comparison_collation, expr_collation, CollationSeq},
         expr::{
@@ -12,8 +12,8 @@ use crate::{
         expression_index::normalize_expr_for_index_matching,
         plan::{
             is_non_null_literal, JoinInfo, JoinOrderMember, JoinOrigin, JoinedTable,
-            NonFromClauseSubquery, Plan, SubqueryState, TableReferences, WhereTerm,
-            WhereTermOrigin,
+            NonFromClauseSubquery, Plan, QueryDestination, SubqueryState, TableReferences,
+            WhereTerm, WhereTermOrigin,
         },
         planner::{
             break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
@@ -107,6 +107,13 @@ pub struct Constraint {
     /// many NULL keys, so such a constraint can match many rows and its cost
     /// and row estimates must not be taken from equality statistics.
     pub null_matching: bool,
+    /// The collation the term compares with (see
+    /// [crate::translate::collate::comparison_collation]). An index can serve
+    /// the term only when its key column has this collation. For `x IN (...)`
+    /// it is the collation of x; for `x IN (SELECT y ...)` it is the collation
+    /// of `x = y`. None for terms that are not collating comparisons (LIKE,
+    /// MATCH and other virtual-table operators).
+    pub collation: Option<CollationSeq>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -215,6 +222,8 @@ impl Constraint {
     }
 
     /// Whether this constraint can drive an index seek on its target column.
+    /// Whether the term can drive a seek in a temporary index built over
+    /// `columns`, whose key columns have the collation of their table column.
     pub fn can_drive_index_seek(&self, columns: &[Column]) -> bool {
         if !self.usable || !self.outer_join_compatible {
             return false;
@@ -225,7 +234,17 @@ impl Constraint {
         let col = columns.get(pos).unwrap_or_else(|| {
             unreachable!("constraint table_col_pos {pos} out of bounds for {columns:?}")
         });
-        self.satisfies_index_affinity(col.affinity())
+        self.collation
+            .is_none_or(|collation| collation == col.collation())
+            && self.satisfies_index_affinity(col.affinity())
+    }
+
+    /// Whether an index key column can serve this term: a seek compares keys
+    /// with the key column's collation, so it must be the collation the term
+    /// compares with (SQLite's `azColl` check in `whereScanNext`).
+    pub fn index_column_can_serve(&self, index_column: &IndexColumn) -> bool {
+        self.collation
+            .is_none_or(|collation| collation == index_column.collation)
     }
 }
 
@@ -821,6 +840,15 @@ pub fn constraints_from_where_clause(
                     .as_ast_operator()
                     .filter(|op| op.is_comparison())
                     .map(|_| comparison_affinity(lhs, rhs, Some(table_references), None));
+                let cmp_collation = match operator.as_ast_operator() {
+                    Some(op) if op.is_comparison() => Some(comparison_collation(
+                        lhs,
+                        rhs,
+                        Some(table_references),
+                        resolver,
+                    )?),
+                    _ => None,
+                };
                 let is_op = matches!(operator.as_ast_operator(), Some(ast::Operator::Is));
                 let outer_join_compatible = can_use_before_null_extension(is_op);
                 // See [Constraint::null_matching]. The constraining value sits
@@ -855,6 +883,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(rhs),
+                                collation: cmp_collation,
                             });
                         }
                     }
@@ -887,6 +916,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(rhs),
+                                collation: cmp_collation,
                             });
                         }
                     }
@@ -928,6 +958,7 @@ pub fn constraints_from_where_clause(
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
                             null_matching: null_matching(rhs),
+                            collation: cmp_collation,
                         });
                     }
                     _ => {}
@@ -958,6 +989,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(lhs),
+                                collation: cmp_collation,
                             });
                         }
                     }
@@ -990,6 +1022,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(lhs),
+                                collation: cmp_collation,
                             });
                         }
                     }
@@ -1031,6 +1064,7 @@ pub fn constraints_from_where_clause(
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
                             null_matching: null_matching(lhs),
+                            collation: cmp_collation,
                         });
                     }
                     _ => {}
@@ -1064,6 +1098,8 @@ pub fn constraints_from_where_clause(
                 // SQLite's `comparisonAffinity` for IN-list (`x IN (lit, ...)`)
                 // is the LHS column's affinity; the RHS literals are not folded.
                 let cmp_aff = Some(get_expr_affinity(lhs, Some(table_references), None));
+                // `x IN (y1, ..., yN)` compares with the collation of x alone.
+                let cmp_collation = Some(expr_collation(lhs, Some(table_references), resolver)?);
 
                 match lhs.as_ref() {
                     ast::Expr::Column { table, column, .. }
@@ -1086,6 +1122,7 @@ pub fn constraints_from_where_clause(
                             is_rowid,
                             comparison_affinity: cmp_aff,
                             null_matching: false,
+                            collation: cmp_collation,
                         });
                     }
                     ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -1105,6 +1142,7 @@ pub fn constraints_from_where_clause(
                             is_rowid: true,
                             comparison_affinity: cmp_aff,
                             null_matching: false,
+                            collation: cmp_collation,
                         });
                     }
                     _ => {}
@@ -1163,6 +1201,7 @@ pub fn constraints_from_where_clause(
                     let cmp_aff = (!is_row_value)
                         .then(|| affinity_str.chars().next().map(Affinity::from_char))
                         .flatten();
+                    let cmp_collation = Some(in_subquery_collation(subquery)?);
 
                     match lhs_expr.as_ref() {
                         ast::Expr::Column { table, column, .. }
@@ -1185,6 +1224,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid,
                                 comparison_affinity: cmp_aff,
                                 null_matching: false,
+                                collation: cmp_collation,
                             });
                         }
                         ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -1204,6 +1244,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                                 null_matching: false,
+                                collation: cmp_collation,
                             });
                         }
                         _ => {}
@@ -1224,40 +1265,6 @@ pub fn constraints_from_where_clause(
             // Skip constraints that don't participate in range-seek matching (IN, collation mismatches)
             if !constraint.usable || !constraint.outer_join_compatible {
                 continue;
-            }
-
-            let constrained_column = constraint
-                .table_col_pos
-                .and_then(|pos| table_reference.table.columns().get(pos));
-            let column_collation = constrained_column.map(|c| c.collation());
-            // Index seek keys compare with the index's collation, so the seek is
-            // only valid when the comparison itself uses that collation. The
-            // comparison collation follows the left operand, so a plain BINARY
-            // column on the left disqualifies an index on a NOCASE column even
-            // though neither side declares a collation explicitly.
-            // LIKE is not a collating comparison, so it puts no condition on
-            // the index collation here.
-            turso_assert!(constraint.constraining_expr.is_none());
-            let term_expr = &where_clause[constraint.where_clause_pos.0].expr;
-            let comparison_collation = match as_binary_components(term_expr)? {
-                Some((lhs, op, rhs))
-                    if op.as_ast_operator().is_some_and(|op| op.is_comparison()) =>
-                {
-                    Some(comparison_collation(
-                        lhs,
-                        rhs,
-                        Some(table_references),
-                        resolver,
-                    )?)
-                }
-                _ => None,
-            };
-            match (comparison_collation, column_collation) {
-                (Some(collation), Some(column_collation)) if collation != column_collation => {
-                    constraint.usable = false;
-                    continue;
-                }
-                _ => {}
             }
 
             if constraint.is_rowid
@@ -1295,17 +1302,14 @@ pub fn constraints_from_where_clause(
                         index.expression_to_index_pos(&normalized)
                     }),
                 } {
-                    turso_assert!(
-                        constraint.usable,
-                        "constraint collation must match table column collation"
-                    );
+                    // An index seek compares keys with the index column's
+                    // collation, so the index serves the term only when that
+                    // is the collation the term compares with.
+                    if !constraint.index_column_can_serve(&index.columns[position_in_index]) {
+                        continue;
+                    }
                     if let Some(table_col_pos) = constraint.table_col_pos {
                         let constrained_column = &table_reference.table.columns()[table_col_pos];
-                        let table_collation = constrained_column.collation();
-                        let index_collation = index.columns[position_in_index].collation;
-                        if table_collation != index_collation {
-                            continue;
-                        }
                         // Custom type columns encode values as blobs. Blob ordering (memcmp)
                         // doesn't necessarily match the custom type's semantic ordering, so
                         // range constraints (>, <, >=, <=) can't use the index. Equality (=)
@@ -1378,6 +1382,22 @@ pub fn constraints_from_where_clause(
     }
 
     Ok(constraints)
+}
+
+/// The collation `x IN (SELECT y ...)` compares with. The subquery's ephemeral
+/// index was built with it (the collation of `x = y`), so it is read from there.
+fn in_subquery_collation(subquery: &NonFromClauseSubquery) -> Result<CollationSeq> {
+    let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
+        return Err(crate::LimboError::InternalError(
+            "an IN subquery must have its plan while its terms are analyzed".into(),
+        ));
+    };
+    match plan.select_query_destination() {
+        Some(QueryDestination::EphemeralIndex { index, .. }) => Ok(index.columns[0].collation),
+        _ => Err(crate::LimboError::InternalError(
+            "an IN subquery must write to an ephemeral index".into(),
+        )),
+    }
 }
 
 /// A reference to a [Constraint]s in a [TableConstraints] for single column.
@@ -2350,6 +2370,7 @@ pub(crate) fn analyze_binary_term_for_index(
         is_rowid,
         comparison_affinity: Some(affinity),
         null_matching,
+        collation: Some(comparison_collation),
     };
 
     Some(AnalyzedTerm {

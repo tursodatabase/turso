@@ -620,16 +620,14 @@ pub(super) fn choose_best_in_seek_candidate(
                 continue;
             }
 
-            // `open_loop` copies the chosen index collation onto the ephemeral
-            // IN cursor. Reject mismatches here so a BINARY `IN` comparison
-            // cannot silently become `NOCASE`/`RTRIM` just because the index is.
+            // The seek compares with the index's collation, and `open_loop`
+            // removes duplicate IN values with it, so it must be the
+            // collation the IN compares with.
             if let (Some(index), Some(col_pos)) = (&candidate.index, constraint.table_col_pos) {
-                let constrained_column = &rhs_table.table.columns()[col_pos];
-                let table_collation = constrained_column.collation();
-                let index_collation = index.columns[0].collation;
-                if table_collation != index_collation {
+                if !constraint.index_column_can_serve(&index.columns[0]) {
                     continue;
                 }
+                let constrained_column = &rhs_table.table.columns()[col_pos];
                 let idx_aff = constrained_column.affinity();
                 if !constraint.satisfies_index_affinity(idx_aff) {
                     continue;
