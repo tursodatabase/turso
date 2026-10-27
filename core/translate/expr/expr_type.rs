@@ -933,7 +933,9 @@ mod tests {
             ("-CAST(1 AS cents)", ExprType::Unknown),
             ("~CAST(1 AS cents)", ExprType::Unknown),
             ("CAST(1 AS cents) & 1", ExprType::Unknown),
-            ("-CAST(1 AS numeric(10, 2))", custom("numeric", &[])),
+            // SQLite's unary minus for now; numeric_neg once comparisons use
+            // numeric's order.
+            ("-CAST(1 AS numeric(10, 2))", builtin(BuiltinType::Numeric)),
             ("-CAST(1 AS smallint)", builtin(BuiltinType::Integer)),
             ("CAST(1 AS smallint) << 1", builtin(BuiltinType::Integer)),
             ("abs(CAST(1 AS cents))", builtin(BuiltinType::Integer)),
