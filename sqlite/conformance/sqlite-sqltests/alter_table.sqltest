@@ -2385,6 +2385,174 @@ expect {
     100
 }
 
+test alter-table-rename-table-trigger-limit-and-window {
+    CREATE TABLE lim_src (z);
+    INSERT INTO lim_src VALUES (1);
+    CREATE TABLE lim_other (z);
+    INSERT INTO lim_other VALUES (9), (10);
+    CREATE TABLE lim_driver (x);
+    CREATE TABLE lim_log (v);
+    CREATE TRIGGER trig_limit_and_window AFTER INSERT ON lim_driver BEGIN
+        INSERT INTO lim_log SELECT z FROM lim_other ORDER BY z
+            LIMIT (SELECT count(*) FROM lim_src) OFFSET (SELECT count(*) FROM lim_src);
+        INSERT INTO lim_log WITH lim_src AS (SELECT 3 AS v)
+            SELECT v FROM lim_src LIMIT (SELECT count(*) FROM main.lim_src);
+        INSERT INTO lim_log SELECT sum(z) OVER w FROM lim_other
+            WINDOW w AS (PARTITION BY (SELECT count(*) FROM lim_src)
+                         ORDER BY (SELECT max(z) FROM lim_src))
+            LIMIT 1;
+    END;
+    ALTER TABLE lim_src RENAME TO lim_src2;
+    INSERT INTO lim_driver VALUES (1);
+    SELECT v FROM lim_log;
+}
+expect {
+    10
+    3
+    19
+}
+
+test alter-table-rename-table-trigger-update-from-alias {
+    CREATE TABLE upd_src (z);
+    CREATE TABLE upd_other (z);
+    INSERT INTO upd_other VALUES (9);
+    CREATE TABLE upd_driver (x);
+    CREATE TRIGGER trig_update_from_alias AFTER INSERT ON upd_driver BEGIN
+        UPDATE upd_other SET z = upd_src.z + 1 FROM upd_other AS upd_src
+            WHERE upd_src.z > 0;
+    END;
+    ALTER TABLE upd_src RENAME TO upd_src2;
+    INSERT INTO upd_driver VALUES (1);
+    SELECT z FROM upd_other;
+    SELECT sql LIKE '%upd_src2%' FROM sqlite_schema WHERE name = 'trig_update_from_alias';
+}
+expect {
+    10
+    0
+}
+
+test alter-table-rename-table-rewrites-views {
+    CREATE TABLE view_src (z);
+    INSERT INTO view_src VALUES (7);
+    CREATE VIEW view_plain AS SELECT z FROM view_src;
+    CREATE VIEW view_qualified AS SELECT view_src.z + 1 AS z FROM view_src;
+    CREATE VIEW view_cte AS WITH view_src AS (SELECT 100 AS z) SELECT z FROM view_src;
+    CREATE TEMP VIEW view_temp AS SELECT z + 2 AS z FROM view_src;
+    ALTER TABLE view_src RENAME TO view_src2;
+    SELECT z FROM view_plain;
+    SELECT z FROM view_qualified;
+    SELECT z FROM view_cte;
+    SELECT z FROM view_temp;
+    SELECT name, sql LIKE '%view_src2%' FROM sqlite_schema WHERE type = 'view' ORDER BY name;
+    SELECT name, sql LIKE '%view_src2%' FROM sqlite_temp_schema WHERE type = 'view';
+}
+expect {
+    7
+    8
+    100
+    9
+    view_cte|0
+    view_plain|1
+    view_qualified|1
+    view_temp|1
+}
+
+test alter-table-rename-table-views-follow-name-lookup {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.lk_src (y);
+    INSERT INTO aux.lk_src VALUES (5);
+    CREATE TABLE lk_src (z);
+    INSERT INTO lk_src VALUES (1);
+    CREATE VIEW aux.lk_aux_view AS SELECT y FROM lk_src;
+    CREATE TEMP VIEW lk_temp AS SELECT z FROM lk_src;
+    CREATE TEMP VIEW lk_temp_main AS SELECT z FROM main.lk_src;
+    CREATE TEMP VIEW lk_temp_three_part AS SELECT main.lk_src.z FROM main.lk_src;
+    ALTER TABLE aux.lk_src RENAME TO lk_src2;
+    SELECT y FROM aux.lk_aux_view;
+    SELECT z FROM lk_temp;
+    SELECT z FROM lk_temp_main;
+    SELECT z FROM lk_temp_three_part;
+    ALTER TABLE main.lk_src RENAME TO lk_src3;
+    SELECT z FROM lk_temp;
+    SELECT z FROM lk_temp_main;
+    SELECT z FROM lk_temp_three_part;
+    CREATE TABLE lk_hidden (z);
+    INSERT INTO lk_hidden VALUES (1);
+    CREATE TEMP TABLE lk_hidden (w);
+    INSERT INTO temp.lk_hidden VALUES (2);
+    CREATE TEMP VIEW lk_hidden_main AS SELECT * FROM main.lk_hidden;
+    CREATE TEMP VIEW lk_hidden_temp AS SELECT * FROM lk_hidden;
+    ALTER TABLE main.lk_hidden RENAME TO lk_hidden2;
+    SELECT * FROM lk_hidden_main;
+    SELECT * FROM lk_hidden_temp;
+    CREATE TABLE lk_t (q);
+    CREATE TEMP TABLE lk_t (q);
+    INSERT INTO temp.lk_t VALUES (3);
+    CREATE TEMP VIEW lk_t_temp AS SELECT q FROM lk_t;
+    CREATE TEMP VIEW lk_t_main AS SELECT q FROM main.lk_t;
+    ALTER TABLE temp.lk_t RENAME TO lk_t2;
+    SELECT q FROM lk_t_temp;
+    SELECT name, sql LIKE '%lk_t2%' FROM sqlite_temp_schema WHERE name IN ('lk_t_main', 'lk_t_temp') ORDER BY name;
+}
+expect {
+    5
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    2
+    3
+    lk_t_main|0
+    lk_t_temp|1
+}
+
+test alter-table-rename-table-parenthesized-from-entries {
+    CREATE TABLE par_t (a);
+    INSERT INTO par_t VALUES (1);
+    CREATE TABLE par_o (b);
+    INSERT INTO par_o VALUES (2);
+    CREATE TABLE par_p (c);
+    INSERT INTO par_p VALUES (3);
+    CREATE VIEW par_alias AS SELECT par_t.b FROM (par_o AS par_t);
+    CREATE VIEW par_alias_list AS SELECT par_t.b, par_p.c FROM (par_o AS par_t, par_p);
+    CREATE VIEW par_cte AS WITH par_t AS (SELECT 5 AS a)
+        SELECT par_t.a, par_o.b FROM (par_t JOIN par_o);
+    CREATE VIEW par_table AS SELECT par_t.a FROM (par_o AS x JOIN par_t);
+    CREATE VIEW par_aliased_join AS SELECT x.b FROM (par_o AS par_t JOIN par_p ON par_t.b + 1 = par_p.c) AS x;
+    CREATE VIEW par_aliased_join_exists AS SELECT 1 WHERE EXISTS (
+        SELECT x.b FROM (par_o AS par_t JOIN par_p ON par_t.b + 1 = par_p.c) AS x);
+    CREATE TABLE par_driver (x);
+    CREATE TABLE par_log (v);
+    CREATE TRIGGER trig_parenthesized_from AFTER INSERT ON par_driver BEGIN
+        INSERT INTO par_log SELECT par_t.b FROM (par_o AS par_t, par_p);
+        INSERT INTO par_log SELECT par_t.a FROM (par_o JOIN par_t);
+        INSERT INTO par_log SELECT x.b FROM (par_o AS par_t JOIN par_p ON par_t.b + 1 = par_p.c) AS x;
+    END;
+    ALTER TABLE par_t RENAME TO par_t2;
+    SELECT * FROM par_alias;
+    SELECT * FROM par_alias_list;
+    SELECT * FROM par_cte;
+    SELECT * FROM par_table;
+    SELECT * FROM par_aliased_join;
+    SELECT * FROM par_aliased_join_exists;
+    INSERT INTO par_driver VALUES (1);
+    SELECT v FROM par_log;
+}
+expect {
+    2
+    2|3
+    5|2
+    1
+    2
+    1
+    2
+    1
+    2
+}
+
 test alter-table-rename-column-temp-trigger-exists-result-expr-error {
     CREATE TEMP TABLE temp_exists_driver (n);
     CREATE TABLE src_temp_exists (c1, c2, b);
