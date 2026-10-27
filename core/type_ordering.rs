@@ -273,7 +273,7 @@ mod tests {
                 &[Value::from_text("{a}")],
                 &[int(5)],
                 &[Value::from_text("not an array")],
-                &[Value::Blob(vec![0xff, 0xff])],
+                &[Value::from_blob(crate::alloc::vec![0xff, 0xff])],
             ],
         );
     }
@@ -302,7 +302,7 @@ mod tests {
                 &[Value::from_text("apple")],
                 &[Value::from_text("cherry")],
                 &[int(1), Value::from_f64(1.0)],
-                &[Value::Blob(vec![0])],
+                &[Value::from_blob(crate::alloc::vec![0])],
             ],
         );
     }

@@ -599,8 +599,8 @@ mod tests {
             Value::from_f64(f64::INFINITY),
             Value::from_text("abc"),
             Value::from_text("abd"),
-            Value::Blob(vec![0x00]),
-            Value::Blob(vec![0x01]),
+            Value::from_blob(crate::alloc::vec![0x00]),
+            Value::from_blob(crate::alloc::vec![0x01]),
         ]
     }
 
