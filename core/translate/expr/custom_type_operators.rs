@@ -8,7 +8,8 @@ use super::*;
 use crate::function::Deterministic;
 use crate::schema::{ArithmeticArg, ArithmeticSignature};
 use crate::translate::expr::expr_type::{
-    same_type_def, sqlite_operand_type, type_of, BuiltinType, ColumnCustomType, ExprType, TypeEnv,
+    same_type_def, sqlite_operand_type, type_of, without_wrappers, BuiltinType, ColumnCustomType,
+    ExprType, TypeEnv,
 };
 use crate::Schema;
 
@@ -49,10 +50,11 @@ pub(super) fn find_arithmetic_call(
     let Some(op_str) = operator_to_str(op) else {
         return Ok(None);
     };
-    if is_null(lhs) || is_null(rhs) {
+    let [lhs_type, rhs_type] = types;
+    // Arithmetic with NULL is NULL whichever function runs it.
+    if matches!(lhs_type, ExprType::Null) || matches!(rhs_type, ExprType::Null) {
         return Ok(None);
     }
-    let [lhs_type, rhs_type] = types;
     let operands = [
         Operand::new(lhs, lhs_type, env)?,
         Operand::new(rhs, rhs_type, env)?,
@@ -83,11 +85,6 @@ pub(super) fn find_arithmetic_call(
 /// work per operator than before custom types existed.
 fn may_run_custom_function(op: &ast::Operator, env: &TypeEnv) -> bool {
     is_arithmetic(op) && !env.schema().type_registry.is_empty()
-}
-
-/// Arithmetic with NULL is NULL whichever function runs it.
-fn is_null(expr: &ast::Expr) -> bool {
-    matches!(expr, ast::Expr::Literal(ast::Literal::Null))
 }
 
 fn is_arithmetic(op: &ast::Operator) -> bool {
@@ -122,14 +119,14 @@ struct Operand<'a> {
 
 impl<'a> Operand<'a> {
     fn new(expr: &'a ast::Expr, expr_type: &'a ExprType, env: &TypeEnv) -> Result<Self> {
+        let expr = without_wrappers(expr);
         let resolver = env.resolver();
         let column_type = match column_custom_type(expr, env) {
             Some(ty) => without_domains(ty, resolver.schema())?,
             None => None,
         };
-        let value_type = match (expr, expr_type) {
-            (ast::Expr::Column { .. }, _) => column_type.clone(),
-            (_, ExprType::Custom { type_def, params }) => without_domains(
+        let value_type = match expr_type {
+            ExprType::Custom { type_def, params } => without_domains(
                 ColumnCustomType {
                     type_def: type_def.clone(),
                     params: params.clone(),

@@ -6,12 +6,13 @@ use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
 
 use super::{
-    emitter::{OperationMode, Resolver, TranslateCtx},
+    emitter::{OperationMode, Resolver, RowValueSubquery, RowValueSubqueryColumn, TranslateCtx},
     main_loop::LoopLabels,
     plan::{Aggregate, Operation, QueryDestination, Search, SelectPlan},
     planner::{resolve_window_and_aggregate_functions, TableMask},
 };
 use crate::translate::expr::comparison_affinity;
+use crate::translate::expr::expr_type::{type_of, TypeEnv};
 use crate::turso_assert;
 use crate::{
     alloc::TursoIteratorExt,
@@ -860,16 +861,26 @@ fn get_subquery_parser<'a>(
                 let reg_count = plan.result_columns.len();
                 let reg_start = program.alloc_registers(reg_count);
 
-                if reg_count == 1 {
-                    if let Some(result_col) = plan.result_columns.first() {
-                        let affinity =
-                            get_expr_affinity(&result_col.expr, Some(&plan.table_references), None);
-                        resolver
-                            .subquery_affinities
-                            .borrow_mut()
-                            .insert(subquery_id, affinity);
-                    }
-                }
+                let env = TypeEnv::new(Some(&plan.table_references), resolver);
+                let columns = plan
+                    .result_columns
+                    .iter()
+                    .map(|result_col| RowValueSubqueryColumn {
+                        affinity: get_expr_affinity(
+                            &result_col.expr,
+                            Some(&plan.table_references),
+                            None,
+                        ),
+                        expr_type: type_of(&result_col.expr, &env),
+                    })
+                    .collect();
+                resolver.row_value_subqueries.borrow_mut().insert(
+                    subquery_id,
+                    RowValueSubquery {
+                        result_reg_start: reg_start,
+                        columns,
+                    },
+                );
 
                 plan.query_destination = QueryDestination::RowValueSubqueryResult {
                     result_reg_start: reg_start,

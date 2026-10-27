@@ -10,10 +10,10 @@ use turso_parser::ast;
 use super::custom_type_operators::find_arithmetic_call;
 use super::get_expr_affinity;
 use crate::function::{AggFunc, Func, ScalarFunc};
-use crate::schema::{Column, Schema, TypeDef};
+use crate::schema::{Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
-use crate::translate::plan::TableReferences;
+use crate::translate::plan::{Plan, SelectPlan, TableReferences};
 use crate::vdbe::affinity::Affinity;
 
 /// Type parameters are kept as written, in the same form as `Column::ty_params`.
@@ -120,10 +120,9 @@ impl<'a> TypeEnv<'a> {
 }
 
 pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
+    let expr = without_wrappers(expr);
     match expr {
         ast::Expr::Literal(literal) => literal_type(literal),
-        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => type_of(&exprs[0], env),
-        ast::Expr::Collate(inner, _) => type_of(inner, env),
         ast::Expr::Column { table, column, .. } => {
             column_reference_type(*table, *column, env).unwrap_or_else(|| affinity_type(expr, env))
         }
@@ -149,7 +148,9 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
                 &ExprType::Builtin(BuiltinType::Integer),
                 &sqlite_operand_type(type_of(inner, env), env.schema()),
             ),
-            ast::UnaryOperator::Positive => type_of(inner, env),
+            ast::UnaryOperator::Positive => {
+                unreachable!("without_wrappers looks through unary +")
+            }
         },
         ast::Expr::Binary(lhs, op, rhs) => binary_type(lhs, op, rhs, expr, env),
         ast::Expr::Case {
@@ -164,10 +165,69 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             env,
         ),
         ast::Expr::FunctionCall { name, args, .. } => function_type(name, args, env),
+        ast::Expr::SubqueryResult {
+            subquery_id,
+            query_type:
+                ast::SubqueryType::RowValue {
+                    result_reg_start,
+                    num_regs: 1,
+                },
+            ..
+        } => {
+            let subqueries = env.resolver.row_value_subqueries.borrow();
+            match subqueries
+                .get(subquery_id)
+                .and_then(|subquery| subquery.column(*result_reg_start))
+            {
+                Some(column) => column.expr_type.clone(),
+                None => ExprType::Unknown,
+            }
+        }
+        // FULL JOIN ... USING (d): the value of `d` from whichever side has one.
+        ast::Expr::MergedColumn(columns) => common_type(columns.iter().map(|c| c.as_ref()), env),
+        ast::Expr::FieldAccess {
+            base,
+            resolved: Some(resolution),
+            ..
+        } => field_type(&type_of(base, env), resolution, env.schema()),
+        // Expressions whose value is never a custom-type value. SQLite's affinity
+        // gives their built-in type.
+        ast::Expr::Between { .. }
+        | ast::Expr::InList { .. }
+        | ast::Expr::InSelect { .. }
+        | ast::Expr::InTable { .. }
+        | ast::Expr::IsNull(_)
+        | ast::Expr::NotNull(_)
+        | ast::Expr::Like { .. }
+        | ast::Expr::Exists(_)
+        | ast::Expr::SubqueryResult {
+            query_type: ast::SubqueryType::Exists { .. } | ast::SubqueryType::In { .. },
+            ..
+        }
+        | ast::Expr::FunctionCallStar { .. }
+        | ast::Expr::Raise(..) => affinity_type(expr, env),
+        // Not bound or planned yet: names, subqueries, `DEFAULT`, and field
+        // access on an unbound base.
+        ast::Expr::Id(_)
+        | ast::Expr::Name(_)
+        | ast::Expr::Qualified(..)
+        | ast::Expr::DoublyQualified(..)
+        | ast::Expr::Subquery(_)
+        | ast::Expr::Default
+        | ast::Expr::FieldAccess { resolved: None, .. }
+        | ast::Expr::Cast {
+            type_name: None, ..
+        } => ExprType::Unknown,
+        // A row value such as `(a, b)` or `(SELECT x, y ...)` is not one value.
+        ast::Expr::Parenthesized(_)
+        | ast::Expr::SubqueryResult {
+            query_type: ast::SubqueryType::RowValue { .. },
+            ..
+        } => ExprType::Unknown,
+        ast::Expr::Collate(..) => unreachable!("without_wrappers looks through COLLATE"),
         ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
             unreachable!("Array and Subscript are desugared into function calls by the parser")
         }
-        _ => affinity_type(expr, env),
     }
 }
 
@@ -180,14 +240,9 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
 /// decoded column value counts as a column read. Once registers always hold the stored form,
 /// `type_of` is enough and this goes away.
 pub(crate) fn column_custom_type(expr: &ast::Expr, env: &TypeEnv) -> Option<ColumnCustomType> {
-    match expr {
-        // These emit their operand's value unchanged.
-        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => column_custom_type(&exprs[0], env),
-        ast::Expr::Collate(inner, _) | ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
-            column_custom_type(inner, env)
-        }
+    match without_wrappers(expr) {
         ast::Expr::Column { table, column, .. } => {
-            match column_reference_type(*table, *column, env)? {
+            match base_table_column_type(*table, *column, env)? {
                 ExprType::Custom { type_def, params } => {
                     Some(ColumnCustomType { type_def, params })
                 }
@@ -203,6 +258,19 @@ pub(crate) fn column_custom_type(expr: &ast::Expr, env: &TypeEnv) -> Option<Colu
             env.schema(),
         )),
         _ => None,
+    }
+}
+
+/// The expression inside parentheses, COLLATE and unary `+`, which give their
+/// operand's value unchanged: `(d)`, `d COLLATE NOCASE` and `+d` are all `d`.
+pub(crate) fn without_wrappers(mut expr: &ast::Expr) -> &ast::Expr {
+    loop {
+        expr = match expr {
+            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => &exprs[0],
+            ast::Expr::Collate(inner, _)
+            | ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => inner,
+            _ => return expr,
+        };
     }
 }
 
@@ -291,10 +359,68 @@ fn column_reference_type(
     column: usize,
     env: &TypeEnv,
 ) -> Option<ExprType> {
+    match env
+        .tables
+        .and_then(|tables| tables.find_table_by_internal_id(table))
+    {
+        Some((_, Table::FromClauseSubquery(subquery))) => {
+            Some(query_column_type(&subquery.plan, column, env.resolver))
+        }
+        Some((_, Table::RecursiveCteInput(input))) => input.column_types.get(column).cloned(),
+        _ => base_table_column_type(table, column, env),
+    }
+}
+
+/// The type of column `column` of a query's result. In a compound SELECT it is
+/// the common type of the column in each SELECT, and in a recursive CTE the type
+/// the first SELECT gives it, as in PostgreSQL.
+pub(crate) fn query_column_type(plan: &Plan, column: usize, resolver: &Resolver) -> ExprType {
+    match plan {
+        Plan::Select(select) => select_column_type(select, column, resolver),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => common_of_types(
+            left.iter()
+                .map(|(select, _)| select)
+                .chain(core::iter::once(right_most.as_ref()))
+                .map(|select| select_column_type(select, column, resolver)),
+            resolver.schema(),
+        ),
+        Plan::RecursiveCte(plan) => query_column_type(&plan.initial_query, column, resolver),
+        Plan::Delete(_) | Plan::Update(_) => {
+            unreachable!("DELETE and UPDATE plans have no result columns")
+        }
+    }
+}
+
+fn select_column_type(select: &SelectPlan, column: usize, resolver: &Resolver) -> ExprType {
+    match select.result_columns.get(column) {
+        Some(result_column) => type_of(
+            &result_column.expr,
+            &TypeEnv::new(Some(&select.table_references), resolver),
+        ),
+        None => ExprType::Unknown,
+    }
+}
+
+/// The type of a column of a table or of the table being written. Derived
+/// tables and recursive CTEs are not included: their columns hold what a SELECT
+/// computed, which may be a custom type's stored or decoded form.
+fn base_table_column_type(
+    table: ast::TableInternalId,
+    column: usize,
+    env: &TypeEnv,
+) -> Option<ExprType> {
     if let Some((_, table)) = env
         .tables
         .and_then(|tables| tables.find_table_by_internal_id(table))
     {
+        if matches!(
+            table,
+            Table::FromClauseSubquery(_) | Table::RecursiveCteInput(_)
+        ) {
+            return None;
+        }
         return Some(column_type(
             table.get_column_at(column)?,
             table.is_strict(),
@@ -310,6 +436,37 @@ fn column_reference_type(
         ));
     }
     None
+}
+
+/// The type of a struct field or union variant, as declared in CREATE TYPE.
+fn field_type(
+    base: &ExprType,
+    resolution: &ast::FieldAccessResolution,
+    schema: &Schema,
+) -> ExprType {
+    let ExprType::Custom { type_def, .. } = base else {
+        return ExprType::Unknown;
+    };
+    let type_name = match resolution {
+        ast::FieldAccessResolution::StructField { field_index } => type_def
+            .struct_def()
+            .and_then(|def| def.fields.get(*field_index))
+            .map(|field| &field.type_name),
+        ast::FieldAccessResolution::UnionVariant { tag_index } => type_def
+            .union_def()
+            .and_then(|def| def.variants.iter().find(|v| v.tag_index == *tag_index))
+            .map(|variant| &variant.type_name),
+    };
+    match type_name {
+        Some(name) => match schema.get_type_def(name, true) {
+            Some(type_def) => ExprType::Custom {
+                type_def: Arc::clone(type_def),
+                params: Vec::new(),
+            },
+            None => builtin_type_of_affinity(Affinity::affinity(name)),
+        },
+        None => ExprType::Unknown,
+    }
 }
 
 /// Custom types only apply to columns of STRICT tables.
@@ -535,14 +692,18 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
 /// and numeric(5,1), is that type without parameters. A custom type mixed with any
 /// other type counts as the type it is stored as. Any other mix is `Any`.
 fn common_type<'e>(exprs: impl Iterator<Item = &'e ast::Expr>, env: &TypeEnv) -> ExprType {
+    common_of_types(exprs.map(|expr| type_of(expr, env)), env.schema())
+}
+
+fn common_of_types(types: impl Iterator<Item = ExprType>, schema: &Schema) -> ExprType {
     let mut common: Option<ExprType> = None;
-    for ty in exprs.map(|expr| type_of(expr, env)) {
+    for ty in types {
         common = Some(match (common, ty) {
             (None, ty) | (Some(ExprType::Null), ty) => ty,
             (Some(common), ExprType::Null) => common,
             (Some(common @ ExprType::Array { .. }), _) => common,
             (_, ty @ ExprType::Array { .. }) => ty,
-            (Some(common), ty) => common_scalar_type(common, ty, env.schema()),
+            (Some(common), ty) => common_scalar_type(common, ty, schema),
         });
     }
     common.unwrap_or(ExprType::Null)
@@ -579,6 +740,10 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
                 Vec::new()
             },
         },
+        // A string literal is a value of the custom type it is mixed with, as in
+        // PostgreSQL: coalesce(date_column, '2024-01-01') is a date.
+        (custom @ ExprType::Custom { .. }, ExprType::Untyped)
+        | (ExprType::Untyped, custom @ ExprType::Custom { .. }) => custom,
         // Mixed with anything else, including another custom type, a custom value
         // is a value of the type it is stored as: coalesce(smallint_column, 0) and
         // coalesce(smallint_column, bigint_column) are integers.

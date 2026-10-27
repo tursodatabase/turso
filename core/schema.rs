@@ -115,6 +115,7 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
+use crate::translate::expr::expr_type::ExprType;
 use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
     column_declared_type, is_rowid_alias_type, module_args_from_sql, module_name_from_sql,
@@ -3836,6 +3837,7 @@ impl TryClone for RecursiveCteInput {
         Ok(Self {
             name: self.name.clone(),
             columns: self.columns.try_clone()?,
+            column_types: self.column_types.clone(),
         })
     }
 }
@@ -5351,6 +5353,9 @@ impl ParenthesizedJoinColumnSource {
 pub struct RecursiveCteInput {
     pub name: String,
     pub columns: Vec<Column>,
+    /// The type of each column: the type the CTE's first SELECT gives it, as in
+    /// PostgreSQL.
+    pub(crate) column_types: Vec<ExprType>,
 }
 
 #[derive(Debug, Clone, Copy)]

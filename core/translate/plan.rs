@@ -38,7 +38,7 @@ use turso_parser::ast::{
 use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
-use super::expr::expr_type::{type_of, TypeEnv};
+use super::expr::expr_type::{query_column_type, type_of, TypeEnv};
 
 /// Infer the affinity of a subquery result column from its expression.
 ///
@@ -3286,9 +3286,13 @@ impl JoinedTable {
         for column in columns.iter_mut() {
             column.override_affinity(Affinity::Blob);
         }
+        let column_types = (0..columns.len())
+            .map(|column| query_column_type(query, column, resolver))
+            .collect();
         let table = Table::RecursiveCteInput(Arc::new(RecursiveCteInput {
             name: identifier.clone(),
             columns,
+            column_types,
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),

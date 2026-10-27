@@ -30,6 +30,7 @@ use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, Index, IndexColumn, Schema,
     Table, EXPR_INDEX_SENTINEL,
 };
+use crate::translate::expr::expr_type::ExprType;
 use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::{Aggregate, ColumnMask};
 use crate::vdbe::{
@@ -159,10 +160,8 @@ pub struct Resolver<'a> {
     /// rewritten to Expr::Register (UPSERT DO UPDATE WHERE/SET), comparisons
     /// must still use the column's implicit collation per SQLite's rule 2.
     pub register_collations: HashMap<usize, CollationSeq>,
-    /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
-    /// This lets comparison affinity follow SQLite rules for expressions like
-    /// `(SELECT text_col FROM ...) > some_numeric_expr`.
-    pub(crate) subquery_affinities: RefCell<HashMap<TableInternalId, Affinity>>,
+    /// Each planned subquery that gives one row, keyed by its internal ID.
+    pub(crate) row_value_subqueries: RefCell<HashMap<TableInternalId, RowValueSubquery>>,
     /// Context and metadata for resolving Expr::Column values that use
     /// [TableInternalId::SELF_TABLE] as a placeholder.
     self_table_scope: RefCell<Option<SelfTableScope>>,
@@ -216,6 +215,33 @@ pub struct Resolver<'a> {
     /// The first one is where CREATE puts an object whose name has no
     /// qualifier.
     search_order: Vec<NamespaceRef>,
+}
+
+/// What the outer query knows about the result columns of a subquery that
+/// gives one row, such as `(SELECT e FROM u)` or `(SELECT x, y FROM v)`.
+#[derive(Clone)]
+pub(crate) struct RowValueSubquery {
+    /// The register of the first result column.
+    pub(crate) result_reg_start: usize,
+    pub(crate) columns: Vec<RowValueSubqueryColumn>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RowValueSubqueryColumn {
+    /// Lets comparisons follow SQLite's affinity rules, as in
+    /// `(SELECT text_col FROM ...) > some_numeric_expr`.
+    pub(crate) affinity: Affinity,
+    /// The column's type, which decides custom-type operators: in
+    /// `d - (SELECT e FROM u)` with `e` a date, the result is a number of days.
+    pub(crate) expr_type: ExprType,
+}
+
+impl RowValueSubquery {
+    /// The column whose value is in `result_reg`.
+    pub(crate) fn column(&self, result_reg: usize) -> Option<&RowValueSubqueryColumn> {
+        self.columns
+            .get(result_reg.checked_sub(self.result_reg_start)?)
+    }
 }
 
 #[derive(Clone)]
@@ -315,7 +341,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
             register_collations: HashMap::default(),
-            subquery_affinities: RefCell::new(HashMap::default()),
+            row_value_subqueries: RefCell::new(HashMap::default()),
             self_table_scope: RefCell::new(None),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types,
@@ -365,7 +391,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
             register_collations: HashMap::default(),
-            subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
+            row_value_subqueries: RefCell::new(self.row_value_subqueries.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,
@@ -393,7 +419,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
             register_affinities: self.register_affinities.clone(),
             register_collations: self.register_collations.clone(),
-            subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
+            row_value_subqueries: RefCell::new(self.row_value_subqueries.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,

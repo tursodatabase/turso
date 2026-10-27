@@ -1185,3 +1185,115 @@ test op-without-function-runs-sqlite-operator {
 expect {
     3|2|3
 }
+
+@requires strict "uses STRICT tables"
+test op-date-with-wrapped-null-or-literal {
+    -- Parentheses, COLLATE and unary + give their operand unchanged.
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('2024-01-05');
+    SELECT d + (NULL) IS NULL, (NULL) + d IS NULL, d + NULL COLLATE BINARY IS NULL,
+        d - ('2024-01-01'), d - '2024-01-01' COLLATE NOCASE, d - +'2024-01-01' FROM t;
+}
+expect {
+    1|1|1|4|4|4
+}
+
+@requires strict "uses STRICT tables"
+test op-date-minus-subquery-and-coalesce {
+    -- A string literal mixed with a date is a date, and a subquery's column has
+    -- the type of what it selects.
+    CREATE TABLE t(d date) STRICT;
+    CREATE TABLE u(e date) STRICT;
+    INSERT INTO t VALUES ('2024-01-05');
+    INSERT INTO u VALUES ('2024-01-01');
+    SELECT d - (SELECT e FROM u), d - coalesce(d, '2024-01-01'),
+        (d - (SELECT e FROM u)) + 1, d - (SELECT e - 1 FROM u) FROM t;
+}
+expect {
+    4|0|5|5
+}
+
+@requires strict "uses STRICT tables"
+test op-date-minus-derived-table-cte-and-view-columns {
+    CREATE TABLE t(d date) STRICT;
+    CREATE TABLE u(e date) STRICT;
+    INSERT INTO t VALUES ('2024-01-05');
+    INSERT INTO u VALUES ('2024-01-01');
+    CREATE VIEW v AS SELECT e AS x FROM u;
+    SELECT d - x FROM t, (SELECT e AS x FROM u);
+    SELECT d - x FROM t, (SELECT e AS x FROM u UNION ALL SELECT e - 1 FROM u) ORDER BY 1;
+    WITH c(x) AS (SELECT e FROM u) SELECT d - x FROM t, c;
+    SELECT d - x FROM t, v;
+}
+expect {
+    4
+    4
+    5
+    4
+    4
+}
+
+@requires strict "uses STRICT tables"
+test op-date-in-update-row-value-subquery {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT;
+    CREATE TABLE u(e date) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-05');
+    INSERT INTO u VALUES ('2024-01-01');
+    UPDATE t SET (id, d) = (SELECT 2, e + 3 FROM u);
+    SELECT id, d FROM t;
+}
+expect {
+    2|2024-01-04
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-result-keeps-operand-decimals {
+    -- As in PostgreSQL: a product has the decimals of both operands, a sum or
+    -- difference those of the operand with more.
+    CREATE TABLE g(n numeric(10,2)) STRICT;
+    INSERT INTO g VALUES (1.00), (0.00);
+    SELECT n * 3, n * 3.5, 3 * n, n + 3, n - 1 FROM g;
+}
+expect {
+    3.00|3.500|3.00|4.00|0.00
+    0.00|0.000|0.00|3.00|-1.00
+}
+
+@requires strict "uses STRICT tables"
+test op-date-full-join-using-column {
+    CREATE TABLE t(d date) STRICT;
+    CREATE TABLE u(d date) STRICT;
+    INSERT INTO t VALUES ('2024-01-05');
+    INSERT INTO u VALUES ('2024-01-05');
+    SELECT d - 1 FROM t FULL JOIN u USING (d);
+}
+expect {
+    2024-01-04
+}
+
+@requires strict "uses STRICT tables"
+test op-date-in-recursive-cte {
+    -- The recursive SELECT reads the CTE's columns with the types the first
+    -- SELECT gives them.
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('2024-01-05');
+    WITH RECURSIVE r(x, i) AS (
+        SELECT d, 0 FROM t UNION ALL SELECT x + 1, i + 1 FROM r WHERE i < 2
+    ) SELECT x, x - 1 FROM r;
+}
+expect {
+    2024-01-05|2024-01-04
+    2024-01-06|2024-01-05
+    2024-01-07|2024-01-06
+}
+
+@requires strict "uses STRICT tables"
+test op-date-struct-field {
+    CREATE TYPE p AS STRUCT(d date, n integer);
+    CREATE TABLE s(v p) STRICT;
+    INSERT INTO s VALUES (struct_pack('2024-01-05', 1));
+    SELECT v.d - 1 FROM s;
+}
+expect {
+    2024-01-04
+}

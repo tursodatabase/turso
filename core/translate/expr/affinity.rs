@@ -103,16 +103,23 @@ pub(crate) fn get_expr_affinity(
         }
         ast::Expr::SubqueryResult {
             subquery_id,
-            query_type: ast::SubqueryType::RowValue { num_regs, .. },
+            query_type:
+                ast::SubqueryType::RowValue {
+                    result_reg_start,
+                    num_regs: 1,
+                },
             ..
-        } if *num_regs == 1 => {
-            if let Some(resolver) = resolver {
-                if let Some(aff) = resolver.subquery_affinities.borrow().get(subquery_id) {
-                    return *aff;
-                }
-            }
-            Affinity::None
-        }
+        } => resolver
+            .and_then(|resolver| {
+                let subqueries = resolver.row_value_subqueries.borrow();
+                Some(
+                    subqueries
+                        .get(subquery_id)?
+                        .column(*result_reg_start)?
+                        .affinity,
+                )
+            })
+            .unwrap_or(Affinity::None),
         _ => Affinity::None,
     }
 }

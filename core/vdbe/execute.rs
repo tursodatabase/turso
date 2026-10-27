@@ -11643,10 +11643,14 @@ pub fn op_function(
                     _ => {
                         let a = value_to_bigdecimal(&lhs_val)?;
                         let b = value_to_bigdecimal(&rhs_val)?;
+                        // The result keeps every decimal of its operands, as in
+                        // PostgreSQL: 1.00 * 3 is 3.00 and 0.00 + 3 is 3.00.
+                        let (a_scale, b_scale) =
+                            (a.fractional_digit_count(), b.fractional_digit_count());
                         let res = match scalar_func {
-                            ScalarFunc::NumericAdd => a + b,
-                            ScalarFunc::NumericSub => a - b,
-                            ScalarFunc::NumericMul => a * b,
+                            ScalarFunc::NumericAdd => (a + b).with_scale(a_scale.max(b_scale)),
+                            ScalarFunc::NumericSub => (a - b).with_scale(a_scale.max(b_scale)),
+                            ScalarFunc::NumericMul => (a * b).with_scale(a_scale + b_scale),
                             ScalarFunc::NumericDiv => {
                                 use bigdecimal::Zero;
                                 if b.is_zero() {
