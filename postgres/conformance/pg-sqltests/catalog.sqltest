@@ -1280,3 +1280,37 @@ expect @tursopg {
     1
     t_pkey|__turso_internal_pk_index_t
 }
+
+test pg-attribute-not-null-dump {
+    CREATE TABLE dump_nulls (id INTEGER PRIMARY KEY, required TEXT NOT NULL, optional TEXT);
+    SELECT a.attname, a.attnotnull,
+           CASE WHEN a.attislocal THEN true
+                WHEN a.attnotnull AND NOT a.attislocal THEN true
+                ELSE false END AS notnull_islocal
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'dump_nulls' AND a.attnum > 0 ORDER BY a.attnum;
+}
+expect {
+    id|t|t
+    required|t|t
+    optional|f|t
+}
+
+test pg-boolean-case-results {
+    SELECT true, false, CASE WHEN true THEN true ELSE false END,
+           CASE WHEN false THEN true ELSE false END,
+           CASE WHEN false THEN true END,
+           CASE WHEN true THEN 1 ELSE 0 END;
+    CREATE TABLE bools (value BOOLEAN);
+    INSERT INTO bools VALUES (true), (false);
+    SELECT CASE WHEN true THEN value ELSE false END FROM bools ORDER BY value;
+    SELECT CASE WHEN true THEN (CASE WHEN false THEN false ELSE true END) ELSE NULL END,
+           CASE WHEN true THEN NULL ELSE NULL END,
+           CASE WHEN true THEN 1 ELSE NULL END;
+}
+expect {
+    t|f|t|f||1
+    f
+    t
+    t||1
+}

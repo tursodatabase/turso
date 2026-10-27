@@ -47,3 +47,44 @@ expect {
     7|c|3
     ok
 }
+
+@cross-check-integrity
+test rowid-notnull-keeps-declaration-and-update-behavior {
+    CREATE TABLE rowid_flags(id INTEGER PRIMARY KEY, value TEXT);
+    SELECT name, "notnull" FROM pragma_table_info('rowid_flags') ORDER BY cid;
+    INSERT INTO rowid_flags VALUES(NULL, 'first');
+    UPDATE rowid_flags SET id = 2;
+    CREATE TRIGGER before_rowid_update BEFORE UPDATE ON rowid_flags BEGIN SELECT 1; END;
+    UPDATE rowid_flags SET id = 3;
+    ALTER TABLE rowid_flags RENAME COLUMN id TO renamed;
+    SELECT name, "notnull" FROM pragma_table_info('rowid_flags') ORDER BY cid;
+    INSERT INTO rowid_flags(value) VALUES('second');
+    SELECT renamed, value FROM rowid_flags ORDER BY renamed;
+    PRAGMA integrity_check;
+}
+expect {
+    id|0
+    value|0
+    renamed|0
+    value|0
+    3|first
+    4|second
+    ok
+}
+
+test rowid-notnull-explicit-and-strict-metadata {
+    CREATE TABLE explicit_nullability(id INTEGER PRIMARY KEY NOT NULL);
+    CREATE TABLE strict_nullability(id INTEGER PRIMARY KEY) STRICT;
+    SELECT "notnull" FROM pragma_table_info('explicit_nullability');
+    SELECT "notnull" FROM pragma_table_info('strict_nullability');
+    INSERT INTO explicit_nullability VALUES(NULL);
+    INSERT INTO strict_nullability VALUES(NULL);
+    SELECT id FROM explicit_nullability;
+    SELECT id FROM strict_nullability;
+}
+expect {
+    1
+    0
+    1
+    1
+}
