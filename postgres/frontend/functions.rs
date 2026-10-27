@@ -403,7 +403,7 @@ pub(crate) enum ConfigParameter {
     SearchPath,
 }
 
-enum Parameter<'a> {
+pub(crate) enum Parameter<'a> {
     BuiltIn(ConfigParameter),
     Custom(&'a str),
 }
@@ -508,7 +508,7 @@ fn unrecognized_parameter(name: &str) -> LimboError {
     )
 }
 
-fn find_parameter(name: &str) -> Option<Parameter<'_>> {
+pub(crate) fn find_parameter(name: &str) -> Option<Parameter<'_>> {
     match name.parse::<ConfigParameter>() {
         Ok(parameter) => Some(Parameter::BuiltIn(parameter)),
         Err(_) if name.contains('.') => Some(Parameter::Custom(name)),
