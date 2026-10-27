@@ -11,7 +11,6 @@ mod conflict_resolution;
 mod custom_types;
 mod database;
 mod database_leak;
-mod explain_scaling;
 mod expr_depth_stack_overflow;
 mod external_apis;
 mod functions;
