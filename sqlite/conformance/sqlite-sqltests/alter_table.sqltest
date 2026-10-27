@@ -2431,84 +2431,6 @@ expect {
     0
 }
 
-test alter-table-rename-table-rewrites-views {
-    CREATE TABLE view_src (z);
-    INSERT INTO view_src VALUES (7);
-    CREATE VIEW view_plain AS SELECT z FROM view_src;
-    CREATE VIEW view_qualified AS SELECT view_src.z + 1 AS z FROM view_src;
-    CREATE VIEW view_cte AS WITH view_src AS (SELECT 100 AS z) SELECT z FROM view_src;
-    CREATE TEMP VIEW view_temp AS SELECT z + 2 AS z FROM view_src;
-    ALTER TABLE view_src RENAME TO view_src2;
-    SELECT z FROM view_plain;
-    SELECT z FROM view_qualified;
-    SELECT z FROM view_cte;
-    SELECT z FROM view_temp;
-    SELECT name, sql LIKE '%view_src2%' FROM sqlite_schema WHERE type = 'view' ORDER BY name;
-    SELECT name, sql LIKE '%view_src2%' FROM sqlite_temp_schema WHERE type = 'view';
-}
-expect {
-    7
-    8
-    100
-    9
-    view_cte|0
-    view_plain|1
-    view_qualified|1
-    view_temp|1
-}
-
-test alter-table-rename-table-views-follow-name-lookup {
-    ATTACH ':memory:' AS aux;
-    CREATE TABLE aux.lk_src (y);
-    INSERT INTO aux.lk_src VALUES (5);
-    CREATE TABLE lk_src (z);
-    INSERT INTO lk_src VALUES (1);
-    CREATE VIEW aux.lk_aux_view AS SELECT y FROM lk_src;
-    CREATE TEMP VIEW lk_temp AS SELECT z FROM lk_src;
-    CREATE TEMP VIEW lk_temp_main AS SELECT z FROM main.lk_src;
-    CREATE TEMP VIEW lk_temp_three_part AS SELECT main.lk_src.z FROM main.lk_src;
-    ALTER TABLE aux.lk_src RENAME TO lk_src2;
-    SELECT y FROM aux.lk_aux_view;
-    SELECT z FROM lk_temp;
-    SELECT z FROM lk_temp_main;
-    SELECT z FROM lk_temp_three_part;
-    ALTER TABLE main.lk_src RENAME TO lk_src3;
-    SELECT z FROM lk_temp;
-    SELECT z FROM lk_temp_main;
-    SELECT z FROM lk_temp_three_part;
-    CREATE TABLE lk_hidden (z);
-    INSERT INTO lk_hidden VALUES (1);
-    CREATE TEMP TABLE lk_hidden (w);
-    INSERT INTO temp.lk_hidden VALUES (2);
-    CREATE TEMP VIEW lk_hidden_main AS SELECT * FROM main.lk_hidden;
-    CREATE TEMP VIEW lk_hidden_temp AS SELECT * FROM lk_hidden;
-    ALTER TABLE main.lk_hidden RENAME TO lk_hidden2;
-    SELECT * FROM lk_hidden_main;
-    SELECT * FROM lk_hidden_temp;
-    CREATE TABLE lk_t (q);
-    CREATE TEMP TABLE lk_t (q);
-    INSERT INTO temp.lk_t VALUES (3);
-    CREATE TEMP VIEW lk_t_temp AS SELECT q FROM lk_t;
-    CREATE TEMP VIEW lk_t_main AS SELECT q FROM main.lk_t;
-    ALTER TABLE temp.lk_t RENAME TO lk_t2;
-    SELECT q FROM lk_t_temp;
-    SELECT name, sql LIKE '%lk_t2%' FROM sqlite_temp_schema WHERE name IN ('lk_t_main', 'lk_t_temp') ORDER BY name;
-}
-expect {
-    5
-    1
-    1
-    1
-    1
-    1
-    1
-    1
-    2
-    3
-    lk_t_main|0
-    lk_t_temp|1
-}
-
 test alter-table-rename-table-parenthesized-from-entries {
     CREATE TABLE par_t (a);
     INSERT INTO par_t VALUES (1);
@@ -2516,41 +2438,52 @@ test alter-table-rename-table-parenthesized-from-entries {
     INSERT INTO par_o VALUES (2);
     CREATE TABLE par_p (c);
     INSERT INTO par_p VALUES (3);
-    CREATE VIEW par_alias AS SELECT par_t.b FROM (par_o AS par_t);
-    CREATE VIEW par_alias_list AS SELECT par_t.b, par_p.c FROM (par_o AS par_t, par_p);
-    CREATE VIEW par_cte AS WITH par_t AS (SELECT 5 AS a)
-        SELECT par_t.a, par_o.b FROM (par_t JOIN par_o);
-    CREATE VIEW par_table AS SELECT par_t.a FROM (par_o AS x JOIN par_t);
-    CREATE VIEW par_aliased_join AS SELECT x.b FROM (par_o AS par_t JOIN par_p ON par_t.b + 1 = par_p.c) AS x;
-    CREATE VIEW par_aliased_join_exists AS SELECT 1 WHERE EXISTS (
-        SELECT x.b FROM (par_o AS par_t JOIN par_p ON par_t.b + 1 = par_p.c) AS x);
     CREATE TABLE par_driver (x);
     CREATE TABLE par_log (v);
     CREATE TRIGGER trig_parenthesized_from AFTER INSERT ON par_driver BEGIN
         INSERT INTO par_log SELECT par_t.b FROM (par_o AS par_t, par_p);
+        INSERT INTO par_log WITH par_t AS (SELECT 5 AS a)
+            SELECT par_t.a FROM (par_t JOIN par_o);
         INSERT INTO par_log SELECT par_t.a FROM (par_o JOIN par_t);
         INSERT INTO par_log SELECT x.b FROM (par_o AS par_t JOIN par_p ON par_t.b + 1 = par_p.c) AS x;
     END;
     ALTER TABLE par_t RENAME TO par_t2;
-    SELECT * FROM par_alias;
-    SELECT * FROM par_alias_list;
-    SELECT * FROM par_cte;
-    SELECT * FROM par_table;
-    SELECT * FROM par_aliased_join;
-    SELECT * FROM par_aliased_join_exists;
     INSERT INTO par_driver VALUES (1);
     SELECT v FROM par_log;
 }
 expect {
     2
-    2|3
-    5|2
+    5
     1
     2
+}
+
+test alter-table-rename-table-trigger-derived-table-skips-sibling-entries {
+    CREATE TABLE dt_src (z);
+    INSERT INTO dt_src VALUES (7);
+    CREATE TABLE dt_other (z);
+    INSERT INTO dt_other VALUES (9);
+    CREATE TABLE dt_driver (x);
+    CREATE TABLE dt_log (v);
+    CREATE TRIGGER trig_derived_table AFTER INSERT ON dt_driver BEGIN
+        INSERT INTO dt_log SELECT (SELECT y FROM dt_other AS dt_src, (SELECT dt_src.z AS y)) FROM dt_src;
+        INSERT INTO dt_log SELECT (SELECT y FROM dt_other AS dt_src JOIN (SELECT dt_src.z AS y)) FROM dt_src;
+        INSERT INTO dt_log SELECT (SELECT y FROM dt_src, (SELECT dt_src.z AS y)) FROM dt_other AS dt_src;
+        INSERT INTO dt_log SELECT 1 FROM dt_src WHERE EXISTS (
+            SELECT 1 FROM dt_other AS dt_src, (SELECT dt_src.z AS y) WHERE y = 7);
+        UPDATE dt_other SET z = y FROM (SELECT dt_src.z + 10 AS y FROM dt_src) AS dt_src;
+    END;
+    ALTER TABLE dt_src RENAME TO dt_src2;
+    INSERT INTO dt_driver VALUES (1);
+    SELECT v FROM dt_log;
+    SELECT z FROM dt_other;
+}
+expect {
+    7
+    7
+    9
     1
-    2
-    1
-    2
+    17
 }
 
 test alter-table-rename-column-temp-trigger-exists-result-expr-error {
