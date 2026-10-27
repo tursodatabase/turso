@@ -139,7 +139,8 @@ The result of a type's operator function has no known type, so it can't be the o
 The `<` operator is special: it controls how values of this type are sorted in ORDER BY, MIN, MAX, and CREATE INDEX.
 
 - **`OPERATOR '<'`** (no function name): Uses the base type's native comparison for ordering. This is sufficient for types where the encoded form sorts correctly (e.g., text dates in ISO 8601 format).
-- **`OPERATOR '<' my_compare`**: Uses `my_compare(a, b)` as a custom comparator. The function must return a negative integer if `a < b`, zero if `a = b`, and a positive integer if `a > b`.
+- **`OPERATOR '<' f`**: Orders values with the order Turso implements for `f`. Only `numeric_lt` (used by the built-in `numeric` type) and `array_lt` have one; any other function fails with `no order is known for OPERATOR '<' f`.
+- **`OPERATOR '=' f`** is only allowed together with an `OPERATOR '<'` function, since equality must agree with the order. Without one, it fails with `OPERATOR '=' f needs an OPERATOR '<' function that orders the type`.
 - **No `<` operator**: The type cannot be used in ORDER BY or CREATE INDEX.
 
 ```sql

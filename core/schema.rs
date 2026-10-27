@@ -17,6 +17,7 @@ use crate::translate::expr::{
 };
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
+use crate::type_ordering::TypeOrdering;
 use crate::types::IOResultOr;
 use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -241,6 +242,9 @@ pub enum TypeDefKind {
         encode: Option<Box<ast::Expr>>,
         decode: Option<Box<ast::Expr>>,
         operators: std::vec::Vec<TypeOperator>,
+        /// How values of the type compare, when its `OPERATOR '<'` names a
+        /// function. `None` compares the stored values as SQLite does.
+        ordering: Option<TypeOrdering>,
         /// How arithmetic operators run on values of this type.
         arithmetic: std::vec::Vec<ArithmeticSignature>,
         default: Option<Box<ast::Expr>>,
@@ -286,6 +290,33 @@ const ARITHMETIC_OPERATORS: [&str; 5] = ["+", "-", "*", "/", "%"];
 /// `CREATE TYPE ... OPERATOR '+' f` runs f for two values of the type, or for a
 /// value of the type and a literal its ENCODE accepts. `OPERATOR '+'` without a
 /// function runs SQLite's operator on the stored value.
+/// The order named by the type's `OPERATOR '<' f`. Comparisons, indexes,
+/// sorting and hashing all use that order, so `f` must be one Turso implements,
+/// and an `OPERATOR '=' g` is only allowed alongside it: equality has to agree
+/// with the order, or DISTINCT and hash joins would disagree with `=`.
+fn declared_ordering(operators: &[TypeOperator]) -> crate::Result<Option<TypeOrdering>> {
+    let function_of = |op: &str| {
+        operators
+            .iter()
+            .find(|o| o.op == op)
+            .and_then(|o| o.func_name.as_deref())
+    };
+    let Some(less_than) = function_of("<") else {
+        if let Some(equals) = function_of("=") {
+            return Err(crate::LimboError::ParseError(format!(
+                "OPERATOR '=' {equals} needs an OPERATOR '<' function that orders the type"
+            )));
+        }
+        return Ok(None);
+    };
+    match TypeOrdering::from_less_than_function(less_than) {
+        Some(ordering) => Ok(Some(ordering)),
+        None => Err(crate::LimboError::ParseError(format!(
+            "no order is known for OPERATOR '<' {less_than}"
+        ))),
+    }
+}
+
 fn declared_arithmetic(operators: &[TypeOperator]) -> std::vec::Vec<ArithmeticSignature> {
     use ArithmeticArg::{Column, EncodableLiteral};
     let mut signatures = std::vec::Vec::new();
@@ -499,6 +530,14 @@ impl TypeDef {
         }
     }
 
+    /// How values of the type compare, when it has its own order.
+    pub fn ordering(&self) -> Option<TypeOrdering> {
+        match &self.kind {
+            TypeDefKind::Custom { ordering, .. } => *ordering,
+            _ => None,
+        }
+    }
+
     /// How `op` can run on a value of this type, most specific first.
     pub fn arithmetic<'a>(&'a self, op: &'a str) -> impl Iterator<Item = &'a ArithmeticSignature> {
         self.all_arithmetic().iter().filter(move |s| s.op == op)
@@ -574,6 +613,7 @@ impl TypeDef {
                     encode: encode.clone(),
                     decode: decode.clone(),
                     operators: operators.clone(),
+                    ordering: declared_ordering(operators)?,
                     arithmetic: if is_builtin {
                         builtin_arithmetic(type_name)
                     } else {
@@ -667,7 +707,8 @@ impl TypeDef {
                 encode: None,
                 decode: None,
                 operators: std::vec::Vec::new(),
-                // A domain has the arithmetic of the type it is based on.
+                // A domain has the order and arithmetic of the type it is based on.
+                ordering: None,
                 arithmetic: std::vec::Vec::new(),
                 default,
             },

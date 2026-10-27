@@ -134,7 +134,7 @@ expect {
 test uint-comparison-equals {
     CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '=' test_uint_eq;
+        OPERATOR '<' test_uint_lt OPERATOR '=' test_uint_eq;
     CREATE TABLE t1(val test_uint) STRICT;
     INSERT INTO t1 VALUES (42);
     INSERT INTO t1 VALUES (99);
@@ -1899,4 +1899,29 @@ test filter-numeric-group-concat {
 }
 expect {
     Alice,Carol
+}
+
+test create-type-less-than-function-must-have-an-order {
+    -- Indexes and sorting use the order behind OPERATOR '<', so the function
+    -- must be one Turso has an order for.
+    CREATE TYPE t1 BASE text OPERATOR '<' upper;
+}
+expect error {
+    no order is known for OPERATOR '<' upper
+}
+
+test create-type-equals-function-needs-an-order {
+    -- Equality has to agree with the order, so an '=' function alone is refused.
+    CREATE TYPE t1 BASE text OPERATOR '=' test_uint_eq;
+}
+expect error {
+    OPERATOR '=' test_uint_eq needs an OPERATOR '<' function that orders the type
+}
+
+test create-type-known-less-than-function {
+    CREATE TYPE t1 BASE text OPERATOR '<' test_uint_lt OPERATOR '=' test_uint_eq;
+    SELECT 1;
+}
+expect {
+    1
 }

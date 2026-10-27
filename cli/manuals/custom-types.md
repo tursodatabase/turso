@@ -165,7 +165,7 @@ SELECT val FROM t ORDER BY val;
 
 ### `OPERATOR '<'` with a Function (Custom Comparator)
 
-For types where the base type comparison on encoded values is not suitable, provide a custom comparator function. The comparator transforms encoded values before comparing:
+For types where the base type comparison on encoded values is not suitable, name a comparator function. Only functions Turso has an order for are accepted (`numeric_lt`, `array_lt`, and the test functions `test_uint_lt` and `string_reverse`); any other name fails with `no order is known for OPERATOR '<' f`. An `OPERATOR '=' f` is only accepted together with such a `<` function, because equality must agree with the order:
 
 ```sql
 -- numeric stores values as blobs; standard blob comparison is wrong.

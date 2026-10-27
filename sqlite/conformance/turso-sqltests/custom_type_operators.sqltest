@@ -663,7 +663,7 @@ expect {
 test op-value-integer-with-text-literal-fallback {
     -- value type is "integer", text literal → NOT compatible → standard operator.
     CREATE TYPE my_int(value integer) BASE integer
-        OPERATOR '=' test_uint_eq;
+        OPERATOR '<' test_uint_lt OPERATOR '=' test_uint_eq;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val my_int) STRICT;
     INSERT INTO t1 VALUES (1, 10);
     -- Standard = compares integer 10 with text '10' → SQLite rules apply.
