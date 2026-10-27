@@ -21,6 +21,7 @@ pub(crate) struct SemanticCatalogDatabase {
 /// Stable schema references and lookup order captured before semantic analysis.
 pub(crate) struct SemanticCatalog {
     pub(crate) databases: Vec<SemanticCatalogDatabase>,
+    pub(crate) namespaces: Vec<crate::namespace::Namespace>,
     pub(crate) unqualified_database_search_path: Vec<DatabaseId>,
     /// The schema `temp` names while the connection has no TEMP database.
     pub(crate) empty_temp_schema: Option<EmptyTempSchema>,
@@ -61,8 +62,9 @@ impl SemanticCatalog {
                 .iter()
                 .map(|(database, attached)| {
                     let name = namespaces
-                        .name(*database)
-                        .expect("attached database must have a namespace");
+                        .of_database(*database)
+                        .expect("attached database must have a namespace")
+                        .name;
                     (*database, name, attached.db.clone())
                 })
                 .collect::<Vec<_>>()
@@ -101,31 +103,16 @@ impl SemanticCatalog {
         if has_temp_schema {
             unqualified_database_search_path.push(DatabaseId::new(TEMP_DB_ID));
         }
-        match configured_search_path {
-            Some(configured) => {
-                for name in configured {
-                    if name.eq_ignore_ascii_case("public") {
-                        unqualified_database_search_path.push(DatabaseId::new(MAIN_DB_ID));
-                    } else if let Some((database, _, _)) = attached
-                        .iter()
-                        .find(|(_, attached_name, _)| attached_name.eq_ignore_ascii_case(name))
-                    {
-                        unqualified_database_search_path.push(DatabaseId::new(*database));
-                    }
-                }
-            }
-            None => {
-                unqualified_database_search_path.push(DatabaseId::new(MAIN_DB_ID));
-                unqualified_database_search_path.extend(
-                    attached
-                        .iter()
-                        .map(|(database, _, _)| DatabaseId::new(*database)),
-                );
-            }
-        }
+        unqualified_database_search_path.extend(
+            namespaces
+                .search_order(configured_search_path)
+                .into_iter()
+                .map(|namespace| DatabaseId::from_namespace(namespace.target)),
+        );
 
         Ok(Self {
             databases,
+            namespaces: namespaces.all(),
             unqualified_database_search_path,
             empty_temp_schema,
             has_temp_database: has_temp_schema,
@@ -195,6 +182,75 @@ mod tests {
         conn.prepare("SELECT name FROM temp.sqlite_temp_master")
             .expect("SELECT from temp prepares");
         assert_eq!(EMPTY_TEMP_SCHEMAS_BUILT.with(Cell::get), 1);
+    }
+
+    #[test]
+    fn prepare_resolves_namespaces_and_aliases_without_reading_the_root_table() {
+        use crate::{Namespace, NamespaceId, NamespaceRef};
+
+        let io = Arc::new(crate::MemoryIO::new());
+        let db = crate::Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let app = NamespaceId::new(7);
+        conn.with_schema_mut(|schema| {
+            schema.add_namespace(app);
+            schema
+                .add_btree_table(
+                    NamespaceId::ROOT,
+                    Arc::new(
+                        crate::schema::BTreeTable::from_sql("CREATE TABLE t(root_value)", 2)
+                            .unwrap(),
+                    ),
+                )
+                .unwrap();
+            schema
+                .add_btree_table(
+                    app,
+                    Arc::new(
+                        crate::schema::BTreeTable::from_sql("CREATE TABLE t(app_value)", 3)
+                            .unwrap(),
+                    ),
+                )
+                .unwrap();
+        })
+        .unwrap();
+        conn.add_namespace(Namespace {
+            name: "app".into(),
+            target: NamespaceRef {
+                database_id: MAIN_DB_ID,
+                id: app,
+            },
+        });
+        conn.add_namespace(Namespace::database("public", MAIN_DB_ID));
+        conn.set_search_path(Some(vec!["app".into(), "public".into()]));
+
+        for (sql, column) in [
+            ("SELECT * FROM t", "app_value"),
+            ("SELECT * FROM app.t", "app_value"),
+            ("SELECT * FROM public.t", "root_value"),
+            ("SELECT * FROM main.t", "root_value"),
+            (
+                "INSERT INTO t(app_value) VALUES (1) RETURNING *",
+                "app_value",
+            ),
+            ("UPDATE app.t SET app_value = 2 RETURNING *", "app_value"),
+            ("DELETE FROM app.t RETURNING *", "app_value"),
+        ] {
+            let statement = conn
+                .prepare(sql)
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            assert_eq!(statement.num_columns(), 1, "{sql}");
+            assert_eq!(statement.get_column_name(0).as_ref(), column, "{sql}");
+        }
+        assert!(conn.prepare("SELECT root_value FROM t").is_err());
+        conn.set_search_path(Some(vec!["public".into(), "app".into()]));
+        assert_eq!(
+            conn.prepare("SELECT * FROM t")
+                .unwrap()
+                .get_column_name(0)
+                .as_ref(),
+            "root_value"
+        );
     }
 
     #[test]

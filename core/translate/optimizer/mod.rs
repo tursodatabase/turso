@@ -48,12 +48,13 @@ pub(crate) fn cost_model_params() -> &'static cost_params::CostModelParams {
 /// Derive a base row-count estimate for a table, preferring ANALYZE stats.
 pub(crate) fn base_row_estimate(
     schema: &Schema,
+    namespace: crate::namespace::NamespaceId,
     table: &Table,
     params: &cost_params::CostModelParams,
 ) -> RowCountEstimate {
     match table {
         Table::BTree(btree) => {
-            if let Some(stats) = schema.analyze_stats.table_stats(&btree.name) {
+            if let Some(stats) = schema.analyze_stats.table_stats(namespace, &btree.name) {
                 if let Some(rows) = stats.row_count.or_else(|| {
                     stats
                         .index_stats
@@ -626,6 +627,7 @@ pub(crate) fn hir_or_union_with_cost(
                     },
                 };
                 let analyze_ctx = cost::AnalyzeCtx {
+                    namespace: source.namespace.id,
                     table_name: source.table.get_name(),
                     index: index.as_ref(),
                     stats: &schema.analyze_stats,

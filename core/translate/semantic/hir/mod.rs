@@ -160,14 +160,24 @@ impl CatalogObjectId {
     }
 }
 
-/// Stable identity of main, temp, or an attached database.
+/// Stable identity of a namespace in main, temp, or an attached database.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct DatabaseId(usize);
+pub struct DatabaseId(usize, crate::namespace::NamespaceId);
 
 impl DatabaseId {
     pub(crate) const fn new(index: usize) -> Self {
-        Self(index)
+        Self(index, crate::namespace::NamespaceId::ROOT)
+    }
+
+    pub(crate) const fn from_namespace(namespace: crate::namespace::NamespaceRef) -> Self {
+        Self(namespace.database_id, namespace.id)
+    }
+
+    pub const fn namespace(self) -> crate::namespace::NamespaceRef {
+        crate::namespace::NamespaceRef {
+            database_id: self.0,
+            id: self.1,
+        }
     }
 
     pub const fn index(self) -> usize {
@@ -716,7 +726,7 @@ impl HirDocument {
     pub fn database(&self, id: DatabaseId) -> Option<&DatabaseSnapshot> {
         self.databases
             .iter()
-            .find(|snapshot| snapshot.database == id)
+            .find(|snapshot| snapshot.database.index() == id.index())
     }
 
     pub fn query(&self, id: QueryId) -> Option<&Query> {

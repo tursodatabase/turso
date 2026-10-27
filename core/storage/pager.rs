@@ -2596,6 +2596,9 @@ impl Pager {
             "memory IO should complete immediately"
         );
 
+        // saveAllCursors at sqlite3BtreeSavepoint (btree.c:4580).
+        self.invalidate_all_cursors();
+
         // Discard all dirty pages allocated after the savepoint. These pages
         // are never subjournaled (see subjournal_page_if_required), so the loop
         // above won't encounter them. We must clean them from dirty_pages before
@@ -2629,9 +2632,6 @@ impl Pager {
                     ))
                 })?;
         }
-
-        // saveAllCursors at sqlite3BtreeSavepoint (btree.c:4580).
-        self.invalidate_all_cursors();
 
         Ok(())
     }

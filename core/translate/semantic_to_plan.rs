@@ -18,6 +18,7 @@ use super::{
     },
     semantic::hir::{self, ColumnUsage, HirDocument, QueryBlockId, QueryId, SourceId},
 };
+#[cfg(test)]
 use crate::namespace::NamespaceId;
 use crate::{
     incremental::view::IncrementalView,
@@ -1961,7 +1962,12 @@ impl<'a> HirPlanContext<'a> {
                 return None;
             }
             let source_rows = match &definition.kind {
-                hir::SourceKind::Table(table) => *base_row_estimate(schema, table.value(), params),
+                hir::SourceKind::Table(table) => *base_row_estimate(
+                    schema,
+                    table.database()?.namespace().id,
+                    table.value(),
+                    params,
+                ),
                 hir::SourceKind::Derived(query) => query_estimate(*query).map_or_else(
                     || *RowCountEstimate::hardcoded_fallback(params),
                     |estimate| estimate.output_cardinality.max(1.0),
@@ -2009,12 +2015,13 @@ impl<'a> HirPlanContext<'a> {
             return None;
         };
         let btree = table.value().btree()?;
-        let table_stats = schema.analyze_stats.table_stats(&btree.name)?;
+        let namespace = table.database()?.namespace().id;
+        let table_stats = schema.analyze_stats.table_stats(namespace, &btree.name)?;
         table_stats
             .index_stats
             .iter()
             .filter_map(|(index_name, index_stats)| {
-                let index = schema.get_index(NamespaceId::ROOT, &btree.name, index_name)?;
+                let index = schema.get_index(namespace, &btree.name, index_name)?;
                 if index.where_clause.is_some() || index.columns.len() < columns.len() {
                     return None;
                 }
@@ -3371,7 +3378,12 @@ impl<'a> HirPlanContext<'a> {
         for source in &mut input.sources {
             match source {
                 HirPlanSource::BTree(source) => {
-                    base_rows.push(base_row_estimate(schema, &source.table, params));
+                    base_rows.push(base_row_estimate(
+                        schema,
+                        source.namespace.id,
+                        &source.table,
+                        params,
+                    ));
                     source_costs.push(Cost(0.0));
                 }
                 HirPlanSource::Derived {
@@ -4353,11 +4365,16 @@ fn materialized_view_sources(
         if source.database.map(hir::DatabaseId::index) != Some(crate::MAIN_DB_ID) {
             continue;
         }
+        let namespace = source
+            .database
+            .expect("a main-database source has a namespace")
+            .namespace()
+            .id;
         let name = table.value().get_name();
-        let Some(view) = schema.get_materialized_view(NamespaceId::ROOT, name) else {
+        let Some(view) = schema.get_materialized_view(namespace, name) else {
             continue;
         };
-        if !schema.has_compatible_materialized_view_storage(NamespaceId::ROOT, name) {
+        if !schema.has_compatible_materialized_view_storage(namespace, name) {
             use crate::incremental::view::DBSP_CIRCUIT_VERSION;
             return Err(LimboError::InternalError(format!(
                 "Materialized view '{name}' has an incompatible version. \n\
@@ -4468,6 +4485,10 @@ fn planned_source_from_definition(
     let (col_used_mask, column_use_counts) = column_usage(source.id, usage)?;
 
     Ok(HirPlannedSource {
+        namespace: source.database.map_or(
+            crate::namespace::NamespaceRef::root_of(crate::MAIN_DB_ID),
+            hir::DatabaseId::namespace,
+        ),
         table: table.value().clone(),
         internal_id: source.id,
         join_info,
@@ -5547,10 +5568,13 @@ pub(crate) mod tests {
 
         let params = CostModelParams::default();
         let mut schema = Schema::default();
-        schema.analyze_stats.table_stats_mut("left_items").row_count = Some(1_000);
         schema
             .analyze_stats
-            .table_stats_mut("right_items")
+            .table_stats_mut(NamespaceId::ROOT, "left_items")
+            .row_count = Some(1_000);
+        schema
+            .analyze_stats
+            .table_stats_mut(NamespaceId::ROOT, "right_items")
             .row_count = Some(1);
         let base_rows = input
             .sources
@@ -5558,6 +5582,7 @@ pub(crate) mod tests {
             .map(|source| {
                 base_row_estimate(
                     &schema,
+                    source.btree().expect("test source is a table").namespace.id,
                     &source.btree().expect("test source is a table").table,
                     &params,
                 )

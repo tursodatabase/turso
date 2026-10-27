@@ -2632,7 +2632,7 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
                     hir::SequenceOperationKind::NextValue => {
                         crate::translate::sequence::emit_disk_read_nextval(
                             self.program,
-                            database.index(),
+                            database.namespace(),
                             backing_table,
                             sqlite_sequence,
                             &operation.normalized_name,
@@ -5374,6 +5374,7 @@ mod tests {
                 name: "main".to_string(),
                 schema: Arc::new(schema),
             }],
+            namespaces: crate::Namespaces::default().all(),
             unqualified_database_search_path: vec![hir::DatabaseId::new(MAIN_DB_ID)],
             empty_temp_schema: None,
             has_temp_database: false,

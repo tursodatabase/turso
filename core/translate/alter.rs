@@ -10,7 +10,7 @@ use turso_parser::{ast, parser::Parser};
 use super::{
     index::emit_refill_index,
     planner::ROWID_STRS,
-    schema::{validate_check_expr, SQLITE_TABLEID},
+    schema::{validate_check_expr, validate_default_expr, SQLITE_TABLEID},
     update::translate_update_for_schema_change,
 };
 use crate::{
@@ -60,7 +60,7 @@ fn validate(alter_table: &ast::AlterTableBody, table_name: &str) -> Result<()> {
 
 #[derive(Clone)]
 struct SchemaTriggerEntry {
-    database_id: usize,
+    namespace: NamespaceRef,
     trigger: Arc<crate::schema::Trigger>,
 }
 
@@ -83,28 +83,22 @@ fn database_uses_mvcc(connection: &Arc<crate::Connection>, database_id: usize) -
 
 fn collect_triggers_for_alter_target(
     catalog: &SemanticContext<'_>,
-    target_database_id: usize,
+    target: NamespaceRef,
 ) -> Vec<SchemaTriggerEntry> {
-    let mut database_ids = vec![target_database_id];
-    if target_database_id != crate::TEMP_DB_ID {
-        database_ids.push(crate::TEMP_DB_ID);
+    let mut namespaces = vec![target];
+    if target.database_id != crate::TEMP_DB_ID {
+        namespaces.push(NamespaceRef::root_of(crate::TEMP_DB_ID));
     }
 
     let mut triggers = Vec::new();
-    for database_id in database_ids {
-        let schema_triggers = catalog.with_schema(database_id, |schema| {
-            schema
-                .triggers(NamespaceId::ROOT)
-                .cloned()
-                .collect::<Vec<_>>()
+    for namespace in namespaces {
+        let schema_triggers = catalog.with_schema(namespace.database_id, |schema| {
+            schema.triggers(namespace.id).cloned().collect::<Vec<_>>()
         });
         triggers.extend(
             schema_triggers
                 .into_iter()
-                .map(|trigger| SchemaTriggerEntry {
-                    database_id,
-                    trigger,
-                }),
+                .map(|trigger| SchemaTriggerEntry { namespace, trigger }),
         );
     }
     triggers
@@ -572,8 +566,9 @@ fn emit_column_constraints_validation(
     constraints: &[ast::NamedColumnConstraint],
     connection: &Arc<crate::Connection>,
     catalog: &SemanticContext<'_>,
-    database_id: usize,
+    namespace: NamespaceRef,
 ) -> Result<()> {
+    let database_id = namespace.database_id;
     let has_notnull = column.notnull();
     let mut check_constraints: Vec<CheckConstraint> = constraints
         .iter()
@@ -616,8 +611,8 @@ fn emit_column_constraints_validation(
     }
     let database = connection
         .namespaces()
-        .name(database_id)
-        .ok_or_else(|| LimboError::InternalError(format!("no database with id {database_id}")))?;
+        .name_of(namespace)
+        .ok_or_else(|| LimboError::InternalError(format!("no namespace {namespace:?}")))?;
     let select = PlannedSelect::scan(
         values,
         database,
@@ -721,7 +716,7 @@ pub fn translate_alter_table(
                 new_name_norm,
                 catalog,
                 connection,
-                database_id,
+                namespace,
             );
         }
     }
@@ -896,12 +891,12 @@ pub fn translate_alter_table(
                 t
             };
             let table_name_norm = normalize_ident(table_name);
-            for trigger_entry in collect_triggers_for_alter_target(catalog, database_id) {
+            for trigger_entry in collect_triggers_for_alter_target(catalog, namespace) {
                 if let Some(missing_table) = validate_trigger_table_refs_after_rename(
                     &trigger_entry.trigger,
                     &table_name_norm,
                     catalog,
-                    trigger_entry.database_id,
+                    trigger_entry.namespace.database_id,
                     database_id,
                 )? {
                     return Err(LimboError::ParseError(format!(
@@ -914,7 +909,7 @@ pub fn translate_alter_table(
                     &table_name_norm,
                     &btree,
                     catalog,
-                    trigger_entry.database_id,
+                    trigger_entry.namespace.database_id,
                     database_id,
                 )? {
                     return Err(LimboError::ParseError(format!(
@@ -927,7 +922,7 @@ pub fn translate_alter_table(
                     &table_name_norm,
                     &post_drop_btree,
                     catalog,
-                    trigger_entry.database_id,
+                    trigger_entry.namespace.database_id,
                     database_id,
                 )? {
                     return Err(LimboError::ParseError(format!(
@@ -1000,7 +995,7 @@ pub fn translate_alter_table(
                             catalog,
                             catalog,
                             connection,
-                            database_id,
+                            namespace,
                         );
                     }
 
@@ -1013,6 +1008,7 @@ pub fn translate_alter_table(
 
                     program.emit_insn(Insn::DropColumn {
                         db: database_id,
+                        namespace: namespace.id,
                         table: btree.name.clone(),
                         column_index: dropped_index,
                     })
@@ -1044,6 +1040,11 @@ pub fn translate_alter_table(
                     if let ast::ColumnConstraint::Generated { expr, .. } = &c.constraint {
                         crate::schema::validate_generated_expr(expr)?;
                     }
+                }
+            }
+            for c in &col_def.constraints {
+                if let ast::ColumnConstraint::Default(expr) = &c.constraint {
+                    validate_default_expr(expr, &col_def)?;
                 }
             }
             let constraints = col_def.constraints.clone();
@@ -1152,6 +1153,7 @@ pub fn translate_alter_table(
                                 .as_ref()
                                 .map(|n| normalize_ident(n.as_str())),
                             parent_table: normalize_ident(clause.tbl_name.as_str()),
+                            parent_namespace: namespace.id,
                             parent_columns: clause
                                 .columns
                                 .iter()
@@ -1247,10 +1249,11 @@ pub fn translate_alter_table(
 
             // The constraints read the table with the new column.
             let added_catalog = catalog.with_altered_table(
-                crate::translate::semantic::hir::DatabaseId::new(database_id),
+                crate::translate::semantic::hir::DatabaseId::from_namespace(namespace),
                 Arc::new(crate::schema::Table::BTree(Arc::new(btree.clone()))),
                 table_indexes,
             );
+            let mut computes_default_for_existing_rows = false;
             if !is_generated {
                 // Check if we need to verify the table is empty at runtime.
                 let type_default = catalog
@@ -1260,21 +1263,29 @@ pub fn translate_alter_table(
                     .flatten()
                     .and_then(|r| r.default_expr().cloned());
                 let effective_default = column.default.as_deref().or(type_default.as_ref());
-                let needs_notnull_check = column.notnull()
-                    && effective_default.is_none_or(crate::util::expr_contains_null);
 
                 // SQLite is very strict about what constitutes a "constant" default
                 // for ALTER TABLE ADD COLUMN: only literals, signed literals, and
                 // bare identifiers qualify. Anything else — (5 + 3), random(),
                 // CURRENT_TIMESTAMP — is permitted only if the table is empty,
                 // checked at runtime (mirroring SQLite's sqlite3ErrorIfNotEmpty).
-                let needs_nondeterministic_check = column.default.as_ref().is_some_and(|default| {
+                // PostgreSQL instead writes the default into every existing row.
+                let has_non_constant_default = column.default.as_ref().is_some_and(|default| {
                     default_requires_empty_table(default) || !is_strict_constant_default(default)
                 });
+                computes_default_for_existing_rows = has_non_constant_default
+                    && connection
+                        .dialect()
+                        .add_column_computes_default_for_existing_rows();
+                // A default computed for each row is checked for NULL row by row
+                // in emit_column_constraints_validation.
+                let needs_notnull_check = column.notnull()
+                    && !computes_default_for_existing_rows
+                    && effective_default.is_none_or(crate::util::expr_contains_null);
 
                 let (needs_empty_table_check, error_message) = if needs_notnull_check {
                     (true, "Cannot add a NOT NULL column with default value NULL")
-                } else if needs_nondeterministic_check {
+                } else if has_non_constant_default && !computes_default_for_existing_rows {
                     (true, "Cannot add a column with non-constant default")
                 } else {
                     (false, "")
@@ -1310,6 +1321,29 @@ pub fn translate_alter_table(
                     emit_add_column_default_type_validation(program, &original_btree, database_id)?;
                 }
             }
+            if computes_default_for_existing_rows {
+                let added_column = btree.columns().len() - 1;
+                let source_columns = btree
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, column)| {
+                        (idx != added_column && !column.is_virtual_generated()).then_some(idx)
+                    })
+                    .collect::<Vec<_>>();
+                emit_rewrite_table_rows(
+                    program,
+                    original_btree.clone(),
+                    &btree,
+                    &source_columns,
+                    &btree.column_layout()?,
+                    Some(added_column),
+                    catalog,
+                    &added_catalog,
+                    connection,
+                    namespace,
+                )?;
+            }
             emit_column_constraints_validation(
                 program,
                 &btree,
@@ -1317,7 +1351,7 @@ pub fn translate_alter_table(
                 &constraints,
                 connection,
                 &added_catalog,
-                database_id,
+                namespace,
             )?;
 
             translate_update_for_schema_change(
@@ -1337,6 +1371,7 @@ pub fn translate_alter_table(
                     program.emit_insn(Insn::AddColumn {
                         data: Box::new(AddColumnData {
                             db: database_id,
+                            namespace: namespace.id,
                             table: table_name.to_owned(),
                             column,
                             check_constraints: btree.check_constraints.to_vec(),
@@ -1366,12 +1401,12 @@ pub fn translate_alter_table(
                 )));
             }
 
-            for trigger_entry in collect_triggers_for_alter_target(catalog, database_id) {
+            for trigger_entry in collect_triggers_for_alter_target(catalog, namespace) {
                 if let Some(missing_table) = validate_trigger_table_refs_after_rename(
                     &trigger_entry.trigger,
                     &normalized_old_name,
                     catalog,
-                    trigger_entry.database_id,
+                    trigger_entry.namespace.database_id,
                     database_id,
                 )? {
                     return Err(LimboError::ParseError(format!(
@@ -1379,7 +1414,7 @@ pub fn translate_alter_table(
                         trigger_entry.trigger.name, missing_table
                     )));
                 }
-                if trigger_entry.database_id == crate::TEMP_DB_ID {
+                if trigger_entry.namespace.database_id == crate::TEMP_DB_ID {
                     let temp_trigger_targets_renamed_table =
                         normalize_ident(&trigger_entry.trigger.table_name) == normalized_old_name
                             && match trigger_entry.trigger.target_database_id {
@@ -1589,6 +1624,7 @@ pub fn translate_alter_table(
 
             program.emit_insn(Insn::RenameTable {
                 db: database_id,
+                namespace: namespace.id,
                 from: table_name.to_owned(),
                 to: new_name.to_owned(),
             });
@@ -1791,7 +1827,7 @@ pub fn translate_alter_table(
 
             // If renaming, rewrite trigger SQL for all triggers that reference this column
             // We'll collect the triggers to rewrite and update them in sqlite_schema
-            let mut triggers_to_rewrite: Vec<(usize, String, String)> = Vec::new();
+            let mut triggers_to_rewrite: Vec<(NamespaceRef, String, String)> = Vec::new();
             let mut views_to_rewrite: Vec<(usize, String, String)> = Vec::new();
             if rename {
                 // Try to rewrite every trigger's SQL for the column rename.
@@ -1800,12 +1836,12 @@ pub fn translate_alter_table(
                 // incomplete detection heuristics that miss expression-level refs
                 // (e.g., `SELECT b FROM src` in a trigger on a different table).
                 let target_table_name = normalize_ident(table_name);
-                for trigger_entry in collect_triggers_for_alter_target(catalog, database_id) {
+                for trigger_entry in collect_triggers_for_alter_target(catalog, namespace) {
                     if let Some(missing_table) = validate_trigger_table_refs_after_rename(
                         &trigger_entry.trigger,
                         &target_table_name,
                         catalog,
-                        trigger_entry.database_id,
+                        trigger_entry.namespace.database_id,
                         database_id,
                     )? {
                         return Err(LimboError::ParseError(format!(
@@ -1818,14 +1854,14 @@ pub fn translate_alter_table(
                         table_name,
                         from,
                         col_name,
-                        trigger_entry.database_id,
+                        trigger_entry.namespace.database_id,
                         database_id,
                         catalog,
                     ) {
                         Ok(new_sql) => {
                             if new_sql != trigger_entry.trigger.sql {
                                 triggers_to_rewrite.push((
-                                    trigger_entry.database_id,
+                                    trigger_entry.namespace,
                                     trigger_entry.trigger.name.clone(),
                                     new_sql,
                                 ));
@@ -1868,6 +1904,7 @@ pub fn translate_alter_table(
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                             &view.sql,
                             s,
+                            namespace.id,
                             table_name,
                             &target_db_name,
                             from,
@@ -1888,6 +1925,7 @@ pub fn translate_alter_table(
                                 if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                                     &view.sql,
                                     s,
+                                    NamespaceId::ROOT,
                                     table_name,
                                     &target_db_name,
                                     from,
@@ -1907,7 +1945,7 @@ pub fn translate_alter_table(
             }
             let has_temp_rewrites = triggers_to_rewrite
                 .iter()
-                .any(|(db, _, _)| *db == crate::TEMP_DB_ID)
+                .any(|(namespace, _, _)| namespace.database_id == crate::TEMP_DB_ID)
                 || views_to_rewrite
                     .iter()
                     .any(|(db, _, _)| *db == crate::TEMP_DB_ID);
@@ -2000,10 +2038,11 @@ pub fn translate_alter_table(
             });
 
             // Update trigger SQL for renamed columns
-            for (trigger_database_id, trigger_name, new_sql) in triggers_to_rewrite.clone() {
+            for (trigger_namespace, trigger_name, new_sql) in triggers_to_rewrite.clone() {
                 let escaped_sql = escape_sql_string_literal(&new_sql);
                 let escaped_trigger_name = escape_sql_string_literal(&trigger_name);
-                let qualified_schema_table = schema_table_name_for_db(catalog, trigger_database_id);
+                let qualified_schema_table =
+                    schema_table_name_for_db(catalog, trigger_namespace.database_id);
                 let update_stmt = format!(
                     r#"
                         UPDATE {qualified_schema_table}
@@ -2095,7 +2134,7 @@ pub fn translate_alter_table(
                     })
                     .collect();
                 let altered_catalog = catalog.with_altered_table(
-                    crate::translate::semantic::hir::DatabaseId::new(database_id),
+                    crate::translate::semantic::hir::DatabaseId::from_namespace(namespace),
                     Arc::new(crate::schema::Table::BTree(altered_table.clone())),
                     altered_indexes,
                 );
@@ -2108,7 +2147,7 @@ pub fn translate_alter_table(
                     &definition.constraints,
                     connection,
                     catalog,
-                    database_id,
+                    namespace,
                 )?;
                 if rewrites_physical_layout {
                     let original_columns = original_btree.columns();
@@ -2151,14 +2190,14 @@ pub fn translate_alter_table(
                         original_catalog,
                         catalog,
                         connection,
-                        database_id,
+                        namespace,
                     )?;
                 }
                 emit_rewrite_table_indexes(
                     program,
                     connection,
                     catalog,
-                    database_id,
+                    namespace,
                     &altered_table,
                     &indexes_to_rewrite,
                 )?;
@@ -2178,6 +2217,7 @@ pub fn translate_alter_table(
             program.emit_insn(Insn::AlterColumn {
                 data: Box::new(crate::vdbe::insn::AlterColumnData {
                     db: database_id,
+                    namespace: namespace.id,
                     table: table_name.to_owned(),
                     column_index,
                     definition,
@@ -2421,7 +2461,7 @@ fn emit_rewrite_table_indexes(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     catalog: &SemanticContext<'_>,
-    database_id: usize,
+    namespace: NamespaceRef,
     rewritten_table: &Arc<BTreeTable>,
     indexes: &[Arc<Index>],
 ) -> Result<()> {
@@ -2431,7 +2471,7 @@ fn emit_rewrite_table_indexes(
             program,
             connection,
             catalog,
-            database_id,
+            namespace,
             rewritten_table,
             index,
             index_cursor_id,
@@ -2465,8 +2505,9 @@ fn emit_rewrite_table_rows(
     original_catalog: &SemanticContext<'_>,
     catalog: &SemanticContext<'_>,
     connection: &Arc<crate::Connection>,
-    database_id: usize,
+    namespace: NamespaceRef,
 ) -> Result<()> {
+    let database_id = namespace.database_id;
     turso_assert_eq!(
         source_column_by_schema_idx.len(),
         rewritten_table.columns().len()
@@ -2479,7 +2520,7 @@ fn emit_rewrite_table_rows(
     let affinity_str = non_virtual_affinity_str(rewritten_table);
     let database = connection
         .namespaces()
-        .name(database_id)
+        .name_of(namespace)
         .ok_or_else(|| LimboError::InternalError(format!("no database with id {database_id}")))?;
     let column_name = |column: &Column| -> Result<ast::Expr> {
         let name = column.name.clone().ok_or_else(|| {
@@ -2492,6 +2533,15 @@ fn emit_rewrite_table_rows(
         .enumerate()
         .map(|(schema_idx, source_column_idx)| {
             let Some(source_column_idx) = source_column_idx else {
+                if converted_column == Some(schema_idx) {
+                    return Ok(ScanValue::Expr(
+                        rewritten_table.columns()[schema_idx]
+                            .default
+                            .as_deref()
+                            .expect("an added column being computed must have a default")
+                            .clone(),
+                    ));
+                }
                 return Ok(ScanValue::Expr(ast::Expr::Literal(ast::Literal::Null)));
             };
             let column = column_name(&original_btree.columns()[*source_column_idx])?;
@@ -2602,8 +2652,9 @@ fn translate_rename_virtual_table(
     new_name_norm: String,
     catalog: &SemanticContext<'_>,
     connection: &Arc<crate::Connection>,
-    database_id: usize,
+    namespace: NamespaceRef,
 ) -> Result<()> {
+    let database_id = namespace.database_id;
     let schema_version = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_operation()?;
     let vtab_cur = program.alloc_cursor_id(CursorType::VirtualTable(vtab));
@@ -2696,6 +2747,7 @@ fn translate_rename_virtual_table(
 
     program.emit_insn(Insn::RenameTable {
         db: database_id,
+        namespace: namespace.id,
         from: old_name.to_owned(),
         to: new_name_norm,
     });
@@ -3088,7 +3140,12 @@ impl TargetQualifiers {
                 _ => {
                     other_table_has_column |= catalog
                         .with_schema(database_id, |schema| {
-                            crate::util::select_table_column_names(select_table, schema, &self.ctes)
+                            crate::util::select_table_column_names(
+                                NamespaceId::ROOT,
+                                select_table,
+                                schema,
+                                &self.ctes,
+                            )
                         })?
                         .iter()
                         .any(|column| column == old_col_norm);
@@ -3551,7 +3608,12 @@ fn apply_select_for_column_rename(
 ) -> Result<()> {
     let outer_target_qualifiers = &TargetQualifiers {
         ctes: catalog.with_schema(database_id, |schema| {
-            crate::util::extract_cte_columns(&select.with, schema, &outer_target_qualifiers.ctes)
+            crate::util::extract_cte_columns(
+                NamespaceId::ROOT,
+                &select.with,
+                schema,
+                &outer_target_qualifiers.ctes,
+            )
         })?,
         ..outer_target_qualifiers.clone()
     };

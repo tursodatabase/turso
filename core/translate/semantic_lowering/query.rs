@@ -9365,6 +9365,30 @@ pub(super) fn predicate_loop(
 ) -> Result<Option<usize>> {
     let mut eval_at = None;
     let mut missing = None;
+    if !loops.is_empty() && !document.exprs.is_constant(document.exprs.at(expression)) {
+        let mut pending: smallvec::SmallVec<[hir::ExprId; 4]> = smallvec::smallvec![expression];
+        let mut changes_per_call = false;
+        while let Some(expression) = pending.pop() {
+            document.exprs.at(expression).for_each(&mut |node| match node.node() {
+                hir::Expr::Function(call)
+                    if matches!(call.evaluation, hir::FunctionEvaluation::Scalar) =>
+                {
+                    let function = call.function.value();
+                    changes_per_call |= !crate::function::Deterministic::is_deterministic(function)
+                        && !matches!(function, crate::function::Func::Scalar(scalar) if scalar.is_date_time_function());
+                }
+                hir::Expr::Output(output) => {
+                    if let Some(output) = document.output(*output) {
+                        pending.push(output.expr);
+                    }
+                }
+                _ => {}
+            });
+        }
+        if changes_per_call {
+            eval_at = Some(0);
+        }
+    }
     // Output references follow the aliased expression, and subqueries
     // contribute their outer captures.
     document.visit_expr_sources(expression, &mut |source| {
@@ -10922,6 +10946,7 @@ pub(super) mod tests {
                 name: "main".to_string(),
                 schema: schema.clone(),
             }],
+            namespaces: crate::Namespaces::default().all(),
             unqualified_database_search_path: vec![hir::DatabaseId::new(MAIN_DB_ID)],
             empty_temp_schema: None,
             has_temp_database: false,
@@ -11116,10 +11141,13 @@ pub(super) mod tests {
                 ),
             )
             .expect("right table name is unique");
-        schema.analyze_stats.table_stats_mut("left_items").row_count = Some(1_000);
         schema
             .analyze_stats
-            .table_stats_mut("right_items")
+            .table_stats_mut(NamespaceId::ROOT, "left_items")
+            .row_count = Some(1_000);
+        schema
+            .analyze_stats
+            .table_stats_mut(NamespaceId::ROOT, "right_items")
             .row_count = Some(1);
         schema
     }
@@ -11151,10 +11179,13 @@ pub(super) mod tests {
                 ),
             )
             .expect("right table name is unique");
-        schema.analyze_stats.table_stats_mut("left_items").row_count = Some(1_000);
         schema
             .analyze_stats
-            .table_stats_mut("right_items")
+            .table_stats_mut(NamespaceId::ROOT, "left_items")
+            .row_count = Some(1_000);
+        schema
+            .analyze_stats
+            .table_stats_mut(NamespaceId::ROOT, "right_items")
             .row_count = Some(1);
         schema
     }
@@ -14060,7 +14091,7 @@ pub(super) mod tests {
         let mut schema = automatic_join_schema();
         schema
             .analyze_stats
-            .table_stats_mut("right_items")
+            .table_stats_mut(NamespaceId::ROOT, "right_items")
             .row_count = Some(100_000);
         let plan = analyze_plan(
             schema,

@@ -101,7 +101,7 @@ impl StatementSequence<'_> {
                 let (database, backing_table, sqlite_sequence) = mvcc_tables(operation)?;
                 crate::translate::sequence::emit_disk_read_nextval(
                     program,
-                    database,
+                    database.namespace(),
                     backing_table,
                     sqlite_sequence,
                     &operation.normalized_name,
@@ -160,7 +160,7 @@ impl StatementSequence<'_> {
 /// The database, backing table and `sqlite_sequence` of a hidden sequence.
 fn mvcc_tables(
     operation: &hir::SequenceOperation,
-) -> Result<(usize, Arc<BTreeTable>, Option<Arc<BTreeTable>>)> {
+) -> Result<(hir::DatabaseId, Arc<BTreeTable>, Option<Arc<BTreeTable>>)> {
     let database = operation
         .sequence
         .database()
@@ -171,7 +171,7 @@ fn mvcc_tables(
         .as_ref()
         .map(|table| table.value().require_btree())
         .transpose()?;
-    Ok((database.index(), backing_table, sqlite_sequence))
+    Ok((database, backing_table, sqlite_sequence))
 }
 
 /// Under MVCC: raise the hidden sequence past the rowid in `value`.
@@ -183,7 +183,7 @@ fn emit_advance_past(
     let (database, backing_table, sqlite_sequence) = mvcc_tables(operation)?;
     crate::translate::sequence::emit_disk_advance_past(
         program,
-        database,
+        database.index(),
         backing_table,
         sqlite_sequence,
         &operation.normalized_name,

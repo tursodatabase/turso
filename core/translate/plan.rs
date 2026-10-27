@@ -847,6 +847,7 @@ impl<N> JoinInfo<N> {
 /// clause with the columns and expressions the query reads from it.
 #[derive(Debug, Clone)]
 pub struct PlannedSource<I, H, E, J> {
+    pub namespace: crate::namespace::NamespaceRef,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
     /// Identity used by expressions and planner metadata.

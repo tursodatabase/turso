@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::bail_parse_error;
 use crate::function::FuncCtx;
-use crate::namespace::NamespaceId;
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     BTreeTable, Sequence, AUTOINCREMENT_SEQ_PREFIX, SEQ_BACKING_TABLE_PREFIX,
     SQLITE_SEQUENCE_TABLE_NAME,
@@ -215,13 +215,14 @@ pub fn emit_sequence_backing_table(
 #[allow(clippy::too_many_arguments)]
 pub fn emit_disk_read_nextval(
     program: &mut ProgramBuilder,
-    database_id: usize,
+    namespace: NamespaceRef,
     backing_table: Arc<BTreeTable>,
     sqlite_sequence: Option<Arc<BTreeTable>>,
     seq_name: &str,
     seq: &Sequence,
     target_register: usize,
 ) -> Result<()> {
+    let database_id = namespace.database_id;
     let root_page = backing_table.root_page;
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(backing_table));
 
@@ -285,6 +286,7 @@ pub fn emit_disk_read_nextval(
 
     program.emit_insn(Insn::SequenceComputeNext {
         db: database_id,
+        namespace: namespace.id,
         seq_name: seq_name.to_string(),
         in_value_reg: col_base,
         in_is_called_reg: col_base + 1,
@@ -427,6 +429,7 @@ pub fn emit_disk_read_nextval(
 
     program.emit_insn(Insn::SequenceTrackAllocation {
         db: database_id,
+        namespace: namespace.id,
         seq_name: seq_name.to_string(),
         value_reg: target_register,
     });
@@ -1075,6 +1078,7 @@ pub fn translate_create_sequence(
     program.emit_insn(Insn::AddSequence {
         data: Box::new(AddSequenceData {
             db: database_id,
+            namespace: namespace.id,
             name: normalized_name,
             start: seq.start_value,
             increment: seq.increment_by,
@@ -1108,12 +1112,13 @@ pub fn translate_create_sequence(
 pub(crate) fn emit_drop_sequence_cleanup(
     program: &mut ProgramBuilder,
     catalog: &SemanticContext<'_>,
-    database_id: usize,
+    namespace: NamespaceRef,
     seq_name: &str,
 ) -> Result<bool> {
+    let database_id = namespace.database_id;
     let backing_table_name = sequence_backing_table_name(seq_name);
     let root_page = catalog.with_schema(database_id, |s| {
-        s.get_sequence(NamespaceId::ROOT, seq_name)?;
+        s.get_sequence(namespace.id, seq_name)?;
         Some(
             s.get_btree_table(NamespaceId::ROOT, &backing_table_name)?
                 .root_page,
@@ -1199,6 +1204,7 @@ pub(crate) fn emit_drop_sequence_cleanup(
     // Remove from the in-memory schema (sequences + tables maps)
     program.emit_insn(Insn::DropSequence {
         db: database_id,
+        namespace: namespace.id,
         seq_name: seq_name.to_string(),
     });
     Ok(true)
@@ -1225,7 +1231,7 @@ pub fn translate_drop_sequence(
     let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
-    let dropped = emit_drop_sequence_cleanup(program, catalog, database_id, &normalized_name)?;
+    let dropped = emit_drop_sequence_cleanup(program, catalog, namespace, &normalized_name)?;
     if !dropped {
         if if_exists {
             return Ok(());

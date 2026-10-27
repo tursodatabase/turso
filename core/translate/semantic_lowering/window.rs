@@ -1735,6 +1735,7 @@ mod tests {
                 name: "main".to_string(),
                 schema: Arc::new(schema),
             }],
+            namespaces: crate::Namespaces::default().all(),
             unqualified_database_search_path: vec![DatabaseId::new(MAIN_DB_ID)],
             empty_temp_schema: None,
             has_temp_database: false,

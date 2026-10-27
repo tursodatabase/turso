@@ -3954,11 +3954,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             None => {
                 let name = normalize_ident(&user_name);
-                let database = self
-                    .context()
-                    .find_existing_sequence(&name)
-                    .map_or(crate::MAIN_DB_ID, |namespace| namespace.database_id);
-                (hir::DatabaseId::new(database), name)
+                let database = self.context().find_existing_sequence(&name).map_or(
+                    hir::DatabaseId::new(crate::MAIN_DB_ID),
+                    hir::DatabaseId::from_namespace,
+                );
+                (database, name)
             }
         };
         let backing_table_name =
@@ -3971,7 +3971,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     LimboError::ParseError(format!("sequence \"{user_name}\" does not exist"))
                 })?;
             let sequence = schema
-                .get_sequence(NamespaceId::ROOT, &normalized_name)
+                .get_sequence(database.namespace().id, &normalized_name)
                 .cloned()
                 .ok_or_else(|| {
                     LimboError::ParseError(format!("sequence \"{user_name}\" does not exist"))

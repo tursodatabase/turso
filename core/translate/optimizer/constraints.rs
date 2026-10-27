@@ -261,7 +261,7 @@ impl<'a> HirConstraintSource<'a> {
         match self {
             Self::BTree(source) => schema
                 .analyze_stats
-                .table_stats(source.table.get_name())
+                .table_stats(source.namespace.id, source.table.get_name())
                 .and_then(|stats| stats.row_count)
                 .unwrap_or(params.rows_per_table_fallback as u64)
                 as f64,
@@ -608,7 +608,7 @@ fn hir_estimate_constraint_selectivity(
 ) -> f64 {
     estimate_constraint_selectivity_for_table(
         schema,
-        table.table.get_name(),
+        table,
         column,
         operator,
         null_matching,
@@ -649,7 +649,7 @@ fn hir_estimate_scan_constraint_selectivity(
 #[allow(clippy::too_many_arguments)]
 fn estimate_constraint_selectivity_for_table(
     schema: &Schema,
-    table_name: &str,
+    table: &HirPlannedSource,
     column: Option<&Column>,
     operator: ConstraintOperator,
     null_matching: bool,
@@ -664,9 +664,7 @@ fn estimate_constraint_selectivity_for_table(
     } else {
         operator
     };
-    estimate_selectivity(
-        schema, table_name, column, index, operator, params, is_rowid,
-    )
+    estimate_selectivity(schema, table, column, index, operator, params, is_rowid)
 }
 
 fn hir_selectivity_index_for_column<'a>(
@@ -675,7 +673,9 @@ fn hir_selectivity_index_for_column<'a>(
     source: &'a hir::Source,
     column_pos: usize,
 ) -> Option<&'a Index> {
-    let table_stats = schema.analyze_stats.table_stats(table.table.get_name());
+    let table_stats = schema
+        .analyze_stats
+        .table_stats(table.namespace.id, table.table.get_name());
     source
         .index_expressions
         .iter()
@@ -1482,7 +1482,7 @@ fn estimate_in_selectivity(in_list_len: f64, row_count: f64, not: bool) -> f64 {
 #[allow(clippy::too_many_arguments)]
 fn estimate_selectivity(
     schema: &Schema,
-    table_name: &str,
+    table_reference: &HirPlannedSource,
     column: Option<&Column>,
     index: Option<&Index>,
     op: ConstraintOperator,
@@ -1490,7 +1490,10 @@ fn estimate_selectivity(
     is_rowid: bool,
 ) -> f64 {
     // Get ANALYZE stats for this table if available
-    let table_stats = schema.analyze_stats.table_stats(table_name);
+    let table_stats = schema.analyze_stats.table_stats(
+        table_reference.namespace.id,
+        table_reference.table.get_name(),
+    );
     let row_count = table_stats.and_then(|s| s.row_count).unwrap_or(0);
 
     match op {
@@ -2109,6 +2112,7 @@ mod tests {
     fn hir_planned_source(source: hir::SourceId, table: &Table) -> HirPlannedSource {
         HirPlannedSource {
             table: table.clone(),
+            namespace: crate::namespace::NamespaceRef::root_of(crate::MAIN_DB_ID),
             internal_id: source,
             join_info: None,
             col_used_mask: crate::translate::plan::ColumnUsedMask::default(),

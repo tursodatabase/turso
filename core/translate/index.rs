@@ -297,7 +297,7 @@ pub fn translate_create_index(
         program,
         connection,
         catalog,
-        database_id,
+        namespace,
         &tbl,
         &idx,
         index_cursor_id,
@@ -384,7 +384,7 @@ impl RefillRows {
 fn refill_rows(
     connection: &Arc<crate::Connection>,
     catalog: &SemanticContext<'_>,
-    database_id: usize,
+    namespace: NamespaceRef,
     tbl: &BTreeTable,
     idx: &Index,
 ) -> crate::Result<RefillRows> {
@@ -403,25 +403,21 @@ fn refill_rows(
         ));
     }
     Ok(RefillRows::Planned(hir_refill_select(
-        connection,
-        catalog,
-        database_id,
-        tbl,
-        idx,
+        connection, catalog, namespace, tbl, idx,
     )?))
 }
 
 fn hir_refill_select(
     connection: &Arc<crate::Connection>,
     catalog: &SemanticContext<'_>,
-    database_id: usize,
+    namespace: NamespaceRef,
     tbl: &BTreeTable,
     idx: &Index,
 ) -> crate::Result<PlannedSelect> {
     let database = connection
         .namespaces()
-        .name(database_id)
-        .ok_or_else(|| LimboError::InternalError(format!("no database with id {database_id}")))?;
+        .name_of(namespace)
+        .ok_or_else(|| LimboError::InternalError(format!("no namespace {namespace:?}")))?;
     let column = |position: usize| -> crate::Result<Expr> {
         let name = tbl.columns()[position].name.as_deref().ok_or_else(|| {
             LimboError::InternalError(format!("column {position} of {} has no name", tbl.name))
@@ -473,14 +469,15 @@ pub(crate) fn emit_refill_index(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     catalog: &SemanticContext<'_>,
-    database_id: usize,
+    namespace: NamespaceRef,
     tbl: &Arc<BTreeTable>,
     idx: &Arc<Index>,
     index_cursor_id: usize,
     index_root_page: RegisterOrLiteral<i64>,
     clear_existing_root: Option<i64>,
 ) -> crate::Result<()> {
-    let rows = refill_rows(connection, catalog, database_id, tbl, idx)?;
+    let database_id = namespace.database_id;
+    let rows = refill_rows(connection, catalog, namespace, tbl, idx)?;
     let columns = &idx.columns;
     let tbl_name = normalize_ident(tbl.name.as_str());
     let mut cursors = vec![index_cursor_id];
@@ -558,7 +555,7 @@ pub(crate) fn emit_refill_index(
 
         if let Some(root) = clear_existing_root {
             program.emit_insn(Insn::ClearBtree {
-                db: database_id,
+                db: namespace.database_id,
                 root,
                 count: ClearBtreeCount::Nothing,
             });
@@ -566,7 +563,7 @@ pub(crate) fn emit_refill_index(
         program.emit_insn(Insn::OpenWrite {
             cursor_id: index_cursor_id,
             root_page: index_root_page,
-            db: database_id,
+            db: namespace.database_id,
         });
 
         let sorted_loop_start = program.allocate_label();
@@ -686,7 +683,7 @@ pub fn translate_reindex(
             program,
             connection,
             catalog,
-            namespace.database_id,
+            namespace,
             &table,
             &index,
             index_cursor_id,
@@ -1383,6 +1380,7 @@ pub fn translate_drop_index(
     program.emit_insn(Insn::DropIndex {
         index: index.clone(),
         db: database_id,
+        namespace: namespace.id,
     });
 
     Ok(())

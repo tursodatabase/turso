@@ -115,6 +115,18 @@ impl<'catalog> SemanticContext<'catalog> {
 
     fn with_catalog(mut self, catalog: &'catalog SemanticCatalog) -> Self {
         self.catalog = Some(catalog);
+        for namespace in &catalog.namespaces {
+            if !self
+                .database_names
+                .iter()
+                .any(|(name, _)| *name == namespace.name)
+            {
+                self.database_names.push((
+                    namespace.name.clone(),
+                    DatabaseId::from_namespace(namespace.target),
+                ));
+            }
+        }
         self
     }
 
@@ -188,7 +200,10 @@ impl<'catalog> SemanticContext<'catalog> {
             .map(|(_, schema)| *schema)
             .ok_or_else(|| LimboError::InvalidArgument("missing main database".to_string()))?;
         for database in &unqualified_database_search_path {
-            if !database_schemas.iter().any(|(id, _)| id == database) {
+            if !database_schemas
+                .iter()
+                .any(|(id, _)| id.index() == database.index())
+            {
                 return Err(LimboError::InvalidArgument(format!(
                     "search path contains unknown database id: {}",
                     database.index()
@@ -287,7 +302,7 @@ impl<'catalog> SemanticContext<'catalog> {
         }
         Ok(self
             .schema(database)?
-            .get_indices(NamespaceId::ROOT, table_name)
+            .get_indices(database.namespace().id, table_name)
             .cloned()
             .collect())
     }
@@ -358,7 +373,7 @@ impl<'catalog> SemanticContext<'catalog> {
         };
         let db_name = normalize_ident(db_name.as_str());
         self.database(&db_name)
-            .map(|database| NamespaceRef::root_of(database.index()))
+            .map(DatabaseId::namespace)
             .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {db_name}")))
     }
 
@@ -373,9 +388,9 @@ impl<'catalog> SemanticContext<'catalog> {
         }
         self.unqualified_database_search_path
             .iter()
-            .map(|database| database.index())
-            .find(|database| *database != crate::TEMP_DB_ID)
-            .map(NamespaceRef::root_of)
+            .copied()
+            .find(|database| database.index() != crate::TEMP_DB_ID)
+            .map(DatabaseId::namespace)
             .ok_or_else(|| {
                 LimboError::ParseError("no schema has been selected to create in".to_string())
             })
@@ -386,7 +401,7 @@ impl<'catalog> SemanticContext<'catalog> {
     pub(crate) fn find_existing_sequence(&self, seq_name: &str) -> Option<NamespaceRef> {
         self.unqualified_database_search_path
             .iter()
-            .map(|database| NamespaceRef::root_of(database.index()))
+            .map(|database| database.namespace())
             .find(|namespace| {
                 self.with_schema(namespace.database_id, |schema| {
                     schema.get_sequence(namespace.id, seq_name).is_some()
@@ -464,8 +479,12 @@ impl<'catalog> SemanticContext<'catalog> {
         namespace_has: impl Fn(&Schema, NamespaceId, &str) -> bool,
     ) -> Result<NamespaceRef> {
         for database in &self.unqualified_database_search_path {
-            if namespace_has(self.schema(*database)?, NamespaceId::ROOT, object_name) {
-                return Ok(NamespaceRef::root_of(database.index()));
+            if namespace_has(
+                self.schema(*database)?,
+                database.namespace().id,
+                object_name,
+            ) {
+                return Ok(database.namespace());
             }
         }
         if self.search_path_configured {
@@ -539,9 +558,6 @@ impl<'catalog> SemanticContext<'catalog> {
 
     pub(crate) fn database(&self, name: &str) -> Option<DatabaseId> {
         let name = normalize_ident(name);
-        if name == "public" {
-            return Some(DatabaseId::new(MAIN_DB_ID));
-        }
         self.database_names
             .iter()
             .find(|(existing, _)| *existing == name)
@@ -609,8 +625,11 @@ impl<'catalog> SemanticContext<'catalog> {
     ) -> Result<Option<(DatabaseId, &'catalog crate::schema::View)>> {
         let view_name = normalize_ident(name.name.as_str());
         let has_view = |database: &DatabaseId| {
-            self.database_schema(*database)
-                .is_some_and(|schema| schema.get_view(NamespaceId::ROOT, &view_name).is_some())
+            self.database_schema(*database).is_some_and(|schema| {
+                schema
+                    .get_view(database.namespace().id, &view_name)
+                    .is_some()
+            })
         };
         // A table in a database that does not exist is a missing table, as
         // in SQLite's sqlite3LocateTable.
@@ -631,7 +650,7 @@ impl<'catalog> SemanticContext<'catalog> {
             .database_schema(database)
             .and_then(|schema| {
                 schema
-                    .views(NamespaceId::ROOT)
+                    .views(database.namespace().id)
                     .find(|(name, _)| *name == view_name)
             })
             .map(|(_, view)| (database, view.as_ref())))
@@ -667,7 +686,7 @@ impl<'catalog> SemanticContext<'catalog> {
                     .database(database.as_str())
                     .ok_or_else(|| no_such_table(name))?;
                 self.schema(database)?
-                    .get_table(NamespaceId::ROOT, &table_name)
+                    .get_table(database.namespace().id, &table_name)
                     .map(|table| (database, table))
             }
             None => self
@@ -675,7 +694,7 @@ impl<'catalog> SemanticContext<'catalog> {
                 .into_iter()
                 .find_map(|database| {
                     self.database_schema(database)?
-                        .get_table(NamespaceId::ROOT, &table_name)
+                        .get_table(database.namespace().id, &table_name)
                         .map(|table| (database, table))
                 }),
         };
@@ -698,7 +717,7 @@ impl<'catalog> SemanticContext<'catalog> {
         let view_name = normalize_ident(name.name.as_str());
         let broken = |database: &DatabaseId| {
             self.database_schema(*database)
-                .is_some_and(|schema| schema.is_broken_view(NamespaceId::ROOT, &view_name))
+                .is_some_and(|schema| schema.is_broken_view(database.namespace().id, &view_name))
         };
         match &name.namespace {
             Some(database) => self
@@ -714,8 +733,9 @@ impl<'catalog> SemanticContext<'catalog> {
     pub(crate) fn is_incompatible_view(&self, name: &turso_parser::ast::QualifiedName) -> bool {
         let view_name = normalize_ident(name.name.as_str());
         let incompatible = |database: &DatabaseId| {
-            self.database_schema(*database)
-                .is_some_and(|schema| schema.is_incompatible_view(NamespaceId::ROOT, &view_name))
+            self.database_schema(*database).is_some_and(|schema| {
+                schema.is_incompatible_view(database.namespace().id, &view_name)
+            })
         };
         match &name.namespace {
             Some(database) => self
@@ -736,7 +756,7 @@ impl<'catalog> SemanticContext<'catalog> {
     ) -> Result<Arc<Index>> {
         let normalized_name = normalize_ident(index_name);
         self.schema(database)?
-            .get_index(NamespaceId::ROOT, table_name, &normalized_name)
+            .get_index(database.namespace().id, table_name, &normalized_name)
             .cloned()
             .ok_or_else(|| LimboError::ParseError(format!("no such index: {index_name}")))
     }
@@ -759,7 +779,11 @@ impl<'catalog> SemanticContext<'catalog> {
     }
 
     fn database_schema(&self, database: DatabaseId) -> Option<&'catalog Schema> {
-        if let Some((_, schema)) = self.database_schemas.iter().find(|(id, _)| *id == database) {
+        if let Some((_, schema)) = self
+            .database_schemas
+            .iter()
+            .find(|(id, _)| id.index() == database.index())
+        {
             return Some(schema);
         }
         if database.index() != TEMP_DB_ID {
