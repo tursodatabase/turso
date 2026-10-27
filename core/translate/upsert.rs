@@ -1,4 +1,5 @@
 use crate::translate::collate::CollationSeq;
+use crate::translate::emitter::RegisterColumn;
 use rustc_hash::FxHashMap as HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -633,21 +634,19 @@ pub fn emit_upsert(
             continue;
         }
         let reg = layout.to_register(expr_current_start, idx);
-        resolver.register_affinities.insert(reg, col.affinity());
-        resolver.register_collations.insert(reg, col.collation());
+        resolver
+            .register_columns
+            .insert(reg, RegisterColumn::table_column(col));
         if let Some(decoded_start) = excluded_decoded_start {
             let excluded_reg = layout.to_register(decoded_start, idx);
             resolver
-                .register_affinities
-                .insert(excluded_reg, col.affinity());
-            resolver
-                .register_collations
-                .insert(excluded_reg, col.collation());
+                .register_columns
+                .insert(excluded_reg, RegisterColumn::table_column(col));
         }
     }
     resolver
-        .register_affinities
-        .insert(ctx.conflict_rowid_reg, Affinity::Integer);
+        .register_columns
+        .insert(ctx.conflict_rowid_reg, RegisterColumn::rowid());
 
     // WHERE on target row
     if let Some(pred) = where_clause.as_mut() {

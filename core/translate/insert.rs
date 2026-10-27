@@ -1,6 +1,7 @@
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::ColumnLayout;
 use crate::translate::collate::CollationSeq;
+use crate::translate::emitter::RegisterColumn;
 use crate::translate::emitter::{
     emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
 };
@@ -903,7 +904,7 @@ pub fn translate_insert(
     // correct column affinity during INSERT.
     //
     // Partial index WHEREs use rewrite_partial_index_where which converts
-    // column refs to Expr::Register — register_affinities handles those.
+    // column refs to Expr::Register — register_columns handles those.
     //
     // Without this, comparisons like `integer_col < '2'` lose their
     // INTEGER affinity and evaluate under type-ordering rules, producing
@@ -911,15 +912,12 @@ pub fn translate_insert(
     // NOCASE column must keep comparing case-insensitively.
     for cm in &insertion.col_mappings {
         resolver
-            .register_affinities
-            .insert(cm.register, cm.column.affinity());
-        resolver
-            .register_collations
-            .insert(cm.register, cm.column.collation());
+            .register_columns
+            .insert(cm.register, RegisterColumn::table_column(cm.column));
     }
     resolver
-        .register_affinities
-        .insert(insertion.key_register(), Affinity::Integer);
+        .register_columns
+        .insert(insertion.key_register(), RegisterColumn::rowid());
 
     emit_preflight_constraint_checks(
         program,
@@ -975,8 +973,7 @@ pub fn translate_insert(
         emit_commit_phase(program, resolver, &insertion, &ctx, skip_replace_indexes)?;
     }
 
-    resolver.register_affinities.clear();
-    resolver.register_collations.clear();
+    resolver.register_columns.clear();
 
     let mut insert_flags = InsertFlags::new();
 

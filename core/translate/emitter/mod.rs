@@ -145,18 +145,14 @@ pub struct Resolver<'a> {
     /// The `needs_custom_type_decode` flag is true for hash-join payload registers
     /// that contain raw encoded values and need DECODE applied when read.
     pub expr_to_reg_cache: Vec<CachedExprReg<'a>>,
-    /// Maps register indices to column affinities for expression index evaluation.
-    /// Populated temporarily during UPDATE new-image expression index key computation,
-    /// where column references have been rewritten to Expr::Register and comparison
-    /// operators need the original column affinity. Analogous to SQLite's iSelfTab
-    /// mechanism, but operates as a side-channel since limbo rewrites the AST rather
-    /// than redirecting column reads at codegen time.
-    pub register_affinities: HashMap<usize, Affinity>,
-    /// Maps register indices to declared column collations, the collation
-    /// counterpart of `register_affinities`: when column references are
-    /// rewritten to Expr::Register (UPSERT DO UPDATE WHERE/SET), comparisons
-    /// must still use the column's implicit collation per SQLite's rule 2.
-    pub register_collations: HashMap<usize, CollationSeq>,
+    /// The column each register stands for, where column references were
+    /// rewritten to Expr::Register: index expressions and partial index WHERE
+    /// clauses during INSERT and UPDATE, UPSERT DO UPDATE, and NEW./OLD. in
+    /// triggers. Comparisons of such a register still use the column's
+    /// affinity and collation. Analogous to SQLite's iSelfTab mechanism, but
+    /// operates as a side-channel since limbo rewrites the AST rather than
+    /// redirecting column reads at codegen time.
+    pub register_columns: HashMap<usize, RegisterColumn>,
     /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
     /// This lets comparison affinity follow SQLite rules for expressions like
     /// `(SELECT text_col FROM ...) > some_numeric_expr`.
@@ -214,6 +210,45 @@ pub struct Resolver<'a> {
     /// The first one is where CREATE puts an object whose name has no
     /// qualifier.
     search_order: Vec<NamespaceRef>,
+}
+
+/// The column a register stands for in [Resolver::register_columns].
+#[derive(Debug, Clone, Copy)]
+pub struct RegisterColumn {
+    pub affinity: Affinity,
+    /// None for the rowid, which has no collation.
+    pub collation: Option<CollationSeq>,
+}
+
+impl RegisterColumn {
+    /// A column of the table being written, with its affinity and collation.
+    pub fn table_column(column: &Column) -> Self {
+        Self {
+            affinity: column.affinity(),
+            collation: crate::translate::collate::column_collation(column),
+        }
+    }
+
+    /// NEW.x or OLD.x in a trigger. It has the collation of column x but, as
+    /// in SQLite, no affinity unless x is the rowid alias.
+    /// See https://www.sqlite.org/forum/forumpost/819f2d6627
+    pub fn trigger_row_column(column: &Column) -> Self {
+        Self {
+            affinity: if column.is_rowid_alias() {
+                Affinity::Integer
+            } else {
+                Affinity::None
+            },
+            collation: crate::translate::collate::column_collation(column),
+        }
+    }
+
+    pub fn rowid() -> Self {
+        Self {
+            affinity: Affinity::Integer,
+            collation: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -331,8 +366,7 @@ impl<'a> Resolver<'a> {
             symbol_table,
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
-            register_affinities: HashMap::default(),
-            register_collations: HashMap::default(),
+            register_columns: HashMap::default(),
             subquery_affinities: RefCell::new(HashMap::default()),
             self_table_scope: RefCell::new(None),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
@@ -381,8 +415,7 @@ impl<'a> Resolver<'a> {
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
-            register_affinities: HashMap::default(),
-            register_collations: HashMap::default(),
+            register_columns: HashMap::default(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
@@ -409,8 +442,7 @@ impl<'a> Resolver<'a> {
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
-            register_affinities: self.register_affinities.clone(),
-            register_collations: self.register_collations.clone(),
+            register_columns: self.register_columns.clone(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),

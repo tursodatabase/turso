@@ -459,7 +459,8 @@ pub fn first_collation<'a>(
 
 /// The collation of one expression, or None when it has none (SQLite's
 /// `sqlite3ExprCollSeq`). A column has its declared collation, BINARY when it
-/// declares none. CAST and unary `+` pass on the collation of their operand. A
+/// declares none, and so do a register and a variable that stand for a column
+/// (rewritten column references, a trigger's NEW.x and OLD.x). CAST and unary `+` pass on the collation of their operand. A
 /// row value has the collation of its first element. Any other expression has
 /// the collation of its leftmost COLLATE operator, or none when it contains no
 /// COLLATE operator.
@@ -469,9 +470,19 @@ fn expr_collation_if_any(
     resolver: &Resolver,
 ) -> Result<Option<CollationSeq>> {
     match expr {
-        Expr::Column { table, column, .. } => column_collation(*table, *column, tables, resolver),
+        Expr::Column { table, column, .. } => {
+            referenced_column_collation(*table, *column, tables, resolver)
+        }
         Expr::RowId { .. } => Ok(None),
-        Expr::Register(register) => Ok(resolver.register_collations.get(register).copied()),
+        Expr::Register(register) => Ok(resolver
+            .register_columns
+            .get(register)
+            .and_then(|column| column.collation)),
+        Expr::Variable(variable) => variable
+            .col_collation
+            .as_deref()
+            .map(|name| resolver.resolve_collation(name))
+            .transpose(),
         Expr::MergedColumn(columns) => {
             let first_column = columns
                 .first()
@@ -501,16 +512,12 @@ fn expr_collation_if_any(
     }
 }
 
-/// A column has its declared collation, BINARY when it declares none. A rowid
-/// alias (INTEGER PRIMARY KEY) is the rowid and has none, as in SQLite.
-fn column_collation(
+fn referenced_column_collation(
     table: TableInternalId,
     column: usize,
     tables: Option<&TableReferences>,
     resolver: &Resolver,
 ) -> Result<Option<CollationSeq>> {
-    let column_collation =
-        |column: &crate::schema::Column| (!column.is_rowid_alias()).then(|| column.collation());
     if table.is_self_table() {
         let self_table = resolver
             .self_table()
@@ -528,6 +535,12 @@ fn column_collation(
         .get_column_at(column)
         .ok_or_else(|| LimboError::ParseError("column not found".to_string()))?;
     Ok(column_collation(column))
+}
+
+/// A column has its declared collation, BINARY when it declares none. A rowid
+/// alias (INTEGER PRIMARY KEY) is the rowid and has none, as in SQLite.
+pub(crate) fn column_collation(column: &crate::schema::Column) -> Option<CollationSeq> {
+    (!column.is_rowid_alias()).then(|| column.collation())
 }
 
 /// Whether the expression contains a COLLATE operator outside of a subquery

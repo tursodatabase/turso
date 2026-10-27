@@ -4,6 +4,7 @@ use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::namespace::NamespaceId;
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::collate::CollationSeq;
+use crate::translate::emitter::RegisterColumn;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::vdbe::builder::SelfTableContext;
@@ -1592,15 +1593,15 @@ fn emit_update_insns<'a>(
     {
         let columns = target_table.table.columns();
         for (idx, col) in columns.iter().enumerate() {
-            t_ctx
-                .resolver
-                .register_affinities
-                .insert(layout.to_register(start, idx), col.affinity());
+            t_ctx.resolver.register_columns.insert(
+                layout.to_register(start, idx),
+                RegisterColumn::table_column(col),
+            );
         }
         t_ctx
             .resolver
-            .register_affinities
-            .insert(effective_rowid_reg, Affinity::Integer);
+            .register_columns
+            .insert(effective_rowid_reg, RegisterColumn::rowid());
     }
 
     let update_affects_virtual_columns = affected_columns.count() > updated_column_indices.count();
@@ -2729,7 +2730,6 @@ fn emit_update_insns<'a>(
     }
     program.preassign_label_to_next_insn(trigger_ignore_jump_label);
 
-    t_ctx.resolver.register_affinities.clear();
-    t_ctx.resolver.register_collations.clear();
+    t_ctx.resolver.register_columns.clear();
     Ok(())
 }

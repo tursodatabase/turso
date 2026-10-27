@@ -95,8 +95,8 @@ pub(crate) fn get_expr_affinity(
             // rewritten to Expr::Register. Look up the original column affinity
             // from the resolver's register_affinities map.
             if let Some(resolver) = resolver {
-                if let Some(aff) = resolver.register_affinities.get(reg) {
-                    return *aff;
+                if let Some(column) = resolver.register_columns.get(reg) {
+                    return column.affinity;
                 }
             }
             Affinity::None
