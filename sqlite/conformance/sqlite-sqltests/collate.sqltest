@@ -2064,3 +2064,146 @@ expect {
     1|1
     0|0|1|1|1|0
 }
+
+# An index can serve a comparison only when the index column's own collation is
+# the comparison's collation. This holds for expression indexes and for an
+# index that declares a collation its table column does not have.
+test collate-index-seek-uses-comparison-collation {
+    CREATE TABLE t(a TEXT);
+    CREATE INDEX t_expr ON t(a || '');
+    INSERT INTO t VALUES ('abc'), ('xyz');
+    SELECT 'expr-eq', a FROM t WHERE a || '' = 'ABC' COLLATE NOCASE;
+    SELECT 'expr-gt', a FROM t WHERE a || '' > 'ABC' COLLATE NOCASE;
+    SELECT 'expr-in', a FROM t WHERE a || '' COLLATE NOCASE IN ('ABC');
+    SELECT 'expr-binary-eq', a FROM t WHERE a || '' = 'abc';
+    CREATE TABLE u(a TEXT);
+    CREATE INDEX u_nocase ON u(a COLLATE NOCASE);
+    INSERT INTO u VALUES ('abc'), ('ABC'), ('x');
+    SELECT 'nocase-index-eq', a FROM u WHERE a = 'Abc' COLLATE NOCASE ORDER BY a;
+    SELECT 'nocase-index-binary-eq', a FROM u WHERE a = 'Abc' ORDER BY a;
+    SELECT 'nocase-index-in', a FROM u WHERE a COLLATE NOCASE IN ('Abc') ORDER BY a;
+    SELECT 'nocase-index-binary-in', a FROM u WHERE a IN ('Abc', 'abc') ORDER BY a;
+}
+expect {
+    expr-eq|abc
+    expr-gt|xyz
+    expr-in|abc
+    expr-binary-eq|abc
+    nocase-index-eq|ABC
+    nocase-index-eq|abc
+    nocase-index-in|ABC
+    nocase-index-in|abc
+    nocase-index-binary-in|abc
+}
+
+# NEW.x and OLD.x in a trigger compare with the collation of column x.
+test collate-trigger-new-and-old-use-column-collation {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT);
+    CREATE TABLE log(k, v1, v2, v3, v4);
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN NEW.a = 'ABC' BEGIN
+        INSERT INTO log VALUES ('ins', NEW.a = 'ABC', NEW.a IN ('ABC'), min(NEW.a, 'B'), NEW.b = 'X');
+    END;
+    CREATE TRIGGER tu AFTER UPDATE ON t BEGIN
+        INSERT INTO log VALUES ('upd', OLD.a = 'ABC', OLD.a IN ('ABC', 'Q'), max(OLD.a, 'B'), NEW.a < 'B');
+    END;
+    CREATE TRIGGER td BEFORE DELETE ON t WHEN OLD.a BETWEEN 'A' AND 'B' BEGIN
+        INSERT INTO log VALUES ('del', CASE OLD.a WHEN 'ABC' THEN 1 ELSE 0 END, nullif(OLD.a, 'ABC') IS NULL, 0, 0);
+    END;
+    INSERT INTO t VALUES ('abc', 'x');
+    UPDATE t SET b = 'y';
+    DELETE FROM t;
+    SELECT * FROM log;
+}
+expect {
+    ins|1|1|abc|0
+    upd|1|1|B|1
+    del|1|1|0|0
+}
+
+# A foreign key finds the child rows of a parent row with the collation of the
+# parent key column.
+@cross-check-integrity
+test collate-fk-delete-parent-with-nocase-key-restricts {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, r TEXT REFERENCES p(k));
+    INSERT INTO p VALUES ('abc');
+    INSERT INTO c VALUES (1, 'ABC');
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test collate-fk-update-parent-with-nocase-key-restricts {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, r TEXT REFERENCES p(k));
+    INSERT INTO p VALUES ('abc');
+    INSERT INTO c VALUES (1, 'ABC');
+    UPDATE p SET k = 'new';
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test collate-fk-deferred-delete-parent-with-nocase-key-fails-at-commit {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, r TEXT REFERENCES p(k) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES ('abc');
+    INSERT INTO c VALUES (1, 'ABC');
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test collate-fk-cascade-and-set-null-with-nocase-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE cascade_delete(id INTEGER PRIMARY KEY, r TEXT REFERENCES p(k) ON DELETE CASCADE);
+    CREATE TABLE set_null(id INTEGER PRIMARY KEY, r TEXT REFERENCES p(k) ON DELETE SET NULL);
+    CREATE TABLE cascade_update(id INTEGER PRIMARY KEY, r TEXT REFERENCES p(k) ON UPDATE CASCADE ON DELETE CASCADE);
+    INSERT INTO p VALUES ('abc'), ('zzz');
+    INSERT INTO cascade_delete VALUES (1, 'ABC'), (2, 'zzz');
+    INSERT INTO set_null VALUES (1, 'ABC'), (2, 'zzz');
+    INSERT INTO cascade_update VALUES (1, 'ABC'), (2, 'zzz');
+    -- Changing the parent key only in letter case keeps it equal under NOCASE,
+    -- so ON UPDATE CASCADE leaves the child alone.
+    UPDATE p SET k = 'Zzz' WHERE k = 'zzz';
+    SELECT 'after-update', * FROM cascade_update ORDER BY id;
+    DELETE FROM p WHERE k = 'abc';
+    SELECT 'cascade-delete', * FROM cascade_delete ORDER BY id;
+    SELECT 'set-null', * FROM set_null ORDER BY id;
+    SELECT 'cascade-update', * FROM cascade_update ORDER BY id;
+}
+expect {
+    after-update|1|ABC
+    after-update|2|zzz
+    cascade-delete|2|zzz
+    set-null|1|
+    set-null|2|zzz
+    cascade-update|2|zzz
+}
+
+# A compound SELECT removes duplicates with its own collation, also when it is
+# the right side of IN and IN compares with another collation.
+test collate-compound-select-inside-in-removes-duplicates-with-its-own-collation {
+    CREATE TABLE t(a TEXT);
+    INSERT INTO t VALUES ('abc'), ('ABC'), ('x');
+    CREATE TABLE n(a TEXT COLLATE NOCASE);
+    INSERT INTO n VALUES ('abc');
+    SELECT 'except', 'abc' COLLATE NOCASE IN (SELECT 'abc' EXCEPT SELECT 'ABC');
+    SELECT 'union-except', a FROM t WHERE a COLLATE NOCASE IN (SELECT 'ABC' UNION SELECT 'abc' EXCEPT SELECT 'abc') ORDER BY a;
+    SELECT 'intersect', a FROM t WHERE a COLLATE NOCASE IN (SELECT 'ABC' INTERSECT SELECT 'abc') ORDER BY a;
+    SELECT 'nocase-compound', a FROM t WHERE a IN (SELECT a FROM n EXCEPT SELECT 'ABC') ORDER BY a;
+}
+expect {
+    except|1
+    union-except|ABC
+    union-except|abc
+}
