@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-use std::hash::{Hash, Hasher};
 
 use bigdecimal::{BigDecimal, Zero};
 use num_bigint::{BigInt, Sign};
@@ -105,22 +104,6 @@ pub fn numeric_compare(left: ValueRef, right: ValueRef) -> Ordering {
         (NumericSortKey::Text(l), NumericSortKey::Text(r)) => l.cmp(r),
         (NumericSortKey::Blob(l), NumericSortKey::Blob(r)) => l.cmp(r),
         (l, r) => l.rank().cmp(&r.rank()),
-    }
-}
-
-/// Hashes `value` so that values `numeric_compare` finds equal hash alike.
-pub fn numeric_hash<H: Hasher>(value: ValueRef, state: &mut H) {
-    let key = NumericSortKey::of(value);
-    key.rank().hash(state);
-    match key {
-        NumericSortKey::Number(number) => {
-            let (digits, scale) = number.normalized().into_bigint_and_exponent();
-            digits.hash(state);
-            scale.hash(state);
-        }
-        NumericSortKey::Text(text) => text.hash(state),
-        NumericSortKey::Blob(blob) => blob.hash(state),
-        NumericSortKey::Null | NumericSortKey::NegativeInfinity | NumericSortKey::Infinity => {}
     }
 }
 
@@ -619,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn numeric_equal_values_compare_and_hash_alike() {
+    fn numeric_equal_values_compare_equal() {
         let blob = Value::Blob(bigdecimal_to_blob(&BigDecimal::from_str("1.500").unwrap()));
         let equal = [
             Value::from_text("1.5"),
@@ -635,7 +618,6 @@ mod tests {
                     Ordering::Equal,
                     "{l:?} vs {r:?}"
                 );
-                assert_eq!(hash_of(l), hash_of(r), "{l:?} vs {r:?}");
             }
         }
         let zeros = [
@@ -648,13 +630,6 @@ mod tests {
                 numeric_compare(z.as_value_ref(), zeros[0].as_value_ref()),
                 Ordering::Equal
             );
-            assert_eq!(hash_of(z), hash_of(&zeros[0]));
         }
-    }
-
-    fn hash_of(value: &Value) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        numeric_hash(value.as_value_ref(), &mut hasher);
-        hasher.finish()
     }
 }
