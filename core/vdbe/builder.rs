@@ -2480,6 +2480,10 @@ impl ProgramBuilder {
 
         self.parameters.list.dedup();
 
+        // Compute ephemeral cursors once so insn_to_row can look them up in O(1)
+        // instead of scanning all instructions on every EXPLAIN step (O(N²)).
+        self.explain.build_ephemeral_cursors(&self.insns);
+
         // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
         // Statement journals are only needed when a statement writes multiple rows AND could
         // abort midway (e.g. constraint violation). Single-row writes are atomic and don't
