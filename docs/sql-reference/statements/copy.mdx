@@ -1,0 +1,36 @@
+---
+title: COPY
+description: Export PostgreSQL table rows through COPY TO STDOUT
+sidebarTitle: COPY
+---
+
+# COPY
+
+The PostgreSQL frontend supports exporting plain tables with `COPY TO STDOUT`
+through the simple query protocol. This statement is not available through the
+SQLite frontend.
+
+```sql
+COPY [schema.]table_name [(column_name, ...)] TO STDOUT [WITH (FORMAT text)];
+```
+
+An unqualified table uses the session's `search_path`. An explicit column list
+sets the export order. Without a column list, COPY exports visible, non-generated
+columns in table order. Explicit generated columns and duplicate columns are
+rejected.
+
+```sql
+COPY public.users (id, name, email) TO STDOUT;
+```
+
+The output uses PostgreSQL COPY text format: tabs separate fields, newlines
+separate rows, and `\N` represents NULL. Backslashes, tabs, newlines, carriage
+returns, backspaces, form feeds, and vertical tabs are escaped. Empty strings
+remain empty fields. The server sends rows individually and reports `COPY n`
+when the export succeeds.
+
+COPY reads changes visible to the current transaction and does not commit that
+transaction. Views, query sources such as `COPY (SELECT ...)`, file or program
+destinations, CSV, binary format, and custom output options are not supported.
+COPY TO STDOUT is not supported through the extended query protocol or the
+embedded `execute()` API.
