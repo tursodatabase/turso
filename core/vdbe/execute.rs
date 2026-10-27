@@ -10686,10 +10686,10 @@ pub fn op_function(
                 // to the schema). Resolve the sequence first so currval
                 // on a dropped sequence reports "does not exist" rather
                 // than silently returning the stale per-session value.
-                let (database_id, sequence) = program.connection.find_sequence(&seq_name)?;
+                let (namespace, sequence) = program.connection.find_sequence(&seq_name)?;
                 match program
                     .connection
-                    .get_sequence_currval(database_id, &sequence.name)
+                    .get_sequence_currval(namespace.database_id, &sequence.name)
                 {
                     Some(val) => {
                         state.registers[*dest].set_value(Value::from_i64(val));
@@ -11327,10 +11327,10 @@ pub fn op_function(
                         .into());
                     }
                 };
-                let (db_id, sequence) = program.connection.find_sequence(sequence_name)?;
+                let (namespace, sequence) = program.connection.find_sequence(sequence_name)?;
                 let watermark = program
                     .connection
-                    .mv_store_for_db(db_id)
+                    .mv_store_for_db(namespace.database_id)
                     .and_then(|mv_store| mv_store.sequence_watermark(&sequence.name));
                 match watermark {
                     Some(watermark) => state.registers[*dest].set_int(watermark),

@@ -561,9 +561,7 @@ fn execute_trigger_commands(
     {
         None
     } else {
-        resolver
-            .namespace_name(namespace.database_id)
-            .map(ast::Name::exact)
+        resolver.name_of_namespace(namespace).map(ast::Name::exact)
     };
     // Parameter indices are allocated on demand during the AST rewrite.
     // Only columns actually referenced in the trigger body get a parameter,
