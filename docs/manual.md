@@ -47,6 +47,7 @@ Welcome to Turso database manual!
   - [CDC](#cdc-early-preview)
   - [Index Method](#index-method-experimental)
   - [Page Codecs](#page-codecs-experimental)
+  - [Huge pages (Linux)](#huge-pages-linux)
   - [Appendix A: Turso Internals](#appendix-a-turso-internals)
     - [Frontend](#frontend)
       - [Parser](#parser)
@@ -1350,6 +1351,34 @@ External page codecs currently support the in-process WAL, checkpointing,
 `VACUUM`, and `VACUUM INTO`. They do not support MVCC, experimental
 multiprocess WAL, `ATTACH`, or partial sync. Files encoded by a non-identity
 codec are not readable by ordinary SQLite tools without a compatible codec.
+
+## Huge pages (Linux)
+
+Each open database keeps its pages in two memory areas of about 3 MB, one for
+database pages and one for WAL frames. On Linux, Turso can ask the kernel to back
+these areas with 2 MB transparent huge pages. It does not by default: a huge page is
+filled as soon as one page in it is used, so even a small database would then cost
+about 2 MB of memory instead of about 150 KB.
+
+Set the `TURSO_HUGE_PAGES` environment variable to `1` or `true` to ask for huge
+pages. The variable is read once, when the process opens its first database, so set
+it before the process starts. Every database in the process uses the same setting.
+
+```console
+TURSO_HUGE_PAGES=1 ./my-server
+```
+
+Huge pages only help a process that keeps many large, busy databases open. In
+measurements on x86_64 and arm64, with 200 open databases of 600 pages each, random
+lookups across all of them were 3 to 4% faster, and filling a new database was 5 to 7%
+faster. Reads and writes on a single database were not measurably faster. The cost is
+up to about 2 MB more memory per open database.
+
+The variable has an effect only when the kernel's transparent huge page mode is
+`madvise`, the default on Ubuntu (see
+`/sys/kernel/mm/transparent_hugepage/enabled`). In `always` mode the kernel uses
+huge pages for these areas anyway, and in `never` mode it never does. On other
+operating systems the variable is ignored.
 
 ## Appendix A: Turso Internals
 
