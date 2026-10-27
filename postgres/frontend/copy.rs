@@ -33,11 +33,12 @@ pub(crate) fn prepare_copy_to_stdout(
             })?;
             conn.search_order()
                 .into_iter()
-                .find_map(|id| {
-                    let name = if id == turso_core::MAIN_DB_ID {
+                .find_map(|namespace| {
+                    let database_id = namespace.database_id();
+                    let name = if database_id == turso_core::MAIN_DB_ID {
                         "main".to_owned()
                     } else {
-                        conn.namespace_name(id)?
+                        conn.namespace_name(database_id)?
                     };
                     schemas.iter().find(|schema| **schema == name).cloned()
                 })
