@@ -41,10 +41,12 @@ fn parse_numeric(text: &str) -> crate::Result<BigDecimal> {
     // than any value within the limits is refused before it is parsed. The
     // allowance covers a sign, a decimal point and an exponent.
     const MAX_TEXT_LEN: usize = (MAX_INTEGER_DIGITS + MAX_FRACTION_DIGITS) as usize + 32;
-    if text.trim().len() > MAX_TEXT_LEN {
+    // PostgreSQL skips the whitespace C's isspace() matches around a number.
+    let number = text.trim_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+    if number.len() > MAX_TEXT_LEN {
         return Err(numeric_overflow());
     }
-    BigDecimal::from_str(text).map_err(|_| {
+    BigDecimal::from_str(number).map_err(|_| {
         LimboError::Constraint(format!("invalid input syntax for type numeric: \"{text}\""))
     })
 }
@@ -599,7 +601,7 @@ mod tests {
         let equal = [
             Value::from_text("1.5"),
             Value::from_text("1.50"),
-            Value::from_text("15e-1"),
+            Value::from_text(" 15e-1\n"),
             Value::from_f64(1.5),
             blob,
         ];

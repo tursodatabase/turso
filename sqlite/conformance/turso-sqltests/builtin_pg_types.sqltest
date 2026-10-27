@@ -429,3 +429,27 @@ test numeric-invalid-input {
 }
 expect error {
 }
+
+@requires strict "uses STRICT tables"
+test numeric-input-ignores-surrounding-whitespace {
+    -- As in PostgreSQL, spaces, tabs and newlines around the number are
+    -- skipped, and text equal to a stored value apart from them compares equal.
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, ' 1.5 '), (2, char(9) || '2' || char(10));
+    SELECT id, val FROM t1 ORDER BY id;
+    SELECT id FROM t1 WHERE val = ' 2 ';
+}
+expect {
+    1|1.50
+    2|2.00
+    2
+}
+
+@requires strict "uses STRICT tables"
+test numeric-input-rejects-space-inside-the-number {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('1 .5');
+}
+expect error {
+    invalid input syntax for type numeric: "1 .5"
+}
