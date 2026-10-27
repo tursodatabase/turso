@@ -4576,7 +4576,7 @@ impl BTreeTable {
             if !written_ty_str.is_empty() {
                 sql.push(' ');
                 sql.push_str(written_ty_str);
-                if !column.ty_params.is_empty() {
+                if !column.ty_params.is_empty() && !written_ty_str.contains('(') {
                     sql.push('(');
                     for (i, param) in column.ty_params.iter().enumerate() {
                         if i > 0 {

@@ -1331,14 +1331,13 @@ impl<'a> Parser<'a> {
             }
             end = self.offset();
         }
-        let type_name = from_bytes(&self.lexer.input[start..end]);
 
         let size = if let Some(tok) = self.peek()? {
             if tok.token_type == TK_LP {
                 eat_assert!(self, TK_LP);
                 let first_size = self.parse_signed()?;
                 let tok = eat_expect!(self, TK_RP, TK_COMMA);
-                match tok.token_type {
+                let size = match tok.token_type {
                     TK_RP => Some(TypeSize::MaxSize(first_size)),
                     TK_COMMA => {
                         let second_size = self.parse_signed()?;
@@ -1346,13 +1345,17 @@ impl<'a> Parser<'a> {
                         Some(TypeSize::TypeSize(first_size, second_size))
                     }
                     _ => unreachable!(),
-                }
+                };
+                end = self.offset();
+                size
             } else {
                 None
             }
         } else {
             None
         };
+
+        let type_name = from_bytes(&self.lexer.input[start..end]);
 
         // Check for array suffix(es) [], [][], etc.
         let mut array_dimensions = 0u32;
@@ -6269,7 +6272,7 @@ mod tests {
                                 Box::new(Expr::Cast {
                                     expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                     type_name: Some(Type {
-                                        name: "VARCHAR".to_owned(),
+                                        name: "VARCHAR(255)".to_owned(),
                                         size: Some(TypeSize::MaxSize(Box::new(Expr::Literal(
                                             Literal::Numeric("255".to_owned()),
                                         )))),
@@ -6300,7 +6303,7 @@ mod tests {
                                 Box::new(Expr::Cast {
                                     expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                     type_name: Some(Type {
-                                        name: "DECIMAL".to_owned(),
+                                        name: "DECIMAL(10, 5)".to_owned(),
                                         size: Some(TypeSize::TypeSize(
                                             Box::new(Expr::Literal(Literal::Numeric(
                                                 "10".to_owned(),

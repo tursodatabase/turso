@@ -825,6 +825,29 @@ expect {
 }
 
 @cross-check-integrity
+test affinity-type-name-with-size {
+    CREATE TABLE t_size(a VARCHAR(10));
+    SELECT type FROM pragma_table_info('t_size');
+}
+expect {
+    VARCHAR(10)
+}
+
+@cross-check-integrity
+test affinity-type-name-with-comment-and-size {
+    CREATE TABLE t(a VARCHAR /*INT*/ (10));
+    INSERT INTO t VALUES('12');
+    SELECT type FROM pragma_table_info('t');
+    SELECT typeof(a) FROM t;
+    SELECT typeof(CAST('123' AS VARCHAR /*INT*/ (10)));
+}
+expect {
+    VARCHAR /*INT*/ (10)
+    integer
+    integer
+}
+
+@cross-check-integrity
 test affinity-type-name-with-quotes {
     CREATE TABLE t (a "BLOB" INTEGER, b "INT", c 'TEXT' INT, d "a""b" INT, e [x] INT);
     INSERT INTO t VALUES ('123', '123', '123', '123', '123');
