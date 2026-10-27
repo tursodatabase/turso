@@ -3978,7 +3978,8 @@ pub fn emit_fk_child_insert_checks(
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_for_child(namespace.id, &child_tbl.name, None)
     })? {
-        let is_self_ref = fk_ref.fk.parent_table.eq_ignore_ascii_case(&child_tbl.name);
+        let is_self_ref = fk_ref.fk.parent_namespace == namespace.id
+            && fk_ref.fk.parent_table.eq_ignore_ascii_case(&child_tbl.name);
 
         // Short-circuit if any NEW component is NULL
         let fk_ok = program.allocate_label();
@@ -3996,7 +3997,7 @@ pub fn emit_fk_child_insert_checks(
         }
         let parent_tbl = resolver
             .with_schema(database_id, |s| {
-                s.get_btree_table(namespace.id, &fk_ref.fk.parent_table)
+                s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
             })
             .expect("parent btree");
         if fk_ref.parent_uses_rowid {
@@ -4291,10 +4292,11 @@ pub fn emit_parent_side_fk_decrement_on_insert(
     for pref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(namespace.id, &parent_table.name)
     })? {
-        let is_self_ref = pref
-            .child_table
-            .name
-            .eq_ignore_ascii_case(&parent_table.name);
+        let is_self_ref = pref.child_namespace == namespace.id
+            && pref
+                .child_table
+                .name
+                .eq_ignore_ascii_case(&parent_table.name);
         // Skip only when it cannot repair anything: non-deferred and not self-referencing
         if !force_immediate && !pref.fk.deferred && !is_self_ref {
             continue;
@@ -4319,7 +4321,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         // its child key was checked.
         let new_row_rowid = is_self_ref.then(|| insertion.key_register());
         let child_tbl = &pref.child_table;
-        if let Some(ix) = child_index_for_fk(resolver, database_id, namespace.id, &pref) {
+        if let Some(ix) = child_index_for_fk(resolver, database_id, &pref) {
             let icur = open_read_index(program, &ix, database_id);
             // Copy key into probe regs and apply child-index affinities
             let probe_start = program.alloc_registers(n_cols);

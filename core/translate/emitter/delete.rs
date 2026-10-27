@@ -405,7 +405,7 @@ pub fn emit_fk_child_decrement_on_delete(
             // Probe parent table by rowid
             let parent_tbl = resolver
                 .with_schema(database_id, |s| {
-                    s.get_btree_table(namespace.id, &fk_ref.fk.parent_table)
+                    s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
                 })
                 .expect("parent btree");
             let pcur = open_read_table(program, &parent_tbl, database_id);
@@ -457,7 +457,7 @@ pub fn emit_fk_child_decrement_on_delete(
             // Probe parent unique index
             let parent_tbl = resolver
                 .with_schema(database_id, |s| {
-                    s.get_btree_table(namespace.id, &fk_ref.fk.parent_table)
+                    s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
                 })
                 .expect("parent btree");
             let idx = fk_ref.parent_unique_index.as_ref().expect("unique index");

@@ -3,7 +3,7 @@ use crate::connection_hooks::{ConnectionHooks, SavepointMemo};
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
-use crate::namespace::NamespaceId;
+use crate::namespace::{Namespace, NamespaceId, NamespaceRef};
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
@@ -2972,9 +2972,9 @@ impl Connection {
 
     pub fn attached_database_names(&self) -> Vec<String> {
         self.namespaces
-            .others()
+            .attached_databases()
             .into_iter()
-            .map(|(_, name)| name)
+            .map(|namespace| namespace.name)
             .collect()
     }
 
@@ -3237,9 +3237,9 @@ impl Connection {
 
     pub(crate) fn is_attached(&self, alias: &str) -> bool {
         self.namespaces
-            .others()
+            .attached_databases()
             .iter()
-            .any(|(_, name)| name == alias)
+            .any(|namespace| namespace.name == alias)
     }
 
     /// List all attached database aliases
@@ -3341,10 +3341,9 @@ impl Connection {
         &self.namespaces
     }
 
-    /// Adds namespace `name`, which refers to database `database_id`, so
-    /// that `name.t` names the objects of that database.
-    pub fn add_namespace(&self, name: &str, database_id: usize) {
-        self.namespaces.add(name, database_id);
+    /// Adds `namespace` under its name, so that `name.t` names its objects.
+    pub fn add_namespace(&self, namespace: Namespace) {
+        self.namespaces.add(namespace);
         self.bump_prepare_context_generation();
     }
 
@@ -3355,9 +3354,11 @@ impl Connection {
         database_id
     }
 
-    /// The name of the namespace that refers to database `database_id`.
+    /// The name of the namespace that is the whole of database `database_id`.
     pub fn namespace_name(&self, database_id: usize) -> Option<String> {
-        self.namespaces.name(database_id)
+        self.namespaces
+            .of_database(database_id)
+            .map(|namespace| namespace.name)
     }
 
     /// Sets the namespace names that a name without a namespace is looked
@@ -3375,10 +3376,10 @@ impl Connection {
         self.search_path.read().clone()
     }
 
-    /// The databases that a name without a namespace is looked up in, in
+    /// The namespaces that a name without a namespace is looked up in, in
     /// order. The first one is where CREATE puts an object whose name has
     /// no namespace.
-    pub fn search_order(&self) -> Vec<usize> {
+    pub fn search_order(&self) -> Vec<Namespace> {
         self.namespaces
             .search_order(self.search_path.read().as_deref())
     }
@@ -3445,13 +3446,14 @@ impl Connection {
 
         // Add attached databases
         let attached_dbs = self.attached_databases.read();
-        for (seq_number, alias) in self.namespaces.others() {
+        for namespace in self.namespaces.attached_databases() {
+            let seq_number = namespace.database_id();
             let file_path = if let Some(entry) = attached_dbs.index_to_data.get(&seq_number) {
                 Self::get_canonical_path_for_database(&entry.db)
             } else {
                 String::new()
             };
-            databases.push((seq_number, alias, file_path));
+            databases.push((seq_number, namespace.name, file_path));
         }
 
         // Sort by sequence number to ensure consistent ordering
@@ -3602,35 +3604,40 @@ impl Connection {
     /// namespace is looked up like the resolver does when a statement is
     /// compiled: in temp when there is a temp database, then through the
     /// search order.
-    pub fn find_sequence(&self, name: &str) -> Result<(usize, Arc<crate::schema::Sequence>)> {
+    pub fn find_sequence(
+        &self,
+        name: &str,
+    ) -> Result<(NamespaceRef, Arc<crate::schema::Sequence>)> {
         let not_found = |seq_name: &str| {
             LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
         };
-        let get = |db_id: usize, seq_name: &str| {
-            self.with_schema(db_id, |schema| {
-                schema
-                    .get_sequence(NamespaceId::ROOT, seq_name)
-                    .map(Arc::clone)
+        let get = |namespace: NamespaceRef, seq_name: &str| {
+            self.with_schema(namespace.database_id, |schema| {
+                schema.get_sequence(namespace.id, seq_name).map(Arc::clone)
             })
-            .map(|sequence| (db_id, sequence))
+            .map(|sequence| (namespace, sequence))
         };
-        if let Some((schema, seq)) = name.split_once('.') {
-            let db_id = self
+        if let Some((namespace, seq)) = name.split_once('.') {
+            let namespace = self
                 .namespaces
-                .database_id(&crate::util::normalize_ident(schema))
+                .get(&crate::util::normalize_ident(namespace))
                 .ok_or_else(|| not_found(name))?;
             let seq_name = crate::util::normalize_ident(seq);
-            return get(db_id, &seq_name).ok_or_else(|| not_found(&seq_name));
+            return get(namespace.target, &seq_name).ok_or_else(|| not_found(&seq_name));
         }
         let seq_name = crate::util::normalize_ident(name);
-        let mut databases = Vec::new();
+        let mut namespaces = Vec::new();
         if self.temp.database.read().is_some() {
-            databases.push(TEMP_DB_ID);
+            namespaces.push(NamespaceRef::root_of(TEMP_DB_ID));
         }
-        databases.extend(self.search_order());
-        databases
+        namespaces.extend(
+            self.search_order()
+                .into_iter()
+                .map(|namespace| namespace.target),
+        );
+        namespaces
             .into_iter()
-            .find_map(|db_id| get(db_id, &seq_name))
+            .find_map(|namespace| get(namespace, &seq_name))
             .ok_or_else(|| not_found(&seq_name))
     }
 

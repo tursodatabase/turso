@@ -7324,10 +7324,13 @@ dependencies = [
  "async-trait",
  "futures",
  "pgwire",
+ "tempfile",
  "tokio",
  "tracing",
  "turso_core",
  "turso_pg",
+ "turso_pg_client",
+ "turso_pg_parser",
 ]
 
 [[package]]

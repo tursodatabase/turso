@@ -1,6 +1,5 @@
 use crate::{alloc, turso_assert, turso_assert_eq, Result, Value, ValueRef};
 
-use crate::namespace::NamespaceId;
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Range;
 use tracing::{instrument, Level};
@@ -2165,7 +2164,7 @@ impl ProgramBuilder {
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
     pub fn epilogue(&mut self, schema: &Schema) {
-        self.has_materialized_views = schema.has_materialized_views(NamespaceId::ROOT);
+        self.has_materialized_views = schema.has_materialized_views();
         if self.flags.is_subprogram() {
             // Subprograms (triggers, FK actions) just emit Halt without Transaction
             let description = if self.trigger.is_some() {
