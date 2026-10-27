@@ -660,9 +660,9 @@ pub fn translate_aggregation_step(
 
             target_register
         }
-        AggFunc::Max => {
+        AggFunc::Min | AggFunc::Max => {
             if num_args != 1 {
-                crate::bail_parse_error!("max bad number of arguments");
+                crate::bail_parse_error!("{} bad number of arguments", func.as_str());
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
@@ -676,30 +676,7 @@ pub fn translate_aggregation_step(
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
-                    func: AccumulatorFunc::Agg(AggFunc::Max),
-                    comparator,
-                    collation: Some(arg_collation),
-                }),
-            });
-            target_register
-        }
-        AggFunc::Min => {
-            if num_args != 1 {
-                crate::bail_parse_error!("min bad number of arguments");
-            }
-            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
-            let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
-            let comparator =
-                super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
-            program.emit_insn(Insn::AggStep {
-                data: Box::new(AggStepData {
-                    skip_bare_columns_reg,
-                    acc_reg: target_register,
-                    col: expr_reg,
-                    delimiter: 0,
-                    func: AccumulatorFunc::Agg(AggFunc::Min),
+                    func: AccumulatorFunc::Agg(func.clone()),
                     comparator,
                     collation: Some(arg_collation),
                 }),
