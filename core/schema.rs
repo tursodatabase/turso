@@ -2052,7 +2052,7 @@ impl Schema {
         if let Some(table) = removed {
             self.unregister_table_root_page(&table);
         }
-        self.analyze_stats.remove_table(&name);
+        self.analyze_stats.remove_table(namespace, &name);
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -2191,7 +2191,7 @@ impl Schema {
     pub fn remove_indices_for_table(&mut self, namespace: NamespaceId, table_name: &str) {
         let name = normalize_ident(table_name);
         self.namespace_mut(namespace).indexes.remove(&name);
-        self.analyze_stats.remove_table(&name);
+        self.analyze_stats.remove_table(namespace, &name);
     }
 
     pub fn remove_index(&mut self, namespace: NamespaceId, idx: &Index) {
@@ -2201,7 +2201,7 @@ impl Schema {
             .get_mut(&name)
             .expect("Must have the index")
             .retain_mut(|other_idx| other_idx.name != idx.name);
-        self.analyze_stats.remove_index(&name, &idx.name);
+        self.analyze_stats.remove_index(namespace, &name, &idx.name);
     }
 
     pub fn table_has_indexes(&self, namespace: NamespaceId, table_name: &str) -> bool {
@@ -7605,6 +7605,37 @@ mod tests {
         assert!(!schema.has_materialized_views());
         schema.add_materialized_view_dependency(other, "t", "v");
         assert!(schema.has_materialized_views());
+    }
+
+    #[test]
+    fn tables_of_the_same_name_in_two_namespaces_keep_their_own_statistics() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(1);
+        schema.add_namespace(other);
+        schema
+            .add_btree_table(NamespaceId::ROOT, table("CREATE TABLE t (x)", 2))
+            .unwrap();
+        schema
+            .add_btree_table(other, table("CREATE TABLE t (x)", 3))
+            .unwrap();
+        schema
+            .analyze_stats
+            .table_stats_mut(NamespaceId::ROOT, "t")
+            .row_count = Some(10);
+        schema.analyze_stats.table_stats_mut(other, "t").row_count = Some(20);
+
+        let row_count = |schema: &Schema, namespace| {
+            schema
+                .analyze_stats
+                .table_stats(namespace, "t")
+                .and_then(|stats| stats.row_count)
+        };
+        assert_eq!(row_count(&schema, NamespaceId::ROOT), Some(10));
+        assert_eq!(row_count(&schema, other), Some(20));
+
+        schema.remove_table(other, "t");
+        assert_eq!(row_count(&schema, other), None);
+        assert_eq!(row_count(&schema, NamespaceId::ROOT), Some(10));
     }
 
     #[test]
