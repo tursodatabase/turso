@@ -4721,9 +4721,8 @@ impl Pager {
                     if !writes.succeeded() {
                         commit_info.completion_group = None;
                         commit_info.prepared_frames.clear();
-                        return Err(LimboError::CompletionError(CompletionError::IOError(
-                            std::io::ErrorKind::Other,
-                            "write",
+                        return Err(LimboError::CompletionError(writes.get_error().unwrap_or(
+                            CompletionError::IOError(std::io::ErrorKind::Other, "write"),
                         ))
                         .into());
                     }
@@ -4772,9 +4771,8 @@ impl Pager {
                                     sync_c.get_error()
                                 );
                             }
-                            return Err(LimboError::CompletionError(CompletionError::IOError(
-                                std::io::ErrorKind::Other,
-                                "sync",
+                            return Err(LimboError::CompletionError(sync_c.get_error().unwrap_or(
+                                CompletionError::IOError(std::io::ErrorKind::Other, "sync"),
                             ))
                             .into());
                         }
