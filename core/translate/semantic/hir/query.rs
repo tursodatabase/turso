@@ -526,6 +526,29 @@ impl SourceColumns {
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = SourceColumnRef<'_>> + Clone + '_ {
         (0..self.len()).map(|index| self.column(index))
     }
+
+    pub fn named_positions<'a>(&'a self, name: &'a str) -> impl Iterator<Item = usize> + 'a {
+        let unique = matches!(self, Self::Table(columns) if matches!(columns.table.as_ref(), crate::schema::Table::BTree(_)));
+        let (table, owned) = match self {
+            Self::Table(columns) => (Some(columns.table.columns()), None),
+            Self::Owned(columns) => (None, Some(columns.as_ref())),
+        };
+        table
+            .into_iter()
+            .flatten()
+            .map(|column| {
+                column
+                    .name
+                    .as_deref()
+                    .expect("a table source only reads named columns from its schema")
+            })
+            .chain(owned.into_iter().flatten().map(|column| &*column.name))
+            .enumerate()
+            .filter_map(move |(position, column)| {
+                column.eq_ignore_ascii_case(name).then_some(position)
+            })
+            .take(if unique { 1 } else { usize::MAX })
+    }
 }
 
 impl std::iter::FromIterator<SourceColumn> for SourceColumns {

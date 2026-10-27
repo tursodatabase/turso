@@ -1635,17 +1635,33 @@ impl Scope {
 
     fn find_source_column(&self, name: &str) -> Result<Option<NameMatch<'_>>> {
         let mut found = None;
-        for column in self
-            .visible_columns()
-            .filter(|column| !column.rowid_names() && column.lookup_matches(name))
-        {
-            if found.is_some() {
-                crate::bail_parse_error!(
-                    "ambiguous column name: {}",
-                    crate::util::normalize_ident(name)
-                );
+        for visible in self.visible.iter() {
+            match visible {
+                VisibleColumn::AllOfSource(source) => {
+                    let source = &self.sources[*source];
+                    for index in source.columns.named_positions(name) {
+                        if found.is_some() {
+                            crate::bail_parse_error!(
+                                "ambiguous column name: {}",
+                                crate::util::normalize_ident(name)
+                            );
+                        }
+                        found = Some(NameMatch::Column(source.column(index)));
+                    }
+                }
+                VisibleColumn::Binding(binding)
+                    if !binding.rowid_names && binding.lookup_name.matches(name) =>
+                {
+                    if found.is_some() {
+                        crate::bail_parse_error!(
+                            "ambiguous column name: {}",
+                            crate::util::normalize_ident(name)
+                        );
+                    }
+                    found = Some(NameMatch::Column(ColumnView::Binding(binding)));
+                }
+                VisibleColumn::Binding(_) => {}
             }
-            found = Some(NameMatch::Column(column));
         }
         if found.is_some() {
             return Ok(found);

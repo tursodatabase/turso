@@ -2916,7 +2916,8 @@ impl<'a> HirPlanContext<'a> {
     /// A hash join does not keep its build table's cursor on the current
     /// row, which a LATERAL subquery reads, so a block with one uses none.
     fn hash_joins_allowed(&self, input: &HirQueryBlockPlanInput) -> bool {
-        matches!(&self.document.root, hir::HirRoot::Query(_))
+        input.sources.len() > 1
+            && matches!(&self.document.root, hir::HirRoot::Query(_))
             && input.groups.is_empty()
             && !input.sources.iter().any(|source| {
                 source.is_lateral()
