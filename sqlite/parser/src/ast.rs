@@ -101,12 +101,16 @@ pub enum Stmt {
         /// password
         key: Option<Box<Expr>>,
     },
-    /// `BEGIN`: tx type, tx name
+    /// `BEGIN`: tx type, tx name, access mode, isolation level
     Begin {
         // transaction type
         typ: Option<TransactionType>,
         // transaction name
         name: Option<Name>,
+        // READ ONLY or READ WRITE (None = use connection default, i.e. READ WRITE)
+        access_mode: Option<AccessMode>,
+        // isolation level (None = use server default)
+        isolation_level: Option<IsolationLevel>,
     },
     /// `COMMIT`/`END`: tx name
     Commit {
@@ -2218,6 +2222,26 @@ pub enum TransactionType {
     Exclusive,
     /// `CONCURRENT`,
     Concurrent,
+}
+
+/// Transaction access mode (orthogonal to locking type).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AccessMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+/// Transaction isolation level.
+/// The engine may not enforce all levels; they are preserved in the AST for
+/// frontends that translate them to engine-level concurrency controls.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum IsolationLevel {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
 }
 
 /// Upsert clause

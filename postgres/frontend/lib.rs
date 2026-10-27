@@ -19,6 +19,7 @@ pub use statement::Statement;
 pub use turso_core::{
     types, Database, DatabaseOpts, Func, LimboError, Numeric, OpenFlags, PlatformIO, StepResult,
 };
+pub use turso_pg_parser::{classify_tx_stmt, TxStmt};
 
 pub mod vtab {
     pub use turso_core::VirtualTable;
