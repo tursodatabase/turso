@@ -202,6 +202,9 @@ pub(crate) struct ChainRange {
     end: Bound<i64>,
     direction: IterationDirection,
     one_key: bool,
+    /// The range starts after the current row, in its direction. The reader
+    /// reads the rowid of the row only when it positions its chain iterator.
+    after_row: bool,
 }
 
 #[derive(Clone)]
@@ -335,6 +338,7 @@ impl BTreeCursor {
         self.drive_mvcc_step::<K>()
     }
 
+    #[inline(always)]
     pub(super) fn mvcc_next<K: MvccKeys>(&mut self) -> IOResultOr<()> {
         if matches!(K::reader(self).step, Step::Idle) {
             if !self.plan_mvcc_step::<K>(IterationDirection::Forwards)? {
@@ -345,6 +349,7 @@ impl BTreeCursor {
         self.drive_mvcc_step::<K>()
     }
 
+    #[inline(always)]
     pub(super) fn mvcc_prev<K: MvccKeys>(&mut self) -> IOResultOr<()> {
         if matches!(K::reader(self).step, Step::Idle)
             && !self.plan_mvcc_step::<K>(IterationDirection::Backwards)?
@@ -548,6 +553,7 @@ impl BTreeCursor {
         }
     }
 
+    #[inline(always)]
     fn plan_mvcc_step<K: MvccKeys>(&mut self, direction: IterationDirection) -> Result<bool> {
         let reader = K::reader(self);
         let (move_cell, advance_chain) = match &reader.row {
@@ -570,21 +576,19 @@ impl BTreeCursor {
                 cell_has_key,
                 chain_has_key,
                 ..
-            } => (*cell_has_key, *chain_has_key),
-            Row::Written(_) => (false, false),
+            } if reader.direction == direction && reader.exact_seek_key.is_none() => {
+                (*cell_has_key, *chain_has_key)
+            }
+            Row::At { .. } | Row::Written(_) => {
+                let key = K::row_seek_key(reader)?;
+                let op = match direction {
+                    IterationDirection::Forwards => SeekOp::GT,
+                    IterationDirection::Backwards => SeekOp::LT,
+                };
+                self.start_mvcc_seek::<K>(key, op);
+                return Ok(true);
+            }
         };
-        if reader.direction != direction
-            || reader.exact_seek_key.is_some()
-            || matches!(reader.row, Row::Written(_))
-        {
-            let key = K::row_seek_key(reader)?;
-            let op = match direction {
-                IterationDirection::Forwards => SeekOp::GT,
-                IterationDirection::Backwards => SeekOp::LT,
-            };
-            self.start_mvcc_seek::<K>(key, op);
-            return Ok(true);
-        }
         let reader = K::reader_mut(self);
         reader.chain_range = K::range_after_row(reader);
         if move_cell {
@@ -676,61 +680,68 @@ impl BTreeCursor {
 
     fn drive_mvcc_step<K: MvccKeys>(&mut self) -> IOResultOr<()> {
         loop {
-            match K::reader(self).step.clone() {
+            match &K::reader(self).step {
                 Step::Idle => return Ok(IOResult::Done(())),
-                Step::Start { motion, range } => self.start_mvcc_motion::<K>(motion, range)?,
-                Step::Move { motion, then } => {
+                Step::Start { .. } => {
+                    let Step::Start { motion, range } =
+                        std::mem::replace(&mut K::reader_mut(self).step, Step::Idle)
+                    else {
+                        unreachable!("the step must be a start");
+                    };
+                    self.start_mvcc_motion::<K>(motion, range)?;
+                }
+                Step::Move { motion, .. } => {
                     match motion {
                         Motion::Rewind => {
-                            inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeForwardProgress)
-                        }
-                        Motion::Last => {
-                            inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeBackwardProgress)
-                        }
-                        Motion::Next => inject_io_yield!(self, CursorYieldPoint::NextBtreeAdvance),
-                        Motion::Prev => inject_io_yield!(self, CursorYieldPoint::PrevBtreeAdvance),
-                        Motion::Seek { .. } => {
-                            inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress)
-                        }
-                    }
-                    let landed = match &motion {
-                        Motion::Rewind => {
+                            inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeForwardProgress);
                             return_if_io!(
                                 self.without_mvcc_reader::<K, _>(|cursor| cursor.rewind())
                             );
-                            true
                         }
                         Motion::Last => {
+                            inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeBackwardProgress);
                             return_if_io!(self.without_mvcc_reader::<K, _>(|cursor| cursor.last()));
-                            true
                         }
                         Motion::Next => {
+                            inject_io_yield!(self, CursorYieldPoint::NextBtreeAdvance);
                             return_if_io!(self.btree_next());
-                            true
                         }
                         Motion::Prev => {
+                            inject_io_yield!(self, CursorYieldPoint::PrevBtreeAdvance);
                             return_if_io!(self.btree_prev());
-                            true
                         }
-                        Motion::Seek { key, op } => !matches!(
-                            return_if_io!(K::seek_btree(self, key, *op)),
-                            SeekResult::TryAdvance
-                        ),
-                    };
-                    if !landed {
-                        let Motion::Seek { op, .. } = motion else {
-                            unreachable!("only a seek can stop before it lands on a cell");
-                        };
-                        let motion = match op.iteration_direction() {
-                            IterationDirection::Forwards => Motion::Next,
-                            IterationDirection::Backwards => Motion::Prev,
-                        };
-                        K::reader_mut(self).step = Step::Move { motion, then };
-                        continue;
+                        Motion::Seek { key, op } => {
+                            let (key, op) = (key.clone(), *op);
+                            inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
+                            let result = return_if_io!(K::seek_btree(self, &key, op));
+                            if matches!(result, SeekResult::TryAdvance) {
+                                let Step::Move { motion, .. } = &mut K::reader_mut(self).step
+                                else {
+                                    unreachable!("the step must be a move");
+                                };
+                                *motion = match op.iteration_direction() {
+                                    IterationDirection::Forwards => Motion::Next,
+                                    IterationDirection::Backwards => Motion::Prev,
+                                };
+                                continue;
+                            }
+                        }
                     }
+                    let Step::Move { then, .. } =
+                        std::mem::replace(&mut K::reader_mut(self).step, Step::Resolve)
+                    else {
+                        unreachable!("the step must be a move");
+                    };
                     return_if_io!(self.read_mvcc_cell::<K>(then));
                 }
-                Step::ReadCell { then } => return_if_io!(self.read_mvcc_cell::<K>(then)),
+                Step::ReadCell { .. } => {
+                    let Step::ReadCell { then } =
+                        std::mem::replace(&mut K::reader_mut(self).step, Step::Resolve)
+                    else {
+                        unreachable!("the step must be a cell read");
+                    };
+                    return_if_io!(self.read_mvcc_cell::<K>(then));
+                }
                 Step::Resolve => {
                     if self.resolve_mvcc_row::<K>()? {
                         return Ok(IOResult::Done(()));
@@ -756,14 +767,20 @@ impl BTreeCursor {
     }
 
     /// Notes the cell where the B-tree cursor stopped, then changes the chain
-    /// iterator as `then` says. An index cell can need IO to read its key, so
-    /// on IO the step waits in `ReadCell` and does not move the B-tree again.
+    /// iterator as `then` says. An index cell can need IO to read its key. If
+    /// the read needs IO or fails, the step waits in `ReadCell`, so the next
+    /// call reads the cell again and does not move the B-tree again.
+    #[inline(always)]
     fn read_mvcc_cell<K: MvccKeys>(&mut self, then: ChainChange<K>) -> IOResultOr<()> {
-        let cell = match K::read_cell(self)? {
-            IOResult::Done(cell) => cell,
-            IOResult::IO(io) => {
+        let cell = match K::read_cell(self) {
+            Ok(IOResult::Done(cell)) => cell,
+            Ok(IOResult::IO(io)) => {
                 K::reader_mut(self).step = Step::ReadCell { then };
                 return Ok(IOResult::IO(io));
+            }
+            Err(err) => {
+                K::reader_mut(self).step = Step::ReadCell { then };
+                return Err(err);
             }
         };
         let reader = K::reader_mut(self);
@@ -901,6 +918,7 @@ impl BTreeCursor {
         }
     }
 
+    #[inline(always)]
     fn read_table_cell(&mut self) -> Result<Option<i64>> {
         if !self.has_record {
             return Ok(None);
@@ -1129,6 +1147,7 @@ impl MvccKeys for TableKeys {
             end: Bound::Included(i64::MAX),
             direction,
             one_key: false,
+            after_row: false,
         }
     }
 
@@ -1148,11 +1167,16 @@ impl MvccKeys for TableKeys {
             end,
             direction: op.iteration_direction(),
             one_key: op.eq_only(),
+            after_row: false,
         }
     }
 
+    #[inline(always)]
     fn range_after_row(reader: &MvccReader<Self>) -> ChainRange {
-        reader.chain_range.after(reader.row_rowid())
+        ChainRange {
+            after_row: true,
+            ..reader.chain_range
+        }
     }
 
     fn range_direction(range: &ChainRange) -> IterationDirection {
@@ -1170,6 +1194,15 @@ impl MvccKeys for TableKeys {
     }
 
     fn restart_chains(reader: &mut MvccReader<Self>, range: ChainRange) -> Result<()> {
+        let range = if range.after_row {
+            ChainRange {
+                after_row: false,
+                ..range
+            }
+            .after(reader.row_rowid())
+        } else {
+            range
+        };
         reader.chain_range = range;
         reader.mark_chains_current();
         if range.one_key {
