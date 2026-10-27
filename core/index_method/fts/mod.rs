@@ -364,44 +364,52 @@ impl IndexMethod for FtsIndexMethod {
         let ast::Expr::Literal(ast::Literal::String(weights)) = value.as_mut() else {
             return Ok(());
         };
-        let entries = split_weights(weights).collect::<Result<Vec<_>>>()?;
-        if !entries
-            .iter()
-            .any(|(column, _)| column.eq_ignore_ascii_case(from))
-        {
-            return Ok(());
+        if let Some(renamed_weights) = rename_column_in_weights(weights, from, to)? {
+            *weights = renamed_weights;
         }
-        let renamed: Vec<(&str, &str)> = entries
-            .into_iter()
-            .map(|(column, weight)| {
-                if column.eq_ignore_ascii_case(from) {
-                    (to, weight)
-                } else {
-                    (column, weight)
-                }
-            })
-            .collect();
-        let renamed_weights = format!(
-            "'{}'",
-            crate::util::escape_sql_string_literal(
-                &renamed
-                    .iter()
-                    .map(|(column, weight)| format!("{column}={weight}"))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        );
-        if !split_weights(&renamed_weights)
-            .collect::<Result<Vec<_>>>()
-            .is_ok_and(|read_back| read_back == renamed)
-        {
-            return Err(LimboError::ParseError(format!(
-                "cannot rename column {from} to \"{to}\": the name cannot be written in FTS weights"
-            )));
-        }
-        *weights = renamed_weights;
         Ok(())
     }
+}
+
+/// Renames column `from` to `to` in a weights value like 'title=2.0,body=1.0'
+/// Returns None if the weights do not name the column
+fn rename_column_in_weights(weights: &str, from: &str, to: &str) -> Result<Option<String>> {
+    let entries = split_weights(weights).collect::<Result<Vec<_>>>()?;
+    if !entries
+        .iter()
+        .any(|(column, _)| column.eq_ignore_ascii_case(from))
+    {
+        return Ok(None);
+    }
+    let renamed: Vec<(&str, &str)> = entries
+        .into_iter()
+        .map(|(column, weight)| {
+            if column.eq_ignore_ascii_case(from) {
+                (to, weight)
+            } else {
+                (column, weight)
+            }
+        })
+        .collect();
+    let renamed_weights = format!(
+        "'{}'",
+        crate::util::escape_sql_string_literal(
+            &renamed
+                .iter()
+                .map(|(column, weight)| format!("{column}={weight}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    );
+    if !split_weights(&renamed_weights)
+        .collect::<Result<Vec<_>>>()
+        .is_ok_and(|read_back| read_back == renamed)
+    {
+        return Err(LimboError::ParseError(format!(
+            "cannot rename column {from} to \"{to}\": the name cannot be written in FTS weights"
+        )));
+    }
+    Ok(Some(renamed_weights))
 }
 
 /// Splits a weights value like 'title=2.0, body=1.0' into (column, weight) pairs
@@ -987,6 +995,37 @@ impl IndexMethodAttachment for FtsIndexAttachment {
         selected.push(args.last()?.clone());
         *args = selected;
         Some(result)
+    }
+
+    fn rename_column(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Option<Arc<dyn IndexMethodAttachment>>> {
+        if !self
+            .cfg
+            .columns
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case(from))
+        {
+            return Ok(None);
+        }
+        let mut cfg = self.cfg.clone();
+        for column in &mut cfg.columns {
+            if column.name.eq_ignore_ascii_case(from) {
+                column.name = to.to_string();
+            }
+        }
+        if let Some((_, Value::Text(weights))) = cfg
+            .parameters
+            .iter_mut()
+            .find(|(key, _)| key.eq_ignore_ascii_case("weights"))
+        {
+            if let Some(renamed_weights) = rename_column_in_weights(weights.as_str(), from, to)? {
+                *weights = crate::types::Text::new(renamed_weights);
+            }
+        }
+        Ok(Some(Arc::new(FtsIndexAttachment::new(cfg)?)))
     }
 }
 

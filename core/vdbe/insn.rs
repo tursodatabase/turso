@@ -319,6 +319,7 @@ pub struct AlterColumnData {
     pub definition: turso_parser::ast::ColumnDefinition,
     pub rename: bool,
     pub rewritten_triggers: Vec<(NamespaceRef, String, String)>,
+    pub renamed_index_methods: Vec<(String, Arc<dyn crate::index_method::IndexMethodAttachment>)>,
 }
 
 /// Data for IntegrityCk instruction (boxed to keep Insn small).
