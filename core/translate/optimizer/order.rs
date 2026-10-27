@@ -1,5 +1,6 @@
 use crate::schema::{impl_effective_nulls_order, Column, Table};
 use crate::turso_assert_greater_than_or_equal;
+use crate::Result;
 use crate::{
     schema::{FromClauseSubquery, Index, Schema},
     translate::{
@@ -91,20 +92,22 @@ impl OrderTarget {
         tables: &crate::translate::plan::TableReferences,
         resolver: &Resolver,
         purpose: OrderTargetPurpose,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>> {
         if list.clone().count() == 0 {
-            return None;
+            return Ok(None);
         }
         let mut cols = Vec::new();
         for (expr, order, nulls) in list {
-            let collation = expr_collation(expr, Some(tables), resolver).ok()?;
-            let col = expr_to_column_order(expr, order, nulls, collation, tables)?;
+            let collation = expr_collation(expr, Some(tables), resolver)?;
+            let Some(col) = expr_to_column_order(expr, order, nulls, collation, tables) else {
+                return Ok(None);
+            };
             cols.push(col);
         }
-        Some(OrderTarget {
+        Ok(Some(OrderTarget {
             columns: cols,
             purpose,
-        })
+        }))
     }
 
     pub fn is_extremum(&self) -> bool {
@@ -117,19 +120,22 @@ pub fn simple_aggregate_order_target(
     simple_aggregate: &SimpleAggregate,
     tables: &TableReferences,
     resolver: &Resolver,
-) -> Option<OrderTarget> {
+) -> Result<Option<OrderTarget>> {
     let SimpleAggregate::MinMax(min_max) = simple_aggregate else {
-        return None;
+        return Ok(None);
     };
 
-    let mut target = OrderTarget::maybe_from_iterator(
+    let Some(mut target) = OrderTarget::maybe_from_iterator(
         std::iter::once((&min_max.argument, min_max.order, None)),
         tables,
         resolver,
         OrderTargetPurpose::Extremum,
-    )?;
+    )?
+    else {
+        return Ok(None);
+    };
     target.columns[0].collation = min_max.collation;
-    Some(target)
+    Ok(Some(target))
 }
 
 /// Compute an [OrderTarget] for the join optimizer to use.
@@ -144,10 +150,10 @@ pub fn compute_order_target(
     group_by_opt: Option<&mut GroupBy>,
     tables: &TableReferences,
     resolver: &Resolver,
-) -> Option<OrderTarget> {
+) -> Result<Option<OrderTarget>> {
     match (order_by.is_empty(), group_by_opt) {
         // No ordering demands - we don't care what order the joined result rows are in
-        (true, None) => None,
+        (true, None) => Ok(None),
         // Only ORDER BY - we would like the joined result rows to be in the order specified by the ORDER BY
         (false, None) => OrderTarget::maybe_from_iterator(
             order_by

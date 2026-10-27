@@ -1996,7 +1996,7 @@ fn emit_flush_buffer_if_new_partition(
                     .partition_by
                     .iter()
                     .find(|e| matches!(e, Expr::Column { column, .. } if *column == i))
-                    .unwrap_or(&window.partition_by[i]);
+                    .expect("every deduplicated partition column has a PARTITION BY entry");
                 Ok(KeyInfo {
                     sort_order: SortOrder::Asc,
                     collation: expr_collation(expr, Some(&plan.table_references), resolver)?,
