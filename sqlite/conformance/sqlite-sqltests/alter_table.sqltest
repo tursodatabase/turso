@@ -3525,3 +3525,41 @@ expect {
     0
     2
 }
+
+@cross-check-integrity
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-table-resolves-view-names-like-sqlite {
+    CREATE TABLE t(x);
+    CREATE TABLE o(x);
+    INSERT INTO t VALUES (1);
+    INSERT INTO o VALUES ('[2]');
+    CREATE VIEW v1 AS SELECT j.value FROM o AS t, json_each(t.x) AS j;
+    CREATE VIEW v2 AS WITH t AS (SELECT 7 AS x) SELECT x FROM main.t;
+    CREATE VIEW v3 AS SELECT t.x FROM t AS t;
+    ALTER TABLE t RENAME TO t2;
+    SELECT * FROM v1;
+    SELECT * FROM v2;
+    SELECT * FROM v3;
+}
+expect {
+    2
+    1
+    1
+}
+
+@cross-check-integrity
+test alter-table-rename-table-renames-schema-qualified-trigger-ref-under-cte {
+    CREATE TABLE t(x);
+    CREATE TABLE log(v);
+    INSERT INTO t VALUES (1);
+    CREATE TRIGGER tr AFTER INSERT ON log WHEN new.v = 0 BEGIN
+        INSERT INTO log WITH t AS (SELECT 7 AS x) SELECT x FROM main.t;
+    END;
+    ALTER TABLE t RENAME TO t2;
+    INSERT INTO log VALUES (0);
+    SELECT v FROM log ORDER BY v;
+}
+expect {
+    0
+    1
+}
