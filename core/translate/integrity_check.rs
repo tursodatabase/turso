@@ -260,7 +260,10 @@ fn translate_integrity_check_for_schema(
             connection,
             catalog,
             schema,
-            database_id,
+            crate::namespace::NamespaceRef {
+                database_id,
+                id: namespace,
+            },
             btree_table,
             &table_indexes,
         )?;
@@ -627,13 +630,14 @@ fn hir_table_rows(
     connection: &std::sync::Arc<crate::Connection>,
     catalog: &SemanticContext<'_>,
     schema: &Schema,
-    database_id: usize,
+    namespace: crate::namespace::NamespaceRef,
     table: &crate::sync::Arc<BTreeTable>,
     indexes: &[crate::sync::Arc<Index>],
 ) -> crate::Result<TableRows> {
-    let database = connection.namespaces().name(database_id).ok_or_else(|| {
-        crate::LimboError::InternalError(format!("no database with id {database_id}"))
-    })?;
+    let database = connection
+        .namespaces()
+        .name_of(namespace)
+        .ok_or_else(|| crate::LimboError::InternalError(format!("no namespace {namespace:?}")))?;
     let column = |position: usize| -> crate::Result<ast::Expr> {
         let name = table.columns()[position].name.as_deref().ok_or_else(|| {
             crate::LimboError::InternalError(format!(

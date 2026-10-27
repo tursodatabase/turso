@@ -745,7 +745,8 @@ impl<'document> HirValidator<'document> {
             "foreign-key child source belongs to another table or row identity"
         })?;
         self.require(
-            foreign_key.child_table.database() == foreign_key.parent_table.database(),
+            foreign_key.child_table.database().map(DatabaseId::index)
+                == foreign_key.parent_table.database().map(DatabaseId::index),
             || "foreign-key child and parent tables belong to different databases",
         )?;
 
@@ -2482,7 +2483,7 @@ impl<'document> HirValidator<'document> {
             self.document
                 .databases
                 .iter()
-                .any(|snapshot| snapshot.database == database),
+                .any(|snapshot| snapshot.database.index() == database.index()),
             || {
                 format!(
                     "database {} is absent from the catalog snapshot",

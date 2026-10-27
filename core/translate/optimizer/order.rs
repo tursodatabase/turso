@@ -957,6 +957,7 @@ mod tests {
         };
         let planned = HirPlannedSource {
             table,
+            namespace: crate::namespace::NamespaceRef::root_of(crate::MAIN_DB_ID),
             internal_id: source_id,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),

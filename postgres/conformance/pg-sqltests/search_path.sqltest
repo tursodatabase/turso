@@ -650,3 +650,62 @@ test drop-view-ignores-relations-outside-the-search-path {
 expect {
     0
 }
+
+test current-schemas-default-and-null {
+    SELECT pg_catalog.current_schemas(false), current_schemas(true);
+    SELECT CASE WHEN current_schemas(NULL) IS NULL THEN 1 ELSE 0 END;
+}
+expect {
+    {public}|{pg_catalog,public}
+    1
+}
+
+test current-schemas-existing-unique-and-explicit-catalog {
+    CREATE SCHEMA sp_list;
+    SET search_path TO missing_schema, sp_list, public, sp_list, information_schema;
+    SELECT current_schemas(false), current_schemas(true);
+    SET search_path TO public, pg_catalog, sp_list, pg_catalog;
+    SELECT current_schemas(false), current_schemas(true);
+    SET search_path TO '';
+    SELECT current_schemas(false), current_schemas(true);
+}
+expect {
+    {sp_list,public,information_schema}|{pg_catalog,sp_list,public,information_schema}
+    {public,pg_catalog,sp_list}|{public,pg_catalog,sp_list}
+    {}|{pg_catalog}
+}
+
+test current-schemas-setting-rollback-and-schema-drop {
+    CREATE SCHEMA sp_live;
+    BEGIN;
+    SET LOCAL search_path TO sp_live, public;
+    SELECT current_schemas(false);
+    ROLLBACK;
+    SELECT current_schemas(false);
+    SET search_path TO sp_live, public;
+    DROP SCHEMA sp_live;
+    SELECT current_schemas(false);
+    SELECT 0 WHERE set_config('search_path', NULL, false) IS NULL;
+    SELECT current_schemas(false);
+}
+expect {
+    {sp_live,public}
+    {public}
+    {public}
+    {public}
+}
+
+test current-schemas-quotes-array-elements {
+    CREATE SCHEMA "a,b";
+    CREATE SCHEMA "a\b";
+    CREATE SCHEMA "null";
+    SET search_path TO "a,b", "a\b", "null";
+    SELECT current_schemas(false);
+    SELECT * FROM unnest(current_schemas(false));
+}
+expect {
+    {"a,b","a\\\\b","null"}
+    a,b
+    a\b
+    null
+}

@@ -303,6 +303,7 @@ impl std::ops::Deref for RowCountEstimate {
 /// Uses sqlite_stat1 histogram data for row estimates when available,
 /// otherwise falls through to heuristic selectivity multipliers.
 pub struct AnalyzeCtx<'a> {
+    pub namespace: crate::namespace::NamespaceId,
     pub table_name: &'a str,
     pub index: Option<&'a Arc<Index>>,
     pub stats: &'a AnalyzeStats,
@@ -428,7 +429,7 @@ fn estimate_rows_from_analyze_stats(
         return None;
     }
 
-    let table_stats = ctx.stats.table_stats(ctx.table_name)?;
+    let table_stats = ctx.stats.table_stats(ctx.namespace, ctx.table_name)?;
     let idx_stats = table_stats.index_stats.get(&index.name)?;
 
     if eq_prefix_len <= idx_stats.avg_rows_per_distinct_prefix.len() {

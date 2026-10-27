@@ -39,6 +39,7 @@ use crate::translate::planner::TableMask;
 
 pub(super) trait AccessSource {
     fn table(&self) -> &Table;
+    fn namespace(&self) -> crate::namespace::NamespaceId;
     fn index_is_covering(&self, index: &Index) -> bool;
     /// Whether the source is the right side of a RIGHT or FULL JOIN, whose
     /// unmatched rows a pass after the loops reads from the table cursor.
@@ -48,6 +49,10 @@ pub(super) trait AccessSource {
 impl<T: AccessSource + ?Sized> AccessSource for &T {
     fn table(&self) -> &Table {
         (*self).table()
+    }
+
+    fn namespace(&self) -> crate::namespace::NamespaceId {
+        (*self).namespace()
     }
 
     fn index_is_covering(&self, index: &Index) -> bool {
@@ -82,6 +87,10 @@ impl<'a> HirAccessSource<'a> {
 impl AccessSource for HirAccessSource<'_> {
     fn table(&self) -> &Table {
         &self.planned.table
+    }
+
+    fn namespace(&self) -> crate::namespace::NamespaceId {
+        self.planned.namespace.id
     }
 
     fn index_is_covering(&self, index: &Index) -> bool {
@@ -409,6 +418,7 @@ pub(super) fn choose_best_btree_candidate<C, I, O>(
         }
 
         let analyze_ctx = AnalyzeCtx {
+            namespace: rhs_source.namespace(),
             table_name: rhs_source.table().get_name(),
             index: candidate.index.as_ref(),
             stats: analyze_stats,
@@ -606,6 +616,7 @@ pub(super) fn build_btree_access_method<E>(
             },
         };
         let analyze_ctx = AnalyzeCtx {
+            namespace: source.namespace(),
             table_name: source.table().get_name(),
             index: index.as_ref(),
             stats: analyze_stats,

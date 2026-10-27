@@ -41,7 +41,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let mut triggers = self
             .context()
             .schema(database)?
-            .get_triggers_for_table(NamespaceId::ROOT, name)
+            .get_triggers_for_table(database.namespace().id, name)
             .filter(|trigger| trigger_targets_database(trigger, database) && selected(trigger))
             .cloned()
             .map(|trigger| (database, trigger))
@@ -130,9 +130,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let (outgoing, incoming, table_has_foreign_keys) = {
             let schema = self.context().schema(database)?;
             let name = target.value().get_name();
-            let incoming = schema.resolved_fks_referencing(NamespaceId::ROOT, name)?;
+            let incoming = schema.resolved_fks_referencing(database.namespace().id, name)?;
             let table_has_foreign_keys =
-                schema.has_child_fks(NamespaceId::ROOT, name) || !incoming.is_empty();
+                schema.has_child_fks(database.namespace().id, name) || !incoming.is_empty();
             // Like SQLite, an UPDATE resolves the constraints the table
             // declares only when it changes a key: one of their child keys,
             // or a parent key another table points at. `updated` covers the
@@ -152,22 +152,32 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         }
                     }
                     if child_key_changed || parent_key_changed {
-                        schema.resolved_fks_for_child(NamespaceId::ROOT, name, Some(updated))?
+                        schema.resolved_fks_for_child(
+                            database.namespace().id,
+                            name,
+                            Some(updated),
+                        )?
                     } else {
                         crate::alloc::vec![]
                     }
                 }
-                None => schema.resolved_fks_for_child(NamespaceId::ROOT, name, None)?,
+                None => schema.resolved_fks_for_child(database.namespace().id, name, None)?,
             };
             (outgoing, incoming, table_has_foreign_keys)
         };
 
         let mut resolved_outgoing = Vec::with_capacity(outgoing.len());
         for foreign_key in outgoing {
-            let parent_table =
-                self.freeze_foreign_key_table(database, &foreign_key.fk.parent_table, "parent")?;
+            let parent_database = hir::DatabaseId::from_namespace(crate::namespace::NamespaceRef {
+                database_id: database.index(),
+                id: foreign_key.fk.parent_namespace,
+            });
+            let parent_table = self.freeze_foreign_key_table(
+                parent_database,
+                &foreign_key.fk.parent_table,
+                "parent",
+            )?;
             resolved_outgoing.push(self.freeze_foreign_key(
-                database,
                 outgoing_child_source,
                 target.clone(),
                 parent_table,
@@ -178,10 +188,14 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let mut resolved_incoming = Vec::with_capacity(incoming.len());
         for foreign_key in incoming {
             let child_name = foreign_key.child_table.name.clone();
+            let child_database = hir::DatabaseId::from_namespace(crate::namespace::NamespaceRef {
+                database_id: database.index(),
+                id: foreign_key.child_namespace,
+            });
             // The child table is always in the parent's database.
             let child_source = self.analyze_base_table_source_in_database(
                 &ast::Name::exact(child_name.clone()),
-                database,
+                child_database,
                 hir::SourceOwner::Root,
             )?;
             let child_table = match &self
@@ -201,7 +215,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 }
             };
             resolved_incoming.push(self.freeze_foreign_key(
-                database,
                 child_source,
                 child_table,
                 target.clone(),
@@ -296,7 +309,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let table = self
             .context()
             .schema(database)?
-            .get_table(NamespaceId::ROOT, &normalized)
+            .get_table(database.namespace().id, &normalized)
             .ok_or_else(|| {
                 LimboError::InternalError(format!(
                     "resolved foreign-key {role} table {normalized} is missing"
@@ -313,7 +326,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
 
     fn freeze_foreign_key(
         &mut self,
-        database: hir::DatabaseId,
         child_source: hir::SourceId,
         child_table: hir::ResolvedTable,
         parent_table: hir::ResolvedTable,
@@ -321,12 +333,15 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
     ) -> Result<hir::ResolvedForeignKey> {
         let parent_unique_index = foreign_key
             .parent_unique_index
-            .map(|index| self.freeze_foreign_key_index(database, index));
+            .map(|index| self.freeze_foreign_key_index(parent_table.database().unwrap(), index));
         // The child index must list exactly the child columns, in the same
         // order.
         let child_index = self
             .context()
-            .table_indexes(database, child_table.value().get_name())?
+            .table_indexes(
+                child_table.database().unwrap(),
+                child_table.value().get_name(),
+            )?
             .into_iter()
             .find(|index| {
                 index.columns.len() == foreign_key.fk.child_columns.len()
@@ -336,7 +351,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         .zip(foreign_key.fk.child_columns.iter())
                         .all(|(column, child)| column.name.eq_ignore_ascii_case(child))
             });
-        let child_index = child_index.map(|index| self.freeze_foreign_key_index(database, index));
+        let child_index = child_index
+            .map(|index| self.freeze_foreign_key_index(child_table.database().unwrap(), index));
         Ok(hir::ResolvedForeignKey {
             child_table,
             child_source,

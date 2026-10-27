@@ -5,7 +5,6 @@ mod cdc;
 mod delete;
 mod dml;
 mod emit;
-use crate::namespace::NamespaceId;
 pub(crate) use emit::format_unique_violation_desc;
 pub(super) mod expr;
 mod fkey;
@@ -20,7 +19,7 @@ use turso_parser::ast;
 
 use crate::{
     function::{AggFunc, Func, ScalarFunc},
-    schema::{Schema, Type},
+    schema::Type,
     sync::Arc,
     translate::{
         optimizer::cost_model_params,
@@ -470,12 +469,7 @@ pub(crate) fn translate_delete(
             "HIR DELETE got another statement".into(),
         ));
     };
-    check_target(
-        context.main_schema(),
-        connection,
-        tbl_name,
-        "DELETE from table",
-    )?;
+    check_target(context, connection, tbl_name, "DELETE from table")?;
     let session = HirSession::new(context, connection);
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let (HirRoot::Delete(delete), HirRootPlan::Delete(access)) = (&plan.document.root, &plan.root)
@@ -534,12 +528,7 @@ fn translate_update_with(
         ));
     };
     if schema_change.is_none() {
-        check_target(
-            context.main_schema(),
-            connection,
-            &syntax.tbl_name,
-            "UPDATE table",
-        )?;
+        check_target(context, connection, &syntax.tbl_name, "UPDATE table")?;
     }
     let session = HirSession::new(context, connection);
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
@@ -580,12 +569,7 @@ pub(crate) fn translate_insert(
             "HIR INSERT got another statement".into(),
         ));
     };
-    check_target(
-        context.main_schema(),
-        connection,
-        tbl_name,
-        "INSERT into table",
-    )?;
+    check_target(context, connection, tbl_name, "INSERT into table")?;
     let session = HirSession::new(context, connection);
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let insert = insert::insert_root(&plan)?;
@@ -626,7 +610,7 @@ pub(super) fn uses_mvcc(
 }
 
 fn check_target(
-    schema: &Schema,
+    context: &SemanticContext<'_>,
     connection: &Connection,
     name: &ast::QualifiedName,
     statement: &str,
@@ -642,26 +626,28 @@ fn check_target(
     }
     // Materialized views live in the main database: a table of the same
     // name in an attached database is an ordinary table.
-    let in_main = name
-        .namespace
-        .as_ref()
-        .is_none_or(|db| crate::util::normalize_ident(db.as_str()) == "main");
-    if in_main && schema.is_materialized_view(NamespaceId::ROOT, &table_name) {
+    let Some((database, _)) = context.find_table_in(name, None)? else {
+        return Ok(());
+    };
+    let namespace = database.namespace();
+    let schema = context.schema(database)?;
+    let in_main = namespace.database_id == crate::MAIN_DB_ID;
+    if in_main && schema.is_materialized_view(namespace.id, &table_name) {
         crate::bail_parse_error!("cannot modify materialized view {table_name}");
     }
     if in_main
         && schema
-            .get_btree_table(NamespaceId::ROOT, &table_name)
+            .get_btree_table(namespace.id, &table_name)
             .is_some_and(|table| !table.has_rowid)
         && !schema
-            .get_dependent_materialized_views(NamespaceId::ROOT, &table_name)
+            .get_dependent_materialized_views(namespace.id, &table_name)
             .is_empty()
     {
         crate::bail_parse_error!("materialized views on WITHOUT ROWID tables are not supported");
     }
     // The VM keeps dependent materialized views up to date as rows are
     // written; views built by another DBSP version are an error.
-    schema.with_incompatible_dependent_views(NamespaceId::ROOT, &table_name, |views| {
+    schema.with_incompatible_dependent_views(namespace.id, &table_name, |views| {
         if views.is_empty() {
             return Ok(());
         }

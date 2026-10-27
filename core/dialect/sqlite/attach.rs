@@ -602,7 +602,7 @@ impl Connection {
                         .attached_databases
                         .write()
                         .insert(db.clone(), pager.clone());
-                    self.add_namespace(alias, database_id);
+                    self.add_namespace(crate::Namespace::database(alias, database_id));
                     *state = AttachDatabaseState::Done;
                     return Ok(IOResult::Done(()));
                 }

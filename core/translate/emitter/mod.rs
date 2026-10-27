@@ -220,7 +220,7 @@ fn emit_cdc_change_id(
             sequence,
         } => crate::translate::sequence::emit_disk_read_nextval(
             program,
-            *database,
+            crate::namespace::NamespaceRef::root_of(*database),
             backing_table.clone(),
             sqlite_sequence.clone(),
             name,

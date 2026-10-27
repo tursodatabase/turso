@@ -308,14 +308,6 @@ pub(super) fn upsert_actions<'a>(
     Ok(compiled)
 }
 
-fn database_index(foreign_key: &hir::ResolvedForeignKey) -> Result<usize> {
-    foreign_key
-        .child_table
-        .database()
-        .map(|database| database.index())
-        .ok_or_else(|| LimboError::InternalError("HIR foreign key has no database".into()))
-}
-
 /// The statement an action stands for.
 fn action_statement(
     session: &HirSession<'_>,
@@ -324,11 +316,16 @@ fn action_statement(
     action: RefAct,
 ) -> Result<ast::Stmt> {
     let child = foreign_key.child_table.value();
-    let database = database_index(foreign_key)?;
+    let namespace = foreign_key
+        .child_table
+        .database()
+        .expect("a foreign-key table has a namespace")
+        .namespace();
     let table = ast::QualifiedName {
-        namespace: (database != crate::MAIN_DB_ID)
-            .then(|| session.connection.namespaces().name(database))
-            .flatten()
+        namespace: session
+            .connection
+            .namespaces()
+            .name_of(namespace)
             .map(Name::from_string),
         name: Name::from_string(child.get_name()),
         alias: None,

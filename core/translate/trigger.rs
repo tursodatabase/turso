@@ -642,6 +642,7 @@ pub fn translate_drop_trigger(
 
     program.emit_insn(Insn::DropTrigger {
         db: database_id,
+        namespace: namespace.id,
         trigger_name: normalized_trigger_name,
     });
 

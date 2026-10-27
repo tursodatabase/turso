@@ -87,6 +87,7 @@ scalar_functions! {
     Version(FunctionArity::Exact(0), true),
     CurrentDatabase(FunctionArity::Exact(0), false),
     CurrentSchema(FunctionArity::Exact(0), true),
+    CurrentSchemas(FunctionArity::Exact(1), false),
     PgBackendPid(FunctionArity::Exact(0), true),
     PgIsInRecovery(FunctionArity::Exact(0), false),
     PgLockAccessShare(FunctionArity::Exact(0), false),
@@ -143,6 +144,7 @@ impl ScalarCall for PgScalarFunction {
                 Some(schema) => Value::build_text(schema),
                 None => Value::Null,
             },
+            Self::CurrentSchemas => exec_current_schemas(connection, args[0].get_value())?,
             Self::PgBackendPid => Value::from_i64(std::process::id() as i64),
             Self::PgIsInRecovery => {
                 // Temporary pg_dump compatibility: "t" means true, not actual recovery state.
@@ -167,6 +169,57 @@ impl ScalarCall for PgScalarFunction {
         };
         Ok(IOResult::Done(value))
     }
+}
+
+fn exec_current_schemas(conn: &Connection, argument: &Value) -> Result<Value> {
+    let include_implicit = match argument {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(text) => parse_pg_bool(text.as_str()).ok_or_else(|| {
+            sqlstate_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!(
+                    "invalid input syntax for type boolean: \"{}\"",
+                    text.as_str()
+                ),
+            )
+        })?,
+        value => match value.as_int() {
+            Some(0) => false,
+            Some(1) => true,
+            _ => {
+                return Err(undefined_function(
+                    "current_schemas",
+                    &[pg_type_name(value)],
+                ))
+            }
+        },
+    };
+    let schemas = crate::session::current_schemas(conn, include_implicit);
+    let mut result = String::from("{");
+    for (i, schema) in schemas.iter().enumerate() {
+        if i > 0 {
+            result.push(',');
+        }
+        let quoted = schema.is_empty()
+            || schema.eq_ignore_ascii_case("null")
+            || schema
+                .chars()
+                .any(|c| c.is_ascii_whitespace() || matches!(c, ',' | '{' | '}' | '"' | '\\'));
+        if quoted {
+            result.push('"');
+        }
+        for c in schema.chars() {
+            if matches!(c, '"' | '\\') {
+                result.push('\\');
+            }
+            result.push(c);
+        }
+        if quoted {
+            result.push('"');
+        }
+    }
+    result.push('}');
+    Ok(Value::build_text(result))
 }
 
 fn exec_acl_default(args: &[Register]) -> Result<Value> {

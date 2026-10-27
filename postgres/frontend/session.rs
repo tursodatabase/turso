@@ -79,7 +79,10 @@ pub fn open_database_with_io(
 impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> crate::Result<Self> {
         let conn = db.connect_with_hooks(Arc::new(PgSessionState::default()))?;
-        conn.add_namespace("public", turso_core::MAIN_DB_ID);
+        conn.add_namespace(turso_core::Namespace::database(
+            "public",
+            turso_core::MAIN_DB_ID,
+        ));
         set_search_path(&conn, None, SettingScope::Session)?;
         Ok(Self {
             inner: Arc::new(PgConnectionInner { conn }),
@@ -92,6 +95,15 @@ impl PgConnection {
 
     pub fn prepare(&self, sql: impl AsRef<str>) -> crate::Result<crate::Statement> {
         prepare_statement(&self.inner, sql.as_ref()).map_err(Into::into)
+    }
+
+    pub fn prepare_copy_to_stdout(
+        &self,
+        spec: &turso_pg_parser::copy::CopyToStdout,
+    ) -> crate::Result<crate::Statement> {
+        crate::copy::prepare_copy_to_stdout(&self.inner.conn, spec)
+            .map(crate::Statement::new)
+            .map_err(Into::into)
     }
 
     pub fn query(&self, sql: impl AsRef<str>) -> crate::Result<Option<crate::Statement>> {
@@ -453,7 +465,11 @@ fn relation_lookup_databases(conn: &Arc<Connection>, schema: Option<&str>) -> Ve
             .contains_key(&turso_core::TEMP_DB_ID)
             .then_some(turso_core::TEMP_DB_ID)
             .into_iter()
-            .chain(conn.search_order())
+            .chain(
+                conn.search_order()
+                    .into_iter()
+                    .map(|namespace| namespace.database_id()),
+            )
             .map(|id| database_names[&id].clone())
             .collect(),
     }
@@ -464,11 +480,27 @@ fn relation_lookup_databases(conn: &Arc<Connection>, schema: Option<&str>) -> Ve
 /// The default search_path, "$user", public, gives public, since there is no
 /// schema named after a user.
 pub(crate) fn current_schema(conn: &Connection) -> Option<String> {
-    let database_id = *conn.search_order().first()?;
+    let database_id = conn.search_order().first()?.database_id();
     if database_id == turso_core::MAIN_DB_ID {
         return Some("public".to_owned());
     }
     conn.namespace_name(database_id)
+}
+
+pub(crate) fn current_schemas(conn: &Connection, include_implicit: bool) -> Vec<String> {
+    let mut schemas = Vec::new();
+    for name in conn
+        .search_path()
+        .unwrap_or_else(|| vec!["public".to_owned()])
+    {
+        if catalog::namespace_exists(conn, &name) && !schemas.contains(&name) {
+            schemas.push(name);
+        }
+    }
+    if include_implicit && !schemas.iter().any(|name| name == "pg_catalog") {
+        schemas.insert(0, "pg_catalog".to_owned());
+    }
+    schemas
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {

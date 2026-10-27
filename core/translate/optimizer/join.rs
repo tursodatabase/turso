@@ -1,4 +1,3 @@
-use crate::namespace::NamespaceId;
 use crate::{alloc::TryReserveError, turso_assert};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -1619,7 +1618,7 @@ pub(crate) fn hir_plain_rowid_table(
         return false;
     };
     matches!(&planned.table, Table::BTree(table)
-        if table.has_rowid && !schema.is_materialized_view(NamespaceId::ROOT, &table.name))
+        if table.has_rowid && !schema.is_materialized_view(planned.namespace.id, &table.name))
         && definition.column_type_programs.iter().all(Option::is_none)
         && definition
             .columns
@@ -2495,6 +2494,7 @@ fn get_best_seek_score<E>(
             },
         };
         let analyze_ctx = AnalyzeCtx {
+            namespace: rhs_source.namespace(),
             table_name: rhs_table.get_name(),
             index: candidate.index.as_ref(),
             stats: analyze_stats,
@@ -3357,6 +3357,7 @@ mod tests {
         let table = Table::BTree(table);
         HirPlannedSource {
             table,
+            namespace: crate::namespace::NamespaceRef::root_of(crate::MAIN_DB_ID),
             internal_id,
             join_info: join_kind.map(|kind| HirJoinInfo { kind }),
             col_used_mask: ColumnUsedMask::default(),

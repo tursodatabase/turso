@@ -68,7 +68,7 @@ pub(super) fn compile_triggers(
     session: &HirSession<'_>,
     parent: &ProgramBuilder,
     table: &BTreeTable,
-    database: usize,
+    database: hir::DatabaseId,
     triggers: &[hir::ResolvedTrigger],
     conflict_override: Option<ResolveType>,
 ) -> Result<Vec<CompiledTrigger>> {
@@ -91,7 +91,7 @@ fn compile_trigger(
     session: &HirSession<'_>,
     parent: &ProgramBuilder,
     table: &BTreeTable,
-    database: usize,
+    database: hir::DatabaseId,
     trigger: &hir::ResolvedTrigger,
     conflict_override: Option<ResolveType>,
 ) -> Result<Compiled> {
@@ -111,11 +111,11 @@ fn compile_trigger(
 
     let definition = trigger.value();
     let plan = session.plan(SemanticRootInput::TriggerProgram {
-        database: hir::DatabaseId::new(database),
+        database,
         // Triggers stored in the temp schema (TEMP triggers, and triggers on
         // TEMP tables) look up their command tables by the normal rules.
-        command_database: (!definition.temporary && database != crate::TEMP_DB_ID)
-            .then(|| hir::DatabaseId::new(database)),
+        command_database: (!definition.temporary && database.index() != crate::TEMP_DB_ID)
+            .then_some(database),
         table_name: &table.name,
         event: definition.event.clone(),
         new_is_decoded: definition.time == TriggerTime::Before,
@@ -432,7 +432,7 @@ fn target_triggers(
         session,
         parent,
         &table,
-        database.index(),
+        database,
         triggers,
         conflict_override,
     )
