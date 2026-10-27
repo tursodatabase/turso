@@ -10,7 +10,6 @@ use super::{
     },
 };
 use crate::alloc::TursoIteratorExt;
-use crate::namespace::NamespaceId;
 use crate::schema::GeneratedType;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::{table_mask_from_expr, TableMask};
@@ -106,12 +105,13 @@ impl AvailableIndexes {
             .filter(|jt| matches!(jt.table, Table::BTree(_) | Table::Virtual(_))) // only b-tree tables can have indexes
             .filter(|jt| jt.btree().is_none_or(|btree| btree.has_rowid))
             .filter_map(|jt| {
-                let indexes: VecDeque<_> = resolver.with_schema(jt.database_id, |schema| {
-                    schema
-                        .indices_including_backing(NamespaceId::ROOT, jt.table.get_name())
-                        .cloned()
-                        .collect()
-                });
+                let indexes: VecDeque<_> =
+                    resolver.with_schema(jt.namespace.database_id, |schema| {
+                        schema
+                            .indices_including_backing(jt.namespace.id, jt.table.get_name())
+                            .cloned()
+                            .collect()
+                    });
                 if indexes.is_empty() {
                     return None;
                 }
@@ -793,8 +793,8 @@ fn transform_match_to_fts_match(
             .find(|t| t.internal_id == table_id)
             .and_then(|t| {
                 if let Table::BTree(btree) = &t.table {
-                    Some(resolver.with_schema(t.database_id, |schema| {
-                        schema.has_fts_index(NamespaceId::ROOT, &btree.name)
+                    Some(resolver.with_schema(t.namespace.database_id, |schema| {
+                        schema.has_fts_index(t.namespace.id, &btree.name)
                     }))
                 } else {
                     None
@@ -1452,10 +1452,9 @@ fn update_write_set_reason(
             .iter()
             .flat_map(|set_clause| set_clause.column_names.iter().cloned())
             .try_collect()?;
-        let database_id = table_ref.database_id;
         if has_triggers_including_temp(
             resolver,
-            database_id,
+            table_ref.namespace,
             TriggerEvent::Update,
             Some(&updated_col_names),
             btree_table,
@@ -1470,8 +1469,8 @@ fn update_write_set_reason(
         // twice. Self-referential cascades likewise rewrite rows in the
         // target during the scan. Materialize target rowids first to keep
         // the write set stable. (See issue #6460.)
-        let referencing_fks = resolver.with_schema(database_id, |s| {
-            s.resolved_fks_referencing(NamespaceId::ROOT, &btree_table.name)
+        let referencing_fks = resolver.with_schema(table_ref.namespace.database_id, |s| {
+            s.resolved_fks_referencing(table_ref.namespace.id, &btree_table.name)
         })?;
         for fk in &referencing_fks {
             if matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict) {
@@ -2177,7 +2176,7 @@ fn group_count_from_analyze(plan: &SelectPlan, group_by: &GroupBy, schema: &Sche
         .index_stats
         .iter()
         .filter_map(|(index_name, index_stats)| {
-            let index = schema.get_index(NamespaceId::ROOT, &btree.name, index_name)?;
+            let index = schema.get_index(table.namespace.id, &btree.name, index_name)?;
             if index.where_clause.is_some() || index.columns.len() < columns.len() {
                 return None;
             }

@@ -15,7 +15,7 @@ use super::integrity_check::{
 use crate::function::Func;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::pragma::pragma_for;
-use crate::schema::{BTreeTable, Index, Schema, Table};
+use crate::schema::{BTreeTable, Index, IndexColumn, Schema, Table, EXPR_INDEX_SENTINEL};
 use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
@@ -1136,8 +1136,7 @@ fn query_pragma(
                     )? {
                         for (seqno, col) in index.columns.iter().enumerate() {
                             program.emit_int(seqno as i64, base_reg);
-                            program.emit_int(col.pos_in_table as i64, base_reg + 1);
-                            program.emit_string8(col.name.clone(), base_reg + 2);
+                            emit_index_column_cid_and_name(program, col, base_reg + 1);
                             program.emit_result_row(base_reg, 3);
                         }
                     }
@@ -1182,8 +1181,7 @@ fn query_pragma(
                                 .unwrap_or_else(|| "BINARY".to_string());
 
                             program.emit_int(seqno as i64, base_reg);
-                            program.emit_int(col.pos_in_table as i64, base_reg + 1);
-                            program.emit_string8(col.name.clone(), base_reg + 2);
+                            emit_index_column_cid_and_name(program, col, base_reg + 1);
                             program.emit_int(desc as i64, base_reg + 3);
                             program.emit_string8(coll, base_reg + 4);
                             program.emit_int(1, base_reg + 5); // key column
@@ -1195,7 +1193,7 @@ fn query_pragma(
                             let seqno = index.columns.len();
                             program.emit_int(seqno as i64, base_reg);
                             program.emit_int(-1, base_reg + 1);
-                            program.emit_string8(String::new(), base_reg + 2);
+                            program.emit_null(base_reg + 2, None);
                             program.emit_int(0, base_reg + 3);
                             program.emit_string8("BINARY".to_string(), base_reg + 4);
                             program.emit_int(0, base_reg + 5); // not a key column
@@ -1955,6 +1953,18 @@ fn without_rowid_primary_key_index(table: &BTreeTable) -> Result<Option<Index>> 
         primary_key.and_then(|us| us.constraint_name.clone()),
     )?;
     Ok(Some(index))
+}
+
+/// Emits the `cid` and `name` of PRAGMA index_info / index_xinfo. Like SQLite,
+/// an expression column has cid -2 and a NULL name.
+fn emit_index_column_cid_and_name(program: &mut ProgramBuilder, col: &IndexColumn, dest: usize) {
+    if col.pos_in_table == EXPR_INDEX_SENTINEL {
+        program.emit_int(-2, dest);
+        program.emit_null(dest + 1, None);
+    } else {
+        program.emit_int(col.pos_in_table as i64, dest);
+        program.emit_string8(col.name.clone(), dest + 1);
+    }
 }
 
 /// 0-based index of `column` within `primary_key_columns`, if present.

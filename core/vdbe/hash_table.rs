@@ -830,11 +830,64 @@ struct SpillState {
     temp_file: TempFile,
     /// Partitioning strategy for this spill.
     partitioning: Partitioning,
-    /// DISTINCT only, empty otherwise: for each partition, the hash of every key
-    /// it holds, in its buffer or on disk. Equal keys have equal hashes, so a key
-    /// whose hash is missing here cannot be a duplicate of anything on disk, and
-    /// `insert_distinct` does not need to load the partition to find that out.
-    distinct_key_hashes: Vec<HashSet<u64>>,
+    /// DISTINCT only, empty otherwise: where the key with each hash is. Equal keys
+    /// have equal hashes, so a new key needs no disk read and a duplicate of a key
+    /// on disk needs to read only that one key, not its whole partition.
+    distinct_key_places: Vec<HashMap<u64, PackedDistinctKeyPlace>>,
+    distinct_key_read: Option<DistinctKeyRead>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DistinctKeyPlace {
+    InBuffer,
+    OnDisk { offset: u64, len: usize },
+    OnDiskWithoutOffset,
+    SharedByDifferentKeys,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PackedDistinctKeyPlace(u64);
+
+impl PackedDistinctKeyPlace {
+    const LEN_BITS: u32 = 24;
+    const IN_BUFFER: u64 = u64::MAX;
+    const SHARED_BY_DIFFERENT_KEYS: u64 = u64::MAX - 1;
+    const ON_DISK_WITHOUT_OFFSET: u64 = u64::MAX - 2;
+
+    fn new(place: DistinctKeyPlace) -> Self {
+        match place {
+            DistinctKeyPlace::InBuffer => Self(Self::IN_BUFFER),
+            DistinctKeyPlace::SharedByDifferentKeys => Self(Self::SHARED_BY_DIFFERENT_KEYS),
+            DistinctKeyPlace::OnDiskWithoutOffset => Self(Self::ON_DISK_WITHOUT_OFFSET),
+            DistinctKeyPlace::OnDisk { offset, len } => {
+                let offset_limit = (1u64 << (u64::BITS - Self::LEN_BITS)) - 1;
+                let len_limit = 1u64 << Self::LEN_BITS;
+                if offset < offset_limit && (len as u64) < len_limit {
+                    Self((offset << Self::LEN_BITS) | len as u64)
+                } else {
+                    Self(Self::ON_DISK_WITHOUT_OFFSET)
+                }
+            }
+        }
+    }
+
+    fn get(self) -> DistinctKeyPlace {
+        match self.0 {
+            Self::IN_BUFFER => DistinctKeyPlace::InBuffer,
+            Self::SHARED_BY_DIFFERENT_KEYS => DistinctKeyPlace::SharedByDifferentKeys,
+            Self::ON_DISK_WITHOUT_OFFSET => DistinctKeyPlace::OnDiskWithoutOffset,
+            packed => DistinctKeyPlace::OnDisk {
+                offset: packed >> Self::LEN_BITS,
+                len: (packed & ((1u64 << Self::LEN_BITS) - 1)) as usize,
+            },
+        }
+    }
+}
+
+struct DistinctKeyRead {
+    offset: u64,
+    io_state: Arc<AtomicSpillIOState>,
+    bytes: Arc<RwLock<Vec<u8>>>,
 }
 
 impl SpillState {
@@ -851,7 +904,10 @@ impl SpillState {
             next_spill_offset: 0,
             temp_file: TempFile::with_temp_store(io, temp_store)?,
             partitioning,
-            distinct_key_hashes: vec![],
+            distinct_key_places: (0..partitioning.count)
+                .map(|_| HashMap::default())
+                .try_collect()?,
+            distinct_key_read: None,
         })
     }
 
@@ -1310,37 +1366,33 @@ impl HashTable {
                 return Ok(IOResult::Done(false));
             }
 
-            // Load the spilled partition only if a key with this hash went to disk;
-            // otherwise nothing there can equal this key.
-            let may_be_on_disk = {
-                let spill_state = self.spill_state.as_ref().expect("spill state exists");
-                turso_assert_eq!(
-                    spill_state.distinct_key_hashes.len(),
-                    spill_state.partitioning.count,
-                    "DISTINCT spill state must track key hashes for every partition"
-                );
-                spill_state.find_partition(partition_idx).is_some()
-                    && spill_state.distinct_key_hashes[partition_idx].contains(&hash)
-            };
-            if may_be_on_disk && !self.is_partition_loaded(partition_idx) {
-                return_if_io!(self.load_spilled_partition(partition_idx, metrics.as_deref_mut()));
-            }
-
-            // Check loaded partition for duplicates
-            let has_spilled_dup = 'has_spilled_dup: {
-                let spill_state = self.spill_state.as_ref().expect("spill state exists");
-                let Some(partition) = spill_state.find_partition(partition_idx) else {
-                    break 'has_spilled_dup false;
-                };
-                if partition.buckets.is_empty() {
-                    break 'has_spilled_dup false;
+            let place = self
+                .spill_state
+                .as_ref()
+                .expect("spill state exists")
+                .distinct_key_places[partition_idx]
+                .get(&hash)
+                .map(|place| place.get());
+            let has_spilled_dup = match place {
+                None | Some(DistinctKeyPlace::InBuffer) => false,
+                Some(DistinctKeyPlace::OnDisk { offset, len }) => {
+                    return_if_io!(self.spilled_key_equals(
+                        offset,
+                        len,
+                        key_refs,
+                        metrics.as_deref_mut()
+                    ))
                 }
-                let bucket_idx = (hash as usize) % partition.buckets.len();
-                let bucket = &partition.buckets[bucket_idx];
-                bucket.entries.iter().any(|entry| {
-                    entry.hash == hash
-                        && keys_equal_distinct(&entry.key_values, key_refs, &self.collations)
-                })
+                Some(
+                    DistinctKeyPlace::OnDiskWithoutOffset | DistinctKeyPlace::SharedByDifferentKeys,
+                ) => {
+                    return_if_io!(self.spilled_partition_has_key(
+                        partition_idx,
+                        hash,
+                        key_refs,
+                        metrics.as_deref_mut()
+                    ))
+                }
             };
             if has_spilled_dup {
                 return Ok(IOResult::Done(false));
@@ -1360,7 +1412,12 @@ impl HashTable {
                     key_values.iter().cloned().try_collect()?,
                     0,
                 ))?;
-                spill_state.distinct_key_hashes[partition_idx].try_insert(hash)?;
+                let new_place = match place {
+                    None => DistinctKeyPlace::InBuffer,
+                    Some(_) => DistinctKeyPlace::SharedByDifferentKeys,
+                };
+                spill_state.distinct_key_places[partition_idx]
+                    .try_insert(hash, PackedDistinctKeyPlace::new(new_place))?;
             }
             self.num_entries += 1;
             self.mem_used += entry_size;
@@ -1385,7 +1442,7 @@ impl HashTable {
                 let partitioning = Partitioning::new(partition_count);
                 self.spill_state = Some(SpillState::new(&self.io, self.temp_store, partitioning)?);
                 self.redistribute_to_partitions()?;
-                self.record_distinct_key_hashes()?;
+                self.record_distinct_key_places()?;
                 self.state = HashTableState::Spilled;
             }
             return self.insert_distinct(key_values, key_refs, metrics);
@@ -1404,20 +1461,114 @@ impl HashTable {
         Ok(IOResult::Done(true))
     }
 
-    /// Called once, when a DISTINCT table first spills and its entries have just
-    /// been moved into the partition buffers: records each entry's hash in the
-    /// set of the partition it belongs to.
-    fn record_distinct_key_hashes(&mut self) -> Result<()> {
-        let spill_state = self.spill_state.as_mut().expect("spill state must exist");
-        let mut hashes = Vec::try_with_capacity_ext(spill_state.partitioning.count)?;
-        for buffer in &spill_state.partition_buffers {
-            let mut set = HashSet::try_with_capacity_ext(buffer.entries.len())?;
-            for entry in &buffer.entries {
-                set.try_insert(entry.hash)?;
+    fn spilled_key_equals(
+        &mut self,
+        offset: u64,
+        len: usize,
+        key_refs: &[ValueRef],
+        metrics: Option<&mut HashJoinMetrics>,
+    ) -> IOResultOr<bool> {
+        let spill_state = self.spill_state.as_mut().expect("spill state exists");
+        let read = match spill_state.distinct_key_read.take() {
+            Some(read) if read.offset == offset => read,
+            _ => {
+                let read = DistinctKeyRead {
+                    offset,
+                    io_state: Arc::new(AtomicSpillIOState::new(SpillIOState::WaitingForRead)),
+                    bytes: Arc::new(RwLock::new(vec![])),
+                };
+                let io_state = read.io_state.clone();
+                let bytes = read.bytes.clone();
+                let read_complete = Box::new(
+                    move |res: Result<(Arc<Buffer>, i32), CompletionError>| match res {
+                        Ok((buf, bytes_read)) => {
+                            bytes
+                                .write()
+                                .extend_from_slice(&buf.as_slice()[..bytes_read as usize]);
+                            io_state.set(SpillIOState::ReadComplete);
+                            None
+                        }
+                        Err(e) => {
+                            tracing::error!("Error reading spilled DISTINCT key: {e:?}");
+                            io_state.set(SpillIOState::Error);
+                            None
+                        }
+                    },
+                );
+                let completion =
+                    Completion::new_read(Arc::new(Buffer::new_temporary(len)), read_complete);
+                let c = spill_state.temp_file.file.pread(offset, completion)?;
+                if !c.finished() {
+                    spill_state.distinct_key_read = Some(read);
+                    io_yield_one!(c);
+                }
+                read
             }
-            hashes.try_push(set)?;
+        };
+        match read.io_state.get() {
+            SpillIOState::ReadComplete => {}
+            SpillIOState::WaitingForRead => {
+                spill_state.distinct_key_read = Some(read);
+                io_yield_one!(Completion::new_yield());
+            }
+            SpillIOState::Error => {
+                return Err(
+                    LimboError::InternalError("hash table spill I/O failure".into()).into(),
+                );
+            }
+            state => unreachable!("unexpected spilled DISTINCT key read state: {state:?}"),
         }
-        spill_state.distinct_key_hashes = hashes;
+        let bytes = read.bytes.read();
+        if unlikely(bytes.len() != len) {
+            return Err(LimboError::Corrupt("HashEntry: truncated entry".into()).into());
+        }
+        if let Some(metrics) = metrics {
+            metrics.load_bytes_read = metrics.load_bytes_read.saturating_add(len as u64);
+        }
+        let (entry, consumed) = HashEntry::deserialize(&bytes)?;
+        turso_assert_eq!(consumed, len, "expected to consume entire entry");
+        Ok(IOResult::Done(keys_equal_distinct(
+            &entry.key_values,
+            key_refs,
+            &self.collations,
+        )))
+    }
+
+    fn spilled_partition_has_key(
+        &mut self,
+        partition_idx: usize,
+        hash: u64,
+        key_refs: &[ValueRef],
+        metrics: Option<&mut HashJoinMetrics>,
+    ) -> IOResultOr<bool> {
+        if !self.is_partition_loaded(partition_idx) {
+            return_if_io!(self.load_spilled_partition(partition_idx, metrics));
+        }
+        let spill_state = self.spill_state.as_ref().expect("spill state exists");
+        let Some(partition) = spill_state.find_partition(partition_idx) else {
+            return Ok(IOResult::Done(false));
+        };
+        if partition.buckets.is_empty() {
+            return Ok(IOResult::Done(false));
+        }
+        let bucket = &partition.buckets[(hash as usize) % partition.buckets.len()];
+        Ok(IOResult::Done(bucket.entries.iter().any(|entry| {
+            entry.hash == hash && keys_equal_distinct(&entry.key_values, key_refs, &self.collations)
+        })))
+    }
+
+    fn record_distinct_key_places(&mut self) -> Result<()> {
+        let spill_state = self.spill_state.as_mut().expect("spill state must exist");
+        for (partition_idx, buffer) in spill_state.partition_buffers.iter().enumerate() {
+            for entry in &buffer.entries {
+                let place = match spill_state.distinct_key_places[partition_idx].get(&entry.hash) {
+                    None => DistinctKeyPlace::InBuffer,
+                    Some(_) => DistinctKeyPlace::SharedByDifferentKeys,
+                };
+                spill_state.distinct_key_places[partition_idx]
+                    .try_insert(entry.hash, PackedDistinctKeyPlace::new(place))?;
+            }
+        }
         Ok(())
     }
 
@@ -1529,14 +1680,20 @@ impl HashTable {
         let buf = buffer.as_mut_slice();
         let mut offset = 0;
 
+        let file_offset = spill_state.next_spill_offset;
         for (entry, &entry_size) in partition.entries.iter().zip(entry_sizes.iter()) {
             offset += write_varint(&mut buf[offset..], entry_size as u64);
+            record_distinct_key_on_disk(
+                &mut spill_state.distinct_key_places[partition_idx],
+                entry.hash,
+                file_offset + offset as u64,
+                entry_size,
+            );
             offset += entry.serialize_to_slice(&mut buf[offset..]);
         }
 
         turso_assert!(offset == total_size, "serialized size mismatch");
 
-        let file_offset = spill_state.next_spill_offset;
         let data_size = total_size;
         let num_entries = spill_state.partition_buffers[partition_idx].entries.len();
         let mem_freed = spill_state.partition_buffers[partition_idx].mem_used;
@@ -1683,6 +1840,12 @@ impl HashTable {
 
             for (entry, &entry_size) in partition.entries.iter().zip(meta.entry_sizes.iter()) {
                 offset += write_varint(&mut buf[offset..], entry_size as u64);
+                record_distinct_key_on_disk(
+                    &mut spill_state.distinct_key_places[meta.idx],
+                    entry.hash,
+                    base_file_offset + offset as u64,
+                    entry_size,
+                );
                 offset += entry.serialize_to_slice(&mut buf[offset..]);
             }
         }
@@ -3328,6 +3491,27 @@ impl HashTable {
     }
 }
 
+fn record_distinct_key_on_disk(
+    places: &mut HashMap<u64, PackedDistinctKeyPlace>,
+    hash: u64,
+    offset: u64,
+    len: usize,
+) {
+    let Some(place) = places.get_mut(&hash) else {
+        return;
+    };
+    turso_assert!(
+        !matches!(
+            place.get(),
+            DistinctKeyPlace::OnDisk { .. } | DistinctKeyPlace::OnDiskWithoutOffset
+        ),
+        "a buffered DISTINCT key cannot share its hash with a key already on disk"
+    );
+    if place.get() == DistinctKeyPlace::InBuffer {
+        *place = PackedDistinctKeyPlace::new(DistinctKeyPlace::OnDisk { offset, len });
+    }
+}
+
 #[cfg(test)]
 mod hashtests {
     use super::*;
@@ -3813,7 +3997,11 @@ mod hashtests {
             next_spill_offset: 0,
             temp_file,
             partitioning,
-            distinct_key_hashes: vec![],
+            distinct_key_places: (0..partitioning.count)
+                .map(|_| HashMap::default())
+                .try_collect()
+                .unwrap(),
+            distinct_key_read: None,
         };
         ht.spill_state = Some(spill_state);
         ht.state = HashTableState::Probing;
@@ -3864,7 +4052,11 @@ mod hashtests {
             next_spill_offset: truncated.len() as u64,
             temp_file,
             partitioning,
-            distinct_key_hashes: vec![],
+            distinct_key_places: (0..partitioning.count)
+                .map(|_| HashMap::default())
+                .try_collect()
+                .unwrap(),
+            distinct_key_read: None,
         };
         ht.spill_state = Some(spill_state);
         ht.state = HashTableState::Probing;
@@ -4159,6 +4351,148 @@ mod hashtests {
             {
                 return inserted;
             }
+        }
+    }
+
+    #[test]
+    fn test_insert_distinct_duplicate_reads_only_its_own_key_from_disk() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 4 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: Some(4),
+        };
+        let mut ht = HashTable::new(config, io).unwrap();
+        let mut metrics = HashJoinMetrics::default();
+
+        for key in 0..2048 {
+            assert!(insert_distinct_text(
+                &mut ht,
+                &format!("key{key}"),
+                &mut metrics
+            ));
+        }
+        assert!(ht.has_spilled());
+
+        for key in (0..2048).rev() {
+            assert!(
+                !insert_distinct_text(&mut ht, &format!("key{key}"), &mut metrics),
+                "key{key} inserted twice"
+            );
+        }
+        assert!(metrics.load_bytes_read > 0, "{metrics:?}");
+        assert!(
+            metrics.load_bytes_read <= metrics.spill_bytes_written,
+            "each duplicate must read only its own key, not its whole partition: {metrics:?}"
+        );
+    }
+
+    #[test]
+    fn test_insert_distinct_finds_duplicates_when_different_keys_share_a_hash() {
+        assert_duplicates_found_when_every_spilled_key_is(DistinctKeyPlace::SharedByDifferentKeys);
+    }
+
+    #[test]
+    fn test_insert_distinct_finds_duplicates_of_keys_on_disk_without_offset() {
+        assert_duplicates_found_when_every_spilled_key_is(DistinctKeyPlace::OnDiskWithoutOffset);
+    }
+
+    fn assert_duplicates_found_when_every_spilled_key_is(place: DistinctKeyPlace) {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 4 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: Some(4),
+        };
+        let mut ht = HashTable::new(config, io).unwrap();
+        let mut metrics = HashJoinMetrics::default();
+
+        for key in 0..2048 {
+            assert!(insert_distinct_text(
+                &mut ht,
+                &format!("key{key}"),
+                &mut metrics
+            ));
+        }
+        for map in ht
+            .spill_state
+            .as_mut()
+            .unwrap()
+            .distinct_key_places
+            .iter_mut()
+        {
+            for stored_place in map.values_mut() {
+                *stored_place = PackedDistinctKeyPlace::new(place);
+            }
+        }
+
+        for key in (0..2048).rev() {
+            assert!(
+                !insert_distinct_text(&mut ht, &format!("key{key}"), &mut metrics),
+                "key{key} inserted twice"
+            );
+        }
+        assert!(insert_distinct_text(&mut ht, "new key", &mut metrics));
+    }
+
+    #[test]
+    fn test_distinct_key_place_map_entry_takes_two_u64s() {
+        assert_eq!(
+            std::mem::size_of::<(u64, PackedDistinctKeyPlace)>(),
+            2 * std::mem::size_of::<u64>()
+        );
+    }
+
+    #[test]
+    fn test_packed_distinct_key_place_keeps_every_place() {
+        let largest_offset = (1u64 << 40) - 2;
+        let largest_len = (1usize << 24) - 1;
+        for place in [
+            DistinctKeyPlace::InBuffer,
+            DistinctKeyPlace::SharedByDifferentKeys,
+            DistinctKeyPlace::OnDiskWithoutOffset,
+            DistinctKeyPlace::OnDisk { offset: 0, len: 0 },
+            DistinctKeyPlace::OnDisk {
+                offset: 12345,
+                len: 678,
+            },
+            DistinctKeyPlace::OnDisk {
+                offset: largest_offset,
+                len: largest_len,
+            },
+        ] {
+            assert_eq!(PackedDistinctKeyPlace::new(place).get(), place);
+        }
+    }
+
+    #[test]
+    fn test_packed_distinct_key_place_without_room_for_offset_or_len() {
+        for place in [
+            DistinctKeyPlace::OnDisk {
+                offset: (1u64 << 40) - 1,
+                len: 0,
+            },
+            DistinctKeyPlace::OnDisk {
+                offset: 0,
+                len: 1usize << 24,
+            },
+            DistinctKeyPlace::OnDisk {
+                offset: u64::MAX,
+                len: usize::MAX,
+            },
+        ] {
+            assert_eq!(
+                PackedDistinctKeyPlace::new(place).get(),
+                DistinctKeyPlace::OnDiskWithoutOffset
+            );
         }
     }
 

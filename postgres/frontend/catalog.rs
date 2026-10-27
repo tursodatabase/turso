@@ -169,7 +169,9 @@ impl Dialect for PostgresDialect {
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
-        register_catalog_modules(crate::functions::register_functions(options))
+        let options = crate::functions::register_functions(options);
+        let options = crate::auth_functions::register_functions(options);
+        register_catalog_modules(options)
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
@@ -202,6 +204,10 @@ impl Dialect for PostgresDialect {
     }
 
     fn mod_of_integers_is_integer(&self) -> bool {
+        true
+    }
+
+    fn add_column_computes_default_for_existing_rows(&self) -> bool {
         true
     }
 }

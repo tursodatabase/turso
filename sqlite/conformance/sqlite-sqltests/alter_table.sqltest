@@ -3385,6 +3385,24 @@ expect error {
     Cannot add a column with non-constant default
 }
 
+# A default that names a column is rejected even on an empty table, as in
+# CREATE TABLE. A bare name is a string literal.
+test alter-table-add-column-default-with-column-name-errors {
+    CREATE TABLE t_cnd(x INTEGER);
+    ALTER TABLE t_cnd ADD COLUMN b DEFAULT (x * 0 + 4);
+}
+expect error {
+    is not constant
+}
+
+test alter-table-add-column-parenthesized-column-name-default-errors {
+    CREATE TABLE t_cnd2(x INTEGER);
+    ALTER TABLE t_cnd2 ADD COLUMN b DEFAULT (x);
+}
+expect error {
+    is not constant
+}
+
 # The following preserve-schema-collate tests ensure that alter table
 # preserve the original collation defined on table creation.
 # https://github.com/tursodatabase/turso/issues/8254

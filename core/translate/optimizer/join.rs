@@ -2387,6 +2387,7 @@ mod tests {
 
     use super::*;
     use crate::alloc::TursoSliceExt;
+    use crate::namespace::NamespaceRef;
     use crate::{
         schema::{
             BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn,
@@ -3929,7 +3930,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
             indexed: None,
         });
@@ -4029,7 +4030,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
             indexed: None,
         });
@@ -4146,7 +4147,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
             indexed: None,
         });
@@ -4342,7 +4343,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
             indexed: None,
         }

@@ -1,7 +1,6 @@
 use super::*;
 use crate::alloc::TursoIteratorExt;
 use crate::function::AggFunc;
-use crate::namespace::NamespaceId;
 
 pub fn init_distinct(
     program: &mut ProgramBuilder,
@@ -73,7 +72,7 @@ impl InitLoop {
             let prepared = prepare_cdc_if_necessary(
                 program,
                 t_ctx.resolver.schema(),
-                changed_table.database_id,
+                changed_table.namespace.database_id,
                 Some(changed_table.table.get_name()),
             )?;
             if let Some((cdc_cursor_id, _)) = prepared {
@@ -150,8 +149,8 @@ impl InitLoop {
             // Ensure non-main databases have a Transaction instruction for read access.
             let schema_cookie = t_ctx
                 .resolver
-                .with_schema(table.database_id, |s| s.schema_version);
-            program.begin_read_on_database(table.database_id, schema_cookie)?;
+                .with_schema(table.namespace.database_id, |s| s.schema_version);
+            program.begin_read_on_database(table.namespace.database_id, schema_cookie)?;
             // Initialize bookkeeping for OUTER JOIN
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.keeps_left_rows() {
@@ -198,14 +197,14 @@ impl InitLoop {
                             program.emit_insn(Insn::OpenRead {
                                 cursor_id,
                                 root_page,
-                                db: table.database_id,
+                                db: table.namespace.database_id,
                             });
                         }
                         if let Some(index_cursor_id) = index_cursor_id {
                             program.emit_insn(Insn::OpenRead {
                                 cursor_id: index_cursor_id,
                                 root_page: index.as_ref().unwrap().root_page,
-                                db: table.database_id,
+                                db: table.namespace.database_id,
                             });
                         }
                     }
@@ -215,21 +214,24 @@ impl InitLoop {
                             cursor_id: table_cursor_id
                                 .expect("table cursor is always opened in OperationMode::DELETE"),
                             root_page: root_page.into(),
-                            db: table.database_id,
+                            db: table.namespace.database_id,
                         });
                         if let Some(index_cursor_id) = index_cursor_id {
                             program.emit_insn(Insn::OpenWrite {
                                 cursor_id: index_cursor_id,
                                 root_page: index.as_ref().unwrap().root_page.into(),
-                                db: table.database_id,
+                                db: table.namespace.database_id,
                             });
                         }
                         // For delete, we need to open all the other indexes too for writing
-                        let indices: Vec<_> = t_ctx.resolver.with_schema(table.database_id, |s| {
-                            s.get_indices(NamespaceId::ROOT, table.table.get_name())
-                                .cloned()
-                                .collect()
-                        });
+                        let indices: Vec<_> =
+                            t_ctx
+                                .resolver
+                                .with_schema(table.namespace.database_id, |s| {
+                                    s.get_indices(table.namespace.id, table.table.get_name())
+                                        .cloned()
+                                        .collect()
+                                });
                         for index in &indices {
                             if table
                                 .op
@@ -245,7 +247,7 @@ impl InitLoop {
                             program.emit_insn(Insn::OpenWrite {
                                 cursor_id,
                                 root_page: index.root_page.into(),
-                                db: table.database_id,
+                                db: table.namespace.database_id,
                             });
                         }
                     }
@@ -258,7 +260,7 @@ impl InitLoop {
                                         "table cursor is always opened in OperationMode::UPDATE",
                                     ),
                                     root_page: root_page.into(),
-                                    db: table.database_id,
+                                    db: table.namespace.database_id,
                                 });
                             }
                             UpdateRowSource::PrebuiltEphemeralTable { target_table, .. } => {
@@ -267,15 +269,15 @@ impl InitLoop {
                                 program.emit_insn(Insn::OpenWrite {
                                     cursor_id: target_table_cursor_id,
                                     root_page: target_table.btree().unwrap().root_page.into(),
-                                    db: target_table.database_id,
+                                    db: target_table.namespace.database_id,
                                 });
                             }
                         }
                         let write_db_id = match &update_mode {
                             UpdateRowSource::PrebuiltEphemeralTable { target_table, .. } => {
-                                target_table.database_id
+                                target_table.namespace.database_id
                             }
-                            _ => table.database_id,
+                            _ => table.namespace.database_id,
                         };
                         if let Some(index_cursor_id) = index_cursor_id {
                             program.emit_insn(Insn::OpenWrite {
@@ -324,7 +326,7 @@ impl InitLoop {
                                 program.emit_insn(Insn::OpenRead {
                                     cursor_id: table_cursor_id,
                                     root_page: table.table.get_root_page()?,
-                                    db: table.database_id,
+                                    db: table.namespace.database_id,
                                 });
                             }
                         }
@@ -336,18 +338,23 @@ impl InitLoop {
                             program.emit_insn(Insn::OpenWrite {
                                 cursor_id: table_cursor_id,
                                 root_page: table.table.get_root_page()?.into(),
-                                db: table.database_id,
+                                db: table.namespace.database_id,
                             });
 
                             // For DELETE, we need to open all the indexes for writing
                             // UPDATE opens these in emit_program_for_update() separately
                             if matches!(mode, OperationMode::DELETE) {
                                 let indices: Vec<_> =
-                                    t_ctx.resolver.with_schema(table.database_id, |s| {
-                                        s.get_indices(NamespaceId::ROOT, table.table.get_name())
+                                    t_ctx
+                                        .resolver
+                                        .with_schema(table.namespace.database_id, |s| {
+                                            s.get_indices(
+                                                table.namespace.id,
+                                                table.table.get_name(),
+                                            )
                                             .cloned()
                                             .collect()
-                                    });
+                                        });
                                 for index in &indices {
                                     if table
                                         .op
@@ -363,7 +370,7 @@ impl InitLoop {
                                     program.emit_insn(Insn::OpenWrite {
                                         cursor_id,
                                         root_page: index.root_page.into(),
-                                        db: table.database_id,
+                                        db: table.namespace.database_id,
                                     });
                                 }
                             }
@@ -394,7 +401,7 @@ impl InitLoop {
                                             "index cursor is always opened in Seek with index",
                                         ),
                                         root_page: index.root_page,
-                                        db: table.database_id,
+                                        db: table.namespace.database_id,
                                     });
                                 }
                                 OperationMode::UPDATE { .. } | OperationMode::DELETE => {
@@ -403,7 +410,7 @@ impl InitLoop {
                                             "index cursor is always opened in Seek with index",
                                         ),
                                         root_page: index.root_page.into(),
-                                        db: table.database_id,
+                                        db: table.namespace.database_id,
                                     });
                                 }
                                 _ => {
@@ -422,14 +429,14 @@ impl InitLoop {
                             program.emit_insn(Insn::OpenRead {
                                 cursor_id: table_cursor_id,
                                 root_page: table.table.get_root_page()?,
-                                db: table.database_id,
+                                db: table.namespace.database_id,
                             });
                         }
                         let index_cursor_id = index_cursor_id.unwrap();
                         program.emit_insn(Insn::OpenRead {
                             cursor_id: index_cursor_id,
                             root_page: table.op.index().unwrap().root_page,
-                            db: table.database_id,
+                            db: table.namespace.database_id,
                         });
                     }
                     OperationMode::DELETE => {
@@ -437,20 +444,23 @@ impl InitLoop {
                             program.emit_insn(Insn::OpenWrite {
                                 cursor_id: table_cursor_id,
                                 root_page: table.table.get_root_page()?.into(),
-                                db: table.database_id,
+                                db: table.namespace.database_id,
                             });
                         }
                         let index_cursor_id = index_cursor_id.expect("index cursor is always opened in OperationMode::DELETE for IndexMethodQuery");
                         program.emit_insn(Insn::OpenWrite {
                             cursor_id: index_cursor_id,
                             root_page: table.op.index().expect("index to exist").root_page.into(),
-                            db: table.database_id,
+                            db: table.namespace.database_id,
                         });
-                        let indices: Vec<_> = t_ctx.resolver.with_schema(table.database_id, |s| {
-                            s.get_indices(NamespaceId::ROOT, table.table.get_name())
-                                .cloned()
-                                .collect()
-                        });
+                        let indices: Vec<_> =
+                            t_ctx
+                                .resolver
+                                .with_schema(table.namespace.database_id, |s| {
+                                    s.get_indices(table.namespace.id, table.table.get_name())
+                                        .cloned()
+                                        .collect()
+                                });
                         for index in &indices {
                             if table
                                 .op
@@ -466,7 +476,7 @@ impl InitLoop {
                             program.emit_insn(Insn::OpenWrite {
                                 cursor_id,
                                 root_page: index.root_page.into(),
-                                db: table.database_id,
+                                db: table.namespace.database_id,
                             });
                         }
                     }
@@ -477,13 +487,13 @@ impl InitLoop {
                         program.emit_insn(Insn::OpenWrite {
                             cursor_id: table_cursor_id,
                             root_page: table.table.get_root_page()?.into(),
-                            db: table.database_id,
+                            db: table.namespace.database_id,
                         });
                         let index_cursor_id = index_cursor_id.unwrap();
                         program.emit_insn(Insn::OpenWrite {
                             cursor_id: index_cursor_id,
                             root_page: table.op.index().expect("index to exist").root_page.into(),
-                            db: table.database_id,
+                            db: table.namespace.database_id,
                         });
                     }
                     _ => panic!("Unsupported operation mode for index method"),
@@ -499,7 +509,7 @@ impl InitLoop {
                                 program.emit_insn(Insn::OpenRead {
                                     cursor_id: table_cursor_id,
                                     root_page: btree.root_page,
-                                    db: table.database_id,
+                                    db: table.namespace.database_id,
                                 });
                             }
                         }
@@ -517,7 +527,7 @@ impl InitLoop {
                                 program.emit_insn(Insn::OpenRead {
                                     cursor_id: table_cursor_id,
                                     root_page: btree.root_page,
-                                    db: table.database_id,
+                                    db: table.namespace.database_id,
                                 });
                             }
                             // Open cursors for each index branch
@@ -530,7 +540,7 @@ impl InitLoop {
                                     program.emit_insn(Insn::OpenRead {
                                         cursor_id: branch_cursor_id,
                                         root_page: index.root_page,
-                                        db: table.database_id,
+                                        db: table.namespace.database_id,
                                     });
                                 }
                             }
@@ -556,10 +566,9 @@ impl InitLoop {
             });
         }
 
-        for cond in where_clause
-            .iter()
-            .filter(|c| c.should_eval_before_loop(join_order, subqueries, Some(tables)))
-        {
+        for cond in where_clause.iter().filter(|c| {
+            c.should_eval_before_loop(join_order, subqueries, Some(tables), &t_ctx.resolver)
+        }) {
             let jump_target = program.allocate_label();
             let meta = ConditionMetadata {
                 jump_if_condition_is_true: false,

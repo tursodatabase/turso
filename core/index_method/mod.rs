@@ -47,6 +47,17 @@ pub trait IndexMethod: std::fmt::Debug + Send + Sync {
         &self,
         configuration: &IndexMethodConfiguration,
     ) -> Result<Arc<dyn IndexMethodAttachment>>;
+
+    /// Called when ALTER TABLE renames a column of a table that has an index of this method
+    /// Updates WITH clause parameters that name the column
+    fn rename_column_in_with_clause(
+        &self,
+        _with_clause: &mut [(ast::Name, Box<ast::Expr>)],
+        _from: &str,
+        _to: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]

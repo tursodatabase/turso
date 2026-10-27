@@ -678,3 +678,74 @@ test table-int4-width-does-not-limit-bigint-or-null {
 expect {
     1
 }
+
+test table-add-column-function-default-fills-each-existing-row {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN c uuid DEFAULT gen_random_uuid();
+    ALTER TABLE t ADD COLUMN d timestamptz DEFAULT now();
+    SELECT count(c), count(DISTINCT c), count(d) FROM t;
+}
+expect {
+    2|2|2
+}
+
+test table-add-column-expression-default-fills-existing-rows {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN e int DEFAULT (5 + 3);
+    INSERT INTO t (x) VALUES (3);
+    SELECT x, e FROM t ORDER BY x;
+}
+expect {
+    1|8
+    2|8
+    3|8
+}
+
+test table-add-column-default-with-column-reference-errors {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (5);
+    ALTER TABLE t ADD COLUMN c int DEFAULT x * 2;
+}
+expect error {}
+
+test table-add-column-not-null-default-with-null-inside-fills-existing-rows {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN c int NOT NULL DEFAULT coalesce(NULL, 7);
+    ALTER TABLE t ADD COLUMN d text NOT NULL DEFAULT CASE WHEN 1 < 2 THEN 'y' ELSE NULL END;
+    SELECT x, c, d FROM t ORDER BY x;
+}
+expect {
+    1|7|y
+    2|7|y
+}
+
+test table-add-column-not-null-default-that-is-null-errors {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN z int NOT NULL DEFAULT nullif(1, 1);
+}
+expect error {}
+
+test table-add-column-int4-volatile-default-keeps-in-range-values {
+    CREATE TABLE t(id bigint);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN a int DEFAULT ((random() * 0 + 7)::bigint);
+    SELECT id, a FROM t ORDER BY id;
+}
+expect {
+    1|7
+    2|7
+}
+
+test table-add-column-int4-volatile-default-rejects-out-of-range-values {
+    CREATE TABLE t(id bigint);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN a int DEFAULT ((random() * 0 + 3000000000)::bigint);
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}

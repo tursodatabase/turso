@@ -134,8 +134,9 @@ pub(crate) fn validate_check_expr(
     Ok(())
 }
 
-fn validate_default_expr(expr: &ast::Expr, col: &ColumnDefinition) -> Result<()> {
-    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+pub(crate) fn validate_default_expr(expr: &ast::Expr, col: &ColumnDefinition) -> Result<()> {
+    let expr = translate_ident_to_string_literal(expr).unwrap_or_else(|| Box::new(expr.clone()));
+    walk_expr(&expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
             ast::Expr::Column { .. }
             | ast::Expr::RowId { .. }
@@ -762,11 +763,7 @@ fn validate(body: &ast::CreateTableBody, table_name: &str, resolver: &Resolver) 
                     ast::ColumnConstraint::Check { expr, .. } => {
                         validate_check_expr(expr, table_name, &column_names, resolver)?;
                     }
-                    ast::ColumnConstraint::Default(expr) => {
-                        let expr =
-                            translate_ident_to_string_literal(expr).unwrap_or_else(|| expr.clone());
-                        validate_default_expr(&expr, col_i)?
-                    }
+                    ast::ColumnConstraint::Default(expr) => validate_default_expr(expr, col_i)?,
                     ast::ColumnConstraint::Collate { collation_name } => {
                         let collation = resolver.resolve_collation(collation_name.as_str())?;
                         if collation.is_custom() {
@@ -1974,7 +1971,7 @@ pub fn translate_drop_table(
             s.any_resolved_fks_referencing(namespace.id, name)
         })
     {
-        emit_fk_drop_table_check(program, resolver, name, connection, database_id)?;
+        emit_fk_drop_table_check(program, resolver, name, connection, namespace)?;
     }
     let cdc_table = prepare_cdc_if_necessary(
         program,
@@ -2598,9 +2595,10 @@ pub fn translate_drop_table(
     // Drop the in-memory structures for the table
     program.emit_insn(Insn::DropTable {
         db: database_id,
+        namespace: namespace.id,
         _p2: 0,
         _p3: 0,
-        table_name: tbl_name.name.as_str().to_string(),
+        table_name: name.to_string(),
     });
 
     // If the dropped table owned an implicit AUTOINCREMENT sequence, tear
@@ -2618,10 +2616,7 @@ pub fn translate_drop_table(
         let seq_name =
             crate::schema::autoincrement_sequence_name(&normalize_ident(tbl_name.name.as_str()));
         crate::translate::sequence::emit_drop_sequence_cleanup(
-            program,
-            resolver,
-            database_id,
-            &seq_name,
+            program, resolver, namespace, &seq_name,
         )?;
     }
 
