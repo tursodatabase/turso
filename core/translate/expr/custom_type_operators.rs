@@ -115,6 +115,8 @@ struct Operand<'a> {
     may_be_integer: bool,
     /// Whether the operand is a REAL value and not a decimal literal.
     is_real: bool,
+    /// Whether the operand is a blob, which is not a number.
+    is_blob: bool,
     /// The operand's type, as `type_of` gives it.
     expr_type: &'a ExprType,
 }
@@ -137,21 +139,21 @@ impl<'a> Operand<'a> {
             )?,
             _ => None,
         };
+        let sqlite_type = sqlite_operand_type(expr_type.clone(), resolver.schema());
         let may_be_integer = matches!(
-            sqlite_operand_type(expr_type.clone(), resolver.schema()),
+            sqlite_type,
             ExprType::Builtin(BuiltinType::Integer | BuiltinType::Any)
         );
         let is_real = !is_decimal_literal(expr)
-            && matches!(
-                sqlite_operand_type(expr_type.clone(), resolver.schema()),
-                ExprType::Builtin(BuiltinType::Real)
-            );
+            && matches!(sqlite_type, ExprType::Builtin(BuiltinType::Real));
+        let is_blob = matches!(sqlite_type, ExprType::Builtin(BuiltinType::Blob));
         Ok(Self {
             value_type,
             column_type,
             literal_kind: literal_type_name(expr),
             may_be_integer,
             is_real,
+            is_blob,
             expr_type,
         })
     }
@@ -227,7 +229,7 @@ fn accepts_operand(arg: ArithmeticArg, op: &str, ty: &ColumnCustomType, operand:
         }
         ArithmeticArg::PlainValue => is_plain_value(op, operand),
         ArithmeticArg::Integer => is_plain_value(op, operand) && operand.may_be_integer,
-        ArithmeticArg::Exact => is_plain_value(op, operand) && !operand.is_real,
+        ArithmeticArg::Exact => is_plain_value(op, operand) && !operand.is_real && !operand.is_blob,
         ArithmeticArg::Real => is_plain_value(op, operand) && operand.is_real,
     }
 }

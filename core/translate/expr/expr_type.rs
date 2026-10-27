@@ -476,6 +476,11 @@ pub(crate) fn column_type(column: &Column, is_strict: bool, schema: &Schema) -> 
             type_def: Arc::clone(type_def),
             params: column.ty_params.clone(),
         },
+        // A BLOB column of a STRICT table holds only blobs. In other tables it
+        // may hold any value, as may an ANY column.
+        None if is_strict && column.ty_str.eq_ignore_ascii_case("blob") => {
+            ExprType::Builtin(BuiltinType::Blob)
+        }
         None => builtin_type_of_affinity(column.affinity()),
     };
     ExprType::array(scalar, column.array_dimensions())
@@ -485,7 +490,11 @@ fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
     let name = crate::util::dequote(&type_name.name);
     let scalar = match custom_cast_target(&name, type_name, schema) {
         Some(custom) => custom,
-        None => builtin_type_of_affinity(Affinity::of_written_type(&name)),
+        None => match Affinity::of_written_type(&name) {
+            // A CAST to BLOB always gives a blob.
+            Affinity::Blob => ExprType::Builtin(BuiltinType::Blob),
+            affinity => builtin_type_of_affinity(affinity),
+        },
     };
     ExprType::array(scalar, type_name.array_dimensions)
 }
@@ -820,6 +829,7 @@ mod tests {
             ("x'00'", builtin(BuiltinType::Blob)),
             ("NULL", ExprType::Null),
             ("CAST(1 AS TEXT)", builtin(BuiltinType::Text)),
+            ("CAST(1 AS BLOB)", builtin(BuiltinType::Blob)),
             ("CAST(1 AS cents)", custom("cents", &[])),
             ("CAST(1 AS numeric(10, 2))", custom("numeric", &["10", "2"])),
             // numeric needs a precision and a scale, so without them this is

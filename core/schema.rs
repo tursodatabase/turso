@@ -279,7 +279,7 @@ pub enum ArithmeticArg {
     /// A `PlainValue` that is an integer, or whose type is not known before the
     /// statement runs, such as a parameter. The function rejects anything else.
     Integer,
-    /// A `PlainValue` that is not a `Real`.
+    /// A `PlainValue` that is neither a `Real` nor a blob.
     Exact,
     /// A REAL value: a REAL column, a CAST to REAL, a function that returns
     /// one. A decimal literal such as `0.5` or `-0.5` is not one: as in

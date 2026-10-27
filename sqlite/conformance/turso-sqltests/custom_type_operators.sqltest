@@ -1419,3 +1419,45 @@ test op-numeric-mul-rounds-to-largest-scale {
 expect {
     16385|16385|001|000
 }
+
+# A blob is not a number, as in PostgreSQL, where numeric + bytea and date +
+# bytea do not exist. It must not be read as a stored numeric.
+@requires strict "uses STRICT tables"
+test op-numeric-plus-blob-column-error {
+    CREATE TABLE t(n numeric(10,2), b blob) STRICT;
+    INSERT INTO t VALUES (1, x'0102');
+    SELECT n + b FROM t;
+}
+expect error {
+    operator does not exist: numeric \+ blob
+}
+
+@requires strict "uses STRICT tables"
+test op-blob-literal-times-numeric-error {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1);
+    SELECT x'01' * n FROM t;
+}
+expect error {
+    operator does not exist: blob \* numeric
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-plus-cast-to-blob-error {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1);
+    SELECT n + CAST('1' AS BLOB) FROM t;
+}
+expect error {
+    operator does not exist: numeric \+ blob
+}
+
+@requires strict "uses STRICT tables"
+test op-date-plus-blob-column-error {
+    CREATE TABLE t(d date, b blob) STRICT;
+    INSERT INTO t VALUES ('2024-01-01', x'0102');
+    SELECT d + b FROM t;
+}
+expect error {
+    operator does not exist: date \+ blob
+}
