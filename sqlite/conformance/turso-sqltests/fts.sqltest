@@ -1134,6 +1134,13 @@ expect {
 
 @backend cli
 test fts-prefix-with-no-tokens {
+    CREATE TABLE prefix_docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT);
+    CREATE INDEX prefix_docs_fts ON prefix_docs USING fts(title, body);
+    INSERT INTO prefix_docs VALUES
+        (1, 'data', 'alpha'),
+        (2, 'database', 'beta'),
+        (3, 'data warehouse', 'gamma'),
+        (4, 'unrelated', 'database');
     SELECT id FROM prefix_docs WHERE fts_match(title, body, 'data !!*') ORDER BY id;
     SELECT id FROM prefix_docs WHERE fts_match(title, body, 'data AND !!*') ORDER BY id;
     SELECT id FROM prefix_docs WHERE fts_match(title, body, 'data AND !!*^2') ORDER BY id;
