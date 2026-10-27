@@ -3,7 +3,7 @@ use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::namespace::NamespaceId;
 use crate::translate::emitter::emit_columns_and_dependencies;
-use crate::translate::expr::{emit_stored_column, emit_table_column_for_dml};
+use crate::translate::expr::{comparison_affinity, emit_stored_column, emit_table_column_for_dml};
 use crate::translate::plan::ColumnMask;
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
@@ -11,6 +11,7 @@ use crate::{
     sync::{Arc, OnceLock, Weak},
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
     vdbe::{
+        affinity::Affinity,
         builder::{CursorType, DmlColumnContext, QueryMode},
         insn::{CmpInsFlags, ConstraintInfo, Insn, Subprogram},
         BranchOffset, PreparedProgram,
@@ -301,7 +302,7 @@ pub fn open_read_table(program: &mut ProgramBuilder, tbl: &Arc<BTreeTable>, db: 
 /// Copy `len` registers starting at `src_start` to a fresh block and apply index affinities.
 /// Returns the destination start register.
 #[inline]
-fn copy_with_affinity(
+pub(super) fn copy_with_affinity(
     program: &mut ProgramBuilder,
     src_start: usize,
     len: usize,
@@ -476,13 +477,17 @@ pub(super) fn emit_skip_if_any_null(
 /// Iterate a table and call `on_match` when all child columns equal the
 /// non-NULL key at `parent_key_start`.
 ///
+/// `comparison` says how a child column is compared with the parent key.
+///
 /// Rows with any NULL FK column do not reference a parent and are ignored. For
 /// self-referential UPDATEs, `self_exclude_rowid` skips the current row when
 /// its old child key is being updated away by the same statement.
-pub fn table_scan_match_any<F>(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn table_scan_match_any<F>(
     program: &mut ProgramBuilder,
     fk_ref: &ResolvedFkRef,
     parent_key_start: usize,
+    comparison: ScanComparison,
     self_exclude_rowid: Option<usize>,
     database_id: usize,
     resolver: &Resolver,
@@ -506,6 +511,30 @@ where
     let some_fk_cols_are_virtual = child_positions
         .iter()
         .any(|&pos| child_tbl.columns()[pos].is_virtual_generated());
+    let sqlite_comparisons = match comparison {
+        ScanComparison::Plain => None,
+        ScanComparison::Sqlite => Some(sqlite_key_comparisons(
+            fk_ref,
+            &child_positions,
+            database_id,
+            resolver,
+        )?),
+    };
+    // Eq writes the values that its affinity converts back to its registers,
+    // so the SQLite comparison uses a copy of the parent key.
+    let key_start = if sqlite_comparisons.is_some() {
+        let copy_start = program.alloc_registers(child_positions.len());
+        for i in 0..child_positions.len() {
+            program.emit_insn(Insn::Copy {
+                src_reg: parent_key_start + i,
+                dst_reg: copy_start + i,
+                extra_amount: 0,
+            });
+        }
+        copy_start
+    } else {
+        parent_key_start
+    };
 
     let ccur = open_read_table(program, child_tbl, database_id);
     let done = program.allocate_label();
@@ -559,12 +588,19 @@ where
         });
 
         let cont = program.allocate_label();
+        let (flags, collation) = match sqlite_comparisons.as_deref() {
+            Some(comparisons) => {
+                let (affinity, collation) = comparisons[i];
+                (CmpInsFlags::default().with_affinity(affinity), collation)
+            }
+            None => (CmpInsFlags::default(), CollationSeq::Binary),
+        };
         program.emit_insn(Insn::Eq {
             lhs: tmp,
-            rhs: parent_key_start + i,
+            rhs: key_start + i,
             target_pc: cont,
-            flags: CmpInsFlags::default(),
-            collation: Some(CollationSeq::Binary),
+            flags,
+            collation: Some(collation),
         });
         program.emit_insn(Insn::Goto {
             target_pc: next_row,
@@ -606,6 +642,42 @@ where
     program.preassign_label_to_next_insn(done);
     program.emit_insn(Insn::Close { cursor_id: ccur });
     Ok(())
+}
+
+/// For each FK column, the affinity and the collation that SQLite uses to
+/// compare the child column with the parent key: numeric affinity when the
+/// parent or the child column has one, and the collation of the parent column.
+///
+/// A rowid parent key has INTEGER affinity. Its collation has no effect,
+/// because a number never equals a text value.
+fn sqlite_key_comparisons(
+    fk_ref: &ResolvedFkRef,
+    child_positions: &[usize],
+    database_id: usize,
+    resolver: &Resolver,
+) -> Result<Vec<(Affinity, CollationSeq)>> {
+    let parent_tbl = resolver
+        .with_schema(database_id, |s| {
+            s.get_btree_table(NamespaceId::ROOT, &fk_ref.fk.parent_table)
+        })
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("parent table {} missing", fk_ref.fk.parent_table))
+        })?;
+    Ok(child_positions
+        .iter()
+        .enumerate()
+        .map(|(i, &child_pos)| {
+            let (parent_affinity, collation) = if fk_ref.parent_uses_rowid {
+                (Affinity::Integer, CollationSeq::Binary)
+            } else {
+                let parent_col = &parent_tbl.columns()[fk_ref.parent_pos[i]];
+                (parent_col.affinity(), parent_col.collation())
+            };
+            let child_affinity = fk_ref.child_table.columns()[child_pos].affinity();
+            let affinity = comparison_affinity(parent_affinity, child_affinity, None, None);
+            (affinity, collation)
+        })
+        .collect())
 }
 
 /// Build the index affinity mask string (one char per indexed column).
@@ -962,7 +1034,6 @@ fn emit_fk_parent_key_probe(
     resolver: &Resolver,
 ) -> Result<()> {
     let child_tbl = &fk_ref.child_table;
-    let child_cols = &fk_ref.fk.child_columns;
     let is_deferred = fk_ref.fk.deferred;
     let is_restrict = matches!(fk_ref.fk.on_update, RefAct::Restrict);
     let skip_probe = program.allocate_label();
@@ -996,43 +1067,32 @@ fn emit_fk_parent_key_probe(
         Ok(())
     };
 
-    // Prefer an exact child index on (child_cols...). If the current row must
-    // be excluded, scan only the matching index range so the rowid can be
-    // checked before counting the match.
-    let idx = resolver.with_schema(database_id, |s| {
-        s.get_indices(NamespaceId::ROOT, &child_tbl.name)
-            .find(|ix| {
-                ix.columns.len() == child_cols.len()
-                    && ix
-                        .columns
-                        .iter()
-                        .zip(child_cols.iter())
-                        .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-            })
-            .cloned()
-    });
+    match child_row_lookup(fk_ref, database_id, resolver) {
+        ChildRowLookup::Probe(ix) => {
+            let icur = open_read_index(program, &ix, database_id);
+            let probe = copy_with_affinity(program, parent_key_start, n_cols, &ix, child_tbl);
 
-    if let Some(ix) = idx.as_ref() {
-        let icur = open_read_index(program, ix, database_id);
-        let probe = copy_with_affinity(program, parent_key_start, n_cols, ix, child_tbl);
-
-        if self_exclude_rowid.is_some() {
-            index_scan_match_any(program, icur, probe, n_cols, self_exclude_rowid, on_match)?;
-        } else {
-            // FOUND => on_match; NOT FOUND => no-op
-            index_probe(program, icur, probe, n_cols, on_match, |_p| Ok(()))?;
+            // If the current row must be excluded, scan only the matching index
+            // range so the rowid can be checked before counting the match.
+            if self_exclude_rowid.is_some() {
+                index_scan_match_any(program, icur, probe, n_cols, self_exclude_rowid, on_match)?;
+            } else {
+                // FOUND => on_match; NOT FOUND => no-op
+                index_probe(program, icur, probe, n_cols, on_match, |_p| Ok(()))?;
+            }
         }
-    } else {
-        // Table scan fallback
-        table_scan_match_any(
-            program,
-            fk_ref,
-            parent_key_start,
-            self_exclude_rowid,
-            database_id,
-            resolver,
-            on_match,
-        )?;
+        ChildRowLookup::Scan(comparison) => {
+            table_scan_match_any(
+                program,
+                fk_ref,
+                parent_key_start,
+                comparison,
+                self_exclude_rowid,
+                database_id,
+                resolver,
+                on_match,
+            )?;
+        }
     }
 
     program.preassign_label_to_next_insn(skip_probe);
@@ -1523,23 +1583,10 @@ fn emit_fk_delete_parent_existence_check_single(
     let skip_check = program.allocate_label();
     emit_skip_if_any_null(program, parent_key_start, ncols, skip_check);
 
-    let child_cols = &fk_ref.fk.child_columns;
-    let child_idx = if !is_self_ref {
-        let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(NamespaceId::ROOT, &fk_ref.child_table.name)
-                .cloned()
-                .collect()
-        });
-        indices.into_iter().find(|idx| {
-            idx.columns.len() == child_cols.len()
-                && idx
-                    .columns
-                    .iter()
-                    .zip(child_cols.iter())
-                    .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-        })
+    let lookup = if is_self_ref {
+        ChildRowLookup::Scan(ScanComparison::Plain)
     } else {
-        None
+        child_row_lookup(fk_ref, database_id, resolver)
     };
 
     // Closure to emit the appropriate violation based on action type
@@ -1552,40 +1599,96 @@ fn emit_fk_delete_parent_existence_check_single(
         Ok(())
     };
 
-    if let Some(ref idx) = child_idx {
-        let icur = open_read_index(program, idx, database_id);
-        let probe = copy_with_affinity(program, parent_key_start, ncols, idx, &fk_ref.child_table);
-        index_probe(
-            program,
-            icur,
-            probe,
-            ncols,
-            |p| {
-                emit_violation(p)?;
-                Ok(())
-            },
-            |_p| Ok(()),
-        )?;
-    } else {
-        table_scan_match_any(
-            program,
-            fk_ref,
-            parent_key_start,
-            if is_self_ref {
-                Some(parent_rowid_reg)
-            } else {
-                None
-            },
-            database_id,
-            resolver,
-            |p| {
-                emit_violation(p)?;
-                Ok(())
-            },
-        )?;
+    match lookup {
+        ChildRowLookup::Probe(idx) => {
+            let icur = open_read_index(program, &idx, database_id);
+            let probe =
+                copy_with_affinity(program, parent_key_start, ncols, &idx, &fk_ref.child_table);
+            index_probe(
+                program,
+                icur,
+                probe,
+                ncols,
+                |p| {
+                    emit_violation(p)?;
+                    Ok(())
+                },
+                |_p| Ok(()),
+            )?;
+        }
+        ChildRowLookup::Scan(comparison) => {
+            table_scan_match_any(
+                program,
+                fk_ref,
+                parent_key_start,
+                comparison,
+                if is_self_ref {
+                    Some(parent_rowid_reg)
+                } else {
+                    None
+                },
+                database_id,
+                resolver,
+                |p| {
+                    emit_violation(p)?;
+                    Ok(())
+                },
+            )?;
+        }
     }
     program.preassign_label_to_next_insn(skip_check);
     Ok(())
+}
+
+/// How a parent-side check finds the child rows that reference a parent key.
+pub(super) enum ChildRowLookup {
+    /// Probe this index on exactly the child columns.
+    Probe(Arc<Index>),
+    /// Scan the child table.
+    Scan(ScanComparison),
+}
+
+/// How a scan of the child table compares a child column with the parent key.
+#[derive(Clone, Copy)]
+pub(super) enum ScanComparison {
+    /// Compare the stored values with no affinity and the BINARY collation.
+    Plain,
+    /// Compare like SQLite, see `sqlite_key_comparisons`.
+    ///
+    /// The scan replaces the probe of a partial index on the child columns. A
+    /// partial index has no entries for the child rows that fail its WHERE
+    /// clause, so the check cannot probe it. A plain scan does not find some
+    /// rows that the probe found, for example the TEXT value '1' of a child
+    /// of the INTEGER key 1.
+    Sqlite,
+}
+
+/// Choose the lookup from the indexes on exactly the FK child columns. A full
+/// index comes before a partial one.
+pub(super) fn child_row_lookup(
+    fk_ref: &ResolvedFkRef,
+    database_id: usize,
+    resolver: &Resolver,
+) -> ChildRowLookup {
+    let child_cols = &fk_ref.fk.child_columns;
+    let index = resolver.with_schema(database_id, |s| {
+        s.get_indices(NamespaceId::ROOT, &fk_ref.child_table.name)
+            .filter(|ix| {
+                ix.columns.len() == child_cols.len()
+                    && ix
+                        .columns
+                        .iter()
+                        .zip(child_cols.iter())
+                        .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
+            })
+            .min_by_key(|ix| ix.where_clause.is_some())
+            .cloned()
+    });
+    match index {
+        Some(ix) if ix.where_clause.is_none() => ChildRowLookup::Probe(ix),
+        Some(_) => ChildRowLookup::Scan(ScanComparison::Sqlite),
+        None => ChildRowLookup::Scan(ScanComparison::Plain),
+    }
 }
 
 /// Parent-side FK counter checks for UPDATE.
@@ -2680,6 +2783,7 @@ pub fn emit_fk_drop_table_check(
             program,
             fk_ref,
             parent_key_start,
+            ScanComparison::Plain,
             None,
             database_id,
             resolver,
