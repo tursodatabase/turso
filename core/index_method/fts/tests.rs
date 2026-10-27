@@ -2,14 +2,14 @@ use super::*;
 use crate::{
     alloc::TursoVecInExt,
     index_method::{
-        IndexMethodAttachment, IndexMethodConfiguration, IndexMethodCostContext,
+        IndexMethod, IndexMethodAttachment, IndexMethodConfiguration, IndexMethodCostContext,
         IndexMethodCostEstimate,
     },
     schema::IndexColumn,
 };
 use rustc_hash::FxHashMap;
 use std::num::NonZeroU32;
-use turso_parser::ast::{Expr, Literal, UnaryOperator, Variable};
+use turso_parser::ast::{Expr, Literal, Name, UnaryOperator, Variable};
 
 #[test]
 fn field_weights_reject_non_finite_and_non_positive_values() {
@@ -68,6 +68,29 @@ fn field_weights_accept_finite_positive_boundaries() {
         let weights = parse_field_weights(&format!("title={input},body=2"), &columns).unwrap();
         assert_eq!(weights["title"], expected, "{input}");
         assert_eq!(weights["body"], 2.0);
+    }
+}
+
+#[test]
+fn field_weights_rename_column() {
+    let rename = |weights: &str, to: &str| -> Result<String> {
+        let mut with_clause = vec![(
+            Name::exact("WEIGHTS".to_string()),
+            Box::new(Expr::Literal(Literal::String(weights.to_string()))),
+        )];
+        FtsIndexMethod.rename_column_in_with_clause(&mut with_clause, "title", to)?;
+        let Expr::Literal(Literal::String(weights)) = *with_clause.remove(0).1 else {
+            panic!("weights must stay a string literal");
+        };
+        Ok(weights)
+    };
+    assert_eq!(
+        rename("'Title=2.0, body=1.5'", "Heading").unwrap(),
+        "'Heading=2.0,body=1.5'"
+    );
+    assert_eq!(rename("'body = 1.5'", "heading").unwrap(), "'body = 1.5'");
+    for to in ["a,b", "a=b", " a", "a ", "it's"] {
+        assert!(rename("'title=2.0'", to).is_err(), "accepted {to:?}");
     }
 }
 
