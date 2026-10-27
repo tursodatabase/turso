@@ -426,7 +426,7 @@ Upgrade is not supported.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Cursors | ❌ Not supported | DECLARE/FETCH/MOVE not translated |
-| Savepoints | ✅ Supported | SAVEPOINT, RELEASE, ROLLBACK TO |
+| Savepoints | ✅ Supported | SAVEPOINT, RELEASE, ROLLBACK TO; only inside a transaction block |
 | Serializable Snapshot Isolation | ❌ Not supported | BEGIN ISOLATION LEVEL SERIALIZABLE is rejected |
 | Two-phase commit | ❌ Not supported | PREPARE TRANSACTION rejected |
 | Updatable cursors | ❌ Not supported | |

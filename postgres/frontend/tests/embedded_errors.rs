@@ -270,6 +270,24 @@ fn nested_begin_reports_active_sql_transaction() {
 }
 
 #[test]
+fn savepoint_checks_for_a_transaction_block_when_it_runs() {
+    let (_io, conn) = pg_connection();
+    let mut savepoint = conn.prepare("SAVEPOINT s").unwrap();
+    let e = savepoint.run_ignore_rows().unwrap_err();
+    assert_eq!(e.sqlstate, "25P01");
+    assert_eq!(
+        e.message,
+        "SAVEPOINT can only be used in transaction blocks"
+    );
+    assert!(conn.inner().get_auto_commit());
+    conn.execute("BEGIN").unwrap();
+    savepoint.reset().unwrap();
+    savepoint.run_ignore_rows().unwrap();
+    conn.execute("RELEASE s").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
 fn division_by_zero_raises_22012() {
     let (_io, conn) = pg_connection();
     for sql in [

@@ -152,3 +152,38 @@ test txn-drop-table-rollback-restores {
 expect {
     0
 }
+
+# Savepoint statements need a transaction block; they do not start one.
+
+test txn-savepoint-outside-transaction-block {
+    SAVEPOINT s;
+}
+@sqlstate 25P01
+expect error {}
+
+test txn-release-savepoint-outside-transaction-block {
+    RELEASE s;
+}
+@sqlstate 25P01
+expect error {}
+
+test txn-rollback-to-savepoint-outside-transaction-block {
+    ROLLBACK TO SAVEPOINT s;
+}
+@sqlstate 25P01
+expect error {}
+
+@setup counter
+test txn-savepoint-inside-transaction-block {
+    BEGIN;
+    UPDATE counter SET n = 1;
+    SAVEPOINT s;
+    UPDATE counter SET n = 2;
+    ROLLBACK TO SAVEPOINT s;
+    RELEASE s;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    1
+}
