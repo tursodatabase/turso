@@ -34,6 +34,8 @@ mod trigger;
 mod unreliable_io;
 mod views;
 mod wal;
+#[cfg(all(target_os = "windows", feature = "win_iocp", not(miri)))]
+mod windows_iocp_concurrent_commit;
 
 #[cfg(test)]
 mod tests {
