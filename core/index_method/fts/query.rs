@@ -100,15 +100,12 @@ fn expand_ast(
             if (boost - 1.0).abs() < f32::EPSILON {
                 Ok(query)
             } else {
-                Ok(Some(Box::new(BoostQuery::new(
-                    query.unwrap_or_else(|| Box::new(EmptyQuery)),
-                    boost,
-                ))))
+                Ok(query.map(|query| Box::new(BoostQuery::new(query, boost)) as Box<dyn Query>))
             }
         }
         UserInputAst::Leaf(leaf) => match *leaf {
             UserInputLeaf::Literal(literal) if literal.prefix => {
-                expand_prefix(literal, parser, index, searcher, fields, boosts).map(Some)
+                expand_prefix(literal, parser, index, searcher, fields, boosts)
             }
             leaf => {
                 let query = build_query(parser, UserInputAst::Leaf(Box::new(leaf)))?;
@@ -129,7 +126,7 @@ fn expand_prefix(
     searcher: &Searcher,
     default_fields: &[Field],
     boosts: &[(Field, f32)],
-) -> Result<Box<dyn Query>> {
+) -> Result<Option<Box<dyn Query>>> {
     let schema = index.schema();
     let fields = match &literal.field_name {
         Some(name) => vec![schema
@@ -139,6 +136,7 @@ fn expand_prefix(
     };
     let mut queries: Vec<(Occur, Box<dyn Query>)> = Vec::new();
     let mut expansion_count = 0;
+    let mut has_tokens = false;
     for field in fields {
         let mut tokenizer = index.tokenizer_for_field(field).map_err(|error| {
             LimboError::InternalError(format!("FTS prefix tokenizer error: {error}"))
@@ -149,6 +147,10 @@ fn expand_prefix(
             .process(&mut |token| {
                 tokens.push(token.text.clone());
             });
+        if tokens.is_empty() {
+            continue;
+        }
+        has_tokens = true;
         if tokens.len() != 1 {
             let mut scoped = literal.clone();
             scoped.field_name = Some(schema.get_field_name(field).to_owned());
@@ -198,10 +200,12 @@ fn expand_prefix(
             queries.push((Occur::Should, Box::new(BoostQuery::new(query, boost))));
         }
     }
-    if queries.is_empty() {
-        Ok(Box::new(EmptyQuery))
+    if !has_tokens {
+        Ok(None)
+    } else if queries.is_empty() {
+        Ok(Some(Box::new(EmptyQuery)))
     } else {
-        Ok(Box::new(BooleanQuery::new(queries)))
+        Ok(Some(Box::new(BooleanQuery::new(queries))))
     }
 }
 

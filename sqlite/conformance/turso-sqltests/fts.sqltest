@@ -1131,3 +1131,21 @@ expect {
     3
     4
 }
+
+@backend cli
+test fts-prefix-with-no-tokens {
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, 'data !!*') ORDER BY id;
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, 'data AND !!*') ORDER BY id;
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, 'data AND !!*^2') ORDER BY id;
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, 'warehouse &*') ORDER BY id;
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, '!!*') ORDER BY id;
+}
+expect {
+    1
+    3
+    1
+    3
+    1
+    3
+    3
+}

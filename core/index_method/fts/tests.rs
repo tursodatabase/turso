@@ -828,6 +828,11 @@ fn single_term_prefixes_match_and_keep_bm25_scores() {
     for (query, expected) in [
         ("dat*", vec![1, 2, 3]),
         ("DAT*", vec![1, 2, 3]),
+        ("data !!*", vec![1, 3]),
+        ("data AND !!*", vec![1, 3]),
+        ("data AND !!*^2", vec![1, 3]),
+        ("warehouse &*", vec![3]),
+        ("!!*", vec![]),
         ("\"dat\"*", vec![1, 2, 3]),
         ("title:dat*", vec![1, 2, 3]),
         ("body:dat*", vec![]),
