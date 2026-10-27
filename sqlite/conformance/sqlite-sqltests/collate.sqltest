@@ -2237,3 +2237,20 @@ expect {
     union-except|ABC
     union-except|abc
 }
+
+# Every temporary index of a compound uses the collations of the whole
+# compound, so the INTERSECT inside compares with the NOCASE of the last arm.
+test collate-nested-compound-arms-use-the-whole-compound-collation {
+    SELECT 'i', * FROM (SELECT 'a' INTERSECT SELECT 'A' UNION SELECT 'b' COLLATE NOCASE);
+    SELECT 'e', * FROM (SELECT 'a' EXCEPT SELECT 'A' UNION SELECT 'b' COLLATE NOCASE);
+    SELECT 'u', * FROM (SELECT 'a' UNION SELECT 'A' UNION SELECT 'b' COLLATE NOCASE);
+    SELECT 'ui', * FROM (SELECT 'a' UNION SELECT 'A' INTERSECT SELECT 'a' COLLATE NOCASE);
+}
+expect {
+    i|a
+    i|b
+    e|b
+    u|A
+    u|b
+    ui|A
+}
