@@ -32,6 +32,8 @@ pub const DEFAULT_MEM_BUDGET: usize = 32 * 1024;
 #[cfg(not(debug_assertions))]
 pub const DEFAULT_MEM_BUDGET: usize = 64 * 1024 * 1024;
 const DEFAULT_BUCKETS: usize = 1024;
+/// Entries per bucket beyond which an in-memory hash table doubles its buckets.
+const MAX_ENTRIES_PER_BUCKET: usize = 8;
 /// Minimum number of partitions for grace hash join.
 pub const MIN_PARTITIONS: usize = 16;
 /// Maximum number of partitions for adaptive partitioning.
@@ -595,6 +597,12 @@ pub struct HashBucket {
 impl HashBucket {
     fn new() -> Self {
         Self { entries: vec![] }
+    }
+
+    fn with_capacity(entries: usize) -> Result<Self> {
+        Ok(Self {
+            entries: Vec::try_with_capacity_ext(entries)?,
+        })
     }
 
     fn insert(&mut self, entry: HashEntry) -> Result<()> {
@@ -1458,7 +1466,75 @@ impl HashTable {
         ))?;
         self.num_entries += 1;
         self.mem_used += entry_size;
+        self.grow_buckets_when_full()?;
         Ok(IOResult::Done(true))
+    }
+
+    /// Doubles the bucket count once the table holds more than
+    /// MAX_ENTRIES_PER_BUCKET entries per bucket. A DISTINCT reads a chain on
+    /// every insert, so its table grows as it fills.
+    fn grow_buckets_when_full(&mut self) -> Result<()> {
+        if self.num_entries > self.buckets.len() * MAX_ENTRIES_PER_BUCKET {
+            self.rehash_to(self.buckets.len() * 2)?;
+        }
+        Ok(())
+    }
+
+    /// Sizes the buckets for the entries the table holds, at most
+    /// MAX_ENTRIES_PER_BUCKET per bucket. A hash join build reads no chain
+    /// until it is probed, so its table is rehashed once, when the build ends.
+    fn grow_buckets_to_fit(&mut self) -> Result<()> {
+        let bucket_count = self
+            .num_entries
+            .div_ceil(MAX_ENTRIES_PER_BUCKET)
+            .next_power_of_two();
+        if bucket_count > self.buckets.len() {
+            self.rehash_to(bucket_count)?;
+        }
+        Ok(())
+    }
+
+    /// Moves every entry to its bucket among `bucket_count` buckets, keeping
+    /// the order of the entries that share a bucket and each matched bit next
+    /// to its entry. A loaded partition sizes its buckets the same way.
+    fn rehash_to(&mut self, bucket_count: usize) -> Result<()> {
+        // Count first so each new bucket is allocated once, at its final size.
+        let mut entries_per_bucket: Vec<usize> = (0..bucket_count).map(|_| 0).try_collect()?;
+        for bucket in &self.buckets {
+            for entry in &bucket.entries {
+                entries_per_bucket[(entry.hash as usize) % bucket_count] += 1;
+            }
+        }
+        let mut buckets: Vec<HashBucket> = Vec::try_with_capacity_ext(bucket_count)?;
+        let mut matched_bits: Vec<Vec<bool>> = vec![];
+        if self.track_matched {
+            matched_bits.try_reserve(bucket_count)?;
+        }
+        for &count in &entries_per_bucket {
+            buckets.try_push(HashBucket::with_capacity(count)?)?;
+            if self.track_matched {
+                matched_bits.try_push(Vec::try_with_capacity_ext(count)?)?;
+            }
+        }
+
+        let old_buckets = std::mem::replace(&mut self.buckets, buckets);
+        let old_matched_bits = std::mem::replace(&mut self.matched_bits, matched_bits);
+        for (old_idx, bucket) in old_buckets.into_iter().enumerate() {
+            for (entry_idx, entry) in bucket.entries.into_iter().enumerate() {
+                let bucket_idx = (entry.hash as usize) % bucket_count;
+                if self.track_matched {
+                    self.matched_bits[bucket_idx].try_push(old_matched_bits[old_idx][entry_idx])?;
+                }
+                self.buckets[bucket_idx].insert(entry)?;
+            }
+        }
+        self.non_empty_buckets.clear();
+        for (bucket_idx, &count) in entries_per_bucket.iter().enumerate() {
+            if count > 0 {
+                self.non_empty_buckets.try_push(bucket_idx)?;
+            }
+        }
+        Ok(())
     }
 
     fn spilled_key_equals(
@@ -2072,6 +2148,9 @@ impl HashTable {
             for partition_idx in materialize_targets {
                 self.materialize_partition_in_memory(partition_idx)?;
             }
+        }
+        if self.spill_state.is_none() {
+            self.grow_buckets_to_fit()?;
         }
         self.current_spill_partition_idx = 0;
         self.state = HashTableState::Probing;
@@ -4288,6 +4367,86 @@ mod hashtests {
             }
         }
         assert!(ht.has_spilled());
+    }
+
+    /// The in-memory table used to keep its initial bucket count however many
+    /// keys it held, so each insert of a large DISTINCT read a chain of
+    /// keys / buckets entries and the whole DISTINCT was quadratic (#10891).
+    #[test]
+    fn test_buckets_grow_with_the_distinct_keys() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: usize::MAX,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: None,
+        };
+        let mut ht = HashTable::new(config, io).unwrap();
+
+        for key in 0..10_000 {
+            assert!(insert_distinct_i64(&mut ht, key));
+        }
+        assert!(!ht.has_spilled());
+        assert!(
+            ht.buckets.len() * MAX_ENTRIES_PER_BUCKET >= ht.num_entries,
+            "{} buckets hold {} keys",
+            ht.buckets.len(),
+            ht.num_entries
+        );
+        for key in 0..10_000 {
+            assert!(
+                !insert_distinct_i64(&mut ht, key),
+                "key {key} inserted twice"
+            );
+        }
+        assert_eq!(ht.num_entries, 10_000);
+    }
+
+    /// Growing the buckets must keep each matched bit next to its entry, or
+    /// marking a match after the build flags the wrong row.
+    #[test]
+    fn test_buckets_grow_with_the_build_rows_and_keep_matched_bits() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: usize::MAX,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: true,
+            partition_count: None,
+        };
+        let mut ht = HashTable::new(config, io).unwrap();
+
+        for i in 0..10_000 {
+            let _ = ht.insert(vec![Value::from_i64(i)], i, vec![], None);
+        }
+        let _ = ht.finalize_build(None);
+        assert!(!ht.has_spilled());
+        assert!(
+            ht.buckets.len() * MAX_ENTRIES_PER_BUCKET >= ht.num_entries,
+            "{} buckets hold {} rows",
+            ht.buckets.len(),
+            ht.num_entries
+        );
+
+        for i in (0..10_000).step_by(2) {
+            assert!(
+                ht.probe(vec![Value::from_i64(i)], None).unwrap().is_some(),
+                "row {i} not found after the buckets grew"
+            );
+            ht.mark_current_matched();
+        }
+        ht.begin_unmatched_scan();
+        let mut unmatched = 0;
+        while let Some(entry) = ht.next_unmatched() {
+            assert_eq!(entry.rowid % 2, 1, "row {} was matched", entry.rowid);
+            unmatched += 1;
+        }
+        assert_eq!(unmatched, 5_000);
     }
 
     fn insert_distinct_i64(ht: &mut HashTable, key: i64) -> bool {
