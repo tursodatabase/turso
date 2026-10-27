@@ -193,10 +193,11 @@ fn bench(c: &mut Criterion) {
 //
 // Two variants isolate the two seek paths via `GhostPlacement`:
 // - `IndexProbe`  (`mvcc-huge-multi-write`): ghost rows have LOW rowids and HIGH
-//   `seq`, so only the eq-only *index* probe (`seek_index`) walks toward them.
+//   `seq`, so only the eq-only *index* probe (an exact seek of the MVCC index
+//   cursor) walks toward them.
 // - `RowidProbe`  (`mvcc-huge-multi-write-rowid`): ghost rows have HIGH rowids and
-//   LOW `seq`, so only the eq-only *table-rowid* probe (`seek_rowid`) walks toward
-//   them.
+//   LOW `seq`, so only the eq-only *table-rowid* probe (an exact seek of the MVCC
+//   table cursor) walks toward them.
 // ---------------------------------------------------------------------------
 
 /// Selects which per-row eq-only probe the invisible ghost rows force to scan,
@@ -204,9 +205,11 @@ fn bench(c: &mut Criterion) {
 /// other's).
 #[derive(Clone, Copy)]
 enum GhostPlacement {
-    /// Low rowid, high `seq`: exercises `seek_index` (the UNIQUE-index probe).
+    /// Low rowid, high `seq`: exercises the exact seek of the MVCC index cursor
+    /// (the UNIQUE-index probe).
     IndexProbe,
-    /// High rowid, low `seq`: exercises `seek_rowid` (the INTEGER PRIMARY KEY probe).
+    /// High rowid, low `seq`: exercises the exact seek of the MVCC table cursor
+    /// (the INTEGER PRIMARY KEY probe).
     RowidProbe,
 }
 
@@ -409,18 +412,20 @@ fn run_huge_multi_write(c: &mut Criterion, group_name: &str, placement: GhostPla
     group.finish();
 }
 
-/// Guards the eq-only bound on the UNIQUE-index probe (`seek_index`): the ghost
-/// rows' `seq` values sit above the measured batch, so each per-row `NoConflict`
-/// probe would scan O(pending) invisible entries without the bound.
+/// Guards the eq-only bound on the UNIQUE-index probe (the exact seek of the
+/// MVCC index cursor): the ghost rows' `seq` values sit above the measured
+/// batch, so each per-row `NoConflict` probe would scan O(pending) invisible
+/// entries without the bound.
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_huge_multi_write(c: &mut Criterion) {
     run_huge_multi_write(c, "mvcc-huge-multi-write", GhostPlacement::IndexProbe);
 }
 
-/// Guards the eq-only bound on the table-rowid probe (`seek_rowid`): the ghost
-/// rows' rowids sit above the measured batch, so each per-row `NotExists` probe
-/// would scan O(pending) invisible entries without the bound. Time should stay
-/// flat across `pending`; pre-fix it grew ~linearly (O(rows * pending)).
+/// Guards the eq-only bound on the table-rowid probe (the exact seek of the
+/// MVCC table cursor): the ghost rows' rowids sit above the measured batch, so
+/// each per-row `NotExists` probe would scan O(pending) invisible entries
+/// without the bound. Time should stay flat across `pending`; pre-fix it grew
+/// ~linearly (O(rows * pending)).
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_huge_multi_write_rowid(c: &mut Criterion) {
     run_huge_multi_write(c, "mvcc-huge-multi-write-rowid", GhostPlacement::RowidProbe);
