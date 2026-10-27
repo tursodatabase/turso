@@ -9,6 +9,7 @@ use turso_parser::ast::{self, SortOrder, TableInternalId};
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
+use crate::translate::emitter::Resolver;
 use crate::translate::expr::{as_binary_components, comparison_affinity, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, expr_uses_custom_collation, ordered_ephemeral_key_columns,
@@ -625,7 +626,7 @@ pub(super) fn choose_best_in_seek_candidate(
             if let (Some(index), Some(col_pos)) = (&candidate.index, constraint.table_col_pos) {
                 let constrained_column = &rhs_table.table.columns()[col_pos];
                 let table_collation = constrained_column.collation();
-                let index_collation = index.columns[0].collation.unwrap_or_default();
+                let index_collation = index.columns[0].collation;
                 if table_collation != index_collation {
                     continue;
                 }
@@ -801,6 +802,7 @@ pub fn find_best_access_method_for_join_order(
             input_cardinality,
             base_row_count,
             params,
+            planning_context.resolver,
         ),
         Table::Virtual(vtab) => find_best_access_method_for_vtab(
             vtab,
@@ -859,6 +861,7 @@ fn find_best_access_method_for_btree(
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
+    resolver: &Resolver,
 ) -> Result<Option<AccessMethod>> {
     let rhs_table_idx = join_order.last().unwrap().original_idx;
     let Some(best) = choose_best_btree_candidate(
@@ -1085,6 +1088,7 @@ fn find_best_access_method_for_btree(
             best_cost_with_filters,
             lhs_mask,
             analyze_stats,
+            resolver,
         )? {
             replace_if_cheaper(
                 &mut best_access_method,
@@ -1112,6 +1116,7 @@ fn find_best_access_method_for_btree(
             best_cost_with_filters,
             lhs_mask,
             analyze_stats,
+            resolver,
         )? {
             replace_if_cheaper(
                 &mut best_access_method,
@@ -2102,7 +2107,7 @@ fn materialized_subquery_ephemeral_index(
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table: col_pos,
-                collation: column.collation_opt(),
+                collation: column.collation(),
                 default: column.default.clone(),
                 expr: None,
             })
@@ -2119,7 +2124,7 @@ fn materialized_subquery_ephemeral_index(
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table: col_pos,
-                collation: column.collation_opt(),
+                collation: column.collation(),
                 default: column.default.clone(),
                 expr: None,
             })

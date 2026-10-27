@@ -246,7 +246,7 @@ fn emit_index_method_predicate(
         rhs: result_rowid,
         target_pc: matched,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
     program.emit_insn(Insn::Next {
         cursor_id,

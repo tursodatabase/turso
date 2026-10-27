@@ -348,7 +348,7 @@ pub struct SorterOpenData {
     /// Combined order, collation, and nulls ordering per column.
     pub order_collations_nulls: crate::alloc::Vec<(
         SortOrder,
-        Option<CollationSeq>,
+        CollationSeq,
         Option<turso_parser::ast::NullsOrder>,
     )>,
     /// Per-column custom type comparators for ORDER BY sorting.
@@ -365,8 +365,8 @@ pub struct AggStepData {
     pub func: AccumulatorFunc,
     /// Optional custom type comparator for MIN/MAX aggregates.
     pub comparator: Option<SortComparatorType>,
-    /// Collation for comparison-based aggregates (MIN/MAX), resolved at
-    /// translation time from the argument expression.
+    /// The argument's collation. Set exactly for the aggregates that compare
+    /// values (MIN, MAX, mode and percentile); the others have none.
     pub collation: Option<CollationSeq>,
 }
 
@@ -619,7 +619,7 @@ pub enum Insn {
         /// Without the jump_if_null flag it would not jump because the logical comparison "id != NULL" is never true.
         /// This flag indicates that if either is null we should still jump.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if they are not equal.
     Ne {
@@ -630,7 +630,7 @@ pub enum Insn {
         ///
         /// jump_if_null jumps if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is less than the right-hand side.
     Lt {
@@ -639,7 +639,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     Le {
         lhs: usize,
@@ -647,7 +647,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is greater than the right-hand side.
     Gt {
@@ -656,7 +656,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is greater than or equal to the right-hand side.
     Ge {
@@ -665,7 +665,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[jump_if_null\] != 0)
     If {

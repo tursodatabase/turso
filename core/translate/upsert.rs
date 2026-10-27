@@ -1,3 +1,4 @@
+use crate::translate::collate::CollationSeq;
 use rustc_hash::FxHashMap as HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -132,17 +133,8 @@ fn extract_target_expr(e: &ast::Expr) -> (&ast::Expr, Option<String>) {
     }
 }
 
-// Return the index key’s effective collation.
-// If `idx_col.collation` is None, fall back to the column default or "BINARY".
-fn effective_collation_for_index_col(idx_col: &IndexColumn, table: &Table) -> String {
-    if let Some(c) = idx_col.collation.as_ref() {
-        return c.to_string().to_ascii_lowercase();
-    }
-    // Otherwise use the table default, or default to BINARY
-    table
-        .get_column_by_name(&idx_col.name)
-        .map(|s| s.1.collation().to_string())
-        .unwrap_or_else(|| "binary".to_string())
+fn index_column_collation_name(idx_col: &IndexColumn) -> String {
+    idx_col.collation.to_string().to_ascii_lowercase()
 }
 
 /// Match ON CONFLICT target to the PRIMARY KEY/rowid alias.
@@ -372,7 +364,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
                     continue;
                 }
                 let iname = normalize_ident(&ic.name);
-                let icoll = effective_collation_for_index_col(ic, table);
+                let icoll = index_column_collation_name(ic);
                 if tname.eq_ignore_ascii_case(&iname)
                     && match conflict_target.collate.as_ref() {
                         Some(c) => c.eq_ignore_ascii_case(&icoll),
@@ -395,7 +387,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
                     if exprs_are_equivalent(target_expr, idx_expr) {
                         // If target specifies a collation, it must match the index column's.
                         if let Some(ref tc) = target_collate {
-                            let icoll = effective_collation_for_index_col(ic, table);
+                            let icoll = index_column_collation_name(ic);
                             if !tc.eq_ignore_ascii_case(&icoll) {
                                 continue;
                             }
@@ -1105,7 +1097,7 @@ pub fn emit_upsert(
             rhs: ctx.conflict_rowid_reg,
             target_pc: ok,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::Binary,
         });
 
         // If another row already has rnew -> constraint
@@ -1266,7 +1258,7 @@ pub fn emit_upsert(
                     rhs: hit,
                     target_pc: ok,
                     flags: CmpInsFlags::default(),
-                    collation: program.curr_collation(),
+                    collation: CollationSeq::Binary,
                 });
                 let description = format_unique_violation_desc(table.get_name(), &idx_meta);
                 let regs: Vec<usize> = (0..k).map(|i| ins + i).collect();

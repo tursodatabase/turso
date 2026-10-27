@@ -1,3 +1,4 @@
+use crate::translate::collate::CollationSeq;
 use crate::vdbe::{
     builder::CursorType,
     insn::{ClearBtreeCount, IntegrityCkData, RegisterOrLiteral, SorterOpenData},
@@ -310,7 +311,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!(
                     "if r[{}]==r[{}] goto {}",
@@ -330,7 +331,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!(
                     "if r[{}]!=r[{}] goto {}",
@@ -350,7 +351,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!("if r[{}]<r[{}] goto {}", lhs, rhs, target_pc.as_debug_int()),
             ),
@@ -365,7 +366,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!(
                     "if r[{}]<=r[{}] goto {}",
@@ -385,7 +386,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!("if r[{}]>r[{}] goto {}", lhs, rhs, target_pc.as_debug_int()),
             ),
@@ -400,7 +401,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!(
                     "if r[{}]>=r[{}] goto {}",
@@ -1485,10 +1486,9 @@ pub fn insn_to_row(
                             SortOrder::Asc => "",
                             SortOrder::Desc => "-",
                         };
-                        let coll_str = if let Some(coll) = collation {
-                            format!("{sign}{coll}")
-                        } else {
-                            format!("{sign}B")
+                        let coll_str = match collation {
+                            CollationSeq::Binary => format!("{sign}B"),
+                            coll => format!("{sign}{coll}"),
                         };
                         match nulls {
                             Some(turso_parser::ast::NullsOrder::First) => format!("{coll_str} NF"),

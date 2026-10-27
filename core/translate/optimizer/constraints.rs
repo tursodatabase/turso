@@ -4,7 +4,7 @@ use crate::translate::expr::comparison_affinity;
 use crate::{
     schema::{Column, Index, Schema},
     translate::{
-        collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
+        collate::{comparison_collation, expr_collation, CollationSeq},
         expr::{
             as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr,
             walk_expr_mut, WalkControl,
@@ -536,6 +536,7 @@ fn expression_matches_table(
 pub(super) fn add_implied_column_equalities(
     where_clause: &mut Vec<WhereTerm>,
     table_references: &TableReferences,
+    resolver: &Resolver,
 ) -> Result<()> {
     let mut columns = Vec::new();
     let mut parents = Vec::new();
@@ -565,8 +566,8 @@ pub(super) fn add_implied_column_equalities(
 
         let left_affinity = get_expr_affinity(left, Some(table_references), None);
         let right_affinity = get_expr_affinity(right, Some(table_references), None);
-        let left_collation = get_collseq_from_expr(left, table_references)?.unwrap_or_default();
-        let right_collation = get_collseq_from_expr(right, table_references)?.unwrap_or_default();
+        let left_collation = expr_collation(left, Some(table_references), resolver)?;
+        let right_collation = expr_collation(right, Some(table_references), resolver)?;
         if left_affinity != right_affinity
             || left_collation != right_collation
             || !matches!(
@@ -717,6 +718,7 @@ pub fn constraints_from_where_clause(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
+    resolver: &Resolver,
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
 
@@ -1233,24 +1235,22 @@ pub fn constraints_from_where_clause(
             // comparison collation follows the left operand, so a plain BINARY
             // column on the left disqualifies an index on a NOCASE column even
             // though neither side declares a collation explicitly.
-            let comparison_collation = if constraint.constraining_expr.is_some() {
-                get_collseq_from_expr(
-                    constraint.get_constraining_expr_ref(where_clause),
-                    table_references,
-                )?
-            } else {
-                let term_expr = &where_clause[constraint.where_clause_pos.0].expr;
-                match as_binary_components(term_expr)? {
-                    Some((lhs, op, rhs))
-                        if op.as_ast_operator().is_some_and(|op| op.is_comparison()) =>
-                    {
-                        Some(resolve_comparison_collseq(lhs, rhs, table_references)?)
-                    }
-                    _ => get_collseq_from_expr(
-                        constraint.get_constraining_expr_ref(where_clause),
-                        table_references,
-                    )?,
+            // LIKE is not a collating comparison, so it puts no condition on
+            // the index collation here.
+            turso_assert!(constraint.constraining_expr.is_none());
+            let term_expr = &where_clause[constraint.where_clause_pos.0].expr;
+            let comparison_collation = match as_binary_components(term_expr)? {
+                Some((lhs, op, rhs))
+                    if op.as_ast_operator().is_some_and(|op| op.is_comparison()) =>
+                {
+                    Some(comparison_collation(
+                        lhs,
+                        rhs,
+                        Some(table_references),
+                        resolver,
+                    )?)
                 }
+                _ => None,
             };
             match (comparison_collation, column_collation) {
                 (Some(collation), Some(column_collation)) if collation != column_collation => {
@@ -1302,9 +1302,7 @@ pub fn constraints_from_where_clause(
                     if let Some(table_col_pos) = constraint.table_col_pos {
                         let constrained_column = &table_reference.table.columns()[table_col_pos];
                         let table_collation = constrained_column.collation();
-                        let index_collation = index.columns[position_in_index]
-                            .collation
-                            .unwrap_or_default();
+                        let index_collation = index.columns[position_in_index].collation;
                         if table_collation != index_collation {
                             continue;
                         }
@@ -2195,6 +2193,7 @@ pub(crate) fn summarize_binary_term_for_index(
     rowid_alias_column: Option<usize>,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
+    resolver: &Resolver,
 ) -> Option<IndexableTermSummary> {
     let BinaryTermIndexInfo {
         lhs,
@@ -2205,7 +2204,8 @@ pub(crate) fn summarize_binary_term_for_index(
         is_rowid,
         ..
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
-    let comparison_collation = resolve_comparison_collseq(lhs, rhs, table_references).ok()?;
+    let comparison_collation =
+        comparison_collation(lhs, rhs, Some(table_references), resolver).ok()?;
 
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
@@ -2258,6 +2258,7 @@ pub(crate) fn analyze_binary_term_for_index(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
+    resolver: &Resolver,
 ) -> Option<AnalyzedTerm> {
     let BinaryTermIndexInfo {
         lhs,
@@ -2268,7 +2269,8 @@ pub(crate) fn analyze_binary_term_for_index(
         side,
         is_rowid,
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
-    let comparison_collation = resolve_comparison_collseq(lhs, rhs, table_references).ok()?;
+    let comparison_collation =
+        comparison_collation(lhs, rhs, Some(table_references), resolver).ok()?;
 
     // Find the best index for this constraint
     let (best_index, constraint_refs) = find_best_index_for_constraint(
@@ -2440,9 +2442,7 @@ fn find_best_index_for_constraint(
             if let Some(idx_col_pos) = index.column_table_pos_to_index_pos(col_pos) {
                 // For multi-index OR, we prefer indexes where the constraint column
                 // is the first column (leftmost prefix)
-                if idx_col_pos == 0
-                    && index.columns[0].collation.unwrap_or_default() == comparison_collation
-                {
+                if idx_col_pos == 0 && index.columns[0].collation == comparison_collation {
                     let constraint_ref = RangeConstraintRef {
                         table_col_pos: Some(col_pos),
                         index_col_pos: 0,

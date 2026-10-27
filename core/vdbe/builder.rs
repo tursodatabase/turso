@@ -270,8 +270,6 @@ pub struct ProgramBuilder {
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     pub table_reference_counter: TableRefIdCounter,
-    /// Curr collation sequence. Bool indicates whether it was set by a COLLATE expr
-    collation: Option<(CollationSeq, bool)>,
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
     /// Whether the main database uses MVCC journal mode, set once at translation time from the connection.
     mvcc_enabled: bool,
@@ -608,10 +606,9 @@ impl CursorType {
                                 SortOrder::Asc => "",
                                 SortOrder::Desc => "-",
                             };
-                            if let Some(coll) = col.collation {
-                                format!("{sign}{coll}")
-                            } else {
-                                format!("{sign}B")
+                            match col.collation {
+                                CollationSeq::Binary => format!("{sign}B"),
+                                coll => format!("{sign}{coll}"),
                             }
                         })
                         .collect::<Vec<_>>()
@@ -791,7 +788,6 @@ impl ProgramBuilder {
             result_columns: Vec::new(),
             result_column_types: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
-            collation: None,
             nested_level: 0,
             // These labels will be filled when `prologue()` is called
             init_label: BranchOffset::Placeholder,
@@ -2063,22 +2059,6 @@ impl ProgramBuilder {
         self.cursor_ref
             .get(cursor_id)
             .map(|(_, cursor_type)| cursor_type)
-    }
-
-    pub const fn set_collation(&mut self, c: Option<(CollationSeq, bool)>) {
-        self.collation = c
-    }
-
-    pub const fn curr_collation_ctx(&self) -> Option<(CollationSeq, bool)> {
-        self.collation
-    }
-
-    pub fn curr_collation(&self) -> Option<CollationSeq> {
-        self.collation.map(|c| c.0)
-    }
-
-    pub const fn reset_collation(&mut self) {
-        self.collation = None;
     }
 
     #[inline]

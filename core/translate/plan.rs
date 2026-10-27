@@ -8,7 +8,7 @@ use crate::{
         ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
     },
     translate::{
-        collate::{get_collseq_from_expr, CollationSeq},
+        collate::{expr_collation, CollationSeq},
         emitter::{Resolver, UpdateRowSource},
         expr::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
@@ -804,8 +804,8 @@ pub struct MinMaxDef {
     pub func: AggFunc,
     pub argument: ast::Expr,
     pub order: SortOrder,
-    /// Explicit COLLATE override, if any. `None` means use the column default.
-    pub collation: Option<CollationSeq>,
+    /// The collation that orders the argument values.
+    pub collation: CollationSeq,
 }
 
 #[derive(Debug, Clone)]
@@ -3121,7 +3121,11 @@ pub(super) fn query_output_columns(
             );
         }
         column.set_array_dimensions(dimensions);
-        column.set_collation(get_collseq_from_expr(result_expr, table_references)?);
+        column.set_collation(Some(expr_collation(
+            result_expr,
+            Some(table_references),
+            resolver,
+        )?));
     }
     Ok(columns)
 }

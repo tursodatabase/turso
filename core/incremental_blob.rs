@@ -27,6 +27,7 @@
 //! close, exactly as `sqlite3_blob_write` documents.
 
 use crate::namespace::NamespaceId;
+use crate::translate::collate::CollationSeq;
 use std::num::NonZero;
 use std::sync::Arc;
 
@@ -464,7 +465,7 @@ fn build_blob_program(
         rhs: r_zero,
         target_pc: l_done,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
     let r_off = b.alloc_register();
     b.emit_insn(Insn::Variable {
@@ -481,7 +482,7 @@ fn build_blob_program(
         rhs: r_two,
         target_pc: l_write,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
 
     // op == 1: read.

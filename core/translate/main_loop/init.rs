@@ -11,14 +11,7 @@ pub fn init_distinct(
     let collations = plan
         .result_columns
         .iter()
-        .map(|col| {
-            get_collseq_from_expr_with_symbols(
-                &col.expr,
-                &plan.table_references,
-                Some(resolver.symbol_table),
-            )
-            .map(|c| c.unwrap_or(CollationSeq::Binary))
-        })
+        .map(|col| expr_collation(&col.expr, Some(&plan.table_references), resolver))
         .collect::<Result<Vec<_>>>()?;
     let hash_table_id = program.alloc_hash_table_id();
     let ctx = DistinctCtx {
@@ -99,12 +92,7 @@ impl InitLoop {
                 1,
                 "DISTINCT aggregate functions must have exactly one argument"
             );
-            let collations = vec![get_collseq_from_expr_with_symbols(
-                &agg.args[0],
-                tables,
-                Some(t_ctx.resolver.symbol_table),
-            )?
-            .unwrap_or(CollationSeq::Binary)];
+            let collations = vec![expr_collation(&agg.args[0], Some(tables), &t_ctx.resolver)?];
             let hash_table_id = program.alloc_hash_table_id();
             agg.distinctness = Distinctness::Distinct {
                 ctx: Some(DistinctCtx {
@@ -611,10 +599,10 @@ fn right_join_metadata(
                     .name
                     .clone()
                     .unwrap_or_default();
-                IndexColumn::new(&name, key_position)
+                IndexColumn::new(&name, key_position, CollationSeq::Binary)
             })
             .try_collect::<crate::alloc::Vec<_>>()?,
-        None => crate::alloc::vec![IndexColumn::new("rowid", 0)],
+        None => crate::alloc::vec![IndexColumn::new("rowid", 0, CollationSeq::Binary)],
     };
     let key_len = key_columns.len();
     let matched_rows_index = Arc::new(Index {
@@ -697,7 +685,7 @@ fn emit_percentile_fraction_check(
         rhs: bound_reg,
         target_pc: bad,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
     program.emit_insn(Insn::Real {
         value: 1.0,
@@ -708,7 +696,7 @@ fn emit_percentile_fraction_check(
         rhs: bound_reg,
         target_pc: done,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
     program.preassign_label_to_next_insn(bad);
     program.emit_insn(Insn::Halt {

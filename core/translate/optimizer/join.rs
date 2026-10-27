@@ -18,6 +18,7 @@ use crate::{
     schema::Schema,
     stats::AnalyzeStats,
     translate::{
+        emitter::Resolver,
         expr::expr_references_subquery_id,
         optimizer::{
             access_method::{
@@ -40,7 +41,7 @@ use crate::{
     LimboError, Result,
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 /// Small bag of planner context that needs to flow through join enumeration.
 ///
 /// Keeping this as a struct avoids threading more ad-hoc parameters through the
@@ -51,16 +52,21 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub cost_limit: Option<Cost>,
     /// Whether this table read may build an automatic index.
     pub allow_automatic_index: bool,
+    pub resolver: &'a Resolver<'a>,
 }
 
 impl<'a> JoinPlanningContext<'a> {
     /// Convenience constructor used by the default planner entrypoints and tests.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn default_with_order_target(maybe_order_target: Option<&'a OrderTarget>) -> Self {
+    fn default_with_order_target(
+        maybe_order_target: Option<&'a OrderTarget>,
+        resolver: &'a Resolver<'a>,
+    ) -> Self {
         Self {
             maybe_order_target,
             cost_limit: None,
             allow_automatic_index: true,
+            resolver,
         }
     }
 }
@@ -1247,11 +1253,12 @@ pub fn compute_best_join_order<'a>(
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     schema: &Schema,
+    resolver: &Resolver,
 ) -> Result<Option<BestJoinOrderResult>> {
     compute_best_join_order_with_context(
         joined_tables,
         initial_input_cardinality,
-        JoinPlanningContext::default_with_order_target(maybe_order_target),
+        JoinPlanningContext::default_with_order_target(maybe_order_target, resolver),
         constraints,
         base_table_rows,
         access_methods_arena,
@@ -2457,6 +2464,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         let mut access_methods = Vec::new();
@@ -2477,6 +2485,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .unwrap()
@@ -2527,6 +2536,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -2644,6 +2654,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )?;
         let base_table_rows =
             [1.0, 1_000_000.0, 10.0, 10.0].map(RowCountEstimate::HardcodedFallback);
@@ -2664,6 +2675,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )?
         .unwrap()
         .best_plan;
@@ -2696,6 +2708,7 @@ mod tests {
         super::super::constraints::add_implied_column_equalities(
             &mut where_clause,
             &table_references,
+            &Resolver::empty_for_tests(),
         )?;
 
         assert_eq!(where_clause.len(), 3);
@@ -2727,6 +2740,7 @@ mod tests {
         super::super::constraints::add_implied_column_equalities(
             &mut where_clause,
             &table_references,
+            &Resolver::empty_for_tests(),
         )?;
 
         assert_eq!(where_clause.len(), 2);
@@ -2767,6 +2781,7 @@ mod tests {
         super::super::constraints::add_implied_column_equalities(
             &mut where_clause,
             &table_references,
+            &Resolver::empty_for_tests(),
         )?;
 
         assert_eq!(where_clause.len(), 2);
@@ -2910,6 +2925,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -2930,6 +2946,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         assert!(result.is_none());
@@ -2953,6 +2970,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -2975,6 +2993,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .unwrap();
@@ -3001,7 +3020,7 @@ mod tests {
                 table_id: joined_tables[0].internal_id,
                 target: ColumnTarget::Column(0),
                 order: SortOrder::Asc,
-                collation: CollationSeq::default(),
+                collation: CollationSeq::Binary,
                 nulls_order: None,
             }],
             purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
@@ -3016,6 +3035,7 @@ mod tests {
             &[],
             &schema,
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         let base_table_rows = default_base_rows(1);
@@ -3037,6 +3057,7 @@ mod tests {
                 &available_indexes,
                 &table_references,
                 &schema,
+                &Resolver::empty_for_tests(),
             )
             .unwrap()
             .unwrap();
@@ -3077,6 +3098,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -3099,6 +3121,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -3140,7 +3163,11 @@ mod tests {
             name: "sqlite_autoindex_test_table_1".to_string(),
             table_name: "test_table".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn::new("id", 0)],
+            columns: crate::alloc::vec![IndexColumn::new(
+                "id",
+                0,
+                crate::translate::collate::CollationSeq::Binary
+            )],
             unique: true,
             ephemeral: false,
             root_page: 1,
@@ -3162,6 +3189,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         // SELECT * FROM test_table WHERE id = 42
@@ -3183,6 +3211,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -3232,7 +3261,11 @@ mod tests {
             name: "index1".to_string(),
             table_name: "table1".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn::new("id", 0)],
+            columns: crate::alloc::vec![IndexColumn::new(
+                "id",
+                0,
+                crate::translate::collate::CollationSeq::Binary
+            )],
             unique: true,
             ephemeral: false,
             root_page: 1,
@@ -3260,6 +3293,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -3280,6 +3314,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -3370,7 +3405,11 @@ mod tests {
                     name: index_name,
                     where_clause: None,
                     table_name: table_name.to_string(),
-                    columns: crate::alloc::vec![IndexColumn::new("id", 0)],
+                    columns: crate::alloc::vec![IndexColumn::new(
+                        "id",
+                        0,
+                        crate::translate::collate::CollationSeq::Binary
+                    )],
                     unique: true,
                     ephemeral: false,
                     root_page: 1,
@@ -3389,7 +3428,11 @@ mod tests {
             name: "orders_customer_id_idx".to_string(),
             table_name: "orders".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn::new("customer_id", 1)],
+            columns: crate::alloc::vec![IndexColumn::new(
+                "customer_id",
+                1,
+                crate::translate::collate::CollationSeq::Binary
+            )],
             unique: false,
             ephemeral: false,
             root_page: 1,
@@ -3402,7 +3445,11 @@ mod tests {
             name: "order_items_order_id_idx".to_string(),
             table_name: "order_items".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn::new("order_id", 1)],
+            columns: crate::alloc::vec![IndexColumn::new(
+                "order_id",
+                1,
+                crate::translate::collate::CollationSeq::Binary
+            )],
             unique: false,
             ephemeral: false,
             root_page: 1,
@@ -3450,6 +3497,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -3470,6 +3518,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -3581,6 +3630,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -3601,6 +3651,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .unwrap();
@@ -3724,6 +3775,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -3744,6 +3796,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -3826,6 +3879,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -3847,6 +3901,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .unwrap();
@@ -3905,7 +3960,10 @@ mod tests {
             name: "idx_xy".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn::new("x", 0), IndexColumn::new("y", 1),],
+            columns: crate::alloc::vec![
+                IndexColumn::new("x", 0, crate::translate::collate::CollationSeq::Binary),
+                IndexColumn::new("y", 1, crate::translate::collate::CollationSeq::Binary),
+            ],
             unique: false,
             root_page: 2,
             ephemeral: false,
@@ -3960,6 +4018,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -3980,6 +4039,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .unwrap();
@@ -4005,9 +4065,9 @@ mod tests {
             table_name: "t1".to_string(),
             where_clause: None,
             columns: crate::alloc::vec![
-                IndexColumn::new("c1", 0),
-                IndexColumn::new("c2", 1),
-                IndexColumn::new("c3", 2),
+                IndexColumn::new("c1", 0, crate::translate::collate::CollationSeq::Binary),
+                IndexColumn::new("c2", 1, crate::translate::collate::CollationSeq::Binary),
+                IndexColumn::new("c3", 2, crate::translate::collate::CollationSeq::Binary),
             ],
             unique: false,
             root_page: 2,
@@ -4076,6 +4136,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -4096,6 +4157,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .unwrap();
@@ -4207,6 +4269,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -4227,6 +4290,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .unwrap();
@@ -4310,7 +4374,13 @@ mod tests {
             where_clause: None,
             columns: columns
                 .iter()
-                .map(|(name, pos_in_table)| IndexColumn::new((*name).to_string(), *pos_in_table))
+                .map(|(name, pos_in_table)| {
+                    IndexColumn::new(
+                        (*name).to_string(),
+                        *pos_in_table,
+                        crate::translate::collate::CollationSeq::Binary,
+                    )
+                })
                 .try_collect()
                 .unwrap(),
             unique,
@@ -4387,6 +4457,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -4459,7 +4530,11 @@ mod tests {
             name: "idx_t2_a".to_string(),
             table_name: "t2".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn::new("a", 0)],
+            columns: crate::alloc::vec![IndexColumn::new(
+                "a",
+                0,
+                crate::translate::collate::CollationSeq::Binary
+            )],
             unique: false, // Non-unique index
             ephemeral: false,
             root_page: 2,
@@ -4486,6 +4561,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -4506,6 +4582,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -4588,6 +4665,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         let joined_before_probe_mask: TableMask = [0].into_iter().try_collect().unwrap();
@@ -4632,6 +4710,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         assert!(!can_replace_build_index_with_hash(&constraints[1], false));

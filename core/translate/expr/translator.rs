@@ -80,7 +80,7 @@ pub fn resolve_expr(
     expr: &ast::Expr,
     resolver: &Resolver,
 ) -> Result<usize> {
-    if let Some((reg, needs_decode, _collation)) = resolver.resolve_cached_expr_reg(expr) {
+    if let Some((reg, needs_decode)) = resolver.resolve_cached_expr_reg(expr) {
         if !needs_decode {
             return Ok(reg);
         }
@@ -247,7 +247,7 @@ fn translate_expr_by_kind(
             translate_unary_expr(program, referenced_tables, expr, target_register, resolver)
         }
         ast::Expr::Variable(_) => translate_variable_expr(program, expr, target_register),
-        ast::Expr::Register(_) => translate_register_expr(program, expr, target_register, resolver),
+        ast::Expr::Register(_) => translate_register_expr(program, expr, target_register),
         ast::Expr::Default => {
             crate::bail_parse_error!("DEFAULT is only valid in INSERT VALUES");
         }
@@ -264,7 +264,7 @@ fn copy_cached_expr_reg(
     expr: &ast::Expr,
     target_register: usize,
     resolver: &Resolver,
-    (reg, needs_decode, collation_ctx): crate::translate::emitter::CachedExprRegHit,
+    (reg, needs_decode): crate::translate::emitter::CachedExprRegHit,
 ) -> Result<()> {
     program.emit_insn(Insn::Copy {
         src_reg: reg,
@@ -297,7 +297,6 @@ fn copy_cached_expr_reg(
             }
         }
     }
-    program.set_collation(collation_ctx);
     Ok(())
 }
 
@@ -463,13 +462,14 @@ fn translate_subquery_result_expr(
                     dest: column_check_reg,
                     default: None,
                 });
-                // Ne with NULL operand does NOT jump (comparison is NULL/unknown)
+                // Ne with NULL operand does NOT jump (comparison is NULL/unknown).
+                // Like SQLite, this compares with the collation of the left side alone.
                 program.emit_insn(Insn::Ne {
                     lhs: lhs_column_regs_start + i,
                     rhs: column_check_reg,
                     target_pc: label_null_checks_next,
                     flags: CmpInsFlags::default().with_affinity(affinity),
-                    collation: program.curr_collation(),
+                    collation: expr_collation(lhs_columns[i], referenced_tables, resolver)?,
                 });
             }
             // All Ne comparisons fell through -> this row has all NULLs -> result is NULL
@@ -689,7 +689,13 @@ fn translate_case_expr(
                 target_pc: next_case_label,
                 // A NULL result is considered untrue when evaluating WHEN terms.
                 flags: CmpInsFlags::default().jump_if_null(),
-                collation: program.curr_collation(),
+                collation: comparison_collation(
+                    base.as_deref()
+                        .expect("base_reg is set only with a base expression"),
+                    when_expr,
+                    referenced_tables,
+                    resolver,
+                )?,
             }),
             // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
             None => program.emit_insn(Insn::IfNot {
@@ -849,11 +855,10 @@ fn translate_collate_expr(
     let ast::Expr::Collate(expr, collation) = expr else {
         unreachable!("translate_collate_expr expects Expr::Collate");
     };
-    // First translate inner expr, then set the curr collation. If we set curr collation before,
-    // it may be overwritten later by inner translate.
+    // COLLATE does not change the value. Comparisons read the collation from
+    // the expression tree; resolving it here only rejects unknown names.
     translate_expr(program, referenced_tables, expr, target_register, resolver)?;
-    let collation = resolver.resolve_collation(collation.as_str())?;
-    program.set_collation(Some((collation, true)));
+    resolver.resolve_collation(collation.as_str())?;
     Ok(target_register)
 }
 
@@ -883,9 +888,19 @@ fn translate_function_call_expr(
         crate::bail_parse_error!("no such function: {}", name.as_str());
     }
 
+    let func = func_type.unwrap();
+    let collation = if func.needs_collation() {
+        Some(first_collation(
+            args.iter().map(|arg| (arg.as_ref(), referenced_tables)),
+            resolver,
+        )?)
+    } else {
+        None
+    };
     let func_ctx = FuncCtx {
-        func: func_type.unwrap(),
+        func,
         arg_count: args_count,
+        collation,
     };
 
     match &func_ctx.func {
@@ -2348,10 +2363,9 @@ fn translate_self_table_column_expr(
                 )
             }
             Some(SelfTableContext::ForDML { dml_ctx, table, .. }) => {
-                let Some(table_column) = table.columns().get(*column) else {
+                if *column >= table.columns().len() {
                     crate::bail_parse_error!("column index out of bounds");
-                };
-                program.set_collation(Some((table_column.collation(), false)));
+                }
                 let src_reg = dml_ctx.to_column_reg(*column);
                 program.emit_insn(Insn::Copy {
                     src_reg,
@@ -2426,14 +2440,6 @@ fn translate_column_expr(
                 table_ref_id, referenced_tables
             )
         });
-
-    if use_index_method.is_none() {
-        let Some(table_column) = table.get_column_at(*column) else {
-            crate::bail_parse_error!("column index out of bounds");
-        };
-        // Counter intuitive but a column always needs to have a collation
-        program.set_collation(Some((table_column.collation(), false)));
-    }
 
     // If we are reading a column from a table, we find the cursor that corresponds to
     // the table and read the column from the cursor.
@@ -2549,9 +2555,6 @@ fn translate_column_expr(
                             target_register,
                             resolver,
                         )?;
-                        // The virtual column's declared collation must override
-                        // whatever collation the inner expression resolved to.
-                        program.set_collation(Some((table_column.collation(), false)));
                     }
                     _ => {
                         let read_cursor = if read_from_index {
@@ -3279,18 +3282,10 @@ fn translate_register_expr(
     program: &mut ProgramBuilder,
     expr: &ast::Expr,
     target_register: usize,
-    resolver: &Resolver,
 ) -> Result<usize> {
     let ast::Expr::Register(src_reg) = expr else {
         unreachable!("translate_register_expr expects Expr::Register");
     };
-    // When a column reference has been rewritten to a register
-    // (UPSERT DO UPDATE WHERE/SET), the register still carries the
-    // column's implicit collation for comparison purposes, same as
-    // translate_column_expr().
-    if let Some(collation) = resolver.register_collations.get(src_reg) {
-        program.set_collation(Some((*collation, false)));
-    }
     // For DBSP expression compilation: copy from source register to target
     program.emit_insn(Insn::Copy {
         src_reg: *src_reg,
@@ -3392,7 +3387,6 @@ fn translate_merged_column(
     };
     assert!(columns.len() >= 2);
     let end_label = program.allocate_label();
-    let mut first_collation = None;
     for (index, column) in columns.iter().enumerate() {
         let register = translate_expr_no_constant_opt(
             program,
@@ -3402,10 +3396,6 @@ fn translate_merged_column(
             resolver,
             NoConstantOptReason::RegisterReuse,
         )?;
-        if index == 0 {
-            first_collation = program.curr_collation_ctx();
-        }
-        program.reset_collation();
         if index + 1 < columns.len() {
             program.emit_insn(Insn::NotNull {
                 reg: register,
@@ -3414,6 +3404,5 @@ fn translate_merged_column(
         }
     }
     program.preassign_label_to_next_insn(end_label);
-    program.set_collation(first_collation);
     Ok(target_register)
 }

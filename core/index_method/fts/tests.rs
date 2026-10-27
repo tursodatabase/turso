@@ -35,7 +35,10 @@ fn field_weights_reject_non_finite_and_non_positive_values() {
         let result = FtsIndexAttachment::new(IndexMethodConfiguration {
             table_name: "w".to_string(),
             index_name: "wx".to_string(),
-            columns: crate::alloc::vec![IndexColumn::new("title", 0), IndexColumn::new("body", 1)],
+            columns: crate::alloc::vec![
+                IndexColumn::new("title", 0, crate::translate::collate::CollationSeq::Binary),
+                IndexColumn::new("body", 1, crate::translate::collate::CollationSeq::Binary)
+            ],
             parameters: FxHashMap::from_iter([(
                 "weights".to_string(),
                 Value::from_text(format!("title={weight},body=1")),
@@ -57,7 +60,10 @@ fn field_weights_reject_non_finite_and_non_positive_values() {
 
 #[test]
 fn field_weights_accept_finite_positive_boundaries() {
-    let columns = [IndexColumn::new("title", 0), IndexColumn::new("body", 1)];
+    let columns = [
+        IndexColumn::new("title", 0, crate::translate::collate::CollationSeq::Binary),
+        IndexColumn::new("body", 1, crate::translate::collate::CollationSeq::Binary),
+    ];
     for (input, expected) in [
         ("1e-45", f32::from_bits(1)),
         ("1.17549435e-38", f32::MIN_POSITIVE),
@@ -98,7 +104,10 @@ fn test_attachment() -> FtsIndexAttachment {
     FtsIndexAttachment::new(IndexMethodConfiguration {
         table_name: "docs".to_string(),
         index_name: "docs_fts".to_string(),
-        columns: crate::alloc::vec![IndexColumn::new("title", 1), IndexColumn::new("body", 2)],
+        columns: crate::alloc::vec![
+            IndexColumn::new("title", 1, crate::translate::collate::CollationSeq::Binary),
+            IndexColumn::new("body", 2, crate::translate::collate::CollationSeq::Binary)
+        ],
         parameters: FxHashMap::<String, Value>::default(),
     })
     .unwrap()
@@ -156,7 +165,11 @@ fn estimate_cost(pattern_idx: i64, limit: Option<Expr>) -> IndexMethodCostEstima
     let attachment = FtsIndexAttachment::new(IndexMethodConfiguration {
         table_name: "docs".to_string(),
         index_name: "docs_fts".to_string(),
-        columns: crate::alloc::vec![IndexColumn::new("body", 1)],
+        columns: crate::alloc::vec![IndexColumn::new(
+            "body",
+            1,
+            crate::translate::collate::CollationSeq::Binary
+        )],
         parameters: FxHashMap::<String, Value>::default(),
     })
     .unwrap();

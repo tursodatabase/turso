@@ -22,6 +22,7 @@
 use crate::function::{Func, FuncCtx, ScalarFunc};
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
+use crate::translate::collate::CollationSeq;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
     to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral,
@@ -144,6 +145,7 @@ pub(super) fn emit_member_columns(
             func: FuncCtx {
                 func: Func::Scalar(ScalarFunc::Typeof),
                 arg_count: 1,
+                collation: None,
             },
         });
     }
@@ -246,7 +248,7 @@ pub(super) fn emit_add_to_member(
         rhs: zero_reg,
         target_pc: corrupt_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
     let keep_label = program.allocate_label();
     program.emit_insn(Insn::Ne {
@@ -254,7 +256,7 @@ pub(super) fn emit_add_to_member(
         rhs: zero_reg,
         target_pc: keep_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
     // The count reached zero. A new row never gets here: a consolidated
     // delta has no zero weights.

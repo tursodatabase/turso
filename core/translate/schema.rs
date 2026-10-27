@@ -2025,7 +2025,7 @@ pub fn translate_drop_table(
         rhs: table_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: Some(CollationSeq::NoCase),
+        collation: CollationSeq::NoCase,
     });
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id_0,
@@ -2044,7 +2044,7 @@ pub fn translate_drop_table(
             rhs: table_type,
             target_pc: skip_cdc_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::Binary,
         });
         let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
@@ -2163,7 +2163,7 @@ pub fn translate_drop_table(
                     rhs: trigger_type_reg,
                     target_pc: temp_next_label,
                     flags: CmpInsFlags::default(),
-                    collation: None,
+                    collation: CollationSeq::Binary,
                 });
 
                 // Cascade-check name (column 1) against each trigger we
@@ -2176,7 +2176,7 @@ pub fn translate_drop_table(
                         rhs: *name_reg,
                         target_pc: temp_delete_label,
                         flags: CmpInsFlags::default(),
-                        collation: None,
+                        collation: CollationSeq::Binary,
                     });
                 }
                 // No name matched — skip the delete.
@@ -2333,7 +2333,7 @@ pub fn translate_drop_table(
             rhs: table_name_and_root_page_register,
             target_pc: next_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::Binary,
         });
         program.emit_insn(Insn::RowId {
             cursor_id: sqlite_schema_cursor_id_1,
@@ -2469,7 +2469,7 @@ pub fn translate_drop_table(
             rhs: dropped_table_name_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: Some(CollationSeq::NoCase),
+            collation: CollationSeq::NoCase,
         });
 
         program.emit_insn(Insn::Delete {
@@ -2548,7 +2548,7 @@ pub fn translate_drop_table(
             rhs: dropped_name_reg,
             target_pc: continue_ver_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::Binary,
         });
 
         if let (Some(index), Some(cursor_id)) = (&version_index, ver_index_cursor_id) {
@@ -3144,7 +3144,7 @@ pub fn translate_drop_type(
         rhs: name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: CollationSeq::Binary,
     });
 
     // Delete matching row

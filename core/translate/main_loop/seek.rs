@@ -428,7 +428,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 flags: CmpInsFlags::default()
                     .jump_if_null()
                     .with_affinity(affinity.unwrap()),
-                collation: self.program.curr_collation(),
+                collation: CollationSeq::Binary,
             }),
             (false, SeekOp::GT) => self.program.emit_insn(Insn::Gt {
                 lhs: rowid_reg.unwrap(),
@@ -437,7 +437,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 flags: CmpInsFlags::default()
                     .jump_if_null()
                     .with_affinity(affinity.unwrap()),
-                collation: self.program.curr_collation(),
+                collation: CollationSeq::Binary,
             }),
             (false, SeekOp::LE { .. }) => self.program.emit_insn(Insn::Le {
                 lhs: rowid_reg.unwrap(),
@@ -446,7 +446,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 flags: CmpInsFlags::default()
                     .jump_if_null()
                     .with_affinity(affinity.unwrap()),
-                collation: self.program.curr_collation(),
+                collation: CollationSeq::Binary,
             }),
             (false, SeekOp::LT) => self.program.emit_insn(Insn::Lt {
                 lhs: rowid_reg.unwrap(),
@@ -455,7 +455,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 flags: CmpInsFlags::default()
                     .jump_if_null()
                     .with_affinity(affinity.unwrap()),
-                collation: self.program.curr_collation(),
+                collation: CollationSeq::Binary,
             }),
         }
         Ok(())

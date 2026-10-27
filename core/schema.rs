@@ -6969,7 +6969,7 @@ pub struct IndexColumn {
     /// CREATE INDEX idx ON t(b)
     /// b.pos_in_table == 1
     pub pos_in_table: usize,
-    pub collation: Option<CollationSeq>,
+    pub collation: CollationSeq,
     pub default: Option<Box<Expr>>,
     /// Expression for expression indexes. None for simple column indexes.
     pub expr: Option<Box<Expr>>,
@@ -7005,19 +7005,20 @@ pub(crate) use impl_effective_nulls_order;
 impl_effective_nulls_order!(IndexColumn);
 
 impl IndexColumn {
-    /// Returns a default column with the given name and position.
-    pub fn new(name: impl ToString, pos_in_table: usize) -> Self {
+    /// An ascending key column with the given name, position and collation.
+    pub fn new(name: impl ToString, pos_in_table: usize, collation: CollationSeq) -> Self {
         Self {
             name: name.to_string(),
             order: SortOrder::Asc,
             nulls_order: None,
             pos_in_table,
-            collation: None,
+            collation,
             default: None,
             expr: None,
         }
     }
 
+    /// Ascending BINARY key columns with the given names, in order.
     pub fn new_many<I>(names: I) -> Vec<Self>
     where
         I: IntoIterator,
@@ -7033,7 +7034,7 @@ impl IndexColumn {
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table: i,
-                collation: None,
+                collation: CollationSeq::Binary,
                 default: None,
                 expr: None,
             })
@@ -7164,7 +7165,7 @@ impl Index {
                     collation: constraint_columns
                         .get(i)
                         .and_then(|c| c.collation)
-                        .or_else(|| column.collation_opt()),
+                        .unwrap_or_else(|| column.collation()),
                     default: column.default.clone(),
                     expr: None,
                 })
@@ -7220,7 +7221,7 @@ impl Index {
                     collation: constraint_columns
                         .get(i)
                         .and_then(|c| c.collation)
-                        .or_else(|| col.collation_opt()),
+                        .unwrap_or_else(|| col.collation()),
                     default: col.default.clone(),
                     expr: None,
                 })

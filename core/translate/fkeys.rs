@@ -440,7 +440,7 @@ where
             rhs: parent_rowid,
             target_pc: next_row,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::Binary,
         });
     }
 
@@ -564,7 +564,7 @@ where
             rhs: parent_key_start + i,
             target_pc: cont,
             flags: CmpInsFlags::default(),
-            collation: Some(CollationSeq::Binary),
+            collation: CollationSeq::Binary,
         });
         program.emit_insn(Insn::Goto {
             target_pc: next_row,
@@ -587,7 +587,7 @@ where
             rhs: parent_rowid,
             target_pc: skip,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::Binary,
         });
         on_match(program)?;
         program.preassign_label_to_next_insn(skip);
@@ -1319,7 +1319,7 @@ pub fn emit_fk_child_update_counters(
                     rhs: parent_reg,
                     target_pc: self_mismatch,
                     flags: CmpInsFlags::default().jump_if_null(),
-                    collation: Some(CollationSeq::Binary),
+                    collation: CollationSeq::Binary,
                 });
             }
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
@@ -1364,7 +1364,7 @@ pub fn emit_fk_child_update_counters(
                     rhs: new_rowid_reg,
                     target_pc: fk_ok,
                     flags: CmpInsFlags::default(),
-                    collation: None,
+                    collation: CollationSeq::Binary,
                 });
             }
 
@@ -1812,7 +1812,7 @@ fn emit_key_change_check(
             rhs: new_key_start + i,
             target_pc: next.unwrap_or(skip_label),
             flags: CmpInsFlags::default().null_eq(),
-            collation: None,
+            collation: CollationSeq::Binary,
         });
         program.emit_insn(Insn::Goto {
             target_pc: changed_label,

@@ -1,5 +1,6 @@
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
+use crate::translate::collate::CollationSeq;
 
 use crate::{
     bail_parse_error,
@@ -300,7 +301,7 @@ pub fn translate_analyze(
             rhs: target_tbl_reg,
             target_pc: skip_label,
             flags: Default::default(),
-            collation: None,
+            collation: CollationSeq::Binary,
         });
 
         if let Some(idx) = target_index.clone() {
@@ -322,7 +323,7 @@ pub fn translate_analyze(
                 rhs: target_idx_reg,
                 target_pc: skip_label,
                 flags: Default::default(),
-                collation: None,
+                collation: CollationSeq::Binary,
             });
             let rowid_reg = program.alloc_register();
             program.emit_insn(Insn::RowId {
@@ -508,6 +509,7 @@ fn emit_index_stats(
         func: FuncCtx {
             func: Func::Scalar(ScalarFunc::StatInit),
             arg_count: 1,
+            collation: None,
         },
     });
 
@@ -596,6 +598,7 @@ fn emit_index_stats(
         func: FuncCtx {
             func: Func::Scalar(ScalarFunc::StatPush),
             arg_count: 2,
+            collation: None,
         },
     });
 
@@ -616,6 +619,7 @@ fn emit_index_stats(
         func: FuncCtx {
             func: Func::Scalar(ScalarFunc::StatGet),
             arg_count: 1,
+            collation: None,
         },
     });
 

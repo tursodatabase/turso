@@ -1,5 +1,6 @@
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::ColumnLayout;
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
     emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
 };
@@ -1367,7 +1368,7 @@ fn emit_write_sqlite_sequence(
         rhs: meta.r_seq,
         target_pc: done_label,
         flags: Default::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
     program.preassign_label_to_next_insn(write_label);
     emit_update_sqlite_sequence(
@@ -1617,7 +1618,7 @@ fn emit_rowid_generation(
             rhs: max_i64_reg,
             target_pc: no_overflow_label,
             flags: Default::default(),
-            collation: None,
+            collation: CollationSeq::Binary,
         });
 
         program.emit_insn(Insn::Halt {
@@ -1832,7 +1833,7 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
         rhs: name_col_reg,
         target_pc: found_label,
         flags: Default::default(),
-        collation: Some(super::collate::CollationSeq::NoCase),
+        collation: super::collate::CollationSeq::NoCase,
     });
     program.emit_insn(Insn::Copy {
         src_reg: name_col_reg,
@@ -4039,7 +4040,7 @@ pub fn emit_fk_child_insert_checks(
                     rhs: new_rowid_reg,
                     target_pc: fk_ok,
                     flags: CmpInsFlags::default(),
-                    collation: None,
+                    collation: CollationSeq::Binary,
                 });
             }
 
@@ -4131,7 +4132,7 @@ pub fn emit_fk_child_insert_checks(
                         // `k TEXT COLLATE NOCASE UNIQUE, pk TEXT REFERENCES t(k)`,
                         // SQLite rejects same-row INSERT `(k, pk)=('A', 'a')`;
                         // NOCASE applies to the later parent-index lookup only.
-                        collation: Some(super::collate::CollationSeq::Binary),
+                        collation: super::collate::CollationSeq::Binary,
                     });
                 }
                 // All equal: same-row OK

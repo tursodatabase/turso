@@ -3,6 +3,7 @@ use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::namespace::NamespaceId;
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
+use crate::translate::collate::CollationSeq;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::vdbe::builder::SelfTableContext;
@@ -1679,7 +1680,7 @@ fn emit_update_insns<'a>(
             rhs: beg,
             target_pc: record_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::Binary,
         });
 
         // If a row with the new rowid doesn't exist, no conflict
@@ -2028,7 +2029,7 @@ fn emit_update_insns<'a>(
                 rhs: idx_rowid_reg,
                 target_pc: constraint_check,
                 flags: CmpInsFlags::default(),
-                collation: program.curr_collation(),
+                collation: CollationSeq::Binary,
             });
             match idx_conflict {
                 ResolveType::Ignore => {
@@ -2142,7 +2143,7 @@ fn emit_update_insns<'a>(
             rhs: beg,
             target_pc: no_rowid_conflict_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::Binary,
         });
 
         // If a row with the new rowid doesn't exist, no conflict.

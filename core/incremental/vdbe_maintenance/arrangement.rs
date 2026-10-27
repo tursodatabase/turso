@@ -11,6 +11,7 @@ use super::MaintenanceInput;
 use crate::incremental::dag;
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
+use crate::translate::collate::CollationSeq;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
@@ -185,7 +186,7 @@ fn emit_output_arrangement(
         rhs: zero_reg,
         target_pc: corrupt_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
     program.emit_insn(Insn::NewRowid {
         cursor: table_cursor,
@@ -237,14 +238,14 @@ fn emit_output_arrangement(
         rhs: zero_reg,
         target_pc: corrupt_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
     program.emit_insn(Insn::Ne {
         lhs: new_mult_reg,
         rhs: zero_reg,
         target_pc: update_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
     program.emit_insn(Insn::IdxDelete {
         start_reg: lookup_start,
@@ -310,7 +311,7 @@ fn emit_output_arrangement(
         rhs: zero_reg,
         target_pc: emit_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(lookup_start),

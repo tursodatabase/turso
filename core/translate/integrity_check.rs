@@ -1,5 +1,6 @@
 use crate::alloc::Arc;
 use crate::schema::Column;
+use crate::translate::collate::CollationSeq;
 use crate::translate::expr::{emit_stored_column, emit_table_column};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::SelfTableContext;
@@ -627,7 +628,7 @@ fn translate_integrity_check_for_schema(
                     rhs: bound_index.expected_count_reg,
                     target_pc: counts_match,
                     flags: CmpInsFlags::default(),
-                    collation: None,
+                    collation: CollationSeq::Binary,
                 });
                 program.emit_string8(
                     format!("wrong # of entries in index {}", bound_index.index.name),

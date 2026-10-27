@@ -1092,12 +1092,7 @@ impl BoxedSortableRecord {
             let cmp = if let Some(Some(comparator)) = self.comparators.get(i) {
                 comparator(&self_val, &other_val).expect("Memory allocation failed here")
             } else {
-                match (self_val, other_val) {
-                    (ValueRef::Text(left), ValueRef::Text(right)) => {
-                        key_info.collation.compare_strings(&left, &right)
-                    }
-                    _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
-                }
+                key_info.collation.compare(self_val, other_val)
             };
             let cmp = cmp_with_sort(cmp, &self_val, &other_val, key_info);
             if cmp != Ordering::Equal {

@@ -1,7 +1,7 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 use super::{
-    collate::{get_expr_collation_ctx_with_symbols, CollationSeq},
+    collate::CollationSeq,
     compound_select::emit_program_for_compound_select,
     emitter::{
         delete::emit_program_for_delete, select::emit_program_for_select,
@@ -103,11 +103,9 @@ pub struct CachedExprReg<'a> {
     pub expr: Cow<'a, ast::Expr>,
     pub reg: usize,
     pub needs_decode: bool,
-    pub collation: CachedExprCollation,
 }
 
-pub type CachedExprCollation = Option<(CollationSeq, bool)>;
-pub type CachedExprRegHit = (usize, bool, CachedExprCollation);
+pub type CachedExprRegHit = (usize, bool);
 
 /// Whether SQLite's DQS (double-quoted strings) misfeature is enabled for DML.
 /// When `Enabled`, unresolved double-quoted identifiers fall back to string literals;
@@ -288,6 +286,26 @@ impl DatabaseScopeContext {
     }
 }
 
+#[cfg(test)]
+impl Resolver<'static> {
+    /// A resolver over an empty main schema with the SQLite dialect. Its state is leaked so
+    /// that unit tests can create one in a single call.
+    pub(crate) fn empty_for_tests() -> Self {
+        Self::new(
+            Box::leak(Box::new(Schema::default())),
+            Box::leak(Box::new(RwLock::new(HashMap::default()))),
+            Box::leak(Box::new(RwLock::new(None))),
+            Box::leak(Box::new(RwLock::new(DatabaseCatalog::new()))),
+            Box::leak(Box::new(crate::Namespaces::default())),
+            Box::leak(Box::new(SymbolTable::new())),
+            true,
+            DoubleQuotedDml::Enabled,
+            Arc::new(crate::dialect::SqliteDialect),
+            None,
+        )
+    }
+}
+
 impl<'a> Resolver<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -450,14 +468,6 @@ impl<'a> Resolver<'a> {
             .borrow()
             .as_ref()
             .and_then(|scope| scope.affinity(column))
-    }
-
-    pub(crate) fn self_table_collation(&self, column: Option<usize>) -> Option<CollationSeq> {
-        let table = self.self_table()?;
-        match column {
-            Some(column) => table.columns().get(column)?.collation_opt(),
-            None => table.get_rowid_alias_column()?.1.collation_opt(),
-        }
     }
 
     /// The table that `SELF_TABLE` column references refer to.
@@ -696,37 +706,12 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    pub fn cache_expr_reg(
-        &mut self,
-        expr: Cow<'a, ast::Expr>,
-        reg: usize,
-        needs_decode: bool,
-        collation: CachedExprCollation,
-    ) {
+    pub fn cache_expr_reg(&mut self, expr: Cow<'a, ast::Expr>, reg: usize, needs_decode: bool) {
         self.expr_to_reg_cache.push(CachedExprReg {
             expr,
             reg,
             needs_decode,
-            collation,
         });
-    }
-
-    /// Cache a scalar expression result together with the collation metadata that
-    /// standalone expression translation would have propagated to a parent comparison.
-    pub fn cache_scalar_expr_reg(
-        &mut self,
-        expr: Cow<'a, ast::Expr>,
-        reg: usize,
-        needs_decode: bool,
-        referenced_tables: &TableReferences,
-    ) -> Result<()> {
-        let collation = get_expr_collation_ctx_with_symbols(
-            expr.as_ref(),
-            referenced_tables,
-            Some(self.symbol_table),
-        )?;
-        self.cache_expr_reg(expr, reg, needs_decode, collation);
-        Ok(())
     }
 
     pub fn resolve_collation(&self, name: &str) -> Result<CollationSeq> {
@@ -736,18 +721,18 @@ impl<'a> Resolver<'a> {
         CollationSeq::new(name)
     }
 
-    /// Returns the register, decode flag, and collation metadata for a previously translated expression.
+    /// Returns the register and decode flag for a previously translated expression.
     ///
     /// We scan from newest to oldest so later translations win when equivalent
     /// expressions are seen multiple times in the same translation pass.
-    /// Returns `(register, needs_custom_type_decode, collation_ctx)`.
+    /// Returns `(register, needs_custom_type_decode)`.
     pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<CachedExprRegHit> {
         if self.expr_to_reg_cache_enabled {
             self.expr_to_reg_cache
                 .iter()
                 .rev()
                 .find(|entry| exprs_are_equivalent(expr, &entry.expr))
-                .map(|entry| (entry.reg, entry.needs_decode, entry.collation))
+                .map(|entry| (entry.reg, entry.needs_decode))
         } else {
             None
         }
@@ -1651,6 +1636,7 @@ fn emit_cdc_insns_v1(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
+        collation: None,
     };
 
     program.emit_insn(Insn::Function {
@@ -1762,6 +1748,7 @@ fn emit_cdc_insns_v2(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
+        collation: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1779,6 +1766,7 @@ fn emit_cdc_insns_v2(
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
+        collation: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1884,6 +1872,7 @@ pub fn emit_cdc_commit_insns(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
+        collation: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1899,6 +1888,7 @@ pub fn emit_cdc_commit_insns(
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
+        collation: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1969,6 +1959,7 @@ pub fn emit_cdc_autocommit_commit(
     let is_autocommit_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
         arg_count: 0,
+        collation: None,
     };
     let autocommit_reg = program.alloc_register();
     program.emit_insn(Insn::Function {
@@ -2001,6 +1992,7 @@ pub fn emit_cdc_autocommit_commit(
                 func: crate::function::FuncCtx {
                     func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
                     arg_count: 1,
+                    collation: None,
                 },
             });
             program.emit_insn(Insn::Eq {
@@ -2008,7 +2000,7 @@ pub fn emit_cdc_autocommit_commit(
                 rhs: minus_one_reg,
                 target_pc: skip_label,
                 flags: crate::vdbe::insn::CmpInsFlags::default(),
-                collation: None,
+                collation: CollationSeq::Binary,
             });
             let (cursor_id, _) =
                 prepare_cdc_if_necessary(program, resolver.schema(), crate::MAIN_DB_ID, None)?
@@ -2055,6 +2047,7 @@ pub fn emit_cdc_explicit_commit_insns(
         func: crate::function::FuncCtx {
             func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
             arg_count: 1,
+            collation: None,
         },
     });
 
@@ -2067,7 +2060,7 @@ pub fn emit_cdc_explicit_commit_insns(
         rhs: minus_one_reg,
         target_pc: skip_label,
         flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
 
     // The CDC record write needs a transaction; joins the open one (keeping its mode) if any.
@@ -2634,32 +2627,23 @@ pub(crate) fn emit_check_constraints<'a>(
     // so that CHECK expressions like `CHECK(rowid > 0)` and `CHECK(t.rowid > 0)` both resolve.
     for rowid_name in ROWID_STRS {
         let rowid_expr = ast::Expr::Id(ast::Name::exact(rowid_name.to_string()));
-        resolver.cache_expr_reg(Cow::Owned(rowid_expr), rowid_reg, false, None);
+        resolver.cache_expr_reg(Cow::Owned(rowid_expr), rowid_reg, false);
         let qualified_expr = ast::Expr::Qualified(
             ast::Name::exact(table_name.to_string()),
             ast::Name::exact(rowid_name.to_string()),
         );
-        resolver.cache_expr_reg(Cow::Owned(qualified_expr), rowid_reg, false, None);
+        resolver.cache_expr_reg(Cow::Owned(qualified_expr), rowid_reg, false);
     }
 
     // Map each column to its register (both unqualified and qualified forms).
     for (col_name, register) in column_mappings.iter().copied() {
-        let collation = joined_table
-            .and_then(|table| {
-                table.columns().iter().find(|col| {
-                    col.name
-                        .as_ref()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(col_name))
-                })
-            })
-            .map(|col| (col.collation(), false));
         let column_expr = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
-        resolver.cache_expr_reg(Cow::Owned(column_expr), register, false, collation);
+        resolver.cache_expr_reg(Cow::Owned(column_expr), register, false);
         let qualified_expr = ast::Expr::Qualified(
             ast::Name::exact(table_name.to_string()),
             ast::Name::exact(col_name.to_string()),
         );
-        resolver.cache_expr_reg(Cow::Owned(qualified_expr), register, false, collation);
+        resolver.cache_expr_reg(Cow::Owned(qualified_expr), register, false);
     }
 
     if let Some(joined_table) = joined_table {
@@ -2670,7 +2654,6 @@ pub(crate) fn emit_check_constraints<'a>(
             }),
             rowid_reg,
             false,
-            None,
         );
 
         for (col_name, register) in column_mappings.iter().copied() {
@@ -2688,7 +2671,6 @@ pub(crate) fn emit_check_constraints<'a>(
                     }),
                     register,
                     false,
-                    Some((col.collation(), false)),
                 );
             }
         }

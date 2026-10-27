@@ -38,7 +38,7 @@ pub(super) fn emit_array_element_loop(
         rhs: max_reg,
         target_pc: ok_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
     program.emit_insn(Insn::Halt {
         constraint_info: None,
@@ -71,7 +71,7 @@ pub(super) fn emit_array_element_loop(
         rhs: reg_len,
         target_pc: loop_end_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
 
     // Extract element from record blob (1-based index)

@@ -11,6 +11,7 @@
 // contract (the outer `Statement::step()` must return
 // `StepResult::IO` rather than blocking).
 
+use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
 
 use crate::bail_parse_error;
@@ -508,14 +509,14 @@ pub fn emit_disk_advance_past(
             rhs: col_value_reg,
             target_pc: done_seek_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::Binary,
         });
         program.emit_insn(Insn::Gt {
             lhs: value_reg,
             rhs: col_value_reg,
             target_pc: do_advance_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::Binary,
         });
     } else {
         program.emit_insn(Insn::Gt {
@@ -523,14 +524,14 @@ pub fn emit_disk_advance_past(
             rhs: col_value_reg,
             target_pc: done_seek_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::Binary,
         });
         program.emit_insn(Insn::Lt {
             lhs: value_reg,
             rhs: col_value_reg,
             target_pc: do_advance_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::Binary,
         });
     }
     program.emit_insn(Insn::If {
@@ -666,7 +667,7 @@ pub(crate) fn emit_backing_table_compaction(
         rhs: keep_value_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: CollationSeq::Binary,
     });
     program.emit_insn(Insn::Delete {
         cursor_id,
@@ -742,7 +743,7 @@ pub(crate) fn emit_sqlite_sequence_sync(
         rhs: name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: CollationSeq::Binary,
     });
     program.emit_insn(Insn::Delete {
         cursor_id: sseq_cursor,
@@ -1030,14 +1031,14 @@ pub(crate) fn emit_drop_sequence_cleanup(
         rhs: type_str_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: CollationSeq::Binary,
     });
     program.emit_insn(Insn::Ne {
         lhs: col1_reg,
         rhs: seq_name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: CollationSeq::Binary,
     });
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id,

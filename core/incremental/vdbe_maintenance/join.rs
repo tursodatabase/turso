@@ -1,4 +1,4 @@
-use super::binding::{cache_stream_expr_reg, make_joined_table, remap_bound_expr, BindingRemap};
+use super::binding::{make_joined_table, remap_bound_expr, BindingRemap};
 use super::output::{DeltaSource, EmittedNodeOutput, NodeOutput, NodeOutputContract};
 use super::plan::OperatorStateDef;
 use super::stream::{
@@ -10,6 +10,7 @@ use crate::incremental::dag;
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
 use crate::sync::Arc;
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{translate_condition_expr, ConditionMetadata};
 use crate::translate::plan::TableReferences;
@@ -398,7 +399,7 @@ fn emit_join_phase(
                 _ => program.emit_column_or_rowid(cursor_ids[pos], physical_column, value_reg),
             }
             let bound = remap_bound_expr(expr, &binding_remap)?;
-            cache_stream_expr_reg(&mut *resolver, bound, value_reg, &table_references)?;
+            resolver.cache_expr_reg(std::borrow::Cow::Owned(bound), value_reg, false);
         }
         for (binding_index, binding) in input.schema.bindings.iter().enumerate() {
             let rowid_reg = program.alloc_register();
@@ -425,7 +426,6 @@ fn emit_join_phase(
                 }),
                 rowid_reg,
                 false,
-                None,
             );
         }
     }
@@ -1061,7 +1061,7 @@ pub(super) fn emit_semi_or_anti_join(
             rhs: zero_reg,
             target_pc: corrupt_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::Binary,
         });
     }
     program.emit_insn(Insn::If {
@@ -1102,7 +1102,7 @@ pub(super) fn emit_semi_or_anti_join(
         rhs: published_reg,
         target_pc: publish,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
     program.emit_insn(Insn::IfNot {
         reg: own_delta_reg,
@@ -1295,7 +1295,7 @@ fn emit_add_change_subroutine(
         rhs: zero_reg,
         target_pc: write,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
     program.emit_int(1, sums_start + 2);
     program.preassign_label_to_next_insn(write);

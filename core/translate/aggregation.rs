@@ -5,7 +5,7 @@ use crate::{
     function::{AccumulatorFunc, AggFunc},
     schema::Table,
     sync::Arc,
-    translate::collate::CollationSeq,
+    translate::collate::{expr_collation, CollationSeq},
     vdbe::{
         builder::ProgramBuilder,
         insn::{AggStepData, HashDistinctData, Insn},
@@ -56,7 +56,6 @@ pub fn emit_ungrouped_aggregation<'a>(
             std::borrow::Cow::Borrowed(&agg.original_expr),
             agg_start_reg + i,
             false,
-            None,
         );
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
@@ -216,45 +215,6 @@ pub fn emit_ungrouped_aggregation<'a>(
     program.preassign_label_to_next_insn(end_label);
 
     Ok(())
-}
-
-/// Resolves the collation a comparison-based aggregate uses for its argument
-/// (explicit COLLATE clause, then the column's table-defined collation, then
-/// BINARY). The result is stored on the AggStep instruction itself.
-pub(crate) fn agg_arg_collation(
-    referenced_tables: &TableReferences,
-    expr: &ast::Expr,
-    resolver: &Resolver,
-) -> CollationSeq {
-    // Check if this is a column expression with explicit COLLATE clause
-    if let ast::Expr::Collate(_, collation_name) = expr {
-        if let Ok(collation) = resolver.resolve_collation(collation_name.as_str()) {
-            return collation;
-        }
-        return CollationSeq::Binary;
-    }
-
-    // A merged USING column compares with the collation of its first column
-    // (see ast::Expr::MergedColumn).
-    if let ast::Expr::MergedColumn(columns) = expr {
-        let first_column = columns
-            .first()
-            .expect("a merged column must have at least two source columns");
-        return agg_arg_collation(referenced_tables, first_column, resolver);
-    }
-
-    // If no explicit collation, check if this is a column with table-defined collation
-    if let ast::Expr::Column { table, column, .. } = expr {
-        if let Some((_, table_ref)) = referenced_tables.find_table_by_internal_id(*table) {
-            if let Some(table_column) = table_ref.get_column_at(*column) {
-                if let Some(c) = table_column.collation_opt() {
-                    return c;
-                }
-            }
-        }
-    }
-
-    CollationSeq::Binary
 }
 
 /// Emits the bytecode for handling duplicates in a distinct aggregate.
@@ -536,7 +496,7 @@ pub(crate) fn open_aggregate_sorter(
         } else {
             ast::SortOrder::Asc
         },
-        Some(CollationSeq::Binary),
+        CollationSeq::Binary,
         None,
     ))?;
     data.comparators.try_push(None)?;
@@ -659,7 +619,7 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
+            let arg_collation = expr_collation(expr, Some(referenced_tables), resolver)?;
             let comparator =
                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
@@ -681,7 +641,7 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
+            let arg_collation = expr_collation(expr, Some(referenced_tables), resolver)?;
             let comparator =
                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
@@ -821,7 +781,7 @@ pub fn translate_aggregation_step(
             let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             // Activate the value's collation so finalize can sort text correctly.
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
+            let arg_collation = expr_collation(expr, Some(referenced_tables), resolver)?;
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -846,7 +806,7 @@ pub fn translate_aggregation_step(
             let fraction_reg =
                 fraction_reg.expect("percentile fraction register must be set by InitLoop::emit");
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
+            let arg_collation = expr_collation(expr, Some(referenced_tables), resolver)?;
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -902,10 +862,6 @@ pub fn translate_aggregation_step(
             target_register
         }
     };
-    // Aggregate arguments can carry column or explicit COLLATE metadata for the
-    // aggregate's internal comparator, but that state must not leak to the
-    // surrounding expression that consumes the aggregate result.
-    program.reset_collation();
     Ok(dest)
 }
 

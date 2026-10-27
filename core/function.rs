@@ -1617,6 +1617,9 @@ impl Display for Func {
 pub struct FuncCtx {
     pub func: Func,
     pub arg_count: usize,
+    /// The collation the function compares its arguments with. Set exactly
+    /// when [Func::needs_collation] is true.
+    pub collation: Option<crate::translate::collate::CollationSeq>,
 }
 
 impl Deterministic for Func {
@@ -1642,6 +1645,16 @@ impl Deterministic for Func {
 }
 
 impl Func {
+    /// Whether the function compares its arguments, and so needs the
+    /// collation of its first argument that has one. SQLite marks these
+    /// functions `SQLITE_FUNC_NEEDCOLL`.
+    pub fn needs_collation(&self) -> bool {
+        matches!(
+            self,
+            Self::Scalar(ScalarFunc::Min | ScalarFunc::Max | ScalarFunc::Nullif)
+        )
+    }
+
     pub fn supports_star_syntax(&self) -> bool {
         // Functions that need star expansion also support star syntax
         if self.needs_star_expansion() {
