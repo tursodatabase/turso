@@ -560,8 +560,7 @@ fn translate_binary_expr(
         }
     }
 
-    if let Some(result_reg) =
-        emit_custom_type_operator(program, referenced_tables, e1, op, e2, resolver)?
+    if let Some(result_reg) = emit_custom_type_operator(program, referenced_tables, expr, resolver)?
     {
         if result_reg != target_register {
             program.emit_insn(Insn::Copy {
@@ -1891,6 +1890,7 @@ fn translate_function_call_expr(
                 | ScalarFunc::NumericMul
                 | ScalarFunc::NumericDiv
                 | ScalarFunc::NumericMod
+                | ScalarFunc::NumericNeg
                 | ScalarFunc::NumericLt
                 | ScalarFunc::NumericEq
                 | ScalarFunc::DatePlus
@@ -3145,6 +3145,17 @@ fn translate_unary_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
+    if let Some(result_reg) = emit_custom_type_operator(program, referenced_tables, expr, resolver)?
+    {
+        if result_reg != target_register {
+            program.emit_insn(Insn::Copy {
+                src_reg: result_reg,
+                dst_reg: target_register,
+                extra_amount: 0,
+            });
+        }
+        return Ok(target_register);
+    }
     let ast::Expr::Unary(op, expr) = expr else {
         unreachable!("translate_unary_expr expects Expr::Unary");
     };

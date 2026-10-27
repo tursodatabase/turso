@@ -540,7 +540,8 @@ fn resolve_scalar_func_return_type(
         | ScalarFunc::NumericSub
         | ScalarFunc::NumericMul
         | ScalarFunc::NumericDiv
-        | ScalarFunc::NumericMod => Ok(CheckExprType::Blob),
+        | ScalarFunc::NumericMod
+        | ScalarFunc::NumericNeg => Ok(CheckExprType::Blob),
 
         // Remaining functions — treat as ANY
         _ => Ok(CheckExprType::Any),

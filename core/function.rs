@@ -941,6 +941,7 @@ pub enum ScalarFunc {
     NumericMul,
     NumericDiv,
     NumericMod,
+    NumericNeg,
     NumericLt,
     NumericEq,
     // Date type functions
@@ -1075,6 +1076,7 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::NumericMul
             | ScalarFunc::NumericDiv
             | ScalarFunc::NumericMod
+            | ScalarFunc::NumericNeg
             | ScalarFunc::NumericLt
             | ScalarFunc::NumericEq
             | ScalarFunc::DatePlus
@@ -1240,6 +1242,7 @@ impl Display for ScalarFunc {
             Self::NumericMul => "numeric_mul",
             Self::NumericDiv => "numeric_div",
             Self::NumericMod => "numeric_mod",
+            Self::NumericNeg => "numeric_neg",
             Self::NumericLt => "numeric_lt",
             Self::NumericEq => "numeric_eq",
             Self::DatePlus => "date_plus",
@@ -1386,7 +1389,8 @@ impl ScalarFunc {
             Self::BooleanToInt
             | Self::IntToBoolean
             | Self::ValidateIpAddr
-            | Self::NumericDecode => &[1],
+            | Self::NumericDecode
+            | Self::NumericNeg => &[1],
             Self::NumericAdd
             | Self::NumericSub
             | Self::NumericMul

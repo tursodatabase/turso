@@ -3981,9 +3981,9 @@ impl Optimizable for ast::Expr {
             Expr::Binary(_, ast::Operator::Modulus | ast::Operator::Divide, _) => false, // 1 % 0, 1 / 0
             Expr::Binary(_, ast::Operator::ArrowRight | ast::Operator::ArrowRightShift, _) => false, // JSON path may be absent, yielding NULL
             Expr::Binary(_, ast::Operator::ArrayContains | ast::Operator::ArrayOverlap, _) => false,
-            Expr::Binary(lhs, op, rhs) => {
+            Expr::Binary(lhs, _, rhs) => {
                 // A custom type's function may return NULL for any operands.
-                !runs_custom_type_function(lhs, op, rhs, &TypeEnv::new(Some(tables), resolver))
+                !runs_custom_type_function(self, &TypeEnv::new(Some(tables), resolver))
                     && lhs.is_nonnull(tables, resolver)
                     && rhs.is_nonnull(tables, resolver)
             }
@@ -4085,7 +4085,10 @@ impl Optimizable for ast::Expr {
             Expr::FieldAccess { .. } => false, // struct/union field extraction can return NULL
             Expr::Raise(..) => false,
             Expr::Subquery(..) => false,
-            Expr::Unary(_, expr) => expr.is_nonnull(tables, resolver),
+            Expr::Unary(_, expr) => {
+                !runs_custom_type_function(self, &TypeEnv::new(Some(tables), resolver))
+                    && expr.is_nonnull(tables, resolver)
+            }
             Expr::Variable(..) => false,
             Expr::Register { .. } => false, // Register values can be null
             Expr::Default => false,

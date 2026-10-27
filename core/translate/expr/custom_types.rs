@@ -191,7 +191,7 @@ pub(super) struct ResolvedOperator {
 /// its type.
 ///
 /// Comparisons are decided here, while emitting, because index seeks look for a
-/// plain comparison in the tree. Arithmetic is decided by `custom_arithmetic_call`.
+/// plain comparison in the tree. Other operators are decided by `custom_operator_call`.
 pub(super) fn find_custom_comparison(
     e1: &ast::Expr,
     e2: &ast::Expr,
@@ -285,38 +285,47 @@ pub(super) fn find_custom_comparison(
     }
 }
 
-/// Whether a custom type's function runs `lhs op rhs`. An operator that does not
-/// exist, such as `date * 2`, counts too: emitting it fails.
-pub(crate) fn runs_custom_type_function(
-    lhs: &ast::Expr,
-    op: &ast::Operator,
-    rhs: &ast::Expr,
-    env: &TypeEnv,
-) -> bool {
-    find_custom_comparison(lhs, rhs, op, env.tables(), env.resolver()).is_some()
-        || !matches!(custom_arithmetic_call(lhs, op, rhs, env), Ok(None))
+/// Whether a custom type's function runs the operator expression `expr`, such
+/// as `a < b` or `-a`. An operator that does not exist, such as `date * 2`,
+/// counts too: emitting it fails.
+pub(crate) fn runs_custom_type_function(expr: &ast::Expr, env: &TypeEnv) -> bool {
+    let runs_comparison = match expr {
+        ast::Expr::Binary(lhs, op, rhs) => {
+            find_custom_comparison(lhs, rhs, op, env.tables(), env.resolver()).is_some()
+        }
+        _ => false,
+    };
+    runs_comparison || !matches!(custom_operator_call(expr, env), Ok(None))
 }
 
-/// Emits `lhs op rhs` with a custom type's function, if one runs it, and returns
-/// the register holding the result. `None` means SQLite's operator runs.
+/// Emits the operator expression `expr` with a custom type's function, if one
+/// runs it, and returns the register holding the result. `None` means SQLite's
+/// operator runs.
 pub(super) fn emit_custom_type_operator(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
-    lhs: &ast::Expr,
-    op: &ast::Operator,
-    rhs: &ast::Expr,
+    expr: &ast::Expr,
     resolver: &Resolver,
 ) -> Result<Option<usize>> {
-    if let Some(comparison) = find_custom_comparison(lhs, rhs, op, referenced_tables, resolver) {
-        let result_reg =
-            emit_custom_comparison(program, referenced_tables, lhs, rhs, &comparison, resolver)?;
-        return Ok(Some(result_reg));
+    if let ast::Expr::Binary(lhs, op, rhs) = expr {
+        if let Some(comparison) = find_custom_comparison(lhs, rhs, op, referenced_tables, resolver)
+        {
+            let result_reg = emit_custom_comparison(
+                program,
+                referenced_tables,
+                lhs,
+                rhs,
+                &comparison,
+                resolver,
+            )?;
+            return Ok(Some(result_reg));
+        }
     }
     let env = TypeEnv::new(referenced_tables, resolver);
-    let Some(call) = custom_arithmetic_call(lhs, op, rhs, &env)? else {
+    let Some(call) = custom_operator_call(expr, &env)? else {
         return Ok(None);
     };
-    let result_reg = emit_arithmetic_call(program, referenced_tables, lhs, rhs, &call, resolver)?;
+    let result_reg = emit_operator_call(program, referenced_tables, expr, &call, resolver)?;
     Ok(Some(result_reg))
 }
 

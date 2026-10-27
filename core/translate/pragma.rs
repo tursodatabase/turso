@@ -1885,7 +1885,7 @@ fn query_pragma(
                         .iter()
                         .map(|op| (op.op.as_str(), op.func_name.as_deref()));
                     let built_in = type_def
-                        .all_arithmetic()
+                        .all_operator_signatures()
                         .iter()
                         .filter(|s| s.func.is_some())
                         .map(|s| (s.op, s.func.as_deref()));

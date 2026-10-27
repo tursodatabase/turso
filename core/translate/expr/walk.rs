@@ -249,9 +249,7 @@ pub fn expr_references_outer_query(expr: &ast::Expr, table_references: &TableRef
 pub(crate) fn expression_can_fail_on_input(expr: &ast::Expr, env: &TypeEnv) -> bool {
     let mut can_fail = false;
     walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
-        if let ast::Expr::Binary(lhs, op, rhs) = expr {
-            can_fail |= runs_custom_type_function(lhs, op, rhs, env);
-        }
+        can_fail |= runs_custom_type_function(expr, env);
         if matches!(
             expr,
             ast::Expr::FunctionCall { .. }

@@ -11546,6 +11546,18 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
+            ScalarFunc::NumericNeg => {
+                check_arg_count!(arg_count, 1);
+                let val = state.registers[*start_reg].get_value().clone();
+                let result = match val {
+                    Value::Null => Value::Null,
+                    // Negating keeps the decimal places: -(1.50) is -1.50.
+                    _ => Value::build_text(crate::numeric::decimal::format_numeric(
+                        &-numeric_from_value(&val)?,
+                    )),
+                };
+                state.registers[*dest].set_value(result);
+            }
             ScalarFunc::NumericLt | ScalarFunc::NumericEq => {
                 check_arg_count!(arg_count, 2);
                 let lhs_val = state.registers[*start_reg].get_value().clone();

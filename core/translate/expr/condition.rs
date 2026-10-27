@@ -505,7 +505,7 @@ fn translate_leaf_condition_expr(
         }
         ast::Expr::Binary(e1, op, e2) => {
             if let Some(result_reg) =
-                emit_custom_type_operator(program, Some(referenced_tables), e1, op, e2, resolver)?
+                emit_custom_type_operator(program, Some(referenced_tables), expr, resolver)?
             {
                 emit_cond_jump(program, condition_metadata, result_reg);
             } else {

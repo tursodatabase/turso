@@ -7,7 +7,7 @@
 
 use turso_parser::ast;
 
-use super::custom_type_operators::find_arithmetic_call;
+use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
 use crate::function::{AggFunc, Func, ScalarFunc};
 use crate::schema::{Column, Schema, Table, TypeDef};
@@ -146,10 +146,16 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             ..
         } => cast_type(type_name, env.schema()),
         ast::Expr::Unary(op, inner) => match op {
-            ast::UnaryOperator::Not | ast::UnaryOperator::BitwiseNot => {
-                ExprType::Builtin(BuiltinType::Integer)
+            ast::UnaryOperator::Not => ExprType::Builtin(BuiltinType::Integer),
+            ast::UnaryOperator::BitwiseNot => {
+                custom_operator_type(expr, &[type_of(inner, env)], env)
+                    .unwrap_or(ExprType::Builtin(BuiltinType::Integer))
             }
-            ast::UnaryOperator::Negative => negated_type(type_of(inner, env), env.schema()),
+            ast::UnaryOperator::Negative => {
+                let inner_type = type_of(inner, env);
+                custom_operator_type(expr, core::slice::from_ref(&inner_type), env)
+                    .unwrap_or_else(|| negated_type(inner_type, env.schema()))
+            }
             ast::UnaryOperator::Positive => {
                 unreachable!("without_wrappers looks through unary +")
             }
@@ -545,12 +551,21 @@ fn binary_type(
         | Operator::Subtract
         | Operator::Multiply
         | Operator::Divide
-        | Operator::Modulus => arithmetic_result_type(lhs, op, rhs, env),
-        Operator::BitwiseAnd
-        | Operator::BitwiseOr
-        | Operator::BitwiseNot
-        | Operator::LeftShift
-        | Operator::RightShift
+        | Operator::Modulus => {
+            let types = [type_of(lhs, env), type_of(rhs, env)];
+            custom_operator_type(expr, &types, env).unwrap_or_else(|| {
+                let [lhs_type, rhs_type] = types;
+                arithmetic_type(
+                    &sqlite_operand_type(lhs_type, env.schema()),
+                    &sqlite_operand_type(rhs_type, env.schema()),
+                )
+            })
+        }
+        Operator::BitwiseAnd | Operator::BitwiseOr | Operator::LeftShift | Operator::RightShift => {
+            custom_operator_type(expr, &[type_of(lhs, env), type_of(rhs, env)], env)
+                .unwrap_or(ExprType::Builtin(BuiltinType::Integer))
+        }
+        Operator::BitwiseNot
         | Operator::Equals
         | Operator::NotEquals
         | Operator::Less
@@ -579,27 +594,18 @@ fn binary_type(
     }
 }
 
-/// The type of `lhs op rhs`: what the custom type's function returns, if one
-/// runs it, or else what SQLite's operator returns. An operator that does not
-/// exist, such as `date * 2`, has no type: emitting it fails.
-fn arithmetic_result_type(
-    lhs: &ast::Expr,
-    op: &ast::Operator,
-    rhs: &ast::Expr,
-    env: &TypeEnv,
-) -> ExprType {
-    let lhs_type = type_of(lhs, env);
-    let rhs_type = type_of(rhs, env);
-    match find_arithmetic_call(lhs, op, rhs, [&lhs_type, &rhs_type], env) {
-        Ok(Some(call)) => match &call.result {
+/// The type of the operator expression `expr` when a custom type's function runs
+/// it: what the function returns. `None` means SQLite's operator runs. An
+/// operator that does not exist, such as `date * 2`, has no type: emitting it
+/// fails. `types` are the operands' types.
+fn custom_operator_type(expr: &ast::Expr, types: &[ExprType], env: &TypeEnv) -> Option<ExprType> {
+    match find_operator_call(expr, types, env) {
+        Ok(Some(call)) => Some(match &call.result {
             Some(result) => call_result_type(result, env.schema()),
             None => ExprType::Unknown,
-        },
-        Ok(None) => arithmetic_type(
-            &sqlite_operand_type(lhs_type, env.schema()),
-            &sqlite_operand_type(rhs_type, env.schema()),
-        ),
-        Err(_) => ExprType::Unknown,
+        }),
+        Ok(None) => None,
+        Err(_) => Some(ExprType::Unknown),
     }
 }
 
@@ -923,6 +929,13 @@ mod tests {
             ("-CAST(1 AS REAL)", builtin(BuiltinType::Real)),
             // cents declares no `+`, so the statement fails with "operator does not exist".
             ("CAST(1 AS cents) + 1", ExprType::Unknown),
+            // Nor any other operator.
+            ("-CAST(1 AS cents)", ExprType::Unknown),
+            ("~CAST(1 AS cents)", ExprType::Unknown),
+            ("CAST(1 AS cents) & 1", ExprType::Unknown),
+            ("-CAST(1 AS numeric(10, 2))", custom("numeric", &[])),
+            ("-CAST(1 AS smallint)", builtin(BuiltinType::Integer)),
+            ("CAST(1 AS smallint) << 1", builtin(BuiltinType::Integer)),
             ("abs(CAST(1 AS cents))", builtin(BuiltinType::Integer)),
             ("1 || 2", builtin(BuiltinType::Text)),
         ]);

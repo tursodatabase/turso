@@ -1501,3 +1501,104 @@ test op-date-plus-decimal-in-subquery-error {
 expect error {
     operator does not exist: date \+ numeric
 }
+
+# Unary minus, ~, &, |, << and >> on a custom type are decided like + - * / %:
+# the type's function runs them, or they are an error. numeric negates
+# exactly, as in PostgreSQL; smallint uses SQLite's operators.
+@requires strict "uses STRICT tables"
+test op-numeric-and-smallint-unary-and-bitwise {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), s smallint) STRICT;
+    INSERT INTO t VALUES (1, 3.50, 5), (2, NULL, NULL), (3, -0.25, -1);
+    SELECT -n, -n % 2, -n * 2, -(-n), - -n, +n, -s, ~s, s & 3, s | 4, s << 2, s >> 1 FROM t ORDER BY id;
+}
+expect {
+    -3.50|-1.50|-7.00|3.50|3.50|3.50|-5|-6|1|5|20|2
+    |||||||||||
+    0.25|0.25|0.50|-0.25|-0.25|-0.25|1|0|3|-1|-4|-1
+}
+
+@requires strict "uses STRICT tables"
+test op-date-negate-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT -d FROM t;
+}
+expect error {
+    operator does not exist: - date
+}
+
+@requires strict "uses STRICT tables"
+test op-date-bitwise-and-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT d & 1 FROM t;
+}
+expect error {
+    operator does not exist: date & integer
+}
+
+@requires strict "uses STRICT tables"
+test op-date-shift-left-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT d << 1 FROM t;
+}
+expect error {
+    operator does not exist: date << integer
+}
+
+@requires strict "uses STRICT tables"
+test op-date-bitwise-not-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT ~d FROM t;
+}
+expect error {
+    operator does not exist: ~ date
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-bitwise-or-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT n | 1 FROM t;
+}
+expect error {
+    operator does not exist: numeric \\| integer
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-bitwise-not-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT ~n FROM t;
+}
+expect error {
+    operator does not exist: ~ numeric
+}
+
+@requires strict "uses STRICT tables"
+test op-integer-shift-right-numeric-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT 1 >> n FROM t;
+}
+expect error {
+    operator does not exist: integer >> numeric
+}
+
+# A user type has only the operators it declares, and OPERATOR '-' declares
+# the binary one.
+@requires strict "uses STRICT tables"
+test op-user-type-negate-error {
+    CREATE TYPE test_uint(value any) BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value)
+        OPERATOR '-' test_uint_sub;
+    CREATE TABLE t(a test_uint) STRICT;
+    INSERT INTO t VALUES (10);
+    SELECT -a FROM t;
+}
+expect error {
+    operator does not exist: - test_uint
+}

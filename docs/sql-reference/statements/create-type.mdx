@@ -115,7 +115,7 @@ When an operator is defined, an expression like `column + 1` runs `function_name
 
 #### Which arithmetic operator runs
 
-For `+`, `-`, `*`, `/` and `%`, the operator is chosen once, when the statement is compiled:
+For `+`, `-`, `*`, `/`, `%`, `&`, `|`, `<<`, `>>`, unary `-` and `~`, the operator is chosen once, when the statement is compiled. An OPERATOR clause can give a function to `+`, `-`, `*`, `/` and `%`; a user type has none of the other operators, so `-x` or `x & 1` fails with `operator does not exist`.
 
 - `OPERATOR '+' f` runs `f` when both operands are columns of the type, or when one is a column of the type and the other is a literal its ENCODE accepts. The literal is encoded first.
 - `OPERATOR '+'` without a function runs SQLite's `+` on the stored value.
@@ -300,7 +300,7 @@ Turso provides the following built-in custom types in STRICT tables:
 | `json` | text | -- | Validated JSON text. |
 | `jsonb` | blob | -- | JSON stored in binary format, returned as JSON text on read. |
 
-Other operators on built-in types fail: `d * 2` on a `date` is `operator does not exist: date * integer`. `smallint` and `bigint` use SQLite's operators.
+Other operators on built-in types fail: `d * 2` on a `date` is `operator does not exist: date * integer`, and `-d` is `operator does not exist: - date`. `-n` on a `numeric` negates exactly, and `~`, `&`, `|`, `<<` and `>>` on a `numeric` fail, as in PostgreSQL. `smallint` and `bigint` use SQLite's operators, including `-`, `~`, `&`, `|`, `<<` and `>>`. Unary `+` gives its operand unchanged for every type.
 
 <Info>
 The `uuid`, `json`, and `jsonb` types require their respective extensions to be compiled in. They are available by default in standard Turso builds.
