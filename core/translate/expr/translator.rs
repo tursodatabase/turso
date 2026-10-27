@@ -688,7 +688,15 @@ fn translate_case_expr(
                 rhs: expr_reg,
                 target_pc: next_case_label,
                 // A NULL result is considered untrue when evaluating WHEN terms.
-                flags: CmpInsFlags::default().jump_if_null(),
+                flags: CmpInsFlags::default()
+                    .jump_if_null()
+                    .with_affinity(comparison_affinity(
+                        base.as_deref()
+                            .expect("base_reg is set only with a base expression"),
+                        when_expr.as_ref(),
+                        referenced_tables,
+                        Some(resolver),
+                    )),
                 collation: comparison_collation(
                     base.as_deref()
                         .expect("base_reg is set only with a base expression"),
