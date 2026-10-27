@@ -12,7 +12,7 @@ use crate::mvcc::database::{
 };
 use crate::mvcc::MvccClock;
 use crate::namespace::NamespaceId;
-use crate::numeric::decimal::numeric_from_value;
+use crate::numeric::decimal::{numeric_from_value, MAX_FRACTION_DIGITS};
 use crate::numeric::Numeric;
 use crate::schema::{
     render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
@@ -11511,13 +11511,18 @@ pub fn op_function(
                         let a = numeric_from_value(&lhs_val)?;
                         let b = numeric_from_value(&rhs_val)?;
                         // The result keeps every decimal of its operands, as in
-                        // PostgreSQL: 1.00 * 3 is 3.00 and 0.00 + 3 is 3.00.
+                        // PostgreSQL: 1.00 * 3 is 3.00 and 0.00 + 3 is 3.00. A
+                        // product may have more decimals than a numeric can hold,
+                        // so PostgreSQL rounds it to the most a numeric can hold.
                         let (a_scale, b_scale) =
                             (a.fractional_digit_count(), b.fractional_digit_count());
                         let res = match scalar_func {
                             ScalarFunc::NumericAdd => (a + b).with_scale(a_scale.max(b_scale)),
                             ScalarFunc::NumericSub => (a - b).with_scale(a_scale.max(b_scale)),
-                            ScalarFunc::NumericMul => (a * b).with_scale(a_scale + b_scale),
+                            ScalarFunc::NumericMul => (a * b).with_scale_round(
+                                (a_scale + b_scale).min(MAX_FRACTION_DIGITS),
+                                bigdecimal::RoundingMode::HalfUp,
+                            ),
                             ScalarFunc::NumericDiv | ScalarFunc::NumericMod => {
                                 use bigdecimal::Zero;
                                 if b.is_zero() {

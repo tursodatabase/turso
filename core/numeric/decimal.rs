@@ -14,7 +14,7 @@ const MAX_SCALE_MAGNITUDE: i64 = 1_000_000;
 /// PostgreSQL's limits on a numeric value: the most digits it may have before
 /// the decimal point, and after it.
 const MAX_INTEGER_DIGITS: i64 = 131_072;
-const MAX_FRACTION_DIGITS: i64 = 16_383;
+pub(crate) const MAX_FRACTION_DIGITS: i64 = 16_383;
 
 /// The numeric value of `val`: an integer, a real, text such as `1.5` or `1e5`,
 /// or a stored numeric blob. Every numeric function reads its arguments with

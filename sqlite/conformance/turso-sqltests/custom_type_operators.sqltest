@@ -1407,3 +1407,15 @@ test op-numeric-text-that-is-not-a-number-errors {
 expect error {
     invalid input syntax for type numeric: "abc"
 }
+
+# As in PostgreSQL, a product keeps the decimals of both operands but at most
+# 16383 of them, the most a numeric can have. It is rounded to that many.
+@requires strict "uses STRICT tables"
+test op-numeric-mul-rounds-to-largest-scale {
+    CREATE TABLE t(a numeric(20000,10000), b numeric(20000,16383), c numeric(2,1)) STRICT;
+    INSERT INTO t VALUES ('1e-10000', '5e-16383', 0.1);
+    SELECT length(a * a), length(b * c), substr(b * c, -3), substr(b * c * c, -3) FROM t;
+}
+expect {
+    16385|16385|001|000
+}
