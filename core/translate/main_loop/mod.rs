@@ -1,51 +1,20 @@
-use turso_parser::ast::{Expr, SortOrder, SubqueryType, TableInternalId};
+use turso_parser::ast::SortOrder;
 
-use super::{
-    aggregation::{emit_aggregate_step, AggArgumentSource},
-    emitter::{
-        InSeekMetadata, MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, Resolver,
-        TranslateCtx, UpdateRowSource,
-    },
-    expr::{
-        emit_stored_column, expr_references_subquery_id, translate_condition_expr, translate_expr,
-        translate_expr_no_constant_opt, walk_expr, walk_expr_mut, ConditionMetadata,
-        NoConstantOptReason, WalkControl,
-    },
-    group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
-    optimizer::{constraints::BinaryExprSide, Optimizable},
-    order_by::sorter_insert,
-    plan::{
-        Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, HashJoinType, InSeekSource,
-        IterationDirection, JoinOrderMember, JoinedTable, MultiIndexBranchAccess, MultiIndexScanOp,
-        NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekDef, SeekKey,
-        SeekKeyComponent, SelectPlan, SetOperation, SubqueryEvalPhase, SubqueryState,
-        TableReferences, UnmatchedRightRowsPlan, WhereTerm,
-    },
-};
+use super::plan::{IterationDirection, SeekDef, SeekKey, SeekKeyComponent};
 use crate::{
-    emit_explain,
-    schema::{Index, IndexColumn, Table},
-    translate::{
-        collate::{
-            get_collseq_from_expr_with_symbols, resolve_comparison_collseq_with_symbols,
-            CollationSeq,
-        },
-        emitter::{prepare_cdc_if_necessary, HashCtx},
-        planner::{expr_reads_an_outer_query, table_mask_from_expr, TableMask},
-        result_row::emit_select_result,
-    },
-    turso_assert, turso_assert_eq,
+    schema::{Index, IndexColumn},
+    translate::collate::CollationSeq,
+    turso_assert,
     types::SeekOp,
     vdbe::{
         affinity::{self, Affinity},
-        builder::{CursorKey, CursorType, HashBuildSignature, ProgramBuilder},
-        insn::{to_u32, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
+        builder::{CursorType, ProgramBuilder},
+        insn::{to_u32, CmpInsFlags, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result,
 };
-use std::{borrow::Cow, collections::HashSet, ops::Range, sync::Arc};
-use turso_macros::turso_assert_some;
+use std::sync::Arc;
 
 mod body;
 mod close;
@@ -57,88 +26,62 @@ mod multi_index;
 mod open;
 mod seek;
 
-use body::emit_unmatched_row_conditions_and_loop;
-pub(crate) use body::LoopBodyEmitter;
-pub(crate) use close::CloseLoop;
-use close::{emit_autoindex, AutoIndexResult};
-use in_seek::{emit_in_seek_end, emit_in_seek_start, open_in_seek_source_cursor};
-pub(crate) use init::{init_distinct, InitLoop};
-use multi_index::emit_multi_index_scan_loop;
-pub(crate) use open::OpenLoop;
-use seek::SeekEmitter;
+pub(crate) use close::{emit_autoindex, AutoIndexBuild};
+pub(crate) use in_seek::{
+    emit_in_seek_advance, emit_in_seek_start, open_in_seek_values_cursor, InSeekLoop,
+};
+pub(crate) use seek::{SeekEmitter, SeekExpressionLowering};
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct LeftJoinMetadata {
     pub reg_match_flag: usize,
     pub label_match_flag_set_true: BranchOffset,
     pub label_match_flag_check_value: BranchOffset,
 }
 
-#[derive(Debug, Clone)]
-/// State shared by the main join loop and the unmatched-right-row pass.
-pub struct RightJoinMetadata {
-    /// Ephemeral index that stores the key of each matched right-side row.
-    pub matched_rows_cursor_id: CursorID,
-    /// First register of the current right-side row's key.
-    pub key_start_reg: usize,
-    /// Primary key column positions of a WITHOUT ROWID right table. The key
-    /// is these columns, or the rowid when this is `None`.
-    pub primary_key_columns: Option<Vec<usize>>,
-    /// Return-address register for the shared result-row subroutine.
-    pub return_reg: usize,
-    /// Entry label for the result-row subroutine.
-    pub body_label: BranchOffset,
-    /// Label that returns from the result-row subroutine to the main loop.
-    pub return_label: BranchOffset,
-}
-
-impl RightJoinMetadata {
-    pub fn key_len(&self) -> usize {
-        self.primary_key_columns.as_ref().map_or(1, Vec::len)
-    }
-}
-
-#[derive(Debug)]
-pub struct SemiAntiJoinMetadata {
-    pub label_body: BranchOffset,
-    pub label_next_outer: BranchOffset,
-    pub outer_table_idx: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct LoopLabels {
-    pub loop_start: BranchOffset,
-    pub next: BranchOffset,
-    pub loop_end: BranchOffset,
-}
-
-impl LoopLabels {
-    pub fn new(program: &mut ProgramBuilder) -> Self {
+impl LeftJoinMetadata {
+    pub(crate) fn new(program: &mut ProgramBuilder) -> Self {
         Self {
-            loop_start: program.allocate_label(),
-            next: program.allocate_label(),
-            loop_end: program.allocate_label(),
+            reg_match_flag: program.alloc_register(),
+            label_match_flag_set_true: program.allocate_label(),
+            label_match_flag_check_value: program.allocate_label(),
         }
     }
-}
 
-fn find_non_semi_anti_ancestor(
-    join_order: &[JoinOrderMember],
-    tables: &[JoinedTable],
-    join_idx: usize,
-) -> usize {
-    assert!(join_idx > 0, "semi/anti-join cannot be the first table");
-    let mut idx = join_idx - 1;
-    while idx > 0 {
-        let prev = &tables[join_order[idx].original_idx];
-        if !prev
-            .join_info
-            .as_ref()
-            .is_some_and(|ji| ji.is_semi_or_anti())
-        {
-            break;
-        }
-        idx -= 1;
+    pub(crate) fn reset(&self, program: &mut ProgramBuilder) {
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: self.reg_match_flag,
+        });
     }
-    join_order[idx].original_idx
+
+    pub(crate) fn mark_matched(&self, program: &mut ProgramBuilder) {
+        program.preassign_label_to_next_insn(self.label_match_flag_set_true);
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: self.reg_match_flag,
+        });
+    }
+
+    pub(crate) fn begin_unmatched_row(&self, program: &mut ProgramBuilder) -> BranchOffset {
+        program.preassign_label_to_next_insn(self.label_match_flag_check_value);
+        let finished = program.allocate_label();
+        program.emit_insn(Insn::IfPos {
+            reg: self.reg_match_flag,
+            target_pc: finished,
+            decrement_by: 0,
+        });
+        finished
+    }
+
+    pub(crate) fn finish_unmatched_row(
+        &self,
+        program: &mut ProgramBuilder,
+        finished: BranchOffset,
+    ) {
+        program.emit_insn(Insn::Goto {
+            target_pc: self.label_match_flag_set_true,
+        });
+        program.preassign_label_to_next_insn(finished);
+    }
 }

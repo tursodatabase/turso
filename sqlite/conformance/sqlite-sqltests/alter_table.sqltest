@@ -1150,6 +1150,42 @@ expect error {
 }
 
 
+@cross-check-integrity
+test fail-alter-table-drop-column-in-partial-index-where {
+    CREATE TABLE t(a, b, c);
+    CREATE INDEX i_part ON t(a) WHERE b > 0;
+    INSERT INTO t VALUES(1, 2, 3);
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fail-alter-table-drop-column-in-partial-index-where-qualified {
+    CREATE TABLE t(a, b, c);
+    CREATE INDEX i_part ON t(a) WHERE t.b > 0;
+    INSERT INTO t VALUES(1, 2, 3);
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+}
+
+@cross-check-integrity
+test alter-table-drop-column-not-in-partial-index-where {
+    CREATE TABLE t(a, b, c);
+    CREATE INDEX i_part ON t(a) WHERE b > 0;
+    INSERT INTO t VALUES(1, 2, 3), (4, -5, 6);
+    ALTER TABLE t DROP COLUMN c;
+    SELECT a FROM t WHERE b > 0;
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1
+    1|2
+    4|-5
+}
+
+
 # Regression: DEFAULT with negative integer on pre-existing rows
 @cross-check-integrity
 test alter-add-column-default-negative-integer {

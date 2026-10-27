@@ -126,3 +126,56 @@ test outer-aggregate-in-a-table-function-argument-is-an-error {
 expect error {
     misuse of aggregate: json_group_array()
 }
+
+# An aggregate that reads a column of its own subquery as well as an outer
+# column belongs to the subquery: the nearest query whose FROM clause supplies
+# a referenced column owns it. So it may sit in a WHERE subquery or a
+# table-valued function argument, where an outer aggregate is a misuse.
+@cross-check-integrity
+test aggregate-of-mixed-columns-stays-in-the-where-subquery {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    CREATE TABLE u(b);
+    INSERT INTO u VALUES (10), (20);
+    SELECT a FROM t WHERE (SELECT count(u.b + t.a) FROM u) = 2 ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+}
+
+@cross-check-integrity
+test aggregate-of-mixed-columns-stays-in-the-table-function-argument {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2);
+    CREATE TABLE u(b);
+    INSERT INTO u VALUES (10), (20);
+    SELECT t.a, j.value FROM t, json_each((SELECT json_group_array(u.b + t.a) FROM u)) AS j ORDER BY 1, 2;
+}
+expect {
+    1|11
+    1|21
+    2|12
+    2|22
+}
+
+# The subquery's column may appear only in the aggregate's ORDER BY or
+# FILTER; that still makes the subquery its owner.
+@cross-check-integrity
+test aggregate-order-by-or-filter-of-local-column-stays-in-the-subquery {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2);
+    CREATE TABLE u(b);
+    INSERT INTO u VALUES (10), (20);
+    SELECT t.a, j.value FROM t, json_each((SELECT json_group_array(t.a ORDER BY u.b) FROM u)) AS j ORDER BY 1, 2;
+    SELECT a FROM t WHERE (SELECT count(t.a) FILTER (WHERE u.b > 10) FROM u) = 1 ORDER BY a;
+}
+expect {
+    1|1
+    1|1
+    2|2
+    2|2
+    1
+    2
+}

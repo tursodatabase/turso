@@ -24,7 +24,7 @@ QUERY PLAN
 BYTECODE
 addr  opcode          p1  p2  p3  p4              p5  comment
    0  Init             0  23   0                   0  Start at 23
-   1  Integer         10   1   0                   0  r[1]=10; LIMIT counter
+   1  Integer         10   1   0                   0  r[1]=10
    2  IfNot            1  22   0                   0  if !r[1] goto 22
    3  OpenEphemeral    0   0   0                   0  cursor=0 is_table=false
    4  OpenRead         1   2   0  k(4,B,B,B,B)     0  table=current_employees, root=2, iDb=0
@@ -39,10 +39,10 @@ addr  opcode          p1  p2  p3  p4              p5  comment
   13    MakeRecord     5   2   7                   0  r[7]=mkrec(r[5..6]); for compound_dedupe
   14    IdxInsert      0   7   0                   8  key=r[7]
   15  Next             2  12   0                   1
-  16  Rewind           0  20   0                   0  Rewind  ephemeral(compound_dedupe)
+  16  Rewind           0  21   0                   0  Rewind index ephemeral(compound_dedupe)
   17    ColumnRange    0   0   8  2                0  r[8..9]=ephemeral(compound_dedupe).name..department
   18    ResultRow      8   2   0                   0  output=r[8..9]
-  19    DecrJumpZero   1  21   0                   0  if (--r[1]==0) goto 21
+  19    DecrJumpZero   1  22   0                   0  if (--r[1]==0) goto 22
   20  Next             0  17   0                   0
   21  Close            0   0   0                   0
   22  Halt             0   0   0                   0

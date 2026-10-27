@@ -1,634 +1,546 @@
-use crate::namespace::NamespaceRef;
 use crate::{
-    alloc::{self, TursoIteratorExt, TursoVecExt},
-    function::{AccumulatorFunc, AggFunc},
-    schema::{
-        BTreeTable, ColDef, Column, FromClauseSubquery, Index, ParenthesizedJoinColumnSource,
-        ParenthesizedJoinColumnVisibility, PseudoCursorType, RecursiveCteInput, Table,
-        ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
-    },
+    alloc::{self},
+    schema::{BTreeTable, Index, Table, ROWID_SENTINEL},
     translate::{
-        collate::{get_collseq_from_expr, CollationSeq},
-        emitter::{Resolver, UpdateRowSource},
-        expr::{
-            as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
-            lookup_unqualified_column, StorageClassMask,
-        },
-        expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
-        planner::determine_where_to_eval_term,
+        planner::{table_mask_from_hir_scope, HirFromScope, TableMask},
+        semantic::hir,
     },
     types::SeekOp,
-    util::exprs_are_equivalent,
     vdbe::{
         affinity::{self, Affinity},
-        builder::{CursorKey, CursorType, ProgramBuilder, Subroutine},
-        insn::{HashDistinctData, Insn},
-        BranchOffset, CursorID,
+        CursorID,
     },
-    Result, VirtualTable, MAIN_DB_ID, TEMP_DB_ID,
+    Result,
 };
-use rustc_hash::FxHashMap as HashMap;
-use smallvec::SmallVec;
-use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
-use turso_parser::ast::{
-    self, Expr, FrameBound, FrameClause, FrameMode, ResolveType, SortOrder, SubqueryType,
-};
+use std::{marker::PhantomData, ops::Range, sync::Arc};
+use turso_parser::ast::{self};
 
-use turso_parser::ast::TableInternalId;
+/// The most sources one FROM clause may join: a join bitmask fits in 64 bits.
+pub(crate) const MAX_JOINED_TABLES: usize = 63;
 
-use super::emitter::OperationMode;
-use super::expr::expr_type::{type_of, TypeEnv};
-
-/// Infer the affinity of a subquery result column from its expression.
+/// In a query plan, WHERE and JOIN conditions are split into predicate terms
+/// so each condition can run at the correct loop depth.
 ///
-/// Used for subquery result columns. SQLite derives column affinity from:
-/// - Column references: the declared column type
-/// - CAST expressions: the cast target type
-/// - Subqueries: recursively from the subquery's result expression
-/// - Literals, function calls, and other computed expressions: no affinity
+/// Outer joins require the originating join source to be retained. For:
 ///
-/// The affinity (and whether it's a real declared one) determines comparison
-/// behavior in IN expressions, etc.
-fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> Affinity {
-    get_expr_affinity(expr, tables, None)
-}
-
-/// Computes the affinity of column `i` of a compound (UNION/INTERSECT/EXCEPT)
-/// subquery, matching SQLite's `sqlite3SubqueryColumnTypes` (select.c).
+/// `SELECT * FROM users u LEFT JOIN products p ON u.id = 5`
 ///
-/// Scanning the arms left-to-right, the affinity is the first arm's affinity,
-/// skipping leading arms that have no affinity (adopting the next arm's). If
-/// every arm has no affinity the result is BLOB (none). Otherwise the column
-/// keeps that affinity unless a later arm yields a conflicting datatype class
-/// (TEXT affinity + a numeric arm, or numeric affinity + a text arm), in which
-/// case it is downgraded to BLOB (none) so the column is compared by storage
-/// class.
-pub(super) fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
-    if arms.is_empty() {
-        return Affinity::None;
-    }
-    let col_affinities = |arm: &SelectPlan| {
-        arm.result_columns
-            .get(i)
-            .map(|rc| get_expr_affinity(&rc.expr, Some(&arm.table_references), None))
-            .unwrap_or(Affinity::None)
-    };
-    let col_data_type = |arm: &SelectPlan| {
-        arm.result_columns
-            .get(i)
-            .map(|rc| expr_data_type(&rc.expr, Some(&arm.table_references)))
-            .unwrap_or(StorageClassMask::from_null())
-    };
-
-    let mut affinity = col_affinities(arms[0]);
-    let mut data_types = StorageClassMask::from_null();
-    let mut idx = 0;
-    // Skip leading arms with no affinity, adopting the next arm's affinity.
-    while affinity == Affinity::None && idx + 1 < arms.len() {
-        data_types |= col_data_type(arms[idx]);
-        idx += 1;
-        affinity = col_affinities(arms[idx]);
-    }
-    if affinity == Affinity::None {
-        return Affinity::None;
-    }
-    // This arm has a real affinity; accumulate the remaining arms' classes.
-    for &arm in &arms[idx + 1..] {
-        data_types |= col_data_type(arm);
-    }
-    match affinity {
-        Affinity::Text if data_types.has_numeric() => Affinity::Blob,
-        a if a.is_numeric() && data_types.has_text() => Affinity::Blob,
-        _ => affinity,
-    }
-}
-
+/// `u.id = 5` cannot run in the `users` loop and skip rows. Every `users` row
+/// must reach the join so `products` can be NULL-extended when the condition
+/// is false.
 #[derive(Debug, Clone)]
-pub struct ResultSetColumn {
-    /// `a + 1` in `SELECT a + 1 FROM t`
-    pub expr: ast::Expr,
-    /// `col` in `SELECT a AS col FROM t`
-    pub alias: Option<String>,
-    /// Original SQL expression text for display as column name.
-    /// Only used when there is no explicit alias and the expression is not
-    /// a simple column reference. This preserves the verbatim SQL text
-    /// (e.g. "f1+F2") as the column name, matching SQLite behavior.
-    pub implicit_column_name: Option<String>,
-    // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
-    pub contains_aggregates: bool,
-}
-
-impl ResultSetColumn {
-    pub fn name<'a>(&'a self, tables: &'a TableReferences) -> Option<&'a str> {
-        if let Some(alias) = &self.alias {
-            return Some(alias);
-        }
-        match &self.expr {
-            ast::Expr::Column { table, column, .. } => {
-                if let Some(joined_table_ref) = tables.find_joined_table_by_internal_id(*table) {
-                    if let Operation::IndexMethodQuery(module) = &joined_table_ref.op {
-                        if module.covered_columns.contains_key(column) {
-                            return None;
-                        }
-                    }
-                    joined_table_ref
-                        .table
-                        .get_column_at(*column)
-                        .unwrap()
-                        .name
-                        .as_deref()
-                } else {
-                    // Column references an outer query table (correlated subquery).
-                    let (_, table_ref) = tables.find_table_by_internal_id(*table)?;
-                    table_ref.get_column_at(*column)?.name.as_deref()
-                }
-            }
-            ast::Expr::RowId { table, .. } => {
-                // If there is a rowid alias column, use its name
-                let (_, table_ref) = tables.find_table_by_internal_id(*table)?;
-                if let Table::BTree(table) = &table_ref {
-                    if let Some(rowid_alias_column) = table.get_rowid_alias_column() {
-                        if let Some(name) = &rowid_alias_column.1.name {
-                            return Some(name);
-                        }
-                    }
-                }
-
-                // If there is no rowid alias, use "rowid".
-                Some("rowid")
-            }
-            _ => self.implicit_column_name.as_deref(),
-        }
-    }
-
-    /// Returns the column name, falling back to the expression's display form.
-    pub fn name_or_expr(&self, tables: &TableReferences) -> String {
-        self.name(tables)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| self.expr.to_string())
-    }
-
-    /// Returns the canonical short type name for this column's affinity,
-    /// matching SQLite's `azType[]` in `createTableStmt()` (build.c).
-    pub fn declared_type(&self, tables: &TableReferences) -> &'static str {
-        get_expr_affinity(&self.expr, Some(tables), None).short_type_name()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct GroupBy {
-    pub exprs: Vec<ast::Expr>,
-    /// Sort direction for each GROUP BY key column. Always present once
-    /// `compute_group_by_sort_order` has run; the outer optimizer reads
-    /// this to derive the materialized CTE's output order.
-    pub sort_order: Vec<SortOrder>,
-    /// NULLS ordering for each GROUP BY key column. Populated when ORDER BY
-    /// with explicit NULLS FIRST/LAST is merged into GROUP BY.
-    pub nulls_order: Vec<Option<ast::NullsOrder>>,
-    /// When true the scan already provides the GROUP BY order and no
-    /// sorter is emitted. The `sort_order` is kept so that the outer
-    /// query can still read the effective output order.
-    pub sort_elided: bool,
-    /// having clause split into a vec at 'AND' boundaries.
-    pub having: Option<Vec<ast::Expr>>,
-}
-
-/// The JOIN that supplied a term and whether that JOIN keeps unmatched rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JoinOrigin {
-    /// An ON or USING term from an inner join.
-    Inner(TableInternalId),
-    /// An ON or USING term from an outer join.
-    Outer(TableInternalId),
-}
-
-impl JoinOrigin {
-    pub fn new(right_table: TableInternalId, is_outer: bool) -> Self {
-        if is_outer {
-            Self::Outer(right_table)
-        } else {
-            Self::Inner(right_table)
-        }
-    }
-
-    /// Get the right table of the JOIN.
-    pub fn right_table(self) -> TableInternalId {
-        match self {
-            Self::Inner(table) | Self::Outer(table) => table,
-        }
-    }
-
-    /// Get the right table only when the JOIN is outer.
-    pub fn outer_table(self) -> Option<TableInternalId> {
-        match self {
-            Self::Inner(_) => None,
-            Self::Outer(table) => Some(table),
-        }
-    }
-
-    /// Whether the JOIN is outer.
-    pub fn is_outer(self) -> bool {
-        matches!(self, Self::Outer(_))
-    }
-}
-
-/// The SQL source that supplied a term.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WhereTermOrigin {
-    /// A term from a WHERE clause.
-    Where,
-    /// A term from an ON or USING clause.
-    ///
-    /// An outer-join term must run in its right-table loop, even when it reads
-    /// only left tables. An earlier check can remove a required NULL row.
-    Join(JoinOrigin),
-    /// A hidden-column constraint made from a table-function argument.
-    ///
-    /// This term also has a join origin. The separate variant lets the
-    /// unmatched-right read rebuild the argument instead of treating it as an ON term.
-    TableFunction(JoinOrigin),
-}
-
-impl WhereTermOrigin {
-    /// Get the join origin when the term belongs to a join source.
-    pub fn join_origin(self) -> Option<JoinOrigin> {
-        match self {
-            Self::Where => None,
-            Self::Join(origin) | Self::TableFunction(origin) => Some(origin),
-        }
-    }
-
-    pub fn is_outer_join(self) -> bool {
-        self.join_origin().is_some_and(JoinOrigin::is_outer)
-    }
-
-    /// Get the table for a table-function argument.
-    pub fn table_function_table(self) -> Option<TableInternalId> {
-        match self {
-            Self::TableFunction(origin) => Some(origin.right_table()),
-            Self::Where | Self::Join(_) => None,
-        }
-    }
-}
-
-/// In a query plan, WHERE clause conditions and JOIN conditions are all folded into a vector of WhereTerm.
-/// This is done so that we can evaluate the conditions at the correct loop depth.
-/// We also need to keep track of whether the condition came from an OUTER JOIN. Take this example:
-/// SELECT * FROM users u LEFT JOIN products p ON u.id = 5.
-/// Even though the condition only refers to 'u', we CANNOT evaluate it at the users loop, because we need to emit NULL
-/// values for the columns of 'p', for EVERY row in 'u', instead of completely skipping any rows in 'u' where the condition is false.
-#[derive(Debug, Clone)]
-pub struct WhereTerm {
+pub struct PredicateTerm<E, S> {
     /// The original condition expression.
-    pub expr: ast::Expr,
-    /// The clause or table function that supplied this term.
-    pub origin: WhereTermOrigin,
-    /// Whether the condition has been consumed by the optimizer in some way, and it should not be evaluated
-    /// in the normal place where WHERE terms are evaluated.
-    /// A term may have been consumed e.g. if:
-    /// - it has been converted into a constraint in a seek key
-    /// - it has been removed due to being trivially true or false
+    pub expr: E,
+
+    /// For ordinary conditions, the optimizer chooses the earliest loop
+    /// containing every referenced source.
+    ///
+    /// Outer-join conditions cannot always run at that earliest loop. For:
+    ///
+    /// `SELECT * FROM t LEFT JOIN s ON t.a = 2`
+    ///
+    /// the engine must:
+    ///
+    /// 1. Process every row from `t`.
+    /// 2. Emit NULL values for `s` when `t.a != 2`.
+    /// 3. Emit the matching `s` values when `t.a = 2`.
+    ///
+    /// This field forces evaluation at the outer join's source loop. `S` is
+    /// the source identity, `SourceId` for HIR.
+    pub from_outer_join: Option<S>,
+
+    /// Whether the optimizer already incorporated this condition elsewhere.
+    ///
+    /// A term may be consumed because:
+    ///
+    /// - it became a seek constraint;
+    /// - it was proven trivially true or false.
     pub consumed: bool,
 }
 
-impl WhereTerm {
-    pub fn should_eval_before_loop(
-        &self,
-        join_order: &[JoinOrderMember],
-        subqueries: &[NonFromClauseSubquery],
-        table_references: Option<&TableReferences>,
-        resolver: &Resolver,
-    ) -> bool {
-        if self.consumed {
-            return false;
-        }
-        let Ok(eval_at) = self.eval_at(join_order, subqueries, table_references, resolver) else {
-            return false;
-        };
-        eval_at == EvalAt::BeforeLoop
-    }
+/// Predicate term used by HIR planning without parser expressions or planner IDs.
+pub(crate) type HirWhereTerm = PredicateTerm<hir::ExprId, hir::SourceId>;
 
-    pub fn should_eval_at_loop(
-        &self,
-        loop_idx: usize,
-        join_order: &[JoinOrderMember],
-        subqueries: &[NonFromClauseSubquery],
-        table_references: Option<&TableReferences>,
-        resolver: &Resolver,
-    ) -> bool {
-        if self.consumed {
-            return false;
-        }
-        let Ok(eval_at) = self.eval_at(join_order, subqueries, table_references, resolver) else {
-            return false;
-        };
-        eval_at == EvalAt::Loop(loop_idx)
-    }
-
-    fn eval_at(
-        &self,
-        join_order: &[JoinOrderMember],
-        subqueries: &[NonFromClauseSubquery],
-        table_references: Option<&TableReferences>,
-        resolver: &Resolver,
-    ) -> Result<EvalAt> {
-        determine_where_to_eval_term(self, join_order, subqueries, table_references, resolver)
-    }
-}
-
-impl From<Expr> for WhereTerm {
-    fn from(value: Expr) -> Self {
+impl From<hir::ExprId> for HirWhereTerm {
+    fn from(expr: hir::ExprId) -> Self {
         Self {
-            expr: value,
-            origin: WhereTermOrigin::Where,
+            expr,
+            from_outer_join: None,
             consumed: false,
         }
     }
 }
 
-/// The loop index where to evaluate the condition.
-/// For example, in `SELECT * FROM u JOIN p WHERE u.id = 5`, the condition can already be evaluated at the first loop (idx 0),
-/// because that is the rightmost table that it references.
-///
-/// Conditions like 1=2 can be evaluated before the main loop is opened, because they are constant.
-/// In theory we should be able to statically analyze them all and reduce them to a single boolean value,
-/// but that is not implemented yet.
-#[derive(Debug, Clone, PartialEq, Eq, Copy)]
-pub enum EvalAt {
-    Loop(usize),
-    BeforeLoop,
+/// Build the planning terms of every predicate of `document`: the
+/// conjuncts each WHERE, ON, DML and partial-index predicate splits into,
+/// the `col IN (...)` terms their ORs imply, and the equality each
+/// `x IN (SELECT y ...)` subquery can run with. A predicate whose terms are
+/// already built is left alone, so this runs again after a rewrite adds
+/// predicates.
+pub(crate) fn prepare_planning_terms(document: &mut hir::HirDocument) {
+    let query_reads = hir::QueryColumnReads::collect(
+        &document.queries,
+        |source| document.source(source),
+        &document.exprs,
+    );
+    prepare_planning_terms_with_reads(document, &query_reads);
 }
 
-#[allow(clippy::non_canonical_partial_ord_impl)]
-impl PartialOrd for EvalAt {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        match (self, other) {
-            (EvalAt::Loop(a), EvalAt::Loop(b)) => a.partial_cmp(b),
-            (EvalAt::BeforeLoop, EvalAt::BeforeLoop) => Some(Ordering::Equal),
-            (EvalAt::BeforeLoop, _) => Some(Ordering::Less),
-            (_, EvalAt::BeforeLoop) => Some(Ordering::Greater),
+pub(crate) fn prepare_planning_terms_with_reads(
+    document: &mut hir::HirDocument,
+    query_reads: &hir::QueryColumnReads,
+) {
+    document.planning.queries = document.query_facts(query_reads);
+    let mut predicates = Vec::new();
+    let mut filters = Vec::new();
+    for query in &document.queries {
+        for block in &query.blocks {
+            if let Some(from) = &block.from {
+                collect_join_predicates(from, &mut predicates);
+            }
+            if let hir::QueryBlockBody::Select {
+                filter: Some(filter),
+                ..
+            } = &block.body
+            {
+                predicates.push(*filter);
+                filters.push(*filter);
+            }
         }
     }
-}
-
-impl Ord for EvalAt {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other)
-            .expect("total ordering not implemented for EvalAt")
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubqueryEvalPhase {
-    BeforeLoop,
-    Loop(usize),
-    /// Evaluate inside the row body so an unmatched-right scan runs it again.
-    RowOutput,
-    GroupedOutput,
-    UngroupedAggregateOutput,
-    WindowOutput,
-    PreWrite,
-    PostWriteReturning,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubqueryOrigin {
-    SelectList,
-    SelectWhere,
-    SelectGroupBy,
-    SelectHaving,
-    SelectOrderBy,
-    SelectLimitOffset,
-    DmlWhere,
-    DmlSet,
-    DmlReturning,
-    ExprWithoutFromClause,
-}
-
-impl SubqueryOrigin {
-    pub fn phase_floor(self) -> SubqueryEvalPhase {
-        match self {
-            SubqueryOrigin::SelectList
-            | SubqueryOrigin::SelectWhere
-            | SubqueryOrigin::SelectGroupBy
-            | SubqueryOrigin::SelectHaving
-            | SubqueryOrigin::SelectOrderBy
-            | SubqueryOrigin::SelectLimitOffset
-            | SubqueryOrigin::ExprWithoutFromClause => SubqueryEvalPhase::BeforeLoop,
-            SubqueryOrigin::DmlWhere => SubqueryEvalPhase::BeforeLoop,
-            SubqueryOrigin::DmlSet => SubqueryEvalPhase::PreWrite,
-            SubqueryOrigin::DmlReturning => SubqueryEvalPhase::PostWriteReturning,
+    for source in &document.sources {
+        if let hir::SourceKind::FromGroup(group) = &source.kind {
+            collect_join_predicates(&group.from, &mut predicates);
         }
-    }
-
-    pub fn is_post_write_returning(self) -> bool {
-        matches!(self, SubqueryOrigin::DmlReturning)
-    }
-
-    pub fn is_write_statement(self) -> bool {
-        matches!(
-            self,
-            SubqueryOrigin::DmlWhere | SubqueryOrigin::DmlSet | SubqueryOrigin::DmlReturning
-        )
-    }
-}
-
-/// One ORDER BY key of a compound SELECT:
-/// `(result_column_index, sort_order, nulls_order, explicit_collation)`.
-/// The column index is 0-based into the result set. The explicit collation is
-/// set when the term carries a COLLATE override and otherwise the referenced
-/// column's own collation is used.
-pub(crate) type CompoundOrderByKey = (
-    usize,
-    SortOrder,
-    Option<ast::NullsOrder>,
-    Option<CollationSeq>,
-);
-
-/// A query plan is either a SELECT or a DELETE (for now)
-/// Variants are boxed so that moving a `Plan` around the prepare path
-/// (returns from plan builders, argument to emitters) costs a pointer
-/// move rather than ~880 B on the stack.
-#[derive(Debug, Clone)]
-#[allow(clippy::large_enum_variant)]
-pub enum Plan {
-    Select(Box<SelectPlan>),
-    CompoundSelect {
-        left: Vec<(SelectPlan, ast::CompoundOperator)>,
-        right_most: Box<SelectPlan>,
-        limit: Option<Box<Expr>>,
-        offset: Option<Box<Expr>>,
-        /// ORDER BY for compound selects, or `None` when the query has none.
-        order_by: Option<Vec<CompoundOrderByKey>>,
-    },
-    /// Runs the initial query once, then runs the recursive query for each queued row.
-    RecursiveCte(Box<RecursiveCtePlan>),
-    Delete(Box<DeletePlan>),
-    Update(Box<UpdatePlan>),
-}
-
-#[derive(Debug, Clone)]
-/// Everything needed to emit one self-referencing CTE.
-pub struct RecursiveCtePlan {
-    pub name: String,
-    pub initial_query: Box<Plan>,
-    pub recursive_query: Box<Plan>,
-    pub input_table_id: TableInternalId,
-    pub union_all: bool,
-    pub limit: Option<Box<Expr>>,
-    pub offset: Option<Box<Expr>>,
-    pub queue_order: Option<Vec<CompoundOrderByKey>>,
-    pub query_destination: QueryDestination,
-}
-
-impl Plan {
-    /// Return the estimated work for this plan's expected number of calls.
-    pub(crate) fn estimated_cost(&self) -> Option<f64> {
-        match self {
-            Plan::Select(plan) => plan.estimated_cost,
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => left
+        predicates.extend(
+            source
+                .index_expressions
                 .iter()
-                .map(|(plan, _)| plan.estimated_cost)
-                .chain(core::iter::once(right_most.estimated_cost))
-                .try_fold(0.0, |total, cost| cost.map(|cost| total + cost)),
-            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => None,
+                .filter_map(|index| index.predicate),
+        );
+    }
+    collect_root_predicates(&document.root, &mut predicates);
+    for predicate in predicates {
+        add_planning_terms(&mut document.exprs, &mut document.planning, predicate);
+    }
+    for filter in filters {
+        add_in_probes(document, filter);
+    }
+    if document.planning.always_true.is_none() {
+        document.planning.always_true = Some(
+            document
+                .exprs
+                .push(hir::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+        );
+        document.planning.null = Some(document.exprs.push(hir::Expr::Literal(ast::Literal::Null)));
+    }
+}
+
+fn collect_join_predicates(from: &hir::From, predicates: &mut Vec<hir::ExprId>) {
+    for join in &from.joins {
+        if let hir::JoinConstraint::On(expression) = join.constraint {
+            predicates.push(expression);
         }
     }
+}
 
-    /// Returns true if this SELECT plan contains a reference to the given table.
-    /// For compound selects, checks all component selects.
-    /// Returns false for Delete/Update plans.
-    pub fn select_contains_table(&self, table: &Table) -> bool {
-        match self {
-            Plan::Select(select_plan) => select_plan.table_references.contains_table(table),
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                right_most.table_references.contains_table(table)
-                    || left
-                        .iter()
-                        .any(|(plan, _)| plan.table_references.contains_table(table))
+fn collect_root_predicates(root: &hir::HirRoot, predicates: &mut Vec<hir::ExprId>) {
+    let add_update = |update: &hir::Update, predicates: &mut Vec<hir::ExprId>| {
+        predicates.extend(update.predicate);
+        if let Some(from) = &update.from {
+            collect_join_predicates(from, predicates);
+        }
+    };
+    let add_command = |command: &hir::TriggerCommand| match command {
+        hir::TriggerCommand::Update(update) => add_update(update, predicates),
+        hir::TriggerCommand::Delete(delete) => predicates.extend(delete.predicate),
+        hir::TriggerCommand::Select(_) | hir::TriggerCommand::Insert(_) => {}
+    };
+    match root {
+        hir::HirRoot::Update(update) => add_update(update, predicates),
+        hir::HirRoot::Delete(delete) => predicates.extend(delete.predicate),
+        hir::HirRoot::Trigger(trigger) => match &trigger.body {
+            #[cfg(test)]
+            hir::TriggerBody::Predicate(_) => {}
+            #[cfg(test)]
+            hir::TriggerBody::Command(command) => std::iter::once(command).for_each(add_command),
+            hir::TriggerBody::Program(program) => program.commands.iter().for_each(add_command),
+        },
+        hir::HirRoot::Query(_) | hir::HirRoot::Insert(_) | hir::HirRoot::SchemaExpressions(_) => {}
+    }
+}
+
+/// The conjuncts of an HIR predicate for planning, rewritten so that each
+/// can drive an index seek and be consumed on its own:
+///
+/// - `x BETWEEN a AND b` on a column becomes `x >= a` and `x <= b`, as
+///   SQLite also does;
+/// - a conjunct every branch of an OR has is lifted out of it:
+///   `(x = 1 AND a) OR (x = 1 AND b)` becomes `x = 1` and `a OR b`, and
+///   `x = 1 OR (x = 1 AND b)` becomes `x = 1`.
+fn add_planning_terms(
+    exprs: &mut hir::ExprArena,
+    planning: &mut hir::PlanningTerms,
+    predicate: hir::ExprId,
+) {
+    if planning.conjuncts.contains_key(&predicate) {
+        return;
+    }
+    let written = exprs
+        .at(predicate)
+        .conjuncts()
+        .map(|conjunct| conjunct.id())
+        .collect::<Vec<_>>();
+    let mut lifted = Vec::with_capacity(written.len());
+    for conjunct in written {
+        match lift_or_common_conjuncts(exprs, conjunct) {
+            Some((common, rest)) => {
+                lifted.extend(common);
+                lifted.extend(rest);
             }
-            Plan::RecursiveCte(plan) => {
-                plan.initial_query.select_contains_table(table)
-                    || plan.recursive_query.select_contains_table(table)
+            None => lifted.push(conjunct),
+        }
+    }
+    let mut conjuncts = Vec::with_capacity(lifted.len());
+    for conjunct in lifted {
+        split_column_between(exprs, conjunct, &mut conjuncts);
+    }
+    for conjunct in &conjuncts {
+        let implied = implied_in_terms(exprs, *conjunct);
+        if !implied.is_empty() {
+            planning.implied_in.insert(*conjunct, implied);
+        }
+    }
+    planning.conjuncts.insert(predicate, conjuncts);
+}
+
+fn hir_operands(
+    expression: hir::ExprRef<'_>,
+    operator: ast::Operator,
+    operands: &mut Vec<hir::ExprId>,
+) {
+    match expression.node() {
+        hir::Expr::Binary {
+            lhs,
+            operator: found,
+            rhs,
+            custom: None,
+            ..
+        } if *found == operator => {
+            hir_operands(expression.at(*lhs), operator, operands);
+            hir_operands(expression.at(*rhs), operator, operands);
+        }
+        _ => operands.push(expression.id()),
+    }
+}
+
+fn hir_chain(
+    exprs: &mut hir::ExprArena,
+    operands: Vec<hir::ExprId>,
+    operator: ast::Operator,
+) -> hir::ExprId {
+    let mut operands = operands.into_iter();
+    let first = operands.next().expect("a chain has at least one operand");
+    operands.fold(first, |lhs, rhs| {
+        exprs.push(hir::Expr::Binary {
+            lhs,
+            operator,
+            rhs,
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        })
+    })
+}
+
+/// The conjuncts every branch of an OR shares, and the OR without them, or
+/// none when it is no longer needed. `None` when nothing is shared.
+fn lift_or_common_conjuncts(
+    exprs: &mut hir::ExprArena,
+    expression: hir::ExprId,
+) -> Option<(Vec<hir::ExprId>, Option<hir::ExprId>)> {
+    let mut disjuncts = Vec::new();
+    hir_operands(exprs.at(expression), ast::Operator::Or, &mut disjuncts);
+    if disjuncts.len() < 2 {
+        return None;
+    }
+    let branches = disjuncts
+        .into_iter()
+        .map(|disjunct| {
+            let mut conjuncts = Vec::new();
+            hir_operands(exprs.at(disjunct), ast::Operator::And, &mut conjuncts);
+            conjuncts
+        })
+        .collect::<Vec<_>>();
+    let same = |left: hir::ExprId, right: hir::ExprId| exprs.at(left).equivalent(exprs.at(right));
+    let mut common: Vec<hir::ExprId> = Vec::new();
+    for candidate in &branches[0] {
+        if !common.iter().any(|found| same(*found, *candidate))
+            && branches[1..]
+                .iter()
+                .all(|branch| branch.iter().any(|other| same(*other, *candidate)))
+        {
+            common.push(*candidate);
+        }
+    }
+    if common.is_empty() {
+        return None;
+    }
+    let mut remaining_branches = Vec::with_capacity(branches.len());
+    for branch in &branches {
+        let remaining = branch
+            .iter()
+            .copied()
+            .filter(|conjunct| !common.iter().any(|found| same(*found, *conjunct)))
+            .collect::<Vec<_>>();
+        if remaining.is_empty() {
+            // One branch is the shared conjuncts alone, so the OR adds
+            // nothing to them.
+            return Some((common, None));
+        }
+        remaining_branches.push(remaining);
+    }
+    let rest = remaining_branches
+        .into_iter()
+        .map(|remaining| hir_chain(exprs, remaining, ast::Operator::And))
+        .collect();
+    Some((common, Some(hir_chain(exprs, rest, ast::Operator::Or))))
+}
+
+/// `col IN (v1, v2, ...)` terms an OR term implies: every branch of the
+/// OR, its ANDs flattened, compares `col` with a literal by `=`. The OR
+/// stays, since the IN only narrows the rows it is checked on, but the IN
+/// can drive an index seek the OR cannot. The planner keeps only some of
+/// them; see [`hir_implied_in_terms`].
+fn implied_in_terms(
+    exprs: &mut hir::ExprArena,
+    expression: hir::ExprId,
+) -> Vec<(hir::ColumnRef, hir::ExprId)> {
+    let mut disjuncts = Vec::new();
+    hir_operands(exprs.at(expression), ast::Operator::Or, &mut disjuncts);
+    if disjuncts.len() < 2 {
+        return Vec::new();
+    }
+    let branches = disjuncts
+        .into_iter()
+        .map(|disjunct| {
+            let mut conjuncts = Vec::new();
+            hir_operands(exprs.at(disjunct), ast::Operator::And, &mut conjuncts);
+            conjuncts
+        })
+        .collect::<Vec<_>>();
+    // A filter true for every branch names a column of the first branch.
+    let mut candidates: Vec<hir::ColumnRef> = Vec::new();
+    for term in &branches[0] {
+        if let Some((column, _, _)) = hir_column_literal_equality(exprs.at(*term)) {
+            if !candidates.contains(&column) {
+                candidates.push(column);
             }
-            Plan::Delete(_) | Plan::Update(_) => false,
         }
     }
-
-    /// Returns the query destination for Select/CompoundSelect plans.
-    /// Returns None for Delete/Update plans.
-    pub fn select_query_destination(&self) -> Option<&QueryDestination> {
-        match self {
-            Plan::Select(select_plan) => Some(&select_plan.query_destination),
-            Plan::CompoundSelect { right_most, .. } => Some(&right_most.query_destination),
-            Plan::RecursiveCte(plan) => Some(&plan.query_destination),
-            Plan::Delete(_) | Plan::Update(_) => None,
-        }
-    }
-
-    /// Returns a mutable reference to the query destination for Select/CompoundSelect plans.
-    /// Returns None for Delete/Update plans.
-    pub fn select_query_destination_mut(&mut self) -> Option<&mut QueryDestination> {
-        match self {
-            Plan::Select(select_plan) => Some(&mut select_plan.query_destination),
-            Plan::CompoundSelect { right_most, .. } => Some(&mut right_most.query_destination),
-            Plan::RecursiveCte(plan) => Some(&mut plan.query_destination),
-            Plan::Delete(_) | Plan::Update(_) => None,
-        }
-    }
-
-    /// Returns the result columns of a SELECT or compound SELECT plan. For a
-    /// compound SELECT the columns of the right-most component are returned,
-    /// since every component must agree on column count and naming.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called on a DELETE or UPDATE plan, which have no result
-    /// columns.
-    pub fn select_result_columns(&self) -> &[ResultSetColumn] {
-        match self {
-            Plan::Select(select_plan) => &select_plan.result_columns,
-            Plan::CompoundSelect { right_most, .. } => &right_most.result_columns,
-            Plan::RecursiveCte(plan) => plan.initial_query.select_result_columns(),
-            Plan::Delete(_) | Plan::Update(_) => {
-                panic!("select_result_columns called on a non-SELECT plan")
-            }
-        }
-    }
-
-    /// Returns the table references of a SELECT or compound SELECT plan. For
-    /// a compound SELECT the references of the right-most component are
-    /// returned.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called on a DELETE or UPDATE plan.
-    pub fn select_table_references(&self) -> &TableReferences {
-        match self {
-            Plan::Select(select_plan) => &select_plan.table_references,
-            Plan::CompoundSelect { right_most, .. } => &right_most.table_references,
-            Plan::RecursiveCte(plan) => plan.initial_query.select_table_references(),
-            Plan::Delete(_) | Plan::Update(_) => {
-                panic!("select_table_references called on a non-SELECT plan")
-            }
-        }
-    }
-
-    /// Returns the IDs of every outer-query reference that this plan actually
-    /// uses. For a compound SELECT, the result spans all of its component
-    /// SELECTs. DELETE and UPDATE plans have no outer-query references and
-    /// always return an empty vector.
-    pub fn used_outer_query_ref_ids(&self) -> Vec<TableInternalId> {
-        fn collect_from_select(plan: &SelectPlan, out: &mut Vec<TableInternalId>) {
-            for outer_ref in plan.table_references.outer_query_refs().iter() {
-                if outer_ref.is_used() {
-                    out.push(outer_ref.internal_id);
+    let mut filters = Vec::new();
+    'candidates: for column in candidates {
+        let mut values: Vec<hir::ExprId> = Vec::new();
+        let mut comparisons = Vec::new();
+        for branch in &branches {
+            let mut found = false;
+            for term in branch {
+                let Some((other, value, comparison)) = hir_column_literal_equality(exprs.at(*term))
+                else {
+                    continue;
+                };
+                if other != column {
+                    continue;
+                }
+                found = true;
+                if !values
+                    .iter()
+                    .any(|known| exprs.at(*known).equivalent(exprs.at(value)))
+                {
+                    values.push(value);
+                    comparisons.push(comparison.clone());
                 }
             }
-        }
-        let mut ids = Vec::new();
-        match self {
-            Plan::Select(plan) => collect_from_select(plan, &mut ids),
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                for (plan, _) in left {
-                    collect_from_select(plan, &mut ids);
-                }
-                collect_from_select(right_most, &mut ids);
+            if !found {
+                // This branch does not restrict the column, so a filter on
+                // it could reject rows of this branch.
+                continue 'candidates;
             }
-            Plan::RecursiveCte(plan) => {
-                ids.extend(plan.initial_query.used_outer_query_ref_ids());
-                ids.extend(plan.recursive_query.used_outer_query_ref_ids());
-            }
-            Plan::Delete(_) | Plan::Update(_) => {}
         }
-        ids
+        // One value for every branch is a conjunct the OR shares, which
+        // `add_planning_terms` lifts out of it.
+        if values.len() > 1 {
+            let lhs = exprs.push(hir::Expr::Column(column));
+            let filter = exprs.push(hir::Expr::InList {
+                lhs,
+                negated: false,
+                values,
+                comparisons,
+            });
+            filters.push((column, filter));
+        }
     }
+    filters
+}
 
-    /// Returns true if this plan or any of its subplans read from the given table.
-    /// (Not for Delete/Update plans)
-    fn reads_table(&self, namespace: NamespaceRef, table_name: &str) -> bool {
-        match self {
-            Plan::Select(select_plan) => select_plan.reads_table(namespace, table_name),
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                left.iter()
-                    .any(|(select_plan, _)| select_plan.reads_table(namespace, table_name))
-                    || right_most.reads_table(namespace, table_name)
-            }
-            Plan::RecursiveCte(plan) => {
-                plan.initial_query.reads_table(namespace, table_name)
-                    || plan.recursive_query.reads_table(namespace, table_name)
-            }
-            Plan::Delete(_) | Plan::Update(_) => false,
+/// Of the `col IN (...)` terms `implied` an OR term implies, the ones to
+/// plan: with several such columns of one table, only the one that alone
+/// starts an index is used, so that two seeks do not compete for the same
+/// table.
+pub(crate) fn hir_implied_in_terms(
+    implied: &[(hir::ColumnRef, hir::ExprId)],
+    sole_indexed_column: &dyn Fn(hir::SourceId, &[usize]) -> Option<usize>,
+) -> Vec<hir::ExprId> {
+    implied
+        .iter()
+        .filter_map(|(column, filter)| {
+            let same_source = implied
+                .iter()
+                .filter(|(other, _)| other.source == column.source)
+                .map(|(other, _)| other.column)
+                .collect::<Vec<_>>();
+            (same_source.len() == 1
+                || sole_indexed_column(column.source, &same_source) == Some(column.column))
+            .then_some(*filter)
+        })
+        .collect()
+}
+
+/// The column and literal of `col = literal` or `literal = col`, with the
+/// comparison's semantics.
+fn hir_column_literal_equality(
+    expression: hir::ExprRef<'_>,
+) -> Option<(hir::ColumnRef, hir::ExprId, &hir::ComparisonSemantics)> {
+    let hir::Expr::Binary {
+        lhs,
+        operator: ast::Operator::Equals,
+        rhs,
+        custom: None,
+        comparison: Some(comparison),
+        ..
+    } = expression.node()
+    else {
+        return None;
+    };
+    match (expression.at(*lhs).node(), expression.at(*rhs)) {
+        (hir::Expr::Column(column), value) if hir_literal_can_be_copied(value) => {
+            Some((*column, *rhs, comparison))
         }
+        _ => match (expression.at(*lhs), expression.at(*rhs).node()) {
+            (value, hir::Expr::Column(column)) if hir_literal_can_be_copied(value) => {
+                Some((*column, *lhs, comparison))
+            }
+            _ => None,
+        },
+    }
+}
+
+/// A number, string, blob or boolean, possibly signed. NULL never satisfies
+/// `=`, so it is left out.
+fn hir_literal_can_be_copied(expression: hir::ExprRef<'_>) -> bool {
+    use turso_parser::ast::{Literal, UnaryOperator};
+    match expression.node() {
+        hir::Expr::Literal(
+            Literal::Numeric(_)
+            | Literal::String(_)
+            | Literal::Blob(_)
+            | Literal::True
+            | Literal::False,
+        ) => true,
+        hir::Expr::Unary {
+            operator: UnaryOperator::Negative | UnaryOperator::Positive,
+            expr,
+        } => matches!(
+            expression.at(*expr).node(),
+            hir::Expr::Literal(Literal::Numeric(_))
+        ),
+        _ => false,
+    }
+}
+
+fn split_column_between(
+    exprs: &mut hir::ExprArena,
+    conjunct: hir::ExprId,
+    conjuncts: &mut Vec<hir::ExprId>,
+) {
+    let hir::Expr::Between {
+        expr,
+        negated: false,
+        start,
+        end,
+        start_comparison,
+        end_comparison,
+    } = &exprs[conjunct]
+    else {
+        conjuncts.push(conjunct);
+        return;
+    };
+    if !matches!(exprs[*expr], hir::Expr::Column(_) | hir::Expr::RowId(_)) {
+        conjuncts.push(conjunct);
+        return;
+    }
+    let bounds = [
+        (
+            ast::Operator::GreaterEquals,
+            *start,
+            start_comparison.clone(),
+        ),
+        (ast::Operator::LessEquals, *end, end_comparison.clone()),
+    ];
+    let lhs = *expr;
+    for (operator, rhs, comparison) in bounds {
+        conjuncts.push(exprs.push(hir::Expr::Binary {
+            lhs,
+            operator,
+            rhs,
+            array_concat: false,
+            custom: None,
+            comparison: Some(comparison),
+        }));
+    }
+}
+
+/// Build the `x = y` term of each `x IN (SELECT y ...)` conjunct of
+/// `filter` whose subquery has one block with one output.
+fn add_in_probes(document: &mut hir::HirDocument, filter: hir::ExprId) {
+    let mut probes = Vec::new();
+    for conjunct in document.expr(filter).conjuncts() {
+        let hir::Expr::Subquery(hir::SubqueryExpr::In {
+            lhs,
+            query,
+            negated: false,
+            comparison,
+        }) = conjunct.node()
+        else {
+            continue;
+        };
+        if comparison.components.len() != 1 || document.planning.in_probe(*query).is_some() {
+            continue;
+        }
+        let Some(definition) = document.query(*query) else {
+            continue;
+        };
+        let [block] = definition.blocks.as_slice() else {
+            continue;
+        };
+        let [output] = block.outputs.as_slice() else {
+            continue;
+        };
+        probes.push((*query, *lhs, output.expr, comparison.clone()));
+    }
+    for (query, lhs, rhs, comparison) in probes {
+        let probe = document.exprs.push(hir::Expr::Binary {
+            lhs,
+            operator: ast::Operator::Equals,
+            rhs,
+            array_concat: false,
+            custom: None,
+            comparison: Some(comparison),
+        });
+        add_planning_terms(&mut document.exprs, &mut document.planning, probe);
+        document.planning.in_probes.insert(query, probe);
     }
 }
 
@@ -639,8 +551,6 @@ impl Plan {
 /// later used by the parent query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EphemeralRowidMode {
-    /// The last result column is used as the rowid key.
-    FromResultColumns,
     /// Generate a fresh rowid for each inserted row.
     Auto,
 }
@@ -654,7 +564,14 @@ pub enum QueryDestination {
         /// The register that holds the program offset that handles jumping to/from the coroutine.
         yield_reg: usize,
         /// The index of the first instruction in the bytecode that implements the coroutine.
-        coroutine_implementation_start: BranchOffset,
+        /// Outputs computed from custom-typed columns as stored, not decoded:
+        /// the values a schema statement compares with an index entry or a
+        /// CHECK constraint, which DML computes the same way.
+        stored_outputs: alloc::Vec<usize>,
+        /// Whether array outputs are turned into text. A FROM subquery or
+        /// CTE keeps them as arrays, so the outer query can still read their
+        /// elements; the outer query turns the arrays it returns into text.
+        decode_arrays: bool,
     },
     /// The results of the query are stored in an ephemeral index,
     /// later used by the parent query.
@@ -700,14 +617,6 @@ pub enum QueryDestination {
         /// The number of registers that hold the result of the subquery.
         num_regs: usize,
     },
-    /// The results of the query are stored in a RowSet (for DELETE operations with triggers).
-    /// Rowids are added to the RowSet using RowSetAdd, then read back using RowSetRead.
-    RowSet {
-        /// The register that holds the RowSet object.
-        rowset_reg: usize,
-    },
-    /// Decision made at some point after query plan construction.
-    Unset,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -719,673 +628,10 @@ pub struct RecursiveCteQueueKey {
     pub nulls_override: Option<ast::NullsOrder>,
 }
 
-impl QueryDestination {
-    pub fn placeholder_for_subquery() -> Self {
-        QueryDestination::CoroutineYield {
-            yield_reg: usize::MAX, // will be set later in bytecode emission
-            coroutine_implementation_start: BranchOffset::Placeholder, // will be set later in bytecode emission
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct JoinOrderMember {
-    /// The internal ID of the[TableReference]
-    pub table_id: TableInternalId,
-    /// The index of the table in the original join order.
-    /// This is used to index into e.g. [TableReferences::joined_tables()]
-    pub original_idx: usize,
-    /// Whether this member is the right side of an OUTER JOIN
-    pub is_outer: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-
-/// Whether a column is DISTINCT or not.
-pub enum Distinctness {
-    /// The column is not a DISTINCT column.
-    NonDistinct,
-    /// The column is a DISTINCT column,
-    /// and includes a translation context for handling duplicates.
-    Distinct { ctx: Option<DistinctCtx> },
-}
-
-impl Distinctness {
-    pub fn from_ast(distinctness: Option<&ast::Distinctness>) -> Self {
-        match distinctness {
-            Some(ast::Distinctness::Distinct) => Self::Distinct { ctx: None },
-            Some(ast::Distinctness::All) => Self::NonDistinct,
-            None => Self::NonDistinct,
-        }
-    }
-    pub fn is_distinct(&self) -> bool {
-        matches!(self, Distinctness::Distinct { .. })
-    }
-}
-
-/// Translation context for handling DISTINCT columns.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DistinctCtx {
-    /// Hash table id used to deduplicate results.
-    pub hash_table_id: usize,
-    /// Collations for each distinct key column.
-    pub collations: Vec<CollationSeq>,
-    /// The label for the on conflict branch.
-    /// When a duplicate is found, the program will jump to the offset this label points to.
-    pub label_on_conflict: BranchOffset,
-}
-
-impl DistinctCtx {
-    pub fn emit_deduplication_insns(
-        &self,
-        program: &mut ProgramBuilder,
-        num_regs: usize,
-        start_reg: usize,
-    ) {
-        program.emit_insn(Insn::HashDistinct {
-            data: Box::new(HashDistinctData {
-                hash_table_id: self.hash_table_id,
-                key_start_reg: start_reg,
-                num_keys: num_regs,
-                collations: self.collations.clone(),
-                target_pc: self.label_on_conflict,
-            }),
-        });
-    }
-}
-
-/// Detected simple-aggregate optimization.
-///
-/// Analogous to SQLite's `isSimpleCount()` / `minMaxQuery()`. When set on a
-/// `SelectPlan`, the emitter can use a specialised fast path instead of a full
-/// scan + accumulate loop.
-#[derive(Debug, Clone)]
-pub struct MinMaxDef {
-    pub func: AggFunc,
-    pub argument: ast::Expr,
-    pub order: SortOrder,
-    /// Explicit COLLATE override, if any. `None` means use the column default.
-    pub collation: Option<CollationSeq>,
-}
-
-#[derive(Debug, Clone)]
-pub enum SimpleAggregate {
-    /// `SELECT count(*) FROM <tbl>` — uses the `Insn::Count` opcode directly.
-    Count,
-    /// `SELECT min(expr) FROM …` or `SELECT max(expr) FROM …` — the optimizer
-    /// will pick an index that delivers rows in the right order so the emitter
-    /// only needs to read the first (non-NULL for MIN) row.
-    MinMax(Box<MinMaxDef>),
-}
-
-#[derive(Debug, Clone)]
-pub struct SelectPlan {
-    pub table_references: TableReferences,
-    /// The order in which the tables are joined. Tables have usize Ids (their index in joined_tables)
-    pub join_order: Vec<JoinOrderMember>,
-    /// the columns inside SELECT ... FROM
-    pub result_columns: Vec<ResultSetColumn>,
-    /// where clause split into a vec at 'AND' boundaries. all join conditions also get shoved in here,
-    /// and we keep track of which join they came from (mainly for OUTER JOIN processing)
-    pub where_clause: Vec<WhereTerm>,
-    /// group by clause
-    pub group_by: Option<GroupBy>,
-    /// order by clause
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
-    /// all the aggregates collected from the result columns, order by, and (TODO) having clauses
-    pub aggregates: Vec<Aggregate>,
-    /// limit clause
-    pub limit: Option<Box<Expr>>,
-    /// offset clause
-    pub offset: Option<Box<Expr>>,
-    /// query contains a constant condition that is always false
-    pub contains_constant_false_condition: bool,
-    /// the destination of the resulting rows from this plan.
-    pub query_destination: QueryDestination,
-    /// whether the query is DISTINCT
-    pub distinctness: Distinctness,
-    /// values: https://sqlite.org/syntax/select-core.html
-    pub values: Vec<Vec<Expr>>,
-    /// The window definition and all window functions associated with it. There is at most one
-    /// window per SELECT. If the original query contains more, they are pushed down into subqueries.
-    pub window: Option<Window>,
-    /// Subqueries that appear in any part of the query apart from the FROM clause
-    pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
-    /// Estimated number of times this SELECT will be invoked by its parent scope.
-    ///
-    /// Top-level queries and standalone FROM-subqueries default to 1. Correlated
-    /// non-FROM subqueries may be re-optimized after their parent join order is
-    /// known so their inner FROM-subqueries can cost repeated probes correctly.
-    pub input_cardinality_hint: Option<f64>,
-    /// Estimated output rows from the optimizer's join order computation.
-    /// Used to propagate cardinality estimates for CTE/subquery tables.
-    pub estimated_output_rows: Option<f64>,
-    /// Estimated work for this query after its table reads are chosen.
-    /// Parent queries use this when they compare a subquery with a join.
-    pub(crate) estimated_cost: Option<f64>,
-    /// When set, this query is a simple aggregate (COUNT(*), MIN, or MAX)
-    /// that can be satisfied without a full table scan.
-    pub simple_aggregate: Option<SimpleAggregate>,
-}
-
-impl SelectPlan {
-    pub fn joined_tables(&self) -> &[JoinedTable] {
-        self.table_references.joined_tables()
-    }
-
-    pub fn agg_args_count(&self) -> usize {
-        self.aggregates.iter().map(|agg| agg.args.len()).sum()
-    }
-
-    /// Whether this query or any of its subqueries reference columns from the outer query.
-    pub fn is_correlated(&self) -> bool {
-        self.table_references
-            .outer_query_refs()
-            .iter()
-            .any(|t| t.is_used())
-            || self.non_from_clause_subqueries.iter().any(|s| s.correlated)
-            || self
-                .table_references
-                .joined_tables()
-                .iter()
-                .any(|t| match &t.table {
-                    Table::FromClauseSubquery(subquery) => plan_is_correlated(&subquery.plan),
-                    _ => false,
-                })
-    }
-
-    fn reads_table(&self, namespace: NamespaceRef, table_name: &str) -> bool {
-        self.table_references.joined_tables().iter().any(|table| {
-            table.matches(namespace, table_name)
-                || match &table.table {
-                    Table::FromClauseSubquery(subquery) => {
-                        subquery.plan.reads_table(namespace, table_name)
-                    }
-                    Table::BTree(_) | Table::Virtual(_) | Table::RecursiveCteInput(_) => false,
-                }
-        }) || self
-            .non_from_clause_subqueries
-            .iter()
-            .any(|subquery| subquery.reads_table(namespace, table_name))
-    }
-}
-
-/// Why an UPDATE/DELETE must gather target rowids first, then apply writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DmlSafetyReason {
-    /// UPDATE ... FROM computes writes from the materialized result of the FROM clause.
-    UpdateFrom,
-    /// Triggers exist, so we lock in target rows before writing.
-    Trigger,
-    /// WHERE has a subquery, so we lock in target rows before writing.
-    SubqueryInWhere,
-    /// The plan reads rowids from multiple index branches (multi-index scan).
-    MultiIndexScan,
-    /// REPLACE may delete conflicting rows while we are scanning.
-    ReplaceMode,
-    /// The statement updates key columns used by the scan itself.
-    KeyMutation,
-    /// The index method cursor does not materialize results up front,
-    /// so writes could invalidate the live iterator.
-    IndexMethodNotMaterialized,
-    FkCascade,
-}
-
-/// Safety decisions made while planning UPDATE/DELETE.
-#[derive(Debug, Clone, Default)]
-pub struct DmlSafety {
-    /// Why the safer "collect first, write later" mode was enabled.
-    pub reasons: SmallVec<[DmlSafetyReason; 2]>,
-}
-
-impl DmlSafety {
-    pub fn requires_stable_write_set(&self) -> bool {
-        !self.reasons.is_empty()
-    }
-
-    pub fn require(&mut self, reason: DmlSafetyReason) {
-        if !self.reasons.contains(&reason) {
-            self.reasons.push(reason);
-        }
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct DeletePlan {
-    pub table_references: TableReferences,
-    /// the columns inside SELECT ... FROM
-    pub result_columns: Vec<ResultSetColumn>,
-    /// where clause split into a vec at 'AND' boundaries.
-    pub where_clause: Vec<WhereTerm>,
-    /// query contains a constant condition that is always false
-    pub contains_constant_false_condition: bool,
-    /// Indexes that must be updated by the delete operation.
-    pub indexes: Vec<Arc<Index>>,
-    /// When DELETE cannot safely write while scanning, we first collect rowids into a RowSet.
-    pub rowset_plan: Option<SelectPlan>,
-    /// Register ID for the RowSet (if rowset_plan is Some)
-    pub rowset_reg: Option<usize>,
-    /// Subqueries that appear in the WHERE clause (for non-rowset path)
-    pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
-    /// Whether this DELETE plan uses the safer pre-materialization path, and why.
-    pub safety: DmlSafety,
-}
-
-#[derive(Debug, Clone)]
-pub struct UpdateSetClause {
-    pub column_index: usize,
-    /// Names the SET list used for this column, as written. UPDATE OF triggers
-    /// match against these, so `SET rowid` and `SET id` differ even when `id` is
-    /// the INTEGER PRIMARY KEY.
-    pub column_names: Vec<ast::Name>,
-    /// Original user-visible SET expression.
-    pub expr: Box<ast::Expr>,
-    /// In UPDATE FROM, SET clause expressions are rewritten to read from the
-    /// scratch table populated before the write loop.
-    ///
-    /// For example, `UPDATE t SET a = s.x + 1 FROM s WHERE t.id = s.id` rewrites
-    /// the SET expression `s.x + 1` (a column reference into the FROM table + a literal 1) into a
-    /// `Column` read from the ephemeral scratch table that was populated during
-    /// the collection phase. That column in the scratch table contains the evaluated result
-    /// of s.x + 1.
-    pub update_from_result: Option<Box<ast::Expr>>,
-}
-
-impl UpdateSetClause {
-    pub fn new(column_index: usize, column_name: ast::Name, expr: Box<ast::Expr>) -> Self {
-        Self {
-            column_index,
-            column_names: vec![column_name],
-            expr,
-            update_from_result: None,
-        }
-    }
-
-    /// If UPDATE ... FROM, the this is the materialized result of a SET clause expression derived from the FROM clause;
-    /// otherwise, it is the original expression.
-    pub fn emitted_expr(&self) -> &ast::Expr {
-        self.update_from_result.as_deref().unwrap_or(&self.expr)
-    }
-}
-
-/// The SELECT plan that is used for either a) UPDATE...FROM or b) a normal UPDATE where the write set must be prematerialized;
-/// see [crate::translate::plan::DmlSafety].
-#[derive(Debug, Clone)]
-pub struct WriteSetPlan {
-    pub select: SelectPlan,
-    pub scratch_table_id: TableInternalId,
-}
-
-#[derive(Debug, Clone)]
-pub struct UpdatePlan {
-    /// The table whose rows this UPDATE mutates.
-    pub target_table: JoinedTable,
-    /// The read-side FROM graph for `UPDATE ... FROM`.
-    ///
-    /// Plain UPDATE statements keep this empty except for any outer-query
-    /// references (for example preplanned CTE definitions) that are still needed
-    /// when binding subqueries later in the pipeline.
-    pub from_tables: TableReferences,
-    /// Conflict resolution strategy (e.g., OR IGNORE, OR REPLACE)
-    pub or_conflict: Option<ResolveType>,
-    /// SET clause assignments
-    pub set_clauses: Vec<UpdateSetClause>,
-    pub where_clause: Vec<WhereTerm>,
-    /// Optional RETURNING clause.
-    pub returning: Option<Vec<ResultSetColumn>>,
-    /// Whether the WHERE clause is always false.
-    pub contains_constant_false_condition: bool,
-    pub indexes_to_update: Vec<Arc<Index>>,
-    /// Prebuilt write-set SELECT for Halloween protection / UPDATE FROM.
-    pub write_set_plan: Option<WriteSetPlan>,
-    /// For ALTER TABLE turso-db emits appropriate DDL statement in the "updates"
-    /// cell of CDC table. This field is present only for update plans created for
-    /// ALTER TABLE when CDC mode has "updates" values.
-    pub cdc_update_alter_statement: Option<String>,
-    /// Subqueries that appear in the WHERE clause (for non-ephemeral path)
-    pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
-    /// Whether this UPDATE plan uses the safer pre-materialization path, and why.
-    pub safety: DmlSafety,
-}
-
-impl UpdatePlan {
-    /// Combine the UPDATE target (always first) and the `FROM`-clause tables
-    /// into one `TableReferences` — the read-side scope used for planning
-    /// outer-`WHERE` subqueries, `EXPLAIN QUERY PLAN`, and rendering the plan
-    /// back to SQL text via `ToTokens`.
-    /// The plan stores the two separately because the write-side emitter
-    /// treats the target table specially; this helper rejoins them for readers.
-    pub fn build_read_scope_tables(&self) -> TableReferences {
-        let mut read_scope_tables = TableReferences::new(vec![self.target_table.clone()], vec![]);
-        read_scope_tables.extend(self.from_tables.clone());
-        read_scope_tables
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IterationDirection {
     Forwards,
     Backwards,
-}
-
-/// Add the columns selected by `*` and record each column read.
-pub(super) fn expand_star(
-    table_references: &mut TableReferences,
-    out_columns: &mut Vec<ResultSetColumn>,
-    long_names: bool,
-    resolver: &Resolver<'_>,
-) -> crate::Result<()> {
-    let tables = table_references.joined_tables();
-    let mut used_columns = Vec::new();
-    for (table_index, table) in tables.iter().enumerate() {
-        // Semi/anti-join tables are internal (from EXISTS/NOT EXISTS unnesting)
-        // and should not contribute columns to SELECT *.
-        if table
-            .join_info
-            .as_ref()
-            .is_some_and(|ji| ji.is_semi_or_anti())
-        {
-            continue;
-        }
-        // If this table's identifier appears more than once in the FROM clause,
-        // expanding * would produce ambiguous column references (matches SQLite).
-        // However, columns deduplicated by USING/NATURAL are not ambiguous.
-        let has_duplicate_identifier = tables
-            .iter()
-            .filter(|t| t.identifier == table.identifier)
-            .count()
-            > 1;
-        if has_duplicate_identifier {
-            // Collect all USING columns from duplicate tables (both this table's
-            // own join_info and the join_info of other tables with the same identifier).
-            let using_cols: Vec<&str> = tables
-                .iter()
-                .filter(|t| t.identifier == table.identifier)
-                .filter_map(|t| t.join_info.as_ref())
-                .flat_map(|ji| ji.using.iter().map(|u| u.as_str()))
-                .collect();
-            for (_, col) in table.columns_for_star() {
-                if let Some(col_name) = &col.name {
-                    let in_using = using_cols.iter().any(|u| u.eq_ignore_ascii_case(col_name));
-                    let matching_columns = tables
-                        .iter()
-                        .filter(|other| {
-                            other.identifier == table.identifier
-                                && other.table.get_column_by_name(col_name).is_some()
-                        })
-                        .count();
-                    if !in_using && matching_columns > 1 {
-                        crate::bail_parse_error!(
-                            "ambiguous column name: {}.{}",
-                            table.identifier,
-                            col_name
-                        );
-                    }
-                }
-            }
-        }
-        let join_columns = table.table.parenthesized_join_columns();
-        for join_column in join_columns.unwrap_or_default() {
-            if let ParenthesizedJoinColumnSource::Using { column_name } = &join_column.source {
-                find_unqualified_column(&table.table, column_name)?;
-            }
-        }
-        for (mut column_index, column) in table.columns_for_star() {
-            let Some(column_name) = column.name.as_deref() else {
-                // Star expansion needs a name for its output and for later USING lookups.
-                continue;
-            };
-            if table
-                .join_info
-                .as_ref()
-                .is_some_and(|join| join.merges_column(column_name))
-            {
-                continue;
-            }
-            if join_columns.is_some() {
-                if tables.len() == 1 {
-                    column_index = rebind_parenthesized_star_column(table, column_name)?;
-                }
-            } else if parenthesized_star_source_match(tables, table_index, column_name)
-                == StarSourceMatch::Ambiguous
-            {
-                if matches!(&table.table, Table::BTree(_) | Table::Virtual(_)) {
-                    let database_name = resolver
-                        .namespace_name(table.namespace.database_id)
-                        .expect("the table database must exist while compiling a query");
-                    crate::bail_parse_error!(
-                        "ambiguous column name: {}.{}.{}",
-                        database_name,
-                        table.identifier,
-                        column_name
-                    );
-                }
-                crate::bail_parse_error!(
-                    "ambiguous column name: {}.{}",
-                    table.identifier,
-                    column_name
-                );
-            }
-            let resolved_column =
-                resolve_star_column(tables, table_index, column_index, column_name)?;
-            used_columns.extend(resolved_column.source_columns);
-            out_columns.push(star_result_column(
-                table,
-                column_index,
-                long_names,
-                resolved_column.expr,
-            ));
-        }
-    }
-    for (table_id, column_index) in used_columns {
-        table_references.mark_column_used(table_id, column_index);
-    }
-    Ok(())
-}
-
-/// Add the columns selected by `<table>.*` and record each column read.
-pub(super) fn expand_table_star(
-    table_references: &mut TableReferences,
-    out_columns: &mut Vec<ResultSetColumn>,
-    table_name: &str,
-    long_names: bool,
-) -> crate::Result<()> {
-    let normalized_name = crate::util::normalize_ident(table_name);
-    let tables = table_references.joined_tables();
-
-    let mut direct_matches = tables.iter().enumerate().filter(|(_, table)| {
-        table.table.parenthesized_join_columns().is_none()
-            && alias_or_stored_name(table) == normalized_name
-    });
-    let first_direct_match = direct_matches.next();
-    if let (Some((_, first_table)), Some(_)) = (first_direct_match, direct_matches.next()) {
-        let column_name = first_table
-            .columns()
-            .iter()
-            .find(|column| !column.hidden())
-            .and_then(|column| column.name.as_deref())
-            .unwrap_or("?");
-        crate::bail_parse_error!("ambiguous column name: {}.{}", table_name, column_name);
-    }
-
-    // SQLite binds each column after it expands `<table>.*`. A table outside
-    // the group conflicts with one inside only if both contain that column.
-    if let Some(column_name) = first_direct_match.and_then(|(table_index, table)| {
-        table
-            .columns_for_star()
-            .filter_map(|(_, column)| column.name.as_deref())
-            .find(|column_name| {
-                parenthesized_star_source_match(tables, table_index, column_name)
-                    == StarSourceMatch::Ambiguous
-            })
-    }) {
-        crate::bail_parse_error!("ambiguous column name: {}.{}", table_name, column_name);
-    }
-
-    let mut matching_columns = Vec::new();
-    for (table_index, table) in tables.iter().enumerate() {
-        if let Some(join_columns) = table.table.parenthesized_join_columns() {
-            // SQLite lets `<table>.*` refer to a table inside a parenthesized
-            // join. The alias of the whole group cannot qualify `*` here.
-            matching_columns.extend(
-                join_columns
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, saved_column)| {
-                        !saved_column.source.is_rowid()
-                            && saved_column.source.matches_table(None, &normalized_name)
-                    })
-                    .map(|(column_index, _)| (table_index, column_index)),
-            );
-        } else if alias_or_stored_name(table) == normalized_name {
-            matching_columns.extend(
-                table
-                    .columns_for_star()
-                    .map(|(column_index, _)| (table_index, column_index)),
-            );
-        }
-    }
-    if matching_columns.is_empty() {
-        crate::bail_parse_error!("no such table: {}", table_name);
-    }
-
-    let mut used_columns = Vec::new();
-    for (table_index, mut column_index) in matching_columns {
-        let table = &tables[table_index];
-        // SQLite cannot add a nameless column to a qualified star result.
-        let Some(column_name) = table.columns()[column_index].name.as_deref() else {
-            continue;
-        };
-        if tables.len() == 1 && table.table.parenthesized_join_columns().is_some() {
-            // SQLite emits a bare generated name in this case. Rebinding that
-            // name can find several sources, or none after a numeric suffix.
-            column_index = rebind_parenthesized_star_column(table, column_name)?;
-        }
-        let mut resolved_column =
-            resolve_star_column(tables, table_index, column_index, column_name)?;
-        if let Some((direct_index, _)) = first_direct_match {
-            if let StarSourceMatch::Merged { first_table_index } =
-                parenthesized_star_source_match(tables, direct_index, column_name)
-            {
-                // SQLite resolves a later direct copy through USING.
-                if table_index == direct_index && table_index != first_table_index {
-                    resolved_column = resolve_unqualified_column(tables, column_name)?
-                        .expect("the merged source must have the USING column");
-                }
-            }
-        }
-        used_columns.extend(resolved_column.source_columns);
-        out_columns.push(star_result_column(
-            table,
-            column_index,
-            long_names,
-            resolved_column.expr,
-        ));
-    }
-    for (table_id, column_index) in used_columns {
-        table_references.mark_column_used(table_id, column_index);
-    }
-    Ok(())
-}
-
-/// The name SQLite gives the FROM item `table` in `<tbl>.*` and in the saved
-/// columns of a parenthesized join: the alias, or else the name the table is
-/// stored under. For the schema table that is `sqlite_master`
-/// (`sqlite_temp_master` in temp), whichever name FROM used.
-pub(crate) fn alias_or_stored_name(table: &JoinedTable) -> &str {
-    if table.has_alias || !is_schema_table(&table.table) {
-        return &table.identifier;
-    }
-    if table.namespace.database_id == TEMP_DB_ID {
-        TEMP_SCHEMA_TABLE_NAME_ALT
-    } else {
-        SCHEMA_TABLE_NAME_ALT
-    }
-}
-
-pub(crate) fn is_schema_table(table: &Table) -> bool {
-    matches!(table, Table::BTree(btree) if btree.root_page == 1)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum StarSourceMatch {
-    NoMatch,
-    Merged { first_table_index: usize },
-    Ambiguous,
-}
-
-/// Check whether a direct table and a saved source have the same column.
-/// A later USING clause allows both names; otherwise SQLite reports ambiguity.
-fn parenthesized_star_source_match(
-    tables: &[JoinedTable],
-    direct_table_index: usize,
-    column_name: &str,
-) -> StarSourceMatch {
-    let direct_table = &tables[direct_table_index];
-    let database_id = matches!(&direct_table.table, Table::BTree(_) | Table::Virtual(_))
-        .then_some(direct_table.namespace.database_id);
-    let mut first_table_index = None;
-    for (group_index, table) in tables.iter().enumerate() {
-        let Some(columns) = table.table.parenthesized_join_columns() else {
-            continue;
-        };
-        let same_source_column = columns.iter().any(|column| {
-            !column.source.is_rowid()
-                && column
-                    .source
-                    .matches_table(database_id, &direct_table.identifier)
-                && column.source.matches_column_name(column_name)
-        });
-        if !same_source_column {
-            continue;
-        }
-
-        // A later USING(id) lets `same.*` name both copies of `same.id`.
-        let later_join = &tables[direct_table_index.max(group_index)];
-        if !later_join
-            .join_info
-            .as_ref()
-            .is_some_and(|join| join.merges_column(column_name))
-        {
-            return StarSourceMatch::Ambiguous;
-        }
-        first_table_index.get_or_insert(direct_table_index.min(group_index));
-    }
-    first_table_index.map_or(StarSourceMatch::NoMatch, |first_table_index| {
-        StarSourceMatch::Merged { first_table_index }
-    })
-}
-
-fn rebind_parenthesized_star_column(table: &JoinedTable, column_name: &str) -> Result<usize> {
-    let Some(column_index) = find_unqualified_column(&table.table, column_name)? else {
-        crate::bail_parse_error!("no such column: {}", column_name);
-    };
-    Ok(column_index)
-}
-
-fn star_result_column(
-    table: &JoinedTable,
-    column_index: usize,
-    long_names: bool,
-    expr: Expr,
-) -> ResultSetColumn {
-    let column = &table.columns()[column_index];
-    // SQLite gives star outputs explicit names. This bypasses the normal
-    // short-name and full-name rules for expression results.
-    let alias = column.name.as_ref().map(|column_name| {
-        if long_names {
-            format!("{}.{}", table.identifier, column_name)
-        } else {
-            column_name.clone()
-        }
-    });
-    ResultSetColumn {
-        alias,
-        implicit_column_name: None,
-        expr,
-        contains_aggregates: false,
-    }
 }
 
 /// The type of join between two tables.
@@ -1401,11 +647,19 @@ pub enum JoinType {
     Anti,
 }
 
+/// Join information for a planned source.
+#[derive(Debug, Clone)]
+pub struct JoinInfo<N = ast::Name> {
+    /// The type of join.
+    pub join_type: JoinType,
+    /// The USING clause for the join, if any. NATURAL JOIN is transformed into USING (col1, col2, ...).
+    pub using: Vec<N>,
+    /// When true, the optimizer must not reorder this table relative to its
+    /// neighbors. Set for CROSS JOIN to match SQLite semantics.
+    pub no_reorder: bool,
+}
+
 impl JoinType {
-    /// Convert parser join flags into the join type used after name binding.
-    ///
-    /// The parser keeps SQLite's accepted spellings as flags. For example,
-    /// `LEFT RIGHT JOIN` means FULL JOIN.
     pub fn from_join_operator(operator: &ast::JoinOperator) -> Self {
         let ast::JoinOperator::TypedJoin(Some(join_type)) = operator else {
             return Self::Inner;
@@ -1423,108 +677,20 @@ impl JoinType {
         }
     }
 
-    /// Return true when this join keeps unmatched rows from its right side.
+    /// Whether the join keeps the rows of its right side that match no row
+    /// of the left side.
     pub fn keeps_right_rows(self) -> bool {
         matches!(self, Self::RightOuter | Self::FullOuter)
     }
 }
 
-/// Join information for a table reference.
-#[derive(Debug, Clone)]
-pub struct JoinInfo {
-    /// The type of join.
-    pub join_type: JoinType,
-    /// The USING clause for the join, if any. NATURAL JOIN is transformed into USING (col1, col2, ...).
-    pub using: Vec<ast::Name>,
-    /// When true, the optimizer must not reorder this table relative to its
-    /// neighbors. Set for CROSS JOIN to match SQLite semantics.
-    pub no_reorder: bool,
-    pub lateral: bool,
-}
-
 impl JoinInfo {
+    /// Whether `column_name` is one of the join's USING columns.
     pub fn merges_column(&self, column_name: &str) -> bool {
         self.using
             .iter()
             .any(|name| name.as_str().eq_ignore_ascii_case(column_name))
     }
-
-    /// Whether this is an OUTER JOIN (LEFT, RIGHT or FULL).
-    pub fn is_outer(&self) -> bool {
-        matches!(
-            self.join_type,
-            JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter
-        )
-    }
-
-    /// Whether this join keeps unmatched rows from the left side.
-    pub fn keeps_left_rows(&self) -> bool {
-        matches!(self.join_type, JoinType::LeftOuter | JoinType::FullOuter)
-    }
-
-    /// Whether this join keeps unmatched rows from the right side.
-    pub fn keeps_right_rows(&self) -> bool {
-        self.join_type.keeps_right_rows()
-    }
-
-    /// Whether this is a FULL OUTER JOIN.
-    pub fn is_full_outer(&self) -> bool {
-        self.join_type == JoinType::FullOuter
-    }
-
-    /// Whether this is a semi-join (EXISTS).
-    pub fn is_semi(&self) -> bool {
-        self.join_type == JoinType::Semi
-    }
-
-    /// Whether this is an anti-join (NOT EXISTS).
-    pub fn is_anti(&self) -> bool {
-        self.join_type == JoinType::Anti
-    }
-
-    /// Whether this is a semi-join or anti-join (EXISTS/NOT EXISTS).
-    pub fn is_semi_or_anti(&self) -> bool {
-        matches!(self.join_type, JoinType::Semi | JoinType::Anti)
-    }
-
-    /// Whether the optimizer must preserve this table's position in the join order.
-    pub fn is_ordering_constrained(&self) -> bool {
-        self.is_outer() || self.is_semi_or_anti() || self.no_reorder || self.lateral
-    }
-}
-
-/// A bound column and all table columns that can supply its value.
-///
-/// The source list lets the planner keep each required table column available.
-/// This is necessary when FULL JOIN produces a value from several sources.
-pub struct ResolvedColumn {
-    /// The expression that returns the visible column value.
-    pub expr: Expr,
-    /// The table columns that the expression reads.
-    pub source_columns: SmallVec<[(TableInternalId, usize); 4]>,
-}
-
-/// Bind one column from `*` or `table.*`.
-fn resolve_star_column(
-    tables: &[JoinedTable],
-    table_index: usize,
-    column_index: usize,
-    column_name: &str,
-) -> Result<ResolvedColumn> {
-    let later_joins = tables[table_index + 1..]
-        .iter()
-        .filter_map(|table| table.join_info.as_ref());
-    if star_column_uses_merged_value(later_joins, column_name) {
-        // SQLite emits an unqualified name here, so normal USING binding merges its value.
-        return Ok(resolve_unqualified_column(tables, column_name)?
-            .expect("star expansion found this column"));
-    }
-    let table = &tables[table_index];
-    Ok(merge_columns([(
-        table.internal_id,
-        &table.table,
-        column_index,
-    )]))
 }
 
 /// Return true when SQLite resolves a qualified star column as an unqualified name.
@@ -1544,61 +710,17 @@ pub fn star_column_uses_merged_value<'a>(
     has_later_using && has_later_right_or_full_join
 }
 
-/// Bind an unqualified column with SQLite's left-to-right USING rules.
-/// See [unqualified_column_sources].
-pub fn resolve_unqualified_column(
-    tables: &[JoinedTable],
-    column_name: &str,
-) -> Result<Option<ResolvedColumn>> {
-    let has_declared_column = crate::translate::planner::ROWID_STRS
-        .iter()
-        .any(|name| name.eq_ignore_ascii_case(column_name))
-        && tables.iter().any(|table| {
-            !matches!(
-                lookup_unqualified_column(&table.table, column_name, false),
-                ColumnLookup::Missing
-            )
-        });
-    let found = unqualified_column_sources(
-        tables,
-        column_name,
-        |table| table.join_info.as_ref(),
-        |table| lookup_unqualified_column(&table.table, column_name, !has_declared_column),
-    );
-    if found.ambiguous {
-        crate::bail_parse_error!("ambiguous column name: {}", column_name);
-    }
-    // With no match, the binder must still try rowid names and outer query scopes.
-    Ok((!found.sources.is_empty()).then(|| {
-        merge_columns(
-            found
-                .sources
-                .into_iter()
-                .map(|(table_index, column_index)| {
-                    let table = &tables[table_index];
-                    (table.internal_id, &table.table, column_index)
-                }),
-        )
-    }))
-}
-
 /// The FROM sources that supply an unqualified column.
 pub struct UnqualifiedColumnSources {
     /// `(source index, column index)` pairs, first source first. Empty when no
     /// source has the column.
-    pub sources: SmallVec<[(usize, usize); 4]>,
-    /// Whether the name is ambiguous. `sources` then holds the copies found
-    /// before the ambiguity.
-    pub ambiguous: bool,
+    pub sources: smallvec::SmallVec<[(usize, usize); 4]>,
 }
 
 /// The result of looking up an unqualified column name in one FROM source.
 pub enum ColumnLookup {
     Found(usize),
     Missing,
-    /// The source has more than one column with this name. A parenthesized
-    /// join can keep a copy of the name from each joined table.
-    Ambiguous,
 }
 
 /// Find the FROM sources that supply an unqualified column, from left to right.
@@ -1607,25 +729,17 @@ pub enum ColumnLookup {
 /// replaces it, because the left copy is NULL in an unmatched right row. FULL
 /// JOIN USING adds a fallback, because either copy can be NULL.
 ///
-/// As in SQLite, an ambiguous name is only ambiguous if no later RIGHT JOIN
-/// replaces it with USING:
-///
-/// ```sql
-/// SELECT a FROM (SELECT 1 AS a, 2 AS a) AS s RIGHT JOIN t3 USING(a); -- t3.a
-/// SELECT a FROM (SELECT 1 AS a, 2 AS a) AS s, t3;  -- ambiguous column name: a
-/// ```
-///
-/// Query binding and view metadata both use this, so their results agree.
+/// View metadata uses this to name a view's columns the way the query
+/// binder resolves them.
 pub fn unqualified_column_sources<'a, S>(
     sources: &'a [S],
     column_name: &str,
     join_info: impl Fn(&'a S) -> Option<&'a JoinInfo>,
     lookup: impl Fn(&'a S) -> ColumnLookup,
 ) -> UnqualifiedColumnSources {
-    let mut found = SmallVec::new();
-    let mut ambiguous = false;
+    let mut found = smallvec::SmallVec::new();
     for (source_index, source) in sources.iter().enumerate() {
-        let already_found = !found.is_empty() || ambiguous;
+        let already_found = !found.is_empty();
         let using_join_type = join_info(source)
             .filter(|join_info| join_info.merges_column(column_name))
             .map(|join_info| join_info.join_type);
@@ -1635,10 +749,6 @@ pub fn unqualified_column_sources<'a, S>(
         let column_index = match lookup(source) {
             ColumnLookup::Found(column_index) => column_index,
             ColumnLookup::Missing => continue,
-            ColumnLookup::Ambiguous => {
-                ambiguous = true;
-                continue;
-            }
         };
 
         if !already_found {
@@ -1647,21 +757,18 @@ pub fn unqualified_column_sources<'a, S>(
         }
 
         match using_join_type {
-            // A repeated name is valid only when this source merged it with USING.
-            None => ambiguous = true,
             Some(JoinType::RightOuter) => {
                 found.clear();
-                ambiguous = false;
                 found.push((source_index, column_index));
             }
             Some(JoinType::FullOuter) => found.push((source_index, column_index)),
-            Some(JoinType::Inner | JoinType::LeftOuter | JoinType::Semi | JoinType::Anti) => {}
+            // A repeated name that no USING merged is ambiguous; the binder
+            // reports that, this only lists the copies in order.
+            None
+            | Some(JoinType::Inner | JoinType::LeftOuter | JoinType::Semi | JoinType::Anti) => {}
         }
     }
-    UnqualifiedColumnSources {
-        sources: found,
-        ambiguous,
-    }
+    UnqualifiedColumnSources { sources: found }
 }
 
 /// Find the earlier FROM sources that a USING or NATURAL join compares with.
@@ -1685,8 +792,8 @@ pub fn left_using_column_sources<'a, S>(
     has_right_or_full_join: bool,
     join_info: impl Fn(&'a S) -> Option<&'a JoinInfo>,
     column_index: impl Fn(&'a S) -> Option<usize>,
-) -> Result<SmallVec<[(usize, usize); 4]>> {
-    let mut found = SmallVec::<[(usize, usize); 4]>::new();
+) -> Result<smallvec::SmallVec<[(usize, usize); 4]>> {
+    let mut found = smallvec::SmallVec::<[(usize, usize); 4]>::new();
     for (source_index, source) in sources.iter().enumerate() {
         let Some(column_index) = column_index(source) else {
             continue;
@@ -1704,76 +811,49 @@ pub fn left_using_column_sources<'a, S>(
     Ok(found)
 }
 
-/// Build the value of a USING column from the table columns that can supply it.
-///
-/// One source gives a plain column. Several sources give an
-/// [Expr::MergedColumn], which returns the first non-NULL source value.
-pub fn merge_columns<'a>(
-    sources: impl IntoIterator<Item = (TableInternalId, &'a Table, usize)>,
-) -> ResolvedColumn {
-    let mut expressions = Vec::new();
-    let mut source_columns = SmallVec::new();
-    for (table_id, table, column_index) in sources {
-        expressions.push(Box::new(Expr::Column {
-            database: None,
-            table: table_id,
-            column: column_index,
-            is_rowid_alias: table.columns()[column_index].is_rowid_alias(),
-        }));
-        source_columns.push((table_id, column_index));
+impl<N> JoinInfo<N> {
+    /// Whether this is an OUTER JOIN (LEFT OUTER or FULL OUTER).
+    pub fn is_outer(&self) -> bool {
+        matches!(
+            self.join_type,
+            JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter
+        )
     }
-    assert!(!expressions.is_empty());
-    let expr = if expressions.len() == 1 {
-        *expressions.pop().unwrap()
-    } else {
-        Expr::MergedColumn(expressions)
-    };
-    ResolvedColumn {
-        expr,
-        source_columns,
+
+    /// Whether the join keeps the rows of its left side that match no row
+    /// of the right side.
+    pub fn keeps_left_rows(&self) -> bool {
+        matches!(self.join_type, JoinType::LeftOuter | JoinType::FullOuter)
+    }
+
+    /// Whether the join keeps the rows of its right side that match no row
+    /// of the left side.
+    pub fn keeps_right_rows(&self) -> bool {
+        self.join_type.keeps_right_rows()
+    }
+
+    /// Whether this is a FULL OUTER JOIN.
+    pub fn is_full_outer(&self) -> bool {
+        self.join_type == JoinType::FullOuter
+    }
+
+    /// Whether this is a semi-join or anti-join (EXISTS/NOT EXISTS).
+    pub fn is_semi_or_anti(&self) -> bool {
+        matches!(self.join_type, JoinType::Semi | JoinType::Anti)
     }
 }
 
-/// The separate read that finds the unmatched right rows of a RIGHT or FULL JOIN.
+/// A source the planner chooses an access path for: a table of the FROM
+/// clause with the columns and expressions the query reads from it.
 #[derive(Debug, Clone)]
-pub struct UnmatchedRightRowsPlan {
-    /// The operation that reads the right source.
-    pub operation: Operation,
-    /// Subqueries used by `conditions`, planned again for this one-table read.
-    pub subqueries: Vec<NonFromClauseSubquery>,
-    /// WHERE conditions to check for each unmatched right row.
-    /// Outer-join terms are not included.
-    pub conditions: Vec<Expr>,
-}
-
-/// A joined table in the query plan.
-/// For example,
-/// ```sql
-/// SELECT * FROM users u JOIN products p JOIN (SELECT * FROM users) sub;
-/// ```
-/// has three table references where
-/// - all have [Operation::Scan]
-/// - identifiers are `t`, `p`, `sub`
-/// - `t` and `p` are [Table::BTree] while `sub` is [Table::FromClauseSubquery]
-/// - join_info is None for the first table reference, and Some(JoinInfo { join_type: JoinType::Inner, using: vec![] }) for the second and third table references
-#[derive(Debug, Clone)]
-pub struct JoinedTable {
-    /// The operation that this table reference performs.
-    pub op: Operation,
-    /// How a RIGHT or FULL JOIN reads unmatched right rows after the main join loop.
-    /// SQLite plans this read separately from the main loop. `None` means a default scan.
-    pub unmatched_right_rows_plan: Option<UnmatchedRightRowsPlan>,
+pub struct PlannedSource<I, H, E, J> {
+    pub namespace: crate::namespace::NamespaceRef,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
-    /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
-    pub identifier: String,
-    /// Whether FROM gave this table an alias. Then `identifier` is the alias,
-    /// and only the alias can qualify the table's columns.
-    pub has_alias: bool,
-    /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
-    pub internal_id: TableInternalId,
-    /// The join info for this table reference, if it is the right side of a join (which all except the first table reference have)
-    pub join_info: Option<JoinInfo>,
+    /// Identity used by expressions and planner metadata.
+    pub internal_id: I,
+    /// Join info when this source is the right side of a join.
+    pub join_info: Option<J>,
     /// Bitmask of columns that are referenced in the query.
     /// Used to decide whether a covering index can be used.
     pub col_used_mask: ColumnUsedMask,
@@ -1786,517 +866,478 @@ pub struct JoinedTable {
     pub column_use_counts: Vec<usize>,
     /// Expressions referencing this table that may be satisfied by an expression index.
     ///
-    /// Each entry stores the normalized expression text and the columns it
-    /// needs. During covering checks we ask: does an index contain this
+    /// Each entry stores the expression shape used by this planning path and
+    /// the columns it needs. During covering checks we ask: does an index contain this
     /// expression? If yes, all columns that *only* feed this expression can be
     /// removed from the required-column set.
-    pub expression_index_usages: Vec<ExpressionIndexUsage>,
-    /// The namespace the table is in.
-    pub namespace: NamespaceRef,
-    /// INDEXED BY / NOT INDEXED hint from the SQL statement.
-    pub indexed: Option<ast::Indexed>,
-    /// Cost and row estimates for the selected table access.
-    pub plan_estimate: Option<TablePlanEstimate>,
+    pub expression_index_usages: Vec<ExpressionIndexUsage<E>>,
+    /// Index-selection hint already represented for this planning path.
+    pub indexed: H,
 }
 
-/// Cost and row estimates for one table in a selected join plan.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TablePlanEstimate {
-    /// Rows from the join prefix before this table access.
-    pub input_rows: f64,
-    /// Rows that this access returns for each input row.
-    pub rows_per_input: f64,
-    /// Rows from the join prefix after this table access.
-    pub output_rows: f64,
-    /// Cost of this table access for all input rows.
-    pub access_cost: f64,
-    /// Cost of the join prefix through this table access.
-    pub total_cost: f64,
-}
-
+/// Resolved join metadata used by HIR planning without rewriting RIGHT JOIN.
 #[derive(Debug, Clone)]
-pub struct OuterQueryReference {
-    /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
-    pub identifier: String,
-    /// Whether FROM gave this table an alias. Then `identifier` is the alias,
-    /// and only the alias can qualify the table's columns.
-    pub has_alias: bool,
-    /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
-    pub internal_id: TableInternalId,
-    /// Table object, which contains metadata about the table, e.g. columns.
-    pub table: Table,
-    /// The namespace the table is in, used to match schema-qualified names.
-    pub namespace: NamespaceRef,
-    /// The join that added this table in the outer scope's FROM list, so an
-    /// unqualified name follows the same USING rules there as it does in the
-    /// outer query itself (see [unqualified_column_sources]). None for the
-    /// first table and for references that are not part of a FROM list.
-    pub join_info: Option<JoinInfo>,
-    /// Bitmask of columns that are referenced in the query.
-    /// Used to track dependencies, so that it can be resolved
-    /// when a WHERE clause subquery should be evaluated;
-    /// i.e., if the subquery depends on tables T and U,
-    /// then both T and U need to be in scope for the subquery to be evaluated.
-    pub col_used_mask: ColumnUsedMask,
-    /// Original CTE SELECT AST for re-planning. When a CTE is referenced
-    /// multiple times, each reference needs a fresh plan with unique
-    /// internal_ids to avoid cursor key collisions.
-    pub cte_select: Option<ast::Select>,
-    /// Explicit column names from WITH t(a, b) AS (...) syntax.
-    pub cte_explicit_columns: Vec<String>,
-    /// CTE ID if this is a CTE reference. Used to track CTE reference counts
-    /// for materialization decisions.
-    pub cte_id: Option<usize>,
-    /// When true, this entry is only for CTE definition lookup in subquery
-    /// FROM clauses, not for column resolution. This is set when the CTE
-    /// has been consumed by a FROM clause (with or without an alias), so
-    /// column resolution goes through the joined_table instead.
-    pub cte_definition_only: bool,
-    /// Whether the rowid of this table is referenced. Tracked separately from
-    /// col_used_mask because rowid is not a real column and setting a fake
-    /// column index in col_used_mask could mislead covering index decisions.
-    pub rowid_referenced: bool,
-    /// Whether an outer join in an outer scope can replace this table's values
-    /// with NULL. The local FROM list does not contain that outer join.
-    pub outer_join_may_null_extend: bool,
-    /// Scope depth for this outer reference. 0 = immediate outer scope,
-    /// 1 = grandparent scope, etc. Used to avoid false "ambiguous column"
-    /// errors when the same column name exists at different nesting depths.
-    pub scope_depth: usize,
+pub(crate) struct HirJoinInfo {
+    pub(crate) kind: crate::translate::semantic::hir::JoinKind,
 }
 
-impl OuterQueryReference {
-    /// Returns the columns of the table that this outer query reference refers to.
-    pub fn columns(&self) -> &[Column] {
-        self.table.columns()
-    }
-
-    pub fn is_cte_name_in_scope(&self) -> bool {
-        (self.cte_id.is_some() || matches!(self.table, Table::RecursiveCteInput(_)))
-            && self.identifier == self.table.get_name()
-    }
-
-    /// Marks a column as used; used means that the column is referenced in the query.
-    pub fn mark_column_used(&mut self, column_index: usize) -> Result<()> {
-        self.col_used_mask.set(column_index)?;
-        Ok(())
-    }
-
-    /// Whether the OuterQueryReference is used by the current query scope.
-    /// This is used primarily to determine at what loop depth a subquery should be evaluated.
-    pub fn is_used(&self) -> bool {
-        !self.col_used_mask.is_empty() || self.rowid_referenced
-    }
+/// Structural boundary for a parenthesized FROM group. Physical leaves remain
+/// in the flat source list; this records their nesting and join position.
+pub(crate) struct HirFromGroupBoundary {
+    pub(crate) source: crate::translate::semantic::hir::SourceId,
+    pub(crate) parent: Option<crate::translate::semantic::hir::SourceId>,
+    pub(crate) source_range: Range<usize>,
+    pub(crate) join_info: Option<HirJoinInfo>,
 }
 
-#[derive(Debug, Clone)]
-/// A collection of table references in a given SQL statement.
-///
-/// `TableReferences::joined_tables` is the list of tables that are joined together.
-/// Example: SELECT * FROM t JOIN u JOIN v -- the joined tables are t, u and v.
-///
-/// `TableReferences::outer_query_refs` are references to tables outside the current scope.
-/// Example: SELECT * FROM t WHERE EXISTS (SELECT * FROM u WHERE u.foo = t.foo)
-/// -- here, 'u' is an outer query reference for the subquery (SELECT * FROM u WHERE u.foo = t.foo),
-/// since that query does not declare 't' in its FROM clause.
-///
-///
-/// Typically a query will only have joined tables, but the following may have outer query references:
-/// - CTEs that refer to other preceding CTEs
-/// - Correlated subqueries, i.e. subqueries that depend on the outer scope
-pub struct TableReferences {
-    /// Tables that are joined together in this query scope.
-    joined_tables: Vec<JoinedTable>,
-    /// Tables from outer scopes that are referenced in this query scope.
-    outer_query_refs: Vec<OuterQueryReference>,
+/// Flat physical source positions plus parenthesized join boundaries for one
+/// resolved FROM clause.
+pub(crate) struct HirFromLayout<'a> {
+    sources: &'a [HirPlanSource],
+    groups: &'a [HirFromGroupBoundary],
 }
 
-impl Default for TableReferences {
-    fn default() -> Self {
-        Self::new_empty()
-    }
-}
-
-impl TableReferences {
-    /// The maximum number of tables that can be joined together in a query.
-    /// This limit is arbitrary, although we currently use a u128 to represent the [crate::translate::planner::TableMask],
-    /// which can represent up to 128 tables.
-    /// Even at 63 tables we currently cannot handle the optimization performantly, hence the arbitrary cap.
-    pub const MAX_JOINED_TABLES: usize = 63;
-    pub const fn new(
-        joined_tables: Vec<JoinedTable>,
-        outer_query_refs: Vec<OuterQueryReference>,
-    ) -> Self {
-        Self {
-            joined_tables,
-            outer_query_refs,
-        }
+impl<'a> HirFromLayout<'a> {
+    pub(crate) fn new(sources: &'a [HirPlanSource], groups: &'a [HirFromGroupBoundary]) -> Self {
+        Self { sources, groups }
     }
 
-    pub const fn new_empty() -> Self {
-        Self {
-            joined_tables: Vec::new(),
-            outer_query_refs: Vec::new(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.joined_tables.is_empty() && self.outer_query_refs.is_empty()
-    }
-
-    /// Add a new [JoinedTable] to the query plan.
-    pub fn add_joined_table(&mut self, joined_table: JoinedTable) {
-        self.joined_tables.push(joined_table);
-    }
-
-    /// Add a new [OuterQueryReference] to the query plan.
-    pub fn add_outer_query_reference(&mut self, outer_query_reference: OuterQueryReference) {
-        self.outer_query_refs.push(outer_query_reference);
-    }
-
-    /// Returns an immutable reference to the [JoinedTable]s in the query plan.
-    pub fn joined_tables(&self) -> &[JoinedTable] {
-        &self.joined_tables
-    }
-
-    /// Returns a mutable reference to the [JoinedTable]s in the query plan.
-    pub const fn joined_tables_mut(&mut self) -> &mut Vec<JoinedTable> {
-        &mut self.joined_tables
-    }
-
-    /// Whether an outer join in the FROM list can give this table's columns
-    /// NULLs ("null-extend" it).
-    ///
-    /// The right table of a LEFT JOIN or FULL JOIN can get NULLs for an unmatched left row.
-    /// A RIGHT JOIN or FULL JOIN can also give NULLs to every table on its left.
-    /// Those left tables have no join information of their own.
-    pub fn outer_join_may_null_extend(&self, table: TableInternalId) -> bool {
-        let Some(pos) = self
-            .joined_tables
+    pub(crate) fn source_position(&self, source: hir::SourceId) -> Option<usize> {
+        self.sources
             .iter()
-            .position(|t| t.internal_id == table)
-        else {
-            // A correlated subquery does not have the outer FROM list. Its
-            // table reference carries the nullability from that outer scope.
-            return self
-                .find_outer_query_ref_by_internal_id(table)
-                .is_some_and(|outer_ref| outer_ref.outer_join_may_null_extend);
-        };
-        if self.joined_tables[pos]
-            .join_info
-            .as_ref()
-            .is_some_and(JoinInfo::keeps_left_rows)
-        {
+            .position(|candidate| candidate.source() == source)
+    }
+
+    pub(crate) fn table_mask(
+        &self,
+        document: &hir::HirDocument,
+        expression: hir::ExprId,
+    ) -> Result<TableMask> {
+        table_mask_from_hir_scope(document, self, expression)
+    }
+
+    pub(crate) fn outer_join_may_null_extend(&self, source: hir::SourceId) -> bool {
+        self.join_may_null_extend(source, false)
+    }
+
+    pub(crate) fn full_join_may_null_extend(&self, source: hir::SourceId) -> bool {
+        self.join_may_null_extend(source, true)
+    }
+
+    /// An outer-join predicate owned by a group can run only when the current
+    /// source completes that group. Requiring the current source to be inside
+    /// the group prevents the predicate from becoming ready again later.
+    pub(crate) fn predicate_owner_ready(
+        &self,
+        owner: hir::SourceId,
+        joined: &TableMask,
+        current: usize,
+    ) -> bool {
+        if self.source_position(owner) == Some(current) {
             return true;
         }
-        any_right_or_full_join(&self.joined_tables[pos + 1..])
-    }
 
-    /// Whether this table's index cursor can be on a null row while its
-    /// expressions are read. That happens when an outer join null-extends the
-    /// table (SQLite's JT_LEFT and JT_LTORJ), and during the unmatched-row pass
-    /// of a RIGHT or FULL JOIN, which reads the table through a separate cursor
-    /// (SQLite's JT_RIGHT).
-    pub fn index_cursor_may_be_null_row(&self, table: TableInternalId) -> bool {
-        self.outer_join_may_null_extend(table)
-            || self
-                .find_joined_table_by_internal_id(table)
-                .and_then(|joined_table| joined_table.join_info.as_ref())
-                .is_some_and(JoinInfo::keeps_right_rows)
-    }
-
-    /// Whether the FROM list has a RIGHT JOIN or FULL JOIN.
-    pub fn has_right_or_full_join(&self) -> bool {
-        any_right_or_full_join(&self.joined_tables)
-    }
-
-    /// Whether this table is the right table of a RIGHT JOIN or FULL JOIN, or
-    /// is left of one. The unmatched-row pass of that join can read this table
-    /// without going through its normal loop.
-    pub fn is_at_or_left_of_right_or_full_join(&self, table: TableInternalId) -> bool {
-        let Some(pos) = self
-            .joined_tables
+        self.groups
             .iter()
-            .position(|t| t.internal_id == table)
-        else {
+            .find(|group| group.source == owner)
+            .is_some_and(|group| {
+                group.source_range.contains(&current)
+                    && group
+                        .source_range
+                        .clone()
+                        .all(|position| joined.get(position))
+            })
+    }
+
+    fn join_may_null_extend(&self, source: hir::SourceId, full_only: bool) -> bool {
+        let Some(position) = self.source_position(source) else {
             return false;
         };
-        any_right_or_full_join(&self.joined_tables[pos..])
+        self.sources.iter().enumerate().any(|(right, candidate)| {
+            candidate.join_info().is_some_and(|join| {
+                (!full_only || join.kind == hir::JoinKind::Full)
+                    && join_kind_may_null_extend(
+                        join.kind,
+                        position,
+                        self.innermost_group_start(right),
+                        right..right + 1,
+                    )
+            })
+        }) || self.groups.iter().any(|group| {
+            group.join_info.as_ref().is_some_and(|join| {
+                (!full_only || join.kind == hir::JoinKind::Full)
+                    && join_kind_may_null_extend(
+                        join.kind,
+                        position,
+                        self.parent_group_start(group),
+                        group.source_range.clone(),
+                    )
+            })
+        })
     }
 
-    /// Whether this table is left of a RIGHT JOIN or FULL JOIN.
-    pub fn is_left_of_right_or_full_join(&self, table: TableInternalId) -> bool {
-        let Some(pos) = self
-            .joined_tables
+    fn innermost_group_start(&self, position: usize) -> usize {
+        self.groups
             .iter()
-            .position(|t| t.internal_id == table)
-        else {
+            .filter(|group| group.source_range.contains(&position))
+            .min_by_key(|group| group.source_range.len())
+            .map_or(0, |group| group.source_range.start)
+    }
+
+    fn parent_group_start(&self, group: &HirFromGroupBoundary) -> usize {
+        group
+            .parent
+            .and_then(|parent| self.groups.iter().find(|group| group.source == parent))
+            .map_or(0, |parent| parent.source_range.start)
+    }
+}
+
+impl HirFromScope for HirFromLayout<'_> {
+    fn source_position(&self, source: hir::SourceId) -> Option<usize> {
+        HirFromLayout::source_position(self, source)
+    }
+
+    fn outer_join_may_null_extend(&self, source: hir::SourceId) -> bool {
+        HirFromLayout::outer_join_may_null_extend(self, source)
+    }
+
+    fn full_join_may_null_extend(&self, source: hir::SourceId) -> bool {
+        HirFromLayout::full_join_may_null_extend(self, source)
+    }
+}
+
+fn join_kind_may_null_extend(
+    kind: hir::JoinKind,
+    source_position: usize,
+    left_start: usize,
+    right: Range<usize>,
+) -> bool {
+    match kind {
+        hir::JoinKind::Left => right.contains(&source_position),
+        hir::JoinKind::Right => (left_start..right.start).contains(&source_position),
+        hir::JoinKind::Full => (left_start..right.end).contains(&source_position),
+        hir::JoinKind::Comma
+        | hir::JoinKind::Inner
+        | hir::JoinKind::Cross
+        | hir::JoinKind::Semi
+        | hir::JoinKind::Anti => false,
+    }
+}
+
+/// Source used by HIR planning without parser expressions or planner IDs.
+pub(crate) type HirPlannedSource = PlannedSource<
+    crate::translate::semantic::hir::SourceId,
+    crate::translate::semantic::hir::IndexHint,
+    hir::ExprId,
+    HirJoinInfo,
+>;
+
+/// Resolved reuse policy for a non-recursive CTE scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HirCteMaterialization {
+    PerReference,
+    Shared,
+    Explicit,
+}
+
+/// One resolved HIR source as seen by join planning.
+///
+/// B-tree sources carry physical access metadata. Query-backed sources point
+/// at their planned query, so they do not need a synthetic table.
+pub(crate) enum HirPlanSource {
+    BTree(HirPlannedSource),
+    Derived {
+        source: crate::translate::semantic::hir::SourceId,
+        query: crate::translate::semantic::hir::QueryId,
+        join_info: Option<HirJoinInfo>,
+        /// The order the subquery's plan returns its rows in.
+        output_order: Vec<crate::translate::optimizer::order::HirOutputOrder>,
+        /// A LATERAL subquery that reads sources of the same FROM clause:
+        /// it runs again for each of their rows, after all of them.
+        lateral: bool,
+    },
+    Cte {
+        source: crate::translate::semantic::hir::SourceId,
+        cte: crate::translate::semantic::hir::CteId,
+        query: crate::translate::semantic::hir::QueryId,
+        materialization: HirCteMaterialization,
+        join_info: Option<HirJoinInfo>,
+        /// The order the CTE body's plan returns its rows in.
+        output_order: Vec<crate::translate::optimizer::order::HirOutputOrder>,
+    },
+    RecursiveCte {
+        source: crate::translate::semantic::hir::SourceId,
+        cte: crate::translate::semantic::hir::CteId,
+        join_info: Option<HirJoinInfo>,
+    },
+    RecursiveInput {
+        source: crate::translate::semantic::hir::SourceId,
+        cte: crate::translate::semantic::hir::CteId,
+        join_info: Option<HirJoinInfo>,
+    },
+}
+
+impl HirPlanSource {
+    pub(crate) fn source(&self) -> crate::translate::semantic::hir::SourceId {
+        match self {
+            Self::BTree(source) => source.internal_id,
+            Self::Derived { source, .. }
+            | Self::Cte { source, .. }
+            | Self::RecursiveCte { source, .. }
+            | Self::RecursiveInput { source, .. } => *source,
+        }
+    }
+
+    /// Whether this is a LATERAL subquery that reads sources of its own
+    /// FROM clause.
+    pub(crate) fn is_lateral(&self) -> bool {
+        matches!(self, Self::Derived { lateral: true, .. })
+    }
+
+    pub(crate) fn join_info_mut(&mut self) -> Option<&mut HirJoinInfo> {
+        match self {
+            Self::BTree(source) => source.join_info.as_mut(),
+            Self::Derived { join_info, .. }
+            | Self::Cte { join_info, .. }
+            | Self::RecursiveCte { join_info, .. }
+            | Self::RecursiveInput { join_info, .. } => join_info.as_mut(),
+        }
+    }
+
+    pub(crate) fn join_info(&self) -> Option<&HirJoinInfo> {
+        match self {
+            Self::BTree(source) => source.join_info.as_ref(),
+            Self::Derived { join_info, .. }
+            | Self::Cte { join_info, .. }
+            | Self::RecursiveCte { join_info, .. }
+            | Self::RecursiveInput { join_info, .. } => join_info.as_ref(),
+        }
+    }
+
+    pub(crate) fn btree(&self) -> Option<&HirPlannedSource> {
+        match self {
+            Self::BTree(source) => Some(source),
+            Self::Derived { .. }
+            | Self::Cte { .. }
+            | Self::RecursiveCte { .. }
+            | Self::RecursiveInput { .. } => None,
+        }
+    }
+
+    pub(crate) fn btree_mut(&mut self) -> Option<&mut HirPlannedSource> {
+        match self {
+            Self::BTree(source) => Some(source),
+            Self::Derived { .. }
+            | Self::Cte { .. }
+            | Self::RecursiveCte { .. }
+            | Self::RecursiveInput { .. } => None,
+        }
+    }
+}
+
+impl<I, H, E, J> PlannedSource<I, H, E, J> {
+    /// Apply shared covering-index rules while letting each expression
+    /// representation decide whether an expression key matches.
+    fn index_is_covering_with(
+        &self,
+        index: &Index,
+        expression_in_index: impl Fn(&E, &Index) -> bool,
+    ) -> bool {
+        let Table::BTree(btree) = &self.table else {
             return false;
         };
-        any_right_or_full_join(&self.joined_tables[pos + 1..])
-    }
-
-    /// Resets the expression index usages for all joined tables.
-    pub fn reset_expression_index_usages(&mut self) {
-        for table in self.joined_tables.iter_mut() {
-            table.clear_expression_index_usages();
+        if index.index_method.is_some() {
+            return false;
         }
-    }
-
-    /// Called before optimization so we can reuse the same registration
-    /// for result columns, ORDER BY, and GROUP BY expressions. If a
-    /// SELECT lists `LOWER(name)` and an index exists on `LOWER(name)`, we
-    /// can plan a covering scan because the expression value lives inside
-    /// the index key.
-    pub fn register_expression_index_usage(&mut self, expr: &ast::Expr) {
-        let Some((table_id, columns_mask)) = single_table_column_usage(expr) else {
-            return;
-        };
-        let Some(table_ref) = self
-            .joined_tables()
-            .iter()
-            .find(|t| t.internal_id == table_id)
-        else {
-            return;
-        };
-        let normalized = normalize_expr_for_index_matching(expr, table_ref, self);
-        let may_be_null_row = self.index_cursor_may_be_null_row(table_id);
-        if let Some(table_ref_mut) = self
-            .joined_tables_mut()
-            .iter_mut()
-            .find(|t| t.internal_id == table_id)
-        {
-            table_ref_mut.register_expression_index_usage(
-                normalized,
-                columns_mask,
-                may_be_null_row,
-            );
+        if self.col_used_mask.is_empty() {
+            // With no referenced columns, a complete index can provide the row-producing
+            // scan without opening the table. Partial-index completeness depends on the
+            // query predicate, so keep this path conservative.
+            return index.where_clause.is_none();
         }
-    }
 
-    /// Returns an immutable reference to the [OuterQueryReference]s in the query plan.
-    pub fn outer_query_refs(&self) -> &[OuterQueryReference] {
-        &self.outer_query_refs
-    }
-
-    /// Remove outer references after an optimizer rewrite has removed every
-    /// expression that uses them.
-    pub(crate) fn clear_outer_query_refs(&mut self) {
-        self.outer_query_refs.clear();
-    }
-
-    /// Returns an immutable reference to the [OuterQueryReference] with the given internal ID.
-    pub fn find_outer_query_ref_by_internal_id(
-        &self,
-        internal_id: TableInternalId,
-    ) -> Option<&OuterQueryReference> {
-        self.outer_query_refs
-            .iter()
-            .find(|t| t.internal_id == internal_id)
-    }
-
-    /// Returns a mutable reference to the [OuterQueryReference] with the given internal ID.
-    pub fn find_outer_query_ref_by_internal_id_mut(
-        &mut self,
-        internal_id: TableInternalId,
-    ) -> Option<&mut OuterQueryReference> {
-        self.outer_query_refs
-            .iter_mut()
-            .find(|t| t.internal_id == internal_id)
-    }
-
-    /// Returns an immutable reference to the [Table] with the given internal ID,
-    /// plus a boolean indicating whether the table is a joined table from the current query scope (false),
-    /// or an outer query reference (true).
-    pub fn find_table_by_internal_id(
-        &self,
-        internal_id: TableInternalId,
-    ) -> Option<(bool, &Table)> {
-        self.joined_tables
-            .iter()
-            .find(|t| t.internal_id == internal_id)
-            .map(|t| (false, &t.table))
-            .or_else(|| {
-                self.outer_query_refs
-                    .iter()
-                    .find(|t| t.internal_id == internal_id)
-                    .map(|t| (true, &t.table))
-            })
-    }
-
-    /// Returns an immutable reference to the [Table] with the given identifier,
-    /// where identifier is either the literal name of the table or an alias.
-    pub fn find_table_by_identifier(&self, identifier: &str) -> Option<&Table> {
-        self.joined_tables
-            .iter()
-            .find(|t| t.identifier == identifier)
-            .map(|t| &t.table)
-            .or_else(|| {
-                self.outer_query_refs
-                    .iter()
-                    .find(|t| t.identifier == identifier)
-                    .map(|t| &t.table)
-            })
-    }
-
-    /// Returns an immutable reference to the first [Table] whose underlying
-    /// table name matches `name`. Unlike [find_table_by_identifier], this
-    /// searches by the base table name (e.g. "t1") rather than the alias
-    /// (e.g. "a"). This is needed when looking up column metadata for
-    /// ephemeral auto-indexes, whose `table_name` field stores the base name
-    /// while the table reference may be aliased.
-    pub fn find_table_by_table_name(&self, name: &str) -> Option<&Table> {
-        self.joined_tables
-            .iter()
-            .find(|t| t.table.get_name() == name)
-            .map(|t| &t.table)
-            .or_else(|| {
-                self.outer_query_refs
-                    .iter()
-                    .find(|t| t.table.get_name() == name)
-                    .map(|t| &t.table)
-            })
-    }
-
-    /// Returns an immutable reference to the [OuterQueryReference] with the given identifier,
-    /// where identifier is either the literal name of the table or an alias.
-    pub fn find_outer_query_ref_by_identifier(
-        &self,
-        identifier: &str,
-    ) -> Option<&OuterQueryReference> {
-        self.outer_query_refs
-            .iter()
-            .find(|t| t.identifier == identifier)
-    }
-
-    pub fn find_cte_outer_query_ref_by_identifier(
-        &self,
-        identifier: &str,
-    ) -> Option<&OuterQueryReference> {
-        self.outer_query_refs
-            .iter()
-            .find(|t| t.identifier == identifier && t.is_cte_name_in_scope())
-    }
-
-    /// Marks the pre-planned [OuterQueryReference] with the given identifier as
-    /// "CTE definition only". This prevents it from being used for column
-    /// resolution while still allowing CTE definition lookup in subquery FROM
-    /// clauses. Called when a CTE is consumed by a FROM clause, since column
-    /// resolution is then handled by the joined_table entry instead.
-    pub fn mark_outer_query_ref_cte_definition_only(&mut self, identifier: &str) {
-        if let Some(outer_ref) = self
-            .outer_query_refs
-            .iter_mut()
-            .find(|t| t.identifier == identifier)
-        {
-            outer_ref.cte_definition_only = true;
-        }
-    }
-
-    /// Returns `(internal_id, &Table)` for the table with the given identifier.
-    /// Searches `joined_tables` first, then visible `outer_query_refs`
-    /// (excluding CTE-definition-only entries).
-    pub fn find_table_and_internal_id_by_identifier(
-        &self,
-        identifier: &str,
-    ) -> Option<(TableInternalId, &Table)> {
-        self.joined_tables
-            .iter()
-            .find(|t| t.identifier == identifier)
-            .map(|t| (t.internal_id, &t.table))
-            .or_else(|| {
-                self.outer_query_refs
-                    .iter()
-                    .find(|t| t.identifier == identifier && !t.cte_definition_only)
-                    .map(|t| (t.internal_id, &t.table))
-            })
-    }
-
-    /// Returns an immutable reference to the [JoinedTable] with the given internal ID.
-    pub fn find_joined_table_by_internal_id(
-        &self,
-        internal_id: TableInternalId,
-    ) -> Option<&JoinedTable> {
-        self.joined_tables
-            .iter()
-            .find(|t| t.internal_id == internal_id)
-    }
-
-    /// Returns a mutable reference to the [JoinedTable] with the given internal ID.
-    pub fn find_joined_table_by_internal_id_mut(
-        &mut self,
-        internal_id: TableInternalId,
-    ) -> Option<&mut JoinedTable> {
-        self.joined_tables
-            .iter_mut()
-            .find(|t| t.internal_id == internal_id)
-    }
-
-    /// Marks a column as used; used means that the column is referenced in the query.
-    pub fn mark_column_used(&mut self, internal_id: TableInternalId, column_index: usize) {
-        if let Some(joined_table) = self.find_joined_table_by_internal_id_mut(internal_id) {
-            joined_table.mark_column_used(column_index);
-        } else if let Some(outer_query_ref) =
-            self.find_outer_query_ref_by_internal_id_mut(internal_id)
-        {
-            outer_query_ref
-                .mark_column_used(column_index)
-                .expect("TODO: alloc error");
+        if self.expression_index_usages.is_empty() {
+            Self::index_covers_columns(index, btree, &self.col_used_mask)
         } else {
-            panic!("table with internal id {internal_id} not found in table references");
+            let mut required_columns = self.col_used_mask.clone();
+            self.apply_expression_index_coverage(index, &mut required_columns, expression_in_index);
+            if required_columns.is_empty() {
+                return true;
+            }
+            Self::index_covers_columns(index, btree, &required_columns)
         }
     }
 
-    /// Marks the rowid of a table as referenced. This is tracked separately
-    /// from column usage because rowid is not a real column.
-    pub fn mark_rowid_referenced(&mut self, internal_id: TableInternalId) {
-        if let Some(outer_query_ref) = self.find_outer_query_ref_by_internal_id_mut(internal_id) {
-            outer_query_ref.rowid_referenced = true;
+    /// Whether the index holds every column the query reads from the table,
+    /// without counting the expressions it keys. A row the join
+    /// NULL-extends reads NULL from every column, so an expression the index
+    /// supplies must be computed from the NULL columns instead: `coalesce(v,
+    /// -1)` is -1 on that row, not the stored key.
+    pub(crate) fn index_covers_columns_without_expressions(&self, index: &Index) -> bool {
+        let Table::BTree(btree) = &self.table else {
+            return false;
+        };
+        if index.index_method.is_some() {
+            return false;
         }
-        // For joined tables, rowid references don't need special tracking
-        // since correlated subquery detection only looks at outer_query_refs.
+        if self.col_used_mask.is_empty() {
+            return index.where_clause.is_none();
+        }
+        Self::index_covers_columns(index, btree, &self.col_used_mask)
     }
 
-    pub fn contains_table(&self, table: &Table) -> bool {
-        self.joined_tables
-            .iter()
-            .map(|t| &t.table)
-            .chain(self.outer_query_refs.iter().map(|t| &t.table))
-            .any(|t| match t {
-                Table::FromClauseSubquery(subquery_table) => {
-                    subquery_table.plan.select_contains_table(table)
+    /// Remove columns fully supplied by expression keys in this index.
+    fn apply_expression_index_coverage(
+        &self,
+        index: &Index,
+        required_columns: &mut ColumnUsedMask,
+        expression_in_index: impl Fn(&E, &Index) -> bool,
+    ) {
+        let mut coverage_counts = vec![0usize; self.column_use_counts.len()];
+        let mut any_covered = false;
+        for usage in &self.expression_index_usages {
+            // If the index stores the expression (e.g. idx on lower(name)), all
+            // columns needed *solely* for that expression can be treated as
+            // covered by the index key. Example:
+            //   CREATE INDEX idx ON t(lower(name));
+            //   SELECT lower(name) FROM t;
+            // Column `name` is not otherwise needed, so we can rely on the
+            // expression value from the index and drop the table cursor.
+            if expression_in_index(&usage.normalized_expr, index) {
+                any_covered = true;
+                for col_idx in usage.columns_mask.iter() {
+                    if col_idx >= coverage_counts.len() {
+                        coverage_counts.resize(col_idx + 1, 0);
+                    }
+                    coverage_counts[col_idx] += 1;
                 }
-                _ => t == table,
-            })
+            }
+        }
+        if !any_covered {
+            return;
+        }
+        for (col_idx, &covered) in coverage_counts.iter().enumerate() {
+            if covered == 0 {
+                continue;
+            }
+            // Only drop the requirement if *all* references to this column are
+            // satisfied by expression-index values. If the column is also
+            // selected or filtered directly, the table data is still needed.
+            if self.column_use_counts.get(col_idx).copied().unwrap_or(0) == covered {
+                required_columns.clear(col_idx);
+            }
+        }
     }
 
-    pub fn extend(&mut self, other: TableReferences) {
-        fn take_or_append<T>(dst: &mut Vec<T>, mut src: Vec<T>) {
-            if dst.is_empty() {
-                *dst = src;
-            } else if !src.is_empty() {
-                dst.append(&mut src);
+    fn index_covers_columns(
+        index: &Index,
+        btree: &BTreeTable,
+        required_columns: &ColumnUsedMask,
+    ) -> bool {
+        // If a table has a rowid, the index is guaranteed to contain it as well.
+        let rowid_alias_pos = if btree.has_rowid {
+            btree.get_rowid_alias_column().map(|(pos, _)| pos)
+        } else {
+            None
+        };
+
+        if let Some(pos) = rowid_alias_pos {
+            if required_columns.is_only(pos) {
+                // If the index would be ONLY used for the rowid, don't bother.
+                // Example: SELECT id FROM t where id is a rowid alias - just scan the table.
+                return false;
             }
         }
 
-        let TableReferences {
-            joined_tables,
-            outer_query_refs,
-        } = other;
-
-        // Avoid `Vec::extend` here: `JoinedTable` is large, and many prepare
-        // paths append into an empty `TableReferences`. Taking ownership of the
-        // source vectors lets us reuse their allocation instead of reallocating
-        // and copying every element into a fresh buffer.
-        take_or_append(&mut self.joined_tables, joined_tables);
-        take_or_append(&mut self.outer_query_refs, outer_query_refs);
+        // Check that every required column is covered by the index
+        for required_col in required_columns.iter() {
+            if rowid_alias_pos == Some(required_col) {
+                // rowid is always implicitly covered by the index
+                continue;
+            }
+            let covered_by_index = index
+                .columns
+                .iter()
+                .filter(|c| c.pos_in_table == required_col)
+                .any(|c| {
+                    // SQLite doesn't consider fulfill covering indexes with virtual columns,
+                    // see `recomputeColumnsNotIndexed` in `build.c`. We might be able to improve this
+                    // in the future, but for now we do this to ensure correctness.
+                    !btree
+                        .columns()
+                        .get(c.pos_in_table)
+                        .expect("column should be in table")
+                        .is_virtual_generated()
+                });
+            if !covered_by_index {
+                return false;
+            }
+        }
+        true
     }
 }
 
-fn any_right_or_full_join(tables: &[JoinedTable]) -> bool {
-    tables
-        .iter()
-        .any(|t| t.join_info.as_ref().is_some_and(JoinInfo::keeps_right_rows))
+impl
+    PlannedSource<
+        crate::translate::semantic::hir::SourceId,
+        crate::translate::semantic::hir::IndexHint,
+        hir::ExprId,
+        HirJoinInfo,
+    >
+{
+    pub(crate) fn register_expression_index_usage(
+        &mut self,
+        expression: hir::ExprId,
+        columns_mask: ColumnUsedMask,
+        exprs: &hir::ExprArena,
+    ) {
+        if columns_mask.is_empty() {
+            return;
+        }
+        if self.expression_index_usages.iter().any(|usage| {
+            exprs
+                .at(*usage.normalized_expr)
+                .equivalent(exprs.at(expression))
+        }) {
+            return;
+        }
+        self.expression_index_usages.push(ExpressionIndexUsage {
+            normalized_expr: Box::new(expression),
+            columns_mask,
+        });
+    }
+
+    /// Whether the index stores every column the query reads from this
+    /// source as a column. An index storing only an expression of a column
+    /// does not count: a hash build input copies the column itself.
+    pub(crate) fn index_stores_read_columns(&self, index: &Index) -> bool {
+        self.index_is_covering_with(index, |_, _| false)
+    }
+
+    pub(crate) fn index_is_covering(
+        &self,
+        source: &crate::translate::semantic::hir::Source,
+        index: &Index,
+        exprs: &hir::ExprArena,
+    ) -> bool {
+        self.index_is_covering_with(index, |expression, index| {
+            let expression = exprs.at(*expression);
+            source
+                .index_expressions
+                .iter()
+                .find(|expressions| std::ptr::eq(expressions.index.value(), index))
+                .is_some_and(|expressions| {
+                    expressions
+                        .columns
+                        .iter()
+                        .flatten()
+                        .any(|indexed| expression.equivalent(exprs.at(*indexed)))
+                        || expressions
+                            .predicate
+                            .is_some_and(|predicate| expression.equivalent(exprs.at(predicate)))
+                })
+        })
+    }
 }
 
 /// Tracks which columns are used in a query.
@@ -2786,16 +1827,13 @@ impl<T> TryFrom<u128> for BitSet<T> {
 }
 
 #[derive(Clone, Debug)]
-pub struct ExpressionIndexUsage {
-    /// Normalized (non-bound) ast of the expression as stored on an index column.
+pub struct ExpressionIndexUsage<E = ast::Expr> {
+    /// Normalized expression as stored on an index column.
     /// Example: `lower(name)` for INDEX ON t(lower(name)).
-    pub normalized_expr: Box<ast::Expr>,
+    pub normalized_expr: Box<E>,
     /// Columns required to compute the expression. Helps decide whether using
     /// the expression value from the index fully covers those column reads.
     pub columns_mask: ColumnUsedMask,
-    /// An outer join can set this table to a null row. That row computes the
-    /// expression from the table columns, so the index key does not cover them.
-    pub may_be_null_row: bool,
 }
 
 /// Represents one key pair in a hash join equality condition.
@@ -2810,34 +1848,6 @@ pub struct HashJoinKey {
     pub build_side: BinaryExprSide,
 }
 
-impl HashJoinKey {
-    /// Get the build table's expression from the WHERE clause.
-    pub fn get_build_expr<'a>(&self, where_clause: &'a [WhereTerm]) -> &'a ast::Expr {
-        let where_term = &where_clause[self.where_clause_idx];
-        let Ok(Some((lhs, _, rhs))) = as_binary_components(&where_term.expr) else {
-            panic!("HashJoinKey: expected a valid binary expression");
-        };
-        if self.build_side == BinaryExprSide::Lhs {
-            lhs
-        } else {
-            rhs
-        }
-    }
-
-    /// Get the probe table's expression from the WHERE clause.
-    pub fn get_probe_expr<'a>(&self, where_clause: &'a [WhereTerm]) -> &'a ast::Expr {
-        let where_term = &where_clause[self.where_clause_idx];
-        let Ok(Some((lhs, _, rhs))) = as_binary_components(&where_term.expr) else {
-            panic!("HashJoinKey: expected a valid binary expression");
-        };
-        if self.build_side == BinaryExprSide::Lhs {
-            rhs // probe is the opposite side
-        } else {
-            lhs
-        }
-    }
-}
-
 /// Hash join semantics. Build = LHS (populates hash table), Probe = RHS (scanned).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashJoinType {
@@ -2845,810 +1855,34 @@ pub enum HashJoinType {
     Inner,
     /// All build rows appear; unmatched build rows get NULLs for the probe side.
     LeftOuter,
-    /// Only unmatched build rows appear.
-    LeftAnti,
     /// Like LeftOuter, plus unmatched probe rows get NULLs for the build side.
     FullOuter,
+    /// Only the build rows no probe row matched appear: the probe side is
+    /// the inner table of a NOT EXISTS.
+    LeftAnti,
 }
 
 impl HashJoinType {
+    /// Whether the build rows that no probe row matched are emitted after
+    /// the probe loop.
     pub fn keeps_unmatched_build_rows(self) -> bool {
-        matches!(self, Self::LeftOuter | Self::LeftAnti | Self::FullOuter)
+        matches!(self, Self::LeftOuter | Self::FullOuter | Self::LeftAnti)
     }
 }
 
-/// Hash join operation metadata
-#[derive(Debug, Clone)]
-pub struct HashJoinOp {
-    /// Index of the build table in the join order
-    pub build_table_idx: usize,
-    /// Index of the probe table in the join order
-    pub probe_table_idx: usize,
-    /// Join key references, each entry points to an equality condition in the [WhereTerm]
-    /// and indicates which side of the equality belongs to the build table.
-    pub join_keys: Vec<HashJoinKey>,
-    /// Memory budget for hash table
-    pub mem_budget: usize,
-    /// Whether to store a filtered build input before building the hash table.
-    pub materialize_build_input: bool,
-    /// Whether to use a bloom filter on the probe side.
-    pub use_bloom_filter: bool,
-    /// Join semantics.
-    pub join_type: HashJoinType,
-}
-
-/// Distinguishes union (OR) from intersection (AND) operations for multi-index scans.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SetOperation {
-    /// Union: rowid appears in result if it's in ANY branch (OR)
-    Union,
-    /// Intersection: rowid appears in result only if it's in ALL branches (AND).
-    /// Carries the indices of additional WHERE terms consumed beyond the primary one.
-    Intersection { additional_consumed_terms: BitSet },
-}
-
-/// Multi-index scan operation metadata for OR-by-union or AND-by-intersection optimization.
-///
-/// When a WHERE clause contains an OR of terms that can each use a different index,
-/// we can scan each index separately and combine the results using a RowSet for deduplication.
-/// For example: `WHERE a = 1 OR b = 2` with indexes on `a` and `b`.
-///
-/// Similarly, when a WHERE clause contains AND terms on different indexed columns,
-/// we can scan each index and intersect the results to reduce the number of table fetches.
-/// For example: `WHERE a = 1 AND b = 2` with separate indexes on `a` and `b`.
-#[derive(Debug, Clone)]
-pub struct MultiIndexScanOp {
-    /// Each branch represents one term with its own index access
-    pub branches: Vec<MultiIndexBranch>,
-    /// Index of the primary WHERE term.
-    /// For Union: the index of the OR expression.
-    /// For Intersection: the index of the first AND term consumed.
-    pub where_term_idx: usize,
-    /// The set operation to perform when combining branches
-    pub set_op: SetOperation,
-}
-
-/// Residual filters that apply only to union (OR) branches.
-///
-/// Each OR disjunct may be a compound expression (e.g. `a = 1 AND c > 5`), so
-/// after the index seek satisfies the indexable part, these residuals filter
-/// the remaining conditions.
-#[derive(Debug, Clone)]
-pub struct UnionBranchPrePostFilters {
-    /// Outer-table-only residuals evaluated before the branch's index seek.
-    /// These reference only tables from earlier (outer) loops, so they can
-    /// short-circuit the entire branch without touching the index.
-    pub pre_filter_exprs: Vec<ast::Expr>,
-    /// Residual filter expressions that could not be satisfied by the index seek.
-    /// Applied within the branch loop after positioning on the table row.
-    pub post_filter_exprs: Vec<ast::Expr>,
-    /// Whether residual evaluation needs the scanned table cursor positioned.
-    pub requires_table_cursor: bool,
-}
-
-/// A single branch of a multi-index scan, representing one disjunct of an OR expression.
-#[derive(Debug, Clone)]
-pub struct MultiIndexBranch {
-    /// The index to use for this branch, or None for rowid access
-    pub index: Option<Arc<Index>>,
-    /// How this branch probes the table/index.
-    pub access: MultiIndexBranchAccess,
-    /// Estimated number of rows from this branch
-    pub estimated_rows: f64,
-    /// Residual filters for union (OR) branches. `None` for intersection branches.
-    pub union_residuals: Option<UnionBranchPrePostFilters>,
-}
-
-/// Access shape for a single multi-index branch.
-#[derive(Debug, Clone)]
-#[expect(clippy::large_enum_variant)]
-pub enum MultiIndexBranchAccess {
-    /// Ordinary seek/range scan on either the rowid btree or a secondary index.
-    Seek { seek_def: SeekDef },
-    /// Repeated equality seeks driven by an IN-list or IN-subquery RHS.
-    InSeek { source: InSeekSource },
-}
-
-#[derive(Clone, Debug)]
-#[allow(clippy::large_enum_variant)]
-pub enum Operation {
-    // Scan operation
-    // This operation is used to scan a table.
-    Scan(Scan),
-    // Search operation
-    // This operation is used to search for a row in a table using an index
-    // (i.e. a primary key or a secondary index)
-    Search(Search),
-    // Access through custom index method query
-    IndexMethodQuery(IndexMethodQuery),
-    // Hash join operation
-    // This operation is used on the probe side of a hash join.
-    // The build table is accessed normally (via Scan), and the probe table
-    // uses this operation to indicate it should probe the hash table.
-    HashJoin(HashJoinOp),
-    // Multi-index scan operation for OR-by-union optimization.
-    // This operation scans multiple indexes (one per OR branch) and combines
-    // results using RowSet deduplication.
-    MultiIndexScan(MultiIndexScanOp),
-}
-
-impl Operation {
-    pub fn default_scan_for(table: &Table) -> Self {
-        match table {
-            Table::BTree(_) => Operation::Scan(Scan::BTreeTable {
-                iter_dir: IterationDirection::Forwards,
-                index: None,
-            }),
-            Table::Virtual(_) => Operation::Scan(Scan::VirtualTable {
-                idx_num: -1,
-                idx_str: None,
-                constraints: Vec::new(),
-            }),
-            Table::FromClauseSubquery(_) => Operation::Scan(Scan::Subquery {
-                iter_dir: IterationDirection::Forwards,
-            }),
-            Table::RecursiveCteInput(_) => Operation::Scan(Scan::RecursiveCteInput),
-        }
-    }
-
-    pub fn index(&self) -> Option<&Arc<Index>> {
-        match self {
-            Operation::Scan(Scan::BTreeTable { index, .. }) => index.as_ref(),
-            Operation::Search(Search::Seek { index, .. })
-            | Operation::Search(Search::InSeek { index, .. }) => index.as_ref(),
-            Operation::IndexMethodQuery(IndexMethodQuery { index, .. }) => Some(index),
-            Operation::Scan(_) => None,
-            Operation::Search(Search::RowidEq { .. }) => None,
-            Operation::HashJoin(_) => None,
-            // Multi-index scan uses multiple indexes; return None as there's no single index
-            Operation::MultiIndexScan(_) => None,
-        }
-    }
-
-    /// Returns true if this operation is guaranteed to access at most one row.
-    /// Used to determine whether UPDATE/DELETE is single-write.
-    ///
-    /// Conservative: returns false when unsure (e.g. table scans, range seeks,
-    /// non-unique index seeks).
-    pub fn affects_max_1_row(&self) -> bool {
-        match self {
-            // RowidEq is always a single-row point lookup.
-            Operation::Search(Search::RowidEq { .. }) => true,
-            // Seek on a unique index with all columns equality-constrained.
-            Operation::Search(Search::Seek { index, seek_def }) => {
-                let Some(idx) = index else {
-                    // Seek on rowid (no index): check if the seek is an equality
-                    // point lookup. This happens when prefix has one eq constraint
-                    // and no range component.
-                    return seek_def.prefix.len() == 1
-                        && seek_def.prefix[0].eq.is_some()
-                        && matches!(seek_def.start.last_component, SeekKeyComponent::None);
-                };
-                if !idx.unique {
-                    return false;
-                }
-                // All index columns must have equality constraints.
-                let num_index_cols = idx.columns.len();
-                let num_eq_prefix = seek_def.prefix.iter().filter(|c| c.eq.is_some()).count();
-                if num_eq_prefix != num_index_cols {
-                    return false;
-                }
-                // Only plain `=` components guarantee one row. An `IS`
-                // component matches NULL keys, and a UNIQUE index stores every
-                // NULL key separately, so e.g. `WHERE a IS NULL` can touch
-                // many rows.
-                (0..seek_def.prefix.len()).all(|i| !seek_def.is_null_matching_key_component(i))
-            }
-            // Table scans, hash joins, multi-index scans, etc. are not single-row.
-            _ => false,
-        }
-    }
-}
-
-pub(super) fn query_output_columns(
-    plan: &Plan,
-    explicit_columns: Option<&[String]>,
-    resolver: &Resolver,
-) -> Result<alloc::Vec<Column>> {
-    let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
-        Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => left
-            .first()
-            .map(|(select, _)| (&select.result_columns[..], &select.table_references))
-            .unwrap_or((&right_most.result_columns, &right_most.table_references)),
-        Plan::RecursiveCte(recursive_cte) => (
-            recursive_cte.initial_query.select_result_columns(),
-            recursive_cte.initial_query.select_table_references(),
-        ),
-        Plan::Delete(_) | Plan::Update(_) => {
-            unreachable!("DELETE/UPDATE plans cannot define query output columns")
-        }
-    };
-
-    let compound_arms = match plan {
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => {
-            let mut arms = left
-                .iter()
-                .map(|(select, _)| select)
-                .try_collect::<alloc::Vec<_>>()?;
-            arms.try_push(right_most)?;
-            Some(arms)
-        }
-        _ => None,
-    };
-
-    let mut columns = result_columns
-        .iter()
-        .enumerate()
-        .map(|(column_index, result_column)| {
-            let name = explicit_columns
-                .and_then(|names| names.get(column_index).cloned())
-                .or_else(|| result_column.name(table_references).map(String::from));
-            let affinity = compound_arms
-                .as_ref()
-                .map(|arms| compound_column_affinity(arms, column_index))
-                .unwrap_or_else(|| {
-                    infer_type_from_expr(&result_column.expr, Some(table_references))
-                });
-            let column_type = affinity.to_type();
-            let mut column = Column::new(
-                name,
-                column_type.to_string(),
-                None,
-                None,
-                column_type,
-                None,
-                ColDef::default(),
-            );
-            column.override_affinity(affinity);
-            column
-        })
-        .try_collect::<alloc::Vec<_>>()?;
-
-    let env = TypeEnv::new(Some(table_references), resolver);
-    for (column_index, column) in columns.iter_mut().enumerate() {
-        let result_expr = &result_columns[column_index].expr;
-        let dimensions = type_of(result_expr, &env).array_dimensions();
-        if dimensions > ast::MAX_ARRAY_DIMENSIONS {
-            crate::bail_parse_error!(
-                "result column {} is an array with {dimensions} dimensions, but arrays have at most {}",
-                column_index + 1,
-                ast::MAX_ARRAY_DIMENSIONS
-            );
-        }
-        column.set_array_dimensions(dimensions);
-        column.set_collation(get_collseq_from_expr(result_expr, table_references)?);
-    }
-    Ok(columns)
-}
-
-fn subquery_output_columns(
-    plan: &Plan,
-    explicit_columns: Option<&[String]>,
-    resolver: &Resolver,
-) -> Result<alloc::Vec<Column>> {
-    let mut columns = query_output_columns(plan, explicit_columns, resolver)?;
-    make_column_names_unique(&mut columns);
-    Ok(columns)
-}
-
-fn make_column_names_unique(columns: &mut [Column]) {
-    let mut used_names: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
-    for column in columns {
-        let Some(name) = column.name.clone() else {
-            continue;
-        };
-        let base_name = strip_numbered_suffix(&name);
-        let mut candidate = name.clone();
-        let mut count = 0;
-        while !used_names.insert(candidate.to_lowercase()) {
-            count += 1;
-            candidate = format!("{base_name}:{count}");
-        }
-        column.name = Some(candidate);
-    }
-}
-
-fn strip_numbered_suffix(name: &str) -> &str {
-    let without_digits = name.trim_end_matches(|c: char| c.is_ascii_digit());
-    match without_digits.strip_suffix(':') {
-        Some(base_name) if !base_name.is_empty() => base_name,
-        _ => name,
-    }
-}
-
-impl JoinedTable {
-    /// Returns the btree table for this table reference, if it is a BTreeTable.
-    pub fn btree(&self) -> Option<Arc<BTreeTable>> {
-        match &self.table {
-            Table::BTree(_) => self.table.btree(),
-            _ => None,
-        }
-    }
-    pub fn virtual_table(&self) -> Option<Arc<VirtualTable>> {
-        match &self.table {
-            Table::Virtual(_) => self.table.virtual_table(),
-            _ => None,
-        }
-    }
-
-    fn matches(&self, namespace: NamespaceRef, table_name: &str) -> bool {
-        self.namespace == namespace
-            && matches!(self.table, Table::BTree(_) | Table::Virtual(_))
-            && self.table.get_name().eq_ignore_ascii_case(table_name)
-    }
-
-    /// Creates a new TableReference for a subquery from a SelectPlan.
-    pub fn new_subquery(
-        identifier: String,
-        plan: SelectPlan,
-        join_info: Option<JoinInfo>,
-        internal_id: TableInternalId,
-        resolver: &Resolver,
-    ) -> Result<Self> {
-        let plan = Plan::Select(Box::new(plan));
-        let columns = subquery_output_columns(&plan, None, resolver)?;
-
-        let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
-            name: identifier.clone(),
-            plan: Box::new(plan),
-            columns,
-            parenthesized_join_columns: None,
-            result_columns_start_reg: None,
-            materialized_cursor_id: None,
-            cte: None,
-        }));
-        Ok(Self {
-            op: Operation::default_scan_for(&table),
-            unmatched_right_rows_plan: None,
-            table,
-            identifier,
-            has_alias: false,
-            internal_id,
-            join_info,
-            col_used_mask: ColumnUsedMask::default(),
-            column_use_counts: Vec::new(),
-            expression_index_usages: Vec::new(),
-            namespace: NamespaceRef::root_of(MAIN_DB_ID),
-            indexed: None,
-            plan_estimate: None,
-        })
-    }
-
-    /// Creates a new TableReference for a subquery from a Plan (either SelectPlan or CompoundSelect).
-    /// If `explicit_columns` is provided, those names override the derived column names from the SELECT.
-    /// If `cte_id` is provided, this subquery is a CTE reference that can share materialized data.
-    /// If `materialize_hint` is true, the CTE was declared with AS MATERIALIZED and should always
-    /// be materialized regardless of reference count.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_subquery_from_plan(
-        identifier: String,
-        plan: Plan,
-        join_info: Option<JoinInfo>,
-        internal_id: TableInternalId,
-        explicit_columns: Option<&[String]>,
-        cte_id: Option<usize>,
-        materialize_hint: bool,
-        resolver: &Resolver,
-    ) -> Result<Self> {
-        let columns = subquery_output_columns(&plan, explicit_columns, resolver)?;
-        // Get result columns and table references from the plan
-        // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
-        // Multi-reference CTEs are also detected at emission time via reference counting,
-        // and they may be materialized regardless of explicit keyword usage.
-        let cte = cte_id.map(|id| crate::schema::FromClauseSubqueryCteMetadata {
-            id,
-            shared_materialization: false,
-            materialize_hint,
-        });
-        let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
-            name: identifier.clone(),
-            plan: Box::new(plan),
-            columns,
-            parenthesized_join_columns: None,
-            result_columns_start_reg: None,
-            materialized_cursor_id: None,
-            cte,
-        }));
-        Ok(Self {
-            op: Operation::default_scan_for(&table),
-            unmatched_right_rows_plan: None,
-            table,
-            identifier,
-            has_alias: false,
-            internal_id,
-            join_info,
-            col_used_mask: ColumnUsedMask::default(),
-            column_use_counts: Vec::new(),
-            expression_index_usages: Vec::new(),
-            namespace: NamespaceRef::root_of(MAIN_DB_ID),
-            indexed: None,
-            plan_estimate: None,
-        })
-    }
-
-    pub fn new_recursive_cte_input(
-        identifier: String,
-        query: &Plan,
-        internal_id: TableInternalId,
-        explicit_columns: Option<&[String]>,
-        resolver: &Resolver,
-    ) -> Result<Self> {
-        let mut columns = subquery_output_columns(query, explicit_columns, resolver)?;
-        // The recursive self-reference reads SQLite's queue table, whose
-        // columns have no declared type: comparisons in the recursive term
-        // see the stored value without the anchor query's affinity. Only the
-        // outer read of the CTE keeps the derived affinity.
-        for column in columns.iter_mut() {
-            column.override_affinity(Affinity::Blob);
-        }
-        let table = Table::RecursiveCteInput(Arc::new(RecursiveCteInput {
-            name: identifier.clone(),
-            columns,
-        }));
-        Ok(Self {
-            op: Operation::default_scan_for(&table),
-            unmatched_right_rows_plan: None,
-            table,
-            identifier,
-            has_alias: false,
-            internal_id,
-            join_info: None,
-            col_used_mask: ColumnUsedMask::default(),
-            column_use_counts: Vec::new(),
-            expression_index_usages: Vec::new(),
-            namespace: NamespaceRef::root_of(MAIN_DB_ID),
-            indexed: None,
-            plan_estimate: None,
-        })
-    }
-
-    pub fn columns(&self) -> &[Column] {
-        self.table.columns()
-    }
-
-    pub(super) fn columns_for_star(&self) -> impl Iterator<Item = (usize, &Column)> {
-        self.columns()
-            .iter()
-            .enumerate()
-            .filter(|(column_index, _)| !self.column_is_hidden_from_star(*column_index))
-    }
-
-    /// Parenthesized joins keep source copies and rowids for qualified names.
-    /// SQLite does not show those extra values in an unqualified star.
-    fn column_is_hidden_from_star(&self, column_index: usize) -> bool {
-        self.columns()[column_index].hidden()
-            || self
-                .table
-                .parenthesized_join_columns()
-                .is_some_and(|join_columns| {
-                    let saved_column = &join_columns[column_index];
-                    saved_column.visibility != ParenthesizedJoinColumnVisibility::Visible
-                        || saved_column.source.is_rowid()
-                })
-    }
-
-    /// Mark a column as used in the query.
-    /// This is used to determine whether a covering index can be used.
-    pub fn mark_column_used(&mut self, index: usize) {
-        if index >= self.column_use_counts.len() {
-            self.column_use_counts.resize(index + 1, 0);
-        }
-        self.column_use_counts[index] += 1;
-        self.col_used_mask.set(index).expect("TODO: alloc error");
-    }
-
-    /// Clear any previously registered expression index usages.
-    pub fn clear_expression_index_usages(&mut self) {
-        self.expression_index_usages.clear();
-    }
-
-    /// Example: SELECT a+b FROM t WHERE a+b=5 with INDEX ON t(a+b)
-    /// We want to remember that (a+b) is available on an index key and that
-    /// columns a and b are only needed to produce that expression. Later we
-    /// can avoid opening the table cursor if all column references are
-    /// covered by expression keys.
-    pub fn register_expression_index_usage(
-        &mut self,
-        normalized_expr: ast::Expr,
-        columns_mask: ColumnUsedMask,
-        may_be_null_row: bool,
-    ) {
-        if columns_mask.is_empty() {
-            return;
-        }
-        if self
-            .expression_index_usages
-            .iter()
-            .any(|usage| exprs_are_equivalent(&usage.normalized_expr, &normalized_expr))
-        {
-            return;
-        }
-        self.expression_index_usages.push(ExpressionIndexUsage {
-            normalized_expr: Box::new(normalized_expr),
-            columns_mask,
-            may_be_null_row,
-        });
-    }
-
-    /// Provided an index that may contain expression keys, remove any
-    /// columns from `required_columns` that are fully covered by expression index values.
-    fn apply_expression_index_coverage(
-        &self,
-        index: &Index,
-        required_columns: &mut ColumnUsedMask,
-    ) {
-        let mut coverage_counts = vec![0usize; self.column_use_counts.len()];
-        let mut any_covered = false;
-        for usage in &self.expression_index_usages {
-            // If the index stores the expression (e.g. idx on lower(name)), all
-            // columns needed *solely* for that expression can be treated as
-            // covered by the index key. Example:
-            //   CREATE INDEX idx ON t(lower(name));
-            //   SELECT lower(name) FROM t;
-            // Column `name` is not otherwise needed, so we can rely on the
-            // expression value from the index and drop the table cursor.
-            let matches_where_clause = if let Some(idx_where_clause) = &index.where_clause {
-                exprs_are_equivalent(idx_where_clause, &usage.normalized_expr)
-            } else {
-                false
-            };
-
-            let index_key_covers_columns = !usage.may_be_null_row
-                && index
-                    .expression_to_index_pos(&usage.normalized_expr)
-                    .is_some();
-            if index_key_covers_columns || matches_where_clause {
-                any_covered = true;
-                for col_idx in usage.columns_mask.iter() {
-                    if col_idx >= coverage_counts.len() {
-                        coverage_counts.resize(col_idx + 1, 0);
-                    }
-                    coverage_counts[col_idx] += 1;
-                }
-            }
-        }
-        if !any_covered {
-            return;
-        }
-        for (col_idx, &covered) in coverage_counts.iter().enumerate() {
-            if covered == 0 {
-                continue;
-            }
-            // Only drop the requirement if *all* references to this column are
-            // satisfied by expression-index values. If the column is also
-            // selected or filtered directly, the table data is still needed.
-            if self.column_use_counts.get(col_idx).copied().unwrap_or(0) == covered {
-                required_columns.clear(col_idx);
-            }
-        }
-    }
-
-    /// Open the necessary cursors for this table reference.
-    /// Generally a table cursor is always opened unless a SELECT query can use a covering index.
-    /// An index cursor is opened if an index is used in any way for reading data from the table.
-    pub fn open_cursors(
-        &self,
-        program: &mut ProgramBuilder,
-        mode: OperationMode,
-        resolver: &Resolver,
-    ) -> Result<(Option<CursorID>, Option<CursorID>)> {
-        let index = self.op.index();
-        match &self.table {
-            Table::BTree(btree) => {
-                let use_covering_index = self.utilizes_covering_index();
-                let index_is_ephemeral = index.is_some_and(|index| index.ephemeral);
-                let table_not_required = matches!(mode, OperationMode::SELECT)
-                    && use_covering_index
-                    && !index_is_ephemeral
-                    && !self.requires_table_cursor_for_unmatched_rows();
-                let table_cursor_id = if table_not_required {
-                    None
-                } else if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
-                    target_table,
-                    ..
-                }) = &mode
-                {
-                    // The cursor for the ephemeral table was already allocated earlier. Let's allocate one for the target table,
-                    // in case it wasn't already allocated when populating the ephemeral table.
-                    Some(program.alloc_cursor_id_keyed_if_not_exists(
-                        CursorKey::table(target_table.internal_id),
-                        match &target_table.table {
-                            Table::BTree(btree) => CursorType::BTreeTable(btree.clone()),
-                            Table::Virtual(virtual_table) => {
-                                CursorType::VirtualTable(virtual_table.clone())
-                            }
-                            _ => unreachable!("target table must be a btree or virtual table"),
-                        },
-                    ))
-                } else {
-                    // Check if this is a materialized view. Must look up the
-                    // schema of the table's own database: a table in an
-                    // attached database can share a name with a materialized
-                    // view in a different database.
-                    let cursor_type = match resolver.with_schema(self.namespace.database_id, |s| {
-                        s.get_materialized_view(self.namespace.id, &btree.name)
-                    }) {
-                        Some(view_mutex) => CursorType::MaterializedView(btree.clone(), view_mutex),
-                        None => CursorType::BTreeTable(btree.clone()),
-                    };
-                    Some(program.alloc_cursor_id_keyed_if_not_exists(
-                        CursorKey::table(self.internal_id),
-                        cursor_type,
-                    ))
-                };
-
-                let index_cursor_id = index
-                    .map(|index| {
-                        program.alloc_cursor_index_if_not_exists(
-                            CursorKey::index(self.internal_id, index.clone()),
-                            index,
-                        )
-                    })
-                    .transpose()?;
-                Ok((table_cursor_id, index_cursor_id))
-            }
-            Table::Virtual(virtual_table) => {
-                let table_cursor_id = Some(program.alloc_cursor_id_keyed_if_not_exists(
-                    CursorKey::table(self.internal_id),
-                    CursorType::VirtualTable(virtual_table.clone()),
-                ));
-                let index_cursor_id = None;
-                Ok((table_cursor_id, index_cursor_id))
-            }
-            Table::FromClauseSubquery(..) => {
-                let index_cursor_id = index
-                    .map(|index| {
-                        program.alloc_cursor_index_if_not_exists(
-                            CursorKey::index(self.internal_id, index.clone()),
-                            index,
-                        )
-                    })
-                    .transpose()?;
-                Ok((None, index_cursor_id))
-            }
-            Table::RecursiveCteInput(input) => {
-                let cursor_id = program.alloc_cursor_id_keyed_if_not_exists(
-                    CursorKey::table(self.internal_id),
-                    CursorType::Pseudo(PseudoCursorType::new_with_columns(&input.columns)),
-                );
-                Ok((Some(cursor_id), None))
-            }
-        }
-    }
-
-    /// Resolve the already opened cursors for this table reference.
-    pub fn resolve_cursors(
-        &self,
-        program: &mut ProgramBuilder,
-        mode: OperationMode,
-    ) -> Result<(Option<CursorID>, Option<CursorID>)> {
-        let index = self.op.index();
-        let table_cursor_id = if let Table::FromClauseSubquery(from_clause_subquery) = &self.table {
-            from_clause_subquery.materialized_cursor_id
-        } else if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
-            target_table,
-            ..
-        }) = &mode
-        {
-            program.resolve_cursor_id_safe(&CursorKey::table(target_table.internal_id))
-        } else {
-            program.resolve_cursor_id_safe(&CursorKey::table(self.internal_id))
-        };
-        let index_cursor_id = index.map(|index| {
-            program.resolve_cursor_id(&CursorKey::index(self.internal_id, index.clone()))
-        });
-        Ok((table_cursor_id, index_cursor_id))
-    }
-
-    /// Returns true if a given index is a covering index for this [TableReference].
-    pub fn index_is_covering(&self, index: &Index) -> bool {
-        let Table::BTree(btree) = &self.table else {
-            return false;
-        };
-        if index.index_method.is_some() {
-            return false;
-        }
-        if self.col_used_mask.is_empty() {
-            // With no referenced columns, a complete index can provide the row-producing
-            // scan without opening the table. Partial-index completeness depends on the
-            // query predicate, so keep this path conservative.
-            return index.where_clause.is_none();
-        }
-
-        if self.expression_index_usages.is_empty() {
-            Self::index_covers_columns(index, btree, &self.col_used_mask)
-        } else {
-            let mut required_columns = self.col_used_mask.clone();
-            self.apply_expression_index_coverage(index, &mut required_columns);
-            if required_columns.is_empty() {
-                return true;
-            }
-            Self::index_covers_columns(index, btree, &required_columns)
-        }
-    }
-
-    fn index_covers_columns(
-        index: &Index,
-        btree: &BTreeTable,
-        required_columns: &ColumnUsedMask,
-    ) -> bool {
-        // If a table has a rowid, the index is guaranteed to contain it as well.
-        let rowid_alias_pos = if btree.has_rowid {
-            btree.get_rowid_alias_column().map(|(pos, _)| pos)
-        } else {
-            None
-        };
-
-        if let Some(pos) = rowid_alias_pos {
-            if required_columns.is_only(pos) {
-                // If the index would be ONLY used for the rowid, don't bother.
-                // Example: SELECT id FROM t where id is a rowid alias - just scan the table.
-                return false;
-            }
-        }
-
-        // Check that every required column is covered by the index
-        for required_col in required_columns.iter() {
-            if rowid_alias_pos == Some(required_col) {
-                // rowid is always implicitly covered by the index
-                continue;
-            }
-            let covered_by_index = index.column_table_pos_to_index_pos(required_col).is_some()
-                && !btree
-                    .columns()
-                    .get(required_col)
-                    .expect("column should be in table")
-                    .is_virtual_generated();
-            if !covered_by_index {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Returns true if the index selected for use with this [TableReference] is a covering index,
-    /// meaning that it contains all the columns that are referenced in the query.
-    pub fn utilizes_covering_index(&self) -> bool {
-        if self.requires_table_cursor_for_unmatched_rows() {
-            return false;
-        }
-        let Some(index) = self.op.index() else {
-            return false;
-        };
-        self.index_is_covering(index.as_ref())
-    }
-
-    pub fn selected_index_stores_used_columns(&self) -> bool {
-        let (Some(index), Table::BTree(btree)) = (self.op.index(), &self.table) else {
-            return false;
-        };
-        if index.index_method.is_some() {
-            return false;
-        }
-        if self.col_used_mask.is_empty() {
-            return index.where_clause.is_none();
-        }
-        Self::index_covers_columns(index.as_ref(), btree, &self.col_used_mask)
-    }
-
-    /// Whether unmatched-row output requires the table cursor.
-    ///
-    /// RIGHT and FULL JOIN use the table rowid to record matches.
-    /// The unmatched-row pass scans the table after the index loop ends, so index-only reads are unsafe.
-    pub fn requires_table_cursor_for_unmatched_rows(&self) -> bool {
-        self.join_info
-            .as_ref()
-            .is_some_and(JoinInfo::keeps_right_rows)
-    }
-
-    pub fn column_is_used(&self, index: usize) -> bool {
-        self.col_used_mask.get(index)
-    }
+/// The planner's estimate for one table access, shown in JSON query plans.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TablePlanEstimate {
+    /// Rows from the join prefix before this table access.
+    pub input_rows: f64,
+    /// Rows that this access returns for each input row.
+    pub rows_per_input: f64,
+    /// Rows from the join prefix after this table access.
+    pub output_rows: f64,
+    /// Cost of this table access for all input rows.
+    pub access_cost: f64,
+    /// Cost of the join prefix through this table access.
+    pub total_cost: f64,
 }
 
 /// A definition of a rowid/index search.
@@ -3656,31 +1890,33 @@ impl JoinedTable {
 /// [SeekKey] is the condition that is used to seek to a specific row in a table/index.
 /// [SeekKey] also used to represent range scan termination condition.
 #[derive(Debug, Clone)]
-pub struct SeekDef {
+pub struct SeekDef<E = ast::Expr> {
     /// Common prefix of the key which is shared between start/end fields
     /// For example, given:
     /// - CREATE INDEX i ON t (x, y desc)
     /// - SELECT * FROM t WHERE x = 1 AND y >= 30
     ///
     /// Then, prefix=[(eq=1, ASC)], start=Some((ge, Expr(30))), end=Some((gt, Sentinel))
-    pub prefix: Vec<SeekRangeConstraint>,
+    pub prefix: Vec<SeekRangeConstraint<E>>,
     /// The condition to use when seeking. See [SeekKey] for more details.
-    pub start: SeekKey,
+    pub start: SeekKey<E>,
     /// The condition to use when terminating the scan that follows the seek. See [SeekKey] for more details.
-    pub end: SeekKey,
+    pub end: SeekKey<E>,
     /// The direction of the scan that follows the seek.
     pub iter_dir: IterationDirection,
 }
 
-pub struct SeekDefKeyIterator<'a, T> {
-    seek_def: &'a SeekDef,
-    seek_key: &'a SeekKey,
+pub(crate) type HirSeekDef = SeekDef<hir::ExprId>;
+
+pub struct SeekDefKeyIterator<'a, E, T> {
+    seek_def: &'a SeekDef<E>,
+    seek_key: &'a SeekKey<E>,
     pos: usize,
     _t: PhantomData<T>,
 }
 
-impl<'a> Iterator for SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
-    type Item = SeekKeyComponent<&'a ast::Expr>;
+impl<'a, E> Iterator for SeekDefKeyIterator<'a, E, SeekKeyComponent<&'a E>> {
+    type Item = SeekKeyComponent<&'a E>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let result = if self.pos < self.seek_def.prefix.len() {
@@ -3701,7 +1937,7 @@ impl<'a> Iterator for SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
     }
 }
 
-impl<'a> Iterator for SeekDefKeyIterator<'a, Affinity> {
+impl<E> Iterator for SeekDefKeyIterator<'_, E, Affinity> {
     type Item = Affinity;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -3722,10 +1958,10 @@ impl<'a> Iterator for SeekDefKeyIterator<'a, Affinity> {
     }
 }
 
-impl SeekDef {
+impl<E> SeekDef<E> {
     /// returns amount of values in the given seek key
     /// - so, for SELECT * FROM t WHERE x = 10 AND y = 20 AND y >= 30 there will be 3 values (10, 20, 30)
-    pub fn size(&self, key: &SeekKey) -> usize {
+    pub fn size(&self, key: &SeekKey<E>) -> usize {
         self.prefix.len()
             + match key.last_component {
                 SeekKeyComponent::Expr(_) => 1,
@@ -3736,8 +1972,8 @@ impl SeekDef {
     /// iterate over value expressions in the given seek key
     pub fn iter<'a>(
         &'a self,
-        key: &'a SeekKey,
-    ) -> SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
+        key: &'a SeekKey<E>,
+    ) -> SeekDefKeyIterator<'a, E, SeekKeyComponent<&'a E>> {
         SeekDefKeyIterator {
             seek_def: self,
             seek_key: key,
@@ -3747,7 +1983,7 @@ impl SeekDef {
     }
 
     /// iterate over affinity in the given seek key
-    pub fn iter_affinity<'a>(&'a self, key: &'a SeekKey) -> SeekDefKeyIterator<'a, Affinity> {
+    pub fn iter_affinity<'a>(&'a self, key: &'a SeekKey<E>) -> SeekDefKeyIterator<'a, E, Affinity> {
         SeekDefKeyIterator {
             seek_def: self,
             seek_key: key,
@@ -3755,43 +1991,6 @@ impl SeekDef {
             _t: PhantomData,
         }
     }
-
-    /// Whether the key component at `pos` came from a NULL-matching equality
-    /// (`x IS <expr>`) rather than `x = <expr>`.
-    ///
-    /// A NULL key value means different things for the two: `NULL = NULL` is not
-    /// true, so an `=` seek can skip the loop entirely once its key turns out to
-    /// be NULL, while an `IS` seek must seek with the NULL key because index keys
-    /// compare NULLs as equal. Only equality prefix components can be
-    /// NULL-matching; range bounds never are.
-    ///
-    /// `x IS 5` does not count: a literal 5 is never NULL, so the component
-    /// behaves exactly like `x = 5`.
-    pub fn is_null_matching_key_component(&self, pos: usize) -> bool {
-        self.prefix.get(pos).is_some_and(|component| {
-            component
-                .eq
-                .as_ref()
-                .is_some_and(|(op, expr, _)| *op == ast::Operator::Is && !is_non_null_literal(expr))
-        })
-    }
-}
-
-/// True only for literal values that are never NULL: numbers, strings, blobs,
-/// TRUE and FALSE. Columns and parameters do not count — their runtime value
-/// can be NULL. A column does not count even when declared NOT NULL, because
-/// an outer join can still null-extend it.
-pub fn is_non_null_literal(expr: &ast::Expr) -> bool {
-    matches!(
-        expr,
-        ast::Expr::Literal(
-            ast::Literal::Numeric(_)
-                | ast::Literal::String(_)
-                | ast::Literal::Blob(_)
-                | ast::Literal::True
-                | ast::Literal::False
-        )
-    )
 }
 
 /// Build the affinity string for a synthesized ephemeral seek index.
@@ -3800,7 +1999,10 @@ pub fn is_non_null_literal(expr: &ast::Expr) -> bool {
 /// stored in the ephemeral index still includes the remaining payload columns
 /// (and possibly a synthetic rowid). Pad those trailing slots with NONE affinity
 /// so MakeRecord sees the same layout the index insert path produced.
-pub fn synthesized_seek_affinity_str(index: &Index, seek_def: &SeekDef) -> Option<Arc<String>> {
+pub fn synthesized_seek_affinity_str<E>(
+    index: &Index,
+    seek_def: &SeekDef<E>,
+) -> Option<Arc<String>> {
     let num_key_cols = seek_def.size(&seek_def.start);
     let total_cols = index.columns.len() + if index.has_rowid { 1 } else { 0 };
     let mut aff: String = seek_def
@@ -3829,362 +2031,15 @@ pub enum SeekKeyComponent<E> {
 
 /// A condition to use when seeking.
 #[derive(Debug, Clone)]
-pub struct SeekKey {
+pub struct SeekKey<E = ast::Expr> {
     /// Complete key must be constructed from common [SeekDef::prefix] and optional last_component
-    pub last_component: SeekKeyComponent<ast::Expr>,
+    pub last_component: SeekKeyComponent<E>,
 
     /// The comparison operator to use when seeking.
     pub op: SeekOp,
 
     /// Affinity of the comparison
     pub affinity: Affinity,
-}
-
-/// Represents the type of table scan performed during query execution.
-#[derive(Clone, Debug)]
-pub enum Scan {
-    /// A scan of a B-tree–backed table, optionally using an index, and with an iteration direction.
-    BTreeTable {
-        /// The iter_dir is used to indicate the direction of the iterator.
-        iter_dir: IterationDirection,
-        /// The index that we are using to scan the table, if any.
-        index: Option<Arc<Index>>,
-    },
-    /// A scan of a virtual table, delegated to the table’s `filter` and related methods.
-    VirtualTable {
-        /// Index identifier returned by the table's `best_index` method.
-        idx_num: i32,
-        /// Optional index name returned by the table’s `best_index` method.
-        idx_str: Option<String>,
-        /// Constraining expressions to be passed to the table’s `filter` method.
-        /// The order of expressions matches the argument order expected by the virtual table.
-        constraints: Vec<Expr>,
-    },
-    /// A scan of a subquery in the `FROM` clause.
-    Subquery {
-        /// Coroutine-backed scans run forwards. Materialized subqueries may
-        /// also be scanned backwards when the planner relies on intrinsic
-        /// subquery order for an extremum fast path.
-        iter_dir: IterationDirection,
-    },
-    /// The one-row input consumed by the recursive part of a recursive CTE.
-    RecursiveCteInput,
-}
-
-/// An enum that represents a search operation that can be used to search for a row in a table using an index
-/// (i.e. a primary key or a secondary index)
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug)]
-pub enum Search {
-    /// A rowid equality point lookup. This is a special case that uses the SeekRowid bytecode instruction and does not loop.
-    RowidEq { cmp_expr: ast::Expr },
-    /// A search on a table btree (via `rowid`) or a secondary index search. Uses bytecode instructions like SeekGE, SeekGT etc.
-    Seek {
-        index: Option<Arc<Index>>,
-        seek_def: SeekDef,
-    },
-    /// An IN-driven index seek. Iterates an ephemeral B-tree of IN values and
-    /// for each value seeks into the real index (or table, if seek by rowid).
-    InSeek {
-        index: Option<Arc<Index>>,
-        source: InSeekSource,
-    },
-}
-
-/// Where IN-seek values come from.
-#[derive(Clone, Debug)]
-pub enum InSeekSource {
-    /// Literal values to materialize into a new ephemeral index at open_loop time.
-    LiteralList {
-        values: Vec<ast::Expr>,
-        affinity: Affinity,
-    },
-    /// Subquery already materialized by emit_non_from_clause_subquery;
-    /// open_loop reuses the existing ephemeral cursor.
-    Subquery { cursor_id: CursorID },
-}
-
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug)]
-pub struct IndexMethodQuery {
-    /// index method to use
-    pub index: Arc<Index>,
-    /// idx of the pattern from [crate::index_method::IndexMethodAttachment::definition] which planner chose to use for the access
-    pub pattern_idx: usize,
-    /// captured arguments for the pattern chosen by the planner
-    pub arguments: Vec<Expr>,
-    /// mapping from index of [ast::Expr::Column] to the column index of IndexMethod response
-    pub covered_columns: HashMap<usize, usize>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Aggregate {
-    pub order_cursor: Option<usize>,
-    pub func: AggFunc,
-    pub args: Vec<ast::Expr>,
-    pub original_expr: ast::Expr,
-    pub distinctness: Distinctness,
-    pub filter_expr: Option<ast::Expr>,
-    /// For `percentile_cont`/`percentile_disc`: register holding the fraction
-    /// after it has been evaluated and range-checked once per invocation,
-    /// before the aggregate row loop. Populated by `InitLoop::emit`.
-    pub fraction_reg: Option<usize>,
-}
-
-impl Aggregate {
-    pub fn new(
-        func: AggFunc,
-        args: &[Box<Expr>],
-        expr: &Expr,
-        distinctness: Distinctness,
-        filter_expr: Option<ast::Expr>,
-    ) -> Self {
-        Aggregate {
-            order_cursor: None,
-            func,
-            args: args.iter().map(|arg| *arg.clone()).collect(),
-            original_expr: expr.clone(),
-            distinctness,
-            filter_expr,
-            fraction_reg: None,
-        }
-    }
-
-    pub fn order_by(&self) -> &[ast::SortedColumn] {
-        if matches!(self.func, AggFunc::Min | AggFunc::Max) {
-            return &[];
-        }
-        match &self.original_expr {
-            ast::Expr::FunctionCall { order_by, .. } => order_by,
-            _ => &[],
-        }
-    }
-
-    pub fn distinct_uses_order_key(&self) -> bool {
-        self.is_distinct()
-            && self.args.len() == 1
-            && self.order_by().len() == 1
-            && exprs_are_equivalent(&self.args[0], &self.order_by()[0].expr)
-    }
-
-    pub fn input_exprs(&self) -> impl Iterator<Item = &ast::Expr> {
-        self.args
-            .iter()
-            .chain(self.filter_expr.iter())
-            .chain(self.order_by().iter().map(|term| term.expr.as_ref()))
-    }
-
-    pub fn is_distinct(&self) -> bool {
-        self.distinctness.is_distinct()
-    }
-}
-
-/// Represents the window definition and all window functions associated with a single SELECT.
-///
-/// All functions in a single `Window` share the same partition/order/frame. When
-/// a user OVER clause is referenced by functions with different coerced frames
-/// (e.g. `row_number() OVER w` coerces to `ROWS UNBOUNDED..CURRENT` while
-/// `rank() OVER w` coerces to `RANGE UNBOUNDED..CURRENT`), the planner splits
-/// them into separate `Window` instances with identical partition/order but
-/// distinct frames. The existing nested-subquery rewrite in
-/// `prepare_window_subquery` then produces one ephemeral-table pass per
-/// `Window` — matching SQLite's behaviour where mixed-frame queries compile to
-/// nested coroutine layers.
-#[derive(Debug, Clone)]
-pub struct Window {
-    /// The window name, either provided in the original statement or synthetically generated by
-    /// the planner. This is optional because it can be assigned at different stages of query
-    /// processing, but it should eventually always be set.
-    pub name: Option<String>,
-    /// Expressions from the PARTITION BY clause.
-    pub partition_by: Vec<Expr>,
-    /// The number of unique expressions in the PARTITION BY clause. This determines how many of
-    /// the leftmost columns in the subquery output make up the partition key.
-    pub deduplicated_partition_by_len: Option<usize>,
-    /// Expressions from the ORDER BY clause.
-    pub order_by: Vec<(Expr, SortOrder, Option<ast::NullsOrder>)>,
-    /// The single coerced frame shared by every function in this window.
-    /// Mirrors SQLite's assert at `window.c:1679` ("All OVER clauses in the
-    /// same window function aggregate step must be the same"). Functions
-    /// whose coerced frames disagree are split into separate `Window`
-    /// instances by the planner.
-    pub frame: Frame,
-    /// All window functions associated with this window.
-    pub functions: Vec<WindowFunction>,
-}
-
-impl Window {
-    const DEFAULT_SORT_ORDER: SortOrder = SortOrder::Asc;
-
-    /// Build a `Window` from an inline `OVER (...)` AST node
-    pub fn new_unnamed(ast: &ast::Window, frame: Frame) -> Result<Self> {
-        Ok(Window {
-            name: None,
-            partition_by: ast.partition_by.iter().map(|arg| *arg.clone()).collect(),
-            deduplicated_partition_by_len: None,
-            order_by: ast
-                .order_by
-                .iter()
-                .map(|col| {
-                    (
-                        *col.expr.clone(),
-                        col.order.unwrap_or(Self::DEFAULT_SORT_ORDER),
-                        col.nulls,
-                    )
-                })
-                .collect(),
-            frame,
-            functions: vec![],
-        })
-    }
-
-    /// Build a `Window` from a previously-bound named definition plus a
-    /// resolved frame.
-    pub fn from_named_bound(name: String, bound: NamedWindowBound, frame: Frame) -> Self {
-        Window {
-            name: Some(name),
-            partition_by: bound.partition_by,
-            deduplicated_partition_by_len: None,
-            order_by: bound.order_by,
-            frame,
-            functions: vec![],
-        }
-    }
-
-    /// Whether this window can host a function with the given coerced frame.
-    /// Two windows are equivalent (and can be merged) when the user OVER
-    /// clause matches AND the coerced frames agree — see SQLite's invariant
-    /// at `window.c:1679`.
-    pub fn is_equivalent(&self, ast: &ast::Window, frame: &Frame) -> bool {
-        // The effective frames must agree exactly (mode, bounds including
-        // offset expressions, EXCLUDE). Two occurrences of the same OVER
-        // clause then share one Window; a window that is NOT merged here
-        // spawns its own subquery layer, and only the layer that owns a
-        // function's rewrite pass populates `WindowFunction::rewritten` —
-        // a duplicate layer would emit against un-rewritten expressions.
-        if &self.frame != frame {
-            return false;
-        }
-
-        if self.partition_by.len() != ast.partition_by.len() {
-            return false;
-        }
-        if !self
-            .partition_by
-            .iter()
-            .zip(&ast.partition_by)
-            .all(|(a, b)| exprs_are_equivalent(a, b))
-        {
-            return false;
-        }
-
-        if self.order_by.len() != ast.order_by.len() {
-            return false;
-        }
-        self.order_by
-            .iter()
-            .zip(&ast.order_by)
-            .all(|((expr_a, order_a, nulls_a), col_b)| {
-                exprs_are_equivalent(expr_a, &col_b.expr)
-                    && *order_a == col_b.order.unwrap_or(Self::DEFAULT_SORT_ORDER)
-                    && *nulls_a == col_b.nulls
-            })
-    }
-}
-
-/// Convert a parsed `FRAME` clause into the planner's `Frame`.
-/// Returns `Ok(None)` when the user wrote no FRAME clause, `Ok(Some(frame))`
-/// for an accepted clause, `Err` for shapes SQLite rejects.
-/// Validation rules ported from `sqlite3WindowCreate` (`window.c:1179-1250`)
-/// and the parser-level guard at `window.c:680-684`.
-pub fn validate_frame_clause(
-    clause: &Option<FrameClause>,
-    order_by_len: usize,
-) -> Result<Option<Frame>> {
-    let Some(clause) = clause else {
-        return Ok(None);
-    };
-    let FrameClause {
-        mode,
-        start,
-        end,
-        exclude,
-    } = clause;
-
-    let start_bound = start.clone();
-    // No END clause means CURRENT ROW per SQL standard.
-    let end_bound = end.clone().unwrap_or(FrameBound::CurrentRow);
-
-    // Combinations that can never describe a real frame (start past
-    // the end, etc.). SQLite rejects the same set at
-    // `window.c:1217-1221`.
-    let illegal = matches!(
-        (&start_bound, &end_bound),
-        (FrameBound::UnboundedFollowing, _)
-            | (_, FrameBound::UnboundedPreceding)
-            | (FrameBound::CurrentRow, FrameBound::Preceding(_))
-            | (FrameBound::Following(_), FrameBound::Preceding(_))
-            | (FrameBound::Following(_), FrameBound::CurrentRow)
-    );
-    if illegal {
-        crate::bail_parse_error!("unsupported frame specification");
-    }
-
-    // RANGE with an N PRECEDING/FOLLOWING bound does arithmetic on the
-    // ORDER BY value, so it needs exactly one ORDER BY column. SQLite
-    // enforces the same rule at `window.c:680-684`.
-    if *mode == FrameMode::Range
-        && (matches!(
-            &start_bound,
-            FrameBound::Preceding(_) | FrameBound::Following(_)
-        ) || matches!(
-            &end_bound,
-            FrameBound::Preceding(_) | FrameBound::Following(_)
-        ))
-        && order_by_len != 1
-    {
-        crate::bail_parse_error!(
-            "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression"
-        );
-    }
-
-    Ok(Some(Frame {
-        mode: *mode,
-        start: start_bound,
-        end: end_bound,
-        exclude: exclude.clone(),
-    }))
-}
-
-/// A named WINDOW clause definition, captured before any function references
-/// it. The effective frame belongs to the resolved `Window` instance the
-/// planner spawns when a function attaches. Whether the user wrote a frame is
-/// retained because SQLite forbids chaining from a framed base window.
-///
-/// `bound` holds the already-bound `partition_by` / `order_by`. The
-/// first `resolve_window` that needs them *takes* them by moving;
-/// subsequent attachments under a different coerced frame deep-clone
-/// from a sister resolved `Window`. This keeps the common case
-/// (1 function per name, or N functions all sharing one frame) at
-/// zero extra clones vs. the old "mutated stub" model.
-#[derive(Debug, Clone)]
-pub struct NamedWindowDef {
-    pub name: String,
-    /// User-written FRAME clause preserved so a function attaching by
-    /// `Over::Name` can compute its effective frame from it.
-    pub user_frame_clause: Option<FrameClause>,
-    /// The bound PARTITION BY / ORDER BY expressions. The first function
-    /// to attach takes them (leaving `None`); any later function under a
-    /// different coerced frame copies them back from a resolved `Window`.
-    /// They live here, rather than inside the frame, so taking them
-    /// doesn't disturb `user_frame_clause`.
-    pub bound: Option<NamedWindowBound>,
-}
-
-#[derive(Debug, Clone)]
-pub struct NamedWindowBound {
-    pub partition_by: Vec<Expr>,
-    pub order_by: Vec<(Expr, SortOrder, Option<ast::NullsOrder>)>,
 }
 
 /// A window function's effective frame. The bounds are interpreted per `mode`:
@@ -4195,8 +2050,8 @@ pub struct NamedWindowBound {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub mode: ast::FrameMode,
-    pub start: FrameBound,
-    pub end: FrameBound,
+    pub start: ast::FrameBound,
+    pub end: ast::FrameBound,
     /// The EXCLUDE clause the user wrote, or `None` if they wrote none.
     ///
     /// `Some(NoOthers)` (an explicit `EXCLUDE NO OTHERS`) excludes
@@ -4212,450 +2067,18 @@ impl Default for Frame {
     fn default() -> Self {
         Self {
             mode: ast::FrameMode::Range,
-            start: FrameBound::UnboundedPreceding,
-            end: FrameBound::CurrentRow,
+            start: ast::FrameBound::UnboundedPreceding,
+            end: ast::FrameBound::CurrentRow,
             exclude: None,
         }
     }
 }
 
-/// One window function call belonging to a `Window`.
-///
-/// Window queries are planned by wrapping the original FROM/WHERE in a
-/// subquery, pushing each window function's arguments and FILTER predicate
-/// into that subquery as new output columns, and rewriting the call to read
-/// those columns instead of the original tables. See `plan_windows` in
-/// `translate/window.rs` for the full rewrite, including worked examples.
-/// "Source subquery" below refers to that wrapper subquery.
-#[derive(Debug, Clone)]
-pub struct WindowFunction {
-    /// The resolved function. Aggregate window functions and specialized window
-    /// functions such as ROW_NUMBER() are supported.
-    pub func: AccumulatorFunc,
-    /// The expression from which the function was resolved. Used as the lookup
-    /// key when matching SQL occurrences back to this entry during rewriting.
-    pub original_expr: Expr,
-    /// Populated the first time `rewrite_terminal_expr` matches this function.
-    /// Later occurrences of the same call reuse this cached rewrite so they
-    /// resolve to the same result register.
-    pub rewritten: Option<RewrittenWindowCall>,
-}
-
-/// The rewritten form of a window function call, populated once `WindowFunction`
-/// has been mapped onto its source subquery.
-#[derive(Debug, Clone)]
-pub struct RewrittenWindowCall {
-    /// `WindowFunction::original_expr` with its arguments, FILTER predicate, and
-    /// OVER clause rewritten to reference the source subquery.
-    pub expr: Expr,
-    /// The FILTER predicate, rewritten to reference the source subquery's
-    /// output columns. AggStep evaluates this once per input row and skips
-    /// the step when it is false. A copy of the predicate already inside
-    /// `expr.filter_over`, lifted to a bare `Expr` so AggStep doesn't have to
-    /// pattern-match it back out on every row.
-    pub filter_expr: Option<Expr>,
-}
-
-impl WindowFunction {
-    /// The expression that downstream lookups should match against: the
-    /// rewritten form once available, otherwise the original.
-    pub fn current_expr(&self) -> &Expr {
-        self.rewritten
-            .as_ref()
-            .map(|r| &r.expr)
-            .unwrap_or(&self.original_expr)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum SubqueryState {
-    /// The subquery has not been evaluated yet.
-    /// The 'plan' field is only optional because it is .take()'d when the the subquery
-    /// is translated into bytecode.
-    Unevaluated { plan: Option<Box<Plan>> },
-    /// The subquery has been evaluated.
-    /// The [evaluated_at] field contains the loop index where the subquery was evaluated.
-    /// The query plan struct no longer exists because translating the plan currently
-    /// requires an ownership transfer. We retain the outer table references so
-    /// later masking/evaluation logic can still reason about dependencies.
-    Evaluated {
-        /// Join-loop position where the subquery was emitted into bytecode.
-        evaluated_at: EvalAt,
-        /// Outer table ids referenced by the subquery when it was planned.
-        /// We keep these so later analysis can still understand dependencies
-        /// even after the plan is consumed.
-        outer_ref_ids: Vec<TableInternalId>,
-        /// Set when the subquery was emitted as a subroutine that a `Gosub`
-        /// can run again, for example against the NULL row of an aggregate
-        /// query that read no rows.
-        subroutine: Option<Subroutine>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubqueryPosition {
-    ResultColumn,
-    Where,
-    GroupBy,
-    Having,
-    OrderBy,
-    LimitOffset,
-}
-
-impl SubqueryPosition {
-    /// Returns true if a subquery in this position of the SELECT can be correlated, i.e. if it can reference columns from the outer query.
-    pub fn allow_correlated(&self) -> bool {
-        matches!(
-            self,
-            SubqueryPosition::ResultColumn
-                | SubqueryPosition::Where
-                | SubqueryPosition::GroupBy
-                | SubqueryPosition::OrderBy
-        )
-    }
-
-    pub fn name(&self) -> &'static str {
-        match self {
-            SubqueryPosition::ResultColumn => "SELECT list",
-            SubqueryPosition::Where => "WHERE",
-            SubqueryPosition::GroupBy => "GROUP BY",
-            SubqueryPosition::Having => "HAVING",
-            SubqueryPosition::OrderBy => "ORDER BY",
-            SubqueryPosition::LimitOffset => "LIMIT/OFFSET",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-/// A subquery that is not part of the `FROM` clause.
-/// This is used for subqueries in the WHERE clause, HAVING clause, ORDER BY clause, LIMIT clause, OFFSET clause, etc.
-/// Currently only subqueries in the WHERE clause are supported.
-pub struct NonFromClauseSubquery {
-    pub internal_id: TableInternalId,
-    /// An earlier scalar subquery with the same text in the same clause.
-    pub same_query: Option<TableInternalId>,
-    pub query_type: SubqueryType,
-    pub state: SubqueryState,
-    pub correlated: bool,
-    pub origin: SubqueryOrigin,
-    pub eval_phase: SubqueryEvalPhase,
-    /// Run after this table, either because a later loop needs fewer calls or
-    /// because this table's hash join loads columns the subquery reads.
-    pub preferred_eval_after_table: Option<TableInternalId>,
-}
-
-impl NonFromClauseSubquery {
-    /// Returns true if the subquery has been evaluated (translated into bytecode).
-    pub fn has_been_evaluated(&self) -> bool {
-        matches!(self.state, SubqueryState::Evaluated { .. })
-    }
-
-    pub fn is_post_write_returning(&self) -> bool {
-        self.origin.is_post_write_returning()
-            && matches!(self.eval_phase, SubqueryEvalPhase::PostWriteReturning)
-    }
-
-    pub fn reads_table(&self, namespace: NamespaceRef, table_name: &str) -> bool {
-        match &self.state {
-            SubqueryState::Unevaluated { plan: Some(plan) } => {
-                Plan::reads_table(plan, namespace, table_name)
-            }
-            _ => false,
-        }
-    }
-
-    /// Returns the loop index where the subquery should be evaluated in this join order.
-    ///
-    /// If the subquery references tables from the parent query, it is evaluated at
-    /// the right-most loop that makes those tables available. For hash joins, this
-    /// may map a build-table reference to the probe loop where its rows are produced.
-    /// The optimizer can choose a later loop when that loop needs fewer calls.
-    pub fn get_eval_at(
-        &self,
-        join_order: &[JoinOrderMember],
-        table_references: Option<&TableReferences>,
-    ) -> Result<EvalAt> {
-        let plan = match &self.state {
-            SubqueryState::Unevaluated { plan } => plan.as_ref().unwrap(),
-            SubqueryState::Evaluated { evaluated_at, .. } => {
-                return Ok(*evaluated_at);
-            }
-        };
-        let required_eval_at = eval_at_for_plan(plan, join_order, table_references)?;
-        let preferred_eval_at = self
-            .preferred_eval_after_table
-            .and_then(|table_id| resolve_outer_ref_loop(table_id, join_order, table_references))
-            .map(EvalAt::Loop)
-            .unwrap_or(EvalAt::BeforeLoop);
-        Ok(required_eval_at.max(preferred_eval_at))
-    }
-
-    /// Consumes the plan and returns it, and sets the subquery to the evaluated state.
-    ///
-    /// This captures any outer references before the plan is moved so later
-    /// phases can still reason about dependencies.
-    pub fn consume_plan(&mut self, evaluated_at: EvalAt) -> Box<Plan> {
-        match &mut self.state {
-            SubqueryState::Unevaluated { plan } => {
-                let outer_ref_ids = plan
-                    .as_ref()
-                    .map(|plan| plan.used_outer_query_ref_ids())
-                    .unwrap_or_default();
-                let plan = plan.take().unwrap();
-                self.state = SubqueryState::Evaluated {
-                    evaluated_at,
-                    outer_ref_ids,
-                    subroutine: None,
-                };
-                plan
-            }
-            SubqueryState::Evaluated { .. } => {
-                panic!("subquery has already been evaluated");
-            }
-        }
-    }
-
-    pub fn set_subroutine(&mut self, new_subroutine: Option<Subroutine>) {
-        let SubqueryState::Evaluated { subroutine, .. } = &mut self.state else {
-            panic!("subquery must be emitted before its subroutine is recorded");
-        };
-        *subroutine = new_subroutine;
-    }
-}
-
-/// Determine the earliest evaluation point for a nested plan by walking all SELECT components.
-fn eval_at_for_plan(
-    plan: &Plan,
-    join_order: &[JoinOrderMember],
-    table_references: Option<&TableReferences>,
-) -> Result<EvalAt> {
-    match plan {
-        Plan::Select(select_plan) => {
-            eval_at_for_select_plan(select_plan, join_order, table_references)
-        }
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => {
-            let mut eval_at = EvalAt::BeforeLoop;
-            for (select_plan, _) in left.iter() {
-                eval_at = eval_at.max(eval_at_for_select_plan(
-                    select_plan,
-                    join_order,
-                    table_references,
-                )?);
-            }
-            eval_at = eval_at.max(eval_at_for_select_plan(
-                right_most,
-                join_order,
-                table_references,
-            )?);
-            Ok(eval_at)
-        }
-        Plan::RecursiveCte(recursive_cte) => {
-            let initial_query =
-                eval_at_for_plan(&recursive_cte.initial_query, join_order, table_references)?;
-            let recursive_query =
-                eval_at_for_plan(&recursive_cte.recursive_query, join_order, table_references)?;
-            Ok(initial_query.max(recursive_query))
-        }
-        Plan::Delete(_) | Plan::Update(_) => Ok(EvalAt::BeforeLoop),
-    }
-}
-
-/// Returns true if a plan (including compound SELECTs) references outer-scope tables.
-pub fn plan_is_correlated(plan: &Plan) -> bool {
-    match plan {
-        Plan::Select(select_plan) => select_plan.is_correlated(),
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => left.iter().any(|(plan, _)| plan.is_correlated()) || right_most.is_correlated(),
-        Plan::RecursiveCte(recursive_cte) => {
-            plan_is_correlated(&recursive_cte.initial_query)
-                || plan_is_correlated(&recursive_cte.recursive_query)
-        }
-        Plan::Delete(_) | Plan::Update(_) => false,
-    }
-}
-
-fn select_plan_has_outer_scope_dependency_with_tables(
-    plan: &SelectPlan,
-    accessible_table_ids: &mut Vec<TableInternalId>,
-) -> bool {
-    let outer_scope_base_len = accessible_table_ids.len();
-    accessible_table_ids.extend(
-        plan.table_references
-            .joined_tables()
-            .iter()
-            .map(|table| table.internal_id),
-    );
-
-    let has_outer_scope_dependency =
-        plan.table_references
-            .outer_query_refs()
-            .iter()
-            .any(|outer_ref| {
-                outer_ref.is_used() && !accessible_table_ids.contains(&outer_ref.internal_id)
-            })
-            || plan
-                .non_from_clause_subqueries
-                .iter()
-                .any(|subquery| match &subquery.state {
-                    SubqueryState::Unevaluated {
-                        plan: Some(subquery_plan),
-                    } => plan_has_outer_scope_dependency_with_tables(
-                        subquery_plan,
-                        accessible_table_ids,
-                    ),
-                    SubqueryState::Unevaluated { plan: None } => false,
-                    SubqueryState::Evaluated { outer_ref_ids, .. } => outer_ref_ids
-                        .iter()
-                        .any(|outer_ref_id| !accessible_table_ids.contains(outer_ref_id)),
-                })
-            || plan
-                .table_references
-                .joined_tables()
-                .iter()
-                .any(|table| match &table.table {
-                    Table::FromClauseSubquery(subquery) => {
-                        plan_has_outer_scope_dependency_with_tables(
-                            subquery.plan.as_ref(),
-                            accessible_table_ids,
-                        )
-                    }
-                    _ => false,
-                });
-
-    accessible_table_ids.truncate(outer_scope_base_len);
-    has_outer_scope_dependency
-}
-
-fn plan_has_outer_scope_dependency_with_tables(
-    plan: &Plan,
-    accessible_table_ids: &mut Vec<TableInternalId>,
-) -> bool {
-    match plan {
-        Plan::Select(select_plan) => {
-            select_plan_has_outer_scope_dependency_with_tables(select_plan, accessible_table_ids)
-        }
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => {
-            left.iter().any(|(select_plan, _)| {
-                select_plan_has_outer_scope_dependency_with_tables(
-                    select_plan,
-                    accessible_table_ids,
-                )
-            }) || select_plan_has_outer_scope_dependency_with_tables(
-                right_most,
-                accessible_table_ids,
-            )
-        }
-        Plan::RecursiveCte(recursive_cte) => {
-            plan_has_outer_scope_dependency_with_tables(
-                &recursive_cte.initial_query,
-                accessible_table_ids,
-            ) || plan_has_outer_scope_dependency_with_tables(
-                &recursive_cte.recursive_query,
-                accessible_table_ids,
-            )
-        }
-        Plan::Delete(_) | Plan::Update(_) => false,
-    }
-}
-
-/// Returns true when evaluating this plan depends on table values from an
-/// enclosing query scope outside the plan itself.
-///
-/// This is narrower than [`plan_is_correlated()`]: a plan may contain
-/// internally correlated scalar subqueries (for example, a scalar subquery that
-/// references another table in the same CTE) without depending on an enclosing
-/// query row. Those plans are still safe to materialize once and reuse.
-pub fn plan_has_outer_scope_dependency(plan: &Plan) -> bool {
-    plan_has_outer_scope_dependency_with_tables(plan, &mut Vec::new())
-}
-
-pub fn select_plan_has_outer_scope_dependency(plan: &SelectPlan) -> bool {
-    select_plan_has_outer_scope_dependency_with_tables(plan, &mut Vec::new())
-}
-
-/// Determine when a SELECT plan can be evaluated, including nested non-FROM and FROM-clause subqueries.
-fn eval_at_for_select_plan(
-    plan: &SelectPlan,
-    join_order: &[JoinOrderMember],
-    table_references: Option<&TableReferences>,
-) -> Result<EvalAt> {
-    let mut eval_at = EvalAt::BeforeLoop;
-    let used_outer_refs = plan
-        .table_references
-        .outer_query_refs()
-        .iter()
-        .filter(|t| t.is_used());
-
-    for outer_ref in used_outer_refs {
-        if let Some(loop_idx) =
-            resolve_outer_ref_loop(outer_ref.internal_id, join_order, table_references)
-        {
-            eval_at = eval_at.max(EvalAt::Loop(loop_idx));
-        }
-    }
-    for subquery in plan.non_from_clause_subqueries.iter() {
-        match &subquery.state {
-            SubqueryState::Unevaluated { .. } => {
-                eval_at = eval_at.max(subquery.get_eval_at(join_order, table_references)?);
-            }
-            // A nested subquery is already emitted when it is inside a pre-materialized CTE.
-            // Its `evaluated_at` is a loop of the nested plan, not of `join_order`.
-            SubqueryState::Evaluated { outer_ref_ids, .. } => {
-                for outer_ref_id in outer_ref_ids {
-                    if let Some(loop_idx) =
-                        resolve_outer_ref_loop(*outer_ref_id, join_order, table_references)
-                    {
-                        eval_at = eval_at.max(EvalAt::Loop(loop_idx));
-                    }
-                }
-            }
-        }
-    }
-    for joined_table in plan.table_references.joined_tables().iter() {
-        if let Table::FromClauseSubquery(from_clause_subquery) = &joined_table.table {
-            eval_at = eval_at.max(eval_at_for_plan(
-                from_clause_subquery.plan.as_ref(),
-                join_order,
-                table_references,
-            )?);
-        }
-    }
-    Ok(eval_at)
-}
-
-/// Resolves the loop index for an outer-table reference.
-///
-/// If the table is not present in the join order, we look for a hash join
-/// where that table is the build side and map it to the probe loop.
-fn resolve_outer_ref_loop(
-    table_id: TableInternalId,
-    join_order: &[JoinOrderMember],
-    table_references: Option<&TableReferences>,
-) -> Option<usize> {
-    if let Some(loop_idx) = join_order.iter().position(|t| t.table_id == table_id) {
-        return Some(loop_idx);
-    }
-    let tables = table_references?;
-    for (probe_idx, member) in join_order.iter().enumerate() {
-        let probe_table = &tables.joined_tables()[member.original_idx];
-        if let Operation::HashJoin(ref hj) = probe_table.op {
-            let build_table = &tables.joined_tables()[hj.build_table_idx];
-            if build_table.internal_id == table_id {
-                return Some(probe_idx);
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use crate::alloc::TursoFromIterator;
+    use crate::translate::semantic::hir;
+    use turso_parser::ast::SortOrder;
 
     use super::*;
     use rand_chacha::{
@@ -4664,6 +2087,385 @@ mod tests {
     };
 
     type TestResult = std::result::Result<(), alloc::TryReserveError>;
+
+    fn hir_integer(exprs: &mut hir::ExprArena, value: i64) -> hir::ExprId {
+        exprs.push(hir::Expr::Literal(ast::Literal::Numeric(value.to_string())))
+    }
+
+    fn hir_and(exprs: &mut hir::ExprArena, lhs: hir::ExprId, rhs: hir::ExprId) -> hir::ExprId {
+        exprs.push(hir::Expr::Binary {
+            lhs,
+            operator: ast::Operator::And,
+            rhs,
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        })
+    }
+
+    #[test]
+    fn hir_seek_definition_keeps_resolved_expressions() {
+        let mut exprs = hir::ExprArena::default();
+        let seek: HirSeekDef = SeekDef {
+            prefix: vec![SeekRangeConstraint::new_eq(
+                SortOrder::Asc,
+                ast::NullsOrder::First,
+                (
+                    ast::Operator::Equals,
+                    hir_integer(&mut exprs, 7),
+                    Affinity::Integer,
+                ),
+            )],
+            start: SeekKey {
+                last_component: SeekKeyComponent::None,
+                op: SeekOp::GE { eq_only: true },
+                affinity: Affinity::Blob,
+            },
+            end: SeekKey {
+                last_component: SeekKeyComponent::None,
+                op: SeekOp::LE { eq_only: true },
+                affinity: Affinity::Blob,
+            },
+            iter_dir: IterationDirection::Forwards,
+        };
+
+        let values = seek.iter(&seek.start).collect::<Vec<_>>();
+        assert!(matches!(
+            values.as_slice(),
+            [SeekKeyComponent::Expr(value)] if matches!(
+                &exprs[**value],
+                hir::Expr::Literal(ast::Literal::Numeric(value)) if value == "7"
+            )
+        ));
+        assert_eq!(
+            seek.iter_affinity(&seek.start).collect::<Vec<_>>(),
+            [Affinity::Integer]
+        );
+    }
+
+    fn hir_output(id: hir::OutputId, expr: hir::ExprId) -> hir::Output {
+        hir::Output {
+            id,
+            name: "value".into(),
+            expr,
+            type_fact: hir::TypeFact::dynamic(),
+            affinity: Affinity::Blob,
+            schema_affinity: Affinity::Blob,
+            has_affinity: false,
+            collation: None,
+            collation_is_explicit: false,
+            name_kind: hir::OutputNameKind::Inferred,
+        }
+    }
+
+    fn hir_dependency_document(
+        output_expr: hir::Expr,
+        captures: Vec<hir::SourceId>,
+    ) -> hir::HirDocument {
+        let mut exprs = hir::ExprArena::default();
+        let output_expr = exprs.push(output_expr);
+        let outer_query = hir::QueryId::new(0);
+        let outer_block = hir::QueryBlockId::new(outer_query, 0);
+        let output = hir::OutputId::query(outer_block, 0);
+        let mut block = hir::QueryBlock::new(
+            outer_block,
+            hir::QueryBlockBody::Values { rows: Vec::new() },
+        );
+        block.outputs.push(hir_output(output, output_expr));
+
+        let inner_query = hir::QueryId::new(1);
+        let inner_block = hir::QueryBlockId::new(inner_query, 0);
+        hir::HirDocument {
+            snapshot: hir::CatalogSnapshot::from_id(0),
+            databases: Vec::new(),
+            root: hir::HirRoot::Query(hir::QueryRoot { query: outer_query }),
+            queries: vec![
+                hir::Query {
+                    id: outer_query,
+                    parent: None,
+                    captures: Vec::new(),
+                    reachable_ctes: Vec::new(),
+                    blocks: vec![block],
+                    first: outer_block,
+                    compounds: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    output: vec![output],
+                },
+                hir::Query {
+                    id: inner_query,
+                    parent: Some(outer_query),
+                    captures,
+                    reachable_ctes: Vec::new(),
+                    blocks: vec![hir::QueryBlock::new(
+                        inner_block,
+                        hir::QueryBlockBody::Values { rows: Vec::new() },
+                    )],
+                    first: inner_block,
+                    compounds: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    output: Vec::new(),
+                },
+            ],
+            sources: Vec::new(),
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
+            exprs,
+            planning: hir::PlanningTerms::default(),
+        }
+    }
+
+    #[test]
+    fn hir_implied_in_terms_need_every_or_branch_to_fix_the_column() {
+        use crate::translate::semantic::hir::Expr;
+        let table = hir::SourceId::new(1);
+        let comparison = hir::ComparisonSemantics {
+            components: vec![hir::ComparisonComponent {
+                affinity: Affinity::Integer,
+                collation: None,
+                array: false,
+            }],
+        };
+        let mut exprs = hir::ExprArena::default();
+        let equals = |exprs: &mut hir::ExprArena, column: usize, value: hir::ExprId| {
+            let lhs = exprs.push(Expr::column(table, column));
+            exprs.push(Expr::Binary {
+                lhs,
+                operator: ast::Operator::Equals,
+                rhs: value,
+                array_concat: false,
+                custom: None,
+                comparison: Some(comparison.clone()),
+            })
+        };
+        let or = |exprs: &mut hir::ExprArena, lhs: hir::ExprId, rhs: hir::ExprId| {
+            exprs.push(Expr::Binary {
+                lhs,
+                operator: ast::Operator::Or,
+                rhs,
+                array_concat: false,
+                custom: None,
+                comparison: None,
+            })
+        };
+        let negative = |exprs: &mut hir::ExprArena, value: i64| {
+            let expr = hir_integer(exprs, value);
+            exprs.push(Expr::Unary {
+                operator: ast::UnaryOperator::Negative,
+                expr,
+            })
+        };
+        let in_values = |exprs: &hir::ExprArena, term: hir::ExprId| match &exprs[term] {
+            Expr::InList {
+                lhs,
+                negated: false,
+                values,
+                comparisons,
+            } => {
+                assert_eq!(values.len(), comparisons.len());
+                let Expr::Column(column) = &exprs[*lhs] else {
+                    panic!("an implied IN tests a column");
+                };
+                (column.column, values.clone())
+            }
+            _ => panic!("an implied term is an IN list"),
+        };
+        let implied =
+            |exprs: &mut hir::ExprArena,
+             expression: hir::ExprId,
+             starts_index: &dyn Fn(hir::SourceId, &[usize]) -> Option<usize>| {
+                hir_implied_in_terms(&implied_in_terms(exprs, expression), starts_index)
+            };
+
+        // Both columns are fixed by every branch; only the one that starts
+        // an index gets a filter. A repeated value is listed once.
+        let one = hir_integer(&mut exprs, 1);
+        let ten = hir_integer(&mut exprs, 10);
+        let first_left = equals(&mut exprs, 0, one);
+        let first_right = equals(&mut exprs, 1, ten);
+        let first = hir_and(&mut exprs, first_left, first_right);
+        let twenty = hir_integer(&mut exprs, 20);
+        let minus_two = negative(&mut exprs, 2);
+        let second_left = equals(&mut exprs, 1, twenty);
+        let second_right = equals(&mut exprs, 0, minus_two);
+        let second = hir_and(&mut exprs, second_left, second_right);
+        let one = hir_integer(&mut exprs, 1);
+        let thirty = hir_integer(&mut exprs, 30);
+        let third_left = equals(&mut exprs, 0, one);
+        let third_right = equals(&mut exprs, 1, thirty);
+        let third = hir_and(&mut exprs, third_left, third_right);
+        let first_two = or(&mut exprs, first, second);
+        let expression = or(&mut exprs, first_two, third);
+        let starts_index = |_: hir::SourceId, columns: &[usize]| {
+            assert_eq!(columns, [0, 1]);
+            Some(1)
+        };
+        let same_values =
+            |exprs: &hir::ExprArena, values: &[hir::ExprId], expected: &[hir::ExprId]| {
+                values.len() == expected.len()
+                    && values
+                        .iter()
+                        .zip(expected)
+                        .all(|(value, expected)| exprs.at(*value).equivalent(exprs.at(*expected)))
+            };
+        let terms = implied(&mut exprs, expression, &starts_index);
+        assert_eq!(terms.len(), 1);
+        let (column, values) = in_values(&exprs, terms[0]);
+        assert_eq!(column, 1);
+        let expected = [
+            hir_integer(&mut exprs, 10),
+            hir_integer(&mut exprs, 20),
+            hir_integer(&mut exprs, 30),
+        ];
+        assert!(same_values(&exprs, &values, &expected));
+
+        // With one fixed column, no index is needed.
+        let one = hir_integer(&mut exprs, 1);
+        let left = equals(&mut exprs, 0, one);
+        let minus_two = negative(&mut exprs, 2);
+        let right = equals(&mut exprs, 0, minus_two);
+        let expression = or(&mut exprs, left, right);
+        let terms = implied(&mut exprs, expression, &|_, _| None);
+        assert_eq!(terms.len(), 1);
+        let (column, values) = in_values(&exprs, terms[0]);
+        assert_eq!(column, 0);
+        let expected = [hir_integer(&mut exprs, 1), negative(&mut exprs, 2)];
+        assert!(same_values(&exprs, &values, &expected));
+
+        // A branch that does not fix the column, or fixes it to a non-literal
+        // or to NULL, gives no filter.
+        let other_column_value = hir_integer(&mut exprs, 2);
+        let other_column = equals(&mut exprs, 1, other_column_value);
+        let column_value = exprs.push(Expr::column(table, 2));
+        let non_literal = equals(&mut exprs, 0, column_value);
+        let null_value = exprs.push(Expr::Literal(ast::Literal::Null));
+        let null = equals(&mut exprs, 0, null_value);
+        for second in [other_column, non_literal, null] {
+            let one = hir_integer(&mut exprs, 1);
+            let first = equals(&mut exprs, 0, one);
+            let expression = or(&mut exprs, first, second);
+            assert!(implied(&mut exprs, expression, &|_, _| None).is_empty());
+        }
+    }
+
+    #[test]
+    fn hir_predicates_split_without_ast_conversion() {
+        let mut exprs = hir::ExprArena::default();
+        let one = hir_integer(&mut exprs, 1);
+        let two = hir_integer(&mut exprs, 2);
+        let three = hir_integer(&mut exprs, 3);
+        let rest = hir_and(&mut exprs, two, three);
+        let expression = hir_and(&mut exprs, one, rest);
+
+        let terms: Vec<HirWhereTerm> = exprs
+            .at(expression)
+            .conjuncts()
+            .map(|conjunct| conjunct.id().into())
+            .collect();
+
+        let values = terms
+            .iter()
+            .map(|term| match &exprs[term.expr] {
+                crate::translate::semantic::hir::Expr::Literal(ast::Literal::Numeric(value)) => {
+                    value.as_str()
+                }
+                _ => panic!("conjunct remains an HIR numeric literal"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["1", "2", "3"]);
+        assert!(terms.iter().all(|term| term.from_outer_join.is_none()));
+    }
+
+    #[test]
+    fn hir_expression_dependencies_map_to_local_from_positions() -> Result<()> {
+        let first = hir::SourceId::new(10);
+        let joined = hir::SourceId::new(20);
+        let outside = hir::SourceId::new(30);
+        let from = hir::From {
+            first,
+            joins: vec![hir::Join {
+                right: joined,
+                kind: hir::JoinKind::Inner,
+                constraint: hir::JoinConstraint::None,
+            }],
+        };
+        let output = hir::OutputId::query(hir::QueryBlockId::new(hir::QueryId::new(0), 0), 0);
+        let mut document =
+            hir_dependency_document(hir::Expr::column(joined, 0), vec![joined, outside]);
+        let exprs = &mut document.exprs;
+
+        let first_column = exprs.push(hir::Expr::column(first, 0));
+        let joined_rowid = exprs.push(hir::Expr::rowid(joined));
+        let direct = hir_and(exprs, first_column, joined_rowid);
+
+        let merged_left = exprs.push(hir::Expr::column(first, 0));
+        let merged_right = exprs.push(hir::Expr::Column(hir::ColumnRef {
+            source: joined,
+            column: 0,
+        }));
+        let merged = exprs.push(hir::Expr::MergedColumn(Box::new(hir::MergedColumn {
+            left: merged_left,
+            right: merged_right,
+            value: hir::MergedColumnValue::Coalesce,
+            type_fact: hir::TypeFact::dynamic(),
+            affinity: Affinity::Blob,
+            has_affinity: false,
+            collation: None,
+        })));
+
+        let output_expr = exprs.push(hir::Expr::output(output));
+
+        let subquery_lhs = exprs.push(hir::Expr::column(first, 0));
+        let subquery = exprs.push(hir::Expr::Subquery(hir::SubqueryExpr::In {
+            lhs: subquery_lhs,
+            query: hir::QueryId::new(1),
+            negated: false,
+            comparison: hir::ComparisonSemantics {
+                components: vec![hir::ComparisonComponent {
+                    affinity: Affinity::Blob,
+                    collation: None,
+                    array: false,
+                }],
+            },
+        }));
+
+        let duplicate_left = exprs.push(hir::Expr::column(first, 0));
+        let duplicate_right = exprs.push(hir::Expr::column(first, 1));
+        let duplicate = hir_and(exprs, duplicate_left, duplicate_right);
+        prepare_planning_terms(&mut document);
+
+        let direct_mask =
+            crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), direct)?;
+        assert!(direct_mask.get(0));
+        assert!(direct_mask.get(1));
+
+        let merged_mask =
+            crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), merged)?;
+        assert!(merged_mask.get(0));
+        assert!(merged_mask.get(1));
+
+        let output_mask = crate::translate::planner::table_mask_from_hir_expr(
+            &document,
+            Some(&from),
+            output_expr,
+        )?;
+        assert!(!output_mask.get(0));
+        assert!(output_mask.get(1));
+
+        let subquery_mask =
+            crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), subquery)?;
+        assert!(subquery_mask.get(0));
+        assert!(subquery_mask.get(1));
+        assert_eq!(subquery_mask.iter().count(), 2);
+
+        let duplicate_mask =
+            crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), duplicate)?;
+        assert_eq!(duplicate_mask.iter().collect::<Vec<_>>(), [0]);
+
+        Ok(())
+    }
 
     #[test]
     fn test_column_used_mask_empty() -> TestResult {
@@ -5351,6 +3153,7 @@ mod tests {
 
     #[test]
     fn test_bitset_with_table_internal_id() -> TestResult {
+        use turso_parser::ast::TableInternalId;
         let a = TableInternalId::from(3);
         let b = TableInternalId::from(70); // exercises overflow path
         let c = TableInternalId::from(200);

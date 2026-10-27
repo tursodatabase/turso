@@ -1,30 +1,26 @@
-use super::binding::{remap_bound_expr, seed_ephemeral_stream_cache, stream_table_references};
+use super::binding::StreamRow;
 use super::output::{EmittedNodeOutput, NodeOutputContract};
 use super::stream::{emit_ephemeral_delta_row, open_ephemeral_delta, EphemeralDelta};
 use crate::incremental::dag;
-use crate::schema::Schema;
-use crate::sync::Arc;
-use crate::translate::emitter::Resolver;
-use crate::translate::expr::{
-    translate_condition_expr, translate_expr_no_constant_opt, ConditionMetadata,
-    NoConstantOptReason,
+use crate::translate::expr::ConditionMetadata;
+use crate::translate::semantic::hir::{self, HirDocument};
+use crate::translate::semantic_lowering::{
+    translate_condition_expr, translate_expr_no_constant_opt,
 };
 use crate::turso_assert;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::{to_u32, InsertFlags, Insn};
-use crate::{Connection, LimboError, Result};
-use turso_parser::ast;
+use crate::{LimboError, Result};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_filter(
     program: &mut ProgramBuilder,
+    document: &HirDocument,
     view_name: &str,
     node_id: dag::NodeId,
     input: &EphemeralDelta,
     output_contract: &NodeOutputContract,
-    predicate: &ast::Expr,
-    schema: &Schema,
-    connection: &Arc<Connection>,
+    predicate: hir::ExprId,
 ) -> Result<EmittedNodeOutput> {
     let output = open_ephemeral_delta(
         program,
@@ -33,21 +29,7 @@ pub(super) fn emit_filter(
         output_contract.emitted_identity,
         output_contract.binding_rowids.clone(),
     )?;
-
-    let syms = connection.syms.read();
-    let mut resolver = Resolver::new(
-        schema,
-        connection.database_schemas(),
-        &connection.temp.database,
-        connection.attached_databases(),
-        connection.namespaces(),
-        &syms,
-        connection.experimental_custom_types_enabled(),
-        connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
-        None,
-    );
-    let (table_references, binding_remap) = stream_table_references(program, &input.schema);
+    let bound_registers = program.expression_register_count();
 
     let end_label = program.allocate_label();
     let loop_label = program.allocate_label();
@@ -69,26 +51,19 @@ pub(super) fn emit_filter(
         pc_if_empty: end_label,
     });
     program.preassign_label_to_next_insn(loop_label);
-    seed_ephemeral_stream_cache(
-        program,
-        input,
-        &binding_remap,
-        &table_references,
-        &mut resolver,
-    )?;
-    let bound_predicate = remap_bound_expr(predicate, &binding_remap)?;
+    let row = StreamRow::load(program, input);
+    row.bind(program, document, predicate);
     translate_condition_expr(
         program,
-        &table_references,
-        &bound_predicate,
+        document,
+        predicate,
         ConditionMetadata {
             jump_if_condition_is_true: false,
             jump_target_when_true: pass_label,
             jump_target_when_false: next_label,
-            jump_target_when_null: next_label,
         },
-        &resolver,
     )?;
+    program.truncate_expression_registers(bound_registers);
     program.preassign_label_to_next_insn(pass_label);
 
     for column in 0..input.weight_column {
@@ -132,7 +107,6 @@ pub(super) fn emit_filter(
         is_index: false,
     });
     program.preassign_label_to_next_insn(end_label);
-    drop(syms);
     EmittedNodeOutput::from_ephemeral(node_id, output, output_contract)
 }
 
@@ -352,13 +326,12 @@ pub(super) fn emit_pad(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_project(
     program: &mut ProgramBuilder,
+    document: &HirDocument,
     view_name: &str,
     node_id: dag::NodeId,
     input: &EphemeralDelta,
-    projections: &[ast::Expr],
+    projections: &[hir::ExprId],
     output_contract: &NodeOutputContract,
-    schema: &Schema,
-    connection: &Arc<Connection>,
 ) -> Result<EmittedNodeOutput> {
     let output = open_ephemeral_delta(
         program,
@@ -367,39 +340,23 @@ pub(super) fn emit_project(
         output_contract.emitted_identity,
         output_contract.binding_rowids.clone(),
     )?;
-    emit_project_rows(program, input, projections, &output, schema, connection)?;
+    emit_project_rows(program, document, input, projections, &output)?;
     EmittedNodeOutput::from_ephemeral(node_id, output, output_contract)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn emit_project_rows(
     program: &mut ProgramBuilder,
+    document: &HirDocument,
     input: &EphemeralDelta,
-    projections: &[ast::Expr],
+    projections: &[hir::ExprId],
     output: &EphemeralDelta,
-    schema: &Schema,
-    connection: &Arc<Connection>,
 ) -> Result<()> {
     let num_output_columns = output.width;
     turso_assert!(
         projections.len() == num_output_columns,
         "projection output does not match its sink schema"
     );
-
-    let syms = connection.syms.read();
-    let mut resolver = Resolver::new(
-        schema,
-        connection.database_schemas(),
-        &connection.temp.database,
-        connection.attached_databases(),
-        connection.namespaces(),
-        &syms,
-        connection.experimental_custom_types_enabled(),
-        connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
-        None,
-    );
-    let (table_references, binding_remap) = stream_table_references(program, &input.schema);
+    let bound_registers = program.expression_register_count();
 
     let end_label = program.allocate_label();
     let loop_label = program.allocate_label();
@@ -408,13 +365,7 @@ fn emit_project_rows(
         pc_if_empty: end_label,
     });
     program.preassign_label_to_next_insn(loop_label);
-    seed_ephemeral_stream_cache(
-        program,
-        input,
-        &binding_remap,
-        &table_references,
-        &mut resolver,
-    )?;
+    let row = StreamRow::load(program, input);
 
     turso_assert!(
         output.identity == input.identity
@@ -435,16 +386,10 @@ fn emit_project_rows(
     let out_start = program.alloc_registers(num_output_columns + 1);
     let new_weight_reg = out_start + num_output_columns;
     for (index, expr) in projections.iter().enumerate() {
-        let bound = remap_bound_expr(expr, &binding_remap)?;
-        translate_expr_no_constant_opt(
-            program,
-            Some(&table_references),
-            &bound,
-            out_start + index,
-            &resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+        row.bind(program, document, *expr);
+        translate_expr_no_constant_opt(program, document, *expr, out_start + index)?;
     }
+    program.truncate_expression_registers(bound_registers);
     let weight_reg = program.alloc_register();
     program.emit_insn(Insn::Column {
         cursor_id: input.cursor_id,
@@ -487,6 +432,5 @@ fn emit_project_rows(
         is_index: false,
     });
     program.preassign_label_to_next_insn(end_label);
-    drop(syms);
     Ok(())
 }

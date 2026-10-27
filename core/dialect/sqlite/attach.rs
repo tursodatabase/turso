@@ -9,10 +9,9 @@ use crate::storage::journal_mode;
 #[cfg(feature = "fs")]
 use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
-use crate::translate::{
-    emitter::Resolver,
-    expr::{sanitize_string, translate_expr},
-};
+use crate::translate::expr::sanitize_string;
+use crate::translate::semantic::context::SemanticContext;
+use crate::translate::semantic_lowering::PlannedSelect;
 use crate::types::IOResultOr;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
@@ -24,17 +23,96 @@ use crate::{
 };
 use turso_parser::ast::{Expr, Literal};
 
+/// How an ATTACH or DETACH argument gets its value.
+enum Argument<'a> {
+    /// A string literal, a name or a dotted name is the text written.
+    Text(String),
+    /// Anything else is evaluated.
+    Value(&'a Expr),
+    /// ATTACH without KEY passes NULL.
+    Null,
+}
+
+impl<'a> Argument<'a> {
+    fn new(expr: &'a Expr) -> Self {
+        match expr {
+            Expr::Literal(Literal::String(s)) => Self::Text(sanitize_string(s)),
+            Expr::Qualified(_, _) => Self::Text(expr.to_string()),
+            // normalize_ident strips the quotes of a double-quoted name.
+            Expr::Id(id) => Self::Text(normalize_ident(id.as_str())),
+            _ => Self::Value(expr),
+        }
+    }
+}
+
+/// Write each argument into consecutive registers from `start`. The
+/// evaluated arguments run as one `SELECT` planned through HIR.
+fn emit_arguments(
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    catalog: &SemanticContext<'_>,
+    arguments: &[Argument<'_>],
+    start: usize,
+) -> Result<()> {
+    let values: Vec<_> = arguments
+        .iter()
+        .filter_map(|argument| match argument {
+            Argument::Value(expr) => Some((*expr).clone()),
+            _ => None,
+        })
+        .collect();
+    let mut hir_values = if values.is_empty() {
+        None
+    } else {
+        let select = PlannedSelect::values(values, catalog, connection)?;
+        Some(select.emit_values(program)?)
+    };
+    for (i, argument) in arguments.iter().enumerate() {
+        let dest = start + i;
+        match argument {
+            Argument::Text(value) => {
+                program.emit_insn(Insn::String8 {
+                    value: value.clone(),
+                    dest,
+                });
+            }
+            Argument::Value(_) => match &mut hir_values {
+                Some(value) => {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: *value,
+                        dst_reg: dest,
+                        extra_amount: 0,
+                    });
+                    *value += 1;
+                }
+                None => {
+                    return Err(LimboError::InternalError(
+                        "ATTACH argument was not planned".to_string(),
+                    ))
+                }
+            },
+            Argument::Null => {
+                program.emit_insn(Insn::Null {
+                    dest,
+                    dest_end: None,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Translate ATTACH statement
-pub fn translate_attach(
+pub(crate) fn translate_attach(
     expr: &Expr,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     db_name: &Expr,
     key: &Option<Box<Expr>>,
     program: &mut ProgramBuilder,
     connection: Arc<Connection>,
 ) -> Result<()> {
     if !connection.experimental_attach_enabled() {
-        return Err(crate::LimboError::ParseError(
+        return Err(LimboError::ParseError(
             "ATTACH is an experimental feature. Enable with --experimental-attach flag".to_string(),
         ));
     }
@@ -45,76 +123,20 @@ pub fn translate_attach(
 
     let arg_reg = program.alloc_registers(4); // 3 for args + 1 for result
 
-    // Load filename argument
-    // Handle different expression types as string literals for filenames
-    match expr {
-        Expr::Literal(Literal::String(s)) => {
-            // For ATTACH, string literals should be used directly (without quotes)
-            program.emit_insn(Insn::String8 {
-                value: sanitize_string(s),
-                dest: arg_reg,
-            });
-        }
-        Expr::Qualified(_, _) => {
-            // For ATTACH, qualified expressions like "foo.db" should be treated as filename strings
-            let filename = expr.to_string();
-            program.emit_insn(Insn::String8 {
-                value: filename,
-                dest: arg_reg,
-            });
-        }
-        Expr::Id(id) => {
-            // For ATTACH, identifiers should be treated as filename strings
-            program.emit_insn(Insn::String8 {
-                value: normalize_ident(id.as_str()),
-                dest: arg_reg,
-            });
-        }
-        _ => {
-            translate_expr(program, None, expr, arg_reg, resolver)?;
-        }
-    }
-
-    // Load database name argument
-    // Handle different expression types as string literals for database names
-    match db_name {
-        Expr::Literal(Literal::String(s)) => {
-            // For ATTACH, string literals should be used directly (without quotes)
-            program.emit_insn(Insn::String8 {
-                value: sanitize_string(s),
-                dest: arg_reg + 1,
-            });
-        }
-        Expr::Qualified(_, _) => {
-            // For ATTACH, qualified expressions should be treated as name strings
-            let db_name_str = format!("{db_name}");
-            program.emit_insn(Insn::String8 {
-                value: db_name_str,
-                dest: arg_reg + 1,
-            });
-        }
-        Expr::Id(id) => {
-            // For ATTACH, identifiers should be treated as name strings
-            // Use normalize_ident to strip quotes from double-quoted identifiers
-            program.emit_insn(Insn::String8 {
-                value: normalize_ident(id.as_str()),
-                dest: arg_reg + 1,
-            });
-        }
-        _ => {
-            translate_expr(program, None, db_name, arg_reg + 1, resolver)?;
-        }
-    }
-
-    // Load key argument (NULL if not provided)
-    if let Some(key_expr) = key {
-        translate_expr(program, None, key_expr, arg_reg + 2, resolver)?;
-    } else {
-        program.emit_insn(Insn::Null {
-            dest: arg_reg + 2,
-            dest_end: None,
-        });
-    }
+    // Like SQLite, a KEY that is a name is that text, case kept; anything
+    // else is evaluated.
+    let key = match key.as_deref() {
+        Some(Expr::Id(id)) => Argument::Text(id.as_str().to_string()),
+        Some(key) => Argument::Value(key),
+        None => Argument::Null,
+    };
+    emit_arguments(
+        program,
+        &connection,
+        catalog,
+        &[Argument::new(expr), Argument::new(db_name), key],
+        arg_reg,
+    )?;
 
     // Call sqlite_attach function
     program.emit_insn(Insn::Function {
@@ -131,14 +153,14 @@ pub fn translate_attach(
 }
 
 /// Translate DETACH statement
-pub fn translate_detach(
+pub(crate) fn translate_detach(
     expr: &Expr,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: Arc<Connection>,
 ) -> Result<()> {
     if !connection.experimental_attach_enabled() {
-        return Err(crate::LimboError::ParseError(
+        return Err(LimboError::ParseError(
             "DETACH is an experimental feature. Enable with --experimental-attach flag".to_string(),
         ));
     }
@@ -147,36 +169,13 @@ pub fn translate_detach(
 
     let arg_reg = program.alloc_registers(2); // 1 for arg + 1 for result
 
-    // Load database name argument
-    // Handle different expression types as string literals for database names
-    match expr {
-        Expr::Literal(Literal::String(s)) => {
-            // For DETACH, string literals should be used directly (without quotes)
-            program.emit_insn(Insn::String8 {
-                value: sanitize_string(s),
-                dest: arg_reg,
-            });
-        }
-        Expr::Qualified(_, _) => {
-            // For DETACH, qualified expressions should be treated as name strings
-            let db_name_str = format!("{expr}");
-            program.emit_insn(Insn::String8 {
-                value: db_name_str,
-                dest: arg_reg,
-            });
-        }
-        Expr::Id(id) => {
-            // For DETACH, identifiers should be treated as name strings
-            // Use normalize_ident to strip quotes from double-quoted identifiers
-            program.emit_insn(Insn::String8 {
-                value: normalize_ident(id.as_str()),
-                dest: arg_reg,
-            });
-        }
-        _ => {
-            translate_expr(program, None, expr, arg_reg, resolver)?;
-        }
-    }
+    emit_arguments(
+        program,
+        &connection,
+        catalog,
+        &[Argument::new(expr)],
+        arg_reg,
+    )?;
 
     // Call sqlite_detach function
     program.emit_insn(Insn::Function {

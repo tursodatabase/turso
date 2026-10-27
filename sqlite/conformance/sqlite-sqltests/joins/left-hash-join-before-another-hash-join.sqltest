@@ -1,0 +1,43 @@
+@database :memory:
+
+# A LEFT JOIN without an index runs as a hash join whose unmatched left rows
+# are emitted after the probe loop, running the joins after it once more.
+# A hash join among those joins must reuse the hash table the first pass
+# built instead of building it again.
+setup left-hash-join-chain-schema {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+    CREATE TABLE t4(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+    INSERT INTO t1 VALUES (1, 1, 0, 1, 0), (2, 2, 0, 2, 0), (3, 3, 0, 3, 0);
+    INSERT INTO t2 VALUES (10, 1, 0, 1, 5), (20, 9, 0, 9, 6);
+    INSERT INTO t3 VALUES (100, 0, 7, 0, 5), (101, 0, 8, 0, NULL);
+    INSERT INTO t4 VALUES (1000, 0, 7, 1, 0), (1001, 0, 8, NULL, 0), (1002, 0, 8, 2, 0),
+        (1003, 0, 0, 0, 5), (1004, 0, 0, 0, NULL);
+}
+
+@setup left-hash-join-chain-schema
+test left-hash-join-then-left-hash-join-then-hash-join {
+    SELECT t1.id, t2.id, t3.id, t4.id FROM t1
+    LEFT JOIN t2 ON t1.a = t2.a AND t1.c = t2.c
+    LEFT JOIN t3 ON t2.d IS t3.d
+    JOIN t4 ON t3.b = t4.b
+    WHERE t4.c IS NOT NULL ORDER BY 1, 2, 3, 4;
+}
+expect {
+1|10|100|1000
+2||101|1002
+3||101|1002
+}
+
+@setup left-hash-join-chain-schema
+test left-hash-join-then-hash-join {
+    SELECT t1.id, t2.id, t4.id FROM t1
+    LEFT JOIN t2 ON t1.a = t2.a AND t1.c = t2.c
+    JOIN t4 ON t2.d IS t4.d ORDER BY 1, 2, 3;
+}
+expect {
+1|10|1003
+2||1004
+3||1004
+}

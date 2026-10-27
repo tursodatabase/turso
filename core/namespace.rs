@@ -87,6 +87,16 @@ pub struct Namespaces {
 }
 
 impl Namespaces {
+    pub(crate) fn all(&self) -> Vec<Namespace> {
+        let mut namespaces = vec![
+            Namespace::database("main", MAIN_DB_ID),
+            Namespace::database("temp", TEMP_DB_ID),
+        ];
+        namespaces.extend(self.name_to_namespace.read().values().cloned());
+        namespaces.sort_by(|a, b| a.name.cmp(&b.name));
+        namespaces
+    }
+
     /// The namespace called `name`. `name` is normalized.
     pub fn get(&self, name: &str) -> Option<Namespace> {
         match name {

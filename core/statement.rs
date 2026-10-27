@@ -8,15 +8,16 @@ use std::{
 };
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{fmt::ToTokens, Cmd};
+use turso_parser::ast::Cmd;
 
 use crate::alloc::TursoIteratorExt;
+use crate::translate::semantic_lowering::{ResolvedResultColumn, ResolvedResultValue};
 use crate::{
     busy::BusyHandlerState,
     parameters,
     schema::Trigger,
     stats::{refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
-    translate::{self, display::PlanContext, emitter::TransactionMode, plan::BitSet},
+    translate::{self, emitter::TransactionMode, plan::BitSet},
     turso_assert,
     vdbe::{
         self,
@@ -165,6 +166,31 @@ pub enum ColumnTypeKind {
     /// Values are stored as BLOBs containing a tag and a payload; the
     /// declared name carries the variant schema.
     Union,
+}
+
+/// The `get_column_type_name` answer for a column storage type.
+fn type_name(ty: crate::schema::Type) -> Option<&'static str> {
+    match ty {
+        crate::schema::Type::Integer => Some("INTEGER"),
+        crate::schema::Type::Real => Some("REAL"),
+        crate::schema::Type::Text => Some("TEXT"),
+        crate::schema::Type::Blob => Some("BLOB"),
+        crate::schema::Type::Numeric => Some("NUMERIC"),
+        crate::schema::Type::Null => None,
+    }
+}
+
+/// Map [`crate::vdbe::affinity::Affinity`] to an uppercase primitive name.
+/// `Blob` collapses to `None` because SQLite's "no determined affinity"
+/// sentinel isn't a usable wire type.
+fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'static str> {
+    match affinity {
+        crate::vdbe::affinity::Affinity::Integer => Some("INTEGER"),
+        crate::vdbe::affinity::Affinity::Real => Some("REAL"),
+        crate::vdbe::affinity::Affinity::Text => Some("TEXT"),
+        crate::vdbe::affinity::Affinity::Numeric => Some("NUMERIC"),
+        crate::vdbe::affinity::Affinity::Blob | crate::vdbe::affinity::Affinity::None => None,
+    }
 }
 
 pub struct Statement {
@@ -1012,7 +1038,7 @@ impl Statement {
 
     pub fn num_columns(&self) -> usize {
         match self.query_mode {
-            QueryMode::Normal => self.program.result_columns.len(),
+            QueryMode::Normal => self.program.resolved_result_columns.len(),
             QueryMode::Explain => EXPLAIN_COLUMNS.len(),
             QueryMode::ExplainQueryPlan {
                 format: EqpFormat::Text,
@@ -1036,68 +1062,12 @@ impl Statement {
         }
         match self.query_mode {
             QueryMode::Normal => {
-                let column = &self.program.result_columns.get(idx).expect("No column");
-
-                // 1. Explicit alias (AS clause) or SELECT * expansion always wins.
-                if let Some(alias) = &column.alias {
-                    return Cow::Borrowed(alias);
-                }
-
-                let full = self.program.connection.get_full_column_names();
-                let short = self.program.connection.get_short_column_names();
-
-                // 2. For column references, apply full/short column name logic.
-                match &column.expr {
-                    turso_parser::ast::Expr::Column {
-                        table,
-                        column: col_idx,
-                        ..
-                    } => {
-                        if full {
-                            // full_column_names=ON: use REAL_TABLE_NAME.COLUMN
-                            if let Some((_, table_ref)) = self
-                                .program
-                                .table_references
-                                .find_table_by_internal_id(*table)
-                            {
-                                let col_name = table_ref
-                                    .get_column_at(*col_idx)
-                                    .and_then(|c| c.name.as_deref())
-                                    .unwrap_or("?");
-                                return Cow::Owned(format!(
-                                    "{}.{}",
-                                    table_ref.get_name(),
-                                    col_name
-                                ));
-                            }
-                        }
-                        if short || full {
-                            // short_column_names=ON: use just COLUMN
-                            if let Some(name) = column.name(&self.program.table_references) {
-                                return Cow::Borrowed(name);
-                            }
-                        }
-                        // Both OFF: use original expression text
-                        if let Some(name) = &column.implicit_column_name {
-                            Cow::Borrowed(name.as_str())
-                        } else {
-                            let tables = [&self.program.table_references];
-                            let ctx = PlanContext(&tables);
-                            Cow::Owned(column.expr.displayer(&ctx).to_string())
-                        }
-                    }
-                    _ => {
-                        // Non-column-ref: use implicit_column_name or displayer
-                        match column.name(&self.program.table_references) {
-                            Some(name) => Cow::Borrowed(name),
-                            None => {
-                                let tables = [&self.program.table_references];
-                                let ctx = PlanContext(&tables);
-                                Cow::Owned(column.expr.displayer(&ctx).to_string())
-                            }
-                        }
-                    }
-                }
+                let column = self
+                    .program
+                    .resolved_result_columns
+                    .get(idx)
+                    .expect("No column");
+                self.resolved_column_name(column)
             }
             QueryMode::Explain => Cow::Borrowed(EXPLAIN_COLUMNS[idx]),
             QueryMode::ExplainQueryPlan {
@@ -1116,15 +1086,13 @@ impl Statement {
         ) {
             return None;
         }
-        let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
-            turso_parser::ast::Expr::Column { table, .. } => self
-                .program
-                .table_references
-                .find_table_by_internal_id(*table)
-                .map(|(_, table_ref)| Cow::Borrowed(table_ref.get_name())),
-            _ => None,
+        if let Some(column) = self.resolved_result_column(idx) {
+            return match &column.value {
+                ResolvedResultValue::Column(source) => Some(Cow::Borrowed(source.table_name())),
+                ResolvedResultValue::Expression | ResolvedResultValue::RowId { .. } => None,
+            };
         }
+        None
     }
 
     /// Returns the declared type of a result column.
@@ -1152,27 +1120,16 @@ impl Statement {
             };
             return Some(column_types.get(idx).expect("No column").to_string());
         }
-        let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
-            turso_parser::ast::Expr::Column {
-                table,
-                column: column_idx,
-                ..
-            } => {
-                let (_, table_ref) = self
-                    .program
-                    .table_references
-                    .find_table_by_internal_id(*table)?;
-                let table_column = table_ref.get_column_at(*column_idx)?;
-                let ty_str = &table_column.ty_str;
-                if ty_str.is_empty() {
-                    None
-                } else {
-                    Some(ty_str.clone())
+        if let Some(column) = self.resolved_result_column(idx) {
+            return match &column.value {
+                ResolvedResultValue::Column(source) if !source.declared_type().is_empty() => {
+                    Some(source.declared_type().to_string())
                 }
-            }
-            _ => None,
+                ResolvedResultValue::RowId { declared_type, .. } => declared_type.clone(),
+                _ => None,
+            };
         }
+        None
     }
 
     /// Returns rich type information for a result column.
@@ -1180,9 +1137,9 @@ impl Statement {
     /// This is Turso's single entry point for "what is the type of this
     /// column?" — covering both **direct table-column references** (where the
     /// schema carries declared name, array depth, custom-type kind, and the
-    /// resolved primitive) and **computed expressions** (which report the
-    /// primitive behind the expression's type). The answer is worked out
-    /// when the statement is compiled.
+    /// resolved primitive) and **computed expressions** (where the SQLite-
+    /// style affinity machinery infers a primitive type from the expression
+    /// shape). One call, one shape, regardless of which path applies.
     ///
     /// ### Return value
     ///
@@ -1193,9 +1150,8 @@ impl Statement {
     ///   before they can rely on it.
     /// - `Ok(None)` when the statement is in EXPLAIN mode, when `idx` is out
     ///   of bounds, when the result column has no schema column behind it
-    ///   and its value may be a blob or anything (including arithmetic on a
-    ///   custom type, whose operator decides the result), or when a join/CTE
-    ///   reference can't be resolved.
+    ///   AND the affinity machinery returns `BLOB` (i.e. "no determined
+    ///   affinity"), or when a join/CTE reference can't be resolved.
     /// - `Ok(Some(info))` otherwise. For a table-column reference, `info`
     ///   carries the declared name verbatim; for an expression, `declared_name`
     ///   is the inferred-affinity primitive (`"INTEGER"`, `"TEXT"`, `"REAL"`,
@@ -1213,9 +1169,10 @@ impl Statement {
         if self.query_mode != QueryMode::Normal {
             return Ok(None);
         }
-        Ok(self.program.result_column_types.get(idx).cloned().flatten())
+        Ok(self
+            .resolved_result_column(idx)
+            .and_then(|column| self.resolved_column_type_info(column)))
     }
-
     /// Returns the type affinity name of a result column (e.g., "INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC").
     ///
     /// Unlike `get_column_decltype` which returns the original declared type string,
@@ -1236,29 +1193,13 @@ impl Statement {
             };
             return Some(column_types.get(idx).expect("No column").to_string());
         }
-        let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
-            turso_parser::ast::Expr::Column {
-                table,
-                column: column_idx,
-                ..
-            } => {
-                let (_, table_ref) = self
-                    .program
-                    .table_references
-                    .find_table_by_internal_id(*table)?;
-                let table_column = table_ref.get_column_at(*column_idx)?;
-                match &table_column.ty() {
-                    crate::schema::Type::Integer => Some("INTEGER".to_string()),
-                    crate::schema::Type::Real => Some("REAL".to_string()),
-                    crate::schema::Type::Text => Some("TEXT".to_string()),
-                    crate::schema::Type::Blob => Some("BLOB".to_string()),
-                    crate::schema::Type::Numeric => Some("NUMERIC".to_string()),
-                    crate::schema::Type::Null => None,
-                }
-            }
-            _ => None,
+        if let Some(column) = self.resolved_result_column(idx) {
+            return match &column.value {
+                ResolvedResultValue::Column(source) => type_name(source.ty).map(str::to_string),
+                ResolvedResultValue::Expression | ResolvedResultValue::RowId { .. } => None,
+            };
         }
+        None
     }
 
     /// Returns the inferred type affinity name for a result column by examining
@@ -1269,13 +1210,87 @@ impl Statement {
         if self.query_mode != QueryMode::Normal {
             return None;
         }
-        let column = &self.program.result_columns.get(idx)?;
-        let affinity = translate::expr::get_expr_affinity(
-            &column.expr,
-            Some(&self.program.table_references),
-            None,
-        );
-        affinity_to_primitive(affinity).map(str::to_string)
+        let column = self.resolved_result_column(idx)?;
+        affinity_to_primitive(column.affinity).map(str::to_string)
+    }
+
+    fn resolved_result_column(&self, idx: usize) -> Option<&ResolvedResultColumn> {
+        if self.program.resolved_result_columns.is_empty() {
+            return None;
+        }
+        Some(
+            self.program
+                .resolved_result_columns
+                .get(idx)
+                .expect("No column"),
+        )
+    }
+
+    /// Column naming for a statement prepared from semantic HIR. An alias
+    /// wins. Otherwise a table column is named `table.column` with
+    /// `full_column_names` on, by its column name with `short_column_names`
+    /// on, and by its resolved name with both off.
+    fn resolved_column_name<'a>(&self, column: &'a ResolvedResultColumn) -> Cow<'a, str> {
+        if column.name_is_alias {
+            return Cow::Borrowed(&column.name);
+        }
+        match &column.value {
+            ResolvedResultValue::Column(source) => {
+                let full = self.program.connection.get_full_column_names();
+                let short = self.program.connection.get_short_column_names();
+                if full {
+                    Cow::Owned(format!("{}.{}", source.table_name(), source.column_name()))
+                } else if short {
+                    Cow::Borrowed(source.column_name())
+                } else {
+                    Cow::Borrowed(&column.name)
+                }
+            }
+            ResolvedResultValue::RowId { name, .. } => Cow::Borrowed(name),
+            ResolvedResultValue::Expression => Cow::Borrowed(&column.name),
+        }
+    }
+
+    /// Type information for a statement prepared from semantic HIR. A table
+    /// column reports its declared type, resolved against the schema's
+    /// custom types; an expression reports its primitive type, when it has
+    /// one.
+    fn resolved_column_type_info(&self, column: &ResolvedResultColumn) -> Option<ColumnTypeInfo> {
+        let ResolvedResultValue::Column(source) = &column.value else {
+            return column.primitive.map(|name| ColumnTypeInfo {
+                declared_name: name.to_string(),
+                array_dimensions: column.array_dimensions,
+                base_type: None,
+                kind: ColumnTypeKind::Builtin,
+            });
+        };
+        let schema = self.program.connection.schema.read();
+        let resolved = schema
+            .resolve_type(source.declared_type(), source.table_is_strict)
+            .ok()
+            .flatten();
+        let (base_type, kind) = match resolved {
+            Some(resolved) => {
+                let leaf = resolved.leaf();
+                let kind = if leaf.is_struct() {
+                    ColumnTypeKind::Struct
+                } else if leaf.is_union() {
+                    ColumnTypeKind::Union
+                } else if leaf.is_domain {
+                    ColumnTypeKind::Domain
+                } else {
+                    ColumnTypeKind::Custom
+                };
+                (Some(resolved.primitive.to_uppercase()), kind)
+            }
+            None => (None, ColumnTypeKind::Builtin),
+        };
+        Some(ColumnTypeInfo {
+            declared_name: source.declared_type().to_string(),
+            array_dimensions: source.array_dimensions,
+            base_type,
+            kind,
+        })
     }
 
     pub fn parameters(&self) -> &parameters::Parameters {
@@ -1673,21 +1688,6 @@ impl Drop for Statement {
             self.program.connection.end_nested();
             self.nested_guard_active = false;
         }
-    }
-}
-
-/// The uppercase primitive name (`"INTEGER"`, `"REAL"`, `"NUMERIC"`, `"TEXT"`) that
-/// [`Statement::get_column_inferred_type`] reports for an expression with this
-/// affinity. `Blob` gives None because it is SQLite's "no affinity", not a usable
-/// wire type.
-fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'static str> {
-    use crate::vdbe::affinity::Affinity;
-    match affinity {
-        Affinity::Integer => Some("INTEGER"),
-        Affinity::Real => Some("REAL"),
-        Affinity::Numeric => Some("NUMERIC"),
-        Affinity::Text => Some("TEXT"),
-        Affinity::Blob | Affinity::None => None,
     }
 }
 

@@ -92,6 +92,11 @@ enum Commands {
         #[arg(long)]
         cross_check_binary: Option<PathBuf>,
 
+        /// Compare EXPLAIN QUERY PLAN output without instruction ids,
+        /// generated name ids and the order of subquery rows, so the plans
+        /// of two planners can be compared.
+        #[arg(long)]
+        normalize_plans: bool,
         /// URL of the PostgreSQL server for --backend postgres, for example
         /// postgres://postgres@127.0.0.1:5432/postgres. Each test gets a new
         /// database on this server, so the user in the URL must be able to
@@ -167,6 +172,7 @@ async fn main() -> ExitCode {
             snapshot_mode,
             snapshot_filter,
             cross_check_binary,
+            normalize_plans,
             postgres_dsn,
         } => {
             run_tests(
@@ -183,6 +189,7 @@ async fn main() -> ExitCode {
                 snapshot_mode,
                 snapshot_filter,
                 cross_check_binary,
+                normalize_plans,
                 postgres_dsn,
             )
             .await
@@ -240,6 +247,7 @@ async fn run_tests(
     snapshot_mode: SnapshotUpdateMode,
     snapshot_filter: Option<String>,
     cross_check_binary: Option<PathBuf>,
+    normalize_plans: bool,
     postgres_dsn: Option<String>,
 ) -> ExitCode {
     match (&postgres_dsn, backend_type.as_str()) {
@@ -357,6 +365,7 @@ async fn run_tests(
     if let Some(binary) = cross_check_binary {
         config = config.with_cross_check_binary(binary);
     }
+    config = config.with_normalize_plans(normalize_plans);
 
     // Create output formatter
     let mut output: Box<dyn OutputFormat> = create_output(format);

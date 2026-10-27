@@ -2529,6 +2529,93 @@ expect error {
     object name reserved for internal use: sqlite_matview
 }
 
+# Computed columns that need a compiled program: function calls, string
+# concatenation and nested arithmetic over the row's values. The view is
+# maintained through inserts and deletes.
+test matview-projection-functions-over-row-values {
+    CREATE TABLE t(a INTEGER, name TEXT);
+    INSERT INTO t VALUES (1, 'ab'), (12, 'cd');
+    CREATE MATERIALIZED VIEW v AS
+    SELECT upper(name) || '!' AS shout,
+           abs(a - 10) AS dist,
+           length(name) * 2 + a AS mixed,
+           coalesce(nullif(a, 12), 0) AS not_twelve
+    FROM t;
+    SELECT * FROM v ORDER BY dist;
+    INSERT INTO t VALUES (7, 'efg');
+    DELETE FROM t WHERE a = 12;
+    SELECT * FROM v ORDER BY dist;
+}
+expect {
+    CD!|2|16|0
+    AB!|9|5|1
+    EFG!|3|13|7
+    AB!|9|5|1
+}
+
+# A projection over aggregate results reads each aggregate by position:
+# its name, such as count(*), is not a column name.
+test matview-projection-functions-over-aggregates {
+    CREATE TABLE t(a INTEGER, name TEXT);
+    INSERT INTO t VALUES (1, 'ab'), (12, 'cd');
+    CREATE MATERIALIZED VIEW w AS SELECT hex(count(*) + 2) AS h, sum(a) * 10 AS s FROM t;
+    SELECT * FROM w;
+    INSERT INTO t VALUES (100, 'z');
+    SELECT * FROM w;
+    CREATE MATERIALIZED VIEW g AS
+    SELECT substr(name, 1, 1) AS initial, count(*) * 100 + max(a) AS score
+    FROM t GROUP BY substr(name, 1, 1);
+    SELECT * FROM g ORDER BY initial;
+}
+expect {
+    34|130
+    35|1130
+    a|101
+    c|112
+    z|200
+}
+
+# A projection or filter may use CASE and negative literals. Both are
+# compiled to bytecode for the view, so they are kept up to date as rows
+# are inserted and deleted.
+test matview-case-and-negative-literal-projections {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t VALUES (1, 5), (2, -3);
+    CREATE MATERIALIZED VIEW signs AS
+    SELECT a, CASE WHEN b > 0 THEN 'pos' ELSE 'neg' END AS sign, -1 AS m, b * -1 AS n
+    FROM t;
+    SELECT * FROM signs ORDER BY a;
+    INSERT INTO t VALUES (3, 0);
+    DELETE FROM t WHERE a = 1;
+    SELECT * FROM signs ORDER BY a;
+}
+expect {
+    1|pos|-1|-5
+    2|neg|-1|3
+    2|neg|-1|3
+    3|neg|-1|0
+}
+
+test matview-case-with-base-and-negative-filter {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t VALUES (1, 5), (2, -3), (3, 0), (4, -7);
+    CREATE MATERIALIZED VIEW w AS
+    SELECT a, CASE b WHEN 0 THEN 'zero' WHEN -7 THEN 'minus seven' END AS word
+    FROM t WHERE b > -5;
+    SELECT * FROM w ORDER BY a;
+    INSERT INTO t VALUES (5, -4), (6, -9);
+    SELECT * FROM w ORDER BY a;
+}
+expect {
+    1|
+    2|
+    3|zero
+    1|
+    2|
+    3|zero
+    5|
+}
+
 # sum() over integer input must return an INTEGER (and REAL as soon as one
 # input is not, flipping back to INTEGER when that row is removed), and
 # sum()/avg() over no non-NULL value must be NULL.
@@ -2794,4 +2881,47 @@ test matview-untyped-column-compares-without-affinity {
 }
 expect {
     Y|1
+}
+
+# A parenthesized join is joined on its own and read under the group's name,
+# both as an inner join input and as the NULL-filled side of a LEFT JOIN. The
+# group's rows are kept up to date as its tables change.
+test matview-parenthesized-join-group {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, y);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, z);
+    INSERT INTO a VALUES (1,1),(2,2),(3,3);
+    INSERT INTO b VALUES (1,10),(2,20),(4,40);
+    INSERT INTO c VALUES (1,100),(3,300),(4,400);
+    CREATE MATERIALIZED VIEW inner_group AS
+      SELECT a.id, b.y, c.z FROM a JOIN (b JOIN c ON b.id = c.id) ON a.id = b.id;
+    CREATE MATERIALIZED VIEW left_group AS
+      SELECT a.id, b.y, c.z FROM a LEFT JOIN (b JOIN c ON b.id = c.id) ON a.id = b.id;
+    CREATE MATERIALIZED VIEW using_group AS
+      SELECT id, y, z FROM (b JOIN c USING (id));
+    SELECT 'inner', * FROM inner_group ORDER BY 2;
+    SELECT 'left', * FROM left_group ORDER BY 2;
+    SELECT 'using', * FROM using_group ORDER BY 2;
+    INSERT INTO c VALUES (2,200);
+    DELETE FROM b WHERE id = 1;
+    INSERT INTO a VALUES (4,4);
+    SELECT 'inner2', * FROM inner_group ORDER BY 2;
+    SELECT 'left2', * FROM left_group ORDER BY 2;
+    SELECT 'using2', * FROM using_group ORDER BY 2;
+}
+expect {
+    inner|1|10|100
+    left|1|10|100
+    left|2||
+    left|3||
+    using|1|10|100
+    using|4|40|400
+    inner2|2|20|200
+    inner2|4|40|400
+    left2|1||
+    left2|2|20|200
+    left2|3||
+    left2|4|40|400
+    using2|2|20|200
+    using2|4|40|400
 }

@@ -1739,3 +1739,53 @@ expect {
     2|5
     3|5
 }
+
+# An inner join written after an outer join applies its ON terms to the
+# rows the outer join NULL-extends, like WHERE terms. `IS` is true for the
+# NULL side, so dropping the term there returns every t4 row instead.
+setup later_inner_on_terms {
+    CREATE TABLE lt1(id INTEGER PRIMARY KEY, c INT, d INT);
+    CREATE TABLE lt2(id INTEGER PRIMARY KEY, c INT, d INT);
+    CREATE TABLE lt3(id INTEGER PRIMARY KEY, c INT, d INT);
+    CREATE TABLE lt4(id INTEGER PRIMARY KEY, c INT, d INT);
+    WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM s WHERE i < 29)
+        INSERT INTO lt1 SELECT i + 1, i % 3, i % 5 FROM s;
+    WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM s WHERE i < 29)
+        INSERT INTO lt2 SELECT i + 101, i % 3, i % 5 FROM s;
+    WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM s WHERE i < 29)
+        INSERT INTO lt3 SELECT i + 201, 900 + i, i % 5 FROM s;
+    WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM s WHERE i < 29)
+        INSERT INTO lt4 SELECT i + 301, i % 3, CASE WHEN i % 4 = 0 THEN NULL ELSE i % 5 END FROM s;
+}
+
+@setup later_inner_on_terms
+test left-hash-join-then-inner-join-is-term-filters-null-extended-rows {
+    SELECT count(*) FROM lt1
+    JOIN lt2 ON lt1.d = lt2.d
+    LEFT JOIN lt3 ON lt2.c = lt3.c
+    JOIN lt4 ON lt3.d IS lt4.d;
+}
+expect {
+    1440
+}
+
+@setup later_inner_on_terms
+test left-hash-join-then-inner-join-is-not-term-filters-null-extended-rows {
+    SELECT count(*) FROM lt1
+    JOIN lt2 ON lt1.d = lt2.d
+    LEFT JOIN lt3 ON lt2.c = lt3.c
+    JOIN lt4 ON lt3.d IS NOT lt4.d;
+}
+expect {
+    3960
+}
+
+@setup later_inner_on_terms
+test right-hash-join-then-inner-join-is-term-filters-null-extended-rows {
+    SELECT count(*) FROM lt3
+    RIGHT JOIN lt2 ON lt2.c = lt3.c
+    JOIN lt4 ON lt3.d IS lt4.d;
+}
+expect {
+    240
+}

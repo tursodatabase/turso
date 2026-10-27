@@ -76,6 +76,22 @@ expect {
     1|2
 }
 
+setup empty-inner-table-null-key {
+    CREATE TABLE a(x);
+    CREATE TABLE b(y, z);
+    INSERT INTO a VALUES (NULL), (1);
+}
+
+# An automatic index built over an empty table must stay empty. Building it
+# once read the unpositioned cursor and stored an all-NULL entry, which a
+# NULL-matching `IS` seek then found.
+@setup empty-inner-table-null-key
+test is-null-seek-on-empty-automatic-index-join {
+    SELECT a.x, b.z FROM a, b WHERE b.y IS a.x;
+}
+expect {
+}
+
 # An automatic index built over an empty table must stay empty. The build loop
 # used to jump into its own body when Rewind found no rows, so it inserted one
 # record of NULL columns. A seek on the NULL key from `k.w IS NULL` then found
@@ -91,6 +107,22 @@ test autoindex-over-empty-table-adds-no-rows {
     SELECT 'row' FROM p JOIN k ON p.id IS NOT k.t WHERE k.w IS NULL;
 }
 expect {
+}
+
+@setup empty-inner-table-null-key
+test is-null-seek-on-empty-automatic-index-exists {
+    SELECT x FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.y IS a.x);
+}
+expect {
+}
+
+@setup empty-inner-table-null-key
+test is-null-seek-on-empty-automatic-index-count {
+    SELECT x, (SELECT count(*) FROM b WHERE b.y IS a.x) FROM a ORDER BY x;
+}
+expect {
+    |0
+    1|0
 }
 
 @setup empty-autoindex-source

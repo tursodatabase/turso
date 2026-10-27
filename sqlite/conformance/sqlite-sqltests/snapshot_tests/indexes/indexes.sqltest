@@ -866,3 +866,41 @@ setup partial-idx-predicate-disjunction {
 snapshot-eqp use-partial-idx-predicate-where-predicate-is-disjunction-term-from-index-where-clause-for-covering-index-scan {
    select a from t where b < 5;
 }
+
+setup or_branch_outer_condition {
+    CREATE TABLE node (id TEXT PRIMARY KEY NOT NULL, type TEXT);
+    CREATE TABLE edge (id TEXT PRIMARY KEY NOT NULL, fromId TEXT NOT NULL, toId TEXT NOT NULL, label TEXT NOT NULL);
+    CREATE INDEX idx_edge_label ON edge (label);
+    INSERT INTO node VALUES ('a', 'course'), ('b', 'course'), ('c', 'topic');
+    INSERT INTO edge VALUES ('e1', 'a', 'b', 'requires'), ('e2', 'c', 'a', 'requires'), ('e3', 'b', 'c', 'mentions');
+}
+
+# Each OR branch seeks the node by one edge column. The branch's other
+# conditions read only the edge, so they are checked before the seek, and an
+# edge they reject seeks nothing.
+@setup or_branch_outer_condition
+snapshot or-branch-outer-condition-checked-before-seek {
+    SELECT DISTINCT n.id
+    FROM node n
+    JOIN edge e ON (
+        (e.fromId = 'a' AND e.toId = n.id AND e.label = 'requires')
+        OR (e.toId = 'a' AND e.fromId = n.id AND e.label = 'requires')
+    )
+    WHERE n.type = 'course'
+    ORDER BY n.id;
+}
+
+setup orders_for_new_index {
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        placed_at TEXT
+    );
+}
+
+# An index of stored columns reads them from the table, with no SELECT.
+@setup orders_for_new_index
+snapshot create-index-reads-stored-columns-from-the-table {
+    CREATE INDEX orders_user_status_placed ON orders(user_id, status, placed_at, id);
+}

@@ -1,0 +1,1375 @@
+//! Lowering shared by HIR DELETE and UPDATE.
+
+use crate::alloc::TursoIteratorExt;
+use turso_parser::ast;
+
+use crate::{
+    error::SQLITE_CONSTRAINT_CHECK,
+    schema::{BTreeTable, Column, Index, Table, EXPR_INDEX_SENTINEL},
+    sync::Arc,
+    translate::{
+        optimizer::HirBtreeOperation,
+        semantic::hir::{self, HirDocument, SourceId},
+        semantic_to_plan::HirAccessPlan,
+    },
+    vdbe::{
+        builder::{CursorType, ProgramBuilder, SourceBinding},
+        insn::{to_u32, ConstraintInfo, InsertFlags, Insn, RegisterOrLiteral},
+        BranchOffset, CursorID,
+    },
+    Connection, LimboError, Result,
+};
+
+use super::fkey_action::CompiledAction;
+use super::query::{
+    close_hir_btree_loop, emit_array_results, predicate_ready_loop, prepare_hir_loop_unexplained,
+    start_hir_loop,
+};
+use super::trigger::CompiledTrigger;
+use super::{HirPlan, HirSession};
+use crate::translate::semantic_to_plan::HirPlannedLoop;
+
+/// The subprograms a DML statement fires. They are compiled before anything
+/// is emitted, so one that fails to compile fails the whole statement before
+/// any bytecode is emitted.
+#[derive(Default)]
+pub(super) struct Subprograms<'a> {
+    /// The statement's row triggers.
+    pub(super) triggers: Vec<CompiledTrigger>,
+    /// The foreign-key actions of the statement's own change: ON DELETE for
+    /// a DELETE, ON UPDATE for an UPDATE.
+    pub(super) actions: Vec<CompiledAction<'a>>,
+    /// The ON DELETE actions of the rows REPLACE deletes.
+    pub(super) replace_actions: Vec<CompiledAction<'a>>,
+    /// INSERT: the UPDATE triggers an UPSERT's DO UPDATE fires.
+    pub(super) upsert_triggers: Vec<CompiledTrigger>,
+    /// INSERT: the ON UPDATE actions of each UPSERT clause's DO UPDATE, in
+    /// clause order.
+    pub(super) upsert_actions: Vec<Vec<CompiledAction<'a>>>,
+    /// DELETE: whether a DELETE of every row may clear the table's B-trees
+    /// instead of deleting row by row. False when MVCC holds the rows or a
+    /// materialized view depends on the table, since both need to see each
+    /// deleted row.
+    pub(super) may_clear_btrees: bool,
+}
+
+impl<'a> Subprograms<'a> {
+    /// What a DELETE fires.
+    pub(super) fn for_delete(
+        session: &HirSession<'_>,
+        parent: &ProgramBuilder,
+        plan: &HirPlan,
+        delete: &'a hir::Delete,
+    ) -> Result<Self> {
+        Ok(Self {
+            triggers: super::trigger::delete_triggers(session, parent, plan, delete)?,
+            actions: super::fkey_action::delete_actions(session, parent, delete)?,
+            may_clear_btrees: may_clear_btrees(session, &plan.document, delete.target),
+            ..Self::default()
+        })
+    }
+
+    /// What an UPDATE fires.
+    pub(super) fn for_update(
+        session: &HirSession<'_>,
+        parent: &ProgramBuilder,
+        plan: &HirPlan,
+        update: &'a hir::Update,
+    ) -> Result<Self> {
+        Ok(Self {
+            triggers: super::trigger::update_triggers(session, parent, plan, update)?,
+            actions: super::fkey_action::update_actions(session, parent, plan, update)?,
+            replace_actions: super::update::replace_actions(session, parent, plan, update)?,
+            ..Self::default()
+        })
+    }
+
+    /// What an INSERT fires.
+    pub(super) fn for_insert(
+        session: &HirSession<'_>,
+        parent: &ProgramBuilder,
+        plan: &HirPlan,
+        insert: &'a hir::Insert,
+    ) -> Result<Self> {
+        Ok(Self {
+            triggers: super::trigger::insert_triggers(session, parent, plan, insert)?,
+            actions: Vec::new(),
+            replace_actions: super::insert::replace_actions(session, parent, plan, insert)?,
+            upsert_triggers: super::trigger::upsert_update_triggers(session, parent, plan, insert)?,
+            upsert_actions: super::fkey_action::upsert_actions(session, parent, plan, insert)?,
+            may_clear_btrees: false,
+        })
+    }
+}
+
+/// Whether a DELETE of every row of `target` may clear its B-trees instead
+/// of deleting row by row. See [`Subprograms::may_clear_btrees`].
+fn may_clear_btrees(session: &HirSession<'_>, document: &HirDocument, target: SourceId) -> bool {
+    if super::uses_mvcc(session.connection, document, target) {
+        return false;
+    }
+    let Some(source) = document.source(target) else {
+        return false;
+    };
+    let (hir::SourceKind::Table(table), Some(database)) = (&source.kind, source.database) else {
+        return false;
+    };
+    let table_name = table.value().get_name();
+    session.context.with_schema(database.index(), |schema| {
+        schema
+            .get_dependent_materialized_views(database.namespace().id, table_name)
+            .is_empty()
+    })
+}
+
+/// The B-tree table a DELETE or UPDATE writes, with what HIR resolved for it.
+pub(super) struct DmlTarget<'a> {
+    pub(super) document: &'a HirDocument,
+    pub(super) source: &'a hir::Source,
+    pub(super) table: &'a Arc<BTreeTable>,
+    pub(super) database: usize,
+    /// The capture table, when the statement captures its changes.
+    pub(super) capture: Option<super::cdc::Capture<'a>>,
+}
+
+impl<'a> DmlTarget<'a> {
+    /// Resolve `target`, which must be a B-tree table source that lists all
+    /// of its indexes, and register the write on its database.
+    pub(super) fn new(
+        program: &mut ProgramBuilder,
+        document: &'a HirDocument,
+        target: SourceId,
+        statement: &str,
+    ) -> Result<Self> {
+        let source = document.source(target).ok_or_else(|| {
+            LimboError::InternalError(format!("HIR {statement} target {target} is missing"))
+        })?;
+        let hir::SourceKind::Table(table) = &source.kind else {
+            return Err(LimboError::InternalError(format!(
+                "HIR {statement} target {target} is not a table"
+            )));
+        };
+        let Table::BTree(table) = table.value() else {
+            return Err(LimboError::InternalError(format!(
+                "HIR {statement} target {target} is not a B-tree table"
+            )));
+        };
+        if !matches!(source.index_coverage, hir::IndexCoverage::Complete { .. }) {
+            return Err(LimboError::InternalError(format!(
+                "HIR {statement} target {target} does not list all of its indexes"
+            )));
+        }
+        let database = source.database.ok_or_else(|| {
+            LimboError::InternalError(format!("HIR {statement} target {target} has no database"))
+        })?;
+        let schema_version = document
+            .database(database)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "HIR {statement} target {target} references missing database {database:?}"
+                ))
+            })?
+            .schema_version;
+        program.begin_write_on_database(database.index(), schema_version)?;
+        Ok(Self {
+            document,
+            source,
+            table,
+            database: database.index(),
+            capture: None,
+        })
+    }
+
+    /// Open the capture table when the statement captures its changes.
+    pub(super) fn with_capture(
+        mut self,
+        program: &mut ProgramBuilder,
+        capture: Option<&'a hir::CaptureChanges>,
+    ) -> Result<Self> {
+        self.capture = super::cdc::Capture::open(program, capture, self.table)?;
+        Ok(self)
+    }
+
+    /// The capture table, open for the target's row changes, when they are
+    /// captured.
+    pub(super) fn capture_rows(&self) -> Option<super::cdc::Rows<'_, 'a>> {
+        self.capture.as_ref().and_then(super::cdc::Capture::rows)
+    }
+
+    /// At the end of the statement: the COMMIT row of change data capture.
+    pub(super) fn emit_capture_commit(&self, program: &mut ProgramBuilder) -> Result<()> {
+        match &self.capture {
+            Some(capture) => capture.emit_commit(program),
+            None => Ok(()),
+        }
+    }
+
+    /// The catalog table the target writes.
+    pub(super) fn resolved_table(&self) -> Result<&'a hir::ResolvedTable> {
+        match &self.source.kind {
+            hir::SourceKind::Table(table) => Ok(table),
+            _ => Err(LimboError::InternalError(format!(
+                "HIR DML target {} is not a table",
+                self.source.id
+            ))),
+        }
+    }
+
+    pub(super) fn open_table_for_write(&self, program: &mut ProgramBuilder) -> CursorID {
+        let cursor = program.alloc_cursor_id(CursorType::BTreeTable(self.table.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: cursor,
+            root_page: RegisterOrLiteral::Literal(self.table.root_page),
+            db: self.database,
+        });
+        cursor
+    }
+
+    /// Open every index for writing, except `skip`.
+    pub(super) fn open_indexes_for_write(
+        &self,
+        program: &mut ProgramBuilder,
+        skip: Option<&Arc<crate::schema::Index>>,
+    ) -> Result<Vec<(&hir::IndexExpressions, CursorID)>> {
+        let mut indexes = Vec::with_capacity(self.source.index_expressions.len());
+        for expressions in &self.source.index_expressions {
+            let index = expressions.index.value();
+            if expressions.columns.len() != index.columns.len() {
+                return Err(LimboError::InternalError(format!(
+                    "HIR index {} has {} key expressions for {} columns",
+                    index.name,
+                    expressions.columns.len(),
+                    index.columns.len()
+                )));
+            }
+            if skip.is_some_and(|skip| skip.name == index.name) {
+                continue;
+            }
+            // An index method without a B-tree of its own (such as FTS) gets
+            // its own kind of cursor.
+            let cursor = program.alloc_cursor_index(None, &expressions.index.handle())?;
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id: cursor,
+                root_page: RegisterOrLiteral::Literal(index.root_page),
+                db: self.database,
+            });
+            indexes.push((expressions, cursor));
+        }
+        Ok(indexes)
+    }
+
+    pub(super) fn index_expressions(
+        &self,
+        index: &crate::schema::Index,
+    ) -> Result<&hir::IndexExpressions> {
+        self.source
+            .index_expressions
+            .iter()
+            .find(|expressions| expressions.index.value().name == index.name)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "HIR DELETE target {} does not list index {}",
+                    self.source.id, index.name
+                ))
+            })
+    }
+}
+
+/// Emit the WHERE terms that become checkable at `loop_index`: `None` is
+/// before the loop, for terms that read no column of the target.
+pub(super) fn emit_access_predicates(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    access: &HirAccessPlan,
+    loop_index: Option<usize>,
+    fail: BranchOffset,
+) -> Result<()> {
+    for (index, predicate) in access
+        .predicates
+        .iter()
+        .enumerate()
+        .filter(|(_, predicate)| !predicate.consumed)
+    {
+        if predicate.from_outer_join.is_some() {
+            return Err(LimboError::InternalError(
+                "HIR DML predicate belongs to an outer join".into(),
+            ));
+        }
+        let ready_at = predicate_ready_loop(
+            program,
+            document,
+            &access.loops,
+            &access.deferred_predicates,
+            &access.predicates,
+            index,
+        )?;
+        if ready_at != loop_index {
+            continue;
+        }
+        super::query::emit_hir_predicate(program, document, predicate, fail)?;
+    }
+    Ok(())
+}
+
+/// Read one index's key for the current row, followed by the rowid. Values
+/// come from the table row: plain columns are read as stored, and generated
+/// columns and expressions are computed.
+pub(super) fn emit_index_key(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    source: &hir::Source,
+    table: &BTreeTable,
+    table_cursor: CursorID,
+    expressions: &hir::IndexExpressions,
+) -> Result<(usize, usize)> {
+    emit_index_key_values(program, document, source, table, table_cursor, expressions)
+}
+
+fn emit_index_key_values(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    source: &hir::Source,
+    table: &BTreeTable,
+    table_cursor: CursorID,
+    expressions: &hir::IndexExpressions,
+) -> Result<(usize, usize)> {
+    let index = expressions.index.value();
+    let count = index.columns.len() + 1;
+    let start = program.alloc_registers(count);
+    for (offset, (column, expression)) in index.columns.iter().zip(&expressions.columns).enumerate()
+    {
+        let register = start + offset;
+        let table_column = (column.pos_in_table != EXPR_INDEX_SENTINEL)
+            .then(|| table.columns().get(column.pos_in_table))
+            .flatten();
+        match (expression, table_column) {
+            // An index on a virtual generated column stores the column's
+            // value: the generated expression computed with the standard
+            // operators, even over custom-typed columns, so the key is read
+            // as the column, never as the index's copy of its expression.
+            (_, Some(table_column)) if table_column.is_virtual_generated() => {
+                super::expr::translate_detached_expr_no_constant_opt(
+                    program,
+                    document,
+                    &hir::Expr::Column(hir::ColumnRef {
+                        source: source.id,
+                        column: column.pos_in_table,
+                    }),
+                    register,
+                )?;
+                program.emit_column_affinity(register, table_column.affinity());
+            }
+            (Some(expression), _) => {
+                super::expr::translate_expr_no_constant_opt(
+                    program,
+                    document,
+                    *expression,
+                    register,
+                )?;
+            }
+            (None, Some(table_column)) => emit_stored_column(
+                program,
+                document,
+                source,
+                table_cursor,
+                table_column,
+                column.pos_in_table,
+                register,
+            )?,
+            (None, None) => {
+                return Err(LimboError::InternalError(format!(
+                    "HIR index {} has an expression column without an expression",
+                    index.name
+                )));
+            }
+        }
+    }
+    program.emit_insn(Insn::RowId {
+        cursor_id: table_cursor,
+        dest: start + count - 1,
+    });
+    Ok((start, count))
+}
+
+/// REPLACE: delete the row whose rowid is in `conflict`: the foreign-key
+/// checks of deleting it, its entry in each of `indexes`, then the row. No
+/// DELETE trigger fires. The target is left bound to `table_cursor`, which
+/// no longer sits on any row.
+///
+/// `replacement` is the row an UPDATE writes in its place: an immediate NO
+/// ACTION parent key it keeps cannot leave a child without its parent.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_replace_delete(
+    program: &mut ProgramBuilder,
+    target: &DmlTarget<'_>,
+    table_cursor: CursorID,
+    indexes: &[(&hir::IndexExpressions, CursorID)],
+    foreign_keys: &hir::DmlForeignKeys,
+    conflict: usize,
+    replacement: Option<SourceId>,
+    actions: &[CompiledAction<'_>],
+) -> Result<()> {
+    let DmlTarget {
+        document,
+        source,
+        table,
+        database,
+        ..
+    } = *target;
+    let missing = program.allocate_label();
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: table_cursor,
+        src_reg: conflict,
+        target_pc: missing,
+    });
+    // Keys and foreign keys of the deleted row are read from the table.
+    program.bind_source(
+        source.id,
+        SourceBinding::BTree {
+            scan_cursor: table_cursor,
+            table_cursor: None,
+        },
+    );
+    super::fkey::emit_delete_checks(
+        program,
+        document,
+        foreign_keys,
+        source.id,
+        conflict,
+        database,
+        replacement,
+    )?;
+    // The ON DELETE actions of the deleted row run once it is gone.
+    let action_keys = actions
+        .iter()
+        .map(|action| {
+            super::fkey::emit_parent_key(program, document, action.foreign_key, source.id)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (expressions, cursor) in indexes {
+        let skip = match &expressions.predicate {
+            Some(predicate) => {
+                let skip = program.allocate_label();
+                let register = program.alloc_register();
+                super::expr::translate_expr_no_constant_opt(
+                    program, document, *predicate, register,
+                )?;
+                program.emit_insn(Insn::IfNot {
+                    reg: register,
+                    jump_if_null: true,
+                    target_pc: skip,
+                });
+                Some(skip)
+            }
+            None => None,
+        };
+        let (start, count) =
+            emit_index_key(program, document, source, table, table_cursor, expressions)?;
+        program.emit_insn(Insn::IdxDelete {
+            start_reg: start,
+            num_regs: count,
+            cursor_id: *cursor,
+            raise_error_if_no_matching_entry: true,
+        });
+        if let Some(skip) = skip {
+            program.preassign_label_to_next_insn(skip);
+        }
+    }
+    if let Some(capture) = target.capture_rows() {
+        let before =
+            capture.before_record(program, document, source, table, table_cursor, conflict)?;
+        capture.emit_row(
+            program,
+            crate::translate::emitter::OperationMode::DELETE,
+            conflict,
+            before,
+            None,
+            None,
+        )?;
+    }
+    program.emit_insn(Insn::Delete {
+        cursor_id: table_cursor,
+        table_name: table.name.clone(),
+        is_part_of_update: true,
+    });
+    for (action, key) in actions.iter().zip(action_keys) {
+        action.emit_fire(program, key, None)?;
+    }
+    program.preassign_label_to_next_insn(missing);
+    Ok(())
+}
+
+pub(super) fn operation_index(operation: &HirBtreeOperation) -> Option<&Arc<crate::schema::Index>> {
+    match operation {
+        HirBtreeOperation::Scan { index, .. }
+        | HirBtreeOperation::Seek { index, .. }
+        | HirBtreeOperation::InSeek { index, .. } => index.as_ref(),
+        HirBtreeOperation::RowidEq { .. } => None,
+    }
+}
+
+/// Run the statement's loop with read cursors and collect the rowid of each
+/// row it finds into a row set, then close those cursors. The loop reads the
+/// table, an index, or one seek per branch of an OR term. Returns the row
+/// set's register.
+pub(super) fn collect_target_rowids(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    target: &DmlTarget<'_>,
+    access: &HirAccessPlan,
+    planned_loop: &HirPlannedLoop,
+) -> Result<usize> {
+    let document = target.document;
+    let rowset = program.alloc_register();
+    program.emit_insn(Insn::Null {
+        dest: rowset,
+        dest_end: None,
+    });
+    let collected = program.allocate_label();
+    let prepared = prepare_hir_loop_unexplained(program, plan, planned_loop)?;
+    emit_access_predicates(program, document, access, None, collected)?;
+    let hir_loop = start_hir_loop(program, document, &prepared, None)?;
+    emit_access_predicates(program, document, access, Some(0), hir_loop.next)?;
+    let rowid = program.alloc_register();
+    super::expr::translate_detached_expr(
+        program,
+        document,
+        &hir::Expr::RowId(target.source.id),
+        rowid,
+    )?;
+    program.emit_insn(Insn::RowSetAdd {
+        rowset_reg: rowset,
+        value_reg: rowid,
+    });
+    close_hir_btree_loop(program, &hir_loop, &[]);
+    program.preassign_label_to_next_insn(collected);
+    for cursor in prepared.read_cursors()? {
+        program.emit_insn(Insn::Close { cursor_id: cursor });
+    }
+    Ok(rowset)
+}
+
+/// Whether a DML access path finds at most one row: a rowid lookup, or a
+/// seek where every column of a unique index (or the rowid) is fixed by `=`.
+pub(super) fn touches_at_most_one_row(
+    document: &HirDocument,
+    operation: &HirBtreeOperation,
+) -> bool {
+    use crate::translate::plan::SeekKeyComponent;
+    match operation {
+        HirBtreeOperation::RowidEq { .. } => true,
+        HirBtreeOperation::Seek {
+            index: None,
+            seek_def,
+        } => {
+            seek_def.prefix.len() == 1
+                && seek_def.prefix[0].eq.is_some()
+                && matches!(seek_def.start.last_component, SeekKeyComponent::None)
+        }
+        HirBtreeOperation::Seek {
+            index: Some(index),
+            seek_def,
+        } => {
+            index.unique
+                && seek_def
+                    .prefix
+                    .iter()
+                    .filter(|component| component.eq.is_some())
+                    .count()
+                    == index.columns.len()
+                // `x IS NULL` can match many NULL keys of a UNIQUE index.
+                && seek_def.prefix.iter().all(|component| {
+                    component.eq.as_ref().is_none_or(|(operator, expression, _)| {
+                        *operator != ast::Operator::Is
+                            || is_non_null_literal(&document.exprs[*expression])
+                    })
+                })
+        }
+        HirBtreeOperation::Scan { .. } | HirBtreeOperation::InSeek { .. } => false,
+    }
+}
+
+fn is_non_null_literal(expression: &hir::Expr) -> bool {
+    matches!(
+        expression,
+        hir::Expr::Literal(
+            ast::Literal::Numeric(_)
+                | ast::Literal::String(_)
+                | ast::Literal::Blob(_)
+                | ast::Literal::True
+                | ast::Literal::False
+        )
+    )
+}
+
+/// The virtual table a DML statement writes, or `None` for a B-tree target.
+pub(super) fn virtual_target(
+    document: &HirDocument,
+    target: SourceId,
+) -> Result<Option<Arc<crate::vtab::VirtualTable>>> {
+    let source = document
+        .source(target)
+        .ok_or_else(|| LimboError::InternalError(format!("HIR DML target {target} is missing")))?;
+    Ok(match &source.kind {
+        hir::SourceKind::Table(table) => table.value().virtual_table(),
+        _ => None,
+    })
+}
+
+/// `sqlite_dbpage` may be written only by a cli_only build
+/// opened with unsafe testing on; every other read-only virtual table
+/// rejects writes.
+pub(super) fn dbpage_write_allowed(
+    table: &crate::vtab::VirtualTable,
+    connection: &Connection,
+) -> bool {
+    #[cfg(feature = "cli_only")]
+    {
+        table.name == crate::dbpage::DBPAGE_TABLE_NAME && connection.db.opts.unsafe_testing
+    }
+    #[cfg(not(feature = "cli_only"))]
+    {
+        let _ = (table, connection);
+        false
+    }
+}
+
+/// Open a virtual table for writing: the rows a statement writes are handed
+/// to the table with `VUpdate` through this cursor, inside the table's own
+/// transaction.
+pub(super) fn open_virtual_for_write(
+    program: &mut ProgramBuilder,
+    table: &Arc<crate::vtab::VirtualTable>,
+) -> CursorID {
+    let cursor = program.alloc_cursor_id(CursorType::VirtualTable(table.clone()));
+    program.emit_insn(Insn::VOpen { cursor_id: cursor });
+    if !program.dbpage_writable() {
+        program.emit_insn(Insn::VBegin { cursor_id: cursor });
+    }
+    cursor
+}
+
+/// RETURNING rows of a DML statement. They wait in an ephemeral table
+/// until every row is written, then are returned.
+#[derive(Clone, Copy)]
+pub(super) struct ReturningBuffer<'a> {
+    cursor: CursorID,
+    pub(super) outputs: &'a [hir::Output],
+}
+
+impl<'a> ReturningBuffer<'a> {
+    /// Like [`Self::open`], for a target that is not a B-tree table.
+    pub(super) fn open_scratch(
+        program: &mut ProgramBuilder,
+        returning: Option<&'a hir::Returning>,
+    ) -> Option<Self> {
+        let returning = returning?;
+        let table = Arc::new(BTreeTable::new(
+            0,
+            "returning_scratch".to_string(),
+            crate::alloc::vec![],
+            (0..returning.outputs.len())
+                .map(|column| {
+                    crate::schema::Column::new(
+                        Some(format!("value_{column}")),
+                        "BLOB".to_string(),
+                        None,
+                        None,
+                        crate::schema::Type::Blob,
+                        None,
+                        crate::schema::ColDef::default(),
+                    )
+                })
+                .collect_vec(),
+            crate::schema::BTreeCharacteristics::HAS_ROWID,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        ));
+        Self::open(program, &table, Some(returning))
+    }
+
+    pub(super) fn open(
+        program: &mut ProgramBuilder,
+        table: &Arc<BTreeTable>,
+        returning: Option<&'a hir::Returning>,
+    ) -> Option<Self> {
+        returning.map(|returning| {
+            let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+            program.emit_insn(Insn::OpenEphemeral {
+                cursor_id: cursor,
+                is_table: true,
+            });
+            Self {
+                cursor,
+                outputs: &returning.outputs,
+            }
+        })
+    }
+
+    /// Evaluate the RETURNING values of the current row into new registers.
+    pub(super) fn emit_values(
+        &self,
+        program: &mut ProgramBuilder,
+        document: &HirDocument,
+        target: &hir::ResolvedTable,
+    ) -> Result<usize> {
+        // Like SQLite, a subquery in RETURNING whose FROM clause names the
+        // target table runs again for each row, so it sees the rows written
+        // so far; any other runs once.
+        for output in self.outputs {
+            document.exprs.at(output.expr).for_each(&mut |expression| {
+                if let hir::Expr::Subquery(subquery) = expression.node() {
+                    let query = subquery_query(subquery);
+                    if document.query_reads_table_directly(query, target) {
+                        program.rerun_subquery(query);
+                    }
+                }
+            });
+        }
+        let start = program.alloc_registers(self.outputs.len());
+        for (position, output) in self.outputs.iter().enumerate() {
+            super::expr::translate_expr_no_constant_opt(
+                program,
+                document,
+                output.expr,
+                start + position,
+            )?;
+        }
+        emit_array_results(program, document, self.outputs, start, &[])?;
+        Ok(start)
+    }
+
+    /// Add values from [`Self::emit_values`] to the buffer.
+    pub(super) fn emit_buffer(&self, program: &mut ProgramBuilder, start: usize) {
+        let record = program.alloc_register();
+        let key = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(start),
+            count: to_u32(self.outputs.len()),
+            dest_reg: to_u32(record),
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::NewRowid {
+            cursor: self.cursor,
+            rowid_reg: key,
+            prev_largest_reg: 0,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: self.cursor,
+            key_reg: key,
+            record_reg: record,
+            flag: InsertFlags::new().is_ephemeral_table_insert(),
+            table_name: String::new(),
+        });
+    }
+
+    /// After the last row is written: return the buffered rows.
+    pub(super) fn emit_rows(&self, program: &mut ProgramBuilder) {
+        // Foreign keys are checked before any row is returned.
+        program.emit_insn(Insn::FkCheck { deferred: false });
+        let done = program.allocate_label();
+        let next = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: self.cursor,
+            pc_if_empty: done,
+        });
+        program.preassign_label_to_next_insn(next);
+        let count = self.outputs.len();
+        let start = program.alloc_registers(count);
+        for i in 0..count {
+            program.emit_insn(Insn::Column {
+                cursor_id: self.cursor,
+                column: i,
+                dest: start + i,
+                default: None,
+            });
+        }
+        program.emit_insn(Insn::ResultRow {
+            start_reg: start,
+            count,
+        });
+        program.emit_insn(Insn::Next {
+            cursor_id: self.cursor,
+            is_index: program.cursor_is_index(self.cursor),
+            pc_if_next: next,
+            fullscan: false,
+        });
+        program.preassign_label_to_next_insn(done);
+    }
+}
+
+/// Run `emit` reading custom-typed columns as stored, not decoded. CHECK
+/// constraints compare stored values.
+pub(super) fn with_stored_values<T>(
+    program: &mut ProgramBuilder,
+    emit: impl FnOnce(&mut ProgramBuilder) -> Result<T>,
+) -> Result<T> {
+    let previous = program.flags.suppress_custom_type_decode();
+    program.flags.set_suppress_custom_type_decode(true);
+    let result = emit(program);
+    program.flags.set_suppress_custom_type_decode(previous);
+    result
+}
+
+/// Check each CHECK constraint against the new row, which the constraint's
+/// source must be bound to. Like SQLite, a NULL result passes. A failure
+/// skips the row under IGNORE and stops the statement otherwise; REPLACE
+/// does not apply to CHECK.
+pub(super) fn emit_check_constraints<'c>(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    constraints: impl IntoIterator<Item = &'c hir::CheckConstraint>,
+    row: ConstraintRow<'_>,
+    or_conflict: ast::ResolveType,
+    skip_row: BranchOffset,
+) -> Result<()> {
+    with_stored_values(program, |program| {
+        emit_check_constraint_list(program, document, constraints, row, or_conflict, skip_row)
+    })
+}
+
+fn emit_check_constraint_list<'c>(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    constraints: impl IntoIterator<Item = &'c hir::CheckConstraint>,
+    row: ConstraintRow<'_>,
+    or_conflict: ast::ResolveType,
+    skip_row: BranchOffset,
+) -> Result<()> {
+    for constraint in constraints {
+        let result = program.alloc_register();
+        super::expr::translate_expr_no_constant_opt(
+            program,
+            document,
+            constraint.expression,
+            result,
+        )?;
+        let passed = program.allocate_label();
+        program.emit_insn(Insn::IsNull {
+            reg: result,
+            target_pc: passed,
+        });
+        program.emit_insn(Insn::If {
+            reg: result,
+            target_pc: passed,
+            jump_if_null: false,
+        });
+        if or_conflict == ast::ResolveType::Ignore {
+            program.emit_insn(Insn::Goto {
+                target_pc: skip_row,
+            });
+        } else {
+            let (registers, names) = row.named_columns(true);
+            program.emit_insn(Insn::Halt {
+                constraint_info: Some(Box::new(ConstraintInfo::check(
+                    &row.table.name,
+                    constraint.name.clone(),
+                    registers,
+                    names,
+                ))),
+                err_code: SQLITE_CONSTRAINT_CHECK,
+                description: constraint.description.clone(),
+                on_error: program.constraint_halt_on_error(or_conflict),
+                description_reg: None,
+            });
+        }
+        program.preassign_label_to_next_insn(passed);
+    }
+    Ok(())
+}
+
+/// The query an expression subquery runs.
+pub(super) fn subquery_query(subquery: &hir::SubqueryExpr) -> hir::QueryId {
+    match subquery {
+        hir::SubqueryExpr::Scalar { query, .. }
+        | hir::SubqueryExpr::Row { query }
+        | hir::SubqueryExpr::Exists(query)
+        | hir::SubqueryExpr::In { query, .. } => *query,
+    }
+}
+
+/// `table` with its columns changed by `edit`, for a type check of a row
+/// held in registers `start + column` for every column, virtual ones
+/// included: the check reads each column at its logical position, not at
+/// its position in the stored record. The position map is set last because
+/// editing the columns rebuilds it from the stored record's layout.
+fn type_check_table(
+    table: &BTreeTable,
+    mut edit: impl FnMut(usize, &mut crate::schema::Column),
+) -> Arc<BTreeTable> {
+    let mut checked = table.clone();
+    for (position, column) in checked.columns_mut().iter_mut().enumerate() {
+        edit(position, column);
+    }
+    checked.logical_to_physical_map = (0..table.columns().len()).collect_vec();
+    Arc::new(checked)
+}
+
+/// STRICT: check each stored value of the row in `start..` against its
+/// column's type, converting it where SQLite allows and failing otherwise.
+/// A STRICT table gets this instead of column affinity. A virtual column
+/// is not computed yet, so it is checked as ANY; see
+/// [`emit_strict_generated_check`].
+pub(super) fn emit_strict_type_check(
+    program: &mut ProgramBuilder,
+    table: &Arc<BTreeTable>,
+    start: usize,
+) {
+    let checked = type_check_table(table, |_, column| {
+        if column.is_virtual_generated() {
+            column.ty_str = "ANY".to_string();
+        }
+    });
+    program.emit_insn(Insn::TypeCheck {
+        start_reg: start,
+        count: table.columns().len(),
+        check_generated: true,
+        table_reference: checked,
+    });
+}
+
+/// STRICT: check each computed virtual generated column of the row in
+/// `start..` against its declared type, like SQLite 3.51. The stored
+/// columns were checked before the virtual ones were computed.
+pub(super) fn emit_strict_generated_check(
+    program: &mut ProgramBuilder,
+    table: &Arc<BTreeTable>,
+    start: usize,
+) {
+    if !table.is_strict || !table.has_virtual_columns() {
+        return;
+    }
+    let checked = type_check_table(table, |_, column| {
+        if !column.is_virtual_generated() {
+            column.ty_str = "ANY".to_string();
+        } else if column.is_array() {
+            column.ty_str = "BLOB".to_string();
+            column.override_affinity(crate::vdbe::affinity::Affinity::Blob);
+        }
+    });
+    program.emit_insn(Insn::TypeCheck {
+        start_reg: start,
+        count: table.columns().len(),
+        check_generated: true,
+        table_reference: checked,
+    });
+}
+
+/// Read a stored column of a DML row from the table. SQLite stores a REAL
+/// value that is a whole number as an integer, so a REAL column gives its
+/// value back as REAL, as a query reads it. A row written before the
+/// column was added holds ENCODE(DEFAULT) for a column of an encoding
+/// custom type, as a query reads it.
+pub(super) fn emit_stored_column(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    source: &hir::Source,
+    table_cursor: usize,
+    column: &crate::schema::Column,
+    position: usize,
+    register: usize,
+) -> Result<()> {
+    let encoded_default = match (
+        source.default_expressions.get(position),
+        source.column_type_programs.get(position),
+    ) {
+        (Some(hir::ColumnReadExpression::Planned(default)), Some(Some(programs)))
+            if !programs.encode.is_empty() =>
+        {
+            Some((default, programs))
+        }
+        _ => None,
+    };
+    match encoded_default {
+        Some((default, programs)) => {
+            program.flags.set_suppress_column_default(true);
+            program.emit_column_or_rowid(table_cursor, position, register);
+            let has_field = program.allocate_label();
+            program.emit_column_has_field(table_cursor, position, has_field);
+            super::expr::translate_expr_no_constant_opt(program, document, *default, register)?;
+            super::expr::translate_schema_calls_in_place(
+                program,
+                document,
+                &programs.encode,
+                register,
+            )?;
+            program.preassign_label_to_next_insn(has_field);
+        }
+        None => program.emit_column_or_rowid(table_cursor, position, register),
+    }
+    if column.ty() == crate::schema::Type::Real {
+        program.emit_insn(Insn::RealAffinity { register });
+    }
+    Ok(())
+}
+
+/// The custom type of `column` of `source`: its definitions from the
+/// declared type through its ancestors.
+fn custom_chain(source: &hir::Source, column: usize) -> Option<&[hir::ResolvedType]> {
+    let hir::SourceColumnRef::Owned(column) = source.columns.column(column) else {
+        return None;
+    };
+    column
+        .type_fact
+        .declared
+        .as_ref()
+        .map(|declared| declared.custom_chain.as_slice())
+        .filter(|chain| !chain.is_empty())
+}
+
+/// Whether writing the column runs an ENCODE expression on its value.
+pub(super) fn column_encodes(source: &hir::Source, column: usize) -> bool {
+    custom_chain(source, column).is_some_and(|chain| {
+        chain
+            .iter()
+            .any(|definition| definition.value().encode().is_some())
+    })
+}
+
+/// Whether a column of the target has a custom type.
+pub(super) fn has_custom_types(source: &hir::Source) -> bool {
+    source.column_type_programs.iter().any(Option::is_some)
+        || source
+            .columns
+            .iter()
+            .any(|column| column.type_fact().is_array())
+}
+
+/// STRICT with custom types: check each value in `start..` against the type
+/// its column accepts as input, encode it, then check the encoded value
+/// against the column's base type. Only the columns at `only` are checked as
+/// input and encoded; `None` means all of them.
+pub(super) fn emit_custom_type_writes(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    source: &hir::Source,
+    table: &Arc<BTreeTable>,
+    start: usize,
+    only: Option<&[usize]>,
+) -> Result<()> {
+    let written = |column: usize| only.is_none_or(|only| only.contains(&column));
+    let check_table = |input: bool| {
+        type_check_table(table, |position, column| {
+            if column.is_virtual_generated() || (input && !written(position)) {
+                column.ty_str = "ANY".to_string();
+                if input {
+                    column.override_affinity(crate::vdbe::affinity::Affinity::Blob);
+                }
+                return;
+            }
+            // An array is given as text or a blob, and is stored as a
+            // record blob.
+            if column.is_array() {
+                column.ty_str = if input { "ANY" } else { "BLOB" }.to_string();
+                column.override_affinity(crate::vdbe::affinity::Affinity::Blob);
+                return;
+            }
+            let Some(chain) = custom_chain(source, position) else {
+                return;
+            };
+            if input {
+                column.ty_str = chain[0].value().value_input_type().to_uppercase();
+            } else {
+                let base = chain.last().expect("a custom chain is not empty");
+                column.ty_str = base.value().base().to_uppercase();
+                column.override_affinity(crate::vdbe::affinity::Affinity::None);
+            }
+        })
+    };
+    program.emit_insn(Insn::TypeCheck {
+        start_reg: start,
+        count: table.columns().len(),
+        check_generated: true,
+        table_reference: check_table(true),
+    });
+    // An array is parsed and its elements checked against the element
+    // type, then stored as a record blob. Only the outer array of a
+    // multi-dimensional one checks nothing but that its elements are arrays.
+    for (position, column) in table.columns().iter().enumerate() {
+        if !column.is_array() || column.is_virtual_generated() || !written(position) {
+            continue;
+        }
+        let register = start + position;
+        let skip = program.allocate_label();
+        program.emit_insn(Insn::IsNull {
+            reg: register,
+            target_pc: skip,
+        });
+        let any = column.ty_str.eq_ignore_ascii_case("ANY") || column.array_dimensions() > 1;
+        // The elements of an array of a custom type are encoded one by
+        // one: the text or blob is first parsed as an array of anything,
+        // each element encoded, then the array checked against the element
+        // type like any other.
+        if let Some(programs) = source
+            .column_type_programs
+            .get(position)
+            .and_then(Option::as_ref)
+        {
+            program.emit_insn(Insn::ArrayEncode {
+                data: Box::new(crate::vdbe::insn::ArrayEncodeData {
+                    reg: register,
+                    element_affinity: crate::vdbe::affinity::Affinity::Blob,
+                    element_type: "ANY".into(),
+                    table_name: table.name.as_str().into(),
+                    col_name: column.name.as_deref().unwrap_or("").into(),
+                }),
+            });
+            super::expr::translate_schema_calls_on_elements(
+                program,
+                document,
+                &programs.encode,
+                register,
+            )?;
+        }
+        program.emit_insn(Insn::ArrayEncode {
+            data: Box::new(crate::vdbe::insn::ArrayEncodeData {
+                reg: register,
+                element_affinity: if any {
+                    crate::vdbe::affinity::Affinity::Blob
+                } else {
+                    crate::vdbe::affinity::Affinity::affinity(&column.ty_str)
+                },
+                element_type: if any {
+                    "ANY".into()
+                } else {
+                    column.ty_str.to_uppercase().into()
+                },
+                table_name: table.name.as_str().into(),
+                col_name: column.name.as_deref().unwrap_or("").into(),
+            }),
+        });
+        program.preassign_label_to_next_insn(skip);
+    }
+    for (position, programs) in source.column_type_programs.iter().enumerate() {
+        let Some(programs) = programs.as_ref().filter(|_| written(position)) else {
+            continue;
+        };
+        // An array's elements were encoded above.
+        if table.columns()[position].is_array() {
+            continue;
+        }
+        let register = start + position;
+        let skip = (!programs.encode_nulls).then(|| {
+            let skip = program.allocate_label();
+            program.emit_insn(Insn::IsNull {
+                reg: register,
+                target_pc: skip,
+            });
+            skip
+        });
+        super::expr::translate_schema_calls_in_place(
+            program,
+            document,
+            &programs.encode,
+            register,
+        )?;
+        if let Some(skip) = skip {
+            program.preassign_label_to_next_insn(skip);
+        }
+    }
+    program.emit_insn(Insn::TypeCheck {
+        start_reg: start,
+        count: table.columns().len(),
+        check_generated: true,
+        table_reference: check_table(false),
+    });
+    Ok(())
+}
+
+/// Compute each virtual generated column of the row in registers
+/// `start + column` into its register, in dependency order. `source` must be
+/// bound to those registers. Reads of the row through `source` compute
+/// virtual columns anyway; this fills the registers that are copied
+/// directly, such as index keys, NOT NULL checks and triggers.
+pub(super) fn emit_virtual_columns(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    source: SourceId,
+    table: &BTreeTable,
+    start: usize,
+) -> Result<()> {
+    if !table.has_virtual_columns() {
+        return Ok(());
+    }
+    for (column, _) in table
+        .columns_topo_sort()?
+        .iter()
+        .filter(|(_, column)| column.is_virtual_generated())
+    {
+        super::expr::translate_detached_expr_no_constant_opt(
+            program,
+            document,
+            &hir::Expr::Column(hir::ColumnRef { source, column }),
+            start + column,
+        )?;
+    }
+    Ok(())
+}
+
+/// The record of the row in registers `start + column`. A virtual
+/// generated column is not stored, so with one the stored columns are first
+/// copied together, in their stored order.
+pub(super) fn emit_row_record(
+    program: &mut ProgramBuilder,
+    table: &BTreeTable,
+    start: usize,
+) -> usize {
+    // A WITHOUT ROWID table stores its primary key columns first.
+    let stored = if table.has_virtual_columns() || !table.has_rowid {
+        let mut stored = table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| !column.is_virtual_generated())
+            .map(|(position, column)| {
+                (table.logical_to_physical_column(position), position, column)
+            })
+            .collect::<Vec<_>>();
+        stored.sort_by_key(|(physical, _, _)| *physical);
+        let block = program.alloc_registers(stored.len());
+        for (offset, (_, position, _)) in stored.iter().enumerate() {
+            program.emit_insn(Insn::Copy {
+                src_reg: start + position,
+                dst_reg: block + offset,
+                extra_amount: 0,
+            });
+        }
+        let affinities = stored
+            .iter()
+            .map(|(_, _, column)| column.affinity().aff_mask())
+            .collect::<String>();
+        (block, stored.len(), affinities)
+    } else {
+        let affinities = table
+            .columns()
+            .iter()
+            .map(|column| column.affinity().aff_mask())
+            .collect::<String>();
+        (start, table.columns().len(), affinities)
+    };
+    let (block, count, affinities) = stored;
+    let record = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(block),
+        count: to_u32(count),
+        dest_reg: to_u32(record),
+        index_name: None,
+        affinity_str: Some(affinities),
+    });
+    record
+}
+
+/// Whether an index key column is a virtual generated column of `table`.
+/// Its value is in the row's registers, computed with the column's
+/// affinity, so a new key copies it instead of computing it again.
+pub(super) fn is_virtual_key_column(
+    table: &BTreeTable,
+    column: &crate::schema::IndexColumn,
+) -> bool {
+    column.pos_in_table != EXPR_INDEX_SENTINEL
+        && table
+            .columns()
+            .get(column.pos_in_table)
+            .is_some_and(|column| column.is_virtual_generated())
+}
+
+/// Whether an expression contains a subquery.
+pub(super) fn has_subquery(document: &HirDocument, expression: hir::ExprId) -> bool {
+    let mut found = false;
+    document.exprs.at(expression).for_each(&mut |expression| {
+        found |= matches!(expression.node(), hir::Expr::Subquery(_));
+    });
+    found
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ConstraintRow<'a> {
+    pub(super) table: &'a BTreeTable,
+    pub(super) start: usize,
+    pub(super) rowid: usize,
+}
+
+impl ConstraintRow<'_> {
+    pub(super) fn named_columns(&self, with_virtual: bool) -> (Vec<usize>, Vec<String>) {
+        let mut registers = Vec::with_capacity(self.table.columns().len());
+        let mut names = Vec::with_capacity(self.table.columns().len());
+        for (position, column) in self
+            .table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| with_virtual || !column.is_virtual_generated())
+        {
+            if let Some(name) = &column.name {
+                let register = if column.is_rowid_alias() {
+                    self.rowid
+                } else {
+                    self.start + position
+                };
+                registers.push(register);
+                names.push(name.clone());
+            }
+        }
+        (registers, names)
+    }
+
+    pub(super) fn not_null(&self, column: &Column) -> Option<Box<ConstraintInfo>> {
+        let (registers, names) = self.named_columns(false);
+        Some(Box::new(ConstraintInfo {
+            kind: crate::ConstraintKind::NotNull,
+            constraint_name: None,
+            index_name: None,
+            table_name: self.table.name.clone(),
+            column_names: vec![column.name.clone().unwrap_or_default()],
+            violation_regs: registers,
+            row_col_names: names,
+            parent_table: None,
+        }))
+    }
+}
+
+pub(super) fn not_null_violation(
+    table: &BTreeTable,
+    column: &Column,
+) -> Option<Box<ConstraintInfo>> {
+    Some(Box::new(ConstraintInfo::not_null(
+        &table.name,
+        column.name.clone().unwrap_or_default(),
+    )))
+}
+
+pub(super) fn rowid_violation(table: &BTreeTable, rowid: usize) -> Option<Box<ConstraintInfo>> {
+    let column = table
+        .get_rowid_alias_column()
+        .and_then(|(_, column)| column.name.clone())
+        .unwrap_or_else(|| "rowid".to_string());
+    primary_key_violation(table, vec![column], vec![rowid])
+}
+
+pub(super) fn primary_key_violation(
+    table: &BTreeTable,
+    columns: Vec<String>,
+    registers: Vec<usize>,
+) -> Option<Box<ConstraintInfo>> {
+    Some(Box::new(ConstraintInfo::primary_key(
+        &table.name,
+        table.primary_key_constraint_name.clone(),
+        columns,
+        registers,
+    )))
+}
+
+pub(super) fn unique_violation(
+    table: &BTreeTable,
+    index: &Index,
+    start: usize,
+) -> Option<Box<ConstraintInfo>> {
+    Some(Box::new(ConstraintInfo::unique_index(
+        &table.name,
+        index,
+        (start..start + index.columns.len()).collect(),
+    )))
+}

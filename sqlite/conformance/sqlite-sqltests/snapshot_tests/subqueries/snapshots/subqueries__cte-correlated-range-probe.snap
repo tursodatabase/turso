@@ -28,10 +28,10 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN sample_points
-|--USE HASH TABLE FOR DISTINCT
-|--USE SORTER FOR ORDER BY
 `--SCAN previous_points
+   |--SCAN sample_points
+   |--USE HASH TABLE FOR DISTINCT
+   |--USE SORTER FOR ORDER BY
    |--SCAN ordered_points AS p1
    `--CORRELATED SCALAR SUBQUERY 1
-      `--SEARCH p2 USING INDEX ephemeral_subquery_t5 (point_key<?)
+      `--SEARCH p2 USING INDEX ephemeral_subquery_s2 (point_key<?)

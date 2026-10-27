@@ -27,18 +27,18 @@ addr  opcode       p1   p2   p3  p4                                             
   12  ParseSchema   0    0    0  tbl_name = 'sqlite_stat1' AND type != 'trigger'   0  tbl_name = 'sqlite_stat1' AND type != 'trigger'
   13  SetCookie     0    1   10                                                    0
   14  OpenWrite     1    2    0                                                    0  root=2; iDb=0
-  15  Rewind        1   22    0                                                    0  Rewind  sqlite_stat1
+  15  Rewind        1   22    0                                                    0  Rewind table sqlite_stat1
   16      Column    1    0   10                                                    0  r[10]=sqlite_stat1.tbl
   17      Ne       10   11   21                                                    0  if r[10]!=r[11] goto 21
   18      RowId     1   12    0                                                    0  r[12]=sqlite_stat1.rowid
   19      Delete    1    0    0  sqlite_stat1                                      0
   20    Next        1   16    0                                                    0
   21  Next          1   16    0                                                    0
-  22  OpenRead      2    2    0  k(6,B,B,B,B,B,B)                                  0  =products, root=2, iDb=0
-  23  OpenRead      3    5    0  k(2,B)                                            0  =idx_products_price, root=5, iDb=0
+  22  OpenRead      2    2    0  k(6,B,B,B,B,B,B)                                  0  table=products, root=2, iDb=0
+  23  OpenRead      3    5    0  k(2,B)                                            0  index=idx_products_price, root=5, iDb=0
   24  Integer       1   15    0                                                    0  r[15]=1
   25  Function      0   15   14  stat_init                                         0  r[14]=func(r[15])
-  26  Rewind        3   43    0                                                    0  Rewind  idx_products_price
+  26  Rewind        3   43    0                                                    0  Rewind index idx_products_price
   27  Integer       0   15    0                                                    0  r[15]=0
   28  Goto          0   34    0                                                    0
   29    Integer     0   15    0                                                    0  r[15]=0
@@ -55,10 +55,10 @@ addr  opcode       p1   p2   p3  p4                                             
   40  MakeRecord   19    3   22                                                    0  r[22]=mkrec(r[19..21])
   41  NewRowid      1   23    0                                                    0  r[23]=rowid
   42  Insert        1   22   23  sqlite_stat1                                      0  intkey=r[23] data=r[22]
-  43  OpenRead      4    4    0  k(2,B)                                            0  =idx_products_category, root=4, iDb=0
+  43  OpenRead      4    4    0  k(2,B)                                            0  index=idx_products_category, root=4, iDb=0
   44  Integer       1   25    0                                                    0  r[25]=1
   45  Function      0   25   24  stat_init                                         0  r[24]=func(r[25])
-  46  Rewind        4   63    0                                                    0  Rewind  idx_products_category
+  46  Rewind        4   63    0                                                    0  Rewind index idx_products_category
   47  Integer       0   25    0                                                    0  r[25]=0
   48  Goto          0   54    0                                                    0
   49    Integer     0   25    0                                                    0  r[25]=0
@@ -75,10 +75,10 @@ addr  opcode       p1   p2   p3  p4                                             
   60  MakeRecord   29    3   32                                                    0  r[32]=mkrec(r[29..31])
   61  NewRowid      1   33    0                                                    0  r[33]=rowid
   62  Insert        1   32   33  sqlite_stat1                                      0  intkey=r[33] data=r[32]
-  63  OpenRead      5    3    0  k(2,B)                                            0  =idx_products_sku, root=3, iDb=0
+  63  OpenRead      5    3    0  k(2,B)                                            0  index=idx_products_sku, root=3, iDb=0
   64  Integer       1   35    0                                                    0  r[35]=1
   65  Function      0   35   34  stat_init                                         0  r[34]=func(r[35])
-  66  Rewind        5   83    0                                                    0  Rewind  idx_products_sku
+  66  Rewind        5   83    0                                                    0  Rewind index idx_products_sku
   67  Integer       0   35    0                                                    0  r[35]=0
   68  Goto          0   74    0                                                    0
   69    Integer     0   35    0                                                    0  r[35]=0
@@ -95,18 +95,18 @@ addr  opcode       p1   p2   p3  p4                                             
   80  MakeRecord   39    3   42                                                    0  r[42]=mkrec(r[39..41])
   81  NewRowid      1   43    0                                                    0  r[43]=rowid
   82  Insert        1   42   43  sqlite_stat1                                      0  intkey=r[43] data=r[42]
-  83  Rewind        1   90    0                                                    0  Rewind  sqlite_stat1
+  83  Rewind        1   90    0                                                    0  Rewind table sqlite_stat1
   84      Column    1    0   44                                                    0  r[44]=sqlite_stat1.tbl
   85      Ne       44   45   89                                                    0  if r[44]!=r[45] goto 89
   86      RowId     1   46    0                                                    0  r[46]=sqlite_stat1.rowid
   87      Delete    1    0    0  sqlite_stat1                                      0
   88    Next        1   84    0                                                    0
   89  Next          1   84    0                                                    0
-  90  OpenRead      6    9    0  k(5,B,B,B,B,B)                                    0  =inventory, root=9, iDb=0
-  91  OpenRead      7   10    0  k(4,B,B,B)                                        0  =idx_inventory_location, root=10, iDb=0
+  90  OpenRead      6    9    0  k(5,B,B,B,B,B)                                    0  table=inventory, root=9, iDb=0
+  91  OpenRead      7   10    0  k(4,B,B,B)                                        0  index=idx_inventory_location, root=10, iDb=0
   92  Integer       3   49    0                                                    0  r[49]=3
   93  Function      0   49   48  stat_init                                         0  r[48]=func(r[49])
-  94  Rewind        7  119    0                                                    0  Rewind  idx_inventory_location
+  94  Rewind        7  119    0                                                    0  Rewind index idx_inventory_location
   95  Integer       0   49    0                                                    0  r[49]=0
   96  Goto          0  108    0                                                    0
   97    Integer     0   49    0                                                    0  r[49]=0
@@ -131,18 +131,18 @@ addr  opcode       p1   p2   p3  p4                                             
  116  MakeRecord   55    3   58                                                    0  r[58]=mkrec(r[55..57])
  117  NewRowid      1   59    0                                                    0  r[59]=rowid
  118  Insert        1   58   59  sqlite_stat1                                      0  intkey=r[59] data=r[58]
- 119  Rewind        1  126    0                                                    0  Rewind  sqlite_stat1
+ 119  Rewind        1  126    0                                                    0  Rewind table sqlite_stat1
  120      Column    1    0   60                                                    0  r[60]=sqlite_stat1.tbl
  121      Ne       60   61  125                                                    0  if r[60]!=r[61] goto 125
  122      RowId     1   62    0                                                    0  r[62]=sqlite_stat1.rowid
  123      Delete    1    0    0  sqlite_stat1                                      0
  124    Next        1  120    0                                                    0
  125  Next          1  120    0                                                    0
- 126  OpenRead      8    6    0  k(5,B,B,B,B,B)                                    0  =orders, root=6, iDb=0
- 127  OpenRead      9    8    0  k(2,B)                                            0  =idx_orders_status, root=8, iDb=0
+ 126  OpenRead      8    6    0  k(5,B,B,B,B,B)                                    0  table=orders, root=6, iDb=0
+ 127  OpenRead      9    8    0  k(2,B)                                            0  index=idx_orders_status, root=8, iDb=0
  128  Integer       1   65    0                                                    0  r[65]=1
  129  Function      0   65   64  stat_init                                         0  r[64]=func(r[65])
- 130  Rewind        9  147    0                                                    0  Rewind  idx_orders_status
+ 130  Rewind        9  147    0                                                    0  Rewind index idx_orders_status
  131  Integer       0   65    0                                                    0  r[65]=0
  132  Goto          0  138    0                                                    0
  133    Integer     0   65    0                                                    0  r[65]=0
@@ -159,10 +159,10 @@ addr  opcode       p1   p2   p3  p4                                             
  144  MakeRecord   69    3   72                                                    0  r[72]=mkrec(r[69..71])
  145  NewRowid      1   73    0                                                    0  r[73]=rowid
  146  Insert        1   72   73  sqlite_stat1                                      0  intkey=r[73] data=r[72]
- 147  OpenRead     10    7    0  k(3,B,B)                                          0  =idx_orders_customer_date, root=7, iDb=0
+ 147  OpenRead     10    7    0  k(3,B,B)                                          0  index=idx_orders_customer_date, root=7, iDb=0
  148  Integer       2   75    0                                                    0  r[75]=2
  149  Function      0   75   74  stat_init                                         0  r[74]=func(r[75])
- 150  Rewind       10  171    0                                                    0  Rewind  idx_orders_customer_date
+ 150  Rewind       10  171    0                                                    0  Rewind index idx_orders_customer_date
  151  Integer       0   75    0                                                    0  r[75]=0
  152  Goto          0  161    0                                                    0
  153    Integer     0   75    0                                                    0  r[75]=0

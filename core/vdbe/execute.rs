@@ -2852,6 +2852,12 @@ pub fn op_array_encode(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    // A write names its column; a CAST to an array type names the type.
+    let target = if table_name.is_empty() {
+        format!("{element_type}[]")
+    } else {
+        format!("{element_type} column {table_name}.{col_name}")
+    };
 
     // Fast path: blob input with ANY type — validate it is a well-formed record
     // before accepting. This avoids the redundant extract→reserialize when MakeArray
@@ -2867,10 +2873,8 @@ pub fn op_array_encode(
                     .unwrap_or(false);
             if !valid {
                 bail_constraint_error!(
-                    "cannot store non-array value in {} column {}.{} ({})",
-                    element_type,
-                    table_name,
-                    col_name,
+                    "cannot store non-array value in {} ({})",
+                    target,
                     SQLITE_CONSTRAINT
                 );
             }
@@ -2887,10 +2891,8 @@ pub fn op_array_encode(
     };
     let Some(raw_elements) = raw_elements else {
         bail_constraint_error!(
-            "cannot store non-array value in {} column {}.{} ({})",
-            element_type,
-            table_name,
-            col_name,
+            "cannot store non-array value in {} ({})",
+            target,
             SQLITE_CONSTRAINT
         );
     };
@@ -2898,7 +2900,7 @@ pub fn op_array_encode(
     const MAX_ARRAY_ELEMENTS: usize = 100_000;
     if raw_elements.len() > MAX_ARRAY_ELEMENTS {
         bail_constraint_error!(
-            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for column {table_name}.{col_name} ({SQLITE_CONSTRAINT})"
+            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for {target} ({SQLITE_CONSTRAINT})"
         );
     }
 
@@ -19001,13 +19003,16 @@ pub fn op_hash_probe(
         };
 
         // Main probe loop: buffer probe rows targeting spilled build partitions.
+        // A buffered row jumps like a miss with NULL in `dest_reg`, so a LEFT
+        // JOIN can tell it from a row without matches, which keeps the value
+        // its caller put there.
         if let Some(rowid_reg) = probe_rowid_reg {
             if probe_buffered {
                 state.pc = deferred_target_pc.as_offset_int();
                 state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
             }
-            if !hash_table.is_partition_loaded(partition_idx) {
+            if hash_table.partition_waits_on_disk(partition_idx) {
                 // Partition is on disk: buffer this probe row for grace processing
                 let probe_rowid = match state.registers[rowid_reg].get_value() {
                     Value::Numeric(Numeric::Integer(i)) => *i,

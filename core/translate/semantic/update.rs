@@ -1,0 +1,579 @@
+//! Basic UPDATE conversion into closed semantic HIR.
+
+use turso_parser::ast;
+
+use super::{
+    analyze::Analyzer,
+    dml::trigger_matches_update,
+    expr::ExprPolicies,
+    hir::{self, HirRoot, SourceOwner},
+    query::FromContext,
+    scope::Scope,
+};
+use crate::{function::ScalarFunc, schema::Table, util::normalize_ident, LimboError, Result};
+
+#[derive(Clone, Copy)]
+pub(super) struct UpdateExprContext<'scope> {
+    pub(super) outer_scope: Option<&'scope Scope>,
+    pub(super) policies: ExprPolicies,
+}
+
+pub(super) struct UpdateBodySyntax<'ast> {
+    pub(super) conflict: Option<ast::ResolveType>,
+    pub(super) assignments: &'ast [ast::Set],
+    pub(super) from: Option<&'ast ast::FromClause>,
+    pub(super) predicate: Option<&'ast ast::Expr>,
+    pub(super) returning: &'ast [ast::ResultColumn],
+}
+
+impl<'ast> Analyzer<'_, '_, 'ast> {
+    pub(super) fn analyze_update(&mut self, syntax: &'ast ast::Update) -> Result<HirRoot> {
+        self.with_cte_scope(syntax.with.as_ref(), |analyzer| {
+            let target = analyzer.analyze_base_table_source(
+                &syntax.tbl_name,
+                None,
+                syntax.indexed.as_ref(),
+                SourceOwner::Root,
+            )?;
+            analyzer.analyze_update_target(
+                target,
+                UpdateBodySyntax {
+                    conflict: syntax.or_conflict,
+                    assignments: &syntax.sets,
+                    from: syntax.from.as_ref(),
+                    predicate: syntax.where_clause.as_deref(),
+                    returning: &syntax.returning,
+                },
+                UpdateExprContext {
+                    outer_scope: None,
+                    policies: ExprPolicies::statement(analyzer.context().dqs_dml()),
+                },
+            )
+        })
+    }
+
+    pub(super) fn analyze_update_target(
+        &mut self,
+        target: hir::SourceId,
+        syntax: UpdateBodySyntax<'ast>,
+        expressions: UpdateExprContext<'_>,
+    ) -> Result<HirRoot> {
+        let table = match &self
+            .source(target)
+            .ok_or_else(|| LimboError::InternalError(format!("missing UPDATE target {target}")))?
+            .kind
+        {
+            hir::SourceKind::Table(table) => table.clone(),
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "UPDATE target {target} is not a catalog table"
+                )));
+            }
+        };
+        let virtual_target = table.value().virtual_table().is_some();
+        if table.value().btree().is_some_and(|btree| !btree.has_rowid) {
+            return Err(LimboError::ParseError(
+                "UPDATE of WITHOUT ROWID tables is not supported".to_string(),
+            ));
+        }
+        let new_source = self.create_update_new_source(target, &table)?;
+        if !virtual_target {
+            self.analyze_btree_write_metadata(target, &table)?;
+            self.analyze_btree_write_metadata(new_source, &table)?;
+        }
+
+        let (from, from_scope) = match syntax.from {
+            Some(syntax) => {
+                let (from, scope) = self.analyze_from_clause(
+                    syntax,
+                    FromContext::Dml {
+                        outer_scope: expressions.outer_scope,
+                        policies: expressions.policies,
+                    },
+                )?;
+                self.check_update_from_ambiguity(&from)?;
+                (Some(from), Some(scope))
+            }
+            None => (None, None),
+        };
+        let mut scope = self.update_read_scope(target)?;
+        if let Some(from_scope) = from_scope {
+            scope.append_local(from_scope.without_outer());
+        }
+        scope.set_outer(expressions.outer_scope);
+        let assignments = self.analyze_update_assignments(
+            syntax.assignments,
+            new_source,
+            table.value(),
+            &scope,
+            expressions.policies,
+        )?;
+        let target_kind = if virtual_target {
+            hir::UpdateTargetKind::Virtual
+        } else {
+            hir::UpdateTargetKind::BTree {
+                defaults: self.analyze_replace_defaults(target, table.value())?,
+                triggers: self.analyze_update_triggers(&table, &assignments)?,
+                foreign_keys: self.analyze_dml_foreign_keys(
+                    &table,
+                    new_source,
+                    Some(&updated_column_mask(table.value(), &assignments)?),
+                )?,
+                autoincrement: self.analyze_autoincrement(&table)?,
+                capture_changes: self.analyze_capture_changes(&table)?,
+            }
+        };
+        let returning = self.analyze_dml_returning_with_policies(
+            syntax.returning,
+            new_source,
+            expressions.policies,
+        )?;
+        let predicate = syntax
+            .predicate
+            .map(|syntax| {
+                self.analyze_root_expr(syntax, &scope, expressions.policies.where_clause())
+                    .map(|resolved| resolved.expr)
+            })
+            .transpose()?;
+
+        Ok(HirRoot::Update(hir::Update {
+            target,
+            new_source,
+            target_kind,
+            from,
+            assignments,
+            predicate,
+            order_by: Vec::new(),
+            limit: None,
+            conflict: syntax.conflict,
+            returning,
+        }))
+    }
+
+    fn analyze_update_triggers(
+        &mut self,
+        table: &hir::ResolvedTable,
+        assignments: &[hir::Assignment],
+    ) -> Result<Vec<hir::ResolvedTrigger>> {
+        let updated_names = assignments
+            .iter()
+            .flat_map(|assignment| assignment.names.iter().cloned())
+            .collect::<Vec<_>>();
+        self.table_triggers(table, |trigger| {
+            trigger_matches_update(trigger, &updated_names)
+        })
+    }
+
+    /// Like SQLite, UPDATE ... FROM rejects up front a FROM clause that
+    /// names a table twice, or where a column that NATURAL or
+    /// USING merges is also exposed, unmerged, by two other tables, even if
+    /// no expression reads it.
+    fn check_update_from_ambiguity(&self, from: &hir::From) -> Result<()> {
+        let entries = std::iter::once((from.first, None))
+            .chain(from.joins.iter().map(|join| {
+                let merged = match &join.constraint {
+                    hir::JoinConstraint::Using(columns) | hir::JoinConstraint::Natural(columns) => {
+                        Some(columns.as_slice())
+                    }
+                    hir::JoinConstraint::None | hir::JoinConstraint::On(_) => None,
+                };
+                (join.right, merged)
+            }))
+            .map(|(source, merged)| {
+                self.source(source)
+                    .map(|source| (source, merged))
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!("missing UPDATE FROM source {source}"))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let identifier =
+            |source: &hir::Source| normalize_ident(source.alias.as_deref().unwrap_or(&source.name));
+        for (position, (source, _)) in entries.iter().enumerate() {
+            let name = identifier(source);
+            if entries[..position]
+                .iter()
+                .any(|(earlier, _)| identifier(earlier) == name)
+            {
+                let database = source
+                    .database
+                    .and_then(|database| self.context().database_name(database))
+                    .unwrap_or("main");
+                crate::bail_parse_error!("ambiguous column name: {database}.{name}._ROWID_");
+            }
+        }
+        let merges = |merged: Option<&[hir::UsingColumn]>, column: &str| {
+            merged.is_some_and(|merged| {
+                merged
+                    .iter()
+                    .any(|merged| merged.name.eq_ignore_ascii_case(column))
+            })
+        };
+        for (position, (_, merged)) in entries.iter().enumerate() {
+            for column in merged.iter().flat_map(|merged| merged.iter()) {
+                let exposing = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, (source, other_merged))| {
+                        *other != position
+                            && source.columns.iter().any(|candidate| {
+                                candidate.name().eq_ignore_ascii_case(&column.name)
+                            })
+                            && !merges(*other_merged, &column.name)
+                    })
+                    .count();
+                if exposing > 1 {
+                    crate::bail_parse_error!("ambiguous column name: {}", column.name);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn create_update_new_source(
+        &mut self,
+        target: hir::SourceId,
+        table: &hir::ResolvedTable,
+    ) -> Result<hir::SourceId> {
+        let old = self.source(target).ok_or_else(|| {
+            LimboError::InternalError(format!("missing UPDATE target source {target}"))
+        })?;
+        let columns = old.columns.clone();
+        let generated_expressions = old.generated_expressions.clone();
+        let default_expressions = old.default_expressions.clone();
+        let column_type_programs = old.column_type_programs.clone();
+        let rowid_available = old.rowid_available;
+        let new_source = self.reserve_source();
+        self.insert_source(
+            new_source,
+            hir::Source {
+                id: new_source,
+                owner: SourceOwner::Root,
+                database: table.database(),
+                name: table.value().get_name().to_string(),
+                alias: None,
+                kind: hir::SourceKind::Pseudo {
+                    kind: hir::PseudoSource::New,
+                    table: table.clone(),
+                },
+                columns,
+                generated_expressions,
+                default_expressions,
+                column_type_programs,
+                check_constraints: None,
+                rowid_available,
+                index_hint: hir::IndexHint::None,
+                index_expressions: Vec::new(),
+                index_coverage: hir::IndexCoverage::Selective,
+                index_method_patterns: Vec::new(),
+            },
+        )?;
+        Ok(new_source)
+    }
+
+    fn update_read_scope(&self, target: hir::SourceId) -> Result<Scope> {
+        let source = self.source(target).ok_or_else(|| {
+            LimboError::InternalError(format!("missing UPDATE target source {target}"))
+        })?;
+        let mut scope = Scope::default();
+        scope.add_source(source, true);
+        Ok(scope)
+    }
+
+    fn analyze_update_assignments(
+        &mut self,
+        sets: &'ast [ast::Set],
+        new_source: hir::SourceId,
+        table: &Table,
+        scope: &Scope,
+        policies: ExprPolicies,
+    ) -> Result<Vec<hir::Assignment>> {
+        let mut assignments = Vec::<hir::Assignment>::new();
+        for set in sets {
+            if set.col_names.len() > 1 {
+                if let Some(select) = row_assignment_subquery(&set.expr) {
+                    let columns = set
+                        .col_names
+                        .iter()
+                        .map(|name| resolve_update_target(table, name))
+                        .collect::<Result<Vec<_>>>()?;
+                    let names = set
+                        .col_names
+                        .iter()
+                        .map(|name| normalize_ident(name.as_str()))
+                        .collect::<Vec<_>>();
+                    let expected_outputs = columns
+                        .iter()
+                        .map(|column| self.write_target_type(new_source, table, *column))
+                        .collect::<Result<Vec<_>>>()?;
+                    let query = self.analyze_subquery_with_expected_outputs(
+                        select,
+                        None,
+                        scope,
+                        &expected_outputs,
+                        policies,
+                    )?;
+                    let output_width = self
+                        .query(query)
+                        .ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "missing UPDATE assignment query {query}"
+                            ))
+                        })?
+                        .output
+                        .len();
+                    if columns.len() != output_width {
+                        crate::bail_parse_error!(
+                            "{} columns assigned {} values",
+                            columns.len(),
+                            output_width
+                        );
+                    }
+                    merge_update_row_assignment(
+                        &mut assignments,
+                        columns,
+                        names,
+                        query,
+                        &mut self.exprs,
+                    )?;
+                    continue;
+                }
+            }
+
+            // `((x, y))` assigns the same values as `(x, y)`.
+            let mut expression = set.expr.as_ref();
+            while let ast::Expr::Parenthesized(expressions) = expression {
+                let [inner] = expressions.as_slice() else {
+                    break;
+                };
+                expression = inner;
+            }
+            let values: Vec<&ast::Expr> = match expression {
+                ast::Expr::Parenthesized(values) => {
+                    if set.col_names.len() != values.len() {
+                        crate::bail_parse_error!(
+                            "{} columns assigned {} values",
+                            set.col_names.len(),
+                            values.len()
+                        );
+                    }
+                    values.iter().map(Box::as_ref).collect()
+                }
+                expression => {
+                    if set.col_names.len() != 1 {
+                        crate::bail_parse_error!(
+                            "{} columns assigned 1 values",
+                            set.col_names.len()
+                        );
+                    }
+                    vec![expression]
+                }
+            };
+
+            for (name, syntax) in set.col_names.iter().zip(values) {
+                let column = resolve_update_target(table, name)?;
+                let value = if matches!(syntax, ast::Expr::Default) {
+                    self.analyze_write_default(new_source, table, column)?
+                } else {
+                    self.analyze_root_expr_with_expected_type(
+                        syntax,
+                        scope,
+                        policies.update(),
+                        self.write_target_type(new_source, table, column)?,
+                    )?
+                    .expr
+                };
+                merge_update_assignment(
+                    &mut assignments,
+                    column,
+                    normalize_ident(name.as_str()),
+                    value,
+                    &mut self.exprs,
+                )?;
+            }
+        }
+        Ok(assignments)
+    }
+}
+
+fn resolve_update_target(table: &Table, name: &ast::Name) -> Result<hir::TargetColumn> {
+    let normalized = normalize_ident(name.as_str());
+    if let Some((column, definition)) = table.get_column_by_name(&normalized) {
+        definition.ensure_not_generated("UPDATE", name.as_str())?;
+        return Ok(hir::TargetColumn::Column(column));
+    }
+    if (table.btree().is_some_and(|btree| btree.has_rowid) || table.virtual_table().is_some())
+        && ["rowid", "_rowid_", "oid"]
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&normalized))
+    {
+        return Ok(table
+            .columns()
+            .iter()
+            .position(|column| column.is_rowid_alias())
+            .map_or(hir::TargetColumn::RowId, hir::TargetColumn::Column));
+    }
+    crate::bail_parse_error!("no such column: {}.{}", table.get_name(), name)
+}
+
+fn merge_update_assignment(
+    assignments: &mut Vec<hir::Assignment>,
+    column: hir::TargetColumn,
+    name: String,
+    value: hir::ExprId,
+    exprs: &mut hir::ExprArena,
+) -> Result<()> {
+    split_overlapping_row_assignment(assignments, column, exprs)?;
+    let Some(existing) = assignments
+        .iter_mut()
+        .find(|assignment| assignment.columns == [column])
+    else {
+        assignments.push(hir::Assignment {
+            columns: vec![column],
+            names: vec![name],
+            value,
+        });
+        return Ok(());
+    };
+    // Every name the column was set under fires its `UPDATE OF` triggers:
+    // `SET oid = 7, rowid = 8` fires triggers on both names.
+    if !existing.names.iter().any(|known| known == &name) {
+        existing.names.push(name);
+    }
+
+    let mut node = exprs[value].clone();
+    if let hir::Expr::Function(call) = &mut node {
+        if matches!(
+            call.function.value(),
+            crate::Func::Scalar(ScalarFunc::ArraySetElement)
+        ) {
+            if let hir::FunctionArguments::Expressions { values, .. } = &mut call.arguments {
+                if values.len() == 3 {
+                    values[0] = existing.value;
+                    existing.value = exprs.push(node);
+                    return Ok(());
+                }
+            }
+        }
+    }
+    existing.value = value;
+    Ok(())
+}
+
+fn merge_update_row_assignment(
+    assignments: &mut Vec<hir::Assignment>,
+    columns: Vec<hir::TargetColumn>,
+    names: Vec<String>,
+    query: hir::QueryId,
+    exprs: &mut hir::ExprArena,
+) -> Result<()> {
+    if columns
+        .iter()
+        .enumerate()
+        .any(|(index, column)| columns[..index].contains(column))
+    {
+        for (output, (column, name)) in columns.into_iter().zip(names).enumerate() {
+            let value = exprs.push(hir::Expr::Subquery(hir::SubqueryExpr::Scalar {
+                query,
+                output,
+            }));
+            merge_update_assignment(assignments, column, name, value, exprs)?;
+        }
+        return Ok(());
+    }
+
+    for column in &columns {
+        split_overlapping_row_assignment(assignments, *column, exprs)?;
+    }
+    assignments.retain(|assignment| {
+        !assignment
+            .columns
+            .first()
+            .is_some_and(|column| columns.contains(column))
+    });
+    assignments.push(hir::Assignment {
+        columns,
+        names,
+        value: exprs.push(hir::Expr::Subquery(hir::SubqueryExpr::Row { query })),
+    });
+    Ok(())
+}
+
+fn split_overlapping_row_assignment(
+    assignments: &mut Vec<hir::Assignment>,
+    column: hir::TargetColumn,
+    exprs: &mut hir::ExprArena,
+) -> Result<()> {
+    let Some(index) = assignments.iter().position(|assignment| {
+        assignment.columns.len() > 1 && assignment.columns.contains(&column)
+    }) else {
+        return Ok(());
+    };
+    let assignment = assignments.remove(index);
+    let hir::Expr::Subquery(hir::SubqueryExpr::Row { query }) = exprs[assignment.value] else {
+        return Err(LimboError::InternalError(
+            "multi-column UPDATE assignment is not a row subquery".to_string(),
+        ));
+    };
+    for (output, (column, name)) in assignment
+        .columns
+        .into_iter()
+        .zip(assignment.names)
+        .enumerate()
+    {
+        assignments.insert(
+            index + output,
+            hir::Assignment {
+                columns: vec![column],
+                names: vec![name],
+                value: exprs.push(hir::Expr::Subquery(hir::SubqueryExpr::Scalar {
+                    query,
+                    output,
+                })),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn row_assignment_subquery(mut expression: &ast::Expr) -> Option<&ast::Select> {
+    while let ast::Expr::Parenthesized(expressions) = expression {
+        let [inner] = expressions.as_slice() else {
+            break;
+        };
+        expression = inner;
+    }
+    match expression {
+        ast::Expr::Subquery(select) => Some(select),
+        _ => None,
+    }
+}
+
+/// The columns `assignments` change, as a mask over the table's columns:
+/// the SET columns, the INTEGER PRIMARY KEY for a rowid assignment, and the
+/// generated columns they feed.
+fn updated_column_mask(
+    table: &Table,
+    assignments: &[hir::Assignment],
+) -> Result<crate::translate::plan::ColumnMask> {
+    let mut mask = crate::translate::plan::ColumnMask::default();
+    for column in assignments
+        .iter()
+        .flat_map(|assignment| assignment.columns.iter())
+    {
+        let position = match column {
+            hir::TargetColumn::Column(position) => Some(*position),
+            hir::TargetColumn::RowId => table
+                .columns()
+                .iter()
+                .position(crate::schema::Column::is_rowid_alias),
+        };
+        if let Some(position) = position {
+            mask.set(position)?;
+        }
+    }
+    match table {
+        Table::BTree(table) => table.columns_affected_by_update(mask.iter()),
+        _ => Ok(mask),
+    }
+}

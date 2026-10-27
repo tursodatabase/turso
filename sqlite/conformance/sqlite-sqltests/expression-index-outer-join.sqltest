@@ -12,6 +12,8 @@ setup ei {
     CREATE INDEX r_all ON r(a, coalesce(b,7), b IS NULL, ifnull(c,'none'),
         CASE WHEN b IS NULL THEN 'nb' ELSE 'b' END, b + 1, length(c));
     CREATE INDEX r_expr_first ON r(coalesce(b,7), a);
+    CREATE INDEX r_cols_and_exprs ON r(a, b, c, coalesce(b,7), b IS NULL, ifnull(c,'none'),
+        CASE WHEN b IS NULL THEN 'nb' ELSE 'b' END, b + 1, length(c));
     CREATE INDEX s_expr ON s(a, coalesce(d,-1));
     INSERT INTO l VALUES (1, 1), (2, 1), (3, 2), (4, 2), (NULL, 3);
     INSERT INTO r VALUES (1, 10, 'x'), (1, NULL, NULL), (2, NULL, 'yy'), (5, 50, 'z'), (NULL, 7, 'n');
@@ -21,6 +23,7 @@ setup ei {
 @setup ei
 @var from {
     l LEFT JOIN r INDEXED BY r_all ON r.a = l.x |
+    l LEFT JOIN r INDEXED BY r_cols_and_exprs ON r.a = l.x |
     l LEFT JOIN r NOT INDEXED ON r.a = l.x |
     l LEFT JOIN r ON r.a = l.x |
     l LEFT JOIN r INDEXED BY r_all ON r.a = l.x AND r.b > 5 |
@@ -38,6 +41,7 @@ matrix null-row-expression-in-result {
 @setup ei
 @var from {
     l LEFT JOIN r INDEXED BY r_all ON r.a = l.x |
+    l LEFT JOIN r INDEXED BY r_cols_and_exprs ON r.a = l.x |
     l LEFT JOIN r ON r.a = l.x |
     l LEFT JOIN r INDEXED BY r_all ON r.a = l.k |
     r INDEXED BY r_all RIGHT JOIN l ON r.a = l.x |
@@ -56,6 +60,7 @@ matrix null-row-expression-in-where {
 @setup ei
 @var from {
     l LEFT JOIN r INDEXED BY r_all ON r.a = l.x |
+    l LEFT JOIN r INDEXED BY r_cols_and_exprs ON r.a = l.x |
     l LEFT JOIN r ON r.a = l.x |
     l LEFT JOIN r INDEXED BY r_all ON r.a = l.k |
     r INDEXED BY r_all RIGHT JOIN l ON r.a = l.x |
@@ -69,6 +74,7 @@ matrix null-row-expression-as-group-key {
 @setup ei
 @var from {
     l LEFT JOIN r INDEXED BY r_all ON r.a = l.x |
+    l LEFT JOIN r INDEXED BY r_cols_and_exprs ON r.a = l.x |
     l LEFT JOIN r NOT INDEXED ON r.a = l.x |
     l LEFT JOIN r ON r.a = l.x |
     l LEFT JOIN r INDEXED BY r_all ON r.a = l.k |
@@ -92,6 +98,7 @@ matrix null-row-expression-in-grouped-aggregate {
 @setup ei
 @var from {
     l LEFT JOIN r INDEXED BY r_all ON r.a = l.x |
+    l LEFT JOIN r INDEXED BY r_cols_and_exprs ON r.a = l.x |
     l LEFT JOIN r ON r.a = l.x |
     r INDEXED BY r_all RIGHT JOIN l ON r.a = l.x |
     l LEFT JOIN (r JOIN s USING(a)) ON r.a = l.x
@@ -109,6 +116,7 @@ matrix null-row-expression-in-aggregate-with-having {
 @setup ei
 @var from {
     l LEFT JOIN r INDEXED BY r_all ON r.a = l.x |
+    l LEFT JOIN r INDEXED BY r_cols_and_exprs ON r.a = l.x |
     l LEFT JOIN r ON r.a = l.x |
     r INDEXED BY r_all RIGHT JOIN l ON r.a = l.x |
     l LEFT JOIN (r JOIN s USING(a)) ON r.a = l.x
@@ -127,6 +135,7 @@ matrix null-row-expression-in-distinct-and-window {
 @setup ei
 @var from {
     l LEFT JOIN r INDEXED BY r_all ON r.a = l.x |
+    l LEFT JOIN r INDEXED BY r_cols_and_exprs ON r.a = l.x |
     l LEFT JOIN r ON r.a = l.x |
     r INDEXED BY r_all RIGHT JOIN l ON r.a = l.x
 }

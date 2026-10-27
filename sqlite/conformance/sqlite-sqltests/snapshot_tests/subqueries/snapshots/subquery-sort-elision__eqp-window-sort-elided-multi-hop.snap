@@ -20,8 +20,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SCAN window_subquery_0
-   `--SCAN step2
-      `--SCAN step1
-         |--SCAN t1
-         `--USE SORTER FOR ORDER BY
+`--SCAN step2
+   `--SCAN step1
+      |--SCAN t1
+      `--USE SORTER FOR ORDER BY

@@ -572,3 +572,31 @@ expect {
     0|0|0
     0
 }
+
+# The WHERE clause does not match the index on the rowid alias, so the loop
+# reads the index and leaves the table cursor's seek pending. The row must be
+# found in the table before it is deleted.
+@cross-check-integrity
+test delete-through-index-loop-without-column-read {
+    CREATE TABLE t5 (id INTEGER PRIMARY KEY, a TEXT, b TEXT);
+    INSERT INTO t5 VALUES (1000976225, 'a', 'alpha');
+    INSERT INTO t5 VALUES (5, 'b', 'beta');
+    CREATE INDEX t5_id ON t5 (id);
+    DELETE FROM t5 WHERE -267659;
+    SELECT count(*) FROM t5;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test delete-through-index-range-without-column-read {
+    CREATE TABLE t6 (a, b, c);
+    INSERT INTO t6 VALUES (1, 'x', 1), (2, 'y', 2), (3, 'z', 3);
+    CREATE INDEX t6_b ON t6 (b);
+    DELETE FROM t6 WHERE b > 'x';
+    SELECT * FROM t6 ORDER BY a;
+}
+expect {
+    1|x|1
+}

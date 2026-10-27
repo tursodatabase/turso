@@ -5,16 +5,15 @@ use crate::schema::{ColDef, FromDefinitionFlags};
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{
-    left_using_column_sources, star_column_uses_merged_value, unqualified_column_sources, BitSet,
-    ColumnLookup, JoinInfo, JoinType, JoinedTable,
+    left_using_column_sources, star_column_uses_merged_value, unqualified_column_sources,
+    ColumnLookup, JoinInfo, JoinType,
 };
-use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
 use crate::types::IOResultOr;
 use crate::vdbe::affinity::Affinity;
 use crate::IO;
 use crate::{
-    schema::{Column, Schema, Table, Type},
+    schema::{Column, Schema, Type},
     types::{Value, ValueType},
     LimboError, OpenFlags, Result, Statement, SymbolTable,
 };
@@ -184,6 +183,86 @@ pub fn is_builtin_strict_type(written_type_name: &str) -> bool {
 /// Removes the quotes around the start of `source` the way SQLite's
 /// `sqlite3Dequote` does: when it starts with a quote character, only the
 /// first quoted token survives, so `"x" < +5` becomes just `x`.
+/// Format a CHECK constraint's captured source text for an error message the
+/// way SQLite does. SQLite dequotes the text: when it starts with a quote
+/// character, only the first quoted token survives, so `"x" < +5` is
+/// reported as just `x`.
+pub fn check_source_for_error(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let close = match bytes.first() {
+        Some(&c @ (b'"' | b'\'' | b'`')) => c,
+        Some(b'[') => b']',
+        _ => return source.to_string(),
+    };
+    let mut i = 1;
+    while i < bytes.len() {
+        if bytes[i] == close {
+            // A doubled quote is an escaped quote, not the end.
+            if close != b']' && bytes.get(i + 1) == Some(&close) {
+                i += 2;
+                continue;
+            }
+            break;
+        }
+        i += 1;
+    }
+    let inner = &source[1..i.min(source.len())];
+    if close == b']' {
+        inner.to_string()
+    } else {
+        let quote = (close as char).to_string();
+        inner.replace(&format!("{quote}{quote}"), &quote)
+    }
+}
+
+/// The parameter index an FTS score pattern stores its field list under.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+pub const FTS_FIELD_PARAMETER: i32 = i32::MAX;
+
+/// Replace the positional parameters of `pattern` with the expressions in
+/// `parameters`, keyed by parameter index. `None` when a parameter has no
+/// expression or is named.
+pub fn try_substitute_parameters(
+    pattern: &Expr,
+    parameters: &HashMap<i32, Expr>,
+) -> Option<Box<Expr>> {
+    match pattern {
+        Expr::FunctionCall {
+            name,
+            distinctness,
+            args,
+            order_by,
+            within_group,
+            filter_over,
+        } => {
+            let mut substituted = Vec::new();
+            for arg in args {
+                substituted.push(try_substitute_parameters(arg, parameters)?);
+            }
+            Some(Box::new(Expr::FunctionCall {
+                args: substituted,
+                distinctness: *distinctness,
+                name: name.clone(),
+                order_by: order_by.clone(),
+                within_group: within_group.clone(),
+                filter_over: filter_over.clone(),
+            }))
+        }
+        Expr::Variable(var) => {
+            // Named parameters (:x) are not placeholders; positional ones,
+            // bare ? and explicit ?N, are.
+            if !var.is_positional() {
+                return None;
+            }
+            let Ok(var) = i32::try_from(var.index.get()) else {
+                return None;
+            };
+            Some(Box::new(parameters.get(&var)?.clone()))
+        }
+        _ => Some(Box::new(pattern.clone())),
+    }
+}
+
 pub fn dequote(source: &str) -> String {
     let bytes = source.as_bytes();
     let close = match bytes.first() {
@@ -515,312 +594,6 @@ pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
         (Literal::CurrentTimestamp, Literal::CurrentTimestamp) => true,
         _ => false,
     }
-}
-
-/// bind AST identifiers to either Column or Rowid if possible
-pub fn simple_bind_expr(
-    joined_table: &JoinedTable,
-    result_columns: &[ast::ResultColumn],
-    expr: &mut ast::Expr,
-) -> Result<()> {
-    let internal_id = joined_table.internal_id;
-    walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
-        #[allow(clippy::single_match)]
-        match expr {
-            Expr::Id(id) => {
-                for result_column in result_columns.iter() {
-                    if let ast::ResultColumn::Expr(result, Some(ast::As::As(alias))) = result_column
-                    {
-                        if alias.as_str().eq_ignore_ascii_case(id.as_str()) {
-                            *expr = *result.clone();
-                            return Ok(WalkControl::Continue);
-                        }
-                    }
-                }
-                let col_idx = joined_table.columns().iter().position(|c| {
-                    c.name
-                        .as_ref()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(id.as_str()))
-                });
-                if let Some(col_idx) = col_idx {
-                    let col = joined_table.table.columns().get(col_idx).unwrap();
-                    *expr = ast::Expr::Column {
-                        database: None,
-                        table: internal_id,
-                        column: col_idx,
-                        is_rowid_alias: col.is_rowid_alias(),
-                    };
-                } else {
-                    // only if we haven't found a match, check for explicit rowid reference
-                    let is_btree_table = matches!(joined_table.table, Table::BTree(_));
-                    if is_btree_table {
-                        if let Some(rowid) =
-                            parse_row_id(&normalize_ident(id.as_str()), internal_id, || false)?
-                        {
-                            *expr = rowid;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(())
-}
-
-pub fn try_substitute_parameters(
-    pattern: &Expr,
-    parameters: &HashMap<i32, Expr>,
-) -> Option<Box<Expr>> {
-    match pattern {
-        Expr::FunctionCall {
-            name,
-            distinctness,
-            args,
-            order_by,
-            within_group,
-            filter_over,
-        } => {
-            let mut substituted = Vec::new();
-            for arg in args {
-                substituted.push(try_substitute_parameters(arg, parameters)?);
-            }
-            Some(Box::new(Expr::FunctionCall {
-                args: substituted,
-                distinctness: *distinctness,
-                name: name.clone(),
-                order_by: order_by.clone(),
-                within_group: within_group.clone(),
-                filter_over: filter_over.clone(),
-            }))
-        }
-        Expr::Variable(var) => {
-            // Named parameters (:x) are not placeholders; positional ones —
-            // bare ? and explicit ?N — are.
-            if !var.is_positional() {
-                return None;
-            }
-            let Ok(var) = i32::try_from(var.index.get()) else {
-                return None;
-            };
-            Some(Box::new(parameters.get(&var)?.clone()))
-        }
-        _ => Some(Box::new(pattern.clone())),
-    }
-}
-
-pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i32, Expr>> {
-    let mut captured = HashMap::default();
-    match (pattern, query) {
-        (
-            Expr::FunctionCall {
-                name: name1,
-                distinctness: distinct1,
-                args: args1,
-                order_by: order1,
-                within_group: within1,
-                filter_over: filter1,
-            },
-            Expr::FunctionCall {
-                name: name2,
-                distinctness: distinct2,
-                args: args2,
-                order_by: order2,
-                within_group: within2,
-                filter_over: filter2,
-            },
-        ) => {
-            if !name1.as_str().eq_ignore_ascii_case(name2.as_str()) {
-                return None;
-            }
-            if distinct1.is_some() || distinct2.is_some() {
-                return None;
-            }
-            if !order1.is_empty() || !order2.is_empty() {
-                return None;
-            }
-            if !within1.is_empty() || !within2.is_empty() {
-                return None;
-            }
-            if filter1.filter_clause.is_some() || filter1.over_clause.is_some() {
-                return None;
-            }
-            if filter2.filter_clause.is_some() || filter2.over_clause.is_some() {
-                return None;
-            }
-            for (arg1, arg2) in args1.iter().zip(args2.iter()) {
-                let result = try_capture_parameters(arg1, arg2)?;
-                captured.extend(result);
-            }
-            Some(captured)
-        }
-        (Expr::Variable(var), expr) => {
-            // Named parameters (:x) are not placeholders; positional ones —
-            // bare ? and explicit ?N — are.
-            if !var.is_positional() {
-                return None;
-            }
-            let Ok(var) = i32::try_from(var.index.get()) else {
-                return None;
-            };
-            captured.insert(var, expr.clone());
-            Some(captured)
-        }
-        (
-            Expr::Id(_) | Expr::Name(_) | Expr::Column { .. },
-            Expr::Id(_) | Expr::Name(_) | Expr::Column { .. },
-        ) => {
-            if pattern == query {
-                Some(captured)
-            } else {
-                None
-            }
-        }
-        (_, _) => None,
-    }
-}
-
-/// Returns the number of column arguments for FTS functions.
-/// FTS functions have column arguments followed by non-column arguments:
-/// - fts_match(col1, col2, ..., query_string) -> columns = args.len() - 1
-/// - fts_score(col1, col2, ..., query_string) -> columns = args.len() - 1
-/// - fts_highlight(col1, col2, ..., before_tag, after_tag, query_string) -> columns = args.len() - 3
-///
-/// Returns 0 for non-FTS functions.
-/// Specific for FTS but cannot gate behind feature = "fts" so it must
-/// live in util.rs :/
-pub fn count_fts_column_args(expr: &Expr) -> usize {
-    match expr {
-        Expr::FunctionCall { name, args, .. } => {
-            let name_lower = name.as_str().to_lowercase();
-            match name_lower.as_str() {
-                "fts_match" | "fts_score" => args.len().saturating_sub(1),
-                "fts_highlight" => args.len().saturating_sub(3),
-                _ => 0,
-            }
-        }
-        _ => 0,
-    }
-}
-
-pub const FTS_FIELD_PARAMETER: i32 = i32::MAX;
-
-/// Match FTS function calls where column arguments can appear in any order.
-///
-/// FTS functions like `fts_match(col1, col2, 'query')` should match
-/// `fts_match(col2, col1, 'query')` as long as the same columns are used.
-///
-/// Semi-specific for FTS but cannot gate behind feature = "fts" so it must
-/// live in util.rs :/
-pub fn try_capture_parameters_column_agnostic(
-    pattern: &Expr,         // pattern expression from index definition
-    query: &Expr,           // the actual query expression
-    num_column_args: usize, // number of leading column arguments
-) -> Option<HashMap<i32, Expr>> {
-    // If not a function call or no column args, fall back to standard matching
-    if num_column_args == 0 {
-        return try_capture_parameters(pattern, query);
-    }
-
-    let (
-        Expr::FunctionCall {
-            name: pattern_name,
-            distinctness: pattern_distinct,
-            args: pattern_args,
-            order_by: pattern_order,
-            within_group: pattern_within,
-            filter_over: pattern_filter,
-        },
-        Expr::FunctionCall {
-            name: query_name,
-            distinctness: query_distinct,
-            args: query_args,
-            order_by: query_order,
-            within_group: query_within,
-            filter_over: query_filter,
-        },
-    ) = (pattern, query)
-    else {
-        return try_capture_parameters(pattern, query);
-    };
-    // Function names must match
-    if !pattern_name
-        .as_str()
-        .eq_ignore_ascii_case(query_name.as_str())
-    {
-        return None;
-    }
-
-    let suffix_len = pattern_args.len().checked_sub(num_column_args)?;
-    let query_column_count = query_args.len().checked_sub(suffix_len)?;
-    if query_column_count == 0 || query_column_count > num_column_args {
-        return None;
-    }
-    // Distinctness must match (we don't support it)
-    if pattern_distinct.is_some() || query_distinct.is_some() {
-        return None;
-    }
-    // ORDER BY within function not supported
-    if !pattern_order.is_empty() || !query_order.is_empty() {
-        return None;
-    }
-    // WITHIN GROUP not supported
-    if !pattern_within.is_empty() || !query_within.is_empty() {
-        return None;
-    }
-
-    // Filter/over clause not supported
-    if pattern_filter.filter_clause.is_some() || pattern_filter.over_clause.is_some() {
-        return None;
-    }
-    if query_filter.filter_clause.is_some() || query_filter.over_clause.is_some() {
-        return None;
-    }
-
-    let mut captured = HashMap::default();
-
-    // Split args into column args (reorderable) and remaining args (positional)
-    let pattern_col_args = &pattern_args[..num_column_args];
-    let query_col_args = &query_args[..query_column_count];
-    let pattern_rest = &pattern_args[num_column_args..];
-    let query_rest = &query_args[query_column_count..];
-
-    let mut matched_pattern_indices = BitSet::default();
-
-    for query_col in query_col_args {
-        let mut found_match = false;
-        for (i, pattern_col) in pattern_col_args.iter().enumerate() {
-            if matched_pattern_indices.get(i) {
-                continue;
-            }
-            if exprs_are_equivalent(pattern_col, query_col) {
-                matched_pattern_indices.set(i).expect("TODO: alloc error");
-                found_match = true;
-                break;
-            }
-        }
-        if !found_match {
-            return None;
-        }
-    }
-    // Remaining args must match positionally (includes the query string parameter)
-    for (pattern_arg, query_arg) in pattern_rest.iter().zip(query_rest.iter()) {
-        let result = try_capture_parameters(pattern_arg, query_arg)?;
-        captured.extend(result);
-    }
-
-    let fields = (0..num_column_args)
-        .filter(|&i| matched_pattern_indices.get(i))
-        .map(|i| i.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    captured.insert(
-        FTS_FIELD_PARAMETER,
-        Expr::Literal(Literal::String(format!("'{fields}'"))),
-    );
-
-    Some(captured)
 }
 
 /// This function is used to determine whether two expressions are logically
@@ -2355,7 +2128,6 @@ fn view_sources_from_clause(
                     ast::JoinOperator::TypedJoin(Some(join_type))
                         if join_type.contains(ast::JoinType::CROSS)
                 ),
-                lateral: false,
             }),
             ..right
         });
@@ -2512,13 +2284,19 @@ fn extract_view_columns_inner(
     let mut columns = Vec::new();
     let mut column_name_counts = HashMap::default();
 
-    let ast::OneSelect::Select {
-        from,
-        columns: select_columns,
-        ..
-    } = &select_stmt.body.select
-    else {
-        return Ok(ViewColumnSchema { tables, columns });
+    let (from, select_columns) = match &select_stmt.body.select {
+        ast::OneSelect::Select { from, columns, .. } => (from, columns),
+        ast::OneSelect::Values(rows) => {
+            // A VALUES body has one column per value of its first row, named
+            // column1, column2, ... like SQLite names them.
+            for (index, expr) in rows.first().into_iter().flatten().enumerate() {
+                let mut column = view_result_column(expr, &[]);
+                column.column.name = Some(format!("column{}", index + 1));
+                deduplicate_view_column_name(&mut column, &mut column_name_counts);
+                columns.push(column);
+            }
+            return Ok(ViewColumnSchema { tables, columns });
+        }
     };
 
     let sources = from
@@ -4210,6 +3988,175 @@ fn rewrite_upsert_table_refs(upsert: &mut ast::Upsert, old_tbl: &str, new_tbl: &
     if let Some(ref mut next) = upsert.next {
         rewrite_upsert_table_refs(next, old_tbl, new_tbl);
     }
+}
+
+/// Call `rewrite_expr` on every expression of `select`, including those of
+/// its CTEs, compound arms, subqueries, windows, ORDER BY and LIMIT.
+pub(crate) fn rewrite_select_expressions<F>(
+    select: &mut ast::Select,
+    rewrite_expr: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<()>,
+{
+    if let Some(with_clause) = &mut select.with {
+        for cte in &mut with_clause.ctes {
+            rewrite_select_expressions(&mut cte.select, rewrite_expr)?;
+        }
+    }
+    rewrite_one_select_expressions(&mut select.body.select, rewrite_expr)?;
+    for compound in &mut select.body.compounds {
+        rewrite_one_select_expressions(&mut compound.select, rewrite_expr)?;
+    }
+    for sorted_col in &mut select.order_by {
+        rewrite_expression_tree(&mut sorted_col.expr, rewrite_expr)?;
+    }
+    if let Some(limit) = &mut select.limit {
+        rewrite_expression_tree(&mut limit.expr, rewrite_expr)?;
+        if let Some(offset) = &mut limit.offset {
+            rewrite_expression_tree(offset, rewrite_expr)?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_one_select_expressions<F>(
+    one_select: &mut ast::OneSelect,
+    rewrite_expr: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<()>,
+{
+    match one_select {
+        ast::OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            window_clause,
+            ..
+        } => {
+            for col in columns {
+                if let ast::ResultColumn::Expr(expr, _) = col {
+                    rewrite_expression_tree(expr, rewrite_expr)?;
+                }
+            }
+            if let Some(from_clause) = from {
+                rewrite_from_clause_expressions(from_clause, rewrite_expr)?;
+            }
+            if let Some(where_expr) = where_clause {
+                rewrite_expression_tree(where_expr, rewrite_expr)?;
+            }
+            if let Some(group_by) = group_by {
+                for expr in &mut group_by.exprs {
+                    rewrite_expression_tree(expr, rewrite_expr)?;
+                }
+                if let Some(having_expr) = &mut group_by.having {
+                    rewrite_expression_tree(having_expr, rewrite_expr)?;
+                }
+            }
+            for window_def in window_clause {
+                rewrite_window_expressions(&mut window_def.window, rewrite_expr)?;
+            }
+        }
+        ast::OneSelect::Values(values) => {
+            for row in values {
+                for expr in row {
+                    rewrite_expression_tree(expr, rewrite_expr)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_from_clause_expressions<F>(
+    from_clause: &mut ast::FromClause,
+    rewrite_expr: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<()>,
+{
+    rewrite_select_table_expressions(&mut from_clause.select, rewrite_expr)?;
+    for join in &mut from_clause.joins {
+        rewrite_select_table_expressions(&mut join.table, rewrite_expr)?;
+        if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
+            rewrite_expression_tree(expr, rewrite_expr)?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_select_table_expressions<F>(
+    select_table: &mut ast::SelectTable,
+    rewrite_expr: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<()>,
+{
+    match select_table {
+        ast::SelectTable::Table(..) => {}
+        ast::SelectTable::TableCall(_, args, _) => {
+            for arg in args {
+                rewrite_expression_tree(arg, rewrite_expr)?;
+            }
+        }
+        ast::SelectTable::Select { select, .. } => {
+            rewrite_select_expressions(select, rewrite_expr)?;
+        }
+        ast::SelectTable::Sub(from_clause, _) => {
+            rewrite_from_clause_expressions(from_clause, rewrite_expr)?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_window_expressions<F>(window: &mut ast::Window, rewrite_expr: &mut F) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<()>,
+{
+    for expr in &mut window.partition_by {
+        rewrite_expression_tree(expr, rewrite_expr)?;
+    }
+    for sorted_col in &mut window.order_by {
+        rewrite_expression_tree(&mut sorted_col.expr, rewrite_expr)?;
+    }
+    if let Some(frame_clause) = &mut window.frame_clause {
+        rewrite_frame_bound_expressions(&mut frame_clause.start, rewrite_expr)?;
+        if let Some(end) = &mut frame_clause.end {
+            rewrite_frame_bound_expressions(end, rewrite_expr)?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_frame_bound_expressions<F>(
+    frame_bound: &mut ast::FrameBound,
+    rewrite_expr: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<()>,
+{
+    match frame_bound {
+        ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
+            rewrite_expression_tree(expr, rewrite_expr)?;
+        }
+        ast::FrameBound::CurrentRow
+        | ast::FrameBound::UnboundedFollowing
+        | ast::FrameBound::UnboundedPreceding => {}
+    }
+    Ok(())
+}
+
+fn rewrite_expression_tree<F>(expr: &mut ast::Expr, rewrite_expr: &mut F) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<()>,
+{
+    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+        rewrite_expr(e)?;
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -6083,27 +6030,5 @@ pub mod tests {
         assert_eq!(cast_real_to_integer(f64::INFINITY), Err(()));
         assert_eq!(cast_real_to_integer(f64::NEG_INFINITY), Err(()));
         assert_eq!(cast_real_to_integer(f64::NAN), Err(()));
-    }
-
-    #[test]
-    fn capture_parameters_treats_numbered_markers_as_placeholders() {
-        use turso_parser::ast::{Literal, Variable};
-        // Index-method patterns use ?N to share one captured argument
-        // across several call sites (fts_score/fts_match); a numbered
-        // marker carries its "?N" spelling as its name and must still
-        // capture. Named parameters are not placeholders.
-        let query = Expr::Literal(Literal::String("'x'".to_string()));
-
-        let numbered = Expr::Variable(Variable::numbered(1.try_into().unwrap()));
-        let captured = try_capture_parameters(&numbered, &query).unwrap();
-        assert_eq!(captured.get(&1), Some(&query));
-
-        let anonymous = Expr::Variable(Variable::indexed(1.try_into().unwrap()));
-        assert!(try_capture_parameters(&anonymous, &query)
-            .unwrap()
-            .contains_key(&1));
-
-        let named = Expr::Variable(Variable::named(":x", 1.try_into().unwrap()));
-        assert!(try_capture_parameters(&named, &query).is_none());
     }
 }

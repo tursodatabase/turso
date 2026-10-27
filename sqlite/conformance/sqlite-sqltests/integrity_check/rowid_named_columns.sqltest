@@ -1,0 +1,71 @@
+@database :memory:
+
+# A table whose columns take every rowid name (rowid, _rowid_ and oid) has
+# no name left for the real rowid, which integrity_check and index building
+# still need: an index entry ends with it. They read it without a name.
+
+@cross-check-integrity
+test integrity-check-table-naming-every-rowid {
+    CREATE TABLE r(rowid INT, _rowid_ INT, oid INT, k INT);
+    CREATE INDEX r_k ON r(k);
+    INSERT INTO r VALUES (7, 8, 9, 1), (70, 80, 90, 2);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test quick-check-table-naming-every-rowid {
+    CREATE TABLE r(rowid INT, _rowid_ INT, oid INT, k INT);
+    CREATE INDEX r_k ON r(k);
+    INSERT INTO r VALUES (7, 8, 9, 1), (70, 80, 90, 2);
+    PRAGMA quick_check;
+}
+expect {
+    ok
+}
+
+test index-built-after-rows-on-table-naming-every-rowid {
+    CREATE TABLE r(rowid INT, _rowid_ INT, oid INT, k INT);
+    INSERT INTO r VALUES (7, 8, 9, 1), (70, 80, 90, 2), (700, 800, 900, 2);
+    CREATE INDEX r_k ON r(k);
+    SELECT rowid, oid FROM r WHERE k = 2 ORDER BY rowid;
+    DELETE FROM r WHERE k = 2 AND rowid = 70;
+    SELECT rowid FROM r WHERE k = 2;
+    PRAGMA integrity_check;
+}
+expect {
+    70|90
+    700|900
+    700
+    ok
+}
+
+test partial-and-expression-indexes-on-table-naming-every-rowid {
+    CREATE TABLE r(rowid INT, _rowid_ INT, oid INT, k INT NOT NULL, CHECK (k > 0));
+    INSERT INTO r VALUES (7, 8, 9, 1), (70, 80, 90, 2);
+    CREATE INDEX r_expr ON r(k * 10);
+    CREATE INDEX r_part ON r(oid) WHERE k > 1;
+    SELECT oid FROM r WHERE k * 10 = 20;
+    SELECT rowid FROM r WHERE oid = 90 AND k > 1;
+    PRAGMA integrity_check;
+}
+expect {
+    90
+    70
+    ok
+}
+
+@skip-if mvcc "REINDEX is not supported in MVCC mode"
+test reindex-table-naming-every-rowid {
+    CREATE TABLE r(rowid INT, _rowid_ INT, oid INT, k INT);
+    CREATE INDEX r_k ON r(k);
+    INSERT INTO r VALUES (7, 8, 9, 1), (70, 80, 90, 2);
+    REINDEX r_k;
+    SELECT oid FROM r WHERE k = 1;
+    PRAGMA integrity_check;
+}
+expect {
+    9
+    ok
+}

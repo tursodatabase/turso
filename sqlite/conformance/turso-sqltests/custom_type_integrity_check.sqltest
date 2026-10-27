@@ -1,0 +1,93 @@
+@database :memory:
+@requires-file custom_types "uses custom types"
+
+@requires strict "custom types and arrays require STRICT tables"
+
+# An index on a custom-typed column stores the encoded value, an expression
+# index computes from decoded values, and a CHECK constraint reads stored
+# values. integrity_check reads each row the same way, and so does the scan
+# that builds an index after the rows are in.
+
+test custom-type-indexes-pass-integrity-check {
+    CREATE TYPE doubled BASE integer ENCODE (value * 2) DECODE (value / 2) OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v doubled, w INTEGER, CHECK (w < 100)) STRICT;
+    INSERT INTO t VALUES (1, 1, 10), (2, 2, 20), (3, 3, 30);
+    CREATE INDEX i1 ON t(v);
+    CREATE INDEX i2 ON t(v * 10);
+    CREATE INDEX i3 ON t(w) WHERE v > 1;
+    PRAGMA integrity_check;
+    SELECT id FROM t WHERE v = 2;
+    SELECT id FROM t WHERE v * 10 = 30;
+    SELECT id FROM t WHERE w = 30 AND v > 1;
+    DELETE FROM t WHERE id = 2;
+    PRAGMA integrity_check;
+    INSERT INTO t VALUES (4, 4, 40);
+    UPDATE t SET v = 5 WHERE id = 3;
+    PRAGMA integrity_check;
+    SELECT id FROM t WHERE v * 10 = 50;
+    PRAGMA quick_check;
+}
+expect {
+    ok
+    2
+    3
+    3
+    ok
+    ok
+    3
+    ok
+}
+
+test custom-type-index-built-before-rows {
+    CREATE TYPE doubled BASE integer ENCODE (value * 2) DECODE (value / 2) OPERATOR '<';
+    CREATE TABLE u(id INTEGER PRIMARY KEY, v doubled) STRICT;
+    CREATE INDEX u1 ON u(v * 10);
+    CREATE INDEX u2 ON u(v);
+    INSERT INTO u VALUES (1, 5);
+    PRAGMA integrity_check;
+    SELECT id FROM u WHERE v * 10 = 50;
+    SELECT id FROM u WHERE v = 5;
+}
+expect {
+    ok
+    1
+    1
+}
+
+@skip-if mvcc "REINDEX is not supported in MVCC mode"
+test custom-type-reindex-keeps-entries {
+    CREATE TYPE doubled BASE integer ENCODE (value * 2) DECODE (value / 2) OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v doubled) STRICT;
+    INSERT INTO t VALUES (1, 1), (2, 2);
+    CREATE INDEX i1 ON t(v);
+    CREATE INDEX i2 ON t(v * 10);
+    REINDEX t;
+    PRAGMA integrity_check;
+    SELECT id FROM t WHERE v = 2;
+    SELECT id FROM t WHERE v * 10 = 10;
+}
+expect {
+    ok
+    2
+    1
+}
+
+test array-indexes-pass-integrity-check {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, tags text[], n INTEGER) STRICT;
+    INSERT INTO a VALUES (1, '{x,y}', 1), (2, '{z}', 2), (3, NULL, 3);
+    CREATE INDEX a1 ON a(tags);
+    CREATE INDEX a2 ON a(n) WHERE tags IS NOT NULL;
+    PRAGMA integrity_check;
+    SELECT id FROM a WHERE n = 2 AND tags IS NOT NULL;
+    DELETE FROM a WHERE id = 1;
+    UPDATE a SET tags = '{q,r}' WHERE id = 2;
+    PRAGMA integrity_check;
+    SELECT id, tags FROM a ORDER BY id;
+}
+expect {
+    ok
+    2
+    ok
+    2|{q,r}
+    3|
+}

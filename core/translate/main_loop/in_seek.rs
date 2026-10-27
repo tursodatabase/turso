@@ -1,59 +1,123 @@
 use super::*;
 
-/// Emit the start of the two-level loop for an `IN` search.
-///
-/// The outer loop reads one value from the `IN` list. The inner loop reads all
-/// table or index rows that match that value.
-/// The main loop and the unmatched-right read use this bytecode shape.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn emit_in_seek_start(
+/// Labels and cursor for the outer loop over one IN source.
+#[derive(Debug)]
+pub(crate) struct InSeekLoop {
+    pub(crate) source_cursor: CursorID,
+    pub(crate) outer_loop_start: BranchOffset,
+    pub(crate) next_value: BranchOffset,
+}
+
+/// Materialize IN values into the unique ephemeral index used by an IN seek.
+/// With `once`, the values are constant for the whole program and the index
+/// is filled the first time only.
+pub(crate) fn open_in_seek_values_cursor<E>(
     program: &mut ProgramBuilder,
-    table_references: &TableReferences,
-    resolver: &Resolver<'_>,
     index: Option<&Arc<Index>>,
-    source: &InSeekSource,
-    table_cursor_id: Option<CursorID>,
-    index_cursor_id: Option<CursorID>,
+    values: &[E],
+    affinity: Affinity,
+    once: bool,
+    mut emit_value: impl FnMut(&mut ProgramBuilder, &E, usize) -> Result<()>,
+) -> Result<CursorID> {
+    let once_done = program.allocate_label();
+    if once {
+        program.emit_insn(Insn::Once {
+            target_pc_when_reentered: once_done,
+        });
+    }
+    let collation = index
+        .as_ref()
+        .and_then(|index| index.columns.first())
+        .and_then(|column| column.collation);
+    let ephemeral_index = Arc::new(Index {
+        constraint_name: None,
+        name: String::new(),
+        table_name: String::new(),
+        root_page: 0,
+        columns: crate::alloc::try_vec![IndexColumn {
+            name: String::new(),
+            order: SortOrder::Asc,
+            nulls_order: None,
+            pos_in_table: 0,
+            collation,
+            default: None,
+            expr: None,
+        }]?,
+        unique: true,
+        ephemeral: true,
+        has_rowid: false,
+        where_clause: None,
+        index_method: None,
+        on_conflict: None,
+    });
+    let source_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(ephemeral_index));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: source_cursor,
+        is_table: false,
+    });
+    let value_register = program.alloc_register();
+    let record_register = program.alloc_register();
+    let affinity = affinity.aff_mask().to_string();
+    for value in values {
+        emit_value(program, value, value_register)?;
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(value_register),
+            count: 1,
+            dest_reg: to_u32(record_register),
+            index_name: None,
+            affinity_str: Some(affinity.clone()),
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: source_cursor,
+            record_reg: record_register,
+            unpacked_start: Some(value_register),
+            unpacked_count: Some(1),
+            flags: IdxInsertFlags::new().no_op_duplicate(),
+        });
+    }
+    program.preassign_label_to_next_insn(once_done);
+    Ok(source_cursor)
+}
+
+/// Emit the outer IN-value loop and position the table or index cursor for its
+/// first matching row.
+pub(crate) fn emit_in_seek_start(
+    program: &mut ProgramBuilder,
+    source_cursor: CursorID,
+    scan_cursor: CursorID,
+    table_cursor: Option<CursorID>,
+    index_backed: bool,
     loop_start: BranchOffset,
     loop_end: BranchOffset,
-) -> Result<InSeekMetadata> {
-    let source_cursor_id =
-        open_in_seek_source_cursor(program, table_references, resolver, index, source)?;
+) -> InSeekLoop {
     program.emit_insn(Insn::NullRow {
-        cursor_id: source_cursor_id,
+        cursor_id: source_cursor,
     });
     program.emit_insn(Insn::Rewind {
-        cursor_id: source_cursor_id,
+        cursor_id: source_cursor,
         pc_if_empty: loop_end,
     });
 
     let outer_loop_start = program.allocate_label();
     program.preassign_label_to_next_insn(outer_loop_start);
-    let seek_reg = program.alloc_register();
+    let seek_register = program.alloc_register();
     program.emit_insn(Insn::Column {
-        cursor_id: source_cursor_id,
+        cursor_id: source_cursor,
         column: 0,
-        dest: seek_reg,
+        dest: seek_register,
         default: None,
     });
 
     let next_value = program.allocate_label();
     program.emit_insn(Insn::IsNull {
-        reg: seek_reg,
+        reg: seek_register,
         target_pc: next_value,
     });
-    if index.is_none() {
-        program.emit_insn(Insn::SeekRowid {
-            cursor_id: table_cursor_id.expect("a rowid IN search must have a table cursor"),
-            src_reg: seek_reg,
-            target_pc: next_value,
-        });
-    } else {
-        let index_cursor_id =
-            index_cursor_id.expect("an indexed IN search must have an index cursor");
+
+    if index_backed {
         program.emit_insn(Insn::SeekGE {
-            cursor_id: index_cursor_id,
-            start_reg: seek_reg,
+            cursor_id: scan_cursor,
+            start_reg: seek_register,
             num_regs: 1,
             target_pc: next_value,
             is_index: true,
@@ -62,134 +126,57 @@ pub(super) fn emit_in_seek_start(
         });
         program.preassign_label_to_next_insn(loop_start);
         program.emit_insn(Insn::IdxGT {
-            cursor_id: index_cursor_id,
-            start_reg: seek_reg,
+            cursor_id: scan_cursor,
+            start_reg: seek_register,
             num_regs: 1,
             target_pc: next_value,
         });
-        if let Some(table_cursor_id) = table_cursor_id {
-            program.emit_deferred_seek(index_cursor_id, table_cursor_id);
+        if let Some(table_cursor) = table_cursor {
+            program.emit_insn(Insn::DeferredSeek {
+                index_cursor_id: scan_cursor,
+                table_cursor_id: table_cursor,
+            });
         }
+    } else {
+        assert!(
+            table_cursor.is_none(),
+            "rowid IN seek cannot have a second table cursor"
+        );
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: scan_cursor,
+            src_reg: seek_register,
+            target_pc: next_value,
+        });
     }
 
-    Ok(InSeekMetadata {
-        ephemeral_cursor_id: source_cursor_id,
+    InSeekLoop {
+        source_cursor,
         outer_loop_start,
-        next_val_label: next_value,
-    })
-}
-
-/// Open or reuse the ephemeral cursor that supplies RHS values for an IN-seek.
-///
-/// Literal lists are materialized once into a unique ephemeral index so both
-/// ordinary `Search::InSeek` and multi-index OR branches can drive repeated
-/// equality seeks from the same bytecode pattern. IN-subqueries already have an
-/// ephemeral cursor from subquery translation, so they are reused directly.
-pub(super) fn open_in_seek_source_cursor(
-    program: &mut ProgramBuilder,
-    table_references: &TableReferences,
-    resolver: &Resolver<'_>,
-    index: Option<&Arc<Index>>,
-    source: &InSeekSource,
-) -> Result<CursorID> {
-    match source {
-        InSeekSource::LiteralList { values, affinity } => {
-            let label_once_end = if values.iter().all(|value| value.is_constant(resolver)) {
-                let label_once_end = program.allocate_label();
-                program.emit_insn(Insn::Once {
-                    target_pc_when_reentered: label_once_end,
-                });
-                Some(label_once_end)
-            } else {
-                None
-            };
-            let collation = index
-                .as_ref()
-                .and_then(|idx| idx.columns.first())
-                .and_then(|c| c.collation);
-            let ephemeral_index = Arc::new(Index {
-                name: String::new(),
-                table_name: String::new(),
-                root_page: 0,
-                columns: crate::alloc::try_vec![IndexColumn {
-                    name: String::new(),
-                    order: SortOrder::Asc,
-                    nulls_order: None,
-                    pos_in_table: 0,
-                    collation,
-                    default: None,
-                    expr: None,
-                }]?,
-                unique: true,
-                ephemeral: true,
-                has_rowid: false,
-                where_clause: None,
-                index_method: None,
-                on_conflict: None,
-                constraint_name: None,
-            });
-            let eph_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(ephemeral_index));
-            program.emit_insn(Insn::OpenEphemeral {
-                cursor_id: eph_cursor,
-                is_table: false,
-            });
-            let val_reg = program.alloc_register();
-            let record_reg = program.alloc_register();
-            let affinity_str = affinity.aff_mask().to_string();
-            for value in values.iter() {
-                translate_expr_no_constant_opt(
-                    program,
-                    Some(table_references),
-                    value,
-                    val_reg,
-                    resolver,
-                    NoConstantOptReason::InListEphemeral,
-                )?;
-                program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u32(val_reg),
-                    count: 1,
-                    dest_reg: to_u32(record_reg),
-                    index_name: None,
-                    affinity_str: Some(affinity_str.clone()),
-                });
-                program.emit_insn(Insn::IdxInsert {
-                    cursor_id: eph_cursor,
-                    record_reg,
-                    unpacked_start: Some(val_reg),
-                    unpacked_count: Some(1),
-                    flags: IdxInsertFlags::new().no_op_duplicate(),
-                });
-            }
-            if let Some(label_once_end) = label_once_end {
-                program.preassign_label_to_next_insn(label_once_end);
-            }
-            Ok(eph_cursor)
-        }
-        InSeekSource::Subquery { cursor_id } => Ok(*cursor_id),
+        next_value,
     }
 }
 
-/// Emit the end of the two-level loop for an `IN` search.
-pub(super) fn emit_in_seek_end(
+/// Finish one IN value, scan duplicate index keys when needed, then advance to
+/// the next value.
+pub(crate) fn emit_in_seek_advance(
     program: &mut ProgramBuilder,
-    index_cursor_id: Option<CursorID>,
+    state: &InSeekLoop,
+    scan_cursor: CursorID,
+    index_backed: bool,
     loop_start: BranchOffset,
-    meta: &InSeekMetadata,
 ) {
-    if let Some(index_cursor_id) = index_cursor_id {
-        // An index key can identify more than one row. The inner loop reads all
-        // matching rows before the outer loop advances to the next `IN` value.
+    if index_backed {
         program.emit_insn(Insn::Next {
-            cursor_id: index_cursor_id,
+            cursor_id: scan_cursor,
             pc_if_next: loop_start,
             fullscan: false,
             is_index: false,
         });
     }
-    program.preassign_label_to_next_insn(meta.next_val_label);
+    program.preassign_label_to_next_insn(state.next_value);
     program.emit_insn(Insn::Next {
-        cursor_id: meta.ephemeral_cursor_id,
-        pc_if_next: meta.outer_loop_start,
+        cursor_id: state.source_cursor,
+        pc_if_next: state.outer_loop_start,
         fullscan: false,
         is_index: false,
     });

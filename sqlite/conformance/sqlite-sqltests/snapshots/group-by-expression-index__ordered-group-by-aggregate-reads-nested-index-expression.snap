@@ -19,53 +19,54 @@ QUERY PLAN
 BYTECODE
 addr  opcode        p1  p2  p3  p4            p5  comment
    0  Init           0  47   0                 0  Start at 47
-   1  Null           0   8   0                 0  r[8]=NULL
-   2  Integer        0   5   0                 0  r[5]=0; clear group by abort flag
-   3  Null           0   6   0                 0  r[6]=NULL; initialize group by comparison registers to NULL
-   4  Gosub         12  43   0                 0  ; go to clear accumulator subroutine
+   1  Null           0   1   0                 0  r[1]=NULL
+   2  Integer        0  14   0                 0  r[14]=0
+   3  Null           0  15   0                 0  r[15]=NULL
+   4  Gosub         13  43   0                 0
    5  OpenRead       0   5   0  k(5,B,B,B,B)   0  index=ordered_input_idx, root=5, iDb=0
-   6  Rewind         0  32   0                 0  Rewind index ordered_input_idx
-   7    Column       0   1  14                 0  r[14]=ordered_input_idx.d
-   8    Lt          14  15  31  Binary         0  if r[14]<r[15] goto 31
-   9    Column       0   1  17                 0  r[17]=ordered_input_idx.d
-  10    Gt          17  18  31  Binary         0  if r[17]>r[18] goto 31
-  11    Column       0   0  10                 0  r[10]=ordered_input_idx.a
-  12    Column       0   2  20                 0  r[20]=ordered_input_idx.b ->> 'x'
-  13    Integer      1  21   0                 0  r[21]=1
-  14    Integer      1  19   0                 0  r[19]=1
-  15    Eq          20  21  17                 0  if r[20]==r[21] goto 17
-  16    ZeroOrNull  20  19  21                 0  ((r[20]=NULL)|(r[21]=NULL)) ? r[19]=NULL : r[19]=0
-  17    IfNot       19  20   1                 0  if !r[19] goto 20
-  18    Column       0   3  11                 0  r[11]=ordered_input_idx.c
-  19    Goto         0  21   0                 0
-  20    Null         0  11   0                 0  r[11]=NULL
-  21    Compare      6  10   1  k(1, Binary)   0  r[6..6]==r[10..10]
-  22    Jump        23  27  23                 0  ; start new group if comparison is not equal
-  23    Gosub        3  36   0                 0  ; check if ended group had data, and output if so
-  24    Move        10   6   1                 0  r[6..6]=r[10..10]
-  25    IfPos        5  46   0                 0  r[5]>0 -> r[5]-=0, goto 46; check abort flag
-  26    Gosub       12  43   0                 0  ; goto clear accumulator subroutine
-  27    AggStep      0  11   8  sum            0  accum=r[8] step(r[11])
-  28    If           4  30   0                 0  if r[4] goto 30; don't emit group columns if continuing existing group
-  29    Column       0   0   7                 0  r[7]=ordered_input_idx.a
-  30    Integer      1   4   0                 0  r[4]=1; indicate data in accumulator
-  31  Next           0   7   0                 1
-  32  Gosub          3  36   0                 0  ; emit row for final group
-  33  Goto           0  46   0                 0  ; group by finished
-  34  Integer        1   5   0                 0  r[5]=1
-  35  Return         3   0   0                 0
-  36  IfPos          4  38   0                 0  r[4]>0 -> r[4]-=0, goto 38; output group by row subroutine start
-  37  Return         3   0   0                 0
-  38  AggFinal       0   8   0  sum            0  accum=r[8]
-  39  Copy           7   1   0                 0  r[1]=r[7]
-  40  Copy           8   2   0                 0  r[2]=r[8]
-  41  ResultRow      1   2   0                 0  output=r[1..2]
-  42  Return         3   0   0                 0
-  43  Null           0   7   8                 0  r[7..8]=NULL; clear accumulator subroutine start
-  44  Integer        0   4   0                 0  r[4]=0
-  45  Return        12   0   0                 0
+   6  Rewind         0  34   0                 0  Rewind index ordered_input_idx
+   7    Column       0   2  17                 0  r[17]=ordered_input_idx.b ->> 'x'
+   8    Column       0   1  18                 0  r[18]=ordered_input_idx.d
+   9    Lt          18  19  33  Binary         0  if r[18]<r[19] goto 33
+  10    Column       0   1  20                 0  r[20]=ordered_input_idx.d
+  11    Gt          20  21  33  Binary         0  if r[20]>r[21] goto 33
+  12    Column       0   0  16                 0  r[16]=ordered_input_idx.a
+  13    Column       0   3   4                 0  r[4]=ordered_input_idx.c
+  14    Copy        17  10   0                 0  r[10]=r[17]
+  15    Compare     15  16   1  k(1, Binary)   0  r[15..15]==r[16..16]
+  16    Jump        17  20  17                 0
+  17    Gosub       12  36   0                 0
+  18    Move        16  15   1                 0  r[15..15]=r[16..16]
+  19    Gosub       13  43   0                 0
+  20    Copy        10  24   0                 0  r[24]=r[10]
+  21    Integer      1  23   0                 0  r[23]=1
+  22    Eq          24  25  24                 0  if r[24]==r[25] goto 24
+  23    ZeroOrNull  24  23  25                 0  ((r[24]=NULL)|(r[25]=NULL)) ? r[23]=NULL : r[23]=0
+  24    IfNot       23  27   1                 0  if !r[23] goto 27
+  25    Copy         4  22   0                 0  r[22]=r[4]
+  26    Goto         0  28   0                 0
+  27    Null         0  22   0                 0  r[22]=NULL
+  28    AggStep      0  22   1  sum            0  accum=r[1] step(r[22])
+  29    If          14  32   0                 0  if r[14] goto 32
+  30    Copy         4   8   0                 0  r[8]=r[4]
+  31    Copy        10  11   0                 0  r[11]=r[10]
+  32    Integer      1  14   0                 0  r[14]=1
+  33  Next           0   7   0                 1
+  34  Gosub         12  36   0                 0
+  35  Goto           0  46   0                 0
+  36  IfPos         14  38   0                 0  r[14]>0 -> r[14]-=0, goto 38
+  37  Return        12   0   0                 0
+  38  AggFinal       0   1   0  sum            0  accum=r[1]
+  39  Copy          15  26   0                 0  r[26]=r[15]
+  40  Copy           1  27   0                 0  r[27]=r[1]
+  41  ResultRow     26   2   0                 0  output=r[26..27]
+  42  Return        12   0   0                 0
+  43  Null           0   1   0                 0  r[1]=NULL
+  44  Integer        0  14   0                 0  r[14]=0
+  45  Return        13   0   0                 0
   46  Halt           0   0   0                 0
   47  Transaction    0   1   4                 0  iDb=0 tx_mode=Read
-  48  Integer        0  15   0                 0  r[15]=0
-  49  Integer       10  18   0                 0  r[18]=10
-  50  Goto           0   1   0                 0
+  48  Integer        0  19   0                 0  r[19]=0
+  49  Integer       10  21   0                 0  r[21]=10
+  50  Integer        1  25   0                 0  r[25]=1
+  51  Goto           0   1   0                 0

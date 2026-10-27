@@ -1,0 +1,920 @@
+//! Foreign-key checks for DML lowered from HIR.
+//!
+//! The checks read key values through HIR sources. Only NO ACTION and
+//! RESTRICT are lowered here: a parent-side CASCADE, SET NULL or SET DEFAULT
+//! changes the child rows instead, through `fkey_action`.
+//!
+//! Violations of an immediate constraint add to the statement's counter,
+//! checked when the statement ends; deferred ones add to the connection's
+//! counter, checked at COMMIT. RESTRICT stops the statement at once.
+
+use std::num::NonZeroUsize;
+
+use turso_parser::ast::RefAct;
+
+use super::emit::{
+    copy_with_affinity, emit_fk_restrict_halt, emit_fk_violation, emit_guarded_fk_decrement,
+    emit_skip_if_any_null, index_probe, index_scan_match_any, open_read_index, open_read_table,
+};
+use crate::{
+    schema::BTreeTable,
+    sync::Arc,
+    translate::{
+        collate::CollationSeq,
+        semantic::hir::{self, HirDocument, SourceId},
+    },
+    vdbe::{
+        builder::{ProgramBuilder, SourceBinding},
+        insn::{CmpInsFlags, ConstraintInfo, Insn},
+        BranchOffset,
+    },
+    LimboError, Result,
+};
+
+/// Whether an UPDATE that sets the columns at `assigned` may change the
+/// parent key. A rowid parent key is the INTEGER PRIMARY KEY column, which
+/// `assigned` lists when the UPDATE sets the rowid.
+pub(super) fn parent_key_may_change(
+    foreign_key: &hir::ResolvedForeignKey,
+    assigned: &[usize],
+) -> bool {
+    foreign_key
+        .parent_positions
+        .iter()
+        .any(|position| assigned.contains(position))
+}
+
+fn child_key_changes(foreign_key: &hir::ResolvedForeignKey, assigned: &[usize]) -> bool {
+    foreign_key
+        .child_positions
+        .iter()
+        .any(|position| assigned.contains(position))
+}
+
+/// Checks before the row of `target` that the table cursor is on is deleted.
+/// `target` must be bound to that cursor and `rowid` must hold its rowid.
+///
+/// Where the target is the parent, a child row that still points at the row
+/// is a violation. Where the target is the child of a deferred constraint, a
+/// row that pointed at a missing parent takes back the violation it added.
+///
+/// `replacement` is a row that REPLACE writes in place of this one, bound to
+/// its registers. An immediate NO ACTION constraint whose key it keeps is
+/// not checked.
+pub(super) fn emit_delete_checks(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_keys: &hir::DmlForeignKeys,
+    target: SourceId,
+    rowid: usize,
+    database: usize,
+    replacement: Option<SourceId>,
+) -> Result<()> {
+    for foreign_key in &foreign_keys.incoming {
+        // An ON DELETE action changes the children instead.
+        if super::fkey_action::has_action(foreign_key, super::fkey_action::ParentChange::Delete) {
+            continue;
+        }
+        let declaration = &foreign_key.declaration;
+        let keeps_key = replacement
+            .filter(|_| declaration.on_delete == RefAct::NoAction && !declaration.deferred);
+        let kept = match keeps_key {
+            Some(replacement) => {
+                let width = foreign_key.parent_positions.len();
+                let old_key = emit_stored_parent_key(program, document, foreign_key, target)?;
+                let new_key = emit_stored_parent_key(program, document, foreign_key, replacement)?;
+                let kept = program.allocate_label();
+                emit_skip_if_same_key(program, old_key, new_key, width, kept);
+                Some(kept)
+            }
+            None => None,
+        };
+        emit_children_still_point_here(program, document, foreign_key, target, rowid, database)?;
+        if let Some(kept) = kept {
+            program.preassign_label_to_next_insn(kept);
+        }
+    }
+    for foreign_key in &foreign_keys.outgoing {
+        emit_deleted_child_releases_violation(program, document, foreign_key, target, database)?;
+    }
+    Ok(())
+}
+
+/// Count, or stop at, child rows that point at the parent key of `target`'s
+/// current row.
+fn emit_children_still_point_here(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_key: &hir::ResolvedForeignKey,
+    target: SourceId,
+    rowid: usize,
+    database: usize,
+) -> Result<()> {
+    let width = foreign_key.parent_columns.len();
+    let key = emit_stored_parent_key(program, document, foreign_key, target)?;
+    let skip = program.allocate_label();
+    emit_skip_if_any_null(program, key, width, skip);
+
+    let child_table = btree(&foreign_key.child_table)?;
+    let self_reference = is_self_reference(foreign_key);
+    let restrict = foreign_key.declaration.on_delete == RefAct::Restrict;
+    let declaration = foreign_key.declaration.clone();
+    let violation = move |program: &mut ProgramBuilder| -> Result<()> {
+        if restrict {
+            emit_fk_restrict_halt(program, None)
+        } else {
+            emit_fk_violation(program, &declaration, None)
+        }
+    };
+    // A self-reference scans the table so that the row being deleted does
+    // not count as its own child.
+    match foreign_key.child_index.as_ref().filter(|_| !self_reference) {
+        Some(index) => {
+            let cursor = open_read_index(program, &index.handle(), database);
+            let probe = copy_with_affinity(program, key, width, index.value(), &child_table);
+            index_probe(program, cursor, probe, width, violation, |_| Ok(()))?;
+        }
+        None => table_scan_match_any(
+            program,
+            document,
+            foreign_key,
+            key,
+            self_reference.then_some(rowid),
+            database,
+            violation,
+        )?,
+    }
+    program.preassign_label_to_next_insn(skip);
+    Ok(())
+}
+
+/// A deleted child row whose parent is missing counted one violation, when
+/// it was written or when its parent went earlier in this statement; take
+/// that back. Like SQLite, this holds for immediate constraints too: a
+/// statement that deletes a parent and its children, such as `DELETE FROM
+/// t` on a self-referencing table, is checked when it ends, not row by row.
+fn emit_deleted_child_releases_violation(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_key: &hir::ResolvedForeignKey,
+    target: SourceId,
+    database: usize,
+) -> Result<()> {
+    let width = foreign_key.child_positions.len();
+    let deferred = foreign_key.declaration.deferred;
+    let key = emit_child_key(program, document, foreign_key, target)?;
+    let skip = program.allocate_label();
+    emit_skip_if_any_null(program, key, width, skip);
+    let parent_table = btree(&foreign_key.parent_table)?;
+    if foreign_key.parent_uses_rowid {
+        let cursor = open_read_table(program, &parent_table, database);
+        let parent_rowid = program.alloc_register();
+        program.emit_insn(Insn::Copy {
+            src_reg: key,
+            dst_reg: parent_rowid,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::MustBeInt {
+            reg: parent_rowid,
+            target_pc: None,
+        });
+        let missing = program.allocate_label();
+        program.emit_insn(Insn::NotExists {
+            cursor,
+            rowid_reg: parent_rowid,
+            target_pc: missing,
+        });
+        program.emit_insn(Insn::Close { cursor_id: cursor });
+        program.emit_insn(Insn::Goto { target_pc: skip });
+        program.preassign_label_to_next_insn(missing);
+        program.emit_insn(Insn::Close { cursor_id: cursor });
+        emit_guarded_fk_decrement(program, skip, deferred);
+    } else {
+        let index = parent_index(foreign_key)?;
+        let cursor = open_read_index(program, &index.handle(), database);
+        let probe = copy_with_affinity(program, key, width, index.value(), &parent_table);
+        let found = program.allocate_label();
+        program.emit_insn(Insn::Found {
+            cursor_id: cursor,
+            target_pc: found,
+            record_reg: probe,
+            num_regs: width,
+        });
+        program.emit_insn(Insn::Close { cursor_id: cursor });
+        emit_guarded_fk_decrement(program, found, deferred);
+        program.preassign_label_to_next_insn(found);
+        program.emit_insn(Insn::Close { cursor_id: cursor });
+    }
+    program.preassign_label_to_next_insn(skip);
+    Ok(())
+}
+
+/// Checks of a new row of `target` before it is written. `target` must be
+/// bound to the row's registers and `rowid` must hold its rowid.
+///
+/// Where the target is the child, its parent must exist: an immediate
+/// constraint stops the statement, a deferred one adds a violation.
+pub(super) fn emit_insert_child_checks(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_keys: &hir::DmlForeignKeys,
+    target: SourceId,
+    rowid: usize,
+    database: usize,
+) -> Result<()> {
+    for foreign_key in &foreign_keys.outgoing {
+        let width = foreign_key.child_positions.len();
+        let key = emit_child_key(program, document, foreign_key, target)?;
+        let ok = program.allocate_label();
+        emit_skip_if_any_null(program, key, width, ok);
+        let parent_table = btree(&foreign_key.parent_table)?;
+        let self_reference = is_self_reference(foreign_key);
+        let declaration = foreign_key.declaration.clone();
+        // Like SQLite, a statement that writes one row on its own stops at
+        // a missing parent at once, so it needs no statement journal to
+        // take the row back. Otherwise a missing parent counts a violation
+        // and an immediate one fails the statement when it ends, which lets
+        // one statement write a child before its parent, as `INSERT INTO t
+        // VALUES (7, 8), (8, 7)` does on a self-referencing table.
+        let halts = !foreign_key.declaration.deferred
+            && !program.flags.is_multi_write()
+            && !program.flags.is_subprogram();
+        let constraint_info = halts.then(|| foreign_key_violation(foreign_key, key));
+        let violation = move |program: &mut ProgramBuilder| -> Result<()> {
+            if halts {
+                emit_fk_restrict_halt(program, constraint_info.clone())
+            } else {
+                emit_fk_violation(program, &declaration, None)
+            }
+        };
+        if foreign_key.parent_uses_rowid {
+            let cursor = open_read_table(program, &parent_table, database);
+            let parent_rowid = program.alloc_register();
+            program.emit_insn(Insn::Copy {
+                src_reg: key,
+                dst_reg: parent_rowid,
+                extra_amount: 0,
+            });
+            let missing = program.allocate_label();
+            program.emit_insn(Insn::MustBeInt {
+                reg: parent_rowid,
+                target_pc: Some(missing),
+            });
+            // A row that points at itself has its parent once it is written.
+            if self_reference {
+                program.emit_insn(Insn::Eq {
+                    lhs: parent_rowid,
+                    rhs: rowid,
+                    target_pc: ok,
+                    flags: CmpInsFlags::default(),
+                    collation: None,
+                });
+            }
+            program.emit_insn(Insn::NotExists {
+                cursor,
+                rowid_reg: parent_rowid,
+                target_pc: missing,
+            });
+            program.emit_insn(Insn::Close { cursor_id: cursor });
+            program.emit_insn(Insn::Goto { target_pc: ok });
+            program.preassign_label_to_next_insn(missing);
+            program.emit_insn(Insn::Close { cursor_id: cursor });
+            violation(program)?;
+        } else {
+            if self_reference {
+                emit_own_parent_check(program, document, foreign_key, target, key, ok)?;
+            }
+            let index = parent_index(foreign_key)?;
+            let cursor = open_read_index(program, &index.handle(), database);
+            let probe = copy_with_affinity(program, key, width, index.value(), &parent_table);
+            index_probe(program, cursor, probe, width, |_| Ok(()), violation)?;
+        }
+        program.preassign_label_to_next_insn(ok);
+    }
+    Ok(())
+}
+
+/// After a new row of `target` is written: where the target is the parent
+/// of a deferred or self-referencing constraint, each child row that points
+/// at the new key had a missing parent until now, so take back its
+/// violation. `target` must be bound to the row's registers.
+///
+/// Under REPLACE (`replaced`), a deleted conflicting row may have counted
+/// children of any constraint, so every constraint is repaired.
+pub(super) fn emit_insert_parent_repairs(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_keys: &hir::DmlForeignKeys,
+    target: SourceId,
+    database: usize,
+    replaced: bool,
+) -> Result<()> {
+    for foreign_key in &foreign_keys.incoming {
+        let deferred = foreign_key.declaration.deferred;
+        if !replaced && !deferred && !is_self_reference(foreign_key) {
+            continue;
+        }
+        let width = foreign_key.parent_positions.len();
+        let skip = program.allocate_label();
+        program.emit_insn(Insn::FkIfZero {
+            deferred,
+            target_pc: skip,
+        });
+        let key = emit_stored_parent_key(program, document, foreign_key, target)?;
+        let parent_table = btree(&foreign_key.parent_table)?;
+        // The key is compared as the parent stores it.
+        let affinities = if foreign_key.parent_uses_rowid {
+            "i".to_string()
+        } else {
+            foreign_key
+                .parent_positions
+                .iter()
+                .map(|&position| parent_table.columns()[position].affinity().aff_mask())
+                .collect()
+        };
+        if let Some(count) = NonZeroUsize::new(width) {
+            program.emit_insn(Insn::Affinity {
+                start_reg: key,
+                count,
+                affinities,
+            });
+        }
+        emit_skip_if_any_null(program, key, width, skip);
+        let child_table = btree(&foreign_key.child_table)?;
+        let repair = |program: &mut ProgramBuilder| -> Result<()> {
+            let next = program.allocate_label();
+            emit_guarded_fk_decrement(program, next, deferred);
+            program.preassign_label_to_next_insn(next);
+            Ok(())
+        };
+        match &foreign_key.child_index {
+            Some(index) => {
+                let cursor = open_read_index(program, &index.handle(), database);
+                let probe = copy_with_affinity(program, key, width, index.value(), &child_table);
+                index_scan_match_any(program, cursor, probe, width, None, repair)?;
+            }
+            None => {
+                table_scan_match_any(program, document, foreign_key, key, None, database, repair)?
+            }
+        }
+        program.preassign_label_to_next_insn(skip);
+    }
+    Ok(())
+}
+
+/// Checks of an UPDATE before any index entry or the row is rewritten.
+/// `old` must be bound to the table cursor on the row, `new` to the new
+/// row's registers, and `rowid` must hold the rowid; `assigned` lists the
+/// columns the UPDATE sets.
+///
+/// Where the target is the parent and the parent key changes,
+/// children of the old key become violations (RESTRICT stops at once) and
+/// children of the new key take back deferred violations. Where the target
+/// is the child and the child key changes, the old key takes back its
+/// deferred violation if its parent was missing, and a new key without a
+/// parent adds one.
+///
+/// `rowid` holds the row's rowid in the table and `new_rowid` the one it is
+/// written with.
+///
+/// When the UPDATE may REPLACE (`replaces`), another row may still hold the
+/// new parent key until the write, so the repairs of the new key are
+/// returned to be emitted after it with [`emit_update_repairs`].
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_update_checks<'a>(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_keys: &'a hir::DmlForeignKeys,
+    old: SourceId,
+    new: SourceId,
+    rowid: usize,
+    new_rowid: usize,
+    assigned: &[usize],
+    database: usize,
+    replaces: bool,
+) -> Result<Vec<PendingRepair<'a>>> {
+    let mut pending = Vec::new();
+    for foreign_key in &foreign_keys.incoming {
+        // An ON UPDATE action changes the children instead.
+        if !parent_key_may_change(foreign_key, assigned)
+            || super::fkey_action::has_action(foreign_key, super::fkey_action::ParentChange::Update)
+        {
+            continue;
+        }
+        let width = foreign_key.parent_positions.len();
+        let old_key = emit_stored_parent_key(program, document, foreign_key, old)?;
+        let new_key = emit_stored_parent_key(program, document, foreign_key, new)?;
+        let deferred = foreign_key.declaration.deferred;
+        // Set when the key changes, for the repairs after the write.
+        let changed = (replaces && deferred).then(|| {
+            let changed = program.alloc_register();
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: changed,
+            });
+            changed
+        });
+        let unchanged = program.allocate_label();
+        emit_skip_if_same_key(program, old_key, new_key, width, unchanged);
+        if let Some(changed) = changed {
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: changed,
+            });
+            pending.push(PendingRepair {
+                foreign_key,
+                changed,
+                new_key,
+            });
+        }
+        // A row that points at itself and changes its child key too no
+        // longer points at its old parent key.
+        let exclude = (is_self_reference(foreign_key) && child_key_changes(foreign_key, assigned))
+            .then_some(rowid);
+        let restrict = foreign_key.declaration.on_update == RefAct::Restrict;
+        let declaration = foreign_key.declaration.clone();
+        emit_child_probe(
+            program,
+            document,
+            foreign_key,
+            old_key,
+            exclude,
+            database,
+            move |program: &mut ProgramBuilder| {
+                if restrict {
+                    emit_fk_restrict_halt(program, None)
+                } else {
+                    emit_fk_violation(program, &declaration, None)
+                }
+            },
+        )?;
+        if deferred && !replaces {
+            emit_new_parent_key_repairs(program, document, foreign_key, new_key, database)?;
+        }
+        program.preassign_label_to_next_insn(unchanged);
+    }
+
+    for foreign_key in &foreign_keys.outgoing {
+        if !child_key_changes(foreign_key, assigned) {
+            continue;
+        }
+        let width = foreign_key.child_positions.len();
+        let parent_table = btree(&foreign_key.parent_table)?;
+        if foreign_key.declaration.deferred {
+            let old_key = emit_child_key(program, document, foreign_key, old)?;
+            let skip = program.allocate_label();
+            emit_skip_if_any_null(program, old_key, width, skip);
+            if foreign_key.parent_uses_rowid {
+                let cursor = open_read_table(program, &parent_table, database);
+                let parent_rowid = program.alloc_register();
+                program.emit_insn(Insn::Copy {
+                    src_reg: old_key,
+                    dst_reg: parent_rowid,
+                    extra_amount: 0,
+                });
+                let missing = program.allocate_label();
+                program.emit_insn(Insn::MustBeInt {
+                    reg: parent_rowid,
+                    target_pc: Some(missing),
+                });
+                program.emit_insn(Insn::NotExists {
+                    cursor,
+                    rowid_reg: parent_rowid,
+                    target_pc: missing,
+                });
+                program.emit_insn(Insn::Close { cursor_id: cursor });
+                program.emit_insn(Insn::Goto { target_pc: skip });
+                program.preassign_label_to_next_insn(missing);
+                program.emit_insn(Insn::Close { cursor_id: cursor });
+                emit_guarded_fk_decrement(program, skip, true);
+            } else {
+                let index = parent_index(foreign_key)?;
+                let cursor = open_read_index(program, &index.handle(), database);
+                let probe =
+                    copy_with_affinity(program, old_key, width, index.value(), &parent_table);
+                index_probe(
+                    program,
+                    cursor,
+                    probe,
+                    width,
+                    |_| Ok(()),
+                    |program| {
+                        let next = program.allocate_label();
+                        emit_guarded_fk_decrement(program, next, true);
+                        program.preassign_label_to_next_insn(next);
+                        Ok(())
+                    },
+                )?;
+            }
+            program.preassign_label_to_next_insn(skip);
+        }
+
+        // Unlike INSERT, a new key without a parent adds a violation even for
+        // an immediate constraint, checked when the statement ends.
+        let new_key = emit_child_key(program, document, foreign_key, new)?;
+        let ok = program.allocate_label();
+        emit_skip_if_any_null(program, new_key, width, ok);
+        let self_reference = is_self_reference(foreign_key);
+        let declaration = foreign_key.declaration.clone();
+        let constraint_info =
+            (!declaration.deferred).then(|| foreign_key_violation(foreign_key, new_key));
+        let violation = move |program: &mut ProgramBuilder| {
+            emit_fk_violation(program, &declaration, constraint_info.clone())
+        };
+        if foreign_key.parent_uses_rowid {
+            let cursor = open_read_table(program, &parent_table, database);
+            let parent_rowid = program.alloc_register();
+            program.emit_insn(Insn::Copy {
+                src_reg: new_key,
+                dst_reg: parent_rowid,
+                extra_amount: 0,
+            });
+            let missing = program.allocate_label();
+            program.emit_insn(Insn::MustBeInt {
+                reg: parent_rowid,
+                target_pc: Some(missing),
+            });
+            // The row may be its own parent, under its new rowid.
+            if self_reference {
+                program.emit_insn(Insn::Eq {
+                    lhs: parent_rowid,
+                    rhs: new_rowid,
+                    target_pc: ok,
+                    flags: CmpInsFlags::default(),
+                    collation: None,
+                });
+            }
+            program.emit_insn(Insn::NotExists {
+                cursor,
+                rowid_reg: parent_rowid,
+                target_pc: missing,
+            });
+            program.emit_insn(Insn::Close { cursor_id: cursor });
+            program.emit_insn(Insn::Goto { target_pc: ok });
+            program.preassign_label_to_next_insn(missing);
+            program.emit_insn(Insn::Close { cursor_id: cursor });
+            violation(program)?;
+        } else {
+            if self_reference {
+                emit_own_parent_check(program, document, foreign_key, new, new_key, ok)?;
+            }
+            let index = parent_index(foreign_key)?;
+            let cursor = open_read_index(program, &index.handle(), database);
+            let probe = copy_with_affinity(program, new_key, width, index.value(), &parent_table);
+            index_probe(program, cursor, probe, width, |_| Ok(()), violation)?;
+        }
+        program.preassign_label_to_next_insn(ok);
+    }
+    Ok(pending)
+}
+
+/// A repair of children of a new parent key that waits until the UPDATE has
+/// written its row.
+pub(super) struct PendingRepair<'a> {
+    foreign_key: &'a hir::ResolvedForeignKey,
+    /// Whether the key changed.
+    changed: usize,
+    new_key: usize,
+}
+
+/// After the row is written, children of a new deferred parent key take
+/// back their violations.
+pub(super) fn emit_update_repairs(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    pending: &[PendingRepair<'_>],
+    database: usize,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let done = program.allocate_label();
+    program.emit_insn(Insn::FkIfZero {
+        deferred: true,
+        target_pc: done,
+    });
+    for repair in pending {
+        let skip = program.allocate_label();
+        program.emit_insn(Insn::IfNot {
+            reg: repair.changed,
+            target_pc: skip,
+            jump_if_null: true,
+        });
+        emit_new_parent_key_repairs(
+            program,
+            document,
+            repair.foreign_key,
+            repair.new_key,
+            database,
+        )?;
+        program.preassign_label_to_next_insn(skip);
+    }
+    program.preassign_label_to_next_insn(done);
+    Ok(())
+}
+
+/// Children of a new deferred parent key had no parent until now: take back
+/// one violation for each.
+fn emit_new_parent_key_repairs(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_key: &hir::ResolvedForeignKey,
+    new_key: usize,
+    database: usize,
+) -> Result<()> {
+    emit_child_probe(
+        program,
+        document,
+        foreign_key,
+        new_key,
+        None,
+        database,
+        |program: &mut ProgramBuilder| {
+            let next = program.allocate_label();
+            emit_guarded_fk_decrement(program, next, true);
+            program.preassign_label_to_next_insn(next);
+            Ok(())
+        },
+    )
+}
+
+/// Jump to `same` when the two keys are equal, NULLs included.
+pub(super) fn emit_skip_if_same_key(
+    program: &mut ProgramBuilder,
+    old_key: usize,
+    new_key: usize,
+    width: usize,
+    same: BranchOffset,
+) {
+    let changed = program.allocate_label();
+    for offset in 0..width {
+        let next = if offset + 1 == width {
+            same
+        } else {
+            program.allocate_label()
+        };
+        program.emit_insn(Insn::Eq {
+            lhs: old_key + offset,
+            rhs: new_key + offset,
+            target_pc: next,
+            flags: CmpInsFlags::default().null_eq(),
+            collation: None,
+        });
+        program.emit_insn(Insn::Goto { target_pc: changed });
+        if offset + 1 != width {
+            program.preassign_label_to_next_insn(next);
+        }
+    }
+    program.preassign_label_to_next_insn(changed);
+}
+
+/// Run `on_match` for child rows that point at the parent key in `key`,
+/// skipping the child row `exclude` and keys with a NULL. An index that
+/// lists exactly the child key is probed, and otherwise the child table is
+/// scanned.
+fn emit_child_probe(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_key: &hir::ResolvedForeignKey,
+    key: usize,
+    exclude: Option<usize>,
+    database: usize,
+    on_match: impl FnMut(&mut ProgramBuilder) -> Result<()>,
+) -> Result<()> {
+    let width = foreign_key.parent_positions.len();
+    let skip = program.allocate_label();
+    emit_skip_if_any_null(program, key, width, skip);
+    let child_table = btree(&foreign_key.child_table)?;
+    match &foreign_key.child_index {
+        Some(index) => {
+            let cursor = open_read_index(program, &index.handle(), database);
+            let probe = copy_with_affinity(program, key, width, index.value(), &child_table);
+            if exclude.is_some() {
+                index_scan_match_any(program, cursor, probe, width, exclude, on_match)?;
+            } else {
+                index_probe(program, cursor, probe, width, on_match, |_| Ok(()))?;
+            }
+        }
+        None => table_scan_match_any(
+            program,
+            document,
+            foreign_key,
+            key,
+            exclude,
+            database,
+            on_match,
+        )?,
+    }
+    program.preassign_label_to_next_insn(skip);
+    Ok(())
+}
+
+/// Scan the child table and run `on_match` for every row whose child key
+/// equals the non-NULL parent key at `key`. Rows with a NULL key column are
+/// skipped, and so is the row `skip_rowid` when given. The child key is read
+/// through the foreign key's child source, so an INTEGER PRIMARY KEY column
+/// reads the rowid and a virtual generated column is computed.
+fn table_scan_match_any(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_key: &hir::ResolvedForeignKey,
+    key: usize,
+    skip_rowid: Option<usize>,
+    database: usize,
+    mut on_match: impl FnMut(&mut ProgramBuilder) -> Result<()>,
+) -> Result<()> {
+    let child_table = btree(&foreign_key.child_table)?;
+    let cursor = open_read_table(program, &child_table, database);
+    program.bind_source(
+        foreign_key.child_source,
+        SourceBinding::BTree {
+            scan_cursor: cursor,
+            table_cursor: None,
+        },
+    );
+    let done = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: cursor,
+        pc_if_empty: done,
+    });
+    let loop_top = program.allocate_label();
+    program.preassign_label_to_next_insn(loop_top);
+    let next_row = program.allocate_label();
+    let child_key = emit_child_key(program, document, foreign_key, foreign_key.child_source)?;
+    for offset in 0..foreign_key.child_positions.len() {
+        program.emit_insn(Insn::IsNull {
+            reg: child_key + offset,
+            target_pc: next_row,
+        });
+        program.emit_insn(Insn::Ne {
+            lhs: child_key + offset,
+            rhs: key + offset,
+            target_pc: next_row,
+            flags: CmpInsFlags::default(),
+            collation: Some(CollationSeq::Binary),
+        });
+    }
+    if let Some(skip_rowid) = skip_rowid {
+        let rowid = program.alloc_register();
+        program.emit_insn(Insn::RowId {
+            cursor_id: cursor,
+            dest: rowid,
+        });
+        program.emit_insn(Insn::Eq {
+            lhs: rowid,
+            rhs: skip_rowid,
+            target_pc: next_row,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+    }
+    on_match(program)?;
+    program.preassign_label_to_next_insn(next_row);
+    program.emit_insn(Insn::Next {
+        cursor_id: cursor,
+        is_index: false,
+        pc_if_next: loop_top,
+        fullscan: false,
+    });
+    program.preassign_label_to_next_insn(done);
+    program.emit_insn(Insn::Close { cursor_id: cursor });
+    Ok(())
+}
+
+/// Jump to `ok` when the child key in `child_key` equals the parent key of
+/// the same row `row`, compared as stored and with BINARY: once written, the
+/// row is its own parent. Like SQLite, the parent's affinity is not applied
+/// here.
+fn emit_own_parent_check(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_key: &hir::ResolvedForeignKey,
+    row: SourceId,
+    child_key: usize,
+    ok: BranchOffset,
+) -> Result<()> {
+    let parent_key = emit_stored_parent_key(program, document, foreign_key, row)?;
+    let mismatch = program.allocate_label();
+    for offset in 0..foreign_key.child_positions.len() {
+        program.emit_insn(Insn::Ne {
+            lhs: child_key + offset,
+            rhs: parent_key + offset,
+            target_pc: mismatch,
+            flags: CmpInsFlags::default().jump_if_null(),
+            collation: Some(CollationSeq::Binary),
+        });
+    }
+    program.emit_insn(Insn::Goto { target_pc: ok });
+    program.preassign_label_to_next_insn(mismatch);
+    Ok(())
+}
+
+/// Read the parent key of `row`, in the constraint's column order, into new
+/// registers and return the first. Custom-typed columns are decoded, as a
+/// foreign-key action takes the key as SQL values.
+pub(super) fn emit_parent_key(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_key: &hir::ResolvedForeignKey,
+    row: SourceId,
+) -> Result<usize> {
+    let start = program.alloc_registers(foreign_key.parent_positions.len());
+    for (offset, &column) in foreign_key.parent_positions.iter().enumerate() {
+        let expression = if foreign_key.parent_uses_rowid {
+            hir::Expr::RowId(row)
+        } else {
+            hir::Expr::Column(hir::ColumnRef {
+                source: row,
+                column,
+            })
+        };
+        super::expr::translate_detached_expr_no_constant_opt(
+            program,
+            document,
+            &expression,
+            start + offset,
+        )?;
+    }
+    Ok(start)
+}
+
+/// Like [`emit_parent_key`], with custom-typed columns as stored: the
+/// checks compare stored keys.
+fn emit_stored_parent_key(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_key: &hir::ResolvedForeignKey,
+    row: SourceId,
+) -> Result<usize> {
+    super::dml::with_stored_values(program, |program| {
+        emit_parent_key(program, document, foreign_key, row)
+    })
+}
+
+/// Read the child key of `row`, in the constraint's column order, into new
+/// registers and return the first. Custom-typed columns are read as stored,
+/// as the checks compare stored keys.
+fn emit_child_key(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_key: &hir::ResolvedForeignKey,
+    row: SourceId,
+) -> Result<usize> {
+    super::dml::with_stored_values(program, |program| {
+        emit_child_key_values(program, document, foreign_key, row)
+    })
+}
+
+fn emit_child_key_values(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_key: &hir::ResolvedForeignKey,
+    row: SourceId,
+) -> Result<usize> {
+    let start = program.alloc_registers(foreign_key.child_positions.len());
+    for (offset, &column) in foreign_key.child_positions.iter().enumerate() {
+        super::expr::translate_detached_expr_no_constant_opt(
+            program,
+            document,
+            &hir::Expr::Column(hir::ColumnRef {
+                source: row,
+                column,
+            }),
+            start + offset,
+        )?;
+    }
+    Ok(start)
+}
+
+fn is_self_reference(foreign_key: &hir::ResolvedForeignKey) -> bool {
+    foreign_key.child_table == foreign_key.parent_table
+}
+
+fn btree(table: &hir::ResolvedTable) -> Result<Arc<BTreeTable>> {
+    table.value().btree().ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "foreign key table {} is not a B-tree table",
+            table.value().get_name()
+        ))
+    })
+}
+
+fn parent_index(foreign_key: &hir::ResolvedForeignKey) -> Result<&hir::ResolvedIndex> {
+    foreign_key.parent_unique_index.as_ref().ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "foreign key to {} has no parent index",
+            foreign_key.parent_table.value().get_name()
+        ))
+    })
+}
+
+fn foreign_key_violation(foreign_key: &hir::ResolvedForeignKey, key: usize) -> Box<ConstraintInfo> {
+    let declaration = &foreign_key.declaration;
+    Box::new(ConstraintInfo::fk(
+        foreign_key.child_table.value().get_name(),
+        declaration.constraint_name.clone(),
+        declaration.child_columns.to_vec(),
+        (key..key + declaration.child_columns.len()).collect(),
+        declaration.parent_table.clone(),
+    ))
+}

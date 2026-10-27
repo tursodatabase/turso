@@ -1,0 +1,587 @@
+//! Property tests for closed HIR document structure.
+
+use hegel::generators;
+use turso_parser::ast::{Literal, Materialized};
+
+use super::*;
+use crate::{schema::Type, vdbe::affinity::Affinity};
+
+fn generated_count(tc: &hegel::TestCase) -> usize {
+    usize::from(tc.draw(generators::integers::<u8>())) + 1
+}
+
+fn generated_position(tc: &hegel::TestCase, width: usize) -> usize {
+    tc.draw(generators::integers::<usize>().max_value(width - 1))
+}
+
+fn source_column(position: usize) -> SourceColumn {
+    SourceColumn {
+        name: format!("c{position}").into(),
+        type_fact: TypeFact::known(Type::Integer),
+        affinity: Affinity::Integer,
+        has_affinity: true,
+        collation: None,
+        hidden: false,
+        rowid_alias: false,
+    }
+}
+
+fn source(id: SourceId, owner: SourceOwner, width: usize, kind: SourceKind) -> Source {
+    Source {
+        id,
+        owner,
+        database: None,
+        name: format!("source_{}", id.index()),
+        alias: None,
+        kind,
+        columns: (0..width).map(source_column).collect(),
+        generated_expressions: ColumnSlots::empty(width),
+        default_expressions: ColumnSlots::empty(width),
+        column_type_programs: ColumnSlots::empty(width),
+        check_constraints: None,
+        rowid_available: false,
+        index_hint: IndexHint::None,
+        index_expressions: Vec::new(),
+        index_coverage: IndexCoverage::Selective,
+        index_method_patterns: Vec::new(),
+    }
+}
+
+fn output(block: QueryBlockId, index: usize, expression: ExprId) -> Output {
+    Output {
+        id: OutputId::query(block, index),
+        name: format!("output_{index}").into(),
+        expr: expression,
+        type_fact: TypeFact::known(Type::Integer),
+        affinity: Affinity::Integer,
+        schema_affinity: Affinity::Integer,
+        has_affinity: true,
+        collation: None,
+        collation_is_explicit: false,
+        name_kind: OutputNameKind::Inferred,
+    }
+}
+
+fn generated_query_document(tc: &hegel::TestCase) -> HirDocument {
+    let query_id = QueryId::new(0);
+    let block_id = QueryBlockId::new(query_id, 0);
+    let source_id = SourceId::new(0);
+    let column_count = generated_count(tc);
+    let output_count = generated_count(tc);
+    let mut exprs = ExprArena::default();
+    let outputs = (0..output_count)
+        .map(|index| {
+            let column = exprs.push(Expr::column(
+                source_id,
+                generated_position(tc, column_count),
+            ));
+            output(block_id, index, column)
+        })
+        .collect::<Vec<_>>();
+    let query_outputs = outputs.iter().map(|output| output.id).collect();
+    let block = QueryBlock {
+        from: Some(From {
+            first: source_id,
+            joins: Vec::new(),
+        }),
+        outputs,
+        ..QueryBlock::new(
+            block_id,
+            QueryBlockBody::Select {
+                distinctness: None,
+                filter: None,
+                grouping: None,
+            },
+        )
+    };
+
+    HirDocument {
+        snapshot: CatalogSnapshot::from_id(1),
+        databases: Vec::new(),
+        root: HirRoot::Query(QueryRoot { query: query_id }),
+        queries: vec![Query {
+            id: query_id,
+            parent: None,
+            captures: Vec::new(),
+            reachable_ctes: Vec::new(),
+            blocks: vec![block],
+            first: block_id,
+            compounds: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            output: query_outputs,
+        }],
+        sources: vec![source(
+            source_id,
+            SourceOwner::QueryBlock(block_id),
+            column_count,
+            SourceKind::SchemaExpression,
+        )],
+        ctes: Vec::new(),
+        schema_programs: Vec::new(),
+        cdc: None,
+        exprs,
+        planning: PlanningTerms::default(),
+    }
+}
+
+fn schema_call(exprs: &mut ExprArena, program: SchemaProgramId) -> BoundSchemaCall {
+    BoundSchemaCall {
+        program,
+        arguments: vec![exprs.push(Expr::Literal(Literal::Null))],
+    }
+}
+
+fn expression_with_schema_call(exprs: &mut ExprArena, program: SchemaProgramId) -> ExprId {
+    let expr = exprs.push(Expr::Literal(Literal::Null));
+    let call = schema_call(exprs, program);
+    exprs.push(Expr::Cast {
+        expr,
+        target: Box::new(TypeName {
+            name: "domain_value".to_string(),
+            parameters: Vec::new(),
+            array_dimensions: 0,
+            type_fact: TypeFact::known(Type::Integer),
+            affinity: Affinity::Integer,
+            programs: BoundCastPrograms {
+                encode: vec![call],
+                domain: None,
+                apply_builtin_affinity: false,
+            },
+        }),
+    })
+}
+
+fn generated_schema_program_document(tc: &hegel::TestCase) -> HirDocument {
+    let mut document = generated_query_document(tc);
+    let program_id = SchemaProgramId::new(0);
+    let input_source = SourceId::new(document.sources.len());
+    let input_width = generated_count(tc);
+    let input_position = generated_position(tc, input_width);
+    document.sources.push(source(
+        input_source,
+        SourceOwner::Root,
+        input_width,
+        SourceKind::SchemaExpression,
+    ));
+    let body = document
+        .exprs
+        .push(Expr::column(input_source, input_position));
+    document
+        .schema_programs
+        .push(BoundSchemaProgram { input_source, body });
+    document.queries[0].blocks[0].outputs[0].expr =
+        expression_with_schema_call(&mut document.exprs, program_id);
+    document
+}
+
+fn generated_cte_document(tc: &hegel::TestCase) -> HirDocument {
+    let root_query = QueryId::new(0);
+    let root_block = QueryBlockId::new(root_query, 0);
+    let body_query = QueryId::new(1);
+    let body_block = QueryBlockId::new(body_query, 0);
+    let cte_id = CteId::new(0);
+    let source_id = SourceId::new(0);
+    let width = generated_count(tc);
+    let mut exprs = ExprArena::default();
+    let root_outputs = (0..width)
+        .map(|position| {
+            let column = exprs.push(Expr::column(source_id, position));
+            output(root_block, position, column)
+        })
+        .collect::<Vec<_>>();
+    let body_outputs = (0..width)
+        .map(|position| {
+            let literal = exprs.push(Expr::Literal(Literal::Numeric(position.to_string())));
+            output(body_block, position, literal)
+        })
+        .collect::<Vec<_>>();
+    let root_output_ids = root_outputs.iter().map(|output| output.id).collect();
+    let body_output_ids = body_outputs.iter().map(|output| output.id).collect();
+
+    HirDocument {
+        snapshot: CatalogSnapshot::from_id(1),
+        databases: Vec::new(),
+        root: HirRoot::Query(QueryRoot { query: root_query }),
+        queries: vec![
+            Query {
+                id: root_query,
+                parent: None,
+                captures: Vec::new(),
+                reachable_ctes: vec![cte_id],
+                blocks: vec![QueryBlock {
+                    from: Some(From {
+                        first: source_id,
+                        joins: Vec::new(),
+                    }),
+                    outputs: root_outputs,
+                    ..QueryBlock::new(
+                        root_block,
+                        QueryBlockBody::Select {
+                            distinctness: None,
+                            filter: None,
+                            grouping: None,
+                        },
+                    )
+                }],
+                first: root_block,
+                compounds: Vec::new(),
+                order_by: Vec::new(),
+                limit: None,
+                output: root_output_ids,
+            },
+            Query {
+                id: body_query,
+                parent: None,
+                captures: Vec::new(),
+                reachable_ctes: Vec::new(),
+                blocks: vec![QueryBlock {
+                    outputs: body_outputs,
+                    ..QueryBlock::new(
+                        body_block,
+                        QueryBlockBody::Select {
+                            distinctness: None,
+                            filter: None,
+                            grouping: None,
+                        },
+                    )
+                }],
+                first: body_block,
+                compounds: Vec::new(),
+                order_by: Vec::new(),
+                limit: None,
+                output: body_output_ids,
+            },
+        ],
+        sources: vec![source(
+            source_id,
+            SourceOwner::QueryBlock(root_block),
+            width,
+            SourceKind::Cte(cte_id),
+        )],
+        ctes: vec![Cte {
+            id: cte_id,
+            name: "generated_cte".to_string(),
+            columns: (0..width)
+                .map(|position| CteColumn {
+                    name: format!("c{position}"),
+                    type_fact: TypeFact::known(Type::Integer),
+                    affinity: Affinity::Integer,
+                    has_affinity: true,
+                    collation: None,
+                })
+                .collect(),
+            materialized: Materialized::Any,
+            body: CteBody::Query(body_query),
+        }],
+        schema_programs: Vec::new(),
+        cdc: None,
+        exprs,
+        planning: PlanningTerms::default(),
+    }
+}
+
+fn first_output_mut(document: &mut HirDocument) -> &mut Output {
+    &mut document.queries[0].blocks[0].outputs[0]
+}
+
+// Example: a generated `SELECT c2 FROM items` has matching query, block,
+// source, output, and column identities and therefore forms a closed document.
+#[hegel::test]
+fn generated_closed_documents_validate(tc: hegel::TestCase) {
+    let document = generated_query_document(&tc);
+
+    document.validate().expect("generated document is closed");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MissingReference {
+    RootQuery,
+    QueryOutput,
+    ExpressionSource,
+    ExpressionColumn,
+}
+
+// Example: changing `c2` to source `s99`, column 99, or a nonexistent output
+// makes validation fail instead of leaving a dangling document-local identity.
+#[hegel::test]
+fn out_of_range_references_are_rejected(tc: hegel::TestCase) {
+    let mut document = generated_query_document(&tc);
+    let corruption = tc.draw(generators::sampled_from(vec![
+        MissingReference::RootQuery,
+        MissingReference::QueryOutput,
+        MissingReference::ExpressionSource,
+        MissingReference::ExpressionColumn,
+    ]));
+    match corruption {
+        MissingReference::RootQuery => {
+            let HirRoot::Query(root) = &mut document.root else {
+                unreachable!("the generator always creates a query root");
+            };
+            root.query = QueryId::new(document.queries.len());
+        }
+        MissingReference::QueryOutput => {
+            let block = document.queries[0].blocks[0].id;
+            document.queries[0].output[0] =
+                OutputId::query(block, document.queries[0].blocks[0].outputs.len());
+        }
+        MissingReference::ExpressionSource => {
+            let column = document
+                .exprs
+                .push(Expr::column(SourceId::new(document.sources.len()), 0));
+            first_output_mut(&mut document).expr = column;
+        }
+        MissingReference::ExpressionColumn => {
+            let width = document.sources[0].columns.len();
+            let column = document.exprs.push(Expr::column(SourceId::new(0), width));
+            first_output_mut(&mut document).expr = column;
+        }
+    }
+
+    assert!(document.validate().is_err());
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WrongIdentity {
+    Query,
+    QueryBlock,
+    Source,
+    SourceOwner,
+    OutputOwner,
+}
+
+// Example: an output stored in query block `q0:0` cannot claim to belong to
+// the root, and a FROM source cannot claim a different owner.
+#[hegel::test]
+fn arena_identity_and_owner_disagreements_are_rejected(tc: hegel::TestCase) {
+    let mut document = generated_query_document(&tc);
+    let corruption = tc.draw(generators::sampled_from(vec![
+        WrongIdentity::Query,
+        WrongIdentity::QueryBlock,
+        WrongIdentity::Source,
+        WrongIdentity::SourceOwner,
+        WrongIdentity::OutputOwner,
+    ]));
+    match corruption {
+        WrongIdentity::Query => document.queries[0].id = QueryId::new(1),
+        WrongIdentity::QueryBlock => {
+            document.queries[0].blocks[0].id = QueryBlockId::new(QueryId::new(0), 1);
+        }
+        WrongIdentity::Source => document.sources[0].id = SourceId::new(1),
+        WrongIdentity::SourceOwner => document.sources[0].owner = SourceOwner::Root,
+        WrongIdentity::OutputOwner => {
+            first_output_mut(&mut document).id = OutputId::root(0);
+        }
+    }
+
+    assert!(document.validate().is_err());
+}
+
+// Example: appending a bound source that no root, query, expression, CTE, or
+// schema program can reach is rejected as leftover analysis state.
+#[hegel::test]
+fn unreachable_arena_entries_are_rejected(tc: hegel::TestCase) {
+    let mut document = generated_query_document(&tc);
+    let source_id = SourceId::new(document.sources.len());
+    document.sources.push(source(
+        source_id,
+        SourceOwner::Root,
+        generated_count(&tc),
+        SourceKind::SchemaExpression,
+    ));
+
+    assert!(document.validate().is_err());
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MisalignedSourceState {
+    GeneratedExpressions,
+    DefaultExpressions,
+    TypePrograms,
+}
+
+// Example: a three-column source must have exactly three generated-expression,
+// default-expression, and type-program slots, even when every slot is empty.
+#[hegel::test]
+fn source_column_state_widths_must_stay_aligned(tc: hegel::TestCase) {
+    let mut document = generated_query_document(&tc);
+    let corruption = tc.draw(generators::sampled_from(vec![
+        MisalignedSourceState::GeneratedExpressions,
+        MisalignedSourceState::DefaultExpressions,
+        MisalignedSourceState::TypePrograms,
+    ]));
+    match corruption {
+        MisalignedSourceState::GeneratedExpressions => {
+            document.sources[0].generated_expressions.pop();
+        }
+        MisalignedSourceState::DefaultExpressions => {
+            document.sources[0].default_expressions.pop();
+        }
+        MisalignedSourceState::TypePrograms => {
+            document.sources[0].column_type_programs.pop();
+        }
+    }
+
+    assert!(document.validate().is_err());
+}
+
+// Example: `SELECT generated_c2 FROM items` cannot leave c2's generated or
+// short-record default expression in `NotRequired`; reading that position
+// makes each stored expression attached to it part of the closed document.
+#[hegel::test]
+fn referenced_columns_require_their_stored_read_programs(tc: hegel::TestCase) {
+    let mut document = generated_query_document(&tc);
+    let expression = first_output_mut(&mut document).expr;
+    let Expr::Column(reference) = &document.exprs[expression] else {
+        unreachable!("the generator emits a column output");
+    };
+    let reference = *reference;
+    if tc.draw(generators::booleans()) {
+        document.sources[reference.source.index()].generated_expressions[reference.column] =
+            ColumnReadExpression::NotRequired;
+    } else {
+        document.sources[reference.source.index()].default_expressions[reference.column] =
+            ColumnReadExpression::NotRequired;
+    }
+
+    assert!(document.validate().is_err());
+}
+
+// Example: `SELECT array_value FROM items` carries all built-in array meaning
+// in the column type fact and needs no synthetic custom-type program bundle.
+#[hegel::test]
+fn referenced_array_columns_are_self_describing(tc: hegel::TestCase) {
+    let mut document = generated_query_document(&tc);
+    let expression = first_output_mut(&mut document).expr;
+    let Expr::Column(reference) = &document.exprs[expression] else {
+        unreachable!("the generator emits a column output");
+    };
+    let reference = *reference;
+    let source = &mut document.sources[reference.source.index()];
+    let mut columns: Vec<_> = source
+        .columns
+        .iter()
+        .map(SourceColumnRef::to_owned)
+        .collect();
+    columns[reference.column].type_fact = TypeFact::declared(DeclaredType {
+        name: "INTEGER".to_string(),
+        storage: Type::Integer,
+        custom_chain: Vec::new(),
+        array_dimensions: 1,
+    });
+    source.columns = columns.into();
+    document
+        .validate()
+        .expect("the referenced array column is described by its type fact");
+
+    let source = &mut document.sources[reference.source.index()];
+    let mut columns: Vec<_> = source
+        .columns
+        .iter()
+        .map(SourceColumnRef::to_owned)
+        .collect();
+    columns[reference.column].type_fact.storage = Some(Type::Integer);
+    source.columns = columns.into();
+    assert!(document.validate().is_err());
+}
+
+// Example: a cast whose encoder points to a completed schema program with a
+// schema-expression input source is a closed part of the document.
+#[hegel::test]
+fn generated_schema_programs_validate(tc: hegel::TestCase) {
+    let document = generated_schema_program_document(&tc);
+
+    document
+        .validate()
+        .expect("generated schema program is closed");
+}
+
+// Example: `WITH generated_cte AS (SELECT 0, 1) SELECT * FROM generated_cte`
+// reaches the CTE body query and keeps the CTE, source, and output widths aligned.
+#[hegel::test]
+fn generated_cte_documents_validate(tc: hegel::TestCase) {
+    let document = generated_cte_document(&tc);
+
+    document
+        .validate()
+        .expect("generated CTE document is closed");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BrokenCte {
+    MissingCte,
+    WrongCteIdentity,
+    MissingBodyQuery,
+    WrongWidth,
+    WrongReachabilitySummary,
+}
+
+// Example: a `FROM generated_cte` source cannot point to `c99`, disagree with
+// the CTE output width, lose its body query, or disappear from the query summary.
+#[hegel::test]
+fn broken_cte_structure_is_rejected(tc: hegel::TestCase) {
+    let mut document = generated_cte_document(&tc);
+    let corruption = tc.draw(generators::sampled_from(vec![
+        BrokenCte::MissingCte,
+        BrokenCte::WrongCteIdentity,
+        BrokenCte::MissingBodyQuery,
+        BrokenCte::WrongWidth,
+        BrokenCte::WrongReachabilitySummary,
+    ]));
+    match corruption {
+        BrokenCte::MissingCte => document.sources[0].kind = SourceKind::Cte(CteId::new(1)),
+        BrokenCte::WrongCteIdentity => document.ctes[0].id = CteId::new(1),
+        BrokenCte::MissingBodyQuery => {
+            document.ctes[0].body = CteBody::Query(QueryId::new(document.queries.len()));
+        }
+        BrokenCte::WrongWidth => {
+            document.ctes[0].columns.pop();
+        }
+        BrokenCte::WrongReachabilitySummary => {
+            document.queries[0].reachable_ctes.clear();
+        }
+    }
+
+    assert!(document.validate().is_err());
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BrokenSchemaProgram {
+    MissingProgram,
+    MissingInputSource,
+    RecursiveProgram,
+    UnreachableProgram,
+}
+
+// Example: an encoder may not call `schema_program99`, use a missing input
+// source, recursively call itself, or remain unreferenced by the document.
+#[hegel::test]
+fn unfinished_schema_program_state_is_rejected(tc: hegel::TestCase) {
+    let mut document = generated_schema_program_document(&tc);
+    let corruption = tc.draw(generators::sampled_from(vec![
+        BrokenSchemaProgram::MissingProgram,
+        BrokenSchemaProgram::MissingInputSource,
+        BrokenSchemaProgram::RecursiveProgram,
+        BrokenSchemaProgram::UnreachableProgram,
+    ]));
+    match corruption {
+        BrokenSchemaProgram::MissingProgram => {
+            let expression =
+                expression_with_schema_call(&mut document.exprs, SchemaProgramId::new(1));
+            first_output_mut(&mut document).expr = expression;
+        }
+        BrokenSchemaProgram::MissingInputSource => {
+            document.schema_programs[0].input_source = SourceId::new(document.sources.len());
+        }
+        BrokenSchemaProgram::RecursiveProgram => {
+            document.schema_programs[0].body =
+                expression_with_schema_call(&mut document.exprs, SchemaProgramId::new(0));
+        }
+        BrokenSchemaProgram::UnreachableProgram => {
+            let null = document.exprs.push(Expr::Literal(Literal::Null));
+            first_output_mut(&mut document).expr = null;
+        }
+    }
+
+    assert!(document.validate().is_err());
+}

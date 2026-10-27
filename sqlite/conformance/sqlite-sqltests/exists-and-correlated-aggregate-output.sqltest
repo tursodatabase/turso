@@ -1,0 +1,56 @@
+@database :memory:
+
+# A WHERE EXISTS or NOT EXISTS runs as a semi-join or anti-join, and a
+# correlated aggregate in the SELECT list becomes a LEFT JOIN of a grouped
+# table. The semi-join or anti-join must stay the last join whatever order
+# the two rewrites run in.
+setup exists-and-aggregate-schema {
+    CREATE TABLE t2 (id INT PRIMARY KEY, ref_id INTEGER, data INTEGER);
+    CREATE TABLE t3 (id INT PRIMARY KEY, category INTEGER, amount INTEGER);
+    INSERT INTO t2 VALUES (1, 1, 0), (2, 5, 0), (3, 2, 0), (4, 2, 0);
+    INSERT INTO t3 VALUES (1, 1, 10), (2, 2, 20), (3, 1, 30), (5, 2, 40);
+}
+
+@setup exists-and-aggregate-schema
+test exists-with-correlated-max-output {
+    SELECT *, (SELECT MAX(amount) FROM t3 WHERE amount IS NOT NULL AND t3.category = t2.ref_id
+               ORDER BY t3.id LIMIT 1) AS s_sub
+    FROM t2 WHERE EXISTS (SELECT 1 FROM t3 WHERE t3.id = t2.id) ORDER BY t2.id;
+}
+expect {
+1|1|0|30
+2|5|0|
+3|2|0|40
+}
+
+@setup exists-and-aggregate-schema
+test not-exists-with-correlated-max-output {
+    SELECT *, (SELECT MAX(amount) FROM t3 WHERE t3.category = t2.ref_id) AS s_sub
+    FROM t2 WHERE NOT EXISTS (SELECT 1 FROM t3 WHERE t3.id = t2.id) ORDER BY t2.id;
+}
+expect {
+4|2|0|40
+}
+
+@setup exists-and-aggregate-schema
+test in-with-correlated-count-output {
+    SELECT *, (SELECT count(*) FROM t3 WHERE t3.category = t2.ref_id) AS s_sub
+    FROM t2 WHERE t2.id IN (SELECT id FROM t3) ORDER BY t2.id;
+}
+expect {
+1|1|0|2
+2|5|0|0
+3|2|0|2
+}
+
+@setup exists-and-aggregate-schema
+test exists-with-correlated-sum-of-joined-table {
+    SELECT t2.id, (SELECT sum(amount) FROM t3 WHERE t3.category = t2.ref_id) AS s
+    FROM t2 WHERE EXISTS (SELECT 1 FROM t3 WHERE t3.category = t2.ref_id AND t3.amount > 15)
+    ORDER BY t2.id;
+}
+expect {
+1|40
+3|60
+4|60
+}

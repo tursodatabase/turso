@@ -217,6 +217,10 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    fn declared_result_type(&self, _name: &str, _array_dimensions: u32) -> Option<&'static str> {
+        None
+    }
+
     /// Whether `ALTER TABLE ADD COLUMN` with a non-constant default works on
     /// a table that has rows.
     ///

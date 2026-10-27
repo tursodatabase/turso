@@ -11,17 +11,13 @@ use crate::namespace::NamespaceId;
 use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
-use crate::translate::emitter::Resolver;
-use crate::translate::expr::{
-    bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
-};
+use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
 use crate::types::IOResultOr;
 use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::CursorID;
 use crate::{turso_assert, turso_debug_assert};
 use smallvec::SmallVec;
 
@@ -115,7 +111,8 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
+use crate::translate::plan::{BitSet, ColumnMask};
+use crate::translate::semantic::hir::TypeFact;
 use crate::util::{
     column_declared_type, is_rowid_alias_type, module_args_from_sql, module_name_from_sql,
     type_from_name, UnparsedFromSqlIndex,
@@ -2345,7 +2342,7 @@ impl Schema {
                     // any connection exists, so there is no attached catalog
                     // to consult. Any `CREATE TEMP TRIGGER ... ON aux.x` row
                     // maps to `Some(INVALID_DB_ID)` until a connection-scoped
-                    // reparse runs with a real resolver.
+                    // reparse runs with a real catalog.
                     self.handle_schema_row(
                         &ty,
                         &name,
@@ -2820,6 +2817,8 @@ impl Schema {
             let cols = incremental_view.column_schema.flat_columns()?;
             let logical_to_physical_map =
                 BTreeTable::build_logical_to_physical_map(&cols, &[], true);
+            let has_column_defaults = BTreeTable::any_column_default(&cols);
+            let has_unnamed_or_collated_columns = BTreeTable::any_unnamed_or_collated_column(&cols);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
                 root_page: main_root,
@@ -2835,8 +2834,12 @@ impl Schema {
                 primary_key_constraint_name: None,
                 unique_sets: vec![],
                 has_virtual_columns: false,
+                has_column_defaults,
+                has_unnamed_or_collated_columns,
                 logical_to_physical_map,
                 column_dependencies: Default::default(),
+                declared_type_facts: Default::default(),
+                column_names: Default::default(),
             })));
 
             self.add_materialized_view(NamespaceId::ROOT, incremental_view, table, sql);
@@ -3374,6 +3377,10 @@ impl Schema {
 
         let mut out = Vec::try_with_capacity_ext(child.foreign_keys.len())?;
         for fk in &child.foreign_keys {
+            // An UPDATE that leaves a constraint's child key alone never
+            // checks it, so a parent it cannot resolve is not an error. A
+            // self-referencing constraint is always resolved, as its parent
+            // key may be the one that changes.
             if let Some(updated_cols) = updated_cols {
                 let is_self_ref = fk.parent_namespace == namespace
                     && fk.parent_table.eq_ignore_ascii_case(&child.name);
@@ -3707,24 +3714,12 @@ impl TryClone for BTreeTable {
             rowid_alias_conflict_clause: self.rowid_alias_conflict_clause,
             primary_key_constraint_name: self.primary_key_constraint_name.clone(),
             has_virtual_columns: self.has_virtual_columns,
+            has_column_defaults: self.has_column_defaults,
+            has_unnamed_or_collated_columns: self.has_unnamed_or_collated_columns,
             logical_to_physical_map: self.logical_to_physical_map.try_clone()?,
             column_dependencies: Default::default(),
-        })
-    }
-}
-
-impl TryClone for FromClauseSubquery {
-    type Error = TryReserveError;
-
-    fn try_clone(&self) -> Result<Self, Self::Error> {
-        Ok(Self {
-            name: self.name.clone(),
-            plan: self.plan.clone(),
-            columns: self.columns.try_clone()?,
-            parenthesized_join_columns: self.parenthesized_join_columns.clone(),
-            result_columns_start_reg: self.result_columns_start_reg,
-            materialized_cursor_id: self.materialized_cursor_id,
-            cte: self.cte,
+            declared_type_facts: Default::default(),
+            column_names: Default::default(),
         })
     }
 }
@@ -3747,9 +3742,6 @@ impl TryClone for Table {
         Ok(match self {
             Table::BTree(table) => Table::BTree(Arc::new(table.as_ref().try_clone()?)),
             Table::Virtual(table) => Table::Virtual(Arc::new(table.as_ref().try_clone()?)),
-            Table::FromClauseSubquery(from_clause_subquery) => {
-                Table::FromClauseSubquery(Arc::new(from_clause_subquery.as_ref().try_clone()?))
-            }
             Table::RecursiveCteInput(input) => {
                 Table::RecursiveCteInput(Arc::new(input.as_ref().try_clone()?))
             }
@@ -3894,9 +3886,6 @@ impl ColumnLayout {
             Table::Virtual(vtable) => Ok(Self::Identity {
                 column_count: vtable.as_ref().columns.len(),
             }),
-            Table::FromClauseSubquery(subquery) => Ok(Self::Identity {
-                column_count: subquery.columns.len(),
-            }),
             Table::RecursiveCteInput(input) => Ok(Self::Identity {
                 column_count: input.columns.len(),
             }),
@@ -4006,7 +3995,6 @@ impl ColumnLayout {
 pub enum Table {
     BTree(Arc<BTreeTable>),
     Virtual(Arc<VirtualTable>),
-    FromClauseSubquery(Arc<FromClauseSubquery>),
     RecursiveCteInput(Arc<RecursiveCteInput>),
 }
 
@@ -4016,9 +4004,6 @@ impl Table {
             Table::BTree(table) => Ok(table.root_page),
             Table::Virtual(_) => Err(crate::LimboError::InternalError(
                 "Virtual tables do not have a root page".to_string(),
-            )),
-            Table::FromClauseSubquery(_) => Err(crate::LimboError::InternalError(
-                "FROM clause subqueries do not have a root page".to_string(),
             )),
             Table::RecursiveCteInput(_) => Err(crate::LimboError::InternalError(
                 "recursive CTE inputs do not have a root page".to_string(),
@@ -4030,7 +4015,6 @@ impl Table {
         match self {
             Self::BTree(table) => &table.name,
             Self::Virtual(table) => &table.name,
-            Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.name,
             Self::RecursiveCteInput(input) => &input.name,
         }
     }
@@ -4039,9 +4023,6 @@ impl Table {
         match self {
             Self::BTree(table) => table.columns.get(index),
             Self::Virtual(table) => table.columns.get(index),
-            Self::FromClauseSubquery(from_clause_subquery) => {
-                from_clause_subquery.columns.get(index)
-            }
             Self::RecursiveCteInput(input) => input.columns.get(index),
         }
     }
@@ -4055,15 +4036,6 @@ impl Table {
                     .as_ref()
                     .is_some_and(|n| n.eq_ignore_ascii_case(name))
             }),
-            Self::FromClauseSubquery(from_clause_subquery) => from_clause_subquery
-                .columns
-                .iter()
-                .enumerate()
-                .find(|(_, col)| {
-                    col.name
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(name))
-                }),
             Self::RecursiveCteInput(input) => input.columns.iter().enumerate().find(|(_, col)| {
                 col.name
                     .as_ref()
@@ -4072,19 +4044,39 @@ impl Table {
         }
     }
 
-    pub(crate) fn parenthesized_join_columns(&self) -> Option<&[ParenthesizedJoinColumn]> {
-        match self {
-            Self::FromClauseSubquery(subquery) => subquery.parenthesized_join_columns.as_deref(),
-            _ => None,
-        }
-    }
-
     pub fn columns(&self) -> &[Column] {
         match self {
             Self::BTree(table) => &table.columns,
             Self::Virtual(table) => &table.columns,
-            Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.columns,
             Self::RecursiveCteInput(input) => &input.columns,
+        }
+    }
+
+    pub fn has_generated_columns(&self) -> bool {
+        match self {
+            Self::BTree(table) => table.has_virtual_columns,
+            Self::Virtual(_) | Self::RecursiveCteInput(_) => self
+                .columns()
+                .iter()
+                .any(|column| column.generated_expr().is_some()),
+        }
+    }
+
+    pub fn has_column_defaults(&self) -> bool {
+        match self {
+            Self::BTree(table) => table.has_column_defaults,
+            Self::Virtual(_) | Self::RecursiveCteInput(_) => {
+                BTreeTable::any_column_default(self.columns())
+            }
+        }
+    }
+
+    pub fn has_unnamed_or_collated_columns(&self) -> bool {
+        match self {
+            Self::BTree(table) => table.has_unnamed_or_collated_columns,
+            Self::Virtual(_) | Self::RecursiveCteInput(_) => {
+                BTreeTable::any_unnamed_or_collated_column(self.columns())
+            }
         }
     }
 
@@ -4092,7 +4084,6 @@ impl Table {
         match self {
             Self::BTree(table) => table.is_strict,
             Self::Virtual(_) => false,
-            Self::FromClauseSubquery(_) => false,
             Self::RecursiveCteInput(_) => false,
         }
     }
@@ -4101,7 +4092,6 @@ impl Table {
         match self {
             Self::BTree(table) => Some(table.clone()),
             Self::Virtual(_) => None,
-            Self::FromClauseSubquery(_) => None,
             Self::RecursiveCteInput(_) => None,
         }
     }
@@ -4119,7 +4109,6 @@ impl Table {
         match self {
             Self::BTree(table) => Some(table),
             Self::Virtual(_) => None,
-            Self::FromClauseSubquery(_) => None,
             Self::RecursiveCteInput(_) => None,
         }
     }
@@ -4192,6 +4181,16 @@ impl CheckConstraint {
         }
     }
 
+    /// What SQLite reports when this constraint fails: its name, or its
+    /// expression's text as the user wrote it.
+    pub fn error_description(&self) -> String {
+        match (&self.name, &self.source) {
+            (Some(name), _) => name.clone(),
+            (None, Some(source)) => crate::util::check_source_for_error(source),
+            (None, None) => self.expr.to_string(),
+        }
+    }
+
     /// Returns the SQL representation of this CHECK constraint (e.g. `CHECK(x > 0)`).
     pub fn sql(&self) -> String {
         match &self.source {
@@ -4232,6 +4231,7 @@ bitflags! {
 #[derive(Debug)]
 pub(crate) struct GeneratedColGraph {
     /// `dependencies[j]` = columns `j` transitively reads from (excludes `j`).
+    #[cfg(test)]
     dependencies: Vec<ColumnMask>,
     /// `dependents[i]` = columns that transitively read from `i` (excludes `i`).
     dependents: Vec<ColumnMask>,
@@ -4314,6 +4314,7 @@ impl GeneratedColGraph {
         }
 
         Ok(Self {
+            #[cfg(test)]
             dependencies,
             dependents,
             topological_sort,
@@ -4339,8 +4340,12 @@ pub struct BTreeTable {
     pub rowid_alias_conflict_clause: Option<ResolveType>,
     pub primary_key_constraint_name: Option<String>,
     pub has_virtual_columns: bool,
+    has_column_defaults: bool,
+    has_unnamed_or_collated_columns: bool,
     pub logical_to_physical_map: Vec<usize>,
     column_dependencies: ResetOnClone<OnceLock<GeneratedColGraph>>,
+    declared_type_facts: ResetOnClone<OnceLock<Box<[TypeFact]>>>,
+    column_names: ResetOnClone<OnceLock<Box<[Arc<str>]>>>,
 }
 
 pub struct ColumnsMut<'a> {
@@ -4363,8 +4368,13 @@ impl std::ops::DerefMut for ColumnsMut<'_> {
 impl Drop for ColumnsMut<'_> {
     fn drop(&mut self) {
         self.table.column_dependencies.0 = OnceLock::new();
+        self.table.declared_type_facts.0 = OnceLock::new();
+        self.table.column_names.0 = OnceLock::new();
         self.table.has_virtual_columns =
             self.table.columns.iter().any(|c| c.is_virtual_generated());
+        self.table.has_column_defaults = BTreeTable::any_column_default(&self.table.columns);
+        self.table.has_unnamed_or_collated_columns =
+            BTreeTable::any_unnamed_or_collated_column(&self.table.columns);
         self.table.logical_to_physical_map = BTreeTable::build_logical_to_physical_map(
             &self.table.columns,
             &self.table.primary_key_columns,
@@ -4387,6 +4397,8 @@ impl BTreeTable {
         rowid_alias_conflict_clause: Option<ResolveType>,
     ) -> Self {
         let has_virtual_columns = columns.iter().any(|c| c.is_virtual_generated());
+        let has_column_defaults = Self::any_column_default(&columns);
+        let has_unnamed_or_collated_columns = Self::any_unnamed_or_collated_column(&columns);
         let has_rowid = characteristics.contains(BTreeCharacteristics::HAS_ROWID);
         let logical_to_physical_map =
             Self::build_logical_to_physical_map(&columns, &primary_key_columns, has_rowid);
@@ -4416,13 +4428,42 @@ impl BTreeTable {
             rowid_alias_conflict_clause,
             primary_key_constraint_name,
             has_virtual_columns,
+            has_column_defaults,
+            has_unnamed_or_collated_columns,
             logical_to_physical_map,
             column_dependencies: Default::default(),
+            declared_type_facts: Default::default(),
+            column_names: Default::default(),
         }
+    }
+
+    fn any_column_default(columns: &[Column]) -> bool {
+        columns.iter().any(|column| column.default.is_some())
+    }
+
+    fn any_unnamed_or_collated_column(columns: &[Column]) -> bool {
+        columns
+            .iter()
+            .any(|column| column.name.is_none() || column.has_explicit_collation())
     }
 
     pub fn columns(&self) -> &[Column] {
         &self.columns
+    }
+
+    pub(crate) fn declared_type_facts(&self) -> &[TypeFact] {
+        self.declared_type_facts
+            .0
+            .get_or_init(|| crate::translate::semantic::hir::declared_type_facts(&self.columns))
+    }
+
+    pub(crate) fn shared_column_names(&self) -> &[Arc<str>] {
+        self.column_names.0.get_or_init(|| {
+            self.columns
+                .iter()
+                .map(|column| Arc::from(column.name.as_deref().unwrap_or_default()))
+                .collect()
+        })
     }
 
     pub fn columns_mut(&mut self) -> ColumnsMut<'_> {
@@ -4500,6 +4541,7 @@ impl BTreeTable {
         if !self.is_strict {
             return;
         }
+        self.declared_type_facts.0 = OnceLock::new();
         for col in &mut self.columns {
             if col.is_array() {
                 // Arrays are stored as record-format blobs regardless of element type.
@@ -4543,6 +4585,14 @@ impl BTreeTable {
 
     pub fn has_virtual_columns(&self) -> bool {
         self.has_virtual_columns
+    }
+
+    pub fn has_column_defaults(&self) -> bool {
+        self.has_column_defaults
+    }
+
+    pub fn has_unnamed_or_collated_columns(&self) -> bool {
+        self.has_unnamed_or_collated_columns
     }
 
     /// Build a `ColumnLayout` for this table's register mapping.
@@ -5053,6 +5103,7 @@ impl BTreeTable {
         Ok(affected)
     }
 
+    #[cfg(test)]
     pub(crate) fn dependencies_of_columns(
         &self,
         targets: impl IntoIterator<Item = usize>,
@@ -5138,166 +5189,11 @@ impl PseudoCursorType {
     }
 }
 
-/// A derived table from a FROM clause subquery.
-#[derive(Debug, Clone)]
-pub struct FromClauseSubquery {
-    /// The name of the derived table; uses the alias if available.
-    pub name: String,
-    /// The query plan for the derived table. Can be either a simple SelectPlan
-    /// or a compound select (UNION/INTERSECT/EXCEPT).
-    pub plan: Box<Plan>,
-    /// The columns of the derived table.
-    pub columns: Vec<Column>,
-    /// Source names for a parenthesized join. SQLite stores these in
-    /// `ExprList_item.zEName` when `selectExpander` handles `SF_NestedFrom`.
-    ///
-    /// Turso keeps the same data here because outer name binding sees this
-    /// derived table, not the inner result expressions. Each item describes
-    /// the column at the same position in `columns`.
-    pub(crate) parenthesized_join_columns: Option<Vec<ParenthesizedJoinColumn>>,
-    /// The start register for the result columns of the derived table;
-    /// must be set before data is read from it.
-    pub result_columns_start_reg: Option<usize>,
-    /// The table cursor backing a materialized EphemeralTable representation of
-    /// this subquery, if one was emitted.
-    pub materialized_cursor_id: Option<CursorID>,
-    /// CTE-specific materialization metadata, when this FROM-subquery is a CTE
-    /// reference rather than an inline derived table.
-    pub cte: Option<FromClauseSubqueryCteMetadata>,
-}
-
-/// Name data that an outer query can use through a parenthesized join.
-#[derive(Debug, Clone)]
-pub(crate) struct ParenthesizedJoinColumn {
-    /// The name that SQLite keeps for later name binding.
-    pub(crate) source: ParenthesizedJoinColumnSource,
-    /// The ways in which an outer query can use this column.
-    pub(crate) visibility: ParenthesizedJoinColumnVisibility,
-}
-
-/// This value tells how an outer query can read a column from a parenthesized join.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ParenthesizedJoinColumnVisibility {
-    /// Bare names, qualified names, and `*` can use this column.
-    Visible,
-    /// Only a qualified name can use this column.
-    QualifiedOnly,
-    /// Bare and qualified names can use this column, but `*` omits it.
-    HiddenFromStar,
-}
-
-/// The source name of a result column from a parenthesized join.
-#[derive(Debug, Clone)]
-pub(crate) enum ParenthesizedJoinColumnSource {
-    /// SQLite inserts one name that represents all copies merged by `USING`.
-    Using { column_name: String },
-    /// Turso keeps these names separate because quoted names can contain dots.
-    /// SQLite's dot-separated string cannot represent those names.
-    Table {
-        database_id: Option<usize>,
-        table_name: String,
-        column_name: String,
-    },
-    /// An implicit rowid keeps its table name but matches each rowid alias.
-    RowId {
-        database_id: Option<usize>,
-        table_name: String,
-    },
-}
-
-impl ParenthesizedJoinColumnSource {
-    pub(crate) fn matches_table(&self, database_id: Option<usize>, table_name: &str) -> bool {
-        match self {
-            Self::Using { .. } => false,
-            Self::Table {
-                database_id: saved_database,
-                table_name: saved_table,
-                ..
-            }
-            | Self::RowId {
-                database_id: saved_database,
-                table_name: saved_table,
-            } => {
-                database_id.is_none_or(|database| *saved_database == Some(database))
-                    && saved_table.eq_ignore_ascii_case(table_name)
-            }
-        }
-    }
-
-    pub(crate) fn matches_column_name(&self, column_name: &str) -> bool {
-        match self {
-            Self::Using {
-                column_name: saved_column,
-            }
-            | Self::Table {
-                column_name: saved_column,
-                ..
-            } => saved_column.eq_ignore_ascii_case(column_name),
-            Self::RowId { .. } => ROWID_STRS
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(column_name)),
-        }
-    }
-
-    pub(crate) fn is_rowid(&self) -> bool {
-        matches!(self, Self::RowId { .. })
-    }
-
-    pub(crate) fn is_using(&self) -> bool {
-        matches!(self, Self::Using { .. })
-    }
-}
-
 /// The one-row table read by the recursive part of a recursive CTE.
 #[derive(Debug, Clone)]
 pub struct RecursiveCteInput {
     pub name: String,
     pub columns: Vec<Column>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct FromClauseSubqueryCteMetadata {
-    /// Identity shared by all references to the same CTE definition.
-    pub id: usize,
-    /// True when more than one read in the same query tree can reuse one
-    /// materialized result for this CTE.
-    pub shared_materialization: bool,
-    /// True for explicit WITH ... AS MATERIALIZED.
-    pub materialize_hint: bool,
-}
-
-impl FromClauseSubquery {
-    pub fn cte_id(&self) -> Option<usize> {
-        self.cte.map(|cte| cte.id)
-    }
-
-    pub fn materialize_hint(&self) -> bool {
-        self.cte.is_some_and(|cte| cte.materialize_hint)
-    }
-
-    pub fn shared_materialization(&self) -> bool {
-        self.cte.is_some_and(|cte| cte.shared_materialization)
-    }
-
-    pub fn set_shared_materialization(&mut self, shared: bool) {
-        if let Some(cte) = &mut self.cte {
-            cte.shared_materialization = shared;
-        }
-    }
-
-    /// Shared CTE references and explicit MATERIALIZED hints both force a
-    /// table-backed materialization that can be scanned or probed later.
-    pub fn requires_table_materialization(&self) -> bool {
-        self.shared_materialization() || self.materialize_hint()
-    }
-
-    /// Only simple single-reference SELECT subqueries can safely use their
-    /// synthesized seek index as the storage target directly. Compound
-    /// subqueries still need table-backed storage so their set-operation
-    /// semantics are preserved before any later SEARCH shape is chosen.
-    pub fn supports_direct_index_materialization(&self) -> bool {
-        matches!(self.plan.as_ref(), Plan::Select(_)) && !self.requires_table_materialization()
-    }
 }
 
 fn collect_column_refs(expr: &Expr) -> HashSet<String> {
@@ -6207,6 +6103,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         }
     }
 
+    let has_column_defaults = BTreeTable::any_column_default(&cols);
+    let has_unnamed_or_collated_columns = BTreeTable::any_unnamed_or_collated_column(&cols);
     let mut table = BTreeTable {
         root_page,
         name: table_name,
@@ -6262,8 +6160,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         rowid_alias_conflict_clause,
         primary_key_constraint_name,
         has_virtual_columns: false,
+        has_column_defaults,
+        has_unnamed_or_collated_columns,
         logical_to_physical_map: vec![],
         column_dependencies: Default::default(),
+        declared_type_facts: Default::default(),
+        column_names: Default::default(),
     };
     table.prepare_generated_columns()?;
     if table.is_strict {
@@ -6965,6 +6867,8 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
     ]?;
     let logical_to_physical_map =
         BTreeTable::try_build_logical_to_physical_map(&columns, &[], true)?;
+    let has_column_defaults = BTreeTable::any_column_default(&columns);
+    let has_unnamed_or_collated_columns = BTreeTable::any_unnamed_or_collated_column(&columns);
     Ok(BTreeTable {
         root_page: 1,
         name: "sqlite_schema".to_string(),
@@ -6980,8 +6884,12 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
         primary_key_constraint_name: None,
         unique_sets: try_vec![]?,
         has_virtual_columns: false,
+        has_column_defaults,
+        has_unnamed_or_collated_columns,
         logical_to_physical_map,
         column_dependencies: Default::default(),
+        declared_type_facts: Default::default(),
+        column_names: Default::default(),
     })
 }
 
@@ -7299,10 +7207,15 @@ impl Index {
     /// CREATE TABLE t (a, b, c)
     /// CREATE INDEX idx ON t(b)
     /// then column_table_pos_to_index_pos(1) returns Some(0)
+    ///
+    /// An index column on a virtual generated column has the column's
+    /// position and its expression, and stores the column's computed
+    /// value, so a seek on that column uses it. An expression column has no
+    /// table position.
     pub fn column_table_pos_to_index_pos(&self, table_pos: usize) -> Option<usize> {
         self.columns
             .iter()
-            .position(|c| c.pos_in_table == table_pos && c.expr.is_none())
+            .position(|c| c.pos_in_table == table_pos)
     }
 
     /// Given an expression, return the position in the index if it matches an expression index column.
@@ -7318,7 +7231,7 @@ impl Index {
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table, _resolver: &Resolver) -> bool {
+    pub fn validate_where_expr(&self, table: &Table) -> bool {
         let Some(where_clause) = &self.where_clause else {
             return true;
         };
@@ -7399,72 +7312,6 @@ impl Index {
             })
         });
         ok
-    }
-
-    /// Bind a copy of this index's WHERE clause against the given table references.
-    ///
-    /// Returns `Ok(None)` when the index has no WHERE clause. Binding errors are
-    /// propagated, never swallowed: callers must not treat `None` as "binding failed".
-    ///
-    /// The predicate may qualify columns with the table's real name
-    /// (e.g. `CREATE INDEX i ON t(a) WHERE t.b > 0`), while the DML statement
-    /// may refer to that table only under an alias (e.g. `UPDATE t AS z ...`).
-    /// Rewrite such qualifiers to the identifier the statement uses, so the
-    /// predicate always resolves against the index's own table, like in SQLite.
-    pub fn bind_where_expr(
-        &self,
-        table_refs: Option<&mut TableReferences>,
-        resolver: &Resolver,
-    ) -> crate::Result<Option<ast::Expr>> {
-        let Some(where_clause) = &self.where_clause else {
-            return Ok(None);
-        };
-        let mut expr = where_clause.clone();
-        let target_identifier = table_refs.as_deref().and_then(|refs| {
-            // Only a real b-tree table can be the DML target that owns this index.
-            // A CTE or subquery sharing the table's name (e.g. `WITH t AS ...
-            // UPDATE t ...`) must not be picked, so match on b-tree identity.
-            let mut matches = refs
-                .joined_tables()
-                .iter()
-                .map(|jt| (&jt.identifier, &jt.table))
-                .chain(
-                    refs.outer_query_refs()
-                        .iter()
-                        .map(|r| (&r.identifier, &r.table)),
-                )
-                .filter(|(_, table)| {
-                    table
-                        .btree()
-                        .is_some_and(|bt| normalize_ident(&bt.name) == self.table_name)
-                })
-                .map(|(identifier, _)| identifier);
-            let target = matches.next().cloned();
-            assert!(
-                matches.next().is_none(),
-                "multiple table references match the table of partial index {}",
-                self.name
-            );
-            target
-        });
-        if let Some(identifier) = target_identifier {
-            walk_expr_mut(&mut expr, &mut |e: &mut Expr| {
-                if let Expr::Qualified(ns, _) | Expr::DoublyQualified(_, ns, _) = e {
-                    if normalize_ident(ns.as_str()) == self.table_name {
-                        *ns = Name::exact(identifier.clone());
-                    }
-                }
-                Ok(WalkControl::Continue)
-            })?;
-        }
-        bind_and_rewrite_expr(
-            &mut expr,
-            table_refs,
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
-        Ok(Some(*expr))
     }
 }
 
@@ -8416,6 +8263,8 @@ mod tests {
         )];
         let logical_to_physical_map =
             BTreeTable::build_logical_to_physical_map(&columns, &[], true);
+        let has_column_defaults = BTreeTable::any_column_default(&columns);
+        let has_unnamed_or_collated_columns = BTreeTable::any_unnamed_or_collated_column(&columns);
         let table = BTreeTable {
             root_page: 0,
             name: "t1".to_string(),
@@ -8431,8 +8280,12 @@ mod tests {
             rowid_alias_conflict_clause: None,
             primary_key_constraint_name: None,
             has_virtual_columns: false,
+            has_column_defaults,
+            has_unnamed_or_collated_columns,
             logical_to_physical_map,
             column_dependencies: Default::default(),
+            declared_type_facts: Default::default(),
+            column_names: Default::default(),
         };
 
         let result = Index::automatic_from_primary_key(
@@ -9157,6 +9010,46 @@ mod tests {
         // Any access through columns_mut() wipes the cache, even if we don't mutate.
         let _ = t.columns_mut();
         assert!(t.peek_column_dependencies().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn shared_column_facts_follow_column_changes() -> Result<()> {
+        let mut t = BTreeTable::from_sql("CREATE TABLE t(a INTEGER, b INTEGER)", 0)?;
+        assert_eq!(t.declared_type_facts()[1].storage, Some(Type::Integer));
+        assert_eq!(&*t.shared_column_names()[1], "b");
+
+        let text = BTreeTable::from_sql("CREATE TABLE u(c TEXT)", 0)?.columns()[0].clone();
+        t.columns_mut()[1] = text;
+        assert_eq!(t.declared_type_facts()[1].storage, Some(Type::Text));
+        assert_eq!(&*t.shared_column_names()[1], "c");
+        Ok(())
+    }
+
+    #[test]
+    fn column_default_and_collation_flags_follow_column_changes() -> Result<()> {
+        let mut t = BTreeTable::from_sql("CREATE TABLE t(a, b TEXT)", 0)?;
+        assert!(!t.has_column_defaults());
+        assert!(!t.has_unnamed_or_collated_columns());
+
+        let added = BTreeTable::from_sql("CREATE TABLE u(c DEFAULT 7)", 0)?.columns()[0].clone();
+        t.columns_mut().push(added);
+        assert!(t.has_column_defaults());
+        assert!(!t.has_unnamed_or_collated_columns());
+
+        let collated =
+            BTreeTable::from_sql("CREATE TABLE u(c TEXT COLLATE NOCASE)", 0)?.columns()[0].clone();
+        t.columns_mut()[1] = collated;
+        assert!(t.has_column_defaults());
+        assert!(t.has_unnamed_or_collated_columns());
+
+        t.columns_mut().truncate(1);
+        assert!(!t.has_column_defaults());
+        assert!(!t.has_unnamed_or_collated_columns());
+
+        let created = BTreeTable::from_sql("CREATE TABLE t(a DEFAULT 1, b COLLATE RTRIM)", 0)?;
+        assert!(created.has_column_defaults());
+        assert!(created.has_unnamed_or_collated_columns());
         Ok(())
     }
 

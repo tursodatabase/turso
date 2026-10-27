@@ -253,6 +253,31 @@ mod tests {
         assert_eq!(real_lit.kind, ColumnTypeKind::Builtin);
     }
 
+    /// Statements prepared through HIR infer computed types by the same
+    /// rules.
+    #[test]
+    fn type_info_for_expressions_through_hir() {
+        let db = fresh_db_with_custom_types("type_info_hir.db");
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT) STRICT")
+            .unwrap();
+        let stmt = conn
+            .prepare(
+                "SELECT 42, 'x', 1.5, -id, id + 1, id * 1.5, name + 1, id < 2, name || 'x' FROM t",
+            )
+            .unwrap();
+        let names = (0..9)
+            .map(|idx| expect_info(&stmt, idx).declared_name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "INTEGER", "TEXT", "REAL", "INTEGER", "INTEGER", "REAL", "NUMERIC", "INTEGER",
+                "TEXT"
+            ]
+        );
+    }
+
     /// Arithmetic over typed operands propagates: `42 + 1` reports INTEGER,
     /// matching what PostgreSQL itself reports. Mixed-precision arithmetic
     /// widens to REAL; mixing in a non-numeric column collapses to NUMERIC.

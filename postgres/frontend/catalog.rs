@@ -206,6 +206,12 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn declared_result_type(&self, name: &str, array_dimensions: u32) -> Option<&'static str> {
+        (array_dimensions == 0
+            && (name.eq_ignore_ascii_case("boolean") || name.eq_ignore_ascii_case("bool")))
+        .then_some("BOOLEAN")
+    }
+
     fn add_column_computes_default_for_existing_rows(&self) -> bool {
         true
     }

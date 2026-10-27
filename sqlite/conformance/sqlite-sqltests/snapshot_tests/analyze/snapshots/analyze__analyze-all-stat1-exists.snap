@@ -15,18 +15,18 @@ addr  opcode       p1  p2  p3  p4                  p5  comment
    0  Init          0  52   0                       0  Start at 52
    1  Null          0   1   0                       0  r[1]=NULL
    2  OpenWrite     0   5   0                       0  root=5; iDb=0
-   3  Rewind        0  10   0                       0  Rewind  sqlite_stat1
+   3  Rewind        0  10   0                       0  Rewind table sqlite_stat1
    4      Column    0   0   2                       0  r[2]=sqlite_stat1.tbl
    5      Ne        2   3   9                       0  if r[2]!=r[3] goto 9
    6      RowId     0   4   0                       0  r[4]=sqlite_stat1.rowid
    7      Delete    0   0   0  sqlite_stat1         0
    8    Next        0   4   0                       0
    9  Next          0   4   0                       0
-  10  OpenRead      1   2   0  k(3,B,B,B)           0  =items, root=2, iDb=0
-  11  OpenRead      2   4   0  k(2,B)               0  =idx_items_category, root=4, iDb=0
+  10  OpenRead      1   2   0  k(3,B,B,B)           0  table=items, root=2, iDb=0
+  11  OpenRead      2   4   0  k(2,B)               0  index=idx_items_category, root=4, iDb=0
   12  Integer       1   7   0                       0  r[7]=1
   13  Function      0   7   6  stat_init            0  r[6]=func(r[7])
-  14  Rewind        2  31   0                       0  Rewind  idx_items_category
+  14  Rewind        2  31   0                       0  Rewind index idx_items_category
   15  Integer       0   7   0                       0  r[7]=0
   16  Goto          0  22   0                       0
   17    Integer     0   7   0                       0  r[7]=0
@@ -43,10 +43,10 @@ addr  opcode       p1  p2  p3  p4                  p5  comment
   28  MakeRecord   11   3  14                       0  r[14]=mkrec(r[11..13])
   29  NewRowid      0  15   0                       0  r[15]=rowid
   30  Insert        0  14  15  sqlite_stat1         0  intkey=r[15] data=r[14]
-  31  OpenRead      3   3   0  k(2,B)               0  =idx_items_name, root=3, iDb=0
+  31  OpenRead      3   3   0  k(2,B)               0  index=idx_items_name, root=3, iDb=0
   32  Integer       1  17   0                       0  r[17]=1
   33  Function      0  17  16  stat_init            0  r[16]=func(r[17])
-  34  Rewind        3  51   0                       0  Rewind  idx_items_name
+  34  Rewind        3  51   0                       0  Rewind index idx_items_name
   35  Integer       0  17   0                       0  r[17]=0
   36  Goto          0  42   0                       0
   37    Integer     0  17   0                       0  r[17]=0

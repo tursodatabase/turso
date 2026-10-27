@@ -11,6 +11,10 @@
     )
 )]
 #![recursion_limit = "256"]
+// The test binary's generated `main` lists every unit test in one array on
+// the stack, and this crate has enough tests for that array to pass clippy's
+// stack frame limit.
+#![cfg_attr(test, allow(clippy::large_stack_frames))]
 
 pub mod alloc;
 pub mod busy;
@@ -113,7 +117,6 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use schema::Schema;
 use std::time::Duration;
 use storage::sqlite3_ondisk::PageSize;
-use tracing::instrument;
 use turso_macros::AtomicEnum;
 use turso_parser::{ast, ast::Cmd};
 
@@ -121,7 +124,6 @@ pub use cdc::{
     CaptureDataChangesExt, CaptureDataChangesInfo, CaptureDataChangesMode, CdcVersion,
     CDC_VERSION_CURRENT,
 };
-#[cfg(feature = "simulator")]
 pub use connection::SubqueryUnnestingMode;
 pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};

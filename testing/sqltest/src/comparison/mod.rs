@@ -1,5 +1,6 @@
 pub mod exact;
 pub mod pattern;
+pub mod plan;
 pub mod unordered;
 
 use crate::backends::QueryResult;
@@ -25,6 +26,17 @@ impl ComparisonResult {
         ComparisonResult::Mismatch {
             reason: reason.into(),
         }
+    }
+}
+
+/// Compare like [compare], but without the parts of an EXPLAIN QUERY PLAN
+/// that differ between two planners that chose the same plan.
+pub fn compare_plans(actual: &QueryResult, expectation: &Expectation) -> ComparisonResult {
+    match expectation {
+        Expectation::Exact(expected_rows) if !actual.is_error() => {
+            plan::compare(&actual.rows, expected_rows)
+        }
+        _ => compare(actual, expectation),
     }
 }
 

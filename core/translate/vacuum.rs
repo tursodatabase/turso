@@ -1,18 +1,12 @@
 //! Translation of VACUUM statements to VDBE bytecode.
 
-use crate::translate::emitter::Resolver;
-use crate::translate::expr::{
-    bind_and_rewrite_expr, expr_vector_size, translate_expr, BindingBehavior,
-};
-use crate::translate::plan::{EvalAt, TableReferences};
-use crate::translate::subquery::{
-    emit_non_from_clause_subquery, plan_subqueries_in_expr_without_from_clause,
-};
+use crate::translate::semantic::context::SemanticContext;
+use crate::translate::semantic_lowering::PlannedSelect;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::Insn;
 use crate::{bail_parse_error, Connection, Result, TEMP_DB_ID};
 use crate::{sync::Arc, LimboError};
-use turso_parser::ast::{Expr, Name, SubqueryType};
+use turso_parser::ast::{Expr, Name};
 
 /// Translate a VACUUM statement into VDBE bytecode.
 ///
@@ -21,7 +15,7 @@ use turso_parser::ast::{Expr, Name, SubqueryType};
 ///
 /// # Arguments
 /// * `program` - The program builder to emit instructions to
-/// * `resolver` - Resolves names in the VACUUM INTO path expression
+/// * `catalog` - Resolves names in the VACUUM INTO path expression
 /// * `schema_name` - Optional schema/database name to vacuum (defaults to "main" if None)
 /// * `into` - Optional destination path for VACUUM INTO
 ///
@@ -29,7 +23,7 @@ use turso_parser::ast::{Expr, Name, SubqueryType};
 /// The modified program builder on success
 pub fn translate_vacuum(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     schema_name: Option<&Name>,
     into: Option<&Expr>,
     connection: Arc<Connection>,
@@ -40,46 +34,8 @@ pub fn translate_vacuum(
             if connection.get_database_id_by_name(&schema_name)? == TEMP_DB_ID {
                 return Ok(());
             }
-            let mut dest_expr = dest_expr.clone();
-            bind_and_rewrite_expr(
-                &mut dest_expr,
-                Some(&mut TableReferences::new(vec![], vec![])),
-                None,
-                resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            )?;
-            let mut subqueries = Vec::new();
-            plan_subqueries_in_expr_without_from_clause(
-                program,
-                &mut subqueries,
-                &mut dest_expr,
-                resolver,
-                &connection,
-            )?;
-            match &dest_expr {
-                Expr::SubqueryResult {
-                    query_type: SubqueryType::RowValue { num_regs, .. },
-                    ..
-                } if *num_regs != 1 => {
-                    bail_parse_error!("sub-select returns {num_regs} columns - expected 1");
-                }
-                _ if expr_vector_size(&dest_expr)? != 1 => {
-                    bail_parse_error!("row value misused");
-                }
-                _ => {}
-            }
-            for subquery in &mut subqueries {
-                let plan = subquery.consume_plan(EvalAt::BeforeLoop);
-                emit_non_from_clause_subquery(
-                    program,
-                    resolver,
-                    *plan,
-                    &subquery.query_type,
-                    false,
-                )?;
-            }
-            let dest_reg = program.alloc_register();
-            translate_expr(program, None, &dest_expr, dest_reg, resolver)?;
+            let path = PlannedSelect::values(vec![dest_expr.clone()], catalog, &connection)?;
+            let dest_reg = path.emit_values(program)?;
             program.emit_insn(Insn::VacuumInto {
                 schema_name,
                 dest_reg,
