@@ -16526,7 +16526,8 @@ pub fn op_read_cookie(
     load_insn!(ReadCookie { db, dest, cookie }, insn);
     let pager = program.get_pager_from_database_index(db)?;
     if let Cookie::DataVersion = cookie {
-        state.registers[*dest].set_int(pager.data_version() as i64);
+        state.registers[*dest]
+            .set_int(pager.wal.as_ref().map_or(0, |wal| wal.data_version()) as i64);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }

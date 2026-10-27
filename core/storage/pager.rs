@@ -3307,11 +3307,6 @@ impl Pager {
         Ok(())
     }
 
-    /// The connection's `PRAGMA data_version`, see [`Wal::data_version`].
-    pub fn data_version(&self) -> u64 {
-        self.wal.as_ref().map_or(0, |wal| wal.data_version())
-    }
-
     /// MVCC-only: refresh connection-private WAL change counters without starting a read tx and invalidate cache if needed.
     pub fn mvcc_refresh_if_db_changed(&self) {
         let Some(wal) = self.wal.as_ref() else {
