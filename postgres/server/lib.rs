@@ -202,6 +202,10 @@ impl SimpleQueryHandler for TursoPgHandler {
         // multiple semicolon-separated statements. Split and execute each one.
         let statements = split_statements(query).map_err(pg_error)?;
 
+        if statements.is_empty() {
+            return Ok(vec![Response::EmptyQuery]);
+        }
+
         let mut responses = Vec::new();
         for sql in &statements {
             let mut stmt = conn.prepare(sql).map_err(pg_error)?;

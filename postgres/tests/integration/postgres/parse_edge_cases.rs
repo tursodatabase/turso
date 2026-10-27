@@ -67,6 +67,30 @@ fn test_pg_parse_garbage_errors(db: TempDatabase) {
     }
 }
 
+#[turso_macros::test]
+fn test_pg_only_semicolons_is_an_empty_query(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    for sql in [";", ";;", "; ;", " ;\n; ", ";;;", "-- nothing\n;"] {
+        let results: Vec<_> = conn.query_runner(sql.as_bytes()).collect();
+        assert!(
+            results.is_empty(),
+            "{sql:?} should run no statements, got {} result(s)",
+            results.len()
+        );
+    }
+}
+
+#[turso_macros::test]
+fn test_pg_invalid_sql_is_a_syntax_error_not_an_empty_query(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    for sql in ["SELEC 1;", "SELEC 1", "hello world;"] {
+        let results: Vec<_> = conn.query_runner(sql.as_bytes()).collect();
+        assert_eq!(results.len(), 1, "{sql:?}");
+        let err = results[0].as_ref().err().expect("expected a syntax error");
+        assert!(err.to_string().contains("syntax error"), "{sql:?}: {err}");
+    }
+}
+
 // -------------------------------------------------------------------------
 // Semantically invalid SQL that pg_query accepts must produce clean errors
 // -------------------------------------------------------------------------
