@@ -380,6 +380,14 @@ expect error {
     ESCAPE expression must be a single character
 }
 
+test like-escape-column {
+    WITH t(s, p, e) AS (VALUES('a','a','#'))
+    SELECT s LIKE 'a' ESCAPE e FROM t;
+}
+expect {
+    1
+}
+
 test like-perf {
     SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' LIKE '%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%b';
 }
