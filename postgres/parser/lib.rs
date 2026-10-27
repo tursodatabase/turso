@@ -1,3 +1,4 @@
+pub mod copy;
 pub use pg_query::ParseResult;
 use thiserror::Error;
 

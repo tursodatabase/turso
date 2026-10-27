@@ -94,6 +94,15 @@ impl PgConnection {
         prepare_statement(&self.inner, sql.as_ref()).map_err(Into::into)
     }
 
+    pub fn prepare_copy_to_stdout(
+        &self,
+        spec: &turso_pg_parser::copy::CopyToStdout,
+    ) -> crate::Result<crate::Statement> {
+        crate::copy::prepare_copy_to_stdout(&self.inner.conn, spec)
+            .map(crate::Statement::new)
+            .map_err(Into::into)
+    }
+
     pub fn query(&self, sql: impl AsRef<str>) -> crate::Result<Option<crate::Statement>> {
         let sql = sql.as_ref().trim();
         if sql.is_empty() {

@@ -364,10 +364,11 @@ Upgrade is not supported.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | COPY table FROM 'file' (text format) | ✅ Supported | DELIMITER (one character), NULL string, HEADER (not HEADER MATCH), column lists, backslash escapes, `\.` end-of-data marker; atomic (rolls back on malformed rows); other options rejected |
-| COPY from/to STDIN/STDOUT | ❌ Not supported | Rejected with an error; no wire-level COPY sub-protocol |
+| COPY table TO STDOUT | ✅ Supported | Simple query protocol, text format; column lists, search_path lookup, COPY text escaping; excludes generated columns by default and rejects them in explicit lists; database reads use blocking helpers, rows are sent one at a time |
+| COPY FROM STDIN | ❌ Not supported | Rejected with an error |
 | COPY FROM ... WHERE | ❌ Not supported | Rejected |
 | COPY ... ON_ERROR | ❌ Not supported | Rejected |
-| COPY with arbitrary SELECT | ❌ Not supported | COPY TO is not supported at all |
+| COPY with arbitrary SELECT | ❌ Not supported | COPY TO requires a plain table |
 | CSV support for COPY | ❌ Not supported | `FORMAT csv` and `FORMAT binary` rejected with an error |
 
 ## Configuration Management
@@ -612,7 +613,7 @@ Upgrade is not supported.
 | Full SSL support | ❌ Not supported | SSLRequest answered with "SSL not available"; plaintext only |
 | IPv6 support | 🟡 Partial | Server binds whatever address it is given, including IPv6 literals; no dual-stack handling |
 | V2 client protocol | ❌ Not supported | |
-| V3 client protocol | 🟡 Partial | Via pgwire: simple query and extended query (Parse/Bind/Execute/Describe/Sync) protocols; trust auth only; parameter values must be text-format; Execute row limits ignored (no portal suspension); no COPY sub-protocol, CancelRequest, or NotificationResponse |
+| V3 client protocol | 🟡 Partial | Via pgwire: simple query and extended query (Parse/Bind/Execute/Describe/Sync) protocols; trust auth only; parameter values must be text-format; Execute row limits ignored (no portal suspension); text COPY TO STDOUT in simple queries; no COPY FROM STDIN, CancelRequest, or NotificationResponse |
 
 ## Platforms
 
