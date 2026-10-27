@@ -673,36 +673,6 @@ pub(crate) trait ExprVisitor<'expr> {
     ) -> Result<Self::Output, Self::Error>;
 }
 
-struct WalkVisitor<'a, F> {
-    visit: &'a mut F,
-}
-
-impl<'expr, F: FnMut(ExprRef<'expr>)> ExprVisitor<'expr> for WalkVisitor<'_, F> {
-    type Context = ();
-    type Output = ();
-    type Error = Infallible;
-
-    fn pre_order(
-        &mut self,
-        _parent: ExprRef<'expr>,
-        _context: &mut (),
-        _child_index: usize,
-        child: ExprRef<'expr>,
-    ) -> Result<ControlFlow<(), ()>, Infallible> {
-        (self.visit)(child);
-        Ok(ControlFlow::Continue(()))
-    }
-
-    fn post_order(
-        &mut self,
-        _expression: ExprRef<'expr>,
-        _context: (),
-        _children: &[()],
-    ) -> Result<(), Infallible> {
-        Ok(())
-    }
-}
-
 struct FoldVisitor<'a, F, T> {
     fold: &'a mut F,
     output: std::marker::PhantomData<fn() -> T>,
@@ -1361,9 +1331,28 @@ impl<'a> ExprRef<'a> {
     /// by the query that owns them.
     pub(crate) fn for_each(self, visitor: &mut impl FnMut(ExprRef<'a>)) {
         visitor(self);
-        let result = self.walk((), &mut WalkVisitor { visit: visitor });
-        if let Err(error) = result {
-            match error {}
+        let Some(mut expression) = self.child(0) else {
+            return;
+        };
+        let mut parents: SmallVec<[(ExprRef<'a>, usize); 4]> = smallvec::smallvec![(self, 1)];
+        loop {
+            visitor(expression);
+            if let Some(child) = expression.child(0) {
+                parents.push((expression, 1));
+                expression = child;
+                continue;
+            }
+            loop {
+                let Some((parent, index)) = parents.last_mut() else {
+                    return;
+                };
+                if let Some(child) = parent.child(*index) {
+                    *index += 1;
+                    expression = child;
+                    break;
+                }
+                parents.pop();
+            }
         }
     }
 
@@ -1706,7 +1695,7 @@ mod tests {
     }
 
     #[test]
-    fn walking_children_without_children_pushes_no_frames() {
+    fn folding_children_without_children_pushes_no_frames() {
         let mut exprs = ExprArena::default();
         let first = exprs.push(Expr::column(SourceId::new(0), 1));
         let negated = exprs.push(Expr::column(SourceId::new(0), 2));
@@ -1719,16 +1708,16 @@ mod tests {
         CHILD_FRAMES_CREATED.with(|created| created.set(0));
 
         let mut visited = Vec::new();
-        exprs.at(row).for_each(&mut |expression| {
+        exprs.at(row).fold(&mut |expression, _: &[()]| {
             visited.push(matches!(*expression, Expr::Column(_)));
         });
 
-        assert_eq!(visited, [false, true, false, true, true]);
+        assert_eq!(visited, [true, true, false, true, false]);
         assert_eq!(CHILD_FRAMES_CREATED.with(|created| created.get()), 1);
     }
 
     #[test]
-    fn walking_an_expression_without_children_creates_no_frame_stack() {
+    fn folding_an_expression_without_children_creates_no_frame_stack() {
         let mut exprs = ExprArena::default();
         let leaf = exprs.push(Expr::column(SourceId::new(0), 3));
         let lhs = exprs.push(Expr::column(SourceId::new(0), 1));
@@ -1744,11 +1733,11 @@ mod tests {
         FRAME_STACKS_CREATED.with(|created| created.set(0));
 
         let mut visited = 0;
-        exprs.at(leaf).for_each(&mut |_| visited += 1);
+        exprs.at(leaf).fold(&mut |_, _: &[()]| visited += 1);
         assert_eq!(visited, 1);
         assert_eq!(FRAME_STACKS_CREATED.with(|created| created.get()), 0);
 
-        exprs.at(binary).for_each(&mut |_| visited += 1);
+        exprs.at(binary).fold(&mut |_, _: &[()]| visited += 1);
         assert_eq!(visited, 4);
         assert_eq!(FRAME_STACKS_CREATED.with(|created| created.get()), 1);
     }
