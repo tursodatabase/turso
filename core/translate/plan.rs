@@ -3288,7 +3288,7 @@ impl JoinedTable {
         }
         let column_types = (0..columns.len())
             .map(|column| query_column_type(query, column, resolver))
-            .collect();
+            .try_collect()?;
         let table = Table::RecursiveCteInput(Arc::new(RecursiveCteInput {
             name: identifier.clone(),
             columns,
