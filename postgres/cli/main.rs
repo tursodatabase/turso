@@ -43,8 +43,8 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use turso_core::{DatabaseOpts, OpenFlags, Value};
-use turso_pg::{Connection, Error, Statement};
+use turso_core::{DatabaseOpts, Numeric, OpenFlags, Value};
+use turso_pg::{column_float_type, Connection, Error, FloatType, Statement};
 use turso_pg_server::TursoPgServer;
 
 // ---------------------------------------------------------------------------
@@ -735,6 +735,9 @@ fn print_result_set(
     let column_names: Vec<String> = (0..num_columns)
         .map(|i| stmt.get_column_name(i).to_string())
         .collect();
+    let float_types: Vec<Option<FloatType>> = (0..num_columns)
+        .map(|i| column_float_type(stmt, i))
+        .collect();
 
     let mut table = Table::new();
     table
@@ -757,7 +760,7 @@ fn print_result_set(
         for (idx, value) in row.get_values().enumerate() {
             let (content, alignment) = match value {
                 Value::Null => ("NULL".to_string(), CellAlignment::Left),
-                Value::Numeric(_) => (format!("{value}"), CellAlignment::Right),
+                Value::Numeric(_) => (format_value(value, float_types[idx]), CellAlignment::Right),
                 Value::Text(_) => (format!("{value}"), CellAlignment::Left),
                 Value::Blob(_) => (format!("{value}"), CellAlignment::Left),
             };
@@ -787,6 +790,9 @@ fn print_result_set_expanded(stmt: &mut Statement, w: &mut dyn Write) -> Result<
     let column_names: Vec<String> = (0..num_columns)
         .map(|i| stmt.get_column_name(i).to_string())
         .collect();
+    let float_types: Vec<Option<FloatType>> = (0..num_columns)
+        .map(|i| column_float_type(stmt, i))
+        .collect();
 
     let max_col_width = column_names.iter().map(|n| n.len()).max().unwrap_or(0);
     let mut record_num = 0u64;
@@ -800,7 +806,7 @@ fn print_result_set_expanded(stmt: &mut Statement, w: &mut dyn Write) -> Result<
             let col = &column_names[idx];
             let val_str = match value {
                 Value::Null => "NULL".to_string(),
-                _ => format!("{value}"),
+                _ => format_value(value, float_types[idx]),
             };
             writeln!(w, "{col:<max_col_width$} | {val_str}")
                 .map_err(|e| turso_core::io_error(e, "write"))?;
@@ -808,6 +814,16 @@ fn print_result_set_expanded(stmt: &mut Statement, w: &mut dyn Write) -> Result<
         Ok(())
     })?;
     Ok(())
+}
+
+/// Renders a value for display. Values of float8 and float4 columns print the
+/// way PostgreSQL prints floats (`1`, `1e+20`) rather than SQLite's `1.0` and
+/// `1.0e+20`.
+fn format_value(value: &Value, float_type: Option<FloatType>) -> String {
+    match (value, float_type) {
+        (Value::Numeric(Numeric::Float(f)), Some(float_type)) => float_type.format(f64::from(*f)),
+        _ => value.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------

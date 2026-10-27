@@ -1377,6 +1377,28 @@ impl Schema {
         }
     }
 
+    /// Parse a CREATE TYPE SQL string and add it to the in-memory registry as a
+    /// built-in type: one a dialect provides, which is never stored in the
+    /// database and cannot be dropped.
+    pub fn add_builtin_type_from_sql(&mut self, sql: &str) -> crate::Result<()> {
+        use turso_parser::ast::{Cmd, Stmt};
+        use turso_parser::parser::Parser;
+
+        let mut parser = Parser::new(sql.as_bytes());
+        let Ok(Some(Cmd::Stmt(Stmt::CreateType {
+            type_name, body, ..
+        }))) = parser.next_cmd()
+        else {
+            return Err(crate::LimboError::ParseError(format!(
+                "invalid built-in type sql: {sql}"
+            )));
+        };
+        let type_def = TypeDef::from_create_type(&type_name, &body, true, sql.to_string())?;
+        self.type_registry
+            .insert(type_registry_key(&type_name), Arc::new(type_def));
+        Ok(())
+    }
+
     /// Parse a CREATE TYPE SQL string and add the type to the in-memory registry.
     pub fn add_type_from_sql(&mut self, sql: &str) -> crate::Result<()> {
         use turso_parser::ast::{Cmd, Stmt};
@@ -4442,8 +4464,18 @@ impl BTreeTable {
                 // so accept ANY here; the encoder handles conversion.
                 col.ty_str = "ANY".to_string();
                 col.override_affinity(Affinity::Blob);
-            } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
-                col.ty_str = type_def.value_input_type().to_uppercase();
+            } else if let Ok(Some(resolved)) = schema.resolve_type(&col.ty_str, table.is_strict) {
+                // A domain accepts what the type under it accepts, so look
+                // through the domains to the first custom type, or to the
+                // primitive when the domains sit directly on one.
+                let input_type = resolved
+                    .chain
+                    .iter()
+                    .find(|type_def| !type_def.is_domain)
+                    .map_or(resolved.primitive.as_str(), |type_def| {
+                        type_def.value_input_type()
+                    });
+                col.ty_str = input_type.to_uppercase();
             }
         }
         Ok(Arc::new(modified))

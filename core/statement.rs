@@ -134,6 +134,12 @@ pub struct ColumnTypeInfo {
     /// than raw bytes. The `kind` field carries that distinction directly
     /// without forcing the caller to re-query the schema.
     pub kind: ColumnTypeKind,
+    /// For an expression whose value has a `CREATE TYPE` type, such as
+    /// `CAST(x AS cents)`, the name of that type. `declared_name` reports the
+    /// primitive the value is stored as, so this is how a wire-protocol layer
+    /// tells `CAST(x AS float8)` from a plain REAL. `None` for table columns,
+    /// whose type is already in `declared_name`.
+    pub custom_type_name: Option<String>,
 }
 
 /// Classification of a result column's declared type.

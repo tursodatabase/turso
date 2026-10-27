@@ -941,6 +941,20 @@ expect {
     5
 }
 
+# A domain accepts the same input as the type under it: the integer 1 becomes
+# a REAL for both columns.
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-custom-type-converts-input {
+    CREATE TYPE score(value real) BASE real;
+    CREATE DOMAIN rating AS score;
+    CREATE TABLE t1(x score, y rating) STRICT;
+    INSERT INTO t1 VALUES (1, 1);
+    SELECT x, typeof(x), y, typeof(y) FROM t1;
+}
+expect {
+    1.0|real|1.0|real
+}
+
 @requires custom_types "uses CREATE DOMAIN"
 test domain-over-custom-type-insert-fail {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;

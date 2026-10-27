@@ -10,7 +10,7 @@ use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::Value;
-use turso_pg::{split_statements, Connection, PgConnection};
+use turso_pg::{column_float_type, split_statements, Connection, FloatType, PgConnection};
 
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format, Portal};
@@ -425,6 +425,15 @@ fn execute_query(
 ) -> PgWireResult<Response> {
     let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
     let header_clone = header.clone();
+    let text_float_types: Vec<Option<FloatType>> = header
+        .iter()
+        .enumerate()
+        .map(|(i, fi)| {
+            (fi.format() == FieldFormat::Text)
+                .then(|| column_float_type(stmt, i))
+                .flatten()
+        })
+        .collect();
 
     stmt.run_with_row_callback(|row| {
         let mut encoder = DataRowEncoder::new(header_clone.clone());
@@ -433,7 +442,8 @@ fn execute_query(
                 .get(i)
                 .map(|fi| fi.datatype().clone())
                 .unwrap_or(Type::TEXT);
-            encode_value(&mut encoder, val, &pg_type)?;
+            let text_float_type = text_float_types.get(i).copied().flatten();
+            encode_value(&mut encoder, val, &pg_type, text_float_type)?;
         }
         rows.push(encoder.finish());
         Ok(())
@@ -587,6 +597,7 @@ fn encode_value(
     encoder: &mut DataRowEncoder,
     val: &Value,
     pg_type: &Type,
+    text_float_type: Option<FloatType>,
 ) -> turso_core::Result<()> {
     match val {
         Value::Null => encoder
@@ -604,9 +615,19 @@ fn encode_value(
                     .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
             }
         }
-        Value::Numeric(turso_core::Numeric::Float(f)) => encoder
-            .encode_field(&f64::from(*f))
-            .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
+        // NUMERIC values are stored as floats too, but PostgreSQL prints them
+        // with their scale (`1.0::numeric` is `1.0`), so only float8 and
+        // float4 columns sent as text use PostgreSQL's float format.
+        Value::Numeric(turso_core::Numeric::Float(f)) => match text_float_type {
+            Some(float_type) => encoder.encode_field_with_type_and_format(
+                &float_type.format(f64::from(*f)).as_str(),
+                &Type::TEXT,
+                FieldFormat::Text,
+                &FormatOptions::default(),
+            ),
+            None => encoder.encode_field(&f64::from(*f)),
+        }
+        .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
         Value::Text(t) => {
             let text = t.value.as_ref();
             // For TIMESTAMPTZ columns, ensure timezone info is present so clients
@@ -894,7 +915,7 @@ mod tests {
                 let rows = stmt.run_collect_rows().unwrap();
                 assert_eq!(rows.len(), 1);
                 let mut encoder = DataRowEncoder::new(fields.clone());
-                encode_value(&mut encoder, &rows[0][0], fields[0].datatype()).unwrap();
+                encode_value(&mut encoder, &rows[0][0], fields[0].datatype(), None).unwrap();
                 let row = encoder.finish().unwrap();
                 assert_eq!(row.field_count, 1);
                 assert_eq!(&row.data[..], b"\0\0\0\x01t");

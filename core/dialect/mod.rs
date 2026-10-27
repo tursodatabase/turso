@@ -210,6 +210,16 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// The function that turns a value of the custom type `type_name` into
+    /// text when it is cast to TEXT, or `None` to use SQLite's conversion.
+    ///
+    /// PostgreSQL prints `float8` values with the shortest digits that read
+    /// back as the same value (`1`, `1e+20`), where SQLite always writes a
+    /// fraction (`1.0`, `1.0e+20`).
+    fn text_cast_function(&self, _type_name: &str) -> Option<&'static str> {
+        None
+    }
+
     /// Whether `mod` of two integers returns an integer.
     ///
     /// PostgreSQL returns an integer. SQLite always returns a REAL.

@@ -64,11 +64,13 @@ fn table_column_type(
         array_dimensions: column.array_dimensions(),
         base_type,
         kind,
+        custom_type_name: None,
     })
 }
 
 /// Any other expression reports the SQLite primitive behind its type: INTEGER,
-/// REAL, NUMERIC or TEXT, or nothing when the value may be anything.
+/// REAL, NUMERIC or TEXT, or nothing when the value may be anything. A value of
+/// a custom type also reports that type's name.
 fn expression_type(ty: &ExprType, schema: &Schema) -> Option<ColumnTypeInfo> {
     let (element, array_dimensions) = match ty {
         ExprType::Array {
@@ -86,11 +88,16 @@ fn expression_type(ty: &ExprType, schema: &Schema) -> Option<ColumnTypeInfo> {
         },
         ExprType::Null | ExprType::Unknown | ExprType::Array { .. } => return None,
     };
+    let custom_type_name = match element {
+        ExprType::Custom { type_def, .. } => Some(type_def.name.clone()),
+        _ => None,
+    };
     Some(ColumnTypeInfo {
         declared_name: declared_name.to_string(),
         array_dimensions,
         base_type: None,
         kind: ColumnTypeKind::Builtin,
+        custom_type_name,
     })
 }
 

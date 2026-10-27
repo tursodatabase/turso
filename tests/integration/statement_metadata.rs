@@ -225,6 +225,36 @@ mod tests {
         assert_eq!(rowid_col.kind, ColumnTypeKind::Builtin);
     }
 
+    /// A CAST to a type registered through CREATE TYPE reports the primitive the
+    /// value is stored as, plus the type's name in `custom_type_name`, so
+    /// wire-protocol layers can tell `CAST(x AS cents)` from a plain INTEGER.
+    #[test]
+    fn type_info_for_cast_to_custom_type() {
+        let db = fresh_db_with_custom_types("type_info_custom_cast.db");
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT CAST(id AS cents), CAST(id AS INTEGER), amount FROM t")
+            .unwrap();
+
+        let cast_cents = expect_info(&stmt, 0);
+        assert_eq!(cast_cents.declared_name, "INTEGER");
+        assert_eq!(cast_cents.custom_type_name.as_deref(), Some("cents"));
+
+        let cast_int = expect_info(&stmt, 1);
+        assert_eq!(cast_int.declared_name, "INTEGER");
+        assert_eq!(cast_int.custom_type_name, None);
+
+        let column = expect_info(&stmt, 2);
+        assert_eq!(column.declared_name, "cents");
+        assert_eq!(column.kind, ColumnTypeKind::Custom);
+        assert_eq!(column.custom_type_name, None);
+    }
+
     /// Bare literals carry a concrete primitive that the wire-protocol layer
     /// must report (a PostgreSQL client running `SELECT 42` expects INT4,
     /// not TEXT). The API deliberately departs from SQLite's "literals have

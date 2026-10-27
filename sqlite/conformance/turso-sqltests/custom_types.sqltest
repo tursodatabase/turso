@@ -170,6 +170,15 @@ expect {
     4200
 }
 
+# float8 and float4 are not custom types here, so a CAST to them converts to
+# REAL as in SQLite.
+test cast-to-float8-converts-to-real {
+    SELECT CAST('1.5' AS float8), typeof(CAST('1.5' AS float8)), CAST(1 AS float4), typeof(CAST(1 AS float4));
+}
+expect {
+    1.5|real|1.0|real
+}
+
 @requires strict "uses STRICT tables"
 test cast-to-varchar {
     SELECT CAST('hello' AS varchar(3));

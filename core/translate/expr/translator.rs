@@ -743,6 +743,11 @@ fn translate_cast_expr(
     let ast::Expr::Cast { expr, type_name } = expr else {
         unreachable!("translate_cast_expr expects Expr::Cast");
     };
+    if let Some(call) =
+        dialect_text_cast_call(referenced_tables, expr, type_name.as_ref(), resolver)
+    {
+        return translate_expr(program, referenced_tables, &call, target_register, resolver);
+    }
     translate_expr(program, referenced_tables, expr, target_register, resolver)?;
 
     let cast_type_name = type_name.as_ref().map(|tn| crate::util::dequote(&tn.name));
@@ -830,6 +835,42 @@ fn translate_cast_expr(
         affinity: type_affinity,
     });
     Ok(target_register)
+}
+
+/// Rewrites `CAST(x AS TEXT)` into a call to the dialect's text function for
+/// `x`'s custom type, when the dialect has one.
+fn dialect_text_cast_call(
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    type_name: Option<&ast::Type>,
+    resolver: &Resolver,
+) -> Option<ast::Expr> {
+    let type_name = type_name?;
+    let target = crate::util::dequote(&type_name.name);
+    if type_name.array_dimensions > 0
+        || Affinity::of_written_type(&target) != Affinity::Text
+        || resolver.schema().get_type_def_unchecked(&target).is_some()
+    {
+        return None;
+    }
+    let super::expr_type::ExprType::Custom { type_def, .. } = super::expr_type::type_of(
+        operand,
+        &super::expr_type::TypeEnv::new(referenced_tables, resolver),
+    ) else {
+        return None;
+    };
+    let function = resolver.dialect.text_cast_function(&type_def.name)?;
+    Some(ast::Expr::FunctionCall {
+        name: ast::Name::exact(function.to_string()),
+        distinctness: None,
+        args: vec![Box::new(operand.clone())],
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    })
 }
 
 #[inline(never)]
