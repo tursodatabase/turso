@@ -86,6 +86,13 @@ fn emit_row_valued_binary_expr(
     if let BinaryEmitMode::Condition(metadata) = emit_mode {
         emit_cond_jump(program, metadata, target_register);
     }
+    let collation =
+        crate::translate::collate::get_explicit_collseq_from_expr(e1, Some(resolver.symbol_table))?
+            .or(crate::translate::collate::get_explicit_collseq_from_expr(
+                e2,
+                Some(resolver.symbol_table),
+            )?);
+    program.set_collation(collation.map(|collation| (collation, true)));
     Ok(target_register)
 }
 
@@ -132,9 +139,11 @@ pub(super) fn emit_binary_expr_scalar(
                 resolver,
             )?,
         }
-        if op.is_comparison() {
-            program.reset_collation();
-        }
+        program.set_collation(
+            program
+                .curr_collation_ctx()
+                .filter(|(_, explicit)| *explicit),
+        );
         Ok(target_register)
     } else {
         let e1_reg = program.alloc_registers(2);
@@ -201,14 +210,7 @@ pub(super) fn emit_binary_expr_scalar(
                 resolver,
             )?,
         }
-        // Only reset collation for comparison operators, which consume it.
-        // Non-comparison operators (Concat, Add, etc.) must propagate the
-        // collation to the parent expression so that e.g.
-        //   (name COLLATE NOCASE || '') <> 'admin'
-        // correctly applies NOCASE to the Ne comparison.
-        if op.is_comparison() {
-            program.reset_collation();
-        }
+        program.set_collation(collation_ctx.filter(|(_, explicit)| *explicit));
         Ok(target_register)
     }
 }

@@ -167,26 +167,10 @@ pub(super) fn cache_stream_expr_reg<'a>(
     value_reg: usize,
     table_references: &TableReferences,
 ) -> Result<()> {
-    fn carries_collation(expr: &ast::Expr) -> bool {
-        match expr {
-            ast::Expr::Column { .. } | ast::Expr::RowId { .. } | ast::Expr::Collate(_, _) => true,
-            ast::Expr::Cast { expr, .. } | ast::Expr::Unary(ast::UnaryOperator::Positive, expr) => {
-                carries_collation(expr)
-            }
-            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => carries_collation(&exprs[0]),
-            _ => false,
-        }
-    }
-
-    if carries_collation(&expr) {
-        resolver.cache_scalar_expr_reg(
-            std::borrow::Cow::Owned(expr),
-            value_reg,
-            false,
-            table_references,
-        )
-    } else {
-        resolver.cache_expr_reg(std::borrow::Cow::Owned(expr), value_reg, false, None);
-        Ok(())
-    }
+    resolver.cache_scalar_expr_reg(
+        std::borrow::Cow::Owned(expr),
+        value_reg,
+        false,
+        table_references,
+    )
 }

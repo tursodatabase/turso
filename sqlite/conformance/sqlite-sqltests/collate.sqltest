@@ -1569,6 +1569,237 @@ test nocase-index-does-not-serve-binary-comparison {
 expect {
 }
 
+setup collation_opacity {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT COLLATE NOCASE);
+    INSERT INTO t1 VALUES (1, 'A'), (2, 'a');
+}
+
+@setup collation_opacity
+test collation-opaque-function-results {
+    SELECT id, ifnull(a, '') = 'a', iif(1, a, '') = 'a', concat(a, '') = 'a', concat_ws('', a) = 'a', printf('%s', a) = 'a', nullif(a, 'x') = 'a', likely(a) = 'a', unlikely(a) = 'a', likelihood(a, 0.5) = 'a' FROM t1 ORDER BY id;
+}
+expect {
+    1|0|0|0|0|0|0|0|0|0
+    2|1|1|1|1|1|1|1|1|1
+}
+
+@setup collation_opacity
+test collation-concat-equal-operands {
+    SELECT id, (a || a) = 'aa' FROM t1 ORDER BY id;
+}
+expect {
+    1|0
+    2|1
+}
+
+@setup collation_opacity
+test collation-explicit-first-function-argument {
+    SELECT id, coalesce(a COLLATE BINARY, a COLLATE NOCASE) = 'a', coalesce(a COLLATE NOCASE, a COLLATE BINARY) = 'a', ifnull(a COLLATE NOCASE, '') = 'a', printf('%s', a COLLATE NOCASE) = 'a' FROM t1 ORDER BY id;
+}
+expect {
+    1|0|1|1|1
+    2|1|1|1|1
+}
+
+@setup collation_opacity
+test collation-explicit-case-conditions {
+    SELECT id, (CASE a COLLATE NOCASE WHEN 'a' THEN a ELSE a END) = 'a', (CASE WHEN a COLLATE NOCASE = 'a' THEN a END) = 'a', (CASE WHEN 1 COLLATE NOCASE THEN a END) = 'a', (CASE a COLLATE BINARY WHEN 'A' THEN a COLLATE NOCASE ELSE a END) = 'a' FROM t1 ORDER BY id;
+}
+expect {
+    1|1|1|1|0
+    2|1|1|1|1
+}
+
+@setup collation_opacity
+test collation-explicit-comparison-results {
+    SELECT CAST(('a' COLLATE RTRIM = 'a') AS TEXT) = '1 ', CAST((1 COLLATE RTRIM AND 1) AS TEXT) = '1 ', CAST(-(1 COLLATE RTRIM) AS TEXT) = '-1 ';
+}
+expect {
+    1|1|1
+}
+
+@setup collation_opacity
+test collation-arithmetic-is-opaque {
+    CREATE TABLE t2(a TEXT COLLATE RTRIM);
+    INSERT INTO t2 VALUES ('1');
+    SELECT CAST(-a AS TEXT) = '-1 ', CAST(a + 0 AS TEXT) = '1 ', CAST(a * 1 AS TEXT) = '1 ', CAST(a | 0 AS TEXT) = '1 ', CAST(+a AS TEXT) = '1 ', CAST(a AS TEXT) = '1 ' FROM t2;
+}
+expect {
+    0|0|0|0|1|1
+}
+
+@setup collation_opacity
+test collation-opaque-distinct-and-aggregate {
+    SELECT count(DISTINCT a), count(DISTINCT trim(a)), count(DISTINCT trim(a COLLATE NOCASE)) FROM t1;
+    SELECT DISTINCT trim(a) FROM t1 ORDER BY trim(a);
+}
+expect {
+    1|2|1
+    A
+    a
+}
+
+@setup collation_opacity
+test collation-opaque-check-constraint {
+    CREATE TABLE t2(a TEXT COLLATE NOCASE CHECK ((a || '') <> 'a'));
+    INSERT INTO t2 VALUES ('A');
+    SELECT a FROM t2;
+}
+expect {
+    A
+}
+
+@setup collation_opacity
+test collation-opaque-delete {
+    DELETE FROM t1 WHERE (a || '') = 'a';
+    SELECT id, a FROM t1;
+}
+expect {
+    1|A
+}
+
+@setup collation_opacity
+test collation-opaque-generated-expression {
+    CREATE TABLE t2(a TEXT COLLATE NOCASE, b TEXT AS (a || ''));
+    INSERT INTO t2(a) VALUES ('A'), ('a');
+    SELECT a FROM t2 WHERE b = 'a';
+}
+expect {
+    a
+}
+
+test collation-explicit-predicate-results {
+    SELECT ((1 COLLATE NOCASE IN (1)) || 'A') = '1a',
+           ((1 COLLATE NOCASE BETWEEN 0 AND 2) || 'A') = '1a',
+           ((1 COLLATE NOCASE IS NOT NULL) || 'A') = '1a',
+           ((NULL COLLATE NOCASE IS NULL) || 'A') = '1a',
+           ((('A' COLLATE BINARY) LIKE ('a' COLLATE NOCASE)) || 'A') = '1a';
+}
+expect {
+    1|1|1|1|1
+}
+
+test collation-predicate-results-drop-column-collation {
+    CREATE TABLE t1(a TEXT COLLATE RTRIM);
+    INSERT INTO t1 VALUES ('1');
+    SELECT CAST(a IS NULL AS TEXT) = '0 ',
+           CAST(a IS NOT NULL AS TEXT) = '1 ',
+           CAST(a IN ('1') AS TEXT) = '1 ',
+           CAST(a BETWEEN '0' AND '2' AS TEXT) = '1 ',
+           CAST(a LIKE '1' AS TEXT) = '1 ' FROM t1;
+}
+expect {
+    0|0|0|0|0
+}
+
+test collation-opaque-check-rejects-invalid-insert {
+    CREATE TABLE t1(a TEXT COLLATE NOCASE CHECK ((a || '') = 'A'));
+    INSERT INTO t1 VALUES ('a');
+}
+expect error {
+    CHECK constraint failed
+}
+
+test collation-opaque-check-rejects-invalid-update {
+    CREATE TABLE t1(a TEXT COLLATE NOCASE CHECK ((a || '') = 'A'));
+    INSERT INTO t1 VALUES ('A');
+    UPDATE t1 SET a = 'a';
+}
+expect error {
+    CHECK constraint failed
+}
+
+test collation-predicate-contexts-are-independent {
+    SELECT 1 COLLATE NOCASE = 1,
+           CASE 'A' WHEN 'a' THEN 1 ELSE 0 END,
+           'A' COLLATE NOCASE IN (trim('a'), 'b'),
+           CASE 'A' COLLATE NOCASE WHEN trim('a') THEN 1 ELSE 0 END,
+           'A' IN ('a' COLLATE NOCASE),
+           'A' IN ('a' COLLATE NOCASE, 'b'),
+           'A' COLLATE BINARY IN ('a' COLLATE NOCASE),
+           'A' COLLATE NOCASE IN ('a' COLLATE BINARY);
+}
+expect {
+    1|0|1|1|1|0|0|1
+}
+
+test collation-row-comparison-keeps-first-explicit-collation {
+    SELECT (((('x' COLLATE NOCASE), 1) = (('x' COLLATE RTRIM), 1)) || 'A') = '1a';
+}
+expect {
+    1
+}
+
+test collation-truth-test-result-is-opaque {
+    CREATE TABLE t1(a TEXT COLLATE RTRIM);
+    INSERT INTO t1 VALUES ('1');
+    SELECT CAST(a IS TRUE AS TEXT) = '1 ',
+           CAST(a COLLATE RTRIM IS TRUE AS TEXT) = '1 ' FROM t1;
+}
+expect {
+    0|1
+}
+
+test collation-in-list-ignores-nonconstant-rhs-collation {
+    CREATE TABLE t1(a TEXT);
+    INSERT INTO t1 VALUES ('a');
+    SELECT 'A' IN (a COLLATE NOCASE),
+           'A' IN (lower(a) COLLATE NOCASE),
+           'A' IN (trim('a') COLLATE NOCASE) FROM t1;
+}
+expect {
+    0|0|1
+}
+
+test collation-min-max-results-are-opaque {
+    CREATE TABLE t1(a TEXT COLLATE NOCASE);
+    INSERT INTO t1 VALUES ('A'), ('C');
+    SELECT min(a) = 'a', max(a) = 'c',
+           min(a COLLATE NOCASE) = 'a', max(a COLLATE NOCASE) = 'c' FROM t1;
+    SELECT min(a) = 'a', max(a) = 'c',
+           min(a COLLATE NOCASE) = 'a', max(a COLLATE NOCASE) = 'c'
+    FROM t1 GROUP BY a IS NOT NULL;
+    SELECT lo = 'a', hi = 'c', explicit_lo = 'a', explicit_hi = 'c'
+    FROM (SELECT min(a) AS lo, max(a) AS hi,
+                 min(a COLLATE NOCASE) AS explicit_lo,
+                 max(a COLLATE NOCASE) AS explicit_hi FROM t1);
+}
+expect {
+    0|0|1|1
+    0|0|1|1
+    0|0|1|1
+}
+
+test collation-ordered-aggregate-results-are-opaque {
+    CREATE TABLE t1(a TEXT COLLATE NOCASE, b INTEGER);
+    INSERT INTO t1 VALUES ('B', 2), ('A', 1);
+    SELECT group_concat(a ORDER BY b) = 'a,b',
+           group_concat(a COLLATE NOCASE ORDER BY b) = 'a,b',
+           group_concat(a ORDER BY b COLLATE NOCASE) = 'a,b'
+    FROM t1 GROUP BY a IS NOT NULL;
+}
+expect {
+    0|1|0
+}
+
+test collation-aggregate-having-keeps-explicit-collation {
+    CREATE TABLE t1(a TEXT COLLATE NOCASE);
+    INSERT INTO t1 VALUES ('A'), ('C');
+    SELECT 'explicit', min(a) FROM t1 HAVING min(a COLLATE NOCASE) = 'a';
+    SELECT 'implicit', min(a) FROM t1 HAVING min(a) = 'a';
+    SELECT 'explicit-group', min(a) FROM t1
+    GROUP BY a IS NOT NULL HAVING min(a COLLATE NOCASE) = 'a';
+    SELECT 'implicit-group', min(a) FROM t1
+    GROUP BY a IS NOT NULL HAVING min(a) = 'a';
+    SELECT CAST(count(a) AS TEXT) = '2 ',
+           CAST(count(a COLLATE RTRIM) AS TEXT) = '2 ' FROM t1;
+}
+expect {
+    explicit|A
+    explicit-group|A
+    0|1
+}
+
 # Same rule for `IN (SELECT ...)`: the LHS column supplies the comparison
 # collation, even when it has no declared collation (BINARY). (#6088)
 @setup mixed_collation_join
@@ -1644,6 +1875,47 @@ test row-valued-comparison-uses-left-column-collation {
 }
 expect {
     0
+}
+
+test in-select-explicit-collation-precedes-column-collation {
+    CREATE TABLE t1(a TEXT, b TEXT COLLATE NOCASE);
+    INSERT INTO t1 VALUES ('a', 'A');
+    SELECT a IN (SELECT b FROM t1),
+           b IN (SELECT a FROM t1),
+           a IN (SELECT b COLLATE NOCASE FROM t1),
+           a COLLATE BINARY IN (SELECT b COLLATE NOCASE FROM t1) FROM t1;
+    SELECT a IN (SELECT b COLLATE NOCASE FROM t1 AS t2 WHERE t2.a = t1.a),
+           a COLLATE BINARY IN (SELECT b COLLATE NOCASE FROM t1 AS t2 WHERE t2.a = t1.a)
+    FROM t1;
+}
+expect {
+    0|1|1|0
+    1|0
+}
+
+test in-select-collation-keeps-expression-boundaries {
+    CREATE TABLE t1(a TEXT, b TEXT COLLATE NOCASE);
+    INSERT INTO t1 VALUES ('a', 'A');
+    SELECT (a || '') IN (SELECT b FROM t1),
+           a IN (SELECT b || '' FROM t1),
+           a IN (SELECT trim(b COLLATE NOCASE) FROM t1),
+           a IN (SELECT trim(b) FROM t1),
+           a IN (SELECT x FROM (SELECT b COLLATE NOCASE AS x FROM t1)) FROM t1;
+}
+expect {
+    1|0|1|0|0
+}
+
+test row-in-select-keeps-each-explicit-collation {
+    CREATE TABLE t1(a TEXT, b TEXT COLLATE NOCASE);
+    INSERT INTO t1 VALUES ('a', 'A');
+    SELECT (a, a) IN (SELECT b, b COLLATE NOCASE FROM t1),
+           (a, a) IN (SELECT b COLLATE NOCASE, b COLLATE NOCASE FROM t1),
+           (a COLLATE BINARY, a) IN (SELECT b COLLATE NOCASE, b COLLATE NOCASE FROM t1)
+    FROM t1;
+}
+expect {
+    0|1|0
 }
 
 @cross-check-integrity
