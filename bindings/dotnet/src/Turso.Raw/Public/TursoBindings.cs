@@ -460,7 +460,6 @@ public static class TursoBindings
             // turso_database_new succeeds.
             TursoNativePageCodec.Release(codec.Context);
             ThrowIfError(status, errorPtr);
-            throw new TursoException($"Turso native call failed with status {status}.");
         }
 
         ThrowIfError(status, errorPtr);

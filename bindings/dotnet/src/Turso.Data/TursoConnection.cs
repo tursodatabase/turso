@@ -110,9 +110,7 @@ public class TursoConnection : DbConnection
             if (cipher.HasValue || !string.IsNullOrWhiteSpace(hexkey))
                 throw new InvalidOperationException("PageCodec cannot be combined with Encryption Cipher or Encryption Key.");
 
-            _turso = IsReadOnlyMode(_connectionOptions["Mode"])
-                ? TursoBindings.OpenDatabaseReadOnlyWithPageCodec(filename, _pageCodec)
-                : TursoBindings.OpenDatabaseWithPageCodec(filename, _pageCodec);
+            _turso = TursoBindings.OpenDatabaseWithPageCodec(filename, _pageCodec);
         }
         else if (cipher.HasValue)
         {
@@ -125,14 +123,6 @@ public class TursoConnection : DbConnection
         {
             _turso = TursoBindings.OpenDatabase(filename);
         }
-    }
-
-    private static bool IsReadOnlyMode(string? mode)
-    {
-        return mode is not null
-               && (mode.Equals("ReadOnly", StringComparison.OrdinalIgnoreCase)
-                   || mode.Equals("Read Only", StringComparison.OrdinalIgnoreCase)
-                   || mode.Equals("ro", StringComparison.OrdinalIgnoreCase));
     }
 
     public override Task OpenAsync(CancellationToken cancellationToken)

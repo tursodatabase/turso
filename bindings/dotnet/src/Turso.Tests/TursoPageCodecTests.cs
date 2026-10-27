@@ -148,23 +148,6 @@ public class TursoPageCodecTests
     }
 
     [Test]
-    public void TursoConnectionReadOnlyOpenUsesCodec()
-    {
-        using var directory = new TemporaryDirectory();
-        var path = directory.File("codec.db");
-        using var codec = new AesGcmTestPageCodec(AesGcmTestPageCodec.NewKey());
-        using (var connection = OpenTurso(path, codec))
-            WriteRows(connection);
-
-        using var readOnly = new TursoConnection($"Data Source={path};Mode=ReadOnly") { PageCodec = codec };
-        readOnly.Open();
-
-        CountRows(readOnly).Should().Be(RowCount);
-        readOnly.Invoking(x => x.ExecuteNonQuery($"INSERT INTO items(name) VALUES ('{Marker}')"))
-            .Should().Throw<TursoException>();
-    }
-
-    [Test]
     public void TursoConnectionRejectsPageCodecWhereItCannotApply()
     {
         using var codec = new AesGcmTestPageCodec(AesGcmTestPageCodec.NewKey());

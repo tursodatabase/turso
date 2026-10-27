@@ -220,8 +220,8 @@ using var connection = new TursoConnection("Data Source=app.db") { PageCodec = c
 connection.Open();
 ```
 
-`Mode=ReadOnly` opens the database read-only. The raw API is `TursoBindings.OpenDatabaseWithPageCodec`,
-`OpenDatabaseReadOnlyWithPageCodec` and `OpenSharedDatabase(path, codec)`.
+The raw API is `TursoBindings.OpenDatabaseWithPageCodec`, `OpenDatabaseReadOnlyWithPageCodec` (read-only) and
+`OpenSharedDatabase(path, codec)`.
 
 - The codec gets whole pages, the reserved tail included. Per-page metadata such as a nonce and tag goes in the last
   `ReservedSpace` bytes; opening an existing database fails unless its header holds the same value.
