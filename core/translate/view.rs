@@ -666,14 +666,14 @@ pub fn translate_drop_view(
         rhs: type_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::Ne {
         lhs: col1_reg,
         rhs: view_name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::for_internal_values(),
     });
     // Matches view - delete it
     program.emit_insn(Insn::RowId {
@@ -754,14 +754,14 @@ pub fn translate_drop_view(
             rhs: table_type_reg_2,
             target_pc: check_dbsp_index_label,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::Ne {
             lhs: dbsp_col1_reg,
             rhs: dbsp_table_name_reg_2,
             target_pc: check_dbsp_index_label,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
         // Matches DBSP table - delete it
         program.emit_insn(Insn::RowId {
@@ -784,14 +784,14 @@ pub fn translate_drop_view(
             rhs: index_type_reg_2,
             target_pc: dbsp_skip_delete_label,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::Ne {
             lhs: dbsp_col1_reg,
             rhs: dbsp_index_name_reg_2,
             target_pc: dbsp_skip_delete_label,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
         // Matches DBSP index - delete it
         program.emit_insn(Insn::RowId {

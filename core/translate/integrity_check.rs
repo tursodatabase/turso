@@ -628,7 +628,7 @@ fn translate_integrity_check_for_schema(
                     rhs: bound_index.expected_count_reg,
                     target_pc: counts_match,
                     flags: CmpInsFlags::default(),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::for_internal_values(),
                 });
                 program.emit_string8(
                     format!("wrong # of entries in index {}", bound_index.index.name),

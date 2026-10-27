@@ -301,7 +301,7 @@ pub fn translate_analyze(
             rhs: target_tbl_reg,
             target_pc: skip_label,
             flags: Default::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
 
         if let Some(idx) = target_index.clone() {
@@ -323,7 +323,7 @@ pub fn translate_analyze(
                 rhs: target_idx_reg,
                 target_pc: skip_label,
                 flags: Default::default(),
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::for_internal_values(),
             });
             let rowid_reg = program.alloc_register();
             program.emit_insn(Insn::RowId {

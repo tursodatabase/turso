@@ -685,7 +685,7 @@ fn emit_percentile_fraction_check(
         rhs: bound_reg,
         target_pc: bad,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::Real {
         value: 1.0,
@@ -696,7 +696,7 @@ fn emit_percentile_fraction_check(
         rhs: bound_reg,
         target_pc: done,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::for_internal_values(),
     });
     program.preassign_label_to_next_insn(bad);
     program.emit_insn(Insn::Halt {

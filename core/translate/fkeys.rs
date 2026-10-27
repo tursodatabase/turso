@@ -459,7 +459,7 @@ where
             rhs: parent_rowid,
             target_pc: next_row,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
     }
 
@@ -606,7 +606,7 @@ where
             rhs: parent_rowid,
             target_pc: skip,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
         on_match(program)?;
         program.preassign_label_to_next_insn(skip);
@@ -1397,7 +1397,7 @@ pub fn emit_fk_child_update_counters(
                     rhs: new_rowid_reg,
                     target_pc: fk_ok,
                     flags: CmpInsFlags::default(),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::for_internal_values(),
                 });
             }
 

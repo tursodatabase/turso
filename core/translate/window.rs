@@ -1038,7 +1038,7 @@ fn emit_window_check_offset(
             flags: crate::vdbe::insn::CmpInsFlags::default()
                 .jump_if_null()
                 .with_affinity(crate::vdbe::affinity::Affinity::Numeric),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
     } else {
         // A ROWS / GROUPS offset has to be an integer. MustBeInt converts
@@ -1060,7 +1060,7 @@ fn emit_window_check_offset(
         target_pc: label_ok,
         flags: crate::vdbe::insn::CmpInsFlags::default()
             .with_affinity(crate::vdbe::affinity::Affinity::Numeric),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::for_internal_values(),
     });
     program.preassign_label_to_next_insn(label_halt);
     let msg = match (mode, pos) {
@@ -1558,7 +1558,7 @@ impl EmitWindow {
                     rhs: start_offset_reg,
                     target_pc: label_frame_valid,
                     flags: crate::vdbe::insn::CmpInsFlags::default(),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::for_internal_values(),
                 });
             } else {
                 program.emit_insn(Insn::Le {
@@ -1566,7 +1566,7 @@ impl EmitWindow {
                     rhs: start_offset_reg,
                     target_pc: label_frame_valid,
                     flags: crate::vdbe::insn::CmpInsFlags::default(),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::for_internal_values(),
                 });
             }
             if window.frame.exclude.is_none() {
@@ -2359,7 +2359,7 @@ fn emit_window_full_scan(
         rhs: frame_end_rowid,
         target_pc: label_break,
         flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::for_internal_values(),
     });
 
     match exclude {
@@ -2370,7 +2370,7 @@ fn emit_window_full_scan(
                 rhs: scan_rowid,
                 target_pc: label_next,
                 flags: crate::vdbe::insn::CmpInsFlags::default(),
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::for_internal_values(),
             });
         }
         turso_parser::ast::FrameExclude::Group | turso_parser::ast::FrameExclude::Ties => {
@@ -2380,7 +2380,7 @@ fn emit_window_full_scan(
                     rhs: scan_rowid,
                     target_pc: label_step,
                     flags: crate::vdbe::insn::CmpInsFlags::default(),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::for_internal_values(),
                 });
             }
             if order_by_len == 0 {
@@ -2603,7 +2603,7 @@ fn emit_window_range_test(
         rhs: reg_empty,
         target_pc: label_after_arithmetic,
         flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::for_internal_values(),
     });
 
     // SQLite performs this comparison before arithmetic in the two cases
@@ -2819,7 +2819,7 @@ fn emit_window_op(
                     rhs: end_rowid,
                     target_pc: label_done,
                     flags: crate::vdbe::insn::CmpInsFlags::default(),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::for_internal_values(),
                 });
             }
             WindowOp::AggStep if !in_flush => {
@@ -2833,7 +2833,7 @@ fn emit_window_op(
                     rhs: registers.rowid,
                     target_pc: label_done,
                     flags: crate::vdbe::insn::CmpInsFlags::default(),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::for_internal_values(),
                 });
             }
             WindowOp::AggStep | WindowOp::ReturnRow => {}
@@ -3595,7 +3595,7 @@ fn emit_first_value_nth_value_lookup(
                 rhs: reg_zero,
                 target_pc: lbl_n_ok,
                 flags: crate::vdbe::insn::CmpInsFlags::default(),
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::for_internal_values(),
             });
             program.preassign_label_to_next_insn(lbl_n_err);
             program.emit_insn(Insn::Halt {
@@ -3653,7 +3653,7 @@ fn emit_first_value_nth_value_lookup(
             rhs: frame_counters + 1,
             target_pc: lbl_past_frame_end,
             flags: crate::vdbe::insn::CmpInsFlags::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::SeekRowid {
             cursor_id: csr_app,

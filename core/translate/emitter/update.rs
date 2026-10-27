@@ -1681,7 +1681,7 @@ fn emit_update_insns<'a>(
             rhs: beg,
             target_pc: record_label,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
 
         // If a row with the new rowid doesn't exist, no conflict
@@ -2030,7 +2030,7 @@ fn emit_update_insns<'a>(
                 rhs: idx_rowid_reg,
                 target_pc: constraint_check,
                 flags: CmpInsFlags::default(),
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::for_internal_values(),
             });
             match idx_conflict {
                 ResolveType::Ignore => {
@@ -2144,7 +2144,7 @@ fn emit_update_insns<'a>(
             rhs: beg,
             target_pc: no_rowid_conflict_label,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
 
         // If a row with the new rowid doesn't exist, no conflict.

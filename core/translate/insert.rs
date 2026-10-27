@@ -1365,7 +1365,7 @@ fn emit_write_sqlite_sequence(
         rhs: meta.r_seq,
         target_pc: done_label,
         flags: Default::default(),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::for_internal_values(),
     });
     program.preassign_label_to_next_insn(write_label);
     emit_update_sqlite_sequence(
@@ -1615,7 +1615,7 @@ fn emit_rowid_generation(
             rhs: max_i64_reg,
             target_pc: no_overflow_label,
             flags: Default::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
 
         program.emit_insn(Insn::Halt {
@@ -4037,7 +4037,7 @@ pub fn emit_fk_child_insert_checks(
                     rhs: new_rowid_reg,
                     target_pc: fk_ok,
                     flags: CmpInsFlags::default(),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::for_internal_values(),
                 });
             }
 
@@ -4129,7 +4129,7 @@ pub fn emit_fk_child_insert_checks(
                         // `k TEXT COLLATE NOCASE UNIQUE, pk TEXT REFERENCES t(k)`,
                         // SQLite rejects same-row INSERT `(k, pk)=('A', 'a')`;
                         // NOCASE applies to the later parent-index lookup only.
-                        collation: super::collate::CollationSeq::Binary,
+                        collation: super::collate::CollationSeq::for_internal_values(),
                     });
                 }
                 // All equal: same-row OK

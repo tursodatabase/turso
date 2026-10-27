@@ -1061,7 +1061,7 @@ pub(super) fn emit_semi_or_anti_join(
             rhs: zero_reg,
             target_pc: corrupt_label,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
     }
     program.emit_insn(Insn::If {
@@ -1102,7 +1102,7 @@ pub(super) fn emit_semi_or_anti_join(
         rhs: published_reg,
         target_pc: publish,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::IfNot {
         reg: own_delta_reg,
@@ -1295,7 +1295,7 @@ fn emit_add_change_subroutine(
         rhs: zero_reg,
         target_pc: write,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_int(1, sums_start + 2);
     program.preassign_label_to_next_insn(write);

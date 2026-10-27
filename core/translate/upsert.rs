@@ -1096,7 +1096,7 @@ pub fn emit_upsert(
             rhs: ctx.conflict_rowid_reg,
             target_pc: ok,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
 
         // If another row already has rnew -> constraint
@@ -1257,7 +1257,7 @@ pub fn emit_upsert(
                     rhs: hit,
                     target_pc: ok,
                     flags: CmpInsFlags::default(),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::for_internal_values(),
                 });
                 let description = format_unique_violation_desc(table.get_name(), &idx_meta);
                 let regs: Vec<usize> = (0..k).map(|i| ins + i).collect();

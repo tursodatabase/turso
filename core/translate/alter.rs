@@ -226,7 +226,7 @@ fn emit_rename_autoincrement_backing_table_entry(
             rhs: old_backing_reg,
             target_pc: continue_label,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
 
         // Preserve type (col 0) and rootpage (col 3); overwrite name/tbl_name
@@ -328,7 +328,7 @@ fn emit_rename_sqlite_sequence_entry(
             rhs: row_name_to_replace_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
 
         program.emit_column_or_rowid(seq_cursor_id, 1, sequence_value_reg);
@@ -408,7 +408,7 @@ fn emit_delete_sqlite_sequence_entry(
             rhs: row_name_to_delete_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
 
         program.emit_insn(Insn::Delete {

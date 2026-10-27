@@ -368,7 +368,7 @@ fn emit_group_aggregate_rows(
         rhs: zero_reg,
         target_pc: corrupt_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_int(0, found_reg);
     program.emit_insn(Insn::Null {
@@ -632,7 +632,7 @@ fn emit_group_aggregate_rows(
                 rhs: shown_after_start + shown_exact_offset,
                 target_pc: aggregate_done_label,
                 flags: CmpInsFlags::default(),
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::for_internal_values(),
             });
             program.preassign_label_to_next_insn(retract_label);
             emit_weighted_apply(
@@ -664,7 +664,7 @@ fn emit_group_aggregate_rows(
                 rhs: zero_reg,
                 target_pc: not_entering_label,
                 flags: CmpInsFlags::default(),
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::for_internal_values(),
             });
             emit_weighted_apply(
                 program,
@@ -679,7 +679,7 @@ fn emit_group_aggregate_rows(
                 rhs: zero_reg,
                 target_pc: aggregate_done_label,
                 flags: CmpInsFlags::default(),
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::for_internal_values(),
             });
             emit_weighted_apply(
                 program,
@@ -739,7 +739,7 @@ fn emit_group_aggregate_rows(
                 rhs: stored_group_exact_reg,
                 target_pc: unchanged_label,
                 flags: CmpInsFlags::default(),
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::for_internal_values(),
             });
             program.emit_insn(Insn::Copy {
                 src_reg: group_start,
@@ -997,14 +997,14 @@ fn emit_group_aggregate_rows(
             rhs: zero_reg,
             target_pc: corrupt_label,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::Ne {
             lhs: cnt_reg,
             rhs: zero_reg,
             target_pc: live_group_label,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::Copy {
             src_reg: group_start,

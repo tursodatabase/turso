@@ -266,7 +266,7 @@ pub(super) fn consolidate_delta(
         rhs: zero_reg,
         target_pc: flush_return_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::NewRowid {
         cursor: output.cursor_id,

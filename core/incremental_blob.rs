@@ -465,7 +465,7 @@ fn build_blob_program(
         rhs: r_zero,
         target_pc: l_done,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::for_internal_values(),
     });
     let r_off = b.alloc_register();
     b.emit_insn(Insn::Variable {
@@ -482,7 +482,7 @@ fn build_blob_program(
         rhs: r_two,
         target_pc: l_write,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::for_internal_values(),
     });
 
     // op == 1: read.

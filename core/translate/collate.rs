@@ -57,6 +57,15 @@ impl CollationSeq {
             .map(Self::Locale)
     }
 
+    /// The collation for comparing values the engine made itself: rowids,
+    /// counters, rows of sqlite_schema, encoded records. It compares bytes
+    /// like BINARY. A comparison of user values gets its collation from
+    /// [comparison_collation] or [expr_collation] instead, so the two kinds of
+    /// comparison look different in the code.
+    pub const fn for_internal_values() -> Self {
+        Self::Binary
+    }
+
     /// The value [Self::to_bits] never returns for a built-in or locale
     /// collation, so stored bits can use it for "no collation".
     pub const NO_COLLATION_BITS: u16 = 0;

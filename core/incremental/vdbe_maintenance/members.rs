@@ -248,7 +248,7 @@ pub(super) fn emit_add_to_member(
         rhs: zero_reg,
         target_pc: corrupt_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::for_internal_values(),
     });
     let keep_label = program.allocate_label();
     program.emit_insn(Insn::Ne {
@@ -256,7 +256,7 @@ pub(super) fn emit_add_to_member(
         rhs: zero_reg,
         target_pc: keep_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::for_internal_values(),
     });
     // The count reached zero. A new row never gets here: a consolidated
     // delta has no zero weights.
