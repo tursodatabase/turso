@@ -190,6 +190,45 @@ expect {
     3|0
 }
 
+test smallint-array-null-element {
+    CREATE TABLE t1(val smallint[]) STRICT;
+    INSERT INTO t1 VALUES ('{5,NULL,7}');
+    SELECT val FROM t1;
+}
+expect {
+    {5,NULL,7}
+}
+
+test smallint-array-nulls-leading-and-trailing {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val smallint[]) STRICT;
+    INSERT INTO t1 VALUES (1, '{NULL,5,7}'), (2, '{5,7,NULL}'), (3, '{NULL,5,NULL,7,NULL}');
+    SELECT id, val FROM t1 ORDER BY id;
+}
+expect {
+    1|{NULL,5,7}
+    2|{5,7,NULL}
+    3|{NULL,5,NULL,7,NULL}
+}
+
+test smallint-array-nulls-long-list {
+    CREATE TABLE t1(val smallint[]) STRICT;
+    INSERT INTO t1 VALUES ('{NULL,-32768,NULL,-1,0,NULL,1,32767,NULL,NULL,7,NULL}');
+    SELECT val FROM t1;
+}
+expect {
+    {NULL,-32768,NULL,-1,0,NULL,1,32767,NULL,NULL,7,NULL}
+}
+
+test smallint-array-nulls-all-and-empty {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val smallint[]) STRICT;
+    INSERT INTO t1 VALUES (1, '{NULL,NULL,NULL}'), (2, '{}');
+    SELECT id, val FROM t1 ORDER BY id;
+}
+expect {
+    1|{NULL,NULL,NULL}
+    2|{}
+}
+
 @requires strict "uses STRICT tables"
 test smallint-overflow {
     CREATE TABLE t1(val smallint) STRICT;
