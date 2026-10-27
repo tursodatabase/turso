@@ -279,6 +279,12 @@ pub enum ArithmeticArg {
     /// A `PlainValue` that is an integer, or whose type is not known before the
     /// statement runs, such as a parameter. The function rejects anything else.
     Integer,
+    /// A `PlainValue` that is not a `Real`.
+    Exact,
+    /// A REAL value: a REAL column, a CAST to REAL, a function that returns
+    /// one. A decimal literal such as `0.5` or `-0.5` is not one: as in
+    /// PostgreSQL, it is an exact number.
+    Real,
 }
 
 const ARITHMETIC_OPERATORS: [&str; 5] = ["+", "-", "*", "/", "%"];
@@ -294,7 +300,7 @@ fn declared_arithmetic(operators: &[TypeOperator]) -> std::vec::Vec<ArithmeticSi
             continue;
         };
         let Some(func) = &declared.func_name else {
-            signatures.extend(sqlite_arithmetic(op));
+            signatures.extend(sqlite_arithmetic(op, ArithmeticArg::PlainValue));
             continue;
         };
         for args in [
@@ -315,9 +321,11 @@ fn declared_arithmetic(operators: &[TypeOperator]) -> std::vec::Vec<ArithmeticSi
 
 /// Arithmetic on built-in types, which an OPERATOR clause can't express. The
 /// functions read plain values as they are, so nothing is encoded first:
-/// - `numeric op x` and `x op numeric` for `+ - * /` compute exactly, and the
+/// - `numeric op x` and `x op numeric` for `+ - * / %` compute exactly, and the
 ///   result is a numeric. Encoding a literal to the column's type would round it
-///   to the column's scale first (`n * 0.005` would be `n * 0.01`).
+///   to the column's scale first (`n * 0.005` would be `n * 0.01`). With a REAL
+///   value `+ - * /` are SQLite's operators and give a REAL, as PostgreSQL gives
+///   double precision; `%` with a REAL value does not exist, as in PostgreSQL.
 /// - `date + integer`, `integer + date` and `date - integer` add or subtract
 ///   days and give a date. `date - date` gives the number of days between them;
 ///   a text literal on either side is encoded to a date first. Each signature
@@ -327,7 +335,7 @@ fn declared_arithmetic(operators: &[TypeOperator]) -> std::vec::Vec<ArithmeticSi
 ///
 /// Other built-in types have no arithmetic.
 fn builtin_arithmetic(type_name: &str) -> std::vec::Vec<ArithmeticSignature> {
-    use ArithmeticArg::{EncodableLiteral, Integer, PlainValue, Value};
+    use ArithmeticArg::{EncodableLiteral, Exact, Integer, Real, Value};
     let call = |op, args, func: &str, result| ArithmeticSignature {
         op,
         args,
@@ -335,19 +343,24 @@ fn builtin_arithmetic(type_name: &str) -> std::vec::Vec<ArithmeticSignature> {
         result,
     };
     match type_name {
-        "numeric" => [
-            ("+", "numeric_add"),
-            ("-", "numeric_sub"),
-            ("*", "numeric_mul"),
-            ("/", "numeric_div"),
-            ("%", "numeric_mod"),
-        ]
-        .into_iter()
-        .flat_map(|(op, func)| {
-            [[Value, Value], [Value, PlainValue], [PlainValue, Value]]
-                .map(|args| call(op, args, func, Some("numeric")))
-        })
-        .collect(),
+        "numeric" => {
+            let mut signatures = std::vec::Vec::new();
+            for (op, func) in [
+                ("+", "numeric_add"),
+                ("-", "numeric_sub"),
+                ("*", "numeric_mul"),
+                ("/", "numeric_div"),
+                ("%", "numeric_mod"),
+            ] {
+                for args in [[Value, Value], [Value, Exact], [Exact, Value]] {
+                    signatures.push(call(op, args, func, Some("numeric")));
+                }
+                if op != "%" {
+                    signatures.extend(sqlite_arithmetic(op, Real));
+                }
+            }
+            signatures
+        }
         "date" => std::vec![
             call("+", [Value, Integer], "date_plus", Some("date")),
             call("+", [Integer, Value], "date_plus", Some("date")),
@@ -358,16 +371,16 @@ fn builtin_arithmetic(type_name: &str) -> std::vec::Vec<ArithmeticSignature> {
         ],
         "smallint" | "bigint" => ARITHMETIC_OPERATORS
             .into_iter()
-            .flat_map(sqlite_arithmetic)
+            .flat_map(|op| sqlite_arithmetic(op, ArithmeticArg::PlainValue))
             .collect(),
         _ => std::vec::Vec::new(),
     }
 }
 
-/// SQLite's operator `op` on a value of the type and a plain value.
-fn sqlite_arithmetic(op: &'static str) -> [ArithmeticSignature; 2] {
-    use ArithmeticArg::{PlainValue, Value};
-    [[Value, PlainValue], [PlainValue, Value]].map(|args| ArithmeticSignature {
+/// SQLite's operator `op` on a value of the type and an operand `other`.
+fn sqlite_arithmetic(op: &'static str, other: ArithmeticArg) -> [ArithmeticSignature; 2] {
+    use ArithmeticArg::Value;
+    [[Value, other], [other, Value]].map(|args| ArithmeticSignature {
         op,
         args,
         func: None,

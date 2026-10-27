@@ -308,6 +308,28 @@ expect {
     2|3.00
 }
 
+# As in PostgreSQL, numeric with a REAL value gives a REAL, while a decimal
+# literal such as 0.005 or -0.005 is exact and gives a numeric.
+@requires strict "uses STRICT tables"
+test op-numeric-with-real-is-real {
+    CREATE TABLE t1(n numeric(10,2), r real) STRICT;
+    INSERT INTO t1 VALUES (0.10, 0.2);
+    SELECT n + r, typeof(n + r), n * r, r - n, n / r, n + CAST(1 AS REAL), n * -0.005, typeof(n * -0.005) FROM t1;
+}
+expect {
+    0.3|real|0.02|0.1|0.5|1.1|-0.00050|text
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-mod-real-error {
+    CREATE TABLE t1(n numeric(10,2), r real) STRICT;
+    INSERT INTO t1 VALUES (0.10, 0.2);
+    SELECT n % r FROM t1;
+}
+expect error {
+    operator does not exist: numeric % real
+}
+
 # Remainders follow PostgreSQL: the sign of the dividend, and the scale of
 # the operand with more decimals.
 @requires strict "uses STRICT tables"
@@ -539,13 +561,13 @@ expect error {
 
 @requires strict "uses STRICT tables"
 test op-numeric-plus-integer-column {
-    -- numeric arithmetic takes any non-custom operand and computes exactly.
+    -- numeric with an integer computes exactly; with a REAL it gives a REAL.
     CREATE TABLE t1(id INTEGER PRIMARY KEY, n numeric(10,2), i INTEGER, r REAL) STRICT;
     INSERT INTO t1 VALUES (1, 1.5, 7, 0.25);
     SELECT n + i, i + n, n * r FROM t1;
 }
 expect {
-    8.50|8.50|0.3750
+    8.50|8.50|0.375
 }
 
 @requires strict "uses STRICT tables"

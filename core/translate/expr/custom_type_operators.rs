@@ -113,6 +113,8 @@ struct Operand<'a> {
     /// Whether SQLite's arithmetic would see an integer, or a value whose type
     /// is not known before the statement runs.
     may_be_integer: bool,
+    /// Whether the operand is a REAL value and not a decimal literal.
+    is_real: bool,
     /// The operand's type, as `type_of` gives it.
     expr_type: &'a ExprType,
 }
@@ -139,11 +141,17 @@ impl<'a> Operand<'a> {
             sqlite_operand_type(expr_type.clone(), resolver.schema()),
             ExprType::Builtin(BuiltinType::Integer | BuiltinType::Any)
         );
+        let is_real = !is_decimal_literal(expr)
+            && matches!(
+                sqlite_operand_type(expr_type.clone(), resolver.schema()),
+                ExprType::Builtin(BuiltinType::Real)
+            );
         Ok(Self {
             value_type,
             column_type,
             literal_kind: literal_type_name(expr),
             may_be_integer,
+            is_real,
             expr_type,
         })
     }
@@ -159,6 +167,15 @@ impl<'a> Operand<'a> {
             (None, ExprType::Null) => "null".to_string(),
             (None, _) => "value".to_string(),
         }
+    }
+}
+
+/// A number written in the statement, with any sign: `0.5`, `-0.5`, `(+1e3)`.
+fn is_decimal_literal(expr: &ast::Expr) -> bool {
+    match without_wrappers(expr) {
+        ast::Expr::Literal(ast::Literal::Numeric(_)) => true,
+        ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => is_decimal_literal(inner),
+        _ => false,
     }
 }
 
@@ -210,6 +227,8 @@ fn accepts_operand(arg: ArithmeticArg, op: &str, ty: &ColumnCustomType, operand:
         }
         ArithmeticArg::PlainValue => is_plain_value(op, operand),
         ArithmeticArg::Integer => is_plain_value(op, operand) && operand.may_be_integer,
+        ArithmeticArg::Exact => is_plain_value(op, operand) && !operand.is_real,
+        ArithmeticArg::Real => is_plain_value(op, operand) && operand.is_real,
     }
 }
 
