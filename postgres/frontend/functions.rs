@@ -90,8 +90,6 @@ scalar_functions! {
     PgBackendPid(FunctionArity::Exact(0), true),
     PgIsInRecovery(FunctionArity::Exact(0), false),
     PgLockAccessShare(FunctionArity::Exact(0), false),
-    Greatest(FunctionArity::Variadic, true),
-    Least(FunctionArity::Variadic, true),
     PgLimitValue(FunctionArity::Exact(2), true),
     Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
 }
@@ -159,16 +157,6 @@ impl ScalarCall for PgScalarFunction {
                 }
                 Value::from_i64(0)
             }
-            Self::Greatest => Value::exec_max(
-                args.iter()
-                    .map(Register::get_value)
-                    .filter(|value| !matches!(value, Value::Null)),
-            ),
-            Self::Least => Value::exec_min(
-                args.iter()
-                    .map(Register::get_value)
-                    .filter(|value| !matches!(value, Value::Null)),
-            ),
             Self::PgLimitValue => exec_pg_limit_value(args)?,
             Self::Now
             | Self::ClockTimestamp
