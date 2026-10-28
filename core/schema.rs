@@ -2816,7 +2816,7 @@ impl Schema {
                         .accumulators
                         .take()
                         .expect("accumulators must be initialized in Init phase");
-                    let type_sqls = std::mem::take(&mut state.type_sqls);
+                    let type_sqls = std::mem::replace(&mut state.type_sqls, vec![]);
                     self.populate_types_views_then_indices(
                         syms,
                         &type_sqls,
