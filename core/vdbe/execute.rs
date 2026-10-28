@@ -10446,6 +10446,15 @@ pub fn op_function(
                 // on a dropped sequence reports "does not exist" rather
                 // than silently returning the stale per-session value.
                 let (namespace, sequence) = program.connection.find_sequence(&seq_name)?;
+                if !program.connection.current_role_is_superuser() {
+                    return Err(crate::LimboError::PermissionDenied(Box::new(
+                        PermissionDenied::privilege(
+                            Action::Use,
+                            Object::Sequence(sequence.name.clone()),
+                        ),
+                    ))
+                    .into());
+                }
                 match program.connection.get_sequence_currval(
                     namespace.database_id,
                     &mangle_name(namespace.id, &sequence.name),
@@ -11098,6 +11107,15 @@ pub fn op_function(
                     }
                 };
                 let (namespace, sequence) = program.connection.find_sequence(sequence_name)?;
+                if !program.connection.current_role_is_superuser() {
+                    return Err(LimboError::PermissionDenied(Box::new(
+                        PermissionDenied::privilege(
+                            Action::Use,
+                            Object::Sequence(sequence.name.clone()),
+                        ),
+                    ))
+                    .into());
+                }
                 let watermark = program
                     .connection
                     .mv_store_for_db(namespace.database_id)
