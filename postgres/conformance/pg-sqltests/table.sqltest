@@ -163,6 +163,64 @@ expect {
     bob
 }
 
+setup typed_src {
+    CREATE TABLE src (b boolean, n numeric(5,2), v varchar(3), a int[]);
+    INSERT INTO src VALUES (true, 1.5, 'abc', '{1,2}');
+}
+
+@setup typed_src
+test table-create-table-as-copies-typed-values {
+    CREATE TABLE dst AS SELECT * FROM src;
+    INSERT INTO dst (n, v, a) VALUES (2.5, 'ab', '{3}');
+    SELECT n, v, a FROM dst ORDER BY v;
+}
+expect {
+    2.50|ab|{3}
+    1.50|abc|{1,2}
+}
+
+@setup typed_src
+test table-create-table-as-rejects-invalid-boolean {
+    CREATE TABLE dst AS SELECT * FROM src;
+    INSERT INTO dst (b) VALUES ('garbage');
+}
+expect error {}
+
+@setup typed_src
+test table-create-table-as-rejects-invalid-numeric {
+    CREATE TABLE dst AS SELECT * FROM src;
+    INSERT INTO dst (n) VALUES ('x');
+}
+expect error {}
+
+@setup typed_src
+test table-create-table-as-rejects-too-long-varchar {
+    CREATE TABLE dst AS SELECT * FROM src;
+    INSERT INTO dst (v) VALUES ('abcd');
+}
+expect error {}
+
+@setup typed_src
+test table-create-table-as-rejects-invalid-array-element {
+    CREATE TABLE dst AS SELECT * FROM src;
+    INSERT INTO dst (a) VALUES ('{x}');
+}
+expect error {}
+
+@setup typed_src
+test table-create-table-as-compound-keeps-column-type {
+    CREATE TABLE dst AS SELECT b FROM src UNION SELECT b FROM src;
+    INSERT INTO dst VALUES ('garbage');
+}
+expect error {}
+
+@setup typed_src
+test table-select-into-rejects-invalid-boolean {
+    SELECT * INTO dst FROM src;
+    INSERT INTO dst (b) VALUES ('garbage');
+}
+expect error {}
+
 test table-select-into-nested-rejected {
     SELECT * FROM (SELECT 1 INTO dst) sub;
 }

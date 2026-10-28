@@ -217,6 +217,10 @@ impl Dialect for PostgresDialect {
     fn add_column_computes_default_for_existing_rows(&self) -> bool {
         true
     }
+
+    fn create_table_as_keeps_column_types(&self) -> bool {
+        true
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
