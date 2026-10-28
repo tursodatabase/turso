@@ -86,6 +86,7 @@ pub fn translate(
     query_mode: QueryMode,
     input: &str,
     origin: crate::statement::StatementOrigin,
+    prepare_options: &crate::connection::PrepareOptions,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
@@ -153,8 +154,7 @@ pub fn translate(
         Ok(WalkControl::Continue)
     })?;
 
-    let check_privileges = matches!(origin, crate::statement::StatementOrigin::Root);
-    if check_privileges {
+    if !prepare_options.reads_engine_metadata {
         roles::check_statement_privileges(&stmt, &resolver, &connection)?;
     }
 
@@ -174,6 +174,10 @@ pub fn translate(
     };
 
     program.epilogue(schema);
+
+    if !prepare_options.reads_engine_metadata {
+        roles::check_storage_access(&program, &resolver, &connection)?;
+    }
 
     program.build(connection, change_cnt_on, input)
 }
@@ -730,6 +734,7 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
+            &crate::connection::PrepareOptions::default(),
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -959,6 +964,7 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
+            &crate::connection::PrepareOptions::default(),
         )
         .expect_err("translation should fail with malformed sqlite_sequence");
         match err {
@@ -1004,6 +1010,7 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
+            &crate::connection::PrepareOptions::default(),
         )
         .expect_err("translation should fail with missing sqlite_sequence");
         match err {
