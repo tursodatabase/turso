@@ -8014,7 +8014,6 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
-        portable_logical_changes: false,
     }
 }
 
@@ -9807,7 +9806,6 @@ fn transaction_display() {
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
-        portable_logical_changes: false,
     };
 
     let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }] }";
@@ -18663,6 +18661,21 @@ fn test_mvcc_portable_changes_delete_of_checkpointed_row_carries_pk_projection()
         pk_values,
         vec![Value::Text(Text::new("item-a".to_string()))]
     );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+#[should_panic(expected = "portable logical changes cannot be changed during an MVCC transaction")]
+fn test_mvcc_portable_changes_setting_cannot_change_during_transaction() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE items(id TEXT PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn.execute("BEGIN").unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES ('item-a', 'alpha')")
+        .unwrap();
+    db.conn.set_portable_logical_changes_enabled(true);
 }
 
 #[cfg(feature = "conn_raw_api")]
