@@ -4,6 +4,7 @@ use crate::settings::SettingScope;
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction};
+use turso_core::security::roles::RoleId;
 use turso_core::types::IOResultOr;
 use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
@@ -99,6 +100,7 @@ scalar_functions! {
     CurrentDatabase(FunctionArity::Exact(0), false, Text),
     CurrentSchema(FunctionArity::Exact(0), true, Text),
     CurrentSchemas(FunctionArity::Exact(1), false, Text),
+    CurrentUser | SessionUser(FunctionArity::Exact(0), false, Text),
     PgBackendPid(FunctionArity::Exact(0), true, Integer),
     PgIsInRecovery(FunctionArity::Exact(0), false, Text),
     PgLockAccessShare(FunctionArity::Exact(0), false, Integer),
@@ -166,6 +168,8 @@ impl ScalarCall for PgScalarFunction {
                 None => Value::Null,
             },
             Self::CurrentSchemas => exec_current_schemas(connection, args[0].get_value())?,
+            Self::CurrentUser => role_name(connection, connection.current_role()),
+            Self::SessionUser => role_name(connection, connection.session_role()),
             Self::PgBackendPid => Value::from_i64(std::process::id() as i64),
             Self::PgIsInRecovery => {
                 // Temporary pg_dump compatibility: "t" means true, not actual recovery state.
@@ -647,6 +651,14 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Value> {
     Ok(Value::from_i64(value))
 }
 
+fn role_name(conn: &Connection, role: RoleId) -> Value {
+    let roles = conn.role_catalog();
+    let role = roles
+        .get(role)
+        .expect("the role of a connection is in its role catalog");
+    Value::build_text(role.name.clone())
+}
+
 fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> Value {
     let name = role_name_by_oid(conn, oid).unwrap_or_else(|| format!("unknown (OID={oid})"));
     Value::build_text(name)
@@ -656,10 +668,10 @@ fn role_name_by_oid(conn: &Connection, oid: i64) -> Option<String> {
     if oid == PG_DATABASE_OWNER_OID {
         return Some("pg_database_owner".to_string());
     }
-    crate::catalog::listed_roles(conn)
-        .into_iter()
-        .find(|role| crate::catalog::role_oid(role.id) == oid)
-        .map(|role| role.name)
+    conn.role_catalog()
+        .iter()
+        .find(|role| role.id != RoleId::PUBLIC && crate::catalog::role_oid(role.id) == oid)
+        .map(|role| role.name.clone())
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Value {

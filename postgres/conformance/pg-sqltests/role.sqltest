@@ -25,6 +25,13 @@ expect {
     unknown (OID=0)
 }
 
+test pg-get-userbyid-accepts-quoted-oid {
+    SELECT pg_get_userbyid('10');
+}
+expect {
+    postgres
+}
+
 test bootstrap-superuser-bypasses-row-level-security {
     SELECT count(*) FROM pg_roles WHERE oid = 10 AND rolbypassrls;
 }
@@ -38,6 +45,52 @@ test create-role-does-not-bypass-row-level-security {
 }
 expect {
     1
+}
+
+test pg-get-expr-shows-role-defaults-as-keywords {
+    CREATE TABLE cu_role_defaults (owner TEXT DEFAULT current_user, creator TEXT DEFAULT session_user);
+    SELECT pg_get_expr(d.adbin, d.adrelid)
+    FROM pg_attrdef d JOIN pg_class c ON c.oid = d.adrelid
+    WHERE c.relname = 'cu_role_defaults'
+    ORDER BY d.adnum;
+}
+expect {
+    CURRENT_USER
+    SESSION_USER
+}
+
+test check-constraint-calls-current-user {
+    CREATE TABLE cu_check (owner TEXT CHECK (owner = current_user));
+    INSERT INTO cu_check VALUES ('postgres');
+    SELECT owner FROM cu_check;
+}
+expect {
+    postgres
+}
+
+test add-column-fills-existing-rows-with-current-user {
+    CREATE TABLE cu_add_column (x int);
+    INSERT INTO cu_add_column VALUES (1);
+    ALTER TABLE cu_add_column ADD COLUMN owner TEXT DEFAULT current_user;
+    SELECT x, owner FROM cu_add_column;
+}
+expect {
+    1|postgres
+}
+
+test check-constraint-definitions-show-role-functions-as-keywords {
+    CREATE TABLE cu_role_checks (owner TEXT CHECK (owner = current_user), creator TEXT CHECK (creator = session_user));
+    SELECT CASE WHEN position('CURRENT_USER' in pg_get_constraintdef(con.oid)) > 0 THEN 'CURRENT_USER'
+                WHEN position('SESSION_USER' in pg_get_constraintdef(con.oid)) > 0 THEN 'SESSION_USER' END,
+           CASE WHEN position('CURRENT_USER' in pg_get_expr(con.conbin, con.conrelid)) > 0 THEN 'CURRENT_USER'
+                WHEN position('SESSION_USER' in pg_get_expr(con.conbin, con.conrelid)) > 0 THEN 'SESSION_USER' END
+    FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid
+    WHERE c.relname = 'cu_role_checks' AND con.contype = 'c'
+    ORDER BY 1;
+}
+expect {
+    CURRENT_USER|CURRENT_USER
+    SESSION_USER|SESSION_USER
 }
 
 test create-role-named-postgres-fails {
