@@ -11338,27 +11338,24 @@ pub fn op_function(
                             bigdecimal_to_blob, validate_precision_scale,
                         };
 
-                        let precision = match precision_reg.get_value() {
-                            Value::Numeric(Numeric::Integer(i)) => *i,
-                            _ => {
-                                return Err(LimboError::Constraint(
-                                    "numeric_encode: precision must be an integer".to_string(),
-                                )
-                                .into());
-                            }
-                        };
-                        let scale = match scale_reg.get_value() {
-                            Value::Numeric(Numeric::Integer(i)) => *i,
-                            _ => {
-                                return Err(LimboError::Constraint(
-                                    "numeric_encode: scale must be an integer".to_string(),
-                                )
-                                .into());
-                            }
-                        };
                         let bd = numeric_from_value(other)?;
-                        let validated = validate_precision_scale(&bd, precision, scale)?;
-                        Value::from_blob(bigdecimal_to_blob(&validated))
+                        // NULL precision and scale mean no limit: the value is
+                        // only converted, as for an index seek key.
+                        let encoded = match (precision_reg.get_value(), scale_reg.get_value()) {
+                            (Value::Null, Value::Null) => bd,
+                            (
+                                Value::Numeric(Numeric::Integer(precision)),
+                                Value::Numeric(Numeric::Integer(scale)),
+                            ) => validate_precision_scale(&bd, *precision, *scale)?,
+                            _ => {
+                                return Err(LimboError::Constraint(
+                                    "numeric_encode: precision and scale must be integers"
+                                        .to_string(),
+                                )
+                                .into());
+                            }
+                        };
+                        Value::from_blob(bigdecimal_to_blob(&encoded))
                     }
                 };
                 state.registers[*dest].set_value(result);

@@ -737,3 +737,39 @@ test cmp-array-of-ordered-type-cast-is-an-error {
 expect error {
     arrays of type numeric are not supported
 }
+
+@requires strict "uses STRICT tables"
+test cmp-index-seek-key-is-encoded {
+    -- The index holds encoded values (500, 700), so a seek key is encoded
+    -- before it is compared. The results match the same queries on a scan.
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<' numeric_lt;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c cents) STRICT;
+    INSERT INTO t VALUES (1, 5), (2, 7);
+    CREATE INDEX t_c ON t(c);
+    SELECT id FROM t WHERE c = 5;
+    SELECT id FROM t WHERE c > 6;
+    SELECT id FROM t WHERE c IN (7, 8);
+}
+expect {
+    1
+    2
+    2
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-index-seek-key-is-not-rounded {
+    -- A seek key is converted to numeric but not rounded to the column's
+    -- scale, as in PostgreSQL: 3.504 equals no row of a numeric(10,2) column.
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (3.5), (3.51), (4);
+    CREATE INDEX t_n ON t(n);
+    SELECT count(*) FROM t WHERE n = 3.504;
+    SELECT n FROM t WHERE n > 3.504;
+    SELECT n FROM t WHERE n IN (3.51, 4.001);
+}
+expect {
+    0
+    3.51
+    4.00
+    3.51
+}

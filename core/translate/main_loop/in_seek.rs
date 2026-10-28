@@ -29,19 +29,15 @@ pub(super) fn emit_in_seek_start(
 
     let outer_loop_start = program.allocate_label();
     program.preassign_label_to_next_insn(outer_loop_start);
-    let seek_reg = program.alloc_register();
-    program.emit_insn(Insn::Column {
-        cursor_id: source_cursor_id,
-        column: 0,
-        dest: seek_reg,
-        default: None,
-    });
-
     let next_value = program.allocate_label();
-    program.emit_insn(Insn::IsNull {
-        reg: seek_reg,
-        target_pc: next_value,
-    });
+    let seek_reg = emit_in_seek_key(
+        program,
+        table_references,
+        resolver,
+        index,
+        source_cursor_id,
+        next_value,
+    )?;
     if index.is_none() {
         program.emit_insn(Insn::SeekRowid {
             cursor_id: table_cursor_id.expect("a rowid IN search must have a table cursor"),
@@ -77,6 +73,42 @@ pub(super) fn emit_in_seek_start(
         outer_loop_start,
         next_val_label: next_value,
     })
+}
+
+/// Read the current `IN` value into a new register and return it as a seek
+/// key. A NULL value matches nothing, so it jumps to `next_value`. An index
+/// holds encoded values, so the key is encoded as for any other index seek.
+pub(super) fn emit_in_seek_key(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    resolver: &Resolver<'_>,
+    index: Option<&Arc<Index>>,
+    source_cursor_id: CursorID,
+    next_value: BranchOffset,
+) -> Result<usize> {
+    let seek_reg = program.alloc_register();
+    program.emit_insn(Insn::Column {
+        cursor_id: source_cursor_id,
+        column: 0,
+        dest: seek_reg,
+        default: None,
+    });
+    program.emit_insn(Insn::IsNull {
+        reg: seek_reg,
+        target_pc: next_value,
+    });
+    if let Some(index) = index {
+        encode_seek_keys_for_custom_types(
+            program,
+            table_references,
+            index,
+            seek_reg,
+            1,
+            0,
+            resolver,
+        )?;
+    }
+    Ok(seek_reg)
 }
 
 /// Open or reuse the ephemeral cursor that supplies RHS values for an IN-seek.

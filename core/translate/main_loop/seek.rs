@@ -1,7 +1,7 @@
 use super::*;
-use crate::translate::collate::CollationSeq;
 use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
+use turso_parser::ast;
 use turso_parser::ast::NullsOrder;
 
 fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
@@ -19,7 +19,7 @@ fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
         .collect()
 }
 
-fn encode_seek_keys_for_custom_types(
+pub(super) fn encode_seek_keys_for_custom_types(
     program: &mut ProgramBuilder,
     tables: &TableReferences,
     seek_index: &Arc<Index>,
@@ -42,10 +42,8 @@ fn encode_seek_keys_for_custom_types(
             break;
         }
         let idx_col = &seek_index.columns[idx_col_pos];
-        // A type ordering compares the value as given, so the key is not
-        // encoded: encoding would round 3.504 to the column's scale. An
-        // expression column holds the expression's value, not the column's.
-        if matches!(idx_col.collation, CollationSeq::Type(_)) || idx_col.expr.is_some() {
+        // An expression column holds the expression's value, not the column's.
+        if idx_col.expr.is_some() {
             continue;
         }
         let table_col = match columns.get(idx_col.pos_in_table) {
@@ -61,6 +59,11 @@ fn encode_seek_keys_for_custom_types(
         if resolved.chain.iter().all(|td| td.encode().is_none()) {
             continue;
         }
+        // The index holds encoded values, so the key is encoded too. The
+        // type's parameters (numeric's precision and scale, say) limit what
+        // the column may store; they are not part of the encoding. They are
+        // passed as NULL so that a key is converted but never rounded or
+        // rejected: `n = 3.504` on a numeric(10,2) column matches no row.
         let reg = start_reg + i;
         let skip_label = program.allocate_label();
         program.emit_insn(Insn::IsNull {
@@ -69,12 +72,16 @@ fn encode_seek_keys_for_custom_types(
         });
         for td in &resolved.chain {
             if let Some(encode_expr) = td.encode() {
+                let no_limits: Vec<Box<ast::Expr>> = td
+                    .user_params()
+                    .map(|_| Box::new(ast::Expr::Literal(ast::Literal::Null)))
+                    .collect();
                 crate::translate::expr::emit_type_expr(
                     program,
                     encode_expr,
                     reg,
                     reg,
-                    &table_col.ty_params,
+                    &no_limits,
                     td,
                     resolver,
                 )?;
