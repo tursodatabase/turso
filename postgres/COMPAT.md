@@ -422,7 +422,7 @@ Upgrade is not supported.
 | Per user/database connection limits | ❌ Not supported | |
 | Predefined roles | ❌ Not supported | |
 | Privileges for setting configuration parameters | ❌ Not supported | |
-| ROLES | ❌ Not supported | pg_roles exposes hardcoded `turso` and `pg_database_owner` roles |
+| ROLES | 🟡 Partial | `CREATE ROLE name` only, with no options; `pg_roles` lists the built-in `postgres` superuser, `pg_database_owner`, and created roles |
 | Row-level security | ❌ Not supported | |
 | SCRAM-SHA-256 authentication | ❌ Not supported | |
 | Search+bind mode operation for LDAP authentication | ❌ Not supported | |

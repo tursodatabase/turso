@@ -273,7 +273,7 @@ fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Value> {
         })?;
     let (public_privileges, owner_privileges) = kind.default_privileges();
 
-    let role = role_name_by_oid(conn, owner).unwrap_or_else(|| owner.to_string());
+    let role = acl_role_name(&role_name_by_oid(conn, owner).unwrap_or_else(|| owner.to_string()));
     let mut entries = Vec::with_capacity(2);
     if !public_privileges.is_empty() {
         entries.push(format!("={public_privileges}/{role}"));
@@ -282,7 +282,31 @@ fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Value> {
         let grantee = if owner == 0 { "" } else { &role };
         entries.push(format!("{grantee}={owner_privileges}/{role}"));
     }
-    Ok(Value::build_text(format!("{{{}}}", entries.join(","))))
+    let elements: Vec<String> = entries.iter().map(|entry| array_element(entry)).collect();
+    Ok(Value::build_text(format!("{{{}}}", elements.join(","))))
+}
+
+fn acl_role_name(name: &str) -> String {
+    if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return name.to_string();
+    }
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn array_element(element: &str) -> String {
+    let needs_quotes = element.is_empty()
+        || element.eq_ignore_ascii_case("NULL")
+        || element.chars().any(|c| {
+            matches!(
+                c,
+                '"' | '\\' | '{' | '}' | ',' | ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'
+            )
+        });
+    if !needs_quotes {
+        return element.to_string();
+    }
+    let escaped = element.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 #[derive(strum::EnumString)]
