@@ -3134,15 +3134,13 @@ impl PostgreSQLTranslator {
                         | SqlValueFunctionOp::SvfopLocaltimestamp
                         | SqlValueFunctionOp::SvfopLocaltimestampN,
                     ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp)),
-                    Ok(
-                        SqlValueFunctionOp::SvfopCurrentUser
-                        | SqlValueFunctionOp::SvfopSessionUser
-                        | SqlValueFunctionOp::SvfopUser
-                        | SqlValueFunctionOp::SvfopCurrentRole,
-                    ) => {
-                        // Return empty string stub for user functions
-                        Ok(ast::Expr::Literal(ast::Literal::String("''".into())))
-                    }
+                    // Each role keyword is stored as a call to the function
+                    // of the same name, so that the catalogs can show the
+                    // keyword that was written.
+                    Ok(SqlValueFunctionOp::SvfopCurrentUser) => Ok(role_function("current_user")),
+                    Ok(SqlValueFunctionOp::SvfopCurrentRole) => Ok(role_function("current_role")),
+                    Ok(SqlValueFunctionOp::SvfopUser) => Ok(role_function("user")),
+                    Ok(SqlValueFunctionOp::SvfopSessionUser) => Ok(role_function("session_user")),
                     // The bare keywords route through the frontend scalars so both
                     // syntaxes share one implementation and agree with pg_catalog.
                     Ok(SqlValueFunctionOp::SvfopCurrentSchema) => Ok(ast::Expr::FunctionCall {
@@ -5987,6 +5985,40 @@ fn translate_create_role(
     Ok(ast::Stmt::CreateRole {
         role_name: stmt.role.clone(),
     })
+}
+
+/// The functions that the role keywords `CURRENT_USER`, `CURRENT_ROLE`,
+/// `USER` and `SESSION_USER` are stored as, with their keywords.
+const ROLE_KEYWORD_FUNCTIONS: [(&str, &str); 4] = [
+    ("current_user", "CURRENT_USER"),
+    ("current_role", "CURRENT_ROLE"),
+    ("user", "USER"),
+    ("session_user", "SESSION_USER"),
+];
+
+fn role_function(name: &str) -> ast::Expr {
+    debug_assert!(ROLE_KEYWORD_FUNCTIONS
+        .iter()
+        .any(|(function, _)| *function == name));
+    ast::Expr::FunctionCall {
+        name: ast::Name::from_string(name),
+        distinctness: None,
+        args: vec![],
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }
+}
+
+/// The role keyword that a call to `function_name` was written as.
+pub fn role_keyword(function_name: &str) -> Option<&'static str> {
+    ROLE_KEYWORD_FUNCTIONS
+        .iter()
+        .find(|(function, _)| function.eq_ignore_ascii_case(function_name))
+        .map(|(_, keyword)| *keyword)
 }
 
 /// Translate `CREATE TYPE <name> AS ENUM (...)` to a Turso `CREATE TYPE` with
