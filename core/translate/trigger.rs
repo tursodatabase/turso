@@ -317,10 +317,13 @@ fn resolve_create_trigger_namespace(
         return resolver.resolve_namespace(trigger_name);
     }
 
-    // Unqualified trigger names default to main, except when the trigger is
-    // attached to a temp object. SQLite stores those triggers in temp.
-    match resolver.resolve_existing_table(tbl_name)?.database_id {
+    // An unqualified trigger name goes with its table: into the namespace
+    // of a table of the main database, into temp for a temp table. SQLite
+    // stores a trigger on an attached database's table in main.
+    let table = resolver.resolve_existing_table(tbl_name)?;
+    match table.database_id {
         crate::TEMP_DB_ID => Ok(NamespaceRef::root_of(crate::TEMP_DB_ID)),
+        crate::MAIN_DB_ID => Ok(table),
         _ => Ok(NamespaceRef::root_of(crate::MAIN_DB_ID)),
     }
 }

@@ -5312,6 +5312,18 @@ mod tests {
         }
     }
 
+    /// Like `query_single_i64`, but runs the statement to its end so that
+    /// what it wrote is committed.
+    fn run_single_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let value = match stmt.step().unwrap() {
+            StepResult::Row => stmt.row().unwrap().get::<i64>(0).unwrap(),
+            other => panic!("expected a row, got {other:?}"),
+        };
+        while !matches!(stmt.step().unwrap(), StepResult::Done) {}
+        value
+    }
+
     fn text_value(value: &Value) -> &str {
         match value {
             Value::Text(text) => text.as_str(),
@@ -5424,6 +5436,352 @@ mod tests {
         assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
         conn.execute("CREATE TABLE v(z INTEGER)").unwrap();
         assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM main.v"), 0);
+    }
+
+    #[test]
+    fn test_a_database_that_does_not_store_namespaces_keeps_names_that_look_stored() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("main.db");
+        let conn = open_connection(&path);
+        conn.execute(
+            "CREATE TABLE __turso_ns1_t(x INTEGER); INSERT INTO __turso_ns1_t VALUES(7); \
+             CREATE TABLE p(v INTEGER); CREATE INDEX __turso_ns2_i ON p(v); INSERT INTO p VALUES(1); \
+             CREATE VIEW __turso_ns3_v AS SELECT x FROM __turso_ns1_t",
+        )
+        .unwrap();
+        assert!(conn.create_namespace("app").is_err());
+        drop(conn);
+
+        let conn = open_connection(&path);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM __turso_ns1_t"), 7);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM __turso_ns3_v"), 7);
+        assert!(conn.execute("DROP INDEX i").is_err());
+        conn.execute("DROP INDEX __turso_ns2_i").unwrap();
+        conn.execute("ALTER TABLE p RENAME TO __turso_ns4_p")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT v FROM __turso_ns4_p"), 1);
+        let mut stmt = conn.prepare("PRAGMA integrity_check").unwrap();
+        assert!(matches!(stmt.step().unwrap(), StepResult::Row));
+        assert_eq!(stmt.row().unwrap().get::<&str>(0).unwrap(), "ok");
+    }
+
+    #[test]
+    fn test_a_materialized_view_of_a_namespace_is_maintained_and_dropped() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("main.db");
+        let open = || {
+            open_connection_with_dialect(
+                &path,
+                DatabaseOpts::new().with_views(true),
+                Arc::new(StoringDialect),
+            )
+        };
+        let conn = open();
+        conn.create_namespace("app").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER); CREATE TABLE app.t(x INTEGER)")
+            .unwrap();
+        conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT count(*) AS n FROM t")
+            .unwrap();
+        conn.execute("CREATE MATERIALIZED VIEW app.mv AS SELECT count(*) AS n FROM t")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES(1)").unwrap();
+        conn.execute("INSERT INTO app.t VALUES(1), (2)").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT n FROM mv"), 1);
+        assert_eq!(query_single_i64(&conn, "SELECT n FROM app.mv"), 2);
+        assert_eq!(
+            query_single_i64(
+                &conn,
+                "SELECT count(*) FROM sqlite_schema WHERE name LIKE '__turso_internal_dbsp%__turso_ns1_mv%'"
+            ),
+            query_single_i64(
+                &conn,
+                "SELECT count(*) FROM sqlite_schema WHERE name LIKE '__turso_internal_dbsp%' AND name NOT LIKE '%__turso_ns1_mv%'"
+            )
+        );
+        drop(conn);
+
+        let conn = open();
+        conn.execute("INSERT INTO app.t VALUES(3)").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT n FROM app.mv"), 3);
+        assert_eq!(query_single_i64(&conn, "SELECT n FROM mv"), 1);
+        conn.execute("DROP VIEW app.mv").unwrap();
+        assert!(conn.prepare("SELECT n FROM app.mv").is_err());
+        assert_eq!(
+            query_single_i64(
+                &conn,
+                "SELECT count(*) FROM sqlite_schema WHERE name LIKE '%__turso_ns1_mv%'"
+            ),
+            0
+        );
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM app.t"), 3);
+        assert_eq!(query_single_i64(&conn, "SELECT n FROM mv"), 1);
+    }
+
+    #[test]
+    fn test_pragma_table_info_finds_a_view_of_a_namespace_through_the_search_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_dialect(
+            &temp_dir.path().join("main.db"),
+            DatabaseOpts::new().with_views(true),
+            Arc::new(StoringDialect),
+        );
+        conn.create_namespace("app").unwrap();
+        conn.set_search_path(Some(vec!["app".to_string()]));
+        conn.execute("CREATE TABLE t(x INTEGER, y TEXT); CREATE VIEW v AS SELECT x, y FROM t")
+            .unwrap();
+        let names = |sql: &str| -> Vec<String> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| row[1].to_string())
+                .collect()
+        };
+        assert_eq!(names("PRAGMA table_info('v')"), ["x", "y"]);
+        assert_eq!(names("PRAGMA table_info('t')"), ["x", "y"]);
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('v') ORDER BY cid")
+            .unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![crate::Value::build_text("x")],
+                vec![crate::Value::build_text("y")]
+            ]
+        );
+    }
+
+    #[test]
+    fn test_vacuum_into_keeps_the_ids_of_namespaces() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_dialect(
+            &temp_dir.path().join("main.db"),
+            DatabaseOpts::new().with_vacuum(true),
+            Arc::new(StoringDialect),
+        );
+        conn.create_namespace("app").unwrap();
+        let shop = conn.create_namespace("shop").unwrap();
+        assert_eq!(shop.target.id, NamespaceId::new(2));
+        conn.execute("CREATE TABLE shop.t(x INTEGER); INSERT INTO shop.t VALUES(7)")
+            .unwrap();
+        conn.drop_namespace("app").unwrap();
+        let copy = temp_dir.path().join("copy.db");
+        conn.execute(format!("VACUUM INTO '{}'", copy.display()))
+            .unwrap();
+
+        let copied = open_connection_with_dialect(
+            &copy,
+            DatabaseOpts::new().with_vacuum(true),
+            Arc::new(StoringDialect),
+        );
+        assert_eq!(
+            copied.namespace("shop"),
+            Some(Namespace::in_main("shop", NamespaceId::new(2)))
+        );
+        assert_eq!(query_single_i64(&copied, "SELECT x FROM shop.t"), 7);
+    }
+
+    #[test]
+    fn test_an_id_whose_objects_are_still_stored_is_not_given_to_a_new_namespace() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_storing_namespaces(&temp_dir.path().join("main.db"));
+        let app = conn.create_namespace("app").unwrap();
+        assert_eq!(app.target.id, NamespaceId::new(1));
+        conn.execute("CREATE TABLE app.t(x INTEGER); INSERT INTO app.t VALUES(5)")
+            .unwrap();
+        conn.drop_namespace("app").unwrap();
+
+        let shop = conn.create_namespace("shop").unwrap();
+        assert_eq!(shop.target.id, NamespaceId::new(2));
+        assert!(conn.prepare("SELECT x FROM shop.t").is_err());
+    }
+
+    #[test]
+    fn test_a_namespace_keeps_the_objects_stored_under_its_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_storing_namespaces(&temp_dir.path().join("main.db"));
+        conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(1)")
+            .unwrap();
+        let app = conn.create_namespace("app").unwrap();
+        assert_eq!(app, Namespace::in_main("app", NamespaceId::new(1)));
+        assert_eq!(conn.namespace("app"), Some(app));
+        assert!(conn.create_namespace("app").is_err());
+        assert!(conn.create_namespace("main").is_err());
+        conn.execute("CREATE TABLE app.t(x INTEGER); INSERT INTO app.t VALUES(5)")
+            .unwrap();
+
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.t"), 5);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 1);
+        assert_eq!(
+            query_single_i64(
+                &conn,
+                "SELECT count(*) FROM sqlite_schema WHERE name = '__turso_ns1_t'"
+            ),
+            1
+        );
+        assert!(conn.prepare("SELECT x FROM __turso_ns1_t").is_err());
+        conn.execute("INSERT INTO app.t VALUES(6)").unwrap();
+        conn.execute("UPDATE app.t SET x = x + 10 WHERE x = 6")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT sum(x) FROM app.t"), 21);
+        conn.execute("DELETE FROM app.t WHERE x = 16").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM app.t"), 1);
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM t"), 1);
+        assert!(conn
+            .execute("CREATE TABLE __turso_ns1_u(x INTEGER)")
+            .is_err());
+        assert!(conn
+            .execute("CREATE TABLE app.__turso_ns1_u(x INTEGER)")
+            .is_err());
+        assert_eq!(
+            query_single_i64(
+                &conn,
+                "SELECT rootpage FROM sqlite_schema WHERE type = 'schema' AND name = 'app' AND sql = 'CREATE SCHEMA app'"
+            ),
+            1
+        );
+        assert!(conn.create_namespace("app").is_err());
+        assert!(conn.drop_namespace("shop").is_err());
+
+        conn.execute("DROP TABLE app.t").unwrap();
+        assert!(conn.prepare("SELECT x FROM app.t").is_err());
+        assert_eq!(
+            query_single_i64(
+                &conn,
+                "SELECT count(*) FROM sqlite_schema WHERE name = '__turso_ns1_t'"
+            ),
+            0
+        );
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 1);
+        conn.drop_namespace("app").unwrap();
+        assert_eq!(conn.namespace("app"), None);
+        assert!(conn.prepare("SELECT x FROM app.t").is_err());
+        assert!(conn.drop_namespace("app").is_err());
+        assert!(conn.drop_namespace("main").is_err());
+        let shop = conn.create_namespace("shop").unwrap();
+        assert_eq!(shop.target.id, NamespaceId::new(1));
+    }
+
+    #[test]
+    fn test_a_namespace_is_part_of_its_transaction_and_seen_by_other_connections() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("main.db");
+        let conn = open_connection_storing_namespaces(&path);
+        let other = conn.db.connect(ConnectOpts::new()).unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        conn.create_namespace("app").unwrap();
+        conn.execute("CREATE TABLE app.t(x INTEGER); INSERT INTO app.t VALUES(5)")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.t"), 5);
+        assert_eq!(other.namespace("app"), None);
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(conn.namespace("app"), None);
+        assert!(conn.prepare("SELECT x FROM app.t").is_err());
+
+        conn.execute("BEGIN").unwrap();
+        conn.create_namespace("app").unwrap();
+        conn.execute("CREATE TABLE app.t(x INTEGER); INSERT INTO app.t VALUES(5)")
+            .unwrap();
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(
+            other.namespace("app"),
+            Some(Namespace::in_main("app", NamespaceId::new(1)))
+        );
+        assert_eq!(query_single_i64(&other, "SELECT x FROM app.t"), 5);
+
+        drop(other);
+        drop(conn);
+        let reopened = open_connection_storing_namespaces(&path);
+        assert_eq!(
+            reopened.namespace("app"),
+            Some(Namespace::in_main("app", NamespaceId::new(1)))
+        );
+        assert_eq!(query_single_i64(&reopened, "SELECT x FROM app.t"), 5);
+    }
+
+    #[test]
+    fn test_the_search_path_finds_objects_through_a_namespace() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_storing_namespaces(&temp_dir.path().join("main.db"));
+        conn.create_namespace("app").unwrap();
+        conn.execute("CREATE TABLE app.t(x INTEGER); INSERT INTO app.t VALUES(5)")
+            .unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(1)")
+            .unwrap();
+        conn.execute("CREATE SEQUENCE app.s START WITH 100")
+            .unwrap();
+        conn.execute("CREATE SEQUENCE s START WITH 1").unwrap();
+
+        conn.set_search_path(Some(vec!["app".to_string()]));
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
+        assert_eq!(run_single_i64(&conn, "SELECT nextval('s')"), 100);
+        assert_eq!(query_single_i64(&conn, "SELECT currval('s')"), 100);
+        assert_eq!(run_single_i64(&conn, "SELECT nextval('app.s')"), 101);
+        assert_eq!(run_single_i64(&conn, "SELECT nextval('main.s')"), 1);
+        assert_eq!(conn.search_order()[0].name, "app");
+
+        conn.set_search_path(Some(vec!["main".to_string(), "app".to_string()]));
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 1);
+        assert_eq!(run_single_i64(&conn, "SELECT nextval('s')"), 2);
+        conn.execute("DROP TABLE t").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
+
+        conn.set_search_path(Some(vec!["app".to_string(), "main".to_string()]));
+        conn.execute("DROP SEQUENCE s").unwrap();
+        assert!(conn.prepare("SELECT nextval('app.s')").is_err());
+        assert_eq!(run_single_i64(&conn, "SELECT nextval('s')"), 3);
+    }
+
+    #[test]
+    fn test_objects_of_a_namespace_survive_reopening_and_renaming() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("main.db");
+        let conn = open_connection_storing_namespaces(&path);
+        conn.create_namespace("app").unwrap();
+        conn.execute("CREATE TABLE app.t(x INTEGER PRIMARY KEY, y TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX app.t_y ON t(y)").unwrap();
+        conn.execute("CREATE VIEW app.v AS SELECT x FROM t")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER app.trg AFTER INSERT ON t BEGIN INSERT INTO t VALUES(new.x + 100, 'copy'); END",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO app.t VALUES(1, 'a')").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM app.t"), 2);
+        assert_eq!(query_single_i64(&conn, "SELECT sum(x) FROM app.v"), 102);
+        drop(conn);
+
+        let conn = open_connection_storing_namespaces(&path);
+        assert_eq!(query_single_i64(&conn, "SELECT sum(x) FROM app.v"), 102);
+        assert_eq!(
+            query_single_i64(&conn, "SELECT count(*) FROM app.t WHERE y = 'copy'"),
+            1
+        );
+        conn.execute("ALTER TABLE app.t RENAME TO u").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM app.u"), 2);
+        conn.execute("INSERT INTO app.u VALUES(2, 'b')").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM app.u"), 4);
+        assert_eq!(
+            query_single_i64(
+                &conn,
+                "SELECT count(*) FROM sqlite_schema WHERE tbl_name = '__turso_ns1_u'"
+            ),
+            3
+        );
+        conn.execute("DROP INDEX app.t_y").unwrap();
+        conn.execute("DROP TRIGGER app.trg").unwrap();
+        conn.execute("DROP VIEW app.v").unwrap();
+        conn.execute("DROP TABLE app.u").unwrap();
+        assert_eq!(
+            query_single_i64(
+                &conn,
+                "SELECT count(*) FROM sqlite_schema WHERE name LIKE '__turso_ns1_%'"
+            ),
+            0
+        );
     }
 
     #[test]
