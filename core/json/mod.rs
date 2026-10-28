@@ -632,6 +632,17 @@ pub fn json_string_to_db_type(
     if matches!(flag, OutputVariant::Binary) {
         return Ok(Value::Blob(json.data()));
     }
+    // SQL values of TEXT5 strings are decoded from the payload, not from the
+    // JSON rendering, because escapes that cannot be rendered as JSON text
+    // still extract, as in SQLite.
+    if element_type == ElementType::TEXT5
+        && matches!(
+            flag,
+            OutputVariant::ElementType | OutputVariant::ElementTypePlain
+        )
+    {
+        return Ok(Value::Text(Text::new(json.scalar_string_value()?)));
+    }
     let mut json_string = json.to_string()?;
     if matches!(flag, OutputVariant::String) {
         return Ok(Value::Text(Text::json(json_string)));
@@ -649,13 +660,9 @@ pub fn json_string_to_db_type(
                 flag,
                 OutputVariant::ElementType | OutputVariant::ElementTypePlain
             ) {
-                if element_type == ElementType::TEXT5 {
-                    Ok(Value::Text(Text::new(json.scalar_string_value()?)))
-                } else {
-                    json_string.remove(json_string.len() - 1);
-                    json_string.remove(0);
-                    Ok(Value::Text(Text::new(unescape_string(&json_string))))
-                }
+                json_string.remove(json_string.len() - 1);
+                json_string.remove(0);
+                Ok(Value::Text(Text::new(unescape_string(&json_string))))
             } else {
                 Ok(Value::Text(Text::new(json_string)))
             }

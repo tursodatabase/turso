@@ -214,3 +214,50 @@ test json_text_blob_parse_error_is_malformed_json {
 expect error {
     malformed JSON
 }
+
+# A TEXT5 escape whose next byte is not ASCII: 0xE2 must start U+2028 or
+# U+2029, and any other character is kept after the backslash.
+test json_blob_text5_escape_e2_without_line_separator_is_malformed {
+    SELECT json(X'3B295CE2');
+}
+expect error {
+    malformed JSON
+}
+
+test json_blob_text5_escape_keeps_non_ascii_character {
+    SELECT json(X'4B395CC3A9');
+}
+expect {
+    ["\é"]
+}
+
+test json_blob_text5_lone_backslash_is_malformed {
+    SELECT json(X'2B195C');
+}
+expect error {
+    malformed JSON
+}
+
+test json_blob_text5_short_hex_escape_is_malformed {
+    SELECT json(X'3B295C78');
+}
+expect error {
+    malformed JSON
+}
+
+# Only rendering JSON text rejects those escapes; extracting the SQL value
+# does not.
+test json_extract_text5_short_hex_escape {
+    SELECT quote(json_extract(X'3B295C78', '$[0]')), quote(X'3B295C78' ->> 0),
+           quote(json_extract(X'295C78', '$')), quote(X'295C78' ->> '$');
+}
+expect {
+    ''|''|''|''
+}
+
+test json_arrow_text5_short_hex_escape_is_malformed {
+    SELECT X'3B295C78' -> 0;
+}
+expect error {
+    malformed JSON
+}

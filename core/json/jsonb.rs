@@ -1317,8 +1317,10 @@ impl Jsonb {
                         }
 
                         // Handle escape sequences
-                        b'\\' if i + 1 < word_slice.len() => {
-                            let next_ch = word_slice[i + 1];
+                        b'\\' => {
+                            let Some(&next_ch) = word_slice.get(i + 1) else {
+                                bail_parse_error!("malformed JSON");
+                            };
                             match next_ch {
                                 // Single quote
                                 b'\'' => {
@@ -1338,7 +1340,10 @@ impl Jsonb {
                                 }
 
                                 // Hex escapes like \x27
-                                b'x' if i + 3 < word_slice.len() => {
+                                b'x' => {
+                                    if i + 3 >= word_slice.len() {
+                                        bail_parse_error!("malformed JSON");
+                                    }
                                     string.push_str("\\u00");
                                     string.push(word_slice[i + 2] as char);
                                     string.push(word_slice[i + 3] as char);
@@ -1366,18 +1371,27 @@ impl Jsonb {
                                 }
 
                                 // Unicode line separators (U+2028 and U+2029)
-                                0xe2 if i + 3 < word_slice.len()
-                                    && word_slice[i + 2] == 0x80
-                                    && (word_slice[i + 3] == 0xa8 || word_slice[i + 3] == 0xa9) =>
-                                {
+                                0xe2 => {
+                                    if !matches!(
+                                        word_slice.get(i + 2..i + 4),
+                                        Some([0x80, 0xa8 | 0xa9])
+                                    ) {
+                                        bail_parse_error!("malformed JSON");
+                                    }
                                     i += 4;
                                 }
 
-                                // All other escapes pass through
-                                _ => {
+                                // All other escapes pass through. A
+                                // non-ASCII character after the backslash
+                                // is decoded by the default case below.
+                                _ if next_ch.is_ascii() => {
                                     string.push('\\');
                                     string.push(next_ch as char);
                                     i += 2;
+                                }
+                                _ => {
+                                    string.push('\\');
+                                    i += 1;
                                 }
                             }
                         }
