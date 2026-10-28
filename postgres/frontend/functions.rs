@@ -42,9 +42,9 @@ macro_rules! scalar_functions {
 
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     scalar_functions!(options, |connection, args| {
-        "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(args)?,
-        "pg_get_userbyid"(FunctionArity::Exact(1), true) => {
-            oid_arg(args, 0)?.map(exec_pg_get_user_by_id)
+        "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(connection, args)?,
+        "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
+            oid_arg(args, 0)?.map(|oid| exec_pg_get_user_by_id(connection, oid))
         },
         "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible"(
             FunctionArity::Exact(1), true
@@ -257,7 +257,7 @@ fn exec_current_schemas(conn: &Connection, argument: &Value) -> Result<Option<St
     Ok(Some(result))
 }
 
-fn exec_acl_default(args: &[Register]) -> Result<Option<String>> {
+fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Option<String>> {
     if matches!(args[0].get_value(), Value::Null) || matches!(args[1].get_value(), Value::Null) {
         return Ok(None);
     }
@@ -287,15 +287,7 @@ fn exec_acl_default(args: &[Register]) -> Result<Option<String>> {
         })?;
     let (public_privileges, owner_privileges) = kind.default_privileges();
 
-    // TODO: This hardcoded role mapping is temporary pg_dump compatibility.
-    // Replace it with a real role OID-to-name lookup later. Keep the numeric fallback for unknown OIDs.
-    let role = if owner == 10 {
-        "turso".to_string()
-    } else if owner == PG_DATABASE_OWNER_OID {
-        "pg_database_owner".to_string()
-    } else {
-        owner.to_string()
-    };
+    let role = role_name_by_oid(conn, owner).unwrap_or_else(|| owner.to_string());
     let mut entries = Vec::with_capacity(2);
     if !public_privileges.is_empty() {
         entries.push(format!("={public_privileges}/{role}"));
@@ -628,12 +620,18 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
     Ok(Some(value))
 }
 
-fn exec_pg_get_user_by_id(oid: i64) -> &'static str {
+fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> String {
+    role_name_by_oid(conn, oid).unwrap_or_else(|| format!("unknown (OID={oid})"))
+}
+
+fn role_name_by_oid(conn: &Connection, oid: i64) -> Option<String> {
     if oid == PG_DATABASE_OWNER_OID {
-        "pg_database_owner"
-    } else {
-        "turso"
+        return Some("pg_database_owner".to_string());
     }
+    crate::catalog::listed_roles(conn)
+        .into_iter()
+        .find(|role| crate::catalog::role_oid(role.id) == oid)
+        .map(|role| role.name)
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Boolean {
