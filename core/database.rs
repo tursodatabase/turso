@@ -1819,8 +1819,10 @@ impl Database {
                         .as_ref()
                         .expect("conn must be initialized in Init phase");
                     conn.maybe_update_schema();
-                    let namespace_rows = conn.query_stored_namespaces()?;
-                    if !namespace_rows.is_empty() {
+                    if !conn
+                        .with_schema(crate::MAIN_DB_ID, |schema| schema.namespace_names_loaded())
+                    {
+                        let namespace_rows = conn.query_stored_namespaces()?;
                         db.with_schema_mut(|schema| schema.load_namespace_names(&namespace_rows))?;
                     }
 

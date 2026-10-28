@@ -797,6 +797,24 @@ pub struct Schema {
     /// Whether the schema rows may hold the objects of namespaces
     /// under their mangled names, as the dialect of the database says.
     supports_namespaces: bool,
+
+    /// Whether the names of the namespaces are loaded. They come from the
+    /// namespaces table, which is read after the schema rows.
+    namespace_names_loaded: bool,
+
+    /// The materialized views met before the names of the namespaces were
+    /// loaded, built once they are.
+    pending_materialized_views: Option<PendingMaterializedViews>,
+}
+
+/// Materialized views the loader read before the names of the namespaces,
+/// with the roots of their state tables. A view body names tables by their
+/// namespace, so a view cannot be built until the names are known.
+#[derive(Debug, Clone, Default)]
+struct PendingMaterializedViews {
+    materialized_view_info: HashMap<String, StoredMaterializedView>,
+    dbsp_state_roots: HashMap<String, i64>,
+    dbsp_state_index_roots: HashMap<String, i64>,
 }
 
 /// The objects of one namespace, by name.
@@ -979,6 +997,8 @@ impl Schema {
             dropped_root_pages: HashSet::default(),
             type_registry,
             supports_namespaces: dialect.supports_namespaces(),
+            namespace_names_loaded: !dialect.supports_namespaces(),
+            pending_materialized_views: None,
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -1063,7 +1083,8 @@ impl Schema {
     }
 
     /// Records the names of the namespaces from the `(id, name)` rows of the
-    /// namespaces table. A schema that does not support namespaces has none.
+    /// namespaces table, and builds the materialized views that waited for
+    /// them. A schema that does not support namespaces has none.
     pub fn load_namespace_names(&mut self, rows: &[(i64, String)]) -> Result<()> {
         if !self.supports_namespaces {
             return Ok(());
@@ -1079,7 +1100,20 @@ impl Schema {
                 })?;
             self.name_namespace(NamespaceId::new(id), name);
         }
+        self.namespace_names_loaded = true;
+        if let Some(pending) = self.pending_materialized_views.take() {
+            self.populate_materialized_views(
+                pending.materialized_view_info,
+                pending.dbsp_state_roots,
+                pending.dbsp_state_index_roots,
+            )?;
+        }
         Ok(())
+    }
+
+    /// Whether the names of the namespaces are loaded.
+    pub fn namespace_names_loaded(&self) -> bool {
+        self.namespace_names_loaded
     }
 
     /// Records that the namespace `id` is called `name`.
@@ -3125,6 +3159,22 @@ impl Schema {
         automatic_indices: HashMap<String, Vec<(String, i64)>>,
         mvcc_enabled: bool,
     ) -> Result<()> {
+        if !self.namespace_names_loaded && !materialized_view_info.is_empty() {
+            // A view body names tables by their namespace, so the views wait
+            // for the names of the namespaces. No index is on a view: CREATE
+            // INDEX refuses views.
+            let pending = self
+                .pending_materialized_views
+                .get_or_insert_with(PendingMaterializedViews::default);
+            pending
+                .materialized_view_info
+                .extend(materialized_view_info);
+            pending.dbsp_state_roots.extend(dbsp_state_roots);
+            pending
+                .dbsp_state_index_roots
+                .extend(dbsp_state_index_roots);
+            return self.populate_indices(syms, from_sql_indexes, automatic_indices, mvcc_enabled);
+        }
         self.populate_materialized_views(
             materialized_view_info,
             dbsp_state_roots,
@@ -4041,6 +4091,8 @@ impl TryClone for Schema {
             schema_version: self.schema_version,
             analyze_stats: self.analyze_stats.clone(),
             supports_namespaces: self.supports_namespaces,
+            namespace_names_loaded: self.namespace_names_loaded,
+            pending_materialized_views: self.pending_materialized_views.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
         })

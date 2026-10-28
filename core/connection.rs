@@ -1532,6 +1532,7 @@ impl Connection {
                             rows: Vec::new(),
                         };
                     } else {
+                        inner.fresh.load_namespace_names(&[])?;
                         inner.phase = ReparsePhase::populate_sequences();
                     }
                 }

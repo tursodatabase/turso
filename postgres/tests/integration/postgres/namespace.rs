@@ -278,3 +278,63 @@ fn pragma_table_info_finds_a_view_of_a_namespace_through_the_search_path(db: Tem
         vec![vec![Value::build_text("x")], vec![Value::build_text("y")]]
     );
 }
+
+/// Opens `path` with the PostgreSQL dialect and without MVCC, which tursopg
+/// always turns on but which refuses materialized views.
+fn open_without_mvcc(path: &Path) -> Arc<Connection> {
+    let db = turso_core::Database::open(
+        Arc::new(turso_core::PlatformIO::new().unwrap()),
+        path.to_str().unwrap(),
+        turso_core::OpenOptions::new(Arc::new(turso_pg::PostgresDialect))
+            .db_opts(turso_core::DatabaseOpts::new().with_views(true)),
+    )
+    .unwrap();
+    db.connect(turso_core::ConnectOpts::new()).unwrap()
+}
+
+#[test]
+fn a_materialized_view_of_a_namespace_is_maintained_and_survives_reopening() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("main.db");
+    let conn = open_without_mvcc(&path);
+    conn.create_namespace("public").unwrap();
+    conn.create_namespace("app").unwrap();
+    conn.execute("CREATE TABLE public.t(x INTEGER); CREATE TABLE app.t(x INTEGER)")
+        .unwrap();
+    conn.execute("CREATE MATERIALIZED VIEW public.mv AS SELECT count(*) AS n FROM public.t")
+        .unwrap();
+    conn.execute("CREATE MATERIALIZED VIEW app.mv AS SELECT count(*) AS n FROM app.t")
+        .unwrap();
+    conn.execute("INSERT INTO public.t VALUES(1)").unwrap();
+    conn.execute("INSERT INTO app.t VALUES(1), (2)").unwrap();
+    assert_eq!(query_i64(&conn, "SELECT n FROM public.mv"), 1);
+    assert_eq!(query_i64(&conn, "SELECT n FROM app.mv"), 2);
+    // Each view has its own state tables, named after its mangled name.
+    assert_eq!(
+        query_i64(
+            &conn,
+            "SELECT count(*) FROM sqlite_schema WHERE name LIKE '__turso_internal_dbsp%__turso_ns2_mv%'"
+        ),
+        query_i64(
+            &conn,
+            "SELECT count(*) FROM sqlite_schema WHERE name LIKE '__turso_internal_dbsp%__turso_ns1_mv%'"
+        )
+    );
+    drop(conn);
+
+    let conn = open_without_mvcc(&path);
+    conn.execute("INSERT INTO app.t VALUES(3)").unwrap();
+    assert_eq!(query_i64(&conn, "SELECT n FROM app.mv"), 3);
+    assert_eq!(query_i64(&conn, "SELECT n FROM public.mv"), 1);
+    conn.execute("DROP MATERIALIZED VIEW app.mv").unwrap();
+    assert!(conn.prepare("SELECT n FROM app.mv").is_err());
+    assert_eq!(
+        query_i64(
+            &conn,
+            "SELECT count(*) FROM sqlite_schema WHERE name LIKE '%__turso_ns2_mv%'"
+        ),
+        0
+    );
+    assert_eq!(query_i64(&conn, "SELECT count(*) FROM app.t"), 3);
+    assert_eq!(query_i64(&conn, "SELECT n FROM public.mv"), 1);
+}
