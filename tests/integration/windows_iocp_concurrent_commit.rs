@@ -148,7 +148,7 @@ fn assert_concurrent_commits_succeed(shape: Shape) -> anyhow::Result<()> {
         &errors[..errors.len().min(5)],
     );
 
-    let db = open(&path, encrypted)?;
+    let db = open(&path, shape)?;
     let conn = connect(&db, encrypted)?;
     let rows = row_count(&conn)?;
     anyhow::ensure!(
