@@ -161,7 +161,10 @@ fn translate_expr_by_kind(
             translate_binary_expr(program, referenced_tables, expr, target_register, resolver)
         }
         ast::Expr::Case { .. } => {
-            translate_case_expr(program, referenced_tables, expr, target_register, resolver)
+            let reg =
+                translate_case_expr(program, referenced_tables, expr, target_register, resolver)?;
+            set_leftmost_collate(program, expr, resolver)?;
+            Ok(reg)
         }
         ast::Expr::Cast { .. } => {
             translate_cast_expr(program, referenced_tables, expr, target_register, resolver)
@@ -178,13 +181,17 @@ fn translate_expr_by_kind(
         ast::Expr::MergedColumn(_) => {
             translate_merged_column(program, referenced_tables, expr, target_register, resolver)
         }
-        ast::Expr::FunctionCall { .. } => translate_function_call_expr(
-            program,
-            referenced_tables,
-            expr,
-            target_register,
-            resolver,
-        ),
+        ast::Expr::FunctionCall { .. } => {
+            let reg = translate_function_call_expr(
+                program,
+                referenced_tables,
+                expr,
+                target_register,
+                resolver,
+            )?;
+            set_leftmost_collate(program, expr, resolver)?;
+            Ok(reg)
+        }
         ast::Expr::FunctionCallStar { .. } => translate_function_call_star_expr(
             program,
             referenced_tables,
@@ -255,6 +262,58 @@ fn translate_expr_by_kind(
             unreachable!("Array and Subscript are desugared into function calls by the parser")
         }
     }
+}
+
+/// SQLite gives an expression the leftmost COLLATE among its parts, so
+/// `coalesce(a COLLATE NOCASE, b COLLATE RTRIM)` compares as NOCASE. Each part
+/// sets its collation in the program builder when it is translated, so without
+/// this the last part sets the collation of a function call or a CASE.
+#[inline(never)]
+pub(super) fn set_leftmost_collate(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    resolver: &Resolver,
+) -> Result<()> {
+    if let Some(name) = leftmost_collate(expr) {
+        let collation = resolver.resolve_collation(name.as_str())?;
+        program.set_collation(Some((collation, true)));
+    }
+    Ok(())
+}
+
+/// The leftmost COLLATE among the parts of an expression, in the order of the
+/// SQLite parse tree:
+/// - The parts of a function call are its arguments. A COLLATE in its ORDER BY,
+///   WITHIN GROUP, FILTER or OVER clause does not count, so
+///   `max(a) FILTER (WHERE b COLLATE NOCASE = 'x')` has no COLLATE.
+/// - SQLite parses `x LIKE y ESCAPE z` as `like(y, x, z)`, so the pattern comes
+///   before the string.
+fn leftmost_collate(expr: &ast::Expr) -> Option<&ast::Name> {
+    let mut leftmost = None;
+    walk_expr(expr, &mut |part| {
+        if leftmost.is_some() {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match part {
+            ast::Expr::Collate(_, name) => leftmost = Some(name),
+            ast::Expr::FunctionCall { args, .. } => {
+                leftmost = args.iter().find_map(|arg| leftmost_collate(arg));
+            }
+            ast::Expr::FunctionCallStar { .. } => {}
+            ast::Expr::Like {
+                lhs, rhs, escape, ..
+            } => {
+                leftmost = [Some(rhs), Some(lhs), escape.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|operand| leftmost_collate(operand));
+            }
+            _ => return Ok(WalkControl::Continue),
+        }
+        Ok(WalkControl::SkipChildren)
+    })
+    .expect("walking an expression cannot fail");
+    leftmost
 }
 
 #[inline(never)]

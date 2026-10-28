@@ -263,6 +263,11 @@ macro_rules! translate_fixed_insn {
 /// expression is computed for that row instead, as in SQLite: an expression
 /// over NULL inputs does not always produce NULL.
 ///
+/// A comparison takes the collation of its operands from the program builder.
+/// Translation of the expression sets its COLLATE there, so a read from the
+/// index sets it too. A read of an expression without a COLLATE does not
+/// change the collation.
+///
 /// We mut do this check early in translate_expr so downstream translation does
 /// not build redundant bytecode.
 pub(super) fn try_emit_expression_index_value(
@@ -295,6 +300,7 @@ pub(super) fn try_emit_expression_index_value(
     };
     if !referenced_tables.index_cursor_may_be_null_row(table.internal_id) {
         program.emit_column_or_rowid(index_cursor, expression_position, target_register);
+        set_leftmost_collate(program, expr, resolver)?;
         return Ok(true);
     }
 

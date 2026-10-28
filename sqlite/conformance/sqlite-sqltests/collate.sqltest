@@ -1704,3 +1704,317 @@ test compound-chain-leftmost-collation {
 expect {
     0
 }
+
+# A value read from an expression index has the collation of its expression.
+# '[O' and '[Z' come after '[m' with NOCASE, but before it with BINARY.
+setup expression_index_nocase {
+    CREATE TABLE expr_nocase(id INTEGER PRIMARY KEY, a TEXT);
+    INSERT INTO expr_nocase VALUES (1, '[m'), (2, '[O'), (3, '[Z'), (4, '[a');
+    CREATE INDEX expr_nocase_a ON expr_nocase((a || '') COLLATE NOCASE);
+}
+
+# The index seek uses one of the two bounds. The other bound is compared with
+# the value from the index. (#9484)
+@setup expression_index_nocase
+test expression-index-value-keeps-collate-in-where {
+    SELECT id FROM expr_nocase
+    WHERE (a || '') COLLATE NOCASE >= '[m' AND (a || '') COLLATE NOCASE > '[m'
+    ORDER BY (a || '') COLLATE NOCASE;
+}
+expect {
+    2
+    3
+}
+
+@setup expression_index_nocase
+test expression-index-value-keeps-collate-in-keyset-pagination {
+    SELECT id FROM expr_nocase
+    WHERE (a || '') COLLATE NOCASE >= '[m'
+      AND ((a || '') COLLATE NOCASE > '[m' OR id < 1)
+    ORDER BY (a || '') COLLATE NOCASE, id;
+}
+expect {
+    2
+    3
+}
+
+@setup expression_index_nocase
+test expression-index-value-keeps-collate-in-not-equal-keyset-pagination {
+    SELECT id FROM expr_nocase
+    WHERE (a || '') COLLATE NOCASE >= '[o'
+      AND NOT ((a || '') COLLATE NOCASE = '[o' AND id >= 2)
+    ORDER BY (a || '') COLLATE NOCASE, id;
+}
+expect {
+    3
+}
+
+@setup expression_index_nocase
+test expression-index-value-keeps-collate-in-result-columns {
+    SELECT id,
+        (a || '') COLLATE NOCASE > '[m',
+        '[m' < (a || '') COLLATE NOCASE,
+        (a || '') COLLATE NOCASE BETWEEN '[n' AND '[z',
+        CASE (a || '') COLLATE NOCASE WHEN '[o' THEN 'o' ELSE '-' END
+    FROM expr_nocase INDEXED BY expr_nocase_a
+    ORDER BY (a || '') COLLATE NOCASE;
+}
+expect {
+    4|0|0|0|-
+    1|0|0|0|-
+    2|1|1|1|o
+    3|1|1|1|-
+}
+
+@setup expression_index_nocase
+@cross-check-integrity
+test expression-index-value-keeps-collate-in-delete {
+    DELETE FROM expr_nocase
+    WHERE (a || '') COLLATE NOCASE >= '[m' AND (a || '') COLLATE NOCASE > '[m';
+    SELECT id FROM expr_nocase ORDER BY id;
+}
+expect {
+    1
+    4
+}
+
+# Inside a larger expression, SQLite uses the leftmost COLLATE. A value read
+# from an index must compare the same way as the computed value.
+setup expression_index_nested {
+    CREATE TABLE expr_nested(a TEXT, b TEXT);
+    INSERT INTO expr_nested VALUES (NULL, 'ABC'), ('abc', 'ABC');
+    CREATE INDEX expr_nested_rtrim ON expr_nested((b || '') COLLATE RTRIM);
+    CREATE INDEX expr_nested_lower ON expr_nested(lower(b));
+}
+
+@setup expression_index_nested
+test expression-index-value-collate-goes-through-function {
+    SELECT coalesce(a, (b || '') COLLATE RTRIM) = 'ABC  '
+    FROM expr_nested INDEXED BY expr_nested_rtrim ORDER BY rowid;
+}
+expect {
+    1
+    0
+}
+
+@setup expression_index_nested
+test expression-index-value-in-function-uses-leftmost-collate {
+    SELECT coalesce(a COLLATE NOCASE, (b || '') COLLATE RTRIM) = 'abc'
+    FROM expr_nested INDEXED BY expr_nested_rtrim ORDER BY rowid;
+    SELECT coalesce(a COLLATE NOCASE, (b || '') COLLATE RTRIM) = 'abc'
+    FROM expr_nested NOT INDEXED ORDER BY rowid;
+    SELECT coalesce(a COLLATE NOCASE, lower(b)) = 'ABC'
+    FROM expr_nested INDEXED BY expr_nested_lower ORDER BY rowid;
+}
+expect {
+    1
+    1
+    1
+    1
+    1
+    1
+}
+
+# The COLLATE of the value replaces the collation that an earlier result
+# column left behind.
+@setup expression_index_nested
+test expression-index-value-collate-after-other-result-column {
+    SELECT a COLLATE BINARY, CASE (b || '') COLLATE RTRIM WHEN 'ABC ' THEN 1 ELSE 0 END
+    FROM expr_nested INDEXED BY expr_nested_rtrim ORDER BY rowid;
+}
+expect {
+    |1
+    abc|1
+}
+
+# A function call or a CASE uses the leftmost COLLATE among its parts, also
+# when a later part has another COLLATE or is a column.
+test function-uses-leftmost-collate {
+    CREATE TABLE leftmost_func(a TEXT, b TEXT);
+    INSERT INTO leftmost_func VALUES (NULL, 'ABC'), ('abc', 'ABC');
+    SELECT coalesce(a COLLATE NOCASE, b COLLATE RTRIM) = 'abc',
+        ifnull(a COLLATE NOCASE, b) = 'abc',
+        iif(a IS NULL, b COLLATE NOCASE, a) = 'abc'
+    FROM leftmost_func ORDER BY rowid;
+}
+expect {
+    1|1|1
+    1|1|1
+}
+
+test case-uses-leftmost-collate {
+    CREATE TABLE leftmost_case(a TEXT);
+    INSERT INTO leftmost_case VALUES ('[m'), ('[O'), ('[Z');
+    SELECT CASE WHEN 1 THEN a COLLATE NOCASE ELSE a COLLATE BINARY END > '[m',
+        CASE WHEN 0 THEN a ELSE a COLLATE NOCASE END > '[m'
+    FROM leftmost_case ORDER BY rowid;
+}
+expect {
+    0|0
+    1|1
+    1|1
+}
+
+# The parts of an aggregate are its arguments. A COLLATE in its FILTER or
+# ORDER BY clause does not give a collation to a function or a CASE around it.
+test collate-in-aggregate-filter-or-order-by-does-not-count {
+    CREATE TABLE agg_filter(a TEXT, b TEXT);
+    INSERT INTO agg_filter VALUES ('abc', 'x'), ('abd', 'y');
+    SELECT coalesce(max(a) FILTER (WHERE b COLLATE NOCASE = 'X'), 'q') = 'ABC',
+        coalesce(group_concat(a, ',' ORDER BY b COLLATE NOCASE), 'q') = 'ABC,ABD',
+        CASE WHEN count(*) FILTER (WHERE b COLLATE NOCASE = 'X') > 0 THEN max(a) END = 'ABD',
+        upper(max(a) FILTER (WHERE b COLLATE NOCASE = 'X')) = 'abc',
+        coalesce(max(a COLLATE NOCASE) FILTER (WHERE b COLLATE RTRIM = 'x'), 'q') = 'ABC'
+    FROM agg_filter;
+}
+expect {
+    0|0|0|0|1
+}
+
+test collate-in-aggregate-filter-does-not-count-in-having {
+    CREATE TABLE having_filter(a TEXT, b TEXT);
+    INSERT INTO having_filter VALUES ('abc', 'x'), ('abd', 'y');
+    SELECT b FROM having_filter GROUP BY b
+    HAVING coalesce(max(a) FILTER (WHERE b COLLATE NOCASE = 'X'), 'q') <> 'ABC'
+    ORDER BY b;
+}
+expect {
+    x
+    y
+}
+
+# SQLite parses `x LIKE y` as `like(y, x)`, so the COLLATE of the pattern comes
+# before the COLLATE of the string.
+test like-pattern-collate-comes-before-string-collate {
+    CREATE TABLE like_order(a TEXT, b TEXT);
+    INSERT INTO like_order VALUES (NULL, 'abc');
+    SELECT coalesce(a COLLATE NOCASE LIKE b COLLATE RTRIM, 'q') = 'Q',
+        coalesce(a COLLATE RTRIM LIKE b COLLATE NOCASE, 'q') = 'Q',
+        coalesce(a COLLATE NOCASE GLOB b COLLATE RTRIM, 'q') = 'Q'
+    FROM like_order;
+}
+expect {
+    0|1|0
+}
+
+# A function hides the column, so the value has no collation. The comparison
+# uses the collation of the other operand.
+test expression-index-value-of-function-uses-collation-of-other-operand {
+    CREATE TABLE expr_trim(x TEXT COLLATE NOCASE, y TEXT);
+    INSERT INTO expr_trim VALUES ('alpha', 'ALPHA'), ('bravo', 'charlie');
+    CREATE INDEX expr_trim_y ON expr_trim(trim(y));
+    SELECT x FROM expr_trim INDEXED BY expr_trim_y WHERE trim(y) = x;
+}
+expect {
+    alpha
+}
+
+# The NOCASE of a does not go through lower(a), so the comparison is BINARY.
+test expression-index-value-of-function-has-no-collation {
+    CREATE TABLE expr_lower(a TEXT COLLATE NOCASE);
+    INSERT INTO expr_lower VALUES ('A'), ('a'), ('b');
+    CREATE INDEX expr_lower_a ON expr_lower(lower(a));
+    SELECT a, lower(a) = 'A' FROM expr_lower INDEXED BY expr_lower_a ORDER BY lower(a), rowid;
+}
+expect {
+    A|0
+    a|0
+    b|0
+}
+
+# +y has the collation of y, but the NOCASE of y does not go through coalesce().
+test expression-index-value-of-unary-plus-in-function-has-no-collation {
+    CREATE TABLE expr_plus(y TEXT COLLATE NOCASE);
+    INSERT INTO expr_plus VALUES ('y');
+    CREATE INDEX expr_plus_y ON expr_plus(+y);
+    SELECT coalesce(+y, 'x') = 'Y' FROM expr_plus INDEXED BY expr_plus_y;
+}
+expect {
+    0
+}
+
+# For the NULL row of an outer join, the expression is computed instead of read
+# from the index. The comparison has one collation for the two cases.
+setup expression_index_outer_join {
+    CREATE TABLE expr_left(id INTEGER PRIMARY KEY, x TEXT COLLATE NOCASE);
+    CREATE TABLE expr_right(id INTEGER PRIMARY KEY, y TEXT);
+    CREATE INDEX expr_right_collate ON expr_right(id, (y || '') COLLATE NOCASE);
+    INSERT INTO expr_left VALUES (1, 'alpha'), (2, 'bravo'), (3, 'x'), (4, NULL);
+    INSERT INTO expr_right VALUES (1, 'ALPHA'), (2, 'charlie'), (4, 'ALPHA');
+}
+
+@setup expression_index_outer_join
+test expression-index-value-in-outer-join-keeps-collate {
+    SELECT l.id, (r.y || '') COLLATE NOCASE = 'alpha'
+    FROM expr_left l LEFT JOIN expr_right r INDEXED BY expr_right_collate ON r.id = l.id
+    ORDER BY l.id;
+}
+expect {
+    1|1
+    2|0
+    3|
+    4|1
+}
+
+@setup expression_index_outer_join
+test expression-index-value-in-outer-join-uses-leftmost-collate {
+    SELECT l.id, coalesce(l.x COLLATE BINARY, (r.y || '') COLLATE NOCASE) = 'alpha'
+    FROM expr_left l LEFT JOIN expr_right r INDEXED BY expr_right_collate ON r.id = l.id
+    ORDER BY l.id;
+}
+expect {
+    1|1
+    2|0
+    3|0
+    4|0
+}
+
+# An expression index orders its keys with the COLLATE at the top of the
+# indexed expression, or BINARY without one. A comparison with another
+# collation cannot use the index to seek.
+test expression-index-seek-needs-the-index-collation {
+    CREATE TABLE seek_lower(a TEXT, c INTEGER);
+    INSERT INTO seek_lower VALUES ('A', 1), ('a', 2), ('b', 3);
+    CREATE INDEX seek_lower_a ON seek_lower(lower(a));
+    SELECT c FROM seek_lower WHERE lower(a) = 'A' COLLATE NOCASE ORDER BY c;
+    SELECT c FROM seek_lower WHERE lower(a) > 'A' COLLATE NOCASE ORDER BY c;
+    DELETE FROM seek_lower WHERE lower(a) > 'A' COLLATE NOCASE;
+    SELECT c FROM seek_lower ORDER BY c;
+}
+expect {
+    1
+    2
+    3
+    1
+    2
+}
+
+# The NOCASE index cannot seek for the BINARY comparison. Another comparison
+# reads the value from the index, so it must not stand in for the BINARY one.
+test expression-index-seek-skips-comparison-with-other-collation {
+    CREATE TABLE seek_nocase(id INTEGER PRIMARY KEY, a TEXT);
+    INSERT INTO seek_nocase VALUES (1, '[m'), (2, '[O'), (3, '[Z');
+    CREATE INDEX seek_nocase_a ON seek_nocase((a || '') COLLATE NOCASE);
+    SELECT count(*) FROM seek_nocase WHERE '[m' COLLATE BINARY < (a || '') COLLATE NOCASE;
+    SELECT count(*) FROM seek_nocase
+    WHERE (a || '') COLLATE NOCASE >= '[m' AND '[m' COLLATE BINARY < (a || '') COLLATE NOCASE;
+    SELECT id FROM seek_nocase WHERE (a || '') COLLATE NOCASE > '[m' ORDER BY id;
+}
+expect {
+    0
+    0
+    2
+    3
+}
+
+# An index on +a has no COLLATE, so it is BINARY, but +a > '[m' compares
+# with the NOCASE of a.
+test expression-index-without-collate-cannot-seek-for-nocase-column {
+    CREATE TABLE seek_plus(id INTEGER PRIMARY KEY, a TEXT COLLATE NOCASE);
+    INSERT INTO seek_plus VALUES (1, '[m'), (2, '[O'), (3, '[Z'), (4, '[a');
+    CREATE INDEX seek_plus_a ON seek_plus(+a);
+    SELECT count(*) FROM seek_plus WHERE +a > '[m';
+}
+expect {
+    2
+}
