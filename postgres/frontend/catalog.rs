@@ -18,6 +18,7 @@ pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_nam
 
 /// PostgreSQL uses OID zero when no object is referenced.
 const PG_INVALID_OID: i64 = 0;
+pub(crate) const PG_DATABASE_OWNER_OID: i64 = 6171;
 /// pg_depend uses column zero for a whole object; table columns are numbered from one.
 const WHOLE_OBJECT_COLUMN_NUMBER: i64 = 0;
 /// Catalog BOOLEAN values are stored as integers; one means true.
@@ -517,11 +518,21 @@ impl SnapshotRows for PgNamespaceTable {
         let mut rows: Vec<_> = BUILTIN_SCHEMAS
             .iter()
             .map(|(oid, name)| {
+                let (owner, acl) = if *name == "public" {
+                    (
+                        PG_DATABASE_OWNER_OID,
+                        Value::build_text(
+                            "{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}",
+                        ),
+                    )
+                } else {
+                    (10, Value::Null)
+                };
                 vec![
                     Value::from_i64(*oid),
                     Value::Text((*name).into()),
-                    Value::from_i64(10), // nspowner (bootstrap superuser)
-                    Value::Null,         // nspacl
+                    Value::from_i64(owner),
+                    acl,
                 ]
             })
             .collect();
@@ -539,6 +550,25 @@ impl SnapshotRows for PgNamespaceTable {
             oid += 1;
         }
         rows
+    }
+}
+
+#[derive(Debug)]
+struct PgDescriptionTable;
+
+impl SnapshotRows for PgDescriptionTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_description (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)";
+    const TABLE_OID: Option<i64> = None;
+    const ESTIMATED_COST: f64 = 1.0;
+    const ESTIMATED_ROWS: u32 = 1;
+
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        vec![vec![
+            Value::from_i64(2200),
+            Value::from_i64(PgNamespaceTable::TABLE_OID.unwrap()),
+            Value::from_i64(0),
+            Value::build_text("standard public schema"),
+        ]]
     }
 }
 
@@ -652,8 +682,13 @@ impl SnapshotRows for PgAttributeTable {
                     Some(td) if !td.is_builtin => user_type_oid(&td.name),
                     _ => sqlite_type_to_pg_oid(&col.ty_str),
                 };
+                let storage = if col.is_array() {
+                    "x"
+                } else {
+                    type_storage(&schema, &col.ty_str)
+                };
                 let attnum = (i + 1) as i64; // 1-based
-                let notnull = if col.notnull() { 1i64 } else { 0i64 };
+                let notnull = i64::from(col.notnull());
                 let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
 
                 rows.push(vec![
@@ -667,7 +702,7 @@ impl SnapshotRows for PgAttributeTable {
                     Value::from_i64(-1),          // attcacheoff
                     Value::from_i64(-1),          // atttypmod
                     Value::from_i64(1),           // attbyval
-                    Value::Text("p".into()),      // attstorage (plain)
+                    Value::build_text(storage),   // attstorage
                     Value::Text("i".into()),      // attalign (int)
                     Value::Text("".into()),
                     Value::from_i64(notnull), // attnotnull
@@ -692,7 +727,7 @@ impl SnapshotRows for PgAttributeTable {
 }
 
 /// Virtual table implementation for pg_catalog.pg_roles
-/// Stub: returns a single hardcoded "turso" superuser role.
+/// Stub: returns the "turso" superuser and the built-in database owner role.
 /// TODO: replace with real role data when authentication is implemented.
 #[derive(Debug)]
 struct PgRolesTable;
@@ -715,26 +750,41 @@ impl SnapshotRows for PgRolesTable {
         )";
     const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 10.0;
-    const ESTIMATED_ROWS: u32 = 1;
+    const ESTIMATED_ROWS: u32 = 2;
 
-    /// Stub: returns a single default superuser role.
-    /// Replace this method with real role lookup when auth is implemented.
     fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        vec![vec![
-            Value::from_i64(10),        // oid
-            Value::build_text("turso"), // rolname
-            Value::from_i64(1),         // rolsuper
-            Value::from_i64(1),         // rolinherit
-            Value::from_i64(1),         // rolcreaterole
-            Value::from_i64(1),         // rolcreatedb
-            Value::from_i64(1),         // rolcanlogin
-            Value::from_i64(1),         // rolreplication
-            Value::from_i64(-1),        // rolconnlimit (-1 = no limit)
-            Value::Null,                // rolpassword (never exposed)
-            Value::Null,                // rolvaliduntil
-            Value::from_i64(1),         // rolbypassrls
-            Value::Null,                // rolconfig
-        ]]
+        vec![
+            vec![
+                Value::from_i64(10),        // oid
+                Value::build_text("turso"), // rolname
+                Value::from_i64(1),         // rolsuper
+                Value::from_i64(1),         // rolinherit
+                Value::from_i64(1),         // rolcreaterole
+                Value::from_i64(1),         // rolcreatedb
+                Value::from_i64(1),         // rolcanlogin
+                Value::from_i64(1),         // rolreplication
+                Value::from_i64(-1),        // rolconnlimit (-1 = no limit)
+                Value::Null,                // rolpassword (never exposed)
+                Value::Null,                // rolvaliduntil
+                Value::from_i64(1),         // rolbypassrls
+                Value::Null,                // rolconfig
+            ],
+            vec![
+                Value::from_i64(PG_DATABASE_OWNER_OID),
+                Value::build_text("pg_database_owner"),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(-1),
+                Value::Null,
+                Value::Null,
+                Value::from_i64(0),
+                Value::Null,
+            ],
+        ]
     }
 }
 
@@ -1471,6 +1521,7 @@ impl SnapshotRows for PgTypeTable {
                 ("e", "E", 0)
             };
             let oid = user_type_oid(&td.name);
+            let storage = type_storage(&schema, &td.name);
             rows.push(vec![
                 Value::from_i64(oid),             // oid
                 Value::Text(name.clone().into()), // typname
@@ -1495,7 +1546,7 @@ impl SnapshotRows for PgTypeTable {
                 Value::Null,                      // typmodout
                 Value::Null,                      // typanalyze
                 Value::build_text("i"),           // typalign
-                Value::build_text("p"),           // typstorage
+                Value::build_text(storage),       // typstorage
                 Value::from_i64(0),               // typnotnull
                 Value::from_i64(typbasetype),     // typbasetype
                 Value::from_i64(-1),              // typtypmod
@@ -1517,6 +1568,24 @@ fn user_type_oid(name: &str) -> i64 {
             .iter()
             .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64))
             % 10000) as i64
+}
+
+fn type_storage<'a>(schema: &'a Schema, mut name: &'a str) -> &'static str {
+    while let Some(ty) = schema.get_type_def_unchecked(name) {
+        if ty.is_builtin {
+            break;
+        }
+        if !ty.is_domain {
+            return "p";
+        }
+        name = ty.base();
+    }
+    let oid = sqlite_type_to_pg_oid(name);
+    PG_BASE_TYPES
+        .iter()
+        .find(|ty| ty.oid == oid)
+        .expect("column type OIDs refer to PostgreSQL base types")
+        .typstorage
 }
 
 fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
@@ -2284,7 +2353,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_description",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_description (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)".to_string() },
+        SnapshotCatalog::<PgDescriptionTable>(PhantomData),
     );
     options = options.native_module(
         "pg_seclabels",
