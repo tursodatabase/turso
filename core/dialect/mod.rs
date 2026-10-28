@@ -194,6 +194,17 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a database of this dialect supports namespaces: the objects of
+    /// a namespace are kept in the schema rows of the main database
+    /// under names that encode the namespace's id, which the loader decodes
+    /// and which no user object may be named.
+    ///
+    /// PostgreSQL stores its schemas this way. SQLite has no namespaces, so
+    /// a name that looks like a mangled name is an ordinary name.
+    fn supports_namespaces(&self) -> bool {
+        false
+    }
+
     /// Whether `INSERT ... ON CONFLICT DO UPDATE` fails when the conflicting
     /// row was already inserted or updated by the same statement.
     ///

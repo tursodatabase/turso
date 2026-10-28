@@ -868,6 +868,18 @@ impl ToTokens for Stmt {
                 seq_name.to_tokens(s, context)?;
                 Ok(())
             }
+            Self::CreateSchema { name, id: _ } => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_ID, Some("SCHEMA"))?;
+                name.to_tokens(s, context)?;
+                Ok(())
+            }
+            Self::DropSchema { name } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_ID, Some("SCHEMA"))?;
+                name.to_tokens(s, context)?;
+                Ok(())
+            }
             Self::DropDomain {
                 if_exists,
                 domain_name,

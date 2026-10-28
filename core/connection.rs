@@ -3,7 +3,7 @@ use crate::connection_hooks::{ConnectionHooks, SavepointMemo};
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
-use crate::namespace::{Namespace, NamespaceId, NamespaceRef};
+use crate::namespace::{Namespace, NamespaceId, NamespaceRef, Namespaces};
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
@@ -3211,7 +3211,7 @@ impl Connection {
 
     /// Get the database id for a schema name ("main", "temp", or an attached db alias).
     pub(crate) fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
-        self.namespaces
+        self.current_qualifiers()
             .database_id(&crate::util::normalize_ident(name))
             .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {name}")))
     }
@@ -3337,8 +3337,18 @@ impl Connection {
         &self.attached_databases
     }
 
-    pub(crate) fn namespaces(&self) -> &crate::Namespaces {
-        &self.namespaces
+    /// The qualifiers the connection accepts, as of the schema it has: its
+    /// databases and the namespaces of its main database.
+    pub(crate) fn current_qualifiers(&self) -> Namespaces {
+        self.maybe_update_schema();
+        let schema = self.schema.read().clone();
+        self.qualifiers(&schema)
+    }
+
+    /// The qualifiers the connection accepts as of `schema`, the main
+    /// database's schema: its databases and the namespaces of `schema`.
+    pub(crate) fn qualifiers(&self, schema: &Schema) -> Namespaces {
+        self.namespaces.with_namespaces(schema.namespaces())
     }
 
     /// Adds `namespace` under its name, so that `name.t` names its objects.
@@ -3354,11 +3364,61 @@ impl Connection {
         database_id
     }
 
+    /// Creates namespace `name` in the main database, as DDL of the
+    /// connection's transaction, and returns it. The schema keeps the
+    /// objects of the namespace under its id, so `name` can be anything
+    /// that no namespace is called yet.
+    pub fn create_namespace(self: &Arc<Self>, name: &str) -> Result<Namespace> {
+        let statement = turso_parser::ast::Stmt::CreateSchema {
+            name: turso_parser::ast::Name::exact(name.to_string()),
+            id: None,
+        };
+        let sql = statement.to_string();
+        self.prepare_translated_stmt(statement, &sql)?
+            .run_ignore_rows()?;
+        let namespace = self
+            .current_qualifiers()
+            .get(name)
+            .expect("CREATE SCHEMA added the namespace");
+        Ok(namespace)
+    }
+
+    /// Drops namespace `name` from the main database, as DDL of the
+    /// connection's transaction. Its objects stay stored under its id, so
+    /// the caller drops them first.
+    pub fn drop_namespace(self: &Arc<Self>, name: &str) -> Result<()> {
+        if self
+            .current_qualifiers()
+            .get(name)
+            .is_none_or(|namespace| namespace.is_database())
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                "no such namespace: {name}"
+            )));
+        }
+        let statement = turso_parser::ast::Stmt::DropSchema {
+            name: turso_parser::ast::Name::exact(name.to_string()),
+        };
+        let sql = statement.to_string();
+        self.prepare_translated_stmt(statement, &sql)?
+            .run_ignore_rows()
+    }
+
     /// The name of the namespace that is the whole of database `database_id`.
     pub fn namespace_name(&self, database_id: usize) -> Option<String> {
         self.namespaces
             .of_database(database_id)
             .map(|namespace| namespace.name)
+    }
+
+    /// The namespace called `name`. `name` is normalized.
+    pub fn namespace(&self, name: &str) -> Option<Namespace> {
+        self.current_qualifiers().get(name)
+    }
+
+    /// The namespaces other than main and temp.
+    pub fn other_namespaces(&self) -> Vec<Namespace> {
+        self.current_qualifiers().others()
     }
 
     /// Sets the namespace names that a name without a namespace is looked
@@ -3380,7 +3440,7 @@ impl Connection {
     /// order. The first one is where CREATE puts an object whose name has
     /// no namespace.
     pub fn search_order(&self) -> Vec<Namespace> {
-        self.namespaces
+        self.current_qualifiers()
             .search_order(self.search_path.read().as_deref())
     }
 
@@ -3619,7 +3679,7 @@ impl Connection {
         };
         if let Some((namespace, seq)) = name.split_once('.') {
             let namespace = self
-                .namespaces
+                .current_qualifiers()
                 .get(&crate::util::normalize_ident(namespace))
                 .ok_or_else(|| not_found(name))?;
             let seq_name = crate::util::normalize_ident(seq);
@@ -5146,6 +5206,151 @@ mod tests {
 
     fn open_connection(path: &std::path::Path) -> Arc<Connection> {
         open_connection_with_opts(path, DatabaseOpts::new())
+    }
+
+    /// Opens `path` with a dialect that supports namespaces, as the
+    /// PostgreSQL frontend does; the SQLite dialect never does.
+    fn open_connection_storing_namespaces(path: &std::path::Path) -> Arc<Connection> {
+        open_connection_with_dialect(path, DatabaseOpts::new(), Arc::new(StoringDialect))
+    }
+
+    fn open_connection_with_dialect(
+        path: &std::path::Path,
+        opts: DatabaseOpts,
+        dialect: Arc<dyn crate::Dialect>,
+    ) -> Arc<Connection> {
+        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            OpenFlags::default(),
+            opts,
+            None,
+            dialect,
+        )
+        .unwrap();
+        db.connect(ConnectOpts::new()).unwrap()
+    }
+
+    /// The SQLite dialect with namespaces stored in the main database.
+    struct StoringDialect;
+
+    impl crate::Dialect for StoringDialect {
+        fn name(&self) -> &'static str {
+            "storing"
+        }
+
+        fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            SqliteDialect.parse(sql)
+        }
+
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<crate::schema::BTreeTable> {
+            SqliteDialect.parse_table_sql(sql, root_page)
+        }
+
+        fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_parser::ast::Stmt> {
+            SqliteDialect.parse_table_sql_ast(sql)
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
+            SqliteDialect.table_sql_for_replay(sql)
+        }
+
+        fn format_table_sql(
+            &self,
+            input: &str,
+            tbl_name: &turso_parser::ast::QualifiedName,
+            body: &turso_parser::ast::CreateTableBody,
+        ) -> Result<String> {
+            SqliteDialect.format_table_sql(input, tbl_name, body)
+        }
+
+        fn register_catalog(
+            &self,
+            schema: &mut crate::schema::Schema,
+            enable_custom_types: bool,
+        ) -> Result<()> {
+            SqliteDialect.register_catalog(schema, enable_custom_types)
+        }
+
+        fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<crate::Func>> {
+            SqliteDialect.resolve_function(name, arg_count)
+        }
+
+        fn supports_namespaces(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_create_schema_is_part_of_its_transaction_and_seen_by_other_connections() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("main.db");
+        let conn = open_connection_storing_namespaces(&path);
+        let other = conn.db.connect(ConnectOpts::new()).unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        conn.create_namespace("app").unwrap();
+        assert!(conn.namespace("app").is_some());
+        assert_eq!(other.namespace("app"), None);
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(conn.namespace("app"), None);
+
+        conn.create_namespace("app").unwrap();
+        assert_eq!(
+            other.namespace("app"),
+            Some(Namespace::in_main("app", NamespaceId::new(1)))
+        );
+        assert!(conn.create_namespace("app").is_err());
+
+        drop(other);
+        drop(conn);
+        let reopened = open_connection_storing_namespaces(&path);
+        assert_eq!(
+            reopened.namespace("app"),
+            Some(Namespace::in_main("app", NamespaceId::new(1)))
+        );
+        reopened.drop_namespace("app").unwrap();
+        assert_eq!(reopened.namespace("app"), None);
+        assert!(reopened.drop_namespace("app").is_err());
+        drop(reopened);
+        let reopened = open_connection_storing_namespaces(&path);
+        assert_eq!(reopened.namespace("app"), None);
+    }
+
+    #[test]
+    fn test_alter_table_rename_leaves_the_row_of_a_namespace_alone() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_storing_namespaces(&temp_dir.path().join("main.db"));
+        conn.create_namespace("app").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+        conn.execute("ALTER TABLE t RENAME TO u").unwrap();
+        conn.execute("ALTER TABLE u RENAME COLUMN x TO y").unwrap();
+        conn.execute("INSERT INTO u(y) VALUES(1)").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT y FROM u"), 1);
+        assert!(conn.namespace("app").is_some());
+    }
+
+    #[test]
+    fn test_a_new_schema_gets_an_id_no_schema_has() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_storing_namespaces(&temp_dir.path().join("main.db"));
+        let app = conn.create_namespace("app").unwrap();
+        let shop = conn.create_namespace("shop").unwrap();
+        assert_eq!(app.target.id, NamespaceId::new(1));
+        assert_eq!(shop.target.id, NamespaceId::new(2));
+        conn.drop_namespace("app").unwrap();
+        let web = conn.create_namespace("web").unwrap();
+        assert_eq!(web.target.id, NamespaceId::new(3));
+    }
+
+    #[test]
+    fn test_the_sqlite_dialect_does_not_store_namespaces() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection(&temp_dir.path().join("main.db"));
+        assert!(conn.prepare("CREATE SCHEMA app").is_err());
+        assert!(conn.create_namespace("app").is_err());
+        assert_eq!(conn.namespace("app"), None);
     }
 
     fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) -> Result<()> {

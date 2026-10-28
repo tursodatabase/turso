@@ -1801,6 +1801,14 @@ pub enum Insn {
         /// The name of the sequence being dropped
         seq_name: String,
     },
+    /// Forget a namespace in the in-memory schema, after DROP SCHEMA
+    /// deleted its row.
+    DropNamespace {
+        /// The database the namespace is stored in
+        db: usize,
+        /// The namespace being dropped
+        namespace: NamespaceId,
+    },
     /// Begin the autonomous inner transaction that wraps a sequence
     /// read-modify-write. The translator emits this immediately before
     /// the cursor-based RMW bytecode and pairs it with a matching
@@ -2555,6 +2563,7 @@ impl InsnVariants {
             InsnVariants::DropType => execute::op_drop_type,
             InsnVariants::AddSequence => execute::op_add_sequence,
             InsnVariants::DropSequence => execute::op_drop_sequence,
+            InsnVariants::DropNamespace => execute::op_drop_namespace,
             InsnVariants::SequenceComputeNext => execute::op_sequence_compute_next,
             InsnVariants::SetSequenceCurrval => execute::op_set_sequence_currval,
             InsnVariants::SequenceTrackAllocation => execute::op_sequence_track_allocation,
@@ -2676,6 +2685,7 @@ impl Insn {
             | Self::DropType { .. }
             | Self::AddSequence { .. }
             | Self::DropSequence { .. }
+            | Self::DropNamespace { .. }
             | Self::SequenceComputeNext { .. }
             | Self::SetSequenceCurrval { .. }
             | Self::SequenceTrackAllocation { .. }

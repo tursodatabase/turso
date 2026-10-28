@@ -1587,12 +1587,179 @@ fn bind_default_sequence_names(
     Ok(bound)
 }
 
+/// Translates `CREATE SCHEMA name`: a new namespace of the main
+/// database, recorded as a row of `sqlite_schema` whose `rootpage` holds
+/// the namespace's id. Only a dialect that supports namespaces has them.
+/// `id` is given when a copy of a database recreates a namespace under
+/// its original id, so that the objects copied under that id stay its
+/// objects; otherwise the namespace takes the next free id.
+pub fn translate_create_schema(
+    name: &ast::Name,
+    id: Option<u32>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    if !resolver.catalog.dialect.supports_namespaces() {
+        bail_parse_error!("CREATE SCHEMA is not supported");
+    }
+    let normalized_name = normalize_ident(name.as_str());
+    if resolver
+        .catalog
+        .namespace_database_id(&normalized_name)
+        .is_some()
+    {
+        bail_parse_error!("schema {normalized_name} already exists");
+    }
+    let id = match id {
+        Some(id) => {
+            let id = NamespaceId::new(id);
+            let taken = id.is_root()
+                || resolver.with_schema(MAIN_DB_ID, |s| s.namespace_name(id).is_some());
+            if taken {
+                bail_parse_error!("namespace id {} is in use", id.as_u32());
+            }
+            id
+        }
+        None => resolver.with_schema(MAIN_DB_ID, |s| s.next_namespace_id()),
+    };
+    let schema_version = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
+    program.begin_write_on_database(MAIN_DB_ID, schema_version)?;
+
+    let sqlite_schema_cursor_id = open_sqlite_schema_for_writing(program, resolver, MAIN_DB_ID);
+    let id_reg = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        dest: id_reg,
+        value: i64::from(id.as_u32()),
+    });
+    emit_schema_entry(
+        program,
+        resolver,
+        sqlite_schema_cursor_id,
+        None,
+        SchemaEntryType::Schema,
+        &normalized_name,
+        &normalized_name,
+        id_reg,
+        Some(format!("CREATE SCHEMA {}", name.as_ident())),
+    )?;
+    program.emit_insn(Insn::ParseSchema {
+        db: MAIN_DB_ID,
+        where_clause: Some(format!(
+            "type = 'schema' AND name = '{}'",
+            escape_sql_string_literal(&normalized_name)
+        )),
+        trigger_target_database_id: None,
+    });
+    program.emit_insn(Insn::SetCookie {
+        db: MAIN_DB_ID,
+        cookie: Cookie::SchemaVersion,
+        value: schema_version as i32 + 1,
+        p5: 0,
+    });
+    Ok(())
+}
+
+/// Translates `DROP SCHEMA name`: removes the namespace's row from
+/// `sqlite_schema` and forgets its name. The objects stored under its id
+/// stay until they are dropped, so the caller drops them first.
+pub fn translate_drop_schema(
+    name: &ast::Name,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    if !resolver.catalog.dialect.supports_namespaces() {
+        bail_parse_error!("DROP SCHEMA is not supported");
+    }
+    let normalized_name = normalize_ident(name.as_str());
+    let Some(id) = resolver.with_schema(MAIN_DB_ID, |s| s.namespace_named(&normalized_name)) else {
+        bail_parse_error!("no such schema: {normalized_name}");
+    };
+    let schema_version = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
+    program.begin_write_on_database(MAIN_DB_ID, schema_version)?;
+
+    let sqlite_schema_cursor_id = open_sqlite_schema_for_writing(program, resolver, MAIN_DB_ID);
+    let type_reg = program.emit_string8_new_reg("schema".to_string());
+    let name_reg = program.emit_string8_new_reg(normalized_name);
+    let end_loop_label = program.allocate_label();
+    let loop_start_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_empty: end_loop_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
+    let type_column_reg = program.alloc_register();
+    let name_column_reg = program.alloc_register();
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, type_column_reg);
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, name_column_reg);
+    let skip_delete_label = program.allocate_label();
+    program.emit_insn(Insn::Ne {
+        lhs: type_column_reg,
+        rhs: type_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: name_column_reg,
+        rhs: name_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+    program.emit_insn(Insn::Delete {
+        cursor_id: sqlite_schema_cursor_id,
+        table_name: SQLITE_TABLEID.to_string(),
+        is_part_of_update: false,
+    });
+    program.preassign_label_to_next_insn(skip_delete_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_next: loop_start_label,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(end_loop_label);
+
+    program.emit_insn(Insn::DropNamespace {
+        db: MAIN_DB_ID,
+        namespace: id,
+    });
+    program.emit_insn(Insn::SetCookie {
+        db: MAIN_DB_ID,
+        cookie: Cookie::SchemaVersion,
+        value: schema_version as i32 + 1,
+        p5: 0,
+    });
+    Ok(())
+}
+
+fn open_sqlite_schema_for_writing(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+) -> usize {
+    let schema_table = resolver.with_schema(MAIN_DB_ID, |s| {
+        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+            .unwrap()
+    });
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page: 1i64.into(),
+        db: database_id,
+    });
+    cursor_id
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum SchemaEntryType {
     Table,
     Index,
     View,
     Trigger,
+    /// A namespace: `rootpage` holds its id and no B-tree has that
+    /// root.
+    Schema,
 }
 
 impl SchemaEntryType {
@@ -1602,6 +1769,7 @@ impl SchemaEntryType {
             SchemaEntryType::Index => "index",
             SchemaEntryType::View => "view",
             SchemaEntryType::Trigger => "trigger",
+            SchemaEntryType::Schema => "schema",
         }
     }
 }
