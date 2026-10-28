@@ -935,7 +935,7 @@ fn index_matches_collation(index: &Index, collation: CollationSeq) -> bool {
     index
         .columns
         .iter()
-        .any(|column| column.collation.unwrap_or_default() == collation)
+        .any(|column| column.collation == collation)
 }
 
 pub fn resolve_sorted_columns(
@@ -970,7 +970,7 @@ fn resolve_sorted_columns_with_catalog(
         // Unwrap parentheses for column resolution (SQLite treats (('col')) same as 'col')
         let unwrapped_expr = unwrap_parens(base_expr)?;
         if let Some((pos, column_name, column)) = resolve_index_column(unwrapped_expr, table) {
-            let collation = explicit_collation.or_else(|| column.collation_opt());
+            let collation = explicit_collation.unwrap_or_else(|| column.collation());
             let expr = match column.generated_type() {
                 GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
                 GeneratedType::NotGenerated => None,
@@ -997,7 +997,7 @@ fn resolve_sorted_columns_with_catalog(
                 order,
                 nulls_order: nulls,
                 pos_in_table: EXPR_INDEX_SENTINEL,
-                collation: explicit_collation,
+                collation: explicit_collation.unwrap_or(CollationSeq::Binary),
                 default: None,
                 expr: Some(sc.expr.clone()),
             })
@@ -1360,7 +1360,7 @@ pub fn translate_drop_index(
         rhs: dest_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: Some(CollationSeq::NoCase),
+        collation: CollationSeq::NoCase,
     });
 
     // read type of table
@@ -1372,7 +1372,7 @@ pub fn translate_drop_index(
         rhs: dest_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: CollationSeq::for_internal_values(),
     });
 
     program.emit_insn(Insn::RowId {

@@ -107,7 +107,7 @@ pub fn create_dbsp_state_index(
             nulls_order: None,
             // Key columns carry the defining query's comparison collation
             // (see state_table_sql), and the index must compare the same way.
-            collation: state_table.columns()[pos_in_table].collation_opt(),
+            collation: state_table.columns()[pos_in_table].collation(),
             pos_in_table,
             default: None,
             expr: None,

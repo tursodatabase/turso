@@ -645,6 +645,11 @@ pub struct Variable {
     pub name: Option<Box<str>>,
     /// Type of the source column, if known (e.g. from trigger NEW/OLD rewrite).
     pub col_type: Option<Box<str>>,
+    /// Collation of the source column, if the variable stands for a column
+    /// (trigger NEW/OLD rewrite). Comparisons of the variable use it like
+    /// they use a column's collation.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub col_collation: Option<Box<str>>,
     /// True for an explicit `?N` marker. Numbered markers carry no allocated
     /// name; their "?N" spelling is derived from the index on demand.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -657,6 +662,7 @@ impl Variable {
             index,
             name: None,
             col_type: None,
+            col_collation: None,
             numbered: false,
         }
     }
@@ -667,11 +673,14 @@ impl Variable {
             index,
             name: None,
             col_type: None,
+            col_collation: None,
             numbered: true,
         }
     }
 
-    pub fn indexed_typed(index: NonZeroU32, col_type: &str) -> Self {
+    /// A variable that stands for a column with the given declared type and
+    /// collation.
+    pub fn for_column(index: NonZeroU32, col_type: &str, col_collation: Option<&str>) -> Self {
         Self {
             index,
             name: None,
@@ -680,6 +689,7 @@ impl Variable {
             } else {
                 Some(col_type.into())
             },
+            col_collation: col_collation.map(Into::into),
             numbered: false,
         }
     }
@@ -689,6 +699,7 @@ impl Variable {
             index,
             name: Some(name.into()),
             col_type: None,
+            col_collation: None,
             numbered: false,
         }
     }

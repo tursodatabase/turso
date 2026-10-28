@@ -32,8 +32,8 @@ use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::IOResultOr;
 use crate::types::{
-    compare_immutable, compare_immutable_single, compare_record, AsValueRef, Extendable,
-    IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
+    compare_immutable, compare_record, AsValueRef, Extendable, IOCompletions, IOResult,
+    ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
@@ -403,45 +403,15 @@ fn make_sort_comparator(
 fn compare_with_collation(
     lhs: &Value,
     rhs: &Value,
-    collation: Option<CollationSeq>,
+    collation: CollationSeq,
     collation_comparator: &Option<crate::vdbe::sorter::SortComparator>,
 ) -> Result<std::cmp::Ordering> {
-    Ok(match (lhs, rhs) {
-        (Value::Text(lhs_text), Value::Text(rhs_text)) => {
-            if let Some(comparator) = collation_comparator {
-                comparator(&lhs.as_ref(), &rhs.as_ref())?
-            } else if let Some(coll) = collation {
-                coll.compare_strings(lhs_text.as_str(), rhs_text.as_str())
-            } else {
-                lhs.cmp(rhs)
-            }
+    match (lhs, rhs, collation_comparator) {
+        (Value::Text(_), Value::Text(_), Some(comparator)) => {
+            comparator(&lhs.as_ref(), &rhs.as_ref())
         }
-        _ => lhs.cmp(rhs),
-    })
-}
-
-fn compare_with_program_collation<V1, V2>(
-    program: &Program,
-    lhs: V1,
-    rhs: V2,
-    collation: CollationSeq,
-) -> Result<std::cmp::Ordering>
-where
-    V1: AsValueRef,
-    V2: AsValueRef,
-{
-    let lhs = lhs.as_value_ref();
-    let rhs = rhs.as_value_ref();
-    if collation.is_custom() {
-        if let (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) = (lhs, rhs) {
-            return program.connection.compare_external_collation(
-                collation,
-                lhs_text.as_str(),
-                rhs_text.as_str(),
-            );
-        }
+        _ => Ok(collation.compare(lhs.as_ref(), rhs.as_ref())),
     }
-    Ok(compare_immutable_single(lhs, rhs, collation))
 }
 
 fn comparison_matches_order(op: ComparisonOp, order: std::cmp::Ordering) -> bool {
@@ -1134,7 +1104,7 @@ macro_rules! comparison_opcode {
     ($name:ident, $variant:ident, $op:expr, $jumps:expr) => {
         #[inline(always)]
         pub fn $name(
-            program: &Program,
+            _program: &Program,
             state: &mut ProgramState,
             insn: &Insn,
             _pager: &Arc<Pager>,
@@ -1181,16 +1151,7 @@ macro_rules! comparison_opcode {
                     return Ok(InsnFunctionStepResult::Step);
                 }
             }
-            op_comparison_slow(
-                program,
-                state,
-                *lhs,
-                *rhs,
-                target_pc,
-                *flags,
-                collation.unwrap_or_default(),
-                $op,
-            )
+            op_comparison_slow(state, *lhs, *rhs, target_pc, *flags, *collation, $op)
         }
     };
 }
@@ -1207,12 +1168,9 @@ fn texts_compare_as_bytes(
     lhs: &Value,
     rhs: &Value,
     flags: crate::vdbe::insn::CmpInsFlags,
-    collation: Option<CollationSeq>,
+    collation: CollationSeq,
 ) -> bool {
-    if !matches!(
-        collation,
-        None | Some(CollationSeq::Binary | CollationSeq::Unset)
-    ) {
+    if collation != CollationSeq::Binary {
         return false;
     }
     !flags.get_affinity().is_numeric()
@@ -1226,7 +1184,6 @@ fn texts_compare_as_bytes(
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn op_comparison_slow(
-    program: &Program,
     state: &mut ProgramState,
     lhs: usize,
     rhs: usize,
@@ -1261,7 +1218,7 @@ fn op_comparison_slow(
                 // expression translation only uses it with Eq/Ne, RANGE
                 // boundary tests use it with relational operators so that
                 // NULL peer groups compare consistently.
-                let order = compare_immutable_single(lhs_value, rhs_value, collation);
+                let order = collation.compare(lhs_value.as_value_ref(), rhs_value.as_value_ref());
                 comparison_matches_order(op, order)
             } else {
                 jump_if_null
@@ -1297,13 +1254,7 @@ fn op_comparison_slow(
     let rhs_for_compare = new_rhs
         .as_ref()
         .map_or(Either::Left(rhs_value), Either::Right);
-    let should_jump = if collation.is_custom() {
-        let order =
-            compare_with_program_collation(program, lhs_for_compare, rhs_for_compare, collation)?;
-        comparison_matches_order(op, order)
-    } else {
-        op.compare(lhs_for_compare, rhs_for_compare, collation)
-    };
+    let should_jump = op.compare(lhs_for_compare, rhs_for_compare, collation);
 
     match (new_lhs, new_rhs) {
         (Some(new_lhs), None) => {
@@ -7782,7 +7733,7 @@ fn update_agg_payload(
                 let payload_ref = payload[0].as_ref();
                 cmp_fn(&arg_ref, &payload_ref)?
             } else {
-                compare_with_collation(arg, &payload[0], Some(collation), &comparator)?
+                compare_with_collation(arg, &payload[0], collation, &comparator)?
             };
             let should_update = match func {
                 AggFunc::Max => cmp == Ordering::Greater,
@@ -8347,8 +8298,7 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
         }
         AggFunc::Mode => {
             // payload: [0]=collation bits, [1]=count, [2..]=buffered values.
-            let collation =
-                CollationSeq::from_storage_bits(payload[0].as_int().unwrap_or(0) as u16);
+            let collation = CollationSeq::from_bits(payload[0].as_int().unwrap_or(0) as u16)?;
             let count = payload[1].as_int().unwrap_or(0) as usize;
             if count == 0 || 2 + count > payload.len() {
                 Value::Null
@@ -8363,8 +8313,7 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
             if matches!(payload[2], Value::Null) {
                 return Ok(Value::Null);
             }
-            let collation =
-                CollationSeq::from_storage_bits(payload[0].as_int().unwrap_or(0) as u16);
+            let collation = CollationSeq::from_bits(payload[0].as_int().unwrap_or(0) as u16)?;
             let count = payload[1].as_int().unwrap_or(0) as usize;
             let fraction = payload[2].as_float();
             if count == 0 {
@@ -8426,29 +8375,18 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
 /// Most frequent value of an ordered set (`mode() WITHIN GROUP (ORDER BY x)`).
 /// Ties are broken by the smallest value, matching PostgreSQL (the first value the
 /// ascending ordering would return).
-/// Compares two ordered-set values, honoring `collation` for text (built-in and locale
-/// collations are resolved without a connection; extension `Custom` collations fall back
-/// to BINARY, matching other connection-less comparison paths).
-fn ordered_set_compare(a: &Value, b: &Value, collation: CollationSeq) -> std::cmp::Ordering {
-    match (a, b) {
-        (Value::Text(lhs), Value::Text(rhs)) => {
-            collation.compare_strings(lhs.as_str(), rhs.as_str())
-        }
-        _ => a.cmp(b),
-    }
-}
-
 fn ordered_set_mode(values: &[Value], collation: CollationSeq) -> Value {
     // NULLs were already dropped at step time.
     let mut sorted: Vec<Value> = values.to_vec();
-    sorted.sort_by(|a, b| ordered_set_compare(a, b, collation));
+    sorted.sort_by(|a, b| collation.compare(a.as_value_ref(), b.as_value_ref()));
     let mut best_idx = 0usize;
     let mut best_count = 0usize;
     let mut i = 0;
     while i < sorted.len() {
         let mut j = i + 1;
         while j < sorted.len()
-            && ordered_set_compare(&sorted[j], &sorted[i], collation) == std::cmp::Ordering::Equal
+            && collation.compare(sorted[j].as_value_ref(), sorted[i].as_value_ref())
+                == std::cmp::Ordering::Equal
         {
             j += 1;
         }
@@ -8497,7 +8435,7 @@ fn ordered_set_percentile_cont(values: &[Value], fraction: f64) -> Value {
 /// distribution (`row / n`) is at least `fraction`.
 fn ordered_set_percentile_disc(values: &[Value], fraction: f64, collation: CollationSeq) -> Value {
     let mut sorted: Vec<Value> = values.to_vec();
-    sorted.sort_by(|a, b| ordered_set_compare(a, b, collation));
+    sorted.sort_by(|a, b| collation.compare(a.as_value_ref(), b.as_value_ref()));
     let n = sorted.len();
     let index = if fraction <= 0.0 {
         0
@@ -9402,7 +9340,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
 }
 
 pub fn op_agg_step(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -9516,9 +9454,7 @@ pub fn op_agg_step(
                     }
                 }
             }
-            AggFunc::Min | AggFunc::Max
-                if data.comparator.is_none() && data.collation.is_none_or(|c| !c.is_custom()) =>
-            {
+            AggFunc::Min | AggFunc::Max if data.comparator.is_none() => {
                 if let Register::Value(Value::Numeric(Numeric::Integer(arg))) =
                     state.registers[data.col]
                 {
@@ -9542,11 +9478,11 @@ pub fn op_agg_step(
             _ => {}
         }
     }
-    op_agg_step_slow(program, state, data)
+    op_agg_step_slow(state, data)
 }
 
 #[inline(never)]
-fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepData) -> InsnResult {
+fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult {
     let AggStepData {
         acc_reg,
         col,
@@ -9602,17 +9538,9 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
         state.registers[*acc_reg] = Register::Aggregate(AggContext::Builtin(payload));
     }
 
-    let current_collation = collation.unwrap_or(CollationSeq::Binary);
+    let collation = *collation;
     let comparator_factory = move || -> Result<Option<crate::vdbe::sorter::SortComparator>> {
-        Ok(match comparator.as_ref() {
-            Some(comparator) => Some(make_sort_comparator(comparator)?),
-            None if current_collation.is_custom() => Some(
-                program
-                    .connection
-                    .make_collation_comparator(current_collation)?,
-            ),
-            None => None,
-        })
+        comparator.as_ref().map(make_sort_comparator).transpose()
     };
 
     // Step the aggregate
@@ -9659,7 +9587,7 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
                 arg,
                 maybe_arg2.as_ref(),
                 payload,
-                current_collation,
+                collation,
                 comparator_factory,
             )?;
         }
@@ -9826,21 +9754,17 @@ pub fn op_sorter_open(
     for (ord, coll, nulls) in order_collations_nulls.iter() {
         // Preallocated for every ORDER BY term above, so these pushes cannot grow the vectors.
         order.push(*ord);
-        collations.push(coll.unwrap_or_default());
+        collations.push(*coll);
         nulls_orders.push(*nulls);
     }
     let mut sort_comparators =
         crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())?;
-    for (idx, (_, coll, _)) in order_collations_nulls.iter().enumerate() {
-        let comparator = match comparators.get(idx).and_then(|c| c.as_ref()) {
-            Some(comparator) => Some(make_sort_comparator(comparator)?),
-            None => match coll {
-                Some(collation) if collation.is_custom() => {
-                    Some(program.connection.make_collation_comparator(*collation)?)
-                }
-                _ => None,
-            },
-        };
+    for idx in 0..order_collations_nulls.len() {
+        let comparator = comparators
+            .get(idx)
+            .and_then(|c| c.as_ref())
+            .map(make_sort_comparator)
+            .transpose()?;
         // Preallocated for every ORDER BY term above, so this push cannot grow the vector.
         sort_comparators.push(comparator);
     }
@@ -10899,22 +10823,29 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Min => {
+                let collation = func.collation;
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                state.registers[*dest]
-                    .set_value(Value::exec_min(reg_values.iter().map(|v| v.get_value())));
+                let result = Value::exec_min(reg_values.iter().map(|v| v.get_value()), |a, b| {
+                    Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
+                })?;
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Max => {
+                let collation = func.collation;
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                state.registers[*dest]
-                    .set_value(Value::exec_max(reg_values.iter().map(|v| v.get_value())));
+                let result = Value::exec_max(reg_values.iter().map(|v| v.get_value()), |a, b| {
+                    Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
+                })?;
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Nullif => {
-                let first_value = &state.registers[*start_reg];
-                let second_value = &state.registers[*start_reg + 1];
-                state.registers[*dest].set_value(Value::exec_nullif(
-                    first_value.get_value(),
-                    second_value.get_value(),
-                ));
+                let collation = func.collation;
+                let first_value = state.registers[*start_reg].get_value();
+                let second_value = state.registers[*start_reg + 1].get_value();
+                let result = first_value.exec_nullif(second_value, |a, b| {
+                    Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
+                })?;
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Substr | ScalarFunc::Substring => {
                 let str_value = &state.registers[*start_reg];

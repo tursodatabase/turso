@@ -1175,10 +1175,7 @@ fn query_pragma(
                     )? {
                         for (seqno, col) in index.columns.iter().enumerate() {
                             let desc = matches!(col.order, ast::SortOrder::Desc);
-                            let coll = col
-                                .collation
-                                .map(|c| c.to_string().to_uppercase())
-                                .unwrap_or_else(|| "BINARY".to_string());
+                            let coll = col.collation.to_string().to_uppercase();
 
                             program.emit_int(seqno as i64, base_reg);
                             emit_index_column_cid_and_name(program, col, base_reg + 1);

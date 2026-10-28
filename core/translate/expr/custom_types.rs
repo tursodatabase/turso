@@ -106,7 +106,11 @@ pub(super) fn emit_custom_type_operator(
         constant_mask: 0,
         start_reg: func_start,
         dest: result_reg,
-        func: FuncCtx { func, arg_count: 2 },
+        func: FuncCtx {
+            func,
+            arg_count: 2,
+            collation: CollationSeq::Binary,
+        },
     });
     if resolved.negate {
         program.emit_insn(Insn::Not {

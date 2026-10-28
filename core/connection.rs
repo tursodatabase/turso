@@ -40,7 +40,7 @@ use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 use std::any::Any;
-use std::cmp::Ordering as CmpOrdering;
+
 use std::fmt::Display;
 use std::ops::Deref;
 #[cfg(feature = "simulator")]
@@ -4227,94 +4227,35 @@ impl Connection {
         callback: crate::ContextCollationFunction,
         context_destructor: Option<crate::ContextDestructor>,
     ) {
-        let collation = CollationSeq::custom(&name);
         let normalized_name = crate::util::normalize_ident(&name);
         self.syms.write().collations.insert(
-            collation.id(),
-            Arc::new(function::ExternalCollation::new(
+            normalized_name.clone(),
+            function::ExternalCollation::new(
                 normalized_name,
                 context,
                 callback,
                 context_destructor,
-            )),
+            ),
         );
         self.bump_prepare_context_generation();
     }
 
     pub fn unregister_external_collation(&self, name: &str) {
-        if let Some(collation) = CollationSeq::known_custom(name) {
-            if self
-                .syms
-                .write()
-                .collations
-                .remove(&collation.id())
-                .is_some()
-            {
-                self.bump_prepare_context_generation();
-            }
+        if self
+            .syms
+            .write()
+            .collations
+            .remove(&crate::util::normalize_ident(name))
+            .is_some()
+        {
+            self.bump_prepare_context_generation();
         }
     }
 
-    pub(crate) fn get_external_collation(
-        &self,
-        collation: CollationSeq,
-    ) -> Result<Arc<function::ExternalCollation>> {
-        self.syms
-            .read()
-            .collations
-            .get(&collation.id())
-            .cloned()
-            .ok_or_else(|| {
-                LimboError::ParseError(format!("no such collation sequence: {}", collation.name()))
-            })
-    }
-
-    pub(crate) fn custom_collation_compare(
-        external: &function::ExternalCollation,
-        left: &str,
-        right: &str,
-    ) -> CmpOrdering {
-        let result = unsafe {
-            (external.callback)(
-                external.context,
-                left.as_ptr(),
-                left.len(),
-                right.as_ptr(),
-                right.len(),
-            )
-        };
-        result.cmp(&0)
-    }
-
-    pub(crate) fn external_collation_comparator(
-        external: Arc<function::ExternalCollation>,
-    ) -> crate::vdbe::sorter::SortComparator {
-        Arc::new(move |left, right| {
-            Ok(match (left, right) {
-                (crate::ValueRef::Text(left), crate::ValueRef::Text(right)) => {
-                    Self::custom_collation_compare(&external, left.as_str(), right.as_str())
-                }
-                _ => left.partial_cmp(right).unwrap_or(CmpOrdering::Equal),
-            })
-        })
-    }
-
-    pub(crate) fn make_collation_comparator(
-        &self,
-        collation: CollationSeq,
-    ) -> Result<crate::vdbe::sorter::SortComparator> {
-        let external = self.get_external_collation(collation)?;
-        Ok(Self::external_collation_comparator(external))
-    }
-
-    pub(crate) fn compare_external_collation(
-        &self,
-        collation: CollationSeq,
-        left: &str,
-        right: &str,
-    ) -> Result<CmpOrdering> {
-        let external = self.get_external_collation(collation)?;
-        Ok(Self::custom_collation_compare(&external, left, right))
+    /// The custom collations registered on this connection. A program keeps
+    /// them so that their callbacks live as long as it does.
+    pub(crate) fn custom_collations(&self) -> Vec<Arc<function::ExternalCollation>> {
+        self.syms.read().collations.values().cloned().collect()
     }
 
     pub(crate) fn database_ptr(&self) -> usize {
@@ -5032,7 +4973,8 @@ pub type StepResult = vdbe::StepResult;
 #[derive(Default)]
 pub struct SymbolTable {
     pub functions: HashMap<String, Arc<function::ExternalFunc>>,
-    pub collations: HashMap<u32, Arc<function::ExternalCollation>>,
+    /// Custom collations by normalized name.
+    pub collations: HashMap<String, Arc<function::ExternalCollation>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
     pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
     pub index_methods: HashMap<String, Arc<dyn IndexMethod>>,
@@ -5096,18 +5038,17 @@ impl SymbolTable {
     }
 
     pub fn resolve_collation(&self, name: &str) -> Option<CollationSeq> {
-        let collation = CollationSeq::known_custom(name)?;
         self.collations
-            .contains_key(&collation.id())
-            .then_some(collation)
+            .get(&crate::util::normalize_ident(name))
+            .map(|external| external.collation)
     }
 
     pub fn extend(&mut self, other: &SymbolTable) {
         for (name, func) in &other.functions {
             self.functions.insert(name.clone(), func.clone());
         }
-        for (id, collation) in &other.collations {
-            self.collations.insert(*id, collation.clone());
+        for (name, collation) in &other.collations {
+            self.collations.insert(name.clone(), collation.clone());
         }
         for (name, vtab) in &other.vtabs {
             self.vtabs.insert(name.clone(), vtab.clone());
