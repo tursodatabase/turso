@@ -162,6 +162,14 @@ pub struct Qualifiers {
     name_to_namespace: RwLock<HashMap<String, Namespace>>,
 }
 
+impl Clone for Qualifiers {
+    fn clone(&self) -> Self {
+        Qualifiers {
+            name_to_namespace: RwLock::new(self.name_to_namespace.read().clone()),
+        }
+    }
+}
+
 impl Qualifiers {
     /// These names together with the namespaces of the main database, with
     /// their ids; a database added here under the same name hides one.

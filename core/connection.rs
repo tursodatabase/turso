@@ -40,6 +40,7 @@ use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 use std::any::Any;
+use std::borrow::Cow;
 
 use std::fmt::Display;
 use std::ops::Deref;
@@ -3387,13 +3388,17 @@ impl Connection {
     pub(crate) fn current_qualifiers(&self) -> Qualifiers {
         self.maybe_update_schema();
         let schema = self.schema.read().clone();
-        self.qualifiers(&schema)
+        self.qualifiers(&schema).into_owned()
     }
 
     /// The qualifiers the connection accepts as of `schema`, the main
     /// database's schema: its databases and the namespaces of `schema`.
-    pub(crate) fn qualifiers(&self, schema: &Schema) -> Qualifiers {
-        self.qualifiers.with_namespaces(schema.namespaces())
+    /// They are the connection's own when `schema` has no namespaces.
+    pub(crate) fn qualifiers(&self, schema: &Schema) -> Cow<'_, Qualifiers> {
+        if schema.namespaces().next().is_none() {
+            return Cow::Borrowed(&self.qualifiers);
+        }
+        Cow::Owned(self.qualifiers.with_namespaces(schema.namespaces()))
     }
 
     /// Adds `namespace` under its name, so that `name.t` names its objects.
