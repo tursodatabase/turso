@@ -264,7 +264,7 @@ struct ParseSchemaRowsInner {
     automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>>,
     dbsp_state_roots: HashMap<String, i64>,
     dbsp_state_index_roots: HashMap<String, i64>,
-    materialized_view_info: HashMap<String, (String, i64)>,
+    materialized_view_info: HashMap<String, crate::schema::StoredMaterializedView>,
 }
 
 impl ParseSchemaRowsState {

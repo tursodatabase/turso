@@ -119,11 +119,14 @@ pub fn translate_create_materialized_view(
     // names to the database it was created in rather than searching temp
     // first (#9456): a TEMP table that happens to share a source table's
     // name must not shadow it here.
+    // The maintenance machinery knows the view by its key, the stored
+    // name, which also names its hidden state tables in the root namespace.
+    let view_key = resolver.mangle_name(namespace, &normalized_view_name);
     let maintenance_plan =
         resolver.with_view_scope(namespace, normalized_view_name.clone(), || {
             resolver.with_schema(database_id, |_| {
                 crate::incremental::vdbe_maintenance::plan_view(
-                    &normalized_view_name,
+                    &view_key,
                     select_stmt,
                     resolver,
                     &connection,
@@ -201,7 +204,7 @@ pub fn translate_create_materialized_view(
     program.preassign_label_to_next_insn(clear_loop_label);
     program.emit_insn(Insn::Delete {
         cursor_id: view_cursor_id,
-        table_name: normalized_view_name.clone(),
+        table_name: normalized_view_name,
         is_part_of_update: false,
     });
     program.emit_insn(Insn::Next {
@@ -232,8 +235,8 @@ pub fn translate_create_materialized_view(
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for views
         SchemaEntryType::View,
-        &normalized_view_name,
-        &normalized_view_name,
+        &view_key,
+        &view_key,
         view_root_reg, // btree root for materialized view data
         Some(sql),
     )?;
@@ -241,7 +244,7 @@ pub fn translate_create_materialized_view(
     // Create the version marker and node-owned operator storage described by
     // the maintenance plan. Stateful tables expose a primary-key index used by
     // codegen; the marker only persists compatibility metadata.
-    let mut parse_schema_names = vec![escape_sql_string_literal(&normalized_view_name)];
+    let mut parse_schema_names = vec![escape_sql_string_literal(&view_key)];
     for hidden in &hidden_tables {
         let table_root_reg = program.alloc_register();
         program.emit_insn(Insn::CreateBtree {
@@ -309,7 +312,7 @@ pub fn translate_create_materialized_view(
     });
 
     // Populate the materialized view
-    let cursor_info = vec![(normalized_view_name.clone(), view_cursor_id)];
+    let cursor_info = vec![(view_key, view_cursor_id)];
     program.emit_insn(Insn::PopulateMaterializedViews {
         cursors: cursor_info,
     });
@@ -422,7 +425,13 @@ pub fn translate_create_view(
     if resolver.catalog.dialect.binds_names_at_create() {
         bind_sequence_names_in_select(&mut select_stmt, resolver)?;
     }
-    let sql = create_view_to_str("VIEW", &view_name.name.as_ident(), columns, &select_stmt);
+    let stored_view_name = resolver.mangle_name(namespace, &normalized_view_name);
+    let sql = create_view_to_str(
+        "VIEW",
+        &resolver.name_in_sql(namespace, &view_name.name).as_ident(),
+        columns,
+        &select_stmt,
+    );
 
     // Open cursor to sqlite_schema table
     let table = resolver
@@ -443,14 +452,14 @@ pub fn translate_create_view(
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for views
         SchemaEntryType::View,
-        &normalized_view_name,
-        &normalized_view_name,
+        &stored_view_name,
+        &stored_view_name,
         0, // Regular views don't have a btree
         Some(sql),
     )?;
 
     // Parse schema to load the new view
-    let escaped_view_name = escape_sql_string_literal(&normalized_view_name);
+    let escaped_view_name = escape_sql_string_literal(&stored_view_name);
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!("name = '{escaped_view_name}'")),
@@ -576,16 +585,15 @@ pub fn translate_drop_view(
         }
 
         // Every node-owned hidden state/multiset table of this view, including
-        // incompatible older storage versions. Ownership parses the complete
+        // incompatible older storage versions. They are tables of the root
+        // namespace named after the view's key. Ownership parses the complete
         // node/branch suffix so similarly prefixed view names cannot steal
         // each other's state.
+        let view_key = resolver.mangle_name(namespace, &normalized_view_name);
         resolver.with_schema(database_id, |s| {
-            s.table_names(namespace.id)
+            s.table_names(NamespaceId::ROOT)
                 .filter(|table_name| {
-                    crate::incremental::view::state_table_belongs_to_view(
-                        table_name,
-                        &normalized_view_name,
-                    )
+                    crate::incremental::view::state_table_belongs_to_view(table_name, &view_key)
                 })
                 .map(str::to_string)
                 .collect::<Vec<String>>()
@@ -597,7 +605,7 @@ pub fn translate_drop_view(
     // Destroy the internal tables' btrees and indexes (those that exist).
     for internal_table_name in &internal_table_names {
         let internal_indexes: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(namespace.id, internal_table_name)
+            s.get_indices(NamespaceId::ROOT, internal_table_name)
                 .cloned()
                 .collect()
         });
@@ -611,7 +619,7 @@ pub fn translate_drop_view(
         }
 
         if let Some(internal_table) = resolver.with_schema(database_id, |s| {
-            s.get_table(namespace.id, internal_table_name)
+            s.get_table(NamespaceId::ROOT, internal_table_name)
         }) {
             if let Some(internal_btree) = internal_table.btree() {
                 program.emit_insn(Insn::Destroy {
@@ -644,7 +652,7 @@ pub fn translate_drop_view(
     // Set the view name and type we're looking for
     program.emit_insn(Insn::String8 {
         dest: view_name_reg,
-        value: normalized_view_name.clone(),
+        value: resolver.mangle_name(namespace, &normalized_view_name),
     });
     program.emit_insn(Insn::String8 {
         dest: type_reg,

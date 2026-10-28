@@ -40,9 +40,16 @@ use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
-fn canonical_create_index_sql(stmt: &ast::Stmt) -> String {
+fn canonical_create_index_sql(
+    stmt: &ast::Stmt,
+    idx_name_in_sql: ast::Name,
+    tbl_name_in_sql: ast::Name,
+) -> String {
     let mut canonical_stmt = stmt.clone();
-    let ast::Stmt::CreateIndex { idx_name, .. } = &mut canonical_stmt else {
+    let ast::Stmt::CreateIndex {
+        idx_name, tbl_name, ..
+    } = &mut canonical_stmt
+    else {
         unreachable!("canonical_create_index_sql requires a CREATE INDEX statement");
     };
     // Attached db's index names may have a connection-local schema alias like `aux.idx1`.
@@ -50,6 +57,8 @@ fn canonical_create_index_sql(stmt: &ast::Stmt) -> String {
     // when the same database is reopened or attached under a different alias.
     // e.g. CREATE INDEX aux.idx1 ON t1 (name) -> CREATE INDEX idx1 ON t1 (name)
     idx_name.namespace = None;
+    idx_name.name = idx_name_in_sql;
+    *tbl_name = tbl_name_in_sql;
     canonical_stmt.to_string()
 }
 
@@ -91,7 +100,7 @@ pub fn translate_create_index(
     resolver: &Resolver,
     stmt: ast::Stmt,
 ) -> crate::Result<()> {
-    let sql = canonical_create_index_sql(&stmt);
+    let written_stmt = stmt.clone();
     let ast::Stmt::CreateIndex {
         unique,
         if_not_exists,
@@ -114,6 +123,11 @@ pub fn translate_create_index(
         resolver.resolve_existing_table_named(original_tbl_name.as_str())?
     };
     let database_id = namespace.database_id;
+    let sql = canonical_create_index_sql(
+        &written_stmt,
+        resolver.name_in_sql(namespace, &original_idx_name.name),
+        resolver.name_in_sql(namespace, &original_tbl_name),
+    );
     let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(original_tbl_name.as_str());
 
@@ -296,8 +310,8 @@ pub fn translate_create_index(
         sqlite_schema_cursor_id,
         cdc_table.map(|x| x.0),
         SchemaEntryType::Index,
-        &idx_name,
-        &tbl_name,
+        &resolver.mangle_name(namespace, &idx_name),
+        &resolver.mangle_name(namespace, &tbl_name),
         root_page_reg,
         Some(sql),
     )?;
@@ -321,7 +335,7 @@ pub fn translate_create_index(
         p5: 0,
     });
     // Parse the schema table to get the index root page and add new index to Schema
-    let escaped_idx_name = escape_sql_string_literal(&idx_name);
+    let escaped_idx_name = escape_sql_string_literal(&resolver.mangle_name(namespace, &idx_name));
     let parse_schema_where_clause = format!("name = '{escaped_idx_name}' AND type = 'index'");
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
@@ -1319,7 +1333,7 @@ pub fn translate_drop_index(
     program.emit_null(null_reg, None);
 
     // String8; r[3] = 'some idx name'
-    let index_name_reg = program.emit_string8_new_reg(idx_name);
+    let index_name_reg = program.emit_string8_new_reg(resolver.mangle_name(namespace, &idx_name));
     // String8; r[4] = 'index'
     let index_str_reg = program.emit_string8_new_reg("index".to_string());
 
@@ -1574,7 +1588,20 @@ mod tests {
             Some("aux")
         );
 
-        let canonical_sql = canonical_create_index_sql(&stmt);
+        let ast::Stmt::CreateIndex { tbl_name, .. } = &stmt else {
+            panic!("expected CREATE INDEX statement");
+        };
+        let canonical_sql =
+            canonical_create_index_sql(&stmt, idx_name.name.clone(), tbl_name.clone());
         assert_eq!(canonical_sql, "CREATE INDEX idx1 ON t1 (name)");
+        let stored_sql = canonical_create_index_sql(
+            &stmt,
+            ast::Name::exact("__turso_ns3_idx1".to_string()),
+            ast::Name::exact("__turso_ns3_t1".to_string()),
+        );
+        assert_eq!(
+            stored_sql,
+            "CREATE INDEX __turso_ns3_idx1 ON __turso_ns3_t1 (name)"
+        );
     }
 }

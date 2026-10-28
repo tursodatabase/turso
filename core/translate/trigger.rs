@@ -94,10 +94,11 @@ pub fn translate_create_trigger(
     temporary: bool,
     if_not_exists: bool,
     time: Option<ast::TriggerTime>,
+    event: &ast::TriggerEvent,
     tbl_name: QualifiedName,
+    for_each_row: bool,
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
-    sql: String,
     commands: &[ast::TriggerCmd],
     when_clause: Option<&ast::Expr>,
 ) -> Result<()> {
@@ -125,6 +126,33 @@ pub fn translate_create_trigger(
         namespace
     };
     let target_table_database_id = target_table_namespace.database_id;
+    let trigger_name_in_sql = QualifiedName {
+        namespace: trigger_name.namespace.clone(),
+        name: resolver.name_in_sql(namespace, &trigger_name.name),
+        alias: None,
+    };
+    let tbl_name_in_sql = if target_table_namespace.id.is_root() {
+        tbl_name.clone()
+    } else {
+        QualifiedName {
+            namespace: None,
+            name: resolver.name_in_sql(target_table_namespace, &tbl_name.name),
+            alias: None,
+        }
+    };
+    let sql = create_trigger_to_sql(
+        temporary,
+        if_not_exists,
+        &trigger_name_in_sql,
+        time,
+        event,
+        &tbl_name_in_sql,
+        for_each_row,
+        when_clause,
+        commands,
+    );
+    let mangled_trigger_name = resolver.mangle_name(namespace, &normalized_trigger_name);
+    let mangled_table_name = resolver.mangle_name(target_table_namespace, &normalized_table_name);
     // Temp triggers are allowed to reference tables in other databases.
     if target_table_database_id != database_id && database_id != crate::TEMP_DB_ID {
         let table_db_name = tbl_name
@@ -245,8 +273,8 @@ pub fn translate_create_trigger(
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for triggers
         SchemaEntryType::Trigger,
-        &normalized_trigger_name,
-        &normalized_table_name,
+        &mangled_trigger_name,
+        &mangled_table_name,
         0, // triggers don't have a root page
         Some(sql),
     )?;
@@ -261,7 +289,7 @@ pub fn translate_create_trigger(
     });
 
     // Parse schema to load the new trigger
-    let escaped_trigger_name = escape_sql_string_literal(&normalized_trigger_name);
+    let escaped_trigger_name = escape_sql_string_literal(&mangled_trigger_name);
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!(
@@ -603,7 +631,8 @@ pub fn translate_drop_trigger(
     });
 
     // Check if name matches
-    let trigger_name_str_reg = program.emit_string8_new_reg(normalized_trigger_name.clone());
+    let trigger_name_str_reg =
+        program.emit_string8_new_reg(resolver.mangle_name(namespace, &normalized_trigger_name));
     program.emit_insn(Insn::Ne {
         lhs: name_reg,
         rhs: trigger_name_str_reg,

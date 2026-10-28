@@ -660,6 +660,22 @@ impl<'a> Resolver<'a> {
         self.catalog.runtime_sequence_name(namespace, seq_name)
     }
 
+    /// The name that object `name` of `namespace` is stored under in the
+    /// schema rows and the SQL text of its database.
+    pub(crate) fn mangle_name(&self, namespace: NamespaceRef, name: &str) -> String {
+        crate::namespace::mangle_name(namespace.id, name)
+    }
+
+    /// The name to write into SQL text for the object `written` of
+    /// `namespace`: the name as written for a root namespace, else the
+    /// mangled name.
+    pub(crate) fn name_in_sql(&self, namespace: NamespaceRef, written: &ast::Name) -> ast::Name {
+        if namespace.id.is_root() {
+            return written.clone();
+        }
+        ast::Name::exact(self.mangle_name(namespace, written.as_str()))
+    }
+
     /// The namespace that the qualifier of `qualified_name` refers to, or
     /// the one an unqualified name is in: the scope's own namespace inside
     /// the body of a trigger or a view, else the root of main.
@@ -692,7 +708,7 @@ impl<'a> Resolver<'a> {
     }
 
     /// The name of `namespace`: the database's name for a root namespace,
-    /// else the name the namespace was added under.
+    /// else the namespace's name.
     pub(crate) fn name_of_namespace(&self, namespace: NamespaceRef) -> Option<String> {
         self.catalog.name_of_namespace(namespace)
     }

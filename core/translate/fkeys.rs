@@ -2064,6 +2064,19 @@ fn build_fk_match_where_clause(child_cols: &[String], ctx: &FkSubprogramContext)
     }
 }
 
+/// The name of the child table's namespace, to qualify the child table of
+/// `fk_ref` with in the SQL of an FK action.
+fn child_namespace_name(
+    resolver: &Resolver,
+    fk_ref: &ResolvedFkRef,
+    database_id: usize,
+) -> Option<String> {
+    resolver.name_of_namespace(NamespaceRef {
+        database_id,
+        id: fk_ref.child_namespace,
+    })
+}
+
 /// Compile and emit an FK CASCADE DELETE action as a sub-program.
 /// This creates a sub-program that deletes all child rows matching the parent key.
 fn fire_fk_cascade_delete(
@@ -2074,7 +2087,7 @@ fn fire_fk_cascade_delete(
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
-    let db_name = resolver.namespace_name(database_id);
+    let db_name = child_namespace_name(resolver, fk_ref, database_id);
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
     let stmt = generate_cascade_delete_stmt(
@@ -2104,7 +2117,7 @@ fn fire_fk_set_null(
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
-    let db_name = resolver.namespace_name(database_id);
+    let db_name = child_namespace_name(resolver, fk_ref, database_id);
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
     let stmt = generate_set_null_stmt(
@@ -2134,7 +2147,7 @@ fn fire_fk_set_default(
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
-    let db_name = resolver.namespace_name(database_id);
+    let db_name = child_namespace_name(resolver, fk_ref, database_id);
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
     let stmt = generate_set_default_stmt(
@@ -2164,7 +2177,7 @@ fn fire_fk_cascade_update(
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
-    let db_name = resolver.namespace_name(database_id);
+    let db_name = child_namespace_name(resolver, fk_ref, database_id);
     let child_cols = &fk_ref.fk.child_columns;
     // CASCADE UPDATE needs new params for the SET clause
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), true);

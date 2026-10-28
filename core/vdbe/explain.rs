@@ -2008,6 +2008,7 @@ pub fn insn_to_row(
             ),
             Insn::SetSequenceCurrval {
                 db,
+                namespace: _,
                 seq_name,
                 value_reg,
             } => (
@@ -2035,6 +2036,7 @@ pub fn insn_to_row(
             ),
             Insn::SequenceRegisterAllocation {
                 db,
+                namespace: _,
                 seq_name,
                 value_reg,
                 saved_outer_reg,

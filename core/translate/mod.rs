@@ -289,33 +289,20 @@ pub fn translate_inner(
             for_each_row,
             when_clause,
             commands,
-        } => {
-            // Reconstruct SQL for storage
-            let sql = trigger::create_trigger_to_sql(
-                temporary,
-                if_not_exists,
-                &trigger_name,
-                time,
-                &event,
-                &tbl_name,
-                for_each_row,
-                when_clause.as_deref(),
-                &commands,
-            );
-            trigger::translate_create_trigger(
-                trigger_name,
-                resolver,
-                temporary,
-                if_not_exists,
-                time,
-                tbl_name,
-                connection,
-                program,
-                sql,
-                &commands,
-                when_clause.as_deref(),
-            )?
-        }
+        } => trigger::translate_create_trigger(
+            trigger_name,
+            resolver,
+            temporary,
+            if_not_exists,
+            time,
+            &event,
+            tbl_name,
+            for_each_row,
+            connection,
+            program,
+            &commands,
+            when_clause.as_deref(),
+        )?,
         ast::Stmt::CreateView {
             view_name,
             select,
