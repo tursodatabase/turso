@@ -9,7 +9,7 @@ use turso_parser::ast;
 
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
-use crate::function::{AggFunc, Func, ScalarFunc};
+use crate::function::{AggFunc, Func, ScalarFunc, WindowFunc};
 use crate::schema::{Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
@@ -718,6 +718,20 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
             common_type(args.iter().map(|arg| arg.as_ref()), env)
         }
         Func::Scalar(ScalarFunc::Iif) => common_type(args.iter().skip(1).map(|a| a.as_ref()), env),
+        // A value of another row: its own argument's type, or for lag and
+        // lead the common type of the argument and the default (the third
+        // argument).
+        Func::Window(WindowFunc::Lag | WindowFunc::Lead) => common_type(
+            args.iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 1)
+                .map(|(_, arg)| arg.as_ref()),
+            env,
+        ),
+        Func::Window(WindowFunc::FirstValue | WindowFunc::LastValue | WindowFunc::NthValue) => {
+            args.first()
+                .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env))
+        }
         // A call with the wrong number of arguments is reported when it is translated.
         Func::Scalar(ScalarFunc::Nullif | ScalarFunc::Abs | ScalarFunc::ArrayElement)
             if args.is_empty() =>

@@ -517,3 +517,40 @@ expect {
     0
     1
 }
+
+@requires strict "uses STRICT tables"
+test cmp-window-value-functions-keep-the-argument-type {
+    -- lag, lead, first_value, last_value and nth_value give a value of their
+    -- argument's type, so it sorts and compares with that type's order.
+    -- Expected rows are from PostgreSQL.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), a integer[]) STRICT;
+    INSERT INTO t VALUES (1, 9.5, '{1,9}'), (2, 10, '{1,10}'), (3, 2, '{2}');
+    SELECT 'lag', id FROM t ORDER BY lag(n) OVER (ORDER BY id), id;
+    SELECT 'lag-default', id FROM t ORDER BY lag(n, 1, 100) OVER (ORDER BY id), id;
+    SELECT 'lead', id FROM t ORDER BY lead(a, 0) OVER (ORDER BY id), id;
+    SELECT 'first', id FROM t ORDER BY first_value(n) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW), id;
+    SELECT 'last', id FROM t ORDER BY last_value(n) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW), id;
+    SELECT 'nth', id FROM t ORDER BY nth_value(a, 1) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW), id;
+    SELECT 'eq', id FROM (SELECT id, lag(n) OVER (ORDER BY id) AS l FROM t) WHERE l = 9.5;
+}
+expect {
+    lag|1
+    lag|2
+    lag|3
+    lag-default|2
+    lag-default|3
+    lag-default|1
+    lead|1
+    lead|2
+    lead|3
+    first|3
+    first|1
+    first|2
+    last|3
+    last|1
+    last|2
+    nth|1
+    nth|2
+    nth|3
+    eq|2
+}
