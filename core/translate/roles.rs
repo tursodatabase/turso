@@ -598,6 +598,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn role_without_privileges_cannot_read_currval() {
+        let conn = connect_with_roles();
+        conn.execute("CREATE SEQUENCE s").unwrap();
+        conn.execute("SELECT nextval('s')").unwrap();
+        become_new_role(&conn, "alice");
+
+        let error = conn.execute("SELECT currval('s')").unwrap_err();
+
+        assert_eq!(
+            denial(error),
+            PermissionDenied::privilege(Action::Use, Object::Sequence("s".to_string()))
+        );
+    }
+
+    #[test]
+    fn role_without_privileges_cannot_read_the_sequence_watermark() {
+        let conn = connect_with_roles();
+        conn.execute("CREATE SEQUENCE s").unwrap();
+        become_new_role(&conn, "alice");
+
+        let error = conn
+            .execute("SELECT sequence_watermark_experimental('s')")
+            .unwrap_err();
+
+        assert_eq!(
+            denial(error),
+            PermissionDenied::privilege(Action::Use, Object::Sequence("s".to_string()))
+        );
+    }
+
     fn denial(error: LimboError) -> PermissionDenied {
         match error {
             LimboError::PermissionDenied(denial) => *denial,
