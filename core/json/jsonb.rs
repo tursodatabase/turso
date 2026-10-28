@@ -1141,6 +1141,10 @@ impl Jsonb {
         let mut current_cursor = cursor;
         depth += 1;
         string.push('{');
+        if current_cursor == end_cursor {
+            string.push('}');
+            return Ok(current_cursor);
+        }
         if indent.is_pretty() {
             string.push('\n');
         };
@@ -1201,6 +1205,10 @@ impl Jsonb {
         let mut current_cursor = cursor;
         depth += 1;
         string.push('[');
+        if current_cursor == end_cursor {
+            string.push(']');
+            return Ok(current_cursor);
+        }
         if indent.is_pretty() {
             string.push('\n');
         };
@@ -5731,5 +5739,20 @@ mod path_operations_tests {
         assert!(jsonb.element_end(0, &[3]).is_err());
         // Exactly the end of the buffer is in range.
         assert!(jsonb.element_end(0, &[2]).is_ok());
+    }
+
+    #[test]
+    fn json_pretty_serializes_empty_containers_compactly() {
+        let empty_obj = Jsonb::from_str("{}").unwrap();
+        assert_eq!(empty_obj.to_string_pretty(Some("  ")).unwrap(), "{}");
+
+        let empty_arr = Jsonb::from_str("[]").unwrap();
+        assert_eq!(empty_arr.to_string_pretty(Some("  ")).unwrap(), "[]");
+
+        let nested = Jsonb::from_str(r#"{"a":{},"b":[]}"#).unwrap();
+        assert_eq!(
+            nested.to_string_pretty(Some("  ")).unwrap(),
+            "{\n  \"a\": {},\n  \"b\": []\n}"
+        );
     }
 }
