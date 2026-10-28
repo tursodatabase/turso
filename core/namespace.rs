@@ -100,6 +100,14 @@ pub fn demangle_name(supports_namespaces: bool, mangled: &str) -> (NamespaceId, 
     }
 }
 
+/// Whether the engine stores an object under `name` for its own use, so
+/// that a user may not name an object so.
+pub fn is_reserved_object_name(name: &str) -> bool {
+    crate::schema::RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
 /// A name that qualifies object names in SQL and the namespace it refers
 /// to.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,5 +1,6 @@
+use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
-use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType, RESERVED_TABLE_PREFIXES};
+use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::sequence::bind_sequence_names_in_select;
@@ -36,10 +37,7 @@ fn validate_materialized(
     if database_id != crate::MAIN_DB_ID {
         crate::bail_parse_error!("materialized views are not supported on attached databases");
     }
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| normalized_view_name.starts_with(prefix))
-    {
+    if is_reserved_object_name(normalized_view_name) {
         bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
     }
 
@@ -335,10 +333,7 @@ fn validate_create_view(
             crate::util::identifier_token_for_error(view_name)
         )));
     }
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| normalized_view_name.starts_with(prefix))
-    {
+    if is_reserved_object_name(normalized_view_name) {
         bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
     }
     Ok(())

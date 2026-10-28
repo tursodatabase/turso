@@ -1,5 +1,5 @@
+use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
-use crate::schema::RESERVED_TABLE_PREFIXES;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
@@ -100,10 +100,7 @@ pub fn translate_create_trigger(
     when_clause: Option<&ast::Expr>,
 ) -> Result<()> {
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| normalized_trigger_name.starts_with(prefix))
-    {
+    if is_reserved_object_name(&normalized_trigger_name) {
         bail_parse_error!(
             "Object name reserved for internal use: {}",
             trigger_name.name.as_str()
