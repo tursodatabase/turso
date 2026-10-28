@@ -671,3 +671,30 @@ expect {
     in|0
     from-array|0
 }
+
+@requires strict "uses STRICT tables"
+test cmp-foreign-key-finds-parent-by-type-order {
+    -- The parent key is looked up through the PRIMARY KEY index, which is
+    -- ordered by the numeric type, so 1.50 finds the parent 1.5.
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id numeric(10,2) PRIMARY KEY) STRICT;
+    CREATE TABLE c(pid numeric(10,2) REFERENCES p(id)) STRICT;
+    INSERT INTO p VALUES (1.5);
+    INSERT INTO c VALUES (1.50);
+    SELECT pid FROM c;
+}
+expect {
+    1.50
+}
+
+@requires strict "uses STRICT tables"
+test cmp-foreign-key-rejects-missing-parent-by-type-order {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id numeric(10,2) PRIMARY KEY) STRICT;
+    CREATE TABLE c(pid numeric(10,2) REFERENCES p(id)) STRICT;
+    INSERT INTO p VALUES (1.5);
+    INSERT INTO c VALUES (2);
+}
+expect error {
+    FOREIGN KEY constraint failed
+}

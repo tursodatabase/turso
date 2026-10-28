@@ -3820,14 +3820,10 @@ impl Schema {
         let mut key_affinities: Vec<Affinity> = Vec::try_with_capacity_ext(parent_cols.len())?;
         for (pc, &cpos) in parent_cols.iter().zip(child_pos.iter()) {
             let (p, collation, parent_affinity) = match parent_tbl.get_column(pc) {
-                Some((i, column)) => (
-                    i,
-                    CollationSeq::Text(
-                        crate::translate::collate::column_collation(column)
-                            .unwrap_or(TextCollation::Binary),
-                    ),
-                    column.affinity(),
-                ),
+                Some((i, column)) if column.is_rowid_alias() => {
+                    (i, CollationSeq::BINARY, column.affinity())
+                }
+                Some((i, column)) => (i, column.collation(), column.affinity()),
                 None if ROWID_STRS.iter().any(|r| pc.eq_ignore_ascii_case(r)) => {
                     (0, CollationSeq::BINARY, Affinity::Integer)
                 }
