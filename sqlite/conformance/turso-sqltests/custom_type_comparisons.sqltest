@@ -710,3 +710,30 @@ test cmp-foreign-key-rejects-missing-parent-by-type-order {
 expect error {
     FOREIGN KEY constraint failed
 }
+
+@requires strict "uses STRICT tables"
+test cmp-array-of-ordered-type-column-is-an-error {
+    -- Array elements compare by their stored form. A numeric's stored form
+    -- does not sort like the number, so an array of numerics would compare
+    -- in the wrong order.
+    CREATE TABLE t(a numeric(10,2)[]) STRICT;
+}
+expect error {
+    arrays of type numeric are not supported
+}
+
+@requires strict "uses STRICT tables"
+test cmp-array-of-ordered-type-added-column-is-an-error {
+    CREATE TABLE t(id INTEGER PRIMARY KEY) STRICT;
+    ALTER TABLE t ADD COLUMN a numeric[];
+}
+expect error {
+    arrays of type numeric are not supported
+}
+
+test cmp-array-of-ordered-type-cast-is-an-error {
+    SELECT CAST('{1}' AS numeric(5,1)[]);
+}
+expect error {
+    arrays of type numeric are not supported
+}

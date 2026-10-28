@@ -817,6 +817,9 @@ fn validate(
                         c.col_name
                     );
                 }
+                if col_type.is_array() {
+                    resolver.schema().check_array_element_type(type_name)?;
+                }
 
                 // Domain types require STRICT tables because domain constraints
                 // (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables.

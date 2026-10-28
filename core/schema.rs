@@ -1588,6 +1588,23 @@ impl Schema {
             .ordering()
     }
 
+    /// Fails when `element_type` has its own order, as numeric does. Array
+    /// elements compare by their stored form, which does not sort in the
+    /// type's order.
+    pub fn check_array_element_type(&self, element_type: &str) -> crate::Result<()> {
+        let Some(type_def) = self.get_type_def_unchecked(element_type) else {
+            return Ok(());
+        };
+        if self.type_ordering(type_def).is_some() {
+            crate::bail_parse_error!(
+                "arrays of type {} are not supported, because their elements would not compare in the order of {}",
+                type_def.name,
+                type_def.name
+            );
+        }
+        Ok(())
+    }
+
     /// Whether the column's values are encoded before they are stored: an array column, or a
     /// column whose type is a custom type of a STRICT table.
     pub fn column_has_custom_type(&self, column: &Column, is_strict: bool) -> bool {

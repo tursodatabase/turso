@@ -742,6 +742,7 @@ fn translate_cast_expr(
 
     if let (Some(tn), Some(cast_type_name)) = (type_name, &cast_type_name) {
         if tn.array_dimensions > 0 {
+            resolver.schema().check_array_element_type(cast_type_name)?;
             let mut column = Column::new(
                 None,
                 cast_type_name.clone(),

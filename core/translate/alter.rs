@@ -1183,6 +1183,11 @@ pub fn translate_alter_table(
                 }
                 let written_ty = column.written_ty_str.as_deref().unwrap_or(ty);
                 let is_builtin = ty.is_empty() || is_builtin_strict_type(written_ty);
+                if column.is_array() {
+                    resolver
+                        .schema()
+                        .check_array_element_type(&normalize_ident(ty))?;
+                }
                 // Domain types require STRICT tables because domain constraints
                 // (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables.
                 if !is_builtin && !btree.is_strict {
