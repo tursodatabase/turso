@@ -30,6 +30,7 @@ members = [
     "postgres/frontend",
     "postgres/parser",
     "postgres/regress",
+    "postgres/dump-fuzzer",
     "postgres/server",
     "postgres/tests",
     "serverless/rust",
@@ -190,6 +191,12 @@ debug = "line-tables-only"
 codegen-units = 4
 panic = "abort"
 lto = "thin"
+
+[profile.pg-dump-fuzzer]
+inherits = "release"
+panic = "unwind"
+lto = false
+codegen-units = 16
 
 # Official release profile - maximum optimization for published binaries
 # Use for CLI releases, PyPI, npm, Maven, NuGet, etc.
