@@ -223,6 +223,8 @@ INSERT INTO sensors VALUES (1, ARRAY[1.5, 2.5, 3.5], '["a","b"]', '[0, 1, 1]');
 
 Arrays are displayed as JSON arrays on output. Element types are validated against the declared base type — for example, an `INTEGER[]` column rejects non-numeric text elements.
 
+Arrays compare element by element, each element by its declared type: in an `INTEGER[]`, `'{1}'` and `'{1.0}'` are equal, while in a `TEXT[]` they are the different texts `'1'` and `'1.0'`.
+
 For the full set of array functions, operators, and subscript syntax, see [Array Functions](/docs/sql-reference/functions/array).
 
 ### Inspecting Types

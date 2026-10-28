@@ -209,6 +209,8 @@ SELECT n FROM t UNION SELECT 4.5;    -- two rows: 4.5 equals 4.50
 
 A COLLATE on a value of such a type is an error (`collations are not supported by type numeric`).
 
+A window `RANGE` frame with an offset (`RANGE 1 PRECEDING`) computes its bounds with numeric's `+` and `-` when the `ORDER BY` value is a numeric. For other types with an order, such as arrays, such a frame is an error.
+
 A type without an order compares the values the column reads as, with SQLite's rules. An index on such a column serves `=` lookups only, since it is ordered by the encoded form.
 
 ### Non-Orderable Types
