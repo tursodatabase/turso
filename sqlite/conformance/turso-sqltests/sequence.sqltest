@@ -320,6 +320,13 @@ expect error {
     sequence name "__turso_internal_autoincrement_pwned" is reserved for internal AUTOINCREMENT use
 }
 
+test create-sequence-rejects-a-name-reserved-for-the-engine {
+    CREATE SEQUENCE __turso_internal_seq_x;
+}
+expect error {
+    Object name reserved for internal use: __turso_internal_seq_x
+}
+
 test qualified-sequence-name-may-contain-a-dot {
     CREATE SEQUENCE "a.b" START WITH 5;
     SELECT nextval('main.a.b');

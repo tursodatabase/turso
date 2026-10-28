@@ -1207,7 +1207,10 @@ pub fn translate_create_table(
     program.extend(&opts);
 
     if !connection.is_mvcc_bootstrap_connection()
-        && is_reserved_object_name(&normalized_tbl_name)
+        && is_reserved_object_name(
+            connection.dialect().supports_namespaces(),
+            &normalized_tbl_name,
+        )
         && !connection.is_nested_stmt()
     {
         bail_parse_error!(

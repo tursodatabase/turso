@@ -37,7 +37,11 @@ fn validate_materialized(
     if database_id != crate::MAIN_DB_ID {
         crate::bail_parse_error!("materialized views are not supported on attached databases");
     }
-    if is_reserved_object_name(normalized_view_name) {
+    if is_reserved_object_name(
+        resolver.catalog.dialect.supports_namespaces(),
+        normalized_view_name,
+    ) && !connection.is_nested_stmt()
+    {
         bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
     }
 
@@ -315,6 +319,7 @@ pub fn translate_create_materialized_view(
 }
 
 fn validate_create_view(
+    connection: &Arc<crate::Connection>,
     resolver: &Resolver,
     namespace: NamespaceRef,
     view_name: &ast::Name,
@@ -333,12 +338,17 @@ fn validate_create_view(
             crate::util::identifier_token_for_error(view_name)
         )));
     }
-    if is_reserved_object_name(normalized_view_name) {
+    if is_reserved_object_name(
+        resolver.catalog.dialect.supports_namespaces(),
+        normalized_view_name,
+    ) && !connection.is_nested_stmt()
+    {
         bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn translate_create_view(
     view_name: &ast::QualifiedName,
     resolver: &Resolver,
@@ -346,6 +356,7 @@ pub fn translate_create_view(
     columns: &[ast::IndexedColumn],
     temporary: bool,
     if_not_exists: bool,
+    connection: &Arc<crate::Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     // TEMP views always live in the temp schema. The parser rejects
@@ -370,7 +381,13 @@ pub fn translate_create_view(
         return Ok(());
     }
 
-    validate_create_view(resolver, namespace, &view_name.name, &normalized_view_name)?;
+    validate_create_view(
+        connection,
+        resolver,
+        namespace,
+        &view_name.name,
+        &normalized_view_name,
+    )?;
 
     // Check for name conflicts with existing schema objects
     if let Some(object_type) = resolver.with_schema(database_id, |s| {

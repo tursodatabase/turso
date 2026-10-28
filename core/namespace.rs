@@ -100,12 +100,14 @@ pub fn demangle_name(supports_namespaces: bool, mangled: &str) -> (NamespaceId, 
     }
 }
 
-/// Whether the engine stores an object under `name` for its own use, so
-/// that a user may not name an object so.
-pub fn is_reserved_object_name(name: &str) -> bool {
+/// Whether the engine stores an object under `name` for its own use or, in
+/// a database that supports namespaces, for a namespace, so that a
+/// user may not name an object so.
+pub fn is_reserved_object_name(supports_namespaces: bool, name: &str) -> bool {
     crate::schema::RESERVED_TABLE_PREFIXES
         .iter()
         .any(|prefix| name.starts_with(prefix))
+        || (supports_namespaces && name.starts_with(MANGLED_NAME_PREFIX))
 }
 
 /// A name that qualifies object names in SQL and the namespace it refers
@@ -308,7 +310,10 @@ impl Namespaces {
 
 #[cfg(test)]
 mod tests {
-    use super::{demangle_name, mangle_name, Namespace, NamespaceId, NamespaceRef, Namespaces};
+    use super::{
+        demangle_name, is_reserved_object_name, mangle_name, Namespace, NamespaceId, NamespaceRef,
+        Namespaces,
+    };
     use crate::{MAIN_DB_ID, TEMP_DB_ID};
 
     #[test]
@@ -498,6 +503,25 @@ mod tests {
             demangle_name(true, "__turso_ns0_t"),
             (NamespaceId::ROOT, "__turso_ns0_t")
         );
+    }
+
+    #[test]
+    fn mangled_names_are_reserved() {
+        assert!(is_reserved_object_name(true, "__turso_ns17_t"));
+        assert!(is_reserved_object_name(true, "__turso_nst"));
+        assert!(is_reserved_object_name(
+            true,
+            "__turso_internal_namespace_17_app"
+        ));
+        assert!(is_reserved_object_name(true, "sqlite_t"));
+        assert!(!is_reserved_object_name(true, "__turso_t"));
+        assert!(!is_reserved_object_name(true, "t"));
+        assert!(!is_reserved_object_name(false, "__turso_ns17_t"));
+        assert!(is_reserved_object_name(
+            false,
+            "__turso_internal_namespace_17_app"
+        ));
+        assert!(is_reserved_object_name(false, "sqlite_t"));
     }
 
     #[test]
