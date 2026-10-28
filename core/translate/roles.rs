@@ -190,6 +190,12 @@ pub fn check_storage_access(program: &ProgramBuilder, resolver: &Resolver) -> Re
     if !resolver.role_is_not_superuser {
         return Ok(());
     }
+    if let Some(view_name) = program.referenced_views.first() {
+        return Err(permission_denied(PermissionDenied::privilege(
+            Action::Read,
+            Object::View(view_name.clone()),
+        )));
+    }
     for (insn, _) in &program.insns {
         let (action, db, root_page) = match insn {
             Insn::OpenRead { db, root_page, .. } => (Action::Read, *db, Some(*root_page)),

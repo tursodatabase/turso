@@ -440,6 +440,26 @@ expect error {
     permission denied for table rw_read
 }
 
+test role-without-privileges-cannot-read-views {
+    CREATE VIEW rw_constant_view AS SELECT 1 AS one;
+    CREATE ROLE rw_view_reader;
+    SET ROLE rw_view_reader;
+    SELECT one FROM rw_constant_view;
+}
+expect error {
+    permission denied for view rw_constant_view
+}
+
+test view-in-an-unused-cte-is-not-read {
+    CREATE VIEW rw_unused_view AS SELECT 1 AS one;
+    CREATE ROLE rw_unused_view_reader;
+    SET ROLE rw_unused_view_reader;
+    WITH unused AS (SELECT one FROM rw_unused_view) SELECT 2;
+}
+expect {
+    2
+}
+
 test role-without-privileges-cannot-insert-rows {
     CREATE TABLE rw_insert (x int);
     INSERT INTO rw_insert VALUES (1);
