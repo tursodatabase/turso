@@ -177,10 +177,16 @@ impl Iterator for PgQueryRunner<'_> {
 
 pub fn split_statements(sql: &str) -> crate::Result<Vec<String>> {
     match turso_pg_parser::split_statements(sql) {
-        Ok(stmts) if stmts.is_empty() && !sql.trim().is_empty() => Ok(vec![sql.trim().to_string()]),
+        Ok(stmts) if stmts.is_empty() && !sql.trim().is_empty() && !has_no_statements(sql) => {
+            Ok(vec![sql.trim().to_string()])
+        }
         Ok(stmts) => Ok(stmts),
         Err(_) => Ok(vec![sql.trim().to_string()]),
     }
+}
+
+fn has_no_statements(sql: &str) -> bool {
+    turso_pg_parser::parse(sql).is_ok_and(|parsed| parsed.protobuf.nodes().is_empty())
 }
 
 fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crate::Statement> {
