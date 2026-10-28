@@ -9,6 +9,7 @@ use crate::catalog::{self, PostgresDialect};
 use crate::error::sqlstate_error;
 use crate::functions::ConfigParameter;
 use crate::settings::{PgSessionState, SettingScope};
+use crate::statement::{collect_core, run_core, run_pg, DeferredIO, DeferredResult};
 use turso_core::{is_memory_like, Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::sqlstate::{
@@ -251,59 +252,72 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
     let sql_owned = sql.into_owned();
     Ok(crate::Statement::with_deferred(
         inner,
-        Box::new(move |inner| {
-            execute_cmd_with_prereqs(&pg_conn, &prereqs, &cmd, &sql_owned, inner)
+        Box::new(move |io| {
+            let pg_conn = Arc::clone(&pg_conn);
+            let prereqs = prereqs.clone();
+            let cmd = cmd.clone();
+            let sql = sql_owned.clone();
+            Box::pin(
+                async move { execute_cmd_with_prereqs(&pg_conn, &prereqs, &cmd, &sql, &io).await },
+            )
         }),
     ))
 }
 
 const PG_STMT_SAVEPOINT: &str = "__turso_pg_stmt";
 
-fn execute_cmd_with_prereqs(
+async fn execute_cmd_with_prereqs(
     pg_conn: &Arc<PgConnectionInner>,
     prereqs: &[ast::Stmt],
     cmd: &ast::Cmd,
     sql: &str,
-    inner: &mut Statement,
-) -> Result<()> {
+    io: &DeferredIO,
+) -> Result<DeferredResult> {
     let conn = &pg_conn.conn;
-    if create_table_if_not_exists_target_present(conn, cmd)? {
-        *inner = conn.prepare_translated_cmd(cmd.clone(), sql)?;
-        return inner.run_ignore_rows();
+    if create_table_if_not_exists_target_present(conn, cmd, io).await? {
+        let mut inner = conn.prepare_translated_cmd(cmd.clone(), sql)?;
+        run_core(&mut inner, io).await?;
+        return Ok(DeferredResult::Replace(inner));
     }
 
     let started_in_autocommit = conn.get_auto_commit();
     let begin_sp = format!("SAVEPOINT \"{PG_STMT_SAVEPOINT}\"");
     let release_sp = format!("RELEASE SAVEPOINT \"{PG_STMT_SAVEPOINT}\"");
-    execute_sqlite(conn, begin_sp)?;
-    let result = (|| {
+    execute_sqlite_nonblock(conn, begin_sp, io).await?;
+    let result = async {
         for prereq in prereqs {
             let input = prereq.to_string();
             let mut stmt = conn.prepare_translated_stmt(prereq.clone(), &input)?;
-            stmt.run_ignore_rows()?;
+            run_core(&mut stmt, io).await?;
         }
-        *inner = conn.prepare_translated_cmd(cmd.clone(), sql)?;
-        inner.run_ignore_rows()
-    })();
+        let mut inner = conn.prepare_translated_cmd(cmd.clone(), sql)?;
+        run_core(&mut inner, io).await?;
+        Ok::<_, LimboError>(inner)
+    }
+    .await;
 
     match result {
-        Ok(()) => execute_sqlite(conn, release_sp),
+        Ok(inner) => {
+            execute_sqlite_nonblock(conn, release_sp, io).await?;
+            Ok(DeferredResult::Replace(inner))
+        }
         Err(err) => {
             if started_in_autocommit {
-                let _ = execute_sqlite(conn, "ROLLBACK");
+                let _ = execute_sqlite_nonblock(conn, "ROLLBACK", io).await;
             } else {
                 let rollback_sp = format!("ROLLBACK TO SAVEPOINT \"{PG_STMT_SAVEPOINT}\"");
-                let _ = execute_sqlite(conn, rollback_sp);
-                let _ = execute_sqlite(conn, release_sp);
+                let _ = execute_sqlite_nonblock(conn, rollback_sp, io).await;
+                let _ = execute_sqlite_nonblock(conn, release_sp, io).await;
             }
             Err(err)
         }
     }
 }
 
-fn create_table_if_not_exists_target_present(
+async fn create_table_if_not_exists_target_present(
     conn: &Arc<Connection>,
     cmd: &ast::Cmd,
+    io: &DeferredIO,
 ) -> Result<bool> {
     let ast::Cmd::Stmt(ast::Stmt::CreateTable {
         if_not_exists: true,
@@ -332,7 +346,7 @@ fn create_table_if_not_exists_target_present(
         NonZero::new(1).unwrap(),
         Value::build_text(tbl_name.name.as_str().to_string()),
     )?;
-    let rows = stmt.run_collect_rows()?;
+    let rows = collect_core(&mut stmt, io).await?;
     Ok(rows
         .first()
         .and_then(|row| row.first())
@@ -579,7 +593,14 @@ fn try_prepare_special(
         let pg_conn = Arc::clone(pg_conn);
         return Ok(Some(crate::Statement::with_deferred(
             inner,
-            Box::new(move |_inner| handle_pg_create_schema(&pg_conn, &stmt)),
+            Box::new(move |io| {
+                let pg_conn = Arc::clone(&pg_conn);
+                let stmt = stmt.clone();
+                Box::pin(async move {
+                    handle_pg_create_schema(&pg_conn, &stmt, &io).await?;
+                    Ok(DeferredResult::Done)
+                })
+            }),
         )));
     }
 
@@ -588,7 +609,14 @@ fn try_prepare_special(
         let conn = Arc::clone(&pg_conn.conn);
         return Ok(Some(crate::Statement::with_deferred(
             inner,
-            Box::new(move |_inner| handle_pg_drop_schema(&conn, &stmt)),
+            Box::new(move |io| {
+                let conn = Arc::clone(&conn);
+                let stmt = stmt.clone();
+                Box::pin(async move {
+                    handle_pg_drop_schema(&conn, &stmt, &io).await?;
+                    Ok(DeferredResult::Done)
+                })
+            }),
         )));
     }
 
@@ -607,10 +635,13 @@ fn try_prepare_special(
         let conn = Arc::clone(&pg_conn.conn);
         return Ok(Some(crate::Statement::with_deferred(
             inner,
-            Box::new(move |inner| {
-                let rows_inserted = handle_pg_copy_from(&conn, &stmt)?;
-                inner.set_n_change(rows_inserted as i64);
-                Ok(())
+            Box::new(move |io| {
+                let conn = Arc::clone(&conn);
+                let stmt = stmt.clone();
+                Box::pin(async move {
+                    let rows_inserted = handle_pg_copy_from(&conn, &stmt, &io).await?;
+                    Ok(DeferredResult::Changed(rows_inserted as i64))
+                })
             }),
         )));
     }
@@ -641,9 +672,13 @@ fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
     conn.prepare("SELECT 0 WHERE 0")
 }
 
-fn execute_sqlite(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
+async fn execute_sqlite_nonblock(
+    conn: &Arc<Connection>,
+    sql: impl AsRef<str>,
+    io: &DeferredIO,
+) -> Result<()> {
     let mut stmt = conn.prepare_sqlite(sql)?;
-    stmt.run_ignore_rows()
+    run_core(&mut stmt, io).await
 }
 
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
@@ -848,9 +883,10 @@ fn search_path_parser<'src>() -> impl Parser<'src, &'src str, Vec<String>, extra
         .padded_by(whitespace)
 }
 
-fn handle_pg_create_schema(
+async fn handle_pg_create_schema(
     pg_conn: &Arc<PgConnectionInner>,
     stmt: &PgCreateSchemaStmt,
+    io: &DeferredIO,
 ) -> Result<()> {
     let conn = &pg_conn.conn;
     let name = stmt.name.to_lowercase();
@@ -863,7 +899,7 @@ fn handle_pg_create_schema(
         )));
     }
 
-    if schema_exists(conn, &name)? {
+    if schema_exists_nonblock(conn, &name, io).await? {
         if stmt.if_not_exists {
             return Ok(());
         }
@@ -889,10 +925,12 @@ fn handle_pg_create_schema(
     }
 
     let path = schema_file_path(conn, &name);
-    execute_sqlite(
+    execute_sqlite_nonblock(
         conn,
         format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name),
-    )?;
+        io,
+    )
+    .await?;
     if stmt.elements.is_empty() {
         return Ok(());
     }
@@ -903,12 +941,18 @@ fn handle_pg_create_schema(
         search_path = format!("{search_path}, {rest}");
     }
     set_search_path(conn, Some(&search_path), SettingScope::Session)?;
-    let result = stmt.elements.iter().try_for_each(|sql| {
-        prepare_statement(pg_conn, sql)?
-            .run_ignore_rows()
-            .map_err(crate::Error::into_core_error)
-    });
-    set_search_path(conn, setting.as_deref(), SettingScope::Session)?;
+    let restore = SearchPathRestore { conn, setting };
+    let result = async {
+        for sql in &stmt.elements {
+            let mut element = prepare_statement(pg_conn, sql)?;
+            run_pg(&mut element, io)
+                .await
+                .map_err(crate::Error::into_core_error)?;
+        }
+        Ok::<_, LimboError>(())
+    }
+    .await;
+    drop(restore);
     if let Err(err) = result {
         handle_pg_drop_schema(
             conn,
@@ -917,10 +961,23 @@ fn handle_pg_create_schema(
                 if_exists: false,
                 cascade: true,
             },
-        )?;
+            io,
+        )
+        .await?;
         return Err(err);
     }
     Ok(())
+}
+
+struct SearchPathRestore<'a> {
+    conn: &'a Connection,
+    setting: Option<String>,
+}
+
+impl Drop for SearchPathRestore<'_> {
+    fn drop(&mut self) {
+        let _ = set_search_path(self.conn, self.setting.as_deref(), SettingScope::Session);
+    }
 }
 
 fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
@@ -938,9 +995,13 @@ fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
     }
 }
 
-fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Result<()> {
+async fn handle_pg_drop_schema(
+    conn: &Arc<Connection>,
+    stmt: &PgDropSchemaStmt,
+    io: &DeferredIO,
+) -> Result<()> {
     let name = stmt.name.to_lowercase();
-    if name != "public" && !schema_exists(conn, &name)? {
+    if name != "public" && !schema_exists_nonblock(conn, &name, io).await? {
         if stmt.if_exists {
             return Ok(());
         }
@@ -950,7 +1011,7 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
     }
 
     let database = if name == "public" { "main" } else { &name };
-    let objects = schema_objects(conn, database)?;
+    let objects = schema_objects_nonblock(conn, database, io).await?;
     if !stmt.cascade && !objects.is_empty() {
         return Err(sqlstate_error(
             SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
@@ -958,29 +1019,37 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
         ));
     }
 
-    without_foreign_keys(conn, || {
+    let restore = ForeignKeysRestore {
+        conn,
+        enabled: conn.foreign_keys_enabled(),
+    };
+    conn.set_foreign_keys_enabled(false);
+    let result = async {
         for object in &objects {
-            execute_sqlite(conn, object.drop_sql(database))?;
+            execute_sqlite_nonblock(conn, object.drop_sql(database), io).await?;
         }
-        Ok(())
-    })?;
+        Ok::<_, LimboError>(())
+    }
+    .await;
+    drop(restore);
+    result?;
     // PostgreSQL drops public like any other schema, but turso keeps it,
     // because unqualified names of the main database are its objects.
     if name == "public" {
         return Ok(());
     }
-    execute_sqlite(conn, format!("DETACH \"{name}\""))
+    execute_sqlite_nonblock(conn, format!("DETACH \"{name}\""), io).await
 }
 
-/// Runs `f` with foreign keys not enforced. DROP SCHEMA ... CASCADE drops
-/// the foreign keys of the tables that it drops along with the tables, so
-/// they must not stop the drops or delete rows.
-fn without_foreign_keys(conn: &Arc<Connection>, f: impl FnOnce() -> Result<()>) -> Result<()> {
-    let enabled = conn.foreign_keys_enabled();
-    conn.set_foreign_keys_enabled(false);
-    let result = f();
-    conn.set_foreign_keys_enabled(enabled);
-    result
+struct ForeignKeysRestore<'a> {
+    conn: &'a Connection,
+    enabled: bool,
+}
+
+impl Drop for ForeignKeysRestore<'_> {
+    fn drop(&mut self) {
+        self.conn.set_foreign_keys_enabled(self.enabled);
+    }
 }
 
 /// An object of a schema, which DROP SCHEMA ... CASCADE drops.
@@ -1019,7 +1088,11 @@ const SEQUENCE_TABLE_PREFIX: &str = "__turso_internal_seq_";
 /// The objects of the schema that database `database` holds, in the order
 /// that DROP SCHEMA drops them: views first, because they depend on tables.
 /// Indexes and triggers go with their tables.
-fn schema_objects(conn: &Arc<Connection>, database: &str) -> Result<Vec<SchemaObject>> {
+async fn schema_objects_nonblock(
+    conn: &Arc<Connection>,
+    database: &str,
+    io: &DeferredIO,
+) -> Result<Vec<SchemaObject>> {
     let mut stmt = conn.prepare_sqlite(format!(
         "SELECT type, name FROM \"{database}\".sqlite_schema \
          WHERE type IN ('view', 'table') ORDER BY name"
@@ -1027,7 +1100,7 @@ fn schema_objects(conn: &Arc<Connection>, database: &str) -> Result<Vec<SchemaOb
     let mut views = Vec::new();
     let mut tables = Vec::new();
     let mut sequences = Vec::new();
-    for row in stmt.run_collect_rows()? {
+    for row in collect_core(&mut stmt, io).await? {
         let (Some(Value::Text(kind)), Some(Value::Text(name))) = (row.first(), row.get(1)) else {
             continue;
         };
@@ -1045,7 +1118,11 @@ fn schema_objects(conn: &Arc<Connection>, database: &str) -> Result<Vec<SchemaOb
     Ok(views.into_iter().chain(tables).chain(sequences).collect())
 }
 
-fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<usize> {
+async fn handle_pg_copy_from(
+    conn: &Arc<Connection>,
+    stmt: &PgCopyFromStmt,
+    io: &DeferredIO,
+) -> Result<usize> {
     let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
         LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
     })?;
@@ -1054,7 +1131,8 @@ fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<
         Some(schema) => format!("\"{schema}\".\"{}\"", stmt.table_name),
         None => format!("\"{}\"", stmt.table_name),
     };
-    let column_names = get_table_columns(conn, &stmt.table_name, stmt.schema_name.as_deref())?;
+    let column_names =
+        get_table_columns(conn, &stmt.table_name, stmt.schema_name.as_deref(), io).await?;
     if column_names.is_empty() {
         return Err(LimboError::ParseError(format!(
             "COPY FROM: table '{}' not found or has no columns",
@@ -1088,9 +1166,9 @@ fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<
 
     let rows_inserted = rows.len();
     let mut begin = conn.prepare_sqlite("BEGIN CONCURRENT")?;
-    begin.run_ignore_rows()?;
+    run_core(&mut begin, io).await?;
 
-    let result = (|| {
+    let result = async {
         let mut insert_stmt = conn.prepare_sqlite(&insert_sql)?;
         for row in &rows {
             for (i, val) in row.iter().enumerate() {
@@ -1100,36 +1178,38 @@ fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<
                     None => insert_stmt.bind_at(index, Value::Null)?,
                 }
             }
-            insert_stmt.run_ignore_rows()?;
+            run_core(&mut insert_stmt, io).await?;
             insert_stmt.reset()?;
             insert_stmt.clear_bindings();
         }
 
         let mut commit = conn.prepare_sqlite("COMMIT")?;
-        commit.run_ignore_rows()?;
-        Ok(rows_inserted)
-    })();
+        run_core(&mut commit, io).await?;
+        Ok::<_, LimboError>(rows_inserted)
+    }
+    .await;
 
     if result.is_err() {
         if let Ok(mut rollback) = conn.prepare_sqlite("ROLLBACK") {
-            let _ = rollback.run_ignore_rows();
+            let _ = run_core(&mut rollback, io).await;
         }
     }
 
     result
 }
 
-fn get_table_columns(
+async fn get_table_columns(
     conn: &Arc<Connection>,
     table_name: &str,
     schema_name: Option<&str>,
+    io: &DeferredIO,
 ) -> Result<Vec<String>> {
     let sql = match schema_name {
         Some(schema) => format!("PRAGMA \"{schema}\".table_info('{table_name}')"),
         None => format!("PRAGMA table_info('{table_name}')"),
     };
     let mut stmt = conn.prepare_internal(&sql)?;
-    let rows = stmt.run_collect_rows()?;
+    let rows = collect_core(&mut stmt, io).await?;
     Ok(rows
         .into_iter()
         .filter_map(|row| match row.get(1) {
@@ -1139,13 +1219,17 @@ fn get_table_columns(
         .collect())
 }
 
-fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
+async fn schema_exists_nonblock(
+    conn: &Arc<Connection>,
+    schema_name: &str,
+    io: &DeferredIO,
+) -> Result<bool> {
     let sql = format!(
         "SELECT 1 FROM pragma_database_list WHERE name = '{}'",
         schema_name.replace('\'', "''")
     );
     let mut stmt = conn.prepare_internal(&sql)?;
-    let rows = stmt.run_collect_rows()?;
+    let rows = collect_core(&mut stmt, io).await?;
     Ok(!rows.is_empty())
 }
 

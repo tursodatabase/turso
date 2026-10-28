@@ -1,5 +1,9 @@
+use std::future::{poll_fn, Future};
 use std::num::NonZero;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::Waker;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use turso_core::{
@@ -8,11 +12,22 @@ use turso_core::{
 
 use crate::Result;
 
-pub(crate) type DeferredExec =
-    Box<dyn FnMut(&mut turso_core::Statement) -> turso_core::Result<()> + Send + Sync>;
+pub(crate) type DeferredIO =
+    Arc<Mutex<Option<(StepResult, Option<turso_core::types::IOCompletions>)>>>;
+pub(crate) type DeferredFuture =
+    Pin<Box<dyn Future<Output = turso_core::Result<DeferredResult>> + Send>>;
+pub(crate) type DeferredExec = Box<dyn Fn(DeferredIO) -> DeferredFuture + Send + Sync>;
+
+pub(crate) enum DeferredResult {
+    Done,
+    Replace(turso_core::Statement),
+    Changed(i64),
+}
 
 struct DeferredState {
     exec: DeferredExec,
+    future: Option<DeferredFuture>,
+    io: DeferredIO,
     completed: bool,
 }
 
@@ -30,45 +45,75 @@ impl Statement {
     }
 
     pub(crate) fn with_deferred(inner: turso_core::Statement, exec: DeferredExec) -> Self {
+        let io = DeferredIO::default();
+        let future = Some(exec(io.clone()));
         Self {
             inner,
             deferred: Some(DeferredState {
                 exec,
+                future,
+                io,
                 completed: false,
             }),
         }
     }
 
-    fn execute_deferred(&mut self) -> Result<()> {
+    fn execute_deferred(&mut self, waker: &Waker) -> Result<StepResult> {
         let Some(deferred) = self.deferred.as_mut() else {
-            return Ok(());
+            return Ok(StepResult::Done);
         };
-        if !deferred.completed {
-            (deferred.exec)(&mut self.inner)?;
-            deferred.completed = true;
+        if deferred.completed {
+            return Ok(StepResult::Done);
         }
-        Ok(())
+        let mut cx = Context::from_waker(waker);
+        match deferred
+            .future
+            .as_mut()
+            .expect("deferred future exists")
+            .as_mut()
+            .poll(&mut cx)
+        {
+            Poll::Pending => Ok(deferred
+                .io
+                .lock()
+                .unwrap()
+                .as_mut()
+                .map(|(result, _)| std::mem::replace(result, StepResult::IO))
+                .unwrap_or(StepResult::IO)),
+            Poll::Ready(Ok(result)) => {
+                deferred.future = None;
+                deferred.completed = true;
+                match result {
+                    DeferredResult::Done => {}
+                    DeferredResult::Replace(inner) => self.inner = inner,
+                    DeferredResult::Changed(count) => self.inner.set_n_change(count),
+                }
+                Ok(StepResult::Done)
+            }
+            Poll::Ready(Err(error)) => {
+                deferred.restart();
+                Err(error.into())
+            }
+        }
     }
 
     pub fn step(&mut self) -> Result<StepResult> {
         if self.deferred.is_some() {
-            self.execute_deferred()?;
-            return Ok(StepResult::Done);
+            return self.execute_deferred(Waker::noop());
         }
         self.inner.step().map_err(Into::into)
     }
 
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
         if self.deferred.is_some() {
-            self.execute_deferred()?;
-            return Ok(StepResult::Done);
+            return self.execute_deferred(waker);
         }
         self.inner.step_with_waker(waker).map_err(Into::into)
     }
 
     pub fn reset(&mut self) -> Result<()> {
         if let Some(deferred) = self.deferred.as_mut() {
-            deferred.completed = false;
+            deferred.restart();
         }
         self.inner.reset().map_err(Into::into)
     }
@@ -95,15 +140,25 @@ impl Statement {
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
-        if self.deferred.is_some() {
-            return self.execute_deferred();
+        if self.deferred.is_none() {
+            return self.inner.run_ignore_rows().map_err(Into::into);
         }
-        self.inner.run_ignore_rows().map_err(Into::into)
+        loop {
+            match self.step()? {
+                StepResult::Done => return Ok(()),
+                StepResult::Row => {}
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    self._io().step()?
+                }
+                StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
+                StepResult::Busy => return Err(LimboError::Busy.into()),
+            }
+        }
     }
 
     pub fn run_collect_rows(&mut self) -> Result<Vec<Vec<Value>>> {
         if self.deferred.is_some() {
-            self.execute_deferred()?;
+            self.run_ignore_rows()?;
             return Ok(Vec::new());
         }
         self.inner.run_collect_rows().map_err(Into::into)
@@ -127,13 +182,31 @@ impl Statement {
     }
 
     pub fn run_ignore_rows_nonblock(&mut self) -> Result<IOResult<()>> {
-        if self.deferred.is_some() {
-            self.execute_deferred()?;
-            return Ok(IOResult::Done(()));
+        if self.deferred.is_none() {
+            return self
+                .inner
+                .run_ignore_rows_nonblock()
+                .map_err(|error| (*error).into());
         }
-        self.inner
-            .run_ignore_rows_nonblock()
-            .map_err(|error| (*error).into())
+        loop {
+            match self.step()? {
+                StepResult::Done => return Ok(IOResult::Done(())),
+                StepResult::Row => {}
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    return Ok(
+                        IOResult::IO(
+                            self.take_io_completions().unwrap_or_else(|| {
+                                turso_core::types::IOCompletions(
+                                    turso_core::io::Completion::new_yield(),
+                                )
+                            }),
+                        ),
+                    );
+                }
+                StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
+                StepResult::Busy => return Err(LimboError::Busy.into()),
+            }
+        }
     }
 
     pub fn run_with_row_callback_nonblock(
@@ -145,7 +218,7 @@ impl Statement {
                 StepResult::Done => return Ok(IOResult::Done(())),
                 StepResult::Row => callback(self.row().expect("row should be present"))?,
                 StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
-                    let completions = self.inner.take_io_completions().unwrap_or_else(|| {
+                    let completions = self.take_io_completions().unwrap_or_else(|| {
                         turso_core::types::IOCompletions(turso_core::io::Completion::new_yield())
                     });
                     return Ok(IOResult::IO(completions));
@@ -177,7 +250,17 @@ impl Statement {
     }
 
     pub fn take_io_completions(&mut self) -> Option<turso_core::types::IOCompletions> {
-        self.inner.take_io_completions()
+        self.deferred
+            .as_ref()
+            .and_then(|state| {
+                state
+                    .io
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .and_then(|(_, completions)| completions.take())
+            })
+            .or_else(|| self.inner.take_io_completions())
     }
 
     pub fn clear_bindings(&mut self) {
@@ -202,10 +285,74 @@ impl Statement {
 
     pub fn reset_best_effort(&mut self) {
         if let Some(deferred) = self.deferred.as_mut() {
-            deferred.completed = false;
+            deferred.restart();
         }
         self.inner.reset_best_effort();
     }
+}
+
+impl DeferredState {
+    fn restart(&mut self) {
+        self.completed = false;
+        *self.io.lock().unwrap() = None;
+        self.future = Some((self.exec)(self.io.clone()));
+    }
+}
+
+pub(crate) async fn run_core(
+    stmt: &mut turso_core::Statement,
+    io: &DeferredIO,
+) -> turso_core::Result<()> {
+    run_core_with_rows(stmt, io, |_| Ok(())).await
+}
+
+pub(crate) async fn collect_core(
+    stmt: &mut turso_core::Statement,
+    io: &DeferredIO,
+) -> turso_core::Result<Vec<Vec<Value>>> {
+    let mut rows = Vec::new();
+    run_core_with_rows(stmt, io, |row| {
+        rows.push(row.get_values().cloned().collect());
+        Ok(())
+    })
+    .await?;
+    Ok(rows)
+}
+
+async fn run_core_with_rows(
+    stmt: &mut turso_core::Statement,
+    io: &DeferredIO,
+    mut on_row: impl FnMut(&Row) -> turso_core::Result<()>,
+) -> turso_core::Result<()> {
+    poll_fn(|cx| loop {
+        match stmt.step_with_waker(cx.waker())? {
+            StepResult::Done => return Poll::Ready(Ok(())),
+            StepResult::Row => on_row(stmt.row().expect("row should be present"))?,
+            result @ (StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
+                *io.lock().unwrap() = Some((result, stmt.take_io_completions()));
+                return Poll::Pending;
+            }
+            StepResult::Interrupt => return Poll::Ready(Err(LimboError::Interrupt)),
+            StepResult::Busy => return Poll::Ready(Err(LimboError::Busy)),
+        }
+    })
+    .await
+}
+
+pub(crate) async fn run_pg(stmt: &mut Statement, io: &DeferredIO) -> Result<()> {
+    poll_fn(|cx| loop {
+        match stmt.step_with_waker(cx.waker())? {
+            StepResult::Done => return Poll::Ready(Ok(())),
+            StepResult::Row => {}
+            result @ (StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
+                *io.lock().unwrap() = Some((result, stmt.take_io_completions()));
+                return Poll::Pending;
+            }
+            StepResult::Interrupt => return Poll::Ready(Err(LimboError::Interrupt.into())),
+            StepResult::Busy => return Poll::Ready(Err(LimboError::Busy.into())),
+        }
+    })
+    .await
 }
 
 enum BooleanResultType {
