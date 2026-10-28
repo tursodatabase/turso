@@ -946,12 +946,6 @@ pub enum ScalarFunc {
     // Test type functions (for custom type system testing)
     TestUintEncode,
     TestUintDecode,
-    TestUintAdd,
-    TestUintSub,
-    TestUintMul,
-    TestUintDiv,
-    TestUintLt,
-    TestUintEq,
     /// Test-only: returns a monotonically increasing 64-bit integer on every
     /// evaluation. Used to verify that the planner does not deduplicate
     /// equivalent SQL calls that contain nondeterministic functions.
@@ -978,8 +972,6 @@ pub enum ScalarFunc {
     NumericDiv,
     NumericMod,
     NumericNeg,
-    NumericLt,
-    NumericEq,
     // Date type functions
     DatePlus,
     DateMinus,
@@ -1086,15 +1078,9 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::ConnTxnId => false, // depends on connection state
             ScalarFunc::IsAutocommit => false, // depends on connection state
             ScalarFunc::SequenceWatermark => false, // depends on active MVCC transactions
-            ScalarFunc::TestUintEncode
-            | ScalarFunc::TestUintDecode
-            | ScalarFunc::TestUintAdd
-            | ScalarFunc::TestUintSub
-            | ScalarFunc::TestUintMul
-            | ScalarFunc::TestUintDiv
-            | ScalarFunc::TestUintLt
-            | ScalarFunc::TestUintEq
-            | ScalarFunc::StringReverse => true,
+            ScalarFunc::TestUintEncode | ScalarFunc::TestUintDecode | ScalarFunc::StringReverse => {
+                true
+            }
             ScalarFunc::Gcd
             | ScalarFunc::Lcm
             | ScalarFunc::Repeat
@@ -1114,8 +1100,6 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::NumericDiv
             | ScalarFunc::NumericMod
             | ScalarFunc::NumericNeg
-            | ScalarFunc::NumericLt
-            | ScalarFunc::NumericEq
             | ScalarFunc::DatePlus
             | ScalarFunc::DateMinus
             | ScalarFunc::DateDiff => true,
@@ -1255,12 +1239,6 @@ impl Display for ScalarFunc {
             Self::SequenceWatermark => "sequence_watermark_experimental",
             Self::TestUintEncode => "test_uint_encode",
             Self::TestUintDecode => "test_uint_decode",
-            Self::TestUintAdd => "test_uint_add",
-            Self::TestUintSub => "test_uint_sub",
-            Self::TestUintMul => "test_uint_mul",
-            Self::TestUintDiv => "test_uint_div",
-            Self::TestUintLt => "test_uint_lt",
-            Self::TestUintEq => "test_uint_eq",
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => "test_nondet_counter",
             Self::StringReverse => "string_reverse",
@@ -1281,8 +1259,6 @@ impl Display for ScalarFunc {
             Self::NumericDiv => "numeric_div",
             Self::NumericMod => "numeric_mod",
             Self::NumericNeg => "numeric_neg",
-            Self::NumericLt => "numeric_lt",
-            Self::NumericEq => "numeric_eq",
             Self::DatePlus => "date_plus",
             Self::DateMinus => "date_minus",
             Self::DateDiff => "date_diff",
@@ -1415,14 +1391,8 @@ impl ScalarFunc {
             // SQL-standard string and math extensions
             Self::Gcd | Self::Lcm | Self::Repeat => &[2],
             Self::Lpad | Self::Rpad => &[2, 3],
-            // Test functions for custom types (1-arg encode/decode, 2-arg operators)
+            // Test functions for custom types
             Self::TestUintEncode | Self::TestUintDecode | Self::StringReverse => &[1],
-            Self::TestUintAdd
-            | Self::TestUintSub
-            | Self::TestUintMul
-            | Self::TestUintDiv
-            | Self::TestUintLt
-            | Self::TestUintEq => &[2],
             // Built-in type functions
             Self::BooleanToInt
             | Self::IntToBoolean
@@ -1435,8 +1405,6 @@ impl ScalarFunc {
             | Self::NumericMul
             | Self::NumericDiv
             | Self::NumericMod
-            | Self::NumericLt
-            | Self::NumericEq
             | Self::DatePlus
             | Self::DateMinus
             | Self::DateDiff => &[2],

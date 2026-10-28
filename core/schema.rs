@@ -133,7 +133,7 @@ use std::sync::OnceLock;
 use tracing::trace;
 use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, NullsOrder, RefAct, ResolveType,
-    SortOrder, TableInternalId, TypeOperator,
+    SortOrder, TableInternalId,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -245,9 +245,9 @@ pub enum TypeDefKind {
         encode: Option<Box<ast::Expr>>,
         coerce: Option<Box<ast::Expr>>,
         decode: Option<Box<ast::Expr>>,
-        operators: std::vec::Vec<TypeOperator>,
-        /// How values of the type compare, when its `OPERATOR '<'` names a
-        /// function. `None` compares the stored values as SQLite does.
+        /// How values of the type compare, for built-in types that have their
+        /// own order, such as numeric. `None` compares the stored values as
+        /// SQLite does.
         ordering: Option<TypeOrdering>,
         /// How operators such as `+` and `-x` run on values of this type.
         operator_signatures: std::vec::Vec<OperatorSignature>,
@@ -267,17 +267,13 @@ pub struct OperatorSignature {
     /// One operand for a prefix operator, two for a binary one.
     pub args: std::vec::Vec<OperatorArg>,
     pub func: Option<String>,
-    /// The result's type, or `None` when the function decides it.
+    /// The type `func` returns. `None` when SQLite's operator runs.
     pub result: Option<&'static str>,
 }
 /// An operand that a signature accepts. "This type" is the type that declares
 /// the signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperatorArg {
-    /// A column of this type. A user type's function is only given columns: a
-    /// CAST gives the stored form, a column the value its DECODE returns, and
-    /// the function can't tell them apart.
-    Column,
     /// A literal that this type's ENCODE accepts. It is encoded before the call.
     EncodableLiteral,
     /// Any value of this type.
@@ -302,69 +298,18 @@ pub enum OperatorArg {
 pub const BINARY_OPERATORS: [&str; 9] = ["+", "-", "*", "/", "%", "&", "|", "<<", ">>"];
 pub const PREFIX_OPERATORS: [&str; 2] = ["-", "~"];
 
-/// The operators an OPERATOR clause can give a function.
-const DECLARABLE_OPERATORS: [&str; 5] = ["+", "-", "*", "/", "%"];
-
-/// The order named by the type's `OPERATOR '<' f`. Comparisons, indexes,
-/// sorting and hashing all use that order, so `f` must be one Turso implements,
-/// and an `OPERATOR '=' g` is only allowed alongside it: equality has to agree
-/// with the order, or DISTINCT and hash joins would disagree with `=`.
-fn declared_ordering(operators: &[TypeOperator]) -> crate::Result<Option<TypeOrdering>> {
-    let function_of = |op: &str| {
-        operators
-            .iter()
-            .find(|o| o.op == op)
-            .and_then(|o| o.func_name.as_deref())
-    };
-    let Some(less_than) = function_of("<") else {
-        if let Some(equals) = function_of("=") {
-            return Err(crate::LimboError::ParseError(format!(
-                "OPERATOR '=' {equals} needs an OPERATOR '<' function that orders the type"
-            )));
-        }
-        return Ok(None);
-    };
-    match TypeOrdering::from_less_than_function(less_than) {
-        Some(ordering) => Ok(Some(ordering)),
-        None => Err(crate::LimboError::ParseError(format!(
-            "no order is known for OPERATOR '<' {less_than}"
-        ))),
+/// The order of a built-in type whose stored values do not sort in the type's
+/// order: numeric is stored as a blob. Every other type, and every user type,
+/// sorts and compares by its stored value as SQLite does.
+fn builtin_ordering(type_name: &str) -> Option<TypeOrdering> {
+    match type_name {
+        "numeric" => Some(TypeOrdering::Numeric),
+        _ => None,
     }
 }
 
-/// `CREATE TYPE ... OPERATOR '+' f` runs f for two values of the type, or for a
-/// value of the type and a literal its ENCODE accepts. `OPERATOR '+'` without a
-/// function runs SQLite's operator on the stored value. A user type has no
-/// other operators: `-x` or `x & 1` is an error.
-fn declared_signatures(operators: &[TypeOperator]) -> std::vec::Vec<OperatorSignature> {
-    use OperatorArg::{Column, EncodableLiteral};
-    let mut signatures = std::vec::Vec::new();
-    for op in DECLARABLE_OPERATORS {
-        let Some(declared) = operators.iter().find(|o| o.op == op) else {
-            continue;
-        };
-        let Some(func) = &declared.func_name else {
-            signatures.extend(sqlite_operator(op, OperatorArg::PlainValue));
-            continue;
-        };
-        for args in [
-            [Column, Column],
-            [Column, EncodableLiteral],
-            [EncodableLiteral, Column],
-        ] {
-            signatures.push(OperatorSignature {
-                op,
-                args: args.to_vec(),
-                func: Some(func.clone()),
-                result: None,
-            });
-        }
-    }
-    signatures
-}
-
-/// Operators on built-in types, which an OPERATOR clause can't express. The
-/// functions read plain values as they are, so nothing is encoded first:
+/// Operators on built-in types. User types have none: `x + 1` on a user type is
+/// an error. The functions read plain values as they are, so nothing is encoded first:
 /// - `numeric op x` and `x op numeric` for `+ - * / %`, and `-numeric`, compute
 ///   exactly, and the result is a numeric. Encoding a literal to the column's type would round it
 ///   to the column's scale first (`n * 0.005` would be `n * 0.01`). With a REAL
@@ -378,8 +323,8 @@ fn declared_signatures(operators: &[TypeOperator]) -> std::vec::Vec<OperatorSign
 /// - `smallint` and `bigint` store plain integers, so SQLite's operators run,
 ///   including `-`, `~`, `&`, `|`, `<<` and `>>`.
 ///
-/// Other built-in types have no operators: `-date` and `numeric & 1` are errors,
-/// as in PostgreSQL.
+/// Other built-in types have no operators, and these types have no others:
+/// `-date` and `numeric & 1` are errors, as in PostgreSQL.
 fn builtin_signatures(type_name: &str) -> std::vec::Vec<OperatorSignature> {
     use OperatorArg::{EncodableLiteral, Exact, Integer, Real, Value};
     let call = |op, args: &[OperatorArg], func: &str, result| OperatorSignature {
@@ -592,14 +537,6 @@ impl TypeDef {
         }
     }
 
-    /// Returns the operators (Custom types only, empty for Struct/Union).
-    pub fn operators(&self) -> &[TypeOperator] {
-        match &self.kind {
-            TypeDefKind::Custom { operators, .. } => operators,
-            _ => &[],
-        }
-    }
-
     /// How values of the type compare, when it has its own order.
     pub fn ordering(&self) -> Option<TypeOrdering> {
         match &self.kind {
@@ -690,10 +627,14 @@ impl TypeDef {
                 encode,
                 coerce,
                 decode,
-                operators,
                 default,
             } => {
                 check_type_param_use(params, encode, coerce, decode)?;
+                let (ordering, operator_signatures) = if is_builtin {
+                    (builtin_ordering(type_name), builtin_signatures(type_name))
+                } else {
+                    (None, std::vec::Vec::new())
+                };
                 Self {
                     name: type_name.to_string(),
                     is_builtin,
@@ -707,13 +648,8 @@ impl TypeDef {
                         encode: encode.clone(),
                         coerce: coerce.clone(),
                         decode: decode.clone(),
-                        operators: operators.clone(),
-                        ordering: declared_ordering(operators)?,
-                        operator_signatures: if is_builtin {
-                            builtin_signatures(type_name)
-                        } else {
-                            declared_signatures(operators)
-                        },
+                        ordering,
+                        operator_signatures,
                         default: default.clone(),
                     },
                 }
@@ -803,7 +739,6 @@ impl TypeDef {
                 encode: None,
                 coerce: None,
                 decode: None,
-                operators: std::vec::Vec::new(),
                 // A domain has the order and arithmetic of the type it is based on.
                 ordering: None,
                 operator_signatures: std::vec::Vec::new(),
@@ -1223,14 +1158,14 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
 
     let type_sqls: &[&str] = &[
         #[cfg(feature = "uuid")]
-        "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'",
-        "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'",
+        "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value)",
+        "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END",
         #[cfg(feature = "json")]
         "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value",
         #[cfg(feature = "json")]
         "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
-        "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
-        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
+        "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value",
+        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value",
         // ENCODE preserves sub-second precision through strftime + a rtrim pair
         // that strips trailing zeros and the dangling dot, matching PostgreSQL's
         // text format: whole seconds render as `HH:MM:SS` (no .000), trailing
@@ -1239,17 +1174,17 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         // the fraction outright, silently dropping precision on insert.
         // Caveat: Turso's `%f` directive is millisecond resolution, so PG's
         // microsecond inputs are clamped to 3 digits (`.123456` -> `.123`).
-        "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE smallint(value integer) BASE integer ENCODE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END DECODE value OPERATOR '<'",
+        "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value",
+        "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value",
+        "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value",
+        "CREATE TYPE smallint(value integer) BASE integer ENCODE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END DECODE value",
         "CREATE TYPE bigint(value integer) BASE integer",
         "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value",
         "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value",
-        "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
-        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value) OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+        "CREATE TYPE bytea(value blob) BASE blob",
+        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)",
     ];
 
     for sql in type_sqls {

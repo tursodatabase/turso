@@ -108,7 +108,7 @@ STRICT tables only allow these base type names:
 **Turso Extension**: Custom types are a Turso-specific feature not available in SQLite. Custom types work only with STRICT tables. This feature is experimental and must be [enabled before use](/docs/sql-reference/experimental-features).
 </Info>
 
-Custom types let you define how values are encoded before storage and decoded when read, enforce domain constraints at the storage layer, attach operators, and provide defaults. Custom types are declared with the `CREATE TYPE` statement.
+Custom types let you define how values are encoded before storage and decoded when read, enforce domain constraints at the storage layer, and provide defaults. Custom types are declared with the `CREATE TYPE` statement.
 
 ```sql
 -- A type that stores monetary values as cents
@@ -163,7 +163,7 @@ INSERT INTO events VALUES (
 );
 ```
 
-For the full custom types reference including ENCODE/DECODE, operators, parametric types, and validation, see [CREATE TYPE](/docs/sql-reference/statements/create-type).
+For the full custom types reference including ENCODE/DECODE/COERCE, parametric types, and validation, see [CREATE TYPE](/docs/sql-reference/statements/create-type).
 
 ### Composite Types: STRUCT and UNION
 

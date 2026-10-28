@@ -481,8 +481,8 @@ impl LocaleCollationRegistry {
 /// expressions; every comparison, sort key, grouping key and hash key gets its
 /// collation from one of them.
 ///
-/// When an operand's type has an order (numeric, arrays, and custom types
-/// whose `OPERATOR '<'` names a function), the comparison uses that order. An
+/// When an operand's type has its own order (numeric and arrays), the
+/// comparison uses that order. An
 /// explicit COLLATE next to such an operand, or two operands with different
 /// orders, is an error, as in PostgreSQL. Otherwise the rules are SQLite's
 /// (`sqlite3BinaryCompareCollSeq`):

@@ -587,8 +587,8 @@ fn field_type(
     }
 }
 
-/// The order values of this type compare in, if the type has one: an array,
-/// or a custom type whose `OPERATOR '<'` names a function. A domain has the
+/// The order values of this type compare in, if the type has its own: an
+/// array, or numeric. A domain has the
 /// order of the type it is based on.
 pub(crate) fn type_ordering(ty: &ExprType, schema: &Schema) -> Option<TypeOrdering> {
     match ty {
@@ -734,10 +734,7 @@ fn binary_type(
 /// fails. `types` are the operands' types.
 fn custom_operator_type(expr: &ast::Expr, types: &[ExprType], env: &TypeEnv) -> Option<ExprType> {
     match find_operator_call(expr, types, env) {
-        Ok(Some(call)) => Some(match &call.result {
-            Some(result) => call_result_type(result, env.schema()),
-            None => ExprType::Unknown,
-        }),
+        Ok(Some(call)) => Some(call_result_type(&call.result, env.schema())),
         Ok(None) => None,
         Err(_) => Some(ExprType::Unknown),
     }

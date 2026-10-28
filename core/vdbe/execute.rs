@@ -11147,59 +11147,6 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
-            ScalarFunc::TestUintAdd
-            | ScalarFunc::TestUintSub
-            | ScalarFunc::TestUintMul
-            | ScalarFunc::TestUintDiv => {
-                check_arg_count!(arg_count, 2);
-                let a = parse_test_uint(&state.registers[*start_reg])?;
-                let b = parse_test_uint(&state.registers[*start_reg + 1])?;
-                let result = match (a, b) {
-                    (Some(a), Some(b)) => {
-                        let r = match scalar_func {
-                            ScalarFunc::TestUintAdd => a.checked_add(b),
-                            ScalarFunc::TestUintSub => a.checked_sub(b),
-                            ScalarFunc::TestUintMul => a.checked_mul(b),
-                            ScalarFunc::TestUintDiv => {
-                                if b == 0 {
-                                    None
-                                } else {
-                                    Some(a / b)
-                                }
-                            }
-                            _ => unreachable!(),
-                        };
-                        match r {
-                            Some(v) => Value::build_text(v.to_string()),
-                            None => {
-                                return Err(LimboError::InternalError(
-                                    "test_uint arithmetic overflow/underflow".to_string(),
-                                )
-                                .into());
-                            }
-                        }
-                    }
-                    _ => Value::Null,
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::TestUintLt | ScalarFunc::TestUintEq => {
-                check_arg_count!(arg_count, 2);
-                let a = parse_test_uint(&state.registers[*start_reg])?;
-                let b = parse_test_uint(&state.registers[*start_reg + 1])?;
-                let result = match (a, b) {
-                    (Some(a), Some(b)) => {
-                        let cmp = match scalar_func {
-                            ScalarFunc::TestUintLt => a < b,
-                            ScalarFunc::TestUintEq => a == b,
-                            _ => unreachable!(),
-                        };
-                        Value::from_i64(if cmp { 1 } else { 0 })
-                    }
-                    _ => Value::Null,
-                };
-                state.registers[*dest].set_value(result);
-            }
             ScalarFunc::StringReverse => {
                 check_arg_count!(arg_count, 1);
                 let val = &state.registers[*start_reg];
@@ -11444,24 +11391,6 @@ pub fn op_function(
                     )),
                 };
                 state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::NumericLt | ScalarFunc::NumericEq => {
-                check_arg_count!(arg_count, 2);
-                let lhs_val = state.registers[*start_reg].get_value().clone();
-                let rhs_val = state.registers[*start_reg + 1].get_value().clone();
-                match (&lhs_val, &rhs_val) {
-                    (Value::Null, _) | (_, Value::Null) => state.registers[*dest].set_null(),
-                    _ => {
-                        let a = numeric_from_value(&lhs_val)?;
-                        let b = numeric_from_value(&rhs_val)?;
-                        let cmp_result = match scalar_func {
-                            ScalarFunc::NumericLt => a < b,
-                            ScalarFunc::NumericEq => a == b,
-                            _ => unreachable!(),
-                        };
-                        state.registers[*dest].set_int(cmp_result as i64)
-                    }
-                };
             }
             ScalarFunc::DatePlus | ScalarFunc::DateMinus | ScalarFunc::DateDiff => {
                 check_arg_count!(arg_count, 2);
@@ -19591,31 +19520,6 @@ fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
     // but return false to indicate the conversion wasn't "complete"
     *value = Value::from_f64(fl);
     false
-}
-
-fn parse_test_uint(reg: &Register) -> Result<Option<u64>> {
-    match reg.get_value() {
-        Value::Null => Ok(None),
-        Value::Numeric(Numeric::Integer(i)) => {
-            if *i < 0 {
-                Err(LimboError::InternalError(
-                    "test_uint: negative value".to_string(),
-                ))
-            } else {
-                Ok(Some(*i as u64))
-            }
-        }
-        Value::Text(t) => {
-            let s = t.to_string();
-            let v = s
-                .parse::<u64>()
-                .map_err(|_| LimboError::InternalError(format!("test_uint: invalid uint: {s}")))?;
-            Ok(Some(v))
-        }
-        _ => Err(LimboError::InternalError(
-            "test_uint: unsupported type".to_string(),
-        )),
-    }
 }
 
 // Compat for applications that test for SQLite.

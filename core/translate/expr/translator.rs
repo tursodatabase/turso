@@ -1885,12 +1885,6 @@ fn translate_function_call_expr(
                 }
                 ScalarFunc::TestUintEncode
                 | ScalarFunc::TestUintDecode
-                | ScalarFunc::TestUintAdd
-                | ScalarFunc::TestUintSub
-                | ScalarFunc::TestUintMul
-                | ScalarFunc::TestUintDiv
-                | ScalarFunc::TestUintLt
-                | ScalarFunc::TestUintEq
                 | ScalarFunc::StringReverse
                 | ScalarFunc::Gcd
                 | ScalarFunc::Lcm
@@ -1909,8 +1903,6 @@ fn translate_function_call_expr(
                 | ScalarFunc::NumericDiv
                 | ScalarFunc::NumericMod
                 | ScalarFunc::NumericNeg
-                | ScalarFunc::NumericLt
-                | ScalarFunc::NumericEq
                 | ScalarFunc::DatePlus
                 | ScalarFunc::DateMinus
                 | ScalarFunc::DateDiff => translate_function(

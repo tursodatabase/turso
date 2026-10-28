@@ -4,273 +4,6 @@
 
 
 @requires strict "uses STRICT tables"
-test op-setup-same-type-both-columns {
-    -- Both columns are the same custom type → operator fires.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, a test_uint, b test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10, 5);
-    INSERT INTO t1 VALUES (2, 3, 7);
-    SELECT id, a + b FROM t1 ORDER BY id;
-}
-expect {
-    1|15
-    2|10
-}
-
-@requires strict "uses STRICT tables"
-test op-window-range-offset-needs-matching-plus {
-    -- A RANGE offset is added with the type's own `+`. This type only adds
-    -- two test_uint values, so an integer offset has no operator.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(a test_uint) STRICT;
-    INSERT INTO t1 VALUES (1), (2), (5);
-    SELECT a, count(*) OVER (ORDER BY a RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t1;
-}
-expect error {
-    operator does not exist: test_uint \+ integer
-}
-
-@requires strict "uses STRICT tables"
-test op-same-type-where-eq {
-    -- WHERE with = between two custom type columns.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, a test_uint, b test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10, 10);
-    INSERT INTO t1 VALUES (2, 3, 7);
-    INSERT INTO t1 VALUES (3, 5, 5);
-    SELECT id FROM t1 WHERE a = b ORDER BY id;
-}
-expect {
-    1
-    3
-}
-
-@requires strict "uses STRICT tables"
-test op-same-type-where-lt {
-    -- WHERE with < between two custom type columns.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, a test_uint, b test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 3, 10);
-    INSERT INTO t1 VALUES (2, 20, 5);
-    INSERT INTO t1 VALUES (3, 1, 1);
-    SELECT id FROM t1 WHERE a < b ORDER BY id;
-}
-expect {
-    1
-}
-
-
-@requires strict "uses STRICT tables"
-test op-literal-add-integer {
-    -- Integer literal + custom type column (value any).
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 20);
-    INSERT INTO t1 VALUES (3, 30);
-    SELECT id, val + 5 FROM t1 ORDER BY id;
-}
-expect {
-    1|15
-    2|25
-    3|35
-}
-
-@requires strict "uses STRICT tables"
-test op-literal-eq-multi-rows {
-    -- Literal comparison with = across multiple rows.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 42);
-    INSERT INTO t1 VALUES (3, 42);
-    INSERT INTO t1 VALUES (4, 99);
-    SELECT id FROM t1 WHERE val = 42 ORDER BY id;
-}
-expect {
-    2
-    3
-}
-
-@requires strict "uses STRICT tables"
-test op-literal-lt-multi-rows {
-    -- Literal comparison with < across multiple rows (no clobbering).
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 3);
-    INSERT INTO t1 VALUES (2, 10);
-    INSERT INTO t1 VALUES (3, 7);
-    INSERT INTO t1 VALUES (4, 1);
-    SELECT id, val FROM t1 WHERE val < 5 ORDER BY id;
-}
-expect {
-    1|3
-    4|1
-}
-
-@requires strict "uses STRICT tables"
-test op-reversed-literal-plus-column {
-    -- Reversed: literal + custom_type_column → operator fires with swapped args.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 20);
-    INSERT INTO t1 VALUES (3, 30);
-    SELECT id, 5 + val FROM t1 ORDER BY id;
-}
-expect {
-    1|15
-    2|25
-    3|35
-}
-
-
-@requires strict "uses STRICT tables"
-test op-derived-gt-literal {
-    -- > derived from swap_args(<)
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, 3);
-    SELECT id FROM t1 WHERE val > 9 ORDER BY id;
-}
-expect {
-    1
-    3
-}
-
-@requires strict "uses STRICT tables"
-test op-derived-gte-literal {
-    -- >= derived from NOT(<)
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, 3);
-    SELECT id FROM t1 WHERE val >= 9 ORDER BY id;
-}
-expect {
-    1
-    2
-    3
-}
-
-@requires strict "uses STRICT tables"
-test op-derived-lte-literal {
-    -- <= derived from NOT(swap_args(<))
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, 3);
-    SELECT id FROM t1 WHERE val <= 50 ORDER BY id;
-}
-expect {
-    2
-    3
-    4
-}
-
-@requires strict "uses STRICT tables"
-test op-derived-neq-literal {
-    -- != derived from NOT(=)
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    SELECT id FROM t1 WHERE val != 9 ORDER BY id;
-}
-expect {
-    1
-    3
-}
-
-@requires strict "uses STRICT tables"
-test op-derived-gt-between-columns {
-    -- > between two custom type columns.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, a test_uint, b test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 20, 5);
-    INSERT INTO t1 VALUES (2, 3, 10);
-    INSERT INTO t1 VALUES (3, 7, 7);
-    SELECT id FROM t1 WHERE a > b ORDER BY id;
-}
-expect {
-    1
-}
-
-
-@requires strict "uses STRICT tables"
 test op-numeric-add-literal-multi-row {
     -- numeric(10,2) + integer literal across multiple rows.
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
@@ -527,15 +260,13 @@ expect {
 
 @requires strict "uses STRICT tables"
 test op-different-types-error {
-    -- Both types declare +, but neither for the other type.
+    -- A user type has no arithmetic, with its own type or another.
     CREATE TYPE type_a(value any) BASE text
         ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add;
+        DECODE test_uint_decode(value);
     CREATE TYPE type_b(value any) BASE text
         ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add;
+        DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY, a type_a, b type_b) STRICT;
     INSERT INTO t1 VALUES (1, 10, 5);
     SELECT a + b FROM t1;
@@ -549,33 +280,15 @@ expect error {
 test op-integer-column-plus-custom-error {
     CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add;
+        DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY, int_col INTEGER, custom_col test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 10, 5);
-    -- test_uint declares + only for test_uint values and literals.
     SELECT int_col + custom_col FROM t1;
 }
 expect error {
     operator does not exist: integer \+ test_uint
 }
 
-
-@requires strict "uses STRICT tables"
-test op-declared-operator-rejects-other-operands {
-    -- cents declares + for cents values and literals. An INTEGER column is
-    -- neither, so it is an error rather than SQLite's + on the decoded value.
-    CREATE TYPE cents(value integer) BASE integer
-        ENCODE value * 100
-        DECODE value / 100
-        OPERATOR '+' max;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, c cents, i INTEGER) STRICT;
-    INSERT INTO t1 VALUES (1, 5, 7);
-    SELECT c + i FROM t1;
-}
-expect error {
-    operator does not exist: cents \+ integer
-}
 
 @requires strict "uses STRICT tables"
 test op-numeric-plus-integer-column {
@@ -586,215 +299,6 @@ test op-numeric-plus-integer-column {
 }
 expect {
     8.50|8.50|0.375
-}
-
-@requires strict "uses STRICT tables"
-test op-order-by-custom-lt {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 3);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, 10);
-    SELECT id, val FROM t1 ORDER BY val;
-}
-expect {
-    2|3
-    4|10
-    3|50
-    1|100
-}
-
-@requires strict "uses STRICT tables"
-test op-order-by-custom-lt-desc {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 3);
-    INSERT INTO t1 VALUES (3, 50);
-    SELECT id, val FROM t1 ORDER BY val DESC;
-}
-expect {
-    1|100
-    3|50
-    2|3
-}
-
-
-@requires strict "uses STRICT tables"
-test op-null-literal-no-override {
-    -- NULL literal: operator should not fire (NULL has no type).
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 42);
-    SELECT val + NULL FROM t1;
-}
-expect {
-
-}
-
-@requires strict "uses STRICT tables"
-test op-null-column-value {
-    -- Column value is NULL: operator should handle gracefully.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, NULL);
-    INSERT INTO t1 VALUES (2, 42);
-    SELECT id, val + 5 FROM t1 ORDER BY id;
-}
-expect {
-    1|
-    2|47
-}
-
-
-@requires strict "uses STRICT tables"
-test op-nested-expression-error {
-    -- The type of what test_uint_add returns isn't known, so the outer + can't
-    -- choose a function for it. Running SQLite's + on it would mix stored and
-    -- decoded values.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, a test_uint, b test_uint, c test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10, 20, 30);
-    SELECT (a + b) + c FROM t1;
-}
-expect error {
-    operator does not exist: value \+ test_uint
-}
-
-
-@requires strict "uses STRICT tables"
-test op-backward-compat-old-syntax {
-    -- Old syntax: OPERATOR 'op' (type) -> func_name
-    CREATE TYPE test_uint_old(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' (test_uint_old) -> test_uint_add
-        OPERATOR '<' (test_uint_old) -> test_uint_lt
-        OPERATOR '=' (test_uint_old) -> test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint_old) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 20);
-    SELECT val + 5 FROM t1 ORDER BY id;
-}
-expect {
-    15
-    25
-}
-
-
-@requires strict "uses STRICT tables"
-test op-value-integer-with-integer-literal {
-    -- value type is "integer", integer literal → compatible → operator fires.
-    CREATE TYPE my_int(value integer) BASE integer
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val my_int) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 20);
-    SELECT id FROM t1 WHERE val = 10;
-}
-expect {
-    1
-}
-
-@requires strict "uses STRICT tables"
-test op-value-integer-with-text-literal-fallback {
-    -- value type is "integer", text literal → NOT compatible → standard operator.
-    CREATE TYPE my_int(value integer) BASE integer
-        OPERATOR '<' test_uint_lt OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val my_int) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    -- Standard = compares integer 10 with text '10' → SQLite rules apply.
-    SELECT id FROM t1 WHERE val = '10';
-}
-expect {
-    1
-}
-
-
-@requires strict "uses STRICT tables"
-test op-many-rows-lt {
-    -- 8 rows to stress-test register handling across iterations.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 1);
-    INSERT INTO t1 VALUES (2, 2);
-    INSERT INTO t1 VALUES (3, 3);
-    INSERT INTO t1 VALUES (4, 4);
-    INSERT INTO t1 VALUES (5, 5);
-    INSERT INTO t1 VALUES (6, 6);
-    INSERT INTO t1 VALUES (7, 7);
-    INSERT INTO t1 VALUES (8, 8);
-    SELECT id FROM t1 WHERE val < 5 ORDER BY id;
-}
-expect {
-    1
-    2
-    3
-    4
-}
-
-@requires strict "uses STRICT tables"
-test op-many-rows-add {
-    -- 8 rows: addition across many iterations.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 20);
-    INSERT INTO t1 VALUES (3, 30);
-    INSERT INTO t1 VALUES (4, 40);
-    INSERT INTO t1 VALUES (5, 50);
-    INSERT INTO t1 VALUES (6, 60);
-    INSERT INTO t1 VALUES (7, 70);
-    INSERT INTO t1 VALUES (8, 80);
-    SELECT id, val + 100 FROM t1 ORDER BY id;
-}
-expect {
-    1|110
-    2|120
-    3|130
-    4|140
-    5|150
-    6|160
-    7|170
-    8|180
 }
 
 @requires strict "uses STRICT tables"
@@ -819,29 +323,6 @@ expect {
 
 
 @requires strict "uses STRICT tables"
-test op-where-and-order-by-combined {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 3);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, 10);
-    INSERT INTO t1 VALUES (5, 7);
-    SELECT id, val FROM t1 WHERE val > 5 ORDER BY val;
-}
-expect {
-    5|7
-    4|10
-    3|50
-    1|100
-}
-
-@requires strict "uses STRICT tables"
 test op-numeric-where-and-order-by {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES (1, 100);
@@ -858,47 +339,6 @@ expect {
     1|100.00
 }
 
-
-@requires strict "uses STRICT tables"
-test op-reversed-literal-lt {
-    -- 5 < val → should use custom operator (literal on LHS).
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 3);
-    INSERT INTO t1 VALUES (2, 10);
-    INSERT INTO t1 VALUES (3, 5);
-    INSERT INTO t1 VALUES (4, 100);
-    SELECT id FROM t1 WHERE 5 < val ORDER BY id;
-}
-expect {
-    2
-    4
-}
-
-@requires strict "uses STRICT tables"
-test op-reversed-literal-eq {
-    -- 42 = val → should use custom operator (literal on LHS).
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 42);
-    INSERT INTO t1 VALUES (2, 99);
-    INSERT INTO t1 VALUES (3, 42);
-    SELECT id FROM t1 WHERE 42 = val ORDER BY id;
-}
-expect {
-    1
-    3
-}
 
 @requires strict "uses STRICT tables"
 test op-numeric-literal-not-rounded-to-column-scale {
@@ -1099,7 +539,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test op-user-type-without-operators-error {
-    -- cents declares no operators. SQLite's + on its decoded value might happen
+    -- A user type has no operators. SQLite's + on its decoded value might happen
     -- to be right here, but not for a type whose values aren't numbers.
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t1(x cents) STRICT;
@@ -1108,33 +548,6 @@ test op-user-type-without-operators-error {
 }
 expect error {
     operator does not exist: cents \+ integer
-}
-
-@requires strict "uses STRICT tables"
-test op-custom-function-that-does-not-exist-error {
-    -- CREATE TYPE doesn't check that an operator's function exists, so using
-    -- the operator must report it.
-    CREATE TYPE c BASE integer ENCODE value DECODE value OPERATOR '+' no_such_function;
-    CREATE TABLE t(x c) STRICT;
-    INSERT INTO t VALUES (5);
-    SELECT x + x FROM t;
-}
-expect error {
-    function no_such_function for operator \+ on type c does not exist
-}
-
-@requires strict "uses STRICT tables"
-test op-custom-function-may-return-null {
-    -- A type's operator function can return NULL for non-NULL operands, so
-    -- count(a + b) must run it on every row instead of counting rows.
-    CREATE TYPE maybe_int(value integer) BASE integer
-        OPERATOR '+' nullif;
-    CREATE TABLE t(id INTEGER PRIMARY KEY, a maybe_int NOT NULL, b maybe_int NOT NULL) STRICT;
-    INSERT INTO t VALUES (1, 5, 5), (2, 3, 4);
-    SELECT count(a + b) FROM t;
-}
-expect {
-    1
 }
 
 @requires strict "uses STRICT tables"
@@ -1199,13 +612,19 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-test op-function-must-be-deterministic {
+test op-create-type-rejects-arithmetic-operator {
     CREATE TYPE stamp(value text) BASE text OPERATOR '+' datetime;
-    CREATE TABLE t(a stamp, b stamp) STRICT;
-    SELECT a + b FROM t;
 }
 expect error {
-    operator \+ on type stamp must be deterministic
+    CREATE TYPE does not accept OPERATOR
+}
+
+@requires strict "uses STRICT tables"
+test op-create-type-rejects-operator-without-function {
+    CREATE TYPE u(value integer) BASE integer OPERATOR '+';
+}
+expect error {
+    CREATE TYPE does not accept OPERATOR
 }
 
 @requires strict "uses STRICT tables"
@@ -1224,31 +643,14 @@ expect error {
 
 @requires strict "uses STRICT tables"
 test op-parenthesized-column-uses-type-operator {
-    -- (a), +a and a COLLATE x give a's value unchanged, so they run the same
-    -- operator as a.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, a test_uint, b test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10, 5);
-    SELECT a + b, (a) + b, +a + (b), a COLLATE BINARY + b FROM t1;
+    -- (d), +d and d COLLATE x give d's value unchanged, so they run the same
+    -- operator as d.
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t1 VALUES (1, '2024-01-05');
+    SELECT d + 1, (d) + 1, +d + (1), d COLLATE BINARY + 1 FROM t1;
 }
 expect {
-    15|15|15|15
-}
-
-@requires strict "uses STRICT tables"
-test op-without-function-runs-sqlite-operator {
-    CREATE TYPE u(value integer) BASE integer OPERATOR '+' OPERATOR '<';
-    CREATE TABLE t(a u, b u) STRICT;
-    INSERT INTO t VALUES (1, 2);
-    SELECT a + b, a + 1, 1 + b FROM t;
-}
-expect {
-    3|2|3
+    2024-01-06|2024-01-06|2024-01-06|2024-01-06
 }
 
 @requires strict "uses STRICT tables"
@@ -1608,14 +1010,12 @@ expect error {
     operator does not exist: integer >> numeric
 }
 
-# A user type has only the operators it declares, and OPERATOR '-' declares
-# the binary one.
+# A user type has no operators.
 @requires strict "uses STRICT tables"
 test op-user-type-negate-error {
     CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '-' test_uint_sub;
+        DECODE test_uint_decode(value);
     CREATE TABLE t(a test_uint) STRICT;
     INSERT INTO t VALUES (10);
     SELECT -a FROM t;

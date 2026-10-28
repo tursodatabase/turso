@@ -140,8 +140,9 @@ mod tests {
         }
     }
 
-    /// Indexes on columns whose type has its own order must keep that order
-    /// after reopening, both for column indexes and for expression indexes.
+    /// Indexes on custom-type columns must keep their order after reopening:
+    /// the stored-value order of a user type, and numeric's own order, both for
+    /// column indexes and for expression indexes.
     #[test]
     fn test_index_keeps_type_order_after_reopen() {
         let temp_dir = TempDir::new().unwrap();
@@ -152,12 +153,12 @@ mod tests {
             let db = TempDatabase::new_with_existent_with_opts(&path, opts);
             let conn = db.connect_limbo();
             conn.execute(
-                "CREATE TYPE rev_cmp BASE text ENCODE string_reverse(value) \
-                 DECODE string_reverse(value) OPERATOR '<' string_reverse",
+                "CREATE TYPE rev BASE text ENCODE string_reverse(value) \
+                 DECODE string_reverse(value)",
             )
             .unwrap();
             conn.execute(
-                "CREATE TABLE t(id INTEGER PRIMARY KEY, word rev_cmp, n numeric(10,2)) STRICT",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, word rev, n numeric(10,2)) STRICT",
             )
             .unwrap();
             conn.execute("CREATE INDEX t_word ON t(word)").unwrap();
@@ -172,12 +173,13 @@ mod tests {
         let conn = db.connect_limbo();
         let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
         assert_eq!(integrity, vec![("ok".to_string(),)]);
-        // A new row goes to its place in the type's order.
+        // A new row goes to its place in the stored (reversed) text order:
+        // ananab < elppa < tocirpa < yrrehc.
         conn.execute("INSERT INTO t VALUES (4,'apricot',0)")
             .unwrap();
         let rows: Vec<(String,)> =
             conn.exec_rows("SELECT word FROM t INDEXED BY t_word ORDER BY word");
-        let words = ["apple", "apricot", "banana", "cherry"];
+        let words = ["banana", "apple", "apricot", "cherry"];
         assert_eq!(rows, words.map(|w| (w.to_string(),)));
         let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
         assert_eq!(integrity, vec![("ok".to_string(),)]);

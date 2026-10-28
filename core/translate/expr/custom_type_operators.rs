@@ -150,10 +150,6 @@ struct Operand<'a> {
     /// The custom type of the operand's value: a column, a CAST, the result of
     /// another operator.
     value_type: Option<ColumnCustomType>,
-    /// The custom type of the operand when it is a column. A user type's function
-    /// is only given columns: a CAST gives the stored form, a column the value
-    /// its DECODE returns, and the function can't tell them apart.
-    column_type: Option<ColumnCustomType>,
     /// The kind of literal the operand is, for literals: "integer", "text", ...
     literal_kind: Option<&'a str>,
     /// Whether SQLite's arithmetic would see an integer, or a value whose type
@@ -171,10 +167,6 @@ struct Operand<'a> {
 impl<'a> Operand<'a> {
     fn new(expr: &'a ast::Expr, expr_type: &'a ExprType, env: &TypeEnv) -> Result<Self> {
         let expr = without_wrappers(expr);
-        let column_type = match column_custom_type(expr, env) {
-            Some(ty) => without_domains(ty, env.schema())?,
-            None => None,
-        };
         let value_type = match expr_type {
             ExprType::Custom { type_def, params } => without_domains(
                 ColumnCustomType {
@@ -195,7 +187,6 @@ impl<'a> Operand<'a> {
         let is_blob = matches!(sqlite_type, ExprType::Builtin(BuiltinType::Blob));
         Ok(Self {
             value_type,
-            column_type,
             literal_kind: literal_type_name(expr),
             may_be_integer,
             is_real,
@@ -258,7 +249,6 @@ fn accepts_operand(
     let is_this_type =
         |t: Option<&ColumnCustomType>| t.is_some_and(|t| same_type_def(&t.type_def, &ty.type_def));
     match arg {
-        OperatorArg::Column => is_this_type(operand.column_type.as_ref()),
         OperatorArg::Value => is_this_type(operand.value_type.as_ref()),
         OperatorArg::EncodableLiteral => {
             operand.value_type.is_none()
@@ -292,8 +282,7 @@ fn has_sqlite_operator(type_def: &TypeDef, signature: &OperatorSignature) -> boo
     signatures.peek().is_some() && signatures.all(|s| s.func.is_none())
 }
 
-/// The call that `signature` makes, or `None` for SQLite's operator. The
-/// function must exist: a type may name one that was never defined.
+/// The call that `signature` makes, or `None` for SQLite's operator.
 fn call_for(
     signature: &OperatorSignature,
     ty: &ColumnCustomType,
@@ -303,11 +292,10 @@ fn call_for(
         return Ok(None);
     };
     let Some(function) = env.resolve_function(func, signature.args.len())? else {
-        crate::bail_parse_error!(
+        return Err(LimboError::InternalError(format!(
             "function {func} for operator {} on type {} does not exist",
-            signature.op,
-            ty.type_def.name
-        );
+            signature.op, ty.type_def.name
+        )));
     };
     let encode = signature
         .args
@@ -321,19 +309,24 @@ fn call_for(
         .collect();
     // Checks such as "is this expression constant" treat `a + b` as SQLite's
     // operator, which gives the same result for the same operands. A type's
-    // operator must too. CREATE TYPE already checks its ENCODE.
+    // operator must too.
     if !function.is_deterministic() {
-        crate::bail_parse_error!(
+        return Err(LimboError::InternalError(format!(
             "operator {} on type {} must be deterministic",
-            signature.op,
-            ty.type_def.name
-        );
+            signature.op, ty.type_def.name
+        )));
     }
-    let result = signature.result.map(|name| ast::Type {
-        name: name.to_string(),
+    let Some(result) = signature.result else {
+        return Err(LimboError::InternalError(format!(
+            "function {func} for operator {} on type {} has no result type",
+            signature.op, ty.type_def.name
+        )));
+    };
+    let result = ast::Type {
+        name: result.to_string(),
         size: None,
         array_dimensions: 0,
-    });
+    };
     Ok(Some(OperatorCall {
         func: function,
         encode,
@@ -345,9 +338,8 @@ pub(crate) struct OperatorCall {
     func: Func,
     /// For each operand, the type to encode it to before the call.
     encode: Vec<Option<Arc<TypeDef>>>,
-    /// The type the function returns. `None` when it is not known, as for a
-    /// user type's function.
-    pub(super) result: Option<ast::Type>,
+    /// The type the function returns.
+    pub(super) result: ast::Type,
 }
 
 /// Emits `call` on the operands of `expr` and returns the register holding its

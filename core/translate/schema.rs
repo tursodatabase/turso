@@ -450,10 +450,6 @@ fn resolve_scalar_func_return_type(
         | ScalarFunc::IntToBoolean
         | ScalarFunc::IsAutocommit
         | ScalarFunc::ConnTxnId
-        | ScalarFunc::TestUintLt
-        | ScalarFunc::TestUintEq
-        | ScalarFunc::NumericLt
-        | ScalarFunc::NumericEq
         | ScalarFunc::ValidateIpAddr
         | ScalarFunc::GetByte
         | ScalarFunc::UnixEpoch => Ok(CheckExprType::Integer),
@@ -532,10 +528,6 @@ fn resolve_scalar_func_return_type(
         // Internal/custom type functions
         ScalarFunc::TestUintEncode
         | ScalarFunc::TestUintDecode
-        | ScalarFunc::TestUintAdd
-        | ScalarFunc::TestUintSub
-        | ScalarFunc::TestUintMul
-        | ScalarFunc::TestUintDiv
         | ScalarFunc::NumericEncode
         | ScalarFunc::NumericFit
         | ScalarFunc::NumericDecode
@@ -3116,9 +3108,6 @@ pub fn translate_create_type(
 /// Build canonical CREATE TYPE SQL from a normalized name and parsed body.
 fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
     use crate::util::quote_identifier as quote_ident;
-    fn quote_string_literal(s: &str) -> String {
-        s.replace('\'', "''")
-    }
 
     match body {
         ast::CreateTypeBody::CustomType {
@@ -3128,7 +3117,6 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
             coerce,
             decode,
             default,
-            operators,
         } => {
             let mut sql = if params.is_empty() {
                 format!(
@@ -3162,16 +3150,6 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
             }
             if let Some(ref default) = default {
                 sql.push_str(&format!(" DEFAULT {default}"));
-            }
-            for op in operators {
-                match &op.func_name {
-                    Some(func_name) => sql.push_str(&format!(
-                        " OPERATOR '{}' {}",
-                        quote_string_literal(&op.op),
-                        quote_ident(func_name)
-                    )),
-                    None => sql.push_str(&format!(" OPERATOR '{}'", quote_string_literal(&op.op))),
-                }
             }
             sql
         }

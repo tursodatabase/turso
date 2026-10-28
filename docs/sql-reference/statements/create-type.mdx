@@ -1,6 +1,6 @@
 ---
 title: CREATE TYPE
-description: Define a custom type with encoding, decoding, validation, operators, and defaults for use in STRICT tables
+description: Define a custom type with encoding, decoding, validation, and defaults for use in STRICT tables
 sidebarTitle: CREATE TYPE
 ---
 
@@ -20,7 +20,6 @@ CREATE TYPE [IF NOT EXISTS] type-name [(parameters)]
     [ENCODE encode-expr]
     [COERCE coerce-expr]
     [DECODE decode-expr]
-    [OPERATOR 'op' [function-name] ...]
     [DEFAULT default-expr];
 ```
 
@@ -112,8 +111,7 @@ CREATE TYPE capped(value integer, maxval integer) BASE integer
     COERCE CASE
         WHEN value <= maxval THEN value
         ELSE RAISE(ABORT, 'value above maximum for capped')
-    END
-    OPERATOR '<';
+    END;
 
 CREATE TABLE t(x capped(10)) STRICT;
 INSERT INTO t VALUES (11);
@@ -124,32 +122,27 @@ SELECT CAST(11 AS capped(10));  -- Runtime error: value above maximum for capped
 
 The built-in `numeric` type uses both clauses: `ENCODE numeric_encode(value)` turns the input into a decimal, and `COERCE numeric_fit(value, precision, scale)` rounds it to `scale` decimal places and rejects it if it has more than `precision` digits.
 
-### OPERATOR
+### Sorting and comparing
 
-The OPERATOR clause maps SQL operators to functions. This allows columns of a custom type to participate in comparisons, arithmetic, and ordering.
+A custom type sorts and compares by its stored value, using SQLite's comparison for the base type. This holds for ORDER BY, MIN, MAX, GROUP BY, DISTINCT and indexes. For a type whose ENCODE does not keep the order of its input, the order follows the stored form:
 
 ```sql
-OPERATOR 'op' function-name
+CREATE TYPE reversed_text BASE text
+    ENCODE turso_reverse(value)
+    DECODE turso_reverse(value);
+CREATE TABLE t(w reversed_text) STRICT;
+INSERT INTO t VALUES ('apple'), ('banana'), ('cherry');
+SELECT w FROM t ORDER BY w;
+-- banana   (stored as 'ananab')
+-- apple    (stored as 'elppa')
+-- cherry   (stored as 'yrrehc')
 ```
 
-| Component | Description |
-|-----------|-------------|
-| `'op'` | The operator symbol as a string literal: `'+'`, `'-'`, `'*'`, `'/'`, `'<'`, `'='`, etc. |
-| `function-name` | The name of a SQL function to call when this operator is used. Omit to use SQLite's own operator on the stored value. |
+The built-in `numeric` type and arrays have their own order, and every comparison of a value of such a type uses it: `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins, and indexes. So a query returns the same rows with and without an index, and `numeric` values compare by value: `9 < 10` and `1.5 = 1.50` are true, and DISTINCT and UNION keep one of them. This holds for expressions of the type too: `n + i`, `n * 2`, `-n` and `coalesce(n, 0)` are numerics, and an index on `n * 2` can serve `n * 2 > 10`. A constant is not rounded to the column's scale first: for a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false. A COLLATE on a value of such a type fails with `collations are not supported by type numeric`, and comparing two types with different orders fails with `cannot compare type x with type y`.
 
-When an operator is defined, an expression like `column + 1` runs `function_name(column, 1)`. This holds everywhere an expression can appear, including generated columns and index expressions.
+### Arithmetic
 
-#### Which arithmetic operator runs
-
-For `+`, `-`, `*`, `/`, `%`, `&`, `|`, `<<`, `>>`, unary `-` and `~`, the operator is chosen once, when the statement is compiled. An OPERATOR clause can give a function to `+`, `-`, `*`, `/` and `%`; a user type has none of the other operators, so `-x` or `x & 1` fails with `operator does not exist`.
-
-- `OPERATOR '+' f` runs `f` when both operands are columns of the type, or when one is a column of the type and the other is a literal its ENCODE accepts. The literal is encoded first.
-- `OPERATOR '+'` without a function runs SQLite's `+` on the stored value.
-- If either operand has a custom type and no operator fits, the statement fails with `operator does not exist`. Turso does not fall back to SQLite's `+`.
-- If neither operand has a custom type, or one is the literal `NULL`, SQLite's operator runs.
-- A domain uses the operators of its base type.
-- The function must be deterministic. `OPERATOR '+' random_fn` fails with `operator + on type t must be deterministic` when a statement uses the operator.
-- A column of a subquery, view or CTE has the type of the value it selects. In `SELECT x + 1 FROM (SELECT d AS x FROM t)`, `x` is a date, and `x * 2` fails with `operator does not exist: date * integer`.
+A user-defined type has no arithmetic operators. `+`, `-`, `*`, `/`, `%`, `&`, `|`, `<<`, `>>`, unary `-` and `~` on a value of the type fail with `operator does not exist`:
 
 ```sql
 CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
@@ -158,40 +151,14 @@ SELECT c + 1 FROM t;
 -- Parse error: operator does not exist: cents + integer
 ```
 
-The result of a type's operator function has no known type, so it can't be the operand of another custom operator: `(a + b) + c` fails with `operator does not exist: value + uint`. The built-in `date` operators do give a typed result, so `(d - 5) + 1` is a date.
+The built-in types `date`, `numeric`, `smallint` and `bigint` have arithmetic operators. The operator is chosen once, when the statement is compiled:
 
-#### Ordering with OPERATOR '<'
+- If either operand has a custom type and no operator of the type fits, the statement fails with `operator does not exist`. Turso does not fall back to SQLite's operator.
+- If neither operand has a custom type, or one is the literal `NULL`, SQLite's operator runs.
+- A domain uses the operators of its base type.
+- A column of a subquery, view or CTE has the type of the value it selects. In `SELECT x + 1 FROM (SELECT d AS x FROM t)`, `x` is a date, and `x * 2` fails with `operator does not exist: date * integer`.
 
-The `<` operator is special: it controls how values of this type are sorted in ORDER BY, MIN, MAX, and CREATE INDEX.
-
-- **`OPERATOR '<'`** (no function name): Uses the base type's native comparison for ordering. This is sufficient for types where the encoded form sorts correctly (e.g., text dates in ISO 8601 format).
-- **`OPERATOR '<' f`**: Orders values with the order Turso implements for `f`. Only `numeric_lt` (used by the built-in `numeric` type) and `array_lt` have one; any other function fails with `no order is known for OPERATOR '<' f`.
-- **`OPERATOR '=' f`** is only allowed together with an `OPERATOR '<'` function, since equality must agree with the order. Without one, it fails with `OPERATOR '=' f needs an OPERATOR '<' function that orders the type`.
-- **No `<` operator**: The type cannot be used in ORDER BY or CREATE INDEX.
-
-A type whose `<` names a function has an order, and every comparison of a value of that type uses it: `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins, and indexes. So a query returns the same rows with and without an index, and `numeric` values compare by value: `1.5 = 1.50` is true, and DISTINCT and UNION keep one of them. This holds for expressions of the type too: `n + i`, `n * 2`, `-n` and `coalesce(n, 0)` are numerics, and an index on `n * 2` can serve `n * 2 > 10`. A constant is not rounded to the column's scale first: for a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false. A COLLATE on a value of such a type fails with `collations are not supported by type numeric`, and comparing two types with different orders fails with `cannot compare type x with type y`.
-
-A type without a `<` function compares its values with SQLite's comparison on the value the column reads as. An index on such a column is ordered by the stored form, so it can serve `=` but not a range or ORDER BY.
-
-```sql
--- Use base type comparison for ordering
-CREATE TYPE cents BASE integer
-    ENCODE value * 100
-    DECODE value / 100
-    OPERATOR '<';
-
--- Full operator set for a numeric type
-CREATE TYPE uint BASE integer
-    ENCODE CASE WHEN value >= 0 THEN value ELSE RAISE(ABORT, 'uint must be non-negative') END
-    DECODE value
-    OPERATOR '+' uint_add
-    OPERATOR '-' uint_sub
-    OPERATOR '*' uint_mul
-    OPERATOR '<'
-    OPERATOR '=';
-```
-
-The `=` operator, when defined, is also used to derive `!=`. The `<` operator is used to derive `>`, `>=`, and `<=` automatically by swapping arguments or negating the result.
+CREATE TYPE has no OPERATOR clause. `CREATE TYPE t BASE text OPERATOR '<'` fails with `CREATE TYPE does not accept OPERATOR: values of a custom type sort and compare by their stored value, and have no arithmetic`.
 
 ### DEFAULT
 
@@ -201,7 +168,6 @@ The DEFAULT clause sets a type-level default value. When a column of this type d
 CREATE TYPE boolean BASE integer
     ENCODE boolean_to_int(value)
     DECODE CASE WHEN value THEN 1 ELSE 0 END
-    OPERATOR '<'
     DEFAULT 0;
 ```
 
@@ -583,13 +549,12 @@ CREATE TABLE notes (
 
 ### Monetary Values as Cents
 
-Store dollar amounts as integer cents for exact arithmetic, present them as the original value:
+Store dollar amounts as integer cents, and present them as the original value:
 
 ```sql
 CREATE TYPE cents BASE integer
     ENCODE value * 100
-    DECODE value / 100
-    OPERATOR '<';
+    DECODE value / 100;
 
 CREATE TABLE invoices (
     id INTEGER PRIMARY KEY,
@@ -624,9 +589,9 @@ INSERT INTO configs VALUES (2, 'not json');
 -- Error: malformed JSON
 ```
 
-### Unsigned Integer with Operators
+### Unsigned Integer
 
-A non-negative integer type with arithmetic and comparison operators:
+A non-negative integer type. Values sort and compare as integers, because the stored value is the integer itself:
 
 ```sql
 CREATE TYPE uint BASE integer
@@ -634,9 +599,7 @@ CREATE TYPE uint BASE integer
         WHEN value >= 0 THEN value
         ELSE RAISE(ABORT, 'uint must be non-negative')
     END
-    DECODE value
-    OPERATOR '<'
-    OPERATOR '=';
+    DECODE value;
 
 CREATE TABLE counters (
     id INTEGER PRIMARY KEY,

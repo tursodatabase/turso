@@ -1821,13 +1821,13 @@ fn query_pragma(
         }
         PragmaName::ListTypes => {
             let base_reg = register;
-            program.alloc_registers(6); // 7 total (1 already allocated)
+            program.alloc_registers(5); // 6 total (1 already allocated)
 
-            // Built-in types: NULL parent, encode, coerce, decode, default, operators
+            // Built-in types: NULL parent, encode, coerce, decode, default
             for builtin in &["INTEGER", "REAL", "TEXT", "BLOB", "ANY"] {
                 program.emit_string8(builtin.to_string(), base_reg);
-                program.emit_null(base_reg + 1, Some(base_reg + 6));
-                program.emit_result_row(base_reg, 7);
+                program.emit_null(base_reg + 1, Some(base_reg + 5));
+                program.emit_result_row(base_reg, 6);
             }
 
             // Custom types from the type registry are only shown when strict mode is enabled
@@ -1870,34 +1870,7 @@ fn query_pragma(
                             None => program.emit_null(base_reg + 2 + i, None),
                         }
                     }
-                    // The declared operators, then the built-in arithmetic that
-                    // runs a function, one entry per operator and function.
-                    // Built-in arithmetic without a function is SQLite's own.
-                    let declared = type_def
-                        .operators()
-                        .iter()
-                        .map(|op| (op.op.as_str(), op.func_name.as_deref()));
-                    let built_in = type_def
-                        .all_operator_signatures()
-                        .iter()
-                        .filter(|s| s.func.is_some())
-                        .map(|s| (s.op, s.func.as_deref()));
-                    let mut ops: Vec<String> = Vec::new();
-                    for (op, func) in declared.chain(built_in) {
-                        let op = match func {
-                            Some(f) => format!("'{op}' {f}"),
-                            None => format!("'{op}'"),
-                        };
-                        if !ops.contains(&op) {
-                            ops.push(op);
-                        }
-                    }
-                    if ops.is_empty() {
-                        program.emit_null(base_reg + 6, None);
-                    } else {
-                        program.emit_string8(ops.join(", "), base_reg + 6);
-                    }
-                    program.emit_result_row(base_reg, 7);
+                    program.emit_result_row(base_reg, 6);
                 }
             }
 

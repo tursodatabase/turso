@@ -53,35 +53,6 @@ fn result_column_custom_type_info<'a>(
     }
 }
 
-/// Returns true if the expression is a column reference to a custom type
-/// (with encode/decode) that does NOT have a `<` operator with a known
-/// sort comparator. This includes types with no `<` operator at all, and
-/// types whose `<` function is not recognized by the sorter.
-fn is_custom_type_without_lt(
-    expr: &ast::Expr,
-    referenced_tables: &TableReferences,
-    schema: &Schema,
-) -> bool {
-    if let ast::Expr::Column {
-        table: table_ref_id,
-        column,
-        ..
-    } = expr
-    {
-        if let Some((_, table)) = referenced_tables.find_table_by_internal_id(*table_ref_id) {
-            if let Some(col) = table.get_column_at(*column) {
-                if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict()) {
-                    if type_def.decode().is_some() {
-                        // No `<` operator at all (naked or with function)
-                        return !type_def.operators().iter().any(|op| op.op == "<");
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
 // Metadata for handling ORDER BY operations
 #[derive(Debug)]
 pub struct SortMetadata {
@@ -120,25 +91,6 @@ impl EmitOrderBy {
         has_distinct: bool,
         aggregates: &[Aggregate],
     ) -> Result<()> {
-        // Block ORDER BY on custom type columns without OPERATOR '<'
-        for (expr, _, _) in order_by.iter() {
-            if is_custom_type_without_lt(expr, referenced_tables, t_ctx.resolver.schema()) {
-                if let Some((col, type_def)) =
-                    result_column_custom_type_info(expr, referenced_tables, t_ctx.resolver.schema())
-                {
-                    let col_name = col.name.as_deref().unwrap_or("?");
-                    crate::bail_parse_error!(
-                    "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
-                    col_name,
-                    type_def.name
-                );
-                }
-                crate::bail_parse_error!(
-                    "cannot ORDER BY a custom type column that does not declare OPERATOR '<'"
-                );
-            }
-        }
-
         let only_aggs = order_by
             .iter()
             .all(|(e, _, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
@@ -461,8 +413,8 @@ impl EmitOrderBy {
                 });
             } else {
                 // Sort keys must be encoded (on-disk) values. Suppress decode so the
-                // sorter compares encoded representations, using either the base type's
-                // built-in comparison (naked OPERATOR '<') or a custom comparator function.
+                // sorter compares stored values, with SQLite's comparison or the
+                // built-in type's own order (numeric).
                 let is_custom =
                     result_column_custom_type_info(expr, &plan.table_references, resolver.schema())
                         .is_some_and(|(_, td)| td.decode().is_some());

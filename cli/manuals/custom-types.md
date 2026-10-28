@@ -6,7 +6,7 @@ display_name: "custom types"
 
 ## Overview
 
-Turso extends SQLite's STRICT table type system with user-defined custom types. Custom types let you define how values are encoded before storage and decoded when read, enforce domain constraints at the storage layer, attach operators, and provide defaults — all declared in pure SQL.
+Turso extends SQLite's STRICT table type system with user-defined custom types. Custom types let you define how values are encoded before storage and decoded when read, enforce domain constraints at the storage layer, and provide defaults — all declared in pure SQL.
 
 Custom types work only with **STRICT** tables (which are always enabled):
 
@@ -23,7 +23,6 @@ CREATE TYPE type_name BASE base_type
     [ENCODE encode_expr]
     [COERCE coerce_expr]
     [DECODE decode_expr]
-    [OPERATOR 'op' [function_name] ...]
     [DEFAULT default_expr];
 ```
 
@@ -31,7 +30,6 @@ CREATE TYPE type_name BASE base_type
 - **ENCODE** — Expression applied to `value` before writing to disk.
 - **COERCE** — (Optional) Expression that fits the encoded `value` to the column's type parameters, such as a maximum length. See [Parametric Types](#parametric-types).
 - **DECODE** — Expression applied to `value` when reading from disk.
-- **OPERATOR** — (Optional) Custom operator overloads for the type. If `function_name` is omitted, the base type's built-in comparison is used (see [Ordering](#ordering) below).
 - **DEFAULT** — (Optional) Default value for columns of this type when no value is supplied.
 
 The special identifier `value` refers to the input being encoded or decoded.
@@ -98,46 +96,24 @@ INSERT INTO t1 VALUES ('not json');    -- Error: malformed JSON
 
 ## Operators
 
-Custom types can overload SQL operators so expressions like `val + val` or `val < 10` call user-defined functions:
+A user-defined type has no arithmetic operators. `val + 1` on a column of the type fails:
 
 ```sql
-CREATE TYPE uint BASE text
-    ENCODE test_uint_encode(value)
-    DECODE test_uint_decode(value)
-    OPERATOR '+' (uint) -> test_uint_add
-    OPERATOR '<' (uint) -> test_uint_lt
-    OPERATOR '=' (uint) -> test_uint_eq;
-
-CREATE TABLE t1(val uint) STRICT;
-INSERT INTO t1 VALUES (20);
-INSERT INTO t1 VALUES (30);
-
-SELECT val + val FROM t1;
--- 40
--- 60
-
-SELECT val FROM t1 WHERE val < 25;
--- 20
+CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+CREATE TABLE prices(amount cents) STRICT;
+SELECT amount + 1 FROM prices;
+-- Error: operator does not exist: cents + integer
 ```
+
+The built-in types `date`, `numeric`, `smallint` and `bigint` have arithmetic operators. `CREATE TYPE` has no `OPERATOR` clause; using one fails with `CREATE TYPE does not accept OPERATOR`.
 
 ## Ordering
 
-A type whose `OPERATOR '<'` names a function has an order (`numeric_lt`, `array_lt`), and values of the type sort and compare by it, whether they are stored or decoded. Other types sort and index by their **encoded (on-disk) values**: there DECODE is purely a presentation layer — it controls how values appear in query results, but has no effect on sort order or index structure.
-
-Custom types that support ordering must declare `OPERATOR '<'`. Without it, `ORDER BY` and `CREATE INDEX` on columns of that type are **forbidden** — attempting either produces a clear error.
-
-### Naked `OPERATOR '<'` (Base Type Comparison)
-
-A naked `OPERATOR '<'` (no function name) tells Turso to compare encoded values using the base type's built-in comparison. This works correctly when the encoding preserves the desired sort order:
+Every custom type sorts, compares in `min`/`max`, and is indexed by its **encoded (on-disk) value**, using the base type's comparison. DECODE only controls how values appear in query results. When the encoding keeps the order of its input, the sort order matches the decoded values:
 
 ```sql
--- ENCODE value * 100 is monotonic: 10→100, 20→200, 30→300.
--- Sorting encoded integers preserves numeric order.
-CREATE TYPE cents BASE integer
-    ENCODE value * 100
-    DECODE value / 100
-    OPERATOR '<';
-
+-- ENCODE value * 100 keeps the order: 10→1000, 20→2000, 30→3000.
+CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
 CREATE TABLE prices(id INTEGER PRIMARY KEY, amount cents) STRICT;
 INSERT INTO prices VALUES (1, 30), (2, 10), (3, 20);
 SELECT amount FROM prices ORDER BY amount;
@@ -146,16 +122,14 @@ SELECT amount FROM prices ORDER BY amount;
 -- 30
 ```
 
-If the encoding does **not** preserve order, the sort will reflect the encoded representation:
+If the encoding does **not** keep the order, the sort follows the encoded form:
 
 ```sql
--- string_reverse is NOT monotonic: encoded text sorts differently than decoded.
 -- Encoded: apple→elppa, banana→ananab, cherry→yrrehc.
 -- Encoded text sort: ananab < elppa < yrrehc → display: banana, apple, cherry.
 CREATE TYPE reversed BASE text
     ENCODE string_reverse(value)
-    DECODE string_reverse(value)
-    OPERATOR '<';
+    DECODE string_reverse(value);
 
 CREATE TABLE t(id INTEGER PRIMARY KEY, val reversed) STRICT;
 INSERT INTO t VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry');
@@ -165,41 +139,9 @@ SELECT val FROM t ORDER BY val;
 -- cherry
 ```
 
-### `OPERATOR '<'` with a Function (Custom Comparator)
+### Types with Their Own Order
 
-For types where the base type comparison on encoded values is not suitable, name a comparator function. Only functions Turso has an order for are accepted (`numeric_lt`, `array_lt`, and the test functions `test_uint_lt` and `string_reverse`); any other name fails with `no order is known for OPERATOR '<' f`. An `OPERATOR '=' f` is only accepted together with such a `<` function, because equality must agree with the order:
-
-```sql
--- numeric stores values as blobs; standard blob comparison is wrong.
--- numeric_lt knows how to compare encoded blobs numerically.
-CREATE TYPE numeric(precision, scale) BASE blob
-    ENCODE numeric_encode(value)
-    COERCE numeric_fit(value, precision, scale)
-    DECODE numeric_decode(value)
-    OPERATOR '<' numeric_lt;
-```
-
-A comparator can also recover a desired sort order from a non-order-preserving encoding:
-
-```sql
--- Same encoding as above, but the comparator reverses encoded values
--- before comparing, recovering alphabetical order.
-CREATE TYPE reversed_alpha BASE text
-    ENCODE string_reverse(value)
-    DECODE string_reverse(value)
-    OPERATOR '<' string_reverse;
-
-CREATE TABLE t(id INTEGER PRIMARY KEY, val reversed_alpha) STRICT;
-INSERT INTO t VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry');
-SELECT val FROM t ORDER BY val;
--- apple
--- banana
--- cherry
-```
-
-### Comparisons
-
-A type with an order uses it in every comparison of its values: `=`, `<` and the other operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins and indexes. The same query returns the same rows with and without an index, and expressions of the type compare the same way:
+The built-in `numeric` type and arrays have their own order, set by Turso. It is used in every comparison of their values: `=`, `<` and the other operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins and indexes. The same query returns the same rows with and without an index, and expressions of the type compare the same way:
 
 ```sql
 CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), i integer) STRICT;
@@ -212,36 +154,9 @@ SELECT n FROM t UNION SELECT 4.5;    -- two rows: 4.5 equals 4.50
 
 A COLLATE on a value of such a type is an error (`collations are not supported by type numeric`).
 
-A window `RANGE` frame with an offset (`RANGE 1 PRECEDING`) computes its bounds with numeric's `+` and `-` when the `ORDER BY` value is a numeric. For other types with an order, such as arrays, such a frame is an error.
+A window `RANGE` frame with an offset (`RANGE 1 PRECEDING`) computes its bounds with numeric's `+` and `-` when the `ORDER BY` value is a numeric. For arrays, such a frame is an error.
 
-A type without an order compares the values the column reads as, with SQLite's rules. An index on such a column serves `=` lookups only, since it is ordered by the encoded form.
-
-### Non-Orderable Types
-
-Types without `OPERATOR '<'` cannot be used in `ORDER BY` or `CREATE INDEX`:
-
-```sql
-CREATE TYPE mytype BASE text ENCODE value DECODE value;
-CREATE TABLE t(val mytype) STRICT;
-
-SELECT val FROM t ORDER BY val;
--- Error: cannot ORDER BY column 'val' of type 'mytype': type does not declare OPERATOR '<'
-
-CREATE INDEX idx ON t(val);
--- Error: cannot create index on column 'val' of type 'mytype': type does not declare OPERATOR '<'
-```
-
-Expression indexes that compute a regular value from a non-orderable column are still allowed:
-
-```sql
-CREATE INDEX idx ON t(length(val));  -- OK: length() returns an integer
-```
-
-### Built-In Types with Ordering
-
-The following built-in types declare `OPERATOR '<'` and support `ORDER BY` and indexing: `date`, `time`, `timestamp`, `varchar`, `smallint`, `boolean`, `uuid`, `bytea`, `numeric`.
-
-Types without ordering support: `json`, `jsonb`, `inet`.
+Other types compare the values the column reads as in `=`, `<` and the other operators, with SQLite's rules. An index on such a column serves `=` lookups only, since it is ordered by the encoded form.
 
 ## Defaults
 
@@ -426,7 +341,7 @@ PRAGMA list_types;
 -- TEXT      |        |                       |        |                       |         |
 -- BLOB      |        |                       |        |                       |         |
 -- ANY       |        |                       |        |                       |         |
--- uint      | text   | test_uint_encode(...) |        | test_uint_decode(...) | 0       | +(uint) -> test_uint_add
+-- uint      | text   | test_uint_encode(...) |        | test_uint_decode(...) | 0       |
 ```
 
 ### sqlite_turso_types
