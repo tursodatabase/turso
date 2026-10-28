@@ -45,6 +45,8 @@ declared primary-key, unique, and foreign-key constraint names, in dumps.
 Foreign-key definitions quote identifiers and include the parent schema when
 the parent table is not visible through the current `search_path`.
 Index definitions retain descending keys.
+Integer literal defaults use PostgreSQL's expression formatting, including casts
+for negative values and values outside the 32-bit integer range.
 
 ## See Also
 
