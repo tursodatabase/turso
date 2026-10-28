@@ -228,14 +228,6 @@ impl Qualifiers {
         names.first().map(|name| name.to_string())
     }
 
-    /// The namespaces other than main and temp, ordered by database, then
-    /// by name.
-    pub fn others(&self) -> Vec<Namespace> {
-        let mut namespaces: Vec<_> = self.name_to_namespace.read().values().cloned().collect();
-        namespaces.sort_by(|a, b| (a.database_id(), &a.name).cmp(&(b.database_id(), &b.name)));
-        namespaces
-    }
-
     /// The namespaces of the attached databases: the databases other than
     /// main and temp, ordered by database.
     pub fn attached_databases(&self) -> Vec<Namespace> {
@@ -467,8 +459,6 @@ mod tests {
             all.get("shop").unwrap(),
             Namespace::in_main("shop", NamespaceId::new(2))
         );
-        assert_eq!(names_of(&all.others()), vec!["shop", "app", "other"]);
-        assert_eq!(names_of(&namespaces.others()), vec!["app", "other"]);
     }
 
     #[test]

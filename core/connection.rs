@@ -3460,11 +3460,6 @@ impl Connection {
         self.current_qualifiers().get(name)
     }
 
-    /// The namespaces other than main and temp.
-    pub fn other_namespaces(&self) -> Vec<Namespace> {
-        self.current_qualifiers().others()
-    }
-
     /// Sets the namespace names that a name without a namespace is looked
     /// up through, in order, or None for the default: main, then the other
     /// databases by id. Names that do not exist are skipped when a name is
