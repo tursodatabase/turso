@@ -2317,6 +2317,175 @@ expect {
     0
 }
 
+test alter-table-rename-table-trigger-cte-hides-table {
+    CREATE TABLE cte_src (z);
+    INSERT INTO cte_src VALUES (7);
+    CREATE TABLE cte_other (z);
+    INSERT INTO cte_other VALUES (9);
+    CREATE TABLE cte_driver (x);
+    CREATE TABLE cte_log (v);
+    CREATE TRIGGER trig_cte_hides_table AFTER INSERT ON cte_driver BEGIN
+        INSERT INTO cte_log WITH cte_src AS (SELECT 100 AS v) SELECT v FROM cte_src;
+        INSERT INTO cte_log WITH cte_src AS (SELECT 2 AS v) SELECT cte_src.v FROM cte_src;
+        INSERT INTO cte_log WITH cte_src AS (SELECT 3 AS v)
+            SELECT (SELECT v FROM cte_src) + (SELECT z FROM main.cte_src);
+        INSERT INTO cte_log WITH cte_src AS (SELECT 4 AS v)
+            SELECT v FROM cte_src UNION ALL SELECT z FROM main.cte_src;
+        INSERT INTO cte_log SELECT z FROM cte_src
+            WHERE EXISTS (WITH cte_src AS (SELECT 1 AS v) SELECT v FROM cte_src);
+        INSERT INTO cte_log WITH cte_src AS (SELECT 100 AS v) SELECT cte_src.z FROM main.cte_src;
+        INSERT INTO cte_log WITH cte_src AS (SELECT 100 AS v) SELECT cte_src.* FROM main.cte_src;
+        INSERT INTO cte_log SELECT z FROM cte_src
+            WHERE EXISTS (WITH cte_src AS (SELECT 1 AS v) SELECT cte_src.z FROM cte_other);
+        INSERT INTO cte_log WITH cte_src AS (SELECT 5 AS v) SELECT (SELECT cte_src.v) FROM cte_src;
+        INSERT INTO cte_log SELECT cte_src.z FROM cte_other AS cte_src;
+        INSERT INTO cte_log WITH cte_src AS (SELECT 6 AS v)
+            SELECT cte_src.v FROM cte_src ORDER BY cte_src.v;
+        INSERT INTO cte_log SELECT cte_src.z FROM cte_other AS cte_src ORDER BY cte_src.z;
+        INSERT INTO cte_log WITH cte_src AS (SELECT 100 AS v)
+            SELECT cte_src.z FROM main.cte_src ORDER BY cte_src.z;
+        INSERT INTO cte_log SELECT cte_src.z FROM cte_src
+            UNION ALL SELECT z FROM cte_other ORDER BY cte_src.z;
+    END;
+    ALTER TABLE cte_src RENAME TO cte_src2;
+    INSERT INTO cte_driver VALUES (1);
+    SELECT v FROM cte_log;
+}
+expect {
+    100
+    2
+    10
+    4
+    7
+    7
+    7
+    7
+    7
+    5
+    9
+    6
+    9
+    7
+    7
+    9
+}
+
+test alter-table-rename-column-trigger-cte-hides-table {
+    CREATE TABLE cte_col_src (a, b);
+    CREATE TABLE cte_col_driver (x);
+    CREATE TABLE cte_col_log (v);
+    CREATE TRIGGER trig_cte_col_hides_table AFTER INSERT ON cte_col_driver BEGIN
+        INSERT INTO cte_col_log WITH cte_col_src AS (SELECT 100 AS b) SELECT b FROM cte_col_src;
+    END;
+    ALTER TABLE cte_col_src RENAME COLUMN b TO c;
+    INSERT INTO cte_col_driver VALUES (1);
+    SELECT v FROM cte_col_log;
+}
+expect {
+    100
+}
+
+test alter-table-rename-table-trigger-limit-and-window {
+    CREATE TABLE lim_src (z);
+    INSERT INTO lim_src VALUES (1);
+    CREATE TABLE lim_other (z);
+    INSERT INTO lim_other VALUES (9), (10);
+    CREATE TABLE lim_driver (x);
+    CREATE TABLE lim_log (v);
+    CREATE TRIGGER trig_limit_and_window AFTER INSERT ON lim_driver BEGIN
+        INSERT INTO lim_log SELECT z FROM lim_other ORDER BY z
+            LIMIT (SELECT count(*) FROM lim_src) OFFSET (SELECT count(*) FROM lim_src);
+        INSERT INTO lim_log WITH lim_src AS (SELECT 3 AS v)
+            SELECT v FROM lim_src LIMIT (SELECT count(*) FROM main.lim_src);
+        INSERT INTO lim_log SELECT sum(z) OVER w FROM lim_other
+            WINDOW w AS (PARTITION BY (SELECT count(*) FROM lim_src)
+                         ORDER BY (SELECT max(z) FROM lim_src))
+            LIMIT 1;
+    END;
+    ALTER TABLE lim_src RENAME TO lim_src2;
+    INSERT INTO lim_driver VALUES (1);
+    SELECT v FROM lim_log;
+}
+expect {
+    10
+    3
+    19
+}
+
+test alter-table-rename-table-trigger-update-from-alias {
+    CREATE TABLE upd_src (z);
+    CREATE TABLE upd_other (z);
+    INSERT INTO upd_other VALUES (9);
+    CREATE TABLE upd_driver (x);
+    CREATE TRIGGER trig_update_from_alias AFTER INSERT ON upd_driver BEGIN
+        UPDATE upd_other SET z = upd_src.z + 1 FROM upd_other AS upd_src
+            WHERE upd_src.z > 0;
+    END;
+    ALTER TABLE upd_src RENAME TO upd_src2;
+    INSERT INTO upd_driver VALUES (1);
+    SELECT z FROM upd_other;
+    SELECT sql LIKE '%upd_src2%' FROM sqlite_schema WHERE name = 'trig_update_from_alias';
+}
+expect {
+    10
+    0
+}
+
+test alter-table-rename-table-parenthesized-from-entries {
+    CREATE TABLE par_t (a);
+    INSERT INTO par_t VALUES (1);
+    CREATE TABLE par_o (b);
+    INSERT INTO par_o VALUES (2);
+    CREATE TABLE par_p (c);
+    INSERT INTO par_p VALUES (3);
+    CREATE TABLE par_driver (x);
+    CREATE TABLE par_log (v);
+    CREATE TRIGGER trig_parenthesized_from AFTER INSERT ON par_driver BEGIN
+        INSERT INTO par_log SELECT par_t.b FROM (par_o AS par_t, par_p);
+        INSERT INTO par_log WITH par_t AS (SELECT 5 AS a)
+            SELECT par_t.a FROM (par_t JOIN par_o);
+        INSERT INTO par_log SELECT par_t.a FROM (par_o JOIN par_t);
+        INSERT INTO par_log SELECT x.b FROM (par_o AS par_t JOIN par_p ON par_t.b + 1 = par_p.c) AS x;
+    END;
+    ALTER TABLE par_t RENAME TO par_t2;
+    INSERT INTO par_driver VALUES (1);
+    SELECT v FROM par_log;
+}
+expect {
+    2
+    5
+    1
+    2
+}
+
+test alter-table-rename-table-trigger-derived-table-skips-sibling-entries {
+    CREATE TABLE dt_src (z);
+    INSERT INTO dt_src VALUES (7);
+    CREATE TABLE dt_other (z);
+    INSERT INTO dt_other VALUES (9);
+    CREATE TABLE dt_driver (x);
+    CREATE TABLE dt_log (v);
+    CREATE TRIGGER trig_derived_table AFTER INSERT ON dt_driver BEGIN
+        INSERT INTO dt_log SELECT (SELECT y FROM dt_other AS dt_src, (SELECT dt_src.z AS y)) FROM dt_src;
+        INSERT INTO dt_log SELECT (SELECT y FROM dt_other AS dt_src JOIN (SELECT dt_src.z AS y)) FROM dt_src;
+        INSERT INTO dt_log SELECT (SELECT y FROM dt_src, (SELECT dt_src.z AS y)) FROM dt_other AS dt_src;
+        INSERT INTO dt_log SELECT 1 FROM dt_src WHERE EXISTS (
+            SELECT 1 FROM dt_other AS dt_src, (SELECT dt_src.z AS y) WHERE y = 7);
+        UPDATE dt_other SET z = y FROM (SELECT dt_src.z + 10 AS y FROM dt_src) AS dt_src;
+    END;
+    ALTER TABLE dt_src RENAME TO dt_src2;
+    INSERT INTO dt_driver VALUES (1);
+    SELECT v FROM dt_log;
+    SELECT z FROM dt_other;
+}
+expect {
+    7
+    7
+    9
+    1
+    17
+}
+
 test alter-table-rename-column-temp-trigger-exists-result-expr-error {
     CREATE TEMP TABLE temp_exists_driver (n);
     CREATE TABLE src_temp_exists (c1, c2, b);

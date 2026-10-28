@@ -3866,26 +3866,52 @@ pub use rename_column_view::{rewrite_view_sql_for_column_rename, RewrittenView};
 /// `t2.a > 0` when renaming t1 to t2. This matches SQLite 3.49.1+ behavior which
 /// rewrites qualified refs during ALTER TABLE RENAME instead of rejecting them.
 pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str) {
+    rewrite_expr_table_refs(expr, from, to, TableRenameScope::OUTSIDE_CTE);
+}
+
+/// What the renamed table's name refers to at one point of a statement.
+#[derive(Clone, Copy)]
+struct TableRenameScope {
+    /// A CTE with the table's name is in scope, so an unqualified table name
+    /// means the CTE and only `main.name` still means the table.
+    cte_hides_table: bool,
+    /// `name.col` and `name.*` refer to the renamed table. They resolve to the
+    /// nearest FROM entry visible as `name`, so a correlated subquery uses the
+    /// value of the enclosing SELECT.
+    qualified_refs_mean_table: bool,
+}
+
+impl TableRenameScope {
+    const OUTSIDE_CTE: Self = Self {
+        cte_hides_table: false,
+        qualified_refs_mean_table: true,
+    };
+
+    fn names_table(self, table: &ast::QualifiedName, table_name: &str) -> bool {
+        table.name.as_str().eq_ignore_ascii_case(table_name)
+            && (table.namespace.is_some() || !self.cte_hides_table)
+    }
+}
+
+fn rewrite_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str, scope: TableRenameScope) {
     let _ = walk_expr_mut(
         expr,
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
             match e {
                 ast::Expr::Qualified(tbl, col) => {
-                    if tbl.as_str().eq_ignore_ascii_case(from) {
+                    if scope.qualified_refs_mean_table && tbl.as_str().eq_ignore_ascii_case(from) {
                         let col = col.clone();
                         *e = ast::Expr::Qualified(ast::Name::exact(to.to_owned()), col);
                     }
                 }
                 ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
-                    rewrite_select_table_refs(select, from, to);
+                    rewrite_select_table_refs(select, from, to, scope);
                 }
                 ast::Expr::InSelect { rhs, .. } => {
-                    rewrite_select_table_refs(rhs, from, to);
+                    rewrite_select_table_refs(rhs, from, to, scope);
                 }
                 ast::Expr::InTable { rhs, .. } => {
-                    if rhs.name.as_str().eq_ignore_ascii_case(from) {
-                        rhs.name = ast::Name::exact(to.to_owned());
-                    }
+                    rewrite_table_name_if_needed(rhs, from, to, scope);
                 }
                 _ => {}
             }
@@ -3984,14 +4010,22 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
             if tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
                 *tbl_name = ast::Name::exact(new_tbl.to_owned());
             }
+            // `name.col` in SET and WHERE can mean an entry of the FROM clause.
+            let scope = from_clause_scope(from.as_ref(), old_tbl, TableRenameScope::OUTSIDE_CTE);
             for set in sets {
-                rewrite_check_expr_table_refs(&mut set.expr, old_tbl, new_tbl);
+                rewrite_expr_table_refs(&mut set.expr, old_tbl, new_tbl, scope);
             }
             if let Some(ref mut from) = from {
-                rewrite_from_clause_table_refs(from, old_tbl, new_tbl);
+                rewrite_from_clause_table_refs(
+                    from,
+                    old_tbl,
+                    new_tbl,
+                    TableRenameScope::OUTSIDE_CTE,
+                    scope,
+                );
             }
             if let Some(ref mut wc) = where_clause {
-                rewrite_check_expr_table_refs(wc, old_tbl, new_tbl);
+                rewrite_expr_table_refs(wc, old_tbl, new_tbl, scope);
             }
         }
         ast::TriggerCmd::Insert {
@@ -4003,7 +4037,7 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
             if tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
                 *tbl_name = ast::Name::exact(new_tbl.to_owned());
             }
-            rewrite_select_table_refs(select, old_tbl, new_tbl);
+            rewrite_select_table_refs(select, old_tbl, new_tbl, TableRenameScope::OUTSIDE_CTE);
             if let Some(ref mut upsert) = upsert {
                 rewrite_upsert_table_refs(upsert, old_tbl, new_tbl);
             }
@@ -4020,7 +4054,7 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
             }
         }
         ast::TriggerCmd::Select(select) => {
-            rewrite_select_table_refs(select, old_tbl, new_tbl);
+            rewrite_select_table_refs(select, old_tbl, new_tbl, TableRenameScope::OUTSIDE_CTE);
         }
     }
 }
@@ -4093,43 +4127,81 @@ fn one_select_has_explicit_alias(one_select: &ast::OneSelect, name: &str) -> boo
     })
 }
 
-fn rewrite_select_table_refs(select: &mut ast::Select, old_tbl: &str, new_tbl: &str) {
+fn rewrite_select_table_refs(
+    select: &mut ast::Select,
+    old_tbl: &str,
+    new_tbl: &str,
+    scope: TableRenameScope,
+) {
+    // A CTE is visible in every CTE body of its WITH clause, not only in later ones.
+    let scope = TableRenameScope {
+        cte_hides_table: scope.cte_hides_table
+            || select.with.as_ref().is_some_and(|with| {
+                with.ctes
+                    .iter()
+                    .any(|cte| cte.tbl_name.as_str().eq_ignore_ascii_case(old_tbl))
+            }),
+        ..scope
+    };
     if let Some(with_clause) = &mut select.with {
         for cte in &mut with_clause.ctes {
-            rewrite_select_table_refs(&mut cte.select, old_tbl, new_tbl);
+            rewrite_select_table_refs(&mut cte.select, old_tbl, new_tbl, scope);
         }
     }
-    rewrite_one_select_table_refs(&mut select.body.select, old_tbl, new_tbl);
+    rewrite_one_select_table_refs(&mut select.body.select, old_tbl, new_tbl, scope);
     for compound in &mut select.body.compounds {
-        rewrite_one_select_table_refs(&mut compound.select, old_tbl, new_tbl);
+        rewrite_one_select_table_refs(&mut compound.select, old_tbl, new_tbl, scope);
     }
+    // ORDER BY and LIMIT, even on a compound SELECT, resolve `name.col`
+    // against the FROM clause of the first SELECT.
+    let first_from = match &select.body.select {
+        ast::OneSelect::Select { from, .. } => from.as_ref(),
+        ast::OneSelect::Values(_) => None,
+    };
+    let order_by_scope = from_clause_scope(first_from, old_tbl, scope);
     for col in &mut select.order_by {
-        rewrite_check_expr_table_refs(&mut col.expr, old_tbl, new_tbl);
+        rewrite_expr_table_refs(&mut col.expr, old_tbl, new_tbl, order_by_scope);
+    }
+    if let Some(limit) = &mut select.limit {
+        rewrite_expr_table_refs(&mut limit.expr, old_tbl, new_tbl, order_by_scope);
+        if let Some(offset) = &mut limit.offset {
+            rewrite_expr_table_refs(offset, old_tbl, new_tbl, order_by_scope);
+        }
     }
 }
 
-fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, old_tbl: &str, new_tbl: &str) {
+fn rewrite_one_select_table_refs(
+    one: &mut ast::OneSelect,
+    old_tbl: &str,
+    new_tbl: &str,
+    scope: TableRenameScope,
+) {
     match one {
         ast::OneSelect::Select {
             from,
             where_clause,
             columns,
             group_by,
+            window_clause,
             ..
         } => {
+            let outer_scope = scope;
+            let scope = from_clause_scope(from.as_ref(), old_tbl, outer_scope);
             if let Some(ref mut from) = from {
-                rewrite_from_clause_table_refs(from, old_tbl, new_tbl);
+                rewrite_from_clause_table_refs(from, old_tbl, new_tbl, outer_scope, scope);
             }
             if let Some(ref mut wc) = where_clause {
-                rewrite_check_expr_table_refs(wc, old_tbl, new_tbl);
+                rewrite_expr_table_refs(wc, old_tbl, new_tbl, scope);
             }
             for col in columns {
                 match col {
                     ast::ResultColumn::Expr(ref mut expr, _) => {
-                        rewrite_check_expr_table_refs(expr, old_tbl, new_tbl);
+                        rewrite_expr_table_refs(expr, old_tbl, new_tbl, scope);
                     }
                     ast::ResultColumn::TableStar(ref mut name) => {
-                        if name.as_str().eq_ignore_ascii_case(old_tbl) {
+                        if scope.qualified_refs_mean_table
+                            && name.as_str().eq_ignore_ascii_case(old_tbl)
+                        {
                             *name = ast::Name::exact(new_tbl.to_owned());
                         }
                     }
@@ -4138,54 +4210,144 @@ fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, old_tbl: &str, new_tb
             }
             if let Some(ref mut gb) = group_by {
                 for expr in &mut gb.exprs {
-                    rewrite_check_expr_table_refs(expr, old_tbl, new_tbl);
+                    rewrite_expr_table_refs(expr, old_tbl, new_tbl, scope);
                 }
                 if let Some(ref mut having) = gb.having {
-                    rewrite_check_expr_table_refs(having, old_tbl, new_tbl);
+                    rewrite_expr_table_refs(having, old_tbl, new_tbl, scope);
+                }
+            }
+            for window_def in window_clause {
+                let window = &mut window_def.window;
+                for expr in &mut window.partition_by {
+                    rewrite_expr_table_refs(expr, old_tbl, new_tbl, scope);
+                }
+                for col in &mut window.order_by {
+                    rewrite_expr_table_refs(&mut col.expr, old_tbl, new_tbl, scope);
                 }
             }
         }
         ast::OneSelect::Values(rows) => {
             for row in rows {
                 for expr in row {
-                    rewrite_check_expr_table_refs(expr, old_tbl, new_tbl);
+                    rewrite_expr_table_refs(expr, old_tbl, new_tbl, scope);
                 }
             }
         }
     }
 }
 
-fn rewrite_from_clause_table_refs(from: &mut ast::FromClause, old_tbl: &str, new_tbl: &str) {
-    rewrite_select_table_entry_table_refs(&mut from.select, old_tbl, new_tbl);
+/// Subqueries in FROM see only `outer_scope`, the scope of the enclosing
+/// statement, because they cannot refer to the other FROM entries. ON clauses
+/// and table function arguments see the FROM entries, so they use `scope`.
+fn rewrite_from_clause_table_refs(
+    from: &mut ast::FromClause,
+    old_tbl: &str,
+    new_tbl: &str,
+    outer_scope: TableRenameScope,
+    scope: TableRenameScope,
+) {
+    rewrite_select_table_entry_table_refs(&mut from.select, old_tbl, new_tbl, outer_scope, scope);
     for join in &mut from.joins {
-        rewrite_select_table_entry_table_refs(&mut join.table, old_tbl, new_tbl);
+        rewrite_select_table_entry_table_refs(
+            &mut join.table,
+            old_tbl,
+            new_tbl,
+            outer_scope,
+            scope,
+        );
         if let Some(ast::JoinConstraint::On(ref mut expr)) = join.constraint {
-            rewrite_check_expr_table_refs(expr, old_tbl, new_tbl);
+            rewrite_expr_table_refs(expr, old_tbl, new_tbl, scope);
         }
     }
 }
 
-fn rewrite_select_table_entry_table_refs(st: &mut ast::SelectTable, old_tbl: &str, new_tbl: &str) {
+fn rewrite_select_table_entry_table_refs(
+    st: &mut ast::SelectTable,
+    old_tbl: &str,
+    new_tbl: &str,
+    outer_scope: TableRenameScope,
+    scope: TableRenameScope,
+) {
     match st {
         ast::SelectTable::Table(ref mut name, _, _) => {
-            if name.name.as_str().eq_ignore_ascii_case(old_tbl) {
-                name.name = ast::Name::exact(new_tbl.to_owned());
-            }
+            rewrite_table_name_if_needed(name, old_tbl, new_tbl, scope);
         }
         ast::SelectTable::TableCall(ref mut name, ref mut args, _) => {
-            if name.name.as_str().eq_ignore_ascii_case(old_tbl) {
-                name.name = ast::Name::exact(new_tbl.to_owned());
-            }
+            rewrite_table_name_if_needed(name, old_tbl, new_tbl, scope);
             for arg in args {
-                rewrite_check_expr_table_refs(arg, old_tbl, new_tbl);
+                rewrite_expr_table_refs(arg, old_tbl, new_tbl, scope);
             }
         }
         ast::SelectTable::Select { ref mut select, .. } => {
-            rewrite_select_table_refs(select, old_tbl, new_tbl);
+            rewrite_select_table_refs(select, old_tbl, new_tbl, outer_scope);
         }
         ast::SelectTable::Sub(ref mut from, _) => {
-            rewrite_from_clause_table_refs(from, old_tbl, new_tbl);
+            // ON clauses inside the parentheses see the entries there, even
+            // when an alias hides them from the enclosing SELECT.
+            let scope = from_clause_scope(Some(from), old_tbl, scope);
+            rewrite_from_clause_table_refs(from, old_tbl, new_tbl, outer_scope, scope);
         }
+    }
+}
+
+/// The scope inside a statement with this FROM clause. If an entry of the FROM
+/// clause is visible as `name` (by alias, or by table name when it has no
+/// alias), `name.col` means that entry; otherwise it keeps the meaning it has
+/// in the enclosing statement.
+fn from_clause_scope(
+    from: Option<&ast::FromClause>,
+    name: &str,
+    scope: TableRenameScope,
+) -> TableRenameScope {
+    let entry_means_table = from.and_then(|from| from_entry_means_table(from, name, scope));
+    TableRenameScope {
+        qualified_refs_mean_table: entry_means_table.unwrap_or(scope.qualified_refs_mean_table),
+        ..scope
+    }
+}
+
+/// Whether the first entry of `from` visible as `name` is the renamed table,
+/// or `None` if no entry is visible as `name`. The entries of a parenthesized
+/// FROM list without an alias, like `FROM (o AS t, p)`, are visible as well.
+fn from_entry_means_table(
+    from: &ast::FromClause,
+    name: &str,
+    scope: TableRenameScope,
+) -> Option<bool> {
+    std::iter::once(from.select.as_ref())
+        .chain(from.joins.iter().map(|join| join.table.as_ref()))
+        .find_map(|entry| match entry {
+            ast::SelectTable::Table(table, alias, _)
+            | ast::SelectTable::TableCall(table, _, alias) => match alias {
+                Some(alias) => alias
+                    .name()
+                    .as_str()
+                    .eq_ignore_ascii_case(name)
+                    .then_some(false),
+                None => table
+                    .name
+                    .as_str()
+                    .eq_ignore_ascii_case(name)
+                    .then(|| scope.names_table(table, name)),
+            },
+            ast::SelectTable::Select { alias, .. } | ast::SelectTable::Sub(_, alias @ Some(_)) => {
+                alias
+                    .as_ref()
+                    .filter(|alias| alias.name().as_str().eq_ignore_ascii_case(name))
+                    .map(|_| false)
+            }
+            ast::SelectTable::Sub(inner, None) => from_entry_means_table(inner, name, scope),
+        })
+}
+
+fn rewrite_table_name_if_needed(
+    name: &mut ast::QualifiedName,
+    old_tbl: &str,
+    new_tbl: &str,
+    scope: TableRenameScope,
+) {
+    if scope.names_table(name, old_tbl) {
+        name.name = ast::Name::exact(new_tbl.to_owned());
     }
 }
 
@@ -4473,7 +4635,7 @@ pub mod tests {
             panic!("expected SELECT trigger command");
         };
 
-        rewrite_select_table_refs(select, "old", "new");
+        rewrite_select_table_refs(select, "old", "new", TableRenameScope::OUTSIDE_CTE);
 
         let Some(with_clause) = &select.with else {
             panic!("expected WITH clause");
@@ -4511,7 +4673,7 @@ pub mod tests {
             panic!("expected SELECT trigger command");
         };
 
-        rewrite_select_table_refs(select, "old", "new");
+        rewrite_select_table_refs(select, "old", "new", TableRenameScope::OUTSIDE_CTE);
 
         let ast::OneSelect::Select { columns, .. } = &select.body.select else {
             panic!("expected SELECT core");
