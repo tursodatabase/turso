@@ -730,7 +730,7 @@ pub fn translate_insert(
     // see the rowids this statement has used unless they are written first.
     if let Some(meta) = ctx
         .autoincrement_meta
-        .filter(|_| any_trigger_inserts_into(resolver, ctx.namespace, &ctx.table.name))
+        .filter(|meta| meta.trigger_inserts_into_table)
     {
         emit_write_sqlite_sequence(program, resolver, ctx.namespace.database_id, meta)?;
     }
@@ -1352,7 +1352,9 @@ fn emit_write_sqlite_sequence(
     database_id: usize,
     meta: AutoincMeta,
 ) -> Result<()> {
-    reload_autoincrement_state(program, meta);
+    if meta.trigger_inserts_into_table {
+        reload_autoincrement_state(program, meta);
+    }
     let write_label = program.allocate_label();
     let done_label = program.allocate_label();
     program.emit_insn(Insn::IsNull {
@@ -1580,7 +1582,9 @@ fn emit_rowid_generation(
             insertion.key_register(),
         )?;
     } else if let Some(meta) = ctx.autoincrement_meta {
-        reload_autoincrement_state(program, meta);
+        if meta.trigger_inserts_into_table {
+            reload_autoincrement_state(program, meta);
+        }
         let r_max = program.alloc_register();
 
         let dummy_reg = program.alloc_register();
@@ -1784,6 +1788,11 @@ fn open_autoincrement_state(
         r_seq_rowid,
         table_name_reg,
         r_max_rowid: program.alloc_register(),
+        trigger_inserts_into_table: any_trigger_inserts_into(
+            resolver,
+            ctx.namespace,
+            &ctx.table.name,
+        ),
     });
 
     program.emit_insn(Insn::Integer {
@@ -2520,6 +2529,10 @@ pub struct AutoincMeta {
     r_seq_rowid: usize,
     table_name_reg: usize,
     r_max_rowid: usize,
+    /// A trigger inserts into this table. Such an INSERT runs as its own
+    /// program and moves sqlite_sequence on disk, so this statement has to
+    /// read sqlite_sequence again before using it.
+    trigger_inserts_into_table: bool,
 }
 
 pub static ROWID_COLUMN: std::sync::LazyLock<Column> = std::sync::LazyLock::new(|| {
@@ -3796,11 +3809,12 @@ fn emit_update_sqlite_sequence(
     });
 
     program.preassign_label_to_next_insn(update_existing_label);
+    // A trigger may have moved the cursor or removed the row since it was found.
     program.emit_insn(Insn::Insert {
         cursor: seq_cursor_id,
         key_reg: r_seq_rowid,
         record_reg,
-        flag: autoincrement_bookkeeping_insert_flags(),
+        flag: autoincrement_bookkeeping_insert_flags().require_seek(),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
 

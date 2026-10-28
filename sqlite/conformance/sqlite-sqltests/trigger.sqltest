@@ -2517,6 +2517,69 @@ expect {
     t_auto|4
 }
 
+# The INSERT reads sqlite_sequence once, before its BEFORE trigger runs, and
+# writes the new value back to the sqlite_sequence row it found then.
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+@cross-check-integrity
+test trigger-autoincrement-before-insert-changes-sqlite-sequence {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(v) VALUES('seed');
+    CREATE TRIGGER bi BEFORE INSERT ON t BEGIN
+        INSERT INTO sqlite_sequence(name, seq) VALUES('t', 5);
+        UPDATE sqlite_sequence SET seq = 4 WHERE name = 't';
+    END;
+    INSERT INTO t(v) VALUES('x');
+    SELECT id, v FROM t ORDER BY id;
+    SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+    1|seed
+    2|x
+    1|t|2
+    2|t|4
+}
+
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+@cross-check-integrity
+test trigger-autoincrement-before-insert-raises-sqlite-sequence {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    CREATE TRIGGER bi BEFORE INSERT ON t BEGIN
+        UPDATE sqlite_sequence SET seq = seq + 10 WHERE name = 't';
+    END;
+    INSERT INTO t(v) VALUES('a');
+    INSERT INTO t(v) VALUES('b'), ('c');
+    SELECT id, v FROM t ORDER BY id;
+    SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+    1|a
+    2|b
+    3|c
+    1|t|3
+}
+
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+@cross-check-integrity
+test trigger-autoincrement-before-insert-clears-sqlite-sequence {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(v) VALUES('seed');
+    CREATE TRIGGER bi BEFORE INSERT ON t BEGIN
+        DELETE FROM sqlite_sequence;
+        INSERT INTO sqlite_sequence VALUES('zz', 1);
+    END;
+    INSERT INTO t(v) VALUES('a');
+    INSERT INTO t(v) VALUES('b'), ('c');
+    SELECT id, v FROM t ORDER BY id;
+    SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+    1|seed
+    2|a
+    3|b
+    4|c
+    1|t|4
+}
+
 test before-update-trigger-panic-on-update {
     CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
     CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN SELECT 1; END;
