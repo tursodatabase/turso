@@ -4,11 +4,13 @@ use crate::alloc::{
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
+    type_sql_from_record, types_table_root_page, IndexRowsEntry, RowVersions,
+};
+use crate::mvcc::database::{
     DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
     TxTimestampOrID, WalPos, WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
     MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
-use crate::mvcc::database::{IndexRowsEntry, RowVersions};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
@@ -2534,14 +2536,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         self.pager.begin_read_tx()?;
                     }
                     self.build_local_schema_began_read_tx = began;
-                    let cursor = BTreeCursor::new_table(
-                        self.pager.clone(),
-                        SQLITE_SCHEMA_ROOT_PAGE,
-                        SQLITE_SCHEMA_COLUMN_COUNT,
-                    );
                     self.build_local_schema_sm =
                         Some(StateMachine::new(BuildLocalSchemaViewStateMachine::new(
-                            cursor,
+                            self.pager.clone(),
                             self.mvstore.clone(),
                             self.connection.clone(),
                             self.snapshot_ts,
@@ -3677,12 +3674,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
 /// checkpoint: scans the on-disk `sqlite_schema` B-tree (root page 1) and overlays the
 /// MVCC delta visible at `snapshot_ts`, matching exactly the rows the checkpoint
 /// collects. The live schema would include post-snapshot objects and mis-map index ids.
+/// It then reads the types table the same way, because indexes take their columns'
+/// type orders from the CREATE TYPE statements stored there.
 enum BuildLocalSchemaViewState {
     Rewind,
     ReadRowid,
     ReadRecord { rowid: i64 },
     Advance,
     MergeMvccDelta,
+    StartTypesScan,
     Done,
 }
 
@@ -3690,39 +3690,56 @@ pub struct BuildLocalSchemaViewStateMachine<
     Clock: LogicalClock,
     A: ConcurrentAllocator = TursoAllocator,
 > {
+    pager: Arc<Pager>,
+    /// Cursor over the B-tree of the table being scanned.
     cursor: BTreeCursor,
+    /// The table being scanned: sqlite_schema, then the types table.
+    table_id: MVTableId,
     mvstore: Arc<MvStore<Clock, A>>,
     connection: Arc<Connection>,
     snapshot_ts: u64,
     state: BuildLocalSchemaViewState,
+    /// Rows of the table being scanned, by rowid.
     rows: HashMap<i64, ImmutableRecordRef<'static>>,
+    /// The sqlite_schema rows, once that scan is done.
+    schema_rows: Option<HashMap<i64, ImmutableRecordRef<'static>>>,
     finalized: bool,
 }
 
 impl<Clock: LogicalClock, A: ConcurrentAllocator> BuildLocalSchemaViewStateMachine<Clock, A> {
     fn new(
-        cursor: BTreeCursor,
+        pager: Arc<Pager>,
         mvstore: Arc<MvStore<Clock, A>>,
         connection: Arc<Connection>,
         snapshot_ts: u64,
     ) -> Self {
+        let cursor = BTreeCursor::new_table(
+            pager.clone(),
+            SQLITE_SCHEMA_ROOT_PAGE,
+            SQLITE_SCHEMA_COLUMN_COUNT,
+        );
         Self {
+            pager,
             cursor,
+            table_id: SQLITE_SCHEMA_MVCC_TABLE_ID,
             mvstore,
             connection,
             snapshot_ts,
             state: BuildLocalSchemaViewState::Rewind,
             rows: HashMap::default(),
+            schema_rows: None,
             finalized: false,
         }
     }
 
-    /// Overlay the in-memory MVCC sqlite_schema versions onto the rows read from
-    /// the B-tree, keeping only the version live at `snapshot_ts` and removing
+    /// Overlay the in-memory MVCC versions of the scanned table onto the rows read
+    /// from the B-tree, keeping only the version live at `snapshot_ts` and removing
     /// rows whose live-at-snapshot state is a delete.
     fn merge_mvcc_delta(&mut self) {
         let snapshot_ts = self.snapshot_ts;
-        for entry in self.mvstore.rows.range(sqlite_schema_row_range_bounds()) {
+        let start = Bound::Included(RowID::new(self.table_id, RowKey::Int(i64::MIN)));
+        let end = next_table_start(self.table_id).map_or(Bound::Unbounded, Bound::Excluded);
+        for entry in self.mvstore.rows.range((start, end)) {
             let key = entry.key();
             let rowid = key.row_id.to_int_or_panic();
             let versions = entry.value().read();
@@ -3746,7 +3763,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> BuildLocalSchemaViewStateMachi
                         .row
                         .data
                         .as_ref()
-                        .expect("present schema version must carry row data at snapshot_ts");
+                        .expect("present row version must carry row data at snapshot_ts");
                     self.rows
                         .insert(rowid, ImmutableRecordRef::from_shared_record(data.clone()));
                 }
@@ -3823,17 +3840,62 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
             },
             BuildLocalSchemaViewState::MergeMvccDelta => {
                 self.merge_mvcc_delta();
-                self.state = BuildLocalSchemaViewState::Done;
+                self.state = if self.schema_rows.is_none() {
+                    BuildLocalSchemaViewState::StartTypesScan
+                } else {
+                    BuildLocalSchemaViewState::Done
+                };
+                Ok(TransitionResult::Continue)
+            }
+            BuildLocalSchemaViewState::StartTypesScan => {
+                let schema_rows = std::mem::take(&mut self.rows);
+                let types_table_root_page = if self.connection.experimental_custom_types_enabled() {
+                    schema_rows.values().find_map(types_table_root_page)
+                } else {
+                    None
+                };
+                self.schema_rows = Some(schema_rows);
+                let Some(root_page) = types_table_root_page else {
+                    self.state = BuildLocalSchemaViewState::Done;
+                    return Ok(TransitionResult::Continue);
+                };
+                self.table_id = self
+                    .mvstore
+                    .try_get_table_id_from_root_page_at(root_page, self.snapshot_ts)
+                    .expect("types table in the snapshot's sqlite_schema must have a table id");
+                // A types table that no checkpoint has written yet has no B-tree.
+                let btree_root_page = self.mvstore.resolve_root_page(root_page);
+                if btree_root_page > 0 {
+                    // The types table has two columns: name and sql.
+                    self.cursor = BTreeCursor::new_table(self.pager.clone(), btree_root_page, 2);
+                    self.state = BuildLocalSchemaViewState::Rewind;
+                } else {
+                    self.state = BuildLocalSchemaViewState::MergeMvccDelta;
+                }
                 Ok(TransitionResult::Continue)
             }
             BuildLocalSchemaViewState::Done => {
                 self.finalized = true;
+                let schema_rows = self
+                    .schema_rows
+                    .as_ref()
+                    .expect("sqlite_schema is scanned before the types table");
+                // The scan after sqlite_schema, if any, was of the types table.
+                let mut type_rows: std::vec::Vec<_> = self.rows.iter().collect();
+                type_rows.sort_unstable_by_key(|(rowid, _)| **rowid);
+                let type_sqls = type_rows
+                    .into_iter()
+                    .map(|(_, record)| type_sql_from_record(record))
+                    .collect::<Result<std::vec::Vec<_>>>()?;
                 let tvfs = MvStore::<Clock, A>::capture_table_valued_functions(
                     &self.connection.schema.read(),
                 );
-                let schema =
-                    self.mvstore
-                        .build_schema_from_rows(&self.connection, &self.rows, &tvfs)?;
+                let schema = self.mvstore.build_schema_from_rows(
+                    &self.connection,
+                    schema_rows,
+                    &type_sqls,
+                    &tvfs,
+                )?;
                 Ok(TransitionResult::Done(schema))
             }
         }

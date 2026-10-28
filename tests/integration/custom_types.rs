@@ -189,6 +189,74 @@ mod tests {
         assert_eq!(rows, vec![(2,), (3,)]);
     }
 
+    /// Under MVCC the schema is rebuilt from sqlite_schema rows when the
+    /// logical log is replayed on open and when a passive checkpoint runs.
+    /// Indexes on columns whose type has its own order must keep that order
+    /// in both.
+    #[test]
+    fn test_mvcc_index_keeps_type_order_after_schema_rebuild() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("mvcc_type_order_rebuild.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_experimental_mvcc_passive_checkpoint(true);
+        let open = || {
+            TempDatabase::builder()
+                .with_db_path(&path)
+                .with_opts(opts)
+                .with_mvcc(true)
+                .build()
+        };
+        let check = |conn: &Arc<turso_core::Connection>, words: &[&str], ids: &[i64]| {
+            let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+            assert_eq!(integrity, vec![("ok".to_string(),)]);
+            let rows: Vec<(String,)> =
+                conn.exec_rows("SELECT word FROM t INDEXED BY t_word ORDER BY word");
+            let words: Vec<(String,)> = words.iter().map(|w| (w.to_string(),)).collect();
+            assert_eq!(rows, words);
+            let ids: Vec<(i64,)> = ids.iter().map(|id| (*id,)).collect();
+            for sql in [
+                "SELECT id FROM t INDEXED BY t_n WHERE n > 10 ORDER BY id",
+                "SELECT id FROM t NOT INDEXED WHERE n > 10 ORDER BY id",
+            ] {
+                let rows: Vec<(i64,)> = conn.exec_rows(sql);
+                assert_eq!(rows, ids, "{sql}");
+            }
+        };
+
+        {
+            let db = open();
+            let conn = db.connect_limbo();
+            conn.execute(
+                "CREATE TYPE rev_cmp BASE text ENCODE string_reverse(value) \
+                 DECODE string_reverse(value) OPERATOR '<' string_reverse",
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, word rev_cmp, n numeric(10,2)) STRICT",
+            )
+            .unwrap();
+            conn.execute("CREATE INDEX t_word ON t(word)").unwrap();
+            conn.execute("CREATE INDEX t_n ON t(n)").unwrap();
+            conn.execute("INSERT INTO t VALUES (1,'cherry',9), (2,'apple',10.5)")
+                .unwrap();
+            conn.close().unwrap();
+        }
+
+        // Reopening replays the logical log, which rebuilds the schema.
+        let db = open();
+        let conn = db.connect_limbo();
+        conn.execute("INSERT INTO t VALUES (3,'banana',100)")
+            .unwrap();
+        check(&conn, &["apple", "banana", "cherry"], &[2, 3]);
+
+        // A passive checkpoint builds its own schema to write the index rows.
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+        conn.execute("INSERT INTO t VALUES (4,'apricot',50)")
+            .unwrap();
+        check(&conn, &["apple", "apricot", "banana", "cherry"], &[2, 3, 4]);
+    }
+
     #[test]
     fn test_reopen_fails_when_stored_custom_type_does_not_parse() {
         let temp_dir = TempDir::new().unwrap();

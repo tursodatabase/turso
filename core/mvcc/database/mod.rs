@@ -51,7 +51,7 @@ use crate::{
 use crate::{Connection, Pager, SyncMode};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
-use std::collections::{BTreeSet, HashMap as StdHashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap as StdHashMap};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
@@ -4274,6 +4274,17 @@ pub enum RecoverLogicalLogState {
         stmt: Option<Box<crate::Statement>>,
         schema_rows: HashMap<i64, ImmutableRecord>,
     },
+    /// Reading the CREATE TYPE statements already in the types table, so that
+    /// schemas rebuilt during replay give indexes their columns' type orders.
+    QueryTypes {
+        reader: Box<StreamingLogicalLogReader>,
+        preserved_tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
+        persistent_tx_ts_max: u64,
+        cookie: u32,
+        schema_rows: HashMap<i64, ImmutableRecord>,
+        stmt: Option<Box<crate::Statement>>,
+        type_sqls: BTreeMap<i64, String>,
+    },
     Replay {
         ctx: Box<RecoverCtx>,
     },
@@ -4292,6 +4303,8 @@ pub struct RecoverCtx {
     replay_cutoff_ts: u64,
     max_commit_ts_seen: u64,
     schema_rows: HashMap<i64, ImmutableRecord>,
+    /// CREATE TYPE statements in the types table, by rowid.
+    type_sqls: BTreeMap<i64, String>,
     dropped_root_pages: HashSet<i64>,
     current_schema: Arc<Schema>,
     index_infos: HashMap<(MVTableId, IndexOpKind), Arc<IndexInfo>>,
@@ -9434,13 +9447,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .unwrap_or(root_page)
     }
 
-    /// Build an `Arc<Schema>` from a set of sqlite_schema rows (keyed by rowid).
-    /// Shared by recovery (replayed rows) and the checkpoint's snapshot-consistent
-    /// `BuildLocalSchemaView` (btree + MVCC-delta merge at snapshot_ts).
+    /// Build an `Arc<Schema>` from a set of sqlite_schema rows (keyed by rowid)
+    /// and the CREATE TYPE statements `type_sqls`. Used by the checkpoint's
+    /// snapshot-consistent `BuildLocalSchemaView` (btree + MVCC-delta merge at
+    /// snapshot_ts).
     pub(crate) fn build_schema_from_rows(
         &self,
         connection: &Arc<Connection>,
         schema_rows: &HashMap<i64, ImmutableRecordRef<'static>>,
+        type_sqls: &[String],
         preserved_table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
     ) -> Result<Arc<Schema>> {
         let pager = connection.pager.load().clone();
@@ -9546,7 +9561,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         fresh.populate_types_views_then_indices(
             &syms,
-            &[],
+            type_sqls,
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
@@ -9713,6 +9728,58 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     else {
                         unreachable!("state is QuerySchema");
                     };
+                    // Types created after the last checkpoint have their rows
+                    // only in the log; replay reads them from there.
+                    let types_table_in_btree = connection.experimental_custom_types_enabled()
+                        && connection
+                            .schema
+                            .read()
+                            .get_btree_table(
+                                NamespaceId::ROOT,
+                                crate::schema::TURSO_TYPES_TABLE_NAME,
+                            )
+                            .is_some_and(|table| table.root_page > 0);
+                    let stmt = if types_table_in_btree {
+                        connection
+                            .query(format!(
+                                "SELECT rowid, sql FROM {}",
+                                crate::schema::TURSO_TYPES_TABLE_NAME
+                            ))?
+                            .map(Box::new)
+                    } else {
+                        None
+                    };
+                    *st = RecoverLogicalLogState::QueryTypes {
+                        reader,
+                        preserved_tvfs,
+                        persistent_tx_ts_max,
+                        cookie,
+                        schema_rows,
+                        stmt,
+                        type_sqls: BTreeMap::new(),
+                    };
+                }
+                RecoverLogicalLogState::QueryTypes {
+                    stmt, type_sqls, ..
+                } => {
+                    if let Some(stmt) = stmt {
+                        return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                            type_sqls.insert(row.get::<i64>(0)?, row.get::<&str>(1)?.to_string());
+                            Ok(())
+                        }));
+                    }
+                    let RecoverLogicalLogState::QueryTypes {
+                        reader,
+                        preserved_tvfs,
+                        persistent_tx_ts_max,
+                        cookie,
+                        schema_rows,
+                        type_sqls,
+                        ..
+                    } = std::mem::take(st)
+                    else {
+                        unreachable!("state is QueryTypes");
+                    };
                     let current_schema = connection.schema.read().clone();
                     *st = RecoverLogicalLogState::Replay {
                         ctx: Box::new(RecoverCtx {
@@ -9723,6 +9790,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             replay_cutoff_ts: persistent_tx_ts_max,
                             max_commit_ts_seen: persistent_tx_ts_max,
                             schema_rows,
+                            type_sqls,
                             dropped_root_pages: HashSet::default(),
                             current_schema,
                             index_infos: HashMap::default(),
@@ -9793,6 +9861,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let replay_cutoff_ts = ctx.replay_cutoff_ts;
         let cookie = ctx.cookie;
         let mut schema_rows = std::mem::take(&mut ctx.schema_rows);
+        let mut type_sqls = std::mem::take(&mut ctx.type_sqls);
         let mut dropped_root_pages = std::mem::take(&mut ctx.dropped_root_pages);
         let mut current_schema = ctx.current_schema.clone();
         let mut index_infos = std::mem::take(&mut ctx.index_infos);
@@ -9898,16 +9967,61 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     _ => {}
                 }
             }
+            // CREATE TYPE and DROP TYPE write the types table. The rebuilt
+            // schema needs those types to give indexes their columns' type
+            // orders, so stage the types table the same way.
+            let types_table_id = if connection.experimental_custom_types_enabled() {
+                schema_rows_after
+                    .as_ref()
+                    .unwrap_or(&schema_rows)
+                    .values()
+                    .find_map(|record| types_table_root_page(&record.as_record_ref()))
+                    .map(|root_page| self.get_table_id_from_root_page(root_page))
+            } else {
+                None
+            };
+            let mut type_sqls_after: Option<BTreeMap<i64, String>> = None;
+            for parsed_op in &frame {
+                match parsed_op {
+                    ParsedOp::UpsertTable {
+                        rowid,
+                        record_bytes,
+                        ..
+                    } if Some(rowid.table_id) == types_table_id => {
+                        let sql = type_sql_from_record(&ImmutableRecordRef::from_bin_record(
+                            record_bytes,
+                        ))?;
+                        type_sqls_after
+                            .get_or_insert_with(|| type_sqls.clone())
+                            .insert(rowid.row_id.to_int_or_panic(), sql);
+                    }
+                    ParsedOp::DeleteTable { rowid, .. }
+                        if Some(rowid.table_id) == types_table_id =>
+                    {
+                        type_sqls_after
+                            .get_or_insert_with(|| type_sqls.clone())
+                            .remove(&rowid.row_id.to_int_or_panic());
+                    }
+                    _ => {}
+                }
+            }
+            if type_sqls_after.is_some() && schema_rows_after.is_none() {
+                schema_rows_after = Some(schema_rows.clone());
+            }
             // schema_rows_after is Some if the frame changes the schema
             let schema_rows_after = schema_rows_after;
 
             let schema_after = match schema_rows_after.as_ref() {
-                Some(schema_rows_after) => Some(self.recover_build_schema(
-                    connection,
-                    schema_rows_after,
-                    cookie,
-                    &ctx.preserved_table_valued_functions,
-                )?),
+                Some(schema_rows_after) => {
+                    let type_sqls_after = type_sqls_after.as_ref().unwrap_or(&type_sqls);
+                    Some(self.recover_build_schema(
+                        connection,
+                        schema_rows_after,
+                        &type_sqls_after.values().cloned().collect::<Vec<_>>(),
+                        cookie,
+                        &ctx.preserved_table_valued_functions,
+                    )?)
+                }
                 None => None,
             };
 
@@ -10364,6 +10478,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let schema_after = schema_after
                     .expect("schema_after must exist when frame_changes_schema is true");
                 schema_rows = schema_rows_after;
+                if let Some(type_sqls_after) = type_sqls_after {
+                    type_sqls = type_sqls_after;
+                }
                 install_schema(schema_after.clone());
                 current_schema = schema_after;
                 // The frame may have decoded DROP INDEX entries using the
@@ -10375,19 +10492,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         ctx.max_commit_ts_seen = max_commit_ts_seen;
         ctx.schema_rows = schema_rows;
+        ctx.type_sqls = type_sqls;
         ctx.dropped_root_pages = dropped_root_pages;
         ctx.current_schema = current_schema;
         ctx.index_infos = index_infos;
         Ok(())
     }
 
-    /// Build a fresh `Schema` from the recovered `sqlite_schema` rows. Sync: the
-    /// schema cookie comes from `global_header` (in-memory) or `fallback_cookie`
-    /// (pre-read by the caller); no IO here.
+    /// Build a fresh `Schema` from the recovered `sqlite_schema` rows and the
+    /// CREATE TYPE statements `type_sqls`. Sync: the schema cookie comes from
+    /// `global_header` (in-memory) or `fallback_cookie` (pre-read by the
+    /// caller); no IO here.
     fn recover_build_schema(
         &self,
         connection: &Arc<Connection>,
         schema_rows: &HashMap<i64, ImmutableRecord>,
+        type_sqls: &[String],
         fallback_cookie: u32,
         preserved_table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
     ) -> Result<Arc<Schema>> {
@@ -10490,7 +10610,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         fresh.populate_types_views_then_indices(
             &syms,
-            &[],
+            type_sqls,
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
@@ -10604,6 +10724,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         } else {
             false
         }
+    }
+}
+
+/// The root page of the types table, if `record` is its sqlite_schema row.
+pub(crate) fn types_table_root_page(record: &ImmutableRecordRef) -> Option<i64> {
+    let is_types_table = matches!(record.get_value_opt(0), Some(ValueRef::Text(ty)) if ty.as_str() == "table")
+        && matches!(record.get_value_opt(1), Some(ValueRef::Text(name)) if name.as_str() == crate::schema::TURSO_TYPES_TABLE_NAME);
+    match record.get_value_opt(3) {
+        Some(ValueRef::Numeric(Numeric::Integer(root_page))) if is_types_table => Some(root_page),
+        _ => None,
+    }
+}
+
+/// The CREATE TYPE statement stored in a `(name, sql)` row of the types table.
+pub(crate) fn type_sql_from_record(record: &ImmutableRecordRef) -> Result<String> {
+    match record.get_value_opt(1) {
+        Some(ValueRef::Text(sql)) => Ok(sql.as_str().to_string()),
+        _ => Err(LimboError::Corrupt(format!(
+            "{} contains a row without CREATE TYPE sql",
+            crate::schema::TURSO_TYPES_TABLE_NAME
+        ))),
     }
 }
 
