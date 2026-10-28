@@ -6,7 +6,7 @@ use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::collate::{expr_collation, CollationSeq};
 use crate::translate::emitter::{Resolver, TranslateCtx};
-use crate::translate::expr::expr_type::TypeEnv;
+use crate::translate::expr::expr_type::{type_of, ExprType, TypeEnv};
 use crate::translate::expr::{
     custom_operator_call, emit_operator_call_on_registers,
     expr_contains_nondeterministic_scalar_function, translate_expr, translate_expr_no_constant_opt,
@@ -2579,10 +2579,17 @@ fn emit_window_range_test(
                 operator,
                 Box::new(offset_expr.clone()),
             );
-            custom_operator_call(
-                &arithmetic,
-                &TypeEnv::new(Some(&plan.table_references), resolver),
-            )?
+            let env = TypeEnv::new(Some(&plan.table_references), resolver);
+            let call = custom_operator_call(&arithmetic, &env)?;
+            // The numeric type has a `+` and `-` for every operand except
+            // NULL. A NULL offset is rejected before any arithmetic, so it
+            // needs no call.
+            turso_assert!(
+                call.is_some() || matches!(type_of(offset_expr, &env), ExprType::Null),
+                "a numeric RANGE offset has no numeric operator",
+                { "offset": offset_expr.to_string() }
+            );
+            call
         }
         CollationSeq::Text(_) => None,
     };

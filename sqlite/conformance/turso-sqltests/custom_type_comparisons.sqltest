@@ -460,6 +460,18 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test cmp-numeric-window-range-null-offset-is-an-error {
+    -- A NULL offset has no numeric `+`. It is rejected when the frame is
+    -- computed, as in SQLite.
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1);
+    SELECT count(*) OVER (ORDER BY n RANGE BETWEEN CURRENT ROW AND NULL FOLLOWING) FROM t;
+}
+expect error {
+    frame ending offset must be a non-negative number
+}
+
+@requires strict "uses STRICT tables"
 test cmp-array-window-range-offset-is-an-error {
     -- An array has an order but no distance, so a RANGE offset on it is an
     -- error, as in PostgreSQL.
