@@ -5119,13 +5119,18 @@ impl PostgreSQLTranslator {
         operator: ast::Operator,
         is_all: bool,
     ) -> ast::Expr {
-        let query = select.to_string().to_ascii_lowercase();
-        let mut table_name = "_turso_anyall_rows".to_owned();
-        while query.contains(&table_name) {
-            table_name.push('_');
-        }
-        let table = exact_name(table_name);
-        let column = exact_name("_turso_anyall_value");
+        // The generated names must not hide a table or column that the
+        // subquery or the left-hand side refers to.
+        let used_names = format!("{select} {lhs}").to_ascii_lowercase();
+        let unused_name = |base: &str| {
+            let mut name = base.to_owned();
+            while used_names.contains(&name) {
+                name.push('_');
+            }
+            exact_name(name)
+        };
+        let table = unused_name("_turso_anyall_rows");
+        let column = unused_name("_turso_anyall_value");
 
         let numeric = |n: &str| Box::new(ast::Expr::Literal(ast::Literal::Numeric(n.to_owned())));
         let null_lit = || Box::new(ast::Expr::Literal(ast::Literal::Null));
@@ -9966,7 +9971,7 @@ fn renamed_object_name(object_type: pg_query::protobuf::ObjectType) -> String {
 
 /// Whether `expr` calls an aggregate or window function of the query it is in.
 /// Calls inside a nested subquery belong to that subquery and do not count.
-/// An aggregate from an extension is not recognized by name.
+/// An aggregate from an extension loaded at runtime is not recognized.
 fn contains_aggregate_or_window(expr: &ast::Expr) -> bool {
     use ast::Expr;
     let any = |exprs: &[Box<Expr>]| exprs.iter().any(|e| contains_aggregate_or_window(e));
@@ -10055,7 +10060,8 @@ fn contains_aggregate_or_window(expr: &ast::Expr) -> bool {
     }
 }
 
-/// Whether `name` called with `arg_count` arguments is a built-in aggregate.
+/// Whether `name` called with `arg_count` arguments is an aggregate that turso
+/// always provides: the built-in ones and those of `core/percentile.rs`.
 /// `min` and `max` with two or more arguments are scalar functions.
 fn is_aggregate_function(name: &str, arg_count: usize) -> bool {
     const AGGREGATES: &[&str] = &[
@@ -10074,9 +10080,12 @@ fn is_aggregate_function(name: &str, arg_count: usize) -> bool {
         "jsonb_group_array",
         "jsonb_group_object",
         "jsonb_object_agg",
+        "median",
         "mode",
+        "percentile",
         "percentile_cont",
         "percentile_disc",
+        "stddev",
         "string_agg",
         "sum",
         "total",
@@ -14536,6 +14545,8 @@ mod tests {
             "SELECT max(a) < ANY (SELECT a FROM t) FROM t",
             "SELECT sum(a) + 1 >= ALL (SELECT a FROM t) FROM t",
             "SELECT row_number() OVER () < ANY (SELECT a FROM t) FROM t",
+            "SELECT stddev(a) > ANY (SELECT 1) FROM t",
+            "SELECT median(a) <= ALL (SELECT a FROM t) FROM t",
         ] {
             assert_not_supported(sql, "an aggregate or window function on the left");
         }
