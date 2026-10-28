@@ -102,7 +102,7 @@ fn normalized_first_key(
             ((1u64 << NORM_CLASS_SHIFT) | (monotone >> 3), exact)
         }
         ValueRef::Text(t) => {
-            if !matches!(key.collation, CollationSeq::Unset | CollationSeq::Binary) {
+            if key.collation != CollationSeq::Binary {
                 // Non-binary collation: constant key, always full comparison.
                 (2u64 << NORM_CLASS_SHIFT, false)
             } else {
@@ -1094,12 +1094,7 @@ impl BoxedSortableRecord {
             let cmp = if let Some(Some(comparator)) = self.comparators.get(i) {
                 comparator(&self_val, &other_val)
             } else {
-                match (self_val, other_val) {
-                    (ValueRef::Text(left), ValueRef::Text(right)) => {
-                        key_info.collation.compare_strings(&left, &right)
-                    }
-                    _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
-                }
+                key_info.collation.compare(self_val, other_val)
             };
             let cmp = cmp_with_sort(cmp, &self_val, &other_val, key_info);
             if cmp != Ordering::Equal {

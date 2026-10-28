@@ -652,6 +652,11 @@ pub struct Variable {
     /// The custom type of the decoded column value this parameter holds: a
     /// trigger's NEW and OLD columns in its body.
     pub custom_type: Option<Box<Type>>,
+    /// Collation of the source column, if the variable stands for a column
+    /// (trigger NEW/OLD rewrite). Comparisons of the variable use it like
+    /// they use a column's collation.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub col_collation: Option<Box<str>>,
     /// True for an explicit `?N` marker. Numbered markers carry no allocated
     /// name; their "?N" spelling is derived from the index on demand.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -664,6 +669,7 @@ impl Variable {
             index,
             name: None,
             custom_type: None,
+            col_collation: None,
             numbered: false,
         }
     }
@@ -674,15 +680,23 @@ impl Variable {
             index,
             name: None,
             custom_type: None,
+            col_collation: None,
             numbered: true,
         }
     }
 
-    pub fn indexed_typed(index: NonZeroU32, custom_type: Type) -> Self {
+    /// A variable that stands for a column with the given custom type and
+    /// collation.
+    pub fn for_column(
+        index: NonZeroU32,
+        custom_type: Option<Type>,
+        col_collation: Option<&str>,
+    ) -> Self {
         Self {
             index,
             name: None,
-            custom_type: Some(Box::new(custom_type)),
+            custom_type: custom_type.map(Box::new),
+            col_collation: col_collation.map(Into::into),
             numbered: false,
         }
     }
@@ -692,6 +706,7 @@ impl Variable {
             index,
             name: Some(name.into()),
             custom_type: None,
+            col_collation: None,
             numbered: false,
         }
     }

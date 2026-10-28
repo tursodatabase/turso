@@ -265,8 +265,6 @@ pub struct ProgramBuilder {
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     pub table_reference_counter: TableRefIdCounter,
-    /// Curr collation sequence. Bool indicates whether it was set by a COLLATE expr
-    collation: Option<(CollationSeq, bool)>,
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
     /// Whether the main database uses MVCC journal mode, set once at translation time from the connection.
     mvcc_enabled: bool,
@@ -603,10 +601,9 @@ impl CursorType {
                                 SortOrder::Asc => "",
                                 SortOrder::Desc => "-",
                             };
-                            if let Some(coll) = col.collation {
-                                format!("{sign}{coll}")
-                            } else {
-                                format!("{sign}B")
+                            match col.collation {
+                                CollationSeq::Binary => format!("{sign}B"),
+                                coll => format!("{sign}{coll}"),
                             }
                         })
                         .collect::<Vec<_>>()
@@ -786,7 +783,6 @@ impl ProgramBuilder {
             result_columns: Vec::new(),
             result_column_types: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
-            collation: None,
             nested_level: 0,
             // These labels will be filled when `prologue()` is called
             init_label: BranchOffset::Placeholder,
@@ -2060,22 +2056,6 @@ impl ProgramBuilder {
             .map(|(_, cursor_type)| cursor_type)
     }
 
-    pub const fn set_collation(&mut self, c: Option<(CollationSeq, bool)>) {
-        self.collation = c
-    }
-
-    pub const fn curr_collation_ctx(&self) -> Option<(CollationSeq, bool)> {
-        self.collation
-    }
-
-    pub fn curr_collation(&self) -> Option<CollationSeq> {
-        self.collation.map(|c| c.0)
-    }
-
-    pub const fn reset_collation(&mut self) {
-        self.collation = None;
-    }
-
     #[inline]
     pub fn nested<T>(&mut self, body: impl FnOnce(&mut Self) -> T) -> T {
         self.incr_nesting();
@@ -2449,6 +2429,7 @@ impl ProgramBuilder {
     pub fn build_prepared_program(
         mut self,
         prepare_context: PrepareContext,
+        custom_collations: Vec<Arc<crate::function::ExternalCollation>>,
         change_cnt_on: bool,
         sql: &str,
     ) -> crate::Result<PreparedProgram> {
@@ -2512,6 +2493,7 @@ impl ProgramBuilder {
             has_materialized_views: self.has_materialized_views,
             resolve_type: self.resolve_type,
             prepare_context,
+            custom_collations,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
         };
@@ -2526,7 +2508,12 @@ impl ProgramBuilder {
         sql: &str,
     ) -> crate::Result<Program> {
         let prepare_context = PrepareContext::from_connection(&connection);
-        let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
+        let prepared = self.build_prepared_program(
+            prepare_context,
+            connection.custom_collations(),
+            change_cnt_on,
+            sql,
+        )?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
     }
 }

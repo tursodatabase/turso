@@ -1,5 +1,5 @@
 use super::{
-    collate::get_collseq_from_expr,
+    collate::expr_collation,
     emitter::Resolver,
     plan::{
         DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember,
@@ -870,7 +870,10 @@ fn transform_match_to_fts_match(
 ///
 /// Analogous to SQLite's `isSimpleCount()` + `minMaxQuery()`.
 /// Must be called before `optimize_table_access` so the order target is available.
-fn detect_simple_aggregate(plan: &SelectPlan, resolver: &Resolver<'_>) -> Option<SimpleAggregate> {
+fn detect_simple_aggregate(
+    plan: &SelectPlan,
+    resolver: &Resolver,
+) -> Result<Option<SimpleAggregate>> {
     // Common preconditions shared by count(*) and min/max.
     if plan.aggregates.len() != 1
         || plan.table_references.joined_tables().len() != 1
@@ -880,7 +883,7 @@ fn detect_simple_aggregate(plan: &SelectPlan, resolver: &Resolver<'_>) -> Option
         || plan.aggregates.first().unwrap().filter_expr.is_some()
         || !plan.aggregates.first().unwrap().order_by().is_empty()
     {
-        return None;
+        return Ok(None);
     }
 
     let table_ref = plan.table_references.joined_tables().first().unwrap();
@@ -890,7 +893,7 @@ fn detect_simple_aggregate(plan: &SelectPlan, resolver: &Resolver<'_>) -> Option
     // The result column must be exactly the aggregate expression (not wrapped in
     // something like `length(count(*))`).
     if !exprs_are_equivalent(result_expr, &agg.original_expr) {
-        return None;
+        return Ok(None);
     }
 
     let is_unfiltered_btree_count = matches!(table_ref.table, Table::BTree(..))
@@ -898,7 +901,7 @@ fn detect_simple_aggregate(plan: &SelectPlan, resolver: &Resolver<'_>) -> Option
         && plan.where_clause.is_empty()
         && plan.offset.is_none();
 
-    match agg.func {
+    Ok(match agg.func {
         AggFunc::Count0 if is_unfiltered_btree_count => Some(SimpleAggregate::Count),
         AggFunc::Count
             if is_unfiltered_btree_count
@@ -923,9 +926,7 @@ fn detect_simple_aggregate(plan: &SelectPlan, resolver: &Resolver<'_>) -> Option
             } else {
                 SortOrder::Desc
             };
-            let collation = get_collseq_from_expr(&argument, &plan.table_references)
-                .ok()
-                .flatten();
+            let collation = expr_collation(&argument, Some(&plan.table_references), resolver)?;
             Some(SimpleAggregate::MinMax(Box::new(MinMaxDef {
                 func: agg.func.clone(),
                 argument,
@@ -934,7 +935,7 @@ fn detect_simple_aggregate(plan: &SelectPlan, resolver: &Resolver<'_>) -> Option
             })))
         }
         _ => None,
-    }
+    })
 }
 
 /// The table reads chosen by the join search.
@@ -1120,7 +1121,7 @@ fn find_select_plan_form(
         return Ok(None);
     }
 
-    plan.simple_aggregate = detect_simple_aggregate(plan, resolver);
+    plan.simple_aggregate = detect_simple_aggregate(plan, resolver)?;
     let mut table_plan = find_table_access_plan(
         schema,
         resolver,
@@ -2670,11 +2671,16 @@ fn find_table_access_plan(
     } else {
         Vec::new()
     };
-    let maybe_order_target = simple_aggregate
-        .and_then(|sa| simple_aggregate_order_target(sa, table_references))
-        .or_else(|| compute_order_target(order_by, group_by.as_mut(), table_references));
+    let simple_aggregate_target = match simple_aggregate {
+        Some(sa) => simple_aggregate_order_target(sa, table_references, resolver)?,
+        None => None,
+    };
+    let maybe_order_target = match simple_aggregate_target {
+        Some(target) => Some(target),
+        None => compute_order_target(order_by, group_by.as_mut(), table_references, resolver)?,
+    };
 
-    add_implied_column_equalities(where_clause, table_references)?;
+    add_implied_column_equalities(where_clause, table_references, resolver)?;
     let mut constraints_per_table = constraints_from_where_clause(
         where_clause,
         table_references,
@@ -2682,6 +2688,7 @@ fn find_table_access_plan(
         subqueries,
         schema,
         params,
+        resolver,
     )?;
 
     // Enforce INDEXED BY / NOT INDEXED after outer-join rewrites settle, because
@@ -2699,6 +2706,7 @@ fn find_table_access_plan(
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
         allow_automatic_index: true,
+        resolver,
     };
 
     let Some(best_join_order_result) = compute_best_join_order_with_context(
@@ -2868,6 +2876,7 @@ fn plan_unmatched_right_rows(
             subqueries,
             schema,
             params,
+            resolver,
         )?
         .swap_remove(table_index);
         // The main plan already checked the INDEXED BY index. The unmatched-row
@@ -2912,6 +2921,7 @@ fn plan_unmatched_right_rows(
                 cost_limit: None,
                 // In SQLite, `WHERE_RIGHT_JOIN` mode disables automatic indexes.
                 allow_automatic_index: false,
+                resolver,
             },
             &where_clause_for_unmatched_rows,
             // The result subroutine evaluates all WHERE terms after matching.
@@ -3930,9 +3940,7 @@ fn maybe_remove_index_candidate(
             };
 
             if let Some(idx_col) = matching_idx_col {
-                // Index columns without explicit COLLATE use BINARY.
-                // Treat them as BINARY for ordering compatibility checks.
-                if col_order.collation != idx_col.collation.unwrap_or_default() {
+                if col_order.collation != idx_col.collation {
                     *index = None;
                     return;
                 }
@@ -4326,7 +4334,7 @@ fn ephemeral_index_build(
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table: i,
-                collation: c.collation_opt(),
+                collation: c.collation(),
                 default: c.default.clone(),
                 expr: expr.map(Box::new),
             }

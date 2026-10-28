@@ -7,7 +7,7 @@ use crate::{
     emit_explain,
     schema::{Index, IndexColumn, PseudoCursorType, Schema},
     translate::{
-        collate::{resolve_comparison_collseq_with_symbols, CollationSeq},
+        collate::{expr_collation, CollationSeq},
         group_by::is_orderby_agg_or_const,
         plan::Aggregate,
     },
@@ -185,12 +185,7 @@ impl EmitOrderBy {
                         "heap sort cannot express an explicit NULLS ordering".to_string(),
                     ));
                 }
-                let collation = Some(resolve_comparison_collseq_with_symbols(
-                    column,
-                    column,
-                    referenced_tables,
-                    Some(t_ctx.resolver.symbol_table),
-                )?);
+                let collation = expr_collation(column, Some(referenced_tables), &t_ctx.resolver)?;
                 let pos_in_table = index_columns.len();
                 // Have enough space pre-allocatoed to push without realloc
                 index_columns.push(IndexColumn {
@@ -210,13 +205,17 @@ impl EmitOrderBy {
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table,
-                collation: None,
+                collation: CollationSeq::Binary,
                 default: None,
                 expr: None,
             })?;
             for _ in remappings.iter().filter(|r| !r.deduplicated) {
                 let pos_in_table = index_columns.len();
-                index_columns.try_push(IndexColumn::new(pos_in_table.to_string(), pos_in_table))?;
+                index_columns.try_push(IndexColumn::new(
+                    pos_in_table.to_string(),
+                    pos_in_table,
+                    CollationSeq::Binary,
+                ))?;
             }
             let index = Arc::new(Index {
                 name: index_name,
@@ -269,7 +268,7 @@ impl EmitOrderBy {
                 // sequence column: ascending with BINARY collation, no comparator, no nulls order
                 data.order_collations_nulls.try_push((
                     SortOrder::Asc,
-                    Some(CollationSeq::default()),
+                    CollationSeq::Binary,
                     None,
                 ))?;
                 data.comparators.try_push(None)?;
@@ -686,14 +685,9 @@ pub(crate) fn sorter_open_data<'a>(
         comparators: Vec::try_with_capacity_ext(capacity)?,
     };
     for (expr, direction, nulls) in terms {
-        let collation = resolve_comparison_collseq_with_symbols(
-            expr,
-            expr,
-            tables,
-            Some(resolver.symbol_table),
-        )?;
+        let collation = expr_collation(expr, Some(tables), resolver)?;
         data.order_collations_nulls
-            .try_push((direction, Some(collation), nulls))?;
+            .try_push((direction, collation, nulls))?;
         data.comparators
             .try_push(custom_type_comparator(expr, tables, resolver))?;
     }

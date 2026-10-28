@@ -392,6 +392,7 @@ pub(super) fn emit_operator_call(
         func: FuncCtx {
             func: call.func.clone(),
             arg_count: call.encode.len(),
+            collation: CollationSeq::Binary,
         },
     });
     Ok(result_reg)

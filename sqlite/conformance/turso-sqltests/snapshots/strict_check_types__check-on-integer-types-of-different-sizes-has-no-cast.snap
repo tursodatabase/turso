@@ -25,12 +25,12 @@ addr  opcode           p1  p2  p3  p4                                 p5  commen
    8  Copy              7   9   0                                      0  r[9]=r[7]
    9  Integer      -32768  10   0                                      0  r[10]=-32768
   10  Integer           1   8   0                                      0  r[8]=1
-  11  Ge                9  10  13                                      0  if r[9]>=r[10] goto 13
+  11  Ge                9  10  13  Binary                              0  if r[9]>=r[10] goto 13
   12  ZeroOrNull        9   8  10                                      0  ((r[9]=NULL)|(r[10]=NULL)) ? r[8]=NULL : r[8]=0
   13  Copy              7  12   0                                      0  r[12]=r[7]
   14  Integer       32767  13   0                                      0  r[13]=32767
   15  Integer           1  11   0                                      0  r[11]=1
-  16  Le               12  13  18                                      0  if r[12]<=r[13] goto 18
+  16  Le               12  13  18  Binary                              0  if r[12]<=r[13] goto 18
   17  ZeroOrNull       12  11  13                                      0  ((r[12]=NULL)|(r[13]=NULL)) ? r[11]=NULL : r[11]=0
   18  And              11   8   6                                      0  r[6]=(r[8] && r[11])
   19  IfNot             6  22   1                                      0  if !r[6] goto 22

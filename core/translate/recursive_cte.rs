@@ -1,7 +1,7 @@
 use crate::alloc::TursoVecExt;
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
-use crate::translate::collate::{get_collseq_from_expr, CollationSeq};
+use crate::translate::collate::{first_collation, CollationSeq};
 use crate::translate::compound_select::{
     emit_program_for_compound_select, set_select_plan_destination,
 };
@@ -11,7 +11,9 @@ use crate::translate::emitter::{
     Resolver, TranslateCtx,
 };
 use crate::translate::eqp::EqpDetail;
-use crate::translate::plan::{Plan, QueryDestination, RecursiveCtePlan, RecursiveCteQueueKey};
+use crate::translate::plan::{
+    Plan, QueryDestination, RecursiveCtePlan, RecursiveCteQueueKey, SelectPlan,
+};
 use crate::translate::result_row::{emit_columns_to_destination, emit_offset};
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, Insn};
@@ -52,15 +54,19 @@ pub(crate) fn emit_recursive_cte(
                     order: SortOrder::Asc,
                     nulls_order: None,
                     pos_in_table: queue_index_columns.len(),
-                    collation: None,
+                    collation: CollationSeq::Binary,
                     default: None,
                     expr: None,
                 })?;
             }
-            let collation = explicit_collation.or(recursive_cte_result_column_collation(
-                recursive_cte,
-                *result_column_index,
-            )?);
+            let collation = match explicit_collation {
+                Some(collation) => *collation,
+                None => recursive_cte_result_column_collation(
+                    recursive_cte,
+                    *result_column_index,
+                    resolver,
+                )?,
+            };
             queue_index_columns.try_push(IndexColumn {
                 name: format!("priority-{}", queue_sort_keys.len()),
                 order: *order,
@@ -77,11 +83,16 @@ pub(crate) fn emit_recursive_cte(
         }
     }
     let queue_sort_column_count = queue_index_columns.len();
-    queue_index_columns.try_push(IndexColumn::new("sequence", queue_index_columns.len()))?;
+    queue_index_columns.try_push(IndexColumn::new(
+        "sequence",
+        queue_index_columns.len(),
+        CollationSeq::Binary,
+    ))?;
     for result_column_index in 0..num_result_columns {
         queue_index_columns.try_push(IndexColumn::new(
             format!("result-{result_column_index}"),
             queue_index_columns.len(),
+            CollationSeq::Binary,
         ))?;
     }
 
@@ -116,6 +127,7 @@ pub(crate) fn emit_recursive_cte(
                 collation: recursive_cte_result_column_collation(
                     recursive_cte,
                     result_column_index,
+                    resolver,
                 )?,
                 default: None,
                 expr: None,
@@ -242,62 +254,40 @@ pub(crate) fn emit_recursive_cte(
     Ok(result_row_regs)
 }
 
+/// The collation of a result column of a recursive CTE: that of the first
+/// SELECT, initial query first, whose column has one.
 fn recursive_cte_result_column_collation(
     recursive_cte: &RecursiveCtePlan,
     result_column_index: usize,
-) -> Result<Option<CollationSeq>> {
-    let initial_query_collation = recursive_cte_query_result_column_collation(
-        &recursive_cte.initial_query,
-        result_column_index,
-    )?;
-    if initial_query_collation.is_some() {
-        Ok(initial_query_collation)
-    } else {
-        recursive_cte_query_result_column_collation(
-            &recursive_cte.recursive_query,
-            result_column_index,
-        )
-    }
-}
-
-fn recursive_cte_query_result_column_collation(
-    query: &Plan,
-    result_column_index: usize,
-) -> Result<Option<CollationSeq>> {
-    match query {
-        Plan::Select(select) => {
+    resolver: &Resolver,
+) -> Result<CollationSeq> {
+    let mut columns = Vec::new();
+    for query in [&recursive_cte.initial_query, &recursive_cte.recursive_query] {
+        let selects: Vec<&SelectPlan> = match query.as_ref() {
+            Plan::Select(select) => vec![select.as_ref()],
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => left
+                .iter()
+                .map(|(select, _)| select)
+                .chain([right_most.as_ref()])
+                .collect(),
+            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {
+                return Err(LimboError::InternalError(
+                    "recursive CTE query is not a SELECT".to_string(),
+                ))
+            }
+        };
+        for select in selects {
             let expr = select
                 .values
                 .first()
                 .and_then(|row| row.get(result_column_index))
                 .unwrap_or(&select.result_columns[result_column_index].expr);
-            get_collseq_from_expr(expr, &select.table_references)
+            columns.push((expr, Some(&select.table_references)));
         }
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => {
-            for (select, _) in left {
-                let expr = select
-                    .values
-                    .first()
-                    .and_then(|row| row.get(result_column_index))
-                    .unwrap_or(&select.result_columns[result_column_index].expr);
-                let collation = get_collseq_from_expr(expr, &select.table_references)?;
-                if collation.is_some() {
-                    return Ok(collation);
-                }
-            }
-            let expr = right_most
-                .values
-                .first()
-                .and_then(|row| row.get(result_column_index))
-                .unwrap_or(&right_most.result_columns[result_column_index].expr);
-            get_collseq_from_expr(expr, &right_most.table_references)
-        }
-        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => Err(
-            LimboError::InternalError("recursive CTE query is not a SELECT".to_string()),
-        ),
     }
+    first_collation(columns, resolver)
 }
 
 fn emit_recursive_cte_query(

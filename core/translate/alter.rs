@@ -1,6 +1,7 @@
 use crate::alloc::TursoIteratorExt;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
+use crate::translate::collate::CollationSeq;
 use crate::{turso_assert_eq, turso_assert_ne};
 use turso_parser::{
     ast::{self, TableInternalId},
@@ -219,7 +220,7 @@ fn emit_rename_autoincrement_backing_table_entry(
             rhs: old_backing_reg,
             target_pc: continue_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
 
         // Preserve type (col 0) and rootpage (col 3); overwrite name/tbl_name
@@ -321,7 +322,7 @@ fn emit_rename_sqlite_sequence_entry(
             rhs: row_name_to_replace_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
 
         program.emit_column_or_rowid(seq_cursor_id, 1, sequence_value_reg);
@@ -401,7 +402,7 @@ fn emit_delete_sqlite_sequence_entry(
             rhs: row_name_to_delete_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
 
         program.emit_insn(Insn::Delete {
@@ -1303,7 +1304,7 @@ pub fn translate_alter_table(
                             .iter()
                             .filter_map(|c| c.name.as_deref())
                             .collect();
-                        validate_check_expr(expr, &btree.name, &column_names, resolver)?;
+                        validate_check_expr(expr, &btree.name, &column_names, &resolver.catalog)?;
                         btree.check_constraints.push(CheckConstraint::new(
                             constraint.name.as_ref(),
                             expr,
@@ -1593,6 +1594,7 @@ pub fn translate_alter_table(
                     func: crate::function::FuncCtx {
                         func: Func::AlterTable(AlterTableFunc::RenameTable),
                         arg_count: 7,
+                        collation: CollationSeq::Binary,
                     },
                 });
 
@@ -1893,7 +1895,7 @@ pub fn translate_alter_table(
                     .collect();
                 for constraint in &definition.constraints {
                     if let ast::ColumnConstraint::Check { expr, .. } = &constraint.constraint {
-                        validate_check_expr(expr, &table.name, &column_names, resolver)?;
+                        validate_check_expr(expr, &table.name, &column_names, &resolver.catalog)?;
                     }
                 }
                 Some(table)
@@ -2097,6 +2099,7 @@ pub fn translate_alter_table(
                             AlterTableFunc::AlterColumn
                         }),
                         arg_count: 8,
+                        collation: CollationSeq::Binary,
                     },
                 });
 
@@ -2786,6 +2789,7 @@ fn translate_rename_virtual_table(
             func: crate::function::FuncCtx {
                 func: Func::AlterTable(AlterTableFunc::RenameTable),
                 arg_count: 7,
+                collation: CollationSeq::Binary,
             },
         });
 

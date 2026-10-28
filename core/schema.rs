@@ -3653,19 +3653,34 @@ impl Schema {
         }
 
         let mut parent_pos: Vec<usize> = Vec::try_with_capacity_ext(parent_cols.len())?;
-        for pc in parent_cols.iter() {
-            let pos = parent_tbl.get_column(pc).map(|(i, _)| i).or_else(|| {
-                ROWID_STRS
-                    .iter()
-                    .any(|r| pc.eq_ignore_ascii_case(r))
-                    .then_some(0)
-            });
-            let Some(p) = pos else {
-                return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+        let mut parent_collations: Vec<CollationSeq> =
+            Vec::try_with_capacity_ext(parent_cols.len())?;
+        let mut key_affinities: Vec<Affinity> = Vec::try_with_capacity_ext(parent_cols.len())?;
+        for (pc, &cpos) in parent_cols.iter().zip(child_pos.iter()) {
+            let (p, collation, parent_affinity) = match parent_tbl.get_column(pc) {
+                Some((i, column)) => (
+                    i,
+                    crate::translate::collate::column_collation(column)
+                        .unwrap_or(CollationSeq::Binary),
+                    column.affinity(),
+                ),
+                None if ROWID_STRS.iter().any(|r| pc.eq_ignore_ascii_case(r)) => {
+                    (0, CollationSeq::Binary, Affinity::Integer)
+                }
+                None => return Err(fk_mismatch_err(&child.name, &parent_tbl.name)),
             };
+            key_affinities
+                .push_within_capacity(crate::translate::expr::do_comparison_affinity(
+                    parent_affinity,
+                    child.columns[cpos].affinity(),
+                ))
+                .expect("FK key affinity vector was preallocated to parent_cols.len()");
             parent_pos
                 .push_within_capacity(p)
                 .expect("parent FK position vector was preallocated to parent_cols.len()");
+            parent_collations
+                .push_within_capacity(collation)
+                .expect("parent FK collation vector was preallocated to parent_cols.len()");
         }
 
         // A single-column parent key is the rowid when it names rowid/_rowid_/oid
@@ -3695,7 +3710,10 @@ impl Schema {
                             .columns
                             .iter()
                             .zip(parent_cols.iter())
-                            .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                            .zip(parent_collations.iter())
+                            .all(|((ic, pc), collation)| {
+                                ic.name.eq_ignore_ascii_case(pc) && ic.collation == *collation
+                            })
                 })
                 .cloned();
             if require_unique && found.is_none() {
@@ -3712,6 +3730,8 @@ impl Schema {
             parent_cols,
             child_pos: child_pos.into_boxed_slice(),
             parent_pos: parent_pos.into_boxed_slice(),
+            parent_collations: parent_collations.into_boxed_slice(),
+            key_affinities: key_affinities.into_boxed_slice(),
             parent_uses_rowid,
             parent_unique_index,
         })
@@ -5310,8 +5330,7 @@ fn push_collation(sql: &mut String, collation: Option<CollationSeq>) {
             sql.push_str(" COLLATE ");
             sql.push_str(&quote_ident(&collation.name()));
         }
-        CollationSeq::Unset | CollationSeq::Custom(_) => {
-            // Unset should not be reachable -- ignore it
+        CollationSeq::Custom(_) => {
             // Custom collation is not allowed in schema definitions
         }
     };
@@ -6612,6 +6631,15 @@ pub struct ResolvedFkRef {
     /// Column positions in the child/parent tables (pos_in_table)
     pub child_pos: BoxedSlice<usize>,
     pub parent_pos: BoxedSlice<usize>,
+    /// The collation of each parent key column, BINARY for the rowid. A child
+    /// key matches a parent key when they compare equal under these
+    /// collations (SQLite's `fkScanChildren` and `fkActionTrigger` compare
+    /// with the parent column's collation), and only an index with these
+    /// collations can enforce the parent key or find the child rows.
+    pub parent_collations: BoxedSlice<CollationSeq>,
+    /// The affinity applied when a child key is compared with a parent key,
+    /// as SQLite compares `parent_col = child_col`.
+    pub key_affinities: BoxedSlice<Affinity>,
 
     /// If the parent key is rowid or a rowid-alias (single-column only)
     pub parent_uses_rowid: bool,
@@ -6704,6 +6732,10 @@ pub struct Column {
     generated_type: GeneratedType,
     generated_always: bool,
     info: ColumnInfo,
+    /// The declared collation, or for a column of a subquery, view or CTE the
+    /// collation of its expression. None means BINARY. Kept apart from
+    /// `info` because a custom collation does not fit in its bits.
+    collation: Option<CollationSeq>,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -6842,7 +6874,6 @@ impl Column {
         };
         let mut info = ColumnInfo::new(NewColumnInfoParams {
             ty,
-            collation: col,
             coldef: &coldef,
         });
         if coldef.flags.contains(ColDefFlags::InStrictTable) && ty_str.eq_ignore_ascii_case("ANY") {
@@ -6860,6 +6891,7 @@ impl Column {
             generated_type,
             generated_always: false,
             info,
+            collation: col,
             explicit_notnull: coldef.flags.contains(ColDefFlags::ExplicitNotNull),
             notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
@@ -7068,15 +7100,15 @@ impl Column {
     }
     #[inline]
     pub fn collation(&self) -> CollationSeq {
-        self.info.collation()
+        self.collation.unwrap_or(CollationSeq::Binary)
     }
     #[inline]
     pub fn has_explicit_collation(&self) -> bool {
-        self.info.has_explicit_collation()
+        self.collation.is_some()
     }
     #[inline]
     pub fn set_collation(&mut self, c: Option<CollationSeq>) {
-        self.info.set_collation(c)
+        self.collation = c;
     }
     #[inline]
     pub fn primary_key(&self) -> bool {
@@ -7234,7 +7266,7 @@ pub struct IndexColumn {
     /// CREATE INDEX idx ON t(b)
     /// b.pos_in_table == 1
     pub pos_in_table: usize,
-    pub collation: Option<CollationSeq>,
+    pub collation: CollationSeq,
     pub default: Option<Box<Expr>>,
     /// Expression for expression indexes. None for simple column indexes.
     pub expr: Option<Box<Expr>>,
@@ -7270,19 +7302,20 @@ pub(crate) use impl_effective_nulls_order;
 impl_effective_nulls_order!(IndexColumn);
 
 impl IndexColumn {
-    /// Returns a default column with the given name and position.
-    pub fn new(name: impl ToString, pos_in_table: usize) -> Self {
+    /// An ascending key column with the given name, position and collation.
+    pub fn new(name: impl ToString, pos_in_table: usize, collation: CollationSeq) -> Self {
         Self {
             name: name.to_string(),
             order: SortOrder::Asc,
             nulls_order: None,
             pos_in_table,
-            collation: None,
+            collation,
             default: None,
             expr: None,
         }
     }
 
+    /// Ascending BINARY key columns with the given names, in order.
     pub fn new_many<I>(names: I) -> Vec<Self>
     where
         I: IntoIterator,
@@ -7298,7 +7331,7 @@ impl IndexColumn {
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table: i,
-                collation: None,
+                collation: CollationSeq::Binary,
                 default: None,
                 expr: None,
             })
@@ -7429,7 +7462,7 @@ impl Index {
                     collation: constraint_columns
                         .get(i)
                         .and_then(|c| c.collation)
-                        .or_else(|| column.collation_opt()),
+                        .unwrap_or_else(|| column.collation()),
                     default: column.default.clone(),
                     expr: None,
                 })
@@ -7485,7 +7518,7 @@ impl Index {
                     collation: constraint_columns
                         .get(i)
                         .and_then(|c| c.collation)
-                        .or_else(|| col.collation_opt()),
+                        .unwrap_or_else(|| col.collation()),
                     default: col.default.clone(),
                     expr: None,
                 })
@@ -9596,7 +9629,6 @@ mod tests {
 mod column_info {
     use crate::schema::{ColDef, ColDefFlags, Type};
     use crate::vdbe::affinity::Affinity;
-    use crate::vdbe::CollationSeq;
 
     // flags
     const F_PRIMARY_KEY: u32 = 1;
@@ -9605,18 +9637,16 @@ mod column_info {
     const F_UNIQUE: u32 = 8;
     const F_HIDDEN: u32 = 16;
 
-    // pack Type and Collation in the remaining bits
+    // pack Type in the remaining bits
     const TYPE_SHIFT: u32 = 5;
     const TYPE_MASK: u32 = 0b111 << TYPE_SHIFT;
-    const COLL_SHIFT: u32 = TYPE_SHIFT + 3;
-    const COLL_MASK: u32 = 0b1111_1111_1111 << COLL_SHIFT;
 
-    // Bits 20-22: base type affinity. Column affinity will resolve to this
+    // Bits 8-10: base type affinity. Column affinity will resolve to this
     // value only if it is > 0, else it uses ty_str.
-    const BASE_AFF_SHIFT: u32 = COLL_SHIFT + 12;
+    const BASE_AFF_SHIFT: u32 = TYPE_SHIFT + 3;
     const BASE_AFF_MASK: u32 = 0b111 << BASE_AFF_SHIFT;
 
-    // Bits 23-25: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
+    // Bits 11-13: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
     const ARRAY_DIM_SHIFT: u32 = BASE_AFF_SHIFT + 3;
     const ARRAY_DIM_MASK: u32 = 0b111 << ARRAY_DIM_SHIFT;
 
@@ -9626,7 +9656,6 @@ mod column_info {
 
     pub struct NewColumnInfoParams<'a> {
         pub ty: Type,
-        pub collation: Option<CollationSeq>,
         pub coldef: &'a ColDef,
     }
 
@@ -9636,9 +9665,6 @@ mod column_info {
             let mut raw: u32 = 0;
 
             raw |= (params.ty as u32) << TYPE_SHIFT;
-            if let Some(c) = params.collation {
-                raw |= (u32::from(c.to_bits()) << COLL_SHIFT) & COLL_MASK;
-            }
             if params.coldef.flags.contains(ColDefFlags::PrimaryKey) {
                 raw |= F_PRIMARY_KEY
             }
@@ -9741,30 +9767,6 @@ mod column_info {
         #[inline]
         pub fn set_ty(&mut self, ty: Type) {
             self.0 = (self.0 & !TYPE_MASK) | (((ty as u32) << TYPE_SHIFT) & TYPE_MASK);
-        }
-
-        #[inline]
-        pub fn collation(&self) -> CollationSeq {
-            let v = ((self.0 & COLL_MASK) >> COLL_SHIFT) as u16;
-            if v == CollationSeq::Unset.to_bits() {
-                CollationSeq::Binary
-            } else {
-                CollationSeq::from_storage_bits(v)
-            }
-        }
-
-        #[inline]
-        pub fn has_explicit_collation(&self) -> bool {
-            let v = ((self.0 & COLL_MASK) >> COLL_SHIFT) as u16;
-            v != CollationSeq::Unset.to_bits()
-        }
-
-        #[inline]
-        pub fn set_collation(&mut self, c: Option<CollationSeq>) {
-            self.0 &= !COLL_MASK;
-            if let Some(c) = c {
-                self.0 |= ((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK;
-            }
         }
 
         #[inline]

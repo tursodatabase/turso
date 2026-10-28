@@ -8014,6 +8014,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
+        portable_logical_changes: false,
     }
 }
 
@@ -9806,6 +9807,7 @@ fn transaction_display() {
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
+        portable_logical_changes: false,
     };
 
     let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }] }";
@@ -12162,6 +12164,98 @@ fn test_gc_shrinks_version_chain_capacity() {
     );
     assert!(small.is_empty());
     assert_eq!(small.capacity(), capacity_before);
+}
+
+/// One `RowVersion` is about 100 bytes and most chains hold one or two
+/// versions, so a short chain must not keep the four-slot minimum capacity of
+/// amortized `Vec` growth.
+#[test]
+fn test_short_version_chain_has_no_unused_capacity() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+    let row_id = RowID::new(table_id, RowKey::Int(1));
+    let tx = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store
+        .insert(tx, generate_simple_string_row(table_id, 1, "version_0"))
+        .unwrap();
+    let chain_len_and_capacity = || {
+        let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+        let versions = entry.value().read();
+        (versions.len(), versions.capacity())
+    };
+    assert_eq!(chain_len_and_capacity(), (1, 1));
+
+    for version in 1..4 {
+        let row = generate_simple_string_row(table_id, 1, &format!("version_{version}"));
+        assert!(db.mvcc_store.update(tx, row).unwrap());
+        assert_eq!(chain_len_and_capacity(), (version + 1, version + 1));
+    }
+}
+
+/// A tombstone over a B-tree row keeps a copy of the deleted row only for the
+/// readers that use it: the checkpoint reads `sqlite_schema` rows, and the
+/// commit reads the primary key for portable logical changes.
+#[test]
+fn test_tombstone_keeps_deleted_row_only_for_sqlite_schema() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn.execute("CREATE TABLE dropped(x)").unwrap();
+    db.conn
+        .execute("INSERT INTO t VALUES (1, 'deleted row')")
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let root_page = get_rows(
+        &db.conn,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let schema_rowid = get_rows(
+        &db.conn,
+        "SELECT rowid FROM sqlite_schema WHERE name = 'dropped'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let user_row = RowID::new(
+        db.mvcc_store.get_table_id_from_root_page(root_page),
+        RowKey::Int(1),
+    );
+    let schema_row = RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(schema_rowid));
+    assert!(db.mvcc_store.rows.get(&user_row).is_none());
+    assert!(db.mvcc_store.rows.get(&schema_row).is_none());
+
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+    db.conn.execute("DROP TABLE dropped").unwrap();
+    let tombstone_payload_len = |row_id: &RowID| {
+        let entry = db.mvcc_store.rows.get(row_id).unwrap();
+        let versions = entry.value().read();
+        let [tombstone] = versions.as_slice() else {
+            panic!("expected one tombstone, got {versions:?}");
+        };
+        assert!(tombstone.begin().is_none());
+        assert!(tombstone.btree_resident);
+        tombstone.row.payload().len()
+    };
+    assert_eq!(tombstone_payload_len(&user_row), 0);
+    assert!(tombstone_payload_len(&schema_row) > 0);
+    db.conn.execute("COMMIT").unwrap();
+
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        get_rows(&db.conn, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(0)]]
+    );
+    assert!(get_rows(
+        &db.conn,
+        "SELECT name FROM sqlite_schema WHERE name = 'dropped'"
+    )
+    .is_empty());
 }
 
 /// `drop_unused_row_versions_and_slots` removes emptied SkipMap entries.
@@ -18523,6 +18617,43 @@ fn test_mvcc_portable_changes_delete_carries_pk_projection_not_old_record() {
         _ => None,
     });
     let delete_pk_record = delete_pk_record.expect("expected data DELETE op");
+    let pk_values = ImmutableRecord::from_bin_record(
+        crate::types::value_blob_from_slice(&delete_pk_record).expect(crate::alloc::ALLOC_ERR_MSG),
+    )
+    .get_values_owned()
+    .unwrap();
+    assert_eq!(
+        pk_values,
+        vec![Value::Text(Text::new("item-a".to_string()))]
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_delete_of_checkpointed_row_carries_pk_projection() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id TEXT PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES ('item-a', 'alpha')")
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    db.conn
+        .execute("DELETE FROM items WHERE id = 'item-a'")
+        .unwrap();
+
+    let delete_pk_record = collect_mvcc_recovery_ops(&db.conn)
+        .into_iter()
+        .find_map(|op| match op {
+            ParsedOp::DeleteTable {
+                rowid,
+                pk_record_bytes,
+                ..
+            } if rowid.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID => Some(pk_record_bytes),
+            _ => None,
+        })
+        .expect("expected data DELETE op");
     let pk_values = ImmutableRecord::from_bin_record(
         crate::types::value_blob_from_slice(&delete_pk_record).expect(crate::alloc::ALLOC_ERR_MSG),
     )

@@ -34,12 +34,7 @@ pub(super) fn translate_between_expr(
     let mut between_resolver = resolver.fork_with_expr_cache();
     between_resolver.enable_expr_to_reg_cache();
     #[allow(clippy::or_fun_call)]
-    between_resolver.cache_scalar_expr_reg(
-        std::borrow::Cow::Owned(*lhs.to_owned()),
-        lhs_reg,
-        false,
-        referenced_tables.unwrap_or(&TableReferences::default()),
-    )?;
+    between_resolver.cache_expr_reg(std::borrow::Cow::Owned(*lhs.to_owned()), lhs_reg, false);
 
     let (lower_expr, upper_expr, combine_op) = build_between_terms(
         std::mem::take(lhs),
