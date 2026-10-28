@@ -577,6 +577,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     /// Eq-only table seek copies the occupying payload under the version lock.
     /// Passive GC can empty the live chain before Column.
     eq_seek_row: Option<Row>,
+    eq_seek_generation: u64,
     /// Set once the B-tree is readable at this cursor's snapshot. It stays
     /// readable for the cursor's lifetime.
     btree_readable: bool,
@@ -660,6 +661,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             payload_row: None,
             last_move: LastMove::Other,
             eq_seek_row: None,
+            eq_seek_generation: 0,
             btree_readable: false,
             btree_cursor,
             null_flag: false,
@@ -1658,23 +1660,25 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             CursorPosition::Loaded { in_btree: true, .. } => self.btree_cursor.record_payload(),
             CursorPosition::Loaded { row_id, .. } => {
                 let generation = self.transaction.write_generation();
-                let read_at_this_position = self.payload_generation == generation
-                    && !self.transaction.is_removed()
-                    && self
-                        .payload_row
+                let is_row_here = |row: &Option<Row>| {
+                    !self.transaction.is_removed()
+                        && row.as_ref().is_some_and(|row| row.id == *row_id)
+                };
+                if self.payload_generation == generation && is_row_here(&self.payload_row) {
+                    return Ok(IOResult::Done(self.payload_row.as_ref().map(Row::payload)));
+                }
+                if self.eq_seek_generation == generation && is_row_here(&self.eq_seek_row) {
+                    return Ok(IOResult::Done(self.eq_seek_row.as_ref().map(Row::payload)));
+                }
+                self.payload_row = self.read_mvcc_current_row()?.or_else(|| {
+                    self.eq_seek_row
                         .as_ref()
-                        .is_some_and(|row| row.id == *row_id);
-                if !read_at_this_position {
-                    self.payload_row = self.read_mvcc_current_row()?.or_else(|| {
-                        self.eq_seek_row
-                            .as_ref()
-                            .filter(|row| row.id == *row_id)
-                            .cloned()
-                    });
-                    self.payload_generation = generation;
-                    if self.payload_row.is_none() && self.transaction.should_abort() {
-                        return Err(LimboError::CommitDependencyAborted.into());
-                    }
+                        .filter(|row| row.id == *row_id)
+                        .cloned()
+                });
+                self.payload_generation = generation;
+                if self.payload_row.is_none() && self.transaction.should_abort() {
+                    return Err(LimboError::CommitDependencyAborted.into());
                 }
                 Ok(IOResult::Done(self.payload_row.as_ref().map(Row::payload)))
             }
@@ -1799,6 +1803,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                 self.dual_peek.mvcc_peek = match mvcc_rowid {
                                     Some((rid, versions, payload)) => {
                                         self.eq_seek_row = payload;
+                                        self.eq_seek_generation =
+                                            self.transaction.write_generation();
                                         CursorPeek::Row {
                                             key: rid.row_id,
                                             versions: Some(versions),

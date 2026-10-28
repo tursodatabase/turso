@@ -11598,6 +11598,67 @@ fn test_lazy_cursor_count_keeps_abort_timing_during_io() {
 }
 
 #[test]
+fn test_lazy_cursor_exact_chain_hit_rereads_after_changes() {
+    for change in [
+        "own write to the row",
+        "own write to another row",
+        "rollback to",
+        "gc",
+        "abort",
+    ] {
+        let (db, conn) = setup_lazy_write_scan(false);
+        let store = db.get_mvcc_store();
+        if change == "rollback to" {
+            conn.execute("SAVEPOINT s").unwrap();
+            conn.execute("UPDATE t SET v = 'inside' WHERE id = 2")
+                .unwrap();
+        }
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor
+                .seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true })),
+            SeekResult::Found
+        );
+        let before = lazy_payload_text(&conn, &mut cursor);
+        let expected = match change {
+            "own write to the row" => {
+                conn.execute("UPDATE t SET v = 'changed' WHERE id = 2")
+                    .unwrap();
+                Some("changed".to_string())
+            }
+            "own write to another row" => {
+                conn.execute("UPDATE t SET v = 'other' WHERE id = 4")
+                    .unwrap();
+                Some("two".to_string())
+            }
+            "rollback to" => {
+                assert_eq!(before.as_deref(), Some("inside"));
+                conn.execute("ROLLBACK TO s").unwrap();
+                Some("two".to_string())
+            }
+            "gc" => {
+                store.drop_unused_row_versions();
+                Some("two".to_string())
+            }
+            "abort" => {
+                let tx_id = conn.get_mv_tx_id().unwrap();
+                let tx = store.txs.get(&tx_id).unwrap();
+                tx.value().abort_now.store(true, Ordering::Release);
+                assert!(matches!(
+                    *cursor.record_payload().unwrap_err(),
+                    LimboError::CommitDependencyAborted
+                ));
+                tx.value().abort_now.store(false, Ordering::Release);
+                Some("two".to_string())
+            }
+            _ => unreachable!("{change}"),
+        };
+        assert_eq!(lazy_payload_text(&conn, &mut cursor), expected, "{change}");
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
 fn reader_fails_at_a_row_updated_after_its_transaction_ends() {
     for foreign_commit in [true, false] {
         let (db, conn) = setup_rows_for_ended_reader();
