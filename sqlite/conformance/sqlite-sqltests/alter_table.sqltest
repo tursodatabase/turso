@@ -154,6 +154,95 @@ expect {
 }
 
 @skip-if mvcc "views not supported in MVCC mode"
+@skip-if sqlite "sqlite does not rewrite dependent views on RENAME COLUMN"
+test alter-table-rename-added-column-read-through-star-view {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v AS SELECT * FROM t;
+    ALTER TABLE t ADD COLUMN c;
+    CREATE VIEW w AS SELECT c FROM v;
+    INSERT INTO t VALUES (1, 2, 3);
+    ALTER TABLE t RENAME COLUMN c TO d;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'w';
+    SELECT * FROM w;
+}
+expect {
+    CREATE VIEW w AS SELECT d FROM v
+    3
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+@cross-check-integrity
+test alter-table-rename-column-keeps-trigger-column-of-view-after-add-column {
+    CREATE TABLE t (a, b);
+    CREATE TABLE s (x);
+    CREATE VIEW v AS SELECT * FROM s;
+    CREATE TABLE log (y);
+    ALTER TABLE s ADD COLUMN a;
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log SELECT a FROM v; END;
+    ALTER TABLE t RENAME COLUMN a TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'tr';
+}
+expect {
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log SELECT a FROM v; END
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-star-view-follows-renamed-table {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v AS SELECT * FROM t;
+    ALTER TABLE t RENAME TO t2;
+    ALTER TABLE t2 ADD COLUMN c;
+    SELECT name, ncol FROM pragma_table_list WHERE type = 'view';
+    ALTER TABLE t2 RENAME COLUMN a TO aa;
+    SELECT name FROM pragma_table_info('v');
+}
+expect {
+    v|3
+    aa
+    b
+    c
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-fails-when-view-reads-dropped-table {
+    CREATE TABLE t (a);
+    CREATE TABLE u (a);
+    CREATE VIEW v AS SELECT a FROM t;
+    CREATE TRIGGER tr AFTER INSERT ON u BEGIN SELECT a FROM v; END;
+    DROP TABLE t;
+    ALTER TABLE u RENAME COLUMN a TO z;
+}
+expect error {
+    error in view v: no such table: main.t
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+@cross-check-integrity
+test alter-table-rename-column-with-values-view {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v AS VALUES (1, 2);
+    ALTER TABLE t RENAME COLUMN b TO bb;
+    SELECT name FROM pragma_table_info('t');
+}
+expect {
+    a
+    bb
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+@cross-check-integrity
+test alter-table-rename-temp-column-with-temp-view-over-main-table {
+    CREATE TABLE m (x);
+    CREATE TEMP TABLE tt (a);
+    CREATE TEMP VIEW tv AS SELECT * FROM m;
+    ALTER TABLE tt RENAME COLUMN a TO b;
+    SELECT name FROM pragma_table_info('tt');
+}
+expect {
+    b
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-subquery {
     CREATE TABLE t (a, b);
     CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t WHERE t.b = 1);

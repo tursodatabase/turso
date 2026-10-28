@@ -1943,6 +1943,7 @@ pub fn translate_alter_table(
                 // in the update list. This matches SQLite's approach and avoids
                 // incomplete detection heuristics that miss expression-level refs
                 // (e.g., `SELECT b FROM src` in a trigger on a different table).
+                reject_rename_with_unresolvable_view(resolver, namespace)?;
                 let target_table_name = normalize_ident(table_name);
                 for trigger_entry in collect_triggers_for_alter_target(resolver, namespace) {
                     if let Some(missing_table) = validate_trigger_table_refs_after_rename(
@@ -2323,6 +2324,34 @@ pub fn translate_alter_table(
     };
 
     Ok(())
+}
+
+/// Like SQLite, RENAME COLUMN fails when a view of the database reads a
+/// missing table or view. A trigger that reads such a view would otherwise
+/// have its columns resolved against the wrong table and renamed.
+fn reject_rename_with_unresolvable_view(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+) -> Result<()> {
+    let database_name = resolver.namespace_name(namespace.database_id);
+    resolver.with_schema(namespace.database_id, |s| {
+        for (view_name, view) in s.views(namespace.id) {
+            let read_names =
+                crate::incremental::view::IncrementalView::referenced_tables(&view.select_stmt);
+            let reads = s.resolve_read_names(namespace.database_id, namespace.id, &read_names);
+            let missing_name = reads.iter().find(|(read_namespace, name)| {
+                s.view_source_is_missing(*read_namespace, namespace.database_id, name)
+            });
+            match (missing_name, &database_name) {
+                (None, _) => {}
+                (Some((_, missing_name)), Some(database_name)) => crate::bail_parse_error!(
+                    "error in view {view_name}: no such table: {database_name}.{missing_name}"
+                ),
+                (Some(_), None) => crate::bail_parse_error!("error in view {view_name}"),
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Reject ALTER TABLE on a plain or materialized view with SQLite's messages

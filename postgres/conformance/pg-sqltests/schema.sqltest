@@ -403,6 +403,19 @@ expect {
     1
 }
 
+test rename-column-while-a-view-of-a-schema-reads-a-table-of-public {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (1);
+    CREATE TABLE p (y int);
+    CREATE VIEW app.v AS SELECT * FROM public.p;
+    ALTER TABLE app.t RENAME COLUMN x TO z;
+    SELECT z FROM app.t;
+}
+expect {
+    1
+}
+
 test rename-table-with-an-automatic-index-frees-the-old-name {
     CREATE TABLE t (id int UNIQUE);
     ALTER TABLE t RENAME TO u;
