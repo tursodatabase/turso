@@ -4022,7 +4022,7 @@ fn main() -> Result<()> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = turso_db.connect(ConnectOpts::new())?;
+    let conn = turso_db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
 
     let panic_context: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut executed_sql: Vec<String> = Vec::new();

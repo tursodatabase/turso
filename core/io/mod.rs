@@ -484,7 +484,9 @@ mod temp_file_tests {
             Arc::new(crate::SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(crate::ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         let count_union = |rows: i64| -> i64 {
             let sql = format!(
                 "SELECT count(*) FROM (\

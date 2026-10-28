@@ -390,7 +390,7 @@ impl Fuzzer {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let turso_conn = turso_db.connect(ConnectOpts::new())?;
+        let turso_conn = turso_db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
 
         // Create SQLite in-memory database
         let sqlite_conn = if config.keep_files {

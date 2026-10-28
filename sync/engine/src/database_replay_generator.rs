@@ -1036,7 +1036,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         for stmt in ddl {
             conn.execute(stmt).unwrap();
         }
@@ -1164,7 +1166,8 @@ mod tests {
         )
         .unwrap();
         let generator = DatabaseReplayGenerator::new(
-            db.connect(ConnectOpts::new()).unwrap(),
+            db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+                .unwrap(),
             DatabaseReplaySessionOpts {
                 use_implicit_rowid: false,
             },
@@ -1209,7 +1212,8 @@ mod tests {
         )
         .unwrap();
         let generator = DatabaseReplayGenerator::new(
-            db.connect(ConnectOpts::new()).unwrap(),
+            db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+                .unwrap(),
             DatabaseReplaySessionOpts {
                 use_implicit_rowid: false,
             },

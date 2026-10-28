@@ -240,7 +240,7 @@ fn read_simple_kv_length(db_path: &Path, table_name: &str, key: &str) -> Option<
     )
     .expect("open observer database");
     let conn = reopened
-        .connect(ConnectOpts::new())
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
         .expect("connect observer db");
     let sql = format!("select length(value) from {table_name} where key='{key}'");
     for _ in 0..32 {
@@ -559,7 +559,7 @@ fn multiprocess_finalize_after_restart_preserves_simple_kv_rows() {
     )
     .expect("reopen finalized database");
     let conn = reopened
-        .connect(ConnectOpts::new())
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
         .expect("connect reopened db");
     assert_eq!(
         count_rows_in_table(&conn, table_name),

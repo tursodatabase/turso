@@ -377,7 +377,7 @@ fn dropping_explicit_commit_waiting_on_io_rolls_back_transaction() -> anyhow::Re
         "queued-explicit-commit-drop.db",
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
 
     conn.execute("CREATE TABLE t(x INTEGER)")?;
     conn.execute("BEGIN")?;

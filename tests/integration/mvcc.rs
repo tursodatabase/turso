@@ -22,7 +22,7 @@ fn create_mvcc_db(io: &Arc<dyn turso_core::io::IO + Send>, path: &Path) -> anyho
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     conn.pragma_update("journal_mode", "'mvcc'")?;
     conn.close()?;
     Ok(())
@@ -205,7 +205,7 @@ fn test_mvcc_custom_durable_storage_injected(tmp_db: TempDatabase) -> anyhow::Re
             recording.clone() as Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>
         ),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     conn.pragma_update("journal_mode", "'mvcc'")?;
 
     // Cause a commit that should append to the MVCC logical log.
@@ -489,7 +489,7 @@ fn test_attach_rejects_incompatible_journal_mode(tmp_db: TempDatabase) -> anyhow
         None,
         Arc::new(SqliteDialect),
     )?;
-    let aux_conn = aux_db.connect(ConnectOpts::new())?;
+    let aux_conn = aux_db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     aux_conn.execute("CREATE TABLE t(x INTEGER)")?;
     aux_conn.close()?;
 
@@ -1039,7 +1039,9 @@ fn test_attach_memory_db_allowed_on_encrypted_mvcc_main(
         Arc::new(SqliteDialect),
     )?;
     let key = EncryptionKey::from_hex_string(hex_key)?;
-    let conn = db.connect(ConnectOpts::new().with_encryption_key(Some(key)))?;
+    let conn = db.connect(
+        ConnectOpts::new(turso_core::SessionRole::Superuser).with_encryption_key(Some(key)),
+    )?;
 
     conn.pragma_update("journal_mode", "'mvcc'")?;
     conn.execute("CREATE TABLE main_t(x INTEGER)")?;
@@ -1147,7 +1149,7 @@ fn test_recover_table_with_create_virtual_substring_in_sql(db: TempDatabase) -> 
 
     // Reopen — triggers bootstrap / log replay; must not report corruption.
     let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     let rows: Vec<(String,)> = conn.exec_rows("select x from t");
     assert_eq!(rows, vec![("create virtual".to_string(),)]);
 
@@ -1204,14 +1206,14 @@ fn test_create_rename_insert_same_tx_recover_then_checkpoint(
 
     {
         let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(SqliteDialect))?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         let rows: Vec<(i64, String)> = conn.exec_rows("select id, v from t2 order by id");
         assert_eq!(rows, vec![(1, "one".to_string()), (2, "two".to_string())]);
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
     }
 
     let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     let rows: Vec<(i64, String)> = conn.exec_rows("select id, v from t2 order by id");
     assert_eq!(rows, vec![(1, "one".to_string()), (2, "two".to_string())]);
 
@@ -1290,7 +1292,7 @@ fn test_mvcc_same_tx_row_and_index_lifecycle_matrix(db: TempDatabase) -> anyhow:
                         path.to_str().unwrap(),
                         Arc::new(SqliteDialect),
                     )?;
-                    let conn = db.connect(ConnectOpts::new())?;
+                    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
                     conn.pragma_update("journal_mode", "'mvcc'")?;
                     conn.execute(format!(
                         "CREATE TABLE {table}(id INTEGER PRIMARY KEY, v TEXT)"
@@ -1308,7 +1310,7 @@ fn test_mvcc_same_tx_row_and_index_lifecycle_matrix(db: TempDatabase) -> anyhow:
                         path.to_str().unwrap(),
                         Arc::new(SqliteDialect),
                     )?;
-                    let conn = db.connect(ConnectOpts::new())?;
+                    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
                     conn.pragma_update("journal_mode", "'mvcc'")?;
 
                     let create_drop_transient_index = || -> anyhow::Result<()> {
@@ -1348,7 +1350,7 @@ fn test_mvcc_same_tx_row_and_index_lifecycle_matrix(db: TempDatabase) -> anyhow:
                         path.to_str().unwrap(),
                         Arc::new(SqliteDialect),
                     )?;
-                    let conn = db.connect(ConnectOpts::new())?;
+                    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
 
                     let rows_sql = format!("SELECT id, v FROM {table} ORDER BY id");
                     let rows: Vec<(i64, String)> = conn.exec_rows(&rows_sql);
@@ -1517,7 +1519,7 @@ fn test_mvcc_update_btree_only_row_after_truncate_checkpoint(
     // Phase 2: reopen and UPDATE the btree-only row. Pre-fix this raised
     // a corruption error from MvccLazyCursor::delete().
     let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     conn.pragma_update("journal_mode", "'mvcc'")?;
     conn.execute("UPDATE quint_corrupt SET value = zeroblob(32) WHERE key = 'k0'")?;
 
@@ -1630,7 +1632,8 @@ fn open_file_conn(path: &str) -> Arc<turso_core::Connection> {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    db.connect(ConnectOpts::new()).unwrap()
+    db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap()
 }
 
 fn collect(conn: &Arc<turso_core::Connection>, sql: &str) -> Vec<Vec<turso_core::Value>> {
@@ -1822,7 +1825,9 @@ fn failed_update_keeps_committed_row_on_truncate_checkpoint() {
         .unwrap()
     };
     let db = open();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
@@ -1836,7 +1841,9 @@ fn failed_update_keeps_committed_row_on_truncate_checkpoint() {
     drop(db);
 
     let db = open();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t");
     assert_eq!(rows, vec![(2, "v".to_string())]);
@@ -1845,7 +1852,9 @@ fn failed_update_keeps_committed_row_on_truncate_checkpoint() {
 fn checkpoint_yields_after_optional_failed_commit(indexed: bool, fail_commit: bool) -> usize {
     let io = Arc::new(CheckpointYieldIo::new());
     let db = open_checkpoint_yield_database(io.clone());
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
         .unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
@@ -1893,7 +1902,7 @@ fn open_checkpoint_yield_database(io: Arc<CheckpointYieldIo>) -> Arc<Database> {
             .db_opts(DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true)),
     )
     .unwrap();
-    db.connect(ConnectOpts::new())
+    db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
         .unwrap()
         .execute("PRAGMA journal_mode = 'mvcc'")
         .unwrap();

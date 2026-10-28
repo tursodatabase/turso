@@ -277,7 +277,7 @@ impl MultiprocessWhopper {
                 None,
                 Arc::new(SqliteDialect),
             )?;
-            let conn = db.connect(ConnectOpts::new())?;
+            let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
 
             if opts.enable_mvcc {
                 conn.execute("PRAGMA journal_mode = 'mvcc'")?;

@@ -31,7 +31,9 @@ fn open_database(mvcc: bool) -> (Arc<Database>, Arc<Connection>) {
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     if mvcc {
         execute(&db, &conn, "PRAGMA journal_mode = 'mvcc'");
     }

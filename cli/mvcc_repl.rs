@@ -67,7 +67,7 @@ pub fn run(path: &str, passive_checkpoint: bool) -> anyhow::Result<()> {
 
                 if let Some((conn_name, sql)) = parse_conn_input(line) {
                     let conn = connections.entry(conn_name.clone()).or_insert_with(|| {
-                        db.connect(ConnectOpts::new())
+                        db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
                             .expect("failed to create connection")
                     });
 
@@ -106,7 +106,7 @@ fn open_mvcc_db(path: &str, passive_checkpoint: bool) -> anyhow::Result<Arc<Data
     )
     .context("failed to open database")?;
 
-    let boot = db.connect(ConnectOpts::new())?;
+    let boot = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     boot.execute("PRAGMA journal_mode = 'mvcc'")?;
     boot.close()?;
 

@@ -209,10 +209,9 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_connect0<'local>(
 
     // Pass the encryption key at connect time to set up the encryption context
     // before the pager reads page 1. This is required for encrypted databases.
-    let conn = match db
-        .db
-        .connect(ConnectOpts::new().with_encryption_key(encryption_key))
-    {
+    let conn = match db.db.connect(
+        ConnectOpts::new(turso_core::SessionRole::Superuser).with_encryption_key(encryption_key),
+    ) {
         Ok(conn) => conn,
         Err(e) => {
             set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());

@@ -34,7 +34,9 @@ fn test_database_rename_registry_stale() {
     )
     .unwrap();
 
-    let conn_a = db_a.connect(ConnectOpts::new()).unwrap();
+    let conn_a = db_a
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     conn_a.execute("CREATE TABLE t(x INTEGER)").unwrap();
     conn_a.execute("INSERT INTO t VALUES (42)").unwrap();
 
@@ -67,7 +69,9 @@ fn test_database_rename_registry_stale() {
     .unwrap();
 
     // 5. The new A.db should be empty — querying table 't' should fail.
-    let conn_a2 = db_a2.connect(ConnectOpts::new()).unwrap();
+    let conn_a2 = db_a2
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     // A new database at A.db has no table `t`. Before the fix,
     // DATABASE_MANAGER returned the stale Database after the rename.
     assert_that!(conn_a2.execute("SELECT x FROM t")).is_err();
@@ -258,7 +262,9 @@ fn test_open_file_with_table_named_like_the_roles_table() {
     drop(sqlite);
 
     let db = open_plain_file(&path).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     conn.force_reparse_schema_without_publish().unwrap();
 
     let mut stmt = conn.prepare("SELECT a FROM t").unwrap();
@@ -351,7 +357,9 @@ fn test_sdk_close_finalizes_leaked_statements() {
     .unwrap();
 
     // 7. The new A.db should be empty — table 't' should NOT exist.
-    let conn_a2 = db_a2.connect(ConnectOpts::new()).unwrap();
+    let conn_a2 = db_a2
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     let result = conn_a2.execute("SELECT x FROM t");
     assert!(
         result.is_err(),
@@ -380,7 +388,9 @@ fn test_database_open_with_options() {
             .flags(OpenFlags::Create),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
 

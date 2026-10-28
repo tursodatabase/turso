@@ -72,7 +72,7 @@ pub fn run_worker(
     }
 
     let connections = (0..connections_per_process)
-        .map(|_| db.connect(ConnectOpts::new()))
+        .map(|_| db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)))
         .collect::<turso_core::Result<Vec<_>>>()?;
 
     if enable_mvcc {

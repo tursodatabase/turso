@@ -20539,8 +20539,10 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     )?,
                 };
                 let output_conn = match page_codec {
-                    Some(codec) => output_db.connect(ConnectOpts::new().with_page_codec(codec))?,
-                    None => output_db.connect(ConnectOpts::new())?,
+                    Some(codec) => output_db.connect(
+                        ConnectOpts::new(crate::SessionRole::Superuser).with_page_codec(codec),
+                    )?,
+                    None => output_db.connect(ConnectOpts::new(crate::SessionRole::Superuser))?,
                 };
                 output_conn.reset_page_size(MAIN_DB_ID, page_size)?;
                 // set reserved_space on output to match source
@@ -20823,7 +20825,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.prepare("SELECT 1;").unwrap()
     }
 
@@ -20884,7 +20888,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(x)").unwrap();
         conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
@@ -20949,7 +20955,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         conn.execute(format!(
             "ATTACH DATABASE '{}' AS att",
@@ -21011,7 +21019,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("ATTACH 'savepoint-aux.db' AS aux").unwrap();
         conn.execute("CREATE TABLE aux.t(x)").unwrap();
 
@@ -21036,7 +21046,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
         for i in 0..128 {
@@ -21081,7 +21093,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
         for i in 0..32 {
@@ -21752,7 +21766,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             conn.execute("SELECT -X'18530E218A8D2D8D8F7456733370E68357745AFE13FC1B94751B77FCB00D0CAD971017936278BFF49BB4C8BD47F874ECA5226D3A433B7DFCD18661673598CED1FDB30A795F6F25'[2]")

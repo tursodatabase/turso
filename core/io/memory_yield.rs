@@ -359,7 +359,9 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryYieldIO::new());
         let db = Database::open_file(io.clone(), "memory_yield_test.db", Arc::new(SqliteDialect))
             .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         // Step statements manually so we can observe the cooperative-yield path.
         // Returns (rows, number of StepResult::IO yields).
@@ -411,7 +413,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         let mut stmt = conn.prepare("PRAGMA journal_mode = 'mvcc'").unwrap();
 
         let mut rows = Vec::new();
@@ -456,7 +460,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let run = |sql: &str| {
             let mut stmt = conn.prepare(sql).unwrap();
@@ -498,7 +504,9 @@ mod tests {
         let io = Arc::new(StepGuardedIO::new());
         let db = Database::open_file(io.clone(), "pager_header_yield.db", Arc::new(SqliteDialect))
             .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(x)").unwrap();
 
         let pager = conn.get_pager();
@@ -531,7 +539,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(x BLOB)").unwrap();
         conn.execute("INSERT INTO t VALUES (zeroblob(20000))")
             .unwrap();
@@ -592,7 +602,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         // Drive one statement to completion exactly like the WASM/OPFS JS
         // binding does: step, and on StepResult::IO hand control back to the

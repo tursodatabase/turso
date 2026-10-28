@@ -58,7 +58,9 @@ fn bench_string_expr(criterion: &mut Criterion) {
 
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     seed(&conn);
 
     for (label, sql) in QUERIES {

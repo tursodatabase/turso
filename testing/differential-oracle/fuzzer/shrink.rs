@@ -100,7 +100,7 @@ impl EnginePair {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let turso = turso_db.connect(ConnectOpts::new())?;
+        let turso = turso_db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         let sqlite = rusqlite::Connection::open_in_memory()?;
         for stmt in state_sql.lines() {
             let stmt = stmt.trim();

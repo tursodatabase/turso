@@ -341,7 +341,7 @@ fn do_fuzz(Ops(ops): Ops) -> Result<Corpus, Box<dyn Error>> {
         ":memory:",
         Arc::new(turso_core::SqliteDialect),
     )?;
-    let limbo_conn = db.connect(ConnectOpts::new())?;
+    let limbo_conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
 
     for op in ops {
         let sql = op.to_string();

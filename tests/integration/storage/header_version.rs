@@ -62,7 +62,9 @@ fn open_with_limbo_and_check(db_path: &Path, enable_mvcc: bool) -> (u8, u8) {
     .expect("Failed to open database with limbo");
 
     // Connect to ensure initialization is complete
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     // Enable MVCC if requested
     if enable_mvcc {
@@ -301,7 +303,9 @@ fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
         )
         .expect("Failed to open database with limbo (non-MVCC)");
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         // Insert some data to ensure WAL has content
         conn.execute("INSERT INTO t (val) VALUES ('limbo_data')")
@@ -335,7 +339,9 @@ fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
     )
     .expect("Failed to open database with limbo (MVCC enabled)");
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     // Switch to MVCC mode via PRAGMA
     // This should work even with pending WAL data
@@ -404,7 +410,9 @@ fn test_pragma_journal_mode_mvcc_to_wal() {
         )
         .expect("Failed to open database with limbo");
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         // Switch to MVCC mode via PRAGMA
         conn.pragma_update("journal_mode", "'mvcc'")
@@ -436,7 +444,9 @@ fn test_pragma_journal_mode_mvcc_to_wal() {
     )
     .expect("Failed to open MVCC database with limbo");
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     let result = conn
         .pragma_query("journal_mode")
@@ -505,7 +515,9 @@ fn test_pragma_journal_mode_multiple_switches() {
     )
     .expect("Failed to open database");
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     // Switch to MVCC
     let result = conn
@@ -601,7 +613,9 @@ fn test_pragma_journal_mode_query() {
     )
     .expect("Failed to open database");
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     // Query current journal mode (should be WAL)
     if let Some(mut stmt) = conn.query("PRAGMA journal_mode").unwrap() {
@@ -629,7 +643,9 @@ fn test_pragma_journal_mode_query() {
     )
     .expect("Failed to open database");
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     // Switch to MVCC mode via PRAGMA
     conn.pragma_update("journal_mode", "'mvcc'")
@@ -676,7 +692,9 @@ fn test_pragma_journal_mode_data_persistence_after_switch() {
         )
         .expect("Failed to open database");
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         // Switch to MVCC
         conn.pragma_update("journal_mode", "'mvcc'")
@@ -705,7 +723,9 @@ fn test_pragma_journal_mode_data_persistence_after_switch() {
         )
         .expect("Failed to reopen database");
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         // Verify data persisted
         let mut stmt = conn
@@ -739,7 +759,9 @@ fn test_autoincrement_continues_after_switch_to_mvcc_and_reopen() {
 
     {
         let db = open_db(&db_path);
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT)")
             .unwrap();
         conn.execute("INSERT INTO posts (title) VALUES ('a'), ('b')")
@@ -747,9 +769,13 @@ fn test_autoincrement_continues_after_switch_to_mvcc_and_reopen() {
     }
     {
         let db = open_db(&db_path);
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         conn.pragma_update("journal_mode", "'mvcc'").unwrap();
-        let other_conn = db.connect(ConnectOpts::new()).unwrap();
+        let other_conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         other_conn
             .execute("INSERT INTO posts (title) VALUES ('c')")
             .unwrap();
@@ -763,7 +789,9 @@ fn test_autoincrement_continues_after_switch_to_mvcc_and_reopen() {
     let log_size_before_reopen = log_size();
     for _ in 0..2 {
         let db = open_db(&db_path);
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         assert_eq!(posts(&conn).len(), 3);
     }
     assert_eq!(log_size(), log_size_before_reopen);
@@ -777,12 +805,16 @@ fn test_autoincrement_continues_after_switch_to_mvcc_and_reopen() {
             Arc::new(SqliteDialect),
         )
         .expect("a read-only open must not need to write");
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         assert_eq!(posts(&conn).len(), 3);
     }
     {
         let db = open_db(&db_path);
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         conn.execute("INSERT INTO posts (title) VALUES ('d')")
             .unwrap();
         assert_eq!(
@@ -802,7 +834,9 @@ fn test_autoincrement_watermark_is_committed_when_opening_mvcc_database() {
     let db_path = tmp_dir.path().join("test.db");
     {
         let db = open_db(&db_path);
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT)")
             .unwrap();
         conn.execute("INSERT INTO posts (title) VALUES ('a'), ('b')")
@@ -812,12 +846,16 @@ fn test_autoincrement_watermark_is_committed_when_opening_mvcc_database() {
     mark_header_as_mvcc(&db_path);
     {
         let db = open_db(&db_path);
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM posts");
         assert_eq!(rows, vec![(2,)]);
     }
     let db = open_db(&db_path);
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     conn.execute("INSERT INTO posts (title) VALUES ('c')")
         .unwrap();
     let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, title FROM posts ORDER BY id");
@@ -858,7 +896,9 @@ fn test_switch_to_mvcc_inside_transaction_is_rejected() {
     let db_path = tmp_dir.path().join("test.db");
     {
         let db = open_db(&db_path);
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT)")
             .unwrap();
         conn.execute("INSERT INTO posts (title) VALUES ('a')")
@@ -872,7 +912,9 @@ fn test_switch_to_mvcc_inside_transaction_is_rejected() {
         conn.execute("COMMIT").unwrap();
     }
     let db = open_db(&db_path);
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, title FROM posts");
     assert_eq!(rows, vec![(1, "a".to_string())]);
 }
@@ -906,7 +948,9 @@ fn open_with_limbo_readonly_and_check(db_path: &Path, enable_mvcc: bool) -> (u8,
     .expect("Failed to open database with limbo in readonly mode");
 
     // Connect to ensure initialization is complete
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     // Try to enable MVCC if requested (will fail in readonly mode, which is expected)
     if enable_mvcc {
@@ -1034,7 +1078,9 @@ fn test_readonly_pragma_journal_mode_cannot_change() {
     )
     .expect("Failed to open database in readonly mode");
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     // Try to switch to MVCC mode via PRAGMA - this should return an error
     // because we cannot change mode on readonly databases
@@ -1077,7 +1123,9 @@ fn test_readonly_mvcc_db_can_be_read() {
         )
         .expect("Failed to open database");
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         // Switch to MVCC mode via PRAGMA
         conn.pragma_update("journal_mode", "'mvcc'")
@@ -1108,7 +1156,9 @@ fn test_readonly_mvcc_db_can_be_read() {
     )
     .expect("Failed to open MVCC database in readonly mode");
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     // Verify we can read data
     let mut stmt = conn

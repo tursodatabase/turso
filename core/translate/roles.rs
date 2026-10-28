@@ -355,7 +355,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(crate::ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let error = create_role(&conn, "alice").unwrap_err();
 
