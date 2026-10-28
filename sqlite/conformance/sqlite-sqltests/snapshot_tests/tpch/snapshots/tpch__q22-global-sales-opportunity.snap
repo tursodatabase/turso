@@ -50,7 +50,7 @@ info:
 QUERY PLAN
 |--SCAN custsale
 |  |--SCALAR SUBQUERY 1
-|  |  `--SCAN customer
-|  |--HASH JOIN orders
-|  `--SCAN customer
+|  |  `--SCAN CUSTOMER
+|  |--HASH JOIN ORDERS
+|  `--SCAN CUSTOMER
 `--USE SORTER FOR GROUP BY

@@ -296,3 +296,13 @@ expect {
     {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t WHERE a > 5;","result_columns":["a"],"nodes":[{"id":1,"parent":null,"detail":"SEARCH t USING COVERING INDEX i (a>?)","op":{"type":"search","table":"t","search_kind":"seek","index":{"name":"i","covering":true,"ephemeral":false},"constraints":["a>?"],"estimate":{"input_rows":1,"rows_per_input":400000,"output_rows":400000,"access_cost":9203.51,"total_cost":9203.51}}}]}
     {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t WHERE a > 2 AND a < 8;","result_columns":["a"],"nodes":[{"id":1,"parent":null,"detail":"SEARCH t USING COVERING INDEX i (a>? AND a<?)","op":{"type":"search","table":"t","search_kind":"seek","index":{"name":"i","covering":true,"ephemeral":false},"constraints":["a>?","a<?"],"estimate":{"input_rows":1,"rows_per_input":160000.00000000003,"output_rows":160000.00000000003,"access_cost":3683.5100000000007,"total_cost":3683.5100000000007}}}]}
 }
+
+test table-name-casing-is-not-an-alias {
+    CREATE TABLE MixedCase(value INTEGER);
+    EXPLAIN QUERY PLAN SELECT * FROM mixedcase;
+    EXPLAIN QUERY PLAN SELECT * FROM MixedCase AS m;
+}
+expect {
+    1|0|0|SCAN MixedCase
+    1|0|0|SCAN MixedCase AS m
+}

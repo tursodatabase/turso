@@ -68,33 +68,19 @@ impl Dialect for PostgresDialect {
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
-        // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
-        // carry no frontend marker and are plain SQLite SQL.
-        let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            let table = BTreeTable::from_stored_sql(sql, root_page, true)?;
-            if !table.has_rowid {
-                return Err(LimboError::ParseError(format!(
-                    "PostgreSQL does not support WITHOUT ROWID table '{}'",
-                    table.name
-                )));
-            }
-            return Ok(table);
-        };
+        use turso_parser::ast::Stmt;
 
-        let parse_result =
-            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
-        let stmt = translator
-            .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
-        match stmt {
-            turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } => {
-                BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)
-            }
-            _ => Err(LimboError::ParseError(
-                "expected CREATE TABLE statement".to_string(),
-            )),
+        let Stmt::CreateTable { tbl_name, body, .. } = self.parse_table_sql_ast(sql)? else {
+            unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement");
+        };
+        let table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)?;
+        if !table.has_rowid {
+            return Err(LimboError::ParseError(format!(
+                "PostgreSQL does not support WITHOUT ROWID table '{}'",
+                table.name
+            )));
         }
+        Ok(table)
     }
 
     fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_parser::ast::Stmt> {
@@ -1966,9 +1952,13 @@ impl SnapshotRows for PgConstraintTable {
                     .collect::<Vec<_>>()
                     .join(" ");
 
-                let confrelid = tbl_oid_map
-                    .get(&(fk.parent_namespace, fk.parent_table.clone()))
-                    .copied()
+                let confrelid = schema
+                    .get_btree_table(fk.parent_namespace, &fk.parent_table)
+                    .and_then(|parent| {
+                        tbl_oid_map
+                            .get(&(fk.parent_namespace, parent.name.clone()))
+                            .copied()
+                    })
                     .unwrap_or(0);
 
                 let confkey: String = fk
@@ -3818,7 +3808,14 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                     .columns
                     .iter()
                     .map(|column| CatalogIndexColumn {
-                        name: column.name.clone(),
+                        name: if column.expr.is_some() {
+                            column.name.clone()
+                        } else {
+                            btree.columns()[column.pos_in_table]
+                                .name
+                                .clone()
+                                .expect("index columns have names")
+                        },
                         position: column.pos_in_table,
                         expression: column.expr.as_ref().map(ToString::to_string),
                     })
@@ -3864,6 +3861,63 @@ mod tests {
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.set_search_path(Some(vec!["public".to_string()]));
         conn
+    }
+
+    #[test]
+    fn schema_constructor_preserves_identifier_spelling() {
+        for sql in [
+            "CREATE TABLE \"Mixed Table\" (id INTEGER CONSTRAINT \"Mixed PK\" PRIMARY KEY)",
+            "CREATE TABLE \"Mixed Table\" (id TEXT, CONSTRAINT \"Mixed PK\" PRIMARY KEY (id))",
+        ] {
+            let stmt = PostgresDialect
+                .parse_table_sql_ast(&encode_pg_schema_sql(sql))
+                .unwrap();
+            let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } = stmt else {
+                unreachable!();
+            };
+            let table = BTreeTable::from_create_table_ast(&tbl_name, &body, 2, true).unwrap();
+            let sqlite_table = BTreeTable::from_sql(sql, 2).unwrap();
+            assert_eq!(sqlite_table.name, "Mixed Table");
+            assert_eq!(
+                sqlite_table.primary_key_constraint_name.as_deref(),
+                Some("Mixed PK")
+            );
+            let mut schema = Schema::new();
+            schema
+                .add_btree_table(NamespaceId::ROOT, Arc::new(table.clone()))
+                .unwrap();
+            assert_eq!(
+                schema
+                    .get_btree_table(NamespaceId::ROOT, "mixed table")
+                    .unwrap()
+                    .name,
+                "Mixed Table"
+            );
+            assert_eq!(table.name, "Mixed Table");
+            assert_eq!(
+                table.primary_key_constraint_name.as_deref(),
+                Some("Mixed PK")
+            );
+        }
+    }
+
+    #[test]
+    fn schema_constructor_preserves_named_unique_and_foreign_keys() {
+        for sql in [
+            "CREATE TABLE t (id INTEGER CONSTRAINT \"Mixed Unique\" UNIQUE, parent INTEGER CONSTRAINT \"Mixed Foreign\" REFERENCES p(id))",
+            "CREATE TABLE t (id INTEGER, parent INTEGER, CONSTRAINT \"Mixed Unique\" UNIQUE (id), CONSTRAINT \"Mixed Foreign\" FOREIGN KEY (parent) REFERENCES p(id))",
+        ] {
+            let stmt = PostgresDialect.parse_table_sql_ast(&encode_pg_schema_sql(sql)).unwrap();
+            let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } = stmt else {
+                unreachable!();
+            };
+            let table = BTreeTable::from_create_table_ast(&tbl_name, &body, 2, true).unwrap();
+            assert_eq!(table.unique_sets[0].constraint_name.as_deref(), Some("Mixed Unique"));
+            assert_eq!(table.foreign_keys[0].constraint_name.as_deref(), Some("Mixed Foreign"));
+            let sqlite_table = BTreeTable::from_sql(sql, 2).unwrap();
+            assert_eq!(sqlite_table.unique_sets[0].constraint_name.as_deref(), Some("Mixed Unique"));
+            assert_eq!(sqlite_table.foreign_keys[0].constraint_name.as_deref(), Some("Mixed Foreign"));
+        }
     }
 
     #[test]

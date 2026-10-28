@@ -40,6 +40,9 @@ The public schema reports `pg_database_owner` as its owner, with `CREATE` and
 The catalogs and role-name lookup expose this built-in role alongside `turso`.
 This metadata does not implement role management or permission enforcement.
 
+PostgreSQL schema catalogs preserve mixed-case table and column names, including
+primary-key constraint names, in dumps.
+
 ## See Also
 
 - [Experimental Features](/docs/sql-reference/experimental-features) for how to enable experimental features

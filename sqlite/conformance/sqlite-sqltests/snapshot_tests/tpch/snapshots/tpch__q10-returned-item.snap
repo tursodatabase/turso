@@ -42,9 +42,9 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN orders
-|--SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
-|--SEARCH customer USING INTEGER PRIMARY KEY (rowid=?)
-|--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
+|--SCAN ORDERS
+|--SEARCH LINEITEM USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
+|--SEARCH CUSTOMER USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH NATION USING INTEGER PRIMARY KEY (rowid=?)
 |--USE SORTER FOR GROUP BY
 `--USE SORTER FOR ORDER BY

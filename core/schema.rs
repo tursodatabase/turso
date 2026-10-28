@@ -1385,15 +1385,15 @@ impl Schema {
     }
 
     /// The indexes stored for `table_name`, backing B-tree indexes included.
-    /// `table_name` is the stored name; it is not normalized.
     pub fn indices_including_backing(
         &self,
         namespace: NamespaceId,
         table_name: &str,
     ) -> impl Iterator<Item = &Arc<Index>> {
+        let name = normalize_ident(table_name);
         self.namespace(namespace)
             .indexes
-            .get(table_name)
+            .get(&name)
             .map(|v| v.iter())
             .unwrap_or_default()
     }
@@ -3868,9 +3868,10 @@ impl Schema {
                 let Some(bt) = t.btree() else {
                     return false;
                 };
-                bt.foreign_keys
-                    .iter()
-                    .any(|fk| fk.parent_namespace == namespace && fk.parent_table == table_name)
+                bt.foreign_keys.iter().any(|fk| {
+                    fk.parent_namespace == namespace
+                        && fk.parent_table.eq_ignore_ascii_case(table_name)
+                })
             })
         })
     }
@@ -6043,7 +6044,7 @@ pub fn create_table(
     root_page: i64,
     supports_namespaces: bool,
 ) -> Result<BTreeTable> {
-    let table_name = normalize_ident(tbl_name);
+    let table_name = tbl_name.to_owned();
     trace!("Creating table {}", table_name);
     let has_rowid;
     let mut has_autoincrement = false;
@@ -6123,7 +6124,7 @@ pub fn create_table(
                         is_primary_key: true,
                         is_inline: false,
                         conflict_clause: *conflict_clause,
-                        constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
+                        constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                     })?;
                 } else if let ast::TableConstraint::Unique {
                     columns,
@@ -6156,7 +6157,7 @@ pub fn create_table(
                         is_primary_key: false,
                         is_inline: false,
                         conflict_clause: *conflict_clause,
-                        constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
+                        constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                     };
                     unique_sets_constraints.try_push(unique_set)?;
                 } else if let ast::TableConstraint::ForeignKey {
@@ -6201,7 +6202,7 @@ pub fn create_table(
                         None => false, // NOT DEFERRABLE INITIALLY IMMEDIATE by default
                     };
                     let fk = ForeignKey {
-                        constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
+                        constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                         parent_table,
                         parent_namespace,
                         parent_columns,
@@ -6349,10 +6350,7 @@ pub fn create_table(
                                 is_primary_key: true,
                                 is_inline: true,
                                 conflict_clause: *conflict_clause,
-                                constraint_name: c_def
-                                    .name
-                                    .as_ref()
-                                    .map(|n| normalize_ident(n.as_str())),
+                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                             })?;
                         }
                         ast::ColumnConstraint::NotNull {
@@ -6382,10 +6380,7 @@ pub fn create_table(
                                 is_primary_key: false,
                                 is_inline: true,
                                 conflict_clause: *conflict,
-                                constraint_name: c_def
-                                    .name
-                                    .as_ref()
-                                    .map(|n| normalize_ident(n.as_str())),
+                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                             })?;
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
@@ -6412,10 +6407,7 @@ pub fn create_table(
                             let (parent_namespace, parent_table) =
                                 demangle_name(supports_namespaces, &mangled_parent_table);
                             let fk = ForeignKey {
-                                constraint_name: c_def
-                                    .name
-                                    .as_ref()
-                                    .map(|n| normalize_ident(n.as_str())),
+                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                                 parent_table: parent_table.to_string(),
                                 parent_namespace,
                                 parent_columns: clause

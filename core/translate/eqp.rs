@@ -29,7 +29,8 @@ impl EqpTable {
         let name = table.table.get_name();
         Self {
             name: name.to_string(),
-            alias: (name != table.identifier).then(|| table.identifier.clone()),
+            alias: (!name.eq_ignore_ascii_case(&table.identifier))
+                .then(|| table.identifier.clone()),
         }
     }
 

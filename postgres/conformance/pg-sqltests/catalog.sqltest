@@ -1380,3 +1380,19 @@ expect {
     c|p|p
     d|p|p
 }
+
+test pg-dump-mixed-case-primary-key-and-reference {
+    CREATE TABLE "Parent" ("Mixed Key" TEXT PRIMARY KEY);
+    CREATE TABLE child (key TEXT REFERENCES "Parent" ("Mixed Key"));
+    SELECT conname FROM pg_constraint JOIN pg_class ON conrelid = pg_class.oid
+    WHERE contype = 'p' AND relname = 'Parent';
+    SELECT substr(pg_get_indexdef(indexrelid), strpos(pg_get_indexdef(indexrelid), ' ON ') + 4) FROM pg_index JOIN pg_class ON indrelid = pg_class.oid
+    WHERE indisprimary AND relname = 'Parent';
+    SELECT relname FROM pg_class JOIN pg_constraint ON confrelid = pg_class.oid
+    WHERE contype = 'f';
+}
+expect {
+    Parent_pkey
+    public."Parent" USING btree ("Mixed Key")
+    Parent
+}

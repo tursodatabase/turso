@@ -51,12 +51,12 @@ info:
 ---
 QUERY PLAN
 |--SCAN shipping
-|  |--MATERIALIZE hash build input for customer
-|  |  |--HASH JOIN customer
-|  |  `--SCAN nation AS n2
-|  |--HASH JOIN orders
-|  |--SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
-|  |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
+|  |--MATERIALIZE hash build input for CUSTOMER
+|  |  |--HASH JOIN CUSTOMER
+|  |  `--SCAN NATION AS n2
+|  |--HASH JOIN ORDERS
+|  |--SEARCH LINEITEM USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
+|  |--SEARCH SUPPLIER USING INTEGER PRIMARY KEY (rowid=?)
 |  |--SEARCH n1 USING INTEGER PRIMARY KEY (rowid=?)
-|  `--SCAN nation AS n2
+|  `--SCAN NATION AS n2
 `--USE SORTER FOR GROUP BY
