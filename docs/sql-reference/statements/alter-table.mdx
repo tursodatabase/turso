@@ -110,6 +110,8 @@ SELECT name, price FROM products;
 
 Add a new column to an existing table. The new column is always appended as the last column.
 
+In a STRICT table, an added custom-type or domain column immediately uses its resolved base type's affinity. Subsequent inserts, including default values, receive the same conversions as columns declared by CREATE TABLE, without reopening the database.
+
 ```sql
 ALTER TABLE table-name ADD COLUMN column-name type [constraints];
 ```
