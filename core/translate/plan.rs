@@ -8,7 +8,7 @@ use crate::{
         ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
     },
     translate::{
-        collate::{get_collseq_from_expr, CollationSeq},
+        collate::{expr_collation, CollationSeq},
         emitter::{Resolver, UpdateRowSource},
         expr::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
@@ -776,6 +776,19 @@ pub struct DistinctCtx {
 }
 
 impl DistinctCtx {
+    /// A DISTINCT that finds duplicates with a hash table. The values are
+    /// compared with `collations`, so each must be one that can be hashed.
+    pub fn new(program: &mut ProgramBuilder, collations: Vec<CollationSeq>) -> Result<Self> {
+        if let Some(collation) = collations.iter().find(|collation| !collation.can_hash()) {
+            crate::bail_parse_error!("DISTINCT does not support the custom collation {collation}");
+        }
+        Ok(Self {
+            hash_table_id: program.alloc_hash_table_id(),
+            collations,
+            label_on_conflict: program.allocate_label(),
+        })
+    }
+
     pub fn emit_deduplication_insns(
         &self,
         program: &mut ProgramBuilder,
@@ -804,8 +817,8 @@ pub struct MinMaxDef {
     pub func: AggFunc,
     pub argument: ast::Expr,
     pub order: SortOrder,
-    /// Explicit COLLATE override, if any. `None` means use the column default.
-    pub collation: Option<CollationSeq>,
+    /// The collation that orders the argument values.
+    pub collation: CollationSeq,
 }
 
 #[derive(Debug, Clone)]
@@ -3121,7 +3134,11 @@ pub(super) fn query_output_columns(
             );
         }
         column.set_array_dimensions(dimensions);
-        column.set_collation(get_collseq_from_expr(result_expr, table_references)?);
+        column.set_collation(Some(expr_collation(
+            result_expr,
+            Some(table_references),
+            resolver,
+        )?));
     }
     Ok(columns)
 }

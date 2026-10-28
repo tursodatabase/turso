@@ -1810,6 +1810,22 @@ impl Database {
                         state.mvcc_bootstrap_conn = None;
                     }
 
+                    // Load the names of the namespaces, which the schema rows
+                    // of their objects do not carry. This comes after the MVCC
+                    // bootstrap, whose recovery rebuilds the schema from the
+                    // schema rows and may replay rows of the namespaces table.
+                    let conn = state
+                        .conn
+                        .as_ref()
+                        .expect("conn must be initialized in Init phase");
+                    conn.maybe_update_schema();
+                    if !conn
+                        .with_schema(crate::MAIN_DB_ID, |schema| schema.namespace_names_loaded())
+                    {
+                        let namespace_rows = conn.query_stored_namespaces()?;
+                        db.with_schema_mut(|schema| schema.load_namespace_names(&namespace_rows))?;
+                    }
+
                     state.phase = OpenDbAsyncPhase::Done;
                     return Ok(IOResult::Done(
                         state
@@ -2693,7 +2709,7 @@ impl Database {
             closed: AtomicBool::new(false),
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
-            namespaces: crate::Namespaces::default(),
+            qualifiers: crate::Qualifiers::default(),
             search_path: RwLock::new(None),
             has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),
@@ -3593,7 +3609,7 @@ pub(crate) struct AttachedDatabase {
 }
 
 /// The databases of a connection other than main and temp, by database id.
-/// Their names are in the connection's [`crate::Namespaces`].
+/// Their names are in the connection's [`crate::Qualifiers`].
 // Optimized for fast get() operations and supports unlimited attached databases.
 pub(crate) struct DatabaseCatalog {
     allocated: Vec<u64>,

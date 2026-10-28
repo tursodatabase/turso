@@ -352,7 +352,7 @@ pub struct SorterOpenData {
     /// Combined order, collation, and nulls ordering per column.
     pub order_collations_nulls: crate::alloc::Vec<(
         SortOrder,
-        Option<CollationSeq>,
+        CollationSeq,
         Option<turso_parser::ast::NullsOrder>,
     )>,
     /// Per-column custom type comparators for ORDER BY sorting.
@@ -369,9 +369,9 @@ pub struct AggStepData {
     pub func: AccumulatorFunc,
     /// Optional custom type comparator for MIN/MAX aggregates.
     pub comparator: Option<SortComparatorType>,
-    /// Collation for comparison-based aggregates (MIN/MAX), resolved at
-    /// translation time from the argument expression.
-    pub collation: Option<CollationSeq>,
+    /// The collation MIN, MAX, mode and percentile compare the argument with.
+    /// BINARY for the aggregates that do not compare values.
+    pub collation: CollationSeq,
 }
 
 /// Which of SUM, TOTAL, or AVG an `IvmSumFinalize` instruction computes. The
@@ -623,7 +623,7 @@ pub enum Insn {
         /// Without the jump_if_null flag it would not jump because the logical comparison "id != NULL" is never true.
         /// This flag indicates that if either is null we should still jump.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if they are not equal.
     Ne {
@@ -634,7 +634,7 @@ pub enum Insn {
         ///
         /// jump_if_null jumps if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is less than the right-hand side.
     Lt {
@@ -643,7 +643,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     Le {
         lhs: usize,
@@ -651,7 +651,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is greater than the right-hand side.
     Gt {
@@ -660,7 +660,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is greater than or equal to the right-hand side.
     Ge {
@@ -669,7 +669,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[jump_if_null\] != 0)
     If {
@@ -1801,6 +1801,24 @@ pub enum Insn {
         /// The name of the sequence being dropped
         seq_name: String,
     },
+    /// Name a namespace in the in-memory schema, after CREATE SCHEMA
+    /// inserted its row into the namespaces table.
+    AddNamespace {
+        /// The database the namespace is stored in
+        db: usize,
+        /// The namespace being created
+        namespace: NamespaceId,
+        /// The name of the namespace
+        name: String,
+    },
+    /// Forget a namespace in the in-memory schema, after DROP SCHEMA
+    /// deleted its row.
+    DropNamespace {
+        /// The database the namespace is stored in
+        db: usize,
+        /// The namespace being dropped
+        namespace: NamespaceId,
+    },
     /// Begin the autonomous inner transaction that wraps a sequence
     /// read-modify-write. The translator emits this immediately before
     /// the cursor-based RMW bytecode and pairs it with a matching
@@ -1877,6 +1895,7 @@ pub enum Insn {
     /// register operation.
     SetSequenceCurrval {
         db: usize,
+        namespace: NamespaceId,
         seq_name: String,
         value_reg: usize,
     },
@@ -1897,6 +1916,7 @@ pub enum Insn {
     /// closes.
     SequenceRegisterAllocation {
         db: usize,
+        namespace: NamespaceId,
         seq_name: String,
         value_reg: usize,
         /// Register holding the encoded saved outer mv_tx (the blob written
@@ -2555,6 +2575,8 @@ impl InsnVariants {
             InsnVariants::DropType => execute::op_drop_type,
             InsnVariants::AddSequence => execute::op_add_sequence,
             InsnVariants::DropSequence => execute::op_drop_sequence,
+            InsnVariants::AddNamespace => execute::op_add_namespace,
+            InsnVariants::DropNamespace => execute::op_drop_namespace,
             InsnVariants::SequenceComputeNext => execute::op_sequence_compute_next,
             InsnVariants::SetSequenceCurrval => execute::op_set_sequence_currval,
             InsnVariants::SequenceTrackAllocation => execute::op_sequence_track_allocation,
@@ -2676,6 +2698,8 @@ impl Insn {
             | Self::DropType { .. }
             | Self::AddSequence { .. }
             | Self::DropSequence { .. }
+            | Self::AddNamespace { .. }
+            | Self::DropNamespace { .. }
             | Self::SequenceComputeNext { .. }
             | Self::SetSequenceCurrval { .. }
             | Self::SequenceTrackAllocation { .. }

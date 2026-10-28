@@ -1,3 +1,4 @@
+use crate::catalog::PG_DATABASE_OWNER_OID;
 use crate::error::sqlstate_error;
 use crate::settings::SettingScope;
 use chrono::Utc;
@@ -256,6 +257,8 @@ fn exec_acl_default(args: &[Register]) -> Result<Value> {
     // Replace it with a real role OID-to-name lookup later. Keep the numeric fallback for unknown OIDs.
     let role = if owner == 10 {
         "turso".to_string()
+    } else if owner == PG_DATABASE_OWNER_OID {
+        "pg_database_owner".to_string()
     } else {
         owner.to_string()
     };
@@ -403,7 +406,7 @@ pub(crate) enum ConfigParameter {
     SearchPath,
 }
 
-enum Parameter<'a> {
+pub(crate) enum Parameter<'a> {
     BuiltIn(ConfigParameter),
     Custom(&'a str),
 }
@@ -508,7 +511,7 @@ fn unrecognized_parameter(name: &str) -> LimboError {
     )
 }
 
-fn find_parameter(name: &str) -> Option<Parameter<'_>> {
+pub(crate) fn find_parameter(name: &str) -> Option<Parameter<'_>> {
     match name.parse::<ConfigParameter>() {
         Ok(parameter) => Some(Parameter::BuiltIn(parameter)),
         Err(_) if name.contains('.') => Some(Parameter::Custom(name)),
@@ -558,8 +561,12 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Value> {
     Ok(Value::from_i64(value))
 }
 
-fn exec_pg_get_user_by_id(_oid: i64) -> Value {
-    Value::build_text("turso")
+fn exec_pg_get_user_by_id(oid: i64) -> Value {
+    Value::build_text(if oid == PG_DATABASE_OWNER_OID {
+        "pg_database_owner"
+    } else {
+        "turso"
+    })
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Value {

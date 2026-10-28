@@ -219,6 +219,7 @@ harness = false
 [[bench]]
 name = "mvcc_benchmark"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "mvcc_recovery_benchmark"

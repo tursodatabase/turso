@@ -1,5 +1,7 @@
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::ColumnLayout;
+use crate::translate::collate::CollationSeq;
+use crate::translate::emitter::RegisterColumn;
 use crate::translate::emitter::{
     emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
 };
@@ -24,10 +26,10 @@ use crate::{
             walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
-            build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
-            emit_guarded_fk_decrement, emit_skip_if_any_null, fk_constraint_info, index_probe,
-            index_scan_match_any, open_read_index, open_read_table, table_scan_match_any,
-            ForeignKeyActions,
+            build_index_affinity_string, child_index_for_fk, emit_fk_restrict_halt,
+            emit_fk_violation, emit_guarded_fk_decrement, emit_skip_if_any_null,
+            fk_constraint_info, index_probe, index_scan_match_any, open_read_index,
+            open_read_table, table_scan_match_any, ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -465,6 +467,7 @@ pub fn translate_insert(
     }
 
     if resolver
+        .catalog
         .dialect
         .upsert_rejects_row_written_by_same_statement()
         && upsert_actions
@@ -695,10 +698,12 @@ pub fn translate_insert(
             // the user-supplied rowid so the next auto-generated rowid is
             // strictly greater. The helper is a no-op when the explicit
             // rowid is already <= current watermark.
-            let seq_name = crate::schema::autoincrement_sequence_name(&ctx.table.name);
+            let seq_name = crate::schema::autoincrement_sequence_name(
+                &resolver.mangle_name(ctx.namespace, &ctx.table.name),
+            );
             let seq = resolver
                 .with_schema(ctx.namespace.database_id, |s| {
-                    s.get_sequence(ctx.namespace.id, &seq_name).cloned()
+                    s.get_sequence(NamespaceId::ROOT, &seq_name).cloned()
                 })
                 .ok_or_else(|| {
                     crate::LimboError::InternalError(format!(
@@ -709,7 +714,7 @@ pub fn translate_insert(
             crate::translate::sequence::emit_disk_advance_past(
                 program,
                 resolver,
-                ctx.namespace,
+                NamespaceRef::root_of(ctx.namespace.database_id),
                 &seq_name,
                 &seq,
                 insertion.key_register(),
@@ -898,7 +903,7 @@ pub fn translate_insert(
     // correct column affinity during INSERT.
     //
     // Partial index WHEREs use rewrite_partial_index_where which converts
-    // column refs to Expr::Register — register_affinities handles those.
+    // column refs to Expr::Register — register_columns handles those.
     //
     // Without this, comparisons like `integer_col < '2'` lose their
     // INTEGER affinity and evaluate under type-ordering rules, producing
@@ -906,15 +911,12 @@ pub fn translate_insert(
     // NOCASE column must keep comparing case-insensitively.
     for cm in &insertion.col_mappings {
         resolver
-            .register_affinities
-            .insert(cm.register, cm.column.affinity());
-        resolver
-            .register_collations
-            .insert(cm.register, cm.column.collation());
+            .register_columns
+            .insert(cm.register, RegisterColumn::table_column(cm.column));
     }
     resolver
-        .register_affinities
-        .insert(insertion.key_register(), Affinity::Integer);
+        .register_columns
+        .insert(insertion.key_register(), RegisterColumn::rowid());
 
     emit_preflight_constraint_checks(
         program,
@@ -970,8 +972,7 @@ pub fn translate_insert(
         emit_commit_phase(program, resolver, &insertion, &ctx, skip_replace_indexes)?;
     }
 
-    resolver.register_affinities.clear();
-    resolver.register_collations.clear();
+    resolver.register_columns.clear();
 
     let mut insert_flags = InsertFlags::new();
 
@@ -1363,7 +1364,7 @@ fn emit_write_sqlite_sequence(
         rhs: meta.r_seq,
         target_pc: done_label,
         flags: Default::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     program.preassign_label_to_next_insn(write_label);
     emit_update_sqlite_sequence(
@@ -1557,10 +1558,12 @@ fn emit_rowid_generation(
     is_mvcc: bool,
 ) -> Result<()> {
     if ctx.table.has_autoincrement && is_mvcc {
-        let seq_name = crate::schema::autoincrement_sequence_name(&ctx.table.name);
+        let seq_name = crate::schema::autoincrement_sequence_name(
+            &resolver.mangle_name(ctx.namespace, &ctx.table.name),
+        );
         let seq = resolver
             .with_schema(ctx.namespace.database_id, |s| {
-                s.get_sequence(ctx.namespace.id, &seq_name).cloned()
+                s.get_sequence(NamespaceId::ROOT, &seq_name).cloned()
             })
             .ok_or_else(|| {
                 crate::LimboError::InternalError(format!(
@@ -1571,7 +1574,7 @@ fn emit_rowid_generation(
         crate::translate::sequence::emit_disk_read_nextval(
             program,
             resolver,
-            ctx.namespace,
+            NamespaceRef::root_of(ctx.namespace.database_id),
             &seq_name,
             &seq,
             insertion.key_register(),
@@ -1613,7 +1616,7 @@ fn emit_rowid_generation(
             rhs: max_i64_reg,
             target_pc: no_overflow_label,
             flags: Default::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
 
         program.emit_insn(Insn::Halt {
@@ -1770,7 +1773,8 @@ fn open_autoincrement_state(
         db: ctx.namespace.database_id,
     });
 
-    let table_name_reg = program.emit_string8_new_reg(ctx.table.name.clone());
+    let table_name_reg =
+        program.emit_string8_new_reg(resolver.mangle_name(ctx.namespace, &ctx.table.name));
     let r_seq = program.alloc_register();
     let r_seq_rowid = program.alloc_register();
 
@@ -1828,7 +1832,7 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
         rhs: name_col_reg,
         target_pc: found_label,
         flags: Default::default(),
-        collation: Some(super::collate::CollationSeq::NoCase),
+        collation: super::collate::CollationSeq::NoCase,
     });
     program.emit_insn(Insn::Copy {
         src_reg: name_col_reg,
@@ -4034,7 +4038,7 @@ pub fn emit_fk_child_insert_checks(
                     rhs: new_rowid_reg,
                     target_pc: fk_ok,
                     flags: CmpInsFlags::default(),
-                    collation: None,
+                    collation: CollationSeq::for_internal_values(),
                 });
             }
 
@@ -4126,7 +4130,7 @@ pub fn emit_fk_child_insert_checks(
                         // `k TEXT COLLATE NOCASE UNIQUE, pk TEXT REFERENCES t(k)`,
                         // SQLite rejects same-row INSERT `(k, pk)=('A', 'a')`;
                         // NOCASE applies to the later parent-index lookup only.
-                        collation: Some(super::collate::CollationSeq::Binary),
+                        collation: super::collate::CollationSeq::for_internal_values(),
                     });
                 }
                 // All equal: same-row OK
@@ -4317,24 +4321,14 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         // never matches any child row (SQL NULL semantics)
         emit_skip_if_any_null(program, new_pk_start, n_cols, skip_fk);
 
+        // The new row is already in the table, but SQLite looks for child rows
+        // before inserting it, so a self-referencing row does not count as
+        // its own child here. Whether it references itself was checked when
+        // its child key was checked.
+        let new_row_rowid = is_self_ref.then(|| insertion.key_register());
         let child_tbl = &pref.child_table;
-        let child_cols = &pref.fk.child_columns;
-        let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(pref.child_namespace, &child_tbl.name)
-                .cloned()
-                .collect()
-        });
-        let idx = indices.iter().find(|ix| {
-            ix.columns.len() == child_cols.len()
-                && ix
-                    .columns
-                    .iter()
-                    .zip(child_cols.iter())
-                    .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-        });
-
-        if let Some(ix) = idx {
-            let icur = open_read_index(program, ix, database_id);
+        if let Some(ix) = child_index_for_fk(resolver, database_id, &pref) {
+            let icur = open_read_index(program, &ix, database_id);
             // Copy key into probe regs and apply child-index affinities
             let probe_start = program.alloc_registers(n_cols);
             for i in 0..n_cols {
@@ -4348,12 +4342,12 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 program.emit_insn(Insn::Affinity {
                     start_reg: probe_start,
                     count,
-                    affinities: build_index_affinity_string(ix, child_tbl),
+                    affinities: build_index_affinity_string(&ix, child_tbl),
                 });
             }
 
             // Decrement once per matching child row
-            index_scan_match_any(program, icur, probe_start, n_cols, None, |p| {
+            index_scan_match_any(program, icur, probe_start, n_cols, new_row_rowid, |p| {
                 let next = p.allocate_label();
                 emit_guarded_fk_decrement(p, next, pref.fk.deferred);
                 p.preassign_label_to_next_insn(next);
@@ -4364,7 +4358,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 program,
                 &pref,
                 new_pk_start,
-                None,
+                new_row_rowid,
                 database_id,
                 resolver,
                 |p| {

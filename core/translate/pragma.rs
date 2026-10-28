@@ -13,7 +13,7 @@ use super::integrity_check::{
     translate_integrity_check, translate_quick_check, MAX_INTEGRITY_CHECK_ERRORS,
 };
 use crate::function::Func;
-use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
 use crate::pragma::pragma_for;
 use crate::schema::{BTreeTable, Index, IndexColumn, Schema, Table, EXPR_INDEX_SENTINEL};
 use crate::storage::encryption::{CipherMode, EncryptionKey};
@@ -164,7 +164,10 @@ fn emit_table_list_rows_for_schema(
                           wr: bool,
                           strict: bool| {
         program.emit_string8(database_name.to_string(), base_reg);
-        program.emit_string8(display_table_list_name(database_id, name), base_reg + 1);
+        program.emit_string8(
+            display_table_list_name(database_id, &mangle_name(namespace, name)),
+            base_reg + 1,
+        );
         program.emit_string8(obj_type.to_string(), base_reg + 2);
         program.emit_int(ncol as i64, base_reg + 3);
         program.emit_int(wr as i64, base_reg + 4);
@@ -1175,10 +1178,7 @@ fn query_pragma(
                     )? {
                         for (seqno, col) in index.columns.iter().enumerate() {
                             let desc = matches!(col.order, ast::SortOrder::Desc);
-                            let coll = col
-                                .collation
-                                .map(|c| c.to_string().to_uppercase())
-                                .unwrap_or_else(|| "BINARY".to_string());
+                            let coll = col.collation.to_string().to_uppercase();
 
                             program.emit_int(seqno as i64, base_reg);
                             emit_index_column_cid_and_name(program, col, base_reg + 1);
@@ -1392,15 +1392,17 @@ fn query_pragma(
                     .namespace_name(current_database_id)
                     .unwrap_or_else(|| "main".to_string());
                 resolver.with_schema(current_database_id, |schema| {
-                    emit_table_list_rows_for_schema(
-                        program,
-                        schema,
-                        NamespaceId::ROOT,
-                        current_database_id,
-                        &database_name,
-                        base_reg,
-                        name.as_deref(),
-                    )
+                    for namespace in schema.namespace_ids() {
+                        emit_table_list_rows_for_schema(
+                            program,
+                            schema,
+                            namespace,
+                            current_database_id,
+                            &database_name,
+                            base_reg,
+                            name.as_deref(),
+                        )
+                    }
                 });
             }
 

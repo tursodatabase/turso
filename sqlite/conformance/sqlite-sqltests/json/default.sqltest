@@ -3796,23 +3796,20 @@ expect {
 # str::from_utf8_unchecked through an object key, and a child element could
 # declare a payload larger than the containing buffer.
 #
-# SQLite is more lenient here: it renders an invalid UTF-8 key with replacement
-# characters rather than rejecting the document.
+# Like SQLite, a key that is not UTF-8 is accepted; it does not match '$.a'.
 
-@skip-if sqlite "sqlite renders malformed jsonb leniently"
 test jsonb-truncated-utf8-key {
-    SELECT json_extract(x'9C79616161616161F000', '$.a');
+    SELECT quote(json_extract(x'9C79616161616161F000', '$.a'));
 }
-expect error {
-    malformed JSON
+expect {
+    NULL
 }
 
-@skip-if sqlite "sqlite renders malformed jsonb leniently"
 test jsonb-invalid-utf8-key {
-    SELECT json_extract(x'9C79FFFFFFFFFFFFFF00', '$.a');
+    SELECT quote(json_extract(x'9C79FFFFFFFFFFFFFF00', '$.a'));
 }
-expect error {
-    malformed JSON
+expect {
+    NULL
 }
 
 @skip-if sqlite "sqlite renders malformed jsonb leniently"

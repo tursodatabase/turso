@@ -189,3 +189,44 @@ fn test_pg_settings_omits_unsupported_restrictions(db: TempDatabase) {
         .execute("SELECT set_config('restrict_nonsystem_relation_kind', 'view', false)")
         .is_err());
 }
+
+/// The DDL that `pg_get_tabledef` reports names tables as a user writes
+/// them, not by the names their schema rows store them under, so the DDL
+/// can be run again.
+#[turso_macros::test(mvcc)]
+fn test_pg_get_tabledef_names_tables_as_a_user_writes_them(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE t(x int PRIMARY KEY, y int REFERENCES t(x))")
+        .unwrap();
+    conn.execute("CREATE TABLE app.u(a int REFERENCES t(x))")
+        .unwrap();
+    let mut stmt = conn
+        .query("SELECT schema_name, table_name, ddl FROM pg_get_tabledef ORDER BY schema_name")
+        .unwrap()
+        .unwrap();
+    let mut rows = Vec::new();
+    while let turso_core::StepResult::Row = stmt.step().unwrap() {
+        let row = stmt.row().unwrap();
+        rows.push(
+            (0..3)
+                .map(|i| row.get_value(i).to_string())
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                "app".to_string(),
+                "u".to_string(),
+                "CREATE TABLE u(a int REFERENCES public.t(x))".to_string()
+            ],
+            vec![
+                "public".to_string(),
+                "t".to_string(),
+                "CREATE TABLE t(x int PRIMARY KEY, y int REFERENCES t(x))".to_string()
+            ],
+        ]
+    );
+}
