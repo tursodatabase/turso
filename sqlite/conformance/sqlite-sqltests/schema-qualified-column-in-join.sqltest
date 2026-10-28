@@ -1,0 +1,120 @@
+@database :memory:
+
+# A schema.table.column reference must read the same value as table.column.
+# In a hash join, Turso returned NULL for the 3-part form.
+
+setup two-tables {
+    CREATE TABLE mt(id, b);
+    CREATE TABLE mu(id);
+    INSERT INTO mt VALUES (1, 'y'), (2, 'z');
+    INSERT INTO mu VALUES (1), (2);
+}
+
+@setup two-tables
+test schema-qualified-column-in-hash-join {
+    SELECT main.mt.b FROM mt JOIN mu ON mt.id = mu.id ORDER BY 1;
+}
+expect {
+    y
+    z
+}
+
+@setup two-tables
+test schema-qualified-rowid-in-hash-join {
+    SELECT main.mt.rowid FROM mt JOIN mu ON mt.id = mu.id ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+@setup two-tables
+test schema-qualified-column-in-join-grouped-by-table-column {
+    SELECT main.mt.b, count(*) FROM mt JOIN mu ON mt.id = mu.id GROUP BY mt.b ORDER BY 1;
+}
+expect {
+    y|1
+    z|1
+}
+
+# A schema.alias.column reference inside a subquery must find the alias of a
+# table in the outer query, as it does in the query that owns the alias.
+
+setup one-table {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (5);
+}
+
+@setup one-table
+test schema-qualified-alias-in-same-query {
+    SELECT main.x.a FROM t AS x;
+}
+expect {
+    5
+}
+
+@setup one-table
+test schema-qualified-outer-alias-in-scalar-subquery {
+    SELECT (SELECT main.x.a) FROM t AS x;
+}
+expect {
+    5
+}
+
+@setup one-table
+test schema-qualified-outer-alias-in-exists-subquery {
+    SELECT * FROM t AS x WHERE EXISTS (SELECT 1 WHERE main.x.a = 5);
+}
+expect {
+    5
+}
+
+@setup one-table
+test schema-qualified-outer-alias-in-table-function-argument {
+    SELECT (SELECT count(*) FROM json_each(main.x.a)) FROM t AS x;
+}
+expect {
+    1
+}
+
+@setup one-table
+test schema-qualified-outer-table-name-in-scalar-subquery {
+    SELECT (SELECT main.t.a) FROM t;
+}
+expect {
+    5
+}
+
+@setup one-table
+test schema-qualified-outer-alias-two-levels-up {
+    SELECT (SELECT (SELECT main.x.a)) FROM t AS x;
+}
+expect {
+    5
+}
+
+@setup one-table
+@cross-check-integrity
+test schema-qualified-outer-alias-in-update-subquery {
+    UPDATE t AS x SET a = (SELECT main.x.a + 1);
+    SELECT a FROM t;
+}
+expect {
+    6
+}
+
+@setup one-table
+test schema-qualified-outer-alias-rejects-the-wrong-schema {
+    SELECT (SELECT temp.x.a) FROM t AS x;
+}
+expect error {
+    no such column: temp.x.a
+}
+
+@setup one-table
+test schema-qualified-outer-cte-name-is-not-found {
+    WITH c(a) AS (SELECT 1) SELECT (SELECT main.c.a) FROM c;
+}
+expect error {
+    no such column: main.c.a
+}

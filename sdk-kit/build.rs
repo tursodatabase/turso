@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -85,28 +85,18 @@ fn find_windows_resource_compiler() -> PathBuf {
         return path;
     }
 
-    let Some(program_files_x86) = env::var_os("ProgramFiles(x86)") else {
-        panic!("rc.exe was not found in PATH and ProgramFiles(x86) is not set");
-    };
-    let sdk_bin = PathBuf::from(program_files_x86)
-        .join("Windows Kits")
-        .join("10")
-        .join("bin");
-    let mut candidates = fs::read_dir(&sdk_bin)
-        .unwrap_or_else(|error| {
-            panic!(
-                "rc.exe was not found in PATH and Windows SDK bin directory {} could not be read: {error}",
-                sdk_bin.display()
-            )
+    let target_arch =
+        env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH is set by Cargo");
+    let sdk = find_msvc_tools::find_windows_sdk(&target_arch)
+        .expect("rc.exe was not found in PATH and no Windows SDK is registered");
+    let sdk_bin_dirs: Vec<&Path> = sdk.path().collect();
+    sdk_bin_dirs
+        .iter()
+        .map(|dir| dir.join("rc.exe"))
+        .find(|path| path.exists())
+        .unwrap_or_else(|| {
+            panic!("rc.exe was not found in PATH or in Windows SDK directories {sdk_bin_dirs:?}")
         })
-        .filter_map(Result::ok)
-        .map(|entry| entry.path().join("x64").join("rc.exe"))
-        .filter(|path| path.exists())
-        .collect::<Vec<_>>();
-    candidates.sort();
-    candidates
-        .pop()
-        .unwrap_or_else(|| panic!("rc.exe was not found under {}", sdk_bin.display()))
 }
 
 fn find_in_path(program: &str) -> Option<PathBuf> {

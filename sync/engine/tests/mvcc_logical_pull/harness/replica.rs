@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use genawaiter::GeneratorState;
 use tempfile::TempDir;
-use turso_core::{PlatformIO, IO};
+use turso_core::{Database, DatabaseOpts, OpenOptions, PlatformIO, SqliteDialect, IO};
 use turso_sync_engine::database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts};
 use turso_sync_engine::database_sync_operations::SyncEngineIoStats;
 use turso_sync_engine::types::{Coro, DatabaseSyncEngineProtocolVersion};
@@ -15,22 +15,58 @@ use super::snapshot::Snapshot;
 pub struct Replica {
     io: Arc<dyn IO>,
     engine: DatabaseSyncEngine<InProcessServer>,
-    _dir: TempDir,
+    _dir: Arc<TempDir>,
 }
 
 impl Replica {
     pub(super) fn bootstrap(remote: Arc<Remote>) -> Result<Self> {
-        let dir = tempfile::tempdir()?;
+        Self::open(
+            &Arc::new(tempfile::tempdir()?),
+            InProcessServer::new(remote),
+            database_opts(),
+        )
+    }
+
+    pub fn open(
+        dir: &Arc<TempDir>,
+        server: InProcessServer,
+        db_opts: DatabaseOpts,
+    ) -> Result<Self> {
         let db_path = dir.path().join("replica.db").to_string_lossy().into_owned();
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
-        let server = SyncEngineIoStats::new(Arc::new(InProcessServer::new(remote)));
+        let server = SyncEngineIoStats::new(Arc::new(server));
         let engine = drive(&io, async |coro| {
-            DatabaseSyncEngine::create_db(coro, io.clone(), server, &db_path, replica_opts()).await
+            DatabaseSyncEngine::create_db(coro, io.clone(), server, &db_path, replica_opts(db_opts))
+                .await
         })?;
         Ok(Self {
             io,
             engine,
-            _dir: dir,
+            _dir: dir.clone(),
+        })
+    }
+
+    pub fn open_existing(
+        dir: &Arc<TempDir>,
+        server: InProcessServer,
+        db_opts: DatabaseOpts,
+    ) -> Result<Self> {
+        let db_path = dir.path().join("replica.db").to_string_lossy().into_owned();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+        let server = SyncEngineIoStats::new(Arc::new(server));
+        let main_db = Database::open(
+            io.clone(),
+            &db_path,
+            OpenOptions::new(Arc::new(SqliteDialect)).db_opts(db_opts),
+        )?;
+        let engine = drive(&io, async |coro| {
+            DatabaseSyncEngine::open_db(coro, io.clone(), server, main_db, replica_opts(db_opts))
+                .await
+        })?;
+        Ok(Self {
+            io,
+            engine,
+            _dir: dir.clone(),
         })
     }
 
@@ -46,7 +82,7 @@ impl Replica {
     }
 }
 
-fn replica_opts() -> DatabaseSyncEngineOpts {
+fn replica_opts(db_opts: DatabaseOpts) -> DatabaseSyncEngineOpts {
     DatabaseSyncEngineOpts {
         remote_url: Some("http://remote".to_string()),
         client_name: "replica".to_string(),
@@ -57,7 +93,7 @@ fn replica_opts() -> DatabaseSyncEngineOpts {
         protocol_version_hint: DatabaseSyncEngineProtocolVersion::V1,
         bootstrap_if_empty: true,
         reserved_bytes: 0,
-        db_opts: database_opts(),
+        db_opts,
         partial_sync_opts: None,
         remote_encryption_key: None,
         push_operations_threshold: None,

@@ -34,11 +34,11 @@ jobs:
       fail-fast: false
       matrix:
         settings:
-          - host: blacksmith-4vcpu-windows-2025
+          - host: blacksmith-8vcpu-windows-2025
             target: x86_64-pc-windows-msvc
             artifact: db-bindings-x86_64-pc-windows-msvc
             build: yarn workspace @tursodatabase/database napi-build --target x86_64-pc-windows-msvc
-          - host: blacksmith-4vcpu-windows-2025
+          - host: blacksmith-8vcpu-windows-2025
             target: x86_64-pc-windows-msvc
             artifact: sync-bindings-x86_64-pc-windows-msvc
             build: yarn workspace @tursodatabase/sync napi-build --target x86_64-pc-windows-msvc
@@ -60,11 +60,11 @@ jobs:
             target: aarch64-apple-darwin
             artifact: sync-bindings-aarch64-apple-darwin
             build: yarn workspace @tursodatabase/sync napi-build --target aarch64-apple-darwin
-          - host: blacksmith-4vcpu-ubuntu-2404-arm
+          - host: blacksmith-8vcpu-ubuntu-2404-arm
             target: aarch64-unknown-linux-gnu
             artifact: db-bindings-aarch64-unknown-linux-gnu
             build: yarn workspace @tursodatabase/database napi-build --target aarch64-unknown-linux-gnu
-          - host: blacksmith-4vcpu-ubuntu-2404-arm
+          - host: blacksmith-8vcpu-ubuntu-2404-arm
             target: aarch64-unknown-linux-gnu
             artifact: sync-bindings-aarch64-unknown-linux-gnu
             build: yarn workspace @tursodatabase/sync napi-build --target aarch64-unknown-linux-gnu
@@ -99,6 +99,24 @@ jobs:
               yarn workspace @tursodatabase/database-wasm-common build
               yarn workspace @tursodatabase/sync-common build
               yarn workspace @tursodatabase/sync-wasm build
+        # On pull requests, skip the macOS builds: no test job uses their
+        # output (tests run on Linux, Windows and in the browser), and the
+        # Rust workflow's macOS build-native job already compiles both napi
+        # crates. main and tags still build them for publishing.
+        event: ["${{ github.event_name }}"]
+        exclude:
+          - event: pull_request
+            settings:
+              host: blacksmith-6vcpu-macos-latest
+              target: aarch64-apple-darwin
+              artifact: db-bindings-aarch64-apple-darwin
+              build: yarn workspace @tursodatabase/database napi-build --target aarch64-apple-darwin
+          - event: pull_request
+            settings:
+              host: blacksmith-6vcpu-macos-latest
+              target: aarch64-apple-darwin
+              artifact: sync-bindings-aarch64-apple-darwin
+              build: yarn workspace @tursodatabase/sync napi-build --target aarch64-apple-darwin
     name: ${{ matrix.settings.artifact }} - node@24
     runs-on: ${{ matrix.settings.host }}
     steps:
@@ -366,7 +384,9 @@ jobs:
         node:
           - "22"
           - "24"
-    runs-on: blacksmith-4vcpu-windows-2025
+    # Each job builds tursodb (the local sync server) before testing; the
+    # larger runner shortens that build, which set the end of the workflow.
+    runs-on: blacksmith-8vcpu-windows-2025
     steps:
       - uses: actions/checkout@v4
       - name: Setup node

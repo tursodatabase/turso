@@ -3358,17 +3358,11 @@ impl StreamingLogicalLogReader {
                 commit_ts,
                 btree_resident,
             } => {
-                // Compute column_count from the serialized record so recovered rows keep
-                // the same shape metadata as non-recovered rows.
-                // Decode shape metadata by reference; ownership is only needed for the row payload.
-                let column_count =
-                    crate::types::ImmutableRecordRef::from_bin_record(&record_bytes).column_count();
                 let row = crate::with_mv_store_allocation_site!(
                     RowPayload,
                     Row::new_table_row_in(
                         RowID::new(table_id, rowid.row_id.clone()),
                         &record_bytes,
-                        column_count,
                         alloc,
                     )?
                 );
@@ -3397,13 +3391,12 @@ impl StreamingLogicalLogReader {
                 btree_resident,
             } => {
                 let key_record = crate::types::ImmutableRecordRef::from_bin_record(&payload);
-                let column_count = key_record.column_count();
                 let index_info = get_index_info(table_id, IndexOpKind::Upsert)?;
                 let key = Arc::new(SortableIndexKey::new_from_payload_in(
                     key_record, index_info, alloc,
                 )?);
                 let rowid = RowID::new(table_id, RowKey::Record(key));
-                let row = Row::new_index_row(rowid.clone(), column_count);
+                let row = Row::new_index_row(rowid.clone());
                 Ok(StreamingResult::UpsertIndexRow {
                     row,
                     rowid,
@@ -3418,13 +3411,12 @@ impl StreamingLogicalLogReader {
                 btree_resident,
             } => {
                 let key_record = crate::types::ImmutableRecordRef::from_bin_record(&payload);
-                let column_count = key_record.column_count();
                 let index_info = get_index_info(table_id, IndexOpKind::Delete)?;
                 let key = Arc::new(SortableIndexKey::new_from_payload_in(
                     key_record, index_info, alloc,
                 )?);
                 let rowid = RowID::new(table_id, RowKey::Record(key));
-                let row = Row::new_index_row(rowid.clone(), column_count);
+                let row = Row::new_index_row(rowid.clone());
                 Ok(StreamingResult::DeleteIndexRow {
                     row,
                     rowid,
@@ -3791,6 +3783,7 @@ pub(crate) enum IndexOpKind {
 
 #[cfg(test)]
 mod tests {
+    use crate::namespace::NamespaceId;
     use crate::types::IOResult;
     use crate::util::IOExt as _;
     use std::cell::RefCell;
@@ -4360,12 +4353,8 @@ mod tests {
             mvcc_store
                 .insert(
                     tx_id,
-                    Row::new_table_row(
-                        RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob(),
-                        5,
-                    )
-                    .unwrap(),
+                    Row::new_table_row(RowID::new((-1).into(), RowKey::Int(1000)), data.as_blob())
+                        .unwrap(),
                 )
                 .unwrap();
             // now insert a row into table -2
@@ -4433,12 +4422,8 @@ mod tests {
             mvcc_store
                 .insert(
                     tx_id,
-                    Row::new_table_row(
-                        RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob(),
-                        5,
-                    )
-                    .unwrap(),
+                    Row::new_table_row(RowID::new((-1).into(), RowKey::Int(1000)), data.as_blob())
+                        .unwrap(),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -4548,12 +4533,8 @@ mod tests {
             mvcc_store
                 .insert(
                     tx_id,
-                    Row::new_table_row(
-                        RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob(),
-                        5,
-                    )
-                    .unwrap(),
+                    Row::new_table_row(RowID::new((-1).into(), RowKey::Int(1000)), data.as_blob())
+                        .unwrap(),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -4646,7 +4627,9 @@ mod tests {
         let pager = conn.pager.load().clone();
         let mvcc_store = db.get_mvcc_store();
         let schema = conn.schema.read();
-        let table = schema.get_table("test").expect("table test should exist");
+        let table = schema
+            .get_table(NamespaceId::ROOT, "test")
+            .expect("table test should exist");
         let Table::BTree(table) = table.as_ref() else {
             panic!("table test should be btree");
         };
@@ -4654,7 +4637,7 @@ mod tests {
 
         // Get the index from schema
         let index = schema
-            .get_index("test", "idx_data")
+            .get_index(NamespaceId::ROOT, "test", "idx_data")
             .expect("Index should exist");
         // Use get_table_id_from_root_page to get the correct index_id (handles both checkpointed and non-checkpointed)
         let index_id = mvcc_store.get_table_id_from_root_page(index.root_page);
@@ -5652,12 +5635,8 @@ mod tests {
                         end: crate::mvcc::database::PackedTs::pack(Some(
                             crate::mvcc::database::TxTimestampOrID::Timestamp(tx.tx_timestamp),
                         )),
-                        row: Row::new_table_row(
-                            RowID::new((-2).into(), RowKey::Int(rowid)),
-                            &[],
-                            0,
-                        )
-                        .unwrap(),
+                        row: Row::new_table_row(RowID::new((-2).into(), RowKey::Int(rowid)), &[])
+                            .unwrap(),
                         btree_resident,
                         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                     });
@@ -6283,7 +6262,7 @@ mod tests {
         )
         .unwrap();
         let row_id = RowID::new(table_id, RowKey::Record(Arc::new(sortable_key)));
-        let row = Row::new_index_row(row_id, 2);
+        let row = Row::new_index_row(row_id);
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
             begin: crate::mvcc::database::PackedTs::pack(Some(
@@ -6327,7 +6306,7 @@ mod tests {
         is_delete: bool,
     ) -> crate::mvcc::database::RowVersion {
         let row =
-            Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), &record_bytes, 1).unwrap();
+            Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), &record_bytes).unwrap();
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
             begin: crate::mvcc::database::PackedTs::pack(if is_delete {
@@ -6360,7 +6339,7 @@ mod tests {
         )
         .unwrap();
         let row_id = RowID::new(table_id, RowKey::Record(Arc::new(sortable_key)));
-        let row = Row::new_index_row(row_id, 2);
+        let row = Row::new_index_row(row_id);
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
             begin: crate::mvcc::database::PackedTs::pack(if is_delete {

@@ -33,6 +33,10 @@ pub trait Dialect: Send + Sync + 'static {
     /// reject an open whose dialect differs from the already-open instance.
     fn name(&self) -> &'static str;
 
+    fn format_error(&self, error: crate::LimboError) -> crate::LimboError {
+        error.into_sqlite_error()
+    }
+
     /// Parse the first statement in `sql` into the engine AST.
     ///
     /// Returns the parsed command, if any, and the number of input bytes
@@ -128,6 +132,10 @@ pub trait Dialect: Send + Sync + 'static {
         options
     }
 
+    fn random_value(&self, bits: i64) -> crate::Value {
+        crate::Value::from_i64(bits) // SQLite default
+    }
+
     /// Resolve a function name in user SQL to the engine's function IR.
     ///
     /// The dialect owns its scalar function surface: the SQLite dialect
@@ -172,6 +180,60 @@ pub trait Dialect: Send + Sync + 'static {
     /// `c`. PostgreSQL stops there and reports that the column does not
     /// exist.
     fn qualified_column_uses_nearest_table_only(&self) -> bool {
+        false
+    }
+
+    /// Whether a sequence named without a schema in a column default or a
+    /// view body is bound to the schema it is found in when the table or
+    /// view is created.
+    ///
+    /// PostgreSQL stores the bound name, so the default or view keeps its
+    /// sequence after the search path changes. SQLite looks the name up
+    /// each time the default or view runs.
+    fn binds_names_at_create(&self) -> bool {
+        false
+    }
+
+    /// Whether a database of this dialect supports namespaces: the objects of
+    /// a namespace are kept in the schema rows of the main database
+    /// under names that encode the namespace's id, which the loader decodes
+    /// and which no user object may be named.
+    ///
+    /// PostgreSQL stores its schemas this way. SQLite has no namespaces, so
+    /// a name that looks like a mangled name is an ordinary name.
+    fn supports_namespaces(&self) -> bool {
+        false
+    }
+
+    /// Whether `INSERT ... ON CONFLICT DO UPDATE` fails when the conflicting
+    /// row was already inserted or updated by the same statement.
+    ///
+    /// PostgreSQL raises an error so that the result does not depend on the
+    /// order of the proposed rows. SQLite updates the row again.
+    fn upsert_rejects_row_written_by_same_statement(&self) -> bool {
+        false
+    }
+
+    /// Whether integer division by zero raises an error.
+    ///
+    /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.
+    fn errors_on_zero_divisor(&self) -> bool {
+        false
+    }
+
+    /// Whether `mod` of two integers returns an integer.
+    ///
+    /// PostgreSQL returns an integer. SQLite always returns a REAL.
+    fn mod_of_integers_is_integer(&self) -> bool {
+        false
+    }
+
+    /// Whether `ALTER TABLE ADD COLUMN` with a non-constant default works on
+    /// a table that has rows.
+    ///
+    /// PostgreSQL rewrites the table and computes the default for each
+    /// existing row. SQLite raises an error unless the table is empty.
+    fn add_column_computes_default_for_existing_rows(&self) -> bool {
         false
     }
 }

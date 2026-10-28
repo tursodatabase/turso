@@ -1,10 +1,13 @@
 use crate::common::{ExecRows, TempDatabase};
+use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use asserting::prelude::*;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use turso_core::{
-    mvcc::persistent_storage::logical_log::LogTxFrameInfo, ConnectOpts, Database, DatabaseOpts,
-    EncryptionKey, EncryptionOpts, OpenFlags, SqliteDialect, StepResult,
+    mvcc::persistent_storage::logical_log::LogTxFrameInfo, Clock, Completion, ConnectOpts,
+    Database, DatabaseOpts, EncryptionKey, EncryptionOpts, File, MonotonicInstant, OpenFlags,
+    OpenOptions, SqliteDialect, StepResult, WallClockInstant, IO,
 };
 
 /// Create a new database file at `path` with MVCC journal mode enabled.
@@ -404,6 +407,28 @@ fn test_mvcc_read_to_write_upgrade_does_not_block_checkpoint(
     let conn2 = tmp_db.connect_limbo();
     conn2.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
 
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_blob_open_reports_unsupported() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_blob_open_reports_unsupported.db");
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, data BLOB)")?;
+    conn.execute("INSERT INTO files VALUES (1, zeroblob(8))")?;
+
+    for read_write in [false, true] {
+        let Err(err) = conn.blob_open("files", "data", 1, read_write) else {
+            panic!("blob_open must fail in MVCC mode");
+        };
+        assert_eq!(
+            err.to_string(),
+            "Internal error: incremental blob I/O is not supported in MVCC mode"
+        );
+    }
+
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT hex(data) FROM files WHERE id = 1");
+    assert_eq!(rows, vec![("0000000000000000".to_string(),)]);
     Ok(())
 }
 
@@ -1501,6 +1526,38 @@ fn test_mvcc_update_btree_only_row_after_truncate_checkpoint(
     Ok(())
 }
 
+/// Regression test for https://github.com/tursodatabase/turso/issues/8067
+///
+/// Under MVCC, an UPSERT (`ON CONFLICT(v) DO UPDATE SET id = excluded.id`) on a
+/// checkpointed row probes the new `INTEGER PRIMARY KEY` with `NotExists` on the
+/// table cursor before re-seeking to the conflicting rowid and deleting it.
+/// `MvccLazyCursor::exists` moved the underlying B-tree cursor during a miss
+/// without clearing `current_pos`, causing the subsequent `SeekRowid` equality
+/// fast-path to short-circuit and `Delete` to fail with a false corruption error.
+#[turso_macros::test]
+fn test_mvcc_checkpointed_upsert_changing_ipk(db: TempDatabase) -> anyhow::Result<()> {
+    let conn = db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two')")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    conn.execute("INSERT INTO t VALUES (3, 'one') ON CONFLICT(v) DO UPDATE SET id = excluded.id")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+
+    let by_pk: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t ORDER BY id");
+    assert_eq!(by_pk, vec![(2, "two".to_string()), (3, "one".to_string())]);
+
+    let by_idx: Vec<(i64, String)> =
+        conn.exec_rows("SELECT id, v FROM t INDEXED BY sqlite_autoindex_t_1 ORDER BY v");
+    assert_eq!(by_idx, vec![(3, "one".to_string()), (2, "two".to_string())]);
+
+    Ok(())
+}
+
 /// Regression test for https://github.com/tursodatabase/turso/issues/7578
 ///
 /// An active MVCC index scan must not return a row deleted after the scan
@@ -1729,4 +1786,319 @@ fn mvcc_passive_checkpoint_must_not_leak_commits_into_pinned_snapshot() {
         vec![(2,)],
         "a pinned BEGIN CONCURRENT snapshot must not see a commit that happened after it"
     );
+}
+
+#[test]
+fn failed_table_commit_does_not_leave_checkpoint_work() {
+    assert_eq!(
+        checkpoint_yields_after_optional_failed_commit(false, true),
+        checkpoint_yields_after_optional_failed_commit(false, false)
+    );
+}
+
+#[test]
+fn failed_index_commit_does_not_leave_checkpoint_work() {
+    assert_eq!(
+        checkpoint_yields_after_optional_failed_commit(true, true),
+        checkpoint_yields_after_optional_failed_commit(true, false)
+    );
+}
+
+#[test]
+fn failed_update_keeps_committed_row_on_truncate_checkpoint() {
+    let io = Arc::new(CheckpointYieldIo::new());
+    static NEXT_PATH: AtomicUsize = AtomicUsize::new(0);
+    let path = format!(
+        "mvcc-dirty-key-failed-update-{}.db",
+        NEXT_PATH.fetch_add(1, Ordering::SeqCst)
+    );
+    let open = || {
+        Database::open(
+            io.clone(),
+            &path,
+            OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new()),
+        )
+        .unwrap()
+    };
+    let db = open();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'v')").unwrap();
+    io.inner.fault_after(".db-log", QueuedIoOpKind::Pwrite, 0);
+    assert!(conn.execute("UPDATE t SET v = 'u' WHERE id = 2").is_err());
+    io.inner.clear_fault();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    drop(conn);
+    drop(db);
+
+    let db = open();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t");
+    assert_eq!(rows, vec![(2, "v".to_string())]);
+}
+
+fn checkpoint_yields_after_optional_failed_commit(indexed: bool, fail_commit: bool) -> usize {
+    let io = Arc::new(CheckpointYieldIo::new());
+    let db = open_checkpoint_yield_database(io.clone());
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    if indexed {
+        conn.execute("CREATE INDEX t_id ON t(id)").unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+    if fail_commit {
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        for rowid in 0..=1024 {
+            conn.execute(format!("INSERT INTO t VALUES ({rowid})"))
+                .unwrap();
+        }
+        io.inner.fault_after(".db-log", QueuedIoOpKind::Pwrite, 0);
+        assert!(conn.execute("COMMIT").is_err());
+        io.inner.clear_fault();
+        let rows = conn
+            .prepare("SELECT count(*) FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_int(), Some(0));
+    }
+
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2000000)").unwrap();
+    io.start_counting();
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    io.finish_counting()
+}
+
+fn open_checkpoint_yield_database(io: Arc<CheckpointYieldIo>) -> Arc<Database> {
+    static NEXT_PATH: AtomicUsize = AtomicUsize::new(0);
+    let path = format!(
+        "mvcc-dirty-key-api-{}.db",
+        NEXT_PATH.fetch_add(1, Ordering::SeqCst)
+    );
+    let db = Database::open(
+        io,
+        &path,
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true)),
+    )
+    .unwrap();
+    db.connect(ConnectOpts::new())
+        .unwrap()
+        .execute("PRAGMA journal_mode = 'mvcc'")
+        .unwrap();
+    db
+}
+
+struct CheckpointYieldIo {
+    inner: Arc<QueuedIo>,
+    yields: AtomicUsize,
+    armed: AtomicBool,
+}
+
+impl CheckpointYieldIo {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(QueuedIo::new()),
+            yields: AtomicUsize::new(0),
+            armed: AtomicBool::new(false),
+        }
+    }
+
+    fn start_counting(&self) {
+        self.yields.store(0, Ordering::SeqCst);
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn finish_counting(&self) -> usize {
+        self.armed.store(false, Ordering::SeqCst);
+        self.yields.load(Ordering::SeqCst)
+    }
+}
+
+impl Clock for CheckpointYieldIo {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for CheckpointYieldIo {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn File>> {
+        self.inner.open_file(path, flags, direct)
+    }
+
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
+        self.inner.file_id(path)
+    }
+
+    fn step(&self) -> turso_core::Result<()> {
+        self.inner.step()
+    }
+
+    fn wait_for_completion(&self, completion: Completion) -> turso_core::Result<()> {
+        if completion.is_explicit_yield() && self.armed.load(Ordering::SeqCst) {
+            self.yields.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.wait_for_completion(completion)
+    }
+}
+
+/// DDL inside BEGIN CONCURRENT upgrades the transaction to exclusive in
+/// place. The upgraded transaction keeps its earlier concurrent writes and
+/// commits everything together.
+#[turso_macros::test]
+fn test_ddl_in_concurrent_tx_upgrades_to_exclusive(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("CREATE TABLE t(x INTEGER)")?;
+
+    conn.execute("BEGIN CONCURRENT")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    conn.execute("CREATE TABLE u(y INTEGER)")?;
+    conn.execute("INSERT INTO u VALUES (2)")?;
+    conn.execute("COMMIT")?;
+
+    let conn2 = tmp_db.connect_limbo();
+    let rows: Vec<(i64, i64)> = conn2.exec_rows("SELECT (SELECT x FROM t), (SELECT y FROM u)");
+    assert_eq!(rows, vec![(1, 2)]);
+    Ok(())
+}
+
+/// The upgrade to exclusive fails with Busy when another transaction
+/// committed after the concurrent transaction began: the snapshot is stale,
+/// so single-writer DDL semantics cannot be granted.
+#[turso_macros::test]
+fn test_ddl_in_concurrent_tx_busy_after_other_commit(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("CREATE TABLE t(x INTEGER)")?;
+
+    let conn2 = tmp_db.connect_limbo();
+    conn2.execute("BEGIN CONCURRENT")?;
+    // BEGIN CONCURRENT is deferred; read to pin the snapshot before the
+    // other connection commits.
+    let _: Vec<(i64,)> = conn2.exec_rows("SELECT count(*) FROM t");
+
+    conn.execute("INSERT INTO t VALUES (1)")?;
+
+    let err = conn2
+        .execute("CREATE TABLE u(y INTEGER)")
+        .expect_err("DDL upgrade must fail after another commit")
+        .to_string();
+    assert!(err.contains("busy"), "expected Busy, got: {err}");
+
+    conn2.execute("ROLLBACK")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM sqlite_schema WHERE name = 'u'");
+    assert_eq!(rows, vec![(0,)]);
+    Ok(())
+}
+
+/// While a DDL-upgraded transaction holds the exclusive slot, other
+/// concurrent transactions abort on commit, matching the behavior of a
+/// transaction that was exclusive from the start.
+#[turso_macros::test]
+fn test_ddl_upgraded_tx_aborts_other_concurrent_commit(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn1 = tmp_db.connect_limbo();
+    conn1.pragma_update("journal_mode", "'mvcc'")?;
+    conn1.execute("CREATE TABLE t(x INTEGER)")?;
+
+    let conn2 = tmp_db.connect_limbo();
+    conn1.execute("BEGIN CONCURRENT")?;
+    conn2.execute("BEGIN CONCURRENT")?;
+    conn2.execute("INSERT INTO t VALUES (1)")?;
+
+    conn1.execute("CREATE TABLE u(y INTEGER)")?;
+
+    let result = conn2.execute("COMMIT");
+    assert_that!(result).is_err();
+
+    conn1.execute("COMMIT")?;
+    let rows: Vec<(i64,)> =
+        conn1.exec_rows("SELECT (SELECT count(*) FROM t) + (SELECT count(*) FROM u)");
+    assert_eq!(rows, vec![(0,)], "aborted concurrent insert must not land");
+    Ok(())
+}
+
+/// PRAGMA statements that write header cookies follow the same upgrade rule
+/// as DDL inside BEGIN CONCURRENT.
+#[turso_macros::test]
+fn test_header_write_in_concurrent_tx_upgrades_to_exclusive(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("BEGIN CONCURRENT")?;
+    conn.execute("PRAGMA user_version = 7")?;
+    conn.execute("COMMIT")?;
+
+    let conn2 = tmp_db.connect_limbo();
+    let rows: Vec<(i64,)> = conn2.exec_rows("PRAGMA user_version");
+    assert_eq!(rows, vec![(7,)]);
+    Ok(())
+}
+
+/// ROLLBACK TO a savepoint undoes the DDL but the transaction keeps the
+/// exclusive slot it gained from the upgrade: other concurrent transactions
+/// still abort on commit until the upgraded transaction ends.
+#[turso_macros::test]
+fn test_savepoint_rollback_after_ddl_upgrade_keeps_exclusivity(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn1 = tmp_db.connect_limbo();
+    conn1.pragma_update("journal_mode", "'mvcc'")?;
+    conn1.execute("CREATE TABLE t(x INTEGER)")?;
+
+    let conn2 = tmp_db.connect_limbo();
+    conn1.execute("BEGIN CONCURRENT")?;
+    conn2.execute("BEGIN CONCURRENT")?;
+    conn2.execute("INSERT INTO t VALUES (1)")?;
+
+    conn1.execute("SAVEPOINT sp")?;
+    conn1.execute("CREATE TABLE u(y INTEGER)")?;
+    conn1.execute("ROLLBACK TO sp")?;
+
+    let result = conn2.execute("COMMIT");
+    assert_that!(result).is_err();
+
+    conn1.execute("COMMIT")?;
+    let rows: Vec<(i64, i64)> = conn1.exec_rows(
+        "SELECT (SELECT count(*) FROM t),
+                (SELECT count(*) FROM sqlite_schema WHERE name = 'u')",
+    );
+    assert_eq!(
+        rows,
+        vec![(0, 0)],
+        "rolled-back DDL must not land and the aborted insert must not land"
+    );
+
+    conn2.execute("INSERT INTO t VALUES (2)")?;
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(
+        rows,
+        vec![(1,)],
+        "writes proceed after the upgraded tx ends"
+    );
+    Ok(())
 }

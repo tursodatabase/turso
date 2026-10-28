@@ -7,9 +7,8 @@ use super::{
     plan::{Distinctness, GroupBy, SelectPlan, SubqueryEvalPhase, SubqueryOrigin},
     result_row::emit_select_result,
 };
-use crate::function::AccumulatorFunc;
 use crate::translate::{
-    aggregation::{translate_aggregation_step, AggArgumentSource},
+    aggregation::{emit_aggregate_final, emit_aggregate_step, AggArgumentSource},
     expression_index::selected_expression_index,
     order_by::{custom_type_comparator, EmitOrderBy},
     plan::{Aggregate, NonFromClauseSubquery},
@@ -23,7 +22,7 @@ use crate::translate::{
 use crate::{
     emit_explain,
     schema::PseudoCursorType,
-    translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq},
+    translate::collate::{expr_collation, CollationSeq},
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -163,7 +162,7 @@ impl EmitGroupBy {
              */
             let order_collations_nulls: crate::alloc::Vec<(
                 SortOrder,
-                Option<CollationSeq>,
+                CollationSeq,
                 Option<turso_parser::ast::NullsOrder>,
             )> = group_by
                 .exprs
@@ -171,11 +170,8 @@ impl EmitGroupBy {
                 .zip(sort_order.iter())
                 .zip(group_by.nulls_order.iter())
                 .map(|((expr, ord), nulls)| {
-                    let collation = get_collseq_from_expr_with_symbols(
-                        expr,
-                        &plan.table_references,
-                        Some(t_ctx.resolver.symbol_table),
-                    )?;
+                    let collation =
+                        expr_collation(expr, Some(&plan.table_references), &t_ctx.resolver)?;
                     Ok::<_, crate::LimboError>((*ord, collation, *nulls))
                 })
                 .try_collect::<Result<crate::alloc::Vec<_>>>()??;
@@ -184,9 +180,7 @@ impl EmitGroupBy {
             let comparators = group_by
                 .exprs
                 .iter()
-                .map(|expr| {
-                    custom_type_comparator(expr, &plan.table_references, t_ctx.resolver.schema())
-                })
+                .map(|expr| custom_type_comparator(expr, &plan.table_references, &t_ctx.resolver))
                 .try_collect()?;
 
             program.emit_insn(Insn::SorterOpen {
@@ -405,11 +399,8 @@ fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Resu
         }
     };
     for agg in aggregates {
-        for arg in &agg.args {
-            walk_expr(arg, &mut collect)?;
-        }
-        if let Some(filter_expr) = &agg.filter_expr {
-            walk_expr(filter_expr, &mut collect)?;
+        for expr in agg.input_exprs() {
+            walk_expr(expr, &mut collect)?;
         }
     }
     Ok(leaf_columns)
@@ -440,9 +431,10 @@ fn collect_non_aggregate_expressions<'a>(
         let expr_appears_in_result_columns = result_columns
             .iter()
             .any(|expr| exprs_are_equivalent(expr, group_expr))
-            || root_result_columns
-                .iter()
-                .any(|rc| exprs_are_equivalent(&rc.expr, group_expr));
+            || (!can_return_json_subtype(group_expr)
+                && root_result_columns
+                    .iter()
+                    .any(|rc| exprs_are_equivalent(&rc.expr, group_expr)));
         non_aggregate_expressions.push((group_expr, expr_appears_in_result_columns));
     }
     for expr in result_columns {
@@ -521,10 +513,13 @@ fn collect_result_columns<'a>(
                 // may need its value afterward. We add it to result_columns so that
                 // value is read back even when the expression isn't selected, and skip
                 // its children because we reuse the expression's computed value.
-                if plan
-                    .group_by
-                    .as_ref()
-                    .is_some_and(|gb| gb.exprs.iter().any(|ge| exprs_are_equivalent(ge, expr)))
+                // A value read back from the GROUP BY sorter has lost its JSON subtype,
+                // so like SQLite we compute such an expression again from its columns.
+                if !can_return_json_subtype(expr)
+                    && plan
+                        .group_by
+                        .as_ref()
+                        .is_some_and(|gb| gb.exprs.iter().any(|ge| exprs_are_equivalent(ge, expr)))
                 {
                     result_columns.push(expr);
                     return Ok(WalkControl::SkipChildren);
@@ -534,6 +529,28 @@ fn collect_result_columns<'a>(
         Ok(WalkControl::Continue)
     })?;
     Ok(())
+}
+
+fn can_return_json_subtype(expr: &ast::Expr) -> bool {
+    let mut can_return_subtype = false;
+    walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        can_return_subtype |= match expr {
+            #[cfg(feature = "json")]
+            ast::Expr::FunctionCall { name, args, .. } => matches!(
+                crate::function::Func::resolve_function(name.as_str(), args.len()),
+                Ok(Some(crate::function::Func::Json(_)))
+            ),
+            ast::Expr::Binary(_, ast::Operator::ArrowRight, _) => true,
+            _ => false,
+        };
+        Ok(if can_return_subtype {
+            WalkControl::SkipChildren
+        } else {
+            WalkControl::Continue
+        })
+    })
+    .expect("walking an expression cannot fail");
+    can_return_subtype
 }
 
 /// In case sorting is needed for GROUP BY, creates a pseudo table that matches
@@ -678,27 +695,17 @@ pub fn group_by_process_single_group(
         GroupByRowSource::MainLoop { start_reg_src, .. } => *start_reg_src,
     };
 
-    let mut compare_key_info = group_by
+    let compare_key_info = group_by
         .exprs
         .iter()
-        .map(|_| KeyInfo {
-            sort_order: SortOrder::Asc,
-            collation: CollationSeq::default(),
-            nulls_order: None,
+        .map(|expr| {
+            Ok(KeyInfo {
+                sort_order: SortOrder::Asc,
+                collation: expr_collation(expr, Some(&plan.table_references), &t_ctx.resolver)?,
+                nulls_order: None,
+            })
         })
-        .collect::<Vec<_>>();
-    for (i, c) in compare_key_info
-        .iter_mut()
-        .enumerate()
-        .take(group_by.exprs.len())
-    {
-        let maybe_collation = get_collseq_from_expr_with_symbols(
-            &group_by.exprs[i],
-            &plan.table_references,
-            Some(t_ctx.resolver.symbol_table),
-        )?;
-        c.collation = maybe_collation.unwrap_or_default();
-    }
+        .collect::<Result<Vec<_>>>()?;
 
     // Compare the group by columns to the previous group by columns to see if we are at a new group or not
     program.emit_insn(Insn::Compare {
@@ -770,7 +777,6 @@ pub fn group_by_process_single_group(
                     std::borrow::Cow::Owned(leaf_expr),
                     leaf_regs + i,
                     false,
-                    None,
                 );
             }
             t_ctx.resolver.enable_expr_to_reg_cache();
@@ -804,13 +810,13 @@ pub fn group_by_process_single_group(
 
                 let agg_arg_source =
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness);
-                translate_aggregation_step(
+                emit_aggregate_step(
                     program,
                     &plan.table_references,
+                    agg,
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
-                    agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -857,15 +863,18 @@ pub fn group_by_process_single_group(
                 };
 
                 let start_reg_aggs = start_reg_src + t_ctx.non_aggregate_expressions.len();
-                let agg_arg_source =
-                    AggArgumentSource::new_from_registers(start_reg_aggs + offset, agg);
-                translate_aggregation_step(
+                let agg_arg_source = if agg.order_by().is_empty() {
+                    AggArgumentSource::new_from_registers(start_reg_aggs + offset, agg)
+                } else {
+                    AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness)
+                };
+                emit_aggregate_step(
                     program,
                     &plan.table_references,
+                    agg,
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
-                    agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -909,12 +918,11 @@ pub fn group_by_process_single_group(
             {
                 if *expr_appears_in_result_columns {
                     program.emit_column_or_rowid(*pseudo_cursor, sorter_column_index, next_reg);
-                    t_ctx.resolver.cache_scalar_expr_reg(
+                    t_ctx.resolver.cache_expr_reg(
                         std::borrow::Cow::Borrowed(expr),
                         next_reg,
                         false,
-                        &plan.table_references,
-                    )?;
+                    );
                     next_reg += 1;
                 }
             }
@@ -937,12 +945,9 @@ pub fn group_by_process_single_group(
                     dest_reg,
                     &t_ctx.resolver,
                 )?;
-                t_ctx.resolver.cache_scalar_expr_reg(
-                    std::borrow::Cow::Borrowed(expr),
-                    dest_reg,
-                    false,
-                    &plan.table_references,
-                )?;
+                t_ctx
+                    .resolver
+                    .cache_expr_reg(std::borrow::Cow::Borrowed(expr), dest_reg, false);
             }
         }
     }
@@ -1059,15 +1064,17 @@ pub fn group_by_emit_row_phase<'a>(
             .reg_agg_start
             .expect("aggregate registers must be initialized");
         let agg_result_reg = agg_start_reg + i;
-        program.emit_insn(Insn::AggFinal {
-            register: agg_result_reg,
-            func: AccumulatorFunc::Agg(agg.func.clone()),
-        });
+        emit_aggregate_final(
+            program,
+            &plan.table_references,
+            agg,
+            agg_result_reg,
+            &t_ctx.resolver,
+        )?;
         t_ctx.resolver.cache_expr_reg(
             std::borrow::Cow::Owned(agg.original_expr.clone()),
             agg_result_reg,
             false,
-            None,
         );
     }
 

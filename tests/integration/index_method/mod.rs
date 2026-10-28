@@ -1,5 +1,9 @@
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+mod json;
+
 use crate::assertions::{AssertColumn, AssertQueryPlan, Cell, NULL};
 use turso_core::ConnectOpts;
+use turso_core::NamespaceId;
 
 fn is_fts_lookup(detail: &rusqlite::types::Value) -> bool {
     matches!(detail, rusqlite::types::Value::Text(d)
@@ -21,6 +25,7 @@ use turso_core::{
     },
     schema::IndexColumn,
     types::IOResult,
+    vdbe::CollationSeq,
     vector::{self, vector_types::VectorType},
     Numeric, Register, Result, Value, MAIN_DB_ID,
 };
@@ -61,7 +66,7 @@ fn fts_test_stats(
             index_name: index_name.to_string(),
             columns: columns
                 .iter()
-                .map(|&(name, index)| IndexColumn::new(name, index))
+                .map(|&(name, index)| IndexColumn::new(name, index, CollationSeq::Binary))
                 .collect(),
             parameters: HashMap::default(),
         })
@@ -84,7 +89,7 @@ fn fts_attachment_test_stats(
     let attachment = conn
         .with_schema_mut(|schema| {
             schema
-                .get_index(table_name, index_name)
+                .get_index(NamespaceId::ROOT, table_name, index_name)
                 .and_then(|index| index.index_method.clone())
         })
         .unwrap()
@@ -184,7 +189,7 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1)],
+            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::Binary)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -276,7 +281,7 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1)],
+            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::Binary)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -368,7 +373,7 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1)],
+            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::Binary)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -661,7 +666,10 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "fts_docs".to_string(),
-            columns: vec![IndexColumn::new("title", 1), IndexColumn::new("body", 2)],
+            columns: vec![
+                IndexColumn::new("title", 1, CollationSeq::Binary),
+                IndexColumn::new("body", 2, CollationSeq::Binary),
+            ],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -709,7 +717,10 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "fts_docs".to_string(),
-            columns: vec![IndexColumn::new("title", 1), IndexColumn::new("body", 2)],
+            columns: vec![
+                IndexColumn::new("title", 1, CollationSeq::Binary),
+                IndexColumn::new("body", 2, CollationSeq::Binary),
+            ],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -986,6 +997,46 @@ fn test_fts_order_by_and_limit(tmp_db: TempDatabase) {
         .satisfies_with_message(REAL_SCORES_NEVER_INCREASE, |scores| {
             scores_never_increase(scores)
         });
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_match_with_order_by_column_and_limit(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT, created_at INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX fts_notes ON notes USING fts (body)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO notes VALUES
+            (1, 'use the cache for lookups', 500),
+            (2, 'invalidate the cache after sync', 900),
+            (3, 'keep the cache bounded', 100),
+            (4, 'prefer streaming over buffering', 1000),
+            (5, 'warm the cache on startup', 700),
+            (6, 'cache eviction is lru', 300),
+            (7, 'never cache read errors', 800)",
+    )
+    .unwrap();
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM notes WHERE fts_match(body, 'cache') ORDER BY created_at DESC LIMIT 2",
+    );
+    assert_that!(rows)
+        .column(0)
+        .contains_exactly([Cell::from(2), Cell::from(7)]);
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, fts_score(body, 'cache') AS score FROM notes WHERE fts_match(body, 'cache') ORDER BY created_at LIMIT 1",
+    );
+    assert_that!(rows)
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from(3));
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -1381,6 +1432,30 @@ fn test_fts_ngram_tokenizer(tmp_db: TempDatabase) {
         "SELECT id FROM products WHERE fts_match(name, 'Gal')",
     );
     assert!(!rows.is_empty());
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_en_stem_tokenizer_matches_other_forms_of_a_word(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO notes VALUES (1, 'She runs daily'), (2, 'walking home')")
+        .unwrap();
+    conn.execute("CREATE INDEX notes_stem ON notes USING fts (body) WITH (tokenizer = 'en_stem')")
+        .unwrap();
+
+    for (query, expected_id) in [("running", 1), ("RUN", 1), ("walks", 2)] {
+        let rows = limbo_exec_rows(
+            &conn,
+            &format!("SELECT id FROM notes WHERE fts_match(body, '{query}')"),
+        );
+        assert_that!(rows)
+            .column(0)
+            .single_element()
+            .is_equal_to(Cell::from(expected_id));
+    }
 }
 
 /// A one-character typo in a WITH clause key must be an error, not a
@@ -3061,6 +3136,88 @@ fn test_fts_mvcc_recovery(tmp_db: TempDatabase) {
             vec![rusqlite::types::Value::Integer(2)],
         ]
     );
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test(mvcc)]
+fn test_fts_rename_weighted_column_keeps_weight_after_reopen(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(a, b) WITH (weights = 'a=10.0,b=1.0')")
+        .unwrap();
+    // Without the weight on column a, row 2 ranks above row 1
+    conn.execute(
+        "INSERT INTO docs VALUES \
+         (1, 'needle hay hay hay', ''), (2, '', 'needle'), (3, '', 'hay hay hay hay hay hay')",
+    )
+    .unwrap();
+    conn.execute("ALTER TABLE docs RENAME COLUMN a TO title")
+        .unwrap();
+    conn.execute("ALTER TABLE docs ALTER COLUMN b TO body TEXT")
+        .unwrap();
+
+    let path = tmp_db.path.clone();
+    let opts = tmp_db.db_opts;
+    let flags = tmp_db.db_flags;
+    let mvcc = tmp_db.enable_mvcc;
+    conn.close().unwrap();
+    drop(conn);
+    drop(tmp_db);
+    let tmp_db = TempDatabase::builder()
+        .with_db_path(&path)
+        .with_opts(opts)
+        .with_flags(flags)
+        .with_mvcc(mvcc)
+        .build();
+    let conn = tmp_db.connect_limbo();
+
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT sql FROM sqlite_schema WHERE name = 'docs_fts'"
+        ),
+        vec![vec![rusqlite::types::Value::Text(
+            "CREATE INDEX docs_fts ON docs USING fts (title, body) WITH (weights = 'title=10.0,body=1.0')"
+                .to_string()
+        )]]
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(title, body, 'needle') \
+             ORDER BY fts_score(title, body, 'needle') DESC"
+        ),
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(2)],
+        ]
+    );
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test(mvcc)]
+fn test_fts_rename_weighted_column_to_name_with_comma_fails(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(a, b) WITH (weights = 'a=10.0')")
+        .unwrap();
+    let schema = "SELECT sql FROM sqlite_schema WHERE name IN ('docs', 'docs_fts') ORDER BY name";
+    let schema_before = limbo_exec_rows(&conn, schema);
+
+    conn.execute("BEGIN").unwrap();
+    let error = conn
+        .execute(r#"ALTER TABLE docs RENAME COLUMN a TO "a,c""#)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("the name cannot be written in FTS weights"),
+        "{error}"
+    );
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(limbo_exec_rows(&conn, schema), schema_before);
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -4876,7 +5033,7 @@ fn fts_read_cache_is_shared_across_connections_and_bounded() {
         .attach(&IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "docs_fts".to_string(),
-            columns: vec![IndexColumn::new("content", 1)],
+            columns: vec![IndexColumn::new("content", 1, CollationSeq::Binary)],
             parameters: HashMap::default(),
         })
         .unwrap();

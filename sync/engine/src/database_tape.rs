@@ -3426,8 +3426,7 @@ mod tests {
 
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
         let open = |path: &str| {
-            let opts = turso_core::OpenOptions::new(Arc::new(SqliteDialect))
-                .db_opts(turso_core::DatabaseOpts::new().with_generated_columns(true));
+            let opts = turso_core::OpenOptions::new(Arc::new(SqliteDialect));
             let db = turso_core::Database::open(io.clone(), path, opts).unwrap();
             Arc::new(DatabaseTape::new(db))
         };
@@ -3810,8 +3809,7 @@ mod tests {
         let db = turso_core::Database::open(
             io.clone(),
             db_path,
-            turso_core::OpenOptions::new(Arc::new(SqliteDialect))
-                .db_opts(turso_core::DatabaseOpts::new().with_generated_columns(true)),
+            turso_core::OpenOptions::new(Arc::new(SqliteDialect)),
         )?;
         let db = Arc::new(DatabaseTape::new(db));
         let setup = setup.iter().map(|sql| sql.to_string()).collect::<Vec<_>>();

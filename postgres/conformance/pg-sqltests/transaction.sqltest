@@ -45,7 +45,6 @@ test txn-set-transaction-options-rollback {
     BEGIN;
     SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
     SET TRANSACTION READ WRITE;
-    SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, NOT DEFERRABLE;
     SELECT 17;
     UPDATE counter SET n = 23;
     ROLLBACK;
@@ -54,6 +53,14 @@ test txn-set-transaction-options-rollback {
 expect {
     17
     0
+}
+
+@skip-if postgres "Turso transactions are snapshot isolation, so only REPEATABLE READ is accepted"
+test txn-set-transaction-serializable-rejected {
+    BEGIN;
+    SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, NOT DEFERRABLE;
+}
+expect error {
 }
 
 @setup counter
@@ -77,4 +84,71 @@ test txn-set-transaction-lowercase-and-newline {
 }
 expect {
     17
+}
+
+@setup counter
+test txn-access-share-lock-preserves-transaction {
+    CREATE TABLE t2 (a int);
+    BEGIN;
+    UPDATE counter SET n = 29;
+    LOCK TABLE public.counter, ONLY public.t2 IN ACCESS SHARE MODE;
+    SELECT n FROM counter;
+    ROLLBACK;
+    SELECT n FROM counter;
+}
+expect {
+    29
+    0
+}
+
+# Postgres DDL is transactional: schema changes inside BEGIN commit and roll
+# back with the transaction.
+
+@setup counter
+test txn-ddl-commit-persists {
+    BEGIN;
+    CREATE TABLE made_in_txn (id int);
+    INSERT INTO made_in_txn VALUES (7);
+    COMMIT;
+    SELECT id FROM made_in_txn;
+}
+expect {
+    7
+}
+
+@setup counter
+test txn-ddl-after-dml-commits {
+    BEGIN;
+    UPDATE counter SET n = 1;
+    CREATE TABLE made_after_dml (id int);
+    INSERT INTO made_after_dml VALUES (8);
+    COMMIT;
+    SELECT n FROM counter;
+    SELECT id FROM made_after_dml;
+}
+expect {
+    1
+    8
+}
+
+@setup counter
+test txn-ddl-rollback-discards {
+    BEGIN;
+    CREATE TABLE gone_on_rollback (id int);
+    ROLLBACK;
+    SELECT count(*) FROM pg_catalog.pg_tables WHERE tablename = 'gone_on_rollback';
+}
+expect {
+    0
+}
+
+@setup counter
+test txn-drop-table-rollback-restores {
+    BEGIN;
+    DROP TABLE counter;
+    ROLLBACK;
+    SELECT n FROM counter;
+}
+expect {
+    0
 }

@@ -70,6 +70,9 @@ pub(super) fn translate_in_list(
     // This follows SQLite's exprINAffinity() approach
     let affinity = in_expr_affinity(lhs, referenced_tables, Some(resolver));
     let cmp_flags = CmpInsFlags::default().with_affinity(affinity);
+    // `x IN (y1, ..., yN)` compares with the collation of x alone, as SQLite
+    // does; the list items do not take part.
+    let collation = expr_collation(lhs, referenced_tables, resolver)?;
 
     if lhs_arity == 1 && false_null_jump_targets_differ {
         check_null_reg = program.alloc_register();
@@ -119,7 +122,7 @@ pub(super) fn translate_in_list(
                         rhs: rhs_reg,
                         target_pc: label_ok,
                         flags: cmp_flags,
-                        collation: program.curr_collation(),
+                        collation,
                     });
                 } else {
                     program.emit_insn(Insn::NotNull {
@@ -133,7 +136,7 @@ pub(super) fn translate_in_list(
                     rhs: rhs_reg,
                     target_pc: condition_metadata.jump_target_when_false,
                     flags: cmp_flags.jump_if_null(),
-                    collation: program.curr_collation(),
+                    collation,
                 });
             } else {
                 program.emit_insn(Insn::IsNull {
@@ -154,7 +157,7 @@ pub(super) fn translate_in_list(
                         expr,
                         j,
                         referenced_tables,
-                        Some(resolver),
+                        resolver,
                     )?;
                     let flags = CmpInsFlags::default().with_affinity(aff);
                     program.emit_insn(Insn::Ne {
@@ -211,7 +214,7 @@ pub(super) fn translate_in_list(
                         expr,
                         j,
                         referenced_tables,
-                        Some(resolver),
+                        resolver,
                     )?;
                     let flags = CmpInsFlags::default().with_affinity(aff).jump_if_null();
                     program.emit_insn(Insn::Ne {
@@ -225,7 +228,6 @@ pub(super) fn translate_in_list(
             }
         }
     }
-    program.reset_collation();
     if check_null_reg != 0 {
         program.emit_insn(Insn::IsNull {
             reg: check_null_reg,
@@ -271,6 +273,26 @@ pub fn translate_condition_expr(
     condition_metadata: ConditionMetadata,
     resolver: &Resolver,
 ) -> Result<()> {
+    if resolver.resolve_cached_expr_reg(expr).is_some() {
+        let reg = program.alloc_register();
+        translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
+        emit_cond_jump(program, condition_metadata, reg);
+        return Ok(());
+    }
+    if has_expression_index_values(program, Some(referenced_tables)) {
+        let index_value_reg = program.alloc_register();
+        if try_emit_expression_index_value(
+            program,
+            Some(referenced_tables),
+            expr,
+            index_value_reg,
+            resolver,
+        )? {
+            emit_cond_jump(program, condition_metadata, index_value_reg);
+            return Ok(());
+        }
+        program.release_registers(index_value_reg, 1);
+    }
     match expr {
         ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
             // In a binary AND, never jump to the parent 'jump_target_when_true' label on the first condition, because

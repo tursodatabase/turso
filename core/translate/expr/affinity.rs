@@ -70,7 +70,7 @@ pub(crate) fn get_expr_affinity(
         ast::Expr::RowId { .. } => Affinity::Integer,
         ast::Expr::Cast { type_name, .. } => {
             if let Some(type_name) = type_name {
-                Affinity::affinity(&type_name.name)
+                Affinity::of_written_type(&crate::util::dequote(&type_name.name))
             } else {
                 Affinity::None
             }
@@ -95,8 +95,8 @@ pub(crate) fn get_expr_affinity(
             // rewritten to Expr::Register. Look up the original column affinity
             // from the resolver's register_affinities map.
             if let Some(resolver) = resolver {
-                if let Some(aff) = resolver.register_affinities.get(reg) {
-                    return *aff;
+                if let Some(column) = resolver.register_columns.get(reg) {
+                    return column.affinity;
                 }
             }
             Affinity::None
@@ -178,7 +178,7 @@ pub(crate) fn expr_data_type(
     }
 }
 
-fn do_comparison_affinity(lhs: Affinity, rhs: Affinity) -> Affinity {
+pub(crate) fn do_comparison_affinity(lhs: Affinity, rhs: Affinity) -> Affinity {
     if lhs != Affinity::None && rhs != Affinity::None {
         // Both sides have affinity - use numeric if either is numeric
         if lhs.is_numeric() || rhs.is_numeric() {

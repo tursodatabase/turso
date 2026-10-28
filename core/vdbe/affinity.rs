@@ -210,6 +210,14 @@ impl Affinity {
         Affinity::Numeric
     }
 
+    pub fn of_written_type(datatype: &str) -> Self {
+        if datatype.is_empty() {
+            Affinity::Numeric
+        } else {
+            Affinity::affinity(datatype)
+        }
+    }
+
     pub fn convert<'a>(&self, val: &'a impl AsValueRef) -> Option<Either<ValueRef<'a>, Value>> {
         let val = val.as_value_ref();
         let is_text = matches!(val, ValueRef::Text(_));
@@ -246,8 +254,15 @@ impl Affinity {
                     .then(|| apply_numeric_affinity(val, false))
                     .flatten();
 
-                if let ValueRef::Numeric(Numeric::Integer(i)) = left.unwrap_or(val) {
-                    left = Some(ValueRef::from_f64(i as f64));
+                match left.unwrap_or(val) {
+                    ValueRef::Numeric(Numeric::Integer(i)) => {
+                        left = Some(ValueRef::from_f64(i as f64));
+                    }
+                    // SQLite stores a whole-number real as an integer, so -0.0 is read back as 0.0
+                    ValueRef::Numeric(Numeric::Float(f)) if f == 0.0 => {
+                        left = Some(ValueRef::from_f64(0.0));
+                    }
+                    _ => {}
                 }
 
                 left.map(Either::Left)

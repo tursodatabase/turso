@@ -25,6 +25,7 @@ pub fn translate_tx_begin(
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,
+                concurrent: false,
             });
         }
         TransactionType::Immediate | TransactionType::Exclusive => {
@@ -54,34 +55,17 @@ pub fn translate_tx_begin(
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,
+                concurrent: false,
             });
         }
         TransactionType::Concurrent => {
-            program.emit_insn(Insn::Transaction {
-                db: crate::MAIN_DB_ID,
-                tx_mode: TransactionMode::Concurrent,
-                schema_cookie: schema.schema_version,
-            });
-            // Temp has no MVCC, so it uses a plain write lock even in
-            // Concurrent mode. The op_transaction handler detects this via
-            // `mv_store_for_db(TEMP) == None` and skips the MVCC path.
-            let temp_schema_cookie = temp_schema_cookie(resolver);
-            program.emit_insn(Insn::Transaction {
-                db: crate::TEMP_DB_ID,
-                tx_mode: TransactionMode::Write,
-                schema_cookie: temp_schema_cookie,
-            });
-            for db_id in resolver.attached_database_ids_in_search_order()? {
-                let cookie = resolver.with_schema(db_id, |s| s.schema_version);
-                program.emit_insn(Insn::Transaction {
-                    db: db_id,
-                    tx_mode: TransactionMode::Write,
-                    schema_cookie: cookie,
-                });
-            }
+            // Like SQLite's begin-concurrent, BEGIN CONCURRENT is a deferred
+            // transaction: nothing is opened here, and the first statement
+            // materializes the MVCC transaction in concurrent mode.
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,
+                concurrent: true,
             });
         }
     }
@@ -115,6 +99,7 @@ pub fn translate_tx_commit(
     program.emit_insn(Insn::AutoCommit {
         auto_commit: true,
         rollback: false,
+        concurrent: false,
     });
     Ok(())
 }

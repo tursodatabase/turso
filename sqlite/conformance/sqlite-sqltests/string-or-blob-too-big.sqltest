@@ -1,0 +1,33 @@
+# Values longer than SQLite's 1,000,000,000-byte limit fail with
+# "string or blob too big" instead of being built.
+
+@database :memory:
+
+test concat-result-too-big {
+    SELECT length(zeroblob(500000001) || zeroblob(500000000));
+}
+expect error {
+    ^string or blob too big$
+}
+
+test hex-result-too-big {
+    SELECT length(hex(zeroblob(500000001)));
+}
+expect error {
+    ^string or blob too big$
+}
+
+test insert-record-too-big {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (zeroblob(500000001), zeroblob(500000000));
+}
+expect error {
+    ^string or blob too big$
+}
+
+test group-concat-result-too-big {
+    SELECT length(group_concat(x, '')) FROM (SELECT zeroblob(500000001) AS x UNION ALL SELECT zeroblob(500000000));
+}
+expect error {
+    ^string or blob too big$
+}

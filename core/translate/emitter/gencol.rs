@@ -1,6 +1,5 @@
 use crate::schema::{BTreeTable, ColumnLayout, ColumnsTopologicalSort, GeneratedType};
 use crate::translate::expr::translate_expr;
-use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{DmlColumnContext, SelfTableContext};
 use crate::{Arc, Result};
 use turso_parser::ast;
@@ -19,6 +18,7 @@ pub fn compute_virtual_columns(
     let ctx = SelfTableContext::ForDML {
         dml_ctx: dml_ctx.clone(),
         table: Arc::clone(table),
+        uses_custom_type_operators: false,
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {
         for (idx, column) in columns.iter() {
@@ -27,9 +27,7 @@ pub fn compute_virtual_columns(
             };
             let target_reg = dml_ctx.to_column_reg(idx);
             translate_expr(program, None, expr, target_reg, resolver)?;
-            if column.affinity() != Affinity::Blob {
-                program.emit_column_affinity(target_reg, column.affinity());
-            }
+            program.emit_column_affinity(target_reg, column.affinity());
         }
         Ok(())
     })
@@ -51,6 +49,7 @@ pub(crate) fn emit_gencol_expr_from_registers(
     let ctx = SelfTableContext::ForDML {
         dml_ctx: DmlColumnContext::layout(columns, registers_start, rowid_reg, layout.clone()),
         table: Arc::clone(table),
+        uses_custom_type_operators: false,
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {
         translate_expr(program, None, expr, target_reg, resolver)?;

@@ -7,6 +7,7 @@ use turso_ext::{
     ValueDestructor,
 };
 
+use crate::translate::collate::CollationSeq;
 use crate::LimboError;
 
 pub type ContextCollationFunction = unsafe extern "C" fn(
@@ -26,7 +27,11 @@ pub struct ExternalFunc {
     pub func: ExtFunc,
 }
 
+/// A collation that an application registered on a connection: a callback
+/// that orders two texts.
 pub struct ExternalCollation {
+    /// The collation that calls this callback.
+    pub collation: CollationSeq,
     pub name: String,
     pub context: usize,
     pub callback: ContextCollationFunction,
@@ -39,18 +44,33 @@ impl ExternalCollation {
         context: usize,
         callback: ContextCollationFunction,
         context_destructor: Option<ContextDestructor>,
-    ) -> Self {
-        Self {
+    ) -> Arc<Self> {
+        CollationSeq::new_custom(|collation| Self {
+            collation,
             name,
             context,
             callback,
             context_destructor,
-        }
+        })
+    }
+
+    pub fn compare(&self, left: &str, right: &str) -> std::cmp::Ordering {
+        let result = unsafe {
+            (self.callback)(
+                self.context,
+                left.as_ptr(),
+                left.len(),
+                right.as_ptr(),
+                right.len(),
+            )
+        };
+        result.cmp(&0)
     }
 }
 
 impl Drop for ExternalCollation {
     fn drop(&mut self) {
+        self.collation.remove_custom();
         if let Some(destructor) = self.context_destructor {
             unsafe { destructor(self.context) };
         }
@@ -588,8 +608,8 @@ impl WindowFunc {
     ///
     /// This is taken from SQLite's `sqlite3WindowUpdate` table at `window.c:699-708`.
     pub fn coerced_frame(&self) -> Option<crate::translate::plan::Frame> {
-        use crate::translate::plan::{Frame, FrameBoundary};
-        use turso_parser::ast::{Expr, FrameMode, Literal};
+        use crate::translate::plan::Frame;
+        use turso_parser::ast::{Expr, FrameBound, FrameMode, Literal};
         match self {
             // Lag shares row_number's streaming frame even though its lookup
             // can point forward (negative offset): SQLite emits a row as soon
@@ -598,40 +618,40 @@ impl WindowFunc {
             // using the same frame rather than caching the whole partition.
             Self::RowNumber | Self::Lag => Some(Frame {
                 mode: FrameMode::Rows,
-                start: FrameBoundary::UnboundedPreceding,
-                end: FrameBoundary::CurrentRow,
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::CurrentRow,
                 exclude: None,
             }),
             Self::Rank | Self::DenseRank => Some(Frame {
                 mode: FrameMode::Range,
-                start: FrameBoundary::UnboundedPreceding,
-                end: FrameBoundary::CurrentRow,
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::CurrentRow,
                 exclude: None,
             }),
             Self::PercentRank => Some(Frame {
                 mode: FrameMode::Groups,
-                start: FrameBoundary::CurrentRow,
-                end: FrameBoundary::UnboundedFollowing,
+                start: FrameBound::CurrentRow,
+                end: FrameBound::UnboundedFollowing,
                 exclude: None,
             }),
             Self::CumeDist => Some(Frame {
                 mode: FrameMode::Groups,
-                start: FrameBoundary::Following(Box::new(Expr::Literal(Literal::Numeric(
+                start: FrameBound::Following(Box::new(Expr::Literal(Literal::Numeric(
                     "1".to_string(),
                 )))),
-                end: FrameBoundary::UnboundedFollowing,
+                end: FrameBound::UnboundedFollowing,
                 exclude: None,
             }),
             Self::Ntile => Some(Frame {
                 mode: FrameMode::Rows,
-                start: FrameBoundary::CurrentRow,
-                end: FrameBoundary::UnboundedFollowing,
+                start: FrameBound::CurrentRow,
+                end: FrameBound::UnboundedFollowing,
                 exclude: None,
             }),
             Self::Lead => Some(Frame {
                 mode: FrameMode::Rows,
-                start: FrameBoundary::UnboundedPreceding,
-                end: FrameBoundary::UnboundedFollowing,
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::UnboundedFollowing,
                 exclude: None,
             }),
             Self::FirstValue | Self::LastValue | Self::NthValue => None,
@@ -702,6 +722,21 @@ pub enum AccumulatorFunc {
 }
 
 impl AccumulatorFunc {
+    /// Whether the aggregate compares its argument values, and so uses the
+    /// collation of its AggStep.
+    pub fn compares_values(&self) -> bool {
+        matches!(
+            self,
+            Self::Agg(
+                AggFunc::Min
+                    | AggFunc::Max
+                    | AggFunc::Mode
+                    | AggFunc::PercentileCont
+                    | AggFunc::PercentileDisc
+            )
+        )
+    }
+
     /// Extract the inner `AggFunc` when this kind is known to be an
     /// aggregate. `unreachable!`s on `Window(...)` — the only opcodes
     /// that carry an `AccumulatorFunc` are the AggStep / AggValue /
@@ -1120,6 +1155,19 @@ impl ScalarFunc {
                 | Self::ArrayRemove
                 | Self::ArraySlice
                 | Self::StringToArray
+        )
+    }
+
+    pub fn is_date_time_function(&self) -> bool {
+        matches!(
+            self,
+            Self::Date
+                | Self::Time
+                | Self::DateTime
+                | Self::JulianDay
+                | Self::UnixEpoch
+                | Self::StrfTime
+                | Self::TimeDiff
         )
     }
 }
@@ -1604,6 +1652,9 @@ impl Display for Func {
 pub struct FuncCtx {
     pub func: Func,
     pub arg_count: usize,
+    /// The collation the function compares its arguments with when
+    /// [Func::needs_collation] is true. BINARY for the other functions.
+    pub collation: CollationSeq,
 }
 
 impl Deterministic for Func {
@@ -1629,6 +1680,16 @@ impl Deterministic for Func {
 }
 
 impl Func {
+    /// Whether the function compares its arguments, and so needs the
+    /// collation of its first argument that has one. SQLite marks these
+    /// functions `SQLITE_FUNC_NEEDCOLL`.
+    pub fn needs_collation(&self) -> bool {
+        matches!(
+            self,
+            Self::Scalar(ScalarFunc::Min | ScalarFunc::Max | ScalarFunc::Nullif)
+        )
+    }
+
     pub fn supports_star_syntax(&self) -> bool {
         // Functions that need star expansion also support star syntax
         if self.needs_star_expansion() {

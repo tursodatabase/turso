@@ -7,7 +7,7 @@ use crate::{
     emit_explain,
     schema::{Index, IndexColumn, PseudoCursorType, Schema},
     translate::{
-        collate::{get_sort_collseq_from_expr_with_symbols, CollationSeq},
+        collate::{expr_collation, CollationSeq},
         group_by::is_orderby_agg_or_const,
         plan::Aggregate,
     },
@@ -20,12 +20,13 @@ use crate::{
 };
 
 use super::{
-    emitter::TranslateCtx,
+    emitter::{Resolver, TranslateCtx},
     expr::translate_expr,
     plan::{Distinctness, ResultSetColumn, SelectPlan, TableReferences},
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
+use super::expr::expr_type::{column_custom_type, type_of, TypeEnv};
 use crate::translate::eqp::{EqpDetail, EqpSortMethod};
 use crate::vdbe::insn::SortComparatorType;
 
@@ -41,39 +42,25 @@ fn sort_comparator_from_func_name(func_name: &str) -> Option<SortComparatorType>
     }
 }
 
-/// For an ORDER BY expression that is a column reference to a custom type,
-/// returns the SortComparatorType if the type has a `<` operator with a known
-/// comparator. Returns None otherwise, which causes the sorter to use encoded
-/// blob ordering instead of silently wrong results.
+/// Returns the comparator for sorting an expression: element by element for an
+/// array, or the function behind the `<` operator of a column's custom type when
+/// the sorter knows it. Returns None otherwise, which sorts by the stored bytes.
 pub(crate) fn custom_type_comparator(
     expr: &ast::Expr,
     referenced_tables: &TableReferences,
-    schema: &Schema,
+    resolver: &Resolver,
 ) -> Option<SortComparatorType> {
-    if let ast::Expr::Column {
-        table: table_ref_id,
-        column,
-        ..
-    } = expr
-    {
-        let (_, table) = referenced_tables.find_table_by_internal_id(*table_ref_id)?;
-        let col = table.get_column_at(*column)?;
-        // Array columns use element-wise comparison
-        if col.is_array() {
-            return Some(SortComparatorType::ArrayLt);
-        }
-        let type_def = schema.get_type_def(&col.ty_str, table.is_strict())?;
-        type_def
-            .operators()
-            .iter()
-            .find(|op| op.op == "<")
-            .and_then(|op| op.func_name.as_ref())
-            .and_then(|func_name| sort_comparator_from_func_name(func_name))
-    } else if super::expr::expr_is_array(expr, Some(referenced_tables)) {
-        Some(SortComparatorType::ArrayLt)
-    } else {
-        None
+    let env = TypeEnv::new(Some(referenced_tables), resolver);
+    if type_of(expr, &env).is_array() {
+        return Some(SortComparatorType::ArrayLt);
     }
+    column_custom_type(expr, &env)?
+        .type_def
+        .operators()
+        .iter()
+        .find(|op| op.op == "<")
+        .and_then(|op| op.func_name.as_ref())
+        .and_then(|func_name| sort_comparator_from_func_name(func_name))
 }
 
 /// For a result column expression that is a column reference to a custom type,
@@ -210,11 +197,7 @@ impl EmitOrderBy {
                         "heap sort cannot express an explicit NULLS ordering".to_string(),
                     ));
                 }
-                let collation = get_sort_collseq_from_expr_with_symbols(
-                    column,
-                    referenced_tables,
-                    Some(t_ctx.resolver.symbol_table),
-                )?;
+                let collation = expr_collation(column, Some(referenced_tables), &t_ctx.resolver)?;
                 let pos_in_table = index_columns.len();
                 // Have enough space pre-allocatoed to push without realloc
                 index_columns.push(IndexColumn {
@@ -234,13 +217,17 @@ impl EmitOrderBy {
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table,
-                collation: None,
+                collation: CollationSeq::Binary,
                 default: None,
                 expr: None,
             })?;
             for _ in remappings.iter().filter(|r| !r.deduplicated) {
                 let pos_in_table = index_columns.len();
-                index_columns.try_push(IndexColumn::new(pos_in_table.to_string(), pos_in_table))?;
+                index_columns.try_push(IndexColumn::new(
+                    pos_in_table.to_string(),
+                    pos_in_table,
+                    CollationSeq::Binary,
+                ))?;
             }
             let index = Arc::new(Index {
                 name: index_name,
@@ -253,6 +240,7 @@ impl EmitOrderBy {
                 where_clause: None,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             });
             program.alloc_cursor_id(CursorType::BTreeIndex(index))
         } else {
@@ -279,46 +267,28 @@ impl EmitOrderBy {
              * then the collating sequence of the column is used to determine sort order.
              * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
              */
-            let mut order_collations_nulls: Vec<(
-                SortOrder,
-                Option<CollationSeq>,
-                Option<turso_parser::ast::NullsOrder>,
-            )> = order_by
-                .iter()
-                .map(|(expr, dir, nulls)| {
-                    let collation = get_sort_collseq_from_expr_with_symbols(
-                        expr,
-                        referenced_tables,
-                        Some(t_ctx.resolver.symbol_table),
-                    )?;
-                    Ok::<_, crate::LimboError>((*dir, collation, *nulls))
-                })
-                .try_collect::<Result<Vec<_>>>()??;
-
-            // Resolve custom type comparators for ORDER BY columns.
-            // For types with a `<` operator, the comparator is used for correct sort ordering.
-            let mut comparators: Vec<Option<SortComparatorType>> = order_by
-                .iter()
-                .map(|(expr, _, _)| {
-                    custom_type_comparator(expr, referenced_tables, t_ctx.resolver.schema())
-                })
-                .try_collect()?;
+            let mut data = sorter_open_data(
+                sort_cursor,
+                order_by
+                    .iter()
+                    .map(|(expr, dir, nulls)| (expr.as_ref(), *dir, *nulls)),
+                referenced_tables,
+                &t_ctx.resolver,
+            )?;
 
             if has_sequence {
                 // sequence column: ascending with BINARY collation, no comparator, no nulls order
-                order_collations_nulls.push((SortOrder::Asc, Some(CollationSeq::default()), None));
-                comparators.try_push(None)?;
+                data.order_collations_nulls.try_push((
+                    SortOrder::Asc,
+                    CollationSeq::Binary,
+                    None,
+                ))?;
+                data.comparators.try_push(None)?;
             }
 
-            let key_len = order_collations_nulls.len();
-
+            data.columns = data.order_collations_nulls.len();
             program.emit_insn(Insn::SorterOpen {
-                data: Box::new(SorterOpenData {
-                    cursor_id: sort_cursor,
-                    columns: key_len,
-                    order_collations_nulls,
-                    comparators,
-                }),
+                data: Box::new(data),
             });
         }
         Ok(())
@@ -435,7 +405,7 @@ impl EmitOrderBy {
                             decode_expr,
                             reg,
                             reg,
-                            col,
+                            &col.ty_params,
                             &type_def,
                             &t_ctx.resolver,
                         )?;
@@ -710,6 +680,31 @@ impl EmitOrderBy {
         }
         Ok(())
     }
+}
+
+pub(crate) fn sorter_open_data<'a>(
+    cursor_id: usize,
+    terms: impl IntoIterator<Item = (&'a ast::Expr, SortOrder, Option<ast::NullsOrder>)>,
+    tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<SorterOpenData> {
+    let terms = terms.into_iter();
+    let capacity = terms.size_hint().0;
+    let mut data = SorterOpenData {
+        cursor_id,
+        columns: 0,
+        order_collations_nulls: Vec::try_with_capacity_ext(capacity)?,
+        comparators: Vec::try_with_capacity_ext(capacity)?,
+    };
+    for (expr, direction, nulls) in terms {
+        let collation = expr_collation(expr, Some(tables), resolver)?;
+        data.order_collations_nulls
+            .try_push((direction, collation, nulls))?;
+        data.comparators
+            .try_push(custom_type_comparator(expr, tables, resolver))?;
+    }
+    data.columns = data.order_collations_nulls.len();
+    Ok(data)
 }
 
 /// Emits the bytecode for inserting a row into a sorter.

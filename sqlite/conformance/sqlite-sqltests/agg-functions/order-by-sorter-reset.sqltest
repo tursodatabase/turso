@@ -1,0 +1,15 @@
+@database :memory:
+
+test aggregate-order-reset-after-spilled-group {
+    PRAGMA cache_size = 1;
+    CREATE TABLE reset_groups(g, x);
+    WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<2000)
+    INSERT INTO reset_groups SELECT 1,x FROM seq UNION ALL SELECT 2,x FROM seq;
+    SELECT g, length(group_concat(x ORDER BY zeroblob(1024), x)),
+           sum(x ORDER BY zeroblob(1024), x)
+    FROM reset_groups GROUP BY g;
+}
+expect {
+    1|8892|2001000
+    2|8892|2001000
+}

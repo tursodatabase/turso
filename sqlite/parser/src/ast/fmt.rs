@@ -868,6 +868,18 @@ impl ToTokens for Stmt {
                 seq_name.to_tokens(s, context)?;
                 Ok(())
             }
+            Self::CreateSchema { name } => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_ID, Some("SCHEMA"))?;
+                name.to_tokens(s, context)?;
+                Ok(())
+            }
+            Self::DropSchema { name } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_ID, Some("SCHEMA"))?;
+                name.to_tokens(s, context)?;
+                Ok(())
+            }
             Self::DropDomain {
                 if_exists,
                 domain_name,
@@ -1501,7 +1513,14 @@ impl ToTokens for SelectTable {
                 }
                 Ok(())
             }
-            Self::Select(select, alias) => {
+            Self::Select {
+                select,
+                alias,
+                lateral,
+            } => {
+                if *lateral {
+                    s.append(TK_LATERAL, None)?;
+                }
                 s.append(TK_LP, None)?;
                 select.to_tokens(s, context)?;
                 s.append(TK_RP, None)?;
@@ -1635,7 +1654,7 @@ impl ToTokens for QualifiedName {
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        if let Some(ref db_name) = self.db_name {
+        if let Some(ref db_name) = self.namespace {
             db_name.to_tokens(s, context)?;
             s.append(TK_DOT, None)?;
         }
@@ -1837,7 +1856,19 @@ impl ToTokens for ColumnConstraint {
             }
             Self::Default(expr) => {
                 s.append(TK_DEFAULT, None)?;
-                expr.to_tokens(s, context)
+                let parses_without_parentheses = match expr.as_ref() {
+                    Expr::Literal(_) | Expr::Id(_) | Expr::Parenthesized(_) => true,
+                    Expr::Unary(UnaryOperator::Positive | UnaryOperator::Negative, operand) => {
+                        matches!(operand.as_ref(), Expr::Literal(_))
+                    }
+                    _ => false,
+                };
+                if parses_without_parentheses {
+                    return expr.to_tokens(s, context);
+                }
+                s.append(TK_LP, None)?;
+                expr.to_tokens(s, context)?;
+                s.append(TK_RP, None)
             }
             Self::Collate { collation_name } => {
                 s.append(TK_COLLATE, None)?;

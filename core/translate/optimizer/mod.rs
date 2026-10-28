@@ -1,5 +1,5 @@
 use super::{
-    collate::get_collseq_from_expr,
+    collate::expr_collation,
     emitter::Resolver,
     plan::{
         DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember,
@@ -14,7 +14,7 @@ use crate::schema::GeneratedType;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::{
-    function::{AggFunc, Deterministic},
+    function::{AggFunc, Deterministic, Func},
     index_method::{IndexMethodAttachment, IndexMethodCostContext, IndexMethodCostEstimate},
     numeric::Numeric,
     schema::{
@@ -103,10 +103,18 @@ impl AvailableIndexes {
             .joined_tables()
             .iter()
             .filter(|jt| matches!(jt.table, Table::BTree(_) | Table::Virtual(_))) // only b-tree tables can have indexes
+            .filter(|jt| jt.btree().is_none_or(|btree| btree.has_rowid))
             .filter_map(|jt| {
-                let indexes = resolver.with_schema(jt.database_id, |schema| {
-                    schema.indexes.get(jt.table.get_name()).cloned()
-                })?;
+                let indexes: VecDeque<_> =
+                    resolver.with_schema(jt.namespace.database_id, |schema| {
+                        schema
+                            .indices_including_backing(jt.namespace.id, jt.table.get_name())
+                            .cloned()
+                            .collect()
+                    });
+                if indexes.is_empty() {
+                    return None;
+                }
                 Some((jt.internal_id, indexes))
             })
             .collect();
@@ -370,8 +378,8 @@ fn try_match_index_method_pattern(
     let pattern_has_order_by = !pattern.order_by.is_empty();
     let pattern_has_limit = pattern.limit.is_some();
 
-    // If pattern has ORDER BY, it must match exactly
-    if pattern_has_order_by && order_by.len() != pattern.order_by.len() {
+    // If pattern has ORDER BY or LIMIT, ORDER BY must match exactly
+    if (pattern_has_order_by || pattern_has_limit) && order_by.len() != pattern.order_by.len() {
         return None;
     }
 
@@ -785,10 +793,9 @@ fn transform_match_to_fts_match(
             .find(|t| t.internal_id == table_id)
             .and_then(|t| {
                 if let Table::BTree(btree) = &t.table {
-                    Some(
-                        resolver
-                            .with_schema(t.database_id, |schema| schema.has_fts_index(&btree.name)),
-                    )
+                    Some(resolver.with_schema(t.namespace.database_id, |schema| {
+                        schema.has_fts_index(t.namespace.id, &btree.name)
+                    }))
                 } else {
                     None
                 }
@@ -862,7 +869,10 @@ fn transform_match_to_fts_match(
 ///
 /// Analogous to SQLite's `isSimpleCount()` + `minMaxQuery()`.
 /// Must be called before `optimize_table_access` so the order target is available.
-fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
+fn detect_simple_aggregate(
+    plan: &SelectPlan,
+    resolver: &Resolver,
+) -> Result<Option<SimpleAggregate>> {
     // Common preconditions shared by count(*) and min/max.
     if plan.aggregates.len() != 1
         || plan.table_references.joined_tables().len() != 1
@@ -870,8 +880,9 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
         || plan.group_by.is_some()
         || plan.contains_constant_false_condition
         || plan.aggregates.first().unwrap().filter_expr.is_some()
+        || !plan.aggregates.first().unwrap().order_by().is_empty()
     {
-        return None;
+        return Ok(None);
     }
 
     let table_ref = plan.table_references.joined_tables().first().unwrap();
@@ -881,7 +892,7 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
     // The result column must be exactly the aggregate expression (not wrapped in
     // something like `length(count(*))`).
     if !exprs_are_equivalent(result_expr, &agg.original_expr) {
-        return None;
+        return Ok(None);
     }
 
     let is_unfiltered_btree_count = matches!(table_ref.table, Table::BTree(..))
@@ -889,7 +900,7 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
         && plan.where_clause.is_empty()
         && plan.offset.is_none();
 
-    match agg.func {
+    Ok(match agg.func {
         AggFunc::Count0 if is_unfiltered_btree_count => Some(SimpleAggregate::Count),
         AggFunc::Count
             if is_unfiltered_btree_count
@@ -914,9 +925,7 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
             } else {
                 SortOrder::Desc
             };
-            let collation = get_collseq_from_expr(&argument, &plan.table_references)
-                .ok()
-                .flatten();
+            let collation = expr_collation(&argument, Some(&plan.table_references), resolver)?;
             Some(SimpleAggregate::MinMax(Box::new(MinMaxDef {
                 func: agg.func.clone(),
                 argument,
@@ -925,7 +934,7 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
             })))
         }
         _ => None,
-    }
+    })
 }
 
 /// The table reads chosen by the join search.
@@ -1111,8 +1120,8 @@ fn find_select_plan_form(
         return Ok(None);
     }
 
-    plan.simple_aggregate = detect_simple_aggregate(plan);
-    let table_plan = find_table_access_plan(
+    plan.simple_aggregate = detect_simple_aggregate(plan, resolver)?;
+    let mut table_plan = find_table_access_plan(
         schema,
         resolver,
         &mut plan.result_columns,
@@ -1127,6 +1136,9 @@ fn find_select_plan_form(
         &mut plan.offset,
         plan.input_cardinality_hint.unwrap_or(1.0),
         cost_limit,
+        // Every row the WHERE clause keeps reaches the LIMIT unless an aggregate or DISTINCT
+        // comes between.
+        !plan.distinctness.is_distinct() && plan.aggregates.is_empty(),
     )?;
 
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
@@ -1184,6 +1196,20 @@ fn find_select_plan_form(
     }
 
     plan_correlated_subqueries(plan, resolver, &subquery_calls, cache, save_subquery_plans)?;
+    // The unmatched-right-row plans copied the WHERE subqueries before the
+    // correlated ones were planned. Copy the planned subqueries instead.
+    if let Some(table_plan) = table_plan.as_mut() {
+        for unmatched_plan in table_plan.unmatched_right_rows_plans.iter_mut().flatten() {
+            for copied_subquery in &mut unmatched_plan.subqueries {
+                *copied_subquery = plan
+                    .non_from_clause_subqueries
+                    .iter()
+                    .find(|subquery| subquery.internal_id == copied_subquery.internal_id)
+                    .expect("a copied WHERE subquery must still be in the query")
+                    .clone();
+            }
+        }
+    }
 
     let table_cost = table_cost.or_else(|| {
         plan.table_references
@@ -1425,12 +1451,16 @@ fn update_write_set_reason(
             .iter()
             .map(|set_clause| set_clause.column_index)
             .try_collect()?;
-        let database_id = table_ref.database_id;
+        let updated_col_names: Vec<_> = plan
+            .set_clauses
+            .iter()
+            .flat_map(|set_clause| set_clause.column_names.iter().cloned())
+            .try_collect()?;
         if has_triggers_including_temp(
             resolver,
-            database_id,
+            table_ref.namespace,
             TriggerEvent::Update,
-            Some(&updated_cols),
+            Some(&updated_col_names),
             btree_table,
         ) {
             break 'requires Some(DmlSafetyReason::Trigger);
@@ -1443,8 +1473,8 @@ fn update_write_set_reason(
         // twice. Self-referential cascades likewise rewrite rows in the
         // target during the scan. Materialize target rowids first to keep
         // the write set stable. (See issue #6460.)
-        let referencing_fks = resolver.with_schema(database_id, |s| {
-            s.resolved_fks_referencing(&btree_table.name)
+        let referencing_fks = resolver.with_schema(table_ref.namespace.database_id, |s| {
+            s.resolved_fks_referencing(table_ref.namespace.id, &btree_table.name)
         })?;
         for fk in &referencing_fks {
             if matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict) {
@@ -1611,6 +1641,7 @@ fn build_update_write_set_plan(
             join_type: JoinType::Inner,
             using: vec![],
             no_reorder: false,
+            lateral: false,
         });
         from_tables.add_joined_table(target_table);
         from_tables
@@ -1686,7 +1717,6 @@ fn build_update_write_set_plan(
             ephemeral_subs
         },
         simple_aggregate: None,
-        phantom_params: vec![],
     };
 
     plan.write_set_plan = Some(WriteSetPlan {
@@ -1890,6 +1920,7 @@ fn optimize_table_access_with_custom_modules(
     group_by: &mut Option<GroupBy>,
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
+    rows_pass_through: bool,
 ) -> Result<bool> {
     let tables = table_references.joined_tables();
     if tables.is_empty() {
@@ -1933,6 +1964,13 @@ fn optimize_table_access_with_custom_modules(
                 if !table_mask_from_expr(argument, table_references, subqueries)?.is_empty() {
                     continue 'patterns;
                 }
+            }
+
+            // A pattern with LIMIT applies the LIMIT to the rows it gives out, so it serves only
+            // a query whose rows reach the LIMIT as they leave the WHERE clause, with no
+            // aggregate or DISTINCT between.
+            if pattern_match.pattern_has_limit && !rows_pass_through {
+                continue;
             }
 
             // Mark WHERE clause as consumed
@@ -2063,7 +2101,10 @@ fn base_row_estimate(
 ) -> RowCountEstimate {
     match &table.table {
         Table::BTree(btree) => {
-            if let Some(stats) = schema.analyze_stats.table_stats(&btree.name) {
+            if let Some(stats) = schema
+                .analyze_stats
+                .table_stats(table.namespace.id, &btree.name)
+            {
                 if let Some(rows) = stats.row_count.or_else(|| {
                     stats
                         .index_stats
@@ -2144,13 +2185,15 @@ fn group_count_from_analyze(plan: &SelectPlan, group_by: &GroupBy, schema: &Sche
         .iter()
         .find(|table| table.internal_id == table_id)?;
     let btree = table.btree()?;
-    let table_stats = schema.analyze_stats.table_stats(&btree.name)?;
+    let table_stats = schema
+        .analyze_stats
+        .table_stats(table.namespace.id, &btree.name)?;
 
     table_stats
         .index_stats
         .iter()
         .filter_map(|(index_name, index_stats)| {
-            let index = schema.get_index(&btree.name, index_name)?;
+            let index = schema.get_index(table.namespace.id, &btree.name, index_name)?;
             if index.where_clause.is_some() || index.columns.len() < columns.len() {
                 return None;
             }
@@ -2338,6 +2381,12 @@ fn enforce_indexed_by_hints(
         match indexed {
             ast::Indexed::IndexedBy(name) => {
                 let idx_name = name.as_str();
+                if table_ref.btree().is_some_and(|btree| !btree.has_rowid) {
+                    crate::bail_parse_error!(
+                        "INDEXED BY is not supported on WITHOUT ROWID tables: {}",
+                        idx_name
+                    );
+                }
                 // Verify the index exists and belongs to this table.
                 let forced_index =
                     available_indexes.btree_index_by_name(table_ref.internal_id, idx_name);
@@ -2433,6 +2482,7 @@ fn optimize_table_access(
         offset,
         initial_input_cardinality,
         None,
+        true,
     )?
     else {
         return Ok(None);
@@ -2469,6 +2519,7 @@ fn find_table_access_plan(
     offset: &mut Option<Box<Expr>>,
     initial_input_cardinality: f64,
     cost_limit: Option<Cost>,
+    rows_pass_through: bool,
 ) -> Result<Option<TableAccessPlan>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
@@ -2601,6 +2652,7 @@ fn find_table_access_plan(
             group_by,
             limit,
             offset,
+            rows_pass_through,
         )?;
         if optimized {
             return Ok(None);
@@ -2632,11 +2684,16 @@ fn find_table_access_plan(
     } else {
         Vec::new()
     };
-    let maybe_order_target = simple_aggregate
-        .and_then(|sa| simple_aggregate_order_target(sa, table_references))
-        .or_else(|| compute_order_target(order_by, group_by.as_mut(), table_references));
+    let simple_aggregate_target = match simple_aggregate {
+        Some(sa) => simple_aggregate_order_target(sa, table_references, resolver)?,
+        None => None,
+    };
+    let maybe_order_target = match simple_aggregate_target {
+        Some(target) => Some(target),
+        None => compute_order_target(order_by, group_by.as_mut(), table_references, resolver)?,
+    };
 
-    add_implied_column_equalities(where_clause, table_references)?;
+    add_implied_column_equalities(where_clause, table_references, resolver)?;
     let mut constraints_per_table = constraints_from_where_clause(
         where_clause,
         table_references,
@@ -2644,6 +2701,7 @@ fn find_table_access_plan(
         subqueries,
         schema,
         params,
+        resolver,
     )?;
 
     // Enforce INDEXED BY / NOT INDEXED after outer-join rewrites settle, because
@@ -2661,6 +2719,7 @@ fn find_table_access_plan(
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
         allow_automatic_index: true,
+        resolver,
     };
 
     let Some(best_join_order_result) = compute_best_join_order_with_context(
@@ -2830,6 +2889,7 @@ fn plan_unmatched_right_rows(
             subqueries,
             schema,
             params,
+            resolver,
         )?
         .swap_remove(table_index);
         // The main plan already checked the INDEXED BY index. The unmatched-row
@@ -2874,6 +2934,7 @@ fn plan_unmatched_right_rows(
                 cost_limit: None,
                 // In SQLite, `WHERE_RIGHT_JOIN` mode disables automatic indexes.
                 allow_automatic_index: false,
+                resolver,
             },
             &where_clause_for_unmatched_rows,
             // The result subroutine evaluates all WHERE terms after matching.
@@ -3793,7 +3854,7 @@ fn mark_seek_constraints_consumed(
     }
 }
 
-fn mark_partial_index_predicate_terms_consumed(
+pub(crate) fn mark_partial_index_predicate_terms_consumed(
     index: &Index,
     table_reference: &JoinedTable,
     where_clause: &mut [WhereTerm],
@@ -3892,9 +3953,7 @@ fn maybe_remove_index_candidate(
             };
 
             if let Some(idx_col) = matching_idx_col {
-                // Index columns without explicit COLLATE use BINARY.
-                // Treat them as BINARY for ordering compatibility checks.
-                if col_order.collation != idx_col.collation.unwrap_or_default() {
+                if col_order.collation != idx_col.collation {
                     *index = None;
                     return;
                 }
@@ -4099,7 +4158,12 @@ impl Optimizable for ast::Expr {
                 else {
                     return false;
                 };
-                func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
+                // Like SQLite's SQLITE_FUNC_SLOCHNG functions, the date and time
+                // functions return the same value for the whole statement, so they
+                // can be computed once instead of on every row.
+                let same_for_whole_statement = func.is_deterministic()
+                    || matches!(func, Func::Scalar(f) if f.is_date_time_function());
+                same_for_whole_statement && args.iter().all(|arg| arg.is_constant(resolver))
             }
             Expr::FunctionCallStar { .. } => false,
             // A merged USING column reads table columns, so its value changes from row to row.
@@ -4269,7 +4333,7 @@ fn ephemeral_index_build(
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table: i,
-                collation: c.collation_opt(),
+                collation: c.collation(),
                 default: c.default.clone(),
                 expr: expr.map(Box::new),
             }
@@ -4318,6 +4382,7 @@ fn ephemeral_index_build(
             .is_some_and(|btree| btree.has_rowid),
         index_method: None,
         on_conflict: None,
+        constraint_name: None,
     };
 
     Ok(ephemeral_index)
@@ -4855,6 +4920,7 @@ mod tests {
         database_schemas: &'a RwLock<HashMap<usize, crate::sync::Arc<Schema>>>,
         temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
+        namespaces: &'a crate::Qualifiers,
         syms: &'a SymbolTable,
     ) -> Resolver<'a> {
         Resolver::new(
@@ -4862,11 +4928,12 @@ mod tests {
             database_schemas,
             temp_database,
             attached_databases,
+            namespaces,
             syms,
             true,
             DoubleQuotedDml::Enabled,
             crate::sync::Arc::new(crate::dialect::SqliteDialect),
-            &None,
+            None,
         )
     }
 
@@ -4894,12 +4961,14 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
+        let namespaces = crate::Qualifiers::default();
         let temp_database = RwLock::new(None);
         let resolver = empty_resolver(
             &schema,
             &database_schemas,
             &temp_database,
             &attached_databases,
+            &namespaces,
             &syms,
         );
 
@@ -4930,12 +4999,14 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
+        let namespaces = crate::Qualifiers::default();
         let temp_database = RwLock::new(None);
         let resolver = empty_resolver(
             &schema,
             &database_schemas,
             &temp_database,
             &attached_databases,
+            &namespaces,
             &syms,
         );
 

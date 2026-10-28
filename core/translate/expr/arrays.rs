@@ -38,9 +38,10 @@ pub(super) fn emit_array_element_loop(
         rhs: max_reg,
         target_pc: ok_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: SQLITE_CONSTRAINT,
         description: format!(
             "array exceeds maximum element count for custom type transform ({MAX_ARRAY_LOOP_ELEMENTS})"
@@ -61,15 +62,16 @@ pub(super) fn emit_array_element_loop(
         dest: reg_offset,
     });
 
-    let loop_start = program.offset();
+    let loop_start = program.allocate_label();
     let loop_end_label = program.allocate_label();
+    program.preassign_label_to_next_insn(loop_start);
 
     program.emit_insn(Insn::Gt {
         lhs: reg_idx,
         rhs: reg_len,
         target_pc: loop_end_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
 
     // Extract element from record blob (1-based index)
@@ -85,7 +87,7 @@ pub(super) fn emit_array_element_loop(
         transform_expr,
         reg_elem,
         reg_elem,
-        col,
+        &col.ty_params,
         type_def,
         resolver,
     )?;
@@ -195,7 +197,9 @@ pub(crate) fn emit_array_decode(
     }
 
     // Convert record blob to JSON text for display
-    program.emit_insn(Insn::ArrayDecode { reg });
+    if !program.flags.keep_array_results_as_blobs() {
+        program.emit_insn(Insn::ArrayDecode { reg });
+    }
     Ok(())
 }
 
@@ -261,7 +265,7 @@ pub(crate) fn emit_custom_type_encode_columns(
         // Apply encode for each type in the chain (child first, then parent)
         for td in &resolved.chain {
             if let Some(encode_expr) = td.encode() {
-                emit_type_expr(program, encode_expr, reg, reg, col, td, resolver)?;
+                emit_type_expr(program, encode_expr, reg, reg, &col.ty_params, td, resolver)?;
             }
         }
 
@@ -324,7 +328,7 @@ pub(crate) fn emit_custom_type_decode_columns(
         // Apply decode in reverse order (parent/ancestor first, then child)
         for td in resolved.chain.iter().rev() {
             if let Some(decode_expr) = td.decode() {
-                emit_type_expr(program, decode_expr, reg, reg, col, td, resolver)?;
+                emit_type_expr(program, decode_expr, reg, reg, &col.ty_params, td, resolver)?;
             }
         }
 

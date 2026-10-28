@@ -1,5 +1,6 @@
 use crate::alloc::TryClone;
 use crate::function::ExternalFunc;
+use crate::namespace::NamespaceId;
 use crate::native_ext::*;
 use crate::sync::{Arc, Mutex};
 use crate::types::{AggContext, ExternalAggState, IOCompletions, IOResultOr};
@@ -137,10 +138,13 @@ fn native_scalar_connection_context_survives_io_and_helper_queries() {
         ),
     );
     let context = Arc::new(AtomicI64::new(7));
-    let first = plain.db.connect_with_context(context.clone()).unwrap();
+    let first = plain
+        .db
+        .connect_with_context(crate::ConnectOpts::new(), context.clone())
+        .unwrap();
     let second = plain
         .db
-        .connect_with_context(Arc::new(AtomicI64::new(19)))
+        .connect_with_context(crate::ConnectOpts::new(), Arc::new(AtomicI64::new(19)))
         .unwrap();
     let mut statement = first.prepare("SELECT connection_context_read(1)").unwrap();
     assert!(matches!(statement.step().unwrap(), StepResult::IO));
@@ -1088,7 +1092,10 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
         )
         .unwrap();
     assert!(matches!(
-        schema.get_table("reloaded").unwrap().as_ref(),
+        schema
+            .get_table(NamespaceId::ROOT, "reloaded")
+            .unwrap()
+            .as_ref(),
         crate::schema::Table::Virtual(_)
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 5);
@@ -1325,13 +1332,50 @@ fn native_modules_require_trigger_permission_for_both_table_kinds() {
         } else {
             [("restricted_rows", false), ("allowed_rows", true)]
         } {
-            let table = conn.current_schema().get_table(name).unwrap();
+            let table = conn
+                .current_schema()
+                .get_table(NamespaceId::ROOT, name)
+                .unwrap();
             let crate::schema::Table::Virtual(table) = table.as_ref() else {
                 panic!("expected virtual table {name}");
             };
             assert_eq!(table.innocuous, expected, "{name}");
         }
     }
+}
+
+/// A view or trigger of an attached database resolves a name without a
+/// database in its own database, as SQLite's fixer binds it there, so it does
+/// not see a virtual table of main.
+#[test]
+fn view_and_trigger_of_attached_database_do_not_see_a_virtual_table_of_main() {
+    let module = RowsModule {
+        queue: Arc::new(Mutex::new(Vec::new())),
+        rows: Arc::new(Mutex::new(Vec::new())),
+        events: Arc::new(Mutex::new(Vec::new())),
+        writable: false,
+    };
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(crate::DatabaseOpts::new().with_attach(true))
+            .native_module("rows", VTabKind::VirtualTable, InnocuousModule(module)),
+    );
+    conn.execute("CREATE VIRTUAL TABLE vt USING rows").unwrap();
+    conn.execute("ATTACH ':memory:' AS aux").unwrap();
+
+    // The name is resolved when the statement is prepared, so the module is
+    // never run.
+    conn.execute("CREATE VIEW aux.v AS SELECT * FROM vt")
+        .unwrap();
+    let err = conn.prepare("SELECT count(*) FROM aux.v").unwrap_err();
+    assert!(err.to_string().contains("no such table"), "{err}");
+
+    conn.execute("CREATE TABLE aux.t(x)").unwrap();
+    conn.execute("CREATE TABLE aux.log(x)").unwrap();
+    conn.execute("CREATE TRIGGER aux.tr AFTER INSERT ON t BEGIN INSERT INTO log SELECT count(*) FROM vt; END")
+        .unwrap();
+    let err = conn.prepare("INSERT INTO aux.t VALUES (1)").unwrap_err();
+    assert!(err.to_string().contains("no such table"), "{err}");
 }
 
 #[test]

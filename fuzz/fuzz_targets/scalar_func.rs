@@ -7,6 +7,7 @@ use turso_core::functions::datetime::{
     exec_unixepoch,
 };
 use turso_core::functions::printf::exec_printf;
+use turso_core::io::clock::DefaultClock;
 use turso_core::json::{
     is_json_valid, json_array, json_array_length, json_error_position, json_extract, json_insert,
     json_object, json_patch, json_quote, json_remove, json_replace, json_set, json_type,
@@ -350,7 +351,7 @@ fn execute_scalar_func(call: ScalarFuncCall) {
                     let _ = CoreValue::exec_substring(&v1, &v2, None);
                 }
                 BinaryFunc::Timediff => {
-                    let _ = exec_timediff([v1, v2]);
+                    let _ = exec_timediff(&DefaultClock, [v1, v2]);
                 }
             }
         }
@@ -372,10 +373,10 @@ fn execute_scalar_func(call: ScalarFuncCall) {
             let vals: Vec<CoreValue> = vals.into_iter().map(|v| v.into()).collect();
             match func {
                 VariadicFunc::Min => {
-                    let _ = CoreValue::exec_min(vals.iter());
+                    let _ = CoreValue::exec_min(vals.iter(), |a, b| Ok(a.cmp(b)));
                 }
                 VariadicFunc::Max => {
-                    let _ = CoreValue::exec_max(vals.iter());
+                    let _ = CoreValue::exec_max(vals.iter(), |a, b| Ok(a.cmp(b)));
                 }
                 VariadicFunc::ConcatStrings => {
                     let _ = CoreValue::exec_concat_strings(vals.iter());
@@ -391,22 +392,22 @@ fn execute_scalar_func(call: ScalarFuncCall) {
                     let _ = exec_printf(&regs);
                 }
                 VariadicFunc::Date => {
-                    let _ = exec_date(vals.iter());
+                    let _ = exec_date(&DefaultClock, vals.iter());
                 }
                 VariadicFunc::Time => {
-                    let _ = exec_time(vals.iter());
+                    let _ = exec_time(&DefaultClock, vals.iter());
                 }
                 VariadicFunc::DateTime => {
-                    let _ = exec_datetime_full(vals.iter());
+                    let _ = exec_datetime_full(&DefaultClock, vals.iter());
                 }
                 VariadicFunc::JulianDay => {
-                    let _ = exec_julianday(vals.iter());
+                    let _ = exec_julianday(&DefaultClock, vals.iter());
                 }
                 VariadicFunc::UnixEpoch => {
-                    let _ = exec_unixepoch(vals.iter());
+                    let _ = exec_unixepoch(&DefaultClock, vals.iter());
                 }
                 VariadicFunc::Strftime => {
-                    let _ = exec_strftime(vals.iter());
+                    let _ = exec_strftime(&DefaultClock, vals.iter());
                 }
             }
         }
@@ -424,7 +425,7 @@ fn execute_scalar_func(call: ScalarFuncCall) {
         ScalarFuncCall::Nullif(v1, v2) => {
             let v1: CoreValue = v1.into();
             let v2: CoreValue = v2.into();
-            let _ = v1.exec_nullif(&v2);
+            let _ = v1.exec_nullif(&v2, |a, b| Ok(a.cmp(b)));
         }
         ScalarFuncCall::Like(pattern, text, escape) => {
             let pattern: CoreValue = pattern.into();
@@ -449,7 +450,7 @@ fn execute_scalar_func(call: ScalarFuncCall) {
             let v1: CoreValue = v1.into();
             let v2: CoreValue = v2.into();
             let math_func: MathFunc = func.into();
-            let _ = v1.exec_math_binary(&v2, &math_func);
+            let _ = v1.exec_math_binary(&v2, &math_func, false);
         }
         ScalarFuncCall::MathLog(val, base) => {
             let v: CoreValue = val.into();

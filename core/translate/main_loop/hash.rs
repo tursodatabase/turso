@@ -2,7 +2,7 @@ use super::*;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
-use crate::translate::expr::comparison_affinity;
+use crate::translate::expr::{comparison_affinity, maybe_apply_affinity};
 use crate::translate::plan::ColumnUsedMask;
 use crate::vdbe::builder::SelfTableContext;
 
@@ -102,7 +102,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
             key_affinities.push(affinity.aff_mask());
         }
 
-        let collations: Vec<CollationSeq> = self
+        let collations = self
             .hash_join_op
             .join_keys
             .iter()
@@ -117,20 +117,17 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                         join_key.get_build_expr(self.predicates),
                     ),
                 };
-                resolve_comparison_collseq_with_symbols(
+                comparison_collation(
                     original_lhs,
                     original_rhs,
-                    self.table_references,
-                    Some(self.t_ctx.resolver.symbol_table),
+                    Some(self.table_references),
+                    &self.t_ctx.resolver,
                 )
-                .unwrap_or(CollationSeq::Binary)
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let use_bloom_filter = self.hash_join_op.use_bloom_filter
-            && collations
-                .iter()
-                .all(|c| matches!(*c, CollationSeq::Binary | CollationSeq::Unset));
+            && collations.iter().all(|c| *c == CollationSeq::Binary);
 
         let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
         let (payload_columns, payload_signature_columns, uses_materialized_keys_and_payload) =
@@ -282,7 +279,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             planner.program.emit_insn(Insn::OpenRead {
                 cursor_id: planner.hash_build_cursor_id,
                 root_page: btree.root_page,
-                db: build_table.database_id,
+                db: build_table.namespace.database_id,
             });
         }
 
@@ -394,6 +391,25 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                             payload_reg + i,
                             build_table.columns()[col_idx].affinity(),
                         );
+                    }
+                    Some(_) if !config.uses_materialized_keys_and_payload => {
+                        emit_stored_column(
+                            planner.program,
+                            payload_source_cursor_id,
+                            col_idx,
+                            payload_reg + i,
+                            &planner.t_ctx.resolver,
+                        )?;
+                        let column = &build_table.columns()[col_idx];
+                        if planner
+                            .t_ctx
+                            .resolver
+                            .schema()
+                            .get_type_def(&column.ty_str, build_table.table.is_strict())
+                            .is_none()
+                        {
+                            maybe_apply_affinity(column.ty(), payload_reg + i, planner.program);
+                        }
                     }
                     _ => planner.program.emit_column_or_rowid(
                         payload_source_cursor_id,
@@ -512,7 +528,7 @@ pub(super) fn build_prefilter_where_terms(
         {
             continue;
         }
-        if expr_references_outer_query(&cond.expr, table_references) {
+        if expr_reads_an_outer_query(&cond.expr, table_references, subqueries)? {
             continue;
         }
         term_indices.push(cond_idx);
@@ -628,7 +644,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                 self.program.emit_insn(Insn::OpenRead {
                     cursor_id,
                     root_page: btree.root_page,
-                    db: build_table.database_id,
+                    db: build_table.namespace.database_id,
                 });
                 cursor_id
             })
@@ -653,11 +669,10 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         let hash_table_id: usize = build_table.internal_id.into();
         let num_keys = self.hash_join_op.join_keys.len();
 
-        // A prior probe pass must not hide unmatched build rows in this pass.
-        if self.hash_join_op.join_type.keeps_unmatched_build_rows() {
-            self.program
-                .emit_insn(Insn::HashResetMatched { hash_table_id });
-        }
+        // The build runs once; every pass through this loop probes it again and
+        // must not see probe rows, grace progress or matched marks of a prior pass.
+        self.program
+            .emit_insn(Insn::HashProbeInit { hash_table_id });
 
         self.program.emit_insn(Insn::Rewind {
             cursor_id: self.probe_cursor_id,
@@ -822,7 +837,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         if build_table_cursor_id.is_some() && !payload_has_build_rowid && !build_table_is_live {
             self.t_ctx
                 .resolver
-                .cache_expr_reg(Cow::Owned(rowid_expr), match_reg, false, None);
+                .cache_expr_reg(Cow::Owned(rowid_expr), match_reg, false);
         }
         if let Some(payload_reg) = payload_dest_reg {
             for (i, payload) in payload_columns.iter().enumerate() {
@@ -854,19 +869,13 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                     continue;
                 }
                 if is_column {
-                    self.t_ctx.resolver.cache_scalar_expr_reg(
-                        Cow::Owned(expr),
-                        payload_reg + i,
-                        true,
-                        self.table_references,
-                    )?;
+                    self.t_ctx
+                        .resolver
+                        .cache_expr_reg(Cow::Owned(expr), payload_reg + i, true);
                 } else {
-                    self.t_ctx.resolver.cache_expr_reg(
-                        Cow::Owned(expr),
-                        payload_reg + i,
-                        false,
-                        None,
-                    );
+                    self.t_ctx
+                        .resolver
+                        .cache_expr_reg(Cow::Owned(expr), payload_reg + i, false);
                 }
             }
         } else if let Some(build_table_cursor_id) =
