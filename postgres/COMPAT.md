@@ -72,11 +72,16 @@ Basics not enumerated by the official feature matrix.
 The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 `pg_namespace`, `pg_attribute`, `pg_type` (builtin + array + enum types),
 `pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_sequence`, `pg_sequences`,
-`pg_database`, `pg_roles` (single hardcoded `turso` role), `pg_proc`, `pg_am`,
+`pg_database`, `pg_roles` (hardcoded `turso` and `pg_database_owner` roles), `pg_proc`, `pg_am`,
 plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
-`pg_foreign_table`, `pg_partitioned_table`, `pg_collation`, `pg_description`,
+`pg_foreign_table`, `pg_partitioned_table`, `pg_collation`,
 `pg_publication*`, `pg_seclabels` (security labels are not supported).
+`pg_description` contains the default `standard public schema` comment for
+`public`, so pg_dump does not emit a command to clear that comment on restore.
+User-defined comments are not persisted. The public schema reports
+`pg_database_owner` as its owner, with CREATE and USAGE for that role and USAGE
+for PUBLIC. These are catalog defaults; role management is not implemented.
 `pg_statistic_ext` exposes the hidden system column
 `tableoid` for pg_dump discovery. `pg_trigger` exposes `tgparentid` for
 parent-trigger lookup and hidden `tableoid` during dump discovery.
@@ -410,7 +415,7 @@ Upgrade is not supported.
 | Per user/database connection limits | ❌ Not supported | |
 | Predefined roles | ❌ Not supported | |
 | Privileges for setting configuration parameters | ❌ Not supported | |
-| ROLES | ❌ Not supported | pg_roles exposes a single hardcoded `turso` role |
+| ROLES | ❌ Not supported | pg_roles exposes hardcoded `turso` and `pg_database_owner` roles |
 | Row-level security | ❌ Not supported | |
 | SCRAM-SHA-256 authentication | ❌ Not supported | |
 | Search+bind mode operation for LDAP authentication | ❌ Not supported | |

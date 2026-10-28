@@ -2052,7 +2052,7 @@ impl Schema {
         if let Some(table) = removed {
             self.unregister_table_root_page(&table);
         }
-        self.analyze_stats.remove_table(&name);
+        self.analyze_stats.remove_table(namespace, &name);
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -2191,7 +2191,7 @@ impl Schema {
     pub fn remove_indices_for_table(&mut self, namespace: NamespaceId, table_name: &str) {
         let name = normalize_ident(table_name);
         self.namespace_mut(namespace).indexes.remove(&name);
-        self.analyze_stats.remove_table(&name);
+        self.analyze_stats.remove_table(namespace, &name);
     }
 
     pub fn remove_index(&mut self, namespace: NamespaceId, idx: &Index) {
@@ -2201,7 +2201,7 @@ impl Schema {
             .get_mut(&name)
             .expect("Must have the index")
             .retain_mut(|other_idx| other_idx.name != idx.name);
-        self.analyze_stats.remove_index(&name, &idx.name);
+        self.analyze_stats.remove_index(namespace, &name, &idx.name);
     }
 
     pub fn table_has_indexes(&self, namespace: NamespaceId, table_name: &str) -> bool {
@@ -2813,7 +2813,8 @@ impl Schema {
             }
 
             // Create the IncrementalView with all root pages
-            let incremental_view = IncrementalView::from_sql(&sql, self, main_root)?;
+            let incremental_view =
+                IncrementalView::from_sql(&sql, self, main_root, NamespaceId::ROOT)?;
 
             // Create a BTreeTable for the materialized view
             let cols = incremental_view.column_schema.flat_columns()?;
@@ -3225,8 +3226,11 @@ impl Schema {
                             select,
                             ..
                         } => {
-                            let mut view_column_schema =
-                                crate::util::extract_view_columns(&select, self)?;
+                            let mut view_column_schema = crate::util::extract_view_columns(
+                                NamespaceId::ROOT,
+                                &select,
+                                self,
+                            )?;
                             view_column_schema.rename_columns(&column_names);
                             let view = View::new(
                                 name.to_string(),
@@ -4902,7 +4906,9 @@ impl BTreeTable {
 
     fn primary_key_implies_not_null(&self, column: &Column) -> bool {
         column.primary_key()
-            && (self.is_strict || (!self.has_rowid && self.primary_key_columns.len() == 1))
+            && (column.is_rowid_alias()
+                || self.is_strict
+                || (!self.has_rowid && self.primary_key_columns.len() == 1))
     }
 
     pub fn column_collations(&self) -> Result<Vec<CollationSeq>> {
@@ -6900,7 +6906,7 @@ impl Column {
     }
     #[inline]
     pub fn notnull(&self) -> bool {
-        self.info.notnull()
+        self.info.notnull() || self.is_rowid_alias()
     }
     #[inline]
     pub fn set_notnull(&mut self, v: bool) {
@@ -7641,6 +7647,37 @@ mod tests {
     }
 
     #[test]
+    fn tables_of_the_same_name_in_two_namespaces_keep_their_own_statistics() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(1);
+        schema.add_namespace(other);
+        schema
+            .add_btree_table(NamespaceId::ROOT, table("CREATE TABLE t (x)", 2))
+            .unwrap();
+        schema
+            .add_btree_table(other, table("CREATE TABLE t (x)", 3))
+            .unwrap();
+        schema
+            .analyze_stats
+            .table_stats_mut(NamespaceId::ROOT, "t")
+            .row_count = Some(10);
+        schema.analyze_stats.table_stats_mut(other, "t").row_count = Some(20);
+
+        let row_count = |schema: &Schema, namespace| {
+            schema
+                .analyze_stats
+                .table_stats(namespace, "t")
+                .and_then(|stats| stats.row_count)
+        };
+        assert_eq!(row_count(&schema, NamespaceId::ROOT), Some(10));
+        assert_eq!(row_count(&schema, other), Some(20));
+
+        schema.remove_table(other, "t");
+        assert_eq!(row_count(&schema, other), None);
+        assert_eq!(row_count(&schema, NamespaceId::ROOT), Some(10));
+    }
+
+    #[test]
     fn persisted_materialized_views_are_loaded_in_dependency_order() {
         let mut views = HashMap::default();
         views.insert(
@@ -7832,13 +7869,17 @@ mod tests {
             for (actual, flag) in [
                 (column.primary_key(), ColDefFlags::PrimaryKey),
                 (column.is_rowid_alias(), ColDefFlags::RowIdAlias),
-                (column.notnull(), ColDefFlags::NotNull),
                 (column.explicit_notnull(), ColDefFlags::ExplicitNotNull),
                 (column.unique(), ColDefFlags::Unique),
                 (column.hidden(), ColDefFlags::Hidden),
             ] {
                 assert_eq!(actual, flags.contains(flag), "{flags:?}: {flag:?}");
             }
+            assert_eq!(
+                column.notnull(),
+                flags.intersects(ColDefFlags::NotNull | ColDefFlags::RowIdAlias),
+                "{flags:?}"
+            );
             assert_eq!(column.ty(), Type::Numeric, "{flags:?}");
             assert_eq!(
                 column.collation_opt(),
@@ -8229,6 +8270,21 @@ mod tests {
         let column = table.get_column("a").unwrap().1;
         assert!(column.notnull());
         Ok(())
+    }
+
+    #[test]
+    fn rowid_alias_is_not_nullable() {
+        for sql in [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE t(id INTEGER, PRIMARY KEY(id))",
+        ] {
+            let table = BTreeTable::from_sql(sql, 2).unwrap();
+            let column = table.get_column("id").unwrap().1;
+            assert!(column.notnull(), "{sql}");
+            assert!(!column.explicit_notnull(), "{sql}");
+        }
+        let table = BTreeTable::from_sql("CREATE TABLE t(id INTEGER PRIMARY KEY DESC)", 2).unwrap();
+        assert!(!table.get_column("id").unwrap().1.notnull());
     }
 
     #[test]

@@ -28,6 +28,8 @@ pub struct ExplainInfo {
     /// Shared CTEs materialized before the main query, for `EXPLAIN QUERY PLAN`
     /// consumers. Empty outside `EXPLAIN QUERY PLAN` mode.
     pub cte_materializations: Vec<EqpCteMaterialization>,
+    /// Cursor IDs opened as ephemeral (OpenEphemeral / OpenAutoindex / OpenDup).
+    pub ephemeral_cursors: HashSet<usize>,
 }
 
 impl ExplainInfo {
@@ -36,6 +38,24 @@ impl ExplainInfo {
             .iter()
             .find(|(offset, _)| *offset == insn_index)
             .map(|(_, comment)| *comment)
+    }
+
+    pub(crate) fn build_ephemeral_cursors(&mut self, insns: &[(Insn, usize)]) {
+        self.ephemeral_cursors.clear();
+        for (insn, _) in insns {
+            match insn {
+                Insn::OpenEphemeral { cursor_id, .. } => {
+                    self.ephemeral_cursors.insert(*cursor_id);
+                }
+                Insn::OpenAutoindex { cursor_id } => {
+                    self.ephemeral_cursors.insert(*cursor_id);
+                }
+                Insn::OpenDup { new_cursor_id, .. } => {
+                    self.ephemeral_cursors.insert(*new_cursor_id);
+                }
+                _ => {}
+            }
+        }
     }
 
     pub(crate) fn remap_insn_indices(&mut self, old_to_new: &[usize]) {
@@ -54,22 +74,7 @@ pub fn insn_to_row(
     program: &PreparedProgram,
     insn: &Insn,
 ) -> (&'static str, i64, i64, i64, Value, i64, String) {
-    let mut ephemeral_cursors = HashSet::default();
-    for (insn, _) in &program.insns {
-        match insn {
-            Insn::OpenEphemeral { cursor_id, .. } => {
-                ephemeral_cursors.insert(*cursor_id);
-            }
-            Insn::OpenAutoindex { cursor_id } => {
-                ephemeral_cursors.insert(*cursor_id);
-            }
-            Insn::OpenDup { new_cursor_id, .. } => {
-                // Note: relies on invariant that OpenDup is only for ephemeral cursors
-                ephemeral_cursors.insert(*new_cursor_id);
-            }
-            _ => {}
-        }
-    }
+    let ephemeral_cursors = &program.explain.ephemeral_cursors;
 
     let get_table_or_index_name = |cursor_id: usize| -> String {
         let cursor_type = &program.cursor_ref[cursor_id].1;

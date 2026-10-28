@@ -93,8 +93,9 @@ pub fn translate_create_materialized_view(
     // Check for cross-database table references first
     crate::util::validate_select_for_views(select_stmt, view_name.namespace.as_ref())?;
 
-    let mut view_column_schema =
-        resolver.with_schema(database_id, |s| extract_view_columns(select_stmt, s))?;
+    let mut view_column_schema = resolver.with_schema(database_id, |s| {
+        extract_view_columns(namespace.id, select_stmt, s)
+    })?;
     // The parser checks the column count when it can count the SELECT's
     // columns; a `*` is only expanded here.
     if !columns.is_empty() && columns.len() != view_column_schema.columns.len() {
