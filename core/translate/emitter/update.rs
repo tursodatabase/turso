@@ -2522,7 +2522,9 @@ fn emit_update_insns<'a>(
                 && table.has_autoincrement
                 && connection.mv_store_for_db(update_database_id).is_some()
             {
-                let seq_name = crate::schema::autoincrement_sequence_name(&target_table.identifier);
+                let seq_name = crate::schema::autoincrement_sequence_name(
+                    &t_ctx.resolver.mangle_name(update_namespace, &table.name),
+                );
                 let seq = t_ctx
                     .resolver
                     .with_schema(update_database_id, |s| {
@@ -2537,7 +2539,7 @@ fn emit_update_insns<'a>(
                 crate::translate::sequence::emit_disk_advance_past(
                     program,
                     &t_ctx.resolver,
-                    update_namespace,
+                    NamespaceRef::root_of(update_database_id),
                     &seq_name,
                     &seq,
                     effective_rowid_reg,

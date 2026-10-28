@@ -30,6 +30,9 @@ pub enum NoConstantOptReason {
     /// Each value reuses the same register, so hoisting would collapse
     /// all values into the last one.
     InListEphemeral,
+    /// The SELECT has a constant-false WHERE clause, so result expressions
+    /// must stay after the jump that skips producing rows.
+    FilteredResultRow,
 }
 
 /// Controls how binary expressions are emitted.

@@ -12,7 +12,7 @@ use crate::mvcc::database::{IndexRowsEntry, RowVersions};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
-use crate::namespace::NamespaceId;
+use crate::namespace::{mangle_name, NamespaceId};
 use crate::schema::{Index, Schema};
 use crate::skiplist::base::RefEntry;
 use crate::skiplist::comparator::{BasicComparator, Comparator};
@@ -802,11 +802,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     // TODO: make sequence compaction setup resumable before re-enabling
                     // fault injection for this collection.
                     schema
-                        .sequences(NamespaceId::ROOT)
-                        .filter(|seq| !seq.cycle)
-                        .filter_map(|seq| {
+                        .all_sequences()
+                        .filter(|(_, seq)| !seq.cycle)
+                        .filter_map(|(namespace, seq)| {
                             let backing_name =
-                                crate::translate::sequence::sequence_backing_table_name(&seq.name);
+                                crate::translate::sequence::sequence_backing_table_name(
+                                    &mangle_name(namespace, &seq.name),
+                                );
                             let bt = schema.get_btree_table(NamespaceId::ROOT, &backing_name)?;
                             let backing_root = resolve_root(bt.root_page)?;
                             // Resolve the MVCC table_id once per sequence so the

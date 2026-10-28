@@ -3,7 +3,7 @@ use crate::connection_hooks::{ConnectionHooks, SavepointMemo};
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
-use crate::namespace::{Namespace, NamespaceId, NamespaceRef};
+use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
@@ -40,6 +40,7 @@ use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 use std::any::Any;
+use std::borrow::Cow;
 
 use std::fmt::Display;
 use std::ops::Deref;
@@ -230,6 +231,11 @@ pub enum SubqueryUnnestingMode {
 enum ReparsePhase {
     /// Scanning `SELECT * FROM sqlite_schema` into `fresh`.
     ParseSchema,
+    /// Loading the names of the namespaces from the namespaces table.
+    LoadNamespaces {
+        stmt: Box<Statement>,
+        rows: Vec<(i64, String)>,
+    },
     /// Recovering sequence descriptors from each `__turso_internal_seq_*`
     /// backing table via SQL (or grafting the VACUUM-preserved map). The
     /// per-backing-table descriptor read yields IO, so the worklist and the
@@ -264,6 +270,20 @@ enum ReparsePhase {
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
     },
+}
+
+impl ReparsePhase {
+    fn populate_sequences() -> Self {
+        ReparsePhase::PopulateSequences {
+            pending: None,
+            idx: 0,
+            stmt: None,
+            meta: None,
+            seq: None,
+            watermark_stmt: None,
+            watermark_row: None,
+        }
+    }
 }
 
 /// Re-entrant driver state for
@@ -419,7 +439,7 @@ pub struct Connection {
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
     /// The names that qualify object names in SQL, each referring to a
     /// database.
-    pub(super) namespaces: crate::Namespaces,
+    pub(super) qualifiers: Qualifiers,
     /// The namespace names that a name without a namespace is looked up
     /// through, in order. None means main, then the other databases by id.
     pub(super) search_path: RwLock<Option<Vec<String>>>,
@@ -1486,7 +1506,7 @@ impl Connection {
                     // Resolver so attached-db qualifiers in temp triggers can be
                     // mapped to their actual index on this connection.
                     let attached_resolver = |name: &str| -> Option<usize> {
-                        self.namespaces
+                        self.qualifiers
                             .database_id(&crate::util::normalize_ident(name))
                     };
                     crate::return_if_io!(crate::util::parse_schema_rows(
@@ -1497,16 +1517,40 @@ impl Connection {
                         self.db.dialect().as_ref(),
                     ));
 
+                    // Under a dialect without namespaces, a table of that name
+                    // is an ordinary table.
+                    if inner.fresh.supports_namespaces()
+                        && inner.fresh.has_table(
+                            NamespaceId::ROOT,
+                            crate::schema::TURSO_NAMESPACES_TABLE_NAME,
+                        )
+                    {
+                        // Install the schema so the namespaces table can be read.
+                        self.with_schema_mut(|schema| {
+                            *schema = inner.fresh.try_clone()?;
+                            Ok::<_, crate::alloc::TryReserveError>(())
+                        })??;
+                        let stmt = self.prepare_internal(format!(
+                            "SELECT id, name FROM {}",
+                            crate::schema::TURSO_NAMESPACES_TABLE_NAME
+                        ))?;
+                        inner.phase = ReparsePhase::LoadNamespaces {
+                            stmt: Box::new(stmt),
+                            rows: Vec::new(),
+                        };
+                    } else {
+                        inner.fresh.load_namespace_names(&[])?;
+                        inner.phase = ReparsePhase::populate_sequences();
+                    }
+                }
+                ReparsePhase::LoadNamespaces { stmt, rows } => {
+                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        rows.push((row.get::<i64>(0)?, row.get::<&str>(1)?.to_string()));
+                        Ok(())
+                    }));
+                    inner.fresh.load_namespace_names(rows)?;
                     // Next: recover sequence descriptors (or graft the VACUUM map).
-                    inner.phase = ReparsePhase::PopulateSequences {
-                        pending: None,
-                        idx: 0,
-                        stmt: None,
-                        meta: None,
-                        seq: None,
-                        watermark_stmt: None,
-                        watermark_row: None,
-                    };
+                    inner.phase = ReparsePhase::populate_sequences();
                 }
                 ReparsePhase::PopulateSequences {
                     pending,
@@ -1552,11 +1596,8 @@ impl Connection {
                         };
                         let (backing_table_name, seq_name) = entry;
                         let normalized = crate::util::normalize_ident(&seq_name);
-                        if inner
-                            .fresh
-                            .get_sequence(NamespaceId::ROOT, &normalized)
-                            .is_some()
-                        {
+                        let (namespace, sequence_name) = inner.fresh.demangle_name(&normalized);
+                        if inner.fresh.has_sequence(namespace, sequence_name) {
                             *idx += 1;
                             *stmt = None;
                             *meta = None;
@@ -1573,7 +1614,7 @@ impl Connection {
                                 meta,
                             ));
                             *seq = Some(Self::sequence_from_descriptor_meta(
-                                &seq_name,
+                                sequence_name,
                                 &backing_table_name,
                                 *meta,
                             )?);
@@ -1596,11 +1637,9 @@ impl Connection {
                             mv_store.set_sequence_watermark(&normalized, watermark);
                         }
                         let sequence = seq.take().expect("sequence set above");
-                        inner.fresh.insert_sequence(
-                            NamespaceId::ROOT,
-                            normalized,
-                            Arc::new(sequence),
-                        );
+                        inner
+                            .fresh
+                            .insert_sequence_under_mangled_name(&normalized, Arc::new(sequence));
                         *idx += 1;
                         *stmt = None;
                         *meta = None;
@@ -1946,6 +1985,33 @@ impl Connection {
 
     pub(crate) fn increment_deferred_foreign_key_violations(&self, v: isize) {
         self.fk_deferred_violations.fetch_add(v, Ordering::AcqRel);
+    }
+
+    /// Query the `(id, name)` rows of the namespaces table. The connection's
+    /// schema must already contain the table definitions so that `prepare`
+    /// can resolve the table name. Returns an empty Vec if the database has
+    /// no namespaces table.
+    pub(crate) fn query_stored_namespaces(self: &Arc<Connection>) -> Result<Vec<(i64, String)>> {
+        let has_namespaces_table = {
+            let s = self.schema.read();
+            s.has_table(
+                NamespaceId::ROOT,
+                crate::schema::TURSO_NAMESPACES_TABLE_NAME,
+            )
+        };
+        if !has_namespaces_table {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.prepare_internal(format!(
+            "SELECT id, name FROM {}",
+            crate::schema::TURSO_NAMESPACES_TABLE_NAME
+        ))?;
+        let mut rows = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            rows.push((row.get::<i64>(0)?, row.get::<&str>(1)?.to_string()));
+            Ok(())
+        })?;
+        Ok(rows)
     }
 
     pub fn maybe_update_schema(&self) {
@@ -2856,7 +2922,7 @@ impl Connection {
             let mut materialized_view_info = HashMap::default();
 
             let attached_resolver = |name: &str| -> Option<usize> {
-                self.namespaces
+                self.qualifiers
                     .database_id(&crate::util::normalize_ident(name))
             };
             for (ty, name, table_name, root_page, sql) in &rows_data {
@@ -2959,7 +3025,7 @@ impl Connection {
     }
 
     pub fn attached_database_names(&self) -> Vec<String> {
-        self.namespaces
+        self.qualifiers
             .attached_databases()
             .into_iter()
             .map(|namespace| namespace.name)
@@ -3095,22 +3161,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let pragma = format!("PRAGMA {pragma_name}({pragma_value})");
-        let mut stmt = self.prepare(pragma)?;
-        let mut results = Vec::new();
-        loop {
-            match stmt.step()? {
-                vdbe::StepResult::Row => {
-                    let row: Vec<Value> = stmt.row().unwrap().get_values().cloned().collect();
-                    results.push(row);
-                }
-                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy);
-                }
-                _ => break,
-            }
-        }
-
-        Ok(results)
+        self.prepare(pragma)?.run_collect_rows()
     }
 
     #[inline]
@@ -3199,7 +3250,7 @@ impl Connection {
 
     /// Get the database id for a schema name ("main", "temp", or an attached db alias).
     pub(crate) fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
-        self.namespaces
+        self.current_qualifiers()
             .database_id(&crate::util::normalize_ident(name))
             .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {name}")))
     }
@@ -3224,7 +3275,7 @@ impl Connection {
     }
 
     pub(crate) fn is_attached(&self, alias: &str) -> bool {
-        self.namespaces
+        self.qualifiers
             .attached_databases()
             .iter()
             .any(|namespace| namespace.name == alias)
@@ -3325,28 +3376,97 @@ impl Connection {
         &self.attached_databases
     }
 
-    pub(crate) fn namespaces(&self) -> &crate::Namespaces {
-        &self.namespaces
+    /// The qualifiers the connection accepts, as of the schema it has: its
+    /// databases and the namespaces of its main database.
+    pub(crate) fn current_qualifiers(&self) -> Qualifiers {
+        self.maybe_update_schema();
+        let schema = self.schema.read().clone();
+        self.qualifiers(&schema).into_owned()
     }
 
-    /// Adds `namespace` under its name, so that `name.t` names its objects.
-    pub fn add_namespace(&self, namespace: Namespace) {
-        self.namespaces.add(namespace);
+    /// The qualifiers the connection accepts as of `schema`, the main
+    /// database's schema: its databases and the namespaces of `schema`.
+    /// They are the connection's own when `schema` has no namespaces.
+    pub(crate) fn qualifiers(&self, schema: &Schema) -> Cow<'_, Qualifiers> {
+        if schema.namespaces().next().is_none() {
+            return Cow::Borrowed(&self.qualifiers);
+        }
+        Cow::Owned(self.qualifiers.with_namespaces(schema.namespaces()))
+    }
+
+    /// Adds `qualifier`, so that `name.t` names the objects of the
+    /// namespace it refers to.
+    pub fn add_qualifier(&self, qualifier: Qualifier) {
+        self.qualifiers.add(qualifier);
         self.bump_prepare_context_generation();
     }
 
-    /// Removes namespace `name` and returns the database it referred to.
-    pub fn remove_namespace(&self, name: &str) -> Option<usize> {
-        let database_id = self.namespaces.remove(name);
+    /// Removes the qualifier `name` and returns the database it referred to.
+    pub fn remove_qualifier(&self, name: &str) -> Option<usize> {
+        let database_id = self.qualifiers.remove(name);
         self.bump_prepare_context_generation();
         database_id
     }
 
+    /// Creates namespace `name` in the main database, as DDL of the
+    /// connection's transaction, and returns it. The schema keeps the
+    /// objects of the namespace under its id, so `name` can be anything
+    /// that no namespace is called yet.
+    pub fn create_namespace(self: &Arc<Self>, name: &str) -> Result<Qualifier> {
+        let statement = turso_parser::ast::Stmt::CreateSchema {
+            name: turso_parser::ast::Name::exact(name.to_string()),
+        };
+        self.prepare_namespace_stmt(statement)?.run_ignore_rows()?;
+        let namespace = self
+            .current_qualifiers()
+            .get(name)
+            .expect("CREATE SCHEMA added the namespace");
+        Ok(namespace)
+    }
+
+    /// Drops namespace `name` from the main database, as DDL of the
+    /// connection's transaction. Its objects stay stored under its id, so
+    /// the caller drops them first.
+    pub fn drop_namespace(self: &Arc<Self>, name: &str) -> Result<()> {
+        if self
+            .current_qualifiers()
+            .get(name)
+            .is_none_or(|namespace| namespace.is_database())
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                "no such namespace: {name}"
+            )));
+        }
+        let statement = turso_parser::ast::Stmt::DropSchema {
+            name: turso_parser::ast::Name::exact(name.to_string()),
+        };
+        self.prepare_namespace_stmt(statement)?.run_ignore_rows()
+    }
+
+    /// Prepares CREATE SCHEMA or DROP SCHEMA. No dialect parses their text, so
+    /// preparing the statement again, after another connection changes the
+    /// schema, translates the statement itself.
+    fn prepare_namespace_stmt(
+        self: &Arc<Self>,
+        statement: turso_parser::ast::Stmt,
+    ) -> Result<Statement> {
+        let sql = statement.to_string();
+        let cmd = turso_parser::ast::Cmd::Stmt(statement);
+        let mut stmt = self.prepare_translated_cmd(cmd.clone(), &sql)?;
+        stmt.reprepare_from(cmd);
+        Ok(stmt)
+    }
+
     /// The name of the namespace that is the whole of database `database_id`.
     pub fn namespace_name(&self, database_id: usize) -> Option<String> {
-        self.namespaces
+        self.qualifiers
             .of_database(database_id)
             .map(|namespace| namespace.name)
+    }
+
+    /// The qualifier `name`. `name` is normalized.
+    pub fn qualifier(&self, name: &str) -> Option<Qualifier> {
+        self.current_qualifiers().get(name)
     }
 
     /// Sets the namespace names that a name without a namespace is looked
@@ -3367,8 +3487,8 @@ impl Connection {
     /// The namespaces that a name without a namespace is looked up in, in
     /// order. The first one is where CREATE puts an object whose name has
     /// no namespace.
-    pub fn search_order(&self) -> Vec<Namespace> {
-        self.namespaces
+    pub fn search_order(&self) -> Vec<Qualifier> {
+        self.current_qualifiers()
             .search_order(self.search_path.read().as_deref())
     }
 
@@ -3434,7 +3554,7 @@ impl Connection {
 
         // Add attached databases
         let attached_dbs = self.attached_databases.read();
-        for namespace in self.namespaces.attached_databases() {
+        for namespace in self.qualifiers.attached_databases() {
             let seq_number = namespace.database_id();
             let file_path = if let Some(entry) = attached_dbs.index_to_data.get(&seq_number) {
                 Self::get_canonical_path_for_database(&entry.db)
@@ -3607,7 +3727,7 @@ impl Connection {
         };
         if let Some((namespace, seq)) = name.split_once('.') {
             let namespace = self
-                .namespaces
+                .current_qualifiers()
                 .get(&crate::util::normalize_ident(namespace))
                 .ok_or_else(|| not_found(name))?;
             let seq_name = crate::util::normalize_ident(seq);
@@ -3657,6 +3777,11 @@ impl Connection {
         self.sequence_currvals
             .write()
             .remove(&(database_id, normalized));
+    }
+
+    /// Drop this connection's currval entries for every sequence.
+    pub fn clear_sequence_currvals(&self) {
+        self.sequence_currvals.write().clear();
     }
 
     /// Drop this connection's currval entries of every sequence of a
@@ -3740,9 +3865,12 @@ impl Connection {
                     };
                     let (backing_table_name, seq_name) = entry;
                     let normalized = crate::util::normalize_ident(&seq_name);
-                    let already_present = self.with_schema(MAIN_DB_ID, |s| {
-                        s.get_sequence(NamespaceId::ROOT, &normalized).is_some()
-                    });
+                    let (namespace, sequence_name) = crate::namespace::demangle_name(
+                        self.dialect().supports_namespaces(),
+                        &normalized,
+                    );
+                    let already_present =
+                        self.with_schema(MAIN_DB_ID, |s| s.has_sequence(namespace, sequence_name));
                     if already_present {
                         *idx += 1;
                         *stmt = None;
@@ -3760,7 +3888,7 @@ impl Connection {
                             meta,
                         ));
                         *seq = Some(Self::sequence_from_descriptor_meta(
-                            &seq_name,
+                            sequence_name,
                             &backing_table_name,
                             *meta,
                         )?);
@@ -3784,11 +3912,7 @@ impl Connection {
                     }
                     let sequence = seq.take().expect("sequence set above");
                     self.with_database_schema_mut(MAIN_DB_ID, |schema| {
-                        schema.insert_sequence(
-                            NamespaceId::ROOT,
-                            normalized.clone(),
-                            Arc::new(sequence),
-                        );
+                        schema.insert_sequence_under_mangled_name(&normalized, Arc::new(sequence));
                     })?;
                     *idx += 1;
                     *stmt = None;
@@ -5077,6 +5201,15 @@ mod tests {
         open_connection_with_opts(path, DatabaseOpts::new())
     }
 
+    #[test]
+    fn test_the_sqlite_dialect_does_not_store_namespaces() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection(&temp_dir.path().join("main.db"));
+        assert!(conn.prepare("CREATE SCHEMA app").is_err());
+        assert!(conn.create_namespace("app").is_err());
+        assert_eq!(conn.qualifier("app"), None);
+    }
+
     fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) -> Result<()> {
         let mut state = AttachDatabaseState::default();
         loop {
@@ -5119,7 +5252,7 @@ mod tests {
 
     // given a attached 'alias', return the Database and Pager for that attached database
     fn attached_entry(conn: &Connection, alias: &str) -> (Arc<Database>, Arc<Pager>) {
-        let index = conn.namespaces.database_id(alias).unwrap();
+        let index = conn.qualifiers.database_id(alias).unwrap();
         let catalog = conn.attached_databases.read();
         let entry = catalog.index_to_data.get(&index).unwrap();
         (entry.db.clone(), entry.pager.clone())
@@ -5222,6 +5355,33 @@ mod tests {
         assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
         conn.execute("CREATE TABLE v(z INTEGER)").unwrap();
         assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM main.v"), 0);
+    }
+
+    #[test]
+    fn test_a_database_that_does_not_store_namespaces_keeps_names_that_look_stored() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("main.db");
+        let conn = open_connection(&path);
+        conn.execute(
+            "CREATE TABLE __turso_ns1_t(x INTEGER); INSERT INTO __turso_ns1_t VALUES(7); \
+             CREATE TABLE p(v INTEGER); CREATE INDEX __turso_ns2_i ON p(v); INSERT INTO p VALUES(1); \
+             CREATE VIEW __turso_ns3_v AS SELECT x FROM __turso_ns1_t",
+        )
+        .unwrap();
+        assert!(conn.create_namespace("app").is_err());
+        drop(conn);
+
+        let conn = open_connection(&path);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM __turso_ns1_t"), 7);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM __turso_ns3_v"), 7);
+        assert!(conn.execute("DROP INDEX i").is_err());
+        conn.execute("DROP INDEX __turso_ns2_i").unwrap();
+        conn.execute("ALTER TABLE p RENAME TO __turso_ns4_p")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT v FROM __turso_ns4_p"), 1);
+        let mut stmt = conn.prepare("PRAGMA integrity_check").unwrap();
+        assert!(matches!(stmt.step().unwrap(), StepResult::Row));
+        assert_eq!(stmt.row().unwrap().get::<&str>(0).unwrap(), "ok");
     }
 
     #[test]

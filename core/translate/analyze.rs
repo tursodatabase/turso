@@ -292,9 +292,10 @@ pub fn translate_analyze(
             dest: tbl_col_reg,
             default: None,
         });
+        let mangled_table_name = resolver.mangle_name(namespace, &target_table.name);
         let target_tbl_reg = program.alloc_register();
         program.emit_insn(Insn::String8 {
-            value: target_table.name.to_string(),
+            value: mangled_table_name.clone(),
             dest: target_tbl_reg,
         });
         program.mark_last_insn_constant();
@@ -381,7 +382,7 @@ pub fn translate_analyze(
         });
         let tablename_reg = program.alloc_register();
         program.emit_insn(Insn::String8 {
-            value: target_table.name.to_string(),
+            value: mangled_table_name.clone(),
             dest: tablename_reg,
         });
         program.mark_last_insn_constant();
@@ -455,7 +456,13 @@ pub fn translate_analyze(
             program.preassign_label_to_next_insn(after_insert);
         }
         for index in indexes {
-            emit_index_stats(program, stat_cursor, &target_table, &index, database_id);
+            emit_index_stats(
+                program,
+                stat_cursor,
+                &mangled_table_name,
+                &index,
+                database_id,
+            );
         }
     }
 
@@ -475,7 +482,7 @@ pub fn translate_analyze(
 fn emit_index_stats(
     program: &mut ProgramBuilder,
     stat_cursor: usize,
-    table: &Arc<BTreeTable>,
+    mangled_table_name: &str,
     index: &Arc<Index>,
     database_id: usize,
 ) {
@@ -637,7 +644,7 @@ fn emit_index_stats(
     // Allocate contiguous registers for MakeRecord: tablename, indexname, stat
     let record_start = program.alloc_registers(3);
     program.emit_insn(Insn::String8 {
-        value: table.name.to_string(),
+        value: mangled_table_name.to_string(),
         dest: record_start,
     });
     program.mark_last_insn_constant();

@@ -1183,7 +1183,7 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let namespaces = crate::Namespaces::default();
+        let namespaces = crate::Qualifiers::default();
         let temp_database = RwLock::new(None);
         let resolver = Resolver::new(
             &schema,

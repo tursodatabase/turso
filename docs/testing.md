@@ -120,16 +120,16 @@ The Turso deterministic simulator
 Usage: limbo_sim [OPTIONS]
 
 Options:
-  -s, --seed <SEED>                  set seed for reproducible runs
-  -d, --doublecheck                  enable doublechecking, run the simulator with the plan twice and check output equality
-  -n, --maximum-size <MAXIMUM_SIZE>  change the maximum size of the randomly generated sequence of interactions [default: 5000]
-  -k, --minimum-size <MINIMUM_SIZE>  change the minimum size of the randomly generated sequence of interactions [default: 1000]
-  -t, --maximum-time <MAXIMUM_TIME>  change the maximum time of the simulation(in seconds) [default: 3600]
-  -l, --load <LOAD>                  load plan from the bug base
-  -w, --watch                        enable watch mode that reruns the simulation on file changes
-      --differential                 run differential testing between sqlite and Turso
-  -h, --help                         Print help
-  -V, --version                      Print version
+  -s, --seed <SEED>                    set seed for reproducible runs
+  -d, --doublecheck                    enable doublechecking, run the simulator with the plan twice and check output equality
+  -n, --maximum-tests <MAXIMUM_TESTS>  change the maximum size of the randomly generated sequence of interactions [default: 5000]
+  -k, --minimum-tests <MINIMUM_TESTS>  change the minimum size of the randomly generated sequence of interactions [default: 1000]
+  -t, --maximum-time <MAXIMUM_TIME>    change the maximum time of the simulation(in seconds) [default: 3600]
+  -l, --load <LOAD>                    load plan from the bug base
+  -w, --watch                          enable watch mode that reruns the simulation on file changes
+      --differential                   run differential testing between sqlite and Turso
+  -h, --help                           Print help
+  -V, --version                        Print version
 ```
 
 ## Fuzzing

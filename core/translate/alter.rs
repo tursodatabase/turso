@@ -1,5 +1,5 @@
 use crate::alloc::TursoIteratorExt;
-use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::namespace::{demangle_name, NamespaceId, NamespaceRef};
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::{turso_assert_eq, turso_assert_ne};
@@ -19,7 +19,6 @@ use crate::{
     schema::{
         collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Column, ColumnLayout,
         ForeignKey, FromDefinitionFlags, Index, Schema, Table, EXPR_INDEX_SENTINEL,
-        RESERVED_TABLE_PREFIXES,
     },
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
@@ -49,17 +48,18 @@ use crate::{
 use either::Either;
 use rustc_hash::FxHashSet as HashSet;
 
-fn validate(alter_table: &ast::AlterTableBody, table_name: &str) -> Result<()> {
+fn validate(
+    alter_table: &ast::AlterTableBody,
+    table_name: &str,
+    supports_namespaces: bool,
+) -> Result<()> {
     // Check if someone is trying to ALTER a system table
     if crate::schema::is_system_table(table_name) {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
     if let ast::AlterTableBody::RenameTo(new_table_name) = alter_table {
         let normalized_new_name = normalize_ident(new_table_name.as_str());
-        if RESERVED_TABLE_PREFIXES
-            .iter()
-            .any(|prefix| normalized_new_name.starts_with(prefix))
-        {
+        if crate::namespace::is_reserved_object_name(supports_namespaces, &normalized_new_name) {
             crate::bail_parse_error!("Object name reserved for internal use: {}", new_table_name);
         }
     }
@@ -743,11 +743,16 @@ pub fn translate_alter_table(
     program.begin_write_on_database(database_id, schema_cookie)?;
     program.begin_write_operation()?;
     let table_name = qualified_name.name.as_str();
+    let mangled_table_name = resolver.mangle_name(namespace, &normalize_ident(table_name));
     // For attached databases, qualify sqlite_schema with the database name
     // so that the UPDATE targets the correct database's schema table.
     let qualified_schema_table = schema_table_name_for_db(resolver, database_id);
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
-    validate(&alter_table, table_name)?;
+    validate(
+        &alter_table,
+        table_name,
+        resolver.catalog.dialect.supports_namespaces(),
+    )?;
     reject_alter_of_view(&alter_table, table_name, resolver, namespace)?;
 
     let table_indexes = resolver.with_schema(database_id, |s| {
@@ -1037,9 +1042,9 @@ pub fn translate_alter_table(
 
             btree.columns_mut().remove(dropped_index);
 
-            let sql = escape_sql_string_literal(&btree.to_sql());
+            let sql = escape_sql_string_literal(&btree.to_sql_as(&mangled_table_name));
 
-            let escaped_table_name = escape_sql_string_literal(table_name);
+            let escaped_table_name = escape_sql_string_literal(&mangled_table_name);
             let stmt = format!(
                 r#"
                     UPDATE {qualified_schema_table}
@@ -1253,13 +1258,18 @@ pub fn translate_alter_table(
                             .map(|fk| fk.decl_order)
                             .max()
                             .map_or(0, |order| order + 1);
+                        let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
+                        let (parent_namespace, parent_table) = demangle_name(
+                            resolver.catalog.dialect.supports_namespaces(),
+                            &mangled_parent_table,
+                        );
                         let fk = ForeignKey {
                             constraint_name: constraint
                                 .name
                                 .as_ref()
                                 .map(|n| normalize_ident(n.as_str())),
-                            parent_table: normalize_ident(clause.tbl_name.as_str()),
-                            parent_namespace: namespace.id,
+                            parent_table: parent_table.to_string(),
+                            parent_namespace,
                             parent_columns: clause
                                 .columns
                                 .iter()
@@ -1333,8 +1343,8 @@ pub fn translate_alter_table(
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
 
-            let escaped = escape_sql_string_literal(&btree.to_sql());
-            let escaped_table_name = escape_sql_string_literal(table_name);
+            let escaped = escape_sql_string_literal(&btree.to_sql_as(&mangled_table_name));
+            let escaped_table_name = escape_sql_string_literal(&mangled_table_name);
             let stmt = format!(
                 r#"
                     UPDATE {qualified_schema_table}
@@ -1584,10 +1594,12 @@ pub fn translate_alter_table(
                     program.emit_column_or_rowid(cursor_id, i, first_column + i);
                 }
 
-                program.emit_string8_new_reg(table_name.to_string());
+                program.emit_string8_new_reg(mangled_table_name.clone());
                 program.mark_last_insn_constant();
 
-                program.emit_string8_new_reg(new_name.to_string());
+                program.emit_string8_new_reg(
+                    resolver.mangle_name(namespace, &normalize_ident(new_name)),
+                );
                 program.mark_last_insn_constant();
 
                 let out = program.alloc_registers(5);
@@ -1632,13 +1644,14 @@ pub fn translate_alter_table(
                 });
             });
 
+            let mangled_new_name = resolver.mangle_name(namespace, &normalized_new_name);
             emit_rename_sqlite_sequence_entry(
                 program,
                 resolver,
                 connection,
                 database_id,
-                &normalized_old_name,
-                &normalized_new_name,
+                &mangled_table_name,
+                &mangled_new_name,
             );
 
             // For AUTOINCREMENT tables, also rewrite the persistent
@@ -1650,8 +1663,8 @@ pub fn translate_alter_table(
             // only emit the sweep when the descriptor is present.
             let has_implicit_seq = resolver.with_schema(database_id, |s| {
                 s.get_sequence(
-                    namespace.id,
-                    &crate::schema::autoincrement_sequence_name(&normalized_old_name),
+                    NamespaceId::ROOT,
+                    &crate::schema::autoincrement_sequence_name(&mangled_table_name),
                 )
                 .is_some()
             });
@@ -1661,8 +1674,8 @@ pub fn translate_alter_table(
                     resolver,
                     connection,
                     database_id,
-                    &normalized_old_name,
-                    &normalized_new_name,
+                    &mangled_table_name,
+                    &mangled_new_name,
                 );
             }
 
@@ -2009,7 +2022,11 @@ pub fn translate_alter_table(
                             from,
                             col_name,
                         )? {
-                            rewrites.push((database_id, view_name.to_string(), rewritten.sql));
+                            rewrites.push((
+                                database_id,
+                                resolver.mangle_name(namespace, view_name),
+                                rewritten.sql,
+                            ));
                         }
                     }
                     Ok(rewrites)
@@ -2082,7 +2099,7 @@ pub fn translate_alter_table(
                     program.emit_column_or_rowid(cursor_id, i, first_column + i);
                 }
 
-                program.emit_string8_new_reg(table_name.to_string());
+                program.emit_string8_new_reg(mangled_table_name.clone());
                 program.mark_last_insn_constant();
 
                 program.emit_string8_new_reg(from.to_string());
@@ -2140,7 +2157,9 @@ pub fn translate_alter_table(
             // Update trigger SQL for renamed columns
             for (trigger_namespace, trigger_name, new_sql) in triggers_to_rewrite.clone() {
                 let escaped_sql = escape_sql_string_literal(&new_sql);
-                let escaped_trigger_name = escape_sql_string_literal(&trigger_name);
+                let escaped_trigger_name = escape_sql_string_literal(
+                    &resolver.mangle_name(trigger_namespace, &trigger_name),
+                );
                 let qualified_schema_table =
                     schema_table_name_for_db(resolver, trigger_namespace.database_id);
                 let update_stmt = format!(
@@ -2280,8 +2299,12 @@ pub fn translate_alter_table(
             }
 
             if clears_autoincrement_sequence {
-                let table_name_norm = normalize_ident(table_name);
-                emit_delete_sqlite_sequence_entry(program, resolver, database_id, &table_name_norm);
+                emit_delete_sqlite_sequence_entry(
+                    program,
+                    resolver,
+                    database_id,
+                    &mangled_table_name,
+                );
             }
 
             program.emit_insn(Insn::SetCookie {

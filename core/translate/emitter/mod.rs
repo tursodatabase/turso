@@ -306,7 +306,7 @@ impl Resolver<'static> {
             Box::leak(Box::new(RwLock::new(HashMap::default()))),
             Box::leak(Box::new(RwLock::new(None))),
             Box::leak(Box::new(RwLock::new(DatabaseCatalog::new()))),
-            Box::leak(Box::new(crate::Namespaces::default())),
+            Box::leak(Box::new(crate::Qualifiers::default())),
             Box::leak(Box::new(SymbolTable::new())),
             true,
             DoubleQuotedDml::Enabled,
@@ -323,7 +323,7 @@ impl<'a> Resolver<'a> {
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
         temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
-        namespaces: &'a crate::Namespaces,
+        qualifiers: &'a crate::Qualifiers,
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
         dqs_dml: DoubleQuotedDml,
@@ -336,7 +336,7 @@ impl<'a> Resolver<'a> {
                 database_schemas,
                 temp_database,
                 attached_databases,
-                namespaces,
+                qualifiers,
                 symbol_table,
                 enable_custom_types,
                 dialect,
@@ -690,6 +690,12 @@ impl<'a> Resolver<'a> {
         self.catalog.resolve_existing_sequence(seq_name)
     }
 
+    /// The namespace and bare name of the sequence whose mangled name is
+    /// `mangled`.
+    pub(crate) fn sequence_of_mangled_name(&self, mangled: &str) -> Option<(NamespaceRef, String)> {
+        self.catalog.sequence_of_mangled_name(mangled)
+    }
+
     pub(crate) fn find_existing_sequence(&self, seq_name: &str) -> Option<NamespaceRef> {
         self.catalog.find_existing_sequence(seq_name)
     }
@@ -699,6 +705,22 @@ impl<'a> Resolver<'a> {
     /// runs.
     pub(crate) fn runtime_sequence_name(&self, namespace: NamespaceRef, seq_name: &str) -> String {
         self.catalog.runtime_sequence_name(namespace, seq_name)
+    }
+
+    /// The name that object `name` of `namespace` is stored under in the
+    /// schema rows and the SQL text of its database.
+    pub(crate) fn mangle_name(&self, namespace: NamespaceRef, name: &str) -> String {
+        crate::namespace::mangle_name(namespace.id, name)
+    }
+
+    /// The name to write into SQL text for the object `written` of
+    /// `namespace`: the name as written for a root namespace, else the
+    /// mangled name.
+    pub(crate) fn name_in_sql(&self, namespace: NamespaceRef, written: &ast::Name) -> ast::Name {
+        if namespace.id.is_root() {
+            return written.clone();
+        }
+        ast::Name::exact(self.mangle_name(namespace, written.as_str()))
     }
 
     /// The namespace that the qualifier of `qualified_name` refers to, or
@@ -733,7 +755,7 @@ impl<'a> Resolver<'a> {
     }
 
     /// The name of `namespace`: the database's name for a root namespace,
-    /// else the name the namespace was added under.
+    /// else the namespace's name.
     pub(crate) fn name_of_namespace(&self, namespace: NamespaceRef) -> Option<String> {
         self.catalog.name_of_namespace(namespace)
     }
