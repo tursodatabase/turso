@@ -1443,3 +1443,12 @@ expect {
     FOREIGN KEY (key) REFERENCES other."Mixed Table"("Mixed Key")
     FOREIGN KEY (key) REFERENCES other."Mixed Table"("Mixed Key")
 }
+
+test pg-dump-descending-index-keys {
+    CREATE TABLE indexed (first INTEGER, second BIGINT, third TEXT);
+    CREATE INDEX idx ON indexed (first DESC, second ASC, third DESC);
+    SELECT indexdef FROM pg_indexes WHERE indexname = 'idx';
+}
+expect {
+    CREATE INDEX idx ON public.indexed USING btree (first DESC, second, third DESC)
+}

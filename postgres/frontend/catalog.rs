@@ -1,6 +1,6 @@
 use crate::functions::validate_pg_input;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::fmt::Debug;
+use std::fmt::{self, Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::{
@@ -12,7 +12,7 @@ use turso_core::{
     Value,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
-use turso_parser::ast::RefAct;
+use turso_parser::ast::{RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
 
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
@@ -3807,28 +3807,58 @@ pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<Stri
 }
 
 fn index_definition(schema: &Schema, index: &CatalogIndex) -> String {
-    let unique = if index.unique { "UNIQUE " } else { "" };
-    let cols: Vec<String> = index
-        .columns
-        .iter()
-        .map(|column| {
-            column
-                .expression
-                .clone()
-                .unwrap_or_else(|| quote_identifier(&column.name))
-        })
-        .collect();
-    let mut def = format!(
-        "CREATE {unique}INDEX {} ON {}.{} USING btree ({})",
-        quote_identifier(&index.name),
-        quote_identifier(schema_name_of(schema, index.namespace)),
-        quote_identifier(&index.table_name),
-        cols.join(", ")
-    );
-    if let Some(where_clause) = &index.where_clause {
-        def.push_str(&format!(" WHERE {where_clause}"));
+    IndexDefinition {
+        name: &index.name,
+        schema_name: schema_name_of(schema, index.namespace),
+        table_name: &index.table_name,
+        unique: index.unique,
+        columns: &index.columns,
+        where_clause: index.where_clause.as_deref(),
     }
-    def
+    .to_string()
+}
+
+struct IndexDefinition<'a> {
+    name: &'a str,
+    schema_name: &'a str,
+    table_name: &'a str,
+    unique: bool,
+    columns: &'a [CatalogIndexColumn],
+    where_clause: Option<&'a str>,
+}
+
+impl Display for IndexDefinition<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("CREATE ")?;
+        if self.unique {
+            f.write_str("UNIQUE ")?;
+        }
+        write!(
+            f,
+            "INDEX {} ON {}.{} USING btree (",
+            quote_identifier(self.name),
+            quote_identifier(self.schema_name),
+            quote_identifier(self.table_name),
+        )?;
+        for (position, column) in self.columns.iter().enumerate() {
+            if position != 0 {
+                f.write_str(", ")?;
+            }
+            match column.expression.as_deref() {
+                Some(expression) => f.write_str(expression)?,
+                None => f.write_str(&quote_identifier(&column.name))?,
+            }
+            match column.order {
+                SortOrder::Asc => {}
+                SortOrder::Desc => f.write_str(" DESC")?,
+            }
+        }
+        f.write_str(")")?;
+        if let Some(where_clause) = self.where_clause {
+            write!(f, " WHERE {where_clause}")?;
+        }
+        Ok(())
+    }
 }
 
 struct CatalogIndex {
@@ -3881,6 +3911,7 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                     name: column.name.clone().expect("primary key columns have names"),
                     position,
                     expression: None,
+                    order: SortOrder::Asc,
                 }],
                 unique: true,
                 primary: true,
@@ -3923,6 +3954,7 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                         },
                         position: column.pos_in_table,
                         expression: column.expr.as_ref().map(ToString::to_string),
+                        order: column.order,
                     })
                     .collect(),
                 unique: index.unique,
@@ -3939,6 +3971,7 @@ struct CatalogIndexColumn {
     name: String,
     position: usize,
     expression: Option<String>,
+    order: SortOrder,
 }
 
 fn unique_set_is_primary_key(table: &BTreeTable, set: &UniqueSet) -> bool {
