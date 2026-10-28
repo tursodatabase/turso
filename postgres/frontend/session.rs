@@ -1,6 +1,5 @@
 use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::num::NonZero;
 use std::str;
 use std::sync::Arc;
@@ -9,8 +8,10 @@ use crate::catalog::{self, PostgresDialect};
 use crate::error::sqlstate_error;
 use crate::functions::{find_parameter, ConfigParameter, Parameter};
 use crate::settings::{ConnectionSettings, PgSessionState, SettingScope};
-use turso_core::{is_memory_like, Connection, LimboError, Result, Statement, Value};
+use turso_core::schema::{Table, SEQ_BACKING_TABLE_PREFIX};
+use turso_core::{Connection, LimboError, Namespace, Result, Statement, Value};
 use turso_parser::ast::{self};
+use turso_pg_parser::foreign_key_tables;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_ACTIVE_SQL_TRANSACTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME,
@@ -66,25 +67,43 @@ pub fn open_database_with_io(
     opts: turso_core::DatabaseOpts,
 ) -> crate::Result<Arc<turso_core::Database>> {
     let file = io.open_file(path, flags, true)?;
+    let is_new = turso_core::is_memory_like(path) || file.size()? == 0;
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
-    turso_core::Database::open(
+    let db = turso_core::Database::open(
         io,
         path,
         turso_core::OpenOptions::new(Arc::new(PostgresDialect))
             .storage(db_file)
             .flags(flags)
             .db_opts(opts.with_mvcc(true)),
-    )
-    .map_err(Into::into)
+    )?;
+    if is_new {
+        set_up_new_database(&db)?;
+    }
+    Ok(db)
+}
+
+/// Sets up a database that was just made: creates the schema `public`, as
+/// PostgreSQL does when a database is created. `public` is a stored
+/// namespace like any other schema, so once dropped it stays dropped, and
+/// the root namespace holds only the engine's own tables. A read-only
+/// database is left as it is.
+pub fn set_up_new_database(db: &Arc<turso_core::Database>) -> crate::Result<()> {
+    let conn = db.connect(turso_core::ConnectOpts::new())?;
+    if conn.namespace("public").is_some() || conn.is_readonly(turso_core::MAIN_DB_ID) {
+        return Ok(());
+    }
+    match conn.create_namespace("public") {
+        Ok(_) => Ok(()),
+        Err(_) if conn.namespace("public").is_some() => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> crate::Result<Self> {
         let conn = db.connect_with_hooks(Arc::new(PgSessionState::default()))?;
-        conn.add_namespace(turso_core::Namespace::database(
-            "public",
-            turso_core::MAIN_DB_ID,
-        ));
+        refuse_tables_in_no_schema(&conn)?;
         set_search_path(&conn, None, SettingScope::Session)?;
         Ok(Self {
             inner: Arc::new(PgConnectionInner { conn }),
@@ -185,6 +204,33 @@ pub fn split_statements(sql: &str) -> crate::Result<Vec<String>> {
     }
 }
 
+/// A database whose tables are in the root namespace, in no schema, was
+/// made by an earlier version of tursopg or by SQLite. This version keeps
+/// every table in a schema and would hide those, so it refuses the
+/// database instead. A database that has a schema, or none and no tables,
+/// is opened as it is: a dropped `public` is not recreated.
+fn refuse_tables_in_no_schema(conn: &Arc<Connection>) -> Result<()> {
+    if conn.namespace("public").is_some() {
+        return Ok(());
+    }
+    let schema = conn.current_schema();
+    if schema.namespaces().next().is_some() {
+        return Ok(());
+    }
+    let has_tables_in_no_schema = schema
+        .tables(turso_core::NamespaceId::ROOT)
+        .any(|table| table.btree().is_some() && !catalog::is_system_table_name(table.get_name()))
+        || schema.views(turso_core::NamespaceId::ROOT).next().is_some();
+    if has_tables_in_no_schema {
+        return Err(LimboError::ParseError(
+            "the database keeps its tables in no schema, as an earlier version of tursopg or \
+             SQLite made it; this version does not open it"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crate::Statement> {
     let sql = sql.trim();
     if sql.is_empty() {
@@ -221,6 +267,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
         }
         None => (Cow::Borrowed(sql), parse_result),
     };
+    let (sql, parse_result) = name_foreign_key_tables(&pg_conn.conn, sql, parse_result)?;
     let translator = PostgreSQLTranslator::new();
     let translated = translator
         .translate_with_prereqs(&parse_result)
@@ -234,6 +281,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
         return pg_conn
             .conn
             .prepare_translated_cmd(translated.cmd, &sql)
+            .map_err(schema_error)
             .map(crate::Statement::new);
     }
 
@@ -244,10 +292,14 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
         let input = prereq.to_string();
         let _ = pg_conn
             .conn
-            .prepare_translated_stmt(prereq.clone(), &input)?;
+            .prepare_translated_stmt(prereq.clone(), &input)
+            .map_err(schema_error)?;
     }
     let cmd = translated.cmd;
-    let inner = pg_conn.conn.prepare_translated_cmd(cmd.clone(), &sql)?;
+    let inner = pg_conn
+        .conn
+        .prepare_translated_cmd(cmd.clone(), &sql)
+        .map_err(schema_error)?;
     let pg_conn = Arc::clone(pg_conn);
     let prereqs = translated.prereqs;
     let sql_owned = sql.into_owned();
@@ -270,7 +322,9 @@ fn execute_cmd_with_prereqs(
 ) -> Result<()> {
     let conn = &pg_conn.conn;
     if create_table_if_not_exists_target_present(conn, cmd)? {
-        *inner = conn.prepare_translated_cmd(cmd.clone(), sql)?;
+        *inner = conn
+            .prepare_translated_cmd(cmd.clone(), sql)
+            .map_err(schema_error)?;
         return inner.run_ignore_rows();
     }
 
@@ -281,10 +335,14 @@ fn execute_cmd_with_prereqs(
     let result = (|| {
         for prereq in prereqs {
             let input = prereq.to_string();
-            let mut stmt = conn.prepare_translated_stmt(prereq.clone(), &input)?;
+            let mut stmt = conn
+                .prepare_translated_stmt(prereq.clone(), &input)
+                .map_err(schema_error)?;
             stmt.run_ignore_rows()?;
         }
-        *inner = conn.prepare_translated_cmd(cmd.clone(), sql)?;
+        *inner = conn
+            .prepare_translated_cmd(cmd.clone(), sql)
+            .map_err(schema_error)?;
         inner.run_ignore_rows()
     })();
 
@@ -323,16 +381,17 @@ fn create_table_if_not_exists_target_present(
             default_schema.as_deref()
         }
     };
-    let Some(database) = relation_lookup_databases(conn, schema).into_iter().next() else {
+    let Some(namespace) = relation_lookup_namespaces(conn, schema).into_iter().next() else {
         return Ok(false);
     };
+    let database = database_of(conn, &namespace);
     let mut stmt = conn.prepare_sqlite(format!(
         "SELECT EXISTS (SELECT 1 FROM \"{database}\".sqlite_schema \
          WHERE type IN ('table', 'view') AND name COLLATE NOCASE = ?1)"
     ))?;
     stmt.bind_at(
         NonZero::new(1).unwrap(),
-        Value::build_text(tbl_name.name.as_str().to_string()),
+        Value::build_text(namespace.mangle_name(tbl_name.name.as_str())),
     )?;
     let rows = stmt.run_collect_rows()?;
     Ok(rows
@@ -341,11 +400,73 @@ fn create_table_if_not_exists_target_present(
         .is_some_and(|val| *val == Value::from_i64(1)))
 }
 
+/// `sql` with each table that a foreign key names replaced by the name the
+/// table is stored under, so that the stored text of the statement names
+/// the table as it is stored, which is how the text is read when the
+/// schema loads. A table named with a schema is in that schema. A table
+/// named without one is in the first schema of the search path that has
+/// it, as in PostgreSQL, or else in the schema the statement creates its
+/// table in, so a table can reference itself.
+fn name_foreign_key_tables<'a>(
+    conn: &Arc<Connection>,
+    sql: Cow<'a, str>,
+    parse_result: turso_pg_parser::ParseResult,
+) -> Result<(Cow<'a, str>, turso_pg_parser::ParseResult)> {
+    let tables = foreign_key_tables(&parse_result);
+    if tables.is_empty() {
+        return Ok((sql, parse_result));
+    }
+    let mut sql = sql.into_owned();
+    for table in tables.iter().rev() {
+        let namespace = match table.schema.as_deref() {
+            Some(schema) => conn.namespace(&schema.to_lowercase()).ok_or_else(|| {
+                LimboError::ParseError(format!("schema \"{schema}\" does not exist"))
+            })?,
+            None => foreign_key_table_namespace(conn, &table.name).ok_or_else(|| {
+                LimboError::ParseError("no schema has been selected to create in".to_string())
+            })?,
+        };
+        sql = turso_pg_parser::name_at(&sql, table.location, &namespace.mangle_name(&table.name))
+            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+    }
+    let parse_result =
+        turso_pg_parser::parse(&sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    Ok((Cow::Owned(sql), parse_result))
+}
+
+/// The schema that a foreign key target named without a schema is in: the
+/// first schema of the search path that has a table of that name, or the
+/// first schema of the search path, where the statement creates its table.
+fn foreign_key_table_namespace(conn: &Arc<Connection>, name: &str) -> Option<Namespace> {
+    let schema = conn.current_schema();
+    let candidates: Vec<Namespace> = conn
+        .search_order()
+        .into_iter()
+        .filter(|namespace| namespace.database_id() == turso_core::MAIN_DB_ID)
+        .collect();
+    candidates
+        .iter()
+        .find(|namespace| schema.has_table(namespace.target.id, name))
+        .or_else(|| candidates.first())
+        .cloned()
+}
+
+/// Core reports a name whose namespace does not exist as a missing
+/// database; in PostgreSQL that is a missing schema.
+fn schema_error(error: LimboError) -> LimboError {
+    let LimboError::InvalidArgument(message) = &error else {
+        return error;
+    };
+    match message.strip_prefix("no such database: ") {
+        Some(schema) => LimboError::ParseError(format!("schema \"{schema}\" does not exist")),
+        None => error,
+    }
+}
+
 /// The schema that a CREATE TABLE statement naming its table without a
 /// schema creates the table in, with the byte offset of the table name: the
 /// first schema of `search_path` that exists, like PostgreSQL. None when the
-/// statement is not such a CREATE TABLE or when the table goes to public,
-/// which is where core puts it anyway.
+/// statement is not such a CREATE TABLE.
 fn create_table_schema_from_search_path(
     pg_conn: &Arc<PgConnectionInner>,
     parse_result: &turso_pg_parser::ParseResult,
@@ -359,42 +480,39 @@ fn create_table_schema_from_search_path(
             "no schema has been selected to create in",
         )
     })?;
-    if schema.eq_ignore_ascii_case("public") {
-        return Ok(None);
-    }
     Ok(Some((location, schema)))
 }
 
 /// Whether the schema of table `table` already has a table, index, view or
 /// sequence named `name`, which makes PostgreSQL choose another name for a
-/// new index on the table. Main when no database has the table.
+/// new index on the table. A table named with a schema is in that schema.
+/// Otherwise the table is looked up in the same order as core does: temp
+/// first, then the namespaces of the search path.
 fn relation_name_is_taken(
     conn: &Arc<Connection>,
     schema: Option<&str>,
     table: &str,
     name: &str,
 ) -> Result<bool> {
-    let mut databases = relation_lookup_databases(conn, schema);
-    if schema.is_none() {
-        databases.push("main".to_string());
-    }
+    let namespaces = relation_lookup_namespaces(conn, schema);
     let mut taken = false;
-    for database in databases {
+    for namespace in namespaces {
+        let database = database_of(conn, &namespace);
         let mut stmt = conn.prepare_sqlite(format!(
             "SELECT \
              EXISTS (SELECT 1 FROM \"{database}\".sqlite_schema \
                      WHERE type = 'table' AND name COLLATE NOCASE = ?1), \
              EXISTS (SELECT 1 FROM \"{database}\".sqlite_schema \
                      WHERE type IN ('table', 'index', 'view') \
-                     AND name COLLATE NOCASE IN (?2, '{SEQUENCE_TABLE_PREFIX}' || ?2))"
+                     AND name COLLATE NOCASE IN (?2, '{SEQ_BACKING_TABLE_PREFIX}' || ?2))"
         ))?;
         stmt.bind_at(
             NonZero::new(1).unwrap(),
-            Value::build_text(table.to_string()),
+            Value::build_text(namespace.mangle_name(table)),
         )?;
         stmt.bind_at(
             NonZero::new(2).unwrap(),
-            Value::build_text(name.to_string()),
+            Value::build_text(namespace.mangle_name(name)),
         )?;
         let row = &stmt.run_collect_rows()?[0];
         taken = row[1] == Value::from_i64(1);
@@ -420,7 +538,8 @@ fn reject_drop_of_other_view_kind(
         "view"
     };
     let schema = view_name.namespace.as_ref().map(|name| name.as_str());
-    for database in relation_lookup_databases(conn, schema) {
+    for namespace in relation_lookup_namespaces(conn, schema) {
+        let database = database_of(conn, &namespace);
         let mut stmt = conn.prepare_sqlite(format!(
             "SELECT CASE WHEN type = 'table' THEN 'table' \
                          WHEN rootpage = 0 THEN 'view' \
@@ -430,7 +549,7 @@ fn reject_drop_of_other_view_kind(
         ))?;
         stmt.bind_at(
             NonZero::new(1).unwrap(),
-            Value::build_text(view_name.name.as_str().to_string()),
+            Value::build_text(namespace.mangle_name(view_name.name.as_str())),
         )?;
         let Some(row) = stmt.run_collect_rows()?.into_iter().next() else {
             continue;
@@ -446,35 +565,35 @@ fn reject_drop_of_other_view_kind(
     Ok(())
 }
 
-/// The databases that a relation is looked up in, in order. A relation
+/// The namespaces that a relation is looked up in, in order. A relation
 /// named with a schema is in that schema. Otherwise it is looked up in the
-/// same order as core does: temp first, then the databases of the search
+/// same order as core does: temp first, then the namespaces of the search
 /// path.
-fn relation_lookup_databases(conn: &Arc<Connection>, schema: Option<&str>) -> Vec<String> {
-    let database_names: HashMap<usize, String> = conn
-        .list_all_databases()
-        .into_iter()
-        .map(|(id, database, _)| (id, database))
-        .collect();
+pub(crate) fn relation_lookup_namespaces(
+    conn: &Arc<Connection>,
+    schema: Option<&str>,
+) -> Vec<Namespace> {
     match schema {
-        Some(schema) if schema.eq_ignore_ascii_case("public") => vec!["main".to_string()],
-        Some(schema) => database_names
-            .values()
-            .filter(|database| database.eq_ignore_ascii_case(schema))
-            .cloned()
-            .collect(),
-        None => database_names
-            .contains_key(&turso_core::TEMP_DB_ID)
-            .then_some(turso_core::TEMP_DB_ID)
-            .into_iter()
-            .chain(
-                conn.search_order()
-                    .into_iter()
-                    .map(|namespace| namespace.database_id()),
-            )
-            .map(|id| database_names[&id].clone())
-            .collect(),
+        Some(schema) => conn.namespace(&schema.to_lowercase()).into_iter().collect(),
+        None => {
+            let has_temp = conn
+                .list_all_databases()
+                .iter()
+                .any(|(id, _, _)| *id == turso_core::TEMP_DB_ID);
+            has_temp
+                .then(|| Namespace::database("temp", turso_core::TEMP_DB_ID))
+                .into_iter()
+                .chain(conn.search_order())
+                .collect()
+        }
     }
+}
+
+/// The name of the database that has the objects of `namespace`, for
+/// reading its sqlite_schema.
+pub(crate) fn database_of(conn: &Connection, namespace: &Namespace) -> String {
+    conn.namespace_name(namespace.database_id())
+        .expect("the database of a namespace has a name")
 }
 
 /// The first schema of `search_path` that exists, which is what PostgreSQL's
@@ -482,11 +601,10 @@ fn relation_lookup_databases(conn: &Arc<Connection>, schema: Option<&str>) -> Ve
 /// The default search_path, "$user", public, gives public, since there is no
 /// schema named after a user.
 pub(crate) fn current_schema(conn: &Connection) -> Option<String> {
-    let database_id = conn.search_order().first()?.database_id();
-    if database_id == turso_core::MAIN_DB_ID {
-        return Some("public".to_owned());
-    }
-    conn.namespace_name(database_id)
+    conn.search_order()
+        .into_iter()
+        .next()
+        .map(|namespace| namespace.name)
 }
 
 pub(crate) fn current_schemas(conn: &Connection, include_implicit: bool) -> Vec<String> {
@@ -929,16 +1047,7 @@ fn handle_pg_create_schema(
 ) -> Result<()> {
     let conn = &pg_conn.conn;
     let name = stmt.name.to_lowercase();
-    if name == "public" {
-        if stmt.if_not_exists {
-            return Ok(());
-        }
-        return Err(LimboError::ParseError(format!(
-            "schema \"{name}\" already exists"
-        )));
-    }
-
-    if schema_exists(conn, &name)? {
+    if conn.namespace(&name).is_some() {
         if stmt.if_not_exists {
             return Ok(());
         }
@@ -955,19 +1064,13 @@ fn handle_pg_create_schema(
         ));
     }
 
-    // A failed element is undone by dropping the schema, and DETACH cannot
-    // run inside a transaction.
     if !stmt.elements.is_empty() && !conn.get_auto_commit() {
         return Err(LimboError::ParseError(
             "CREATE SCHEMA with schema elements cannot run inside a transaction block".to_string(),
         ));
     }
 
-    let path = schema_file_path(conn, &name);
-    execute_sqlite(
-        conn,
-        format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name),
-    )?;
+    conn.create_namespace(&name)?;
     if stmt.elements.is_empty() {
         return Ok(());
     }
@@ -998,24 +1101,9 @@ fn handle_pg_create_schema(
     Ok(())
 }
 
-fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
-    let main_path = conn.db_file_path();
-    let filename = format!("turso-postgres-schema-{schema_name}.db");
-    if is_memory_like(main_path) {
-        // Each `ATTACH ':memory:'` opens a new empty database, so schemas of
-        // an in-memory server start empty and leave no files behind.
-        ":memory:".to_string()
-    } else {
-        let parent = std::path::Path::new(&main_path)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        parent.join(&filename).to_string_lossy().to_string()
-    }
-}
-
 fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Result<()> {
     let name = stmt.name.to_lowercase();
-    if name != "public" && !schema_exists(conn, &name)? {
+    if !schema_exists(conn, &name) {
         if stmt.if_exists {
             return Ok(());
         }
@@ -1024,8 +1112,7 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
         )));
     }
 
-    let database = if name == "public" { "main" } else { &name };
-    let objects = schema_objects(conn, database)?;
+    let objects = schema_objects(conn, &name);
     if !stmt.cascade && !objects.is_empty() {
         return Err(sqlstate_error(
             SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
@@ -1035,16 +1122,11 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
 
     without_foreign_keys(conn, || {
         for object in &objects {
-            execute_sqlite(conn, object.drop_sql(database))?;
+            execute_sqlite(conn, object.drop_sql(&name))?;
         }
         Ok(())
     })?;
-    // PostgreSQL drops public like any other schema, but turso keeps it,
-    // because unqualified names of the main database are its objects.
-    if name == "public" {
-        return Ok(());
-    }
-    execute_sqlite(conn, format!("DETACH \"{name}\""))
+    conn.drop_namespace(&name)
 }
 
 /// Runs `f` with foreign keys not enforced. DROP SCHEMA ... CASCADE drops
@@ -1066,14 +1148,17 @@ enum SchemaObject {
 }
 
 impl SchemaObject {
-    fn drop_sql(&self, database: &str) -> String {
+    /// The statement that drops the object, named with its schema so that
+    /// the search path does not change what it names.
+    fn drop_sql(&self, schema: &str) -> String {
         let kind = match self {
             SchemaObject::View(_) => "VIEW",
             SchemaObject::Table(_) => "TABLE",
             SchemaObject::Sequence(_) => "SEQUENCE",
         };
         format!(
-            "DROP {kind} \"{database}\".\"{}\"",
+            "DROP {kind} \"{}\".\"{}\"",
+            schema.replace('"', "\"\""),
             self.name().replace('"', "\"\"")
         )
     }
@@ -1087,37 +1172,55 @@ impl SchemaObject {
     }
 }
 
-/// The table in which core stores sequence `s` is named
-/// `__turso_internal_seq_s`.
-const SEQUENCE_TABLE_PREFIX: &str = "__turso_internal_seq_";
-
-/// The objects of the schema that database `database` holds, in the order
-/// that DROP SCHEMA drops them: views first, because they depend on tables.
-/// Indexes and triggers go with their tables.
-fn schema_objects(conn: &Arc<Connection>, database: &str) -> Result<Vec<SchemaObject>> {
-    let mut stmt = conn.prepare_sqlite(format!(
-        "SELECT type, name FROM \"{database}\".sqlite_schema \
-         WHERE type IN ('view', 'table') ORDER BY name"
-    ))?;
-    let mut views = Vec::new();
-    let mut tables = Vec::new();
-    let mut sequences = Vec::new();
-    for row in stmt.run_collect_rows()? {
-        let (Some(Value::Text(kind)), Some(Value::Text(name))) = (row.first(), row.get(1)) else {
+/// The objects of schema `schema`, in the order that DROP SCHEMA drops
+/// them: views first, because they depend on tables. Indexes and triggers
+/// go with their tables.
+fn schema_objects(conn: &Arc<Connection>, schema: &str) -> Vec<SchemaObject> {
+    let Some(namespace) = conn.namespace(schema) else {
+        return Vec::new();
+    };
+    let namespace = namespace.target.id;
+    let current = conn.current_schema();
+    let is_user_object =
+        |name: &str| !name.starts_with("sqlite_") && !name.starts_with("__turso_internal_");
+    let mut views: Vec<String> = current
+        .views(namespace)
+        .map(|(name, _)| name.to_string())
+        .collect();
+    let mut tables: Vec<String> = Vec::new();
+    for table in current.tables(namespace) {
+        let name = table.get_name();
+        if !is_user_object(name) || !matches!(table.as_ref(), Table::BTree(_)) {
             continue;
-        };
-        let name = name.as_str().to_string();
-        if kind.as_str() == "view" {
-            views.push(SchemaObject::View(name));
-        } else if let Some(sequence) = name.strip_prefix(SEQUENCE_TABLE_PREFIX) {
-            if !sequence.starts_with("__turso_internal_") {
-                sequences.push(SchemaObject::Sequence(sequence.to_string()));
-            }
-        } else if !name.starts_with("sqlite_") && !name.starts_with("__turso_internal_") {
-            tables.push(SchemaObject::Table(name));
+        }
+        if current.is_materialized_view(namespace, name) {
+            views.push(name.to_string());
+        } else {
+            tables.push(name.to_string());
         }
     }
-    Ok(views.into_iter().chain(tables).chain(sequences).collect())
+    let mut sequences: Vec<String> = current
+        .sequences_by_name(namespace)
+        .keys()
+        .filter(|name| is_user_object(name))
+        .cloned()
+        .collect();
+    views.sort();
+    tables.sort();
+    sequences.sort();
+    views
+        .into_iter()
+        .map(SchemaObject::View)
+        .chain(tables.into_iter().map(SchemaObject::Table))
+        .chain(sequences.into_iter().map(SchemaObject::Sequence))
+        .collect()
+}
+
+/// Whether `schema_name` is a schema: a namespace stored in the main
+/// database. `main` and `temp` name databases, not schemas.
+fn schema_exists(conn: &Connection, schema_name: &str) -> bool {
+    conn.namespace(schema_name)
+        .is_some_and(|namespace| !namespace.is_database())
 }
 
 fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<usize> {
@@ -1199,7 +1302,21 @@ fn get_table_columns(
     table_name: &str,
     schema_name: Option<&str>,
 ) -> Result<Vec<String>> {
-    let sql = match schema_name {
+    // The pragma runs as an engine statement, without the search path, so
+    // a table named without a schema is looked up here, as a query would.
+    let schema = match schema_name {
+        Some(schema) => Some(schema.to_string()),
+        None => relation_lookup_namespaces(conn, None)
+            .into_iter()
+            .find(|namespace| {
+                namespace.database_id() == turso_core::MAIN_DB_ID
+                    && conn
+                        .current_schema()
+                        .has_table(namespace.target.id, &table_name.to_lowercase())
+            })
+            .map(|namespace| namespace.name),
+    };
+    let sql = match schema {
         Some(schema) => format!("PRAGMA \"{schema}\".table_info('{table_name}')"),
         None => format!("PRAGMA table_info('{table_name}')"),
     };
@@ -1214,23 +1331,88 @@ fn get_table_columns(
         .collect())
 }
 
-fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
-    let sql = format!(
-        "SELECT 1 FROM pragma_database_list WHERE name = '{}'",
-        schema_name.replace('\'', "''")
-    );
-    let mut stmt = conn.prepare_internal(&sql)?;
-    let rows = stmt.run_collect_rows()?;
-    Ok(!rows.is_empty())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{search_path_parser, PgConnection};
+    use super::{open_database_with_io, search_path_parser, PgConnection};
+    use crate::session::set_up_new_database;
     use crate::PostgresDialect;
     use chumsky::Parser;
     use std::sync::Arc;
-    use turso_core::{Database, DatabaseOpts, MemoryIO, OpenOptions, Value};
+    use turso_core::{Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions, Value};
+
+    #[test]
+    fn a_materialized_view_of_a_schema_is_maintained_and_dropped_with_the_schema() {
+        let db = Database::open(
+            Arc::new(MemoryIO::new()),
+            ":memory:",
+            OpenOptions::new(Arc::new(PostgresDialect))
+                .db_opts(DatabaseOpts::new().with_views(true)),
+        )
+        .unwrap();
+        set_up_new_database(&db).unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
+        conn.execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE t (x int); \
+             CREATE TABLE app.t (x int); \
+             CREATE MATERIALIZED VIEW mv AS SELECT count(*) AS n FROM t; \
+             CREATE MATERIALIZED VIEW app.mv AS SELECT count(*) AS n FROM t; \
+             INSERT INTO t VALUES (1); \
+             INSERT INTO app.t VALUES (1), (2);",
+        )
+        .unwrap();
+        let count = |sql: &str| -> i64 {
+            let mut rows = conn.query(sql).unwrap().unwrap();
+            let turso_core::StepResult::Row = rows.step().unwrap() else {
+                panic!("expected a row");
+            };
+            let turso_core::Value::Numeric(turso_core::Numeric::Integer(n)) =
+                rows.row().unwrap().get_value(0)
+            else {
+                panic!("expected an integer");
+            };
+            *n
+        };
+        assert_eq!(count("SELECT n FROM mv"), 1);
+        assert_eq!(count("SELECT n FROM app.mv"), 2);
+        conn.execute("DROP SCHEMA app CASCADE").unwrap();
+        assert!(conn.query("SELECT n FROM app.mv").is_err());
+        assert_eq!(count("SELECT n FROM mv"), 1);
+    }
+
+    #[test]
+    fn a_view_of_a_schema_reads_catalog_tables_with_aliases_and_using() {
+        let db = Database::open(
+            Arc::new(MemoryIO::new()),
+            ":memory:",
+            OpenOptions::new(Arc::new(PostgresDialect))
+                .db_opts(DatabaseOpts::new().with_views(true)),
+        )
+        .unwrap();
+        set_up_new_database(&db).unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
+        conn.execute(
+            "CREATE VIEW aliased AS SELECT a.nspname FROM pg_namespace a JOIN pg_namespace b ON a.oid = b.oid; \
+             CREATE VIEW joined AS WITH c AS (SELECT * FROM pg_namespace) SELECT c.nspname FROM c JOIN pg_namespace USING (oid); \
+             CREATE SCHEMA app; \
+             CREATE VIEW app.joined AS WITH c AS (SELECT * FROM pg_namespace) SELECT c.nspname FROM c JOIN pg_namespace USING (oid);",
+        )
+        .unwrap();
+        for view in ["aliased", "joined", "app.joined"] {
+            let mut rows = conn
+                .query(format!("SELECT count(*) FROM {view}"))
+                .unwrap()
+                .unwrap();
+            let turso_core::StepResult::Row = rows.step().unwrap() else {
+                panic!("expected a row from {view}");
+            };
+            assert_eq!(
+                *rows.row().unwrap().get_value(0),
+                turso_core::Value::from_i64(4),
+                "{view}"
+            );
+        }
+    }
 
     #[test]
     fn drop_view_refuses_a_relation_of_another_kind() {
@@ -1241,6 +1423,7 @@ mod tests {
                 .db_opts(DatabaseOpts::new().with_views(true)),
         )
         .unwrap();
+        set_up_new_database(&db).unwrap();
         let conn = PgConnection::connect(&db).unwrap();
         conn.execute(
             "CREATE TABLE t (a int); \
@@ -1279,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn create_schema_on_an_in_memory_database_attaches_an_in_memory_database() {
+    fn create_schema_on_an_in_memory_database_stores_the_schema_in_it() {
         for path in [":memory:", ":memory:named", "file::memory:"] {
             let db = Database::open(
                 Arc::new(MemoryIO::new()),
@@ -1288,19 +1471,68 @@ mod tests {
                     .db_opts(DatabaseOpts::new().with_attach(true)),
             )
             .unwrap();
+            set_up_new_database(&db).unwrap();
             let conn = PgConnection::connect(&db).unwrap();
             conn.execute("CREATE SCHEMA s").unwrap();
+            assert!(
+                conn.inner()
+                    .namespace("s")
+                    .is_some_and(|namespace| !namespace.is_database()),
+                "{path}"
+            );
             let mut stmt = conn
                 .inner()
-                .prepare_internal("SELECT file FROM pragma_database_list WHERE name = 's'")
+                .prepare_internal("SELECT name FROM pragma_database_list")
                 .unwrap();
-            // pragma_database_list shows an empty file name for in-memory databases.
             assert_eq!(
                 stmt.run_collect_rows().unwrap(),
-                vec![vec![Value::build_text("")]],
+                vec![vec![Value::build_text("main")]],
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn a_dropped_public_schema_stays_dropped_for_later_connections() {
+        let db = open_database_with_io(
+            Arc::new(MemoryIO::new()),
+            ":memory:",
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
+        conn.execute("CREATE TABLE t (x int)").unwrap();
+        conn.execute("DROP SCHEMA public CASCADE").unwrap();
+
+        let later = PgConnection::connect(&db).unwrap();
+        assert!(later.inner().namespace("public").is_none());
+        let error = later
+            .execute("CREATE TABLE t (x int)")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no schema has been selected"), "{error}");
+        later.execute("CREATE SCHEMA public").unwrap();
+        later.execute("CREATE TABLE t (x int)").unwrap();
+    }
+
+    #[test]
+    fn a_database_with_tables_in_no_schema_is_refused() {
+        let db = Database::open(
+            Arc::new(MemoryIO::new()),
+            ":memory:",
+            OpenOptions::new(Arc::new(PostgresDialect)),
+        )
+        .unwrap();
+        db.connect(turso_core::ConnectOpts::new())
+            .unwrap()
+            .execute("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let error = match PgConnection::connect(&db) {
+            Ok(_) => panic!("expected the database to be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("in no schema"), "{error}");
     }
 
     #[test]

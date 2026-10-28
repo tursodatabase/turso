@@ -709,3 +709,15 @@ expect {
     a\b
     null
 }
+
+test cte-hides-table-of-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_cte;
+    DROP TABLE IF EXISTS sp_cte.t;
+    CREATE TABLE sp_cte.t (x int);
+    INSERT INTO sp_cte.t VALUES (1);
+    SET search_path TO sp_cte;
+    WITH t AS (SELECT 2 AS x) SELECT x FROM t;
+}
+expect {
+    2
+}
