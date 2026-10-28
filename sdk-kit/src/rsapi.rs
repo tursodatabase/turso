@@ -17,6 +17,7 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
     EnvFilter, Layer,
 };
+use turso_core::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 use turso_core::{
     storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
     DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, OpenOptions,
@@ -761,9 +762,6 @@ impl From<LimboError> for TursoError {
     }
 }
 
-/// Size of the header that precedes each page in a WAL frame.
-const WAL_FRAME_HEADER_SIZE: usize = 24;
-
 fn sync_busy_error() -> TursoError {
     TursoError::Busy("database is locked".to_string())
 }
@@ -1143,6 +1141,7 @@ pub struct TursoConnection {
     /// handle and sets it to `None` to release `Arc<Connection>` → `Arc<Database>`.
     stmts: StmtRegistry,
     next_stmt_id: Arc<AtomicUsize>,
+    in_wal_insert_session: Arc<AtomicBool>,
 }
 
 impl TursoConnection {
@@ -1163,6 +1162,7 @@ impl TursoConnection {
             cached_statements: Arc::new(Mutex::new(HashMap::new())),
             stmts: Arc::new(Mutex::new(HashMap::new())),
             next_stmt_id: Arc::new(AtomicUsize::new(0)),
+            in_wal_insert_session: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1237,6 +1237,11 @@ impl TursoConnection {
             return Err(sync_busy_error());
         }
         self.require_wal_journal()?;
+        if frame_no == 0 {
+            return Err(TursoError::Misuse(
+                "WAL frame numbers start at 1".to_string(),
+            ));
+        }
         let info = self.connection.wal_get_frame(frame_no, frame)?;
         Ok((info.page_no, info.db_size))
     }
@@ -1247,12 +1252,23 @@ impl TursoConnection {
             return Err(sync_busy_error());
         }
         self.require_wal_journal()?;
+        if !self.connection.get_auto_commit() || self.connection.get_pager().holds_read_lock() {
+            return Err(TursoError::Misuse(
+                "cannot begin a WAL insert session inside a transaction".to_string(),
+            ));
+        }
         self.connection.wal_insert_begin()?;
+        self.in_wal_insert_session.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     /// Write `frame` (header included) at position `frame_no` in the WAL.
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<(), TursoError> {
+        if frame_no == 0 {
+            return Err(TursoError::Misuse(
+                "WAL frame numbers start at 1".to_string(),
+            ));
+        }
         if frame.len() <= WAL_FRAME_HEADER_SIZE {
             return Err(TursoError::Misuse(format!(
                 "WAL frame must be longer than its {WAL_FRAME_HEADER_SIZE}-byte header, got {} bytes",
@@ -1260,14 +1276,32 @@ impl TursoConnection {
             )));
         }
         self.require_wal_journal()?;
+        self.require_wal_insert_session()?;
         self.connection.wal_insert_frame(frame_no, frame)?;
         Ok(())
     }
 
     /// End the session started by [Self::wal_insert_begin].
     pub fn wal_insert_end(&self, force_commit: bool) -> Result<(), TursoError> {
+        let session = self.require_wal_insert_session();
+        self.in_wal_insert_session.store(false, Ordering::SeqCst);
+        session?;
         self.connection.wal_insert_end(force_commit)?;
         Ok(())
+    }
+
+    /// Fail unless a WAL insert session holds the write lock. A COMMIT or
+    /// ROLLBACK statement inside the session releases the lock and so ends the
+    /// session too.
+    fn require_wal_insert_session(&self) -> Result<(), TursoError> {
+        if self.in_wal_insert_session.load(Ordering::SeqCst)
+            && self.connection.get_pager().holds_write_lock()
+        {
+            return Ok(());
+        }
+        Err(TursoError::Misuse(
+            "no WAL insert session is open on this connection".to_string(),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3129,6 +3163,7 @@ mod tests {
 
         let mut short = vec![0u8; TEST_FRAME_LEN - 1];
         assert!(conn.wal_get_frame(1, &mut short).is_err());
+        assert_misuse(conn.wal_get_frame(0, &mut vec![0u8; TEST_FRAME_LEN]));
 
         let other_db = open_file_database(&tmp_dir.path().join("other.db"));
         let other = other_db.connect().unwrap();
@@ -3137,6 +3172,7 @@ mod tests {
             other.wal_insert_frame(1, &frames[0][..super::WAL_FRAME_HEADER_SIZE]),
             Err(TursoError::Misuse(_))
         ));
+        assert_misuse(other.wal_insert_frame(0, &frames[0]));
         assert!(
             other.wal_insert_frame(2, &frames[0]).is_err(),
             "a gap in frame numbers must fail"
@@ -3186,6 +3222,96 @@ mod tests {
         misuse(
             conn.wal_insert_frame(1, &vec![0u8; TEST_FRAME_LEN]),
             "wal_insert_frame",
+        );
+
+        exec(&conn, "BEGIN");
+        exec(&conn, "INSERT INTO t VALUES (2)");
+        assert_misuse(conn.wal_insert_end(false));
+        exec(&conn, "COMMIT");
+        assert_eq!(query_i64(&conn, "SELECT count(*) FROM t"), 2);
+    }
+
+    #[test]
+    pub fn wal_insert_begin_is_misuse_while_a_transaction_is_open() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let db = open_file_database(&tmp_dir.path().join("db.db"));
+        let conn = db.connect().unwrap();
+        exec(&conn, "CREATE TABLE t(x)");
+        exec(&conn, "INSERT INTO t VALUES (1)");
+
+        conn.wal_insert_begin().unwrap();
+        assert_misuse(conn.wal_insert_begin());
+        conn.wal_insert_end(false).unwrap();
+
+        exec(&conn, "BEGIN");
+        assert_misuse(conn.wal_insert_begin());
+        exec(&conn, "INSERT INTO t VALUES (2)");
+        assert_misuse(conn.wal_insert_begin());
+        exec(&conn, "COMMIT");
+
+        let mut stmt = conn.prepare_single("SELECT x FROM t").unwrap();
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+        assert_misuse(conn.wal_insert_begin());
+        stmt.reset().unwrap();
+
+        conn.wal_insert_begin().unwrap();
+        conn.wal_insert_end(false).unwrap();
+        assert_eq!(query_i64(&conn, "SELECT count(*) FROM t"), 2);
+    }
+
+    #[test]
+    pub fn wal_insert_end_is_misuse_without_a_session() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let db = open_file_database(&tmp_dir.path().join("db.db"));
+        let conn = db.connect().unwrap();
+        exec(&conn, "CREATE TABLE t(x)");
+        assert_misuse(conn.wal_insert_end(false));
+
+        let writer = db.connect().unwrap();
+        exec(&writer, "BEGIN");
+        exec(&writer, "INSERT INTO t VALUES (1)");
+        assert!(matches!(conn.wal_insert_begin(), Err(TursoError::Busy(_))));
+        assert_misuse(conn.wal_insert_end(false));
+        exec(&writer, "COMMIT");
+
+        conn.wal_insert_begin().unwrap();
+        conn.wal_insert_end(false).unwrap();
+        assert_misuse(conn.wal_insert_end(false));
+
+        conn.wal_insert_begin().unwrap();
+        exec(&conn, "ROLLBACK");
+        assert_misuse(conn.wal_insert_end(false));
+
+        exec(&conn, "BEGIN");
+        exec(&conn, "INSERT INTO t VALUES (2)");
+        assert_misuse(conn.wal_insert_end(false));
+        exec(&conn, "COMMIT");
+        assert_eq!(query_i64(&conn, "SELECT count(*) FROM t"), 2);
+    }
+
+    #[test]
+    pub fn wal_insert_frame_is_misuse_without_a_session() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let source_db = open_file_database(&tmp_dir.path().join("source.db"));
+        let source = source_db.connect().unwrap();
+        source.wal_disable_auto_actions().unwrap();
+        exec(&source, "CREATE TABLE t(x)");
+        let frames = read_all_frames(&source);
+
+        let target_db = open_file_database(&tmp_dir.path().join("target.db"));
+        let target = target_db.connect().unwrap();
+        assert_misuse(target.wal_insert_frame(1, &frames[0]));
+        exec(&target, "BEGIN");
+        exec(&target, "CREATE TABLE u(y)");
+        assert_misuse(target.wal_insert_frame(1, &frames[0]));
+        exec(&target, "ROLLBACK");
+        assert_eq!(target.wal_state().unwrap().0, 0);
+    }
+
+    fn assert_misuse<T: std::fmt::Debug>(result: Result<T, TursoError>) {
+        assert!(
+            matches!(result, Err(TursoError::Misuse(_))),
+            "want Misuse, got {result:?}"
         );
     }
 }

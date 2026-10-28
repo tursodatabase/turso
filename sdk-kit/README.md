@@ -36,7 +36,7 @@ with binding-specific lifetime management for the callback context.
 - `turso_connection_wal_disable_auto_actions` stops the connection from checkpointing on its own, so frames stay in the WAL until the caller has copied them and runs `PRAGMA wal_checkpoint`;
 - `turso_connection_wal_state` reports the last frame number and the checkpoint sequence number, which changes when a checkpoint restarts the WAL;
 - `turso_connection_wal_get_frame` copies one frame (24-byte header plus page); a non-zero database size marks a commit frame;
-- `turso_connection_wal_insert_begin`, `_insert_frame`, and `_insert_end` append frames to another database's WAL.
+- `turso_connection_wal_insert_begin`, `_insert_frame`, and `_insert_end` append frames to another database's WAL. A session cannot start inside a transaction, and the other two calls fail with `TURSO_MISUSE` outside a session.
 
 These functions work only on databases in WAL journal mode. In MVCC mode recent changes live in the logical log, so every function except `turso_connection_wal_insert_end` fails with `TURSO_MISUSE` rather than hand out an incomplete copy.
 

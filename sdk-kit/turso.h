@@ -369,15 +369,18 @@ turso_status_code_t turso_connection_wal_get_frame(
     const char **error_opt_out);
 
 /** Start a session that appends raw frames to the WAL. It holds a write
- * transaction until turso_connection_wal_insert_end. */
+ * transaction until turso_connection_wal_insert_end. Fails with TURSO_MISUSE
+ * if the connection already has an open transaction, an open session or an
+ * unfinished statement. */
 turso_status_code_t turso_connection_wal_insert_begin(
     const turso_connection_t *self,
     /** Optional return error parameter (can be null) */
     const char **error_opt_out);
 
-/** Write `frame` (header included) at position `frame_no` in the WAL. Writing a
- * frame that already exists with the same content succeeds; different content
- * or a gap in frame numbers fails. */
+/** Write `frame` (header included) at position `frame_no` (1-based) in the WAL.
+ * Writing a frame that already exists with the same content succeeds; different
+ * content or a gap in frame numbers fails. Fails with TURSO_MISUSE outside a
+ * session. */
 turso_status_code_t turso_connection_wal_insert_frame(
     const turso_connection_t *self,
     uint64_t frame_no,
@@ -388,7 +391,9 @@ turso_status_code_t turso_connection_wal_insert_frame(
 
 /** End the session started by turso_connection_wal_insert_begin. Changes not
  * closed by a commit frame are rolled back, unless `force_commit` is set, in
- * which case pending changes are committed first. */
+ * which case pending changes are committed first. Fails with TURSO_MISUSE when
+ * no session is open. A COMMIT or ROLLBACK statement inside the session also
+ * ends it. */
 turso_status_code_t turso_connection_wal_insert_end(
     const turso_connection_t *self,
     bool force_commit,

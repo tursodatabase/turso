@@ -466,14 +466,14 @@ unsafe extern "C" {
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " Start a session that appends raw frames to the WAL. It holds a write\n transaction until turso_connection_wal_insert_end."]
+    #[doc = " Start a session that appends raw frames to the WAL. It holds a write\n transaction until turso_connection_wal_insert_end. Fails with TURSO_MISUSE\n if the connection already has an open transaction, an open session or an\n unfinished statement."]
     pub fn turso_connection_wal_insert_begin(
         self_: *const turso_connection_t,
         error_opt_out: *mut *const ::std::os::raw::c_char,
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " Write `frame` (header included) at position `frame_no` in the WAL. Writing a\n frame that already exists with the same content succeeds; different content\n or a gap in frame numbers fails."]
+    #[doc = " Write `frame` (header included) at position `frame_no` (1-based) in the WAL.\n Writing a frame that already exists with the same content succeeds; different\n content or a gap in frame numbers fails. Fails with TURSO_MISUSE outside a\n session."]
     pub fn turso_connection_wal_insert_frame(
         self_: *const turso_connection_t,
         frame_no: u64,
@@ -483,7 +483,7 @@ unsafe extern "C" {
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " End the session started by turso_connection_wal_insert_begin. Changes not\n closed by a commit frame are rolled back, unless `force_commit` is set, in\n which case pending changes are committed first."]
+    #[doc = " End the session started by turso_connection_wal_insert_begin. Changes not\n closed by a commit frame are rolled back, unless `force_commit` is set, in\n which case pending changes are committed first. Fails with TURSO_MISUSE when\n no session is open. A COMMIT or ROLLBACK statement inside the session also\n ends it."]
     pub fn turso_connection_wal_insert_end(
         self_: *const turso_connection_t,
         force_commit: bool,
