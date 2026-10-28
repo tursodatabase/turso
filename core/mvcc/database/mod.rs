@@ -9544,8 +9544,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 connection.dialect().as_ref(),
             )?;
         }
-        fresh.populate_materialized_views_then_indices(
+        fresh.populate_types_views_then_indices(
             &syms,
+            &[],
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
@@ -10487,8 +10488,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 connection.dialect().as_ref(),
             )?;
         }
-        fresh.populate_materialized_views_then_indices(
+        fresh.populate_types_views_then_indices(
             &syms,
+            &[],
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,

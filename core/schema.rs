@@ -845,6 +845,14 @@ pub enum MakeFromBtreePhase {
     /// driving the schema reparse).
     PopulatingSequencesRewind,
     PopulatingSequencesFetch,
+    /// Reading the CREATE TYPE statements stored in the types table, so that
+    /// indexes are built from tables whose columns already know their types.
+    LoadingTypesStart,
+    LoadingTypesRewind,
+    LoadingTypesFetch,
+    LoadingTypesAdvance,
+    /// Building materialized views and indexes, then ending the read.
+    BuildingIndexes,
     Done,
 }
 
@@ -860,6 +868,8 @@ pub struct MakeFromBtreeState {
     /// Cursor for the source currently being scanned (the back of
     /// `sequence_sources` is popped onto this when entering Rewind).
     sequence_cursor: Option<BTreeCursor>,
+    /// CREATE TYPE statements read from the types table.
+    type_sqls: Vec<String>,
 }
 
 impl Default for MakeFromBtreeState {
@@ -877,6 +887,7 @@ impl MakeFromBtreeState {
             read_tx_active: false,
             sequence_sources: vec![],
             sequence_cursor: None,
+            type_sqls: vec![],
         }
     }
 
@@ -1729,9 +1740,8 @@ impl Schema {
     }
 
     /// Load type definitions from CREATE TYPE SQL strings and resolve custom
-    /// type affinities on all STRICT tables. This is the shared entry point
-    /// used by both initial database open and schema reparse.
-    pub fn load_type_definitions(&mut self, type_sqls: &[String]) -> crate::Result<()> {
+    /// type affinities on all STRICT tables.
+    fn load_type_definitions(&mut self, type_sqls: &[String]) -> crate::Result<()> {
         for sql in type_sqls {
             self.add_type_from_sql(sql).map_err(|e| {
                 crate::LimboError::Corrupt(format!("malformed database schema - {e}"))
@@ -2491,6 +2501,8 @@ impl Schema {
 
     /// Update [Schema] by scanning the first root page (sqlite_schema)
     /// Returns IOResultOr<()> to allow async operation with external IO loop
+    /// With `load_custom_types`, the types stored in the types table are
+    /// loaded too.
     pub fn make_from_btree(
         &mut self,
         state: &mut MakeFromBtreeState,
@@ -2498,8 +2510,16 @@ impl Schema {
         pager: &Arc<Pager>,
         syms: &SymbolTable,
         dialect: &dyn crate::dialect::Dialect,
+        load_custom_types: bool,
     ) -> IOResultOr<()> {
-        let result = self.make_from_btree_internal(state, mv_cursor, pager, syms, dialect);
+        let result = self.make_from_btree_internal(
+            state,
+            mv_cursor,
+            pager,
+            syms,
+            dialect,
+            load_custom_types,
+        );
         if result.is_err() {
             state.cleanup(pager);
         } else if let Ok(IOResult::Done(..)) = result {
@@ -2518,6 +2538,7 @@ impl Schema {
         pager: &Arc<Pager>,
         syms: &SymbolTable,
         dialect: &dyn crate::dialect::Dialect,
+        load_custom_types: bool,
     ) -> IOResultOr<()> {
         loop {
             tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
@@ -2649,28 +2670,12 @@ impl Schema {
                 }
 
                 MakeFromBtreePhase::PopulatingSequencesRewind => {
-                    // Either no sources left → finalize, or pop the next
-                    // source and rewind its cursor.
+                    // Either no sources left → load the types, or pop the
+                    // next source and rewind its cursor.
                     if state.sequence_sources.is_empty() {
-                        pager.end_read_tx();
-                        state.read_tx_active = false;
-
-                        let acc = state
-                            .accumulators
-                            .take()
-                            .expect("accumulators must be initialized in Init phase");
-                        self.populate_materialized_views_then_indices(
-                            syms,
-                            acc.materialized_view_info,
-                            acc.dbsp_state_roots,
-                            acc.dbsp_state_index_roots,
-                            acc.from_sql_indexes,
-                            acc.automatic_indices,
-                            mv_cursor.is_some(),
-                        )?;
-
-                        state.phase = MakeFromBtreePhase::Done;
-                        return Ok(IOResult::Done(()));
+                        state.sequence_cursor = None;
+                        state.phase = MakeFromBtreePhase::LoadingTypesStart;
+                        continue;
                     }
                     // Drop any cursor from a previous source before opening
                     // the new one (Drop logic on the BTreeCursor releases
@@ -2725,6 +2730,89 @@ impl Schema {
                     // rewind starts.
                     state.sequence_cursor = None;
                     state.phase = MakeFromBtreePhase::PopulatingSequencesRewind;
+                }
+
+                MakeFromBtreePhase::LoadingTypesStart => {
+                    let types_table = self
+                        .get_btree_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME)
+                        .filter(|_| load_custom_types);
+                    match types_table {
+                        // A types table created in MVCC mode and not yet
+                        // checkpointed has a negative root page and its rows
+                        // live only in the MVCC log, which the pager can't read.
+                        Some(table) if table.root_page > 0 => {
+                            state.cursor = Some(BTreeCursor::new_table(
+                                Arc::clone(pager),
+                                table.root_page,
+                                table.columns().len(),
+                            ));
+                            state.phase = MakeFromBtreePhase::LoadingTypesRewind;
+                        }
+                        _ => state.phase = MakeFromBtreePhase::BuildingIndexes,
+                    }
+                }
+
+                MakeFromBtreePhase::LoadingTypesRewind => {
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in LoadingTypesStart");
+                    return_if_io!(cursor.rewind());
+                    state.phase = MakeFromBtreePhase::LoadingTypesFetch;
+                }
+
+                MakeFromBtreePhase::LoadingTypesFetch => {
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in LoadingTypesStart");
+                    let Some(record) = return_if_io!(cursor.record()) else {
+                        state.cursor = None;
+                        state.phase = MakeFromBtreePhase::BuildingIndexes;
+                        continue;
+                    };
+                    // The types table is (name TEXT PRIMARY KEY, sql TEXT).
+                    let ValueRef::Text(sql) = record.get_value(1)? else {
+                        return Err(LimboError::Corrupt(format!(
+                            "{TURSO_TYPES_TABLE_NAME} contains a row without CREATE TYPE sql"
+                        ))
+                        .into());
+                    };
+                    state.type_sqls.push(sql.as_str().to_string());
+                    state.phase = MakeFromBtreePhase::LoadingTypesAdvance;
+                }
+
+                MakeFromBtreePhase::LoadingTypesAdvance => {
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in LoadingTypesStart");
+                    return_if_io!(cursor.next());
+                    state.phase = MakeFromBtreePhase::LoadingTypesFetch;
+                }
+
+                MakeFromBtreePhase::BuildingIndexes => {
+                    pager.end_read_tx();
+                    state.read_tx_active = false;
+
+                    let acc = state
+                        .accumulators
+                        .take()
+                        .expect("accumulators must be initialized in Init phase");
+                    let type_sqls = std::mem::take(&mut state.type_sqls);
+                    self.populate_types_views_then_indices(
+                        syms,
+                        &type_sqls,
+                        acc.materialized_view_info,
+                        acc.dbsp_state_roots,
+                        acc.dbsp_state_index_roots,
+                        acc.from_sql_indexes,
+                        acc.automatic_indices,
+                        mv_cursor.is_some(),
+                    )?;
+
+                    state.phase = MakeFromBtreePhase::Done;
+                    return Ok(IOResult::Done(()));
                 }
 
                 MakeFromBtreePhase::Done => {
@@ -3172,8 +3260,13 @@ impl Schema {
         out
     }
 
-    /// Populate materialized views and then indices from rows collected
-    /// while loading or reparsing `sqlite_schema`.
+    /// Load the CREATE TYPE statements `type_sqls`, then populate materialized
+    /// views and then indices from rows collected while loading or reparsing
+    /// `sqlite_schema`.
+    ///
+    /// Types must be loaded before indices: an index key column copies the
+    /// order of its table column's type when the index is built, and a table
+    /// column only knows its type once the type is loaded.
     ///
     /// Materialized views must be populated before indices: a materialized
     /// view's backing btree is only registered as a table here, and CREATE
@@ -3181,9 +3274,10 @@ impl Schema {
     /// any other table. Indexing it first would fail to find that table and
     /// report the schema as corrupt.
     #[allow(clippy::too_many_arguments)]
-    pub fn populate_materialized_views_then_indices(
+    pub fn populate_types_views_then_indices(
         &mut self,
         syms: &SymbolTable,
+        type_sqls: &[String],
         materialized_view_info: HashMap<String, (String, i64)>,
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
@@ -3191,6 +3285,9 @@ impl Schema {
         automatic_indices: HashMap<String, Vec<(String, i64)>>,
         mvcc_enabled: bool,
     ) -> Result<()> {
+        if !type_sqls.is_empty() {
+            self.load_type_definitions(type_sqls)?;
+        }
         self.populate_materialized_views(
             materialized_view_info,
             dbsp_state_roots,

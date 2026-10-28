@@ -15935,8 +15935,10 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 let mv_store = stmt.mv_store();
                 let syms = conn.syms.read();
 
-                let populate_result = schema.populate_materialized_views_then_indices(
+                // The schema already holds every stored type.
+                let populate_result = schema.populate_types_views_then_indices(
                     &syms,
+                    &[],
                     materialized_view_info,
                     dbsp_state_roots,
                     dbsp_state_index_roots,

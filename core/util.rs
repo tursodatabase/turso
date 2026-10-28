@@ -288,7 +288,8 @@ impl ParseSchemaRowsState {
 /// Non-blocking schema-row parser: steps the schema-scan statement held in
 /// `state`, feeding each row to `handle_schema_row`, and yields IO instead of
 /// pumping it. Re-invoke after each yielded completion; accumulators persist in
-/// `state`. On completion, populates indices and materialized views.
+/// `state`. Indexes and materialized views are built afterwards by
+/// [`populate_types_views_then_indices`], once the types are loaded.
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn parse_schema_rows(
     state: &mut ParseSchemaRowsState,
@@ -336,23 +337,33 @@ pub fn parse_schema_rows(
         }));
     }
 
-    // Scan complete: finalize. Take ownership of the accumulators.
+    Ok(IOResult::Done(()))
+}
+
+/// After [`parse_schema_rows`] has scanned every row: load the CREATE TYPE
+/// statements `type_sqls`, then build the materialized views and indexes
+/// collected during the scan.
+pub fn populate_types_views_then_indices(
+    state: &mut ParseSchemaRowsState,
+    schema: &mut Schema,
+    syms: &SymbolTable,
+    type_sqls: &[String],
+) -> Result<()> {
     let inner = state
         .inner
         .take()
         .expect("ParseSchemaRowsState not initialized");
     let has_mv_store = inner.rows.mv_store().is_some();
-    schema.populate_materialized_views_then_indices(
+    schema.populate_types_views_then_indices(
         syms,
+        type_sqls,
         inner.materialized_view_info,
         inner.dbsp_state_roots,
         inner.dbsp_state_index_roots,
         inner.from_sql_indexes,
         inner.automatic_indices,
         has_mv_store,
-    )?;
-
-    Ok(IOResult::Done(()))
+    )
 }
 
 fn cmp_numeric_strings(num_str: &str, other: &str) -> bool {
