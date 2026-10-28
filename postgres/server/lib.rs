@@ -927,7 +927,22 @@ fn is_create_table_as(upper: &str) -> bool {
 }
 
 fn error_info(message: &str) -> ErrorInfo {
-    ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), message.to_owned())
+    ErrorInfo::new(
+        "ERROR".to_owned(),
+        "XX000".to_owned(),
+        error_field_value(message),
+    )
+}
+
+/// ErrorResponse fields are NUL-terminated strings, so a NUL inside a value
+/// would end the field early and the client would read the rest as more
+/// fields. PostgreSQL fills these fields from C strings, which also end at
+/// the first NUL, so cut the value there.
+fn error_field_value(value: &str) -> String {
+    match value.find('\0') {
+        Some(end) => value[..end].to_owned(),
+        None => value.to_owned(),
+    }
 }
 
 fn pg_error(error: turso_pg::Error) -> PgWireError {
@@ -954,7 +969,7 @@ where
     let mut fields = vec![
         (b'S', "ERROR".to_string()),
         (b'C', error.sqlstate.to_string()),
-        (b'M', error.message.clone()),
+        (b'M', error_field_value(&error.message)),
     ];
     for (tag, value) in [
         (b'D', &error.detail),
@@ -963,7 +978,7 @@ where
         (b'n', &error.constraint_name),
     ] {
         if let Some(value) = value {
-            fields.push((tag, value.clone()));
+            fields.push((tag, error_field_value(value)));
         }
     }
     client
@@ -992,6 +1007,31 @@ mod tests {
     use super::*;
 
     use turso_pg_client::{BackendEvent, ConnParams, PgConn};
+
+    #[test]
+    fn error_response_fields_end_at_nul() {
+        let (mut client, _conn) = copy_test_client();
+        let events = client
+            .simple_query("SELECT set_config('nodot' || chr(0) || 'Dinjected detail', 'x', false)")
+            .unwrap();
+        let fields = events
+            .iter()
+            .find_map(|event| match event {
+                BackendEvent::ErrorResponse(fields) => Some(fields),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{events:?}"));
+        assert_eq!(
+            fields.get(&b'M').map(String::as_str),
+            Some("unrecognized configuration parameter \"nodot"),
+            "{fields:?}"
+        );
+        assert!(!fields.contains_key(&b'D'), "{fields:?}");
+        assert!(
+            matches!(events.last(), Some(BackendEvent::ReadyForQuery(_))),
+            "{events:?}"
+        );
+    }
 
     #[test]
     fn copy_to_stdout_sends_text_in_statement_order() {
