@@ -2,6 +2,7 @@ use std::{cmp::Ordering, collections::HashMap, hash::Hasher, str::FromStr as _};
 
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
+use smallvec::SmallVec;
 use turso_parser::ast::{Expr, TableInternalId, UnaryOperator};
 
 use crate::{
@@ -658,7 +659,8 @@ fn common_type_ordering<'a>(
     resolver: &Resolver,
 ) -> Result<Option<TypeOrdering>> {
     let mut has_collate = false;
-    let orders: Vec<OperandOrder> = exprs
+    // Most comparisons have two operands; keep their orders off the heap.
+    let orders: SmallVec<[OperandOrder; 2]> = exprs
         .into_iter()
         .map(|(expr, tables)| {
             has_collate |= has_collate_operator(expr);

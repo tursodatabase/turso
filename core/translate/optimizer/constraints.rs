@@ -726,6 +726,10 @@ pub fn constraints_from_where_clause(
     resolver: &Resolver,
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
+    // A term's collation is the same for every table it constrains, and
+    // deciding it means working out the types of its operands, so each term's
+    // collation is decided at most once, the first time a table needs it.
+    let mut term_collations: Vec<Option<CollationSeq>> = vec![None; where_clause.len()];
 
     // For each table, collect all the Constraints and all potential index candidates that may use them.
     for table_reference in table_references.joined_tables() {
@@ -827,12 +831,11 @@ pub fn constraints_from_where_clause(
                     .filter(|op| op.is_comparison())
                     .map(|_| comparison_affinity(lhs, rhs, Some(table_references), None));
                 let cmp_collation = match operator.as_ast_operator() {
-                    Some(op) if op.is_comparison() => Some(comparison_collation(
-                        lhs,
-                        rhs,
-                        Some(table_references),
-                        resolver,
-                    )?),
+                    Some(op) if op.is_comparison() => {
+                        Some(decide_once(&mut term_collations[i], || {
+                            comparison_collation(lhs, rhs, Some(table_references), resolver)
+                        })?)
+                    }
                     _ => None,
                 };
                 let is_op = matches!(operator.as_ast_operator(), Some(ast::Operator::Is));
@@ -1085,12 +1088,9 @@ pub fn constraints_from_where_clause(
                 // SQLite's `comparisonAffinity` for IN-list (`x IN (lit, ...)`)
                 // is the LHS column's affinity; the RHS literals are not folded.
                 let cmp_aff = Some(get_expr_affinity(lhs, Some(table_references), None));
-                let cmp_collation = Some(in_list_collation(
-                    lhs,
-                    rhs,
-                    Some(table_references),
-                    resolver,
-                )?);
+                let cmp_collation = Some(decide_once(&mut term_collations[i], || {
+                    in_list_collation(lhs, rhs, Some(table_references), resolver)
+                })?);
 
                 match lhs.as_ref() {
                     ast::Expr::Column { table, column, .. }
@@ -1360,6 +1360,19 @@ pub fn constraints_from_where_clause(
     }
 
     Ok(constraints)
+}
+
+/// The collation in `slot`, deciding it with `decide` if it is not decided yet.
+fn decide_once(
+    slot: &mut Option<CollationSeq>,
+    decide: impl FnOnce() -> Result<CollationSeq>,
+) -> Result<CollationSeq> {
+    if let Some(collation) = *slot {
+        return Ok(collation);
+    }
+    let collation = decide()?;
+    *slot = Some(collation);
+    Ok(collation)
 }
 
 /// The collation `x IN (SELECT y ...)` compares with. The subquery's ephemeral
