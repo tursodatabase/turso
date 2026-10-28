@@ -1471,3 +1471,126 @@ mod tests {
         table_references
     }
 }
+
+/// Every query here compares, sorts or hashes only values of a type with its
+/// own order. No instruction of its program may use a text collation: if one
+/// does, some code path took the collation from the text rules instead of
+/// from the value's type, and would compare '10.00' before '9.50'.
+#[cfg(test)]
+mod typed_value_order_tests {
+    use crate::sync::Arc;
+    use crate::vdbe::insn::Insn;
+    use crate::{
+        ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, IO,
+    };
+
+    /// Each query, with the number of its instructions that compare values the
+    /// engine made itself (row counters, sequence numbers) with BINARY.
+    const QUERIES: &[(&str, usize)] = &[
+        // comparisons
+        ("SELECT n FROM t WHERE n > 1.5", 0),
+        ("SELECT n FROM t WHERE n BETWEEN 1.5 AND 2", 0),
+        ("SELECT n FROM t WHERE a = '{1}'", 0),
+        ("SELECT n FROM t WHERE b < '{x}'", 0),
+        ("SELECT n FROM t WHERE n = (SELECT max(m) FROM u)", 0),
+        ("SELECT n > 1.5, nullif(n, 2), n IS 1.5 FROM t", 0),
+        // IN
+        ("SELECT n FROM t WHERE n IN (1.5, 2)", 0),
+        ("SELECT n FROM t WHERE n NOT IN (1.5, 2)", 0),
+        ("SELECT n FROM t WHERE n IN (SELECT m FROM u)", 0),
+        ("SELECT n FROM t WHERE n IN (SELECT m FROM u UNION SELECT n FROM t)", 0),
+        ("SELECT n FROM t WHERE a IN (SELECT a FROM t)", 0),
+        // CASE
+        ("SELECT CASE n WHEN 1.5 THEN 1 WHEN 2 THEN 2 END FROM t", 0),
+        ("SELECT n FROM t ORDER BY CASE WHEN a IS NULL THEN n ELSE n END", 0),
+        // ORDER BY
+        ("SELECT n FROM t ORDER BY n", 0),
+        ("SELECT n FROM t ORDER BY a DESC, b", 0),
+        ("SELECT n FROM t ORDER BY likely(n), coalesce(n, 1)", 0),
+        ("SELECT n + 1 AS x FROM t ORDER BY x", 0),
+        // GROUP BY
+        ("SELECT n FROM t GROUP BY n", 0),
+        ("SELECT a, b FROM t GROUP BY a, b", 0),
+        ("SELECT n FROM t GROUP BY n HAVING n > 1", 0),
+        // DISTINCT
+        ("SELECT DISTINCT n FROM t", 0),
+        ("SELECT DISTINCT a, b FROM t", 0),
+        ("SELECT count(DISTINCT n) FROM t", 0),
+        // compound
+        ("SELECT n FROM t UNION SELECT m FROM u", 0),
+        ("SELECT n FROM t INTERSECT SELECT m FROM u", 0),
+        ("SELECT n FROM t EXCEPT SELECT m FROM u", 0),
+        // The sorter's last key is the sequence number of the row.
+        ("SELECT n FROM t UNION ALL SELECT m FROM u ORDER BY 1", 1),
+        ("SELECT a FROM t UNION SELECT a FROM t", 0),
+        // window
+        ("SELECT min(n) OVER (PARTITION BY a ORDER BY b) FROM t", 0),
+        ("SELECT max(n) OVER (ORDER BY n RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t", 0),
+        ("SELECT n FROM t ORDER BY lag(n) OVER (ORDER BY a)", 0),
+        // Two comparisons of the frame's row numbers.
+        ("SELECT n FROM t ORDER BY first_value(b) OVER (ORDER BY n)", 2),
+        // min/max
+        ("SELECT min(n), max(a), min(b) FROM t", 0),
+        ("SELECT max(n, 2), min(n, 1.5) FROM t", 0),
+        // join
+        ("SELECT t.n FROM t JOIN u ON t.n = u.m", 0),
+        ("SELECT t.n FROM t LEFT JOIN u ON t.n = u.m", 0),
+        ("SELECT t.n FROM t, u WHERE t.n > u.m", 0),
+        ("SELECT t.n FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.m = t.n)", 0),
+    ];
+
+    #[test]
+    fn no_text_collation_on_typed_values() {
+        let conn = connection_with_typed_tables();
+        let mut failures = Vec::new();
+        for &(sql, internal_comparisons) in QUERIES {
+            let stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let with_text_collation: Vec<String> = stmt
+                .get_program()
+                .prepared
+                .insns
+                .iter()
+                .filter(|(insn, _)| compares_values(insn))
+                .map(|(insn, _)| format!("{insn:?}"))
+                .filter(|insn| insn.contains("Text("))
+                .collect();
+            if with_text_collation.len() != internal_comparisons {
+                failures.push(format!("{sql}\n    {}", with_text_collation.join("\n    ")));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "instructions on typed values that use a text collation:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Functions and aggregates that never compare values carry an unused
+    /// BINARY collation.
+    fn compares_values(insn: &Insn) -> bool {
+        match insn {
+            Insn::Function { func, .. } => func.func.needs_collation(),
+            Insn::AggStep { data } => data.func.compares_values(),
+            _ => true,
+        }
+    }
+
+    fn connection_with_typed_tables() -> Arc<Connection> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_custom_types(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(n numeric(10,2), a integer[], b text[]) STRICT")
+            .unwrap();
+        conn.execute("CREATE TABLE u(m numeric(10,2)) STRICT")
+            .unwrap();
+        conn
+    }
+}
