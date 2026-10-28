@@ -8975,7 +8975,7 @@ mod tests {
                 assert_eq!(columns.len(), 2);
                 if let ast::ResultColumn::Expr(expr, _) = &columns[0] {
                     if let ast::Expr::FunctionCall { name, args, .. } = &**expr {
-                        assert_eq!(name.as_str(), "greatest");
+                        assert_eq!(name.as_str(), "MAX");
                         assert_eq!(args.len(), 3);
                     } else {
                         panic!("Expected greatest function call");
@@ -8983,7 +8983,7 @@ mod tests {
                 }
                 if let ast::ResultColumn::Expr(expr, _) = &columns[1] {
                     if let ast::Expr::FunctionCall { name, args, .. } = &**expr {
-                        assert_eq!(name.as_str(), "least");
+                        assert_eq!(name.as_str(), "MIN");
                         assert_eq!(args.len(), 2);
                     } else {
                         panic!("Expected least function call");
