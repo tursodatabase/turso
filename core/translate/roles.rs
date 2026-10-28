@@ -21,8 +21,10 @@
 use std::sync::Arc;
 
 use crate::namespace::NamespaceId;
+use turso_ext::VTabKind;
 use turso_parser::ast;
 
+use crate::ext::ExtensionTable;
 use crate::schema::{BTreeTable, Schema, SEQ_BACKING_TABLE_PREFIX};
 use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::security::roles::{CREATE_ROLES_TABLE_SQL, ROLES_TABLE_NAME};
@@ -31,6 +33,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, Cookie, InsertFlags, Insn, RegisterOrLiteral};
+use crate::vtab::VirtualTableType;
 use crate::{bail_parse_error, Connection, LimboError, Result, MAIN_DB_ID};
 
 const MAIN_SCHEMA_NAME: &str = "main";
@@ -182,6 +185,12 @@ pub fn check_storage_access(
             Object::View(view_name.clone()),
         )));
     }
+    if let Some(virtual_table) = program.written_virtual_tables.first() {
+        return Err(permission_denied(PermissionDenied::privilege(
+            Action::Write,
+            Object::Table(virtual_table.name.clone()),
+        )));
+    }
     for (insn, index) in &program.insns {
         if program.change_capture_writes.contains(index) {
             continue;
@@ -211,6 +220,29 @@ pub fn check_storage_access(
         return Err(permission_denied(PermissionDenied::privilege(
             action, object,
         )));
+    }
+    for virtual_table in &program.opened_virtual_tables {
+        let readable = match &virtual_table.vtab_type {
+            VirtualTableType::Internal(table) => table.read().readable_without_privileges(),
+            VirtualTableType::External(ExtensionTable::C(_)) => {
+                virtual_table.kind == VTabKind::TableValuedFunction
+            }
+            VirtualTableType::External(table) => table.readable_without_privileges(),
+            VirtualTableType::Pragma(_) => false,
+        };
+        if !readable {
+            let denial = match virtual_table.kind {
+                VTabKind::TableValuedFunction => PermissionDenied::privilege(
+                    Action::Execute,
+                    Object::Function(virtual_table.name.clone()),
+                ),
+                VTabKind::VirtualTable => PermissionDenied::privilege(
+                    Action::Read,
+                    Object::Table(virtual_table.name.clone()),
+                ),
+            };
+            return Err(permission_denied(denial));
+        }
     }
     Ok(())
 }
@@ -403,13 +435,17 @@ mod tests {
 
     use turso_parser::ast;
 
+    use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
+
     use crate::connection::PrepareOptions;
+    use crate::native_ext::{TableUpdate, VirtualTable, VirtualTableCursor, VirtualTableModule};
     use crate::security::permission::{Action, Object, PermissionDenied};
     use crate::security::roles::RoleId;
     use crate::statement::StatementOrigin;
+    use crate::types::IOResultOr;
     use crate::{
-        Connection, Database, DatabaseOpts, LimboError, MemoryIO, OpenFlags, SqliteDialect,
-        StepResult, Value, IO,
+        Connection, Database, DatabaseOpts, IOResult, LimboError, MemoryIO, OpenFlags,
+        SqliteDialect, StepResult, Value, IO,
     };
 
     #[test]
@@ -665,6 +701,120 @@ mod tests {
     }
 
     #[test]
+    fn role_without_privileges_may_use_only_virtual_tables_that_allow_it() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        let pragma = conn
+            .execute("SELECT * FROM pragma_table_info('t')")
+            .unwrap_err();
+        assert_eq!(
+            denial(pragma),
+            PermissionDenied::privilege(
+                Action::Execute,
+                Object::Function("pragma_table_info".to_string())
+            )
+        );
+        #[cfg(feature = "json")]
+        conn.execute("SELECT * FROM json_each('[1, 2]')").unwrap();
+    }
+
+    #[test]
+    fn role_without_privileges_may_read_native_virtual_tables_that_allow_it() {
+        let options = crate::OpenOptions::new(Arc::new(SqliteDialect))
+            .native_module(
+                "open_rows",
+                VTabKind::VirtualTable,
+                EmptyModule { readable: true },
+            )
+            .native_module(
+                "closed_rows",
+                VTabKind::VirtualTable,
+                EmptyModule { readable: false },
+            );
+        let conn = Database::open(Arc::new(MemoryIO::new()), ":memory:", options)
+            .unwrap()
+            .connect(crate::ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
+        conn.execute("CREATE VIRTUAL TABLE open_table USING open_rows")
+            .unwrap();
+        conn.execute("CREATE VIRTUAL TABLE closed_table USING closed_rows")
+            .unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        conn.execute("SELECT * FROM open_table").unwrap();
+        let closed = conn.execute("SELECT * FROM closed_table").unwrap_err();
+        assert_eq!(
+            denial(closed),
+            PermissionDenied::privilege(Action::Read, Object::Table("closed_table".to_string()))
+        );
+    }
+
+    #[test]
+    fn role_without_privileges_may_use_only_native_table_valued_functions_that_allow_it() {
+        let options = crate::OpenOptions::new(Arc::new(SqliteDialect))
+            .native_module(
+                "open_rows",
+                VTabKind::TableValuedFunction,
+                EmptyModule { readable: true },
+            )
+            .native_module(
+                "closed_rows",
+                VTabKind::TableValuedFunction,
+                EmptyModule { readable: false },
+            );
+        let conn = Database::open(Arc::new(MemoryIO::new()), ":memory:", options)
+            .unwrap()
+            .connect(crate::ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        conn.execute("SELECT * FROM open_rows()").unwrap();
+        let closed = conn.execute("SELECT * FROM closed_rows()").unwrap_err();
+        assert_eq!(
+            denial(closed),
+            PermissionDenied::privilege(
+                Action::Execute,
+                Object::Function("closed_rows".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn role_without_privileges_cannot_change_virtual_tables_it_may_read() {
+        let options = crate::OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+            "open_rows",
+            VTabKind::VirtualTable,
+            EmptyModule { readable: true },
+        );
+        let conn = Database::open(Arc::new(MemoryIO::new()), ":memory:", options)
+            .unwrap()
+            .connect(crate::ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
+        conn.execute("CREATE VIRTUAL TABLE open_table USING open_rows")
+            .unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        for sql in [
+            "INSERT INTO open_table VALUES (1)",
+            "UPDATE open_table SET value = 2",
+            "DELETE FROM open_table",
+        ] {
+            let error = conn.execute(sql).unwrap_err();
+            assert_eq!(
+                denial(error),
+                PermissionDenied::privilege(Action::Write, Object::Table("open_table".to_string())),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn role_without_privileges_can_read_the_schema_again() {
         let conn = open_connection();
         conn.execute("CREATE TABLE t (x)").unwrap();
@@ -857,6 +1007,91 @@ mod tests {
                 "interrupted at step {interrupt_at_step}, the role is still in the catalog"
             );
             create_role(&conn, "alice").unwrap();
+        }
+    }
+
+    #[derive(Debug)]
+    struct EmptyModule {
+        readable: bool,
+    }
+
+    impl VirtualTableModule for EmptyModule {
+        type Table = EmptyTable;
+
+        fn schema(&self, _args: &[Value]) -> crate::Result<String> {
+            Ok("CREATE TABLE x(value INTEGER)".to_string())
+        }
+
+        fn create(&self, _args: &[Value]) -> crate::Result<Self::Table> {
+            Ok(EmptyTable {
+                readable: self.readable,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct EmptyTable {
+        readable: bool,
+    }
+
+    impl VirtualTable for EmptyTable {
+        type Cursor = EmptyCursor;
+
+        fn open(&self, _connection: Arc<Connection>) -> crate::Result<Self::Cursor> {
+            Ok(EmptyCursor)
+        }
+
+        fn best_index(
+            &self,
+            _constraints: &[ConstraintInfo],
+            _order_by: &[OrderByInfo],
+        ) -> Result<IndexInfo, ResultCode> {
+            Ok(IndexInfo::default())
+        }
+
+        fn readonly(&self) -> bool {
+            false
+        }
+
+        fn readable_without_privileges(&self) -> bool {
+            self.readable
+        }
+
+        fn create_update(&mut self, _args: Vec<Value>) -> crate::Result<Box<dyn TableUpdate>> {
+            Ok(Box::new(IgnoredUpdate))
+        }
+    }
+
+    struct IgnoredUpdate;
+
+    impl TableUpdate for IgnoredUpdate {
+        fn step(&mut self) -> IOResultOr<Option<i64>> {
+            Ok(IOResult::Done(None))
+        }
+    }
+
+    struct EmptyCursor;
+
+    impl VirtualTableCursor for EmptyCursor {
+        fn filter(
+            &mut self,
+            _args: &[Value],
+            _idx_str: Option<&str>,
+            _idx_num: i32,
+        ) -> IOResultOr<bool> {
+            Ok(IOResult::Done(false))
+        }
+
+        fn next(&mut self) -> IOResultOr<bool> {
+            Ok(IOResult::Done(false))
+        }
+
+        fn column(&mut self, _column: usize) -> IOResultOr<Value> {
+            unreachable!("an empty table has no rows")
+        }
+
+        fn rowid(&self) -> i64 {
+            unreachable!("an empty table has no rows")
         }
     }
 
