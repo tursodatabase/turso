@@ -1810,6 +1810,20 @@ impl Database {
                         state.mvcc_bootstrap_conn = None;
                     }
 
+                    // Load the names of the namespaces, which the schema rows
+                    // of their objects do not carry. This comes after the MVCC
+                    // bootstrap, whose recovery rebuilds the schema from the
+                    // schema rows and may replay rows of the namespaces table.
+                    let conn = state
+                        .conn
+                        .as_ref()
+                        .expect("conn must be initialized in Init phase");
+                    conn.maybe_update_schema();
+                    let namespace_rows = conn.query_stored_namespaces()?;
+                    if !namespace_rows.is_empty() {
+                        db.with_schema_mut(|schema| schema.load_namespace_names(&namespace_rows))?;
+                    }
+
                     state.phase = OpenDbAsyncPhase::Done;
                     return Ok(IOResult::Done(
                         state

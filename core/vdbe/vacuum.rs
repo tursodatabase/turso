@@ -42,8 +42,6 @@ pub(crate) enum SchemaEntryType {
     Index,
     Trigger,
     View,
-    /// A namespace; `rootpage` holds its id.
-    Schema,
 }
 
 impl SchemaEntryType {
@@ -53,7 +51,6 @@ impl SchemaEntryType {
             "index" => Ok(Self::Index),
             "trigger" => Ok(Self::Trigger),
             "view" => Ok(Self::View),
-            "schema" => Ok(Self::Schema),
             other => Err(crate::error::LimboError::Corrupt(format!(
                 "unexpected sqlite_schema type: {other}"
             ))),
@@ -138,16 +135,8 @@ pub(crate) fn classify_schema_entries(
     let mut post_data_entries: Vec<usize> = Vec::new();
     let mut counter_tables_to_copy: Vec<usize> = Vec::new();
 
-    // Namespaces come first, under their ids, so that every object copied
-    // under a namespace id is an object of that namespace in the copy too.
-    for (idx, entry) in entries.iter().enumerate() {
-        if entry.entry_type == SchemaEntryType::Schema {
-            tables_to_create.push(idx);
-        }
-    }
     for (idx, entry) in entries.iter().enumerate() {
         match entry.entry_type {
-            SchemaEntryType::Schema => {}
             SchemaEntryType::Table if entry.is_materialized_view_state_table() => {}
             SchemaEntryType::Table if entry.is_storage_backed() => {
                 // Skip sqlite_sequence and AUTOINCREMENT implicit sequence
@@ -623,6 +612,26 @@ pub(crate) fn vacuum_target_build_step(
                     })?;
                 }
 
+                // The rows of the namespaces table are copied with the data,
+                // but the tables of a namespace are copied by the namespace's
+                // name, so the target needs the names before that.
+                let namespaces: Vec<(NamespaceId, String)> =
+                    config
+                        .source_conn
+                        .with_schema(config.source_db_id, |schema| {
+                            schema
+                                .namespaces()
+                                .map(|(id, name)| (id, name.to_string()))
+                                .collect()
+                        });
+                if !namespaces.is_empty() {
+                    state.target_conn.with_schema_mut(|target_schema| {
+                        for (id, name) in &namespaces {
+                            target_schema.name_namespace(*id, name);
+                        }
+                    })?;
+                }
+
                 // Auto-vacuum must be installed before MVCC bootstrap creates
                 // internal tables, otherwise full auto-vacuum can reserve page
                 // 2 as a ptrmap page after MVCC has already used it as a root.
@@ -750,42 +759,23 @@ pub(crate) fn vacuum_target_build_step(
 
                 let entry_ordinal = state.tables_to_create[idx];
                 let entry = &state.schema_entries[entry_ordinal];
-                let target_stmt = if entry.entry_type == SchemaEntryType::Schema {
-                    // A namespace is recreated under its own id, which its
-                    // row keeps in rootpage.
-                    let id = u32::try_from(entry.rootpage).map_err(|_| {
-                        LimboError::Corrupt(format!(
-                            "schema row of '{}' has no namespace id: rootpage={}",
-                            entry.name, entry.rootpage
-                        ))
-                    })?;
-                    state.target_conn.prepare_translated_stmt(
-                        turso_parser::ast::Stmt::CreateSchema {
-                            name: turso_parser::ast::Name::exact(entry.name.clone()),
-                            id: Some(id),
-                        },
-                        &entry.sql,
-                    )
-                } else {
-                    let sql = table_sql_for_vacuum_replay(&state.target_conn, &entry.sql)?;
+                let sql = table_sql_for_vacuum_replay(&state.target_conn, &entry.sql)?;
 
-                    // System tables (sqlite_stat1, __turso_internal_types, etc.) have
-                    // reserved name prefixes that translate_create_table rejects for
-                    // user SQL. Temporarily mark the target connection as nested during
-                    // prepare() so the reserved-name check is bypassed at compile
-                    // time. The guard is only for prepare: keeping it during step()
-                    // would make this CREATE TABLE look nested, so its Transaction
-                    // opcode would skip write setup.
-                    let is_system = replay_bypasses_reserved_names(&entry.name);
-                    if is_system {
-                        state.target_conn.start_nested();
-                    }
-                    let target_stmt = state.target_conn.prepare(&sql);
-                    if is_system {
-                        state.target_conn.end_nested();
-                    }
-                    target_stmt
-                };
+                // System tables (sqlite_stat1, __turso_internal_types, etc.) have
+                // reserved name prefixes that translate_create_table rejects for
+                // user SQL. Temporarily mark the target connection as nested during
+                // prepare() so the reserved-name check is bypassed at compile
+                // time. The guard is only for prepare: keeping it during step()
+                // would make this CREATE TABLE look nested, so its Transaction
+                // opcode would skip write setup.
+                let is_system = replay_bypasses_reserved_names(&entry.name);
+                if is_system {
+                    state.target_conn.start_nested();
+                }
+                let target_stmt = state.target_conn.prepare(&sql);
+                if is_system {
+                    state.target_conn.end_nested();
+                }
                 let target_stmt = target_stmt?;
                 state.phase = VacuumTargetBuildPhase::StepCreateTable {
                     target_schema_stmt: Box::new(target_stmt),
@@ -913,7 +903,7 @@ pub(crate) fn vacuum_target_build_step(
                 let table_name = &entry.name;
                 // A table of a namespace is copied by the name that
                 // names it in SQL: its namespace and its bare name, which
-                // the target knows too, since namespaces are recreated first.
+                // the target knows too, since its namespaces were named above.
                 // Derive copy-column list from BTreeTable.columns in schema,
                 // filtering out virtual generated columns so the SELECT and
                 // INSERT arities stay aligned.
@@ -940,7 +930,7 @@ pub(crate) fn vacuum_target_build_step(
                         })
                         .ok_or_else(|| {
                             LimboError::Corrupt(format!(
-                                "table \"{table_name}\" is stored under a namespace without a schema row"
+                                "table \"{table_name}\" is stored under a namespace without a name"
                             ))
                         })?
                 };

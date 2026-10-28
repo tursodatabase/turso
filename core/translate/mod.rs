@@ -514,8 +514,8 @@ pub fn translate_inner(
         } => {
             sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
         }
-        ast::Stmt::CreateSchema { name, id } => {
-            schema::translate_create_schema(&name, id, resolver, program)?;
+        ast::Stmt::CreateSchema { name } => {
+            schema::translate_create_schema(&name, resolver, program)?;
         }
         ast::Stmt::DropSchema { name } => {
             schema::translate_drop_schema(&name, resolver, program)?;

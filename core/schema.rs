@@ -144,6 +144,9 @@ pub const TEMP_SCHEMA_TABLE_NAME: &str = "sqlite_temp_schema";
 pub const TEMP_SCHEMA_TABLE_NAME_ALT: &str = "sqlite_temp_master";
 pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
+/// The table of the main database that keeps the id and name of each
+/// namespace.
+pub const TURSO_NAMESPACES_TABLE_NAME: &str = "__turso_internal_namespaces";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 /// Hidden per-view value-multiset table backing MIN/MAX and DISTINCT
 /// aggregates.
@@ -1012,7 +1015,7 @@ impl Schema {
     }
 
     /// The namespaces of the schema, with their names: the ones
-    /// whose `schema` row the schema has.
+    /// that have a row in the namespaces table.
     pub fn namespaces(&self) -> impl Iterator<Item = (NamespaceId, &str)> {
         self.namespaces
             .iter()
@@ -1020,7 +1023,7 @@ impl Schema {
     }
 
     /// The name of namespace `id`. None for the root and for a
-    /// namespace that has objects but no `schema` row.
+    /// namespace that has objects but no row in the namespaces table.
     pub fn namespace_name(&self, id: NamespaceId) -> Option<&str> {
         self.namespaces.get(&id)?.name.as_deref()
     }
@@ -1053,20 +1056,39 @@ impl Schema {
     }
 
     /// Makes sure namespace `id` exists before an object stored under it is
-    /// added, since the schema rows of a namespace's objects may be read
-    /// before its `schema` row.
+    /// added, since the schema rows of a namespace's objects are read
+    /// before the namespaces table.
     fn add_namespace_of_object(&mut self, id: NamespaceId) {
         self.namespaces.entry(id).or_default();
     }
 
-    /// Records that the namespace `id` is called `name`, as its
-    /// `schema` row says.
-    fn name_namespace(&mut self, id: NamespaceId, name: &str) {
+    /// Records the names of the namespaces from the `(id, name)` rows of the
+    /// namespaces table. A schema that does not support namespaces has none.
+    pub fn load_namespace_names(&mut self, rows: &[(i64, String)]) -> Result<()> {
+        if !self.supports_namespaces {
+            return Ok(());
+        }
+        for (id, name) in rows {
+            let id = u32::try_from(*id)
+                .ok()
+                .filter(|id| *id != 0)
+                .ok_or_else(|| {
+                    LimboError::Corrupt(format!(
+                        "{TURSO_NAMESPACES_TABLE_NAME} row of '{name}' has an invalid id: {id}"
+                    ))
+                })?;
+            self.name_namespace(NamespaceId::new(id), name);
+        }
+        Ok(())
+    }
+
+    /// Records that the namespace `id` is called `name`.
+    pub(crate) fn name_namespace(&mut self, id: NamespaceId, name: &str) {
         self.namespaces.entry(id).or_default().name = Some(name.to_string());
     }
 
-    /// Forgets the name of namespace `id` when its `schema` row is
-    /// deleted. Its objects, if any are left, stay until they are removed.
+    /// Forgets the name of namespace `id` when its row is deleted from the
+    /// namespaces table. Its objects, if any are left, stay until they are removed.
     pub(crate) fn unname_namespace(&mut self, id: NamespaceId) {
         if let Some(objects) = self.namespaces.get_mut(&id) {
             objects.name = None;
@@ -3501,20 +3523,6 @@ impl Schema {
                     table_name,
                 )?;
             }
-            "schema" => {
-                if !self.supports_namespaces {
-                    return Ok(());
-                }
-                let id = u32::try_from(root_page)
-                    .ok()
-                    .filter(|id| *id != 0)
-                    .ok_or_else(|| {
-                        LimboError::Corrupt(format!(
-                            "sqlite_schema row of schema '{name}' has no namespace id: rootpage={root_page}"
-                        ))
-                    })?;
-                self.name_namespace(NamespaceId::new(id), name);
-            }
             // Types are stored in sqlite_turso_types, not sqlite_schema
             _ => {}
         };
@@ -3780,6 +3788,16 @@ impl Schema {
         self.namespace(namespace)
             .sequences
             .get(&normalize_ident(name))
+    }
+
+    /// Whether namespace `namespace` has the sequence `name`. Unlike
+    /// [`Self::get_sequence`], the namespace need not exist: the backing
+    /// table of a sequence is in the root namespace, so a loader can meet it
+    /// before anything has added the sequence's namespace.
+    pub fn has_sequence(&self, namespace: NamespaceId, name: &str) -> bool {
+        self.namespaces
+            .get(&namespace)
+            .is_some_and(|objects| objects.sequences.contains_key(&normalize_ident(name)))
     }
 
     /// Remove a sequence and its backing table from the in-memory schema.

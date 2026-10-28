@@ -868,7 +868,7 @@ impl ToTokens for Stmt {
                 seq_name.to_tokens(s, context)?;
                 Ok(())
             }
-            Self::CreateSchema { name, id: _ } => {
+            Self::CreateSchema { name } => {
                 s.append(TK_CREATE, None)?;
                 s.append(TK_ID, Some("SCHEMA"))?;
                 name.to_tokens(s, context)?;
