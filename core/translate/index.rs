@@ -7,14 +7,15 @@ use crate::numeric::Numeric;
 use crate::schema::{
     Column, GeneratedType, Schema, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES,
 };
-use crate::sync::{Arc, RwLock};
+use crate::sync::Arc;
 use crate::translate::{
     catalog::CatalogContext,
-    collate::{expr_type_ordering, CollationSeq, TextCollation},
+    collate::{CollationSeq, TextCollation},
     emitter::{
         emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
-        DoubleQuotedDml, OperationMode, Resolver,
+        OperationMode, Resolver,
     },
+    expr::expr_type::{type_of, type_ordering, TypeEnv},
     expr::{
         bind_and_rewrite_expr, emit_stored_column, translate_condition_expr, translate_expr,
         unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
@@ -23,11 +24,10 @@ use crate::translate::{
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
 };
 use crate::type_ordering::TypeOrdering;
-use crate::vdbe::builder::{CursorKey, DmlColumnContext, ProgramBuilderOpts, SelfTableContext};
+use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
 use crate::vdbe::insn::{to_u32, ClearBtreeCount, CmpInsFlags, Cookie};
 use crate::{
-    bail_parse_error, CaptureDataChangesExt, DatabaseCatalog, LimboError, SymbolTable, MAIN_DB_ID,
-    TEMP_DB_ID,
+    bail_parse_error, CaptureDataChangesExt, LimboError, SymbolTable, MAIN_DB_ID, TEMP_DB_ID,
 };
 use crate::{
     schema::{
@@ -1056,28 +1056,8 @@ fn expression_type_ordering(
 ) -> crate::Result<Option<TypeOrdering>> {
     let mut expr = expr.clone();
     crate::schema::resolve_gencol_expr_columns(&mut expr, table.columns())?;
-    let database_schemas = RwLock::new(HashMap::default());
-    let temp_database = RwLock::new(None);
-    let attached_databases = RwLock::new(DatabaseCatalog::new());
-    let namespaces = crate::Namespaces::default();
-    let resolver = Resolver::new(
-        schema,
-        &database_schemas,
-        &temp_database,
-        &attached_databases,
-        &namespaces,
-        syms,
-        true,
-        DoubleQuotedDml::Disabled,
-        Arc::new(crate::dialect::SqliteDialect),
-        None,
-    );
-    let table = Arc::new(table.clone());
-    let self_table = SelfTableContext::ForDML {
-        dml_ctx: DmlColumnContext::from_column_reg_mapping(table.columns().iter().map(|c| (c, 0))),
-        table: Arc::clone(&table),
-    };
-    Ok(resolver.with_self_table(&self_table, || expr_type_ordering(&expr, None, &resolver)))
+    let ty = type_of(&expr, &TypeEnv::over_table(table, schema, syms));
+    Ok(type_ordering(&ty, schema))
 }
 
 /// Extracts collation sequence from an expression if it is a Collate expression.

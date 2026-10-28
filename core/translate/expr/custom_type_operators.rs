@@ -86,7 +86,7 @@ pub(super) fn find_operator_call(
             _ => unreachable!("an operator has one or two operands"),
         }
     };
-    call_for(signature, ty, env.resolver())
+    call_for(signature, ty, env)
 }
 
 /// The symbol and operands of `expr` when it is an operator that custom types
@@ -171,9 +171,8 @@ struct Operand<'a> {
 impl<'a> Operand<'a> {
     fn new(expr: &'a ast::Expr, expr_type: &'a ExprType, env: &TypeEnv) -> Result<Self> {
         let expr = without_wrappers(expr);
-        let resolver = env.resolver();
         let column_type = match column_custom_type(expr, env) {
-            Some(ty) => without_domains(ty, resolver.schema())?,
+            Some(ty) => without_domains(ty, env.schema())?,
             None => None,
         };
         let value_type = match expr_type {
@@ -182,11 +181,11 @@ impl<'a> Operand<'a> {
                     type_def: type_def.clone(),
                     params: params.clone(),
                 },
-                resolver.schema(),
+                env.schema(),
             )?,
             _ => None,
         };
-        let sqlite_type = sqlite_operand_type(expr_type.clone(), resolver.schema());
+        let sqlite_type = sqlite_operand_type(expr_type.clone(), env.schema());
         let may_be_integer = matches!(
             sqlite_type,
             ExprType::Builtin(BuiltinType::Integer | BuiltinType::Any)
@@ -298,12 +297,12 @@ fn has_sqlite_operator(type_def: &TypeDef, signature: &OperatorSignature) -> boo
 fn call_for(
     signature: &OperatorSignature,
     ty: &ColumnCustomType,
-    resolver: &Resolver,
+    env: &TypeEnv,
 ) -> Result<Option<OperatorCall>> {
     let Some(func) = &signature.func else {
         return Ok(None);
     };
-    let Some(function) = resolver.resolve_function(func, signature.args.len())? else {
+    let Some(function) = env.resolve_function(func, signature.args.len())? else {
         crate::bail_parse_error!(
             "function {func} for operator {} on type {} does not exist",
             signature.op,

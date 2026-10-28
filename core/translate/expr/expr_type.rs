@@ -10,12 +10,13 @@ use turso_parser::ast;
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
 use crate::function::{AggFunc, Func, ScalarFunc, WindowFunc};
-use crate::schema::{Column, Schema, Table, TypeDef};
+use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::translate::plan::{Plan, SelectPlan, TableReferences};
 use crate::type_ordering::TypeOrdering;
 use crate::vdbe::affinity::Affinity;
+use crate::{Result, SymbolTable};
 
 /// Type parameters are kept as written, in the same form as `Column::ty_params`.
 #[allow(clippy::vec_box)]
@@ -99,25 +100,92 @@ pub(crate) fn same_type_def(a: &TypeDef, b: &TypeDef) -> bool {
 }
 
 /// What an expression's column references and registers refer to.
-///
-/// The resolver holds the table being written (`SELF_TABLE`) and what is known
-/// about registers and subquery results, so every caller sees the same types.
-pub(crate) struct TypeEnv<'a> {
-    tables: Option<&'a TableReferences>,
-    resolver: &'a Resolver<'a>,
+pub(crate) enum TypeEnv<'a> {
+    /// An expression in a statement being translated. The resolver holds the
+    /// table being written (`SELF_TABLE`) and what is known about registers
+    /// and subquery results, so every caller sees the same types.
+    Statement {
+        tables: Option<&'a TableReferences>,
+        resolver: &'a Resolver<'a>,
+    },
+    /// An expression over the columns of one table, such as an index
+    /// expression read from the schema. Its columns are `SELF_TABLE` columns.
+    Table {
+        table: &'a BTreeTable,
+        schema: &'a Schema,
+        syms: &'a SymbolTable,
+    },
 }
 
 impl<'a> TypeEnv<'a> {
     pub(crate) fn new(tables: Option<&'a TableReferences>, resolver: &'a Resolver<'a>) -> Self {
-        Self { tables, resolver }
+        Self::Statement { tables, resolver }
+    }
+
+    pub(crate) fn over_table(
+        table: &'a BTreeTable,
+        schema: &'a Schema,
+        syms: &'a SymbolTable,
+    ) -> Self {
+        Self::Table {
+            table,
+            schema,
+            syms,
+        }
     }
 
     pub(crate) fn schema(&self) -> &Schema {
-        self.resolver.schema()
+        match self {
+            Self::Statement { resolver, .. } => resolver.schema(),
+            Self::Table { schema, .. } => schema,
+        }
     }
 
-    pub(crate) fn resolver(&self) -> &Resolver<'a> {
-        self.resolver
+    /// The function a custom type's operator calls.
+    pub(crate) fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
+        match self {
+            Self::Statement { resolver, .. } => resolver.resolve_function(name, arg_count),
+            // The schema is read without the connection's dialect. Both
+            // dialects resolve built-in functions the same way.
+            Self::Table { syms, .. } => {
+                match crate::dialect::sqlite::resolve_builtin_function(name, arg_count)? {
+                    Some(func) => Ok(Some(func)),
+                    None => Ok(syms.resolve_function(name, arg_count).map(Func::External)),
+                }
+            }
+        }
+    }
+
+    fn tables(&self) -> Option<&TableReferences> {
+        match self {
+            Self::Statement { tables, .. } => *tables,
+            Self::Table { .. } => None,
+        }
+    }
+
+    fn resolver(&self) -> Option<&Resolver<'a>> {
+        match self {
+            Self::Statement { resolver, .. } => Some(resolver),
+            Self::Table { .. } => None,
+        }
+    }
+
+    fn self_table_column_type(&self, column: usize) -> Option<ExprType> {
+        match self {
+            Self::Statement { resolver, .. } => {
+                let table = resolver.self_table()?;
+                Some(column_type(
+                    table.columns().get(column)?,
+                    table.is_strict,
+                    resolver.schema(),
+                ))
+            }
+            Self::Table { table, schema, .. } => Some(column_type(
+                table.columns().get(column)?,
+                table.is_strict,
+                schema,
+            )),
+        }
     }
 }
 
@@ -179,7 +247,10 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
                 },
             ..
         } => {
-            let subqueries = env.resolver.row_value_subqueries.borrow();
+            let Some(resolver) = env.resolver() else {
+                return ExprType::Unknown;
+            };
+            let subqueries = resolver.row_value_subqueries.borrow();
             match subqueries
                 .get(subquery_id)
                 .and_then(|subquery| subquery.column(*result_reg_start))
@@ -365,12 +436,15 @@ fn column_reference_type(
     env: &TypeEnv,
 ) -> Option<ExprType> {
     match env
-        .tables
+        .tables()
         .and_then(|tables| tables.find_table_by_internal_id(table))
     {
-        Some((_, Table::FromClauseSubquery(subquery))) => {
-            Some(query_column_type(&subquery.plan, column, env.resolver))
-        }
+        Some((_, Table::FromClauseSubquery(subquery))) => Some(query_column_type(
+            &subquery.plan,
+            column,
+            env.resolver()
+                .expect("only a statement's expressions refer to FROM clause subqueries"),
+        )),
         Some((_, Table::RecursiveCteInput(input))) => input.column_types.get(column).cloned(),
         _ => base_table_column_type(table, column, env),
     }
@@ -417,7 +491,7 @@ fn base_table_column_type(
     env: &TypeEnv,
 ) -> Option<ExprType> {
     if let Some((_, table)) = env
-        .tables
+        .tables()
         .and_then(|tables| tables.find_table_by_internal_id(table))
     {
         if matches!(
@@ -433,12 +507,7 @@ fn base_table_column_type(
         ));
     }
     if table.is_self_table() {
-        let table = env.resolver.self_table()?;
-        return Some(column_type(
-            table.columns().get(column)?,
-            table.is_strict,
-            env.schema(),
-        ));
+        return env.self_table_column_type(column);
     }
     None
 }
@@ -853,7 +922,7 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
 /// For expressions whose type is only known through their SQLite affinity: a column
 /// that could not be found, a register, a subquery result.
 fn affinity_type(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
-    builtin_type_of_affinity(get_expr_affinity(expr, env.tables, Some(env.resolver)))
+    builtin_type_of_affinity(get_expr_affinity(expr, env.tables(), env.resolver()))
 }
 
 fn builtin_type_of_affinity(affinity: Affinity) -> ExprType {
