@@ -305,7 +305,7 @@ impl VirtualTableCursor {
     pub(crate) fn next(&mut self) -> IOResultOr<bool> {
         self.null_flag = false;
         let result = match &mut self.inner {
-            VirtualTableCursorInner::Pragma(cursor) => cursor.next(),
+            VirtualTableCursorInner::Pragma(cursor) => return cursor.next().map_err(Into::into),
             VirtualTableCursorInner::External(cursor) => return cursor.next(),
             VirtualTableCursorInner::Internal(cursor) => cursor.write().next(),
         };
@@ -344,7 +344,9 @@ impl VirtualTableCursor {
     ) -> IOResultOr<bool> {
         self.null_flag = false;
         let result = match &mut self.inner {
-            VirtualTableCursorInner::Pragma(cursor) => cursor.filter(args),
+            VirtualTableCursorInner::Pragma(cursor) => {
+                return cursor.filter(args).map_err(Into::into)
+            }
             VirtualTableCursorInner::External(cursor) => {
                 return cursor.filter(idx_num, idx_str, arg_count, args);
             }

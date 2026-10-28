@@ -1,6 +1,7 @@
 use crate::sync::Arc;
+use crate::types::IOCompletions;
 use crate::util::{escape_sql_string_literal, quote_identifier};
-use crate::{Connection, LimboError, Statement, StepResult, Value};
+use crate::{Completion, Connection, IOResult, LimboError, Statement, StepResult, Value};
 use bitflags::bitflags;
 use strum::IntoEnumIterator;
 use turso_ext::{ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, ResultCode};
@@ -319,6 +320,7 @@ impl PragmaVirtualTable {
             visible_column_count: self.visible_column_count,
             max_arg_count: self.max_arg_count,
             has_pragma_arg: self.has_pragma_arg,
+            filter_pending: false,
         })
     }
 
@@ -385,6 +387,7 @@ pub struct PragmaVirtualTableCursor {
     visible_column_count: usize,
     max_arg_count: usize,
     has_pragma_arg: bool,
+    filter_pending: bool,
 }
 
 impl PragmaVirtualTableCursor {
@@ -392,18 +395,25 @@ impl PragmaVirtualTableCursor {
         self.pos as i64
     }
 
-    pub(crate) fn next(&mut self) -> crate::Result<bool> {
+    pub(crate) fn next(&mut self) -> crate::Result<IOResult<bool>> {
         let stmt = self
             .stmt
             .as_mut()
             .ok_or_else(|| LimboError::InternalError("Statement is missing".into()))?;
-        let result = stmt.step()?;
-        match result {
-            StepResult::Done => Ok(false),
-            _ => {
+        match stmt.step()? {
+            StepResult::Done => Ok(IOResult::Done(false)),
+            StepResult::Row => {
                 self.pos += 1;
-                Ok(true)
+                Ok(IOResult::Done(true))
             }
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                let io = stmt
+                    .take_io_completions()
+                    .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
+                Ok(IOResult::IO(io))
+            }
+            StepResult::Busy => Err(LimboError::Busy),
+            StepResult::Interrupt => Err(LimboError::Interrupt),
         }
     }
 
@@ -430,7 +440,22 @@ impl PragmaVirtualTableCursor {
         Ok(value)
     }
 
-    pub(crate) fn filter(&mut self, args: crate::alloc::Vec<Value>) -> crate::Result<bool> {
+    pub(crate) fn filter(
+        &mut self,
+        args: crate::alloc::Vec<Value>,
+    ) -> crate::Result<IOResult<bool>> {
+        if !self.filter_pending {
+            self.start_scan(args)?;
+            self.filter_pending = true;
+        }
+        let result = self.next();
+        if !matches!(result, Ok(IOResult::IO(_))) {
+            self.filter_pending = false;
+        }
+        result
+    }
+
+    fn start_scan(&mut self, args: crate::alloc::Vec<Value>) -> crate::Result<()> {
         if args.len() > self.max_arg_count {
             return Err(LimboError::ParseError(format!(
                 "Too many arguments for pragma {}: expected at most {}, got {}",
@@ -477,8 +502,7 @@ impl PragmaVirtualTableCursor {
         // outer UPDATE still has an active MVCC transaction and write cursor open on `dst`.
         // The helper must stay nested so it does not disturb the parent's transaction state.
         self.stmt = Some(self.conn.prepare_internal(sql)?);
-
-        self.next()
+        Ok(())
     }
 }
 
@@ -504,17 +528,23 @@ mod tests {
         };
         let mut cursor = pragma_vtab.open(conn).unwrap();
 
-        assert!(cursor
-            .filter(crate::alloc::vec![Value::from_text("scan_target")])
-            .unwrap());
+        assert!(matches!(
+            cursor
+                .filter(crate::alloc::vec![Value::from_text("scan_target")])
+                .unwrap(),
+            IOResult::Done(true)
+        ));
         assert_eq!(cursor.rowid(), 1);
-        assert!(cursor.next().unwrap());
+        assert!(matches!(cursor.next().unwrap(), IOResult::Done(true)));
         assert_eq!(cursor.rowid(), 2);
-        assert!(!cursor.next().unwrap());
+        assert!(matches!(cursor.next().unwrap(), IOResult::Done(false)));
 
-        assert!(cursor
-            .filter(crate::alloc::vec![Value::from_text("scan_target")])
-            .unwrap());
+        assert!(matches!(
+            cursor
+                .filter(crate::alloc::vec![Value::from_text("scan_target")])
+                .unwrap(),
+            IOResult::Done(true)
+        ));
         assert_eq!(cursor.rowid(), 1);
     }
 
