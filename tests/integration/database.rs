@@ -544,3 +544,35 @@ fn test_errors_on_zero_divisor_dialect() {
         );
     }
 }
+
+/// SQLite lets a user create a table named like the namespaces table of a
+/// database that supports namespaces. Under the SQLite dialect it is an
+/// ordinary table, and loading the schema must not read it as one.
+#[test]
+fn test_a_sqlite_table_named_like_the_namespaces_table_is_an_ordinary_table() {
+    use crate::common::{limbo_exec_rows, TempDatabase};
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("main.db");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE __turso_internal_namespaces(x); \
+             CREATE TABLE t(a); INSERT INTO t VALUES(5);",
+        )
+        .unwrap();
+    let db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new().with_vacuum(true),
+    );
+    let conn = db.connect_limbo();
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT a FROM t"),
+        vec![vec![rusqlite::types::Value::Integer(5)]]
+    );
+    // VACUUM reloads the schema afterwards.
+    conn.execute("VACUUM").unwrap();
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT a FROM t"),
+        vec![vec![rusqlite::types::Value::Integer(5)]]
+    );
+}

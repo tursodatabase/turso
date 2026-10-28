@@ -606,7 +606,7 @@ impl Connection {
                         .attached_databases
                         .write()
                         .insert(db.clone(), pager.clone());
-                    self.add_namespace(crate::Namespace::database(alias, database_id));
+                    self.add_qualifier(crate::Qualifier::database(alias, database_id));
                     *state = AttachDatabaseState::Done;
                     return Ok(IOResult::Done(()));
                 }
@@ -636,7 +636,7 @@ impl Connection {
         // *before* removing the database from the catalog.  mv_store_for_db
         // and get_pager_from_database_index read `attached_databases`, so we
         // must not hold the write lock during the rollback.
-        let Some(database_id) = self.namespaces.database_id(alias) else {
+        let Some(database_id) = self.qualifiers.database_id(alias) else {
             return Err(LimboError::InvalidArgument(format!(
                 "no such database: {alias}"
             )));
@@ -674,7 +674,7 @@ impl Connection {
         // Remove from catalog. The write lock must be released before
         // acquiring database_schemas.write() to maintain consistent lock
         // ordering (attached_databases before database_schemas).
-        self.remove_namespace(alias);
+        self.remove_qualifier(alias);
         self.attached_databases.write().remove(database_id);
         self.clear_sequence_currvals_of_database(database_id);
 

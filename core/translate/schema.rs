@@ -4,11 +4,12 @@ use crate::LimboError;
 
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
+use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES,
-    SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    BTreeTable, ColDef, Column, SchemaObjectType, Table, Type, SQLITE_SEQUENCE_TABLE_NAME,
+    TURSO_NAMESPACES_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -887,7 +888,7 @@ fn validate(
             }
         }
 
-        let table = create_table(table_name, body, 0)?;
+        let table = create_table(table_name, body, 0, resolver.dialect.supports_namespaces())?;
         if !table.has_rowid {
             if table.has_autoincrement {
                 bail_parse_error!("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
@@ -915,7 +916,7 @@ struct CtasInfo {
 /// Returns the plan (for reuse in emission) along with the complete schema SQL and column definitions.
 fn derive_ctas_schema(
     select: ast::Select,
-    table_name: &str,
+    table_name_in_sql: &str,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
@@ -1002,7 +1003,7 @@ fn derive_ctas_schema(
 
     let info = CtasInfo {
         plan,
-        schema_sql: format!("CREATE TABLE {table_name}({})", sql_parts.join(",")),
+        schema_sql: format!("CREATE TABLE {table_name_in_sql}({})", sql_parts.join(",")),
     };
     Ok((info, col_defs))
 }
@@ -1066,7 +1067,12 @@ fn emit_ctas_insert(
     program.preassign_label_to_next_insn(jump_on_definition_label);
 
     // Open the new table for writing using the root page from CreateBtree.
-    let ctas_btree = Arc::new(create_table(table_name, body, 0)?);
+    let ctas_btree = Arc::new(create_table(
+        table_name,
+        body,
+        0,
+        resolver.catalog.dialect.supports_namespaces(),
+    )?);
     // SQLite applies the derived CTAS affinity in MakeRecord. This keeps each
     // stored value consistent with the declared type of the CTAS column.
     let affinity_str = ctas_btree
@@ -1151,7 +1157,12 @@ pub fn translate_create_table(
         ast::CreateTableBody::AsSelect(select) => {
             let (info, col_defs) = derive_ctas_schema(
                 select,
-                &tbl_name.name.as_ident(),
+                &resolver
+                    .name_in_sql(
+                        resolver.resolve_namespace_for_create(&tbl_name)?,
+                        &tbl_name.name,
+                    )
+                    .as_ident(),
                 resolver,
                 program,
                 connection,
@@ -1175,6 +1186,12 @@ pub fn translate_create_table(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
+    let mangled_tbl_name = resolver.mangle_name(namespace, &normalized_tbl_name);
+    let tbl_name_in_sql = ast::QualifiedName {
+        namespace: None,
+        name: resolver.name_in_sql(namespace, &tbl_name.name),
+        alias: None,
+    };
     validate(&body, &normalized_tbl_name, &resolver.catalog)?;
     let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
         && bind_default_sequence_names(&mut body, resolver)?;
@@ -1206,9 +1223,10 @@ pub fn translate_create_table(
     program.extend(&opts);
 
     if !connection.is_mvcc_bootstrap_connection()
-        && RESERVED_TABLE_PREFIXES
-            .iter()
-            .any(|prefix| normalized_tbl_name.starts_with(prefix))
+        && is_reserved_object_name(
+            connection.dialect().supports_namespaces(),
+            &normalized_tbl_name,
+        )
         && !connection.is_nested_stmt()
     {
         bail_parse_error!(
@@ -1368,17 +1386,13 @@ pub fn translate_create_table(
             .format_rewritten_table_sql(&ast::Stmt::CreateTable {
                 temporary,
                 if_not_exists,
-                tbl_name: ast::QualifiedName {
-                    namespace: None,
-                    name: tbl_name.name,
-                    alias: None,
-                },
+                tbl_name: tbl_name_in_sql,
                 body: body.clone(),
             })?
     } else {
         connection
             .dialect()
-            .format_table_sql(input, &tbl_name, &body)?
+            .format_table_sql(input, &tbl_name_in_sql, &body)?
     };
 
     let parse_schema_label = program.allocate_label();
@@ -1422,7 +1436,7 @@ pub fn translate_create_table(
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L2856-L2871
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
 
-    let index_regs = collect_autoindexes(&body, program, &normalized_tbl_name)?;
+    let index_regs = collect_autoindexes(&body, program, &mangled_tbl_name, resolver)?;
     if let Some(index_regs) = index_regs.as_ref() {
         for index_reg in index_regs.iter() {
             program.emit_insn(Insn::CreateBtree {
@@ -1457,8 +1471,8 @@ pub fn translate_create_table(
         sqlite_schema_cursor_id,
         cdc_table.as_ref().map(|x| x.0),
         SchemaEntryType::Table,
-        &normalized_tbl_name,
-        &normalized_tbl_name,
+        &mangled_tbl_name,
+        &mangled_tbl_name,
         table_root_reg,
         Some(sql),
     )?;
@@ -1467,7 +1481,7 @@ pub fn translate_create_table(
         for (idx, index_reg) in index_regs.into_iter().enumerate() {
             let index_name = format!(
                 "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_{}",
-                normalized_tbl_name,
+                mangled_tbl_name,
                 idx + 1
             );
             emit_schema_entry(
@@ -1477,7 +1491,7 @@ pub fn translate_create_table(
                 None,
                 SchemaEntryType::Index,
                 &index_name,
-                &normalized_tbl_name,
+                &mangled_tbl_name,
                 index_reg,
                 None,
             )?;
@@ -1490,11 +1504,11 @@ pub fn translate_create_table(
     // `__turso_internal_seq_<sequence-name>` table.
     // Skip if it already exists (e.g. VACUUM INTO copies all tables first).
     if has_autoincrement {
-        let autoinc_seq_name = crate::schema::autoincrement_sequence_name(&normalized_tbl_name);
+        let autoinc_seq_name = crate::schema::autoincrement_sequence_name(&mangled_tbl_name);
         let backing_table_name =
             crate::translate::sequence::sequence_backing_table_name(&autoinc_seq_name);
         let already_exists = resolver.with_schema(database_id, |s| {
-            s.get_btree_table(namespace.id, &backing_table_name)
+            s.get_btree_table(NamespaceId::ROOT, &backing_table_name)
                 .is_some()
         });
         if !already_exists {
@@ -1522,7 +1536,7 @@ pub fn translate_create_table(
         p5: 0,
     });
 
-    let escaped_tbl_name = escape_sql_string_literal(&normalized_tbl_name);
+    let escaped_tbl_name = escape_sql_string_literal(&mangled_tbl_name);
     let mut parse_schema_where_clause = String::with_capacity(
         "tbl_name = '' AND type != 'trigger'".len()
             + escaped_tbl_name.len()
@@ -1585,6 +1599,229 @@ fn bind_default_sequence_names(
         }
     }
     Ok(bound)
+}
+
+/// Translates `CREATE SCHEMA name`: a new namespace of the main
+/// database, recorded as a row of the namespaces table, under the next
+/// free id. Only a dialect that supports namespaces has them.
+pub fn translate_create_schema(
+    name: &ast::Name,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    if !resolver.catalog.dialect.supports_namespaces() {
+        bail_parse_error!("CREATE SCHEMA is not supported");
+    }
+    let normalized_name = normalize_ident(name.as_str());
+    if resolver
+        .catalog
+        .namespace_database_id(&normalized_name)
+        .is_some()
+    {
+        bail_parse_error!("schema {normalized_name} already exists");
+    }
+    let id = resolver.with_schema(MAIN_DB_ID, |s| s.next_namespace_id());
+    let schema_version = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
+    program.begin_write_on_database(MAIN_DB_ID, schema_version)?;
+
+    let cursor_id = open_namespaces_table_for_writing(program, resolver)?;
+    let id_reg = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        dest: id_reg,
+        value: i64::from(id.as_u32()),
+    });
+    let insert_label = program.allocate_label();
+    program.emit_insn(Insn::NotExists {
+        cursor: cursor_id,
+        rowid_reg: id_reg,
+        target_pc: insert_label,
+    });
+    program.emit_insn(Insn::Halt {
+        constraint_info: None,
+        err_code: crate::error::SQLITE_CONSTRAINT_PRIMARYKEY,
+        description: format!("UNIQUE constraint failed: {TURSO_NAMESPACES_TABLE_NAME}.id"),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(insert_label);
+    // The id is the rowid, so the record keeps NULL for it, as SQLite does
+    // for an INTEGER PRIMARY KEY column.
+    let record_start_reg = program.alloc_registers(2);
+    program.emit_insn(Insn::Null {
+        dest: record_start_reg,
+        dest_end: None,
+    });
+    program.emit_insn(Insn::String8 {
+        value: normalized_name.clone(),
+        dest: record_start_reg + 1,
+    });
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(record_start_reg),
+        count: to_u32(2),
+        dest_reg: to_u32(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: cursor_id,
+        key_reg: id_reg,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: TURSO_NAMESPACES_TABLE_NAME.to_string(),
+    });
+    program.emit_insn(Insn::AddNamespace {
+        db: MAIN_DB_ID,
+        namespace: id,
+        name: normalized_name,
+    });
+    program.emit_insn(Insn::SetCookie {
+        db: MAIN_DB_ID,
+        cookie: Cookie::SchemaVersion,
+        value: schema_version as i32 + 1,
+        p5: 0,
+    });
+    Ok(())
+}
+
+/// Translates `DROP SCHEMA name`: removes the namespace's row from the
+/// namespaces table and forgets its name. The objects stored under its id
+/// stay until they are dropped, so the caller drops them first.
+pub fn translate_drop_schema(
+    name: &ast::Name,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    if !resolver.catalog.dialect.supports_namespaces() {
+        bail_parse_error!("DROP SCHEMA is not supported");
+    }
+    let normalized_name = normalize_ident(name.as_str());
+    let Some(id) = resolver.with_schema(MAIN_DB_ID, |s| s.namespace_named(&normalized_name)) else {
+        bail_parse_error!("no such schema: {normalized_name}");
+    };
+    let schema_version = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
+    program.begin_write_on_database(MAIN_DB_ID, schema_version)?;
+
+    let namespaces_table = resolver
+        .with_schema(MAIN_DB_ID, |s| {
+            s.get_btree_table(NamespaceId::ROOT, TURSO_NAMESPACES_TABLE_NAME)
+        })
+        .expect("a database with a namespace has the namespaces table");
+    let root_page = namespaces_table.root_page;
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(namespaces_table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page: root_page.into(),
+        db: MAIN_DB_ID,
+    });
+    let id_reg = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        dest: id_reg,
+        value: i64::from(id.as_u32()),
+    });
+    let missing_row_label = program.allocate_label();
+    let delete_done_label = program.allocate_label();
+    program.emit_insn(Insn::NotExists {
+        cursor: cursor_id,
+        rowid_reg: id_reg,
+        target_pc: missing_row_label,
+    });
+    program.emit_insn(Insn::Delete {
+        cursor_id,
+        table_name: TURSO_NAMESPACES_TABLE_NAME.to_string(),
+        is_part_of_update: false,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: delete_done_label,
+    });
+    program.preassign_label_to_next_insn(missing_row_label);
+    program.emit_insn(Insn::Halt {
+        constraint_info: None,
+        err_code: crate::error::SQLITE_ERROR,
+        description: format!(
+            "{TURSO_NAMESPACES_TABLE_NAME} has no row for namespace {normalized_name}"
+        ),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(delete_done_label);
+
+    program.emit_insn(Insn::DropNamespace {
+        db: MAIN_DB_ID,
+        namespace: id,
+    });
+    program.emit_insn(Insn::SetCookie {
+        db: MAIN_DB_ID,
+        cookie: Cookie::SchemaVersion,
+        value: schema_version as i32 + 1,
+        p5: 0,
+    });
+    Ok(())
+}
+
+/// Opens the namespaces table of the main database for writing, creating
+/// it first when this is the database's first namespace.
+fn open_namespaces_table_for_writing(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let existing = resolver.with_schema(MAIN_DB_ID, |s| {
+        s.get_btree_table(NamespaceId::ROOT, TURSO_NAMESPACES_TABLE_NAME)
+    });
+    let (table, root_page) = match existing {
+        Some(table) => {
+            let root_page = RegisterOrLiteral::Literal(table.root_page);
+            (table, root_page)
+        }
+        None => {
+            let root_reg = program.alloc_register();
+            program.emit_insn(Insn::CreateBtree {
+                db: MAIN_DB_ID,
+                root: root_reg,
+                flags: CreateBTreeFlags::new_table(),
+            });
+            let create_sql = format!(
+                "CREATE TABLE {TURSO_NAMESPACES_TABLE_NAME}(id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+            );
+            let table = Arc::new(BTreeTable::from_sql(&create_sql, 0)?);
+            let schema_table = resolver.with_schema(MAIN_DB_ID, |s| {
+                s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+                    .expect("every database has sqlite_schema")
+            });
+            let schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id: schema_cursor_id,
+                root_page: 1i64.into(),
+                db: MAIN_DB_ID,
+            });
+            emit_schema_entry(
+                program,
+                resolver,
+                schema_cursor_id,
+                None,
+                SchemaEntryType::Table,
+                TURSO_NAMESPACES_TABLE_NAME,
+                TURSO_NAMESPACES_TABLE_NAME,
+                root_reg,
+                Some(create_sql),
+            )?;
+            program.emit_insn(Insn::ParseSchema {
+                db: MAIN_DB_ID,
+                where_clause: Some(format!(
+                    "tbl_name = '{TURSO_NAMESPACES_TABLE_NAME}' AND type != 'trigger'"
+                )),
+                trigger_target_database_id: None,
+            });
+            (table, RegisterOrLiteral::Register(root_reg))
+        }
+    };
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page,
+        db: MAIN_DB_ID,
+    });
+    Ok(cursor_id)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1703,8 +1940,14 @@ fn collect_autoindexes(
     body: &ast::CreateTableBody,
     program: &mut ProgramBuilder,
     tbl_name: &str,
+    resolver: &Resolver,
 ) -> Result<Option<Vec<usize>>> {
-    let table = create_table(tbl_name, body, 0)?;
+    let table = create_table(
+        tbl_name,
+        body,
+        0,
+        resolver.catalog.dialect.supports_namespaces(),
+    )?;
 
     let mut regs: Vec<usize> = Vec::new();
 
@@ -1963,6 +2206,7 @@ pub fn translate_drop_table(
         );
     };
     let database_id = namespace.database_id;
+    let mangled_name = resolver.mangle_name(namespace, &normalize_ident(name));
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
@@ -1996,7 +2240,7 @@ pub fn translate_drop_table(
     let null_reg = program.alloc_register(); //  r1
     program.emit_null(null_reg, None);
     let table_name_and_root_page_register = program.alloc_register(); //  r2, this register is special because it's first used to track table name and then moved root page
-    let table_reg = program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str())); //  r3
+    let table_reg = program.emit_string8_new_reg(mangled_name.clone()); //  r3
     program.mark_last_insn_constant();
     let _table_type = program.emit_string8_new_reg("trigger".to_string()); //  r4
     program.mark_last_insn_constant();
@@ -2454,8 +2698,7 @@ pub fn translate_drop_table(
     }) {
         let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
         let seq_table_name_reg = program.alloc_register();
-        let dropped_table_name_reg =
-            program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()));
+        let dropped_table_name_reg = program.emit_string8_new_reg(mangled_name.clone());
         program.mark_last_insn_constant();
 
         program.emit_insn(Insn::OpenWrite {
@@ -2526,8 +2769,7 @@ pub fn translate_drop_table(
             .map(|index| program.alloc_cursor_index(None, index))
             .transpose()?;
         let ver_table_name_reg = program.alloc_register();
-        let dropped_name_reg =
-            program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()));
+        let dropped_name_reg = program.emit_string8_new_reg(mangled_name.clone());
         program.mark_last_insn_constant();
 
         program.emit_insn(Insn::OpenWrite {
@@ -2626,10 +2868,12 @@ pub fn translate_drop_table(
     // sequence/backing-table is somehow already missing — same idempotency
     // contract as DROP SEQUENCE IF EXISTS.
     if table.btree().is_some_and(|bt| bt.has_autoincrement) {
-        let seq_name =
-            crate::schema::autoincrement_sequence_name(&normalize_ident(tbl_name.name.as_str()));
+        let seq_name = crate::schema::autoincrement_sequence_name(&mangled_name);
         crate::translate::sequence::emit_drop_sequence_cleanup(
-            program, resolver, namespace, &seq_name,
+            program,
+            resolver,
+            NamespaceRef::root_of(database_id),
+            &seq_name,
         )?;
     }
 

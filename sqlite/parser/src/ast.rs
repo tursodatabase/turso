@@ -359,6 +359,18 @@ pub enum Stmt {
         /// sequence name
         seq_name: QualifiedName,
     },
+    /// `CREATE SCHEMA`: a namespace stored in the main database. Only a
+    /// frontend that supports namespaces builds this statement; the SQLite
+    /// parser has no such syntax.
+    CreateSchema {
+        /// schema name
+        name: Name,
+    },
+    /// `DROP SCHEMA`, built only by a frontend that supports namespaces.
+    DropSchema {
+        /// schema name
+        name: Name,
+    },
 }
 
 #[repr(transparent)]

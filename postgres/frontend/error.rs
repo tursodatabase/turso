@@ -83,7 +83,10 @@ impl From<&LimboError> for ErrorReport {
         };
         if let LimboError::ConstraintViolation(violation) = error {
             if let Some(table) = &violation.table_name {
-                report.table_name = Some(table.clone());
+                // Core names the table as it is stored; the user knows it by
+                // its bare name.
+                let table = turso_core::namespace::demangle_name(true, table).1;
+                report.table_name = Some(table.to_string());
                 report.constraint_name = constraint_name(violation, table);
                 if violation.kind == ConstraintKind::NotNull {
                     report.column_name = violation.column_names.first().cloned();

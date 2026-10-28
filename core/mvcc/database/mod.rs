@@ -9465,7 +9465,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mut automatic_indices = HashMap::default();
         let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
         let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-        let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
+        let mut materialized_view_info: HashMap<String, crate::schema::StoredMaterializedView> =
+            HashMap::default();
         let syms = connection.syms.read();
         let mv_store = connection.db.get_mv_store().clone();
 
@@ -9525,7 +9526,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             };
             let attached_resolver = |alias: &str| -> Option<usize> {
                 connection
-                    .namespaces()
+                    .current_qualifiers()
                     .database_id(&crate::util::normalize_ident(alias))
             };
             fresh.handle_schema_row(
@@ -10408,7 +10409,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             HashMap::default();
         let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
         let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-        let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
+        let mut materialized_view_info: HashMap<String, crate::schema::StoredMaterializedView> =
+            HashMap::default();
         let syms = connection.syms.read();
         let mv_store = connection.db.get_mv_store().clone();
 
@@ -10468,7 +10470,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             };
             let attached_resolver = |alias: &str| -> Option<usize> {
                 connection
-                    .namespaces()
+                    .current_qualifiers()
                     .database_id(&crate::util::normalize_ident(alias))
             };
             fresh.handle_schema_row(

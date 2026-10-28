@@ -1979,6 +1979,28 @@ pub fn insn_to_row(
                 0,
                 format!("DROP SEQUENCE {seq_name}"),
             ),
+            Insn::AddNamespace {
+                db,
+                namespace,
+                name,
+            } => (
+                "AddNamespace",
+                *db as i64,
+                i64::from(namespace.as_u32()),
+                0,
+                Value::build_text(name.clone()),
+                0,
+                format!("CREATE SCHEMA {name} id={}", namespace.as_u32()),
+            ),
+            Insn::DropNamespace { db, namespace } => (
+                "DropNamespace",
+                *db as i64,
+                i64::from(namespace.as_u32()),
+                0,
+                Value::Null,
+                0,
+                format!("DROP SCHEMA id={}", namespace.as_u32()),
+            ),
             Insn::SequenceComputeNext {
                 db,
                 namespace: _,
@@ -2000,6 +2022,7 @@ pub fn insn_to_row(
             ),
             Insn::SetSequenceCurrval {
                 db,
+                namespace: _,
                 seq_name,
                 value_reg,
             } => (
@@ -2027,6 +2050,7 @@ pub fn insn_to_row(
             ),
             Insn::SequenceRegisterAllocation {
                 db,
+                namespace: _,
                 seq_name,
                 value_reg,
                 saved_outer_reg,

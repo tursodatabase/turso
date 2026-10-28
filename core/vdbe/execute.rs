@@ -11,7 +11,7 @@ use crate::mvcc::database::{
     BootstrapState, CheckpointReadLockState, CheckpointStateMachine, TxID,
 };
 use crate::mvcc::MvccClock;
-use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
 use crate::numeric::Numeric;
 use crate::schema::{
     render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
@@ -39,9 +39,9 @@ use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
     rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
     rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
-    rewrite_inline_col_fk_target_if_needed, rewrite_select_table_refs,
-    rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename, trim_ascii_whitespace,
-    RewrittenView,
+    rewrite_inline_col_fk_target_if_needed, rewrite_select_namespace_table_refs,
+    rewrite_select_table_refs, rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
+    trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -10619,10 +10619,10 @@ pub fn op_function(
                 // on a dropped sequence reports "does not exist" rather
                 // than silently returning the stale per-session value.
                 let (namespace, sequence) = program.connection.find_sequence(&seq_name)?;
-                match program
-                    .connection
-                    .get_sequence_currval(namespace.database_id, &sequence.name)
-                {
+                match program.connection.get_sequence_currval(
+                    namespace.database_id,
+                    &mangle_name(namespace.id, &sequence.name),
+                ) {
                     Some(val) => {
                         state.registers[*dest].set_value(Value::from_i64(val));
                     }
@@ -11270,7 +11270,9 @@ pub fn op_function(
                 let watermark = program
                     .connection
                     .mv_store_for_db(namespace.database_id)
-                    .and_then(|mv_store| mv_store.sequence_watermark(&sequence.name));
+                    .and_then(|mv_store| {
+                        mv_store.sequence_watermark(&mangle_name(namespace.id, &sequence.name))
+                    });
                 match watermark {
                     Some(watermark) => state.registers[*dest].set_int(watermark),
                     None => state.registers[*dest].set_value(Value::Null),
@@ -11938,6 +11940,9 @@ pub fn op_function(
                         }
                     };
                     let rename_to = normalize_ident(original_rename_to.as_str());
+                    let supports_namespaces = program.connection.dialect().supports_namespaces();
+                    let row_namespace =
+                        crate::namespace::demangle_name(supports_namespaces, &name).0;
 
                     let new_name = if let Some(column) =
                         &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
@@ -11959,7 +11964,6 @@ pub fn op_function(
                         let Value::Text(sql) = sql else {
                             break 'sql None;
                         };
-
                         let cmd = parse_schema_sql_for_alter(
                             program.connection.dialect().as_ref(),
                             entry_type.as_str(),
@@ -12213,12 +12217,30 @@ pub fn op_function(
                                     .to_string(),
                                 )
                             }
-                            view @ ast::Stmt::CreateView { .. } => rewrite_view_for_table_rename(
-                                view,
-                                &rename_from,
-                                original_rename_to.as_str(),
-                            )
-                            .map(|(new_sql, _)| new_sql),
+                            view @ ast::Stmt::CreateView { .. } => {
+                                // The view text names the table as its own SQL
+                                // does: by its bare name, maybe with a qualifier.
+                                let (table_namespace, from) = crate::namespace::demangle_name(
+                                    supports_namespaces,
+                                    &rename_from,
+                                );
+                                let (_, to) = crate::namespace::demangle_name(
+                                    supports_namespaces,
+                                    original_rename_to.as_str(),
+                                );
+                                let qualifiers =
+                                    program.connection.with_schema(crate::MAIN_DB_ID, |schema| {
+                                        table_qualifiers(schema, table_namespace)
+                                    });
+                                rewrite_view_for_table_rename(
+                                    view,
+                                    from,
+                                    to,
+                                    row_namespace == table_namespace,
+                                    qualifiers.as_deref(),
+                                )
+                                .map(|(new_sql, _)| new_sql)
+                            }
                             _ => None,
                         }
                     };
@@ -12257,7 +12279,6 @@ pub fn op_function(
                         let Value::Text(sql) = sql else {
                             break 'sql None;
                         };
-
                         let cmd = parse_schema_sql_for_alter(
                             program.connection.dialect().as_ref(),
                             entry_type.as_str(),
@@ -12857,13 +12878,20 @@ fn change_log_route(
         _ => return Ok(None),
     };
     let schema = program.connection.schema.read();
-    // Check for dependent views before doing anything else: a plain write to
-    // a table with no materialized views is the overwhelmingly common case,
-    // and it must stay as cheap as it was before change-log routing existed,
-    // i.e. a single schema-map lookup rather than also resolving the
-    // schema-owned table descriptor and the is_materialized_view check below.
-    let dependent_views =
-        schema.get_dependent_materialized_views(NamespaceId::ROOT, &cursor_table.name);
+    // Check for materialized views before doing anything else: a plain write
+    // to a database with no materialized views is the overwhelmingly common
+    // case, and it must stay as cheap as it was before change-log routing
+    // existed, rather than also resolving the schema-owned table descriptor
+    // and the is_materialized_view check below.
+    if !schema.has_materialized_views() {
+        return Ok(None);
+    }
+    let Some((namespace, _)) =
+        schema.btree_table_with_root(&cursor_table.name, cursor_table.root_page)
+    else {
+        return Ok(None);
+    };
+    let dependent_views = schema.get_dependent_materialized_views(namespace, &cursor_table.name);
     if dependent_views.is_empty() {
         return Ok(None);
     }
@@ -12871,19 +12899,10 @@ fn change_log_route(
     // descriptor that includes the trailing weight column. Resolve the bound
     // cursor back to the schema-owned descriptor so change capture always
     // deals in the relation's logical row shape.
-    let Some(table) = schema.get_btree_table(NamespaceId::ROOT, &cursor_table.name) else {
+    let Some(table) = schema.get_btree_table(namespace, &cursor_table.name) else {
         return Ok(None);
     };
-    // A zero root belongs to a cursor whose btree is assigned at runtime
-    // (CREATE) or to an ephemeral relation. Otherwise the root is part of the
-    // bound relation identity and must still match the current schema.
-    if cursor_table.root_page != 0 && cursor_table.root_page != table.root_page {
-        return Err(LimboError::InternalError(format!(
-            "changed btree {} has root {}, but the current schema binds it to root {}",
-            cursor_table.name, cursor_table.root_page, table.root_page
-        )));
-    }
-    let is_materialized_view = schema.is_materialized_view(NamespaceId::ROOT, &table.name);
+    let is_materialized_view = schema.is_materialized_view(namespace, &table.name);
     Ok(Some(ChangeLogRoute {
         table,
         dependent_views,
@@ -15209,8 +15228,9 @@ pub fn op_drop_sequence(
         // The btree pages won't be freed until checkpoint, so integrity_check needs
         // to include them to avoid "page never used" false positives.
         if is_mvcc {
-            let backing_table_name =
-                crate::translate::sequence::sequence_backing_table_name(seq_name);
+            let backing_table_name = crate::translate::sequence::sequence_backing_table_name(
+                &mangle_name(*namespace, seq_name),
+            );
             let root_page = schema
                 .get_btree_table(NamespaceId::ROOT, &backing_table_name)
                 .expect("DROP SEQUENCE: backing table must exist in schema")
@@ -15227,7 +15247,44 @@ pub fn op_drop_sequence(
     // "not yet defined in this session" — covered by the regression
     // test `currval-after-drop-then-recreate-uses-new-sequence-currval`
     // in `sequence_adversarial.sqltest`.
-    conn.clear_sequence_currval(*db, seq_name);
+    conn.clear_sequence_currval(*db, &mangle_name(*namespace, seq_name));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_add_namespace(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        AddNamespace {
+            db,
+            namespace,
+            name
+        },
+        insn
+    );
+    let conn = program.connection.clone();
+    conn.with_database_schema_mut(*db, |schema| {
+        schema.name_namespace(*namespace, name);
+    })?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_drop_namespace(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(DropNamespace { db, namespace }, insn);
+    let conn = program.connection.clone();
+    conn.with_database_schema_mut(*db, |schema| {
+        schema.unname_namespace(*namespace);
+    })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -15364,6 +15421,7 @@ pub fn op_set_sequence_currval(
     load_insn!(
         SetSequenceCurrval {
             db,
+            namespace,
             seq_name,
             value_reg,
         },
@@ -15381,7 +15439,7 @@ pub fn op_set_sequence_currval(
 
     program
         .connection
-        .set_sequence_currval(*db, seq_name, value);
+        .set_sequence_currval(*db, &mangle_name(*namespace, seq_name), value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -15426,11 +15484,12 @@ pub fn op_sequence_track_allocation(
             })?;
         let current_watermark =
             crate::mvcc::database::first_unsafe_sequence_watermark(&seq, value, true);
-        mv_store.set_sequence_watermark(seq_name, current_watermark);
+        let mangled_seq_name = mangle_name(*namespace, seq_name);
+        mv_store.set_sequence_watermark(&mangled_seq_name, current_watermark);
 
         if let Some((tx_id, _)) = program.connection.get_mv_tx_for_db(*db) {
             if mv_store.is_tx_rollbackable(tx_id) {
-                mv_store.register_sequence_allocation(tx_id, seq_name, value)?;
+                mv_store.register_sequence_allocation(tx_id, &mangled_seq_name, value)?;
             }
         }
     }
@@ -15466,6 +15525,7 @@ pub fn op_sequence_register_allocation(
     load_insn!(
         SequenceRegisterAllocation {
             db,
+            namespace,
             seq_name,
             value_reg,
             saved_outer_reg,
@@ -15497,7 +15557,11 @@ pub fn op_sequence_register_allocation(
 
     if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
         if mv_store.is_tx_rollbackable(outer_tx_id) {
-            mv_store.register_sequence_allocation(outer_tx_id, seq_name, value)?;
+            mv_store.register_sequence_allocation(
+                outer_tx_id,
+                &mangle_name(*namespace, seq_name),
+                value,
+            )?;
         }
     }
 
@@ -15907,7 +15971,7 @@ pub struct OpParseSchemaInner {
     automatic_indices: crate::HashMap<String, crate::alloc::Vec<(String, i64)>>,
     dbsp_state_roots: crate::HashMap<String, i64>,
     dbsp_state_index_roots: crate::HashMap<String, i64>,
-    materialized_view_info: crate::HashMap<String, (String, i64)>,
+    materialized_view_info: crate::HashMap<String, crate::schema::StoredMaterializedView>,
     trigger_target_database_id: Option<usize>,
     db: usize,
     previous_auto_commit: bool,
@@ -16059,7 +16123,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 let schema = Schema::try_make_mut(&mut inner.schema_arc)?;
                 let syms = conn.syms.read();
                 let attached_resolver = |alias: &str| -> Option<usize> {
-                    conn.namespaces()
+                    conn.current_qualifiers()
                         .database_id(&crate::util::normalize_ident(alias))
                 };
                 schema.handle_schema_row(
@@ -16451,8 +16515,8 @@ pub fn op_populate_materialized_views(
             };
 
             let schema = conn.schema.read();
-            let Some(view_mutex) = schema.get_materialized_view(NamespaceId::ROOT, view_name)
-            else {
+            let (namespace, name) = schema.demangle_name(view_name);
+            let Some(view_mutex) = schema.get_materialized_view(namespace, name) else {
                 return Err(LimboError::InternalError(format!(
                     "materialized view {view_name} missing from schema during population"
                 ))
@@ -17714,13 +17778,16 @@ pub fn op_rename_table(
 
     conn.with_database_schema_mut(*db, |schema| -> crate::Result<()> {
         if let Some(mut indexes) = schema.take_indices(*namespace, &normalized_from) {
-            let autoindex_prefix = format!("sqlite_autoindex_{normalized_from}_");
+            // An automatic index is named after the table's mangled name, the
+            // name its schema row has.
+            let mangled_from = crate::namespace::mangle_name(*namespace, &normalized_from);
+            let mangled_to = crate::namespace::mangle_name(*namespace, &normalized_to);
+            let autoindex_prefix = format!("sqlite_autoindex_{mangled_from}_");
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
                 normalized_to.clone_into(&mut index.table_name);
-                // Rename autoindexes to match the new table name
                 if let Some(suffix) = index.name.strip_prefix(&autoindex_prefix) {
-                    index.name = format!("sqlite_autoindex_{normalized_to}_{suffix}");
+                    index.name = format!("sqlite_autoindex_{mangled_to}_{suffix}");
                 }
             });
 
@@ -17810,9 +17877,13 @@ pub fn op_rename_table(
         // INSERT into the renamed table would error with "missing
         // implicit sequence for AUTOINCREMENT table" until the next
         // schema reparse.
-        let old_seq_name = crate::schema::autoincrement_sequence_name(&normalized_from);
-        if let Some(mut seq_arc) = schema.take_sequence(*namespace, &old_seq_name) {
-            let new_seq_name = crate::schema::autoincrement_sequence_name(&normalized_to);
+        let old_seq_name =
+            crate::schema::autoincrement_sequence_name(&mangle_name(*namespace, &normalized_from));
+        if let Some(mut seq_arc) = schema.take_sequence(NamespaceId::ROOT, &old_seq_name) {
+            let new_seq_name = crate::schema::autoincrement_sequence_name(&mangle_name(
+                *namespace,
+                &normalized_to,
+            ));
             // Mutate the Sequence's `name` field so its internal identity
             // tracks the new table. `seq.name` is used by the exhaustion
             // error message in `op_sequence_compute_next` and by the
@@ -17845,22 +17916,32 @@ pub fn op_rename_table(
             rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
         }
 
+        let qualifiers = table_qualifiers(schema, *namespace);
         let mut view_rewrites = Vec::new();
-        for (view_name, view) in schema.views(NamespaceId::ROOT) {
-            if !sql_might_reference_identifier(&view.sql, &normalized_from) {
-                continue;
-            }
-            let Some(ast::Cmd::Stmt(stmt)) = conn.dialect().parse(&view.sql)?.0 else {
-                continue;
-            };
-            if let Some(rewrite) = rewrite_view_for_table_rename(stmt, &normalized_from, to) {
-                view_rewrites.push((view_name.to_string(), rewrite));
+        let view_namespaces: Vec<NamespaceId> = schema.namespace_ids().collect();
+        for view_namespace in view_namespaces {
+            for (view_name, view) in schema.views(view_namespace) {
+                if !sql_might_reference_identifier(&view.sql, &normalized_from) {
+                    continue;
+                }
+                let Some(ast::Cmd::Stmt(stmt)) = conn.dialect().parse(&view.sql)?.0 else {
+                    continue;
+                };
+                if let Some(rewrite) = rewrite_view_for_table_rename(
+                    stmt,
+                    &normalized_from,
+                    to,
+                    view_namespace == *namespace,
+                    qualifiers.as_deref(),
+                ) {
+                    view_rewrites.push((view_namespace, view_name.to_string(), rewrite));
+                }
             }
         }
-        for (view_name, (new_sql, new_select)) in view_rewrites {
+        for (view_namespace, view_name, (new_sql, new_select)) in view_rewrites {
             let view = Arc::make_mut(
                 schema
-                    .view_mut(NamespaceId::ROOT, &view_name)
+                    .view_mut(view_namespace, &view_name)
                     .expect("view being rewritten should be in schema"),
             );
             view.sql = new_sql;
@@ -17924,10 +18005,16 @@ pub fn op_rename_table(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Renames the table `normalized_from` to `to` in a view. In a database
+/// with namespaces, `unqualified_names_table` says whether the view is in
+/// the table's namespace, and `table_qualifiers` are the names of that
+/// namespace; without namespaces both are ignored.
 fn rewrite_view_for_table_rename(
     view: ast::Stmt,
     normalized_from: &str,
     to: &str,
+    unqualified_names_table: bool,
+    table_qualifiers: Option<&[String]>,
 ) -> Option<(String, ast::Select)> {
     let ast::Stmt::CreateView {
         temporary,
@@ -17940,7 +18027,16 @@ fn rewrite_view_for_table_rename(
         panic!("rewrite_view_for_table_rename called with a statement that is not CREATE VIEW");
     };
     let old_select = select.clone();
-    rewrite_select_table_refs(&mut select, normalized_from, to);
+    match table_qualifiers {
+        Some(qualifiers) => rewrite_select_namespace_table_refs(
+            &mut select,
+            normalized_from,
+            to,
+            unqualified_names_table,
+            qualifiers,
+        ),
+        None => rewrite_select_table_refs(&mut select, normalized_from, to),
+    }
     if select == old_select {
         return None;
     }
@@ -17953,6 +18049,20 @@ fn rewrite_view_for_table_rename(
     }
     .to_string();
     Some((new_sql, select))
+}
+
+/// The qualifiers that name `namespace` in the body of a view, or None when
+/// the database has no namespaces and any qualifier may name a table.
+fn table_qualifiers(schema: &Schema, namespace: NamespaceId) -> Option<Vec<String>> {
+    if !schema.supports_namespaces() {
+        return None;
+    }
+    let name = if namespace.is_root() {
+        Some("main")
+    } else {
+        schema.namespace_name(namespace)
+    };
+    Some(name.into_iter().map(str::to_string).collect())
 }
 
 pub fn op_drop_column(
@@ -18060,7 +18170,7 @@ pub fn op_drop_column(
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
         for (view_name, view) in schema.views(*namespace) {
-            let view_select_sql = select_from_view_sql(&conn, *db, view_name);
+            let view_select_sql = select_from_view_sql(&conn, *db, schema, *namespace, view_name);
             let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                 LimboError::ParseError(format!(
                     "cannot drop column \"{}\": referenced in VIEW {view_name}: {}. {e}",
@@ -18077,13 +18187,25 @@ pub fn op_drop_column(
 
 /// SQL that selects from the view `view_name` of database `db`, named with
 /// its database so the lookup does not go through the search path.
-fn select_from_view_sql(conn: &Connection, db: usize, view_name: &str) -> String {
-    let database_name = conn
-        .namespace_name(db)
-        .expect("the database of a view has a name");
+/// A statement that reads view `view_name` of `namespace` in database `db`,
+/// named so that it resolves without a search path: by the namespace's name
+/// when the namespace is stored, else by the database's name.
+fn select_from_view_sql(
+    conn: &Connection,
+    db: usize,
+    schema: &crate::schema::Schema,
+    namespace: NamespaceId,
+    view_name: &str,
+) -> String {
+    let qualifier = match schema.namespace_name(namespace) {
+        Some(namespace_name) => namespace_name.to_string(),
+        None => conn
+            .namespace_name(db)
+            .expect("the database of a view has a name"),
+    };
     format!(
         "SELECT * FROM \"{}\".\"{}\"",
-        database_name.replace('"', "\"\""),
+        qualifier.replace('"', "\"\""),
         view_name.replace('"', "\"\"")
     )
 }
@@ -18442,7 +18564,8 @@ pub fn op_alter_column(
                     .get_column_at(*column_index)
                     .expect("column being ALTERed should be in schema");
                 for (view_name, view) in schema.views(NamespaceId::ROOT) {
-                    let view_select_sql = select_from_view_sql(&conn, *db, view_name);
+                    let view_select_sql =
+                        select_from_view_sql(&conn, *db, schema, NamespaceId::ROOT, view_name);
                     let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                         LimboError::ParseError(format!(
                             "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",

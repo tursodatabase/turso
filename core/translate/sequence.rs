@@ -15,14 +15,14 @@ use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
 
 use crate::bail_parse_error;
-use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::namespace::{NamespaceId, NamespaceRef, MANGLED_NAME_PREFIX};
 use crate::schema::{
     BTreeTable, Sequence, AUTOINCREMENT_SEQ_PREFIX, SEQ_BACKING_TABLE_PREFIX,
     SQLITE_SEQUENCE_TABLE_NAME,
 };
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::functions::qualify_sequence_argument;
+use crate::translate::expr::functions::{names_mangled_sequence, qualify_sequence_argument};
 use crate::translate::expr::{walk_expr_mut, WalkControl};
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::trigger_exec::rewrite_select_expressions;
@@ -31,6 +31,7 @@ use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
     to_u32, AddSequenceData, CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral,
 };
+use crate::Connection;
 use crate::Result;
 use turso_parser::ast;
 
@@ -190,7 +191,8 @@ pub fn emit_disk_read_nextval(
     target_register: usize,
 ) -> Result<()> {
     let database_id = namespace.database_id;
-    let backing_table_name = sequence_backing_table_name(seq_name);
+    let mangled_seq_name = resolver.mangle_name(namespace, seq_name);
+    let backing_table_name = sequence_backing_table_name(&mangled_seq_name);
     let backing_table = resolver
         .with_schema(database_id, |s| {
             s.get_btree_table(NamespaceId::ROOT, &backing_table_name)
@@ -365,7 +367,7 @@ pub fn emit_disk_read_nextval(
         program,
         resolver,
         database_id,
-        seq_name,
+        &mangled_seq_name,
         target_register,
     )?;
 
@@ -376,6 +378,7 @@ pub fn emit_disk_read_nextval(
     // `op_sequence_register_allocation`.
     program.emit_insn(Insn::SequenceRegisterAllocation {
         db: database_id,
+        namespace: namespace.id,
         seq_name: seq_name.to_string(),
         value_reg: target_register,
         saved_outer_reg,
@@ -413,6 +416,7 @@ pub fn emit_disk_read_nextval(
 
     program.emit_insn(Insn::SetSequenceCurrval {
         db: database_id,
+        namespace: namespace.id,
         seq_name: seq_name.to_string(),
         value_reg: target_register,
     });
@@ -438,7 +442,8 @@ pub fn emit_disk_advance_past(
     value_reg: usize,
 ) -> Result<()> {
     let database_id = namespace.database_id;
-    let backing_table_name = sequence_backing_table_name(seq_name);
+    let mangled_seq_name = resolver.mangle_name(namespace, seq_name);
+    let backing_table_name = sequence_backing_table_name(&mangled_seq_name);
     let backing_table = resolver
         .with_schema(database_id, |s| {
             s.get_btree_table(NamespaceId::ROOT, &backing_table_name)
@@ -578,6 +583,7 @@ pub fn emit_disk_advance_past(
     });
     program.emit_insn(Insn::SetSequenceCurrval {
         db: database_id,
+        namespace: namespace.id,
         seq_name: seq_name.to_string(),
         value_reg,
     });
@@ -613,7 +619,13 @@ pub fn emit_disk_advance_past(
     // row even though the engine's autoinc state is unchanged. Repro
     // covered by `mvcc-autoinc-explicit-low-rowid-preserves-sqlite-sequence`
     // in `sqlite/conformance/turso-sqltests/mvcc_sequence.sqltest`.
-    emit_autoincrement_sqlite_sequence_sync(program, resolver, database_id, seq_name, value_reg)?;
+    emit_autoincrement_sqlite_sequence_sync(
+        program,
+        resolver,
+        database_id,
+        &mangled_seq_name,
+        value_reg,
+    )?;
 
     program.preassign_label_to_next_insn(done_seek_label);
     program.emit_insn(Insn::Close { cursor_id });
@@ -868,6 +880,7 @@ pub fn translate_create_sequence(
     max_value: &Option<i64>,
     cycle: bool,
     resolver: &Resolver,
+    connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let namespace = resolver.resolve_namespace_for_create(seq_name)?;
@@ -876,6 +889,7 @@ pub fn translate_create_sequence(
     program.begin_write_on_database(database_id, schema_cookie)?;
 
     let normalized_name = normalize_ident(seq_name.name.as_str());
+    let mangled_seq_name = resolver.mangle_name(namespace, &normalized_name);
 
     // `__turso_internal_autoincrement_<table>` is reserved for the
     // implicit sequences CREATE TABLE ... AUTOINCREMENT installs.
@@ -893,6 +907,20 @@ pub fn translate_create_sequence(
         bail_parse_error!(
             "sequence name \"{}\" is reserved for internal AUTOINCREMENT use",
             normalized_name
+        );
+    }
+
+    // A sequence of a namespace is stored under its mangled name, so a name
+    // like that would be read as a sequence of another namespace. The other
+    // reserved prefixes are for tables: a sequence's backing table has a
+    // prefix of its own, so they cannot collide.
+    if resolver.catalog.dialect.supports_namespaces()
+        && normalized_name.starts_with(MANGLED_NAME_PREFIX)
+        && !connection.is_nested_stmt()
+    {
+        bail_parse_error!(
+            "Object name reserved for internal use: {}",
+            seq_name.name.as_str()
         );
     }
 
@@ -934,7 +962,7 @@ pub fn translate_create_sequence(
         resolver,
         database_id,
         sqlite_schema_cursor_id,
-        &normalized_name,
+        &mangled_seq_name,
         seq.start_value,
         seq.increment_by,
         seq.min_value,
@@ -984,7 +1012,8 @@ pub(crate) fn emit_drop_sequence_cleanup(
     seq_name: &str,
 ) -> Result<bool> {
     let database_id = namespace.database_id;
-    let backing_table_name = sequence_backing_table_name(seq_name);
+    let backing_table_name =
+        sequence_backing_table_name(&resolver.mangle_name(namespace, seq_name));
     let root_page = resolver.with_schema(database_id, |s| {
         s.get_sequence(namespace.id, seq_name)?;
         Some(
@@ -1148,6 +1177,10 @@ fn bind_sequence_call(expr: &mut ast::Expr, resolver: &Resolver) -> bool {
     if !is_sequence_function(name.as_str()) {
         return false;
     }
+    // A sequence named by its mangled name is bound to its namespace already.
+    if names_mangled_sequence(args, resolver) {
+        return false;
+    }
     let Some(qualified_args) = qualify_sequence_argument(args, resolver) else {
         return false;
     };
@@ -1155,7 +1188,7 @@ fn bind_sequence_call(expr: &mut ast::Expr, resolver: &Resolver) -> bool {
     true
 }
 
-fn is_sequence_function(name: &str) -> bool {
+pub(crate) fn is_sequence_function(name: &str) -> bool {
     name.eq_ignore_ascii_case("nextval")
         || name.eq_ignore_ascii_case("currval")
         || name.eq_ignore_ascii_case("setval")
