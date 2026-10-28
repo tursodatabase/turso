@@ -13,7 +13,7 @@ The types live in `core/namespace.rs`:
 - `NamespaceId` is the id of a namespace within one database's schema.
 - `NamespaceRef` is a database id together with a namespace id. It is the place a name resolves to. `NamespaceRef::root_of(database_id)` is the root namespace of a database.
 - `Namespace` is a name the connection knows, such as `main`, `aux`, `public` or `app`, together with the `NamespaceRef` it refers to.
-- `Namespaces` is the connection's table of those names.
+- `Qualifiers` is the connection's table of those names.
 
 `Schema` in `core/schema.rs` is the catalog of one database. It keeps the objects of each namespace apart, and every accessor takes the namespace id first: `get_table(namespace, name)`, `get_indices(namespace, table)`, `get_view`, `get_sequence`, `triggers(namespace)`, and so on. An object is always looked up by `(NamespaceId, bare name)`. The bare name is the name the user wrote, `users`, never an encoded form. Nothing above the schema loader and the DDL writers knows how a namespace is written to disk.
 
@@ -51,7 +51,7 @@ Object name resolution happens through a connection, which has a set of namespac
 
 The figure shows `public.users` shadowed by `app.users`: with `app` first on the search path, the bare name `users` resolves to namespace 2.
 
-`Namespaces` maps each name to a `NamespaceRef`. `main` and `temp` always exist and refer to the roots of the main and temp databases. ATTACH adds a name for the root of the attached database. `Connection::namespaces()` adds every namespace of the main database under its name; for a Postgres database that includes `public`.
+`Qualifiers` maps each name to a `NamespaceRef`. `main` and `temp` always exist and refer to the roots of the main and temp databases. ATTACH adds a name for the root of the attached database. `Connection::namespaces()` adds every namespace of the main database under its name; for a Postgres database that includes `public`.
 
 The resolver (`core/translate/emitter/mod.rs`) turns a written name into a `NamespaceRef`:
 

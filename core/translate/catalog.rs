@@ -19,7 +19,7 @@ pub(crate) struct CatalogContext<'a> {
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
     temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
     attached_databases: &'a RwLock<DatabaseCatalog>,
-    namespaces: &'a crate::Namespaces,
+    qualifiers: &'a crate::Qualifiers,
     non_main_schema_cache: RefCell<HashMap<usize, Arc<Schema>>>,
     pub symbol_table: &'a SymbolTable,
     pub enable_custom_types: bool,
@@ -74,7 +74,7 @@ impl<'a> CatalogContext<'a> {
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
         temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
-        namespaces: &'a crate::Namespaces,
+        qualifiers: &'a crate::Qualifiers,
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
         dialect: Arc<dyn crate::dialect::Dialect>,
@@ -86,14 +86,14 @@ impl<'a> CatalogContext<'a> {
             database_schemas,
             temp_database,
             attached_databases,
-            namespaces,
+            qualifiers,
             non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table,
             enable_custom_types,
             dialect,
             database_scope: RefCell::new(None),
             has_temp_schema,
-            search_order: namespaces
+            search_order: qualifiers
                 .search_order(search_path)
                 .into_iter()
                 .map(|namespace| namespace.target)
@@ -107,7 +107,7 @@ impl<'a> CatalogContext<'a> {
             database_schemas: self.database_schemas,
             temp_database: self.temp_database,
             attached_databases: self.attached_databases,
-            namespaces: self.namespaces,
+            qualifiers: self.qualifiers,
             non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table: self.symbol_table,
             enable_custom_types: self.enable_custom_types,
@@ -572,19 +572,19 @@ impl<'a> CatalogContext<'a> {
 
     /// The database that namespace `name` refers to. `name` is normalized.
     pub(crate) fn namespace_database_id(&self, name: &str) -> Option<usize> {
-        self.namespaces.database_id(name)
+        self.qualifiers.database_id(name)
     }
 
     /// The namespace called `name`, whatever the statement is being
     /// compiled for. `name` is normalized.
     pub(crate) fn namespace_named(&self, name: &str) -> Option<NamespaceRef> {
-        self.namespaces.get(name).map(|namespace| namespace.target)
+        self.qualifiers.get(name).map(|namespace| namespace.target)
     }
 
     /// Get the database name for a given database index.
     /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
     pub(crate) fn namespace_name(&self, index: usize) -> Option<String> {
-        self.namespaces
+        self.qualifiers
             .of_database(index)
             .map(|namespace| namespace.name)
     }
@@ -592,6 +592,6 @@ impl<'a> CatalogContext<'a> {
     /// The name of `namespace`: the database's name for a root namespace,
     /// else the name the namespace was added under.
     pub(crate) fn name_of_namespace(&self, namespace: NamespaceRef) -> Option<String> {
-        self.namespaces.name_of(namespace)
+        self.qualifiers.name_of(namespace)
     }
 }

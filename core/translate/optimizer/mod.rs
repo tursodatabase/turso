@@ -4898,7 +4898,7 @@ mod tests {
         database_schemas: &'a RwLock<HashMap<usize, crate::sync::Arc<Schema>>>,
         temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
-        namespaces: &'a crate::Namespaces,
+        namespaces: &'a crate::Qualifiers,
         syms: &'a SymbolTable,
     ) -> Resolver<'a> {
         Resolver::new(
@@ -4939,7 +4939,7 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let namespaces = crate::Namespaces::default();
+        let namespaces = crate::Qualifiers::default();
         let temp_database = RwLock::new(None);
         let resolver = empty_resolver(
             &schema,
@@ -4977,7 +4977,7 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let namespaces = crate::Namespaces::default();
+        let namespaces = crate::Qualifiers::default();
         let temp_database = RwLock::new(None);
         let resolver = empty_resolver(
             &schema,
