@@ -5065,6 +5065,74 @@ fn drop_attached_checkpoint_paused_at_before_pager_commit() {
 }
 
 #[test]
+fn drop_attached_insert_paused_at_before_publish_window_keeps_integrity() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir
+        .path()
+        .join(format!("aux_{}.db", rand::random::<u64>()));
+    let aux_path_str = aux_path.to_str().unwrap().to_string();
+
+    let writer = db.connect();
+    writer
+        .execute(format!("ATTACH '{aux_path_str}' AS aux"))
+        .unwrap();
+    writer
+        .execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+        .unwrap();
+    let aux_db_id = writer.get_database_id_by_name("aux").unwrap();
+    let aux_mv_store = writer
+        .mv_store_for_db(aux_db_id)
+        .expect("attached aux database must be MVCC");
+    aux_mv_store.set_checkpoint_threshold(-1);
+    writer
+        .execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer.execute("CREATE INDEX aux.tv ON t(v)").unwrap();
+    writer
+        .execute("INSERT INTO aux.t VALUES (1, 'seed')")
+        .unwrap();
+    aux_mv_store.set_checkpoint_threshold(0);
+
+    let aux_pager = writer.get_pager_from_database_index(&aux_db_id).unwrap();
+    let checkpoint_io = aux_pager.io.clone();
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforePublishWindow.point()]);
+    writer.set_yield_injector(Some(injector.clone()));
+    let mut delayed = writer.prepare("INSERT INTO aux.t VALUES (2, 'c')").unwrap();
+    let mut parked = false;
+    for _ in 0..200_000 {
+        match delayed.step().unwrap() {
+            crate::StepResult::Yield | crate::StepResult::IO => {
+                if injector.is_empty() {
+                    parked = true;
+                    break;
+                }
+                checkpoint_io.step().unwrap();
+            }
+            crate::StepResult::Done => break,
+            other => panic!("unexpected checkpoint step: {other:?}"),
+        }
+    }
+    writer.set_yield_injector(None);
+    assert!(
+        parked,
+        "attached INSERT should pause after pager commit and before publishing roots"
+    );
+    drop(delayed);
+
+    writer
+        .execute("INSERT INTO aux.t VALUES (3, 'd'), (4, 'e')")
+        .unwrap();
+    writer
+        .execute("PRAGMA aux.wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    assert_eq!(
+        get_rows(&writer, "PRAGMA aux.integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+}
+
+#[test]
 fn drop_attached_ddl_checkpoint_paused_at_before_pager_commit_keeps_new_schema() {
     let (db, writer, aux_path_str, _aux_dir) =
         drop_attached_statement_paused_at_checkpoint_before_pager_commit("CREATE TABLE aux.t2(x)");

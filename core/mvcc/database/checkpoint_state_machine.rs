@@ -1020,17 +1020,44 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         }
     }
 
+    /// Finish the mandatory publish window when an already-committed pager transaction is
+    /// abandoned before the checkpoint state machine reaches it.
+    fn publish_committed_checkpoint_before_cleanup(&mut self) -> Result<()> {
+        if !self.pager_commit_done || self.state != CheckpointState::CommitPagerTxn {
+            return Ok(());
+        }
+
+        let materialized_at = WalPos::from_pair(self.pager.wal_pos());
+        if self.mvstore.uses_passive_checkpoint() {
+            // A durable pager commit cannot be canceled. Wait for the brief publish window
+            // rather than discard its staged roots and leave the in-memory boundary behind.
+            while !self.mvstore.try_begin_passive_publish_window() {
+                std::thread::yield_now();
+            }
+            self.apply_passive_publish_window_ordered(materialized_at)
+        } else {
+            if !self.lock_states.blocking_checkpoint_lock_held {
+                if !self.checkpoint_lock.write() {
+                    return Err(LimboError::Busy);
+                }
+                self.lock_states.blocking_checkpoint_lock_held = true;
+            }
+            self.apply_checkpoint_publish_window(materialized_at, None)
+        }
+    }
+
     /// Cleanup path for I/O errors that happen while waiting on completions outside
-    /// of `step()`. This mirrors `step()` error handling and also resets pager/WAL
-    /// checkpoint bookkeeping.
+    /// of `step()`, or when a caller abandons the checkpoint. This mirrors `step()`
+    /// error handling and resets pager/WAL checkpoint bookkeeping.
     pub fn cleanup_after_external_io_error(&mut self, err: LimboError) -> Result<()> {
-        // run storage cleanup within proper checkpoint context (e.g. pager has pending read/write txn)
+        // The pager commit atomically persisted the checkpoint pages and MVCC watermark. If
+        // publication has not run yet, complete it before storage cleanup discards staged state.
+        let publish_result = self.publish_committed_checkpoint_before_cleanup();
+        // Run storage cleanup within proper checkpoint context (e.g. pager has pending read/write txn).
         let result = self.mvstore.storage.on_checkpoint_end(Err(err));
 
-        // Drop this checkpoint's staged (not-yet-applied) root-map mutations. They were never
-        // written to the shared map (deferred to the post-commit publish window), so a failed
-        // checkpoint simply discards them — no revert, no divergence. A post-commit failure
-        // finds these already drained, so nothing is dropped.
+        // Pre-commit failures never changed the shared root map, so discard their staged ops.
+        // A post-commit checkpoint was published above before this cleanup path.
         self.pending_rootmap_ops.clear();
         self.pending_alloc_roots.clear();
 
@@ -1058,6 +1085,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
         self.release_checkpoint_locks_if_needed();
 
+        publish_result?;
         result
     }
 
