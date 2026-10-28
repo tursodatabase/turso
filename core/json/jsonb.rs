@@ -1035,10 +1035,6 @@ impl Jsonb {
         }
     }
 
-    pub fn is_valid(&self) -> bool {
-        validate_jsonb(&self.data)
-    }
-
     pub fn to_string(&self) -> Result<String> {
         let mut result = String::with_capacity(self.data.len() * 2);
         self.serialize_value(&mut result, 0, 0, &JsonIndentation::None)?;
@@ -1051,10 +1047,10 @@ impl Jsonb {
     /// rendering translates the JSON5 \v escape to \u0009 for SQLite
     /// bug-compatibility, while extraction must yield the real 0x0B.
     pub fn scalar_string_value(&self) -> Result<String> {
-        Ok(unescape_string(self.scalar_payload_text()?))
+        Ok(unescape_string(&self.scalar_payload_text()?))
     }
 
-    pub fn scalar_payload_text(&self) -> Result<&str> {
+    pub fn scalar_payload_text(&self) -> Result<Cow<'_, str>> {
         let (JsonbHeader(_, len), header_size) = self.read_header(0)?;
         // The 8-byte size format lets a crafted header declare a length
         // near usize::MAX, so the end must be computed without overflow.
@@ -1065,8 +1061,7 @@ impl Jsonb {
             .data
             .get(header_size..payload_end)
             .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
-        from_utf8(payload)
-            .map_err(|_| LimboError::ParseError("Failed to serialize string!".to_string()))
+        Ok(String::from_utf8_lossy(payload))
     }
 
     pub fn to_string_pretty(&self, indentation: Option<&str>) -> Result<String> {
@@ -1249,9 +1244,7 @@ impl Jsonb {
 
         match kind {
             ElementType::TEXT | ElementType::TEXTRAW | ElementType::TEXTJ => {
-                let word = from_utf8(word_slice).map_err(|_| {
-                    LimboError::ParseError("Failed to serialize string!".to_string())
-                })?;
+                let word = String::from_utf8_lossy(word_slice);
 
                 let mut last_end = 0;
                 let bytes = word.as_bytes();
@@ -1397,10 +1390,15 @@ impl Jsonb {
                             let seq_len = utf8_sequence_len(ch);
                             let end = (i + seq_len).min(word_slice.len());
                             match std::str::from_utf8(&word_slice[i..end]) {
-                                Ok(s) => string.push_str(s),
-                                Err(_) => string.push(ch as char),
+                                Ok(s) => {
+                                    string.push_str(s);
+                                    i = end;
+                                }
+                                Err(e) => {
+                                    string.push(char::REPLACEMENT_CHARACTER);
+                                    i += e.error_len().unwrap_or(end - i);
+                                }
                             }
-                            i = end;
                         }
                     }
                 }
@@ -2849,7 +2847,7 @@ impl Jsonb {
                         let key_start = pos + key_header_len;
                         let json_key = read_text_payload(&self.data, key_start, key_len)?;
 
-                        if compare((json_key, key_type), (path_key, *is_raw)) {
+                        if compare((json_key, key_type), (path_key.as_bytes(), *is_raw)) {
                             if mode.allows_replace() {
                                 let value_pos = pos + key_header_len + key_len;
                                 let key_pos = pos;
@@ -3024,7 +3022,7 @@ impl Jsonb {
                     let obj_key =
                         read_text_payload(&self.data, current_pos + key_header_size, key_size)?;
 
-                    if compare((obj_key, key_type), (path_key, *is_raw)) {
+                    if compare((obj_key, key_type), (path_key.as_bytes(), *is_raw)) {
                         break;
                     } else {
                         current_pos =
@@ -3324,7 +3322,7 @@ impl Jsonb {
         &self,
         members_start: usize,
         members_end: usize,
-        patch_key: (&str, bool),
+        patch_key: (&[u8], bool),
     ) -> Result<Option<(usize, usize, usize)>> {
         let mut cursor = members_start;
         while cursor < members_end {
@@ -3524,21 +3522,20 @@ impl std::str::FromStr for Jsonb {
     }
 }
 
-/// Reads the `len`-byte text payload that starts at `start`.
+/// Reads the `len`-byte text payload that starts at `start`. The bytes may
+/// not be UTF-8.
 ///
 /// JSONB documents are validated on entry, but text payloads are read from
-/// buffers that user-supplied blobs flow into, so neither the range nor the
-/// UTF-8 well-formedness of the payload may be assumed here: an unchecked
-/// decode would hand invalid UTF-8 to `&str` consumers such as
-/// [`unescape_string`], which is undefined behaviour.
-fn read_text_payload(data: &[u8], start: usize, len: usize) -> Result<&str> {
+/// buffers that user-supplied blobs flow into, so the range may not be
+/// assumed here.
+fn read_text_payload(data: &[u8], start: usize, len: usize) -> Result<&[u8]> {
     let Some(end) = start.checked_add(len) else {
         bail_parse_error!("malformed JSON: text payload size overflow");
     };
     let Some(bytes) = data.get(start..end) else {
         bail_parse_error!("malformed JSON: text payload extends beyond data");
     };
-    from_utf8(bytes).map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
+    Ok(bytes)
 }
 
 /// Picks the element type for an object key created from a path label.
@@ -3566,8 +3563,11 @@ fn new_key_element_type(path_key: &str, is_quoted: bool) -> ElementType {
 /// escape-free when it was written without quotes (backslashes in an
 /// unquoted label are literal characters), or quoted but containing no
 /// backslash.
+///
+/// Keys are compared as bytes, because a key that is not UTF-8 must not
+/// match a different key or a label holding U+FFFD.
 #[inline]
-fn compare(key: (&str, ElementType), path_key: (&str, bool)) -> bool {
+fn compare(key: (&[u8], ElementType), path_key: (&[u8], bool)) -> bool {
     let (key, element_type) = key;
     let (path_key, is_quoted) = path_key;
     if !matches!(
@@ -3577,23 +3577,33 @@ fn compare(key: (&str, ElementType), path_key: (&str, bool)) -> bool {
         return false;
     }
     let key_is_raw = matches!(element_type, ElementType::TEXT | ElementType::TEXTRAW);
-    let path_is_raw = !is_quoted || !path_key.contains('\\');
+    let path_is_raw = !is_quoted || !path_key.contains(&b'\\');
     match (key_is_raw, path_is_raw) {
         (true, true) => key == path_key,
-        (true, false) => key == unescape_string(path_key),
-        (false, true) => unescape_string(key) == path_key,
-        (false, false) => unescape_string(key) == unescape_string(path_key),
+        (true, false) => key == unescape_bytes(path_key),
+        (false, true) => unescape_bytes(key) == path_key,
+        (false, false) => unescape_bytes(key) == unescape_bytes(path_key),
     }
 }
 
+/// [`unescape_string`] for text that may not be UTF-8: escape sequences
+/// are decoded and bytes that are not UTF-8 are kept as they are.
+fn unescape_bytes(input: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(input.len());
+    for chunk in input.utf8_chunks() {
+        result.extend_from_slice(unescape_string(chunk.valid()).as_bytes());
+        result.extend_from_slice(chunk.invalid());
+    }
+    result
+}
+
 #[inline]
-/// Whether `data` is structurally valid JSONB with UTF-8 text
-/// payloads, which is what document arguments need before their
-/// interior offsets are trusted. Numeric payload bytes are not
-/// examined: SQLite accepts a number-typed payload as-is when reading
-/// a JSONB document argument, so a lenient pass here keeps blobs like
-/// x'45312e652b' (FLOAT "1.e+") flowing through the JSON functions the
-/// way SQLite passes them through.
+/// Whether `data` is structurally valid JSONB, which is what document
+/// arguments need before their interior offsets are trusted. Numeric
+/// and text payload bytes are not examined: SQLite accepts a payload
+/// as-is when reading a JSONB document argument, so a lenient pass here
+/// keeps blobs like x'45312e652b' (FLOAT "1.e+") flowing through the
+/// JSON functions the way SQLite passes them through.
 pub(super) fn validate_jsonb(data: &[u8]) -> bool {
     validate_element(data, 0, data.len(), 0, false).is_ok()
 }
@@ -3736,19 +3746,11 @@ fn validate_element(
         | ElementType::TEXTJ
         | ElementType::TEXT5
         | ElementType::TEXTRAW) => {
+            // Like SQLite, both checks accept text payloads that are not
+            // UTF-8 (a raw 0xFF passes in every text type). Readers
+            // decode such bytes as U+FFFD.
             if strict {
-                // SQLite's strict check works on raw bytes and accepts
-                // text payloads that are not UTF-8 (a raw 0xFF passes
-                // in every text type); its callers only ever turn the
-                // verdict into a number, never into a string.
                 return validate_text_payload(data, payload_start, payload_end, element_type);
-            }
-            // The lenient document check is stricter than SQLite here:
-            // later readers decode text payloads as &str, so the
-            // payload must be valid UTF-8.
-            let payload = &data[payload_start..payload_end];
-            if let Err(e) = std::str::from_utf8(payload) {
-                return Err(payload_start + e.valid_up_to() + 1);
             }
             Ok(())
         }
@@ -4489,12 +4491,11 @@ mod tests {
     }
 
     #[test]
-    fn strict_check_accepts_non_utf8_text_payload_bytes() {
+    fn checks_accept_non_utf8_text_payload_bytes() {
         // SQLite's strict check works on raw bytes: a raw 0xFF passes
         // in every text type (sqlite3: json_valid(x'17FF',8) through
-        // json_valid(x'1AFF',8) are all 1). The lenient document
-        // check keeps requiring UTF-8, because document readers
-        // decode text payloads as &str.
+        // json_valid(x'1AFF',8) are all 1). So does the lenient
+        // document check.
         for blob in [
             &[0x17_u8, 0xFF] as &[u8],
             &[0x18, 0xFF],
@@ -4502,7 +4503,7 @@ mod tests {
             &[0x1A, 0xFF],
         ] {
             assert_eq!(jsonb_error_position(blob), 0, "{blob:x?}");
-            assert!(!validate_jsonb(blob), "{blob:x?}");
+            assert!(validate_jsonb(blob), "{blob:x?}");
         }
     }
 

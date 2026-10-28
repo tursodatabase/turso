@@ -1,0 +1,216 @@
+@database :memory:
+
+# A BLOB argument to a JSON function is read as JSONB only when SQLite's
+# jsonArgIsJsonb accepts it; anything else is read as JSON text, which
+# stops at the first NUL. JSONB text payloads may hold bytes that are not
+# UTF-8.
+
+# As JSONB, X'34313233' would be an INT5 with payload "123", which is not
+# a hex literal, so it is the text 4123.
+test json_blob_invalid_int5_is_text {
+    SELECT json_valid(X'34313233', 8), json(X'34313233');
+}
+expect {
+    0|4123
+}
+
+test json_blob_invalid_float_is_malformed_text {
+    SELECT json(X'3531652B');
+}
+expect error {
+    malformed JSON
+}
+
+# 0x09 is an empty TEXT5 element, not whitespace before JSON text.
+test json_blob_tab_byte_is_empty_text5 {
+    SELECT json(X'09');
+}
+expect {
+    ""
+}
+
+test json_extract_blob_text_stops_at_nul {
+    SELECT json_extract(X'3400E2D0', '$');
+}
+expect {
+    4
+}
+
+test json_valid_strict_accepts_non_utf8_text_payload {
+    SELECT json_valid(X'47E221502E', 8), json_valid(X'29999A', 8);
+}
+expect {
+    1|1
+}
+
+test json_type_non_utf8_text_payload {
+    SELECT json_type(X'47E221502E');
+}
+expect {
+    text
+}
+
+test json_arrow_non_utf8_text_payload {
+    SELECT X'47E221502E' -> '$' IS NOT NULL;
+}
+expect {
+    1
+}
+
+test json_extract_non_utf8_text5_payload {
+    SELECT json_extract(X'29999A', '$') IS NOT NULL;
+}
+expect {
+    1
+}
+
+test json_array_length_non_utf8_text5_payload {
+    SELECT json_array_length(X'29999A');
+}
+expect {
+    0
+}
+
+test json_each_non_utf8_text_payload {
+    SELECT count(*) FROM json_each(X'47E221502E');
+}
+expect {
+    1
+}
+
+# jsonb_array(CAST(X'E221' AS TEXT), 1) as written by SQLite.
+test json_array_with_non_utf8_text_element {
+    CREATE TABLE t(j);
+    INSERT INTO t VALUES (X'5B27E2211331');
+    SELECT json_array_length(j), j ->> 1 FROM t;
+}
+expect {
+    2|1
+}
+
+test json_object_with_non_utf8_key {
+    SELECT X'7C179900177A1331' ->> '$.z', json_type(X'7C179900177A1331');
+}
+expect {
+    1|object
+}
+
+# Value arguments take a blob only when it is JSONB by the same rule.
+test json_array_rejects_blob_that_is_not_jsonb {
+    SELECT json_array(X'34313233');
+}
+expect error {
+    JSON cannot hold BLOB values
+}
+
+test json_set_rejects_blob_value_that_is_not_jsonb {
+    SELECT json_set('{}', '$.a', X'3400E2D0');
+}
+expect error {
+    JSON cannot hold BLOB values
+}
+
+test json_quote_rejects_blob_that_is_not_jsonb {
+    SELECT json_quote(X'34313233');
+}
+expect error {
+    JSON cannot hold BLOB values
+}
+
+test json_group_array_rejects_blob_that_is_not_jsonb {
+    SELECT json_group_array(x) FROM (SELECT X'3531652B' AS x);
+}
+expect error {
+    JSON cannot hold BLOB values
+}
+
+test json_array_accepts_empty_text5_blob {
+    SELECT json_array(X'09');
+}
+expect {
+    [""]
+}
+
+# Keys that are not UTF-8 are compared by their bytes: 0x99 and 0x9A are
+# different keys, and neither matches a path label holding U+FFFD.
+test jsonb_patch_keeps_distinct_non_utf8_keys {
+    SELECT hex(jsonb_patch(X'4C17991331', X'4C179A1332'));
+}
+expect {
+    8C17991331179A1332
+}
+
+test jsonb_patch_merges_equal_non_utf8_keys {
+    SELECT hex(jsonb_patch(X'4C17991331', X'4C17991332'));
+}
+expect {
+    4C17991332
+}
+
+test jsonb_patch_compares_non_utf8_text5_keys_by_bytes {
+    SELECT hex(jsonb_patch(X'9C79616161616161F000', X'AC79616161616161F01331')),
+           hex(jsonb_patch(X'9C79616161616161F000', X'AC79616161616161F11331'));
+}
+expect {
+    AC79616161616161F01331|CC1379616161616161F00079616161616161F11331
+}
+
+test jsonb_set_replacement_char_label_does_not_match_non_utf8_key {
+    SELECT hex(jsonb_set(X'4C17991331', '$."' || char(65533) || '"', 2));
+}
+expect {
+    AC179913313AEFBFBD1332
+}
+
+test json_arrow_replacement_char_label_does_not_match_non_utf8_key {
+    SELECT quote(X'7C179900177A1331' -> ('$."' || char(65533) || '"'));
+}
+expect {
+    NULL
+}
+
+test jsonb_remove_replacement_char_label_does_not_match_non_utf8_key {
+    SELECT hex(jsonb_remove(X'7C179900177A1331', '$."' || char(65533) || '"'));
+}
+expect {
+    7C179900177A1331
+}
+
+# A blob read as JSON text may hold bytes that are not UTF-8. Like
+# CAST(blob AS TEXT), they are read as U+FFFD instead of failing.
+test json_text_blob_with_non_utf8_bytes {
+    SELECT json_array_length(X'5B22E9222C315D'), json_type(X'22E922'),
+           json_extract(X'7B2261223A22E9227D', '$.a') IS NOT NULL;
+}
+expect {
+    2|text|1
+}
+
+test json_valid_text_blob_with_non_utf8_bytes {
+    SELECT json_valid(X'22E922'), json_valid(X'22E922', 2), json_error_position(X'22E922');
+}
+expect {
+    1|1|0
+}
+
+@skip-if sqlite "sqlite keeps the bytes that are not UTF-8"
+test json_text_blob_non_utf8_bytes_become_replacement_char {
+    SELECT hex(json(X'22E922'));
+}
+expect {
+    22EFBFBD22
+}
+
+test json_text_blob_with_non_utf8_bytes_outside_string_is_malformed {
+    SELECT json(X'E9');
+}
+expect error {
+    malformed JSON
+}
+
+test json_text_blob_parse_error_is_malformed_json {
+    SELECT json(X'78');
+}
+expect error {
+    malformed JSON
+}
