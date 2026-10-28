@@ -443,3 +443,21 @@ fn vacuum_into_copies_the_indexes_of_tables_of_a_namespace(db: TempDatabase) {
         2
     );
 }
+
+/// Creating and dropping a namespace through the engine's API works after
+/// another connection has changed the schema, which makes the statement be
+/// prepared again.
+#[turso_macros::test]
+fn a_namespace_is_created_and_dropped_after_another_connection_changes_the_schema(
+    db: TempDatabase,
+) {
+    let conn = db.connect_limbo();
+    let other = db.connect_limbo();
+    conn.execute("SELECT 1").unwrap();
+    other.execute("CREATE TABLE public.x(a INTEGER)").unwrap();
+    let shop = conn.create_namespace("shop").unwrap();
+    assert_eq!(shop.target.id, NamespaceId::new(2));
+    other.execute("CREATE TABLE public.y(a INTEGER)").unwrap();
+    conn.drop_namespace("shop").unwrap();
+    assert_eq!(other.qualifier("shop"), None);
+}

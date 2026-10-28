@@ -3428,9 +3428,7 @@ impl Connection {
         let statement = turso_parser::ast::Stmt::CreateSchema {
             name: turso_parser::ast::Name::exact(name.to_string()),
         };
-        let sql = statement.to_string();
-        self.prepare_translated_stmt(statement, &sql)?
-            .run_ignore_rows()?;
+        self.prepare_namespace_stmt(statement)?.run_ignore_rows()?;
         let namespace = self
             .current_qualifiers()
             .get(name)
@@ -3454,9 +3452,21 @@ impl Connection {
         let statement = turso_parser::ast::Stmt::DropSchema {
             name: turso_parser::ast::Name::exact(name.to_string()),
         };
+        self.prepare_namespace_stmt(statement)?.run_ignore_rows()
+    }
+
+    /// Prepares CREATE SCHEMA or DROP SCHEMA. No dialect parses their text, so
+    /// preparing the statement again, after another connection changes the
+    /// schema, translates the statement itself.
+    fn prepare_namespace_stmt(
+        self: &Arc<Self>,
+        statement: turso_parser::ast::Stmt,
+    ) -> Result<Statement> {
         let sql = statement.to_string();
-        self.prepare_translated_stmt(statement, &sql)?
-            .run_ignore_rows()
+        let cmd = turso_parser::ast::Cmd::Stmt(statement);
+        let mut stmt = self.prepare_translated_cmd(cmd.clone(), &sql)?;
+        stmt.reprepare_from(cmd);
+        Ok(stmt)
     }
 
     /// The name of the namespace that is the whole of database `database_id`.
