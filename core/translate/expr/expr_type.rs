@@ -85,6 +85,16 @@ impl ExprType {
         matches!(self, Self::Array { .. })
     }
 
+    /// Whether this is an array whose element type nothing declares, such as
+    /// `ARRAY[x]` over a column without a type, or `ARRAY[]`.
+    pub(crate) fn is_array_of_unknown_elements(&self) -> bool {
+        matches!(
+            self,
+            Self::Array { element, .. }
+                if matches!(**element, Self::Builtin(BuiltinType::Any) | Self::Null | Self::Unknown)
+        )
+    }
+
     pub(crate) fn array_dimensions(&self) -> u32 {
         match self {
             Self::Array { dimensions, .. } => *dimensions,
@@ -203,7 +213,7 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
                     type_def: ty.type_def,
                     params: ty.params,
                 },
-                None => affinity_type(expr, env),
+                None => register_column_type(expr, env).unwrap_or_else(|| affinity_type(expr, env)),
             }
         }
         ast::Expr::Cast {
@@ -335,6 +345,21 @@ pub(crate) fn column_custom_type(expr: &ast::Expr, env: &TypeEnv) -> Option<Colu
         )),
         _ => None,
     }
+}
+
+/// The type of a register that stands for a column (see
+/// `Resolver::register_columns`), when it doesn't say it holds a decoded
+/// custom-type value. Such a register holds a custom type's stored form, so
+/// its type is the type the custom type is stored as.
+fn register_column_type(expr: &ast::Expr, env: &TypeEnv) -> Option<ExprType> {
+    let ast::Expr::Register { register, .. } = expr else {
+        return None;
+    };
+    let column = env.resolver()?.register_columns.get(register)?;
+    Some(sqlite_operand_type(
+        column.column_type.clone(),
+        env.schema(),
+    ))
 }
 
 /// The expression inside parentheses, COLLATE and unary `+`, which give their
@@ -772,9 +797,20 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
         return ExprType::Builtin(BuiltinType::Any);
     };
     match func {
-        Func::Scalar(f) if f.returns_array_blob() => {
-            ExprType::array(ExprType::Builtin(BuiltinType::Any), 1)
+        Func::Scalar(ScalarFunc::Array) => {
+            ExprType::array(common_type(args.iter().map(|arg| arg.as_ref()), env), 1)
         }
+        Func::Scalar(ScalarFunc::StringToArray) => {
+            ExprType::array(ExprType::Builtin(BuiltinType::Text), 1)
+        }
+        // The other functions that build an array give an array of the type of
+        // their array argument: array_prepend(element, array) and
+        // array_cat(array1, array2) take it second when the first is not one.
+        Func::Scalar(f) if f.returns_array_blob() => args
+            .iter()
+            .map(|arg| type_of(arg, env))
+            .find(ExprType::is_array)
+            .unwrap_or_else(|| ExprType::array(ExprType::Builtin(BuiltinType::Any), 1)),
         Func::Agg(AggFunc::ArrayAgg) => ExprType::array(
             args.first()
                 .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),

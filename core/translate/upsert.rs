@@ -627,22 +627,22 @@ pub fn emit_upsert(
     // already recorded by the enclosing INSERT translation, except for the
     // decoded copies made for STRICT custom-type tables. Cleared wholesale
     // at the end of the enclosing INSERT translation.
+    let is_strict = table.btree().is_some_and(|bt| bt.is_strict);
     for (idx, col) in table.columns().iter().enumerate() {
         if col.is_rowid_alias() {
             // The rewrite maps rowid-alias references to conflict_rowid_reg;
             // the image register for the alias column is never referenced.
             continue;
         }
+        let register_column = RegisterColumn::table_column(col, is_strict, resolver.schema());
         let reg = layout.to_register(expr_current_start, idx);
-        resolver
-            .register_columns
-            .insert(reg, RegisterColumn::table_column(col));
         if let Some(decoded_start) = excluded_decoded_start {
             let excluded_reg = layout.to_register(decoded_start, idx);
             resolver
                 .register_columns
-                .insert(excluded_reg, RegisterColumn::table_column(col));
+                .insert(excluded_reg, register_column.clone());
         }
+        resolver.register_columns.insert(reg, register_column);
     }
     resolver
         .register_columns
@@ -650,11 +650,8 @@ pub fn emit_upsert(
 
     // The decoded copies hold the columns' custom-type values, so their
     // registers say which type they hold.
-    let decoded_column_types: Option<Vec<Option<Box<ast::Type>>>> =
-        decoded_current_start.map(|_| {
-            let is_strict = table.btree().is_some_and(|bt| bt.is_strict);
-            column_custom_type_names(table.columns(), is_strict, resolver.schema())
-        });
+    let decoded_column_types: Option<Vec<Option<Box<ast::Type>>>> = decoded_current_start
+        .map(|_| column_custom_type_names(table.columns(), is_strict, resolver.schema()));
 
     // WHERE on target row
     if let Some(pred) = where_clause.as_mut() {

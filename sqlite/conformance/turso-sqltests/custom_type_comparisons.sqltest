@@ -575,3 +575,82 @@ expect {
     unlikely|2
     unlikely|3
 }
+
+@requires strict "uses STRICT tables"
+test cmp-array-function-results-have-element-types {
+    -- ARRAY[...] has the common type of its elements, array_append and
+    -- array_cat give an array of their array argument's type, and
+    -- string_to_array gives a text[]. An array whose element type is unknown,
+    -- such as array_append over a text literal, compares with the order of the
+    -- array on the other side. Expected values are from PostgreSQL.
+    CREATE TABLE t(a integer[], b text[]) STRICT;
+    INSERT INTO t VALUES ('{9}', '{9}');
+    SELECT 'array-text', count(*) FROM t WHERE b = ARRAY['9'];
+    SELECT 'array-int', count(*) FROM t WHERE a = ARRAY[9];
+    SELECT 'append', count(*) FROM t WHERE array_append(b, '1') = ARRAY['9', '1'];
+    SELECT 'cat', count(*) FROM t WHERE array_cat(b, b) = ARRAY['9', '9'];
+    SELECT 'split', count(*) FROM t WHERE string_to_array('9', ',') = b;
+    SELECT 'union', count(*) FROM (SELECT b FROM t UNION SELECT ARRAY['9']);
+    SELECT 'cast', CAST('{9.0}' AS text[]) = ARRAY['9.0'], CAST('{9.0}' AS text[]) = ARRAY['9'];
+    SELECT 'unknown-text', count(*) FROM t WHERE b = array_append('{}', '9');
+    SELECT 'unknown-int', count(*) FROM t WHERE a = array_append('{}', 9.0);
+}
+expect {
+    array-text|1
+    array-int|1
+    append|1
+    cat|1
+    split|1
+    union|1
+    cast|1|0
+    unknown-text|1
+    unknown-int|1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-in-list-order-comes-from-every-item {
+    -- `x IN (y1, ..., yN)` compares like `x = y1 OR ... OR x = yN`, so an
+    -- item whose type has an order decides the order also when x has none.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 10), (2, 9.5);
+    SELECT 'eq', id FROM t WHERE '10.0' = n;
+    SELECT 'in', id FROM t WHERE '10.0' IN (n);
+    SELECT 'in-two', id FROM t WHERE '9.50' IN (1, n) ORDER BY id;
+    SELECT 'not-in', id FROM t WHERE '10.0' NOT IN (n);
+}
+expect {
+    eq|1
+    in|1
+    in-two|2
+    not-in|2
+}
+
+@requires strict "uses STRICT tables"
+test cmp-in-list-with-two-orders-is-an-error {
+    -- PostgreSQL has no operator that compares text[] with integer[].
+    CREATE TABLE t(a integer[], b text[]) STRICT;
+    SELECT 1 FROM t WHERE b IN (a);
+}
+expect error {
+    cannot compare type text_array with type array
+}
+
+@requires strict "uses STRICT tables"
+test cmp-array-registers-keep-the-column-type {
+    -- excluded.a in an upsert and NEW.a in a trigger's WHEN clause are
+    -- integer[] values, so they compare element by element as numbers:
+    -- {100} > {9}.
+    CREATE TABLE t(a integer[], k int PRIMARY KEY) STRICT;
+    CREATE TABLE log(msg text) STRICT;
+    CREATE TRIGGER t_grew AFTER UPDATE ON t WHEN NEW.a > OLD.a BEGIN
+        INSERT INTO log VALUES ('grew');
+    END;
+    INSERT INTO t VALUES ('{9}', 1);
+    INSERT INTO t VALUES ('{100}', 1) ON CONFLICT(k) DO UPDATE SET a = excluded.a WHERE excluded.a > t.a;
+    SELECT 'upsert', a FROM t;
+    SELECT 'trigger', msg FROM log;
+}
+expect {
+    upsert|{100}
+    trigger|grew
+}

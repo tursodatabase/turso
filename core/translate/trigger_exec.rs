@@ -1109,9 +1109,9 @@ fn populate_trigger_row_register_columns(
         "a trigger row has one register per column and one for the rowid"
     );
     for (column, &register) in columns.iter().zip(registers) {
-        resolver
-            .register_columns
-            .insert(register, RegisterColumn::trigger_row_column(column));
+        let register_column =
+            RegisterColumn::trigger_row_column(column, table.is_strict, resolver.schema());
+        resolver.register_columns.insert(register, register_column);
     }
     let rowid_register = *registers
         .last()

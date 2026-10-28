@@ -70,9 +70,7 @@ pub(super) fn translate_in_list(
     // This follows SQLite's exprINAffinity() approach
     let affinity = in_expr_affinity(lhs, referenced_tables, Some(resolver));
     let cmp_flags = CmpInsFlags::default().with_affinity(affinity);
-    // `x IN (y1, ..., yN)` compares with the collation of x alone, as SQLite
-    // does; the list items do not take part.
-    let collation = expr_collation(lhs, referenced_tables, resolver)?;
+    let collation = in_list_collation(lhs, rhs, referenced_tables, resolver)?;
 
     if lhs_arity == 1 && false_null_jump_targets_differ {
         check_null_reg = program.alloc_register();

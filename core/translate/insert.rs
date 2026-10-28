@@ -908,9 +908,11 @@ pub fn translate_insert(
     // wrong index entries. Collations likewise: a rewritten reference to a
     // NOCASE column must keep comparing case-insensitively.
     for cm in &insertion.col_mappings {
+        let register_column =
+            RegisterColumn::table_column(cm.column, ctx.table.is_strict, resolver.schema());
         resolver
             .register_columns
-            .insert(cm.register, RegisterColumn::table_column(cm.column));
+            .insert(cm.register, register_column);
     }
     resolver
         .register_columns

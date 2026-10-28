@@ -6,10 +6,11 @@ use turso_parser::ast::{Expr, TableInternalId, UnaryOperator};
 
 use crate::{
     function::ExternalCollation,
+    schema::Schema,
     sync::{Arc, LazyLock, RwLock, Weak},
     translate::{
         emitter::Resolver,
-        expr::expr_type::{query_column_type, type_of, type_ordering, TypeEnv},
+        expr::expr_type::{query_column_type, type_of, type_ordering, ExprType, TypeEnv},
         plan::{Plan, TableReferences},
     },
     type_ordering::TypeOrdering,
@@ -532,22 +533,40 @@ pub fn in_subquery_collation(
 ) -> Result<CollationSeq> {
     let rhs = &query.select_result_columns()[column].expr;
     let rhs_tables = Some(query.select_table_references());
-    let rhs_ordering = type_ordering(
+    let rhs_order = operand_order(
         &query_column_type(query, column, resolver),
         resolver.schema(),
     );
-    let lhs_ordering = expr_type_ordering(lhs, lhs_tables, resolver);
+    let lhs_order = expr_operand_order(lhs, lhs_tables, resolver);
     let has_collate = has_collate_operator(lhs) || has_collate_operator(rhs);
-    if let Some(ordering) = common_ordering([lhs_ordering, rhs_ordering], has_collate)? {
+    if let Some(ordering) = common_ordering([lhs_order, rhs_order], has_collate)? {
         return Ok(CollationSeq::Type(ordering));
     }
     comparison_collation_across_queries(lhs, lhs_tables, rhs, rhs_tables, resolver)
 }
 
+/// The collation that `x IN (y1, ..., yN)` compares with. When x or any item
+/// has a type with an order, every comparison uses that order, so
+/// `'10.0' IN (n)` agrees with `'10.0' = n`. Otherwise the text collation is
+/// the one of x alone, as in SQLite.
+pub fn in_list_collation(
+    lhs: &Expr,
+    rhs: &[Box<Expr>],
+    tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<CollationSeq> {
+    let operands = std::iter::once(lhs)
+        .chain(rhs.iter().map(|item| item.as_ref()))
+        .map(|expr| (expr, tables));
+    if let Some(ordering) = common_type_ordering(operands, resolver)? {
+        return Ok(CollationSeq::Type(ordering));
+    }
+    expr_text_collation(lhs, tables, resolver).map(CollationSeq::Text)
+}
+
 /// The collation of one expression, BINARY when it has none. Sort, grouping,
-/// DISTINCT, compound select, window partition and index keys use it, and so
-/// does `x IN (y1, ..., yN)`, which compares with the collation of x alone.
-/// An expression whose type has an order uses that order.
+/// DISTINCT, compound select, window partition and index keys use it. An
+/// expression whose type has an order uses that order.
 pub fn expr_collation(
     expr: &Expr,
     tables: Option<&TableReferences>,
@@ -603,38 +622,45 @@ fn common_type_ordering<'a>(
     resolver: &Resolver,
 ) -> Result<Option<TypeOrdering>> {
     let mut has_collate = false;
-    let orderings: Vec<Option<TypeOrdering>> = exprs
+    let orders: Vec<OperandOrder> = exprs
         .into_iter()
         .map(|(expr, tables)| {
             has_collate |= has_collate_operator(expr);
-            expr_type_ordering(expr, tables, resolver)
+            expr_operand_order(expr, tables, resolver)
         })
         .collect();
-    common_ordering(orderings, has_collate)
+    common_ordering(orders, has_collate)
 }
 
-/// The one order among `orderings`, as [common_type_ordering] decides it.
+/// The one order among `orders`, as [common_type_ordering] decides it.
 /// `has_collate` says whether any of the values has a COLLATE operator.
 fn common_ordering(
-    orderings: impl IntoIterator<Item = Option<TypeOrdering>>,
+    orders: impl IntoIterator<Item = OperandOrder>,
     has_collate: bool,
 ) -> Result<Option<TypeOrdering>> {
     let mut found: Option<TypeOrdering> = None;
-    for ordering in orderings {
-        let Some(ordering) = ordering else {
-            continue;
+    let mut has_array_of_unknown_elements = false;
+    for order in orders {
+        let ordering = match order {
+            OperandOrder::None => continue,
+            OperandOrder::ArrayOfUnknownElements => {
+                has_array_of_unknown_elements = true;
+                continue;
+            }
+            OperandOrder::Type(ordering) => ordering,
         };
         match found {
-            Some(other) if other != ordering => {
-                return Err(LimboError::ParseError(format!(
-                    "cannot compare type {} with type {}",
-                    other.name(),
-                    ordering.name()
-                )));
-            }
+            Some(other) if other != ordering => return Err(cannot_compare(other, ordering)),
             _ => found = Some(ordering),
         }
     }
+    let found = match (found, has_array_of_unknown_elements) {
+        (None, true) => Some(TypeOrdering::Array),
+        (Some(other), true) if !matches!(other, TypeOrdering::Array | TypeOrdering::TextArray) => {
+            return Err(cannot_compare(other, TypeOrdering::Array));
+        }
+        (found, _) => found,
+    };
     if let (Some(ordering), true) = (found, has_collate) {
         return Err(LimboError::ParseError(format!(
             "collations are not supported by type {}",
@@ -644,14 +670,43 @@ fn common_ordering(
     Ok(found)
 }
 
-/// The order of the expression's type, if its type has one.
-pub(crate) fn expr_type_ordering(
+fn cannot_compare(a: TypeOrdering, b: TypeOrdering) -> LimboError {
+    LimboError::ParseError(format!(
+        "cannot compare type {} with type {}",
+        a.name(),
+        b.name()
+    ))
+}
+
+/// The order a value brings to a comparison with other values.
+#[derive(Clone, Copy)]
+enum OperandOrder {
+    /// The value's type has no order.
+    None,
+    Type(TypeOrdering),
+    /// An array whose element type nothing declares, such as `ARRAY[x]` over a
+    /// column without a type. It compares with the order of the other values'
+    /// array type, or as an array of numbers when there is none.
+    ArrayOfUnknownElements,
+}
+
+fn expr_operand_order(
     expr: &Expr,
     tables: Option<&TableReferences>,
     resolver: &Resolver,
-) -> Option<TypeOrdering> {
+) -> OperandOrder {
     let ty = type_of(expr, &TypeEnv::new(tables, resolver));
-    type_ordering(&ty, resolver.schema())
+    operand_order(&ty, resolver.schema())
+}
+
+fn operand_order(ty: &ExprType, schema: &Schema) -> OperandOrder {
+    if ty.is_array_of_unknown_elements() {
+        return OperandOrder::ArrayOfUnknownElements;
+    }
+    match type_ordering(ty, schema) {
+        Some(ordering) => OperandOrder::Type(ordering),
+        None => OperandOrder::None,
+    }
 }
 
 /// The collation of one expression, or None when it has none (SQLite's

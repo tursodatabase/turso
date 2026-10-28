@@ -4,7 +4,7 @@ use crate::translate::expr::comparison_affinity;
 use crate::{
     schema::{Column, Index, IndexColumn, Schema},
     translate::{
-        collate::{comparison_collation, expr_collation, CollationSeq},
+        collate::{comparison_collation, expr_collation, in_list_collation, CollationSeq},
         expr::{
             as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr_mut,
             WalkControl,
@@ -1085,8 +1085,12 @@ pub fn constraints_from_where_clause(
                 // SQLite's `comparisonAffinity` for IN-list (`x IN (lit, ...)`)
                 // is the LHS column's affinity; the RHS literals are not folded.
                 let cmp_aff = Some(get_expr_affinity(lhs, Some(table_references), None));
-                // `x IN (y1, ..., yN)` compares with the collation of x alone.
-                let cmp_collation = Some(expr_collation(lhs, Some(table_references), resolver)?);
+                let cmp_collation = Some(in_list_collation(
+                    lhs,
+                    rhs,
+                    Some(table_references),
+                    resolver,
+                )?);
 
                 match lhs.as_ref() {
                     ast::Expr::Column { table, column, .. }

@@ -31,7 +31,7 @@ use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, Index, IndexColumn, Schema,
     Table, EXPR_INDEX_SENTINEL,
 };
-use crate::translate::expr::expr_type::ExprType;
+use crate::translate::expr::expr_type::{column_type, BuiltinType, ExprType};
 use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::{Aggregate, ColumnMask};
 use crate::vdbe::{
@@ -176,26 +176,30 @@ pub struct Resolver<'a> {
 }
 
 /// The column a register stands for in [Resolver::register_columns].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RegisterColumn {
     pub affinity: Affinity,
     /// None for the rowid, which has no collation.
     pub collation: Option<TextCollation>,
+    /// The column's declared type, such as `integer[]` or `numeric(10, 2)`.
+    pub(crate) column_type: ExprType,
 }
 
 impl RegisterColumn {
-    /// A column of the table being written, with its affinity and collation.
-    pub fn table_column(column: &Column) -> Self {
+    /// A column of the table being written, with its affinity, collation and
+    /// type.
+    pub fn table_column(column: &Column, is_strict: bool, schema: &Schema) -> Self {
         Self {
             affinity: column.affinity(),
             collation: crate::translate::collate::column_collation(column),
+            column_type: column_type(column, is_strict, schema),
         }
     }
 
-    /// NEW.x or OLD.x in a trigger. It has the collation of column x but, as
-    /// in SQLite, no affinity unless x is the rowid alias.
+    /// NEW.x or OLD.x in a trigger. It has the collation and type of column x
+    /// but, as in SQLite, no affinity unless x is the rowid alias.
     /// See https://www.sqlite.org/forum/forumpost/819f2d6627
-    pub fn trigger_row_column(column: &Column) -> Self {
+    pub fn trigger_row_column(column: &Column, is_strict: bool, schema: &Schema) -> Self {
         Self {
             affinity: if column.is_rowid_alias() {
                 Affinity::Integer
@@ -203,6 +207,7 @@ impl RegisterColumn {
                 Affinity::None
             },
             collation: crate::translate::collate::column_collation(column),
+            column_type: column_type(column, is_strict, schema),
         }
     }
 
@@ -210,6 +215,7 @@ impl RegisterColumn {
         Self {
             affinity: Affinity::Integer,
             collation: None,
+            column_type: ExprType::Builtin(BuiltinType::Integer),
         }
     }
 }
