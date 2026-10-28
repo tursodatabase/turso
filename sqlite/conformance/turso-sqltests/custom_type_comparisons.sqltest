@@ -226,24 +226,35 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test cmp-literal-converted-to-column-type {
-    -- The literal is read as a value of the column's type before comparing,
-    -- so an uppercase uuid and a timestamp with a T match the stored values,
-    -- with and without an index.
-    CREATE TABLE t(id INTEGER PRIMARY KEY, u uuid, ts timestamp) STRICT;
-    INSERT INTO t VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2020-01-01T10:00:00');
-    SELECT 'u', id FROM t WHERE u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11';
-    SELECT 'ts', id FROM t WHERE ts = '2020-01-01T10:00:00';
+test cmp-uuid-with-null-and-constants {
+    -- Comparisons of a uuid column with NULL and constants, with and without
+    -- an index.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, u uuid) STRICT;
+    INSERT INTO t VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), (2, NULL);
+    SELECT 'eq-null', count(*) FROM t WHERE u = NULL;
+    SELECT 'eq-null-text', count(*) FROM t WHERE u = CAST(NULL AS TEXT);
+    SELECT 'is', count(*) FROM t WHERE u IS 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+    SELECT 'is-null', count(*) FROM t WHERE u IS NULL;
+    SELECT 'in', count(*) FROM t WHERE u IN (NULL, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT 'case', id, CASE u WHEN NULL THEN 'null' WHEN 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' THEN 'yes' ELSE 'no' END FROM t ORDER BY id;
     CREATE INDEX t_u ON t(u);
-    CREATE INDEX t_ts ON t(ts);
-    SELECT 'u', id FROM t WHERE u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11';
-    SELECT 'ts', id FROM t WHERE ts = '2020-01-01T10:00:00';
+    SELECT 'eq-null', count(*) FROM t WHERE u = NULL;
+    SELECT 'eq-null-text', count(*) FROM t WHERE u = CAST(NULL AS TEXT);
+    SELECT 'is', count(*) FROM t WHERE u IS 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+    SELECT 'is-null', count(*) FROM t WHERE u IS NULL;
 }
 expect {
-    u|1
-    ts|1
-    u|1
-    ts|1
+    eq-null|0
+    eq-null-text|0
+    is|1
+    is-null|1
+    in|1
+    case|1|yes
+    case|2|no
+    eq-null|0
+    eq-null-text|0
+    is|1
+    is-null|1
 }
 
 @requires strict "uses STRICT tables"

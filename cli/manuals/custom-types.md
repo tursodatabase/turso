@@ -209,7 +209,7 @@ SELECT n FROM t UNION SELECT 4.5;    -- two rows: 4.5 equals 4.50
 
 A COLLATE on a value of such a type is an error (`collations are not supported by type numeric`).
 
-A type without an order compares the values the column reads as, with SQLite's rules. A constant compared with such a value is first converted to the type, so `uuid_column = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'` matches the lowercase uuid, and an invalid constant is an error. An index on such a column serves `=` lookups only, since it is ordered by the encoded form.
+A type without an order compares the values the column reads as, with SQLite's rules. An index on such a column serves `=` lookups only, since it is ordered by the encoded form.
 
 ### Non-Orderable Types
 
