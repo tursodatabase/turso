@@ -80,11 +80,11 @@ build-dump-fuzzer:
 test-pgdump: build-tursopg build-dump-fuzzer
 	cd $(ROOT_DIR) && cargo test $(FUZZER_CARGO_PROFILE) --package turso_pg_dump_fuzzer
 	@for fixture in $(or $(FILE),$(wildcard pgdump/*.sql)); do \
-		POSTGRES_TEST_USER=turso POSTGRES_VERSION=$${POSTGRES_VERSION:-18} ./with-postgres.sh "$(PGDUMP_FUZZER)" --binary "$(TURSOPG)" --output pgdump/results replay "$$fixture" || exit $$?; \
+		POSTGRES_VERSION=$${POSTGRES_VERSION:-18} ./with-postgres.sh "$(PGDUMP_FUZZER)" --binary "$(TURSOPG)" --output pgdump/results replay "$$fixture" || exit $$?; \
 	done
 
 fuzz-pgdump: build-tursopg build-dump-fuzzer
-	POSTGRES_TEST_USER=turso POSTGRES_VERSION=$${POSTGRES_VERSION:-18} ./with-postgres.sh "$(PGDUMP_FUZZER)" --binary "$(TURSOPG)" --output pgdump/results --profile $(PGDUMP_PROFILE) fuzz $(FUZZ_ARGS)
+	POSTGRES_VERSION=$${POSTGRES_VERSION:-18} ./with-postgres.sh "$(PGDUMP_FUZZER)" --binary "$(TURSOPG)" --output pgdump/results --profile $(PGDUMP_PROFILE) fuzz $(FUZZ_ARGS)
 
 # Run the upstream PostgreSQL regress corpus with pass/fail statuses.
 # Exit 0 means every test matched its status in run.py's STATUS table;
