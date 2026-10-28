@@ -26,6 +26,8 @@ RELEASE [SAVEPOINT] savepoint-name;
 
 The BEGIN statement starts a new explicit transaction. While a transaction is open, all subsequent statements are part of that transaction until a COMMIT or ROLLBACK is issued.
 
+If a statement inside the transaction fails, only that statement's changes are undone and the transaction stays open, as in SQLite. Some errors, such as an I/O error, a full disk, or a constraint with the `ROLLBACK` conflict clause, can roll back the whole transaction.
+
 ### Transaction Types
 
 | Type | Description |

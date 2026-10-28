@@ -199,6 +199,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn any_error_undoes_statement(&self) -> bool {
+        true
+    }
+
     fn errors_on_zero_divisor(&self) -> bool {
         true
     }

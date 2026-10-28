@@ -3842,37 +3842,45 @@ impl Program {
                         "RaiseIgnore should be caught by op_program, not reach abort"
                     );
                 }
-                _ => match state.auto_txn_cleanup {
-                    TxnCleanup::RollbackTxn => {
-                        if must_rollback_tx_if_needed {
-                            self.rollback_current_txn(pager);
+                _ => {
+                    // As in SQLite, an error inside an explicit transaction
+                    // ends only the failed statement, unless the error class
+                    // says the whole transaction must go.
+                    let has_statement_journal =
+                        state.auto_txn_cleanup == TxnCleanup::RollbackSavepoint;
+                    let rollback_explicit_txn = inside_explicit_transaction
+                        && err.is_some_and(|err| err.rolls_back_transaction(has_statement_journal));
+                    match state.auto_txn_cleanup {
+                        TxnCleanup::RollbackTxn => {
+                            if must_rollback_tx_if_needed {
+                                self.rollback_current_txn(pager);
+                            }
                         }
-                    }
-                    TxnCleanup::RollbackSavepoint => {
-                        if can_autocommit_now {
-                            self.rollback_current_txn(pager);
-                        } else if err.is_none() && !pager.is_checkpointing() {
-                            if let Err(end_stmt_err) = state.end_statement(
-                                &self.connection,
-                                pager,
-                                EndStatement::RollbackSavepoint,
-                            ) {
-                                capture_abort_error(
-                                    &mut abort_error,
-                                    end_stmt_err,
-                                    "Failed to rollback statement savepoint during abort",
-                                );
+                        TxnCleanup::RollbackSavepoint => {
+                            // An error already rolled back the statement savepoint above.
+                            if can_autocommit_now || rollback_explicit_txn {
+                                self.rollback_current_txn(pager);
+                            } else if err.is_none() && !pager.is_checkpointing() {
+                                if let Err(end_stmt_err) = state.end_statement(
+                                    &self.connection,
+                                    pager,
+                                    EndStatement::RollbackSavepoint,
+                                ) {
+                                    capture_abort_error(
+                                        &mut abort_error,
+                                        end_stmt_err,
+                                        "Failed to rollback statement savepoint during abort",
+                                    );
+                                }
+                            }
+                        }
+                        TxnCleanup::None => {
+                            if can_autocommit_now || rollback_explicit_txn {
+                                self.rollback_current_txn(pager);
                             }
                         }
                     }
-                    TxnCleanup::None => {
-                        if can_autocommit_now
-                            || (!self.connection.get_auto_commit() && err.is_some())
-                        {
-                            self.rollback_current_txn(pager);
-                        }
-                    }
-                },
+                }
             }
             if (must_rollback_tx_if_needed || inside_explicit_transaction)
                 && !keeps_prior_changes

@@ -388,9 +388,12 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
                 }
                 assert!(!conn.is_nested_stmt(), "{mode}: {explicit}: {cancellation}");
                 assert!(conn.executing_triggers.read().is_empty());
-                if explicit {
+                // As in SQLite, an I/O error ends the explicit transaction.
+                let transaction_survives = explicit && cancellation != "io_error";
+                if transaction_survives {
                     conn.execute("COMMIT").unwrap();
                 }
+                assert!(conn.get_auto_commit(), "{mode}: {explicit}: {cancellation}");
                 conn.execute("INSERT INTO audit VALUES (504)").unwrap();
                 let other = conn.db.connect(ConnectOpts::new()).unwrap();
                 for table in ["parent", "child"] {
@@ -402,7 +405,7 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
                         .is_empty());
                 }
                 let mut expected = vec![vec![Value::from_i64(501)], vec![Value::from_i64(502)]];
-                if explicit {
+                if transaction_survives {
                     expected.push(vec![Value::from_i64(503)]);
                 }
                 expected.push(vec![Value::from_i64(504)]);

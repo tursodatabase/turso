@@ -850,3 +850,154 @@ fn upsert_or_replace_do_update_unique_failure_no_index_corruption(
     );
     Ok(())
 }
+
+// ──────────────────────────────────────────────────────────
+// Regression: run-time errors inside an explicit transaction
+// ──────────────────────────────────────────────────────────
+
+/// Like SQLite, a run-time error inside BEGIN ends only the failed statement:
+/// the transaction stays open and COMMIT keeps the rows written before and
+/// after the error. The INSERT fails before it writes anything, and it has no
+/// statement journal.
+#[turso_macros::test(init_sql = "CREATE TABLE t (x);")]
+fn runtime_error_in_tx_keeps_transaction(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    for failing in [
+        "SELECT abs(-9223372036854775807 - 1)",
+        "INSERT INTO t VALUES (abs(-9223372036854775807 - 1))",
+    ] {
+        conn.execute("DELETE FROM t")?;
+        conn.execute("BEGIN")?;
+        conn.execute("INSERT INTO t VALUES (1)")?;
+        let err = conn.execute(failing).expect_err(failing);
+        assert!(
+            matches!(err, turso_core::LimboError::IntegerOverflow),
+            "{failing}: {err}"
+        );
+        conn.execute("INSERT INTO t VALUES (2)")?;
+        conn.execute("COMMIT")?;
+        assert_eq!(
+            query_rows(&conn, "SELECT x FROM t ORDER BY x"),
+            vec!["1", "2"],
+            "{failing}"
+        );
+    }
+    Ok(())
+}
+
+/// RETURNING values are computed after the row is written, so a single-row
+/// write with a RETURNING expression that can fail needs a statement journal,
+/// as in SQLite, where RETURNING is coded as a trigger.
+#[turso_macros::test(init_sql = "CREATE TABLE t (x);")]
+fn single_row_write_with_returning_needs_stmt_journal(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    assert!(!needs_stmt_journal(&conn, "INSERT INTO t VALUES (1)"));
+    for sql in [
+        "INSERT INTO t VALUES (1) RETURNING abs(x)",
+        "UPDATE t SET x = 1 WHERE rowid = 1 RETURNING abs(x)",
+        "DELETE FROM t WHERE rowid = 1 RETURNING abs(x)",
+    ] {
+        assert!(needs_stmt_journal(&conn, sql), "{sql}");
+    }
+    Ok(())
+}
+
+/// A RETURNING expression that fails after the row was written must undo
+/// that write and leave the rest of the transaction in place.
+#[turso_macros::test(init_sql = "CREATE TABLE t (x);")]
+fn returning_error_in_tx_rolls_back_only_the_statement(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    for failing in [
+        "INSERT INTO t VALUES (-9223372036854775807 - 1) RETURNING abs(x)",
+        "UPDATE t SET x = -9223372036854775807 - 1 WHERE x = 1 RETURNING abs(x)",
+        "DELETE FROM t WHERE x = 1 RETURNING abs(x - 9223372036854775807 - 2)",
+    ] {
+        conn.execute("DELETE FROM t")?;
+        conn.execute("BEGIN")?;
+        conn.execute("INSERT INTO t VALUES (1)")?;
+        let err = conn.execute(failing).expect_err(failing);
+        assert!(
+            matches!(err, turso_core::LimboError::IntegerOverflow),
+            "{failing}: {err}"
+        );
+        conn.execute("INSERT INTO t VALUES (2)")?;
+        conn.execute("COMMIT")?;
+        assert_eq!(
+            query_rows(&conn, "SELECT x FROM t ORDER BY x"),
+            vec!["1", "2"],
+            "{failing}"
+        );
+    }
+    Ok(())
+}
+
+/// As in SQLite, an I/O error ends the whole explicit transaction, even when
+/// the failed statement has a statement journal that could undo only itself.
+#[test]
+fn io_error_in_tx_rolls_back_transaction_with_stmt_journal() -> anyhow::Result<()> {
+    use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+    use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, SqliteDialect};
+
+    let io = Arc::new(QueuedIo::new());
+    let db_path = "stmt-journal-io-error.db";
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let setup = db.connect(ConnectOpts::new())?;
+    setup.execute("CREATE TABLE s (x)")?;
+    setup.execute("CREATE TABLE t (x NOT NULL)")?;
+    setup.execute("INSERT INTO s SELECT randomblob(1000) FROM generate_series(1, 200)")?;
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    setup.close()?;
+
+    let conn = db.connect(ConnectOpts::new())?;
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    let failing = "INSERT INTO t SELECT x FROM s";
+    assert!(needs_stmt_journal(&conn, failing));
+    io.fault_after(db_path, QueuedIoOpKind::Pread, 0);
+    let err = conn.execute(failing).expect_err(failing);
+    io.clear_fault();
+    assert!(
+        matches!(err, turso_core::LimboError::CompletionError(_)),
+        "{err}"
+    );
+
+    assert!(conn.get_auto_commit(), "the transaction should have ended");
+    assert_eq!(query_rows(&conn, "SELECT count(*) FROM t"), vec!["0"]);
+    Ok(())
+}
+
+/// As in SQLite, an internal error ends only the failed statement when a
+/// statement journal can undo it. Turso raises an internal error for
+/// features it does not support, such as creating a table in a database
+/// with incremental auto-vacuum.
+#[test]
+fn internal_error_in_tx_with_stmt_journal_keeps_transaction() -> anyhow::Result<()> {
+    use turso_core::DatabaseOpts;
+
+    let tmp_db = TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_autovacuum(true))
+        .build();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA auto_vacuum = incremental")?;
+    conn.execute("BEGIN")?;
+    conn.execute("SAVEPOINT a")?;
+    let failing = "CREATE TABLE t (x)";
+    assert!(needs_stmt_journal(&conn, failing));
+    let err = conn.execute(failing).expect_err(failing);
+    assert!(
+        matches!(err, turso_core::LimboError::InternalError(_)),
+        "{err}"
+    );
+
+    assert!(!conn.get_auto_commit(), "the transaction should stay open");
+    conn.execute("ROLLBACK TO a")?;
+    conn.execute("COMMIT")?;
+    Ok(())
+}

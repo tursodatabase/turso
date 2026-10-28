@@ -301,6 +301,9 @@ pub struct ProgramBuilder {
     pub flags: ProgramBuilderFlags,
     /// True once any `Insn::Function` has been emitted. See [`Self::may_abort`].
     emitted_function_call: bool,
+    /// True when any run-time error must undo the statement's writes, so the
+    /// statement may abort whatever it contains. See [`Self::may_abort`].
+    any_error_undoes_statement: bool,
     next_free_register: usize,
     free_register_ranges: Vec<Range<usize>>,
     next_free_cursor_id: usize,
@@ -802,6 +805,7 @@ impl ProgramBuilder {
             reg_result_cols_start: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
             emitted_function_call: false,
+            any_error_undoes_statement: false,
             trigger,
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
@@ -1027,7 +1031,13 @@ impl ProgramBuilder {
     /// separate monotonic bit (not folded into the flag) because the analysis
     /// assigns the flag mid-translation and would clobber it.
     pub const fn may_abort(&self) -> bool {
-        self.flags.may_abort() || self.emitted_function_call
+        self.flags.may_abort() || self.emitted_function_call || self.any_error_undoes_statement
+    }
+
+    /// Makes every statement count as one that may abort, for a dialect in
+    /// which any run-time error undoes the failed statement's writes.
+    pub const fn set_any_error_undoes_statement(&mut self, v: bool) {
+        self.any_error_undoes_statement = v;
     }
 
     pub const fn capture_data_changes_info(&self) -> &Option<CaptureDataChangesInfo> {
@@ -2468,8 +2478,11 @@ impl ProgramBuilder {
         // abort midway (e.g. constraint violation). Single-row writes are atomic and don't
         // need statement-level rollback. Both flags default to true; specific translate paths
         // (e.g., single-row INSERT) set is_multi_write=false to opt out.
+        // A write with RETURNING computes the returned values after it has written the row,
+        // and that can fail (e.g. `RETURNING abs(x)` overflows). The statement then needs a
+        // journal to undo the row, even when it writes only one row.
         let needs_stmt_subtransactions = matches!(self.txn_mode, TransactionMode::Write)
-            && self.flags.is_multi_write()
+            && (self.flags.is_multi_write() || !self.result_columns.is_empty())
             && self.may_abort();
 
         let prepared = PreparedProgram {
