@@ -4526,6 +4526,7 @@ fn begin_mvcc_tx(
                 pager.clone(),
                 expected_schema_generation,
                 checkpoint_read_guard,
+                connection.portable_logical_changes_enabled(),
             ),
         TransactionMode::Write => mv_store.begin_exclusive_tx_with_checkpoint_read_guard(
             pager.clone(),
@@ -15669,7 +15670,12 @@ pub fn op_sequence_begin_inner_tx(
         }
     }
 
-    let inner_tx_id = mv_store.begin_tx(pager.clone())?;
+    let inner_tx_id = mv_store.begin_tx_with_schema_generation_and_checkpoint_read_guard(
+        pager.clone(),
+        None,
+        CheckpointReadLockState::NotHeld,
+        conn.portable_logical_changes_enabled(),
+    )?;
     conn.set_mv_tx_for_db(
         *db,
         Some((
