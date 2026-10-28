@@ -728,17 +728,23 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
                 .map(|(_, arg)| arg.as_ref()),
             env,
         ),
-        Func::Window(WindowFunc::FirstValue | WindowFunc::LastValue | WindowFunc::NthValue) => {
-            args.first()
-                .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env))
-        }
+        Func::Window(WindowFunc::FirstValue | WindowFunc::LastValue | WindowFunc::NthValue) => args
+            .first()
+            .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),
         // A call with the wrong number of arguments is reported when it is translated.
-        Func::Scalar(ScalarFunc::Nullif | ScalarFunc::Abs | ScalarFunc::ArrayElement)
-            if args.is_empty() =>
-        {
-            ExprType::Builtin(BuiltinType::Any)
-        }
-        Func::Scalar(ScalarFunc::Nullif) => type_of(&args[0], env),
+        Func::Scalar(
+            ScalarFunc::Nullif
+            | ScalarFunc::Likely
+            | ScalarFunc::Unlikely
+            | ScalarFunc::Likelihood
+            | ScalarFunc::Abs
+            | ScalarFunc::ArrayElement,
+        ) if args.is_empty() => ExprType::Builtin(BuiltinType::Any),
+        // nullif returns its first argument or NULL; likely, unlikely and
+        // likelihood return their first argument unchanged.
+        Func::Scalar(
+            ScalarFunc::Nullif | ScalarFunc::Likely | ScalarFunc::Unlikely | ScalarFunc::Likelihood,
+        ) => type_of(&args[0], env),
         Func::Scalar(ScalarFunc::Abs) => negated_type(type_of(&args[0], env), env.schema()),
         Func::Scalar(ScalarFunc::ArrayElement) => match type_of(&args[0], env) {
             ExprType::Array {

@@ -554,3 +554,24 @@ expect {
     nth|3
     eq|2
 }
+
+@requires strict "uses STRICT tables"
+test cmp-likely-keeps-the-argument-type {
+    -- likely, unlikely and likelihood return their first argument unchanged,
+    -- so their result compares and sorts with the argument's order.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 9.5), (2, 10), (3, 100);
+    SELECT 'likely', id FROM t ORDER BY likely(n);
+    SELECT 'likelihood', id FROM t ORDER BY likelihood(n, 0.5);
+    SELECT 'unlikely', id FROM t WHERE unlikely(n) > 9.6 ORDER BY id;
+}
+expect {
+    likely|1
+    likely|2
+    likely|3
+    likelihood|1
+    likelihood|2
+    likelihood|3
+    unlikely|2
+    unlikely|3
+}
