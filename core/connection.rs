@@ -3107,22 +3107,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let pragma = format!("PRAGMA {pragma_name}({pragma_value})");
-        let mut stmt = self.prepare(pragma)?;
-        let mut results = Vec::new();
-        loop {
-            match stmt.step()? {
-                vdbe::StepResult::Row => {
-                    let row: Vec<Value> = stmt.row().unwrap().get_values().cloned().collect();
-                    results.push(row);
-                }
-                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy);
-                }
-                _ => break,
-            }
-        }
-
-        Ok(results)
+        self.prepare(pragma)?.run_collect_rows()
     }
 
     #[inline]
