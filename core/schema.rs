@@ -1193,6 +1193,39 @@ impl Schema {
         self.namespace(namespace).tables.values()
     }
 
+    /// The tables of every namespace of the schema.
+    pub fn all_tables(&self) -> impl Iterator<Item = &Arc<Table>> {
+        self.namespaces
+            .values()
+            .flat_map(|objects| objects.tables.values())
+    }
+
+    /// The tables of every namespace of the schema, to change, with the
+    /// namespace and lookup name of each.
+    pub fn all_tables_mut(&mut self) -> impl Iterator<Item = (NamespaceId, &str, &mut Arc<Table>)> {
+        self.namespaces.iter_mut().flat_map(|(namespace, objects)| {
+            objects
+                .tables
+                .iter_mut()
+                .map(move |(name, table)| (*namespace, name.as_str(), table))
+        })
+    }
+
+    /// The indexes of every namespace of the schema, backing B-tree indexes
+    /// included.
+    pub fn all_indexes(&self) -> impl Iterator<Item = &Arc<Index>> {
+        self.namespaces
+            .values()
+            .flat_map(|objects| objects.indexes.values().flatten())
+    }
+
+    /// The indexes of every namespace of the schema, to change.
+    pub fn all_indexes_mut(&mut self) -> impl Iterator<Item = &mut Arc<Index>> {
+        self.namespaces
+            .values_mut()
+            .flat_map(|objects| objects.indexes.values_mut().flatten())
+    }
+
     pub fn table_names(&self, namespace: NamespaceId) -> impl Iterator<Item = &str> {
         self.namespace(namespace).tables.keys().map(String::as_str)
     }
@@ -1284,11 +1317,11 @@ impl Schema {
             .copied()
     }
 
-    pub fn has_materialized_views(&self, namespace: NamespaceId) -> bool {
-        !self
-            .namespace(namespace)
-            .table_to_materialized_views
-            .is_empty()
+    /// Whether any table of any namespace feeds a materialized view.
+    pub fn has_materialized_views(&self) -> bool {
+        self.namespaces
+            .values()
+            .any(|objects| !objects.table_to_materialized_views.is_empty())
     }
 
     /// Every index of the namespace, backing B-tree indexes included.
@@ -2229,7 +2262,7 @@ impl Schema {
         if let Some(table) = removed {
             self.unregister_table_root_page(&table);
         }
-        self.analyze_stats.remove_table(&name);
+        self.analyze_stats.remove_table(namespace, &name);
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -2368,7 +2401,7 @@ impl Schema {
     pub fn remove_indices_for_table(&mut self, namespace: NamespaceId, table_name: &str) {
         let name = normalize_ident(table_name);
         self.namespace_mut(namespace).indexes.remove(&name);
-        self.analyze_stats.remove_table(&name);
+        self.analyze_stats.remove_table(namespace, &name);
     }
 
     pub fn remove_index(&mut self, namespace: NamespaceId, idx: &Index) {
@@ -2378,7 +2411,7 @@ impl Schema {
             .get_mut(&name)
             .expect("Must have the index")
             .retain_mut(|other_idx| other_idx.name != idx.name);
-        self.analyze_stats.remove_index(&name, &idx.name);
+        self.analyze_stats.remove_index(namespace, &name, &idx.name);
     }
 
     pub fn table_has_indexes(&self, namespace: NamespaceId, table_name: &str) -> bool {
@@ -2990,7 +3023,8 @@ impl Schema {
             }
 
             // Create the IncrementalView with all root pages
-            let incremental_view = IncrementalView::from_sql(&sql, self, main_root)?;
+            let incremental_view =
+                IncrementalView::from_sql(&sql, self, main_root, NamespaceId::ROOT)?;
 
             // Create a BTreeTable for the materialized view
             let cols = incremental_view.column_schema.flat_columns()?;
@@ -3402,8 +3436,11 @@ impl Schema {
                             select,
                             ..
                         } => {
-                            let mut view_column_schema =
-                                crate::util::extract_view_columns(&select, self)?;
+                            let mut view_column_schema = crate::util::extract_view_columns(
+                                NamespaceId::ROOT,
+                                &select,
+                                self,
+                            )?;
                             view_column_schema.rename_columns(&column_names);
                             let view = View::new(
                                 name.to_string(),
@@ -3507,22 +3544,25 @@ impl Schema {
             .ok_or_else(|| fk_mismatch_err("<unknown>", &target))?;
 
         let mut out = Vec::try_with_capacity_ext(4)?; // arbitrary estimate
-        let objects = self.namespace(namespace);
-        for t in objects.tables.values() {
-            let Some(child) = t.btree() else {
-                continue;
-            };
-            for fk in &child.foreign_keys {
-                if !fk.parent_table.eq_ignore_ascii_case(&target) {
+        for (child_namespace, objects) in &self.namespaces {
+            for t in objects.tables.values() {
+                let Some(child) = t.btree() else {
                     continue;
+                };
+                for fk in &child.foreign_keys {
+                    if fk.parent_namespace != namespace
+                        || !fk.parent_table.eq_ignore_ascii_case(&target)
+                    {
+                        continue;
+                    }
+                    out.try_push(self.resolve_fk(
+                        *child_namespace,
+                        fk,
+                        &child,
+                        &parent_tbl,
+                        /*require_unique=*/ false,
+                    )?)?;
                 }
-                out.try_push(self.resolve_fk(
-                    namespace,
-                    fk,
-                    &child,
-                    &parent_tbl,
-                    /*require_unique=*/ false,
-                )?)?;
             }
         }
         Ok(out)
@@ -3545,14 +3585,15 @@ impl Schema {
         let mut out = Vec::try_with_capacity_ext(child.foreign_keys.len())?;
         for fk in &child.foreign_keys {
             if let Some(updated_cols) = updated_cols {
-                let is_self_ref = fk.parent_table.eq_ignore_ascii_case(&child.name);
+                let is_self_ref = fk.parent_namespace == namespace
+                    && fk.parent_table.eq_ignore_ascii_case(&child.name);
                 if !is_self_ref && !fk.child_key_assigned(&child, updated_cols) {
                     continue;
                 }
             }
             let parent_name = normalize_ident(&fk.parent_table);
             let parent_tbl = self
-                .get_btree_table(namespace, &parent_name)
+                .get_btree_table(fk.parent_namespace, &parent_name)
                 .ok_or_else(|| fk_mismatch_err(&child.name, &parent_name))?;
             out.push_within_capacity(self.resolve_fk(
                 namespace,
@@ -3571,7 +3612,7 @@ impl Schema {
     /// a non-partial UNIQUE index on exactly those columns.
     fn resolve_fk(
         &self,
-        namespace: NamespaceId,
+        child_namespace: NamespaceId,
         fk: &Arc<ForeignKey>,
         child: &Arc<BTreeTable>,
         parent_tbl: &Arc<BTreeTable>,
@@ -3645,7 +3686,7 @@ impl Schema {
             None
         } else {
             let found = self
-                .get_indices(namespace, &parent_tbl.name)
+                .get_indices(fk.parent_namespace, &parent_tbl.name)
                 .find(|idx| {
                     idx.unique
                         && idx.where_clause.is_none()
@@ -3665,6 +3706,7 @@ impl Schema {
 
         fk.validate()?;
         Ok(ResolvedFkRef {
+            child_namespace,
             child_table: Arc::clone(child),
             fk: Arc::clone(fk),
             parent_cols,
@@ -3677,14 +3719,15 @@ impl Schema {
 
     /// Returns if any table declares a FOREIGN KEY whose parent is `table_name`.
     pub fn any_resolved_fks_referencing(&self, namespace: NamespaceId, table_name: &str) -> bool {
-        let objects = self.namespace(namespace);
-        objects.tables.values().any(|t| {
-            let Some(bt) = t.btree() else {
-                return false;
-            };
-            bt.foreign_keys
-                .iter()
-                .any(|fk| fk.parent_table == table_name)
+        self.namespaces.values().any(|objects| {
+            objects.tables.values().any(|t| {
+                let Some(bt) = t.btree() else {
+                    return false;
+                };
+                bt.foreign_keys
+                    .iter()
+                    .any(|fk| fk.parent_namespace == namespace && fk.parent_table == table_name)
+            })
         })
     }
 
@@ -5054,7 +5097,9 @@ impl BTreeTable {
 
     fn primary_key_implies_not_null(&self, column: &Column) -> bool {
         column.primary_key()
-            && (self.is_strict || (!self.has_rowid && self.primary_key_columns.len() == 1))
+            && (column.is_rowid_alias()
+                || self.is_strict
+                || (!self.has_rowid && self.primary_key_columns.len() == 1))
     }
 
     pub fn column_collations(&self) -> Result<Vec<CollationSeq>> {
@@ -5970,6 +6015,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     let fk = ForeignKey {
                         constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
                         parent_table,
+                        parent_namespace: NamespaceId::ROOT,
                         parent_columns,
                         child_columns,
                         on_delete: clause
@@ -6180,6 +6226,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     .as_ref()
                                     .map(|n| normalize_ident(n.as_str())),
                                 parent_table: normalize_ident(clause.tbl_name.as_str()),
+                                parent_namespace: NamespaceId::ROOT,
                                 parent_columns: clause
                                     .columns
                                     .iter()
@@ -6503,6 +6550,8 @@ pub struct ForeignKey {
     pub child_columns: Box<[String]>,
     /// Referenced (parent) table
     pub parent_table: String,
+    /// The namespace of the parent table, within the child's database.
+    pub parent_namespace: NamespaceId,
     /// Parent-side referenced columns. Empty means "use parent's PRIMARY KEY".
     pub parent_columns: Box<[String]>,
     pub on_delete: RefAct,
@@ -6550,6 +6599,8 @@ impl ForeignKey {
 /// Child column names live in `fk.child_columns` — not duplicated here.
 #[derive(Clone, Debug)]
 pub struct ResolvedFkRef {
+    /// The namespace of the child table.
+    pub child_namespace: NamespaceId,
     /// Child table that owns the FK.
     pub child_table: Arc<BTreeTable>,
     /// The FK as declared on the child table.
@@ -7037,7 +7088,7 @@ impl Column {
     }
     #[inline]
     pub fn notnull(&self) -> bool {
-        self.info.notnull()
+        self.info.notnull() || self.is_rowid_alias()
     }
     #[inline]
     pub fn set_notnull(&mut self, v: bool) {
@@ -7705,6 +7756,109 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_key_finds_its_parent_in_the_parent_namespace() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(1);
+        schema.add_namespace(other);
+        schema
+            .add_btree_table(
+                NamespaceId::ROOT,
+                table("CREATE TABLE p (id INTEGER PRIMARY KEY)", 2),
+            )
+            .unwrap();
+        schema
+            .add_btree_table(other, table("CREATE TABLE p (id INTEGER PRIMARY KEY)", 3))
+            .unwrap();
+        schema
+            .add_btree_table(other, table("CREATE TABLE c (x REFERENCES p(id))", 4))
+            .unwrap();
+
+        let children = schema
+            .resolved_fks_referencing(NamespaceId::ROOT, "p")
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].child_namespace, other);
+        assert_eq!(children[0].child_table.name, "c");
+        assert!(schema.any_resolved_fks_referencing(NamespaceId::ROOT, "p"));
+
+        assert!(schema
+            .resolved_fks_referencing(other, "p")
+            .unwrap()
+            .is_empty());
+        assert!(!schema.any_resolved_fks_referencing(other, "p"));
+
+        let parents = schema.resolved_fks_for_child(other, "c", None).unwrap();
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].fk.parent_namespace, NamespaceId::ROOT);
+    }
+
+    #[test]
+    fn schema_wide_scans_see_every_namespace() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(1);
+        schema.add_namespace(other);
+        schema
+            .add_btree_table(other, table("CREATE TABLE t (x UNIQUE)", 3))
+            .unwrap();
+        let t = schema.get_btree_table(other, "t").unwrap();
+        schema
+            .add_index(
+                other,
+                Arc::new(
+                    Index::from_sql(
+                        &SymbolTable::new(),
+                        "CREATE INDEX i ON t (x)",
+                        4,
+                        t.as_ref(),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+
+        assert!(schema.all_tables().any(|table| table.get_name() == "t"));
+        assert!(schema.all_indexes().any(|index| index.name == "i"));
+        assert!(schema
+            .all_tables_mut()
+            .any(|(namespace, name, _)| namespace == other && name == "t"));
+
+        assert!(!schema.has_materialized_views());
+        schema.add_materialized_view_dependency(other, "t", "v");
+        assert!(schema.has_materialized_views());
+    }
+
+    #[test]
+    fn tables_of_the_same_name_in_two_namespaces_keep_their_own_statistics() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(1);
+        schema.add_namespace(other);
+        schema
+            .add_btree_table(NamespaceId::ROOT, table("CREATE TABLE t (x)", 2))
+            .unwrap();
+        schema
+            .add_btree_table(other, table("CREATE TABLE t (x)", 3))
+            .unwrap();
+        schema
+            .analyze_stats
+            .table_stats_mut(NamespaceId::ROOT, "t")
+            .row_count = Some(10);
+        schema.analyze_stats.table_stats_mut(other, "t").row_count = Some(20);
+
+        let row_count = |schema: &Schema, namespace| {
+            schema
+                .analyze_stats
+                .table_stats(namespace, "t")
+                .and_then(|stats| stats.row_count)
+        };
+        assert_eq!(row_count(&schema, NamespaceId::ROOT), Some(10));
+        assert_eq!(row_count(&schema, other), Some(20));
+
+        schema.remove_table(other, "t");
+        assert_eq!(row_count(&schema, other), None);
+        assert_eq!(row_count(&schema, NamespaceId::ROOT), Some(10));
+    }
+
+    #[test]
     fn persisted_materialized_views_are_loaded_in_dependency_order() {
         let mut views = HashMap::default();
         views.insert(
@@ -7896,13 +8050,17 @@ mod tests {
             for (actual, flag) in [
                 (column.primary_key(), ColDefFlags::PrimaryKey),
                 (column.is_rowid_alias(), ColDefFlags::RowIdAlias),
-                (column.notnull(), ColDefFlags::NotNull),
                 (column.explicit_notnull(), ColDefFlags::ExplicitNotNull),
                 (column.unique(), ColDefFlags::Unique),
                 (column.hidden(), ColDefFlags::Hidden),
             ] {
                 assert_eq!(actual, flags.contains(flag), "{flags:?}: {flag:?}");
             }
+            assert_eq!(
+                column.notnull(),
+                flags.intersects(ColDefFlags::NotNull | ColDefFlags::RowIdAlias),
+                "{flags:?}"
+            );
             assert_eq!(column.ty(), Type::Numeric, "{flags:?}");
             assert_eq!(
                 column.collation_opt(),
@@ -8293,6 +8451,21 @@ mod tests {
         let column = table.get_column("a").unwrap().1;
         assert!(column.notnull());
         Ok(())
+    }
+
+    #[test]
+    fn rowid_alias_is_not_nullable() {
+        for sql in [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE t(id INTEGER, PRIMARY KEY(id))",
+        ] {
+            let table = BTreeTable::from_sql(sql, 2).unwrap();
+            let column = table.get_column("id").unwrap().1;
+            assert!(column.notnull(), "{sql}");
+            assert!(!column.explicit_notnull(), "{sql}");
+        }
+        let table = BTreeTable::from_sql("CREATE TABLE t(id INTEGER PRIMARY KEY DESC)", 2).unwrap();
+        assert!(!table.get_column("id").unwrap().1.notnull());
     }
 
     #[test]

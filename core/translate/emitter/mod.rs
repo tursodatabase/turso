@@ -355,7 +355,7 @@ impl<'a> Resolver<'a> {
             search_order: namespaces
                 .search_order(search_path)
                 .into_iter()
-                .map(NamespaceRef::root_of)
+                .map(|namespace| namespace.target)
                 .collect(),
         }
     }
@@ -991,14 +991,14 @@ impl<'a> Resolver<'a> {
         })
     }
 
-    /// `seq_name` qualified with the database it resolved to, for the
+    /// `seq_name` qualified with the namespace it resolved to, for the
     /// opcodes that look a sequence up again by its name when the statement
     /// runs.
     pub(crate) fn runtime_sequence_name(&self, namespace: NamespaceRef, seq_name: &str) -> String {
-        let database_name = self
-            .namespace_name(namespace.database_id)
-            .expect("the database of a sequence has a name");
-        format!("{database_name}.{seq_name}")
+        let namespace_name = self
+            .name_of_namespace(namespace)
+            .expect("the namespace of a sequence has a name");
+        format!("{namespace_name}.{seq_name}")
     }
 
     /// The namespace that the qualifier of `qualified_name` refers to, or
@@ -1010,11 +1010,9 @@ impl<'a> Resolver<'a> {
     ) -> Result<NamespaceRef> {
         let resolved = if let Some(db_name) = &qualified_name.namespace {
             let db_name_normalized = normalize_ident(db_name.as_str());
-            self.namespace_database_id(&db_name_normalized)
-                .map(NamespaceRef::root_of)
-                .ok_or_else(|| {
-                    LimboError::InvalidArgument(format!("no such database: {db_name_normalized}"))
-                })
+            self.namespace_named(&db_name_normalized).ok_or_else(|| {
+                LimboError::InvalidArgument(format!("no such database: {db_name_normalized}"))
+            })
         } else if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if ctx.restricts_db_references() {
                 Ok(ctx.namespace)
@@ -1068,10 +1066,24 @@ impl<'a> Resolver<'a> {
         self.namespaces.database_id(name)
     }
 
+    /// The namespace called `name`, whatever the statement is being
+    /// compiled for. `name` is normalized.
+    pub(crate) fn namespace_named(&self, name: &str) -> Option<NamespaceRef> {
+        self.namespaces.get(name).map(|namespace| namespace.target)
+    }
+
     /// Get the database name for a given database index.
     /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
     pub(crate) fn namespace_name(&self, index: usize) -> Option<String> {
-        self.namespaces.name(index)
+        self.namespaces
+            .of_database(index)
+            .map(|namespace| namespace.name)
+    }
+
+    /// The name of `namespace`: the database's name for a root namespace,
+    /// else the name the namespace was added under.
+    pub(crate) fn name_of_namespace(&self, namespace: NamespaceRef) -> Option<String> {
+        self.namespaces.name_of(namespace)
     }
 }
 

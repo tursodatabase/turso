@@ -10569,10 +10569,10 @@ pub fn op_function(
                 // to the schema). Resolve the sequence first so currval
                 // on a dropped sequence reports "does not exist" rather
                 // than silently returning the stale per-session value.
-                let (database_id, sequence) = program.connection.find_sequence(&seq_name)?;
+                let (namespace, sequence) = program.connection.find_sequence(&seq_name)?;
                 match program
                     .connection
-                    .get_sequence_currval(database_id, &sequence.name)
+                    .get_sequence_currval(namespace.database_id, &sequence.name)
                 {
                     Some(val) => {
                         state.registers[*dest].set_value(Value::from_i64(val));
@@ -11210,10 +11210,10 @@ pub fn op_function(
                         .into());
                     }
                 };
-                let (db_id, sequence) = program.connection.find_sequence(sequence_name)?;
+                let (namespace, sequence) = program.connection.find_sequence(sequence_name)?;
                 let watermark = program
                     .connection
-                    .mv_store_for_db(db_id)
+                    .mv_store_for_db(namespace.database_id)
                     .and_then(|mv_store| mv_store.sequence_watermark(&sequence.name));
                 match watermark {
                     Some(watermark) => state.registers[*dest].set_int(watermark),
@@ -17683,7 +17683,9 @@ pub fn op_rename_table(
                 // update this table's own foreign keys
                 for fk_arc in &mut btree.foreign_keys {
                     let fk = Arc::make_mut(fk_arc);
-                    if normalize_ident(&fk.parent_table) == normalized_from {
+                    if fk.parent_namespace == *namespace
+                        && normalize_ident(&fk.parent_table) == normalized_from
+                    {
                         fk.parent_table.clone_from(&normalized_to);
                     }
                 }
@@ -17712,15 +17714,17 @@ pub fn op_rename_table(
         schema.register_table_root_page(&normalized_to, table.as_ref());
         schema.insert_table(*namespace, normalized_to.to_owned(), table);
 
-        for (tname, t_arc) in schema.tables_mut(*namespace) {
+        for (child_namespace, tname, t_arc) in schema.all_tables_mut() {
             // skip the table we just renamed
-            if normalize_ident(tname) == normalized_to {
+            if child_namespace == *namespace && normalize_ident(tname) == normalized_to {
                 continue;
             }
             if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
                 let child_btree = Arc::make_mut(child_btree_arc);
                 for fk_arc in &mut child_btree.foreign_keys {
-                    if normalize_ident(&fk_arc.parent_table) == normalized_from {
+                    if fk_arc.parent_namespace == *namespace
+                        && normalize_ident(&fk_arc.parent_table) == normalized_from
+                    {
                         let fk = Arc::make_mut(fk_arc);
                         fk.parent_table.clone_from(&normalized_to);
                     }
@@ -18072,6 +18076,7 @@ pub fn op_alter_column(
                     if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                         &view.sql,
                         schema,
+                        *namespace,
                         table_name.as_str(),
                         &target_db_name,
                         &old_column_name,
@@ -18100,6 +18105,7 @@ pub fn op_alter_column(
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                             &view.sql,
                             schema,
+                            NamespaceId::ROOT,
                             table_name.as_str(),
                             &target_db_name,
                             &old_column_name,
@@ -18261,7 +18267,9 @@ pub fn op_alter_column(
                 }
             }
             // parent side: if self-referencing, rename parent column too
-            if normalize_ident(&fk.parent_table) == normalized_table_name {
+            if fk.parent_namespace == *namespace
+                && normalize_ident(&fk.parent_table) == normalized_table_name
+            {
                 for pc in &mut fk.parent_columns {
                     if pc.eq_ignore_ascii_case(&old_column_name) {
                         pc.clone_from(&new_name);
@@ -18270,15 +18278,17 @@ pub fn op_alter_column(
             }
         }
 
-        // fix OTHER tables that reference this table as parent
-        for (tname, t_arc) in schema.tables_mut(*namespace) {
-            if normalize_ident(tname) == normalized_table_name {
+        // fix OTHER tables, of any namespace, that reference this table as parent
+        for (child_namespace, tname, t_arc) in schema.all_tables_mut() {
+            if child_namespace == *namespace && normalize_ident(tname) == normalized_table_name {
                 continue;
             }
             if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
                 let child_btree = Arc::make_mut(child_btree_arc);
                 for fk_arc in &mut child_btree.foreign_keys {
-                    if normalize_ident(&fk_arc.parent_table) != normalized_table_name {
+                    if fk_arc.parent_namespace != *namespace
+                        || normalize_ident(&fk_arc.parent_table) != normalized_table_name
+                    {
                         continue;
                     }
                     let fk = Arc::make_mut(fk_arc);

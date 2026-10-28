@@ -1,5 +1,4 @@
 use super::*;
-use crate::namespace::NamespaceRef;
 use crate::translate::sequence::emit_sequence_descriptor_literals;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{to_u32, InsertFlags, RegisterOrLiteral};
@@ -195,12 +194,10 @@ pub(super) fn translate_sequence_function(
     let seq_name_raw = extract_string_literal(&args[0])?;
     let (namespace, normalized_name) = if let Some((schema, name)) = seq_name_raw.split_once('.') {
         let schema_norm = normalize_ident(schema);
-        let db_id = resolver
-            .namespace_database_id(&schema_norm)
-            .ok_or_else(|| {
-                LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist"))
-            })?;
-        (NamespaceRef::root_of(db_id), normalize_ident(name))
+        let namespace = resolver.namespace_named(&schema_norm).ok_or_else(|| {
+            LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist"))
+        })?;
+        (namespace, normalize_ident(name))
     } else {
         let name = normalize_ident(&seq_name_raw);
         (resolver.resolve_existing_sequence(&name)?, name)

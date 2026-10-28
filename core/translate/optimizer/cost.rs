@@ -444,7 +444,9 @@ fn estimate_rows_from_analyze_stats(
 
     let table_name = ctx.rhs_table.table.get_name();
 
-    let table_stats = ctx.stats.table_stats(table_name)?;
+    let table_stats = ctx
+        .stats
+        .table_stats(ctx.rhs_table.namespace.id, table_name)?;
     let idx_stats = table_stats.index_stats.get(&index.name)?;
 
     if eq_prefix_len <= idx_stats.avg_rows_per_distinct_prefix.len() {

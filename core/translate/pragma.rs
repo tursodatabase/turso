@@ -2040,7 +2040,10 @@ fn emit_columns_for_table_info(
         program.emit_string8(column.ty_str.clone(), base_reg + 2);
 
         // notnull
-        program.emit_bool(column.notnull(), base_reg + 3);
+        program.emit_bool(
+            column.notnull() && (!column.is_rowid_alias() || column.explicit_notnull()),
+            base_reg + 3,
+        );
 
         // dflt_value
         match &column.default {
