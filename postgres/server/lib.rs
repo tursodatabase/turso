@@ -11,7 +11,9 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::{ConnectOpts, Database, Value};
 use turso_pg::{split_statements, PgConnection};
+use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
+use turso_pg_parser::{returns_rows, ParseResult};
 
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format, Portal};
@@ -185,9 +187,10 @@ impl SimpleQueryHandler for TursoPgHandler {
         let mut responses = Vec::new();
         for sql in &statements {
             let mut stmt = conn.prepare(sql).map_err(pg_error)?;
+            let parsed = parse_statement(sql)?;
 
-            if stmt.num_columns() == 0 || is_pg_non_query(sql) {
-                responses.push(execute_non_query(&mut stmt, sql)?);
+            if stmt.num_columns() == 0 || !returns_rows(&parsed) {
+                responses.push(execute_non_query(&mut stmt, &parsed)?);
             } else {
                 let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
                 responses.push(execute_query(&mut stmt, header)?);
@@ -384,8 +387,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
         // Bind parameters from the portal
         bind_portal_parameters(&mut stmt, portal)?;
 
-        if stmt.num_columns() == 0 || is_pg_non_query(query) {
-            return execute_non_query(&mut stmt, query);
+        let parsed = parse_statement(query)?;
+        if stmt.num_columns() == 0 || !returns_rows(&parsed) {
+            return execute_non_query(&mut stmt, &parsed);
         }
 
         let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
@@ -409,7 +413,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
             .map(|t| t.clone().unwrap_or(Type::TEXT))
             .collect();
 
-        let fields = build_field_info(&stmt, &Format::UnifiedText);
+        let fields = describe_fields(&stmt, &target.statement, &Format::UnifiedText)?;
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -426,16 +430,34 @@ impl ExtendedQueryHandler for TursoPgHandler {
             .prepare(&portal.statement.statement)
             .map_err(pg_error)?;
 
-        let fields = build_field_info(&stmt, &portal.result_column_format);
+        let fields = describe_fields(
+            &stmt,
+            &portal.statement.statement,
+            &portal.result_column_format,
+        )?;
         Ok(DescribePortalResponse::new(fields))
     }
 }
 
+/// The fields of the rows that `sql` returns, or none if it returns no rows.
+fn describe_fields(
+    stmt: &turso_pg::Statement,
+    sql: &str,
+    format: &Format,
+) -> PgWireResult<Vec<FieldInfo>> {
+    if !returns_rows(&parse_statement(sql)?) {
+        return Ok(vec![]);
+    }
+    Ok(build_field_info(stmt, format))
+}
+
+fn parse_statement(sql: &str) -> PgWireResult<ParseResult> {
+    turso_pg_parser::parse(sql)
+        .map_err(|error| pg_error(turso_core::LimboError::ParseError(error.to_string()).into()))
+}
+
 /// Build FieldInfo metadata from a prepared statement's column information.
 fn build_field_info(stmt: &turso_pg::Statement, format: &Format) -> Vec<FieldInfo> {
-    if is_pg_non_query(stmt.get_sql()) {
-        return vec![];
-    }
     (0..stmt.num_columns())
         .map(|i| {
             let name = stmt.get_column_name(i).into_owned();
@@ -558,12 +580,27 @@ fn execute_query(
 }
 
 /// Execute a non-SELECT statement and build an Execution response.
-fn execute_non_query(stmt: &mut turso_pg::Statement, query: &str) -> PgWireResult<Response> {
+fn execute_non_query(
+    stmt: &mut turso_pg::Statement,
+    parsed: &ParseResult,
+) -> PgWireResult<Response> {
     stmt.run_ignore_rows().map_err(pg_error)?;
 
-    let affected = stmt.n_change();
-    let tag = command_tag(query, affected as usize);
-    Ok(Response::Execution(tag))
+    let affected = stmt.n_change() as usize;
+    Ok(Response::Execution(wire_tag(
+        CommandTag::of(parsed),
+        affected,
+    )))
+}
+
+fn wire_tag(tag: CommandTag, affected_rows: usize) -> Tag {
+    match tag {
+        // INSERT also reports the OID of the inserted row, which is always 0
+        // because tables have no OIDs.
+        CommandTag::Insert => Tag::new(tag.name()).with_oid(0).with_rows(affected_rows),
+        _ if tag.has_row_count() => Tag::new(tag.name()).with_rows(affected_rows),
+        _ => Tag::new(tag.name()),
+    }
 }
 
 /// Extract parameters from a Portal and bind them to a prepared statement.
@@ -791,139 +828,6 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
             }
         }
     }
-}
-
-/// PG statements handled by `try_prepare_pg()` that return a dummy SELECT
-/// but should produce a command-tag response, not a result set.
-fn is_pg_non_query(sql: &str) -> bool {
-    let upper = sql.trim().to_uppercase();
-    upper.starts_with("COPY")
-        || upper.starts_with("SET")
-        || upper.starts_with("RESET")
-        || upper.starts_with("DISCARD")
-        || upper.starts_with("LOCK")
-        || upper.starts_with("CREATE SCHEMA")
-        || upper.starts_with("DROP SCHEMA")
-        || upper.starts_with("REFRESH MATERIALIZED VIEW")
-        || upper.starts_with("COMMENT")
-}
-
-fn command_tag(query: &str, affected_rows: usize) -> Tag {
-    let upper = query.trim().to_uppercase();
-    if upper.starts_with("INSERT") {
-        Tag::new("INSERT").with_oid(0).with_rows(affected_rows)
-    } else if upper.starts_with("UPDATE") {
-        Tag::new("UPDATE").with_rows(affected_rows)
-    } else if upper.starts_with("DELETE") || upper.starts_with("TRUNCATE") {
-        Tag::new("DELETE").with_rows(affected_rows)
-    } else if upper.starts_with("CREATE VIEW") {
-        Tag::new("CREATE VIEW")
-    } else if upper.starts_with("CREATE INDEX") {
-        Tag::new("CREATE INDEX")
-    } else if upper.starts_with("CREATE SCHEMA") {
-        Tag::new("CREATE SCHEMA")
-    } else if is_create_table_as(&upper) {
-        // PostgreSQL reports CREATE TABLE AS completion as `SELECT n` (the
-        // rows inserted), except WITH NO DATA which skips the insert and
-        // keeps the plain tag.
-        if ends_with_with_no_data(&upper) {
-            Tag::new("CREATE TABLE AS")
-        } else {
-            Tag::new("SELECT").with_rows(affected_rows)
-        }
-    } else if upper.starts_with("CREATE") {
-        Tag::new("CREATE TABLE")
-    } else if upper.starts_with("DROP VIEW") {
-        Tag::new("DROP VIEW")
-    } else if upper.starts_with("DROP INDEX") {
-        Tag::new("DROP INDEX")
-    } else if upper.starts_with("DROP SCHEMA") {
-        Tag::new("DROP SCHEMA")
-    } else if upper.starts_with("DROP") {
-        Tag::new("DROP TABLE")
-    } else if upper.starts_with("ALTER") {
-        Tag::new("ALTER TABLE")
-    } else if upper.starts_with("BEGIN") || upper.starts_with("START") {
-        Tag::new("BEGIN")
-    } else if upper.starts_with("COMMIT") {
-        Tag::new("COMMIT")
-    } else if upper.starts_with("ROLLBACK") {
-        Tag::new("ROLLBACK")
-    } else if upper.starts_with("SAVEPOINT") {
-        Tag::new("SAVEPOINT")
-    } else if upper.starts_with("RELEASE") {
-        Tag::new("RELEASE")
-    } else if upper.starts_with("SET") {
-        Tag::new("SET")
-    } else if upper.starts_with("RESET") {
-        Tag::new("RESET")
-    } else if upper.starts_with("DISCARD") {
-        Tag::new("DISCARD ALL")
-    } else if upper.starts_with("LOCK") {
-        Tag::new("LOCK TABLE")
-    } else if upper.starts_with("COPY") {
-        Tag::new("COPY").with_rows(affected_rows)
-    } else if upper.starts_with("COMMENT") {
-        Tag::new("COMMENT")
-    } else if upper.starts_with("SELECT") || upper.starts_with("WITH") {
-        // Row-returning SELECTs never reach command_tag (they take the
-        // query-response path), so a zero-column SELECT- or WITH-prefixed
-        // statement is SELECT ... INTO (writable CTEs are unsupported),
-        // which PostgreSQL reports as `SELECT n` like CREATE TABLE AS.
-        Tag::new("SELECT").with_rows(affected_rows)
-    } else {
-        Tag::new("OK")
-    }
-}
-
-/// Whether the statement ends with `WITH NO DATA`, token-wise (ignoring
-/// trailing whitespace and statement terminators).
-fn ends_with_with_no_data(upper: &str) -> bool {
-    let mut tokens = upper
-        .trim_end()
-        .trim_end_matches(';')
-        .split_whitespace()
-        .rev();
-    tokens.next() == Some("DATA") && tokens.next() == Some("NO") && tokens.next() == Some("WITH")
-}
-
-/// Best-effort detection of `CREATE [TEMP|UNLOGGED] TABLE [IF NOT EXISTS]
-/// <name> AS ...` from the statement text, in the same spirit as the prefix
-/// matching in `command_tag`. Quoted table names containing whitespace are
-/// not recognized and fall back to the plain CREATE TABLE tag.
-fn is_create_table_as(upper: &str) -> bool {
-    let mut tokens = upper.split_whitespace();
-    if tokens.next() != Some("CREATE") {
-        return false;
-    }
-    let mut tok = tokens.next();
-    while matches!(
-        tok,
-        Some("TEMP" | "TEMPORARY" | "UNLOGGED" | "GLOBAL" | "LOCAL")
-    ) {
-        tok = tokens.next();
-    }
-    if tok != Some("TABLE") {
-        return false;
-    }
-    tok = tokens.next();
-    if tok == Some("IF") {
-        if tokens.next() != Some("NOT") || tokens.next() != Some("EXISTS") {
-            return false;
-        }
-        tok = tokens.next();
-    }
-    // `tok` is the table name; AS must follow it (possibly fused with an
-    // opening parenthesis, as in `AS(SELECT 1)`).
-    let Some(name) = tok else {
-        return false;
-    };
-    // A quoted name that opens without closing in the same token spans
-    // whitespace, so the next token is part of the name, not AS.
-    if name.starts_with('"') && (name.len() == 1 || !name.ends_with('"')) {
-        return false;
-    }
-    matches!(tokens.next(), Some(t) if t == "AS" || t.starts_with("AS("))
 }
 
 fn error_info(message: &str) -> ErrorInfo {
@@ -1279,46 +1183,6 @@ mod tests {
     }
 
     #[test]
-    fn test_set_transaction_is_non_query() {
-        assert!(is_pg_non_query(
-            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
-        ));
-        assert!(is_pg_non_query("  set\ntransaction read only"));
-        assert!(!is_pg_non_query(
-            "SELECT set_config('search_path', '', false)"
-        ));
-    }
-
-    #[test]
-    fn test_reset_and_discard_are_non_queries() {
-        for (sql, tag) in [
-            ("RESET app.mode", "RESET"),
-            ("reset all", "RESET"),
-            ("DISCARD ALL", "DISCARD ALL"),
-        ] {
-            assert!(is_pg_non_query(sql), "{sql}");
-            assert_eq!(command_tag(sql, 0), Tag::new(tag), "{sql}");
-        }
-    }
-
-    #[test]
-    fn test_access_share_lock_is_non_query() {
-        assert!(is_pg_non_query(
-            "LOCK TABLE public.items IN ACCESS SHARE MODE"
-        ));
-        assert!(is_pg_non_query("  lock\ntable items in access share mode"));
-        assert!(!is_pg_non_query("SELECT 'LOCK TABLE items'"));
-    }
-
-    #[test]
-    fn test_access_share_lock_command_tag() {
-        assert_eq!(
-            command_tag("LOCK TABLE items IN ACCESS SHARE MODE", 0),
-            Tag::new("LOCK TABLE")
-        );
-    }
-
-    #[test]
     fn test_access_share_lock_has_no_result_fields() {
         let (_io, db) = turso_pg::open_database(
             ":memory:",
@@ -1333,10 +1197,20 @@ mod tests {
             .prepare("LOCK TABLE items IN ACCESS SHARE MODE")
             .unwrap();
         for format in [Format::UnifiedText, Format::UnifiedBinary] {
-            assert!(build_field_info(&stmt, &format).is_empty());
+            assert!(
+                describe_fields(&stmt, "LOCK TABLE items IN ACCESS SHARE MODE", &format)
+                    .unwrap()
+                    .is_empty()
+            );
         }
-        let query = conn.prepare("SELECT 'LOCK TABLE items'").unwrap();
-        assert_eq!(build_field_info(&query, &Format::UnifiedText).len(), 1);
+        let sql = "SELECT 'LOCK TABLE items'";
+        let query = conn.prepare(sql).unwrap();
+        assert_eq!(
+            describe_fields(&query, sql, &Format::UnifiedText)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1503,37 +1377,5 @@ mod tests {
         // UNKNOWN type should keep text for non-numeric strings
         let val = pg_bytes_to_value(b"hello", &Type::UNKNOWN).unwrap();
         assert!(matches!(val, Value::Text(_)));
-    }
-
-    #[test]
-    fn test_is_create_table_as() {
-        assert!(is_create_table_as("CREATE TABLE T AS SELECT 1"));
-        assert!(is_create_table_as("CREATE TEMP TABLE T AS SELECT 1"));
-        assert!(is_create_table_as("CREATE UNLOGGED TABLE T AS SELECT 1"));
-        assert!(is_create_table_as(
-            "CREATE TABLE IF NOT EXISTS T AS SELECT 1"
-        ));
-        assert!(is_create_table_as("CREATE TABLE S.T AS SELECT 1"));
-        assert!(is_create_table_as("CREATE TABLE T AS(SELECT 1)"));
-        assert!(is_create_table_as("CREATE TABLE \"T\" AS SELECT 1"));
-
-        assert!(!is_create_table_as("CREATE TABLE T (X INT)"));
-        assert!(!is_create_table_as("CREATE INDEX I ON T (X)"));
-        assert!(!is_create_table_as("CREATE VIEW V AS SELECT 1"));
-        // Quoted name containing whitespace: `AS` is part of the name.
-        assert!(!is_create_table_as("CREATE TABLE \"A AS B\" (X INT)"));
-    }
-
-    #[test]
-    fn test_ends_with_with_no_data() {
-        assert!(ends_with_with_no_data(
-            "CREATE TABLE T AS SELECT 1 WITH NO DATA"
-        ));
-        assert!(ends_with_with_no_data(
-            "CREATE TABLE T AS SELECT 1 WITH  NO\nDATA ; "
-        ));
-
-        assert!(!ends_with_with_no_data("CREATE TABLE T AS SELECT 1"));
-        assert!(!ends_with_with_no_data("SELECT 'WITH NO DATA'"));
     }
 }

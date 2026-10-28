@@ -1,4 +1,6 @@
+pub mod cmdtag;
 pub mod copy;
+use pg_query::NodeEnum;
 pub use pg_query::ParseResult;
 use thiserror::Error;
 
@@ -25,6 +27,23 @@ pub enum ParseError {
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
     pg_query::parse(sql).map_err(|e| ParseError::ParseError(e.to_string()))
+}
+
+/// Whether the first statement in `parsed` sends rows to the client.
+pub fn returns_rows(parsed: &ParseResult) -> bool {
+    match first_statement(parsed) {
+        Some(NodeEnum::SelectStmt(select)) => select.into_clause.is_none(),
+        Some(NodeEnum::InsertStmt(insert)) => !insert.returning_list.is_empty(),
+        Some(NodeEnum::UpdateStmt(update)) => !update.returning_list.is_empty(),
+        Some(NodeEnum::DeleteStmt(delete)) => !delete.returning_list.is_empty(),
+        Some(NodeEnum::MergeStmt(merge)) => !merge.returning_list.is_empty(),
+        Some(NodeEnum::ExplainStmt(_) | NodeEnum::VariableShowStmt(_)) => true,
+        _ => false,
+    }
+}
+
+fn first_statement(parsed: &ParseResult) -> Option<&NodeEnum> {
+    parsed.protobuf.stmts.first()?.stmt.as_ref()?.node.as_ref()
 }
 
 /// Split a multi-statement SQL string into individual statements.
@@ -149,8 +168,6 @@ pub fn foreign_key_tables(parse_result: &ParseResult) -> Vec<ForeignKeyTable> {
 }
 
 fn collect_foreign_key_tables(node: &pg_query::protobuf::Node, tables: &mut Vec<ForeignKeyTable>) {
-    use pg_query::NodeEnum;
-
     let children: &[pg_query::protobuf::Node] = match &node.node {
         Some(NodeEnum::CreateStmt(create)) => &create.table_elts,
         Some(NodeEnum::AlterTableStmt(alter)) => &alter.cmds,
@@ -225,6 +242,30 @@ fn keyword_requires_quoting(ident: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn returns_rows_is_true_only_for_statements_that_send_rows() {
+        let returns = |sql: &str| returns_rows(&parse(sql).unwrap());
+        for sql in [
+            "/* a comment */ SELECT 1",
+            "VALUES (1)",
+            "SHOW search_path",
+            "EXPLAIN SELECT 1",
+            "INSERT INTO t VALUES (1) RETURNING x",
+            "DELETE FROM t RETURNING *",
+            "SELECT 'LOCK TABLE t'",
+        ] {
+            assert!(returns(sql), "{sql}");
+        }
+        for sql in [
+            "-- a comment\nSET search_path TO s",
+            "SELECT 1 INTO t",
+            "INSERT INTO t VALUES (1)",
+            "LOCK TABLE t IN ACCESS SHARE MODE",
+        ] {
+            assert!(!returns(sql), "{sql}");
+        }
+    }
 
     #[test]
     fn name_create_table_writes_the_mangled_name_over_the_written_one() {
