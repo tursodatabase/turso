@@ -469,7 +469,8 @@ pub fn first_collation<'a>(
 /// The collation of one expression, or None when it has none (SQLite's
 /// `sqlite3ExprCollSeq`). A column has its declared collation, BINARY when it
 /// declares none, and so do a register and a variable that stand for a column
-/// (rewritten column references, a trigger's NEW.x and OLD.x). CAST and unary `+` pass on the collation of their operand. A
+/// (rewritten column references, a trigger's NEW.x and OLD.x). A value an index
+/// method provides in place of an expression it computes has none. CAST and unary `+` pass on the collation of their operand. A
 /// row value has the collation of its first element. Any other expression has
 /// the collation of its leftmost COLLATE operator, or none when it contains no
 /// COLLATE operator.
@@ -536,6 +537,11 @@ fn referenced_column_collation(
             .get(column)
             .ok_or_else(|| LimboError::ParseError("column not found".to_string()))?;
         return Ok(column_collation(column));
+    }
+    // A value an index method provides stands for an expression the method computes, which has
+    // no column collation.
+    if tables.is_some_and(|tables| tables.provided_by_index_method(table, column)) {
+        return Ok(None);
     }
     let (_, table_ref) = tables
         .and_then(|tables| tables.find_table_by_internal_id(table))
