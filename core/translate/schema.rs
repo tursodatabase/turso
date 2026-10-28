@@ -4,11 +4,12 @@ use crate::LimboError;
 
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
+use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES,
-    SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    BTreeTable, ColDef, Column, SchemaObjectType, Table, Type, SQLITE_SEQUENCE_TABLE_NAME,
+    TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -1206,9 +1207,7 @@ pub fn translate_create_table(
     program.extend(&opts);
 
     if !connection.is_mvcc_bootstrap_connection()
-        && RESERVED_TABLE_PREFIXES
-            .iter()
-            .any(|prefix| normalized_tbl_name.starts_with(prefix))
+        && is_reserved_object_name(&normalized_tbl_name)
         && !connection.is_nested_stmt()
     {
         bail_parse_error!(
