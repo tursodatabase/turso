@@ -143,7 +143,10 @@ fn native_scalar_receives_each_executing_connection() {
             .unwrap(),
         ),
     );
-    let other = conn.db.connect(ConnectOpts::new()).unwrap();
+    let other = conn
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("CREATE TABLE t(x)").unwrap();
     conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
     other.execute("INSERT INTO t VALUES (4)").unwrap();
@@ -179,11 +182,17 @@ fn native_scalar_connection_context_survives_io_and_helper_queries() {
     let context = Arc::new(AtomicI64::new(7));
     let first = plain
         .db
-        .connect_with_context(crate::ConnectOpts::new(), context.clone())
+        .connect_with_context(
+            ConnectOpts::new(crate::SessionRole::Superuser),
+            context.clone(),
+        )
         .unwrap();
     let second = plain
         .db
-        .connect_with_context(crate::ConnectOpts::new(), Arc::new(AtomicI64::new(19)))
+        .connect_with_context(
+            ConnectOpts::new(crate::SessionRole::Superuser),
+            Arc::new(AtomicI64::new(19)),
+        )
         .unwrap();
     let mut statement = first.prepare("SELECT connection_context_read(1)").unwrap();
     assert!(matches!(statement.step().unwrap(), StepResult::IO));
@@ -446,7 +455,10 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
                     );
                 }
                 conn.execute("INSERT INTO audit VALUES (504)").unwrap();
-                let other = conn.db.connect(ConnectOpts::new()).unwrap();
+                let other = conn
+                    .db
+                    .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                    .unwrap();
                 for table in ["parent", "child"] {
                     assert!(other
                         .prepare(format!("SELECT id FROM {table}"))
@@ -795,7 +807,10 @@ fn scalar_calls_resume_independently_and_create_once() {
         ),
     );
     let mut first = conn.prepare("SELECT delayed(7, 3)").unwrap();
-    let other = conn.db.connect(ConnectOpts::new()).unwrap();
+    let other = conn
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let mut second = other.prepare("SELECT delayed(2, 9)").unwrap();
     assert!(matches!(first.step().unwrap(), StepResult::IO));
     assert!(matches!(second.step().unwrap(), StepResult::IO));
@@ -1022,7 +1037,10 @@ fn aggregates_resume_steps_and_finalization_for_each_group() {
         ]
     );
     assert_eq!(created.load(Ordering::SeqCst), 4);
-    let other = conn.db.connect(ConnectOpts::new()).unwrap();
+    let other = conn
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     other.set_vdbe_trace(true);
     let mut empty = other.prepare("SELECT weighted(3, 7) WHERE 0").unwrap();
     assert_eq!(
@@ -1348,7 +1366,10 @@ fn native_table_functions_survive_mvcc_schema_refresh_and_other_connection_ddl()
             collect(&mut stmt, &queue),
             vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]]
         );
-        let other = conn.db.connect(ConnectOpts::new()).unwrap();
+        let other = conn
+            .db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         other.execute("CREATE TABLE unrelated(value)").unwrap();
         stmt.reset().unwrap();
         assert_eq!(
@@ -1399,7 +1420,9 @@ fn native_table_function_views_survive_checkpoint_and_reopen() {
         let expected_rows = vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]];
         {
             let db = open();
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
             if mvcc {
                 conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
             }
@@ -1414,7 +1437,9 @@ fn native_table_function_views_survive_checkpoint_and_reopen() {
             assert_eq!(columns(&conn), expected_columns);
         }
         let db = open();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         assert_eq!(columns(&conn), expected_columns);
         let mut stmt = conn
             .prepare("SELECT * FROM native_view ORDER BY value")
@@ -1856,7 +1881,10 @@ fn c_extensions_still_execute_with_native_registration() {
                     .unwrap(),
             ),
     );
-    let other = conn.db.connect(ConnectOpts::new()).unwrap();
+    let other = conn
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     assert_eq!(
         other
             .prepare("SELECT c_open_double(7)")
@@ -1970,7 +1998,7 @@ fn c_and_native_tables_share_cursor_dispatch() {
 fn connection(options: OpenOptions) -> Arc<Connection> {
     Database::open(Arc::new(MemoryIO::new()), ":memory:", options)
         .unwrap()
-        .connect(ConnectOpts::new())
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
         .unwrap()
 }
 

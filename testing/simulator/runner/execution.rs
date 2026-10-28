@@ -581,7 +581,8 @@ mod tests {
     fn memory_connection() -> Arc<Connection> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        db.connect(ConnectOpts::new()).unwrap()
+        db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap()
     }
 
     fn query_interaction(query: Query) -> Interaction {

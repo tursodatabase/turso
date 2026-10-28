@@ -114,7 +114,7 @@ fn reindex_query_only_allows_empty_work(tmp_db: crate::common::TempDatabase) -> 
 fn reindex_reset_during_pending_io_preserves_original_indexes() -> anyhow::Result<()> {
     let io = Arc::new(QueuedIo::new());
     let db = open_queued_db(io.clone(), "queued-reindex-reset.db")?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     let rows = 700;
     populate_reindex_fixture(&conn, rows)?;
 
@@ -143,7 +143,7 @@ fn reindex_write_fault_rolls_back_without_emptying_index() -> anyhow::Result<()>
     let db_path = "queued-reindex-fault.db";
     let wal_path = format!("{db_path}-wal");
     let db = open_queued_db(io.clone(), db_path)?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     let rows = 700;
     populate_reindex_fixture(&conn, rows)?;
 
@@ -208,7 +208,7 @@ fn delete_all_write_fault_rolls_back_every_btree() -> anyhow::Result<()> {
     let db_path = "queued-delete-all-fault.db";
     let wal_path = format!("{db_path}-wal");
     let db = open_queued_db(io.clone(), db_path)?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     conn.execute("PRAGMA page_size = 512")?;
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT UNIQUE, payload BLOB)")?;
     conn.execute("CREATE INDEX idx_even ON t(id) WHERE id % 2 = 0")?;

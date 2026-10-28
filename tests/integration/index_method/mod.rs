@@ -3138,7 +3138,9 @@ fn test_fts_mvcc_recovery(tmp_db: TempDatabase) {
         std::sync::Arc::new(turso_core::SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     assert_eq!(
         limbo_exec_rows(
             &conn,
@@ -3164,7 +3166,9 @@ fn test_fts_mvcc_recovery(tmp_db: TempDatabase) {
         std::sync::Arc::new(turso_core::SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     assert_eq!(
         limbo_exec_rows(
             &conn,
@@ -6812,7 +6816,9 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
     let db1 = open();
     let db2 = open();
 
-    let setup = db1.connect(ConnectOpts::new()).unwrap();
+    let setup = db1
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     setup
         .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();
@@ -6847,7 +6853,9 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
 
     // Step 1: "process" 1, connection X pins an old snapshot and warms the
     // shared cache with FTS backing pages at that snapshot.
-    let conn_x = db1.connect(ConnectOpts::new()).unwrap();
+    let conn_x = db1
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     conn_x.execute("BEGIN").unwrap();
     let _ = run_rows(
         &conn_x,
@@ -6856,7 +6864,9 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
 
     // Step 2: "process" 2 commits FTS churn — deletes make old postings
     // dead (tombstones) and add new ones. Process 1's cache sees none of it.
-    let writer = db2.connect(ConnectOpts::new()).unwrap();
+    let writer = db2
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     for id in 0..50 {
         writer
             .execute(format!(
@@ -6867,7 +6877,9 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
 
     // Step 3: process 1, connection Z begins a fresh snapshot: its
     // changed-detection clears the shared cache and loads some NEW pages.
-    let conn_z = db1.connect(ConnectOpts::new()).unwrap();
+    let conn_z = db1
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     let _ = run_rows(&conn_z, "SELECT count(*) FROM docs WHERE id < 10");
 
     // Step 4: connection X (still pinned at the OLD snapshot) runs another

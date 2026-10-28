@@ -29,6 +29,8 @@ const MULTIPROCESS_SHM_DB_FILE_READER_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_db_file_reader_child_process";
 const MULTIPROCESS_SHM_SCHEMA_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_schema_child_process";
+const MULTIPROCESS_SHM_CREATE_ROLE_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_shm_create_role_child_process";
 const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_insert_and_close_child_process";
 const MULTIPROCESS_SHM_EXPECT_OPEN_FAILURE_CHILD_TEST: &str =
@@ -326,7 +328,9 @@ fn multiprocess_wal_rejects_journal_mode_mvcc_pragma() {
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let err = conn
         .execute("PRAGMA journal_mode = mvcc")
         .expect_err("switching a multiprocess-coordinated database to MVCC must be rejected");
@@ -345,7 +349,9 @@ fn multiprocess_wal_rejects_opening_mvcc_database() {
 
     {
         let db = Database::open_file(io.clone(), db_path_str, Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         conn.execute("PRAGMA journal_mode = mvcc").unwrap();
@@ -370,7 +376,9 @@ fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_
 
     {
         let db = Database::open_file(io.clone(), db_path_str, Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
     }
@@ -439,7 +447,9 @@ fn database_open_async_with_default_flags_allows_second_multiprocess_process() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db_async(io, db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
     conn.execute("insert into test(value) values ('parent')")
@@ -469,7 +479,9 @@ fn multiprocess_async_open_child_process() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db_async(io, db_path.to_str().unwrap()).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     assert_eq!(count_test_rows(&conn), 1);
 }
 
@@ -518,7 +530,9 @@ fn reject_live_multiprocess_probe_uses_configured_wal_path() {
     // Parent keeps the multiprocess database open so a second (child) opener
     // flips the authority into multiprocess mode.
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
 
@@ -594,7 +608,9 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db_a = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn_a = db_a.connect(ConnectOpts::new()).unwrap();
+    let conn_a = db_a
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn_a
         .execute("create table test(id integer primary key, value text)")
         .unwrap();
@@ -625,7 +641,9 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
         "cold reopen should fall back to a WAL disk scan when tshm snapshot is stale"
     );
 
-    let conn_b = db_b.connect(ConnectOpts::new()).unwrap();
+    let conn_b = db_b
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let rows = get_rows(&conn_b, "select id, value from test order by id");
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
@@ -642,7 +660,9 @@ fn database_open_reuses_trusted_tshm_snapshot_without_disk_scan_when_no_backfill
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
     conn.execute("insert into test(value) values ('before-reopen')")
@@ -693,7 +713,9 @@ fn database_open_reuses_trusted_tshm_snapshot_without_disk_scan_when_no_backfill
         "trusted reopen must preserve durable frame-index content"
     );
 
-    let reopened_conn = reopened.connect(ConnectOpts::new()).unwrap();
+    let reopened_conn = reopened
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     assert_eq!(count_test_rows(&reopened_conn), 2);
 }
 
@@ -707,7 +729,9 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
@@ -765,7 +789,9 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
         "disk-scan reopen must preserve the WAL generation while clearing untrusted positive nbackfills"
     );
 
-    let reopened_conn = reopened.connect(ConnectOpts::new()).unwrap();
+    let reopened_conn = reopened
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     assert_eq!(
         count_test_rows(&reopened_conn),
         32,
@@ -783,7 +809,9 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
@@ -835,7 +863,9 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
         "reopen must rebuild from disk after a WAL append invalidates the tshm backfill proof"
     );
 
-    let reopened_conn = reopened.connect(ConnectOpts::new()).unwrap();
+    let reopened_conn = reopened
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     assert_eq!(
         count_test_rows(&reopened_conn),
         33,
@@ -853,7 +883,9 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
@@ -907,7 +939,9 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
         "disk-scan reopen must preserve the WAL generation while clearing untrusted positive nbackfills"
     );
 
-    let reopened_conn = reopened.connect(ConnectOpts::new()).unwrap();
+    let reopened_conn = reopened
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     assert_eq!(
         count_test_rows(&reopened_conn),
         32,
@@ -961,7 +995,9 @@ fn multiprocess_shm_insert_child_process() {
     assert_eq!(wal_file.coordination_backend_name(), "tshm");
     assert_eq!(wal_file.coordination_open_mode_name(), Some("multiprocess"));
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("insert into test(value) values ('child')")
         .unwrap();
 }
@@ -982,7 +1018,9 @@ fn multiprocess_shm_insert_and_close_child_process() {
     assert_eq!(wal_file.coordination_backend_name(), "tshm");
     assert_eq!(wal_file.coordination_open_mode_name(), Some("multiprocess"));
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("insert into test(value) values ('child-close')")
         .unwrap();
     conn.close().unwrap();
@@ -1008,7 +1046,9 @@ fn multiprocess_shm_count_child_process() {
     assert_eq!(wal_file.coordination_backend_name(), "tshm");
     assert_eq!(wal_file.coordination_open_mode_name(), Some("multiprocess"));
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     assert_eq!(count_test_rows(&conn), expected_count);
 }
 
@@ -1049,7 +1089,9 @@ fn multiprocess_shm_hold_read_tx_child_process() {
         "child reopen path did not match expected disk-scan behavior"
     );
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let pager = conn.pager.load();
     let wal = pager.wal.as_ref().unwrap();
     wal.begin_read_tx().unwrap();
@@ -1079,7 +1121,9 @@ fn multiprocess_shm_db_file_reader_child_process() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("begin").unwrap();
     assert_eq!(count_test_rows(&conn), 1);
     std::fs::write(&ready_file, b"ready").unwrap();
@@ -1108,7 +1152,9 @@ fn multiprocess_shm_schema_child_process() {
     assert_eq!(wal_file.coordination_backend_name(), "tshm");
     assert_eq!(wal_file.coordination_open_mode_name(), Some("multiprocess"));
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("create table child_table(id integer primary key, value text)")
         .unwrap();
     conn.execute("insert into child_table(value) values ('child-schema')")
@@ -1130,7 +1176,9 @@ fn subprocess_database_open_selects_multiprocess_shm_backend() {
     assert_eq!(wal_file.coordination_backend_name(), "tshm");
     assert_eq!(wal_file.coordination_open_mode_name(), Some("exclusive"));
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
     conn.execute("insert into test(value) values ('parent')")
@@ -1183,7 +1231,9 @@ fn plain_vacuum_rejects_multiprocess_wal_database() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
     conn.execute("insert into test(value) values ('parent')")
@@ -1210,7 +1260,9 @@ fn subprocess_child_close_skips_shutdown_checkpoint_in_multiprocess_wal_mode() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
 
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
@@ -1259,7 +1311,9 @@ fn subprocess_database_open_survives_truncate_rewrite_cycles() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
     conn.execute("insert into test(value) values ('parent-0')")
@@ -1316,13 +1370,128 @@ fn subprocess_database_open_survives_truncate_rewrite_cycles() {
 }
 
 #[test]
+fn multiprocess_shm_create_role_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
+    let create_role = turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateRole {
+        role_name: "alice".to_string(),
+    });
+    conn.prepare_translated_cmd(create_role, "CREATE ROLE alice")
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+}
+
+#[test]
+fn subprocess_database_open_connects_as_role_created_by_another_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-peer-role.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table t(value integer)").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_CREATE_ROLE_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "child role process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+
+    let alice = db
+        .connect(ConnectOpts::new(crate::SessionRole::Named(
+            "alice".to_string(),
+        )))
+        .unwrap();
+    assert!(!alice.current_role_is_superuser());
+    let Err(missing) = db.connect(ConnectOpts::new(crate::SessionRole::Named(
+        "bob".to_string(),
+    ))) else {
+        panic!("connecting as a missing role must fail");
+    };
+    assert!(
+        matches!(missing, LimboError::InvalidArgument(ref message) if message == "role \"bob\" does not exist"),
+        "expected an error about a missing role, got {missing:?}"
+    );
+}
+
+#[test]
+fn subprocess_connect_async_hands_back_io_while_reading_a_role_created_by_another_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-peer-role-async.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table t(value integer)").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_CREATE_ROLE_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "child role process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+
+    let mut state = ConnectAsyncState::new();
+    let mut handed_back_io = false;
+    let alice = loop {
+        match db
+            .connect_async(
+                ConnectOpts::new(crate::SessionRole::Named("alice".to_string())),
+                &mut state,
+            )
+            .unwrap()
+        {
+            IOResult::Done(conn) => break conn,
+            IOResult::IO(completion) => {
+                handed_back_io = true;
+                completion.wait(&*io).unwrap();
+            }
+        }
+    };
+
+    assert!(handed_back_io);
+    assert!(!alice.current_role_is_superuser());
+}
+
+#[test]
 fn subprocess_database_open_peer_refreshes_remote_schema_without_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-peer-schema-refresh.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("create table t(value integer, next_value integer)")
         .unwrap();
 
@@ -1385,7 +1554,9 @@ fn subprocess_database_open_parent_directly_uses_child_created_table() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("create table t(value integer)").unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
@@ -1424,7 +1595,9 @@ fn subprocess_database_open_parent_translated_stmt_uses_child_created_table() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("create table t(value integer)").unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
@@ -1466,7 +1639,9 @@ fn subprocess_database_open_parent_execute_uses_child_created_table() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("create table t(value integer)").unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
@@ -1506,7 +1681,9 @@ fn subprocess_readonly_child_reader_blocks_restart_and_truncate_checkpoints() {
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
@@ -1599,7 +1776,9 @@ fn subprocess_db_file_reader_stops_checkpoint_in_other_process() {
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
@@ -1687,7 +1866,9 @@ fn subprocess_db_file_reader_allows_wal_restart_but_stops_backfill() {
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
     conn.execute("create table other(id integer primary key, value text)")
@@ -1766,7 +1947,9 @@ fn write_after_full_checkpoint_restarts_wal() {
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
     for _ in 0..20 {
@@ -1805,7 +1988,9 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
@@ -1866,7 +2051,9 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
     );
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
-    let reopened_conn = reopened.connect(ConnectOpts::new()).unwrap();
+    let reopened_conn = reopened
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
 
     let restart_err = reopened_conn
         .checkpoint(CheckpointMode::Restart)
@@ -1906,7 +2093,9 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
     );
 
     let reopened = open_multiprocess_db(multiprocess_test_io(), db_path_str).unwrap();
-    let reopened_conn = reopened.connect(ConnectOpts::new()).unwrap();
+    let reopened_conn = reopened
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let checkpoint = reopened_conn
         .checkpoint(CheckpointMode::Truncate {
             upper_bound_inclusive: None,
@@ -1932,7 +2121,9 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
     conn.execute("insert into test(value) values ('before-reader')")
@@ -2018,7 +2209,9 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
-    let reopened_conn = reopened.connect(ConnectOpts::new()).unwrap();
+    let reopened_conn = reopened
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     assert_eq!(
         count_test_rows(&reopened_conn),
         2,
@@ -2036,7 +2229,9 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
@@ -2115,7 +2310,9 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
         "child reader should exit cleanly after reopen repair: {child_status:?}"
     );
 
-    let reopened_conn = reopened.connect(ConnectOpts::new()).unwrap();
+    let reopened_conn = reopened
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     assert_eq!(
         count_test_rows(&reopened_conn),
         32,
@@ -2133,7 +2330,9 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db_a = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn_a = db_a.connect(ConnectOpts::new()).unwrap();
+    let conn_a = db_a
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn_a
         .execute("create table test(id integer primary key, value text)")
         .unwrap();
@@ -2197,7 +2396,9 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
         "disk-scan reopen should repopulate the durable frame index from the WAL"
     );
 
-    let conn_b = db_b.connect(ConnectOpts::new()).unwrap();
+    let conn_b = db_b
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let rows = get_rows(&conn_b, "select value from test order by id");
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0][0].to_string(), "before-overflow");
@@ -2221,7 +2422,9 @@ fn memory_database_keeps_in_process_wal_backend() {
 fn memory_database_query_can_close_without_checkpointing() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
 
     conn.query("VALUES ('ok')").unwrap();
     conn.close().unwrap();
@@ -2273,7 +2476,9 @@ fn multiprocess_sequence_nextval_child_process() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
 
     // Signal that the connection is open (atomic loaded from disk). This is
     // what we need to overlap across all participating children.
@@ -2407,7 +2612,9 @@ fn test_multiprocess_concurrent_nextval_returns_distinct_values() {
     {
         let io: Arc<dyn IO> = multiprocess_test_io();
         let db = open_multiprocess_db(io, db_path_str).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE SEQUENCE s START 1 INCREMENT 1")
             .unwrap();
         conn.close().unwrap();
@@ -2433,7 +2640,9 @@ fn test_multiprocess_nextval_after_other_process_committed_is_monotonic() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn_a = db.connect(ConnectOpts::new()).unwrap();
+    let conn_a = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn_a
         .execute("CREATE SEQUENCE s START 1 INCREMENT 1")
         .unwrap();
@@ -2487,7 +2696,9 @@ fn test_multiprocess_setval_visible_to_other_process_nextval() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn_a = db.connect(ConnectOpts::new()).unwrap();
+    let conn_a = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn_a
         .execute("CREATE SEQUENCE s START 1 INCREMENT 1")
         .unwrap();
@@ -2573,7 +2784,9 @@ fn multiprocess_sequence_nextval_burst_child_process() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
 
     std::fs::write(&ready_path, b"").expect("write ready marker");
 
@@ -2652,7 +2865,9 @@ fn test_multiprocess_nextval_burst_no_duplicates() {
     {
         let io: Arc<dyn IO> = multiprocess_test_io();
         let db = open_multiprocess_db(io, db_path_str).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE SEQUENCE s START 1 INCREMENT 1")
             .unwrap();
         conn.close().unwrap();
@@ -2778,7 +2993,9 @@ fn multiprocess_autoinc_burst_child_process() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
 
     std::fs::write(&ready_path, b"").expect("write ready marker");
 
@@ -2870,7 +3087,9 @@ fn test_multiprocess_autoinc_burst_no_duplicates() {
     {
         let io: Arc<dyn IO> = multiprocess_test_io();
         let db = open_multiprocess_db(io, db_path_str).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT)")
             .unwrap();
         conn.close().unwrap();
@@ -2971,7 +3190,7 @@ fn test_multiprocess_autoinc_burst_no_duplicates() {
     let observer_db =
         open_multiprocess_db(observer_io, db_path_str).expect("reopen db for fresh observer");
     let observer_conn = observer_db
-        .connect(ConnectOpts::new())
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
         .expect("connect fresh observer");
 
     let count_rows = get_rows(&observer_conn, "SELECT COUNT(*) FROM t");
@@ -3029,10 +3248,14 @@ fn checkpoints_and_reads_stay_correct_while_a_reader_holds_a_late_wal_frame() {
     let io = multiprocess_test_io();
     let db = open_multiprocess_db(io, dir.path().join("late-reader.db").to_str().unwrap()).unwrap();
     let readers = [
-        db.connect(ConnectOpts::new()).unwrap(),
-        db.connect(ConnectOpts::new()).unwrap(),
+        db.connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap(),
+        db.connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap(),
     ];
-    let writer = db.connect(ConnectOpts::new()).unwrap();
+    let writer = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     writer.execute("PRAGMA synchronous = NORMAL").unwrap();
     writer
         .execute("CREATE TABLE test(id INTEGER PRIMARY KEY, k BLOB UNIQUE, v BLOB)")
@@ -3090,7 +3313,9 @@ fn checkpoints_and_reads_stay_correct_while_a_reader_holds_a_late_wal_frame() {
     );
     assert!(checkpoint.everything_backfilled());
     assert_eq!(wal_max_frame(&writer), 0);
-    let fresh = db.connect(ConnectOpts::new()).unwrap();
+    let fresh = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     assert_eq!(count_test_rows(&fresh), rows);
     assert_eq!(
         get_rows(&fresh, "PRAGMA integrity_check")[0][0].to_string(),
@@ -3105,7 +3330,9 @@ fn subprocess_idle_begin_sees_table_created_by_other_process() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
     conn.execute("begin").unwrap();

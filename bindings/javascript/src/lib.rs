@@ -354,7 +354,10 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
     // Pass the encryption key at connect time to set up the encryption context
     // before the pager reads page 1. This is required for encrypted databases.
     let conn = db_core
-        .connect(ConnectOpts::new().with_encryption_key(encryption_key))
+        .connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(encryption_key),
+        )
         .map_err(|e| to_generic_error("failed to connect", e))?;
 
     if let Some(busy_timeout) = busy_timeout {

@@ -4535,7 +4535,9 @@ mod tests {
             let io = Arc::new(crate::MemoryIO::new());
             let db =
                 crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
             conn.set_vdbe_trace(trace);
             let mut stmt = conn.prepare("SELECT 1 UNION ALL SELECT 2").unwrap();
             assert_eq!(stmt.execution_state(), ProgramExecutionState::Init);

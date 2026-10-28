@@ -626,7 +626,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         conn.set_foreign_keys_enabled(true);
         conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
             .unwrap();

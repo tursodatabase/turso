@@ -54,7 +54,9 @@ fn test_abandoned_create_index_does_not_poison_later_allocation() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let setup_conn = db.connect(ConnectOpts::new()).unwrap();
+    let setup_conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     exec_sql(&setup_conn, io.as_ref(), "PRAGMA page_size = 512").unwrap();
     exec_sql(&setup_conn, io.as_ref(), "CREATE TABLE t(v BLOB)").unwrap();
@@ -77,7 +79,9 @@ fn test_abandoned_create_index_does_not_poison_later_allocation() {
     }
     drop(setup_conn);
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     exec_sql(&conn, io.as_ref(), "BEGIN").unwrap();
     drop_statement_at_io(&conn, io.as_ref(), "CREATE INDEX idx_t_v ON t(v)", 45);
 
