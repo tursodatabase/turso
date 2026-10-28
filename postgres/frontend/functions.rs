@@ -4,6 +4,7 @@ use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
+use turso_core::security::roles::RoleId;
 use turso_core::types::IOResultOr;
 use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
@@ -98,6 +99,12 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         },
         "current_schemas"(FunctionArity::Exact(1), false) => {
             exec_current_schemas(connection, args[0].get_value())?
+        },
+        "current_user"(FunctionArity::Exact(0), false) => {
+            role_name(connection, connection.current_role())
+        },
+        "session_user"(FunctionArity::Exact(0), false) => {
+            role_name(connection, connection.session_role())
         },
         "pg_backend_pid"(FunctionArity::Exact(0), true) => std::process::id() as i64,
         // Temporary pg_dump compatibility: "t" means true, not actual recovery state.
@@ -644,6 +651,14 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
     Ok(Some(value))
 }
 
+fn role_name(conn: &Connection, role: RoleId) -> String {
+    let roles = conn.role_catalog();
+    let role = roles
+        .get(role)
+        .expect("the role of a connection is in its role catalog");
+    role.name.clone()
+}
+
 fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> String {
     role_name_by_oid(conn, oid).unwrap_or_else(|| format!("unknown (OID={oid})"))
 }
@@ -652,10 +667,10 @@ fn role_name_by_oid(conn: &Connection, oid: i64) -> Option<String> {
     if oid == PG_DATABASE_OWNER_OID {
         return Some("pg_database_owner".to_string());
     }
-    crate::catalog::listed_roles(conn)
-        .into_iter()
-        .find(|role| crate::catalog::role_oid(role.id) == oid)
-        .map(|role| role.name)
+    conn.role_catalog()
+        .iter()
+        .find(|role| role.id != RoleId::PUBLIC && crate::catalog::role_oid(role.id) == oid)
+        .map(|role| role.name.clone())
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Boolean {
