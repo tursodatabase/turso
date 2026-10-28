@@ -5717,6 +5717,46 @@ mod tests {
     }
 
     #[test]
+    fn test_a_view_may_read_a_table_of_another_namespace_of_its_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_dialect(
+            &temp_dir.path().join("main.db"),
+            DatabaseOpts::new().with_views(true).with_attach(true),
+            Arc::new(StoringDialect),
+        );
+        conn.create_namespace("app").unwrap();
+        conn.execute("CREATE TABLE app.t(x INTEGER); INSERT INTO app.t VALUES(3)")
+            .unwrap();
+        conn.execute("CREATE TABLE u(x INTEGER); INSERT INTO u VALUES(4)")
+            .unwrap();
+        conn.execute("ATTACH ':memory:aux' AS aux; CREATE TABLE aux.t(x INTEGER)")
+            .unwrap();
+
+        conn.execute("CREATE VIEW v AS SELECT x FROM app.t")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM v"), 3);
+        conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT x FROM app.t")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM mv"), 3);
+        conn.execute("CREATE VIEW app.v AS SELECT x FROM main.u")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.v"), 4);
+        conn.execute("CREATE VIEW app.w AS SELECT x FROM main.v")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.w"), 3);
+
+        let err = conn
+            .prepare("CREATE VIEW w AS SELECT x FROM aux.t")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("view cannot reference table in attached database"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn test_a_namespace_keeps_the_objects_stored_under_its_id() {
         let temp_dir = TempDir::new().unwrap();
         let conn = open_connection_storing_namespaces(&temp_dir.path().join("main.db"));

@@ -1,5 +1,6 @@
 use crate::{alloc, turso_assert, turso_assert_eq, Result, Value, ValueRef};
 
+use crate::namespace::NamespaceRef;
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Range;
 use tracing::{instrument, Level};
@@ -265,7 +266,7 @@ pub struct ProgramBuilder {
     /// Stack of views currently being expanded, keyed by `(database_id, name)`
     /// so a view is distinguished from a same-named view in another attached or
     /// temp schema. Used to detect self-referential views.
-    views_being_expanded: Vec<(usize, String)>,
+    views_being_expanded: Vec<(NamespaceRef, String)>,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     pub table_reference_counter: TableRefIdCounter,
@@ -903,7 +904,7 @@ impl ProgramBuilder {
     /// CTE context. Restore both stacks even when expansion returns an error.
     pub fn with_view_expansion<T>(
         &mut self,
-        database_id: usize,
+        namespace: NamespaceRef,
         name: &str,
         expand: impl FnOnce(&mut Self) -> crate::Result<T>,
     ) -> crate::Result<T> {
@@ -911,14 +912,13 @@ impl ProgramBuilder {
         if self
             .views_being_expanded
             .iter()
-            .any(|(db, n)| *db == database_id && n == name)
+            .any(|(expanding, n)| *expanding == namespace && n == name)
         {
             crate::bail_parse_error!("view {} is circularly defined", name);
         }
 
         // push
-        self.views_being_expanded
-            .push((database_id, name.to_owned()));
+        self.views_being_expanded.push((namespace, name.to_owned()));
         let saved_ctes = std::mem::take(&mut self.ctes_being_defined);
 
         // expand

@@ -424,3 +424,17 @@ test create-schema-if-not-exists-rejects-the-names-of-the-databases {
 expect error {
     unacceptable schema name "main"
 }
+
+test view-reads-a-table-of-another-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (3);
+    CREATE VIEW v AS SELECT x FROM app.t;
+    CREATE VIEW app.v AS SELECT x FROM public.v;
+    SELECT * FROM v;
+    SELECT * FROM app.v;
+}
+expect {
+    3
+    3
+}

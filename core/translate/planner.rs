@@ -2207,7 +2207,7 @@ fn parse_table(
         // fixed to the database it was created in, not resolved TEMP-first
         // like an ordinary top-level query.
         let view_plan = resolver.with_view_scope(namespace, view.name.clone(), || {
-            program.with_view_expansion(database_id, &view.name, |program| {
+            program.with_view_expansion(namespace, &view.name, |program| {
                 prepare_select_plan(
                     view.select_stmt.clone(),
                     resolver,
