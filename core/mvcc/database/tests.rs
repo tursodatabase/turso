@@ -8955,7 +8955,7 @@ fn test_lazy_cursor_chain_payload_rereads_after_movement() {
             ("prev", Some("one".to_string()), 1),
             ("next", Some("two".to_string()), 1),
             ("seek_same_row", Some("two".to_string()), 1),
-            ("seek_four", Some("four".to_string()), 1),
+            ("seek_four", Some("four".to_string()), 0),
         ]
     );
 
@@ -11069,6 +11069,183 @@ fn walk_order(mut rowids: Vec<i64>, backwards: bool) -> Vec<i64> {
         rowids.reverse();
     }
     rowids
+}
+
+#[test]
+fn test_lazy_cursor_exact_chain_hit_reads_the_seek_row() {
+    let mut observed = Vec::new();
+    for shadowed in [false, true] {
+        let (db, conn) = if shadowed {
+            setup_lazy_shadowed_physical_rows()
+        } else {
+            setup_lazy_write_scan(false)
+        };
+        let store = db.get_mvcc_store();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        for (rowid, expected) in [
+            (2, Some(SeekResult::Found)),
+            (9, Some(SeekResult::NotFound)),
+        ] {
+            store.cursor_chain_payload_reads.store(0, Ordering::Relaxed);
+            let found = drive_lazy_payload_io(&conn, || {
+                cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+            });
+            assert_eq!(Some(found), expected, "shadowed={shadowed} rowid={rowid}");
+            let first = lazy_payload_text(&conn, &mut cursor);
+            assert_eq!(lazy_payload_text(&conn, &mut cursor), first);
+            observed.push((
+                shadowed,
+                rowid,
+                first,
+                store.cursor_chain_payload_reads.load(Ordering::Relaxed),
+            ));
+        }
+        conn.execute("ROLLBACK").unwrap();
+    }
+    assert_eq!(
+        observed,
+        [
+            (false, 2, Some("two".to_string()), 0),
+            (false, 9, None, 0),
+            (true, 2, Some("two-new".to_string()), 0),
+            (true, 9, None, 0),
+        ]
+    );
+}
+
+#[test]
+fn test_lazy_cursor_exact_chain_hit_rereads_after_changes() {
+    for change in [
+        "own write to the row",
+        "own write to another row",
+        "rollback to",
+        "gc",
+        "abort",
+        "removed transaction",
+    ] {
+        let (db, conn) = setup_lazy_write_scan(false);
+        let store = db.get_mvcc_store();
+        if change == "rollback to" {
+            conn.execute("SAVEPOINT s").unwrap();
+            conn.execute("UPDATE t SET v = 'inside' WHERE id = 2")
+                .unwrap();
+        }
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor
+                .seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true })),
+            SeekResult::Found
+        );
+        let before = lazy_payload_text(&conn, &mut cursor);
+        store.cursor_chain_payload_reads.store(0, Ordering::Relaxed);
+        let (expected, rereads) = match change {
+            "own write to the row" => {
+                conn.execute("UPDATE t SET v = 'changed' WHERE id = 2")
+                    .unwrap();
+                (Some("changed".to_string()), 1)
+            }
+            "own write to another row" => {
+                conn.execute("UPDATE t SET v = 'other' WHERE id = 4")
+                    .unwrap();
+                (Some("two".to_string()), 1)
+            }
+            "rollback to" => {
+                assert_eq!(before.as_deref(), Some("inside"));
+                conn.execute("ROLLBACK TO s").unwrap();
+                (Some("two".to_string()), 1)
+            }
+            "gc" => {
+                store.drop_unused_row_versions();
+                (Some("two".to_string()), 0)
+            }
+            "abort" => {
+                let tx_id = conn.get_mv_tx_id().unwrap();
+                let tx = store.txs.get(&tx_id).unwrap();
+                tx.value().abort_now.store(true, Ordering::Release);
+                assert!(matches!(
+                    *cursor.record_payload().unwrap_err(),
+                    LimboError::CommitDependencyAborted
+                ));
+                tx.value().abort_now.store(false, Ordering::Release);
+                (Some("two".to_string()), 0)
+            }
+            _ => {
+                conn.execute("ROLLBACK").unwrap();
+                let rereads_before = store.cursor_chain_payload_reads.load(Ordering::Relaxed);
+                let _ = cursor.record_payload();
+                assert_eq!(
+                    store.cursor_chain_payload_reads.load(Ordering::Relaxed),
+                    rereads_before + 1,
+                    "a removed transaction must not reuse the seek row"
+                );
+                continue;
+            }
+        };
+        assert_eq!(lazy_payload_text(&conn, &mut cursor), expected, "{change}");
+        assert_eq!(
+            store.cursor_chain_payload_reads.load(Ordering::Relaxed),
+            rereads,
+            "{change}"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_exact_chain_hit_rereads_after_moving_away() {
+    for change in [
+        "none",
+        "own write between moves",
+        "own delete after the seek",
+    ] {
+        let (db, conn) = setup_lazy_write_scan(false);
+        let store = db.get_mvcc_store();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor
+                .seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true })),
+            SeekResult::Found
+        );
+        assert_eq!(
+            lazy_payload_text(&conn, &mut cursor).as_deref(),
+            Some("two")
+        );
+        if change == "own delete after the seek" {
+            store.cursor_chain_payload_reads.store(0, Ordering::Relaxed);
+            conn.execute("DELETE FROM t WHERE id = 2").unwrap();
+            let _ = lazy_payload_bytes(&conn, &mut cursor);
+            assert_eq!(
+                store.cursor_chain_payload_reads.load(Ordering::Relaxed),
+                1,
+                "the seek row must not serve a read after an own delete"
+            );
+            conn.execute("ROLLBACK").unwrap();
+            continue;
+        }
+        drive_lazy_payload_io(&conn, || cursor.next());
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(4));
+        let expected = if change == "own write between moves" {
+            conn.execute("UPDATE t SET v = 'changed' WHERE id = 2")
+                .unwrap();
+            "changed"
+        } else {
+            "two"
+        };
+        drive_lazy_payload_io(&conn, || cursor.prev());
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(2));
+        store.cursor_chain_payload_reads.store(0, Ordering::Relaxed);
+        assert_eq!(
+            lazy_payload_text(&conn, &mut cursor).as_deref(),
+            Some(expected),
+            "{change}"
+        );
+        assert_eq!(
+            store.cursor_chain_payload_reads.load(Ordering::Relaxed),
+            1,
+            "{change}: moving away and back drops the seek row, so the row is resolved again"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
 }
 
 fn lazy_payload_text(

@@ -1834,6 +1834,16 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         .payload_row
                         .as_ref()
                         .is_some_and(|row| row.id == *row_id);
+                if !read_at_this_position
+                    && self.transaction.eq_seek_generation == generation
+                    && !self.transaction.is_removed()
+                    && self
+                        .eq_seek_row
+                        .as_ref()
+                        .is_some_and(|row| row.id == *row_id)
+                {
+                    return Ok(IOResult::Done(self.eq_seek_row.as_ref().map(Row::payload)));
+                }
                 if !read_at_this_position {
                     #[cfg(test)]
                     self.db
@@ -1973,6 +1983,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                 self.dual_peek.mvcc_peek = match mvcc_rowid {
                                     Some((rid, versions, payload)) => {
                                         self.eq_seek_row = payload;
+                                        self.transaction.eq_seek_generation =
+                                            self.transaction.write_generation();
                                         CursorPeek::Row {
                                             key: rid.row_id,
                                             versions: Some(versions),

@@ -10759,6 +10759,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             _store: self.clone(),
             table_scan: TableScan::new(generation),
             payload_generation: 0,
+            eq_seek_generation: 0,
         }))
     }
 }
@@ -11485,6 +11486,7 @@ pub(crate) struct CursorTransaction<
     _store: Arc<MvStore<Clock, A>>,
     pub(crate) table_scan: TableScan,
     pub(crate) payload_generation: u64,
+    pub(crate) eq_seek_generation: u64,
 }
 
 impl<Clock: LogicalClock, A: ConcurrentAllocator> CursorTransaction<Clock, A> {
