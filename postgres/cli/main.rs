@@ -101,7 +101,11 @@ fn open_database(
     vfs: Option<&String>,
     readonly: bool,
     enable_load_extension: bool,
-) -> anyhow::Result<(Arc<dyn turso_core::IO>, Connection)> {
+) -> anyhow::Result<(
+    Arc<dyn turso_core::IO>,
+    Arc<turso_core::Database>,
+    Connection,
+)> {
     let db_opts = DatabaseOpts::new()
         .with_views(true)
         .with_custom_types(true)
@@ -123,7 +127,7 @@ fn open_database(
 
     let (io, db) = turso_pg::open_database(db_path, vfs.map(|v| v.as_str()), flags, db_opts)?;
     let conn = Connection::connect(&db)?;
-    Ok((io, conn))
+    Ok((io, db, conn))
 }
 
 // ---------------------------------------------------------------------------
@@ -989,7 +993,7 @@ fn main() -> anyhow::Result<()> {
         .as_ref()
         .map_or(":memory:".to_string(), |p| p.to_string_lossy().to_string());
 
-    let (io, conn) = open_database(
+    let (io, db, conn) = open_database(
         &db_file,
         opts.vfs.as_ref(),
         opts.readonly,
@@ -1007,7 +1011,14 @@ fn main() -> anyhow::Result<()> {
 
     // Server mode: start PG wire protocol server and exit
     if let Some(ref address) = opts.server {
-        let server = TursoPgServer::new(address.clone(), db_file, conn, interrupt_count);
+        conn.close()?;
+        let server = TursoPgServer::new(
+            address.clone(),
+            db_file,
+            db,
+            turso_core::ConnectOpts::new(),
+            interrupt_count,
+        );
         return server.run();
     }
 

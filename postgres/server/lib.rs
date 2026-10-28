@@ -2,15 +2,15 @@ use std::fmt::Debug;
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 
 use async_trait::async_trait;
 use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
-use turso_core::Value;
-use turso_pg::{split_statements, Connection, PgConnection};
+use turso_core::{ConnectOpts, Database, Value};
+use turso_pg::{split_statements, PgConnection};
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
 
 use pgwire::api::auth::StartupHandler;
@@ -43,7 +43,10 @@ use pgwire::types::format::FormatOptions;
 pub struct TursoPgServer {
     address: String,
     db_file: String,
-    conn: Arc<Mutex<PgConnection>>,
+    db: Arc<Database>,
+    /// The settings that each session connects with, such as the encryption
+    /// key.
+    connect_opts: ConnectOpts,
     interrupt_count: Arc<AtomicUsize>,
 }
 
@@ -51,13 +54,15 @@ impl TursoPgServer {
     pub fn new(
         address: String,
         db_file: String,
-        conn: Connection,
+        db: Arc<Database>,
+        connect_opts: ConnectOpts,
         interrupt_count: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             address,
             db_file,
-            conn: Arc::new(Mutex::new(conn)),
+            db,
+            connect_opts,
             interrupt_count,
         }
     }
@@ -74,24 +79,40 @@ impl TursoPgServer {
             listener.local_addr()?,
             self.db_file
         );
+        self.serve(listener).await
+    }
 
-        let factory = Arc::new(TursoPgFactory {
-            handler: Arc::new(TursoPgHandler {
-                conn: self.conn.clone(),
-                query_parser: Arc::new(NoopQueryParser::new()),
-            }),
-        });
-
+    /// Accepts clients on `listener` until the server is interrupted. Each
+    /// client gets its own session, with its own transaction and settings.
+    pub async fn serve(&self, listener: TcpListener) -> anyhow::Result<()> {
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
                         Ok((socket, addr)) => {
                             info!("PostgreSQL client connected from {}", addr);
-                            let factory_ref = factory.clone();
+                            let session = match PgConnection::connect_with(
+                                &self.db,
+                                self.connect_opts.clone(),
+                            ) {
+                                Ok(session) => session,
+                                Err(e) => {
+                                    error!("Error opening a session for {}: {}", addr, e);
+                                    continue;
+                                }
+                            };
+                            let factory = Arc::new(TursoPgFactory {
+                                handler: Arc::new(TursoPgHandler {
+                                    conn: session.clone(),
+                                    query_parser: Arc::new(NoopQueryParser::new()),
+                                }),
+                            });
                             tokio::spawn(async move {
-                                if let Err(e) = process_socket(socket, None, factory_ref).await {
+                                if let Err(e) = process_socket(socket, None, factory).await {
                                     error!("Error processing connection from {}: {}", addr, e);
+                                }
+                                if let Err(e) = session.close() {
+                                    error!("Error closing the session of {}: {}", addr, e);
                                 }
                             });
                         }
@@ -117,7 +138,7 @@ impl TursoPgServer {
 }
 
 struct TursoPgHandler {
-    conn: Arc<Mutex<PgConnection>>,
+    conn: PgConnection,
     query_parser: Arc<NoopQueryParser>,
 }
 
@@ -155,7 +176,7 @@ impl SimpleQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = &self.conn;
 
         // Per the PostgreSQL simple query protocol, a query string may contain
         // multiple semicolon-separated statements. Split and execute each one.
@@ -201,12 +222,12 @@ impl TursoPgHandler {
                 ))
                 .await?;
         }
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = &self.conn;
         for sql in statements {
             match parse_copy_to_stdout(&sql).map_err(|error| {
                 pg_error(turso_core::LimboError::ParseError(error.to_string()).into())
             })? {
-                Some(copy) => copy_to_stdout(client, &conn, &copy).await?,
+                Some(copy) => copy_to_stdout(client, conn, &copy).await?,
                 None => {
                     for response in SimpleQueryHandler::do_query(self, client, &sql).await? {
                         match response {
@@ -355,7 +376,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = &self.conn;
         let query = &portal.statement.statement;
 
         let mut stmt = conn.prepare(query).map_err(pg_error)?;
@@ -379,7 +400,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = &self.conn;
         let stmt = conn.prepare(&target.statement).map_err(pg_error)?;
 
         let param_types: Vec<Type> = target
@@ -400,7 +421,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = &self.conn;
         let stmt = conn
             .prepare(&portal.statement.statement)
             .map_err(pg_error)?;
@@ -1149,7 +1170,7 @@ mod tests {
         .unwrap();
         let conn = PgConnection::connect(&db).unwrap();
         let handler = Arc::new(TursoPgHandler {
-            conn: Arc::new(Mutex::new(conn.clone())),
+            conn: conn.clone(),
             query_parser: Arc::new(NoopQueryParser::new()),
         });
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1207,7 +1228,7 @@ mod tests {
             turso_pg::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = Connection::connect(&db).unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
         for sql in [
             "SELECT pg_catalog.pg_is_in_recovery()",
             "SELECT pg_is_in_recovery() AS recovery",
@@ -1240,7 +1261,7 @@ mod tests {
             turso_pg::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = Connection::connect(&db).unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
         conn.execute("CREATE TABLE t(id int PRIMARY KEY, x int)")
             .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
