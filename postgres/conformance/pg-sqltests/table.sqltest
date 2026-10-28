@@ -234,6 +234,17 @@ expect {
     0
 }
 
+test table-expression-index-with-qualified-column {
+    CREATE TABLE qual (a int, b int);
+    CREATE INDEX qual_a_plus_one ON qual ((qual.a + 1));
+    CREATE INDEX qual_a ON qual ((public.qual.a));
+    INSERT INTO qual VALUES (1, 2), (5, 6);
+    SELECT b FROM qual WHERE a + 1 = 6;
+}
+expect {
+    6
+}
+
 test table-numeric-column-compared-with-expression {
     CREATE TABLE nm (v numeric(10,2));
     INSERT INTO nm VALUES (1.50);

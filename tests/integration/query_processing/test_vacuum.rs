@@ -4787,6 +4787,39 @@ fn test_plain_vacuum_preserves_indexes(tmp_db: TempDatabase) -> anyhow::Result<(
     Ok(())
 }
 
+/// Earlier Turso versions accepted `CREATE INDEX i ON t(t.a + 1)`, which new
+/// `CREATE INDEX` statements reject. VACUUM replays the stored index SQL, so it
+/// must still copy such an index.
+#[test]
+fn test_vacuum_keeps_index_with_qualified_column() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let db_path = temp_dir.path().join("qualified-index.db");
+    let sqlite_conn = SqliteConnection::open(&db_path)?;
+    sqlite_conn.execute_batch(
+        "CREATE TABLE t(a, b);
+         CREATE INDEX i ON t(a + 1);
+         INSERT INTO t VALUES (1, 2), (5, 6);
+         PRAGMA writable_schema = ON;
+         UPDATE sqlite_schema SET sql = 'CREATE INDEX i ON t(t.a + 1)' WHERE name = 'i';",
+    )?;
+    drop(sqlite_conn);
+    let tmp_db = TempDatabase::new_with_existent(&db_path);
+    let conn = tmp_db.connect_limbo();
+
+    let dest_path = temp_dir.path().join("qualified-index-dest.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+    conn.execute("VACUUM")?;
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    for conn in [&conn, &dest_conn] {
+        assert_eq!(run_integrity_check(conn), "ok");
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT b FROM t INDEXED BY i WHERE a + 1 = 6");
+        assert_eq!(rows, vec![(6,)]);
+    }
+    Ok(())
+}
+
 /// Plain VACUUM must preserve `sqlite_stat1` rows produced by ANALYZE.
 #[turso_macros::test(mvcc)]
 fn test_plain_vacuum_preserves_sqlite_stat1(tmp_db: TempDatabase) -> anyhow::Result<()> {
