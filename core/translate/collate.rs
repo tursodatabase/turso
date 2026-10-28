@@ -177,6 +177,16 @@ impl CollationSeq {
         }
     }
 
+    /// [Self::compare] for the two sides of a comparison operator, which
+    /// fails where the type's [TypeOrdering::compare_operands] does.
+    #[inline(always)]
+    pub fn compare_operands(self, lhs: ValueRef, rhs: ValueRef) -> Result<Ordering> {
+        match self {
+            Self::Type(ordering) => ordering.compare_operands(lhs, rhs),
+            Self::Text(_) => Ok(self.compare(lhs, rhs)),
+        }
+    }
+
     /// Feeds `value` to `hasher` so that values that [Self::compare] calls
     /// equal hash the same. Integers hash like the equal REAL, so 10 and 10.0
     /// land in the same bucket.

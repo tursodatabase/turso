@@ -100,7 +100,22 @@ fn numeric_overflow() -> LimboError {
 /// then any other blob by bytes. Numbers that differ only in trailing zeros,
 /// such as 1.5 and 1.50, are equal.
 pub fn numeric_compare(left: ValueRef, right: ValueRef) -> Ordering {
-    match (NumericSortKey::of(left), NumericSortKey::of(right)) {
+    compare_sort_keys(NumericSortKey::of(left), NumericSortKey::of(right))
+}
+
+/// [numeric_compare] for the two sides of a comparison operator, such as
+/// `n = 'abc'`. A text that is not a number, or a blob that is not a stored
+/// numeric, is an error instead of a value after every number, as PostgreSQL
+/// fails to read 'abc' as a numeric.
+pub fn numeric_compare_operands(left: ValueRef, right: ValueRef) -> crate::Result<Ordering> {
+    let (left, right) = (NumericSortKey::of(left), NumericSortKey::of(right));
+    left.check_is_number()?;
+    right.check_is_number()?;
+    Ok(compare_sort_keys(left, right))
+}
+
+fn compare_sort_keys(left: NumericSortKey, right: NumericSortKey) -> Ordering {
+    match (left, right) {
         (NumericSortKey::Number(l), NumericSortKey::Number(r)) => compare_numbers(&l, &r),
         (NumericSortKey::Text(l), NumericSortKey::Text(r)) => l.cmp(r),
         (NumericSortKey::Blob(l), NumericSortKey::Blob(r)) => l.cmp(r),
@@ -163,6 +178,21 @@ impl<'a> NumericSortKey<'a> {
                 Ok(number) => Self::Number(number),
                 Err(_) => Self::Blob(blob),
             },
+        }
+    }
+
+    /// The error reading the value as a numeric gives, if it is not one.
+    fn check_is_number(&self) -> crate::Result<()> {
+        match self {
+            Self::Text(text) => {
+                parse_numeric(text).and_then(|number| check_numeric_limits(&number))?;
+                unreachable!("a text that reads as a numeric within the limits is a number")
+            }
+            Self::Blob(blob) => {
+                blob_to_bigdecimal(blob)?;
+                unreachable!("a blob that reads as a numeric is a number")
+            }
+            _ => Ok(()),
         }
     }
 

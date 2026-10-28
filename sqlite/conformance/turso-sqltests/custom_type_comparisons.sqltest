@@ -808,3 +808,26 @@ expect {
     2
     2
 }
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-with-non-number-text-scan {
+    -- 'abc' is not a numeric, so comparing it with one is an error, as in
+    -- PostgreSQL, and as through an index on the column.
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1);
+    SELECT count(*) FROM t WHERE n = 'abc';
+}
+expect error {
+    invalid input syntax for type numeric: "abc"
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-with-non-number-text-index {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1);
+    CREATE INDEX t_n ON t(n);
+    SELECT count(*) FROM t WHERE n = 'abc';
+}
+expect error {
+    invalid input syntax for type numeric: "abc"
+}

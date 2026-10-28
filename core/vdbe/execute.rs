@@ -1107,7 +1107,7 @@ fn op_comparison_slow(
     let rhs_for_compare = new_rhs
         .as_ref()
         .map_or(Either::Left(rhs_value), Either::Right);
-    let should_jump = op.compare(lhs_for_compare, rhs_for_compare, collation);
+    let should_jump = op.compare(lhs_for_compare, rhs_for_compare, collation)?;
 
     match (new_lhs, new_rhs) {
         (Some(new_lhs), None) => {

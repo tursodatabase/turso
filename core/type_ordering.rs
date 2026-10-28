@@ -9,7 +9,7 @@
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
-use crate::numeric::decimal::{numeric_compare, numeric_hash};
+use crate::numeric::decimal::{numeric_compare, numeric_compare_operands, numeric_hash};
 use crate::numeric::Numeric;
 use crate::types::AsValueRef;
 use crate::vdbe::array::{array_values_from_blob, parse_text_array, parse_text_array_of_texts};
@@ -71,6 +71,17 @@ impl TypeOrdering {
                 .cmp(&ArraySortKey::of(right, parse_text_array_of_texts)),
             Self::TestUint => UintSortKey::of(left).cmp(&UintSortKey::of(right)),
             Self::StringReverse => ReversedSortKey::of(left).compare(&ReversedSortKey::of(right)),
+        }
+    }
+
+    /// Orders the two sides of a comparison operator, such as `n = 'abc'`.
+    /// Unlike [Self::compare], it fails when a numeric is compared with a
+    /// value that is not a number, as in PostgreSQL. The other orders never
+    /// fail.
+    pub fn compare_operands(self, left: ValueRef, right: ValueRef) -> crate::Result<Ordering> {
+        match self {
+            Self::Numeric => numeric_compare_operands(left, right),
+            _ => Ok(self.compare(left, right)),
         }
     }
 
