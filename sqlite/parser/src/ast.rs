@@ -365,10 +365,6 @@ pub enum Stmt {
     CreateSchema {
         /// schema name
         name: Name,
-        /// the id to store the namespace under, when a copy of a database
-        /// recreates a namespace under its original id; None takes the next
-        /// free id. Not part of the syntax.
-        id: Option<u32>,
     },
     /// `DROP SCHEMA`, built only by a frontend that supports namespaces.
     DropSchema {

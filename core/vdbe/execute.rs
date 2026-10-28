@@ -12024,11 +12024,6 @@ pub fn op_function(
                         let Value::Text(sql) = sql else {
                             break 'sql None;
                         };
-                        // A namespace's row names no table or column.
-                        if entry_type.as_str() == "schema" {
-                            break 'sql None;
-                        }
-
                         let cmd = parse_schema_sql_for_alter(
                             program.connection.dialect().as_ref(),
                             entry_type.as_str(),
@@ -12326,11 +12321,6 @@ pub fn op_function(
                         let Value::Text(sql) = sql else {
                             break 'sql None;
                         };
-                        // A namespace's row names no table or column.
-                        if entry_type.as_str() == "schema" {
-                            break 'sql None;
-                        }
-
                         let cmd = parse_schema_sql_for_alter(
                             program.connection.dialect().as_ref(),
                             entry_type.as_str(),
@@ -15300,6 +15290,28 @@ pub fn op_drop_sequence(
     // test `currval-after-drop-then-recreate-uses-new-sequence-currval`
     // in `sequence_adversarial.sqltest`.
     conn.clear_sequence_currval(*db, &mangle_name(*namespace, seq_name));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_add_namespace(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        AddNamespace {
+            db,
+            namespace,
+            name
+        },
+        insn
+    );
+    let conn = program.connection.clone();
+    conn.with_database_schema_mut(*db, |schema| {
+        schema.name_namespace(*namespace, name);
+    })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

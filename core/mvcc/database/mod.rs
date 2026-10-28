@@ -713,10 +713,6 @@ fn table_name_for_rootpage_in_mvcc_schema<Clock: LogicalClock, A: ConcurrentAllo
             let Ok(row) = portable_schema_row_from_record(row_version.row.payload()) else {
                 continue;
             };
-            // The rootpage of a schema row is the id of its namespace, not a page.
-            if row.row_type == "schema" {
-                continue;
-            }
             if row.rootpage == rootpage || row.rootpage == alternate_rootpage {
                 return Some(row.name);
             }
@@ -10106,9 +10102,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                         };
                                         turso_assert_eq!(value, root_page as u64, "logical log root page does not match table_id_to_rootpage map", { "root_page": root_page, "map_value": value });
                                     }
-                                } else if root_page != 0 && row_type != "schema" {
-                                    // A schema row keeps the namespace id in
-                                    // rootpage; no B-tree has that root.
+                                } else if root_page != 0 {
                                     return Err(LimboError::Corrupt(format!(
                                         "sqlite_schema root_page must be 0 for {row_type}, got {root_page}"
                                     )));

@@ -19,11 +19,11 @@ The types live in `core/namespace.rs`:
 
 ## Namespace representation
 
-The on-disk representation of namespaces extends the `sqlite_schema` table adding a `schema` type, which holds Postgres `CREATE SCHEMA` statements, similar to `table` holds `CREATE TABLE` statements, shown in the figure below.
+A database keeps its namespaces in the table `__turso_internal_namespaces(id INTEGER PRIMARY KEY, name TEXT NOT NULL)` of its root namespace, shown in the figure below with the `sqlite_schema` rows of the objects.
 
 ![On-disk format](namespaces/ondisk.svg)
 
-A `schema` row records a namespace: its name in `name` and `tbl_name`, its id in `rootpage`, and `CREATE SCHEMA app` as its `sql`. No B-tree has that root: `rootpage` is an integer column that means nothing for a row without a B-tree, the way views and triggers store 0 there. A namespace exists while its row exists, so a schema can be empty. The Postgres frontend creates the `public` row when it first connects to a database, as initdb does, so `public` is usually namespace 1.
+A row of the namespaces table records a namespace: its id, which is the rowid, and its name. The first CREATE SCHEMA creates the table. A namespace exists while its row exists, so a schema can be empty. The Postgres frontend creates `public` when it first connects to a database, as initdb does, so `public` is usually namespace 1.
 
 The objects of a namespace share the one `sqlite_schema` with the engine's tables of the root namespace, so their names encode the namespace. An object `users` of the namespace with id 2 is stored under the name `__turso_ns2_users`. The `name` and `tbl_name` columns of its row use that name, and so does the SQL text of the row: the loader reads `CREATE TABLE __turso_ns2_users (...)` and decodes it to table `users` of namespace 2. Views, indexes, triggers and sequences are named the same way. Encoding the id rather than the name means the mangled names of two schemas can never collide, whatever the schemas are called: `app."sub.t"` and `"app.sub".t` are different tables, and `public."app.x"` is not a table of schema `app`.
 
@@ -31,16 +31,15 @@ The objects the engine derives from a table also use the mangled name and live i
 
 The encoding is confined to two places:
 
-- The loader decodes. `handle_schema_row` and `populate_indices` in `core/schema.rs` call `demangle_name`, a `schema` row names its namespace, and `load_sqlite_stat1_row` decodes the `tbl` column.
+- The loader decodes. `handle_schema_row` and `populate_indices` in `core/schema.rs` call `demangle_name`, and `load_sqlite_stat1_row` decodes the `tbl` column. The schema rows carry only the id of a namespace, so the names are read from the namespaces table after the schema rows: when the database is opened, after the MVCC bootstrap, whose recovery rebuilds the schema from the schema rows, and when a connection reparses the schema.
 - The DDL writers encode. `Resolver::mangle_name(namespace, name)` is the name to write into a schema row, and `Resolver::name_in_sql` is the name to write into stored SQL text. CREATE TABLE, CREATE TABLE AS, CREATE INDEX, CREATE VIEW, CREATE TRIGGER, CREATE SEQUENCE and ALTER TABLE use them.
 
-Only a database of a dialect that supports namespaces decodes these names, reads `schema` rows, or refuses `__turso_ns...` as a user name. `Dialect::supports_namespaces` says so; it is true for the Postgres dialect and false for SQLite, and the schema keeps the answer for its loader. SQLite allows a table called `__turso_ns1_t`, and a database made by SQLite may hold one, so under the SQLite dialect such a name is the name of an ordinary object of the root namespace and nothing is decoded. A database is always opened with the dialect that made it, so a Postgres database never reads its mangled names as plain ones.
+Only a database of a dialect that supports namespaces decodes these names, reads the namespaces table, or refuses `__turso_ns...` as a user name. `Dialect::supports_namespaces` says so; it is true for the Postgres dialect and false for SQLite, and the schema keeps the answer for its loader. SQLite allows a table called `__turso_ns1_t`, and a database made by SQLite may hold one, so under the SQLite dialect such a name is the name of an ordinary object of the root namespace and nothing is decoded. A database is always opened with the dialect that made it, so a Postgres database never reads its mangled names as plain ones.
 
-VACUUM INTO recreates each namespace in the copy under its own id, before the objects stored under that id, so the copy reads the same.
+VACUUM INTO copies the namespaces table like the other tables of the engine, and names the namespaces of the copy before it copies the rows of their tables, which it inserts by the namespace's name.
 
 Limits of the format:
 
-- The MVCC logical log carries a `schema` row like any other row of `sqlite_schema`, and recovery replays it. The sync engine knows table, index, view and trigger rows only and rejects a `schema` row as an unsupported object type, so a database that has a schema cannot be synced.
 - Databases with schemas in `turso-postgres-schema-*.db` files from earlier versions are not read and are not migrated.
 
 ## Object name resolution
@@ -73,7 +72,7 @@ Places that address an internal table like `sqlite_schema` name `NamespaceId::RO
 
 `CREATE SCHEMA app` and `DROP SCHEMA app` are statements of core (`translate_create_schema` and `translate_drop_schema` in `core/translate/schema.rs`), accepted only when the dialect supports namespaces. They exist only in the AST: the SQLite parser has no such syntax, and a frontend runs them through `Connection::create_namespace` and `drop_namespace`, which prepare the statement without parsing it.
 
-CREATE SCHEMA picks the next id, one more than the largest id that a namespace or any object stored under a namespace has, so an id whose objects are still stored is never given out again. It inserts the `schema` row, reparses it so the schema in memory names the namespace, and bumps the schema cookie. The cookie change makes the namespace visible to every connection of the database, and the row is deleted again if the transaction rolls back.
+CREATE SCHEMA picks the next id, one more than the largest id that a namespace or any object stored under a namespace has, so an id whose objects are still stored is never given out again. It inserts the namespace's row into the namespaces table, names the namespace in the schema in memory with the `AddNamespace` opcode, and bumps the schema cookie. The cookie change makes the namespace visible to every connection of the database, and the row is deleted again if the transaction rolls back.
 
 DROP SCHEMA deletes the row and forgets the name with the `DropNamespace` opcode. The objects stored under the id stay until they are dropped, so the caller drops them first; the id is not reused while any of them remain.
 
@@ -81,7 +80,7 @@ DROP SCHEMA deletes the row and forgets the name with the `DropNamespace` opcode
 
 ## SQLite frontend
 
-Only root namespaces exist, so every `NamespaceRef` is the root of some database, the search order is main, then the attached databases, and every lookup finds what it found when the catalog was keyed by database alone. `CREATE SCHEMA` is refused, `schema` rows are skipped, and a name that looks like a mangled name is an ordinary name.
+Only root namespaces exist, so every `NamespaceRef` is the root of some database, the search order is main, then the attached databases, and every lookup finds what it found when the catalog was keyed by database alone. `CREATE SCHEMA` is refused, and a name that looks like a mangled name is an ordinary name.
 
 ## Postgres frontend
 

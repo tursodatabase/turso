@@ -4372,7 +4372,7 @@ fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabas
 
     let mut rows = conn
         .inner()
-        .prepare_internal("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name != '__turso_internal_mvcc_meta' ORDER BY name")
+        .prepare_internal("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB '__turso_internal_*' ORDER BY name")
         .unwrap();
     let mut stored = Vec::new();
     while let StepResult::Row = rows.step().unwrap() {
