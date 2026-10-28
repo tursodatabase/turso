@@ -8,7 +8,7 @@ use crate::{
         ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
     },
     translate::{
-        collate::{expr_text_collation, CollationSeq},
+        collate::{expr_text_collation, first_text_collation, CollationSeq},
         emitter::{Resolver, UpdateRowSource},
         expr::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
@@ -38,7 +38,9 @@ use turso_parser::ast::{
 use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
-use super::expr::expr_type::{query_column_type, type_of, type_ordering, TypeEnv};
+use super::expr::expr_type::{
+    compound_column_type, query_column_type, type_of, type_ordering, TypeEnv,
+};
 
 /// Infer the affinity of a subquery result column from its expression.
 ///
@@ -3125,7 +3127,24 @@ pub(super) fn query_output_columns(
     let env = TypeEnv::new(Some(table_references), resolver);
     for (column_index, column) in columns.iter_mut().enumerate() {
         let result_expr = &result_columns[column_index].expr;
-        let result_type = type_of(result_expr, &env);
+        let (result_type, text_collation) = match &compound_arms {
+            Some(arms) => (
+                compound_column_type(arms.iter().copied(), column_index, resolver),
+                first_text_collation(
+                    arms.iter().map(|arm| {
+                        (
+                            &arm.result_columns[column_index].expr,
+                            Some(&arm.table_references),
+                        )
+                    }),
+                    resolver,
+                )?,
+            ),
+            None => (
+                type_of(result_expr, &env),
+                expr_text_collation(result_expr, Some(table_references), resolver)?,
+            ),
+        };
         let dimensions = result_type.array_dimensions();
         if dimensions > ast::MAX_ARRAY_DIMENSIONS {
             crate::bail_parse_error!(
@@ -3135,11 +3154,7 @@ pub(super) fn query_output_columns(
             );
         }
         column.set_array_dimensions(dimensions);
-        column.set_collation(Some(expr_text_collation(
-            result_expr,
-            Some(table_references),
-            resolver,
-        )?));
+        column.set_collation(Some(text_collation));
         column.set_type_ordering(type_ordering(&result_type, resolver.schema()));
     }
     Ok(columns)

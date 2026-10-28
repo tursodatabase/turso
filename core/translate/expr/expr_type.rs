@@ -88,10 +88,14 @@ impl ExprType {
     /// Whether this is an array whose element type nothing declares, such as
     /// `ARRAY[x]` over a column without a type, or `ARRAY[]`.
     pub(crate) fn is_array_of_unknown_elements(&self) -> bool {
+        matches!(self, Self::Array { element, .. } if element.is_unknown_element())
+    }
+
+    /// Whether nothing declares the type of this array element.
+    fn is_unknown_element(&self) -> bool {
         matches!(
             self,
-            Self::Array { element, .. }
-                if matches!(**element, Self::Builtin(BuiltinType::Any) | Self::Null | Self::Unknown)
+            Self::Builtin(BuiltinType::Any) | Self::Null | Self::Unknown
         )
     }
 
@@ -476,25 +480,40 @@ fn column_reference_type(
 }
 
 /// The type of column `column` of a query's result. In a compound SELECT it is
-/// the common type of the column in each SELECT, and in a recursive CTE the type
-/// the first SELECT gives it, as in PostgreSQL.
+/// [compound_column_type], and in a recursive CTE the type the first SELECT
+/// gives it, as in PostgreSQL.
 pub(crate) fn query_column_type(plan: &Plan, column: usize, resolver: &Resolver) -> ExprType {
     match plan {
         Plan::Select(select) => select_column_type(select, column, resolver),
         Plan::CompoundSelect {
             left, right_most, ..
-        } => common_of_types(
+        } => compound_column_type(
             left.iter()
                 .map(|(select, _)| select)
-                .chain(core::iter::once(right_most.as_ref()))
-                .map(|select| select_column_type(select, column, resolver)),
-            resolver.schema(),
+                .chain(core::iter::once(right_most.as_ref())),
+            column,
+            resolver,
         ),
         Plan::RecursiveCte(plan) => query_column_type(&plan.initial_query, column, resolver),
         Plan::Delete(_) | Plan::Update(_) => {
             unreachable!("DELETE and UPDATE plans have no result columns")
         }
     }
+}
+
+/// The type of column `column` of a compound SELECT whose SELECTs are `arms`:
+/// the common type of the column in each SELECT. The compound removes
+/// duplicates with the order of this type, and an outer query sees this type.
+pub(crate) fn compound_column_type<'p>(
+    arms: impl IntoIterator<Item = &'p SelectPlan>,
+    column: usize,
+    resolver: &Resolver,
+) -> ExprType {
+    common_of_types(
+        arms.into_iter()
+            .map(|select| select_column_type(select, column, resolver)),
+        resolver.schema(),
+    )
 }
 
 fn select_column_type(select: &SelectPlan, column: usize, resolver: &Resolver) -> ExprType {
@@ -867,7 +886,9 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
 /// PostgreSQL frontend will choose its own common type through the dialect.
 ///
 /// NULLs don't count. An array wins over anything else, as main has always decoded
-/// such a value as an array. Numbers widen as in arithmetic, except that a decimal
+/// such a value as an array. Two arrays give an array of the common type of
+/// their elements, where elements of unknown type take the other array's
+/// element type. Numbers widen as in arithmetic, except that a decimal
 /// written in the statement mixed with an integer stays a decimal: both are
 /// exact, as in PostgreSQL. String literals count
 /// as text. The same custom type with different parameters, such as numeric(10,2)
@@ -885,12 +906,33 @@ fn common_of_types(types: impl Iterator<Item = ExprType>, schema: &Schema) -> Ex
         common = Some(match (common, ty) {
             (None, ty) | (Some(ExprType::Null), ty) => ty,
             (Some(common), ExprType::Null) => common,
+            (
+                Some(ExprType::Array {
+                    element: a,
+                    dimensions: a_dimensions,
+                }),
+                ExprType::Array {
+                    element: b,
+                    dimensions: b_dimensions,
+                },
+            ) => ExprType::array(
+                common_element_type(*a, *b, schema),
+                a_dimensions.max(b_dimensions),
+            ),
             (Some(common @ ExprType::Array { .. }), _) => common,
             (_, ty @ ExprType::Array { .. }) => ty,
             (Some(common), ty) => common_scalar_type(common, ty, schema),
         });
     }
     common.unwrap_or(ExprType::Null)
+}
+
+fn common_element_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
+    match (a, b) {
+        (a, b) if a.is_unknown_element() => b,
+        (a, b) if b.is_unknown_element() => a,
+        (a, b) => common_scalar_type(a, b, schema),
+    }
 }
 
 fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {

@@ -10,8 +10,10 @@ use crate::{
     sync::{Arc, LazyLock, RwLock, Weak},
     translate::{
         emitter::Resolver,
-        expr::expr_type::{query_column_type, type_of, type_ordering, ExprType, TypeEnv},
-        plan::{Plan, TableReferences},
+        expr::expr_type::{
+            compound_column_type, query_column_type, type_of, type_ordering, ExprType, TypeEnv,
+        },
+        plan::{Plan, SelectPlan, TableReferences},
     },
     type_ordering::TypeOrdering,
     types::ValueRef,
@@ -605,12 +607,46 @@ pub fn first_collation<'a>(
     if let Some(ordering) = common_type_ordering(exprs.clone(), resolver)? {
         return Ok(CollationSeq::Type(ordering));
     }
+    first_text_collation(exprs, resolver).map(CollationSeq::Text)
+}
+
+/// The collation that column `column` of a compound SELECT compares with,
+/// where `arms` are its SELECTs: the order of [compound_column_type] when that
+/// type has one, otherwise the text collation of the leftmost SELECT whose
+/// column has one, as in SQLite's `multiSelectCollSeq`. SELECTs whose columns
+/// have different orders, and COLLATE on a column whose type has an order,
+/// are errors, as in a comparison.
+pub fn compound_column_collation(
+    arms: &[&SelectPlan],
+    column: usize,
+    resolver: &Resolver,
+) -> Result<CollationSeq> {
+    let columns = arms.iter().map(|select| {
+        (
+            &select.result_columns[column].expr,
+            Some(&select.table_references),
+        )
+    });
+    common_type_ordering(columns.clone(), resolver)?;
+    let column_type = compound_column_type(arms.iter().copied(), column, resolver);
+    if let Some(ordering) = type_ordering(&column_type, resolver.schema()) {
+        return Ok(CollationSeq::Type(ordering));
+    }
+    first_text_collation(columns, resolver).map(CollationSeq::Text)
+}
+
+/// The text collation of the first expression that has one, BINARY when none
+/// has.
+pub(crate) fn first_text_collation<'a>(
+    exprs: impl IntoIterator<Item = (&'a Expr, Option<&'a TableReferences>)>,
+    resolver: &Resolver,
+) -> Result<TextCollation> {
     for (expr, tables) in exprs {
         if let Some(collation) = expr_collation_if_any(expr, tables, resolver)? {
-            return Ok(CollationSeq::Text(collation));
+            return Ok(collation);
         }
     }
-    Ok(CollationSeq::BINARY)
+    Ok(TextCollation::Binary)
 }
 
 /// The order that values compared with each other use when one of them has a

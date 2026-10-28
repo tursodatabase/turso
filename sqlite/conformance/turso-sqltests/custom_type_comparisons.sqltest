@@ -654,3 +654,20 @@ expect {
     upsert|{100}
     trigger|grew
 }
+
+@requires strict "uses STRICT tables"
+test cmp-compound-column-has-one-type {
+    -- A compound SELECT's column has the common type of its SELECTs, whether
+    -- the compound removes duplicates, feeds an IN, or is a subquery in FROM.
+    -- Expected values are from PostgreSQL.
+    CREATE TABLE t(n numeric(10,2), b text[]) STRICT;
+    INSERT INTO t VALUES (10, '{1}');
+    SELECT 'from', x FROM (SELECT 1 AS x UNION SELECT n FROM t) WHERE x = '10.0';
+    SELECT 'in', '{1.0}' IN (SELECT array_append('{}', '1') UNION ALL SELECT b FROM t);
+    SELECT 'from-array', count(*) FROM (SELECT array_append('{}', '1') AS a UNION ALL SELECT b FROM t) WHERE a = '{1.0}';
+}
+expect {
+    from|10.00
+    in|0
+    from-array|0
+}

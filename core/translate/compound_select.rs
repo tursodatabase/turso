@@ -1,7 +1,7 @@
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
-use crate::translate::collate::{first_collation, CollationSeq};
+use crate::translate::collate::{compound_column_collation, CollationSeq};
 use crate::translate::emitter::{
     select::{emit_materialized_build_inputs, emit_query},
     LimitCtx, Resolver, TranslateCtx,
@@ -813,29 +813,21 @@ fn create_collection_index(
     Ok((cursor_id, index))
 }
 
-/// The collation of one result column of a compound SELECT: that of the
-/// leftmost SELECT whose column has one, as in SQLite's `multiSelectCollSeq`.
 /// The collation of each compound result column. Every ephemeral index of the
 /// compound, including those of nested arms, uses it, as SQLite's
-/// multiSelectCollSeq does: the first explicit collation among all the arms.
+/// multiSelectCollSeq does.
 fn compound_collations(
     left: &[(SelectPlan, CompoundOperator)],
     right_most: &SelectPlan,
     resolver: &Resolver,
 ) -> crate::Result<Vec<CollationSeq>> {
-    let selects = left.iter().map(|(select, _)| select).chain([right_most]);
+    let arms: Vec<&SelectPlan> = left
+        .iter()
+        .map(|(select, _)| select)
+        .chain([right_most])
+        .collect();
     (0..right_most.result_columns.len())
-        .map(|column| {
-            first_collation(
-                selects.clone().map(|select| {
-                    (
-                        &select.result_columns[column].expr,
-                        Some(&select.table_references),
-                    )
-                }),
-                resolver,
-            )
-        })
+        .map(|column| compound_column_collation(&arms, column, resolver))
         .collect()
 }
 
