@@ -5,8 +5,9 @@
 
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
-    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_UNDEFINED_FUNCTION,
-    SQLSTATE_UNDEFINED_TABLE,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
+    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
+    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -3403,37 +3404,26 @@ impl PostgreSQLTranslator {
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("SIMILAR TO: missing lhs".into()))?;
 
-                // The rhs is wrapped in a FuncCall to similar_to_escape(pattern).
-                // Extract the actual pattern from inside that wrapper.
                 let rhs_node = a_expr
                     .rexpr
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("SIMILAR TO: missing rhs".into()))?;
 
-                let pattern_node = match &rhs_node.node {
-                    Some(pg_query::protobuf::node::Node::FuncCall(fc)) => {
-                        if fc.args.len() > 1 {
-                            return Err(not_supported("SIMILAR TO ... ESCAPE"));
-                        }
-                        // Extract the first argument (the pattern) from similar_to_escape()
-                        fc.args.first().unwrap_or(rhs_node)
-                    }
-                    _ => rhs_node,
-                };
-
-                let rhs_expr = self.translate_operand(pattern_node)?;
-                let regex_rhs = match rhs_expr {
-                    ast::Expr::Literal(ast::Literal::String(ref pat)) => {
-                        // String literals in our AST include surrounding quotes
-                        let unquoted = pat
-                            .strip_prefix('\'')
-                            .and_then(|s| s.strip_suffix('\''))
-                            .unwrap_or(pat);
-                        let regex = similar_to_regex(unquoted);
-                        // Re-wrap with quotes for the AST
-                        ast::Expr::Literal(ast::Literal::String(format!("'{regex}'")))
-                    }
-                    _ => return Err(not_supported("SIMILAR TO with a non-literal pattern")),
+                // A literal pattern becomes a literal regex, which also works in
+                // index expressions, where frontend functions cannot.
+                let regex_rhs = if let Some((pattern, escape)) = similar_to_literal_args(rhs_node) {
+                    let regex = similar_to_regex(pattern, escape)?;
+                    ast::Expr::Literal(ast::Literal::String(format!(
+                        "'{}'",
+                        regex.replace('\'', "''")
+                    )))
+                } else if self.translating_index.get() {
+                    return Err(ParseError::ParseError(
+                        "CREATE INDEX supports SIMILAR TO only with a string-literal pattern and ESCAPE".to_string(),
+                    ));
+                } else {
+                    // The frontend's similar_to_escape() converts the pattern at run time.
+                    self.translate_operand(rhs_node)?
                 };
 
                 Ok(ast::Expr::Like {
@@ -6995,33 +6985,90 @@ fn like_pattern_to_glob(pattern: &str) -> Option<String> {
     (glob.len() <= SQLITE_MAX_LIKE_PATTERN_LENGTH).then_some(glob)
 }
 
-/// Convert a SQL SIMILAR TO pattern to a regex anchored with ^(?:...)$.
-/// `%` → `.*`, `_` → `.`, and `.`, `^`, `$`, which are literals in SIMILAR TO,
-/// are escaped; other regex metacharacters and escapes are kept as-is.
-fn similar_to_regex(pattern: &str) -> String {
+/// The pattern and ESCAPE string of a SIMILAR TO, when both are string
+/// literals. pg_query passes them as the arguments of
+/// similar_to_escape(pattern[, escape]); without ESCAPE, `\` is the escape.
+fn similar_to_literal_args(rhs: &pg_query::protobuf::Node) -> Option<(&str, &str)> {
+    use pg_query::protobuf::{a_const::Val, node::Node, AConst};
+    let Some(Node::FuncCall(call)) = &rhs.node else {
+        return None;
+    };
+    let mut args = call.args.iter().map(|arg| match &arg.node {
+        Some(Node::AConst(AConst {
+            val: Some(Val::Sval(s)),
+            ..
+        })) => Some(s.sval.as_str()),
+        _ => None,
+    });
+    let pattern = args.next()??;
+    let escape = match args.next() {
+        Some(escape) => escape?,
+        None => "\\",
+    };
+    Some((pattern, escape))
+}
+
+/// Convert a SQL SIMILAR TO pattern to a regex anchored with ^(?:...)$, as
+/// PostgreSQL's similar_to_escape() does. `%` → `.*`, `_` → `.`, and `.`, `^`,
+/// `$` and `\`, which are literals in SIMILAR TO, are escaped; other regex
+/// metacharacters are kept as-is. `escape` is the ESCAPE string: one
+/// character, or empty for none. The escape character followed by `"`
+/// separates the pattern into the parts that substring() would return.
+pub fn similar_to_regex(pattern: &str, escape: &str) -> Result<String, ParseError> {
+    let mut escape_chars = escape.chars();
+    let escape = match (escape_chars.next(), escape_chars.next()) {
+        (escape, None) => escape,
+        _ => {
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+                message: "invalid escape string: Escape string must be empty or one character."
+                    .to_string(),
+            })
+        }
+    };
     let mut regex = String::with_capacity(pattern.len() + 8);
     regex.push_str("^(?:");
     let mut in_bracket = false;
+    let mut separators = 0;
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
         if in_bracket {
+            if c == '\\' && escape != Some('\\') {
+                regex.push('\\');
+            }
             regex.push(c);
             if c == ']' {
                 in_bracket = false;
             }
             continue;
         }
-        match c {
-            '%' => regex.push_str(".*"),
-            '_' => regex.push('.'),
-            '\\' => {
-                // Escaped character: pass through literally
-                if let Some(next) = chars.next() {
+        if Some(c) == escape {
+            match chars.next() {
+                Some('"') => {
+                    regex.push_str(match separators {
+                        0 => "){1,1}?(",
+                        1 => "){1,1}(?:",
+                        _ => {
+                            return Err(ParseError::Sqlstate {
+                                sqlstate: SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
+                                message: "SQL regular expression may not contain more than two escape-double-quote separators".to_string(),
+                            })
+                        }
+                    });
+                    separators += 1;
+                }
+                Some(next) => {
                     regex.push('\\');
                     regex.push(next);
                 }
+                None => {}
             }
-            '.' | '^' | '$' => {
+            continue;
+        }
+        match c {
+            '%' => regex.push_str(".*"),
+            '_' => regex.push('.'),
+            '.' | '^' | '$' | '\\' => {
                 regex.push('\\');
                 regex.push(c);
             }
@@ -7039,7 +7086,7 @@ fn similar_to_regex(pattern: &str) -> String {
         }
     }
     regex.push_str(")$");
-    regex
+    Ok(regex)
 }
 
 /// Converts a CamelCase identifier to UPPER CASE SQL keywords.
@@ -11035,10 +11082,17 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_similar_to() {
-        assert_not_supported("SELECT 'a%' SIMILAR TO 'a#%' ESCAPE '#'", "ESCAPE");
-        assert_not_supported("SELECT a SIMILAR TO b FROM t", "non-literal pattern");
+    fn similar_to_escape() {
+        assert_translates("SELECT 'a%' SIMILAR TO 'a#%' ESCAPE '#'");
+        assert_translates("SELECT a SIMILAR TO b FROM t");
         assert_translates("SELECT 'abc' SIMILAR TO 'a%'");
+        assert_eq!(
+            similar_to_regex(r#"a#%#"b#"c\"#, "#").unwrap(),
+            r#"^(?:a\%){1,1}?(b){1,1}(?:c\\)$"#
+        );
+        assert_eq!(similar_to_regex(r"a\%", "").unwrap(), r"^(?:a\\.*)$");
+        assert!(similar_to_regex("a", "##").is_err());
+        assert!(similar_to_regex(r#"#"a#"b#"c"#, "#").is_err());
     }
 
     #[test]
