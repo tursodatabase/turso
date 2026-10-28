@@ -5,7 +5,8 @@
 
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
-    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE,
+    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_FUNCTION,
+    SQLSTATE_UNDEFINED_TABLE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -3550,13 +3551,10 @@ impl PostgreSQLTranslator {
         }
 
         // Map PostgreSQL operators to Turso operators
+        if let Some(comparison) = Self::comparison_operator(op_name) {
+            return Ok(ast::Expr::Binary(left, comparison, right));
+        }
         let binary_op = match op_name {
-            "=" => ast::Operator::Equals,
-            "!=" | "<>" => ast::Operator::NotEquals,
-            "<" => ast::Operator::Less,
-            "<=" => ast::Operator::LessEquals,
-            ">" => ast::Operator::Greater,
-            ">=" => ast::Operator::GreaterEquals,
             "+" => ast::Operator::Add,
             "-" => ast::Operator::Subtract,
             "*" => ast::Operator::Multiply,
@@ -4312,6 +4310,20 @@ impl PostgreSQLTranslator {
             _ => {
                 let operator = Self::comparison_operator(op_name)
                     .ok_or_else(|| not_supported(format!("{op_name} {kw} (subquery)")))?;
+                // The lowering evaluates the left-hand side inside a new
+                // subquery, where an aggregate or window function would
+                // belong to that subquery instead of the outer query.
+                if contains_aggregate_or_window(&lhs) {
+                    return Err(not_supported(format!(
+                        "an aggregate or window function on the left of {op_name} {kw} (subquery)"
+                    )));
+                }
+                if result_column_count(&select).is_some_and(|count| count > 1) {
+                    return Err(ParseError::Sqlstate {
+                        sqlstate: SQLSTATE_SYNTAX_ERROR,
+                        message: "subquery has too many columns".to_string(),
+                    });
+                }
                 Ok(Self::any_all_subquery(lhs, select, operator, is_all))
             }
         }
@@ -4398,7 +4410,7 @@ impl PostgreSQLTranslator {
     fn comparison_operator(name: &str) -> Option<ast::Operator> {
         Some(match name {
             "=" => ast::Operator::Equals,
-            "<>" => ast::Operator::NotEquals,
+            "!=" | "<>" => ast::Operator::NotEquals,
             "<" => ast::Operator::Less,
             "<=" => ast::Operator::LessEquals,
             ">" => ast::Operator::Greater,
@@ -7184,6 +7196,142 @@ fn not_supported(what: impl std::fmt::Display) -> ParseError {
     ParseError::Sqlstate {
         sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
         message: format!("{what} is not supported"),
+    }
+}
+
+/// Whether `expr` calls an aggregate or window function of the query it is in.
+/// Calls inside a nested subquery belong to that subquery and do not count.
+/// An aggregate from an extension is not recognized by name.
+fn contains_aggregate_or_window(expr: &ast::Expr) -> bool {
+    use ast::Expr;
+    let any = |exprs: &[Box<Expr>]| exprs.iter().any(|e| contains_aggregate_or_window(e));
+    match expr {
+        Expr::FunctionCall {
+            name,
+            distinctness,
+            args,
+            order_by,
+            within_group,
+            filter_over,
+        } => {
+            distinctness.is_some()
+                || !order_by.is_empty()
+                || !within_group.is_empty()
+                || filter_over.filter_clause.is_some()
+                || filter_over.over_clause.is_some()
+                || is_aggregate_function(name.as_str(), args.len())
+                || any(args)
+        }
+        Expr::FunctionCallStar { name, filter_over } => {
+            filter_over.filter_clause.is_some()
+                || filter_over.over_clause.is_some()
+                || is_aggregate_function(name.as_str(), 0)
+        }
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            contains_aggregate_or_window(lhs)
+                || contains_aggregate_or_window(start)
+                || contains_aggregate_or_window(end)
+        }
+        Expr::Binary(left, _, right)
+        | Expr::Subscript {
+            base: left,
+            index: right,
+        } => contains_aggregate_or_window(left) || contains_aggregate_or_window(right),
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            base.as_deref().is_some_and(contains_aggregate_or_window)
+                || when_then_pairs.iter().any(|(when, then)| {
+                    contains_aggregate_or_window(when) || contains_aggregate_or_window(then)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(contains_aggregate_or_window)
+        }
+        Expr::Cast { expr, .. }
+        | Expr::Collate(expr, _)
+        | Expr::FieldAccess { base: expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::NotNull(expr)
+        | Expr::Unary(_, expr)
+        | Expr::InSelect { lhs: expr, .. } => contains_aggregate_or_window(expr),
+        Expr::InList { lhs, rhs, .. } => contains_aggregate_or_window(lhs) || any(rhs),
+        Expr::InTable { lhs, args, .. } => contains_aggregate_or_window(lhs) || any(args),
+        Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            contains_aggregate_or_window(lhs)
+                || contains_aggregate_or_window(rhs)
+                || escape.as_deref().is_some_and(contains_aggregate_or_window)
+        }
+        Expr::MergedColumn(exprs)
+        | Expr::Parenthesized(exprs)
+        | Expr::Array { elements: exprs } => any(exprs),
+        Expr::Raise(_, expr) => expr.as_deref().is_some_and(contains_aggregate_or_window),
+        Expr::SubqueryResult { lhs, .. } => {
+            lhs.as_deref().is_some_and(contains_aggregate_or_window)
+        }
+        Expr::Exists(_)
+        | Expr::Subquery(_)
+        | Expr::Register(_)
+        | Expr::DoublyQualified(..)
+        | Expr::Id(_)
+        | Expr::Column { .. }
+        | Expr::RowId { .. }
+        | Expr::Literal(_)
+        | Expr::Name(_)
+        | Expr::Qualified(..)
+        | Expr::Variable(_)
+        | Expr::Default => false,
+    }
+}
+
+/// Whether `name` called with `arg_count` arguments is a built-in aggregate.
+/// `min` and `max` with two or more arguments are scalar functions.
+fn is_aggregate_function(name: &str, arg_count: usize) -> bool {
+    const AGGREGATES: &[&str] = &[
+        "array_agg",
+        "avg",
+        "bool_and",
+        "bool_or",
+        "count",
+        "every",
+        "group_concat",
+        "json_agg",
+        "json_group_array",
+        "json_group_object",
+        "json_object_agg",
+        "jsonb_agg",
+        "jsonb_group_array",
+        "jsonb_group_object",
+        "jsonb_object_agg",
+        "mode",
+        "percentile_cont",
+        "percentile_disc",
+        "string_agg",
+        "sum",
+        "total",
+    ];
+    let name = name.to_ascii_lowercase();
+    match name.as_str() {
+        "min" | "max" => arg_count <= 1,
+        name => AGGREGATES.contains(&name),
+    }
+}
+
+/// The number of columns `select` returns, when it can be read from the
+/// statement without the schema (no `*`).
+fn result_column_count(select: &ast::Select) -> Option<usize> {
+    match &select.body.select {
+        ast::OneSelect::Select { columns, .. } => columns
+            .iter()
+            .all(|column| matches!(column, ast::ResultColumn::Expr(..)))
+            .then_some(columns.len()),
+        ast::OneSelect::Values(rows) => rows.first().map(Vec::len),
     }
 }
 
@@ -11171,6 +11319,31 @@ mod tests {
         assert_translates("SELECT 1 <> SOME (SELECT a FROM t)");
         assert_translates("SELECT 1 IN (SELECT a FROM t)");
         assert_translates("SELECT 1 NOT IN (SELECT a FROM t)");
+    }
+
+    #[test]
+    fn any_all_sublink_rejects_aggregate_or_window_on_the_left() {
+        for sql in [
+            "SELECT a FROM t GROUP BY a HAVING count(*) > ALL (SELECT a FROM t)",
+            "SELECT max(a) < ANY (SELECT a FROM t) FROM t",
+            "SELECT sum(a) + 1 >= ALL (SELECT a FROM t) FROM t",
+            "SELECT row_number() OVER () < ANY (SELECT a FROM t) FROM t",
+        ] {
+            assert_not_supported(sql, "an aggregate or window function on the left");
+        }
+        assert_translates("SELECT (SELECT max(a) FROM t) > ALL (SELECT a FROM t)");
+        assert_translates("SELECT max(a, 1) > ANY (SELECT a FROM t) FROM t");
+        assert_translates("SELECT a FROM t GROUP BY a HAVING count(*) = ANY (SELECT a FROM t)");
+    }
+
+    #[test]
+    fn any_all_sublink_rejects_subquery_with_two_columns() {
+        let parsed = crate::parse("SELECT 1 > ANY (SELECT a, a FROM t)").unwrap();
+        let err = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&parsed)
+            .expect_err("two columns")
+            .to_string();
+        assert!(err.contains("subquery has too many columns"), "got: {err}");
     }
 
     #[test]

@@ -539,6 +539,55 @@ expect {
     4
 }
 
+# turso evaluates the left-hand side inside a subquery it builds, where an
+# aggregate or window function would belong to that subquery. It rejects them
+# instead of returning wrong rows.
+
+@setup anyall_cmp
+@skip-if postgres "PostgreSQL supports an aggregate on the left of > ALL"
+test gt-all-subquery-rejects-aggregate-in-having {
+    SELECT a FROM nums GROUP BY a HAVING count(*) > ALL (SELECT a FROM nums WHERE a < 3);
+}
+@sqlstate 0A000
+expect error {
+}
+
+@setup anyall_cmp
+@skip-if postgres "PostgreSQL supports an aggregate on the left of > ANY"
+test gt-any-subquery-rejects-aggregate-in-select-list {
+    SELECT count(*) > ANY (SELECT a FROM nums) FROM nums;
+}
+@sqlstate 0A000
+expect error {
+}
+
+@setup anyall_cmp
+@skip-if postgres "PostgreSQL supports a window function on the left of < ANY"
+test lt-any-subquery-rejects-window-function {
+    SELECT row_number() OVER () < ANY (SELECT a FROM nums) FROM nums;
+}
+@sqlstate 0A000
+expect error {
+}
+
+@setup anyall_cmp
+test gt-all-subquery-allows-aggregate-in-scalar-subquery {
+    SELECT a FROM nums WHERE (SELECT max(a) FROM nums) > ALL (SELECT a FROM nums WHERE a < 6) ORDER BY a;
+}
+expect {
+    2
+    4
+    6
+}
+
+@setup anyall_cmp
+test gt-any-subquery-rejects-two-columns {
+    SELECT 1 > ANY (SELECT a, a FROM nums);
+}
+@sqlstate 42601
+expect error {
+}
+
 test select-current-data-and-time {
     SELECT 'ok'
     WHERE CURRENT_DATE IS NOT NULL
