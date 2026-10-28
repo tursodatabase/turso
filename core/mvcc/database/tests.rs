@@ -12164,6 +12164,35 @@ fn test_gc_shrinks_version_chain_capacity() {
     assert_eq!(small.capacity(), capacity_before);
 }
 
+/// One `RowVersion` is about 100 bytes and most chains hold one or two
+/// versions, so a short chain must not keep the four-slot minimum capacity of
+/// amortized `Vec` growth.
+#[test]
+fn test_short_version_chain_has_no_unused_capacity() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+    let row_id = RowID::new(table_id, RowKey::Int(1));
+    let tx = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store
+        .insert(tx, generate_simple_string_row(table_id, 1, "version_0"))
+        .unwrap();
+    let chain_len_and_capacity = || {
+        let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+        let versions = entry.value().read();
+        (versions.len(), versions.capacity())
+    };
+    assert_eq!(chain_len_and_capacity(), (1, 1));
+
+    for version in 1..4 {
+        let row = generate_simple_string_row(table_id, 1, &format!("version_{version}"));
+        assert!(db.mvcc_store.update(tx, row).unwrap());
+        assert_eq!(chain_len_and_capacity(), (version + 1, version + 1));
+    }
+}
+
 /// `drop_unused_row_versions_and_slots` removes emptied SkipMap entries.
 #[test]
 fn test_gc_with_slot_removal_drops_empty_skipmap_entries() {
