@@ -121,6 +121,7 @@ pub enum ExtFunc {
     NativeScalar {
         arity: crate::native_ext::FunctionArity,
         deterministic: bool,
+        return_type: Option<crate::native_ext::ReturnType>,
         function: Arc<dyn crate::native_ext::ScalarFactory>,
     },
     NativeAggregate {
@@ -175,6 +176,13 @@ impl ExtFunc {
             Self::Scalar { argc, .. }
             | Self::Aggregate { argc, .. }
             | Self::NativeAggregate { argc, .. } => vec![*argc],
+        }
+    }
+
+    pub fn return_type(&self) -> Option<crate::native_ext::ReturnType> {
+        match self {
+            Self::NativeScalar { return_type, .. } => *return_type,
+            Self::Scalar { .. } | Self::Aggregate { .. } | Self::NativeAggregate { .. } => None,
         }
     }
 

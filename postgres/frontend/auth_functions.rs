@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::error::sqlstate_error;
-use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
+use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
 use turso_core::{Connection, ExternalFunc, IOResult, OpenOptions, Register, Result, Value};
 use turso_pg_parser::sqlstate::{
@@ -19,6 +19,7 @@ pub(crate) fn register_functions(mut options: OpenOptions) -> OpenOptions {
                 name.to_string(),
                 FunctionArity::Exact(0),
                 false,
+                Some(ReturnType::Text),
                 function,
             )
             .expect("auth function declarations have a valid argument count"),

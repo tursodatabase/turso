@@ -118,6 +118,14 @@ impl PartialEq for AggregateState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnType {
+    Integer,
+    Real,
+    Text,
+    Blob,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum FunctionArity {
     Exact(usize),
