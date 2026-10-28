@@ -112,6 +112,7 @@ impl Trigger {
     }
 }
 
+use crate::security::roles::RoleCatalog;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
@@ -1103,6 +1104,9 @@ pub struct Schema {
     /// The materialized views met before the names of the namespaces were
     /// loaded, built once they are.
     pending_materialized_views: Option<PendingMaterializedViews>,
+
+    /// The roles of the database. Copies of the schema share them.
+    pub roles: Arc<RoleCatalog>,
 }
 
 /// Materialized views the loader read before the names of the namespaces,
@@ -1299,6 +1303,7 @@ impl Schema {
             default_namespaces: dialect.default_namespaces(),
             namespace_names_loaded: !dialect.supports_namespaces(),
             pending_materialized_views: None,
+            roles: Arc::new(RoleCatalog::new(dialect.builtin_role_names())),
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -4575,6 +4580,7 @@ impl TryClone for Schema {
             default_namespaces: self.default_namespaces,
             namespace_names_loaded: self.namespace_names_loaded,
             pending_materialized_views: self.pending_materialized_views.clone(),
+            roles: self.roles.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
             custom_types_enabled: self.custom_types_enabled,
@@ -8668,6 +8674,18 @@ mod tests {
     }
 
     use crate::alloc::vec;
+
+    #[test]
+    fn schema_starts_with_the_superuser_role_and_clones_keep_its_roles() {
+        let schema = Schema::new();
+
+        let clone = schema.try_clone().unwrap();
+
+        assert!(schema
+            .roles
+            .is_superuser(crate::security::roles::RoleId::SUPERUSER));
+        assert!(Arc::ptr_eq(&schema.roles, &clone.roles));
+    }
 
     #[test]
     fn test_column_definition_flag_conversion() {
