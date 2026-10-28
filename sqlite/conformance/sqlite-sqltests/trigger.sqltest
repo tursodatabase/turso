@@ -2580,6 +2580,32 @@ expect {
     1|t|4
 }
 
+# A trigger on another table inserts into t while the outer INSERT runs. The
+# outer INSERT must read sqlite_sequence again before writing it, or it adds a
+# second row for t.
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+@cross-check-integrity
+test trigger-autoincrement-insert-through-other-table-trigger {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    CREATE TABLE log(x);
+    CREATE TRIGGER ai AFTER INSERT ON t WHEN new.v = 'outer' BEGIN
+        INSERT INTO log VALUES(new.id);
+    END;
+    CREATE TRIGGER al AFTER INSERT ON log BEGIN
+        INSERT INTO t(v) VALUES('nested');
+    END;
+    INSERT INTO t(v) VALUES('outer');
+    SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+    DELETE FROM t WHERE v = 'nested';
+    INSERT INTO t(v) VALUES('after');
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|t|2
+    1|outer
+    3|after
+}
+
 test before-update-trigger-panic-on-update {
     CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
     CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN SELECT 1; END;
