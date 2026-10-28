@@ -20,7 +20,7 @@ addr  opcode          p1  p2  p3  p4        p5  comment
    3  SeekGT           0  12   4             0  key=[4..4]
    4  Integer         20   4   0             0  r[4]=20
    5    RowId          0   5   0             0  r[5]=items.rowid
-   6    Ge             5   4  12             0  if r[5]>=r[4] goto 12
+   6    Ge             5   4  12  Binary     0  if r[5]>=r[4] goto 12
    7    RowId          0   1   0             0  r[1]=items.rowid
    8    ColumnRange    0   0   2  2          0  r[2..3]=items.name..value
    9    RealAffinity   3   0   0             0

@@ -558,6 +558,8 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "numeric_sub" => Ok(Some(Func::Scalar(ScalarFunc::NumericSub))),
         "numeric_mul" => Ok(Some(Func::Scalar(ScalarFunc::NumericMul))),
         "numeric_div" => Ok(Some(Func::Scalar(ScalarFunc::NumericDiv))),
+        "numeric_mod" => Ok(Some(Func::Scalar(ScalarFunc::NumericMod))),
+        "numeric_neg" => Ok(Some(Func::Scalar(ScalarFunc::NumericNeg))),
         "numeric_lt" => Ok(Some(Func::Scalar(ScalarFunc::NumericLt))),
         "numeric_eq" => Ok(Some(Func::Scalar(ScalarFunc::NumericEq))),
         "date_plus" => Ok(Some(Func::Scalar(ScalarFunc::DatePlus))),

@@ -11,6 +11,8 @@ pub fn to_u32(v: usize) -> u32 {
 
 use super::{execute, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::function::AccumulatorFunc;
+use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::type_ordering::TypeOrdering;
 use crate::{
     schema::{BTreeTable, CheckConstraint, Column, ForeignKey, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
@@ -62,16 +64,6 @@ impl Subprogram {
             }),
         }
     }
-}
-
-/// Known custom type comparator functions for sorting and MIN/MAX aggregates.
-/// These replace heap-allocated String names with a compact enum.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SortComparatorType {
-    NumericLt,
-    StringReverse,
-    TestUintLt,
-    ArrayLt,
 }
 
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
@@ -301,6 +293,7 @@ impl From<BitSet> for NullMatchingMask {
 #[derive(Debug, Clone)]
 pub struct AddColumnData {
     pub db: usize,
+    pub namespace: NamespaceId,
     pub table: String,
     pub column: Column,
     pub check_constraints: Vec<CheckConstraint>,
@@ -311,11 +304,12 @@ pub struct AddColumnData {
 #[derive(Debug, Clone)]
 pub struct AlterColumnData {
     pub db: usize,
+    pub namespace: NamespaceId,
     pub table: String,
     pub column_index: usize,
     pub definition: turso_parser::ast::ColumnDefinition,
     pub rename: bool,
-    pub rewritten_triggers: Vec<(usize, String, String)>,
+    pub rewritten_triggers: Vec<(NamespaceRef, String, String)>,
 }
 
 /// Data for IntegrityCk instruction (boxed to keep Insn small).
@@ -332,6 +326,7 @@ pub struct IntegrityCkData {
 #[derive(Debug, Clone)]
 pub struct AddSequenceData {
     pub db: usize,
+    pub namespace: NamespaceId,
     pub name: String,
     pub start: i64,
     pub increment: i64,
@@ -348,12 +343,12 @@ pub struct SorterOpenData {
     /// Combined order, collation, and nulls ordering per column.
     pub order_collations_nulls: crate::alloc::Vec<(
         SortOrder,
-        Option<CollationSeq>,
+        CollationSeq,
         Option<turso_parser::ast::NullsOrder>,
     )>,
     /// Per-column custom type comparators for ORDER BY sorting.
     /// When present, the comparator is used instead of standard value comparison.
-    pub comparators: crate::alloc::Vec<Option<SortComparatorType>>,
+    pub comparators: crate::alloc::Vec<Option<TypeOrdering>>,
 }
 
 /// Data for AggStep instruction (boxed to keep Insn small).
@@ -364,10 +359,10 @@ pub struct AggStepData {
     pub delimiter: usize,
     pub func: AccumulatorFunc,
     /// Optional custom type comparator for MIN/MAX aggregates.
-    pub comparator: Option<SortComparatorType>,
-    /// Collation for comparison-based aggregates (MIN/MAX), resolved at
-    /// translation time from the argument expression.
-    pub collation: Option<CollationSeq>,
+    pub comparator: Option<TypeOrdering>,
+    /// The collation MIN, MAX, mode and percentile compare the argument with.
+    /// BINARY for the aggregates that do not compare values.
+    pub collation: CollationSeq,
 }
 
 /// Which of SUM, TOTAL, or AVG an `IvmSumFinalize` instruction computes. The
@@ -619,7 +614,7 @@ pub enum Insn {
         /// Without the jump_if_null flag it would not jump because the logical comparison "id != NULL" is never true.
         /// This flag indicates that if either is null we should still jump.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if they are not equal.
     Ne {
@@ -630,7 +625,7 @@ pub enum Insn {
         ///
         /// jump_if_null jumps if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is less than the right-hand side.
     Lt {
@@ -639,7 +634,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     Le {
         lhs: usize,
@@ -647,7 +642,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is greater than the right-hand side.
     Gt {
@@ -656,7 +651,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is greater than or equal to the right-hand side.
     Ge {
@@ -665,7 +660,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[jump_if_null\] != 0)
     If {
@@ -1410,7 +1405,7 @@ pub enum Insn {
         col: usize,
         delimiter: usize,
         func: AccumulatorFunc,
-        comparator: Option<SortComparatorType>,
+        comparator: Option<TypeOrdering>,
     },
 
     AggFinal {
@@ -1742,6 +1737,8 @@ pub enum Insn {
     DropTable {
         ///  The database within which this b-tree needs to be dropped (P1).
         db: usize,
+        /// The namespace of the table being dropped.
+        namespace: NamespaceId,
         ///  unused register p2
         _p2: usize,
         ///  unused register p3
@@ -1752,12 +1749,16 @@ pub enum Insn {
     DropView {
         /// The database within which this view needs to be dropped
         db: usize,
+        /// The namespace of the view being dropped.
+        namespace: NamespaceId,
         /// The name of the view being dropped
         view_name: String,
     },
     DropIndex {
         ///  The database within which this index needs to be dropped (P1).
         db: usize,
+        /// The namespace of the index being dropped.
+        namespace: NamespaceId,
         //  The name of the index being dropped
         index: Arc<Index>,
     },
@@ -1765,6 +1766,8 @@ pub enum Insn {
     DropTrigger {
         /// The database within which this trigger needs to be dropped (P1).
         db: usize,
+        /// The namespace of the trigger being dropped.
+        namespace: NamespaceId,
         /// The name of the trigger being dropped
         trigger_name: String,
     },
@@ -1784,6 +1787,8 @@ pub enum Insn {
     DropSequence {
         /// The database within which this sequence needs to be dropped
         db: usize,
+        /// The namespace of the sequence being dropped.
+        namespace: NamespaceId,
         /// The name of the sequence being dropped
         seq_name: String,
     },
@@ -1851,6 +1856,7 @@ pub enum Insn {
     /// `LimboError::SequenceExhausted` on overflow when `cycle` is false.
     SequenceComputeNext {
         db: usize,
+        namespace: NamespaceId,
         seq_name: String,
         in_value_reg: usize,
         in_is_called_reg: usize,
@@ -1869,6 +1875,7 @@ pub enum Insn {
     /// successful sequence RMW commit.
     SequenceTrackAllocation {
         db: usize,
+        namespace: NamespaceId,
         seq_name: String,
         value_reg: usize,
     },
@@ -2113,11 +2120,13 @@ pub enum Insn {
     },
     RenameTable {
         db: usize,
+        namespace: NamespaceId,
         from: String,
         to: String,
     },
     DropColumn {
         db: usize,
+        namespace: NamespaceId,
         table: String,
         column_index: usize,
     },

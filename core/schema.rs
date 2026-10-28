@@ -245,30 +245,31 @@ pub enum TypeDefKind {
         /// How values of the type compare, when its `OPERATOR '<'` names a
         /// function. `None` compares the stored values as SQLite does.
         ordering: Option<TypeOrdering>,
-        /// How arithmetic operators run on values of this type.
-        arithmetic: std::vec::Vec<ArithmeticSignature>,
+        /// How operators such as `+` and `-x` run on values of this type.
+        operator_signatures: std::vec::Vec<OperatorSignature>,
         default: Option<Box<ast::Expr>>,
     },
     Struct(StructDef),
     Union(UnionDef),
 }
 
-/// One way an arithmetic operator runs when an operand has a custom type:
-/// `args[0] op args[1]` runs `func`, or SQLite's operator when `func` is `None`.
+/// One way an operator runs when an operand has a custom type: `args[0] op
+/// args[1]`, or `op args[0]` for a prefix operator such as `-x`, runs `func`,
+/// or SQLite's operator when `func` is `None`.
 #[derive(Debug, Clone)]
-pub struct ArithmeticSignature {
-    /// `+`, `-`, `*`, `/` or `%`.
+pub struct OperatorSignature {
+    /// One of [BINARY_OPERATORS] or [PREFIX_OPERATORS].
     pub op: &'static str,
-    pub args: [ArithmeticArg; 2],
+    /// One operand for a prefix operator, two for a binary one.
+    pub args: std::vec::Vec<OperatorArg>,
     pub func: Option<String>,
     /// The result's type, or `None` when the function decides it.
     pub result: Option<&'static str>,
 }
-
 /// An operand that a signature accepts. "This type" is the type that declares
 /// the signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArithmeticArg {
+pub enum OperatorArg {
     /// A column of this type. A user type's function is only given columns: a
     /// CAST gives the stored form, a column the value its DECODE returns, and
     /// the function can't tell them apart.
@@ -278,18 +279,28 @@ pub enum ArithmeticArg {
     /// Any value of this type.
     Value,
     /// A value SQLite can compute with: anything without a custom type, or a
-    /// value of a type whose own arithmetic is SQLite's operator.
+    /// value of a type whose only way to run the operator is SQLite's.
     PlainValue,
     /// A `PlainValue` that is an integer, or whose type is not known before the
     /// statement runs, such as a parameter. The function rejects anything else.
     Integer,
+    /// A `PlainValue` that is neither a `Real` nor a blob.
+    Exact,
+    /// A REAL value: a REAL column, a CAST to REAL, arithmetic on two plain
+    /// values. A decimal written in the statement, such as `0.5`, `-0.5` or
+    /// the `0.5` of `(SELECT 0.5)`, is not one: as in PostgreSQL, it is an
+    /// exact number.
+    Real,
 }
 
-const ARITHMETIC_OPERATORS: [&str; 5] = ["+", "-", "*", "/", "%"];
+/// The operators whose function an operand's custom type decides. Comparisons
+/// are decided separately, and unary `+` gives its operand unchanged.
+pub const BINARY_OPERATORS: [&str; 9] = ["+", "-", "*", "/", "%", "&", "|", "<<", ">>"];
+pub const PREFIX_OPERATORS: [&str; 2] = ["-", "~"];
 
-/// `CREATE TYPE ... OPERATOR '+' f` runs f for two values of the type, or for a
-/// value of the type and a literal its ENCODE accepts. `OPERATOR '+'` without a
-/// function runs SQLite's operator on the stored value.
+/// The operators an OPERATOR clause can give a function.
+const DECLARABLE_OPERATORS: [&str; 5] = ["+", "-", "*", "/", "%"];
+
 /// The order named by the type's `OPERATOR '<' f`. Comparisons, indexes,
 /// sorting and hashing all use that order, so `f` must be one Turso implements,
 /// and an `OPERATOR '=' g` is only allowed alongside it: equality has to agree
@@ -317,15 +328,19 @@ fn declared_ordering(operators: &[TypeOperator]) -> crate::Result<Option<TypeOrd
     }
 }
 
-fn declared_arithmetic(operators: &[TypeOperator]) -> std::vec::Vec<ArithmeticSignature> {
-    use ArithmeticArg::{Column, EncodableLiteral};
+/// `CREATE TYPE ... OPERATOR '+' f` runs f for two values of the type, or for a
+/// value of the type and a literal its ENCODE accepts. `OPERATOR '+'` without a
+/// function runs SQLite's operator on the stored value. A user type has no
+/// other operators: `-x` or `x & 1` is an error.
+fn declared_signatures(operators: &[TypeOperator]) -> std::vec::Vec<OperatorSignature> {
+    use OperatorArg::{Column, EncodableLiteral};
     let mut signatures = std::vec::Vec::new();
-    for op in ARITHMETIC_OPERATORS {
+    for op in DECLARABLE_OPERATORS {
         let Some(declared) = operators.iter().find(|o| o.op == op) else {
             continue;
         };
         let Some(func) = &declared.func_name else {
-            signatures.extend(sqlite_arithmetic(op));
+            signatures.extend(sqlite_operator(op, OperatorArg::PlainValue));
             continue;
         };
         for args in [
@@ -333,9 +348,9 @@ fn declared_arithmetic(operators: &[TypeOperator]) -> std::vec::Vec<ArithmeticSi
             [Column, EncodableLiteral],
             [EncodableLiteral, Column],
         ] {
-            signatures.push(ArithmeticSignature {
+            signatures.push(OperatorSignature {
                 op,
-                args,
+                args: args.to_vec(),
                 func: Some(func.clone()),
                 result: None,
             });
@@ -344,62 +359,99 @@ fn declared_arithmetic(operators: &[TypeOperator]) -> std::vec::Vec<ArithmeticSi
     signatures
 }
 
-/// Arithmetic on built-in types, which an OPERATOR clause can't express. The
+/// Operators on built-in types, which an OPERATOR clause can't express. The
 /// functions read plain values as they are, so nothing is encoded first:
-/// - `numeric op x` and `x op numeric` for `+ - * /` compute exactly, and the
-///   result is a numeric. Encoding a literal to the column's type would round it
-///   to the column's scale first (`n * 0.005` would be `n * 0.01`).
+/// - `numeric op x` and `x op numeric` for `+ - * / %`, and `-numeric`, compute
+///   exactly, and the result is a numeric. Encoding a literal to the column's type would round it
+///   to the column's scale first (`n * 0.005` would be `n * 0.01`). With a REAL
+///   value `+ - * /` are SQLite's operators and give a REAL, as PostgreSQL gives
+///   double precision; `%` with a REAL value does not exist, as in PostgreSQL.
 /// - `date + integer`, `integer + date` and `date - integer` add or subtract
 ///   days and give a date. `date - date` gives the number of days between them;
 ///   a text literal on either side is encoded to a date first. Each signature
 ///   has its own function, so its result type is known before the statement
 ///   runs.
-/// - `smallint` and `bigint` store plain integers, so SQLite's operators run.
+/// - `smallint` and `bigint` store plain integers, so SQLite's operators run,
+///   including `-`, `~`, `&`, `|`, `<<` and `>>`.
 ///
-/// Other built-in types have no arithmetic.
-fn builtin_arithmetic(type_name: &str) -> std::vec::Vec<ArithmeticSignature> {
-    use ArithmeticArg::{EncodableLiteral, Integer, PlainValue, Value};
-    let call = |op, args, func: &str, result| ArithmeticSignature {
+/// Other built-in types have no operators: `-date` and `numeric & 1` are errors,
+/// as in PostgreSQL.
+fn builtin_signatures(type_name: &str) -> std::vec::Vec<OperatorSignature> {
+    use OperatorArg::{EncodableLiteral, Exact, Integer, Real, Value};
+    let call = |op, args: &[OperatorArg], func: &str, result| OperatorSignature {
         op,
-        args,
+        args: args.to_vec(),
         func: Some(func.to_string()),
         result,
     };
     match type_name {
-        "numeric" => [
-            ("+", "numeric_add"),
-            ("-", "numeric_sub"),
-            ("*", "numeric_mul"),
-            ("/", "numeric_div"),
-        ]
-        .into_iter()
-        .flat_map(|(op, func)| {
-            [[Value, Value], [Value, PlainValue], [PlainValue, Value]]
-                .map(|args| call(op, args, func, Some("numeric")))
-        })
-        .collect(),
+        "numeric" => {
+            let mut signatures = std::vec::Vec::new();
+            for (op, func) in [
+                ("+", "numeric_add"),
+                ("-", "numeric_sub"),
+                ("*", "numeric_mul"),
+                ("/", "numeric_div"),
+                ("%", "numeric_mod"),
+            ] {
+                for args in [[Value, Value], [Value, Exact], [Exact, Value]] {
+                    signatures.push(call(op, &args, func, Some("numeric")));
+                }
+                if op != "%" {
+                    signatures.extend(sqlite_operator(op, Real));
+                }
+            }
+            // TODO: run numeric_neg once every comparison uses numeric's
+            // order. Until then its text result would compare as text in IN,
+            // CASE, min/max and index seeks, where SQLite's REAL compares right.
+            signatures.push(OperatorSignature {
+                op: "-",
+                args: std::vec![Value],
+                func: None,
+                result: None,
+            });
+            signatures
+        }
         "date" => std::vec![
-            call("+", [Value, Integer], "date_plus", Some("date")),
-            call("+", [Integer, Value], "date_plus", Some("date")),
-            call("-", [Value, Value], "date_diff", Some("integer")),
-            call("-", [Value, EncodableLiteral], "date_diff", Some("integer")),
-            call("-", [EncodableLiteral, Value], "date_diff", Some("integer")),
-            call("-", [Value, Integer], "date_minus", Some("date")),
+            call("+", &[Value, Integer], "date_plus", Some("date")),
+            call("+", &[Integer, Value], "date_plus", Some("date")),
+            call("-", &[Value, Value], "date_diff", Some("integer")),
+            call(
+                "-",
+                &[Value, EncodableLiteral],
+                "date_diff",
+                Some("integer")
+            ),
+            call(
+                "-",
+                &[EncodableLiteral, Value],
+                "date_diff",
+                Some("integer")
+            ),
+            call("-", &[Value, Integer], "date_minus", Some("date")),
         ],
-        "smallint" | "bigint" => ARITHMETIC_OPERATORS
-            .into_iter()
-            .flat_map(sqlite_arithmetic)
-            .collect(),
+        "smallint" | "bigint" => {
+            let binary = BINARY_OPERATORS
+                .into_iter()
+                .flat_map(|op| sqlite_operator(op, OperatorArg::PlainValue));
+            let prefix = PREFIX_OPERATORS.into_iter().map(|op| OperatorSignature {
+                op,
+                args: std::vec![Value],
+                func: None,
+                result: None,
+            });
+            binary.chain(prefix).collect()
+        }
         _ => std::vec::Vec::new(),
     }
 }
 
-/// SQLite's operator `op` on a value of the type and a plain value.
-fn sqlite_arithmetic(op: &'static str) -> [ArithmeticSignature; 2] {
-    use ArithmeticArg::{PlainValue, Value};
-    [[Value, PlainValue], [PlainValue, Value]].map(|args| ArithmeticSignature {
+/// SQLite's binary operator `op` on a value of the type and an operand `other`.
+fn sqlite_operator(op: &'static str, other: OperatorArg) -> [OperatorSignature; 2] {
+    use OperatorArg::Value;
+    [[Value, other], [other, Value]].map(|args| OperatorSignature {
         op,
-        args,
+        args: args.to_vec(),
         func: None,
         result: None,
     })
@@ -538,15 +590,25 @@ impl TypeDef {
         }
     }
 
-    /// How `op` can run on a value of this type, most specific first.
-    pub fn arithmetic<'a>(&'a self, op: &'a str) -> impl Iterator<Item = &'a ArithmeticSignature> {
-        self.all_arithmetic().iter().filter(move |s| s.op == op)
+    /// How `op` with `operand_count` operands can run on a value of this type,
+    /// most specific first.
+    pub fn operator_signatures<'a>(
+        &'a self,
+        op: &'a str,
+        operand_count: usize,
+    ) -> impl Iterator<Item = &'a OperatorSignature> {
+        self.all_operator_signatures()
+            .iter()
+            .filter(move |s| s.op == op && s.args.len() == operand_count)
     }
 
-    /// Every arithmetic signature of the type, declared or built in.
-    pub fn all_arithmetic(&self) -> &[ArithmeticSignature] {
+    /// Every operator signature of the type, declared or built in.
+    pub fn all_operator_signatures(&self) -> &[OperatorSignature] {
         match &self.kind {
-            TypeDefKind::Custom { arithmetic, .. } => arithmetic,
+            TypeDefKind::Custom {
+                operator_signatures,
+                ..
+            } => operator_signatures,
             _ => &[],
         }
     }
@@ -614,10 +676,10 @@ impl TypeDef {
                     decode: decode.clone(),
                     operators: operators.clone(),
                     ordering: declared_ordering(operators)?,
-                    arithmetic: if is_builtin {
-                        builtin_arithmetic(type_name)
+                    operator_signatures: if is_builtin {
+                        builtin_signatures(type_name)
                     } else {
-                        declared_arithmetic(operators)
+                        declared_signatures(operators)
                     },
                     default: default.clone(),
                 },
@@ -709,7 +771,7 @@ impl TypeDef {
                 operators: std::vec::Vec::new(),
                 // A domain has the order and arithmetic of the type it is based on.
                 ordering: None,
-                arithmetic: std::vec::Vec::new(),
+                operator_signatures: std::vec::Vec::new(),
                 default,
             },
         }
@@ -1172,6 +1234,39 @@ impl Schema {
         self.namespace(namespace).tables.values()
     }
 
+    /// The tables of every namespace of the schema.
+    pub fn all_tables(&self) -> impl Iterator<Item = &Arc<Table>> {
+        self.namespaces
+            .values()
+            .flat_map(|objects| objects.tables.values())
+    }
+
+    /// The tables of every namespace of the schema, to change, with the
+    /// namespace and lookup name of each.
+    pub fn all_tables_mut(&mut self) -> impl Iterator<Item = (NamespaceId, &str, &mut Arc<Table>)> {
+        self.namespaces.iter_mut().flat_map(|(namespace, objects)| {
+            objects
+                .tables
+                .iter_mut()
+                .map(move |(name, table)| (*namespace, name.as_str(), table))
+        })
+    }
+
+    /// The indexes of every namespace of the schema, backing B-tree indexes
+    /// included.
+    pub fn all_indexes(&self) -> impl Iterator<Item = &Arc<Index>> {
+        self.namespaces
+            .values()
+            .flat_map(|objects| objects.indexes.values().flatten())
+    }
+
+    /// The indexes of every namespace of the schema, to change.
+    pub fn all_indexes_mut(&mut self) -> impl Iterator<Item = &mut Arc<Index>> {
+        self.namespaces
+            .values_mut()
+            .flat_map(|objects| objects.indexes.values_mut().flatten())
+    }
+
     pub fn table_names(&self, namespace: NamespaceId) -> impl Iterator<Item = &str> {
         self.namespace(namespace).tables.keys().map(String::as_str)
     }
@@ -1263,11 +1358,11 @@ impl Schema {
             .copied()
     }
 
-    pub fn has_materialized_views(&self, namespace: NamespaceId) -> bool {
-        !self
-            .namespace(namespace)
-            .table_to_materialized_views
-            .is_empty()
+    /// Whether any table of any namespace feeds a materialized view.
+    pub fn has_materialized_views(&self) -> bool {
+        self.namespaces
+            .values()
+            .any(|objects| !objects.table_to_materialized_views.is_empty())
     }
 
     /// Every index of the namespace, backing B-tree indexes included.
@@ -2208,7 +2303,7 @@ impl Schema {
         if let Some(table) = removed {
             self.unregister_table_root_page(&table);
         }
-        self.analyze_stats.remove_table(&name);
+        self.analyze_stats.remove_table(namespace, &name);
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -2347,7 +2442,7 @@ impl Schema {
     pub fn remove_indices_for_table(&mut self, namespace: NamespaceId, table_name: &str) {
         let name = normalize_ident(table_name);
         self.namespace_mut(namespace).indexes.remove(&name);
-        self.analyze_stats.remove_table(&name);
+        self.analyze_stats.remove_table(namespace, &name);
     }
 
     pub fn remove_index(&mut self, namespace: NamespaceId, idx: &Index) {
@@ -2357,7 +2452,7 @@ impl Schema {
             .get_mut(&name)
             .expect("Must have the index")
             .retain_mut(|other_idx| other_idx.name != idx.name);
-        self.analyze_stats.remove_index(&name, &idx.name);
+        self.analyze_stats.remove_index(namespace, &name, &idx.name);
     }
 
     pub fn table_has_indexes(&self, namespace: NamespaceId, table_name: &str) -> bool {
@@ -2969,7 +3064,8 @@ impl Schema {
             }
 
             // Create the IncrementalView with all root pages
-            let incremental_view = IncrementalView::from_sql(&sql, self, main_root)?;
+            let incremental_view =
+                IncrementalView::from_sql(&sql, self, main_root, NamespaceId::ROOT)?;
 
             // Create a BTreeTable for the materialized view
             let cols = incremental_view.column_schema.flat_columns()?;
@@ -3381,8 +3477,11 @@ impl Schema {
                             select,
                             ..
                         } => {
-                            let mut view_column_schema =
-                                crate::util::extract_view_columns(&select, self)?;
+                            let mut view_column_schema = crate::util::extract_view_columns(
+                                NamespaceId::ROOT,
+                                &select,
+                                self,
+                            )?;
                             view_column_schema.rename_columns(&column_names);
                             let view = View::new(
                                 name.to_string(),
@@ -3486,22 +3585,25 @@ impl Schema {
             .ok_or_else(|| fk_mismatch_err("<unknown>", &target))?;
 
         let mut out = Vec::try_with_capacity_ext(4)?; // arbitrary estimate
-        let objects = self.namespace(namespace);
-        for t in objects.tables.values() {
-            let Some(child) = t.btree() else {
-                continue;
-            };
-            for fk in &child.foreign_keys {
-                if !fk.parent_table.eq_ignore_ascii_case(&target) {
+        for (child_namespace, objects) in &self.namespaces {
+            for t in objects.tables.values() {
+                let Some(child) = t.btree() else {
                     continue;
+                };
+                for fk in &child.foreign_keys {
+                    if fk.parent_namespace != namespace
+                        || !fk.parent_table.eq_ignore_ascii_case(&target)
+                    {
+                        continue;
+                    }
+                    out.try_push(self.resolve_fk(
+                        *child_namespace,
+                        fk,
+                        &child,
+                        &parent_tbl,
+                        /*require_unique=*/ false,
+                    )?)?;
                 }
-                out.try_push(self.resolve_fk(
-                    namespace,
-                    fk,
-                    &child,
-                    &parent_tbl,
-                    /*require_unique=*/ false,
-                )?)?;
             }
         }
         Ok(out)
@@ -3524,14 +3626,15 @@ impl Schema {
         let mut out = Vec::try_with_capacity_ext(child.foreign_keys.len())?;
         for fk in &child.foreign_keys {
             if let Some(updated_cols) = updated_cols {
-                let is_self_ref = fk.parent_table.eq_ignore_ascii_case(&child.name);
+                let is_self_ref = fk.parent_namespace == namespace
+                    && fk.parent_table.eq_ignore_ascii_case(&child.name);
                 if !is_self_ref && !fk.child_key_assigned(&child, updated_cols) {
                     continue;
                 }
             }
             let parent_name = normalize_ident(&fk.parent_table);
             let parent_tbl = self
-                .get_btree_table(namespace, &parent_name)
+                .get_btree_table(fk.parent_namespace, &parent_name)
                 .ok_or_else(|| fk_mismatch_err(&child.name, &parent_name))?;
             out.push_within_capacity(self.resolve_fk(
                 namespace,
@@ -3550,7 +3653,7 @@ impl Schema {
     /// a non-partial UNIQUE index on exactly those columns.
     fn resolve_fk(
         &self,
-        namespace: NamespaceId,
+        child_namespace: NamespaceId,
         fk: &Arc<ForeignKey>,
         child: &Arc<BTreeTable>,
         parent_tbl: &Arc<BTreeTable>,
@@ -3591,19 +3694,34 @@ impl Schema {
         }
 
         let mut parent_pos: Vec<usize> = Vec::try_with_capacity_ext(parent_cols.len())?;
-        for pc in parent_cols.iter() {
-            let pos = parent_tbl.get_column(pc).map(|(i, _)| i).or_else(|| {
-                ROWID_STRS
-                    .iter()
-                    .any(|r| pc.eq_ignore_ascii_case(r))
-                    .then_some(0)
-            });
-            let Some(p) = pos else {
-                return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+        let mut parent_collations: Vec<CollationSeq> =
+            Vec::try_with_capacity_ext(parent_cols.len())?;
+        let mut key_affinities: Vec<Affinity> = Vec::try_with_capacity_ext(parent_cols.len())?;
+        for (pc, &cpos) in parent_cols.iter().zip(child_pos.iter()) {
+            let (p, collation, parent_affinity) = match parent_tbl.get_column(pc) {
+                Some((i, column)) => (
+                    i,
+                    crate::translate::collate::column_collation(column)
+                        .unwrap_or(CollationSeq::Binary),
+                    column.affinity(),
+                ),
+                None if ROWID_STRS.iter().any(|r| pc.eq_ignore_ascii_case(r)) => {
+                    (0, CollationSeq::Binary, Affinity::Integer)
+                }
+                None => return Err(fk_mismatch_err(&child.name, &parent_tbl.name)),
             };
+            key_affinities
+                .push_within_capacity(crate::translate::expr::do_comparison_affinity(
+                    parent_affinity,
+                    child.columns[cpos].affinity(),
+                ))
+                .expect("FK key affinity vector was preallocated to parent_cols.len()");
             parent_pos
                 .push_within_capacity(p)
                 .expect("parent FK position vector was preallocated to parent_cols.len()");
+            parent_collations
+                .push_within_capacity(collation)
+                .expect("parent FK collation vector was preallocated to parent_cols.len()");
         }
 
         // A single-column parent key is the rowid when it names rowid/_rowid_/oid
@@ -3624,7 +3742,7 @@ impl Schema {
             None
         } else {
             let found = self
-                .get_indices(namespace, &parent_tbl.name)
+                .get_indices(fk.parent_namespace, &parent_tbl.name)
                 .find(|idx| {
                     idx.unique
                         && idx.where_clause.is_none()
@@ -3633,7 +3751,10 @@ impl Schema {
                             .columns
                             .iter()
                             .zip(parent_cols.iter())
-                            .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                            .zip(parent_collations.iter())
+                            .all(|((ic, pc), collation)| {
+                                ic.name.eq_ignore_ascii_case(pc) && ic.collation == *collation
+                            })
                 })
                 .cloned();
             if require_unique && found.is_none() {
@@ -3644,11 +3765,14 @@ impl Schema {
 
         fk.validate()?;
         Ok(ResolvedFkRef {
+            child_namespace,
             child_table: Arc::clone(child),
             fk: Arc::clone(fk),
             parent_cols,
             child_pos: child_pos.into_boxed_slice(),
             parent_pos: parent_pos.into_boxed_slice(),
+            parent_collations: parent_collations.into_boxed_slice(),
+            key_affinities: key_affinities.into_boxed_slice(),
             parent_uses_rowid,
             parent_unique_index,
         })
@@ -3656,14 +3780,15 @@ impl Schema {
 
     /// Returns if any table declares a FOREIGN KEY whose parent is `table_name`.
     pub fn any_resolved_fks_referencing(&self, namespace: NamespaceId, table_name: &str) -> bool {
-        let objects = self.namespace(namespace);
-        objects.tables.values().any(|t| {
-            let Some(bt) = t.btree() else {
-                return false;
-            };
-            bt.foreign_keys
-                .iter()
-                .any(|fk| fk.parent_table == table_name)
+        self.namespaces.values().any(|objects| {
+            objects.tables.values().any(|t| {
+                let Some(bt) = t.btree() else {
+                    return false;
+                };
+                bt.foreign_keys
+                    .iter()
+                    .any(|fk| fk.parent_namespace == namespace && fk.parent_table == table_name)
+            })
         })
     }
 
@@ -5033,7 +5158,9 @@ impl BTreeTable {
 
     fn primary_key_implies_not_null(&self, column: &Column) -> bool {
         column.primary_key()
-            && (self.is_strict || (!self.has_rowid && self.primary_key_columns.len() == 1))
+            && (column.is_rowid_alias()
+                || self.is_strict
+                || (!self.has_rowid && self.primary_key_columns.len() == 1))
     }
 
     pub fn column_collations(&self) -> Result<Vec<CollationSeq>> {
@@ -5244,8 +5371,7 @@ fn push_collation(sql: &mut String, collation: Option<CollationSeq>) {
             sql.push_str(" COLLATE ");
             sql.push_str(&quote_ident(&collation.name()));
         }
-        CollationSeq::Unset | CollationSeq::Custom(_) => {
-            // Unset should not be reachable -- ignore it
+        CollationSeq::Custom(_) => {
             // Custom collation is not allowed in schema definitions
         }
     };
@@ -5949,6 +6075,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     let fk = ForeignKey {
                         constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
                         parent_table,
+                        parent_namespace: NamespaceId::ROOT,
                         parent_columns,
                         child_columns,
                         on_delete: clause
@@ -6159,6 +6286,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     .as_ref()
                                     .map(|n| normalize_ident(n.as_str())),
                                 parent_table: normalize_ident(clause.tbl_name.as_str()),
+                                parent_namespace: NamespaceId::ROOT,
                                 parent_columns: clause
                                     .columns
                                     .iter()
@@ -6482,6 +6610,8 @@ pub struct ForeignKey {
     pub child_columns: Box<[String]>,
     /// Referenced (parent) table
     pub parent_table: String,
+    /// The namespace of the parent table, within the child's database.
+    pub parent_namespace: NamespaceId,
     /// Parent-side referenced columns. Empty means "use parent's PRIMARY KEY".
     pub parent_columns: Box<[String]>,
     pub on_delete: RefAct,
@@ -6529,6 +6659,8 @@ impl ForeignKey {
 /// Child column names live in `fk.child_columns` — not duplicated here.
 #[derive(Clone, Debug)]
 pub struct ResolvedFkRef {
+    /// The namespace of the child table.
+    pub child_namespace: NamespaceId,
     /// Child table that owns the FK.
     pub child_table: Arc<BTreeTable>,
     /// The FK as declared on the child table.
@@ -6540,6 +6672,15 @@ pub struct ResolvedFkRef {
     /// Column positions in the child/parent tables (pos_in_table)
     pub child_pos: BoxedSlice<usize>,
     pub parent_pos: BoxedSlice<usize>,
+    /// The collation of each parent key column, BINARY for the rowid. A child
+    /// key matches a parent key when they compare equal under these
+    /// collations (SQLite's `fkScanChildren` and `fkActionTrigger` compare
+    /// with the parent column's collation), and only an index with these
+    /// collations can enforce the parent key or find the child rows.
+    pub parent_collations: BoxedSlice<CollationSeq>,
+    /// The affinity applied when a child key is compared with a parent key,
+    /// as SQLite compares `parent_col = child_col`.
+    pub key_affinities: BoxedSlice<Affinity>,
 
     /// If the parent key is rowid or a rowid-alias (single-column only)
     pub parent_uses_rowid: bool,
@@ -6632,6 +6773,10 @@ pub struct Column {
     generated_type: GeneratedType,
     generated_always: bool,
     info: ColumnInfo,
+    /// The declared collation, or for a column of a subquery, view or CTE the
+    /// collation of its expression. None means BINARY. Kept apart from
+    /// `info` because a custom collation does not fit in its bits.
+    collation: Option<CollationSeq>,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -6770,7 +6915,6 @@ impl Column {
         };
         let mut info = ColumnInfo::new(NewColumnInfoParams {
             ty,
-            collation: col,
             coldef: &coldef,
         });
         if coldef.flags.contains(ColDefFlags::InStrictTable) && ty_str.eq_ignore_ascii_case("ANY") {
@@ -6788,6 +6932,7 @@ impl Column {
             generated_type,
             generated_always: false,
             info,
+            collation: col,
             explicit_notnull: coldef.flags.contains(ColDefFlags::ExplicitNotNull),
             notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
@@ -6996,15 +7141,15 @@ impl Column {
     }
     #[inline]
     pub fn collation(&self) -> CollationSeq {
-        self.info.collation()
+        self.collation.unwrap_or(CollationSeq::Binary)
     }
     #[inline]
     pub fn has_explicit_collation(&self) -> bool {
-        self.info.has_explicit_collation()
+        self.collation.is_some()
     }
     #[inline]
     pub fn set_collation(&mut self, c: Option<CollationSeq>) {
-        self.info.set_collation(c)
+        self.collation = c;
     }
     #[inline]
     pub fn primary_key(&self) -> bool {
@@ -7016,7 +7161,7 @@ impl Column {
     }
     #[inline]
     pub fn notnull(&self) -> bool {
-        self.info.notnull()
+        self.info.notnull() || self.is_rowid_alias()
     }
     #[inline]
     pub fn set_notnull(&mut self, v: bool) {
@@ -7162,7 +7307,7 @@ pub struct IndexColumn {
     /// CREATE INDEX idx ON t(b)
     /// b.pos_in_table == 1
     pub pos_in_table: usize,
-    pub collation: Option<CollationSeq>,
+    pub collation: CollationSeq,
     pub default: Option<Box<Expr>>,
     /// Expression for expression indexes. None for simple column indexes.
     pub expr: Option<Box<Expr>>,
@@ -7198,19 +7343,20 @@ pub(crate) use impl_effective_nulls_order;
 impl_effective_nulls_order!(IndexColumn);
 
 impl IndexColumn {
-    /// Returns a default column with the given name and position.
-    pub fn new(name: impl ToString, pos_in_table: usize) -> Self {
+    /// An ascending key column with the given name, position and collation.
+    pub fn new(name: impl ToString, pos_in_table: usize, collation: CollationSeq) -> Self {
         Self {
             name: name.to_string(),
             order: SortOrder::Asc,
             nulls_order: None,
             pos_in_table,
-            collation: None,
+            collation,
             default: None,
             expr: None,
         }
     }
 
+    /// Ascending BINARY key columns with the given names, in order.
     pub fn new_many<I>(names: I) -> Vec<Self>
     where
         I: IntoIterator,
@@ -7226,7 +7372,7 @@ impl IndexColumn {
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table: i,
-                collation: None,
+                collation: CollationSeq::Binary,
                 default: None,
                 expr: None,
             })
@@ -7357,7 +7503,7 @@ impl Index {
                     collation: constraint_columns
                         .get(i)
                         .and_then(|c| c.collation)
-                        .or_else(|| column.collation_opt()),
+                        .unwrap_or_else(|| column.collation()),
                     default: column.default.clone(),
                     expr: None,
                 })
@@ -7413,7 +7559,7 @@ impl Index {
                     collation: constraint_columns
                         .get(i)
                         .and_then(|c| c.collation)
-                        .or_else(|| col.collation_opt()),
+                        .unwrap_or_else(|| col.collation()),
                     default: col.default.clone(),
                     expr: None,
                 })
@@ -7684,6 +7830,109 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_key_finds_its_parent_in_the_parent_namespace() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(1);
+        schema.add_namespace(other);
+        schema
+            .add_btree_table(
+                NamespaceId::ROOT,
+                table("CREATE TABLE p (id INTEGER PRIMARY KEY)", 2),
+            )
+            .unwrap();
+        schema
+            .add_btree_table(other, table("CREATE TABLE p (id INTEGER PRIMARY KEY)", 3))
+            .unwrap();
+        schema
+            .add_btree_table(other, table("CREATE TABLE c (x REFERENCES p(id))", 4))
+            .unwrap();
+
+        let children = schema
+            .resolved_fks_referencing(NamespaceId::ROOT, "p")
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].child_namespace, other);
+        assert_eq!(children[0].child_table.name, "c");
+        assert!(schema.any_resolved_fks_referencing(NamespaceId::ROOT, "p"));
+
+        assert!(schema
+            .resolved_fks_referencing(other, "p")
+            .unwrap()
+            .is_empty());
+        assert!(!schema.any_resolved_fks_referencing(other, "p"));
+
+        let parents = schema.resolved_fks_for_child(other, "c", None).unwrap();
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].fk.parent_namespace, NamespaceId::ROOT);
+    }
+
+    #[test]
+    fn schema_wide_scans_see_every_namespace() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(1);
+        schema.add_namespace(other);
+        schema
+            .add_btree_table(other, table("CREATE TABLE t (x UNIQUE)", 3))
+            .unwrap();
+        let t = schema.get_btree_table(other, "t").unwrap();
+        schema
+            .add_index(
+                other,
+                Arc::new(
+                    Index::from_sql(
+                        &SymbolTable::new(),
+                        "CREATE INDEX i ON t (x)",
+                        4,
+                        t.as_ref(),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+
+        assert!(schema.all_tables().any(|table| table.get_name() == "t"));
+        assert!(schema.all_indexes().any(|index| index.name == "i"));
+        assert!(schema
+            .all_tables_mut()
+            .any(|(namespace, name, _)| namespace == other && name == "t"));
+
+        assert!(!schema.has_materialized_views());
+        schema.add_materialized_view_dependency(other, "t", "v");
+        assert!(schema.has_materialized_views());
+    }
+
+    #[test]
+    fn tables_of_the_same_name_in_two_namespaces_keep_their_own_statistics() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(1);
+        schema.add_namespace(other);
+        schema
+            .add_btree_table(NamespaceId::ROOT, table("CREATE TABLE t (x)", 2))
+            .unwrap();
+        schema
+            .add_btree_table(other, table("CREATE TABLE t (x)", 3))
+            .unwrap();
+        schema
+            .analyze_stats
+            .table_stats_mut(NamespaceId::ROOT, "t")
+            .row_count = Some(10);
+        schema.analyze_stats.table_stats_mut(other, "t").row_count = Some(20);
+
+        let row_count = |schema: &Schema, namespace| {
+            schema
+                .analyze_stats
+                .table_stats(namespace, "t")
+                .and_then(|stats| stats.row_count)
+        };
+        assert_eq!(row_count(&schema, NamespaceId::ROOT), Some(10));
+        assert_eq!(row_count(&schema, other), Some(20));
+
+        schema.remove_table(other, "t");
+        assert_eq!(row_count(&schema, other), None);
+        assert_eq!(row_count(&schema, NamespaceId::ROOT), Some(10));
+    }
+
+    #[test]
     fn persisted_materialized_views_are_loaded_in_dependency_order() {
         let mut views = HashMap::default();
         views.insert(
@@ -7875,13 +8124,17 @@ mod tests {
             for (actual, flag) in [
                 (column.primary_key(), ColDefFlags::PrimaryKey),
                 (column.is_rowid_alias(), ColDefFlags::RowIdAlias),
-                (column.notnull(), ColDefFlags::NotNull),
                 (column.explicit_notnull(), ColDefFlags::ExplicitNotNull),
                 (column.unique(), ColDefFlags::Unique),
                 (column.hidden(), ColDefFlags::Hidden),
             ] {
                 assert_eq!(actual, flags.contains(flag), "{flags:?}: {flag:?}");
             }
+            assert_eq!(
+                column.notnull(),
+                flags.intersects(ColDefFlags::NotNull | ColDefFlags::RowIdAlias),
+                "{flags:?}"
+            );
             assert_eq!(column.ty(), Type::Numeric, "{flags:?}");
             assert_eq!(
                 column.collation_opt(),
@@ -8272,6 +8525,21 @@ mod tests {
         let column = table.get_column("a").unwrap().1;
         assert!(column.notnull());
         Ok(())
+    }
+
+    #[test]
+    fn rowid_alias_is_not_nullable() {
+        for sql in [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE t(id INTEGER, PRIMARY KEY(id))",
+        ] {
+            let table = BTreeTable::from_sql(sql, 2).unwrap();
+            let column = table.get_column("id").unwrap().1;
+            assert!(column.notnull(), "{sql}");
+            assert!(!column.explicit_notnull(), "{sql}");
+        }
+        let table = BTreeTable::from_sql("CREATE TABLE t(id INTEGER PRIMARY KEY DESC)", 2).unwrap();
+        assert!(!table.get_column("id").unwrap().1.notnull());
     }
 
     #[test]
@@ -9402,7 +9670,6 @@ mod tests {
 mod column_info {
     use crate::schema::{ColDef, ColDefFlags, Type};
     use crate::vdbe::affinity::Affinity;
-    use crate::vdbe::CollationSeq;
 
     // flags
     const F_PRIMARY_KEY: u32 = 1;
@@ -9411,18 +9678,16 @@ mod column_info {
     const F_UNIQUE: u32 = 8;
     const F_HIDDEN: u32 = 16;
 
-    // pack Type and Collation in the remaining bits
+    // pack Type in the remaining bits
     const TYPE_SHIFT: u32 = 5;
     const TYPE_MASK: u32 = 0b111 << TYPE_SHIFT;
-    const COLL_SHIFT: u32 = TYPE_SHIFT + 3;
-    const COLL_MASK: u32 = 0b1111_1111_1111 << COLL_SHIFT;
 
-    // Bits 20-22: base type affinity. Column affinity will resolve to this
+    // Bits 8-10: base type affinity. Column affinity will resolve to this
     // value only if it is > 0, else it uses ty_str.
-    const BASE_AFF_SHIFT: u32 = COLL_SHIFT + 12;
+    const BASE_AFF_SHIFT: u32 = TYPE_SHIFT + 3;
     const BASE_AFF_MASK: u32 = 0b111 << BASE_AFF_SHIFT;
 
-    // Bits 23-25: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
+    // Bits 11-13: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
     const ARRAY_DIM_SHIFT: u32 = BASE_AFF_SHIFT + 3;
     const ARRAY_DIM_MASK: u32 = 0b111 << ARRAY_DIM_SHIFT;
 
@@ -9432,7 +9697,6 @@ mod column_info {
 
     pub struct NewColumnInfoParams<'a> {
         pub ty: Type,
-        pub collation: Option<CollationSeq>,
         pub coldef: &'a ColDef,
     }
 
@@ -9442,9 +9706,6 @@ mod column_info {
             let mut raw: u32 = 0;
 
             raw |= (params.ty as u32) << TYPE_SHIFT;
-            if let Some(c) = params.collation {
-                raw |= (u32::from(c.to_bits()) << COLL_SHIFT) & COLL_MASK;
-            }
             if params.coldef.flags.contains(ColDefFlags::PrimaryKey) {
                 raw |= F_PRIMARY_KEY
             }
@@ -9547,30 +9808,6 @@ mod column_info {
         #[inline]
         pub fn set_ty(&mut self, ty: Type) {
             self.0 = (self.0 & !TYPE_MASK) | (((ty as u32) << TYPE_SHIFT) & TYPE_MASK);
-        }
-
-        #[inline]
-        pub fn collation(&self) -> CollationSeq {
-            let v = ((self.0 & COLL_MASK) >> COLL_SHIFT) as u16;
-            if v == CollationSeq::Unset.to_bits() {
-                CollationSeq::Binary
-            } else {
-                CollationSeq::from_storage_bits(v)
-            }
-        }
-
-        #[inline]
-        pub fn has_explicit_collation(&self) -> bool {
-            let v = ((self.0 & COLL_MASK) >> COLL_SHIFT) as u16;
-            v != CollationSeq::Unset.to_bits()
-        }
-
-        #[inline]
-        pub fn set_collation(&mut self, c: Option<CollationSeq>) {
-            self.0 &= !COLL_MASK;
-            if let Some(c) = c {
-                self.0 |= ((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK;
-            }
         }
 
         #[inline]

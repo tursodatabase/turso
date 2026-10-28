@@ -1,3 +1,5 @@
+use crate::translate::collate::CollationSeq;
+use crate::translate::emitter::RegisterColumn;
 use rustc_hash::FxHashMap as HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -7,7 +9,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 use super::emitter::gencol::compute_virtual_columns;
 use crate::alloc::TursoIteratorExt;
 use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR};
-use crate::namespace::NamespaceId;
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
@@ -132,17 +134,8 @@ fn extract_target_expr(e: &ast::Expr) -> (&ast::Expr, Option<String>) {
     }
 }
 
-// Return the index key’s effective collation.
-// If `idx_col.collation` is None, fall back to the column default or "BINARY".
-fn effective_collation_for_index_col(idx_col: &IndexColumn, table: &Table) -> String {
-    if let Some(c) = idx_col.collation.as_ref() {
-        return c.to_string().to_ascii_lowercase();
-    }
-    // Otherwise use the table default, or default to BINARY
-    table
-        .get_column_by_name(&idx_col.name)
-        .map(|s| s.1.collation().to_string())
-        .unwrap_or_else(|| "binary".to_string())
+fn index_column_collation_name(idx_col: &IndexColumn) -> String {
+    idx_col.collation.to_string().to_ascii_lowercase()
 }
 
 /// Match ON CONFLICT target to the PRIMARY KEY/rowid alias.
@@ -372,7 +365,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
                     continue;
                 }
                 let iname = normalize_ident(&ic.name);
-                let icoll = effective_collation_for_index_col(ic, table);
+                let icoll = index_column_collation_name(ic);
                 if tname.eq_ignore_ascii_case(&iname)
                     && match conflict_target.collate.as_ref() {
                         Some(c) => c.eq_ignore_ascii_case(&icoll),
@@ -395,7 +388,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
                     if exprs_are_equivalent(target_expr, idx_expr) {
                         // If target specifies a collation, it must match the index column's.
                         if let Some(ref tc) = target_collate {
-                            let icoll = effective_collation_for_index_col(ic, table);
+                            let icoll = index_column_collation_name(ic);
                             if !tc.eq_ignore_ascii_case(&icoll) {
                                 continue;
                             }
@@ -641,21 +634,19 @@ pub fn emit_upsert(
             continue;
         }
         let reg = layout.to_register(expr_current_start, idx);
-        resolver.register_affinities.insert(reg, col.affinity());
-        resolver.register_collations.insert(reg, col.collation());
+        resolver
+            .register_columns
+            .insert(reg, RegisterColumn::table_column(col));
         if let Some(decoded_start) = excluded_decoded_start {
             let excluded_reg = layout.to_register(decoded_start, idx);
             resolver
-                .register_affinities
-                .insert(excluded_reg, col.affinity());
-            resolver
-                .register_collations
-                .insert(excluded_reg, col.collation());
+                .register_columns
+                .insert(excluded_reg, RegisterColumn::table_column(col));
         }
     }
     resolver
-        .register_affinities
-        .insert(ctx.conflict_rowid_reg, Affinity::Integer);
+        .register_columns
+        .insert(ctx.conflict_rowid_reg, RegisterColumn::rowid());
 
     // The decoded copies hold the columns' custom-type values, so their
     // registers say which type they hold.
@@ -861,7 +852,8 @@ pub fn emit_upsert(
     let (directly_changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
 
     // Fire BEFORE UPDATE triggers
-    let upsert_database_id = ctx.database_id;
+    let upsert_namespace: NamespaceRef = ctx.namespace;
+    let upsert_database_id = upsert_namespace.database_id;
     let updated_positions: ColumnMask = set_pairs
         .iter()
         .map(|(col_idx, _)| *col_idx)
@@ -869,7 +861,7 @@ pub fn emit_upsert(
     let table_btree = table.btree();
     let affected_parent_fks = match (connection.foreign_keys_enabled(), table_btree.as_deref()) {
         (true, Some(table)) => {
-            affected_parent_fks_for_update(resolver, table, &updated_positions, upsert_database_id)?
+            affected_parent_fks_for_update(resolver, table, &updated_positions, upsert_namespace)?
         }
         _ => crate::alloc::vec![],
     };
@@ -888,7 +880,7 @@ pub fn emit_upsert(
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table_btree {
         let relevant_before_update_triggers = get_triggers_including_temp(
             resolver,
-            upsert_database_id,
+            upsert_namespace,
             TriggerEvent::Update,
             TriggerTime::Before,
             Some(set_column_names),
@@ -926,7 +918,7 @@ pub fn emit_upsert(
                     trigger,
                     &trigger_ctx,
                     connection,
-                    upsert_database_id,
+                    upsert_namespace,
                     ctx.loop_labels.row_done,
                 )?;
             }
@@ -986,7 +978,7 @@ pub fn emit_upsert(
 
             let has_relevant_after_triggers = has_triggers_including_temp(
                 resolver,
-                upsert_database_id,
+                upsert_namespace,
                 TriggerEvent::Update,
                 Some(set_column_names),
                 &btree_table,
@@ -1013,7 +1005,7 @@ pub fn emit_upsert(
             // Check if we need to preserve for AFTER triggers
             let has_relevant_after_triggers = has_triggers_including_temp(
                 resolver,
-                upsert_database_id,
+                upsert_namespace,
                 TriggerEvent::Update,
                 Some(set_column_names),
                 &btree_table,
@@ -1059,7 +1051,7 @@ pub fn emit_upsert(
                     rowid_new_reg,
                     &directly_changed_cols,
                     !affected_parent_fks.is_empty(),
-                    upsert_database_id,
+                    upsert_namespace,
                     resolver,
                     &layout,
                 )?;
@@ -1115,7 +1107,7 @@ pub fn emit_upsert(
             rhs: ctx.conflict_rowid_reg,
             target_pc: ok,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::for_internal_values(),
         });
 
         // If another row already has rnew -> constraint
@@ -1159,7 +1151,7 @@ pub fn emit_upsert(
         // unique ones for conflicts, without modifying any index yet.
         for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
             let idx_meta = resolver
-                .with_schema(ctx.database_id, |s| {
+                .with_schema(ctx.namespace.database_id, |s| {
                     s.get_index(ctx.namespace.id, table.get_name(), idx_name)
                         .cloned()
                 })
@@ -1276,7 +1268,7 @@ pub fn emit_upsert(
                     rhs: hit,
                     target_pc: ok,
                     flags: CmpInsFlags::default(),
-                    collation: program.curr_collation(),
+                    collation: CollationSeq::for_internal_values(),
                 });
                 let description = format_unique_violation_desc(table.get_name(), &idx_meta);
                 let regs: Vec<usize> = (0..k).map(|i| ins + i).collect();
@@ -1493,7 +1485,7 @@ pub fn emit_upsert(
             crate::translate::sequence::emit_disk_advance_past(
                 program,
                 resolver,
-                upsert_database_id,
+                upsert_namespace,
                 &seq_name,
                 &seq,
                 rnew,
@@ -1606,7 +1598,7 @@ pub fn emit_upsert(
                 new_start,              // new_values_start
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg), // new_rowid_reg
                 connection,
-                upsert_database_id,
+                upsert_namespace,
                 &affected_parent_fks,
             )?;
         }
@@ -1616,7 +1608,7 @@ pub fn emit_upsert(
     if let (Some(btree_table), Some(old_regs)) = (table.btree(), preserved_old_registers) {
         let relevant_triggers = get_triggers_including_temp(
             resolver,
-            upsert_database_id,
+            upsert_namespace,
             TriggerEvent::Update,
             TriggerTime::After,
             Some(set_column_names),
@@ -1649,7 +1641,7 @@ pub fn emit_upsert(
                     trigger,
                     &trigger_ctx_after,
                     connection,
-                    upsert_database_id,
+                    upsert_namespace,
                     after_trigger_done,
                 )?;
             }

@@ -308,6 +308,53 @@ expect {
     2|3.00
 }
 
+# As in PostgreSQL, numeric with a REAL value gives a REAL, while a decimal
+# literal such as 0.005 or -0.005 is exact and gives a numeric.
+@requires strict "uses STRICT tables"
+test op-numeric-with-real-is-real {
+    CREATE TABLE t1(n numeric(10,2), r real) STRICT;
+    INSERT INTO t1 VALUES (0.10, 0.2);
+    SELECT n + r, typeof(n + r), n * r, r - n, n / r, n + CAST(1 AS REAL), n * -0.005, typeof(n * -0.005) FROM t1;
+}
+expect {
+    0.3|real|0.02|0.1|0.5|1.1|-0.00050|text
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-mod-real-error {
+    CREATE TABLE t1(n numeric(10,2), r real) STRICT;
+    INSERT INTO t1 VALUES (0.10, 0.2);
+    SELECT n % r FROM t1;
+}
+expect error {
+    operator does not exist: numeric % real
+}
+
+# Remainders follow PostgreSQL: the sign of the dividend, and the scale of
+# the operand with more decimals.
+@requires strict "uses STRICT tables"
+test op-numeric-mod {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 3.5), (2, -7.5), (3, 1), (4, NULL);
+    SELECT id, val % 2, val % 0.3, val % -2, 10 % val FROM t1 ORDER BY id;
+}
+expect {
+    1|1.50|0.20|1.50|3.00
+    2|-1.50|0.00|-1.50|2.50
+    3|1.00|0.10|1.00|0.00
+    4||||
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-mod-by-zero {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1);
+    SELECT val % 0 FROM t1;
+}
+expect error {
+    division by zero
+}
+
 @requires strict "uses STRICT tables"
 test op-numeric-lt-literal-multi-row {
     -- numeric < literal across 4 rows (tests no register clobbering).
@@ -514,13 +561,13 @@ expect error {
 
 @requires strict "uses STRICT tables"
 test op-numeric-plus-integer-column {
-    -- numeric arithmetic takes any non-custom operand and computes exactly.
+    -- numeric with an integer computes exactly; with a REAL it gives a REAL.
     CREATE TABLE t1(id INTEGER PRIMARY KEY, n numeric(10,2), i INTEGER, r REAL) STRICT;
     INSERT INTO t1 VALUES (1, 1.5, 7, 0.25);
     SELECT n + i, i + n, n * r FROM t1;
 }
 expect {
-    8.50|8.50|0.3750
+    8.50|8.50|0.375
 }
 
 @requires strict "uses STRICT tables"
@@ -1359,4 +1406,246 @@ test op-numeric-text-that-is-not-a-number-errors {
 }
 expect error {
     invalid input syntax for type numeric: "abc"
+}
+
+# As in PostgreSQL, a product keeps the decimals of both operands but at most
+# 16383 of them, the most a numeric can have. It is rounded to that many.
+@requires strict "uses STRICT tables"
+test op-numeric-mul-rounds-to-largest-scale {
+    CREATE TABLE t(a numeric(20000,10000), b numeric(20000,16383), c numeric(2,1)) STRICT;
+    INSERT INTO t VALUES ('1e-10000', '5e-16383', 0.1);
+    SELECT length(a * a), length(b * c), substr(b * c, -3), substr(b * c * c, -3) FROM t;
+}
+expect {
+    16385|16385|001|000
+}
+
+# A blob is not a number, as in PostgreSQL, where numeric + bytea and date +
+# bytea do not exist. It must not be read as a stored numeric.
+@requires strict "uses STRICT tables"
+test op-numeric-plus-blob-column-error {
+    CREATE TABLE t(n numeric(10,2), b blob) STRICT;
+    INSERT INTO t VALUES (1, x'0102');
+    SELECT n + b FROM t;
+}
+expect error {
+    operator does not exist: numeric \+ blob
+}
+
+@requires strict "uses STRICT tables"
+test op-blob-literal-times-numeric-error {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1);
+    SELECT x'01' * n FROM t;
+}
+expect error {
+    operator does not exist: blob \* numeric
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-plus-cast-to-blob-error {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1);
+    SELECT n + CAST('1' AS BLOB) FROM t;
+}
+expect error {
+    operator does not exist: numeric \+ blob
+}
+
+@requires strict "uses STRICT tables"
+test op-date-plus-blob-column-error {
+    CREATE TABLE t(d date, b blob) STRICT;
+    INSERT INTO t VALUES ('2024-01-01', x'0102');
+    SELECT d + b FROM t;
+}
+expect error {
+    operator does not exist: date \+ blob
+}
+
+# A decimal number written in the statement is exact wherever it is written, as
+# in PostgreSQL: inside a subquery, coalesce, abs, CASE, max, a derived table or
+# a CTE it still gives a numeric result, not a REAL one.
+@requires strict "uses STRICT tables"
+test op-numeric-decimal-literal-inside-expressions-is-exact {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (0.1);
+    SELECT n + (SELECT 0.2) - 0.3, n + coalesce(0.2, 0) - 0.3, n + abs(-0.2) - 0.3, n + CASE WHEN n > 0 THEN 0.2 ELSE 0 END - 0.3, n + (SELECT max(0.2)) - 0.3, n - (-0.2) - 0.5 FROM t;
+    SELECT t.n + x.v - 0.3 FROM t, (SELECT 0.2 AS v) x;
+    WITH c(v) AS (SELECT 0.2) SELECT n + v - 0.3 FROM t, c;
+}
+expect {
+    0.00|0.00|0.00|0.00|0.00|-0.20
+    0.00
+    0.00
+}
+
+# A REAL value stays REAL wherever it comes from, as double precision does in
+# PostgreSQL. So does arithmetic on two plain values, which SQLite computes as
+# a REAL.
+@requires strict "uses STRICT tables"
+test op-numeric-real-inside-expressions-is-real {
+    CREATE TABLE t(n numeric(10,2), r real) STRICT;
+    INSERT INTO t VALUES (0.1, 0.2);
+    SELECT typeof(n + (SELECT r)), typeof(n + coalesce(r, 0)), typeof(n + (SELECT CAST(0.2 AS REAL))), typeof(n + (0.1 + 0.2)) FROM t;
+}
+expect {
+    real|real|real|real
+}
+
+@requires strict "uses STRICT tables"
+test op-date-plus-decimal-in-subquery-error {
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('2024-01-01');
+    SELECT d + (SELECT 0.5) FROM t;
+}
+expect error {
+    operator does not exist: date \+ numeric
+}
+
+# Unary minus, ~, &, |, << and >> on a custom type are decided like + - * / %:
+# the type's function runs them, or they are an error. numeric and smallint
+# declare SQLite's operators for them, so -n is the REAL -3.5, as on main.
+# TODO: -n gives the numeric -3.50, as in PostgreSQL, once every comparison
+# uses numeric's order; a numeric text result compares as text in IN, CASE,
+# min/max and index seeks today.
+@requires strict "uses STRICT tables"
+test op-numeric-and-smallint-unary-and-bitwise {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), s smallint) STRICT;
+    INSERT INTO t VALUES (1, 3.50, 5), (2, NULL, NULL), (3, -0.25, -1);
+    SELECT -n, -n % 2, -n * 2, -(-n), - -n, +n, -s, ~s, s & 3, s | 4, s << 2, s >> 1 FROM t ORDER BY id;
+}
+expect {
+    -3.5|-1.0|-7.0|3.5|3.5|3.50|-5|-6|1|5|20|2
+    |||||||||||
+    0.25|0.0|0.5|-0.25|-0.25|-0.25|1|0|3|-1|-4|-1
+}
+
+@requires strict "uses STRICT tables"
+test op-date-negate-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT -d FROM t;
+}
+expect error {
+    operator does not exist: - date
+}
+
+@requires strict "uses STRICT tables"
+test op-date-bitwise-and-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT d & 1 FROM t;
+}
+expect error {
+    operator does not exist: date & integer
+}
+
+@requires strict "uses STRICT tables"
+test op-date-shift-left-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT d << 1 FROM t;
+}
+expect error {
+    operator does not exist: date << integer
+}
+
+@requires strict "uses STRICT tables"
+test op-date-bitwise-not-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT ~d FROM t;
+}
+expect error {
+    operator does not exist: ~ date
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-bitwise-or-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT n | 1 FROM t;
+}
+expect error {
+    operator does not exist: numeric \\| integer
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-bitwise-not-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT ~n FROM t;
+}
+expect error {
+    operator does not exist: ~ numeric
+}
+
+@requires strict "uses STRICT tables"
+test op-integer-shift-right-numeric-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT 1 >> n FROM t;
+}
+expect error {
+    operator does not exist: integer >> numeric
+}
+
+# A user type has only the operators it declares, and OPERATOR '-' declares
+# the binary one.
+@requires strict "uses STRICT tables"
+test op-user-type-negate-error {
+    CREATE TYPE test_uint(value any) BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value)
+        OPERATOR '-' test_uint_sub;
+    CREATE TABLE t(a test_uint) STRICT;
+    INSERT INTO t VALUES (10);
+    SELECT -a FROM t;
+}
+expect error {
+    operator does not exist: - test_uint
+}
+
+# smallint and bigint run SQLite's operators, but not on a numeric: the
+# numeric's function runs, whichever side the numeric is on.
+@requires strict "uses STRICT tables"
+test op-smallint-and-bigint-with-numeric {
+    CREATE TABLE t(s smallint, b bigint, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 2, 3.50);
+    SELECT s - n, n - s, s + n, s * n, b - n, b * n FROM t;
+}
+expect {
+    -2.50|2.50|4.50|3.50|-1.50|7.00
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-result-compares-as-numeric {
+    -- An operator result on a numeric compares as a number, and the literal
+    -- is not rounded to a scale the result does not have. From PostgreSQL.
+    CREATE TABLE t(n numeric(10,2), i integer) STRICT;
+    INSERT INTO t VALUES (3.50, 10);
+    SELECT (n - 10) > 0, -n < 0, n + 100 > 5, (n - i) > 0, n * 2 = 7, -n < i FROM t;
+    SELECT n = 3.5, n - 1 = 2.5, n - 1 = 2.504 FROM t;
+}
+expect {
+    0|1|1|0|1|1
+    1|1|0
+}
+
+# -n compares as a number wherever values are compared, with and without an
+# index. From PostgreSQL.
+@requires strict "uses STRICT tables"
+test op-numeric-negation-compares-as-number {
+    CREATE TABLE t(n numeric(10,2), i integer) STRICT;
+    INSERT INTO t VALUES (3.50, 10), (0.50, 1);
+    SELECT -n IN (-3.5), CASE -n WHEN -3.5 THEN 'y' ELSE 'n' END, nullif(-n, -3.5) IS NULL FROM t ORDER BY i DESC;
+    SELECT max(-n) = -0.5, min(-n) = -3.5 FROM t;
+    CREATE INDEX t_neg ON t(-n);
+    SELECT i FROM t WHERE -n = -3.5;
+}
+expect {
+    1|y|1
+    0|n|0
+    1|1
+    10
 }

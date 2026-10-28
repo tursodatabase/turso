@@ -7,6 +7,7 @@ use crate::numeric::Numeric;
 use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
 use crate::sync::Arc;
 use crate::translate::{
+    catalog::CatalogContext,
     collate::CollationSeq,
     emitter::{
         emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
@@ -170,7 +171,7 @@ pub fn translate_create_index(
     if !tbl.has_rowid {
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
     }
-    let columns = resolve_sorted_columns_with_resolver(&tbl, &columns, Some(resolver))?;
+    let columns = resolve_sorted_columns_with_catalog(&tbl, &columns, Some(&resolver.catalog))?;
 
     // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
     for col in &columns {
@@ -209,7 +210,7 @@ pub fn translate_create_index(
 
     let mut index_method = None;
     if let Some(using) = &using {
-        let index_modules = &resolver.symbol_table.index_methods;
+        let index_modules = &resolver.catalog.symbol_table.index_methods;
         let using = using.as_str();
         let index_module = index_modules.get(using);
         if index_module.is_none() {
@@ -303,7 +304,7 @@ pub fn translate_create_index(
     emit_refill_index(
         program,
         resolver,
-        database_id,
+        namespace,
         &tbl,
         &idx,
         index_cursor_id,
@@ -344,7 +345,7 @@ pub fn translate_create_index(
 pub(crate) fn emit_refill_index(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    database_id: usize,
+    namespace: NamespaceRef,
     tbl: &Arc<BTreeTable>,
     idx: &Arc<Index>,
     index_cursor_id: usize,
@@ -378,7 +379,7 @@ pub(crate) fn emit_refill_index(
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id,
+            namespace,
             indexed: None,
             plan_estimate: None,
         }],
@@ -394,13 +395,13 @@ pub(crate) fn emit_refill_index(
         program.emit_insn(Insn::OpenRead {
             cursor_id: table_cursor_id,
             root_page: tbl.root_page,
-            db: database_id,
+            db: namespace.database_id,
         });
 
         program.emit_insn(Insn::OpenWrite {
             cursor_id: index_cursor_id,
             root_page: index_root_page,
-            db: database_id,
+            db: namespace.database_id,
         });
 
         let loop_start_label = program.allocate_label();
@@ -501,7 +502,7 @@ pub(crate) fn emit_refill_index(
         program.emit_insn(Insn::OpenRead {
             cursor_id: table_cursor_id,
             root_page: tbl.root_page,
-            db: database_id,
+            db: namespace.database_id,
         });
 
         let loop_start_label = program.allocate_label();
@@ -575,7 +576,7 @@ pub(crate) fn emit_refill_index(
 
         if let Some(root) = clear_existing_root {
             program.emit_insn(Insn::ClearBtree {
-                db: database_id,
+                db: namespace.database_id,
                 root,
                 count: ClearBtreeCount::Nothing,
             });
@@ -583,7 +584,7 @@ pub(crate) fn emit_refill_index(
         program.emit_insn(Insn::OpenWrite {
             cursor_id: index_cursor_id,
             root_page: index_root_page,
-            db: database_id,
+            db: namespace.database_id,
         });
 
         let sorted_loop_start = program.allocate_label();
@@ -668,7 +669,7 @@ pub fn translate_reindex(
     let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);
 
-    let targets = resolve_reindex_targets(name.as_ref(), resolver, connection)?;
+    let targets = resolve_reindex_targets(name.as_ref(), &resolver.catalog, connection)?;
     if targets.is_empty() {
         return Ok(());
     }
@@ -702,7 +703,7 @@ pub fn translate_reindex(
         emit_refill_index(
             program,
             resolver,
-            namespace.database_id,
+            namespace,
             &table,
             &index,
             index_cursor_id,
@@ -720,7 +721,7 @@ pub fn translate_reindex(
 /// names are schema-local and can only refer to a table or index in that database.
 fn resolve_reindex_targets(
     name: Option<&QualifiedName>,
-    resolver: &Resolver,
+    resolver: &CatalogContext,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<Vec<ReindexTarget>> {
     let Some(name) = name else {
@@ -762,7 +763,7 @@ fn resolve_reindex_targets(
 
 /// Returns every reindexable index across temp, main, and attached databases.
 fn collect_all_reindex_targets(
-    resolver: &Resolver,
+    resolver: &CatalogContext,
     connection: &Arc<crate::Connection>,
 ) -> Vec<ReindexTarget> {
     let mut targets = Vec::new();
@@ -774,7 +775,7 @@ fn collect_all_reindex_targets(
 
 /// Returns every index across all schemas that contains at least one column using `collation`.
 fn collect_reindex_targets_by_collation(
-    resolver: &Resolver,
+    resolver: &CatalogContext,
     connection: &Arc<crate::Connection>,
     collation: CollationSeq,
 ) -> Vec<ReindexTarget> {
@@ -792,7 +793,7 @@ fn collect_reindex_targets_by_collation(
 /// Returns every reindexable index in one schema database.
 fn collect_all_reindex_targets_in_db(
     database_id: usize,
-    resolver: &Resolver,
+    resolver: &CatalogContext,
 ) -> Vec<ReindexTarget> {
     resolver.with_schema(database_id, |schema| {
         schema
@@ -826,7 +827,7 @@ fn collect_all_reindex_targets_in_db(
 /// temp first, main second, then attached databases by numeric database id.
 fn find_reindex_table(
     table_name: &str,
-    resolver: &Resolver,
+    resolver: &CatalogContext,
     connection: &Arc<crate::Connection>,
 ) -> Option<Vec<ReindexTarget>> {
     for database_id in reindex_unqualified_search_database_ids(connection) {
@@ -848,7 +849,7 @@ fn find_reindex_table(
 fn find_reindex_table_in_namespace(
     table_name: &str,
     namespace: NamespaceRef,
-    resolver: &Resolver,
+    resolver: &CatalogContext,
 ) -> Option<Vec<ReindexTarget>> {
     resolver.with_schema(namespace.database_id, |schema| {
         let object_type = schema.get_object_type(namespace.id, table_name)?;
@@ -876,7 +877,7 @@ fn find_reindex_table_in_namespace(
 /// This is tried only after collation and table lookup fail.
 fn find_reindex_index(
     index_name: &str,
-    resolver: &Resolver,
+    resolver: &CatalogContext,
     connection: &Arc<crate::Connection>,
 ) -> Option<ReindexTarget> {
     for database_id in reindex_unqualified_search_database_ids(connection) {
@@ -891,7 +892,7 @@ fn find_reindex_index(
 fn find_reindex_index_in_db(
     index_name: &str,
     database_id: usize,
-    resolver: &Resolver,
+    resolver: &CatalogContext,
 ) -> Option<ReindexTarget> {
     resolver.with_schema(database_id, |schema| {
         for namespace in schema.namespace_ids() {
@@ -934,14 +935,14 @@ fn index_matches_collation(index: &Index, collation: CollationSeq) -> bool {
     index
         .columns
         .iter()
-        .any(|column| column.collation.unwrap_or_default() == collation)
+        .any(|column| column.collation == collation)
 }
 
 pub fn resolve_sorted_columns(
     table: &BTreeTable,
     cols: &[SortedColumn],
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
-    resolve_sorted_columns_with_resolver(table, cols, None)
+    resolve_sorted_columns_with_catalog(table, cols, None)
 }
 
 pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
@@ -953,10 +954,10 @@ pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
     Ok(())
 }
 
-fn resolve_sorted_columns_with_resolver(
+fn resolve_sorted_columns_with_catalog(
     table: &BTreeTable,
     cols: &[SortedColumn],
-    resolver: Option<&Resolver>,
+    resolver: Option<&CatalogContext>,
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
     let mut resolved =
         <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
@@ -969,7 +970,7 @@ fn resolve_sorted_columns_with_resolver(
         // Unwrap parentheses for column resolution (SQLite treats (('col')) same as 'col')
         let unwrapped_expr = unwrap_parens(base_expr)?;
         if let Some((pos, column_name, column)) = resolve_index_column(unwrapped_expr, table) {
-            let collation = explicit_collation.or_else(|| column.collation_opt());
+            let collation = explicit_collation.unwrap_or_else(|| column.collation());
             let expr = match column.generated_type() {
                 GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
                 GeneratedType::NotGenerated => None,
@@ -996,7 +997,7 @@ fn resolve_sorted_columns_with_resolver(
                 order,
                 nulls_order: nulls,
                 pos_in_table: EXPR_INDEX_SENTINEL,
-                collation: explicit_collation,
+                collation: explicit_collation.unwrap_or(CollationSeq::Binary),
                 default: None,
                 expr: Some(sc.expr.clone()),
             })
@@ -1010,7 +1011,7 @@ fn resolve_sorted_columns_with_resolver(
 /// returns (Some(CollationSeq), Expr::Id(col1))
 fn extract_collation<'a>(
     expr: &'a Expr,
-    resolver: Option<&Resolver>,
+    resolver: Option<&CatalogContext>,
 ) -> crate::Result<(Option<CollationSeq>, &'a Expr)> {
     let mut current = expr;
     let mut coll = None;
@@ -1359,7 +1360,7 @@ pub fn translate_drop_index(
         rhs: dest_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: Some(CollationSeq::NoCase),
+        collation: CollationSeq::NoCase,
     });
 
     // read type of table
@@ -1371,7 +1372,7 @@ pub fn translate_drop_index(
         rhs: dest_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: CollationSeq::for_internal_values(),
     });
 
     program.emit_insn(Insn::RowId {
@@ -1458,6 +1459,7 @@ pub fn translate_drop_index(
     program.emit_insn(Insn::DropIndex {
         index: index.clone(),
         db: database_id,
+        namespace: namespace.id,
     });
 
     Ok(())

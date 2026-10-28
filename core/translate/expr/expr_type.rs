@@ -7,7 +7,7 @@
 
 use turso_parser::ast;
 
-use super::custom_type_operators::find_arithmetic_call;
+use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
 use crate::function::{AggFunc, Func, ScalarFunc};
 use crate::schema::{Column, Schema, Table, TypeDef};
@@ -47,6 +47,11 @@ pub(crate) enum ExprType {
 pub(crate) enum BuiltinType {
     Integer,
     Real,
+    /// A decimal number written in the statement, such as `0.5` or `1e3`. SQLite
+    /// stores it as a REAL, but like a PostgreSQL numeric literal it is exact to
+    /// a custom type's operators: `numeric_column * 0.1` computes with 0.1, not
+    /// with the REAL nearest to it.
+    Decimal,
     /// A number that may be an integer or a real.
     Numeric,
     Text,
@@ -141,13 +146,16 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             ..
         } => cast_type(type_name, env.schema()),
         ast::Expr::Unary(op, inner) => match op {
-            ast::UnaryOperator::Not | ast::UnaryOperator::BitwiseNot => {
-                ExprType::Builtin(BuiltinType::Integer)
+            ast::UnaryOperator::Not => ExprType::Builtin(BuiltinType::Integer),
+            ast::UnaryOperator::BitwiseNot => {
+                custom_operator_type(expr, &[type_of(inner, env)], env)
+                    .unwrap_or(ExprType::Builtin(BuiltinType::Integer))
             }
-            ast::UnaryOperator::Negative => arithmetic_type(
-                &ExprType::Builtin(BuiltinType::Integer),
-                &sqlite_operand_type(type_of(inner, env), env.schema()),
-            ),
+            ast::UnaryOperator::Negative => {
+                let inner_type = type_of(inner, env);
+                custom_operator_type(expr, core::slice::from_ref(&inner_type), env)
+                    .unwrap_or_else(|| negated_type(inner_type, env.schema()))
+            }
             ast::UnaryOperator::Positive => {
                 unreachable!("without_wrappers looks through unary +")
             }
@@ -344,7 +352,7 @@ fn literal_type(literal: &ast::Literal) -> ExprType {
         _ => {
             match crate::translate::alter::literal_default_value(literal).map(|v| v.value_type()) {
                 Ok(crate::types::ValueType::Integer) => ExprType::Builtin(BuiltinType::Integer),
-                Ok(crate::types::ValueType::Float) => ExprType::Builtin(BuiltinType::Real),
+                Ok(crate::types::ValueType::Float) => ExprType::Builtin(BuiltinType::Decimal),
                 Ok(crate::types::ValueType::Text) => ExprType::Builtin(BuiltinType::Text),
                 _ => ExprType::Builtin(BuiltinType::Any),
             }
@@ -476,6 +484,11 @@ pub(crate) fn column_type(column: &Column, is_strict: bool, schema: &Schema) -> 
             type_def: Arc::clone(type_def),
             params: column.ty_params.clone(),
         },
+        // A BLOB column of a STRICT table holds only blobs. In other tables it
+        // may hold any value, as may an ANY column.
+        None if is_strict && column.ty_str.eq_ignore_ascii_case("blob") => {
+            ExprType::Builtin(BuiltinType::Blob)
+        }
         None => builtin_type_of_affinity(column.affinity()),
     };
     ExprType::array(scalar, column.array_dimensions())
@@ -485,7 +498,11 @@ fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
     let name = crate::util::dequote(&type_name.name);
     let scalar = match custom_cast_target(&name, type_name, schema) {
         Some(custom) => custom,
-        None => builtin_type_of_affinity(Affinity::of_written_type(&name)),
+        None => match Affinity::of_written_type(&name) {
+            // A CAST to BLOB always gives a blob.
+            Affinity::Blob => ExprType::Builtin(BuiltinType::Blob),
+            affinity => builtin_type_of_affinity(affinity),
+        },
     };
     ExprType::array(scalar, type_name.array_dimensions)
 }
@@ -534,12 +551,21 @@ fn binary_type(
         | Operator::Subtract
         | Operator::Multiply
         | Operator::Divide
-        | Operator::Modulus => arithmetic_result_type(lhs, op, rhs, env),
-        Operator::BitwiseAnd
-        | Operator::BitwiseOr
-        | Operator::BitwiseNot
-        | Operator::LeftShift
-        | Operator::RightShift
+        | Operator::Modulus => {
+            let types = [type_of(lhs, env), type_of(rhs, env)];
+            custom_operator_type(expr, &types, env).unwrap_or_else(|| {
+                let [lhs_type, rhs_type] = types;
+                arithmetic_type(
+                    &sqlite_operand_type(lhs_type, env.schema()),
+                    &sqlite_operand_type(rhs_type, env.schema()),
+                )
+            })
+        }
+        Operator::BitwiseAnd | Operator::BitwiseOr | Operator::LeftShift | Operator::RightShift => {
+            custom_operator_type(expr, &[type_of(lhs, env), type_of(rhs, env)], env)
+                .unwrap_or(ExprType::Builtin(BuiltinType::Integer))
+        }
+        Operator::BitwiseNot
         | Operator::Equals
         | Operator::NotEquals
         | Operator::Less
@@ -568,37 +594,42 @@ fn binary_type(
     }
 }
 
-/// The type of `lhs op rhs`: what the custom type's function returns, if one
-/// runs it, or else what SQLite's operator returns. An operator that does not
-/// exist, such as `date * 2`, has no type: emitting it fails.
-fn arithmetic_result_type(
-    lhs: &ast::Expr,
-    op: &ast::Operator,
-    rhs: &ast::Expr,
-    env: &TypeEnv,
-) -> ExprType {
-    let lhs_type = type_of(lhs, env);
-    let rhs_type = type_of(rhs, env);
-    match find_arithmetic_call(lhs, op, rhs, [&lhs_type, &rhs_type], env) {
-        Ok(Some(call)) => match &call.result {
+/// The type of the operator expression `expr` when a custom type's function runs
+/// it: what the function returns. `None` means SQLite's operator runs. An
+/// operator that does not exist, such as `date * 2`, has no type: emitting it
+/// fails. `types` are the operands' types.
+fn custom_operator_type(expr: &ast::Expr, types: &[ExprType], env: &TypeEnv) -> Option<ExprType> {
+    match find_operator_call(expr, types, env) {
+        Ok(Some(call)) => Some(match &call.result {
             Some(result) => call_result_type(result, env.schema()),
             None => ExprType::Unknown,
-        },
-        Ok(None) => arithmetic_type(
-            &sqlite_operand_type(lhs_type, env.schema()),
-            &sqlite_operand_type(rhs_type, env.schema()),
-        ),
-        Err(_) => ExprType::Unknown,
+        }),
+        Ok(None) => None,
+        Err(_) => Some(ExprType::Unknown),
     }
 }
 
 /// The type an operand has for SQLite's own arithmetic. A custom value that no
 /// function of its type runs goes to SQLite's operator as a value of the type it
-/// is stored as: `smallint * 2` is an integer.
+/// is stored as: `smallint * 2` is an integer. A decimal written in the
+/// statement is a REAL to SQLite.
 pub(super) fn sqlite_operand_type(ty: ExprType, schema: &Schema) -> ExprType {
     match &ty {
         ExprType::Custom { type_def, .. } => stored_type(type_def, schema),
+        ExprType::Builtin(BuiltinType::Decimal) => ExprType::Builtin(BuiltinType::Real),
         _ => ty,
+    }
+}
+
+/// The type of `-x` and `abs(x)`. Negating a decimal written in the statement
+/// gives a decimal, as `-0.5` is one.
+fn negated_type(ty: ExprType, schema: &Schema) -> ExprType {
+    match ty {
+        ExprType::Builtin(BuiltinType::Decimal) => ty,
+        ty => arithmetic_type(
+            &ExprType::Builtin(BuiltinType::Integer),
+            &sqlite_operand_type(ty, schema),
+        ),
     }
 }
 
@@ -624,9 +655,15 @@ pub(crate) fn stored_type(type_def: &TypeDef, schema: &Schema) -> ExprType {
 /// result is unknown.
 fn arithmetic_type(lhs: &ExprType, rhs: &ExprType) -> ExprType {
     use BuiltinType::{Integer, Numeric, Real};
+    let is_custom_or_decimal = |ty: &ExprType| {
+        matches!(
+            ty,
+            ExprType::Custom { .. } | ExprType::Builtin(BuiltinType::Decimal)
+        )
+    };
     assert!(
-        !matches!(lhs, ExprType::Custom { .. }) && !matches!(rhs, ExprType::Custom { .. }),
-        "custom operands of SQLite arithmetic must be typed by their stored type first"
+        !is_custom_or_decimal(lhs) && !is_custom_or_decimal(rhs),
+        "operands of SQLite arithmetic must be typed as SQLite sees them first"
     );
     let is_array_or_unknown =
         |ty: &ExprType| matches!(ty, ExprType::Array { .. } | ExprType::Unknown);
@@ -667,10 +704,7 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
             ExprType::Builtin(BuiltinType::Any)
         }
         Func::Scalar(ScalarFunc::Nullif) => type_of(&args[0], env),
-        Func::Scalar(ScalarFunc::Abs) => arithmetic_type(
-            &ExprType::Builtin(BuiltinType::Integer),
-            &sqlite_operand_type(type_of(&args[0], env), env.schema()),
-        ),
+        Func::Scalar(ScalarFunc::Abs) => negated_type(type_of(&args[0], env), env.schema()),
         Func::Scalar(ScalarFunc::ArrayElement) => match type_of(&args[0], env) {
             ExprType::Array {
                 element,
@@ -687,7 +721,9 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
 /// PostgreSQL frontend will choose its own common type through the dialect.
 ///
 /// NULLs don't count. An array wins over anything else, as main has always decoded
-/// such a value as an array. Numbers widen as in arithmetic. String literals count
+/// such a value as an array. Numbers widen as in arithmetic, except that a decimal
+/// written in the statement mixed with an integer stays a decimal: both are
+/// exact, as in PostgreSQL. String literals count
 /// as text. The same custom type with different parameters, such as numeric(10,2)
 /// and numeric(5,1), is that type without parameters. A custom type mixed with any
 /// other type counts as the type it is stored as. Any other mix is `Any`.
@@ -710,7 +746,7 @@ fn common_of_types(types: impl Iterator<Item = ExprType>, schema: &Schema) -> Ex
 }
 
 fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
-    use BuiltinType::{Integer, Numeric, Real, Text};
+    use BuiltinType::{Decimal, Integer, Numeric, Real, Text};
     match (a, b) {
         (ExprType::Unknown, _) | (_, ExprType::Unknown) => ExprType::Unknown,
         (ExprType::Untyped, ExprType::Untyped) => ExprType::Untyped,
@@ -719,10 +755,15 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
             ExprType::Untyped | ExprType::Builtin(Text),
         ) => ExprType::Builtin(Text),
         (ExprType::Builtin(a), ExprType::Builtin(b)) if a == b => ExprType::Builtin(a),
+        (ExprType::Builtin(Decimal), ExprType::Builtin(Integer))
+        | (ExprType::Builtin(Integer), ExprType::Builtin(Decimal)) => ExprType::Builtin(Decimal),
         (
-            a @ ExprType::Builtin(Integer | Real | Numeric),
-            b @ ExprType::Builtin(Integer | Real | Numeric),
-        ) => arithmetic_type(&a, &b),
+            a @ ExprType::Builtin(Integer | Real | Decimal | Numeric),
+            b @ ExprType::Builtin(Integer | Real | Decimal | Numeric),
+        ) => arithmetic_type(
+            &sqlite_operand_type(a, schema),
+            &sqlite_operand_type(b, schema),
+        ),
         (
             ExprType::Custom {
                 type_def,
@@ -815,11 +856,14 @@ mod tests {
     fn literals_and_casts() {
         check(&[
             ("1", builtin(BuiltinType::Integer)),
-            ("1.5", builtin(BuiltinType::Real)),
+            ("1.5", builtin(BuiltinType::Decimal)),
+            ("-1.5", builtin(BuiltinType::Decimal)),
+            ("abs(-1.5)", builtin(BuiltinType::Decimal)),
             ("'a'", ExprType::Untyped),
             ("x'00'", builtin(BuiltinType::Blob)),
             ("NULL", ExprType::Null),
             ("CAST(1 AS TEXT)", builtin(BuiltinType::Text)),
+            ("CAST(1 AS BLOB)", builtin(BuiltinType::Blob)),
             ("CAST(1 AS cents)", custom("cents", &[])),
             ("CAST(1 AS numeric(10, 2))", custom("numeric", &["10", "2"])),
             // numeric needs a precision and a scale, so without them this is
@@ -837,6 +881,10 @@ mod tests {
         check(&[
             (
                 "CASE WHEN 1 THEN 1 ELSE 2.5 END",
+                builtin(BuiltinType::Decimal),
+            ),
+            (
+                "CASE WHEN 1 THEN CAST(1 AS REAL) ELSE 2.5 END",
                 builtin(BuiltinType::Real),
             ),
             ("CASE WHEN 1 THEN 'a' END", ExprType::Untyped),
@@ -876,10 +924,20 @@ mod tests {
         check(&[
             ("1 + 2", builtin(BuiltinType::Integer)),
             ("1 + 2.5", builtin(BuiltinType::Real)),
+            ("0.5 + 2.5", builtin(BuiltinType::Real)),
             ("1 + 'a'", builtin(BuiltinType::Numeric)),
             ("-CAST(1 AS REAL)", builtin(BuiltinType::Real)),
             // cents declares no `+`, so the statement fails with "operator does not exist".
             ("CAST(1 AS cents) + 1", ExprType::Unknown),
+            // Nor any other operator.
+            ("-CAST(1 AS cents)", ExprType::Unknown),
+            ("~CAST(1 AS cents)", ExprType::Unknown),
+            ("CAST(1 AS cents) & 1", ExprType::Unknown),
+            // SQLite's unary minus for now; numeric_neg once comparisons use
+            // numeric's order.
+            ("-CAST(1 AS numeric(10, 2))", builtin(BuiltinType::Numeric)),
+            ("-CAST(1 AS smallint)", builtin(BuiltinType::Integer)),
+            ("CAST(1 AS smallint) << 1", builtin(BuiltinType::Integer)),
             ("abs(CAST(1 AS cents))", builtin(BuiltinType::Integer)),
             ("1 || 2", builtin(BuiltinType::Text)),
         ]);

@@ -107,7 +107,7 @@ pub fn create_dbsp_state_index(
             nulls_order: None,
             // Key columns carry the defining query's comparison collation
             // (see state_table_sql), and the index must compare the same way.
-            collation: state_table.columns()[pos_in_table].collation_opt(),
+            collation: state_table.columns()[pos_in_table].collation(),
             pos_in_table,
             default: None,
             expr: None,
@@ -704,7 +704,14 @@ pub struct IncrementalView {
 crate::assert::assert_send_sync!(IncrementalView);
 
 impl IncrementalView {
-    pub fn from_sql(sql: &str, schema: &Schema, main_data_root: i64) -> Result<Self> {
+    /// Builds the view from its `CREATE MATERIALIZED VIEW` text. `namespace`
+    /// is the namespace the view is in, where its unqualified names resolve.
+    pub fn from_sql(
+        sql: &str,
+        schema: &Schema,
+        main_data_root: i64,
+        namespace: crate::namespace::NamespaceId,
+    ) -> Result<Self> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         let cmd = cmd.expect("View is an empty statement");
@@ -715,7 +722,7 @@ impl IncrementalView {
                 columns,
                 select,
             }) => {
-                let mut column_schema = extract_view_columns(&select, schema)?;
+                let mut column_schema = extract_view_columns(namespace, &select, schema)?;
                 column_schema.rename_columns(&columns);
                 Ok(Self {
                     name: view_name.name.as_str().to_string(),

@@ -58,10 +58,11 @@ impl TypeOrdering {
     }
 }
 
-/// Arrays first, element by element and then shorter first; then any other
-/// value in SQLite's order. NULL is an empty array, as in the array functions.
+/// NULL first; then arrays, element by element and then shorter first; then
+/// any other value in SQLite's order.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum ArraySortKey<'a> {
+    Null,
     Elements(ArrayElements),
     Other(ValueRef<'a>),
 }
@@ -69,7 +70,7 @@ enum ArraySortKey<'a> {
 impl<'a> ArraySortKey<'a> {
     fn of(value: ValueRef<'a>) -> Self {
         let elements = match value {
-            ValueRef::Null => Some(Vec::new()),
+            ValueRef::Null => return Self::Null,
             ValueRef::Blob(blob) => array_values_from_blob(blob).ok(),
             ValueRef::Text(text) => parse_text_array(text.as_str()),
             ValueRef::Numeric(_) => None,
@@ -84,15 +85,16 @@ impl<'a> ArraySortKey<'a> {
 impl Hash for ArraySortKey<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
+            Self::Null => 0u8.hash(state),
             Self::Elements(elements) => {
-                0u8.hash(state);
+                1u8.hash(state);
                 elements.0.len().hash(state);
                 for element in &elements.0 {
                     hash_sqlite_value(element.as_value_ref(), state);
                 }
             }
             Self::Other(value) => {
-                1u8.hash(state);
+                2u8.hash(state);
                 hash_sqlite_value(*value, state);
             }
         }
@@ -263,14 +265,15 @@ mod tests {
         assert_order(
             TypeOrdering::Array,
             &[
-                &[Value::Null, Value::from_text("{}")],
+                &[Value::Null],
+                &[Value::from_text("{}")],
                 &[Value::from_text("{1}"), Value::from_text("{1.0}")],
                 &[Value::from_text("{1, 2}")],
                 &[Value::from_text("{2}")],
                 &[Value::from_text("{a}")],
                 &[int(5)],
                 &[Value::from_text("not an array")],
-                &[Value::Blob(vec![0xff, 0xff])],
+                &[Value::from_blob(crate::alloc::vec![0xff, 0xff])],
             ],
         );
     }
@@ -299,7 +302,7 @@ mod tests {
                 &[Value::from_text("apple")],
                 &[Value::from_text("cherry")],
                 &[int(1), Value::from_f64(1.0)],
-                &[Value::Blob(vec![0])],
+                &[Value::from_blob(crate::alloc::vec![0])],
             ],
         );
     }

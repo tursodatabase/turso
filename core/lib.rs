@@ -39,6 +39,7 @@ pub mod schema;
 pub mod skiplist;
 pub mod state_machine;
 pub mod storage;
+pub mod type_ordering;
 pub mod types;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod vdbe;
@@ -84,7 +85,6 @@ mod stats;
 #[cfg(feature = "time")]
 mod time;
 mod translate;
-pub mod type_ordering;
 mod util;
 #[cfg(feature = "uuid")]
 mod uuid;
@@ -162,7 +162,7 @@ pub use io::{
     CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO, SharedBufferData,
     SyscallIO, WriteCompletion, IO,
 };
-pub use namespace::{NamespaceId, NamespaceRef, Namespaces};
+pub use namespace::{Namespace, NamespaceId, NamespaceRef, Namespaces};
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
 pub use storage::{

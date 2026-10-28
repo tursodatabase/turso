@@ -306,20 +306,8 @@ fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<Has
     let valid_columns: HashSet<&str> = columns.iter().map(|c| c.name.as_str()).collect();
 
     // Parse format: "col1=1.5,col2=2.0"
-    for part in weights_str.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-
-        let (col_name, weight_str) = part.split_once('=').ok_or_else(|| {
-            LimboError::ParseError(format!(
-                "invalid weight format '{part}'. Expected 'column=weight' (e.g., 'title=2.0')",
-            ))
-        })?;
-
-        let col_name = col_name.trim();
-        let weight_str = weight_str.trim();
+    for entry in split_weights(weights_str) {
+        let (col_name, weight_str) = entry?;
 
         // Validate column exists in index
         if !valid_columns.contains(col_name) {
@@ -360,6 +348,77 @@ impl IndexMethod for FtsIndexMethod {
         let attachment = FtsIndexAttachment::new(cfg.clone())?;
         Ok(Arc::new(attachment))
     }
+
+    fn rename_column_in_with_clause(
+        &self,
+        with_clause: &mut [(ast::Name, Box<ast::Expr>)],
+        from: &str,
+        to: &str,
+    ) -> Result<()> {
+        let Some((_, value)) = with_clause
+            .iter_mut()
+            .find(|(key, _)| key.as_str().eq_ignore_ascii_case("weights"))
+        else {
+            return Ok(());
+        };
+        let ast::Expr::Literal(ast::Literal::String(weights)) = value.as_mut() else {
+            return Ok(());
+        };
+        let entries = split_weights(weights).collect::<Result<Vec<_>>>()?;
+        if !entries
+            .iter()
+            .any(|(column, _)| column.eq_ignore_ascii_case(from))
+        {
+            return Ok(());
+        }
+        let renamed: Vec<(&str, &str)> = entries
+            .into_iter()
+            .map(|(column, weight)| {
+                if column.eq_ignore_ascii_case(from) {
+                    (to, weight)
+                } else {
+                    (column, weight)
+                }
+            })
+            .collect();
+        let renamed_weights = format!(
+            "'{}'",
+            crate::util::escape_sql_string_literal(
+                &renamed
+                    .iter()
+                    .map(|(column, weight)| format!("{column}={weight}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        );
+        if !split_weights(&renamed_weights)
+            .collect::<Result<Vec<_>>>()
+            .is_ok_and(|read_back| read_back == renamed)
+        {
+            return Err(LimboError::ParseError(format!(
+                "cannot rename column {from} to \"{to}\": the name cannot be written in FTS weights"
+            )));
+        }
+        *weights = renamed_weights;
+        Ok(())
+    }
+}
+
+/// Splits a weights value like 'title=2.0, body=1.0' into (column, weight) pairs
+fn split_weights(weights: &str) -> impl Iterator<Item = Result<(&str, &str)>> + '_ {
+    weights
+        .trim_matches(|c| c == '\'' || c == '"')
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (column, weight) = part.split_once('=').ok_or_else(|| {
+                LimboError::ParseError(format!(
+                    "invalid weight format '{part}'. Expected 'column=weight' (e.g., 'title=2.0')",
+                ))
+            })?;
+            Ok((column.trim(), weight.trim()))
+        })
 }
 
 /// The single cursor allowed to flush this FTS index for a given connection.
@@ -732,13 +791,10 @@ impl FtsIndexAttachment {
         let field_weights = if let Some(weights_value) = parameters.get(UncasedStr::new("weights"))
         {
             let weights_str = match weights_value {
-                Value::Text(t) => {
-                    let s = t.to_string();
-                    s.trim_matches(|c| c == '\'' || c == '"').to_string()
-                }
-                _ => String::new(),
+                Value::Text(t) => t.as_str(),
+                _ => "",
             };
-            parse_field_weights(&weights_str, &cfg.columns)?
+            parse_field_weights(weights_str, &cfg.columns)?
         } else {
             HashMap::default()
         };

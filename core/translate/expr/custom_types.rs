@@ -106,7 +106,11 @@ pub(super) fn emit_custom_comparison(
         constant_mask: 0,
         start_reg: func_start,
         dest: result_reg,
-        func: FuncCtx { func, arg_count: 2 },
+        func: FuncCtx {
+            func,
+            arg_count: 2,
+            collation: CollationSeq::Binary,
+        },
     });
     if resolved.negate {
         program.emit_insn(Insn::Not {
@@ -191,7 +195,7 @@ pub(super) struct ResolvedOperator {
 /// its type.
 ///
 /// Comparisons are decided here, while emitting, because index seeks look for a
-/// plain comparison in the tree. Arithmetic is decided by `custom_arithmetic_call`.
+/// plain comparison in the tree. Other operators are decided by `custom_operator_call`.
 pub(super) fn find_custom_comparison(
     e1: &ast::Expr,
     e2: &ast::Expr,
@@ -204,8 +208,10 @@ pub(super) fn find_custom_comparison(
     }
     let op_str = operator_to_str(op)?;
     let env = TypeEnv::new(referenced_tables, resolver);
-    let lhs_info = column_custom_type(e1, &env);
-    let rhs_info = column_custom_type(e2, &env);
+    let lhs = comparison_operand_type(e1, &env);
+    let rhs = comparison_operand_type(e2, &env);
+    let lhs_info = lhs.as_ref().map(|operand| &operand.ty);
+    let rhs_info = rhs.as_ref().map(|operand| &operand.ty);
 
     // Try to find a direct or derived operator match on a type definition.
     let find_in_type_def = |type_def: &TypeDef| -> Option<(String, bool, bool)> {
@@ -241,7 +247,7 @@ pub(super) fn find_custom_comparison(
     };
 
     // Case 1: Both operands are custom type columns of the SAME type.
-    if let (Some(ref lhs), Some(ref rhs)) = (&lhs_info, &rhs_info) {
+    if let (Some(lhs), Some(rhs)) = (lhs_info, rhs_info) {
         if same_type_def(&lhs.type_def, &rhs.type_def) {
             if let Some((func_name, swap_args, negate)) = find_in_type_def(&lhs.type_def) {
                 return Some(ResolvedOperator {
@@ -257,10 +263,20 @@ pub(super) fn find_custom_comparison(
     }
 
     let resolve_one_custom_operand =
-        |info: &ColumnCustomType, other: &ast::Expr, which: EncodeArg| {
-            let encode_other = literal_type_name(other).is_some_and(|lit_type| {
-                literal_compatible_with_value_type(lit_type, info.type_def.value_input_type())
-            });
+        |operand: &ComparisonOperand, other: &ast::Expr, which: EncodeArg| {
+            let info = &operand.ty;
+            // A literal is encoded to the operand's type, as an index seek on a
+            // column encodes it. An operator result, such as `n - 1`, has no
+            // type parameters to encode with, so the literal is passed as it
+            // is; only a type whose value is `any` accepts that.
+            // TODO: rounding the literal to the column's scale is wrong
+            // (`n = 3.504` is true for 3.50); comparing with the type's
+            // ordering and converting the literal without the column's
+            // parameters, in comparisons and seeks alike, fixes it.
+            let encode_other = operand.is_column
+                && literal_type_name(other).is_some_and(|lit_type| {
+                    literal_compatible_with_value_type(lit_type, info.type_def.value_input_type())
+                });
             let pass_other_unencoded = info.type_def.value_input_type().eq_ignore_ascii_case("any");
             if !encode_other && !pass_other_unencoded {
                 return None;
@@ -278,45 +294,85 @@ pub(super) fn find_custom_comparison(
             })
         };
 
-    match (&lhs_info, &rhs_info) {
+    match (&lhs, &rhs) {
         (Some(lhs), None) => resolve_one_custom_operand(lhs, e2, EncodeArg::Second),
         (None, Some(rhs)) => resolve_one_custom_operand(rhs, e1, EncodeArg::First),
         _ => None,
     }
 }
 
-/// Whether a custom type's function runs `lhs op rhs`. An operator that does not
-/// exist, such as `date * 2`, counts too: emitting it fails.
-pub(crate) fn runs_custom_type_function(
-    lhs: &ast::Expr,
-    op: &ast::Operator,
-    rhs: &ast::Expr,
-    env: &TypeEnv,
-) -> bool {
-    find_custom_comparison(lhs, rhs, op, env.tables(), env.resolver()).is_some()
-        || !matches!(custom_arithmetic_call(lhs, op, rhs, env), Ok(None))
+/// The custom type of a comparison operand whose value the type's comparison
+/// functions read: a column, or the result of an operator on a custom type,
+/// such as `n - 1` on a numeric. Without the second, `n - 1 > 0` would compare
+/// the text `'2.50'` with the integer 0.
+fn comparison_operand_type(expr: &ast::Expr, env: &TypeEnv) -> Option<ComparisonOperand> {
+    if let Some(ty) = column_custom_type(expr, env) {
+        return Some(ComparisonOperand {
+            ty,
+            is_column: true,
+        });
+    }
+    if !matches!(
+        without_wrappers(expr),
+        ast::Expr::Binary(..) | ast::Expr::Unary(..)
+    ) {
+        return None;
+    }
+    match type_of(expr, env) {
+        ExprType::Custom { type_def, params } => Some(ComparisonOperand {
+            ty: ColumnCustomType { type_def, params },
+            is_column: false,
+        }),
+        _ => None,
+    }
 }
 
-/// Emits `lhs op rhs` with a custom type's function, if one runs it, and returns
-/// the register holding the result. `None` means SQLite's operator runs.
+struct ComparisonOperand {
+    ty: ColumnCustomType,
+    is_column: bool,
+}
+
+/// Whether a custom type's function runs the operator expression `expr`, such
+/// as `a < b` or `-a`. An operator that does not exist, such as `date * 2`,
+/// counts too: emitting it fails.
+pub(crate) fn runs_custom_type_function(expr: &ast::Expr, env: &TypeEnv) -> bool {
+    let runs_comparison = match expr {
+        ast::Expr::Binary(lhs, op, rhs) => {
+            find_custom_comparison(lhs, rhs, op, env.tables(), env.resolver()).is_some()
+        }
+        _ => false,
+    };
+    runs_comparison || !matches!(custom_operator_call(expr, env), Ok(None))
+}
+
+/// Emits the operator expression `expr` with a custom type's function, if one
+/// runs it, and returns the register holding the result. `None` means SQLite's
+/// operator runs.
 pub(super) fn emit_custom_type_operator(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
-    lhs: &ast::Expr,
-    op: &ast::Operator,
-    rhs: &ast::Expr,
+    expr: &ast::Expr,
     resolver: &Resolver,
 ) -> Result<Option<usize>> {
-    if let Some(comparison) = find_custom_comparison(lhs, rhs, op, referenced_tables, resolver) {
-        let result_reg =
-            emit_custom_comparison(program, referenced_tables, lhs, rhs, &comparison, resolver)?;
-        return Ok(Some(result_reg));
+    if let ast::Expr::Binary(lhs, op, rhs) = expr {
+        if let Some(comparison) = find_custom_comparison(lhs, rhs, op, referenced_tables, resolver)
+        {
+            let result_reg = emit_custom_comparison(
+                program,
+                referenced_tables,
+                lhs,
+                rhs,
+                &comparison,
+                resolver,
+            )?;
+            return Ok(Some(result_reg));
+        }
     }
     let env = TypeEnv::new(referenced_tables, resolver);
-    let Some(call) = custom_arithmetic_call(lhs, op, rhs, &env)? else {
+    let Some(call) = custom_operator_call(expr, &env)? else {
         return Ok(None);
     };
-    let result_reg = emit_arithmetic_call(program, referenced_tables, lhs, rhs, &call, resolver)?;
+    let result_reg = emit_operator_call(program, referenced_tables, expr, &call, resolver)?;
     Ok(Some(result_reg))
 }
 

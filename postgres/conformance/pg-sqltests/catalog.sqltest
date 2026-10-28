@@ -1180,3 +1180,203 @@ test pg-sequence-reflects-drop {
 expect {
     kept_seq
 }
+
+test pg-primary-key-dump-catalogs {
+    CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE SEQUENCE after_indexes;
+    SELECT t.relname, c.conname, i.indkey,
+           CASE WHEN t.relhasindex AND i.indisprimary AND i.indisunique THEN 1 ELSE 0 END,
+           x.relkind, pg_get_constraintdef(c.oid), pg_get_indexdef(i.indexrelid)
+    FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_index i ON i.indexrelid = c.conindid
+    JOIN pg_class x ON x.oid = i.indexrelid
+    WHERE t.relname = 'items' AND c.contype = 'p';
+    SELECT count(*) FROM pg_depend d
+    JOIN pg_constraint c ON d.refobjid = c.oid AND d.refclassid = 2606
+    WHERE c.conname = 'items_pkey' AND d.classid = 1259
+      AND d.objid = c.conindid AND d.deptype = 'i';
+    SELECT CASE WHEN count(*) = count(DISTINCT oid) THEN 1 ELSE 0 END FROM pg_class;
+}
+expect {
+    items|items_pkey|1|1|i|PRIMARY KEY (id)|CREATE UNIQUE INDEX items_pkey ON public.items USING btree (id)
+    1
+    1
+}
+
+expect @tursopg {
+    items|items_pkey|1|1|i|PRIMARY KEY (id)|CREATE UNIQUE INDEX __turso_internal_pk_index_items ON public.items USING btree (id)
+    1
+    1
+}
+
+test pg-primary-key-with-other-unique-constraint {
+    CREATE TABLE keys (a TEXT UNIQUE, b TEXT, c TEXT, PRIMARY KEY (b, c));
+    SELECT c.contype, i.indkey, CASE WHEN i.indisprimary THEN 1 ELSE 0 END,
+           pg_get_constraintdef(c.oid)
+    FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_index i ON i.indexrelid = c.conindid
+    WHERE t.relname = 'keys' ORDER BY c.contype;
+}
+expect {
+    p|2 3|1|PRIMARY KEY (b, c)
+    u|1|0|UNIQUE (a)
+}
+
+test pg-primary-key-named-and-quoted {
+    CREATE TABLE "quoted table" (payload TEXT, "key column" INTEGER CONSTRAINT "custom key" PRIMARY KEY);
+    SELECT c.conname, i.indkey, pg_get_constraintdef(c.oid), pg_get_indexdef(c.conindid)
+    FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_index i ON i.indexrelid = c.conindid
+    WHERE t.relname = 'quoted table' AND c.contype = 'p';
+    SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'quoted table';
+}
+expect {
+    custom key|2|PRIMARY KEY ("key column")|CREATE UNIQUE INDEX "custom key" ON public."quoted table" USING btree ("key column")
+    custom key|CREATE UNIQUE INDEX "custom key" ON public."quoted table" USING btree ("key column")
+}
+
+expect @tursopg {
+    custom key|2|PRIMARY KEY ("key column")|CREATE UNIQUE INDEX "__turso_internal_pk_index_quoted table" ON public."quoted table" USING btree ("key column")
+    __turso_internal_pk_index_quoted table|CREATE UNIQUE INDEX "__turso_internal_pk_index_quoted table" ON public."quoted table" USING btree ("key column")
+}
+
+test pg-primary-key-after-identical-unique {
+    CREATE TABLE t(a TEXT, UNIQUE(a), PRIMARY KEY(a));
+    CREATE TABLE composite(a TEXT, b TEXT, UNIQUE(a, b), CONSTRAINT named_pk PRIMARY KEY(a, b));
+    SELECT t.relname, c.conname, c.contype, pg_get_constraintdef(c.oid),
+           CASE WHEN i.indisprimary THEN 1 ELSE 0 END
+    FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_index i ON i.indexrelid = c.conindid
+    WHERE t.relname IN ('t', 'composite') ORDER BY t.relname;
+}
+expect {
+    composite|named_pk|p|PRIMARY KEY (a, b)|1
+    t|t_pkey|p|PRIMARY KEY (a)|1
+}
+
+test pg-primary-key-index-name-collisions {
+    CREATE TABLE t_pkey(x INTEGER);
+    CREATE INDEX t_pkey1 ON t_pkey(x);
+    CREATE SEQUENCE t_pkey2;
+    CREATE TABLE t(id INTEGER PRIMARY KEY);
+    SELECT c.conname, x.relname, pg_get_indexdef(c.conindid)
+    FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_class x ON x.oid = c.conindid WHERE t.relname = 't';
+    SELECT CASE WHEN count(*) = count(DISTINCT relname) THEN 1 ELSE 0 END
+    FROM pg_class WHERE relnamespace = 2200;
+    DROP TABLE t_pkey;
+    DROP SEQUENCE t_pkey2;
+    SELECT c.conname, x.relname FROM pg_constraint c
+    JOIN pg_class t ON t.oid = c.conrelid JOIN pg_class x ON x.oid = c.conindid
+    WHERE t.relname = 't';
+}
+expect {
+    t_pkey3|t_pkey3|CREATE UNIQUE INDEX t_pkey3 ON public.t USING btree (id)
+    1
+    t_pkey3|t_pkey3
+}
+expect @tursopg {
+    t_pkey|__turso_internal_pk_index_t|CREATE UNIQUE INDEX __turso_internal_pk_index_t ON public.t USING btree (id)
+    1
+    t_pkey|__turso_internal_pk_index_t
+}
+
+test pg-attribute-not-null-dump {
+    CREATE TABLE dump_nulls (id INTEGER PRIMARY KEY, required TEXT NOT NULL, optional TEXT);
+    SELECT a.attname, a.attnotnull,
+           CASE WHEN a.attislocal THEN true
+                WHEN a.attnotnull AND NOT a.attislocal THEN true
+                ELSE false END AS notnull_islocal
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'dump_nulls' AND a.attnum > 0 ORDER BY a.attnum;
+}
+expect {
+    id|t|t
+    required|t|t
+    optional|f|t
+}
+
+test pg-boolean-case-results {
+    SELECT true, false, CASE WHEN true THEN true ELSE false END,
+           CASE WHEN false THEN true ELSE false END,
+           CASE WHEN false THEN true END,
+           CASE WHEN true THEN 1 ELSE 0 END;
+    CREATE TABLE bools (value BOOLEAN);
+    INSERT INTO bools VALUES (true), (false);
+    SELECT CASE WHEN true THEN value ELSE false END FROM bools ORDER BY value;
+    SELECT CASE WHEN true THEN (CASE WHEN false THEN false ELSE true END) ELSE NULL END,
+           CASE WHEN true THEN NULL ELSE NULL END,
+           CASE WHEN true THEN 1 ELSE NULL END;
+}
+expect {
+    t|f|t|f||1
+    f
+    t
+    t||1
+}
+
+test pg-public-schema-owner-and-acl {
+    SELECT n.nspowner, r.rolname, pg_get_userbyid(n.nspowner), n.nspacl::text,
+           acldefault('n', n.nspowner)::text
+    FROM pg_namespace n JOIN pg_roles r ON r.oid = n.nspowner
+    WHERE n.nspname = 'public';
+    SELECT oid, rolname, CAST(rolsuper AS INTEGER), CAST(rolinherit AS INTEGER),
+           CAST(rolcreaterole AS INTEGER), CAST(rolcreatedb AS INTEGER),
+           CAST(rolcanlogin AS INTEGER), CAST(rolreplication AS INTEGER),
+           rolconnlimit, CAST(rolbypassrls AS INTEGER)
+    FROM pg_roles WHERE rolname = 'pg_database_owner';
+}
+expect {
+    6171|pg_database_owner|pg_database_owner|{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}|{pg_database_owner=UC/pg_database_owner}
+    6171|pg_database_owner|0|1|0|0|0|0|-1|0
+}
+
+test pg-description-public-schema-default {
+    SELECT d.objoid, d.classoid, d.objsubid, d.description
+    FROM pg_catalog.pg_description d
+    JOIN pg_catalog.pg_namespace n ON n.oid = d.objoid
+    WHERE n.nspname = 'public' AND d.classoid = 2615 AND d.objsubid = 0;
+}
+expect {
+    2200|2615|0|standard public schema
+}
+
+test pg-attribute-default-storage {
+    CREATE TABLE storage_types (
+        id INTEGER PRIMARY KEY, body TEXT, label VARCHAR(40), data BYTEA,
+        amount NUMERIC(10,2), enabled BOOLEAN, identifier UUID, document JSONB,
+        numbers INTEGER[]
+    );
+    SELECT a.attname, a.attstorage
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'storage_types' AND a.attnum > 0 ORDER BY a.attnum;
+}
+expect {
+    id|p
+    body|x
+    label|x
+    data|x
+    amount|m
+    enabled|p
+    identifier|p
+    document|x
+    numbers|x
+}
+
+test pg-attribute-domain-storage {
+    CREATE DOMAIN text_value AS TEXT;
+    CREATE DOMAIN nested_text_value AS text_value;
+    CREATE DOMAIN number_value AS INTEGER;
+    CREATE TYPE mood_storage AS ENUM ('happy', 'sad');
+    CREATE TABLE domain_storage (a text_value, b nested_text_value, c number_value, d mood_storage);
+    SELECT a.attname, a.attstorage, t.typstorage
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    JOIN pg_type t ON t.oid = a.atttypid
+    WHERE c.relname = 'domain_storage' AND a.attnum > 0 ORDER BY a.attnum;
+}
+expect {
+    a|x|x
+    b|x|x
+    c|p|p
+    d|p|p
+}

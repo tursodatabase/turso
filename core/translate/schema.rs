@@ -12,6 +12,7 @@ use crate::schema::{
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
+use crate::translate::catalog::CatalogContext;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
@@ -46,7 +47,7 @@ pub(crate) fn validate_check_expr(
     expr: &ast::Expr,
     table_name: &str,
     column_names: &[&str],
-    resolver: &Resolver,
+    resolver: &CatalogContext,
 ) -> Result<()> {
     let normalized_table = normalize_ident(table_name);
     walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
@@ -218,7 +219,7 @@ impl CheckExprType {
 fn resolve_check_expr_type(
     expr: &ast::Expr,
     columns: &[&ast::ColumnDefinition],
-    resolver: &Resolver,
+    resolver: &CatalogContext,
 ) -> Result<CheckExprType> {
     use ast::{Literal, Operator, UnaryOperator};
     match expr {
@@ -401,7 +402,7 @@ fn resolve_func_return_type(
     name: &str,
     args: &[Box<ast::Expr>],
     columns: &[&ast::ColumnDefinition],
-    resolver: &Resolver,
+    resolver: &CatalogContext,
 ) -> Result<CheckExprType> {
     match func {
         Func::Scalar(sf) => resolve_scalar_func_return_type(sf, args, columns, resolver),
@@ -426,7 +427,7 @@ fn resolve_scalar_func_return_type(
     func: &ScalarFunc,
     args: &[Box<ast::Expr>],
     columns: &[&ast::ColumnDefinition],
-    resolver: &Resolver,
+    resolver: &CatalogContext,
 ) -> Result<CheckExprType> {
     match func {
         // Functions that always return INTEGER
@@ -539,7 +540,9 @@ fn resolve_scalar_func_return_type(
         | ScalarFunc::NumericAdd
         | ScalarFunc::NumericSub
         | ScalarFunc::NumericMul
-        | ScalarFunc::NumericDiv => Ok(CheckExprType::Blob),
+        | ScalarFunc::NumericDiv
+        | ScalarFunc::NumericMod
+        | ScalarFunc::NumericNeg => Ok(CheckExprType::Blob),
 
         // Remaining functions — treat as ANY
         _ => Ok(CheckExprType::Any),
@@ -600,7 +603,10 @@ fn resolve_json_func_return_type(func: &crate::function::JsonFunc) -> Result<Che
 }
 
 /// Resolve a column's type from its definition.
-fn resolve_column_type(col: &ast::ColumnDefinition, resolver: &Resolver) -> Result<CheckExprType> {
+fn resolve_column_type(
+    col: &ast::ColumnDefinition,
+    resolver: &CatalogContext,
+) -> Result<CheckExprType> {
     if let Some(ref col_type) = col.col_type {
         resolve_type_name(&column_declared_type(&col_type.name), resolver)
     } else {
@@ -611,7 +617,7 @@ fn resolve_column_type(col: &ast::ColumnDefinition, resolver: &Resolver) -> Resu
 }
 
 /// Resolve a type name string to a CheckExprType.
-fn resolve_type_name(type_name: &str, resolver: &Resolver) -> Result<CheckExprType> {
+fn resolve_type_name(type_name: &str, resolver: &CatalogContext) -> Result<CheckExprType> {
     let name_bytes = type_name.as_bytes();
     let result = turso_macros::match_ignore_ascii_case!(match name_bytes {
         b"INT" | b"INTEGER" => Some(CheckExprType::Integer),
@@ -641,7 +647,7 @@ fn resolve_type_name(type_name: &str, resolver: &Resolver) -> Result<CheckExprTy
 fn validate_check_types_in_expr(
     expr: &ast::Expr,
     columns: &[&ast::ColumnDefinition],
-    resolver: &Resolver,
+    resolver: &CatalogContext,
 ) -> Result<()> {
     use ast::Operator;
     match expr {
@@ -743,7 +749,11 @@ fn validate_check_types_in_expr(
     Ok(())
 }
 
-fn validate(body: &ast::CreateTableBody, table_name: &str, resolver: &Resolver) -> Result<()> {
+fn validate(
+    body: &ast::CreateTableBody,
+    table_name: &str,
+    resolver: &CatalogContext,
+) -> Result<()> {
     if let ast::CreateTableBody::ColumnsAndConstraints {
         options,
         columns,
@@ -1167,8 +1177,8 @@ pub fn translate_create_table(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
-    validate(&body, &normalized_tbl_name, resolver)?;
-    let bound_sequence_names = resolver.dialect.binds_names_at_create()
+    validate(&body, &normalized_tbl_name, &resolver.catalog)?;
+    let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
         && bind_default_sequence_names(&mut body, resolver)?;
 
     // Gate array column types behind the experimental custom types flag.
@@ -1796,7 +1806,12 @@ pub fn translate_create_virtual_table(
     let table_name = tbl_name.name.as_str().to_string();
     let module_name_str = module_name.as_str().to_string();
     let args_vec = args.clone();
-    let Some(vtab_module) = resolver.symbol_table.vtab_modules.get(&module_name_str) else {
+    let Some(vtab_module) = resolver
+        .catalog
+        .symbol_table
+        .vtab_modules
+        .get(&module_name_str)
+    else {
         bail_parse_error!("no such module: {}", module_name_str);
     };
     if !vtab_module.module_kind.eq(&VTabKind::VirtualTable) {
@@ -1897,7 +1912,7 @@ pub fn translate_create_virtual_table(
 
 /// Validates whether a DROP TABLE operation is allowed on the given table name.
 fn validate_drop_table(
-    resolver: &Resolver,
+    resolver: &CatalogContext,
     namespace: NamespaceRef,
     tbl_name: &str,
     connection: &Arc<Connection>,
@@ -1963,7 +1978,7 @@ pub fn translate_drop_table(
             crate::util::table_name_for_error(&tbl_name)
         );
     };
-    validate_drop_table(resolver, namespace, name, connection)?;
+    validate_drop_table(&resolver.catalog, namespace, name, connection)?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
     if connection.foreign_keys_enabled()
@@ -1971,7 +1986,7 @@ pub fn translate_drop_table(
             s.any_resolved_fks_referencing(namespace.id, name)
         })
     {
-        emit_fk_drop_table_check(program, resolver, name, connection, database_id)?;
+        emit_fk_drop_table_check(program, resolver, name, connection, namespace)?;
     }
     let cdc_table = prepare_cdc_if_necessary(
         program,
@@ -2025,7 +2040,7 @@ pub fn translate_drop_table(
         rhs: table_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: Some(CollationSeq::NoCase),
+        collation: CollationSeq::NoCase,
     });
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id_0,
@@ -2044,7 +2059,7 @@ pub fn translate_drop_table(
             rhs: table_type,
             target_pc: skip_cdc_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
         let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
@@ -2163,7 +2178,7 @@ pub fn translate_drop_table(
                     rhs: trigger_type_reg,
                     target_pc: temp_next_label,
                     flags: CmpInsFlags::default(),
-                    collation: None,
+                    collation: CollationSeq::for_internal_values(),
                 });
 
                 // Cascade-check name (column 1) against each trigger we
@@ -2176,7 +2191,7 @@ pub fn translate_drop_table(
                         rhs: *name_reg,
                         target_pc: temp_delete_label,
                         flags: CmpInsFlags::default(),
-                        collation: None,
+                        collation: CollationSeq::for_internal_values(),
                     });
                 }
                 // No name matched — skip the delete.
@@ -2333,7 +2348,7 @@ pub fn translate_drop_table(
             rhs: table_name_and_root_page_register,
             target_pc: next_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::RowId {
             cursor_id: sqlite_schema_cursor_id_1,
@@ -2469,7 +2484,7 @@ pub fn translate_drop_table(
             rhs: dropped_table_name_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: Some(CollationSeq::NoCase),
+            collation: CollationSeq::NoCase,
         });
 
         program.emit_insn(Insn::Delete {
@@ -2548,7 +2563,7 @@ pub fn translate_drop_table(
             rhs: dropped_name_reg,
             target_pc: continue_ver_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
 
         if let (Some(index), Some(cursor_id)) = (&version_index, ver_index_cursor_id) {
@@ -2595,9 +2610,10 @@ pub fn translate_drop_table(
     // Drop the in-memory structures for the table
     program.emit_insn(Insn::DropTable {
         db: database_id,
+        namespace: namespace.id,
         _p2: 0,
         _p3: 0,
-        table_name: tbl_name.name.as_str().to_string(),
+        table_name: name.to_string(),
     });
 
     // If the dropped table owned an implicit AUTOINCREMENT sequence, tear
@@ -2615,10 +2631,7 @@ pub fn translate_drop_table(
         let seq_name =
             crate::schema::autoincrement_sequence_name(&normalize_ident(tbl_name.name.as_str()));
         crate::translate::sequence::emit_drop_sequence_cleanup(
-            program,
-            resolver,
-            database_id,
-            &seq_name,
+            program, resolver, namespace, &seq_name,
         )?;
     }
 
@@ -2635,7 +2648,7 @@ pub fn translate_drop_table(
 
 /// Validate an encode or decode expression for safety.
 /// Rejects subqueries, aggregates, and window functions.
-fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &Resolver) -> Result<()> {
+fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &CatalogContext) -> Result<()> {
     walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
             ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
@@ -2833,10 +2846,10 @@ pub fn translate_create_type(
     } = body
     {
         if let Some(ref encode) = encode {
-            validate_type_expr(encode, "ENCODE", resolver)?;
+            validate_type_expr(encode, "ENCODE", &resolver.catalog)?;
         }
         if let Some(ref decode) = decode {
-            validate_type_expr(decode, "DECODE", resolver)?;
+            validate_type_expr(decode, "DECODE", &resolver.catalog)?;
         }
     }
 
@@ -2999,10 +3012,10 @@ pub fn translate_create_domain(
 
     // Validate CHECK and DEFAULT expressions (reject subqueries, aggregates, etc.)
     for c in constraints {
-        validate_type_expr(&c.check, "domain CHECK", resolver)?;
+        validate_type_expr(&c.check, "domain CHECK", &resolver.catalog)?;
     }
     if let Some(ref def) = default {
-        validate_type_expr(def, "domain DEFAULT", resolver)?;
+        validate_type_expr(def, "domain DEFAULT", &resolver.catalog)?;
     }
 
     // Build the CREATE DOMAIN SQL for persistence
@@ -3144,7 +3157,7 @@ pub fn translate_drop_type(
         rhs: name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: CollationSeq::for_internal_values(),
     });
 
     // Delete matching row

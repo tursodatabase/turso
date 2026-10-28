@@ -27,7 +27,10 @@ use crate::{io_yield_one, return_if_io, CompletionError};
 /// A custom comparison function for sorting custom type columns.
 /// Takes two value references and returns an Ordering.
 /// Used when a custom type defines a `<` operator for correct sort behavior.
-pub type SortComparator = Arc<dyn Fn(&ValueRef, &ValueRef) -> Result<Ordering> + Send + Sync>;
+/// Orders two values of one sort key column. It cannot fail: a sort cannot stop
+/// halfway, so every value, including ones that are not of the column's type,
+/// must have a place.
+pub type SortComparator = Arc<dyn Fn(&ValueRef, &ValueRef) -> Ordering + Send + Sync>;
 
 /// Bit position of the 3-bit class rank in a normalized key.
 const NORM_CLASS_SHIFT: u32 = 61;
@@ -99,7 +102,7 @@ fn normalized_first_key(
             ((1u64 << NORM_CLASS_SHIFT) | (monotone >> 3), exact)
         }
         ValueRef::Text(t) => {
-            if !matches!(key.collation, CollationSeq::Unset | CollationSeq::Binary) {
+            if key.collation != CollationSeq::Binary {
                 // Non-binary collation: constant key, always full comparison.
                 (2u64 << NORM_CLASS_SHIFT, false)
             } else {
@@ -976,8 +979,7 @@ impl ArenaSortableRecord {
             .enumerate()
         {
             let cmp = if let Some(Some(comparator)) = comparators.get(i) {
-                let base =
-                    comparator(&self_val, &other_val).expect("Memory allocation failed here");
+                let base = comparator(&self_val, &other_val);
                 cmp_with_sort(base, &self_val, &other_val, key_info)
             } else {
                 cmp_in_column(&self_val, &other_val, key_info)
@@ -1090,14 +1092,9 @@ impl BoxedSortableRecord {
             .enumerate()
         {
             let cmp = if let Some(Some(comparator)) = self.comparators.get(i) {
-                comparator(&self_val, &other_val).expect("Memory allocation failed here")
+                comparator(&self_val, &other_val)
             } else {
-                match (self_val, other_val) {
-                    (ValueRef::Text(left), ValueRef::Text(right)) => {
-                        key_info.collation.compare_strings(&left, &right)
-                    }
-                    _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
-                }
+                key_info.collation.compare(self_val, other_val)
             };
             let cmp = cmp_with_sort(cmp, &self_val, &other_val, key_info);
             if cmp != Ordering::Equal {

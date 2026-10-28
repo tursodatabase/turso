@@ -1055,6 +1055,9 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// Table and index ids this transaction allocated with `CreateBtree`. No other
     /// transaction can see these objects, so rollback drops their row maps whole.
     created_table_ids: Mutex<Vec<MVTableId>>,
+    /// The portable logical-change setting of the connection when this transaction
+    /// began.
+    portable_logical_changes: bool,
 }
 
 impl<A: RowVersionAllocator> Transaction<A> {
@@ -1064,6 +1067,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
         header: DatabaseHeader,
         read_mark: WalPos,
         schema_generation_at_begin: u64,
+        portable_logical_changes: bool,
     ) -> Transaction<A> {
         Transaction {
             state: TransactionState::Active.into(),
@@ -1071,6 +1075,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             begin_ts,
             read_mark,
             schema_generation_at_begin,
+            portable_logical_changes,
             write_set: Mutex::new(WriteSet::new()),
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
@@ -4977,14 +4982,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.checkpoint_dirty_table_keys.clear();
         self.checkpoint_dirty_index_keys.clear();
         let root_pages = schema
-            .tables(NamespaceId::ROOT)
+            .all_tables()
             .filter_map(|table| match table.as_ref() {
                 Table::BTree(btree) => Some(btree.root_page),
                 _ => None,
             })
             .chain(
                 schema
-                    .indexes(NamespaceId::ROOT)
+                    .all_indexes()
                     .filter(|index| index.is_btree_backed())
                     .map(|index| index.root_page),
             )
@@ -5378,7 +5383,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let schema = bootstrap_conn.schema.read();
         let sqlite_schema_root_pages = {
             schema
-                .tables(NamespaceId::ROOT)
+                .all_tables()
                 .filter_map(|t| {
                     if let Table::BTree(btree) = t.as_ref() {
                         Some(btree.root_page)
@@ -5388,7 +5393,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 })
                 .chain(
                     schema
-                        .indexes(NamespaceId::ROOT)
+                        .all_indexes()
                         .filter(|index| index.is_btree_backed())
                         .map(|index| index.root_page),
                 )
@@ -5756,14 +5761,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let Some(record) = btree_record else {
                     return Ok(false);
                 };
+                let (payload, column_count) = if Self::tombstone_keeps_deleted_row(tx, id.table_id)
+                {
+                    (record.get_payload(), record.column_count())
+                } else {
+                    (&[][..], 0)
+                };
                 let row = crate::with_mv_store_allocation_site!(
                     RowPayload,
-                    Row::new_table_row_in(
-                        id.clone(),
-                        record.get_payload(),
-                        record.column_count(),
-                        self.allocator(),
-                    )
+                    Row::new_table_row_in(id.clone(), payload, column_count, self.allocator())
                 )?;
                 let version_id = self.insert_tombstone(tx_id, row, &mut locked_row_versions)?;
                 drop(locked_row_versions);
@@ -5772,6 +5778,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 return Ok(true);
             },
         }
+    }
+
+    /// Only two readers use the deleted row in a table tombstone: the checkpoint,
+    /// to find the B-tree that a `sqlite_schema` row names, and the commit, to
+    /// write the primary key into portable logical changes. Other tombstones
+    /// keep an empty payload, just like tombstones created by recovery.
+    fn tombstone_keeps_deleted_row(tx: &Transaction<A>, table_id: MVTableId) -> bool {
+        table_id == SQLITE_SCHEMA_MVCC_TABLE_ID || tx.portable_logical_changes
     }
 
     fn insert_tombstone(
@@ -6437,8 +6451,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         expected_schema_generation: Option<u64>,
         checkpoint_read_guard: CheckpointReadLockState,
     ) -> Result<TxID> {
-        #[cfg(not(any(test, injected_yields)))]
-        let _ = connection;
+        let portable_logical_changes = connection.portable_logical_changes_enabled();
         turso_assert!(
             maybe_existing_tx_id.is_none() || !checkpoint_read_guard.is_held(),
             "checkpoint read guard is only passed for fresh MVCC begins"
@@ -6513,7 +6526,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .expect("global_header initialized above");
                 self.txs.insert(
                     tx_id,
-                    Transaction::new(tx_id, ts, header, read_mark, schema_generation),
+                    Transaction::new(
+                        tx_id,
+                        ts,
+                        header,
+                        read_mark,
+                        schema_generation,
+                        portable_logical_changes,
+                    ),
                 );
             });
             if schema_stale {
@@ -6650,6 +6670,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// This function starts a new transaction in the database and returns a `TxID` value
     /// that you can use to perform operations within the transaction. All changes made within the
     /// transaction are isolated from other transactions until you commit the transaction.
+    #[cfg(any(test, feature = "bench"))]
     pub fn begin_tx(&self, pager: Arc<Pager>) -> Result<TxID> {
         self.begin_tx_with_schema_generation(pager, None)
     }
@@ -6658,6 +6679,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// `Connection::mvcc_begin_schema_generation`). Used by the statement begin path so a passive
     /// checkpoint that republishes physical roots into the begin window forces a reprepare instead
     /// of a transaction beginning against stale roots.
+    #[cfg(any(test, feature = "bench"))]
     pub fn begin_tx_with_schema_generation(
         &self,
         pager: Arc<Pager>,
@@ -6667,6 +6689,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             pager,
             expected_schema_generation,
             CheckpointReadLockState::NotHeld,
+            false,
         )
     }
 
@@ -6685,6 +6708,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         pager: Arc<Pager>,
         expected_schema_generation: Option<u64>,
         checkpoint_read_guard: CheckpointReadLockState,
+        portable_logical_changes: bool,
     ) -> Result<TxID> {
         turso_assert!(
             !checkpoint_read_guard.is_held() || !self.experimental_mvcc_passive_checkpoint,
@@ -6751,7 +6775,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
             self.txs.insert(
                 tx_id,
-                Transaction::new(tx_id, ts, header, read_mark, schema_generation),
+                Transaction::new(
+                    tx_id,
+                    ts,
+                    header,
+                    read_mark,
+                    schema_generation,
+                    portable_logical_changes,
+                ),
             );
         });
         if schema_stale || schema_change_unpublished {
@@ -8816,7 +8847,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // another data structure, e.g. a BTreeSet. If it proves to be too quadratic empirically,
         // we can either switch to a tree-like structure, or at least use partition_point()
         // which performs a binary search for the insertion point.
-        versions.try_reserve(1)?;
+        Self::reserve_space_for_one_version(versions)?;
         let mut position = 0_usize;
         for (i, v) in versions.iter().enumerate().rev() {
             let existing_begin = self.resolve_begin_timestamp(&v.begin());
@@ -8851,6 +8882,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // reaching here). Track it for the GC trigger heuristic.
         self.live_version_count_approx
             .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Chains with fewer versions than this grow by exactly one slot.
+    const CHAIN_EXACT_GROWTH_MAX_LEN: usize = 4;
+
+    /// Most chains hold one or two versions. Amortized `Vec` growth gives an
+    /// empty chain four slots of about 100 bytes each, so a short chain grows
+    /// by one slot at a time and a long chain doubles as before.
+    fn reserve_space_for_one_version(
+        versions: &mut RowVersionChain<A>,
+    ) -> Result<(), TryReserveError> {
+        if versions.len() < Self::CHAIN_EXACT_GROWTH_MAX_LEN {
+            versions.try_reserve_exact(1)?;
+        } else {
+            versions.try_reserve(1)?;
+        }
         Ok(())
     }
 
@@ -9350,7 +9398,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .and_then(|e| e.value().root_page)
                 .map(|r| r as i64)
         };
-        for (_, table) in schema.tables_mut(NamespaceId::ROOT) {
+        for (_, _, table) in schema.all_tables_mut() {
             let needs = table
                 .btree()
                 .is_some_and(|b| resolve(b.root_page).is_some());
@@ -9365,7 +9413,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
             }
         }
-        for index in schema.indexes_mut(NamespaceId::ROOT) {
+        for index in schema.all_indexes_mut() {
             if let Some(rp) = resolve(index.root_page) {
                 Arc::make_mut(index).root_page = rp;
             }
@@ -9762,7 +9810,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let find_index_info =
             |schema: &Schema, root_page: i64| -> Result<Option<Arc<IndexInfo>>, TryReserveError> {
                 schema
-                    .indexes(NamespaceId::ROOT)
+                    .all_indexes()
                     .find(|idx| idx.root_page == root_page)
                     .map(|idx| {
                         IndexInfo::new_from_index_in(idx.as_ref(), self.alloc.clone()).map(Arc::new)
@@ -9771,9 +9819,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             };
 
         let schema_has_index_root = |schema: &Schema, root_page: i64| -> bool {
-            schema
-                .indexes(NamespaceId::ROOT)
-                .any(|idx| idx.root_page == root_page)
+            schema.all_indexes().any(|idx| idx.root_page == root_page)
         };
 
         let parsed_op_commit_ts = |op: &ParsedOp| match op {

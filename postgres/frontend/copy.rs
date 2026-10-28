@@ -10,6 +10,94 @@
 //! - Lines starting with `\.` = end of data
 
 use turso_core::{LimboError, Result};
+use turso_pg_parser::{copy::CopyToStdout, quote_identifier};
+
+pub(crate) fn prepare_copy_to_stdout(
+    conn: &std::sync::Arc<turso_core::Connection>,
+    spec: &CopyToStdout,
+) -> Result<turso_core::Statement> {
+    let schema = match &spec.schema {
+        Some(schema) => match schema.as_str() {
+            "public" => "main".to_owned(),
+            schema => schema.to_owned(),
+        },
+        None => {
+            let mut schemas = Vec::new();
+            conn.prepare_sqlite(format!(
+                "PRAGMA table_list({})",
+                quote_identifier(&spec.table)
+            ))?
+            .run_with_row_callback(|row| {
+                schemas.push(row.get::<String>(0)?);
+                Ok(())
+            })?;
+            conn.search_order()
+                .into_iter()
+                .find_map(|namespace| {
+                    let id = namespace.database_id();
+                    let name = if id == turso_core::MAIN_DB_ID {
+                        "main".to_owned()
+                    } else {
+                        conn.namespace_name(id)?
+                    };
+                    schemas.iter().find(|schema| **schema == name).cloned()
+                })
+                .ok_or_else(|| {
+                    LimboError::ParseError(format!("COPY table '{}' does not exist", spec.table))
+                })?
+        }
+    };
+    let mut table = None;
+    conn.prepare_sqlite(format!(
+        "SELECT type, rootpage, sql FROM {}.sqlite_schema \
+         WHERE type IN ('table', 'view') AND name = '{}'",
+        quote_identifier(&schema),
+        spec.table.to_ascii_lowercase().replace('\'', "''")
+    ))?
+    .run_with_row_callback(|row| {
+        let kind = row.get::<String>(0)?;
+        let root_page = row.get::<i64>(1)?;
+        if kind != "table" || root_page == 0 {
+            return Err(LimboError::ParseError(
+                "COPY TO STDOUT requires a plain table".to_owned(),
+            ));
+        }
+        table = Some(
+            conn.dialect()
+                .parse_table_sql(&row.get::<String>(2)?, root_page)?,
+        );
+        Ok(())
+    })?;
+    let table = table.ok_or_else(|| {
+        LimboError::ParseError(format!("COPY table '{}' does not exist", spec.table))
+    })?;
+    let columns = if spec.columns.is_empty() {
+        table
+            .columns()
+            .iter()
+            .filter(|column| !column.hidden() && !column.is_generated())
+            .map(|column| column.name.as_ref().expect("table columns have names"))
+            .collect::<Vec<_>>()
+    } else {
+        for name in &spec.columns {
+            let (_, column) = table.get_column(name).ok_or_else(|| {
+                LimboError::ParseError(format!("COPY column '{name}' does not exist"))
+            })?;
+            column.ensure_not_generated("COPY", name)?;
+        }
+        spec.columns.iter().collect()
+    };
+    let columns = columns
+        .into_iter()
+        .map(|column| quote_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    conn.prepare_sqlite(format!(
+        "SELECT {columns} FROM {}.{}",
+        quote_identifier(&schema),
+        quote_identifier(&spec.table)
+    ))
+}
 
 /// A parsed row from COPY text format: each element is None for NULL, Some for a value.
 type CopyRow = Vec<Option<String>>;
