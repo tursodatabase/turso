@@ -571,6 +571,37 @@ expect error {
 }
 
 @setup anyall_cmp
+@skip-if postgres "PostgreSQL supports stddev on the left of > ANY"
+test gt-any-subquery-rejects-stddev {
+    SELECT stddev(a) > ANY (SELECT 1) FROM nums;
+}
+@sqlstate 0A000
+expect error {
+}
+
+test gt-any-subquery-outer-column-named-like-generated-column {
+    SELECT x._turso_anyall_value FROM (SELECT 3 AS _turso_anyall_value) x
+    WHERE _turso_anyall_value > ANY (SELECT 1);
+}
+expect {
+    3
+}
+
+setup anyall_rows_table {
+    CREATE TABLE _turso_anyall_rows (a int);
+    INSERT INTO _turso_anyall_rows VALUES (1), (5);
+}
+
+@setup anyall_rows_table
+test gt-any-subquery-outer-table-named-like-generated-table {
+    SELECT _turso_anyall_rows.a FROM _turso_anyall_rows
+    WHERE _turso_anyall_rows.a > ANY (SELECT 2) ORDER BY 1;
+}
+expect {
+    5
+}
+
+@setup anyall_cmp
 test gt-all-subquery-allows-aggregate-in-scalar-subquery {
     SELECT a FROM nums WHERE (SELECT max(a) FROM nums) > ALL (SELECT a FROM nums WHERE a < 6) ORDER BY a;
 }
