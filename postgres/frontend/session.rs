@@ -1286,7 +1286,7 @@ mod tests {
              CREATE TABLE t (x int); \
              CREATE TABLE app.t (x int); \
              CREATE MATERIALIZED VIEW mv AS SELECT count(*) AS n FROM t; \
-             CREATE MATERIALIZED VIEW app.mv AS SELECT count(*) AS n FROM t; \
+             CREATE MATERIALIZED VIEW app.mv AS SELECT count(*) AS n FROM app.t; \
              INSERT INTO t VALUES (1); \
              INSERT INTO app.t VALUES (1), (2);",
         )

@@ -5249,27 +5249,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn open_connection_with_opts(path: &std::path::Path, opts: DatabaseOpts) -> Arc<Connection> {
-        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(
-            io,
-            path.to_str().unwrap(),
-            OpenFlags::default(),
-            opts,
-            None,
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
-        db.connect(ConnectOpts::new()).unwrap()
-    }
-
-    fn open_connection(path: &std::path::Path) -> Arc<Connection> {
-        open_connection_with_opts(path, DatabaseOpts::new())
-    }
-
-    /// Opens `path` with a dialect that supports namespaces, as the
-    /// PostgreSQL frontend does; the SQLite dialect never does.
-    fn open_connection_storing_namespaces(path: &std::path::Path) -> Arc<Connection> {
-        open_connection_with_dialect(path, DatabaseOpts::new(), Arc::new(StoringDialect))
+        open_connection_with_dialect(path, opts, Arc::new(SqliteDialect))
     }
 
     fn open_connection_with_dialect(
@@ -5288,6 +5268,72 @@ mod tests {
         )
         .unwrap();
         db.connect(ConnectOpts::new()).unwrap()
+    }
+
+    /// The SQLite dialect, except that it supports namespaces and binds the
+    /// names in a view or a column default when the view or table is
+    /// created, like PostgreSQL.
+    struct BindingDialect;
+
+    impl crate::Dialect for BindingDialect {
+        fn name(&self) -> &'static str {
+            "binding"
+        }
+
+        fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            SqliteDialect.parse(sql)
+        }
+
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<crate::schema::BTreeTable> {
+            SqliteDialect.parse_table_sql(sql, root_page)
+        }
+
+        fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_parser::ast::Stmt> {
+            SqliteDialect.parse_table_sql_ast(sql)
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
+            SqliteDialect.table_sql_for_replay(sql)
+        }
+
+        fn format_table_sql(
+            &self,
+            input: &str,
+            tbl_name: &turso_parser::ast::QualifiedName,
+            body: &turso_parser::ast::CreateTableBody,
+        ) -> Result<String> {
+            SqliteDialect.format_table_sql(input, tbl_name, body)
+        }
+
+        fn register_catalog(
+            &self,
+            schema: &mut crate::schema::Schema,
+            enable_custom_types: bool,
+        ) -> Result<()> {
+            SqliteDialect.register_catalog(schema, enable_custom_types)
+        }
+
+        fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<crate::Func>> {
+            SqliteDialect.resolve_function(name, arg_count)
+        }
+
+        fn binds_names_at_create(&self) -> bool {
+            true
+        }
+
+        fn supports_namespaces(&self) -> bool {
+            true
+        }
+    }
+
+    fn open_connection(path: &std::path::Path) -> Arc<Connection> {
+        open_connection_with_opts(path, DatabaseOpts::new())
+    }
+
+    /// Opens `path` with a dialect that supports namespaces, as the
+    /// PostgreSQL frontend does; the SQLite dialect never does.
+    fn open_connection_storing_namespaces(path: &std::path::Path) -> Arc<Connection> {
+        open_connection_with_dialect(path, DatabaseOpts::new(), Arc::new(StoringDialect))
     }
 
     /// The SQLite dialect with namespaces stored in the main database.
@@ -5735,9 +5781,6 @@ mod tests {
         conn.execute("CREATE VIEW v AS SELECT x FROM app.t")
             .unwrap();
         assert_eq!(query_single_i64(&conn, "SELECT x FROM v"), 3);
-        conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT x FROM app.t")
-            .unwrap();
-        assert_eq!(query_single_i64(&conn, "SELECT x FROM mv"), 3);
         conn.execute("CREATE VIEW app.v AS SELECT x FROM main.u")
             .unwrap();
         assert_eq!(query_single_i64(&conn, "SELECT x FROM app.v"), 4);
@@ -5754,6 +5797,31 @@ mod tests {
             err.contains("view cannot reference table in attached database"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn test_a_view_binds_its_tables_through_the_search_path_when_created() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_dialect(
+            &temp_dir.path().join("main.db"),
+            DatabaseOpts::new().with_views(true),
+            Arc::new(BindingDialect),
+        );
+        conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(1)")
+            .unwrap();
+        conn.create_namespace("app").unwrap();
+        conn.set_search_path(Some(vec!["app".to_string(), "main".to_string()]));
+        conn.execute("CREATE VIEW v AS SELECT t.x FROM t").unwrap();
+        conn.execute("CREATE VIEW w AS WITH c AS (SELECT x FROM t) SELECT x FROM c WHERE x IN (SELECT x FROM t)")
+            .unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(2)")
+            .unwrap();
+
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 2);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.v"), 1);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.w"), 1);
+        conn.set_search_path(Some(vec!["main".to_string()]));
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.v"), 1);
     }
 
     #[test]

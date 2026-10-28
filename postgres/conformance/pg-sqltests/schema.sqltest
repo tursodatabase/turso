@@ -438,3 +438,19 @@ expect {
     3
     3
 }
+
+test view-in-schema-binds-a-public-table-through-search-path {
+    CREATE SCHEMA app;
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    CREATE VIEW app.v AS SELECT x FROM t;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (2);
+    SELECT * FROM app.v;
+    SET search_path TO app;
+    SELECT * FROM app.v;
+}
+expect {
+    1
+    1
+}

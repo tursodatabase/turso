@@ -56,7 +56,7 @@ The resolver (`core/translate/emitter/mod.rs`) turns a written name into a `Name
 
 - A qualified name, `app.users`, is looked up in the namespace called `app`.
 - An unqualified name, `users`, is looked up through the search order, a list of namespaces. With no search path the order is main, then the attached databases by id. With a search path it is the namespaces of the names that exist, each once, so `public` and `app` can both be in the order although both are in the main database. The first namespace of the order is where CREATE puts an object whose name has no namespace. Temp is not in the list: it comes before the list when the connection has a temp database.
-- The body of a view or trigger resolves names written without a namespace in the namespace of the view or trigger, not in the search path of the session that runs it. A trigger created without a namespace goes into the namespace of its table.
+- The body of a trigger resolves names written without a namespace in the namespace of the trigger, not in the search path of the session that runs it. A trigger created without a namespace goes into the namespace of its table. For a dialect that binds names when a view is created (`Dialect::binds_names_at_create`, true for PostgreSQL), the stored body of a view names each table with the namespace it was found in through the search path of that moment, so the view reads the same tables whatever the search path is later; for SQLite the body is stored as written and resolves in the namespace of the view.
 - The engine's virtual tables, such as table-valued functions and a frontend's catalog tables, exist only in the root namespace and are found from every namespace when no namespace of the search order has an object of that name, the way PostgreSQL's `pg_catalog` is on every search path.
 
 Once resolved, the namespace travels with the object through the planner and into the bytecode:
@@ -96,5 +96,5 @@ The frontend (`postgres/frontend/session.rs`) maps the statements:
 
 Limits of the frontend:
 
-- `ALTER TABLE RENAME` rewrites the table's own rows but does not rewrite references written without a schema inside the view and trigger bodies of the same schema on disk.
+- `ALTER TABLE RENAME` rewrites the table's own rows but does not rewrite references written without a schema inside the view and trigger bodies of the same schema on disk. `ALTER TABLE RENAME COLUMN` rewrites the views of the table's own namespace only, so a view of another schema that reads the table is left as it was.
 - A table in a schema whose column default calls a sequence stores the translated statement text rather than the original, so the sequence name is not derived from the mangled table name when the schema loads.
