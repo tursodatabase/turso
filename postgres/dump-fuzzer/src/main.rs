@@ -128,9 +128,9 @@ fn main() -> Result<()> {
         disabled_features: saved_features,
     };
     if matches!(profile, Profile::Compatible)
-        && url::Url::parse(&runner.reference)?.username() != "turso"
+        && url::Url::parse(&runner.reference)?.username() != "postgres"
     {
-        anyhow::bail!("Compatible default privileges include their creating role: use PG_DSN with role turso (LOGIN CREATEDB), or --profile tables");
+        anyhow::bail!("Compatible default privileges include their creating role: use PG_DSN with role postgres, or --profile tables");
     }
     match args.command {
         Mode::Fuzz {

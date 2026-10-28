@@ -265,6 +265,7 @@ test pg-function-support-catalogs-are-empty {
 }
 expect {}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-init-privs-is-read-only {
     DELETE FROM pg_init_privs;
 }
@@ -273,6 +274,7 @@ expect error {permission denied for table pg_init_privs}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_init_privs"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-cast-is-read-only {
     DELETE FROM pg_cast;
 }
@@ -281,6 +283,7 @@ expect error {permission denied for table pg_cast}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_cast"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-transform-is-read-only {
     DELETE FROM pg_transform;
 }
@@ -410,6 +413,7 @@ test pg-object-unsupported-catalogs-are-empty {
 }
 expect {}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-object-operator-is-read-only {
     DELETE FROM pg_operator;
 }
@@ -418,6 +422,7 @@ expect error {permission denied for table pg_operator}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_operator"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-object-opclass-is-read-only {
     DELETE FROM pg_opclass;
 }
@@ -426,6 +431,7 @@ expect error {permission denied for table pg_opclass}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_opclass"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-object-opfamily-is-read-only {
     DELETE FROM pg_opfamily;
 }
@@ -434,6 +440,7 @@ expect error {permission denied for table pg_opfamily}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_opfamily"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-object-ts-parser-is-read-only {
     DELETE FROM pg_ts_parser;
 }
@@ -442,6 +449,7 @@ expect error {permission denied for table pg_ts_parser}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_ts_parser"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-object-ts-template-is-read-only {
     DELETE FROM pg_ts_template;
 }
@@ -450,6 +458,7 @@ expect error {permission denied for table pg_ts_template}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_ts_template"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-object-ts-dict-is-read-only {
     DELETE FROM pg_ts_dict;
 }
@@ -458,6 +467,7 @@ expect error {permission denied for table pg_ts_dict}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_ts_dict"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-object-ts-config-is-read-only {
     DELETE FROM pg_ts_config;
 }
@@ -466,6 +476,7 @@ expect error {permission denied for table pg_ts_config}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_ts_config"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-object-foreign-data-wrapper-is-read-only {
     DELETE FROM pg_foreign_data_wrapper;
 }
@@ -474,6 +485,7 @@ expect error {permission denied for table pg_foreign_data_wrapper}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_foreign_data_wrapper"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-object-foreign-server-is-read-only {
     DELETE FROM pg_foreign_server;
 }
@@ -482,6 +494,7 @@ expect error {permission denied for table pg_foreign_server}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_foreign_server"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-object-default-acl-is-read-only {
     DELETE FROM pg_default_acl;
 }
@@ -490,6 +503,7 @@ expect error {permission denied for table pg_default_acl}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_default_acl"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-object-conversion-is-read-only {
     DELETE FROM pg_conversion;
 }
@@ -498,6 +512,7 @@ expect error {permission denied for table pg_conversion}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_conversion"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-object-range-is-read-only {
     DELETE FROM pg_range;
 }
@@ -506,6 +521,7 @@ expect error {permission denied for table pg_range}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_range"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-object-event-trigger-is-read-only {
     DELETE FROM pg_event_trigger;
 }
@@ -514,6 +530,7 @@ expect error {permission denied for table pg_event_trigger}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_event_trigger"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-object-subscription-is-read-only {
     DELETE FROM pg_subscription;
 }
@@ -522,6 +539,7 @@ expect error {permission denied for table pg_subscription}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_subscription"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-object-largeobject-metadata-is-read-only {
     DELETE FROM pg_largeobject_metadata;
 }
@@ -530,6 +548,7 @@ expect error {permission denied for table pg_largeobject_metadata}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_largeobject_metadata"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-object-amop-is-read-only {
     DELETE FROM pg_amop;
 }
@@ -538,6 +557,7 @@ expect error {permission denied for table pg_amop}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_amop"}
 
+@skip-if postgres "The superuser postgres may write to the PostgreSQL catalogs"
 test pg-object-amproc-is-read-only {
     DELETE FROM pg_amproc;
 }

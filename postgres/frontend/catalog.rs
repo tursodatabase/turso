@@ -16,6 +16,7 @@ use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
 
+use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
 
 /// PostgreSQL uses OID zero when no object is referenced.
@@ -804,8 +805,6 @@ pub(crate) fn role_oid(id: RoleId) -> i64 {
         _ => USER_ROLE_OID_START + id.get(),
     }
 }
-
-const BOOTSTRAP_SUPERUSER_NAME: &str = "postgres";
 
 /// The roles that PostgreSQL has: its bootstrap superuser, which is the
 /// built-in [RoleId::SUPERUSER], and the roles in the core role catalog.

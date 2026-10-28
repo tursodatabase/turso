@@ -22,7 +22,7 @@ fi
 if ! docker info >/dev/null 2>&1; then
     echo "error: PG_DSN is not set and Docker is not running." >&2
     echo "Start Docker, or set PG_DSN to a PostgreSQL server, for example" >&2
-    echo "PG_DSN=postgres://sqltest@127.0.0.1:5432/postgres." >&2
+    echo "PG_DSN=postgres://postgres@127.0.0.1:5432/postgres." >&2
     exit 2
 fi
 
@@ -54,16 +54,7 @@ if ! docker exec "$container" pg_isready --host 127.0.0.1 --username postgres >/
     exit 1
 fi
 
-POSTGRES_TEST_USER="${POSTGRES_TEST_USER:-sqltest}"
-if [[ ! "$POSTGRES_TEST_USER" =~ ^[a-z_][a-z0-9_]*$ ]]; then
-    echo "error: POSTGRES_TEST_USER must be a lowercase SQL identifier" >&2
-    exit 2
-fi
-
-docker exec "$container" psql --quiet --username postgres \
-    --command "CREATE ROLE $POSTGRES_TEST_USER LOGIN CREATEDB" >/dev/null
-
 port=$(docker port "$container" 5432/tcp | head -n 1 | sed 's/.*://')
-export PG_DSN="postgres://${POSTGRES_TEST_USER}@127.0.0.1:${port}/postgres"
+export PG_DSN="postgres://postgres@127.0.0.1:${port}/postgres"
 echo "Using $POSTGRES_IMAGE at $PG_DSN" >&2
 "$@"
