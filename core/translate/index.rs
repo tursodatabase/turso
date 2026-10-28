@@ -115,12 +115,23 @@ pub fn translate_create_index(
         panic!("translate_create_index must be called with CreateIndex AST node");
     };
 
-    let original_idx_name = idx_name;
-    let original_tbl_name = tbl_name;
-    let namespace = if original_idx_name.namespace.is_some() {
-        resolver.resolve_namespace(&original_idx_name)?
-    } else {
-        resolver.resolve_existing_table_named(original_tbl_name.as_str())?
+    let mut original_idx_name = idx_name;
+    let mut original_tbl_name = tbl_name;
+    let namespace = match stored_index_of_namespace(
+        connection,
+        resolver,
+        &original_idx_name,
+        &original_tbl_name,
+    ) {
+        Some((namespace, bare_idx_name, bare_tbl_name)) => {
+            original_idx_name.name = bare_idx_name;
+            original_tbl_name = bare_tbl_name;
+            namespace
+        }
+        None if original_idx_name.namespace.is_some() => {
+            resolver.resolve_namespace(&original_idx_name)?
+        }
+        None => resolver.resolve_existing_table_named(original_tbl_name.as_str())?,
     };
     let database_id = namespace.database_id;
     let sql = canonical_create_index_sql(
@@ -348,6 +359,36 @@ pub fn translate_create_index(
     });
 
     Ok(())
+}
+
+/// The namespace of the index that `idx_name` and `tbl_name` name by their
+/// mangled names, with their bare names. The stored text of an index of a
+/// table of a namespace names both so, and the engine runs that text again,
+/// as VACUUM does when it copies a database.
+fn stored_index_of_namespace(
+    connection: &Arc<crate::Connection>,
+    resolver: &Resolver,
+    idx_name: &QualifiedName,
+    tbl_name: &ast::Name,
+) -> Option<(NamespaceRef, ast::Name, ast::Name)> {
+    if !connection.is_nested_stmt() || idx_name.namespace.is_some() {
+        return None;
+    }
+    resolver.with_schema(crate::MAIN_DB_ID, |schema| {
+        let (id, bare_tbl_name) = schema.demangle_name(tbl_name.as_str());
+        if id.is_root() {
+            return None;
+        }
+        let (_, bare_idx_name) = schema.demangle_name(idx_name.name.as_str());
+        Some((
+            NamespaceRef {
+                database_id: crate::MAIN_DB_ID,
+                id,
+            },
+            ast::Name::exact(bare_idx_name.to_string()),
+            ast::Name::exact(bare_tbl_name.to_string()),
+        ))
+    })
 }
 
 /// Emits the bytecode that rebuilds `idx` from a full scan of `tbl`.

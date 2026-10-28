@@ -404,3 +404,42 @@ fn serial_tables_of_two_schemas_keep_their_sequences(db: TempDatabase) {
         );
     }
 }
+
+/// VACUUM INTO copies the indexes of the tables of every schema, public
+/// included, whose stored text names the table by its mangled name.
+#[turso_macros::test]
+fn vacuum_into_copies_the_indexes_of_tables_of_a_namespace(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("CREATE TABLE app.t (x int)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("INSERT INTO app.t VALUES (2)").unwrap();
+    conn.execute("CREATE INDEX i ON t (x)").unwrap();
+    conn.execute("CREATE INDEX i ON app.t (x)").unwrap();
+    let copy = db.path.with_file_name(format!(
+        "{}-copy.db",
+        db.path.file_stem().unwrap().to_str().unwrap()
+    ));
+    db.connect_limbo()
+        .execute(format!("VACUUM INTO '{}'", copy.display()))
+        .unwrap();
+
+    let copied_db = reopen(&copy);
+    let copied = copied_db.connect_limbo();
+    assert_eq!(
+        query_i64(&copied, "SELECT count(*) FROM public.t WHERE x = 1"),
+        1
+    );
+    assert_eq!(
+        query_i64(&copied, "SELECT count(*) FROM app.t WHERE x = 2"),
+        1
+    );
+    assert_eq!(
+        query_i64(
+            &copied,
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND name IN ('__turso_ns1_i', '__turso_ns2_i')"
+        ),
+        2
+    );
+}
