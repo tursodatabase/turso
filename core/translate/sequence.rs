@@ -22,7 +22,7 @@ use crate::schema::{
 };
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::functions::qualify_sequence_argument;
+use crate::translate::expr::functions::{names_mangled_sequence, qualify_sequence_argument};
 use crate::translate::expr::{walk_expr_mut, WalkControl};
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::trigger_exec::rewrite_select_expressions;
@@ -1172,6 +1172,10 @@ fn bind_sequence_call(expr: &mut ast::Expr, resolver: &Resolver) -> bool {
         return false;
     };
     if !is_sequence_function(name.as_str()) {
+        return false;
+    }
+    // A sequence named by its mangled name is bound to its namespace already.
+    if names_mangled_sequence(args, resolver) {
         return false;
     }
     let Some(qualified_args) = qualify_sequence_argument(args, resolver) else {

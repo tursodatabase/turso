@@ -666,6 +666,12 @@ impl<'a> Resolver<'a> {
         self.catalog.resolve_existing_sequence(seq_name)
     }
 
+    /// The namespace and bare name of the sequence whose mangled name is
+    /// `mangled`.
+    pub(crate) fn sequence_of_mangled_name(&self, mangled: &str) -> Option<(NamespaceRef, String)> {
+        self.catalog.sequence_of_mangled_name(mangled)
+    }
+
     pub(crate) fn find_existing_sequence(&self, seq_name: &str) -> Option<NamespaceRef> {
         self.catalog.find_existing_sequence(seq_name)
     }

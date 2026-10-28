@@ -206,7 +206,10 @@ pub(super) fn translate_sequence_function(
         (namespace, normalize_ident(name))
     } else {
         let name = normalize_ident(&seq_name_raw);
-        (resolver.resolve_existing_sequence(&name)?, name)
+        match resolver.sequence_of_mangled_name(&name) {
+            Some(sequence) => sequence,
+            None => (resolver.resolve_existing_sequence(&name)?, name),
+        }
     };
     let database_id = namespace.database_id;
     let mangled_seq_name = resolver.mangle_name(namespace, &normalized_name);
@@ -363,6 +366,20 @@ pub(super) fn translate_sequence_function(
 /// currval session value is keyed by it. None when the name keeps its
 /// spelling: it has a schema, it is not a string literal, or the search
 /// order is empty.
+/// Whether the sequence argument of `args` is the mangled name of a
+/// sequence of a namespace, which names the namespace by its id.
+pub(crate) fn names_mangled_sequence(args: &[Box<ast::Expr>], resolver: &Resolver) -> bool {
+    let Some(name) = args
+        .first()
+        .and_then(|arg| extract_string_literal(arg).ok())
+    else {
+        return false;
+    };
+    resolver.with_schema(crate::MAIN_DB_ID, |schema| {
+        !schema.demangle_name(&normalize_ident(&name)).0.is_root()
+    })
+}
+
 pub(crate) fn qualify_sequence_argument(
     args: &[Box<ast::Expr>],
     resolver: &Resolver,
@@ -372,7 +389,10 @@ pub(crate) fn qualify_sequence_argument(
         return None;
     }
     let name = normalize_ident(&seq_name_raw);
-    let namespace = resolver.find_existing_sequence(&name)?;
+    let (namespace, name) = match resolver.sequence_of_mangled_name(&name) {
+        Some(sequence) => sequence,
+        None => (resolver.find_existing_sequence(&name)?, name),
+    };
     let runtime_name = resolver.runtime_sequence_name(namespace, &name);
     let mut args = args.to_vec();
     args[0] = Box::new(ast::Expr::Literal(ast::Literal::String(format!(

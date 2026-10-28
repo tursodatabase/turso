@@ -1380,7 +1380,7 @@ pub fn translate_create_table(
     // input text).
     let sql = if let Some(ref info) = ctas_info {
         info.schema_sql.clone()
-    } else if bound_sequence_names || (!namespace.id.is_root() && defaults_name_sequences(&body)) {
+    } else if bound_sequence_names {
         connection
             .dialect()
             .format_rewritten_table_sql(&ast::Stmt::CreateTable {
@@ -1579,33 +1579,6 @@ pub fn translate_create_table(
     }
 
     Ok(())
-}
-
-/// Whether a column default of `body` calls a sequence function. The
-/// stored text of such a table in a namespace is the translated
-/// statement: the text as written would derive the sequence's name from
-/// the mangled table name again when the schema loads.
-fn defaults_name_sequences(body: &ast::CreateTableBody) -> bool {
-    let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
-        return false;
-    };
-    columns.iter().any(|column| {
-        column.constraints.iter().any(|constraint| {
-            let ast::ColumnConstraint::Default(expr) = &constraint.constraint else {
-                return false;
-            };
-            let mut names_sequence = false;
-            let _ = crate::translate::expr::walk_expr(expr, &mut |expr: &ast::Expr| {
-                if let ast::Expr::FunctionCall { name, .. } = expr {
-                    if crate::translate::sequence::is_sequence_function(name.as_str()) {
-                        names_sequence = true;
-                    }
-                }
-                Ok::<_, LimboError>(crate::translate::expr::WalkControl::Continue)
-            });
-            names_sequence
-        })
-    })
 }
 
 /// Binds the sequences named in the column defaults of `body` to the

@@ -632,13 +632,20 @@ impl PostgreSQLTranslator {
                 tbl_name.name.as_str().to_lowercase(),
                 name.to_lowercase()
             );
-            serial_sequences.push(seq_name.clone());
-            let namespace = serial_sequence_namespace(tbl_name);
+            // The stored text of a table of a schema names the table by its
+            // mangled name, and the sequence's mangled name is that name with
+            // the same suffix, so the default names the sequence that way.
+            let sequence = if bare_table_name(tbl_name.name.as_str()) != tbl_name.name.as_str() {
+                seq_name.clone()
+            } else {
+                format!("{}.{seq_name}", serial_sequence_namespace(tbl_name))
+            };
+            serial_sequences.push(seq_name);
             default_expr = Some(ast::Expr::FunctionCall {
                 name: exact_name("nextval"),
                 distinctness: None,
                 args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                    "'{namespace}.{seq_name}'"
+                    "'{sequence}'"
                 ))))],
                 order_by: vec![],
                 within_group: vec![],

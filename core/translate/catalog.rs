@@ -500,6 +500,25 @@ impl<'a> CatalogContext<'a> {
         })
     }
 
+    /// The namespace and bare name of the sequence whose mangled name is
+    /// `mangled`. A column default read from the stored text of a table of
+    /// a namespace names its serial sequence so, since that text names the
+    /// table by its mangled name too.
+    pub(crate) fn sequence_of_mangled_name(&self, mangled: &str) -> Option<(NamespaceRef, String)> {
+        self.with_schema(crate::MAIN_DB_ID, |schema| {
+            let (id, name) = schema.demangle_name(mangled);
+            (!id.is_root() && schema.has_sequence(id, name)).then(|| {
+                (
+                    NamespaceRef {
+                        database_id: crate::MAIN_DB_ID,
+                        id,
+                    },
+                    name.to_string(),
+                )
+            })
+        })
+    }
+
     /// `seq_name` qualified with the namespace it resolved to, for the
     /// opcodes that look a sequence up again by its name when the statement
     /// runs.

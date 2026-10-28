@@ -338,3 +338,69 @@ fn a_materialized_view_of_a_namespace_is_maintained_and_survives_reopening() {
     assert_eq!(query_i64(&conn, "SELECT count(*) FROM app.t"), 3);
     assert_eq!(query_i64(&conn, "SELECT n FROM public.mv"), 1);
 }
+
+/// Runs `sql` on the PostgreSQL connection and returns the integer in the
+/// first column of its first row.
+fn pg_query_i64(conn: &turso_pg::Connection, sql: &str) -> i64 {
+    let mut stmt = conn.query(sql).unwrap().unwrap();
+    let mut value = None;
+    while let turso_core::StepResult::Row = stmt.step().unwrap() {
+        if value.is_none() {
+            value = stmt.row().unwrap().get_value(0).as_int();
+        }
+    }
+    value.unwrap_or_else(|| panic!("expected an integer for: {sql}"))
+}
+
+/// A serial column takes its default from its own sequence, in the table's
+/// schema, also after the stored text of the table is read again.
+#[turso_macros::test]
+fn serial_tables_of_two_schemas_keep_their_sequences(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE t(id serial, v text)").unwrap();
+    conn.execute("CREATE TABLE app.t(id serial, v text)")
+        .unwrap();
+    conn.execute("INSERT INTO t(v) VALUES ('a'), ('b')")
+        .unwrap();
+    conn.execute("INSERT INTO app.t(v) VALUES ('c')").unwrap();
+    let mut ddl = conn
+        .query("SELECT ddl FROM pg_get_tabledef ORDER BY schema_name")
+        .unwrap()
+        .unwrap();
+    let mut ddls = Vec::new();
+    while let turso_core::StepResult::Row = ddl.step().unwrap() {
+        ddls.push(ddl.row().unwrap().get_value(0).to_string());
+    }
+    assert_eq!(
+        ddls,
+        [
+            "CREATE TABLE t(id serial, v text)",
+            "CREATE TABLE t(id serial, v text)"
+        ]
+    );
+    let copy = db.path.with_file_name(format!(
+        "{}-copy.db",
+        db.path.file_stem().unwrap().to_str().unwrap()
+    ));
+    db.connect_limbo()
+        .execute(format!("VACUUM INTO '{}'", copy.display()))
+        .unwrap();
+
+    let path = db.path.clone();
+    drop(ddl);
+    drop(conn);
+    drop(db);
+    for path in [path, copy] {
+        let db = reopen(&path);
+        let conn = db.connect_postgres();
+        assert_eq!(
+            pg_query_i64(&conn, "INSERT INTO t(v) VALUES ('d') RETURNING id"),
+            3
+        );
+        assert_eq!(
+            pg_query_i64(&conn, "INSERT INTO app.t(v) VALUES ('e') RETURNING id"),
+            2
+        );
+    }
+}
