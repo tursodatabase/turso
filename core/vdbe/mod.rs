@@ -2079,6 +2079,7 @@ pub struct PreparedProgram {
     /// mirrors: <https://sqlite.org/c3ref/stmt_readonly.html>.
     pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
+    pub result_column_types: Vec<Option<crate::statement::ColumnTypeInfo>>,
     pub table_references: TableReferences,
     pub sql: String,
     /// The statement is ANALYZE, so its completion refreshes the in-memory
@@ -2103,6 +2104,10 @@ pub struct PreparedProgram {
     pub has_materialized_views: bool,
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
+    /// The custom collations of the connection that prepared the program. The
+    /// program keeps them alive because its `CollationSeq::Custom` values
+    /// call their callbacks.
+    pub custom_collations: Vec<Arc<crate::function::ExternalCollation>>,
     /// Set of attached database indices that need write transactions.
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.

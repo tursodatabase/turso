@@ -132,6 +132,10 @@ pub trait Dialect: Send + Sync + 'static {
         options
     }
 
+    fn random_value(&self, bits: i64) -> crate::Value {
+        crate::Value::from_i64(bits) // SQLite default
+    }
+
     /// Resolve a function name in user SQL to the engine's function IR.
     ///
     /// The dialect owns its scalar function surface: the SQLite dialect
@@ -210,6 +214,15 @@ pub trait Dialect: Send + Sync + 'static {
     ///
     /// PostgreSQL returns an integer. SQLite always returns a REAL.
     fn mod_of_integers_is_integer(&self) -> bool {
+        false
+    }
+
+    /// Whether `ALTER TABLE ADD COLUMN` with a non-constant default works on
+    /// a table that has rows.
+    ///
+    /// PostgreSQL rewrites the table and computes the default for each
+    /// existing row. SQLite raises an error unless the table is empty.
+    fn add_column_computes_default_for_existing_rows(&self) -> bool {
         false
     }
 }

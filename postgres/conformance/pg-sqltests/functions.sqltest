@@ -255,6 +255,7 @@ expect {
 test current-setting-unknown-parameter-errors {
     SELECT current_setting('no_such_setting');
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "no_such_setting"
 }
@@ -262,6 +263,7 @@ expect error {
 test current-setting-unknown-parameter-without-missing-ok-errors {
     SELECT current_setting('no_such_setting', false);
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "no_such_setting"
 }
@@ -269,6 +271,7 @@ expect error {
 test current-setting-does-not-trim-the-parameter-name {
     SELECT current_setting('search_path ');
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "search_path "
 }
@@ -276,21 +279,96 @@ expect error {
 test current-setting-integer-parameter-name-errors {
     SELECT current_setting(5);
 }
+@sqlstate 42883
 expect error {}
 
 test current-setting-text-missing-ok-errors {
     SELECT current_setting('search_path', 'x');
 }
+@sqlstate 22P02
 expect error {}
+
+test current-setting-missing-ok-accepts-boolean-text {
+    SELECT coalesce(current_setting('no_such_setting', 'yes'), '<null>');
+    SELECT coalesce(current_setting('no_such_setting', ' TRUE '), '<null>');
+}
+expect {
+    <null>
+    <null>
+}
+
+test current-setting-missing-ok-false-text-errors {
+    SELECT current_setting('no_such_setting', ' Off ');
+}
+@sqlstate 42704
+expect error {
+    unrecognized configuration parameter "no_such_setting"
+}
+
+test current-setting-missing-ok-accepts-the-start-of-a-boolean-word {
+    SELECT coalesce(current_setting('no_such_setting', 'tr'), '<null>');
+    SELECT coalesce(current_setting('no_such_setting', 'Y'), '<null>');
+    SELECT coalesce(current_setting('no_such_setting', 'tRu'), '<null>');
+}
+expect {
+    <null>
+    <null>
+    <null>
+}
+
+test current-setting-missing-ok-of-is-false {
+    SELECT current_setting('no_such_setting', 'of');
+}
+@sqlstate 42704
+expect error {
+    unrecognized configuration parameter "no_such_setting"
+}
+
+test current-setting-missing-ok-o-is-not-a-boolean {
+    SELECT current_setting('no_such_setting', 'o');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type boolean: "o"
+}
+
+test current-setting-missing-ok-longer-than-a-boolean-word-errors {
+    SELECT current_setting('no_such_setting', 'truee');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type boolean: "truee"
+}
+
+test pg-input-is-valid-accepts-the-start-of-a-boolean-word {
+    SELECT CASE WHEN pg_input_is_valid('tr', 'bool') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid(' on ', 'bool') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('o', 'bool') THEN 'valid' ELSE 'invalid' END;
+}
+expect {
+    valid
+    valid
+    invalid
+}
+
+test current-setting-numeric-parameter-name-errors {
+    SELECT current_setting(5.5);
+}
+@sqlstate 42883
+expect error {
+    function current_setting\(numeric\) does not exist
+}
 
 test current-setting-without-arguments-errors {
     SELECT current_setting();
 }
+@sqlstate 42883
 expect error {}
 
 test current-setting-with-three-arguments-errors {
     SELECT current_setting('search_path', true, true);
 }
+@sqlstate 42883
 expect error {}
 
 test set-config-custom-parameter {
@@ -344,6 +422,7 @@ expect {
 test current-setting-undefined-custom-parameter-errors {
     SELECT current_setting('app.never_set');
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "app\.never_set"
 }
@@ -364,6 +443,7 @@ expect {
 test set-config-custom-parameter-name-with-an-empty-part-errors {
     SELECT set_config('app..user_id', 'v', false);
 }
+@sqlstate 42602
 expect error {
     invalid configuration parameter name "app\.\.user_id"
 }
@@ -371,6 +451,7 @@ expect error {
 test set-config-custom-parameter-name-with-a-trailing-dot-errors {
     SELECT set_config('app.', 'v', false);
 }
+@sqlstate 42602
 expect error {
     invalid configuration parameter name "app\."
 }
@@ -378,6 +459,7 @@ expect error {
 test set-config-custom-parameter-name-with-a-leading-digit-errors {
     SELECT set_config('app.1user', 'v', false);
 }
+@sqlstate 42602
 expect error {
     invalid configuration parameter name "app\.1user"
 }
@@ -385,6 +467,7 @@ expect error {
 test set-config-custom-parameter-name-with-a-space-errors {
     SELECT set_config('app.user id', 'v', false);
 }
+@sqlstate 42602
 expect error {
     invalid configuration parameter name "app\.user id"
 }
@@ -392,6 +475,7 @@ expect error {
 test set-config-unknown-parameter-without-a-dot-errors {
     SELECT set_config('no_such_setting', 'v', false);
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "no_such_setting"
 }
@@ -599,11 +683,13 @@ expect {
 test version-wrong-arity-errors {
     SELECT version(1);
 }
+@sqlstate 42883
 expect error {}
 
 test quote-ident-wrong-arity-errors {
     SELECT quote_ident();
 }
+@sqlstate 42883
 expect error {}
 
 test pg-get-expr-default-two-args {
@@ -633,11 +719,13 @@ test pg-get-expr-non-text-expression-errors {
     CREATE TABLE demo (id int DEFAULT 7, label text);
     SELECT pg_get_expr(42, 1::oid) FROM pg_attrdef;
 }
+@sqlstate 42883
 expect error {}
 
 test pg-get-expr-null-oid-does-not-hide-invalid-expression {
     SELECT pg_get_expr(42, NULL::oid);
 }
+@sqlstate 42883
 expect error {}
 
 @skip-if postgres "PostgreSQL prints (val > 0), and also lists the CHECK constraints of the information_schema domains"
@@ -747,26 +835,31 @@ expect {
 test acldefault-unknown-object-kind-errors {
     SELECT acldefault('?', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test acldefault-empty-object-kind-errors {
     SELECT acldefault('', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test acldefault-leading-space-object-kind-errors {
     SELECT acldefault(' r', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test acldefault-uppercase-object-kind-errors {
     SELECT acldefault('R', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test acldefault-non-ascii-object-kind-errors {
     SELECT acldefault('é', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test format-type-expanded {
@@ -873,6 +966,7 @@ expect {
 test pg-options-to-table-null-element {
     SELECT * FROM pg_options_to_table(ARRAY['a=b', NULL]);
 }
+@sqlstate 22004
 expect error {
     null array element not allowed in this context
 }
@@ -1007,6 +1101,7 @@ expect {
 test json-to-record-requires-column-list {
     SELECT * FROM json_to_record('{"id":1}') AS _;
 }
+@sqlstate 42601
 expect error {
     a column definition list is required for functions returning "record"
 }
@@ -1036,6 +1131,7 @@ expect {
 test json-to-recordset-object-errors {
     SELECT * FROM json_to_recordset('{"a":1}') AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call json_to_recordset on an object
 }
@@ -1043,6 +1139,7 @@ expect error {
 test json-to-recordset-scalar-errors {
     SELECT * FROM jsonb_to_recordset('5'::jsonb) AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call jsonb_to_recordset on a non-array
 }
@@ -1050,6 +1147,7 @@ expect error {
 test json-to-recordset-json-scalar-errors {
     SELECT * FROM json_to_recordset('5') AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call json_to_recordset on a scalar
 }
@@ -1057,6 +1155,7 @@ expect error {
 test json-to-recordset-non-object-element-errors {
     SELECT * FROM json_to_recordset('[{"a":1},5]') AS _(a int);
 }
+@sqlstate 22023
 expect error {
     argument of json_to_recordset must be an array of objects
 }
@@ -1064,6 +1163,7 @@ expect error {
 test json-to-recordset-null-element-errors {
     SELECT * FROM jsonb_to_recordset('[null]'::jsonb) AS _(a int);
 }
+@sqlstate 22023
 expect error {
     argument of jsonb_to_recordset must be an array of objects
 }
@@ -1071,6 +1171,7 @@ expect error {
 test json-to-record-array-errors {
     SELECT * FROM json_to_record('[{"a":1}]') AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call populate_composite on an array
 }
@@ -1078,6 +1179,7 @@ expect error {
 test json-to-record-scalar-errors {
     SELECT * FROM jsonb_to_record('null'::jsonb) AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call populate_composite on a scalar
 }
@@ -1099,6 +1201,16 @@ expect {
     <null>|<null>|<null>|-1
     <null>|"x"
     {"y":2}|"z"
+}
+
+test function-whose-name-starts-with-a-bracket-does-not-exist {
+    SELECT "[x"();
+}
+expect error {
+    function \[x\(\) does not exist
+}
+expect @tursopg error {
+    no such function: \[x
 }
 
 test mod-of-integers-is-integer {
@@ -1137,4 +1249,79 @@ test mod-with-null-is-null {
 }
 expect {
     <null>|<null>
+}
+
+test quoted-function-name-keeps-its-case {
+    SELECT "lower"('A');
+}
+expect {
+    a
+}
+
+test quoted-uppercase-scalar-function-name-errors {
+    SELECT "LOWER"('A');
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-mixed-case-version-errors {
+    SELECT "Version"() IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-uppercase-current-setting-errors {
+    SELECT "CURRENT_SETTING"('search_path');
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-uppercase-count-star-errors {
+    SELECT "COUNT"(*);
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-uppercase-aggregate-errors {
+    SELECT "SUM"(1);
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-mixed-case-window-function-errors {
+    SELECT "Row_Number"() OVER ();
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-uppercase-type-cast-function-errors {
+    SELECT "FLOAT8"(1);
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-schema-qualified-mixed-case-function-errors {
+    SELECT pg_catalog."Lower"('A');
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-uppercase-table-function-in-from-errors {
+    SELECT * FROM "GENERATE_SERIES"(1, 2);
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-mixed-case-json-table-function-in-from-errors {
+    SELECT * FROM "Json_Each"('[1]');
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-lowercase-table-function-in-from {
+    SELECT * FROM "generate_series"(1, 2);
+}
+expect {
+    1
+    2
 }

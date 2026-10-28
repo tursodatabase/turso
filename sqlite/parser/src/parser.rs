@@ -10,7 +10,7 @@ use crate::ast::{
     ResultColumn, Select, SelectBody, SelectTable, Set, SortOrder, SortedColumn, Stmt,
     TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent, TriggerTime, Type,
     TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert, UpsertDo,
-    UpsertIndex, Variable, Window, WindowDef, With,
+    UpsertIndex, Variable, Window, WindowDef, With, MAX_ARRAY_DIMENSIONS,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
@@ -1360,6 +1360,11 @@ impl<'a> Parser<'a> {
             eat_assert!(self, TK_LBRACKET);
             eat_expect!(self, TK_RBRACKET);
             array_dimensions += 1;
+        }
+        if array_dimensions > MAX_ARRAY_DIMENSIONS {
+            return Err(Error::Custom(format!(
+                "array type {type_name} has {array_dimensions} dimensions, but arrays have at most {MAX_ARRAY_DIMENSIONS}"
+            )));
         }
 
         Ok(Some(Type {

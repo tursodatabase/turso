@@ -310,7 +310,7 @@ impl OpenOptions {
 ///
 /// Turso treats every path with the `:memory:` prefix as a named
 /// in-memory database.
-pub(crate) fn is_memory_like(path: &str) -> bool {
+pub fn is_memory_like(path: &str) -> bool {
     path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty()
 }
 

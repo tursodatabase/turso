@@ -128,7 +128,7 @@ fn open_database(
 
 /// Discover and attach existing PG schema database files in the same directory.
 fn auto_attach_pg_schemas(conn: &Connection, db_file: &str) {
-    if db_file == ":memory:" {
+    if turso_core::is_memory_like(db_file) {
         return;
     }
     let dir = Path::new(db_file)

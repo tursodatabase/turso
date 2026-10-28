@@ -263,3 +263,13 @@ expect {
     1500
     1500
 }
+
+# Every key repeats four times, spread over the whole input, so most duplicates
+# are of keys already written to disk (#10705).
+@cross-check-integrity
+test distinct-spilled-many-duplicates {
+    SELECT count(*), sum(v) FROM (SELECT DISTINCT value % 5000 AS v FROM generate_series(1, 20000));
+}
+expect {
+    5000|12497500
+}

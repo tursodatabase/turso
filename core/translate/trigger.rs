@@ -1,5 +1,6 @@
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::RESERVED_TABLE_PREFIXES;
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
@@ -596,7 +597,7 @@ pub fn translate_drop_trigger(
         rhs: type_str_reg,
         target_pc: skip_non_trigger_label,
         flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: CollationSeq::for_internal_values(),
     });
 
     // Check if name matches
@@ -606,7 +607,7 @@ pub fn translate_drop_trigger(
         rhs: trigger_name_str_reg,
         target_pc: skip_non_trigger_label,
         flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: CollationSeq::for_internal_values(),
     });
 
     // Found it! Delete the row
@@ -643,6 +644,7 @@ pub fn translate_drop_trigger(
 
     program.emit_insn(Insn::DropTrigger {
         db: database_id,
+        namespace: namespace.id,
         trigger_name: normalized_trigger_name,
     });
 

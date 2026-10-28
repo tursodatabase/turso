@@ -2639,7 +2639,7 @@ impl IndexInfo {
             .iter()
             .map(|c| KeyInfo {
                 sort_order: c.order,
-                collation: c.collation.unwrap_or_default(),
+                collation: c.collation,
                 nulls_order: c.nulls_order,
             })
             .chain(has_rowid.then_some(KeyInfo {
@@ -2720,22 +2720,8 @@ where
     Ok(std::cmp::Ordering::Equal)
 }
 
-/// Treats `NULL` as equal to itself and smaller than other values.
-pub fn compare_immutable_single<V1, V2>(l: V1, r: V2, collation: CollationSeq) -> std::cmp::Ordering
-where
-    V1: AsValueRef,
-    V2: AsValueRef,
-{
-    let l = l.as_value_ref();
-    let r = r.as_value_ref();
-    match (l, r) {
-        (ValueRef::Text(left), ValueRef::Text(right)) => collation.compare_strings(&left, &right),
-        _ => l.cmp(&r),
-    }
-}
-
 pub fn cmp_in_column(a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
-    cmp_with_sort(compare_immutable_single(a, b, key.collation), a, b, key)
+    cmp_with_sort(key.collation.compare(*a, *b), a, b, key)
 }
 
 /// Outputs a modified [Ordering] that takes into account the sort order and the NULLS order.
@@ -3041,7 +3027,7 @@ where
     };
 
     let collation = index_info.key_info[0].collation;
-    let comparison = collation.compare_strings(&lhs_text, &rhs_text);
+    let comparison = collation.compare(ValueRef::Text(lhs_text), ValueRef::Text(rhs_text));
 
     let final_comparison = match index_info.key_info[0].sort_order {
         SortOrder::Asc => comparison,
@@ -3170,12 +3156,7 @@ where
         };
 
         let key_info = &index_info.key_info[field_idx];
-        let comparison = match (&lhs_value, rhs_value) {
-            (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) => {
-                key_info.collation.compare_strings(lhs_text, rhs_text)
-            }
-            _ => lhs_value.cmp(rhs_value),
-        };
+        let comparison = key_info.collation.compare(lhs_value, *rhs_value);
 
         let final_comparison = cmp_with_sort(comparison, &lhs_value, rhs_value, key_info);
 
@@ -4225,12 +4206,7 @@ mod tests {
             let column_order = index_key_info[i].sort_order;
             let collation = index_key_info[i].collation;
 
-            let cmp = match (&l[i], &r[i]) {
-                (ValueRef::Text(left), ValueRef::Text(right)) => {
-                    collation.compare_strings(left, right)
-                }
-                _ => l[i].partial_cmp(&r[i]).unwrap_or(std::cmp::Ordering::Equal),
-            };
+            let cmp = collation.compare(l[i], r[i]);
 
             if cmp != std::cmp::Ordering::Equal {
                 return match column_order {
@@ -5086,7 +5062,7 @@ mod tests {
     /// Before the Numeric refactor, ValueRef had separate Float(f64) and Integer(i64)
     /// variants. A raw f64::NAN could be stored in Float, and comparing two NaN floats
     /// via partial_cmp returned None. The .unwrap() in Ord::cmp and
-    /// compare_immutable_single would then panic.
+    /// the single-value compare would then panic.
     ///
     /// Now Numeric::Float wraps NonNan, which rejects NaN at construction time.
     /// This makes it impossible to represent NaN in a ValueRef, so partial_cmp
@@ -5103,7 +5079,7 @@ mod tests {
         assert_eq!(ValueRef::from_f64(f64::NAN), ValueRef::Null);
 
         // Exercise every representable float edge case through partial_cmp,
-        // Ord::cmp, and compare_immutable_single — none of these can panic now.
+        // Ord::cmp, and CollationSeq::compare — none of these can panic now.
         let values: Vec<ValueRef> = vec![
             ValueRef::Null,
             ValueRef::from_i64(0),
@@ -5140,10 +5116,10 @@ mod tests {
             }
         }
 
-        // compare_immutable_single is where the unwrap panic originally surfaced.
+        // The single-value compare, now CollationSeq::compare, is where the unwrap panic originally surfaced.
         for a in &values {
             for b in &values {
-                let _ = compare_immutable_single(*a, *b, CollationSeq::Binary);
+                let _ = CollationSeq::Binary.compare(*a, *b);
             }
         }
 

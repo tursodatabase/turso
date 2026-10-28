@@ -22,7 +22,7 @@ use crate::translate::{
 use crate::{
     emit_explain,
     schema::PseudoCursorType,
-    translate::collate::{resolve_comparison_collseq_with_symbols, CollationSeq},
+    translate::collate::{expr_collation, CollationSeq},
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -162,7 +162,7 @@ impl EmitGroupBy {
              */
             let order_collations_nulls: crate::alloc::Vec<(
                 SortOrder,
-                Option<CollationSeq>,
+                CollationSeq,
                 Option<turso_parser::ast::NullsOrder>,
             )> = group_by
                 .exprs
@@ -170,12 +170,8 @@ impl EmitGroupBy {
                 .zip(sort_order.iter())
                 .zip(group_by.nulls_order.iter())
                 .map(|((expr, ord), nulls)| {
-                    let collation = Some(resolve_comparison_collseq_with_symbols(
-                        expr,
-                        expr,
-                        &plan.table_references,
-                        Some(t_ctx.resolver.symbol_table),
-                    )?);
+                    let collation =
+                        expr_collation(expr, Some(&plan.table_references), &t_ctx.resolver)?;
                     Ok::<_, crate::LimboError>((*ord, collation, *nulls))
                 })
                 .try_collect::<Result<crate::alloc::Vec<_>>>()??;
@@ -184,9 +180,7 @@ impl EmitGroupBy {
             let comparators = group_by
                 .exprs
                 .iter()
-                .map(|expr| {
-                    custom_type_comparator(expr, &plan.table_references, t_ctx.resolver.schema())
-                })
+                .map(|expr| custom_type_comparator(expr, &plan.table_references, &t_ctx.resolver))
                 .try_collect()?;
 
             program.emit_insn(Insn::SorterOpen {
@@ -701,28 +695,17 @@ pub fn group_by_process_single_group(
         GroupByRowSource::MainLoop { start_reg_src, .. } => *start_reg_src,
     };
 
-    let mut compare_key_info = group_by
+    let compare_key_info = group_by
         .exprs
         .iter()
-        .map(|_| KeyInfo {
-            sort_order: SortOrder::Asc,
-            collation: CollationSeq::default(),
-            nulls_order: None,
+        .map(|expr| {
+            Ok(KeyInfo {
+                sort_order: SortOrder::Asc,
+                collation: expr_collation(expr, Some(&plan.table_references), &t_ctx.resolver)?,
+                nulls_order: None,
+            })
         })
-        .collect::<Vec<_>>();
-    for (i, c) in compare_key_info
-        .iter_mut()
-        .enumerate()
-        .take(group_by.exprs.len())
-    {
-        let collation = resolve_comparison_collseq_with_symbols(
-            &group_by.exprs[i],
-            &group_by.exprs[i],
-            &plan.table_references,
-            Some(t_ctx.resolver.symbol_table),
-        )?;
-        c.collation = collation;
-    }
+        .collect::<Result<Vec<_>>>()?;
 
     // Compare the group by columns to the previous group by columns to see if we are at a new group or not
     program.emit_insn(Insn::Compare {
@@ -794,7 +777,6 @@ pub fn group_by_process_single_group(
                     std::borrow::Cow::Owned(leaf_expr),
                     leaf_regs + i,
                     false,
-                    None,
                 );
             }
             t_ctx.resolver.enable_expr_to_reg_cache();
@@ -936,12 +918,11 @@ pub fn group_by_process_single_group(
             {
                 if *expr_appears_in_result_columns {
                     program.emit_column_or_rowid(*pseudo_cursor, sorter_column_index, next_reg);
-                    t_ctx.resolver.cache_scalar_expr_reg(
+                    t_ctx.resolver.cache_expr_reg(
                         std::borrow::Cow::Borrowed(expr),
                         next_reg,
                         false,
-                        &plan.table_references,
-                    )?;
+                    );
                     next_reg += 1;
                 }
             }
@@ -964,12 +945,9 @@ pub fn group_by_process_single_group(
                     dest_reg,
                     &t_ctx.resolver,
                 )?;
-                t_ctx.resolver.cache_scalar_expr_reg(
-                    std::borrow::Cow::Borrowed(expr),
-                    dest_reg,
-                    false,
-                    &plan.table_references,
-                )?;
+                t_ctx
+                    .resolver
+                    .cache_expr_reg(std::borrow::Cow::Borrowed(expr), dest_reg, false);
             }
         }
     }
@@ -1097,7 +1075,6 @@ pub fn group_by_emit_row_phase<'a>(
             std::borrow::Cow::Owned(agg.original_expr.clone()),
             agg_result_reg,
             false,
-            None,
         );
     }
 

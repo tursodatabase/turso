@@ -1,8 +1,10 @@
 use crate::assertions::{AssertColumn, Cell};
 use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
+use crate::queued_io::QueuedIo;
 use asserting::prelude::*;
 use rusqlite::types::Value as RValue;
-use turso_core::StepResult;
+use std::sync::Arc;
+use turso_core::{ConnectOpts, Database, SqliteDialect, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
 fn test_pragma_module_list_returns_list(db: TempDatabase) {
@@ -560,4 +562,20 @@ fn test_pragma_vtab_query_with_limit_then_write(db: TempDatabase) {
     assert_that!(limbo_exec_rows(&conn2, "SELECT a FROM t"))
         .named("rows committed after a pragma vtab query with LIMIT")
         .is_equal_to(vec![row![2]]);
+}
+
+/// `Connection::pragma` must wait for page reads instead of returning the rows
+/// it has collected so far.
+#[test]
+fn test_connection_pragma_waits_for_io() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open_file(io, "pragma-waits-for-io.db", Arc::new(SqliteDialect))?;
+    let conn = db.connect(ConnectOpts::new())?;
+    conn.execute("CREATE TABLE t1(a)")?;
+    conn.execute("INSERT INTO t1 VALUES (1)")?;
+    // A new connection starts with an empty page cache.
+    let conn = db.connect(ConnectOpts::new())?;
+    assert_that!(conn.pragma("integrity_check", 10)?)
+        .is_equal_to(vec![vec![Value::from_text("ok")]]);
+    Ok(())
 }

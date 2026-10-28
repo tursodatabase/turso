@@ -18,7 +18,7 @@ use crate::{
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
-        collate::in_subquery_side_collation,
+        collate::comparison_collation_across_queries,
         compound_select::emit_program_for_compound_select,
         emitter::select::{
             emit_materialized_build_inputs, emit_program_for_select_with_resolver, emit_query,
@@ -638,7 +638,7 @@ pub(crate) fn outer_query_refs_for_correlated_subquery(
             };
             let outer_ref = OuterQueryReference {
                 table: t.table.clone(),
-                database_id: t.database_id,
+                namespace: t.namespace,
                 identifier: t.identifier.clone(),
                 has_alias: t.has_alias,
                 internal_id: t.internal_id,
@@ -658,7 +658,7 @@ pub(crate) fn outer_query_refs_for_correlated_subquery(
         .chain(referenced_tables.outer_query_refs().iter().map(|t| {
             Ok(OuterQueryReference {
                 table: t.table.clone(),
-                database_id: t.database_id,
+                namespace: t.namespace,
                 identifier: t.identifier.clone(),
                 has_alias: t.has_alias,
                 internal_id: t.internal_id,
@@ -998,13 +998,11 @@ fn get_subquery_parser<'a>(
                         result_columns.len()
                     );
                 }
-                // Collect affinity and LHS collation in a single pass over lhs_columns.
-                // "x IN (SELECT y ...)" uses the collation of x
-                // (https://www.sqlite.org/datatype3.html#collation §7.1),
-                // so the ephemeral index must use the LHS collation for correct
-                // NotFound/Found probe comparisons.
+                // "x IN (SELECT y ...)" compares x and y like "x = y" does, so
+                // the ephemeral index uses the collation of that comparison
+                // for its NotFound/Found probes.
                 let mut affinity_chars = String::with_capacity(lhs_column_count);
-                let mut lhs_collations = Vec::with_capacity(lhs_column_count);
+                let mut lhs_exprs = Vec::with_capacity(lhs_column_count);
                 for (i, lhs_expr) in lhs_columns.enumerate() {
                     let lhs_affinity = get_expr_affinity(lhs_expr, Some(referenced_tables), None);
                     affinity_chars.push(
@@ -1016,7 +1014,7 @@ fn get_subquery_parser<'a>(
                         )
                         .aff_mask(),
                     );
-                    lhs_collations.push(in_subquery_side_collation(lhs_expr, referenced_tables)?);
+                    lhs_exprs.push(lhs_expr);
                 }
                 let in_affinity_str: Arc<String> = Arc::new(affinity_chars);
 
@@ -1024,13 +1022,19 @@ fn get_subquery_parser<'a>(
                     .iter()
                     .enumerate()
                     .map(|(i, c)| {
-                        let rhs_collation = in_subquery_side_collation(&c.expr, table_references)?;
+                        let collation = comparison_collation_across_queries(
+                            lhs_exprs[i],
+                            Some(referenced_tables),
+                            &c.expr,
+                            Some(table_references),
+                            resolver,
+                        )?;
                         Ok::<_, crate::LimboError>(IndexColumn {
                             name: c.name(table_references).unwrap_or("").to_string(),
                             order: SortOrder::Asc,
                             nulls_order: None,
                             pos_in_table: i,
-                            collation: lhs_collations[i].or(rhs_collation),
+                            collation,
                             default: None,
                             expr: None,
                         })

@@ -9,6 +9,7 @@ use crate::storage::journal_mode;
 #[cfg(feature = "fs")]
 use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
+use crate::translate::collate::CollationSeq;
 use crate::translate::{
     emitter::Resolver,
     expr::{sanitize_string, translate_expr},
@@ -124,6 +125,7 @@ pub fn translate_attach(
         func: crate::function::FuncCtx {
             func: Func::Scalar(ScalarFunc::Attach),
             arg_count: 3,
+            collation: CollationSeq::Binary,
         },
     });
 
@@ -186,6 +188,7 @@ pub fn translate_detach(
         func: crate::function::FuncCtx {
             func: Func::Scalar(ScalarFunc::Detach),
             arg_count: 1,
+            collation: CollationSeq::Binary,
         },
     });
 
@@ -603,7 +606,7 @@ impl Connection {
                         .attached_databases
                         .write()
                         .insert(db.clone(), pager.clone());
-                    self.add_namespace(alias, database_id);
+                    self.add_namespace(crate::Namespace::database(alias, database_id));
                     *state = AttachDatabaseState::Done;
                     return Ok(IOResult::Done(()));
                 }

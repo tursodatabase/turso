@@ -2,6 +2,7 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType, RESERVED_TABLE_PREFIXES};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
+use crate::translate::collate::CollationSeq;
 use crate::translate::sequence::bind_sequence_names_in_select;
 use crate::translate::{
     emitter::Resolver,
@@ -92,8 +93,9 @@ pub fn translate_create_materialized_view(
     // Check for cross-database table references first
     crate::util::validate_select_for_views(select_stmt, view_name.namespace.as_ref())?;
 
-    let mut view_column_schema =
-        resolver.with_schema(database_id, |s| extract_view_columns(select_stmt, s))?;
+    let mut view_column_schema = resolver.with_schema(database_id, |s| {
+        extract_view_columns(namespace.id, select_stmt, s)
+    })?;
     // The parser checks the column count when it can count the SELECT's
     // columns; a `*` is only expanded here.
     if !columns.is_empty() && columns.len() != view_column_schema.columns.len() {
@@ -406,7 +408,7 @@ pub fn translate_create_view(
     crate::util::validate_select_for_views(select_stmt, view_name.namespace.as_ref())?;
 
     let mut select_stmt = select_stmt.clone();
-    if resolver.dialect.binds_names_at_create() {
+    if resolver.catalog.dialect.binds_names_at_create() {
         bind_sequence_names_in_select(&mut select_stmt, resolver)?;
     }
     let sql = create_view_to_str("VIEW", &view_name.name.as_ident(), columns, &select_stmt);
@@ -665,14 +667,14 @@ pub fn translate_drop_view(
         rhs: type_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::Ne {
         lhs: col1_reg,
         rhs: view_name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: CollationSeq::for_internal_values(),
     });
     // Matches view - delete it
     program.emit_insn(Insn::RowId {
@@ -753,14 +755,14 @@ pub fn translate_drop_view(
             rhs: table_type_reg_2,
             target_pc: check_dbsp_index_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::Ne {
             lhs: dbsp_col1_reg,
             rhs: dbsp_table_name_reg_2,
             target_pc: check_dbsp_index_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::for_internal_values(),
         });
         // Matches DBSP table - delete it
         program.emit_insn(Insn::RowId {
@@ -783,14 +785,14 @@ pub fn translate_drop_view(
             rhs: index_type_reg_2,
             target_pc: dbsp_skip_delete_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::Ne {
             lhs: dbsp_col1_reg,
             rhs: dbsp_index_name_reg_2,
             target_pc: dbsp_skip_delete_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::for_internal_values(),
         });
         // Matches DBSP index - delete it
         program.emit_insn(Insn::RowId {
@@ -819,6 +821,7 @@ pub fn translate_drop_view(
     // Remove the view from the in-memory schema
     program.emit_insn(Insn::DropView {
         db: database_id,
+        namespace: namespace.id,
         view_name: normalized_view_name,
     });
 

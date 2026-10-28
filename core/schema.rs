@@ -983,6 +983,39 @@ impl Schema {
         self.namespace(namespace).tables.values()
     }
 
+    /// The tables of every namespace of the schema.
+    pub fn all_tables(&self) -> impl Iterator<Item = &Arc<Table>> {
+        self.namespaces
+            .values()
+            .flat_map(|objects| objects.tables.values())
+    }
+
+    /// The tables of every namespace of the schema, to change, with the
+    /// namespace and lookup name of each.
+    pub fn all_tables_mut(&mut self) -> impl Iterator<Item = (NamespaceId, &str, &mut Arc<Table>)> {
+        self.namespaces.iter_mut().flat_map(|(namespace, objects)| {
+            objects
+                .tables
+                .iter_mut()
+                .map(move |(name, table)| (*namespace, name.as_str(), table))
+        })
+    }
+
+    /// The indexes of every namespace of the schema, backing B-tree indexes
+    /// included.
+    pub fn all_indexes(&self) -> impl Iterator<Item = &Arc<Index>> {
+        self.namespaces
+            .values()
+            .flat_map(|objects| objects.indexes.values().flatten())
+    }
+
+    /// The indexes of every namespace of the schema, to change.
+    pub fn all_indexes_mut(&mut self) -> impl Iterator<Item = &mut Arc<Index>> {
+        self.namespaces
+            .values_mut()
+            .flat_map(|objects| objects.indexes.values_mut().flatten())
+    }
+
     pub fn table_names(&self, namespace: NamespaceId) -> impl Iterator<Item = &str> {
         self.namespace(namespace).tables.keys().map(String::as_str)
     }
@@ -1074,11 +1107,11 @@ impl Schema {
             .copied()
     }
 
-    pub fn has_materialized_views(&self, namespace: NamespaceId) -> bool {
-        !self
-            .namespace(namespace)
-            .table_to_materialized_views
-            .is_empty()
+    /// Whether any table of any namespace feeds a materialized view.
+    pub fn has_materialized_views(&self) -> bool {
+        self.namespaces
+            .values()
+            .any(|objects| !objects.table_to_materialized_views.is_empty())
     }
 
     /// Every index of the namespace, backing B-tree indexes included.
@@ -2019,7 +2052,7 @@ impl Schema {
         if let Some(table) = removed {
             self.unregister_table_root_page(&table);
         }
-        self.analyze_stats.remove_table(&name);
+        self.analyze_stats.remove_table(namespace, &name);
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -2158,7 +2191,7 @@ impl Schema {
     pub fn remove_indices_for_table(&mut self, namespace: NamespaceId, table_name: &str) {
         let name = normalize_ident(table_name);
         self.namespace_mut(namespace).indexes.remove(&name);
-        self.analyze_stats.remove_table(&name);
+        self.analyze_stats.remove_table(namespace, &name);
     }
 
     pub fn remove_index(&mut self, namespace: NamespaceId, idx: &Index) {
@@ -2168,7 +2201,7 @@ impl Schema {
             .get_mut(&name)
             .expect("Must have the index")
             .retain_mut(|other_idx| other_idx.name != idx.name);
-        self.analyze_stats.remove_index(&name, &idx.name);
+        self.analyze_stats.remove_index(namespace, &name, &idx.name);
     }
 
     pub fn table_has_indexes(&self, namespace: NamespaceId, table_name: &str) -> bool {
@@ -2780,7 +2813,8 @@ impl Schema {
             }
 
             // Create the IncrementalView with all root pages
-            let incremental_view = IncrementalView::from_sql(&sql, self, main_root)?;
+            let incremental_view =
+                IncrementalView::from_sql(&sql, self, main_root, NamespaceId::ROOT)?;
 
             // Create a BTreeTable for the materialized view
             let cols = incremental_view.column_schema.flat_columns()?;
@@ -3192,8 +3226,11 @@ impl Schema {
                             select,
                             ..
                         } => {
-                            let mut view_column_schema =
-                                crate::util::extract_view_columns(&select, self)?;
+                            let mut view_column_schema = crate::util::extract_view_columns(
+                                NamespaceId::ROOT,
+                                &select,
+                                self,
+                            )?;
                             view_column_schema.rename_columns(&column_names);
                             let view = View::new(
                                 name.to_string(),
@@ -3297,22 +3334,25 @@ impl Schema {
             .ok_or_else(|| fk_mismatch_err("<unknown>", &target))?;
 
         let mut out = Vec::try_with_capacity_ext(4)?; // arbitrary estimate
-        let objects = self.namespace(namespace);
-        for t in objects.tables.values() {
-            let Some(child) = t.btree() else {
-                continue;
-            };
-            for fk in &child.foreign_keys {
-                if !fk.parent_table.eq_ignore_ascii_case(&target) {
+        for (child_namespace, objects) in &self.namespaces {
+            for t in objects.tables.values() {
+                let Some(child) = t.btree() else {
                     continue;
+                };
+                for fk in &child.foreign_keys {
+                    if fk.parent_namespace != namespace
+                        || !fk.parent_table.eq_ignore_ascii_case(&target)
+                    {
+                        continue;
+                    }
+                    out.try_push(self.resolve_fk(
+                        *child_namespace,
+                        fk,
+                        &child,
+                        &parent_tbl,
+                        /*require_unique=*/ false,
+                    )?)?;
                 }
-                out.try_push(self.resolve_fk(
-                    namespace,
-                    fk,
-                    &child,
-                    &parent_tbl,
-                    /*require_unique=*/ false,
-                )?)?;
             }
         }
         Ok(out)
@@ -3335,14 +3375,15 @@ impl Schema {
         let mut out = Vec::try_with_capacity_ext(child.foreign_keys.len())?;
         for fk in &child.foreign_keys {
             if let Some(updated_cols) = updated_cols {
-                let is_self_ref = fk.parent_table.eq_ignore_ascii_case(&child.name);
+                let is_self_ref = fk.parent_namespace == namespace
+                    && fk.parent_table.eq_ignore_ascii_case(&child.name);
                 if !is_self_ref && !fk.child_key_assigned(&child, updated_cols) {
                     continue;
                 }
             }
             let parent_name = normalize_ident(&fk.parent_table);
             let parent_tbl = self
-                .get_btree_table(namespace, &parent_name)
+                .get_btree_table(fk.parent_namespace, &parent_name)
                 .ok_or_else(|| fk_mismatch_err(&child.name, &parent_name))?;
             out.push_within_capacity(self.resolve_fk(
                 namespace,
@@ -3361,7 +3402,7 @@ impl Schema {
     /// a non-partial UNIQUE index on exactly those columns.
     fn resolve_fk(
         &self,
-        namespace: NamespaceId,
+        child_namespace: NamespaceId,
         fk: &Arc<ForeignKey>,
         child: &Arc<BTreeTable>,
         parent_tbl: &Arc<BTreeTable>,
@@ -3402,19 +3443,34 @@ impl Schema {
         }
 
         let mut parent_pos: Vec<usize> = Vec::try_with_capacity_ext(parent_cols.len())?;
-        for pc in parent_cols.iter() {
-            let pos = parent_tbl.get_column(pc).map(|(i, _)| i).or_else(|| {
-                ROWID_STRS
-                    .iter()
-                    .any(|r| pc.eq_ignore_ascii_case(r))
-                    .then_some(0)
-            });
-            let Some(p) = pos else {
-                return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+        let mut parent_collations: Vec<CollationSeq> =
+            Vec::try_with_capacity_ext(parent_cols.len())?;
+        let mut key_affinities: Vec<Affinity> = Vec::try_with_capacity_ext(parent_cols.len())?;
+        for (pc, &cpos) in parent_cols.iter().zip(child_pos.iter()) {
+            let (p, collation, parent_affinity) = match parent_tbl.get_column(pc) {
+                Some((i, column)) => (
+                    i,
+                    crate::translate::collate::column_collation(column)
+                        .unwrap_or(CollationSeq::Binary),
+                    column.affinity(),
+                ),
+                None if ROWID_STRS.iter().any(|r| pc.eq_ignore_ascii_case(r)) => {
+                    (0, CollationSeq::Binary, Affinity::Integer)
+                }
+                None => return Err(fk_mismatch_err(&child.name, &parent_tbl.name)),
             };
+            key_affinities
+                .push_within_capacity(crate::translate::expr::do_comparison_affinity(
+                    parent_affinity,
+                    child.columns[cpos].affinity(),
+                ))
+                .expect("FK key affinity vector was preallocated to parent_cols.len()");
             parent_pos
                 .push_within_capacity(p)
                 .expect("parent FK position vector was preallocated to parent_cols.len()");
+            parent_collations
+                .push_within_capacity(collation)
+                .expect("parent FK collation vector was preallocated to parent_cols.len()");
         }
 
         // A single-column parent key is the rowid when it names rowid/_rowid_/oid
@@ -3435,7 +3491,7 @@ impl Schema {
             None
         } else {
             let found = self
-                .get_indices(namespace, &parent_tbl.name)
+                .get_indices(fk.parent_namespace, &parent_tbl.name)
                 .find(|idx| {
                     idx.unique
                         && idx.where_clause.is_none()
@@ -3444,7 +3500,10 @@ impl Schema {
                             .columns
                             .iter()
                             .zip(parent_cols.iter())
-                            .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                            .zip(parent_collations.iter())
+                            .all(|((ic, pc), collation)| {
+                                ic.name.eq_ignore_ascii_case(pc) && ic.collation == *collation
+                            })
                 })
                 .cloned();
             if require_unique && found.is_none() {
@@ -3455,11 +3514,14 @@ impl Schema {
 
         fk.validate()?;
         Ok(ResolvedFkRef {
+            child_namespace,
             child_table: Arc::clone(child),
             fk: Arc::clone(fk),
             parent_cols,
             child_pos: child_pos.into_boxed_slice(),
             parent_pos: parent_pos.into_boxed_slice(),
+            parent_collations: parent_collations.into_boxed_slice(),
+            key_affinities: key_affinities.into_boxed_slice(),
             parent_uses_rowid,
             parent_unique_index,
         })
@@ -3467,14 +3529,15 @@ impl Schema {
 
     /// Returns if any table declares a FOREIGN KEY whose parent is `table_name`.
     pub fn any_resolved_fks_referencing(&self, namespace: NamespaceId, table_name: &str) -> bool {
-        let objects = self.namespace(namespace);
-        objects.tables.values().any(|t| {
-            let Some(bt) = t.btree() else {
-                return false;
-            };
-            bt.foreign_keys
-                .iter()
-                .any(|fk| fk.parent_table == table_name)
+        self.namespaces.values().any(|objects| {
+            objects.tables.values().any(|t| {
+                let Some(bt) = t.btree() else {
+                    return false;
+                };
+                bt.foreign_keys
+                    .iter()
+                    .any(|fk| fk.parent_namespace == namespace && fk.parent_table == table_name)
+            })
         })
     }
 
@@ -4843,7 +4906,9 @@ impl BTreeTable {
 
     fn primary_key_implies_not_null(&self, column: &Column) -> bool {
         column.primary_key()
-            && (self.is_strict || (!self.has_rowid && self.primary_key_columns.len() == 1))
+            && (column.is_rowid_alias()
+                || self.is_strict
+                || (!self.has_rowid && self.primary_key_columns.len() == 1))
     }
 
     pub fn column_collations(&self) -> Result<Vec<CollationSeq>> {
@@ -5054,8 +5119,7 @@ fn push_collation(sql: &mut String, collation: Option<CollationSeq>) {
             sql.push_str(" COLLATE ");
             sql.push_str(&quote_ident(&collation.name()));
         }
-        CollationSeq::Unset | CollationSeq::Custom(_) => {
-            // Unset should not be reachable -- ignore it
+        CollationSeq::Custom(_) => {
             // Custom collation is not allowed in schema definitions
         }
     };
@@ -5756,6 +5820,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     let fk = ForeignKey {
                         constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
                         parent_table,
+                        parent_namespace: NamespaceId::ROOT,
                         parent_columns,
                         child_columns,
                         on_delete: clause
@@ -5966,6 +6031,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     .as_ref()
                                     .map(|n| normalize_ident(n.as_str())),
                                 parent_table: normalize_ident(clause.tbl_name.as_str()),
+                                parent_namespace: NamespaceId::ROOT,
                                 parent_columns: clause
                                     .columns
                                     .iter()
@@ -6289,6 +6355,8 @@ pub struct ForeignKey {
     pub child_columns: Box<[String]>,
     /// Referenced (parent) table
     pub parent_table: String,
+    /// The namespace of the parent table, within the child's database.
+    pub parent_namespace: NamespaceId,
     /// Parent-side referenced columns. Empty means "use parent's PRIMARY KEY".
     pub parent_columns: Box<[String]>,
     pub on_delete: RefAct,
@@ -6336,6 +6404,8 @@ impl ForeignKey {
 /// Child column names live in `fk.child_columns` — not duplicated here.
 #[derive(Clone, Debug)]
 pub struct ResolvedFkRef {
+    /// The namespace of the child table.
+    pub child_namespace: NamespaceId,
     /// Child table that owns the FK.
     pub child_table: Arc<BTreeTable>,
     /// The FK as declared on the child table.
@@ -6347,6 +6417,15 @@ pub struct ResolvedFkRef {
     /// Column positions in the child/parent tables (pos_in_table)
     pub child_pos: BoxedSlice<usize>,
     pub parent_pos: BoxedSlice<usize>,
+    /// The collation of each parent key column, BINARY for the rowid. A child
+    /// key matches a parent key when they compare equal under these
+    /// collations (SQLite's `fkScanChildren` and `fkActionTrigger` compare
+    /// with the parent column's collation), and only an index with these
+    /// collations can enforce the parent key or find the child rows.
+    pub parent_collations: BoxedSlice<CollationSeq>,
+    /// The affinity applied when a child key is compared with a parent key,
+    /// as SQLite compares `parent_col = child_col`.
+    pub key_affinities: BoxedSlice<Affinity>,
 
     /// If the parent key is rowid or a rowid-alias (single-column only)
     pub parent_uses_rowid: bool,
@@ -6439,6 +6518,10 @@ pub struct Column {
     generated_type: GeneratedType,
     generated_always: bool,
     info: ColumnInfo,
+    /// The declared collation, or for a column of a subquery, view or CTE the
+    /// collation of its expression. None means BINARY. Kept apart from
+    /// `info` because a custom collation does not fit in its bits.
+    collation: Option<CollationSeq>,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -6577,7 +6660,6 @@ impl Column {
         };
         let mut info = ColumnInfo::new(NewColumnInfoParams {
             ty,
-            collation: col,
             coldef: &coldef,
         });
         if coldef.flags.contains(ColDefFlags::InStrictTable) && ty_str.eq_ignore_ascii_case("ANY") {
@@ -6595,6 +6677,7 @@ impl Column {
             generated_type,
             generated_always: false,
             info,
+            collation: col,
             explicit_notnull: coldef.flags.contains(ColDefFlags::ExplicitNotNull),
             notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
@@ -6803,15 +6886,15 @@ impl Column {
     }
     #[inline]
     pub fn collation(&self) -> CollationSeq {
-        self.info.collation()
+        self.collation.unwrap_or(CollationSeq::Binary)
     }
     #[inline]
     pub fn has_explicit_collation(&self) -> bool {
-        self.info.has_explicit_collation()
+        self.collation.is_some()
     }
     #[inline]
     pub fn set_collation(&mut self, c: Option<CollationSeq>) {
-        self.info.set_collation(c)
+        self.collation = c;
     }
     #[inline]
     pub fn primary_key(&self) -> bool {
@@ -6823,7 +6906,7 @@ impl Column {
     }
     #[inline]
     pub fn notnull(&self) -> bool {
-        self.info.notnull()
+        self.info.notnull() || self.is_rowid_alias()
     }
     #[inline]
     pub fn set_notnull(&mut self, v: bool) {
@@ -6969,7 +7052,7 @@ pub struct IndexColumn {
     /// CREATE INDEX idx ON t(b)
     /// b.pos_in_table == 1
     pub pos_in_table: usize,
-    pub collation: Option<CollationSeq>,
+    pub collation: CollationSeq,
     pub default: Option<Box<Expr>>,
     /// Expression for expression indexes. None for simple column indexes.
     pub expr: Option<Box<Expr>>,
@@ -7005,19 +7088,20 @@ pub(crate) use impl_effective_nulls_order;
 impl_effective_nulls_order!(IndexColumn);
 
 impl IndexColumn {
-    /// Returns a default column with the given name and position.
-    pub fn new(name: impl ToString, pos_in_table: usize) -> Self {
+    /// An ascending key column with the given name, position and collation.
+    pub fn new(name: impl ToString, pos_in_table: usize, collation: CollationSeq) -> Self {
         Self {
             name: name.to_string(),
             order: SortOrder::Asc,
             nulls_order: None,
             pos_in_table,
-            collation: None,
+            collation,
             default: None,
             expr: None,
         }
     }
 
+    /// Ascending BINARY key columns with the given names, in order.
     pub fn new_many<I>(names: I) -> Vec<Self>
     where
         I: IntoIterator,
@@ -7033,7 +7117,7 @@ impl IndexColumn {
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table: i,
-                collation: None,
+                collation: CollationSeq::Binary,
                 default: None,
                 expr: None,
             })
@@ -7164,7 +7248,7 @@ impl Index {
                     collation: constraint_columns
                         .get(i)
                         .and_then(|c| c.collation)
-                        .or_else(|| column.collation_opt()),
+                        .unwrap_or_else(|| column.collation()),
                     default: column.default.clone(),
                     expr: None,
                 })
@@ -7220,7 +7304,7 @@ impl Index {
                     collation: constraint_columns
                         .get(i)
                         .and_then(|c| c.collation)
-                        .or_else(|| col.collation_opt()),
+                        .unwrap_or_else(|| col.collation()),
                     default: col.default.clone(),
                     expr: None,
                 })
@@ -7491,6 +7575,109 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_key_finds_its_parent_in_the_parent_namespace() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(1);
+        schema.add_namespace(other);
+        schema
+            .add_btree_table(
+                NamespaceId::ROOT,
+                table("CREATE TABLE p (id INTEGER PRIMARY KEY)", 2),
+            )
+            .unwrap();
+        schema
+            .add_btree_table(other, table("CREATE TABLE p (id INTEGER PRIMARY KEY)", 3))
+            .unwrap();
+        schema
+            .add_btree_table(other, table("CREATE TABLE c (x REFERENCES p(id))", 4))
+            .unwrap();
+
+        let children = schema
+            .resolved_fks_referencing(NamespaceId::ROOT, "p")
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].child_namespace, other);
+        assert_eq!(children[0].child_table.name, "c");
+        assert!(schema.any_resolved_fks_referencing(NamespaceId::ROOT, "p"));
+
+        assert!(schema
+            .resolved_fks_referencing(other, "p")
+            .unwrap()
+            .is_empty());
+        assert!(!schema.any_resolved_fks_referencing(other, "p"));
+
+        let parents = schema.resolved_fks_for_child(other, "c", None).unwrap();
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].fk.parent_namespace, NamespaceId::ROOT);
+    }
+
+    #[test]
+    fn schema_wide_scans_see_every_namespace() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(1);
+        schema.add_namespace(other);
+        schema
+            .add_btree_table(other, table("CREATE TABLE t (x UNIQUE)", 3))
+            .unwrap();
+        let t = schema.get_btree_table(other, "t").unwrap();
+        schema
+            .add_index(
+                other,
+                Arc::new(
+                    Index::from_sql(
+                        &SymbolTable::new(),
+                        "CREATE INDEX i ON t (x)",
+                        4,
+                        t.as_ref(),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+
+        assert!(schema.all_tables().any(|table| table.get_name() == "t"));
+        assert!(schema.all_indexes().any(|index| index.name == "i"));
+        assert!(schema
+            .all_tables_mut()
+            .any(|(namespace, name, _)| namespace == other && name == "t"));
+
+        assert!(!schema.has_materialized_views());
+        schema.add_materialized_view_dependency(other, "t", "v");
+        assert!(schema.has_materialized_views());
+    }
+
+    #[test]
+    fn tables_of_the_same_name_in_two_namespaces_keep_their_own_statistics() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(1);
+        schema.add_namespace(other);
+        schema
+            .add_btree_table(NamespaceId::ROOT, table("CREATE TABLE t (x)", 2))
+            .unwrap();
+        schema
+            .add_btree_table(other, table("CREATE TABLE t (x)", 3))
+            .unwrap();
+        schema
+            .analyze_stats
+            .table_stats_mut(NamespaceId::ROOT, "t")
+            .row_count = Some(10);
+        schema.analyze_stats.table_stats_mut(other, "t").row_count = Some(20);
+
+        let row_count = |schema: &Schema, namespace| {
+            schema
+                .analyze_stats
+                .table_stats(namespace, "t")
+                .and_then(|stats| stats.row_count)
+        };
+        assert_eq!(row_count(&schema, NamespaceId::ROOT), Some(10));
+        assert_eq!(row_count(&schema, other), Some(20));
+
+        schema.remove_table(other, "t");
+        assert_eq!(row_count(&schema, other), None);
+        assert_eq!(row_count(&schema, NamespaceId::ROOT), Some(10));
+    }
+
+    #[test]
     fn persisted_materialized_views_are_loaded_in_dependency_order() {
         let mut views = HashMap::default();
         views.insert(
@@ -7682,13 +7869,17 @@ mod tests {
             for (actual, flag) in [
                 (column.primary_key(), ColDefFlags::PrimaryKey),
                 (column.is_rowid_alias(), ColDefFlags::RowIdAlias),
-                (column.notnull(), ColDefFlags::NotNull),
                 (column.explicit_notnull(), ColDefFlags::ExplicitNotNull),
                 (column.unique(), ColDefFlags::Unique),
                 (column.hidden(), ColDefFlags::Hidden),
             ] {
                 assert_eq!(actual, flags.contains(flag), "{flags:?}: {flag:?}");
             }
+            assert_eq!(
+                column.notnull(),
+                flags.intersects(ColDefFlags::NotNull | ColDefFlags::RowIdAlias),
+                "{flags:?}"
+            );
             assert_eq!(column.ty(), Type::Numeric, "{flags:?}");
             assert_eq!(
                 column.collation_opt(),
@@ -8079,6 +8270,21 @@ mod tests {
         let column = table.get_column("a").unwrap().1;
         assert!(column.notnull());
         Ok(())
+    }
+
+    #[test]
+    fn rowid_alias_is_not_nullable() {
+        for sql in [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE t(id INTEGER, PRIMARY KEY(id))",
+        ] {
+            let table = BTreeTable::from_sql(sql, 2).unwrap();
+            let column = table.get_column("id").unwrap().1;
+            assert!(column.notnull(), "{sql}");
+            assert!(!column.explicit_notnull(), "{sql}");
+        }
+        let table = BTreeTable::from_sql("CREATE TABLE t(id INTEGER PRIMARY KEY DESC)", 2).unwrap();
+        assert!(!table.get_column("id").unwrap().1.notnull());
     }
 
     #[test]
@@ -9209,7 +9415,6 @@ mod tests {
 mod column_info {
     use crate::schema::{ColDef, ColDefFlags, Type};
     use crate::vdbe::affinity::Affinity;
-    use crate::vdbe::CollationSeq;
 
     // flags
     const F_PRIMARY_KEY: u32 = 1;
@@ -9218,18 +9423,16 @@ mod column_info {
     const F_UNIQUE: u32 = 8;
     const F_HIDDEN: u32 = 16;
 
-    // pack Type and Collation in the remaining bits
+    // pack Type in the remaining bits
     const TYPE_SHIFT: u32 = 5;
     const TYPE_MASK: u32 = 0b111 << TYPE_SHIFT;
-    const COLL_SHIFT: u32 = TYPE_SHIFT + 3;
-    const COLL_MASK: u32 = 0b1111_1111_1111 << COLL_SHIFT;
 
-    // Bits 20-22: base type affinity. Column affinity will resolve to this
+    // Bits 8-10: base type affinity. Column affinity will resolve to this
     // value only if it is > 0, else it uses ty_str.
-    const BASE_AFF_SHIFT: u32 = COLL_SHIFT + 12;
+    const BASE_AFF_SHIFT: u32 = TYPE_SHIFT + 3;
     const BASE_AFF_MASK: u32 = 0b111 << BASE_AFF_SHIFT;
 
-    // Bits 23-25: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
+    // Bits 11-13: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
     const ARRAY_DIM_SHIFT: u32 = BASE_AFF_SHIFT + 3;
     const ARRAY_DIM_MASK: u32 = 0b111 << ARRAY_DIM_SHIFT;
 
@@ -9239,7 +9442,6 @@ mod column_info {
 
     pub struct NewColumnInfoParams<'a> {
         pub ty: Type,
-        pub collation: Option<CollationSeq>,
         pub coldef: &'a ColDef,
     }
 
@@ -9249,9 +9451,6 @@ mod column_info {
             let mut raw: u32 = 0;
 
             raw |= (params.ty as u32) << TYPE_SHIFT;
-            if let Some(c) = params.collation {
-                raw |= (u32::from(c.to_bits()) << COLL_SHIFT) & COLL_MASK;
-            }
             if params.coldef.flags.contains(ColDefFlags::PrimaryKey) {
                 raw |= F_PRIMARY_KEY
             }
@@ -9337,7 +9536,11 @@ mod column_info {
 
         #[inline]
         pub fn set_array_dimensions(&mut self, dims: u32) {
-            assert!(dims <= 7, "array dimensions must be <= 7");
+            assert!(
+                dims <= turso_parser::ast::MAX_ARRAY_DIMENSIONS,
+                "array dimensions must be <= {}",
+                turso_parser::ast::MAX_ARRAY_DIMENSIONS
+            );
             self.0 = (self.0 & !ARRAY_DIM_MASK) | (dims << ARRAY_DIM_SHIFT);
         }
 
@@ -9350,30 +9553,6 @@ mod column_info {
         #[inline]
         pub fn set_ty(&mut self, ty: Type) {
             self.0 = (self.0 & !TYPE_MASK) | (((ty as u32) << TYPE_SHIFT) & TYPE_MASK);
-        }
-
-        #[inline]
-        pub fn collation(&self) -> CollationSeq {
-            let v = ((self.0 & COLL_MASK) >> COLL_SHIFT) as u16;
-            if v == CollationSeq::Unset.to_bits() {
-                CollationSeq::Binary
-            } else {
-                CollationSeq::from_storage_bits(v)
-            }
-        }
-
-        #[inline]
-        pub fn has_explicit_collation(&self) -> bool {
-            let v = ((self.0 & COLL_MASK) >> COLL_SHIFT) as u16;
-            v != CollationSeq::Unset.to_bits()
-        }
-
-        #[inline]
-        pub fn set_collation(&mut self, c: Option<CollationSeq>) {
-            self.0 &= !COLL_MASK;
-            if let Some(c) = c {
-                self.0 |= ((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK;
-            }
         }
 
         #[inline]

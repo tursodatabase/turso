@@ -17,9 +17,9 @@ addr  opcode       p1  p2  p3  p4              p5  comment
    2  OpenWrite     0   5   0                   0  root=5; iDb=0
    3  Rewind        0  12   0                   0  Rewind  sqlite_stat1
    4      Column    0   0   2                   0  r[2]=sqlite_stat1.tbl
-   5      Ne        2   3  11                   0  if r[2]!=r[3] goto 11
+   5      Ne        2   3  11  Binary           0  if r[2]!=r[3] goto 11
    6      Column    0   1   4                   0  r[4]=sqlite_stat1.idx
-   7      Ne        4   5  11                   0  if r[4]!=r[5] goto 11
+   7      Ne        4   5  11  Binary           0  if r[4]!=r[5] goto 11
    8      RowId     0   6   0                   0  r[6]=sqlite_stat1.rowid
    9      Delete    0   0   0  sqlite_stat1     0
   10    Next        0   4   0                   0
@@ -33,7 +33,7 @@ addr  opcode       p1  p2  p3  p4              p5  comment
   18  Goto          0  24   0                   0
   19    Integer     0   9   0                   0  r[9]=0
   20    Column      2   0  11                   0  r[11]=idx_items_name.name
-  21    Ne         11  10  24                   0  if r[11]!=r[10] goto 24
+  21    Ne         11  10  24  Binary           0  if r[11]!=r[10] goto 24
   22    Integer     1   9   0                   0  r[9]=1
   23    Goto        0  25   0                   0
   24    Column      2   0  10                   0  r[10]=idx_items_name.name

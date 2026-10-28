@@ -1,5 +1,4 @@
 use super::*;
-use crate::namespace::NamespaceRef;
 use crate::translate::sequence::emit_sequence_descriptor_literals;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{to_u32, InsertFlags, RegisterOrLiteral};
@@ -53,6 +52,7 @@ pub(super) fn translate_like_base(
                 func: FuncCtx {
                     func: Func::Scalar(func),
                     arg_count,
+                    collation: CollationSeq::Binary,
                 },
             });
         }
@@ -81,7 +81,11 @@ pub(super) fn translate_like_base(
                 constant_mask: 0,
                 start_reg,
                 dest: target_register,
-                func: FuncCtx { func, arg_count },
+                func: FuncCtx {
+                    func,
+                    arg_count,
+                    collation: CollationSeq::Binary,
+                },
             });
         }
     }
@@ -195,12 +199,10 @@ pub(super) fn translate_sequence_function(
     let seq_name_raw = extract_string_literal(&args[0])?;
     let (namespace, normalized_name) = if let Some((schema, name)) = seq_name_raw.split_once('.') {
         let schema_norm = normalize_ident(schema);
-        let db_id = resolver
-            .namespace_database_id(&schema_norm)
-            .ok_or_else(|| {
-                LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist"))
-            })?;
-        (NamespaceRef::root_of(db_id), normalize_ident(name))
+        let namespace = resolver.namespace_named(&schema_norm).ok_or_else(|| {
+            LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist"))
+        })?;
+        (namespace, normalize_ident(name))
     } else {
         let name = normalize_ident(&seq_name_raw);
         (resolver.resolve_existing_sequence(&name)?, name)
@@ -241,7 +243,7 @@ pub(super) fn translate_sequence_function(
         crate::translate::sequence::emit_disk_read_nextval(
             program,
             resolver,
-            database_id,
+            namespace,
             &normalized_name,
             &seq_arc,
             target_register,
