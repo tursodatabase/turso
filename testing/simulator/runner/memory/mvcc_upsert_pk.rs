@@ -20,7 +20,7 @@ fn open_conn(io: Arc<MemorySimIO>, path: &str) -> Result<Arc<Connection>> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    Ok(db.connect(ConnectOpts::new())?)
+    Ok(db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?)
 }
 
 fn step_done(conn: &Arc<Connection>, io: &MemorySimIO, sql: &str) -> Result<()> {

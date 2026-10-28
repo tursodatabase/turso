@@ -119,14 +119,19 @@ fn refuse_a_file_with_tables_in_no_schema(
     if db.mvcc_enabled() {
         return Ok(());
     }
-    let conn = db.connect(turso_core::ConnectOpts::new())?;
+    let conn = db.connect(turso_core::ConnectOpts::new(
+        turso_core::SessionRole::Superuser,
+    ))?;
     refuse_tables_in_no_schema(&conn)?;
     Ok(())
 }
 
 impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> crate::Result<Self> {
-        Self::connect_with(db, turso_core::ConnectOpts::new())
+        Self::connect_with(
+            db,
+            turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser),
+        )
     }
 
     /// Opens a session on `db`, connecting with `opts`, such as the
@@ -2321,10 +2326,12 @@ mod tests {
             OpenOptions::new(Arc::new(PostgresDialect)),
         )
         .unwrap();
-        db.connect(turso_core::ConnectOpts::new())
-            .unwrap()
-            .execute("CREATE TABLE users (id INTEGER PRIMARY KEY)")
-            .unwrap();
+        db.connect(turso_core::ConnectOpts::new(
+            turso_core::SessionRole::Superuser,
+        ))
+        .unwrap()
+        .execute("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+        .unwrap();
         let error = match PgConnection::connect(&db) {
             Ok(_) => panic!("expected the database to be refused"),
             Err(error) => error.to_string(),

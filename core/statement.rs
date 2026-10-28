@@ -1999,7 +1999,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        db.connect(ConnectOpts::new())
+        db.connect(ConnectOpts::new(crate::SessionRole::Superuser))
     }
 
     /// A hash join inside a correlated subquery is built once and probed once per

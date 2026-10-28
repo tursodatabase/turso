@@ -549,7 +549,9 @@ impl TursoMcpServer {
                 None,
                 Arc::new(SqliteDialect),
             ) {
-                Ok((_io, db)) => match db.connect(ConnectOpts::new()) {
+                Ok((_io, db)) => match db
+                    .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+                {
                     Ok(c) => c,
                     Err(e) => return Err(format!("Failed to connect to database '{path}': {e}")),
                 },

@@ -205,7 +205,9 @@ impl TempDatabase {
     }
 
     pub fn connect_limbo(&self) -> Arc<turso_core::Connection> {
-        self.db.connect(ConnectOpts::new()).unwrap()
+        self.db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap()
     }
 
     pub fn connect_postgres(&self) -> Connection {

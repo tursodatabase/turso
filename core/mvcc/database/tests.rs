@@ -527,7 +527,9 @@ impl MvccTestDb {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         // Enable MVCC via PRAGMA
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         let mvcc_store = db.get_mv_store().clone().unwrap();
@@ -1637,7 +1639,9 @@ impl MvccTestDbNoConn {
         )
         .unwrap();
         // Enable MVCC via PRAGMA
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
         Self {
@@ -1681,7 +1685,9 @@ impl MvccTestDbNoConn {
         )
         .unwrap();
         // Enable MVCC via PRAGMA
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
         Self {
@@ -1714,7 +1720,10 @@ impl MvccTestDbNoConn {
         .unwrap();
         let encryption_key = EncryptionKey::from_hex_string(hex_key).unwrap();
         let conn = db
-            .connect(ConnectOpts::new().with_encryption_key(Some(encryption_key)))
+            .connect(
+                ConnectOpts::new(crate::SessionRole::Superuser)
+                    .with_encryption_key(Some(encryption_key)),
+            )
             .unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
@@ -1774,7 +1783,10 @@ impl MvccTestDbNoConn {
         .unwrap();
         let encryption_key = EncryptionKey::from_hex_string(hex_key).unwrap();
         let conn = db
-            .connect(ConnectOpts::new().with_encryption_key(Some(encryption_key)))
+            .connect(
+                ConnectOpts::new(crate::SessionRole::Superuser)
+                    .with_encryption_key(Some(encryption_key)),
+            )
             .unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
@@ -1819,7 +1831,7 @@ impl MvccTestDbNoConn {
             .as_ref()
             .map(|e| EncryptionKey::from_hex_string(&e.hexkey).unwrap());
         self.get_db()
-            .connect(ConnectOpts::new().with_encryption_key(enc_key))
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser).with_encryption_key(enc_key))
             .unwrap()
     }
 
@@ -2824,7 +2836,9 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
     {
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
             .unwrap();
         conn.close().unwrap();
@@ -2837,7 +2851,9 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
     {
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
     }
@@ -2845,7 +2861,9 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
     remove_file_from_database_registry(&db_path_str);
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let meta = get_rows(
         &conn,
         "SELECT v FROM __turso_internal_mvcc_meta WHERE k = 'persistent_tx_ts_max'",
@@ -3232,7 +3250,7 @@ fn test_bootstrap_recovers_committed_wal_without_log_file() {
     )
     .expect("open should recover, not fail closed");
     let conn = db
-        .connect(ConnectOpts::new())
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
         .expect("connect should recover the committed WAL");
     let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
     assert_eq!(rows.len(), 1, "committed row must survive recovery");
@@ -3262,7 +3280,7 @@ fn test_full_checkpoint_reopen_recovers_truncate_mode() {
     let db = Database::open_file(io, &db_path, Arc::new(SqliteDialect))
         .expect("FULL checkpoint reopen should recover");
     let conn = db
-        .connect(ConnectOpts::new())
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
         .expect("connect should recover after FULL checkpoint");
     let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
     assert_eq!(
@@ -3360,7 +3378,7 @@ fn test_bootstrap_rejects_torn_log_header_with_committed_wal() {
 
     let io = Arc::new(PlatformIO::new().unwrap());
     match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
-        Ok(db) => match db.connect(ConnectOpts::new()) {
+        Ok(db) => match db.connect(ConnectOpts::new(crate::SessionRole::Superuser)) {
             Ok(_) => panic!("expected connect to fail with Corrupt"),
             Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
         },
@@ -3398,7 +3416,7 @@ fn test_bootstrap_rejects_corrupt_log_header_without_wal() {
 
     let io = Arc::new(PlatformIO::new().unwrap());
     match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
-        Ok(db) => match db.connect(ConnectOpts::new()) {
+        Ok(db) => match db.connect(ConnectOpts::new(crate::SessionRole::Superuser)) {
             Ok(_) => panic!("expected connect to fail with Corrupt"),
             Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
         },
@@ -3467,7 +3485,7 @@ fn test_bootstrap_ignores_wal_frames_without_commit_marker() {
     let db2 =
         Database::open_file(io, &db_path, Arc::new(SqliteDialect)).expect("open should succeed");
     let conn2 = db2
-        .connect(ConnectOpts::new())
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
         .expect("connect should succeed");
     let rows = get_rows(&conn2, "SELECT id, v FROM t ORDER BY id");
     assert_eq!(rows.len(), 1);
@@ -3933,7 +3951,9 @@ fn test_begin_concurrent_on_readonly_connection_reads() {
     )
     .unwrap();
     {
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
             .unwrap();
@@ -3952,7 +3972,9 @@ fn test_begin_concurrent_on_readonly_connection_reads() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("BEGIN CONCURRENT").unwrap();
     let rows = get_rows(&conn, "SELECT id FROM t");
     assert_eq!(rows[0][0].as_int().unwrap(), 7);
@@ -4135,7 +4157,7 @@ fn test_meta_recovery_case_3_no_wal_log_frames_without_valid_metadata_fails_clos
     remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
-        Ok(db2) => match db2.connect(ConnectOpts::new()) {
+        Ok(db2) => match db2.connect(ConnectOpts::new(crate::SessionRole::Superuser)) {
             Ok(_) => panic!("expected connect to fail with Corrupt"),
             Err(err) => assert!(
                 matches!(err, LimboError::Corrupt(_)),
@@ -4217,7 +4239,7 @@ fn test_meta_recovery_case_5_committed_wal_missing_metadata_fails_closed() {
     remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
-        Ok(db2) => match db2.connect(ConnectOpts::new()) {
+        Ok(db2) => match db2.connect(ConnectOpts::new(crate::SessionRole::Superuser)) {
             Ok(_) => panic!("expected connect to fail closed"),
             Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
         },
@@ -4252,9 +4274,10 @@ fn test_meta_recovery_case_6_committed_wal_corrupt_metadata_fails_closed() {
     // Ensure cold open after artifact tamper.
     remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
-    if Database::open_file(io, &db_path, Arc::new(SqliteDialect))
-        .is_ok_and(|db2| db2.connect(ConnectOpts::new()).is_ok())
-    {
+    if Database::open_file(io, &db_path, Arc::new(SqliteDialect)).is_ok_and(|db2| {
+        db2.connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .is_ok()
+    }) {
         panic!("expected connect to fail closed")
     }
 }
@@ -4282,9 +4305,10 @@ fn test_meta_recovery_case_7_metadata_table_shape_violation_fails_closed() {
     // Ensure cold open after artifact tamper.
     remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
-    if Database::open_file(io, &db_path, Arc::new(SqliteDialect))
-        .is_ok_and(|db2| db2.connect(ConnectOpts::new()).is_ok())
-    {
+    if Database::open_file(io, &db_path, Arc::new(SqliteDialect)).is_ok_and(|db2| {
+        db2.connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .is_ok()
+    }) {
         panic!("expected connect to fail closed")
     }
 }
@@ -4317,7 +4341,7 @@ fn test_meta_recovery_case_9_metadata_row_deleted_fails_closed() {
     remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
-        Ok(db2) => match db2.connect(ConnectOpts::new()) {
+        Ok(db2) => match db2.connect(ConnectOpts::new(crate::SessionRole::Superuser)) {
             Ok(_) => panic!("expected connect to fail closed"),
             Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
         },
@@ -5748,7 +5772,9 @@ fn conflict_abort_ckpt_indexed_update_body(db: MvccTestDbNoConn) {
     let reader_stop = stop.clone();
     let reader_db = db_arc.clone();
     let reader_handle = std::thread::spawn(move || {
-        let reader = reader_db.connect(ConnectOpts::new()).unwrap();
+        let reader = reader_db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         reader
             .execute("PRAGMA mvcc_checkpoint_threshold = 0")
             .unwrap();
@@ -5776,11 +5802,15 @@ fn conflict_abort_ckpt_indexed_update_body(db: MvccTestDbNoConn) {
 
     let writer_db = db_arc;
     let writer_handle = std::thread::spawn(move || {
-        let conn1 = writer_db.connect(ConnectOpts::new()).unwrap();
+        let conn1 = writer_db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn1
             .execute("PRAGMA mvcc_checkpoint_threshold = 0")
             .unwrap();
-        let conn2 = writer_db.connect(ConnectOpts::new()).unwrap();
+        let conn2 = writer_db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn2
             .execute("PRAGMA mvcc_checkpoint_threshold = 0")
             .unwrap();
@@ -5929,7 +5959,9 @@ fn test_passive_concurrent_transfer_preserves_sum_and_count() {
     let reader_stop = stop.clone();
     let reader_db = db_arc.clone();
     let reader = std::thread::spawn(move || {
-        let conn = reader_db.connect(ConnectOpts::new()).unwrap();
+        let conn = reader_db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
             .unwrap();
         let mut iters = 0u64;
@@ -5973,7 +6005,9 @@ fn test_passive_concurrent_transfer_preserves_sum_and_count() {
     // Writer: sum-preserving transfers between accounts, atomic per txn.
     let writer_db = db_arc;
     let writer = std::thread::spawn(move || {
-        let conn = writer_db.connect(ConnectOpts::new()).unwrap();
+        let conn = writer_db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
             .unwrap();
         let mut rng = 0x9e3779b97f4a7c15u64;
@@ -6896,7 +6930,10 @@ fn test_dirty_write() {
         .unwrap();
     assert_eq!(tx1_row, row);
 
-    let conn2 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     // T2 attempts to delete row with ID 1, but fails because T1 has not committed.
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
     let tx2_row = generate_simple_string_row((-2).into(), 1, "World");
@@ -6931,7 +6968,10 @@ fn test_dirty_read() {
     db.mvcc_store.insert(tx1, row1).unwrap();
 
     // T2 attempts to read row with ID 1, but doesn't see one because T1 has not committed.
-    let conn2 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
     let row2 = db
         .mvcc_store
@@ -6962,7 +7002,10 @@ fn test_dirty_read_deleted() {
     commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
 
     // T2 deletes row with ID 1, but does not commit.
-    let conn2 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
     assert!(db
         .mvcc_store
@@ -6976,7 +7019,10 @@ fn test_dirty_read_deleted() {
         .unwrap());
 
     // T3 reads row with ID 1, but doesn't see the delete because T2 hasn't committed.
-    let conn3 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn3 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx3 = db.mvcc_store.begin_tx(conn3.pager.load().clone()).unwrap();
     let row = db
         .mvcc_store
@@ -7020,7 +7066,10 @@ fn test_fuzzy_read() {
     commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
 
     // T2 reads the row with ID 1 within an active transaction.
-    let conn2 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
     let row = db
         .mvcc_store
@@ -7036,7 +7085,10 @@ fn test_fuzzy_read() {
     assert_eq!(tx1_row, row);
 
     // T3 updates the row and commits.
-    let conn3 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn3 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx3 = db.mvcc_store.begin_tx(conn3.pager.load().clone()).unwrap();
     let tx3_row = generate_simple_string_row((-2).into(), 1, "Second");
     db.mvcc_store.update(tx3, tx3_row).unwrap();
@@ -7091,13 +7143,19 @@ fn test_lost_update() {
     commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
 
     // T2 attempts to update row ID 1 within an active transaction.
-    let conn2 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
     let tx2_row = generate_simple_string_row((-2).into(), 1, "World");
     assert!(db.mvcc_store.update(tx2, tx2_row.clone()).unwrap());
 
     // T3 also attempts to update row ID 1 within an active transaction.
-    let conn3 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn3 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx3 = db.mvcc_store.begin_tx(conn3.pager.load().clone()).unwrap();
     let tx3_row = generate_simple_string_row((-2).into(), 1, "Hello, world!");
     assert!(matches!(
@@ -7114,7 +7172,10 @@ fn test_lost_update() {
         Err(LimboError::TxTerminated)
     ));
 
-    let conn4 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn4 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx4 = db.mvcc_store.begin_tx(conn4.pager.load().clone()).unwrap();
     let row = db
         .mvcc_store
@@ -7146,7 +7207,10 @@ fn test_committed_visibility() {
     commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
 
     // but I like more money, so let me try adding $10 more
-    let conn2 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
     let tx2_row = generate_simple_string_row((-2).into(), 1, "20");
     assert!(db.mvcc_store.update(tx2, tx2_row.clone()).unwrap());
@@ -7164,7 +7228,10 @@ fn test_committed_visibility() {
     assert_eq!(row, tx2_row);
 
     // can I check how much money I have?
-    let conn3 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn3 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx3 = db.mvcc_store.begin_tx(conn3.pager.load().clone()).unwrap();
     let row = db
         .mvcc_store
@@ -7190,7 +7257,10 @@ fn test_future_row() {
         .begin_tx(db.conn.pager.load().clone())
         .unwrap();
 
-    let conn2 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
     let tx2_row = generate_simple_string_row((-2).into(), 1, "Hello");
     db.mvcc_store.insert(tx2, tx2_row).unwrap();
@@ -7548,7 +7618,9 @@ fn test_sequence_watermark_reader_never_skips_committed_rows_fuzz() {
         let db_arc = db.get_db();
         let done = done.clone();
         writers.push(std::thread::spawn(move || {
-            let conn = db_arc.connect(ConnectOpts::new()).unwrap();
+            let conn = db_arc
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
             // Seed each writer differently so jitter (and thus the
             // commit/abort interleaving) varies between threads but stays
             // reproducible across runs.
@@ -8586,7 +8658,9 @@ fn test_commit_dep_threaded_abort_cascades() {
 
     let db_arc = db.get_db();
     let reader_handle = std::thread::spawn(move || {
-        let reader_conn = db_arc.connect(ConnectOpts::new()).unwrap();
+        let reader_conn = db_arc
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         reader_conn.execute("BEGIN CONCURRENT").unwrap();
 
         // SELECT triggers speculative read: reader.begin_ts >= writer.end_ts
@@ -8700,7 +8774,9 @@ fn test_commit_dep_threaded_multiple_dependents_abort() {
         let db_arc = db.get_db();
         let barrier_clone = barrier.clone();
         handles.push(std::thread::spawn(move || {
-            let conn = db_arc.connect(ConnectOpts::new()).unwrap();
+            let conn = db_arc
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
             conn.execute("BEGIN CONCURRENT").unwrap();
 
             // Speculative read from Preparing writer
@@ -8787,7 +8863,9 @@ fn test_commit_dep_threaded_commit_resolves() {
 
     let db_arc = db.get_db();
     let reader_handle = std::thread::spawn(move || {
-        let reader_conn = db_arc.connect(ConnectOpts::new()).unwrap();
+        let reader_conn = db_arc
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         reader_conn.execute("BEGIN CONCURRENT").unwrap();
 
         let mut stmt = reader_conn
@@ -8904,7 +8982,9 @@ fn test_commit_dep_threaded_readonly_abort_cascades() {
 
     let db_arc = db.get_db();
     let reader_handle = std::thread::spawn(move || {
-        let reader_conn = db_arc.connect(ConnectOpts::new()).unwrap();
+        let reader_conn = db_arc
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         reader_conn.execute("BEGIN CONCURRENT").unwrap();
 
         // Read-only: no writes, only SELECT → triggers speculative read
@@ -9048,7 +9128,9 @@ fn test_commit_dep_readonly_does_not_advance_timestamp() {
     let db_arc = db.get_db();
     let mvcc_clone = mvcc_store.clone();
     let reader_handle = std::thread::spawn(move || {
-        let reader_conn = db_arc.connect(ConnectOpts::new()).unwrap();
+        let reader_conn = db_arc
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         reader_conn.execute("BEGIN CONCURRENT").unwrap();
 
         // Read-only: SELECT only → speculative read registers dependency
@@ -9214,7 +9296,9 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
 
     let db_arc = db.get_db();
     let reader_handle = std::thread::spawn(move || {
-        let reader_conn = db_arc.connect(ConnectOpts::new()).unwrap();
+        let reader_conn = db_arc
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         reader_conn.execute("BEGIN CONCURRENT").unwrap();
 
         let mut stmt = reader_conn
@@ -10955,7 +11039,9 @@ fn test_interrupted_drop_table_rolls_back_schema_table_and_indexes() {
     let io = Arc::new(MemoryIO::new());
     let path = ":memory:interrupted-drop-table-schema-rollback";
     let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
 
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
 
@@ -11001,7 +11087,9 @@ fn test_interrupted_drop_table_rolls_back_schema_table_and_indexes() {
     // Reopening used to fail here because the same-connection SELECT could
     // commit the interrupted DROP TABLE's partial sqlite_schema delete.
     let db = Database::open_file(io, path, Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let target_schema_rows = get_rows(
         &conn,
         "SELECT type, name FROM sqlite_schema \
@@ -12492,12 +12580,18 @@ fn test_gc_active_reader_pins_lwm() {
     commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
 
     // T2 begins a read transaction — pins LWM at T2's begin_ts.
-    let conn2 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
     let tx2_begin_ts = db.mvcc_store.txs.get(&tx2).unwrap().value().begin_ts;
 
     // T3 updates the row and commits, creating a superseded version.
-    let conn3 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn3 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx3 = db.mvcc_store.begin_tx(conn3.pager.load().clone()).unwrap();
     let row_v2 = generate_simple_string_row(table_id, 1, "version_2");
     db.mvcc_store.update(tx3, row_v2).unwrap();
@@ -13070,11 +13164,17 @@ fn test_gc_incremental_respects_held_snapshot() {
     commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
 
     // T2 opens a read snapshot and pins the LWM.
-    let conn2 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
 
     // T3 updates and commits v2, superseding v1.
-    let conn3 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn3 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx3 = db.mvcc_store.begin_tx(conn3.pager.load().clone()).unwrap();
     db.mvcc_store
         .update(tx3, generate_simple_string_row(table_id, 1, "version_2"))
@@ -13704,7 +13804,10 @@ fn test_gc_incremental_keeps_held_reader_row() {
         .durable_txid_max
         .store(u64::MAX, Ordering::SeqCst);
 
-    let conn2 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
     assert_eq!(db.mvcc_store.read(tx2, &row_id).unwrap().unwrap(), row);
 
@@ -14706,7 +14809,9 @@ fn test_index_scan_sees_its_own_insert_ahead_of_the_scan() {
                         }
                         conn.execute(begin).unwrap();
                         let writer = if insert_from_other_connection {
-                            db.db.connect(ConnectOpts::new()).unwrap()
+                            db.db
+                                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                                .unwrap()
                         } else {
                             conn.clone()
                         };
@@ -14870,7 +14975,12 @@ fn test_scan_skips_its_own_write_to_the_next_btree_entry() {
                             .unwrap();
                         conn.execute(begin).unwrap();
                         let (writer, expected) = if write_from_other_connection {
-                            (db.db.connect(ConnectOpts::new()).unwrap(), all_rows)
+                            (
+                                db.db
+                                    .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                                    .unwrap(),
+                                all_rows,
+                            )
                         } else {
                             (conn.clone(), expected)
                         };
@@ -15675,7 +15785,9 @@ fn test_abandoned_journal_mode_mvcc_bootstrap_restores_connection() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     // Give the bootstrap real schema/WAL work to span several yields.
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
@@ -16811,7 +16923,9 @@ fn test_abandoned_drop() {
     let io = Arc::new(MemoryIO::new());
     let path = ":memory:";
     let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
 
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, row_number INTEGER, ts INTEGER)")
@@ -16847,7 +16961,9 @@ fn test_abandoned_drop() {
     let db = Database::open_file(io, path, Arc::new(SqliteDialect)).expect(
         "reopen should not fail; abandoned DROP must not have committed its partial Delete",
     );
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let after = get_rows(
         &conn,
         "SELECT type, name FROM sqlite_schema \
@@ -17188,7 +17304,9 @@ fn test_autoincrement_insert_works_for_preexisting_table() {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
             .unwrap();
         conn.execute("INSERT INTO t(b) VALUES ('before_mvcc')")
@@ -17210,7 +17328,9 @@ fn test_autoincrement_insert_works_for_preexisting_table() {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
             .unwrap();
 
@@ -17771,11 +17891,17 @@ fn test_speculative_delete_hides_committed_version() {
     commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
 
     // T2: begin (will write later).
-    let conn2 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
 
     // T3: begin, update row 1 → delete sets end=TxID(T3) on T1's version.
-    let conn3 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn3 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx3 = db.mvcc_store.begin_tx(conn3.pager.load().clone()).unwrap();
     let row_v3 = generate_simple_string_row(table_id, 1, "v3");
     assert!(db.mvcc_store.update(tx3, row_v3).unwrap());
@@ -17825,11 +17951,17 @@ fn test_committed_delete_tombstone_conflict() {
     commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
 
     // T2: begin (will write later).
-    let conn2 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
 
     // Td: delete row 1 and commit.
-    let conn_d = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn_d = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx_d = db.mvcc_store.begin_tx(conn_d.pager.load().clone()).unwrap();
     assert!(db
         .mvcc_store
@@ -17881,11 +18013,17 @@ fn test_committed_update_version_conflict() {
     commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
 
     // T2: begin (will write later).
-    let conn2 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
 
     // Td: update row 1 and commit.
-    let conn_d = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn_d = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx_d = db.mvcc_store.begin_tx(conn_d.pager.load().clone()).unwrap();
     let row_vd = generate_simple_string_row(table_id, 1, "vd");
     assert!(db.mvcc_store.update(tx_d, row_vd).unwrap());
@@ -17983,7 +18121,9 @@ fn test_mvcc_late_encryption_setup_keeps_metadata_bootstrapped() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
 
     // Reproduce the deferred-key flow: encryption is enabled as a feature, but
     // the session has not configured any key/cipher when MVCC bootstrap runs.
@@ -18476,7 +18616,9 @@ fn test_mvcc_portable_changes_encoder_matches_metadata_wire_golden() {
 fn test_mvcc_portable_changes_disabled_by_default() {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
         .unwrap();
@@ -18614,7 +18756,9 @@ fn test_mvcc_portable_changes_resolve_rows_through_object_map_in_same_txn() {
 fn test_mvcc_mode_supports_cdc_for_client_push() {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     conn.execute("PRAGMA capture_data_changes_conn('full,turso_cdc')")
         .unwrap();
@@ -18812,7 +18956,9 @@ fn test_mvcc_portable_changes_use_checkpointed_schema_after_restart() {
 fn test_mvcc_portable_changes_resolve_user_table_after_cross_connection_checkpoint() {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let creator = db.connect(ConnectOpts::new()).unwrap();
+    let creator = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     creator.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     creator.set_portable_logical_changes_enabled(true);
     creator
@@ -18825,7 +18971,9 @@ fn test_mvcc_portable_changes_resolve_user_table_after_cross_connection_checkpoi
     let initial_rootpage = rows[0][0].as_int().unwrap();
     assert!(initial_rootpage < 0);
 
-    let checkpoint = db.connect(ConnectOpts::new()).unwrap();
+    let checkpoint = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     checkpoint
         .execute("PRAGMA wal_checkpoint(TRUNCATE)")
         .unwrap();
@@ -18846,7 +18994,9 @@ fn test_mvcc_portable_changes_resolve_user_table_after_cross_connection_checkpoi
         assert_eq!(schema.table_name_for_root_page(initial_rootpage), None);
     }
 
-    let writer = db.connect(ConnectOpts::new()).unwrap();
+    let writer = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     writer.set_portable_logical_changes_enabled(true);
     writer
         .execute("INSERT INTO items(id, payload) VALUES (1, 'after-checkpoint')")
@@ -19100,7 +19250,9 @@ fn test_mvcc_portable_changes_mark_internal_only_commits_explicitly() {
 fn test_mvcc_portable_changes_metadata_does_not_auto_enable_or_get_consumed() {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     conn.set_mvcc_log_meta("client".to_string(), Some("client-a".to_string()));
     conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
@@ -20417,7 +20569,9 @@ fn test_snapshot_stability_full() {
         let mismatch_idx_a = mismatch_idx_a.clone();
         let mismatch_idx_b = mismatch_idx_b.clone();
         std::thread::spawn(move || {
-            let conn = db_arc.connect(ConnectOpts::new()).unwrap();
+            let conn = db_arc
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
             while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
                 if conn.execute("BEGIN CONCURRENT").is_err() {
                     std::thread::yield_now();
@@ -20473,7 +20627,9 @@ fn test_snapshot_stability_full() {
         let sp_iters = sp_iters.clone();
         let next_id = next_id.clone();
         std::thread::spawn(move || {
-            let conn = db_arc.connect(ConnectOpts::new()).unwrap();
+            let conn = db_arc
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
             let mut rng = ChaCha8Rng::seed_from_u64(0xCAFEF00D);
             while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
                 if conn.execute("BEGIN CONCURRENT").is_err() {
@@ -20536,7 +20692,9 @@ fn test_snapshot_stability_full() {
         let writer_iters = writer_iters.clone();
         let next_id = next_id.clone();
         std::thread::spawn(move || {
-            let conn = db_arc.connect(ConnectOpts::new()).unwrap();
+            let conn = db_arc
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
             let mut rng = ChaCha8Rng::seed_from_u64(0xDEADBEEF);
             while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
                 if conn.execute("BEGIN CONCURRENT").is_err() {
@@ -20568,7 +20726,9 @@ fn test_snapshot_stability_full() {
         let mismatch = mismatch.clone();
         let ckpt_iters = ckpt_iters.clone();
         std::thread::spawn(move || {
-            let conn = db_arc.connect(ConnectOpts::new()).unwrap();
+            let conn = db_arc
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
             let modes = ["PASSIVE", "FULL", "RESTART", "TRUNCATE"];
             let mut idx = 0usize;
             while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
@@ -20589,7 +20749,9 @@ fn test_snapshot_stability_full() {
         let mismatch = mismatch.clone();
         let ddl_iters = ddl_iters.clone();
         std::thread::spawn(move || {
-            let conn = db_arc.connect(ConnectOpts::new()).unwrap();
+            let conn = db_arc
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
             let mut i = 0u32;
             while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
                 let name = format!("idx_dyn_{}", i % 4);
@@ -20793,7 +20955,9 @@ fn test_open_with_mvcc_option_converts_fresh_database() {
         "open must leave the database in MVCC mode"
     );
     {
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
             .unwrap();
         conn.execute("BEGIN CONCURRENT").unwrap();
@@ -20815,7 +20979,9 @@ fn test_open_with_mvcc_option_converts_fresh_database() {
     )
     .unwrap();
     assert!(db.mvcc_enabled());
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let rows = get_rows(&conn, "SELECT id FROM t");
     assert_eq!(rows.len(), 1);
 }
@@ -20836,7 +21002,9 @@ fn test_open_with_mvcc_option_converts_existing_wal_database() {
     .unwrap();
     assert!(!db.mvcc_enabled());
     {
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
             .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'wal-era')").unwrap();
@@ -20854,7 +21022,9 @@ fn test_open_with_mvcc_option_converts_existing_wal_database() {
     )
     .unwrap();
     assert!(db.mvcc_enabled(), "open must convert the WAL database");
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let rows = get_rows(&conn, "SELECT c FROM t");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0].to_string(), "wal-era");
@@ -20881,7 +21051,9 @@ fn test_open_with_mvcc_option_readonly_keeps_current_mode() {
     )
     .unwrap();
     {
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
             .unwrap();
         conn.close().unwrap();
@@ -20901,7 +21073,9 @@ fn test_open_with_mvcc_option_readonly_keeps_current_mode() {
         !db.mvcc_enabled(),
         "a read-only open cannot write the conversion"
     );
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let rows = get_rows(&conn, "SELECT count(*) FROM t");
     assert_eq!(rows[0][0].as_int().unwrap(), 0);
 }
@@ -21678,7 +21852,9 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
         remove_file_from_database_registry(&path_str);
@@ -21704,8 +21880,12 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
     )
     .unwrap();
 
-    let conn_a = db.connect(ConnectOpts::new()).unwrap();
-    let conn_b = db.connect(ConnectOpts::new()).unwrap();
+    let conn_a = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
+    let conn_b = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn_a
         .execute(format!(
             "PRAGMA mvcc_group_commit = {}",
@@ -21939,7 +22119,9 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
         remove_file_from_database_registry(&path_str);
@@ -21957,7 +22139,9 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
     ));
     let storage = DeferredOnLogWriteCompleteStorage::new(inner_storage);
     let db = open_db(&storage, io.clone(), &path_str);
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
 
@@ -24174,7 +24358,9 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
         remove_file_from_database_registry(&path_str);
@@ -24202,7 +24388,9 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
     let mv_store = db.get_mv_store().clone().unwrap();
     observe.set_lock(mv_store.blocking_checkpoint_lock.clone());
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
@@ -24296,7 +24484,10 @@ fn commit_validation_reports_conflict_for_evicted_tombstone_writer() {
 
     // T2 updates the row, putting it into T2's write set so T2's commit
     // walks this version chain.
-    let conn2 = db.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
     assert!(db
         .mvcc_store
@@ -24557,7 +24748,7 @@ fn connect_async_yields_instead_of_spinning_on_preparing_commit_dependency() {
     let mut yielded = false;
     for _ in 0..1_000 {
         match database
-            .connect_async(ConnectOpts::new(), &mut state)
+            .connect_async(ConnectOpts::new(crate::SessionRole::Superuser), &mut state)
             .unwrap()
         {
             crate::IOResult::Done(_) => panic!(
@@ -24589,7 +24780,7 @@ fn connect_async_yields_instead_of_spinning_on_preparing_commit_dependency() {
     }
     let conn = loop {
         match database
-            .connect_async(ConnectOpts::new(), &mut state)
+            .connect_async(ConnectOpts::new(crate::SessionRole::Superuser), &mut state)
             .unwrap()
         {
             crate::IOResult::Done(conn) => break conn,
@@ -24641,7 +24832,7 @@ fn dropping_connect_async_state_mid_wait_does_not_block() {
     let mut yielded = false;
     for _ in 0..100 {
         match database
-            .connect_async(ConnectOpts::new(), &mut state)
+            .connect_async(ConnectOpts::new(crate::SessionRole::Superuser), &mut state)
             .unwrap()
         {
             crate::IOResult::Done(_) => panic!("connect must wait for the parked commit"),
@@ -24899,7 +25090,9 @@ fn update_survives_restart_when_prune_cannot_mark_its_key_again() {
                 }),
         )
         .unwrap();
-        let checkpointer = db.connect(ConnectOpts::new()).unwrap();
+        let checkpointer = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         checkpointer
             .execute("PRAGMA journal_mode = 'mvcc'")
             .unwrap();
@@ -24937,7 +25130,9 @@ fn update_survives_restart_when_prune_cannot_mark_its_key_again() {
         };
         assert!(dirty_stamp(&key).is_some());
 
-        let writer = db.connect(ConnectOpts::new()).unwrap();
+        let writer = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         writer.execute("BEGIN CONCURRENT").unwrap();
         writer
             .execute("UPDATE t SET v = 'new' WHERE id = 1")
@@ -25030,7 +25225,8 @@ fn update_survives_restart_when_prune_cannot_mark_its_key_again() {
     )
     .unwrap();
     let rows = get_rows(
-        &db.connect(ConnectOpts::new()).unwrap(),
+        &db.connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap(),
         "SELECT v FROM t WHERE id = 1",
     );
     assert_eq!(

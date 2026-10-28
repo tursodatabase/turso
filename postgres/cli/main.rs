@@ -1016,7 +1016,7 @@ fn main() -> anyhow::Result<()> {
             address.clone(),
             db_file,
             db,
-            turso_core::ConnectOpts::new(),
+            turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser),
             interrupt_count,
         );
         return server.run();

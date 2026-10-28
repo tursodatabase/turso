@@ -208,7 +208,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
             .unwrap();
 

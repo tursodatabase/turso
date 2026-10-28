@@ -289,7 +289,10 @@ fn open_without_mvcc(path: &Path) -> Arc<Connection> {
             .db_opts(turso_core::DatabaseOpts::new().with_views(true)),
     )
     .unwrap();
-    db.connect(turso_core::ConnectOpts::new()).unwrap()
+    db.connect(turso_core::ConnectOpts::new(
+        turso_core::SessionRole::Superuser,
+    ))
+    .unwrap()
 }
 
 /// Opens `path` with the PostgreSQL dialect through the engine alone, as a
@@ -302,7 +305,10 @@ fn open_through_the_engine(path: &Path, mvcc: bool) -> Arc<Connection> {
             .db_opts(turso_core::DatabaseOpts::new().with_mvcc(mvcc)),
     )
     .unwrap();
-    db.connect(turso_core::ConnectOpts::new()).unwrap()
+    db.connect(turso_core::ConnectOpts::new(
+        turso_core::SessionRole::Superuser,
+    ))
+    .unwrap()
 }
 
 fn has_namespaces_table(conn: &Arc<Connection>) -> bool {

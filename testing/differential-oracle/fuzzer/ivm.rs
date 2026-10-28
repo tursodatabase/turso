@@ -1554,7 +1554,8 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        db.connect(ConnectOpts::new()).unwrap()
+        db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap()
     }
 
     #[test]

@@ -437,7 +437,11 @@ mod tests {
                 path.to_str().unwrap(),
                 Arc::new(turso_core::SqliteDialect),
             )
-            .and_then(|db| db.connect(turso_core::ConnectOpts::new()))
+            .and_then(|db| {
+                db.connect(turso_core::ConnectOpts::new(
+                    turso_core::SessionRole::Superuser,
+                ))
+            })
             .and_then(|conn| conn.execute("SELECT 1"))
             .unwrap_err()
             .to_string();

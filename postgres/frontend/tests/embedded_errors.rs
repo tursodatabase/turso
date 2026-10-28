@@ -1887,7 +1887,11 @@ fn sqlite_connection() -> (Arc<dyn turso_core::IO>, Arc<turso_core::Connection>)
         Arc::new(turso_core::SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(turso_core::ConnectOpts::new(
+            turso_core::SessionRole::Superuser,
+        ))
+        .unwrap();
     conn.set_foreign_keys_enabled(true);
     (io, conn)
 }

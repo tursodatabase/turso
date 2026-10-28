@@ -38,6 +38,14 @@ pub struct BuiltinRoleNames {
     pub public: &'static str,
 }
 
+/// The role a new connection runs as. The program that opens the connection
+/// chooses it; SQL cannot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRole {
+    Superuser,
+    Named(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RoleId(i64);
 

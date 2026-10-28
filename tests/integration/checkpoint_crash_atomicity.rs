@@ -63,7 +63,7 @@ fn run_checkpoint_crash_scenario(sync_pragma: &str) -> anyhow::Result<()> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
 
     // S0: a multi-page table, fully checkpointed and durable.
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
@@ -115,7 +115,7 @@ fn run_checkpoint_crash_scenario(sync_pragma: &str) -> anyhow::Result<()> {
         db_path.to_str().unwrap(),
         Arc::new(SqliteDialect),
     )?;
-    let recovered = recovered_db.connect(ConnectOpts::new())?;
+    let recovered = recovered_db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
 
     let integrity = query_rows(&recovered, "PRAGMA integrity_check")?;
     assert_eq!(
@@ -186,7 +186,7 @@ fn crash_now_and_recover(
         db_path.to_str().unwrap(),
         Arc::new(SqliteDialect),
     )?;
-    let recovered = recovered_db.connect(ConnectOpts::new())?;
+    let recovered = recovered_db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     Ok((dir, recovered))
 }
 
@@ -207,7 +207,7 @@ fn full_commit_right_after_truncate_checkpoint_survives_power_loss() -> anyhow::
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     conn.execute("PRAGMA synchronous=FULL")?;
     conn.execute("CREATE TABLE t(x)")?;
     conn.execute("INSERT INTO t VALUES (1)")?;
@@ -242,7 +242,7 @@ fn savepoint_spill_crash_image_matches_sqlite_recovery() -> anyhow::Result<()> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     conn.execute("PRAGMA synchronous=FULL")?;
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")?;
     conn.execute("CREATE INDEX t_anchor_idx ON t(id, v)")?;
@@ -340,7 +340,7 @@ fn first_full_commit_on_fresh_database_fsyncs_the_wal() -> anyhow::Result<()> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     conn.execute("PRAGMA synchronous=FULL")?;
     conn.execute("CREATE TABLE t(x)")?;
 
