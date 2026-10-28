@@ -406,6 +406,7 @@ fn translate_statement(
             if_exists,
             view_name,
         } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+        ast::Stmt::SetRole { role_name } => roles::translate_set_role(role_name, program)?,
         ast::Stmt::CreateRole { role_name } => {
             roles::translate_create_role(&role_name, resolver, program)?
         }
@@ -615,6 +616,7 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::CreateType { .. } => "create_type",
         ast::Stmt::CreateDomain { .. } => "create_domain",
         ast::Stmt::CreateRole { .. } => "create_role",
+        ast::Stmt::SetRole { .. } => "set_role",
         ast::Stmt::Delete { .. } => "delete",
         ast::Stmt::Detach { .. } => "detach",
         ast::Stmt::DropIndex { .. } => "drop_index",

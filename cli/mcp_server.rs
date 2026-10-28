@@ -96,6 +96,7 @@ impl StmtClass {
             | Stmt::Attach { .. }
             | Stmt::Begin { .. }
             | Stmt::Commit { .. }
+            | Stmt::SetRole { .. }
             | Stmt::Detach { .. }
             | Stmt::Pragma { .. }
             | Stmt::Reindex { .. }
