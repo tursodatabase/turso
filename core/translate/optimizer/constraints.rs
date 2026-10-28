@@ -577,7 +577,7 @@ pub(super) fn add_implied_column_equalities(
             || left_collation != right_collation
             || !matches!(
                 left_collation,
-                CollationSeq::Binary | CollationSeq::NoCase | CollationSeq::Rtrim
+                CollationSeq::BINARY | CollationSeq::NOCASE | CollationSeq::RTRIM
             )
         {
             continue;

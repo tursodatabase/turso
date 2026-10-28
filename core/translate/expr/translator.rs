@@ -876,7 +876,7 @@ fn translate_function_call_expr(
             resolver,
         )?
     } else {
-        CollationSeq::Binary
+        CollationSeq::BINARY
     };
     let func_ctx = FuncCtx {
         func,

@@ -66,7 +66,7 @@ fn fts_test_stats(
             index_name: index_name.to_string(),
             columns: columns
                 .iter()
-                .map(|&(name, index)| IndexColumn::new(name, index, CollationSeq::Binary))
+                .map(|&(name, index)| IndexColumn::new(name, index, CollationSeq::BINARY))
                 .collect(),
             parameters: HashMap::default(),
         })
@@ -189,7 +189,7 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::Binary)],
+            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -281,7 +281,7 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::Binary)],
+            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -373,7 +373,7 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::Binary)],
+            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -667,8 +667,8 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
             table_name: "docs".to_string(),
             index_name: "fts_docs".to_string(),
             columns: vec![
-                IndexColumn::new("title", 1, CollationSeq::Binary),
-                IndexColumn::new("body", 2, CollationSeq::Binary),
+                IndexColumn::new("title", 1, CollationSeq::BINARY),
+                IndexColumn::new("body", 2, CollationSeq::BINARY),
             ],
             parameters: HashMap::default(),
         })
@@ -718,8 +718,8 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
             table_name: "docs".to_string(),
             index_name: "fts_docs".to_string(),
             columns: vec![
-                IndexColumn::new("title", 1, CollationSeq::Binary),
-                IndexColumn::new("body", 2, CollationSeq::Binary),
+                IndexColumn::new("title", 1, CollationSeq::BINARY),
+                IndexColumn::new("body", 2, CollationSeq::BINARY),
             ],
             parameters: HashMap::default(),
         })
@@ -5033,7 +5033,7 @@ fn fts_read_cache_is_shared_across_connections_and_bounded() {
         .attach(&IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "docs_fts".to_string(),
-            columns: vec![IndexColumn::new("content", 1, CollationSeq::Binary)],
+            columns: vec![IndexColumn::new("content", 1, CollationSeq::BINARY)],
             parameters: HashMap::default(),
         })
         .unwrap();

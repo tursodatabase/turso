@@ -25,7 +25,7 @@ use crate::{
     io::{MemoryIO, IO},
     progress::{ProgressHandler, ProgressHandlerCallback},
     translate,
-    translate::collate::CollationSeq,
+    translate::collate::TextCollation,
     util::IOExt,
     vdbe, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler, BusyHandlerCallback,
     CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion,
@@ -5037,7 +5037,7 @@ impl SymbolTable {
             .filter(|func| func.func.matches_arg_count(arg_count))
     }
 
-    pub fn resolve_collation(&self, name: &str) -> Option<CollationSeq> {
+    pub fn resolve_collation(&self, name: &str) -> Option<TextCollation> {
         self.collations
             .get(&crate::util::normalize_ident(name))
             .map(|external| external.collation)

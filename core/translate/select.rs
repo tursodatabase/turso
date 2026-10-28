@@ -1861,7 +1861,7 @@ fn is_constant_or_group_by(
         for group_by_expr in group_by_exprs {
             if exprs_are_equivalent(e, group_by_expr)
                 && expr_collation(group_by_expr, Some(table_references), resolver)?
-                    == CollationSeq::Binary
+                    == CollationSeq::BINARY
             {
                 *e = Expr::Literal(ast::Literal::Null);
                 return Ok(WalkControl::SkipChildren);

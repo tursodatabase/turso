@@ -430,7 +430,7 @@ fn build_select_plan_dag(
             (
                 vec![ast::Expr::Literal(ast::Literal::Numeric("0".to_string()))],
                 vec![dag::KeyColumn {
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                     ambiguous: false,
                 }],
                 true,
@@ -632,7 +632,7 @@ fn key_column(
     let collation = supported_key_collation(expr_collation(expr, Some(tables), resolver)?)?;
     Ok(dag::KeyColumn {
         collation,
-        ambiguous: collation != CollationSeq::Binary || stored_affinity(expr, tables).is_none(),
+        ambiguous: collation != CollationSeq::BINARY || stored_affinity(expr, tables).is_none(),
     })
 }
 
@@ -662,7 +662,7 @@ fn set_op_key_column(
         affinities.contains(&Some(Affinity::Integer)) && affinities.contains(&Some(Affinity::Real));
     Ok(dag::KeyColumn {
         collation,
-        ambiguous: collation != CollationSeq::Binary
+        ambiguous: collation != CollationSeq::BINARY
             || affinities.contains(&None)
             || mixes_integers_and_reals,
     })
@@ -1925,7 +1925,7 @@ fn match_counts_table_sql(table_name: &str, payload_width: usize) -> String {
 /// collations (which do not) are rejected at classify time.
 fn collate_clause(collation: CollationSeq) -> String {
     match collation {
-        CollationSeq::Binary => String::new(),
+        CollationSeq::BINARY => String::new(),
         other => format!(" COLLATE \"{}\"", other.name()),
     }
 }

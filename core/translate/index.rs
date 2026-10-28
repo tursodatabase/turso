@@ -10,7 +10,7 @@ use crate::schema::{
 use crate::sync::{Arc, RwLock};
 use crate::translate::{
     catalog::CatalogContext,
-    collate::{expr_type_ordering, CollationSeq},
+    collate::{expr_type_ordering, CollationSeq, TextCollation},
     emitter::{
         emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
         DoubleQuotedDml, OperationMode, Resolver,
@@ -746,7 +746,9 @@ fn resolve_reindex_targets(
         let collation = CollationSeq::new(&normalized_name).ok();
         if let Some(collation) = collation {
             let targets = collect_reindex_targets_by_collation(resolver, connection, collation);
-            if !targets.is_empty() || !matches!(collation, CollationSeq::Locale(_)) {
+            if !targets.is_empty()
+                || !matches!(collation, CollationSeq::Text(TextCollation::Locale(_)))
+            {
                 return Ok(targets);
             }
         }
@@ -1020,7 +1022,7 @@ fn resolve_sorted_columns_with_catalog(
                 order,
                 nulls_order: nulls,
                 pos_in_table: EXPR_INDEX_SENTINEL,
-                collation: collation.unwrap_or(CollationSeq::Binary),
+                collation: collation.unwrap_or(CollationSeq::BINARY),
                 default: None,
                 expr: Some(sc.expr.clone()),
             })
@@ -1032,7 +1034,7 @@ fn resolve_sorted_columns_with_catalog(
 /// The collation of an index column: the order of its type when it has one,
 /// otherwise the explicit COLLATE, if any.
 fn index_collation(
-    explicit_collation: Option<CollationSeq>,
+    explicit_collation: Option<TextCollation>,
     ordering: Option<TypeOrdering>,
 ) -> crate::Result<Option<CollationSeq>> {
     match (ordering, explicit_collation) {
@@ -1040,7 +1042,7 @@ fn index_collation(
             bail_parse_error!("collations are not supported by type {}", ordering.name())
         }
         (Some(ordering), None) => Ok(Some(CollationSeq::Type(ordering))),
-        (None, explicit_collation) => Ok(explicit_collation),
+        (None, explicit_collation) => Ok(explicit_collation.map(CollationSeq::Text)),
     }
 }
 
@@ -1084,7 +1086,7 @@ fn expression_type_ordering(
 fn extract_collation<'a>(
     expr: &'a Expr,
     resolver: Option<&CatalogContext>,
-) -> crate::Result<(Option<CollationSeq>, &'a Expr)> {
+) -> crate::Result<(Option<TextCollation>, &'a Expr)> {
     let mut current = expr;
     let mut coll = None;
     loop {
@@ -1094,7 +1096,7 @@ fn extract_collation<'a>(
                 if coll.is_none() {
                     let collation = match resolver {
                         Some(resolver) => resolver.resolve_collation(seq.as_str())?,
-                        None => CollationSeq::new(seq.as_str())?,
+                        None => TextCollation::new(seq.as_str())?,
                     };
                     if collation.is_custom() {
                         crate::bail_parse_error!("custom collations are not supported in indexes");
@@ -1432,7 +1434,7 @@ pub fn translate_drop_index(
         rhs: dest_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::NoCase,
+        collation: CollationSeq::NOCASE,
     });
 
     // read type of table

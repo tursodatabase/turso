@@ -182,7 +182,7 @@ impl EmitOrderBy {
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table,
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::BINARY,
                 default: None,
                 expr: None,
             })?;
@@ -191,7 +191,7 @@ impl EmitOrderBy {
                 index_columns.try_push(IndexColumn::new(
                     pos_in_table.to_string(),
                     pos_in_table,
-                    CollationSeq::Binary,
+                    CollationSeq::BINARY,
                 ))?;
             }
             let index = Arc::new(Index {
@@ -245,7 +245,7 @@ impl EmitOrderBy {
                 // sequence column: ascending with BINARY collation, no nulls order
                 data.order_collations_nulls.try_push((
                     SortOrder::Asc,
-                    CollationSeq::Binary,
+                    CollationSeq::BINARY,
                     None,
                 ))?;
             }

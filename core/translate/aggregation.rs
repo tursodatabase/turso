@@ -496,7 +496,7 @@ pub(crate) fn open_aggregate_sorter(
         } else {
             ast::SortOrder::Asc
         },
-        CollationSeq::Binary,
+        CollationSeq::BINARY,
         None,
     ))?;
     data.columns = aggregate.order_by().len() + 1 + 2 * aggregate.args.len();
@@ -542,7 +542,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Avg),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register
@@ -557,7 +557,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Count0),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register
@@ -574,7 +574,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Count),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register
@@ -601,7 +601,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: delimiter_reg,
                     func: AccumulatorFunc::Agg(AggFunc::GroupConcat),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
 
@@ -660,7 +660,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: value_reg,
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupObject),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register
@@ -678,7 +678,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupArray),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register
@@ -698,7 +698,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: delimiter_reg,
                     func: AccumulatorFunc::Agg(AggFunc::StringAgg),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
 
@@ -716,7 +716,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Sum),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register
@@ -733,7 +733,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Total),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register
@@ -751,7 +751,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::ArrayAgg),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register
@@ -836,7 +836,7 @@ pub fn translate_aggregation_step(
                     } else {
                         func.clone()
                     })),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register

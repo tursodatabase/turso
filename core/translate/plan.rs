@@ -8,7 +8,7 @@ use crate::{
         ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
     },
     translate::{
-        collate::{expr_collation_ignoring_type, CollationSeq},
+        collate::{expr_text_collation, CollationSeq},
         emitter::{Resolver, UpdateRowSource},
         expr::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
@@ -3135,7 +3135,7 @@ pub(super) fn query_output_columns(
             );
         }
         column.set_array_dimensions(dimensions);
-        column.set_collation(Some(expr_collation_ignoring_type(
+        column.set_collation(Some(expr_text_collation(
             result_expr,
             Some(table_references),
             resolver,

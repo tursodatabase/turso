@@ -127,7 +127,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
             .collect::<Result<Vec<_>>>()?;
 
         let use_bloom_filter = self.hash_join_op.use_bloom_filter
-            && collations.iter().all(|c| *c == CollationSeq::Binary);
+            && collations.iter().all(|c| *c == CollationSeq::BINARY);
 
         let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
         let (payload_columns, payload_signature_columns, uses_materialized_keys_and_payload) =

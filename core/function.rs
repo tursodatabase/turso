@@ -7,7 +7,7 @@ use turso_ext::{
     ValueDestructor,
 };
 
-use crate::translate::collate::CollationSeq;
+use crate::translate::collate::{CollationSeq, TextCollation};
 use crate::LimboError;
 
 pub type ContextCollationFunction = unsafe extern "C" fn(
@@ -31,7 +31,7 @@ pub struct ExternalFunc {
 /// that orders two texts.
 pub struct ExternalCollation {
     /// The collation that calls this callback.
-    pub collation: CollationSeq,
+    pub collation: TextCollation,
     pub name: String,
     pub context: usize,
     pub callback: ContextCollationFunction,
@@ -45,7 +45,7 @@ impl ExternalCollation {
         callback: ContextCollationFunction,
         context_destructor: Option<ContextDestructor>,
     ) -> Arc<Self> {
-        CollationSeq::new_custom(|collation| Self {
+        TextCollation::new_custom(|collation| Self {
             collation,
             name,
             context,

@@ -1588,7 +1588,7 @@ mod tests {
                 columns: crate::alloc::vec![IndexColumn::new(
                     "a",
                     1,
-                    crate::translate::collate::CollationSeq::Binary
+                    crate::translate::collate::CollationSeq::BINARY
                 )],
                 unique: false,
                 ephemeral: false,

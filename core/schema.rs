@@ -115,7 +115,7 @@ impl Trigger {
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
-use crate::translate::collate::CollationSeq;
+use crate::translate::collate::{CollationSeq, TextCollation};
 use crate::translate::expr::expr_type::ExprType;
 use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
@@ -3725,12 +3725,14 @@ impl Schema {
             let (p, collation, parent_affinity) = match parent_tbl.get_column(pc) {
                 Some((i, column)) => (
                     i,
-                    crate::translate::collate::column_collation(column)
-                        .unwrap_or(CollationSeq::Binary),
+                    CollationSeq::Text(
+                        crate::translate::collate::column_collation(column)
+                            .unwrap_or(TextCollation::Binary),
+                    ),
                     column.affinity(),
                 ),
                 None if ROWID_STRS.iter().any(|r| pc.eq_ignore_ascii_case(r)) => {
-                    (0, CollationSeq::Binary, Affinity::Integer)
+                    (0, CollationSeq::BINARY, Affinity::Integer)
                 }
                 None => return Err(fk_mismatch_err(&child.name, &parent_tbl.name)),
             };
@@ -4454,7 +4456,7 @@ pub struct UniqueSet {
 pub struct UniqueSetColumn {
     pub name: String,
     pub sort_order: SortOrder,
-    pub collation: Option<CollationSeq>,
+    pub collation: Option<TextCollation>,
     pub nulls_order: Option<NullsOrder>,
 }
 
@@ -4964,7 +4966,7 @@ impl BTreeTable {
                 sql.push_str(&ast::ColumnConstraint::Default(default.clone()).to_string());
             }
 
-            push_collation(&mut sql, column.collation_opt());
+            push_collation(&mut sql, column.text_collation());
 
             if let GeneratedType::Virtual { original_sql, .. } = &column.generated_type() {
                 if column.generated_always {
@@ -5170,7 +5172,7 @@ impl BTreeTable {
             })
     }
 
-    fn primary_key_constraint_collation(&self, column_name: &str) -> Option<CollationSeq> {
+    fn primary_key_constraint_collation(&self, column_name: &str) -> Option<TextCollation> {
         self.unique_sets
             .iter()
             .find(|unique_set| unique_set.is_primary_key)
@@ -5386,23 +5388,20 @@ fn push_on_conflict_clause(sql: &mut String, conflict_clause: Option<ResolveType
     });
 }
 
-fn push_collation(sql: &mut String, collation: Option<CollationSeq>) {
+fn push_collation(sql: &mut String, collation: Option<TextCollation>) {
     let Some(collation) = collation else {
         return;
     };
     match collation {
-        CollationSeq::Binary => sql.push_str(" COLLATE BINARY"),
-        CollationSeq::NoCase => sql.push_str(" COLLATE NOCASE"),
-        CollationSeq::Rtrim => sql.push_str(" COLLATE RTRIM"),
-        CollationSeq::Locale(_) => {
+        TextCollation::Binary => sql.push_str(" COLLATE BINARY"),
+        TextCollation::NoCase => sql.push_str(" COLLATE NOCASE"),
+        TextCollation::Rtrim => sql.push_str(" COLLATE RTRIM"),
+        TextCollation::Locale(_) => {
             sql.push_str(" COLLATE ");
             sql.push_str(&quote_ident(&collation.name()));
         }
-        CollationSeq::Custom(_) => {
+        TextCollation::Custom(_) => {
             // Custom collation is not allowed in schema definitions
-        }
-        CollationSeq::Type(_) => {
-            unreachable!("a type's order comes from the column's type, not a COLLATE clause")
         }
     };
 }
@@ -5932,10 +5931,10 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
 /// Peel an optional `COLLATE` wrapper off a PRIMARY KEY / UNIQUE table
 /// constraint column, e.g. `PRIMARY KEY(a COLLATE NOCASE)`, returning the
 /// inner expression and the resolved collation.
-fn constraint_column_collation(expr: &Expr) -> Result<(&Expr, Option<CollationSeq>)> {
+fn constraint_column_collation(expr: &Expr) -> Result<(&Expr, Option<TextCollation>)> {
     match expr {
         Expr::Collate(inner, collation_name) => {
-            let collation_seq = CollationSeq::new(collation_name.as_str())?;
+            let collation_seq = TextCollation::new(collation_name.as_str())?;
             if collation_seq.is_custom() {
                 crate::bail_parse_error!(
                     "custom collations are not supported in schema definitions"
@@ -6291,7 +6290,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             })?;
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
-                            let collation_seq = CollationSeq::new(collation_name.as_str())?;
+                            let collation_seq = TextCollation::new(collation_name.as_str())?;
                             if collation_seq.is_custom() {
                                 crate::bail_parse_error!(
                                     "custom collations are not supported in schema definitions"
@@ -6806,7 +6805,7 @@ pub struct Column {
     /// The declared collation, or for a column of a subquery, view or CTE the
     /// collation of its expression. None means BINARY. Kept apart from
     /// `info` because a custom collation does not fit in its bits.
-    collation: Option<CollationSeq>,
+    collation: Option<TextCollation>,
     /// The order of the column's type, when it has one (numeric, arrays).
     /// Keys on the column use it instead of `collation`. Set from the schema's
     /// types by `BTreeTable::resolve_custom_types`, never stored in the SQL.
@@ -6937,7 +6936,7 @@ impl Column {
         default: Option<Box<Expr>>,
         generated: Option<Box<Expr>>,
         ty: Type,
-        col: Option<CollationSeq>,
+        col: Option<TextCollation>,
         coldef: ColDef,
     ) -> Self {
         let generated_type = match generated {
@@ -7009,7 +7008,7 @@ impl Column {
                     );
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
-                    let collation_seq = CollationSeq::new(collation_name.as_str())?;
+                    let collation_seq = TextCollation::new(collation_name.as_str())?;
                     if collation_seq.is_custom() {
                         crate::bail_parse_error!(
                             "custom collations are not supported in schema definitions"
@@ -7097,8 +7096,13 @@ impl Column {
         }
     }
 
+    /// The collation from the column's COLLATE clause, or for a column of a
+    /// subquery, view or CTE the collation of its expression by SQLite's
+    /// rules. None means BINARY. It applies to text only: comparisons use
+    /// [Self::collation], which gives the order of the column's type instead
+    /// when the type has one.
     #[inline]
-    pub fn collation_opt(&self) -> Option<CollationSeq> {
+    pub fn text_collation(&self) -> Option<TextCollation> {
         self.collation
     }
 
@@ -7176,15 +7180,8 @@ impl Column {
     pub fn collation(&self) -> CollationSeq {
         match self.type_ordering {
             Some(ordering) => CollationSeq::Type(ordering),
-            None => self.declared_collation(),
+            None => CollationSeq::Text(self.collation.unwrap_or(TextCollation::Binary)),
         }
-    }
-    /// The collation from the column's COLLATE clause, or for a column of a
-    /// subquery, view or CTE the collation of its expression by SQLite's
-    /// rules. BINARY when none.
-    #[inline]
-    pub fn declared_collation(&self) -> CollationSeq {
-        self.collation.unwrap_or(CollationSeq::Binary)
     }
     #[inline]
     pub fn type_ordering(&self) -> Option<TypeOrdering> {
@@ -7206,7 +7203,7 @@ impl Column {
         self.collation.is_some()
     }
     #[inline]
-    pub fn set_collation(&mut self, c: Option<CollationSeq>) {
+    pub fn set_collation(&mut self, c: Option<TextCollation>) {
         self.collation = c;
     }
     #[inline]
@@ -7430,7 +7427,7 @@ impl IndexColumn {
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table: i,
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::BINARY,
                 default: None,
                 expr: None,
             })
@@ -7562,7 +7559,7 @@ impl Index {
                     collation: constraint_columns
                         .get(i)
                         .and_then(|c| c.collation)
-                        .unwrap_or_else(|| column.collation()),
+                        .map_or_else(|| column.collation(), CollationSeq::Text),
                     default: column.default.clone(),
                     expr: None,
                 })
@@ -7618,7 +7615,7 @@ impl Index {
                     collation: constraint_columns
                         .get(i)
                         .and_then(|c| c.collation)
-                        .unwrap_or_else(|| col.collation()),
+                        .map_or_else(|| col.collation(), CollationSeq::Text),
                     default: col.default.clone(),
                     expr: None,
                 })
@@ -8175,7 +8172,7 @@ mod tests {
                 None,
                 None,
                 Type::Numeric,
-                Some(CollationSeq::NoCase),
+                Some(TextCollation::NoCase),
                 ColDef {
                     flags,
                     notnull_conflict_clause: Some(ResolveType::Ignore),
@@ -8197,8 +8194,8 @@ mod tests {
             );
             assert_eq!(column.ty(), Type::Numeric, "{flags:?}");
             assert_eq!(
-                column.collation_opt(),
-                Some(CollationSeq::NoCase),
+                column.text_collation(),
+                Some(TextCollation::NoCase),
                 "{flags:?}"
             );
             assert_eq!(
@@ -8258,7 +8255,7 @@ mod tests {
                 assert_eq!(actual.default, expected.default, "{sql}");
                 assert_eq!(actual.ty(), expected.ty(), "{sql}");
                 assert_eq!(actual.affinity(), expected.affinity(), "{sql}");
-                assert_eq!(actual.collation_opt(), expected.collation_opt(), "{sql}");
+                assert_eq!(actual.text_collation(), expected.text_collation(), "{sql}");
                 assert_eq!(actual.primary_key(), expected.primary_key(), "{sql}");
                 assert_eq!(actual.is_rowid_alias(), expected.is_rowid_alias(), "{sql}");
                 assert_eq!(actual.notnull(), expected.notnull(), "{sql}");
@@ -8311,8 +8308,8 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a TEXT);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.collation(), CollationSeq::Binary);
-        assert_eq!(column.collation_opt(), None);
+        assert_eq!(column.collation(), CollationSeq::BINARY);
+        assert_eq!(column.text_collation(), None);
         Ok(())
     }
 
@@ -9597,7 +9594,7 @@ mod tests {
                 col.set_unique(enabled);
                 col.set_hidden(enabled);
                 col.set_ty(if enabled { Type::Real } else { Type::Null });
-                col.set_collation(enabled.then_some(CollationSeq::NoCase));
+                col.set_collation(enabled.then_some(TextCollation::NoCase));
                 col.set_array_dimensions(if enabled { 7 } else { 0 });
                 assert_eq!(col.affinity(), affinity);
             }

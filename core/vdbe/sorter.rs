@@ -44,7 +44,7 @@ fn normalized_first_key(values: &[ValueRef<'_>], key_info: &[KeyInfo]) -> (u64, 
     let (Some(value), Some(key)) = (values.first(), key_info.first()) else {
         return (0, false);
     };
-    if !key.collation.compares_non_text_like_sqlite() {
+    if !matches!(key.collation, CollationSeq::Text(_)) {
         // A type's order: the normalized key cannot mirror it.
         return (0, false);
     }
@@ -90,7 +90,7 @@ fn normalized_first_key(values: &[ValueRef<'_>], key_info: &[KeyInfo]) -> (u64, 
             ((1u64 << NORM_CLASS_SHIFT) | (monotone >> 3), exact)
         }
         ValueRef::Text(t) => {
-            if key.collation != CollationSeq::Binary {
+            if key.collation != CollationSeq::BINARY {
                 // Non-binary collation: constant key, always full comparison.
                 (2u64 << NORM_CLASS_SHIFT, false)
             } else {
@@ -1176,7 +1176,7 @@ mod tests {
             } else {
                 SortOrder::Desc
             },
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::BINARY,
             nulls_order: match rng.next_u64() % 3 {
                 0 => None,
                 1 => Some(NullsOrder::First),
@@ -1248,7 +1248,7 @@ mod tests {
         for _ in 0..attempts {
             let mut sorter = Sorter::new(
                 &[SortOrder::Asc],
-                try_vec![CollationSeq::Binary].unwrap(),
+                try_vec![CollationSeq::BINARY].unwrap(),
                 try_vec![None].unwrap(),
                 256,
                 64,
@@ -1301,7 +1301,7 @@ mod tests {
         let min_read_buffer_size = 4096;
         let mut sorter = Sorter::new(
             &[SortOrder::Asc],
-            try_vec![CollationSeq::Binary].unwrap(),
+            try_vec![CollationSeq::BINARY].unwrap(),
             try_vec![None].unwrap(),
             max_buffer_size,
             min_read_buffer_size,
@@ -1362,7 +1362,7 @@ mod tests {
             let io = Arc::new(crate::io::MemoryYieldIO::new());
             let mut sorter = Sorter::new(
                 &[SortOrder::Asc],
-                try_vec![CollationSeq::Binary].unwrap(),
+                try_vec![CollationSeq::BINARY].unwrap(),
                 try_vec![None].unwrap(),
                 2000 * 1024,
                 4096,
@@ -1416,7 +1416,7 @@ mod tests {
         let io = Arc::new(crate::io::MemoryYieldIO::new());
         let mut sorter = Sorter::new(
             &[SortOrder::Asc],
-            try_vec![CollationSeq::Binary].unwrap(),
+            try_vec![CollationSeq::BINARY].unwrap(),
             try_vec![None].unwrap(),
             2048,
             64,
@@ -1508,7 +1508,7 @@ mod tests {
         let io = Arc::new(PlatformIO::new().unwrap());
         let mut sorter = Sorter::new(
             &[SortOrder::Asc, second_order],
-            try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
+            try_vec![CollationSeq::BINARY, CollationSeq::BINARY].unwrap(),
             try_vec![None, second_nulls].unwrap(),
             1 << 20,
             64,
@@ -1548,7 +1548,7 @@ mod tests {
         let io = Arc::new(PlatformIO::new().unwrap());
         let mut sorter = Sorter::new(
             &[SortOrder::Asc, SortOrder::Asc],
-            try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
+            try_vec![CollationSeq::BINARY, CollationSeq::BINARY].unwrap(),
             try_vec![None, None].unwrap(),
             // Tiny buffer so the sorter spills to multiple chunk files.
             256,
@@ -1598,7 +1598,7 @@ mod tests {
         let io = Arc::new(PlatformIO::new().unwrap());
         let mut sorter = Sorter::new(
             &[SortOrder::Asc, SortOrder::Asc],
-            try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
+            try_vec![CollationSeq::BINARY, CollationSeq::BINARY].unwrap(),
             try_vec![None, Some(turso_parser::ast::NullsOrder::Last)].unwrap(),
             256,
             64,

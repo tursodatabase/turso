@@ -1883,7 +1883,7 @@ mod tests {
     }
 
     fn binary(lhs: &Value, rhs: &Value) -> crate::Result<std::cmp::Ordering> {
-        Ok(crate::translate::collate::CollationSeq::Binary.compare(lhs.as_ref(), rhs.as_ref()))
+        Ok(crate::translate::collate::CollationSeq::BINARY.compare(lhs.as_ref(), rhs.as_ref()))
     }
 
     fn allocated(result: std::result::Result<Value, crate::alloc::TryReserveError>) -> Value {

@@ -513,7 +513,7 @@ fn emit_index_stats(
         func: FuncCtx {
             func: Func::Scalar(ScalarFunc::StatInit),
             arg_count: 1,
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::BINARY,
         },
     });
 
@@ -602,7 +602,7 @@ fn emit_index_stats(
         func: FuncCtx {
             func: Func::Scalar(ScalarFunc::StatPush),
             arg_count: 2,
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::BINARY,
         },
     });
 
@@ -623,7 +623,7 @@ fn emit_index_stats(
         func: FuncCtx {
             func: Func::Scalar(ScalarFunc::StatGet),
             arg_count: 1,
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::BINARY,
         },
     });
 

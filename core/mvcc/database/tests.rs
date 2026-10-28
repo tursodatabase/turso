@@ -447,7 +447,7 @@ fn index_key_payload_allocation_uses_passed_allocator() {
         IndexInfo::new(
             [crate::types::KeyInfo {
                 sort_order: turso_parser::ast::SortOrder::Asc,
-                collation: crate::translate::collate::CollationSeq::Binary,
+                collation: crate::translate::collate::CollationSeq::BINARY,
                 nulls_order: None,
             }],
             false,
@@ -8416,7 +8416,7 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
         crate::types::IndexInfo::new(
             crate::alloc::vec![crate::types::KeyInfo {
                 sort_order: turso_parser::ast::SortOrder::Asc,
-                collation: crate::translate::collate::CollationSeq::Binary,
+                collation: crate::translate::collate::CollationSeq::BINARY,
                 nulls_order: None,
             }],
             false,

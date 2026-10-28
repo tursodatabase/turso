@@ -576,7 +576,7 @@ impl CursorType {
                         .columns()
                         .iter()
                         .map(|col| {
-                            if let Some(coll) = col.collation_opt() {
+                            if let Some(coll) = col.text_collation() {
                                 format!("{coll}")
                             } else {
                                 "B".to_string()
@@ -602,7 +602,7 @@ impl CursorType {
                                 SortOrder::Desc => "-",
                             };
                             match col.collation {
-                                CollationSeq::Binary => format!("{sign}B"),
+                                CollationSeq::BINARY => format!("{sign}B"),
                                 coll => format!("{sign}{coll}"),
                             }
                         })

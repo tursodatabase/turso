@@ -54,7 +54,7 @@ pub(crate) fn emit_recursive_cte(
                     order: SortOrder::Asc,
                     nulls_order: None,
                     pos_in_table: queue_index_columns.len(),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                     default: None,
                     expr: None,
                 })?;
@@ -86,13 +86,13 @@ pub(crate) fn emit_recursive_cte(
     queue_index_columns.try_push(IndexColumn::new(
         "sequence",
         queue_index_columns.len(),
-        CollationSeq::Binary,
+        CollationSeq::BINARY,
     ))?;
     for result_column_index in 0..num_result_columns {
         queue_index_columns.try_push(IndexColumn::new(
             format!("result-{result_column_index}"),
             queue_index_columns.len(),
-            CollationSeq::Binary,
+            CollationSeq::BINARY,
         ))?;
     }
 

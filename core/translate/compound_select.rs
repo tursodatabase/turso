@@ -876,7 +876,7 @@ fn emit_compound_order_by(
         // Sequence tie-breaker: preserves insertion order for rows with equal ORDER BY keys
         .chain(std::iter::once((
             SortOrder::Asc,
-            CollationSeq::Binary,
+            CollationSeq::BINARY,
             None,
         )))
         .try_collect()?;

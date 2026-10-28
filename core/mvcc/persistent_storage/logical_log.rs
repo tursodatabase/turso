@@ -6305,12 +6305,12 @@ mod tests {
                 [
                     crate::types::KeyInfo {
                         sort_order: turso_parser::ast::SortOrder::Asc,
-                        collation: crate::translate::collate::CollationSeq::Binary,
+                        collation: crate::translate::collate::CollationSeq::BINARY,
                         nulls_order: None,
                     },
                     crate::types::KeyInfo {
                         sort_order: turso_parser::ast::SortOrder::Asc,
-                        collation: crate::translate::collate::CollationSeq::Binary,
+                        collation: crate::translate::collate::CollationSeq::BINARY,
                         nulls_order: None,
                     },
                 ],

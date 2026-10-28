@@ -994,7 +994,7 @@ macro_rules! comparison_opcode {
             ) = (
                 &state.registers[*lhs],
                 &state.registers[*rhs],
-                collation.compares_non_text_like_sqlite(),
+                matches!(collation, CollationSeq::Text(_)),
             ) {
                 let jumps = $jumps;
                 state.pc = if jumps(*l, *r) {
@@ -1037,7 +1037,7 @@ fn texts_compare_as_bytes(
     flags: crate::vdbe::insn::CmpInsFlags,
     collation: CollationSeq,
 ) -> bool {
-    if collation != CollationSeq::Binary {
+    if collation != CollationSeq::BINARY {
         return false;
     }
     !flags.get_affinity().is_numeric()
@@ -9297,7 +9297,7 @@ pub fn op_agg_step(
                     }
                 }
             }
-            AggFunc::Min | AggFunc::Max if data.collation.compares_non_text_like_sqlite() => {
+            AggFunc::Min | AggFunc::Max if matches!(data.collation, CollationSeq::Text(_)) => {
                 if let Register::Value(Value::Numeric(Numeric::Integer(arg))) =
                     state.registers[data.col]
                 {
@@ -20667,7 +20667,7 @@ mod tests {
             initial_buckets: 4,
             mem_budget: 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![CollationSeq::BINARY],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             ..Default::default()
@@ -21326,7 +21326,7 @@ mod tests {
             &Value::Null,
             None,
             &mut payload,
-            CollationSeq::Binary,
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(5)); // unchanged
@@ -21340,7 +21340,7 @@ mod tests {
             &Value::from_i64(42),
             None,
             &mut payload,
-            CollationSeq::Binary,
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(6));
@@ -21360,7 +21360,7 @@ mod tests {
             &Value::from_i64(10),
             None,
             &mut payload,
-            CollationSeq::Binary,
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(10));
@@ -21370,7 +21370,7 @@ mod tests {
             &Value::from_i64(5),
             None,
             &mut payload,
-            CollationSeq::Binary,
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(15));
@@ -21390,7 +21390,7 @@ mod tests {
             &Value::Null,
             None,
             &mut payload,
-            CollationSeq::Binary,
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(10)); // unchanged
@@ -21405,7 +21405,7 @@ mod tests {
             &Value::from_i64(5),
             None,
             &mut payload,
-            CollationSeq::Binary,
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(5));
@@ -21416,7 +21416,7 @@ mod tests {
             &Value::from_i64(3),
             None,
             &mut payload,
-            CollationSeq::Binary,
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(3));
@@ -21427,7 +21427,7 @@ mod tests {
             &Value::from_i64(10),
             None,
             &mut payload,
-            CollationSeq::Binary,
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(3));
@@ -21446,7 +21446,7 @@ mod tests {
             &Value::from_i64(10),
             None,
             &mut payload,
-            CollationSeq::Binary,
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_f64(10.0));
@@ -21457,7 +21457,7 @@ mod tests {
             &Value::from_i64(20),
             None,
             &mut payload,
-            CollationSeq::Binary,
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_f64(30.0));
@@ -21508,7 +21508,7 @@ mod tests {
             &Value::from_i64(9007199254740994),
             None,
             &mut payload,
-            CollationSeq::Binary,
+            CollationSeq::BINARY,
         )
         .unwrap();
         update_agg_payload(
@@ -21516,7 +21516,7 @@ mod tests {
             &Value::from_i64(-9007199254740993),
             None,
             &mut payload,
-            CollationSeq::Binary,
+            CollationSeq::BINARY,
         )
         .unwrap();
 

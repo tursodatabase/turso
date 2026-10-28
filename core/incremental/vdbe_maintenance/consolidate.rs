@@ -78,7 +78,7 @@ pub(super) fn consolidate_delta(
             cursor_id: sorter_cursor,
             columns: key_width,
             order_collations_nulls: (0..key_width)
-                .map(|_| (SortOrder::Asc, CollationSeq::Binary, None))
+                .map(|_| (SortOrder::Asc, CollationSeq::BINARY, None))
                 .try_collect()?,
         }),
     });

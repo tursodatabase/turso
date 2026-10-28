@@ -2,7 +2,7 @@
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 use super::{
     catalog::{CatalogContext, DatabaseScopeContext},
-    collate::CollationSeq,
+    collate::{CollationSeq, TextCollation},
     compound_select::emit_program_for_compound_select,
     emitter::{
         delete::emit_program_for_delete, select::emit_program_for_select,
@@ -180,7 +180,7 @@ pub struct Resolver<'a> {
 pub struct RegisterColumn {
     pub affinity: Affinity,
     /// None for the rowid, which has no collation.
-    pub collation: Option<CollationSeq>,
+    pub collation: Option<TextCollation>,
 }
 
 impl RegisterColumn {
@@ -584,7 +584,7 @@ impl<'a> Resolver<'a> {
         });
     }
 
-    pub fn resolve_collation(&self, name: &str) -> Result<CollationSeq> {
+    pub fn resolve_collation(&self, name: &str) -> Result<TextCollation> {
         self.catalog.resolve_collation(name)
     }
 
@@ -1324,7 +1324,7 @@ fn emit_cdc_insns_v1(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::BINARY,
     };
 
     program.emit_insn(Insn::Function {
@@ -1436,7 +1436,7 @@ fn emit_cdc_insns_v2(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::BINARY,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1454,7 +1454,7 @@ fn emit_cdc_insns_v2(
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::BINARY,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1560,7 +1560,7 @@ pub fn emit_cdc_commit_insns(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::BINARY,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1576,7 +1576,7 @@ pub fn emit_cdc_commit_insns(
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::BINARY,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1647,7 +1647,7 @@ pub fn emit_cdc_autocommit_commit(
     let is_autocommit_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
         arg_count: 0,
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::BINARY,
     };
     let autocommit_reg = program.alloc_register();
     program.emit_insn(Insn::Function {
@@ -1680,7 +1680,7 @@ pub fn emit_cdc_autocommit_commit(
                 func: crate::function::FuncCtx {
                     func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
                     arg_count: 1,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 },
             });
             program.emit_insn(Insn::Eq {
@@ -1688,7 +1688,7 @@ pub fn emit_cdc_autocommit_commit(
                 rhs: minus_one_reg,
                 target_pc: skip_label,
                 flags: crate::vdbe::insn::CmpInsFlags::default(),
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::BINARY,
             });
             let (cursor_id, _) =
                 prepare_cdc_if_necessary(program, resolver.schema(), crate::MAIN_DB_ID, None)?
@@ -1735,7 +1735,7 @@ pub fn emit_cdc_explicit_commit_insns(
         func: crate::function::FuncCtx {
             func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
             arg_count: 1,
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::BINARY,
         },
     });
 
@@ -1748,7 +1748,7 @@ pub fn emit_cdc_explicit_commit_insns(
         rhs: minus_one_reg,
         target_pc: skip_label,
         flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::BINARY,
     });
 
     // The CDC record write needs a transaction; joins the open one (keeping its mode) if any.

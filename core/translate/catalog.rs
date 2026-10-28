@@ -11,7 +11,7 @@ use crate::sync::Arc;
 use crate::util::normalize_ident;
 use crate::{DatabaseCatalog, LimboError, Result, RwLock, SymbolTable};
 
-use super::collate::CollationSeq;
+use super::collate::TextCollation;
 use super::plan::BitSet;
 
 pub(crate) struct CatalogContext<'a> {
@@ -178,11 +178,11 @@ impl<'a> CatalogContext<'a> {
         }
     }
 
-    pub fn resolve_collation(&self, name: &str) -> Result<CollationSeq> {
+    pub fn resolve_collation(&self, name: &str) -> Result<TextCollation> {
         if let Some(collation) = self.symbol_table.resolve_collation(name) {
             return Ok(collation);
         }
-        CollationSeq::new(name)
+        TextCollation::new(name)
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning

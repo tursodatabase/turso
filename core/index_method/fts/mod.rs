@@ -128,7 +128,7 @@ impl FtsStore {
 
 fn key_info() -> KeyInfo {
     KeyInfo {
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::BINARY,
         sort_order: SortOrder::Asc,
         nulls_order: None,
     }

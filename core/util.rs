@@ -2267,7 +2267,7 @@ fn view_output_column(source: &ViewColumn) -> ViewColumn {
             None,
             None,
             source.column.ty(),
-            source.column.collation_opt(),
+            source.column.text_collation(),
             ColDef::default(),
         ),
     }
@@ -2479,7 +2479,7 @@ fn view_merged_column(first_column: &ViewColumn) -> ViewColumn {
             None,
             None,
             first_column.column.affinity().to_type(),
-            first_column.column.collation_opt(),
+            first_column.column.text_collation(),
             ColDef::default(),
         ),
     }
