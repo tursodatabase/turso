@@ -31,10 +31,7 @@ pub(super) struct Config {
     pub disabled: Vec<Feature>,
 }
 
-const DISABLED_BY_DEFAULT: [Feature; 7] = [
-    Feature::Defaults,
-    Feature::MixedCaseIdentifiers,
-    Feature::DescendingIndexes,
+const DISABLED_BY_DEFAULT: [Feature; 4] = [
     Feature::Rls,
     Feature::Policies,
     Feature::Grants,
@@ -88,8 +85,15 @@ mod tests {
     use hegel::{generators as gs, TestCase};
 
     #[test]
-    fn compatible_defaults_exclude_known_failures() {
+    fn compatible_defaults_exclude_access_control() {
         assert_eq!(disabled_features(&[], &[]).unwrap(), DISABLED_BY_DEFAULT);
+        for feature in [
+            Feature::Defaults,
+            Feature::MixedCaseIdentifiers,
+            Feature::DescendingIndexes,
+        ] {
+            assert!(!disabled_features(&[], &[]).unwrap().contains(&feature));
+        }
     }
     #[hegel::test(test_cases = 2000)]
     fn explicit_feature_overrides_apply_to_the_default_config(tc: TestCase) {

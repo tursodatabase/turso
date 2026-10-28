@@ -909,6 +909,9 @@ fn workload_uses_declared_tables_and_distinct_relation_names(tc: TestCase) {
 fn seeded_campaign_exercises_schema_and_index_variants() {
     use model::*;
     use std::collections::BTreeSet;
+    let mut default_signs = BTreeSet::new();
+    let mut mixed_case_table = false;
+    let mut mixed_case_column = false;
     let mut widths = BTreeSet::new();
     let mut types = BTreeSet::new();
     let mut primary_positions = BTreeSet::new();
@@ -916,11 +919,24 @@ fn seeded_campaign_exercises_schema_and_index_variants() {
     let mut directions = BTreeSet::new();
     let mut uniqueness = BTreeSet::new();
     hegel::Hegel::new(|tc: TestCase| {
-        for statement in tc.draw(cases(Profile::Tables, vec![])).0 {
+        for statement in tc
+            .draw(cases(
+                Profile::Compatible,
+                disabled_features(&[], &[]).unwrap(),
+            ))
+            .0
+        {
             match statement {
                 Statement::CreateTable(table) => {
+                    mixed_case_table |= table.name.as_str().chars().any(char::is_uppercase);
                     widths.insert(table.columns.len());
                     for (position, column) in table.columns.iter().enumerate() {
+                        mixed_case_column |= column.name.as_str().chars().any(char::is_uppercase);
+                        for constraint in &column.constraints {
+                            if let Constraint::Default(value) = constraint {
+                                default_signs.insert(value.signum());
+                            }
+                        }
                         types.insert(column.data_type.to_string());
                         if column.is_primary_key() {
                             primary_positions.insert(position);
@@ -945,6 +961,9 @@ fn seeded_campaign_exercises_schema_and_index_variants() {
             .phases([hegel::Phase::Generate]),
     )
     .run();
+    assert!(mixed_case_table);
+    assert!(mixed_case_column);
+    assert_eq!(default_signs, [-1, 0, 1].into_iter().collect());
     assert_eq!(widths, (1..=8).collect());
     assert_eq!(
         types,
