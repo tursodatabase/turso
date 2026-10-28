@@ -6,6 +6,7 @@ use std::fmt::Write;
 use std::sync::Arc;
 use tempfile::TempDir;
 use turso::{Connection, Database};
+use turso_core::ConnectOpts;
 use turso_core::IO;
 
 use crate::workload::JournalMode;
@@ -383,7 +384,7 @@ impl FtsFixture {
             turso_core::OpenOptions::new(Arc::new(turso_core::SqliteDialect))
                 .db_opts(turso_core::DatabaseOpts::new().with_index_method(true)),
         )?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         conn.execute("BEGIN")?;
         conn.execute("SELECT count(*) FROM docs")?;
         let mut dumper = turso_core::index_method::fts::FtsBackingRowDumper::new(

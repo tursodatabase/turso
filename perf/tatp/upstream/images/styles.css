@@ -1,0 +1,117 @@
+body { font-family: Arial, Helvetica, Verdana, sans-serif; color: #4D4D4D; font-size: 12px; margin: 0px 0px 0px 0px; background-color: #DDDCDB; }
+
+h1 { font-family: Arial, Helvetica, Verdana, sans-serif; color: #0072C4; font-size: 18px; font-weight: bold; line-height: 22px; }
+
+h2 { font-family: Arial, Helvetica, Verdana, sans-serif; font-size: 16px; font-weight: bold; line-height: 18px; }
+
+h3 { font-family: Arial, Helvetica, Verdana, sans-serif; font-size: 12px; font-weight: bold; line-height: 12px;}
+
+h4 { font-family: Arial, Helvetica, Verdana, sans-serif; font-size: 12px; font-weight: bold; line-height: 12px; padding-left: 20px;}
+
+td { font-family: Arial, Helvetica, Verdana, sans-serif; color: #4D4D4D; font-size: 12px; line-height: 16px; }
+
+p { font-family: Arial, Helvetica, Verdana, sans-serif; color: #4D4D4D; font-size: 12px; line-height: 16px; }
+
+.subhead { font-family: Arial, Helvetica, Verdana, sans-serif; color: #0072C4; font-size: 12px; font-weight: bold; }
+
+.mission { font-family: Arial, Helvetica, Verdana, sans-serif; color: #ffffff; font-size: 16px; font-weight: bold; }
+
+.action { font-family: Arial, Helvetica, Verdana, sans-serif; color: #000000; font-size: 12px; font-weight: bold; }
+
+.ann { font-family: Arial, Helvetica, Verdana, sans-serif; color: #566782; font-size: 12px; }
+
+pre { padding-left: 20px; }
+
+.padded { font-family: Arial, Helvetica, Verdana, sans-serif; color: #4D4D4D; font-size: 12px; line-height: 16px; padding-left: 20px;}
+
+.customersquote { font-family: Arial, Helvetica, Verdana, sans-serif; color: #566782; font-size: 12px; }
+
+.copyright { font-family: Arial, Helvetica, Verdana, sans-serif; color: #E0DDE0; font-size: 10px; }
+
+.footer{ font-family: Arial, Helvetica, Verdana, sans-serif; color: #FFFFFF; font-size: 10px; }
+
+.nav { font-family: Arial, Helvetica, Verdana, sans-serif; color: #FFFFFF; font-size: 12px; font-weight: bold; }
+
+.nav3on { font-family: Arial, Helvetica, Verdana, sans-serif; color: #FFFFFF; font-size: 11px; font-weight: bold; }
+
+.nav3 { font-family: Arial, Helvetica, Verdana, sans-serif; color: #FFFFFF; font-size: 11px;  }
+
+.notetitle { font-family: Arial, Helvetica, Verdana, sans-serif; color: #FCA311; font-size: 12px; font-weight: bold; }
+
+.note { font-family: Arial, Helvetica, Verdana, sans-serif; color: #FFFFFF; font-size: 12px; }
+
+.textfield {	font-family: Arial, Helvetica, Verdana, sans-serif; color: #4D4D4D; font-size: 12px; line-height: 16px; }
+
+.filesize {	font-family: Arial, Helvetica, Verdana, sans-serif; color: #4D4D4D; font-size: 11px; }
+
+a:link { color: #0072C6; text-decoration: none; }
+
+a:visited { color: #0072C6; text-decoration: none; }
+
+a:active { color: #0072C6; text-decoration: none; }
+
+a:hover { color: #0072C6; text-decoration: underline; }
+
+a.actionlink:link { color: #ffffff; font-weight: normal; text-decoration: none; }
+
+a.actionlink:visited { color: #ffffff; font-weight: normal; text-decoration: none; }
+
+a.actionlink:active { color: #ffffff; font-weight: normal; text-decoration: none; }
+
+a.actionlink:hover { color: #ffffff; font-weight: normal; text-decoration: underline; }
+
+a.morenews:link { color: #FCA311; text-decoration: none; }
+
+a.morenews:visited { color: #FCA311; text-decoration: none; }
+
+a.morenews:active { color: #FCA311; text-decoration: none; }
+
+a.morenews:hover { color: #FCA311; text-decoration: underline; }
+
+a.return:link { font-family: Arial, Helvetica, Verdana, sans-serif; font-size: 11px; color: #FCA311; text-decoration: none; }
+
+a.return:visited { font-family: Arial, Helvetica, Verdana, sans-serif; font-size: 11px; color: #FCA311; text-decoration: none; }
+
+a.return:active { font-family: Arial, Helvetica, Verdana, sans-serif; font-size: 11px; color: #FCA311; text-decoration: none; }
+
+a.return:hover { font-family: Arial, Helvetica, Verdana, sans-serif; font-size: 11px; color: #FCA311; text-decoration: underline; }
+
+a.footerlink:link { color: #FFFFFF; text-decoration: none; }
+
+a.footerlink:visited { color: #FFFFFF; text-decoration: none; }
+
+a.footerlink:active { color: #FFFFFF; text-decoration: none; }
+
+a.footerlink:hover { color: #FFFFFF; text-decoration: underline; }
+
+a.navlink:link { color: #FFFFFF; text-decoration: none; }
+
+a.navlink:visited { color: #FFFFFF; text-decoration: none; }
+
+a.navlink:active { color: #FFFFFF; text-decoration: none; }
+
+a.navlink:hover { color: #FFFFFF; text-decoration: none; }
+
+a.notelink:link { color: #FFFFFF; text-decoration: none; }
+
+a.notelink:visited { color: #FFFFFF; text-decoration: none; }
+
+a.notelink:active { color: #FFFFFF; text-decoration: none; }
+
+a.notelink:hover { color: #FFFFFF; text-decoration: none; }
+
+a.copyrightlink:link { color: #E0DDE0; text-decoration: none; }
+
+a.copyrightlink:visited { color: #E0DDE0; text-decoration: none; }
+
+a.copyrightlink:active { color: #E0DDE0; text-decoration: none; }
+
+a.copyrightlink:hover { color: #E0DDE0; text-decoration: underline; }
+
+a.annlink:link { color: #566782; text-decoration: none; }
+
+a.annlink:visited { color: #566782; text-decoration: none; }
+
+a.annlink:active { color: #566782; text-decoration: none; }
+
+a.annlink:hover { color: #566782; text-decoration: underline; }

@@ -46,3 +46,59 @@ test default-values-no-type-default-gives-null {
 expect {
     1||null|x
 }
+
+@requires strict "uses STRICT tables"
+test multi-row-insert-encodes-column-default-once-per-row {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents DEFAULT 1) STRICT;
+    INSERT INTO t1(id) VALUES (1), (2), (3);
+    SELECT id, amount FROM t1 ORDER BY id;
+}
+expect {
+    1|1
+    2|1
+    3|1
+}
+
+@requires strict "uses STRICT tables"
+test multi-row-insert-encodes-type-default-once-per-row {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 2;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents) STRICT;
+    INSERT INTO t1(id) VALUES (1), (2), (3);
+    SELECT id, amount FROM t1 ORDER BY id;
+}
+expect {
+    1|2
+    2|2
+    3|2
+}
+
+@requires strict "uses STRICT tables"
+test insert-select-encodes-defaults-once-per-row {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TYPE cents2 BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 2;
+    CREATE TABLE src(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO src VALUES (1), (2), (3);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a cents DEFAULT 1, b cents2) STRICT;
+    INSERT INTO t1(id) SELECT id FROM src;
+    SELECT id, a, b FROM t1 ORDER BY id;
+}
+expect {
+    1|1|2
+    2|1|2
+    3|1|2
+}
+
+@requires strict "uses STRICT tables"
+test multi-row-insert-encodes-domain-default-once-per-row {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN money AS cents DEFAULT 4;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a money, b money DEFAULT 5) STRICT;
+    INSERT INTO t1(id) VALUES (1), (2), (3);
+    SELECT id, a, b FROM t1 ORDER BY id;
+}
+expect {
+    1|4|5
+    2|4|5
+    3|4|5
+}

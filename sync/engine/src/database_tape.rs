@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use turso_core::{types::WalFrameInfo, LimboError, StepResult};
+use turso_core::{types::WalFrameInfo, ConnectOpts, LimboError, StepResult};
 
 use crate::{
     database_replay_generator::{DatabaseReplayGenerator, ReplayInfo},
@@ -163,14 +163,14 @@ impl DatabaseTape {
         }
     }
     pub(crate) fn connect_untracked(&self) -> Result<Arc<turso_core::Connection>> {
-        let connection = self.inner.connect()?;
+        let connection = self.inner.connect(ConnectOpts::new())?;
         if self.disable_auto_checkpoint {
             connection.wal_auto_actions_disable();
         }
         Ok(connection)
     }
     pub async fn connect<Ctx>(&self, coro: &Coro<Ctx>) -> Result<Arc<turso_core::Connection>> {
-        let connection = self.inner.connect()?;
+        let connection = self.inner.connect(ConnectOpts::new())?;
         if self.disable_auto_checkpoint {
             connection.wal_auto_actions_disable();
         }
@@ -226,7 +226,7 @@ impl DatabaseTape {
         opts: DatabaseChangesIteratorOpts,
     ) -> Result<DatabaseChangesIterator> {
         tracing::debug!("opening changes iterator with options {:?}", opts);
-        let conn = self.inner.connect()?;
+        let conn = self.inner.connect(ConnectOpts::new())?;
         if self.disable_auto_checkpoint {
             conn.wal_auto_actions_disable();
         }
@@ -908,6 +908,7 @@ fn quote_ident(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use turso_core::ConnectOpts;
     use turso_core::SqliteDialect;
 
     use tempfile::NamedTempFile;
@@ -1533,7 +1534,7 @@ mod tests {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
         let db1 =
             turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
-        db1.connect()
+        db1.connect(ConnectOpts::new())
             .unwrap()
             .execute("PRAGMA journal_mode = 'mvcc'")
             .unwrap();
@@ -1621,7 +1622,7 @@ mod tests {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
         let db1 =
             turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
-        db1.connect()
+        db1.connect(ConnectOpts::new())
             .unwrap()
             .execute("PRAGMA journal_mode = 'mvcc'")
             .unwrap();
@@ -3425,8 +3426,7 @@ mod tests {
 
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
         let open = |path: &str| {
-            let opts = turso_core::OpenOptions::new(Arc::new(SqliteDialect))
-                .db_opts(turso_core::DatabaseOpts::new().with_generated_columns(true));
+            let opts = turso_core::OpenOptions::new(Arc::new(SqliteDialect));
             let db = turso_core::Database::open(io.clone(), path, opts).unwrap();
             Arc::new(DatabaseTape::new(db))
         };
@@ -3809,8 +3809,7 @@ mod tests {
         let db = turso_core::Database::open(
             io.clone(),
             db_path,
-            turso_core::OpenOptions::new(Arc::new(SqliteDialect))
-                .db_opts(turso_core::DatabaseOpts::new().with_generated_columns(true)),
+            turso_core::OpenOptions::new(Arc::new(SqliteDialect)),
         )?;
         let db = Arc::new(DatabaseTape::new(db));
         let setup = setup.iter().map(|sql| sql.to_string()).collect::<Vec<_>>();

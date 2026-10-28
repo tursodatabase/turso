@@ -397,7 +397,28 @@ pub fn resolve_comparison_collseq_with_resolver(
         symbol_table,
         resolver,
     )?;
+    let lhs_column = lhs_column.or(comparison_operand_column_collseq(
+        lhs_expr,
+        referenced_tables,
+    )?);
+    let rhs_column = rhs_column.or(comparison_operand_column_collseq(
+        rhs_expr,
+        referenced_tables,
+    )?);
     Ok(lhs_explicit.or(rhs_explicit).or(lhs_column).or(rhs_column))
+}
+
+/// Collation of `x` or of `y` in `x IN (SELECT y ...)`: its explicit `COLLATE` if any,
+/// otherwise its column's collation (BINARY when the column declares none). `x` belongs
+/// to the outer query and `y` to the subquery, so each side is looked up in its own tables.
+pub fn in_subquery_side_collation(
+    expr: &Expr,
+    referenced_tables: &TableReferences,
+) -> Result<Option<CollationSeq>> {
+    let (explicit, _) =
+        get_collseq_parts_from_expr_with_symbols(expr, referenced_tables, None, None)?;
+    let column = comparison_operand_column_collseq(expr, referenced_tables)?;
+    Ok(explicit.or(column))
 }
 
 /// Return the collation context that standalone expression translation would
@@ -653,6 +674,7 @@ fn get_collseq_parts_from_expr_with_symbols(
 #[cfg(test)]
 mod tests {
     use crate::alloc::vec;
+    use crate::namespace::NamespaceRef;
     use crate::{sync::Arc, MAIN_DB_ID};
 
     use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
@@ -1070,8 +1092,9 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             identifier: "foo".to_string(),
+            has_alias: false,
             internal_id: TableInternalId::from(1),
             join_info: None,
             table,
@@ -1106,8 +1129,9 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             identifier: "t1".to_string(),
+            has_alias: false,
             internal_id: TableInternalId::from(1),
             join_info: None,
             plan_estimate: None,
@@ -1143,8 +1167,9 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             identifier: "t2".to_string(),
+            has_alias: false,
             internal_id: TableInternalId::from(2),
             join_info: None,
             plan_estimate: None,
@@ -1190,8 +1215,9 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             identifier: "bar".to_string(),
+            has_alias: false,
             internal_id: TableInternalId::from(1),
             join_info: None,
             plan_estimate: None,

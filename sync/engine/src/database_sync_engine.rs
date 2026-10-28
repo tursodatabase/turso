@@ -7,7 +7,9 @@ use std::{
 };
 use turso_core::SqliteDialect;
 
-use turso_core::{Buffer, Completion, DatabaseStorage, LimboError, OpenDbAsyncState, OpenFlags};
+use turso_core::{
+    Buffer, Completion, ConnectOpts, DatabaseStorage, LimboError, OpenDbAsyncState, OpenFlags,
+};
 
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
@@ -1043,6 +1045,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         None
                     },
                     fresh_bootstrap_pending_cdc_ack: false,
+                    fresh_bootstrap_catch_up_pending: remote_pull_protocol
+                        == RemotePullProtocol::MvccLogical,
                     remote_pull_protocol,
                     logical_table_names_by_stable_id: Default::default(),
                     saved_configuration: Some(configuration),
@@ -1089,6 +1093,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     last_push_unix_time: None,
                     partial_bootstrap_server_revision: None,
                     fresh_bootstrap_pending_cdc_ack: false,
+                    fresh_bootstrap_catch_up_pending: false,
                     remote_pull_protocol,
                     logical_table_names_by_stable_id: Default::default(),
                     saved_configuration: Some(configuration),
@@ -1213,7 +1218,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         // DB wasn't synced with remote but will be encrypted on remote - so we must properly set reserved bytes field in advance
         if meta.synced_revision.is_none() && opts.reserved_bytes != 0 {
-            let conn = main_db.connect()?;
+            let conn = main_db.connect(ConnectOpts::new())?;
             conn.wal_auto_actions_disable();
             conn.set_reserved_bytes(opts.reserved_bytes as u8)?;
 
@@ -1261,6 +1266,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             // sync WAL from the remote in case of bootstrap - all subsequent initializations will be fast
             db.pull_changes_from_remote(coro).await?;
         }
+        // An MVCC bootstrap serves the last durable generation base so commits
+        // since the last natural checkpoint exist only in the retained
+        // logical log. Catch up with one incremental pull so a freshly
+        // bootstrapped database is current at connect time, matching what
+        // page-protocol bootstraps always provided.
+        db.catch_up_after_fresh_bootstrap(coro).await?;
 
         tracing::info!("sync engine was initialized");
         Ok(db)
@@ -1283,7 +1294,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         .await?;
         let meta = Self::read_db_meta(coro, Some(io.clone()), sync_engine_io.clone(), main_db_path)
             .await?;
-        let fresh_bootstrap = meta.is_none() && opts.bootstrap_if_empty;
         let meta = Self::bootstrap_db(
             coro,
             io.clone(),
@@ -1323,16 +1333,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
         };
 
-        let engine = Self::open_db(coro, io, sync_engine_io, main_db, opts).await?;
-        // An MVCC bootstrap serves the last durable generation base so commits
-        // since the last natural checkpoint exist only in the retained
-        // logical log. Catch up with one incremental pull so a freshly
-        // bootstrapped database is current at connect time, matching what
-        // page-protocol bootstraps always provided.
-        if fresh_bootstrap {
-            engine.catch_up_after_fresh_bootstrap(coro).await?;
-        }
-        Ok(engine)
+        Self::open_db(coro, io, sync_engine_io, main_db, opts).await
     }
 
     async fn open_revert_db_conn<Ctx>(
@@ -1363,7 +1364,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 }
             }
         };
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         conn.wal_auto_actions_disable();
         Ok(conn)
     }
@@ -1670,20 +1671,20 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     /// when the base is already current this must return immediately rather
     /// than hold `connect()` open waiting for future changes.
     ///
-    /// No-op for page-protocol replicas (their bootstrap is already
-    /// current). Every initialization path that can perform a fresh
-    /// bootstrap must call this after opening the engine — both
-    /// [`DatabaseSyncEngine::create_db`] and the sdk-kit `rsapi` create flow,
-    /// which assembles the same sequence manually.
-    pub async fn catch_up_after_fresh_bootstrap<Ctx>(&self, coro: &Coro<Ctx>) -> Result<()> {
-        if self.meta().remote_pull_protocol != RemotePullProtocol::MvccLogical {
+    /// No-op unless an MVCC bootstrap still has to catch up; a failed catch-up
+    /// is retried by the next open.
+    async fn catch_up_after_fresh_bootstrap<Ctx>(&self, coro: &Coro<Ctx>) -> Result<()> {
+        if !self.meta().fresh_bootstrap_catch_up_pending {
             return Ok(());
         }
         let changes = self.wait_changes_from_remote_inner(coro, None).await?;
         if changes.file_slot.is_some() {
             self.apply_changes_from_remote(coro, changes).await?;
         }
-        Ok(())
+        self.update_meta(coro, |m| {
+            m.fresh_bootstrap_catch_up_pending = false;
+        })
+        .await
     }
 
     pub async fn wait_changes_from_remote<Ctx>(&self, coro: &Coro<Ctx>) -> Result<DbChangesStatus> {
@@ -3284,6 +3285,7 @@ mod tests {
         time::Duration,
     };
     use tempfile::NamedTempFile;
+    use turso_core::ConnectOpts;
     use turso_core::SqliteDialect;
 
     #[test]
@@ -4070,6 +4072,7 @@ mod tests {
             last_pushed_replay_floor_change_id_hint: 0,
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
+            fresh_bootstrap_catch_up_pending: false,
             remote_pull_protocol: RemotePullProtocol::MvccLogical,
             logical_table_names_by_stable_id: Default::default(),
             saved_configuration: Some(DatabaseSavedConfiguration {
@@ -4220,6 +4223,7 @@ mod tests {
             last_pushed_replay_floor_change_id_hint: 0,
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
+            fresh_bootstrap_catch_up_pending: false,
             remote_pull_protocol: RemotePullProtocol::MvccLogical,
             logical_table_names_by_stable_id: Default::default(),
             saved_configuration: Some(DatabaseSavedConfiguration {
@@ -4395,6 +4399,7 @@ mod tests {
             last_pushed_replay_floor_change_id_hint: 0,
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
+            fresh_bootstrap_catch_up_pending: false,
             remote_pull_protocol: RemotePullProtocol::MvccLogical,
             logical_table_names_by_stable_id: Default::default(),
             saved_configuration: Some(DatabaseSavedConfiguration {
@@ -4525,7 +4530,7 @@ mod tests {
         let remote_db =
             turso_core::Database::open_file(io.clone(), &remote_path, Arc::new(SqliteDialect))
                 .unwrap();
-        let remote_conn = remote_db.connect().unwrap();
+        let remote_conn = remote_db.connect(ConnectOpts::new()).unwrap();
         remote_conn
             .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
@@ -4645,7 +4650,7 @@ mod tests {
                 .map_err(|error| {
                     Error::DatabaseSyncEngineError(format!("test verify open failed: {error}"))
                 })?;
-                let verify_conn = verify_db.connect().map_err(|error| {
+                let verify_conn = verify_db.connect(ConnectOpts::new()).map_err(|error| {
                     Error::DatabaseSyncEngineError(format!("test verify connect failed: {error}"))
                 })?;
                 let mut value_stmt = verify_conn
@@ -4731,7 +4736,7 @@ mod tests {
         let remote_db =
             turso_core::Database::open_file(io.clone(), &remote_path, Arc::new(SqliteDialect))
                 .unwrap();
-        let remote_conn = remote_db.connect().unwrap();
+        let remote_conn = remote_db.connect(ConnectOpts::new()).unwrap();
         remote_conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         assert!(remote_conn.mvcc_enabled());
         remote_conn
@@ -4873,7 +4878,7 @@ mod tests {
                 .map_err(|error| {
                     Error::DatabaseSyncEngineError(format!("test verify open failed: {error}"))
                 })?;
-                let verify_conn = verify_db.connect().map_err(|error| {
+                let verify_conn = verify_db.connect(ConnectOpts::new()).map_err(|error| {
                     Error::DatabaseSyncEngineError(format!("test verify connect failed: {error}"))
                 })?;
                 assert!(verify_conn.mvcc_enabled());
@@ -4908,7 +4913,7 @@ mod tests {
         let remote_db =
             turso_core::Database::open_file(io.clone(), &remote_path, Arc::new(SqliteDialect))
                 .unwrap();
-        let remote_conn = remote_db.connect().unwrap();
+        let remote_conn = remote_db.connect(ConnectOpts::new()).unwrap();
         remote_conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         remote_conn
             .execute("CREATE TABLE items(id INTEGER PRIMARY KEY)")
@@ -5036,6 +5041,7 @@ mod tests {
             last_pushed_replay_floor_change_id_hint: 0,
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
+            fresh_bootstrap_catch_up_pending: false,
             remote_pull_protocol: RemotePullProtocol::Pages,
             logical_table_names_by_stable_id: Default::default(),
             saved_configuration: Some(DatabaseSavedConfiguration {
@@ -5083,7 +5089,7 @@ mod tests {
         let foreign_db =
             turso_core::Database::open_file(io.clone(), &main_path, Arc::new(SqliteDialect))
                 .unwrap();
-        let foreign_conn = foreign_db.connect().unwrap();
+        let foreign_conn = foreign_db.connect(ConnectOpts::new()).unwrap();
         foreign_conn
             .execute("CREATE TABLE orphaned(id INTEGER PRIMARY KEY)")
             .unwrap();
@@ -5157,7 +5163,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let remote_conn = remote_db.connect().unwrap();
+        let remote_conn = remote_db.connect(ConnectOpts::new()).unwrap();
         remote_conn
             .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();

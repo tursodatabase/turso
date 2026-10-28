@@ -1,5 +1,6 @@
 use std::sync::{Arc, Weak};
 
+use crate::namespace::NamespaceId;
 use crate::types::IOResultOr;
 use rustc_hash::FxHashMap as HashMap;
 #[cfg(any(test, injected_yields))]
@@ -46,6 +47,17 @@ pub trait IndexMethod: std::fmt::Debug + Send + Sync {
         &self,
         configuration: &IndexMethodConfiguration,
     ) -> Result<Arc<dyn IndexMethodAttachment>>;
+
+    /// Called when ALTER TABLE renames a column of a table that has an index of this method
+    /// Updates WITH clause parameters that name the column
+    fn rename_column_in_with_clause(
+        &self,
+        _with_clause: &mut [(ast::Name, Box<ast::Expr>)],
+        _from: &str,
+        _to: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +77,7 @@ pub struct IndexMethodConfiguration {
 pub trait IndexMethodAttachment: std::fmt::Debug + Send + Sync {
     fn definition<'a>(&'a self) -> IndexMethodDefinition<'a>;
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>>;
+    fn backing_schema(&self) -> BackingSchema;
 
     /// Returns the result expression this index provides for the captured query parameters.
     /// The planner compares it with the requested expression before using an index result
@@ -270,7 +283,11 @@ impl IndexMethodContext {
         let pager = connection.get_pager_from_database_index(&database_id)?;
         let schema_root = connection.with_schema(database_id, |schema| {
             schema
-                .get_index(definition.table_name, definition.index_name)
+                .get_index(
+                    NamespaceId::ROOT,
+                    definition.table_name,
+                    definition.index_name,
+                )
                 .map_or(0, |index| index.root_page)
         });
         if !definition.backing_btree && schema_root != 0 {
@@ -330,7 +347,7 @@ impl IndexMethodContext {
             database: IndexMethodDatabaseIdentity {
                 id: database_id,
                 name: connection
-                    .get_database_name_by_index(database_id)
+                    .namespace_name(database_id)
                     .unwrap_or_else(|| format!("database-{database_id}")),
                 incarnation: database_incarnation,
             },
@@ -721,7 +738,9 @@ pub(crate) fn open_table_cursor(
     table: &str,
 ) -> Result<Box<dyn CursorTrait>> {
     let pager = connection.get_pager_from_database_index(&database_id)?;
-    let Some(table) = connection.with_schema(database_id, |schema| schema.get_table(table)) else {
+    let Some(table) = connection.with_schema(database_id, |schema| {
+        schema.get_table(NamespaceId::ROOT, table)
+    }) else {
         return Err(LimboError::InternalError(format!(
             "table {table} not found",
         )));

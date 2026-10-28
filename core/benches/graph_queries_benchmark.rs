@@ -9,7 +9,7 @@ use codspeed_criterion_compat::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode,
 };
 
-use turso_core::{Database, PlatformIO};
+use turso_core::{ConnectOpts, Database, PlatformIO};
 
 const DB_PATH: &str = "../perf/graph-queries/graph-queries.db";
 const DB_PATH_ANALYZED: &str = "../perf/graph-queries/graph-queries-analyzed.db";
@@ -37,10 +37,10 @@ fn bench_graph_queries(criterion: &mut Criterion) {
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io.clone(), DB_PATH, Arc::new(SqliteDialect)).unwrap();
-    let limbo_conn = db.connect().unwrap();
+    let limbo_conn = db.connect(ConnectOpts::new()).unwrap();
 
     let db_analyzed = Database::open_file(io, DB_PATH_ANALYZED, Arc::new(SqliteDialect)).unwrap();
-    let limbo_conn_analyzed = db_analyzed.connect().unwrap();
+    let limbo_conn_analyzed = db_analyzed.connect(ConnectOpts::new()).unwrap();
 
     let queries = [
         gq_query!("a_cooccurrence"),

@@ -104,3 +104,65 @@ expect {
     main|t|table|3|1|1
     ok
 }
+
+test strict-primary-key-columns-are-not-null {
+    CREATE TABLE pk1 (code TEXT PRIMARY KEY, n INT) STRICT;
+    CREATE TABLE pk2 (a TEXT, b INT, c INT, PRIMARY KEY (a, b)) STRICT;
+    CREATE TABLE pk3 (id INTEGER PRIMARY KEY, x TEXT) STRICT;
+    SELECT name, "notnull", pk FROM pragma_table_info('pk1');
+    SELECT name, "notnull", pk FROM pragma_table_info('pk2');
+    SELECT name, "notnull", pk FROM pragma_table_info('pk3');
+}
+expect {
+    code|1|1
+    n|0|0
+    a|1|1
+    b|1|2
+    c|0|0
+    id|0|1
+    x|0|0
+}
+
+test strict-primary-key-schema-sql-after-add-column {
+    CREATE TABLE pk1 (code TEXT PRIMARY KEY, n INT) STRICT;
+    ALTER TABLE pk1 ADD COLUMN z INT;
+    SELECT sql FROM sqlite_schema WHERE name = 'pk1';
+}
+expect {
+    CREATE TABLE pk1 (code TEXT PRIMARY KEY, n INT, z INT) STRICT
+}
+
+@cross-check-integrity
+test strict-insert-or-ignore-not-null-checked-before-type {
+    CREATE TABLE t7 (a INT, b REAL NOT NULL) STRICT;
+    INSERT OR IGNORE INTO t7 (a) VALUES ('x');
+    SELECT count(*) FROM t7;
+}
+expect {
+    0
+}
+
+test strict-insert-not-null-error-before-type-error {
+    CREATE TABLE t8 (a INT, b REAL NOT NULL) STRICT;
+    INSERT INTO t8 (a) VALUES ('x');
+}
+expect error {
+    NOT NULL constraint failed: t8.b
+}
+
+test strict-insert-generated-column-type-error-before-not-null {
+    CREATE TABLE t9 (a INT, b TEXT NOT NULL, c INT AS (a + 1)) STRICT;
+    INSERT OR IGNORE INTO t9 (a) VALUES ('x');
+}
+expect error {
+    cannot store TEXT value in INT column t9.a
+}
+
+test strict-insert-before-trigger-type-error-before-not-null {
+    CREATE TABLE t10 (a INT, b TEXT NOT NULL) STRICT;
+    CREATE TRIGGER t10_before BEFORE INSERT ON t10 BEGIN SELECT 1; END;
+    INSERT OR IGNORE INTO t10 (a) VALUES ('x');
+}
+expect error {
+    cannot store TEXT value in INT column t10.a
+}

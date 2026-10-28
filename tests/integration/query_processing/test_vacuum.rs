@@ -1,7 +1,8 @@
 use crate::assertions::{AssertQueryPlan, NULL};
 use crate::common::{
     compute_dbhash, compute_dbhash_with_database_opts, compute_dbhash_with_options,
-    compute_dbhash_with_options_and_database_opts, do_flush, ExecRows, TempDatabase,
+    compute_dbhash_with_options_and_database_opts, do_flush, limbo_exec_rows, ExecRows,
+    TempDatabase,
 };
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use asserting::prelude::*;
@@ -9,7 +10,7 @@ use rusqlite::Connection as SqliteConnection;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
 use turso_core::SqliteDialect;
-use turso_core::{Connection, Database, DatabaseOpts, LimboError, StepResult, Value};
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, LimboError, StepResult, Value};
 use turso_parser::{ast::Cmd, parser::Parser};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -591,7 +592,6 @@ fn populate_until_page_count(
     }
 }
 
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER, b TEXT, c BLOB);")]
 fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -662,8 +662,49 @@ fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Test VACUUM INTO error cases: plain VACUUM, existing file, within
-/// transaction, and query_only mode.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER, path TEXT);")]
+fn test_vacuum_into_path_expression(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let dest_dir = TempDir::new()?;
+    let subquery_path = dest_dir.path().join("subquery.db");
+    let subquery_path_str = subquery_path.to_str().unwrap().to_string();
+    let concat_prefix = dest_dir.path().join("concat");
+    let concat_prefix_str = concat_prefix.to_str().unwrap();
+
+    conn.execute(format!(
+        "INSERT INTO t VALUES (42, '{}')",
+        escape_sqlite_string_literal(&subquery_path_str)
+    ))?;
+    conn.execute("VACUUM INTO (SELECT path FROM t)")?;
+    conn.execute(format!(
+        "VACUUM INTO '{}' || '.db'",
+        escape_sqlite_string_literal(concat_prefix_str)
+    ))?;
+    let parameter_path = dest_dir.path().join("parameter.db");
+    let mut stmt = conn.prepare("VACUUM INTO ?")?;
+    stmt.bind_at(
+        1.try_into()?,
+        Value::build_text(parameter_path.to_str().unwrap().to_string()),
+    )?;
+    stmt.run_ignore_rows()?;
+
+    for dest_path in [
+        subquery_path,
+        dest_dir.path().join("concat.db"),
+        parameter_path,
+    ] {
+        let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, tmp_db.db_opts);
+        let dest_conn = dest_db.connect_limbo();
+        assert_eq!(run_integrity_check(&dest_conn), "ok");
+        let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT a, path FROM t");
+        assert_eq!(rows, vec![(42, subquery_path_str.clone())]);
+    }
+
+    Ok(())
+}
+
+/// Test VACUUM INTO error cases: plain VACUUM, existing non-empty and empty
+/// files, within transaction, and query_only mode.
 #[turso_macros::test(mvcc)]
 fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -688,6 +729,14 @@ fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
         err_msg.contains("already exists") || err_msg.contains("output file"),
         "Error should mention file exists, got: {err_msg}"
     );
+
+    // 2b. VACUUM INTO an existing empty file should succeed
+    let empty_path = dest_dir.path().join("empty.db");
+    std::fs::write(&empty_path, b"")?;
+    conn.execute(format!("VACUUM INTO '{}'", empty_path.to_str().unwrap()))?;
+    let (_dest_db, dest_conn) = connect_existing_with_opts(&empty_path, tmp_db.db_opts);
+    let rows: Vec<(i64,)> = dest_conn.exec_rows("SELECT a FROM t");
+    assert_eq!(rows, vec![(1,)]);
 
     // 3. VACUUM INTO within transaction should fail
     conn.execute("BEGIN")?;
@@ -955,7 +1004,6 @@ fn test_vacuum_into_multiple_tables(tmp_db: TempDatabase) -> anyhow::Result<()> 
     Ok(())
 }
 
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
 fn test_vacuum_into_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -1184,7 +1232,6 @@ fn test_vacuum_into_with_triggers(tmp_db: TempDatabase) {
 
 /// Test VACUUM INTO preserves and bumps meta values like SQLite.
 /// Note: Some pragmas don't work correctly with MVCC yet
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER);")]
 fn test_vacuum_into_preserves_meta_values(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -1283,6 +1330,94 @@ fn test_vacuum_into_preserves_page_size(_tmp_db: TempDatabase) -> anyhow::Result
         rows,
         vec![(1, "hello".to_string()), (2, "world".to_string())]
     );
+    Ok(())
+}
+
+/// PRAGMA page_size on an existing database leaves the source unchanged, but
+/// VACUUM INTO writes the output with the requested page size, like SQLite.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_vacuum_into_uses_pending_page_size(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+    let dest_dir = TempDir::new()?;
+
+    for page_size in [1024, 8192, 65536] {
+        conn.execute(format!("PRAGMA page_size = {page_size}"))?;
+        let dest_path = dest_dir.path().join(format!("vacuumed_{page_size}.db"));
+        conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+        let source_page_size: Vec<(i64,)> = conn.exec_rows("PRAGMA page_size");
+        assert_eq!(source_page_size, vec![(4096,)]);
+
+        let dest_db = TempDatabase::new_with_existent(&dest_path);
+        let dest_conn = dest_db.connect_limbo();
+        let dest_page_size: Vec<(i64,)> = dest_conn.exec_rows("PRAGMA page_size");
+        assert_eq!(dest_page_size, vec![(page_size,)]);
+        assert_eq!(run_integrity_check(&dest_conn), "ok");
+        let rows: Vec<(i64,)> = dest_conn.exec_rows("SELECT a FROM t ORDER BY a");
+        assert_eq!(rows, vec![(1,), (2,), (3,)]);
+    }
+
+    // An invalid size replaces the earlier request, so the output keeps the source page size.
+    // 4294968320 is 2^32 + 1024: SQLite reads it as 0, not as 1024. SQLite reads 8.192e3
+    // from its leading digits, as 8.
+    for invalid_page_size in ["1000", "4294968320", "8.192e3"] {
+        conn.execute("PRAGMA page_size = 1024")?;
+        conn.execute(format!("PRAGMA page_size = {invalid_page_size}"))?;
+        let dest_path = dest_dir
+            .path()
+            .join(format!("vacuumed_{invalid_page_size}.db"));
+        conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+        let dest_db = TempDatabase::new_with_existent(&dest_path);
+        let dest_page_size: Vec<(i64,)> = dest_db.connect_limbo().exec_rows("PRAGMA page_size");
+        assert_eq!(dest_page_size, vec![(4096,)]);
+    }
+    Ok(())
+}
+
+/// Like SQLite, VACUUM INTO uses 1024 instead of a requested 512 when the source has
+/// more than 32 reserved bytes, so the output keeps enough usable space per page.
+#[turso_macros::test]
+fn test_vacuum_into_pending_page_size_512_with_large_reserved_space(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let source_db = TempDatabase::new_empty();
+    let conn = source_db.connect_limbo();
+    conn.set_reserved_bytes(33)?;
+    conn.execute("CREATE TABLE t (a INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+
+    conn.execute("PRAGMA page_size = 512")?;
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    let dest_page_size: Vec<(i64,)> = dest_conn.exec_rows("PRAGMA page_size");
+    assert_eq!(dest_page_size, vec![(1024,)]);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    let rows: Vec<(i64,)> = dest_conn.exec_rows("SELECT a FROM t");
+    assert_eq!(rows, vec![(1,)]);
+    Ok(())
+}
+
+/// Like SQLite, an in-place VACUUM of a WAL database drops the pending page size,
+/// so a later VACUUM INTO keeps the source page size.
+#[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_vacuum_clears_pending_page_size(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    conn.execute("PRAGMA page_size = 1024")?;
+    conn.execute("VACUUM")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_page_size: Vec<(i64,)> = dest_db.connect_limbo().exec_rows("PRAGMA page_size");
+    assert_eq!(dest_page_size, vec![(4096,)]);
     Ok(())
 }
 
@@ -2682,6 +2817,55 @@ fn test_plain_vacuum_preserves_mvcc_after_reopen(tmp_db: TempDatabase) -> anyhow
     Ok(())
 }
 
+#[cfg(not(windows))]
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_file_targets_create_the_named_file(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+
+    let tag = if tmp_db.enable_mvcc {
+        "vacuum_into_mvcc"
+    } else {
+        "vacuum_into_wal"
+    };
+    let targets = [
+        (format!("':memory:{tag}'"), format!(":memory:{tag}")),
+        (format!("' :memory:{tag}'"), format!(" :memory:{tag}")),
+        (format!("'file:{tag}_uri.db'"), format!("{tag}_uri.db")),
+        (
+            format!("'file:{tag}%20space.db'"),
+            format!("{tag} space.db"),
+        ),
+        (
+            format!("'file:file::memory:{tag}'"),
+            format!("file::memory:{tag}"),
+        ),
+        (format!("'''{tag}'''"), format!("'{tag}'")),
+        (format!("'\"{tag}\"'"), format!("\"{tag}\"")),
+    ];
+    for (literal, file_name) in targets {
+        let remove_files = || {
+            let _ = std::fs::remove_file(&file_name);
+            let _ = std::fs::remove_file(format!("{file_name}-wal"));
+            let _ = std::fs::remove_file(Path::new(&file_name).with_extension("db-log"));
+        };
+        remove_files();
+
+        let result = conn.execute(format!("VACUUM INTO {literal}"));
+        let file_created = Path::new(&file_name).exists();
+        remove_files();
+
+        result?;
+        assert!(
+            file_created,
+            "VACUUM INTO {literal} should create the file {file_name:?}"
+        );
+    }
+
+    Ok(())
+}
+
 #[test]
 fn test_vacuum_into_from_memory_database() -> anyhow::Result<()> {
     use std::sync::Arc;
@@ -2699,7 +2883,7 @@ fn test_vacuum_into_from_memory_database() -> anyhow::Result<()> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
 
     conn.execute("CREATE TABLE t (a INTEGER, b TEXT)")?;
     conn.execute("INSERT INTO t VALUES (1, 'hello')")?;
@@ -3423,8 +3607,6 @@ fn test_vacuum_into_column_name_with_comma(tmp_db: TempDatabase) -> anyhow::Resu
     Ok(())
 }
 
-// checksum feature changes reserved_space which breaks VACUUM INTO hash comparison
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE main_t(x INTEGER);")]
 fn test_vacuum_main_into(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -3623,7 +3805,7 @@ fn test_vacuum_into_preserves_sqlite_stat1(tmp_db: TempDatabase) -> anyhow::Resu
 #[test]
 fn test_vacuum_into_preserves_generated_columns() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
+    let opts = turso_core::DatabaseOpts::new();
     let tmp_db = TempDatabase::builder().with_opts(opts).build();
     let conn = tmp_db.connect_limbo();
 
@@ -3670,7 +3852,7 @@ fn test_vacuum_into_preserves_generated_columns() -> anyhow::Result<()> {
 #[test]
 fn test_vacuum_into_generated_column_with_rowid_and_deletes() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
+    let opts = turso_core::DatabaseOpts::new();
     let tmp_db = TempDatabase::builder().with_opts(opts).build();
     let conn = tmp_db.connect_limbo();
 
@@ -3822,8 +4004,8 @@ fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> any
     conn.execute("INSERT INTO t (val) VALUES ('a')")?;
     conn.execute("INSERT INTO t (val) VALUES ('b')")?;
     conn.execute("INSERT INTO t (val) VALUES ('c')")?;
-    // Delete some rows to create a gap - AUTOINCREMENT should never reuse rowids
-    conn.execute("DELETE FROM t WHERE id = 2")?;
+    // Delete the newest rows so the counter is above max(id) - AUTOINCREMENT should never reuse rowids
+    conn.execute("DELETE FROM t WHERE id >= 2")?;
     let source_seq: Vec<(String, i64)> =
         conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 't'");
     assert_eq!(source_seq, vec![("t".to_string(), 3)]);
@@ -3841,6 +4023,12 @@ fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> any
     let dest_seq: Vec<(String, i64)> =
         dest_conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 't'");
     assert_eq!(dest_seq, source_seq);
+    if tmp_db.enable_mvcc {
+        let dest_counter: Vec<(i64, i64)> = dest_conn.exec_rows(
+            "SELECT value, is_called FROM __turso_internal_seq___turso_internal_autoincrement_t",
+        );
+        assert_eq!(dest_counter, vec![(3, 1)]);
+    }
 
     // Insert a new row on the source - should get id=4 (not 2, because AUTOINCREMENT)
     conn.execute("INSERT INTO t (val) VALUES ('d')")?;
@@ -3859,6 +4047,34 @@ fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> any
         dest_new, source_new,
         "AUTOINCREMENT counter should produce the same next rowid on both databases"
     );
+
+    Ok(())
+}
+
+/// Plain VACUUM must leave the AUTOINCREMENT counter exactly as it was. On an
+/// MVCC database the counter's backing table must keep a single row.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_preserves_autoincrement_counter(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")?;
+    conn.execute("INSERT INTO t (val) VALUES ('a'), ('b'), ('c')")?;
+    conn.execute("DELETE FROM t WHERE id >= 2")?;
+    checkpoint_if_mvcc(&tmp_db, &conn)?;
+
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    let seq: Vec<(String, i64)> = conn.exec_rows("SELECT name, seq FROM sqlite_sequence");
+    assert_eq!(seq, vec![("t".to_string(), 3)]);
+    if tmp_db.enable_mvcc {
+        let counter: Vec<(i64, i64)> = conn.exec_rows(
+            "SELECT value, is_called FROM __turso_internal_seq___turso_internal_autoincrement_t",
+        );
+        assert_eq!(counter, vec![(3, 1)]);
+    }
+    conn.execute("INSERT INTO t (val) VALUES ('d')")?;
+    assert_eq!(scalar_i64(&conn, "SELECT id FROM t WHERE val = 'd'"), 4);
 
     Ok(())
 }
@@ -4042,8 +4258,7 @@ fn test_vacuum_into_preserves_vector_blobs(tmp_db: TempDatabase) -> anyhow::Resu
 /// Plain VACUUM must preserve generated column values.
 #[test]
 fn test_plain_vacuum_preserves_generated_columns() -> anyhow::Result<()> {
-    let opts = DatabaseOpts::new().with_generated_columns(true);
-    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let tmp_db = TempDatabase::new_empty();
     let conn = tmp_db.connect_limbo();
 
     conn.execute(
@@ -4101,6 +4316,53 @@ fn test_plain_vacuum_preserves_custom_types() -> anyhow::Result<()> {
     let reopened_rows: Vec<(i64, i64)> =
         reopened_conn.exec_rows("SELECT id, amount FROM t ORDER BY id");
     assert_eq!(reopened_rows, before_rows);
+
+    Ok(())
+}
+
+/// Plain VACUUM must copy array values as stored. Converting them to display
+/// text and back turned BLOB[] elements into TEXT and changed ANY[] element
+/// types.
+#[test]
+fn test_plain_vacuum_preserves_array_values() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_custom_types(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB[], a ANY[], c cents[]) STRICT")?;
+    conn.execute(
+        "INSERT INTO t VALUES \
+         (1, ARRAY[], ARRAY[1, '1', x'01'], ARRAY[1, 2]), \
+         (2, ARRAY[x'cafe'], NULL, ARRAY[])",
+    )?;
+
+    let query = "SELECT id, hex(b), hex(a), hex(c), c FROM t ORDER BY id";
+    let before_rows: Vec<(i64, String, String, String, String)> = conn.exec_rows(query);
+    assert_eq!(
+        before_rows,
+        vec![
+            (
+                1,
+                "01".to_string(),
+                "04090F0E3101".to_string(),
+                "0301026400C8".to_string(),
+                "{1,2}".to_string()
+            ),
+            (
+                2,
+                "0210CAFE".to_string(),
+                String::new(),
+                "01".to_string(),
+                "{}".to_string()
+            ),
+        ]
+    );
+
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+    let after_rows: Vec<(i64, String, String, String, String)> = conn.exec_rows(query);
+    assert_eq!(after_rows, before_rows);
 
     Ok(())
 }
@@ -4495,7 +4757,6 @@ fn test_plain_vacuum_with_multiple_strict_tables(tmp_db: TempDatabase) -> anyhow
 }
 
 /// Plain VACUUM preserves indexes (queries using them still work).
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);")]
 fn test_plain_vacuum_preserves_indexes(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4691,7 +4952,6 @@ fn test_plain_vacuum_preserves_vector_blobs(tmp_db: TempDatabase) -> anyhow::Res
 }
 
 /// Plain VACUUM preserves views.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(views, init_sql = "CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);")]
 fn test_plain_vacuum_preserves_views(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4713,8 +4973,113 @@ fn test_plain_vacuum_preserves_views(tmp_db: TempDatabase) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Each materialized view created by `create_materialized_view_fixture`,
+/// with its defining query.
+const MATERIALIZED_VIEW_FIXTURE: &[(&str, &str)] = &[
+    ("v", "SELECT a, b FROM t WHERE b > 100"),
+    (
+        "vg",
+        "SELECT g, count(*) AS n, sum(b) AS s, min(b) AS lo FROM t GROUP BY g",
+    ),
+    ("vj", "SELECT t.a, u.n FROM t JOIN u ON t.a = u.k"),
+    ("vv", "SELECT g, n FROM vg WHERE n > 1"),
+    ("vd", "SELECT DISTINCT g, b % 3 FROM t"),
+];
+
+/// Plain VACUUM keeps materialized views, their internal state tables, and
+/// their maintenance working. VACUUM used to fail with "table
+/// __turso_internal_dbsp_metadata_v2_v already exists", because it copied a
+/// view's internal tables and then replayed the CREATE MATERIALIZED VIEW
+/// that creates them.
+///
+/// VACUUM now rebuilds the views from the base tables, so the rowids of view
+/// rows and internal state rows may change, as SQLite allows for tables
+/// without an INTEGER PRIMARY KEY. The base tables must stay identical.
+#[turso_macros::test(views)]
+fn test_plain_vacuum_preserves_materialized_views(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    create_materialized_view_fixture(&conn)?;
+    let base_tables_before = base_table_hashes(&tmp_db);
+    let schema_before = normalized_schema_snapshot(&conn);
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_eq!(base_table_hashes(&tmp_db), base_tables_before);
+    assert_eq!(normalized_schema_snapshot(&conn), schema_before);
+    assert_materialized_views_equal_their_queries(&conn);
+
+    conn.execute("INSERT INTO t VALUES (1000, 2, 999)")?;
+    conn.execute("DELETE FROM u WHERE k = 3")?;
+    assert_materialized_views_equal_their_queries(&conn);
+    drop(conn);
+
+    let (_reopened, conn) = connect_existing_with_opts(&tmp_db.path, tmp_db.db_opts);
+    assert_materialized_views_equal_their_queries(&conn);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+/// VACUUM INTO writes a copy whose materialized views equal their queries and
+/// keep being maintained.
+#[turso_macros::test(views)]
+fn test_vacuum_into_preserves_materialized_views(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    create_materialized_view_fixture(&conn)?;
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let (dest_db, dest_conn) = connect_existing_with_opts(&dest_path, tmp_db.db_opts);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(base_table_hashes(&dest_db), base_table_hashes(&tmp_db));
+    assert_eq!(
+        normalized_schema_snapshot(&dest_conn),
+        normalized_schema_snapshot(&conn)
+    );
+    assert_materialized_views_equal_their_queries(&dest_conn);
+
+    dest_conn.execute("INSERT INTO t VALUES (1000, 2, 999)")?;
+    assert_materialized_views_equal_their_queries(&dest_conn);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    Ok(())
+}
+
+fn create_materialized_view_fixture(conn: &Arc<Connection>) -> anyhow::Result<()> {
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, g INTEGER, b INTEGER)")?;
+    conn.execute("CREATE TABLE u(k INTEGER PRIMARY KEY, n INTEGER)")?;
+    conn.execute("INSERT INTO t SELECT value, value % 5, value * 2 FROM generate_series(1, 300)")?;
+    conn.execute("INSERT INTO u SELECT value, value * 10 FROM generate_series(1, 50)")?;
+    for (name, query) in MATERIALIZED_VIEW_FIXTURE {
+        conn.execute(format!("CREATE MATERIALIZED VIEW {name} AS {query}"))?;
+    }
+    conn.execute("DELETE FROM t WHERE a % 7 = 0")?;
+    Ok(())
+}
+
+fn base_table_hashes(db: &TempDatabase) -> Vec<String> {
+    ["t", "u"]
+        .into_iter()
+        .map(|table| {
+            let options = turso_dbhash::DbHashOptions {
+                table_filter: Some(table.to_string()),
+                without_schema: true,
+                ..Default::default()
+            };
+            compute_dbhash_with_options_and_database_opts(db, &options, db.db_opts).hash
+        })
+        .collect()
+}
+
+fn assert_materialized_views_equal_their_queries(conn: &Arc<Connection>) {
+    for (name, query) in MATERIALIZED_VIEW_FIXTURE {
+        let mut view = limbo_exec_rows(conn, &format!("SELECT * FROM {name}"));
+        let mut fresh = limbo_exec_rows(conn, query);
+        view.sort_by_key(|row| format!("{row:?}"));
+        fresh.sort_by_key(|row| format!("{row:?}"));
+        assert_eq!(view, fresh, "materialized view {name} differs from {query}");
+    }
+}
+
 /// Plain VACUUM works on empty databases.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER);")]
 fn test_plain_vacuum_empty_table(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4749,7 +5114,6 @@ fn test_plain_vacuum_empty_table(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 /// Plain VACUUM preserves an empty table after heavy insert/update/delete churn.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);")]
 fn test_plain_vacuum_empty_table_after_updates(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4803,7 +5167,6 @@ fn test_plain_vacuum_empty_table_after_updates(tmp_db: TempDatabase) -> anyhow::
 }
 
 /// Multiple VACUUMs in a row work correctly.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")]
 fn test_plain_vacuum_repeated(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4824,7 +5187,6 @@ fn test_plain_vacuum_repeated(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 /// Writes after VACUUM work correctly.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")]
 fn test_plain_vacuum_then_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4870,7 +5232,6 @@ fn test_plain_vacuum_rejects_active_statement(tmp_db: TempDatabase) -> anyhow::R
 
 /// Plain VACUUM reduces page_count when rows are deleted, and a subsequent
 /// checkpoint truncates the .db file to the compacted size.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")]
 fn test_plain_vacuum_reduces_page_count(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -5863,6 +6224,53 @@ fn test_mvcc_plain_vacuum_discards_reused_index_rootpage_state() -> anyhow::Resu
 }
 
 #[test]
+fn test_mvcc_plain_vacuum_after_checkpoint_of_rows_never_written() -> anyhow::Result<()> {
+    let scenarios = [
+        (
+            "drop table with rows never written",
+            "CREATE TABLE u(x); CREATE INDEX u_x ON u(x); INSERT INTO u VALUES (1); DROP TABLE u;",
+            vec![(1, 1)],
+        ),
+        (
+            "drop index with rows never written",
+            "CREATE INDEX t_a ON t(a); INSERT INTO t VALUES (3, 3); DROP INDEX t_a;",
+            vec![(1, 1), (3, 3)],
+        ),
+        (
+            "delete rows never written",
+            "CREATE INDEX t_a ON t(a); INSERT INTO t VALUES (2, 2); DELETE FROM t WHERE id = 2;",
+            vec![(1, 1)],
+        ),
+    ];
+    for passive_checkpoint in [false, true] {
+        for (scenario, sql, expected_rows) in &scenarios {
+            let opts =
+                DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(passive_checkpoint);
+            let tmp_db = TempDatabase::builder()
+                .with_opts(opts)
+                .with_mvcc(true)
+                .build();
+            let conn = tmp_db.connect_limbo();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT)")?;
+            conn.execute("INSERT INTO t VALUES (1, 1)")?;
+            conn.execute(sql)?;
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+            conn.execute("VACUUM")?;
+
+            let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, a FROM t ORDER BY id");
+            assert_eq!(
+                &rows, expected_rows,
+                "{scenario}, passive_checkpoint={passive_checkpoint}"
+            );
+            assert_eq!(run_integrity_check(&conn), "ok");
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_mvcc_plain_vacuum_requires_checkpointed_image() -> anyhow::Result<()> {
     let tmp_db =
         TempDatabase::new_with_mvcc("test_mvcc_plain_vacuum_requires_checkpointed_image.db");
@@ -6021,7 +6429,6 @@ fn populate_queued_multibatch(conn: &Arc<Connection>) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "checksum", ignore)]
 #[test]
 fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_locks(
 ) -> anyhow::Result<()> {
@@ -6035,7 +6442,7 @@ fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_
     let path = "queued-vacuum-reset-during-checkpoint.db";
     let source_wal_path = format!("{path}-wal");
     let db = open_queued_db(io.clone(), path)?;
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
 
     populate_queued_multibatch(&conn)?;
 
@@ -6081,7 +6488,7 @@ fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_
 
     stmt.reset()?;
 
-    let reader = db.connect()?;
+    let reader = db.connect(ConnectOpts::new())?;
     assert_eq!(scalar_i64(&reader, "SELECT COUNT(*) FROM t"), 176);
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
     let before_schema = normalized_schema_snapshot(&conn);

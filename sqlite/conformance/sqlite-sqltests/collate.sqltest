@@ -1568,3 +1568,139 @@ test nocase-index-does-not-serve-binary-comparison {
 }
 expect {
 }
+
+# Same rule for `IN (SELECT ...)`: the LHS column supplies the comparison
+# collation, even when it has no declared collation (BINARY). (#6088)
+@setup mixed_collation_join
+test in-select-uses-left-column-collation {
+    SELECT b.v FROM binary_side b WHERE b.k IN (SELECT k FROM nocase_side) ORDER BY b.v;
+}
+expect {
+}
+
+# Flipped: the NOCASE column is the LHS now, so the comparison is NOCASE.
+@setup mixed_collation_join
+test in-select-uses-left-column-collation-flipped {
+    SELECT n.id FROM nocase_side n WHERE n.k IN (SELECT k FROM binary_side) ORDER BY n.id;
+}
+expect {
+    1
+    2
+}
+
+# A correlated `IN (SELECT ...)` must follow the same rule.
+setup correlated_in_mixed_collation {
+    CREATE TABLE o(k INTEGER, v TEXT);
+    CREATE TABLE i(k INTEGER, x TEXT COLLATE NOCASE);
+    INSERT INTO o VALUES (1,'a');
+    INSERT INTO i VALUES (1,'A');
+}
+
+@setup correlated_in_mixed_collation
+test correlated-in-select-uses-left-column-collation {
+    SELECT count(*) FROM o WHERE v IN (SELECT x FROM i WHERE i.k = o.k);
+}
+expect {
+    0
+}
+
+# A plain IN-list follows the same precedence rule as `=` and `IN (SELECT ...)`.
+setup in_list_mixed_collation {
+    CREATE TABLE t(plain_key TEXT, nocase_key TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('a', 'A');
+}
+
+@setup in_list_mixed_collation
+test in-list-uses-left-column-collation {
+    SELECT count(*) FROM t WHERE plain_key IN (nocase_key);
+}
+expect {
+    0
+}
+
+# Flipped: the NOCASE column is the LHS now, so the comparison is NOCASE.
+@setup in_list_mixed_collation
+test in-list-uses-left-column-collation-flipped {
+    SELECT count(*) FROM t WHERE nocase_key IN (plain_key);
+}
+expect {
+    1
+}
+
+# The exact repro from #6088: a plain BINARY left column must not inherit the
+# NOCASE collation of the right-hand subquery's source column.
+@setup in_list_mixed_collation
+test in-select-same-table-uses-left-column-collation {
+    SELECT count(*) FROM t WHERE plain_key IN (SELECT nocase_key FROM t);
+}
+expect {
+    0
+}
+
+# Row-valued (tuple) comparisons follow the same per-component precedence rule.
+@setup in_list_mixed_collation
+test row-valued-comparison-uses-left-column-collation {
+    SELECT count(*) FROM t WHERE (plain_key, 1) = (nocase_key, 1);
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test group_concat_column_uses_binary_collation {
+    CREATE TABLE t(value TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('abc'), ('ABC'), ('Abc'), ('abc');
+    SELECT count(*) FROM t GROUP BY value ORDER BY 1;
+    SELECT count(*) FROM t GROUP BY (value || '') ORDER BY 1;
+    SELECT count(*) FROM t GROUP BY (value || '') COLLATE NOCASE ORDER BY 1;
+}
+expect {
+    4
+    1
+    1
+    2
+    4
+}
+
+@cross-check-integrity
+test order_concat_column_uses_binary_collation {
+    CREATE TABLE t(id INTEGER, value TEXT COLLATE RTRIM);
+    INSERT INTO t VALUES (1, 'abc  '), (2, 'abc'), (3, 'abc '), (4, 'ABC');
+    SELECT id FROM t ORDER BY value, id;
+    SELECT id FROM t ORDER BY (value || ''), id;
+    SELECT id FROM t ORDER BY (value || ''), id LIMIT 4;
+    SELECT id FROM t ORDER BY value COLLATE NOCASE, id;
+}
+expect {
+    4
+    1
+    2
+    3
+    4
+    2
+    3
+    1
+    4
+    2
+    3
+    1
+    2
+    4
+    3
+    1
+}
+
+test compound-chain-leftmost-collation {
+    CREATE TABLE compound_collate_left(n TEXT COLLATE NOCASE, p TEXT);
+    CREATE TABLE compound_collate_right(n TEXT);
+    INSERT INTO compound_collate_left VALUES ('a', 'z'), ('A', 'A');
+    INSERT INTO compound_collate_right VALUES ('a');
+    SELECT count(*) FROM (
+        SELECT n FROM compound_collate_left
+        EXCEPT SELECT p FROM compound_collate_left
+        INTERSECT SELECT n FROM compound_collate_right
+    );
+}
+expect {
+    0
+}

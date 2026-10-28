@@ -107,6 +107,7 @@ CREATE INDEX idx_products ON products USING fts (name) WITH (tokenizer = 'ngram'
 | Tokenizer | Description | Use Case |
 |-----------|-------------|----------|
 | `default` | Lowercase, punctuation split, 40 char limit | General English text |
+| `en_stem` | Like `default`, plus English stemming | Natural-language text |
 | `raw` | No tokenization - exact match only | IDs, UUIDs, tags, categories |
 | `simple` | Basic whitespace/punctuation split | Simple text without lowercase |
 | `whitespace` | Split on whitespace only | Space-separated tokens |
@@ -201,6 +202,7 @@ SELECT fts_highlight('The quick brown fox', '<em>', '</em>', 'quick fox');
 **Features:**
 - Supports multiple text columns (concatenated with spaces)
 - Case-insensitive matching (uses the default tokenizer)
+- Does not stem: with the `en_stem` tokenizer, only the exact query words are highlighted
 - Highlights all occurrences of matching terms
 - Works as a standalone function (doesn't require an FTS index)
 - Returns original text if no matches found
@@ -470,5 +472,5 @@ The FTS implementation has some known limitations that may be addressed in futur
 | Phrase search | `"exact phrase"` | `"exact phrase"` ✓ |
 | Prefix search | `word*` | `word*` ✓ |
 | Column filter | `col:term` | `col:term` ✓ |
-| Tokenizers | unicode61, ascii, porter | default, raw, simple, whitespace, ngram ✓ |
+| Tokenizers | unicode61, ascii, porter | default, en_stem, raw, simple, whitespace, ngram ✓ |
 | External content | contentless tables | Not supported |

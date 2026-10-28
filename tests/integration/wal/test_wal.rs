@@ -2,7 +2,7 @@ use crate::common::{compute_dbhash, do_flush, maybe_setup_tracing, TempDatabase}
 use asserting::prelude::*;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
-use turso_core::{Connection, LimboError, Result};
+use turso_core::{ConnectOpts, Connection, LimboError, Result};
 
 #[allow(clippy::arc_with_non_send_sync)]
 #[turso_macros::test]
@@ -194,7 +194,7 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
     let db = tmp_db.lock().unwrap().limbo_database();
 
     {
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         match conn.query("CREATE TABLE t (id)")? {
             Some(ref mut rows) => {
                 rows.run_with_row_callback(|_| Ok(())).unwrap();
@@ -208,7 +208,7 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
     const ROWS_WRITE: usize = 1000;
     let tmp_db_w = db.clone();
     let writer_thread = std::thread::spawn(move || {
-        let conn = tmp_db_w.connect().unwrap();
+        let conn = tmp_db_w.connect(ConnectOpts::new()).unwrap();
         for i in 0..ROWS_WRITE {
             conn.execute(format!("INSERT INTO t values({i})").as_str())
                 .unwrap();
@@ -218,7 +218,7 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
     });
     let rows_ = rows.clone();
     let reader_thread = std::thread::spawn(move || {
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         loop {
             let rows = *rows_.lock().unwrap();
             let mut i = 0;
@@ -292,14 +292,14 @@ fn test_wal_read_lock_released_on_conn_drop() {
     let db = tmp_db.limbo_database();
 
     // Setup: create table and insert data so WAL has content
-    let setup_conn = db.connect().unwrap();
+    let setup_conn = db.connect(ConnectOpts::new()).unwrap();
     setup_conn
         .execute("CREATE TABLE t (id integer primary key)")
         .unwrap();
     setup_conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
-    let conn1 = db.connect().unwrap();
-    let conn2 = db.connect().unwrap();
+    let conn1 = db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db.connect(ConnectOpts::new()).unwrap();
 
     // conn1 starts a read transaction and panics while holding the read lock
     let join_result = std::thread::spawn(move || {
@@ -325,13 +325,59 @@ fn test_wal_read_lock_released_on_conn_drop() {
 }
 
 #[test]
+fn test_deferred_transaction_first_write_retries_stale_snapshot() {
+    maybe_setup_tracing();
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tmp_db = TempDatabase::new("test_deferred_first_write_stale_snapshot.db");
+    let db = tmp_db.limbo_database();
+    let setup = tmp_db.connect_limbo();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT)")
+        .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_stop = stop.clone();
+    let writer_db = db.clone();
+    let writer = std::thread::spawn(move || {
+        let conn = writer_db.connect(ConnectOpts::new()).unwrap();
+        while !writer_stop.load(Ordering::Relaxed) {
+            match conn.execute("INSERT INTO t(source) VALUES ('writer')") {
+                Ok(()) | Err(LimboError::Busy) => {}
+                Err(err) => panic!("writer failed: {err:?}"),
+            }
+        }
+    });
+
+    let conn = tmp_db.connect_limbo();
+    let mut result = Ok(());
+    for _ in 0..20_000 {
+        conn.execute("BEGIN DEFERRED").unwrap();
+        result = match conn.execute("INSERT INTO t(source) VALUES ('deferred')") {
+            Ok(()) | Err(LimboError::Busy) => Ok(()),
+            Err(err) => Err(err),
+        };
+        conn.execute("ROLLBACK").unwrap();
+        if result.is_err() {
+            break;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "first write after BEGIN DEFERRED must not fail on a stale snapshot, got {result:?}"
+    );
+}
+
+#[test]
 fn test_wal_write_lock_released_on_conn_drop() {
     maybe_setup_tracing();
     let tmp_db = TempDatabase::new("test_wal_write_lock_released.db");
     let db = tmp_db.limbo_database();
 
-    let conn1 = db.connect().unwrap();
-    let conn2 = db.connect().unwrap();
+    let conn1 = db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db.connect(ConnectOpts::new()).unwrap();
 
     let join_result = std::thread::spawn(move || {
         conn1.execute("BEGIN IMMEDIATE").unwrap();
@@ -347,4 +393,59 @@ fn test_wal_write_lock_released_on_conn_drop() {
     conn2
         .execute("CREATE TABLE t (id integer primary key)")
         .unwrap();
+}
+
+/// A WAL whose header checksum is wrong must be ignored, the way SQLite's
+/// `walIndexRecover()` ignores it. Its page size must not be used either: a
+/// header claiming 512-byte pages next to a 4096-byte-page database used to
+/// make the next write fail and truncate the main file on close.
+#[test]
+fn test_wal_with_bad_header_checksum_is_ignored() -> anyhow::Result<()> {
+    let temp_dir = tempfile::TempDir::new()?;
+    let source_path = temp_dir.path().join("source.db");
+    let db_path = temp_dir.path().join("bad_wal_header.db");
+    let wal_path = db_path.with_extension("db-wal");
+
+    // Copy the pair aside while the WAL still holds uncheckpointed rows,
+    // because SQLite checkpoints and removes the WAL when it closes.
+    let sqlite = rusqlite::Connection::open(&source_path)?;
+    sqlite.pragma_update(None, "journal_mode", "WAL")?;
+    sqlite.execute_batch(
+        "CREATE TABLE t(x TEXT);
+         WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<50)
+         INSERT INTO t SELECT printf('%0100d', i) FROM c;
+         PRAGMA wal_checkpoint(TRUNCATE);
+         WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<20)
+         INSERT INTO t SELECT printf('%0100d', i) FROM c;",
+    )?;
+    std::fs::copy(&source_path, &db_path)?;
+    std::fs::copy(source_path.with_extension("db-wal"), &wal_path)?;
+    drop(sqlite);
+
+    let mut wal = std::fs::read(&wal_path)?;
+    wal[8..12].copy_from_slice(&512u32.to_be_bytes());
+    wal[24..32].fill(0xab);
+    std::fs::write(&wal_path, wal)?;
+
+    {
+        let tmp_db = TempDatabase::new_with_existent(&db_path);
+        let conn = tmp_db.connect_limbo();
+        assert_eq!(
+            execute_and_get_ints(&conn, "SELECT count(*) FROM t")?,
+            vec![50]
+        );
+        conn.execute("INSERT INTO t VALUES ('after')")?;
+        assert_eq!(
+            execute_and_get_ints(&conn, "SELECT count(*) FROM t")?,
+            vec![51]
+        );
+        conn.close()?;
+    }
+
+    let sqlite = rusqlite::Connection::open(&db_path)?;
+    let quick_check: String = sqlite.query_row("PRAGMA quick_check", (), |row| row.get(0))?;
+    assert_eq!(quick_check, "ok");
+    let count: i64 = sqlite.query_row("SELECT count(*) FROM t", (), |row| row.get(0))?;
+    assert_eq!(count, 51);
+    Ok(())
 }

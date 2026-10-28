@@ -6,13 +6,17 @@ queries through the `turso_core` engine. The goal is to behave like a real
 PostgreSQL server, so most of the work is closing the gap between what real
 PostgreSQL does and what the front-end does today.
 
-Two things keep that work honest:
+Three things keep that work honest:
 
 - **[`COMPAT.md`](COMPAT.md)** — feature-by-feature compatibility status, and
   where Turso intentionally diverges from PostgreSQL.
 - **[`conformance/upstream/`](conformance/upstream/)** — regression tests
   imported verbatim from the PostgreSQL source tree, run against the front-end
   so divergence can't sneak in unnoticed.
+- **[`conformance/pg-sqltests/`](conformance/pg-sqltests/)** — `.sqltest` tests
+  that CI runs against the front-end and against a real PostgreSQL server
+  (`make -C postgres/conformance run-postgres`). Tests of Turso-specific
+  behavior have `@skip-if postgres "reason"`.
 
 ## Verification workflow
 
@@ -21,7 +25,8 @@ When changing the parser, translator, or query behavior:
 1. Check the relevant page of the PostgreSQL documentation.
 2. Confirm the behavior against a real PostgreSQL server.
 3. Encode the observed behavior in a test — an upstream regression script that
-   now passes, or a Rust test (see below) — so it can't regress.
+   now passes, a `.sqltest` in `conformance/pg-sqltests/`, or a Rust test (see
+   below) — so it can't regress.
 
 If Turso intentionally diverges from PostgreSQL, document that in
 [`COMPAT.md`](COMPAT.md). Pay particular attention to clauses that parse but
@@ -51,6 +56,29 @@ cargo run -p tursopg -- --server 127.0.0.1:5432 /tmp/regress.db &
 cargo run -p turso_pg_regress -- --dsn 'postgres://127.0.0.1:5432/regression'
 ```
 
+## Compare pg_dump files
+
+Install Python 3 and PostgreSQL clients that support `pg_dump --restrict-key`.
+Use Docker for a disposable PostgreSQL server, or set `PG_DSN` to a disposable server whose role can create databases.
+Run all fixtures, or select one SQL file:
+
+```bash
+make -C postgres/conformance test-pgdump
+make -C postgres/conformance test-pgdump FILE=pgdump/tables.sql
+```
+
+The runner loads each SQL file in `conformance/pgdump/` into fresh Turso and PostgreSQL databases.
+It uses the same `pg_dump` client for both databases and compares the output files byte for byte.
+The client uses a fixed restriction key, which replaces its random token.
+The runner does not remove headers, owner names, privileges, or other differences.
+Different server versions and row orders can therefore fail this comparison.
+
+Each run saves `postgres.sql`, `turso.sql`, command logs, and a `dump.diff` file for unequal dumps under `conformance/pgdump/results/`.
+Failed commands return a nonzero status and keep their logs and any partial dump files.
+The runner stops its Turso processes and drops only the PostgreSQL databases that it creates.
+It does not restore the dumps or treat known compatibility failures as passes.
+Add a `.sql` file to `conformance/pgdump/` to test another fixture.
+
 ## The corpus is pristine
 
 Everything under [`conformance/upstream/`](conformance/upstream/) is imported
@@ -72,6 +100,18 @@ corpus file needs a psql feature the runner doesn't emulate yet (see the
 module docs in `postgres/regress/main.rs` for known gaps), extend the runner —
 never adapt the corpus. If every test suddenly fails with uniform, systematic
 diffs, suspect the runner's psql emulation before suspecting the server.
+
+## Embedded errors
+
+The `turso_pg` connection and statement APIs return `turso_pg::Error`.
+Its `Display` implementation uses the PostgreSQL message, and its
+`sqlstate`, `detail`, `table_name`, `column_name`, and `constraint_name`
+fields are available without a separate conversion. `core_error()` and
+`std::error::Error::source()` expose the original engine error.
+
+The CLI prints these fields and the wire server serializes them. Error
+classification and PostgreSQL wording belong in the frontend. Explicit
+access through `Connection::inner()` uses the core API and its error type.
 
 ## Rust tests
 

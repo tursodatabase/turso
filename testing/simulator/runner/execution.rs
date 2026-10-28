@@ -522,8 +522,8 @@ fn execute_query_rusqlite(
         );
     }
     match query {
-        Query::Select(select) => {
-            let mut stmt = connection.prepare(select.to_string().as_str())?;
+        Query::Select(_) | Query::LateralSelect(_) => {
+            let mut stmt = connection.prepare(query.to_string().as_str())?;
             let rows = stmt.query_map([], |row| {
                 let mut values = vec![];
                 for i in 0.. {
@@ -574,12 +574,12 @@ mod tests {
     use clap::Parser as _;
     use sql_generation::model::query::pragma::{CheckpointMode, Pragma};
     use std::num::NonZeroUsize;
-    use turso_core::{Database, IO, MemoryIO, SqliteDialect};
+    use turso_core::{ConnectOpts, Database, IO, MemoryIO, SqliteDialect};
 
     fn memory_connection() -> Arc<Connection> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        db.connect().unwrap()
+        db.connect(ConnectOpts::new()).unwrap()
     }
 
     fn query_interaction(query: Query) -> Interaction {

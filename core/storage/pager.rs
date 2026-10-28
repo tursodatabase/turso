@@ -1666,6 +1666,9 @@ pub struct Pager {
     pub(crate) io_ctx: RwLock<IOContext>,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
+    /// Whether this pager holds an ephemeral table or index, whose file no
+    /// other pager reads.
+    ephemeral: AtomicBool,
     shared: Arc<SharedPagerState>,
     /// Sync type for durability. FullFsync uses F_FULLFSYNC on macOS (PRAGMA fullfsync).
     /// Only stored on Apple platforms; on others, always returns Fsync.
@@ -1972,6 +1975,7 @@ impl Pager {
             }),
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
+            ephemeral: AtomicBool::new(false),
             shared,
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
@@ -2006,8 +2010,11 @@ impl Pager {
     }
 
     /// Keep a retired record buffer for the next cursor on this pager. Extra
-    /// buffers beyond the pool size are freed.
+    /// buffers beyond the pool size or larger than the largest page are freed.
     pub(crate) fn recycle_record_buf(&self, buf: crate::types::RecordBuf) {
+        if buf.capacity() > PageSize::MAX as usize {
+            return;
+        }
         let mut pool = self.record_pool.lock();
         if pool.len() < RECORD_POOL_SIZE {
             pool.push(buf);
@@ -2589,6 +2596,9 @@ impl Pager {
             "memory IO should complete immediately"
         );
 
+        // saveAllCursors at sqlite3BtreeSavepoint (btree.c:4580).
+        self.invalidate_all_cursors();
+
         // Discard all dirty pages allocated after the savepoint. These pages
         // are never subjournaled (see subjournal_page_if_required), so the loop
         // above won't encounter them. We must clean them from dirty_pages before
@@ -2622,9 +2632,6 @@ impl Pager {
                     ))
                 })?;
         }
-
-        // saveAllCursors at sqlite3BtreeSavepoint (btree.c:4580).
-        self.invalidate_all_cursors();
 
         Ok(())
     }
@@ -3094,6 +3101,10 @@ impl Pager {
 
     pub fn db_initialized(&self) -> bool {
         self.shared.initialized()
+    }
+
+    pub(crate) fn mark_ephemeral(&self) {
+        self.ephemeral.store(true, Ordering::Relaxed);
     }
 
     /// Set the page size of an empty database for all of its pagers. Does nothing once page 1 exists.
@@ -4929,6 +4940,7 @@ impl Pager {
     fn reset_checkpoint_state(&self) {
         self.clear_checkpoint_state();
         self.commit_info.write().state = CommitState::PrepareWal;
+        *self.header_ref_state.write() = HeaderRefState::Start;
     }
 
     /// Reset checkpoint state machine to initial state.
@@ -5720,6 +5732,12 @@ impl Pager {
                     (default_header.page_size.get() - default_header.reserved_space as u32)
                         as usize,
                 );
+                // The page cache never evicts or spills page 1, so an
+                // ephemeral pager never reads it back from its file.
+                if self.ephemeral.load(Ordering::Relaxed) {
+                    page1.pin();
+                    return self.finish_allocate_page1(page1);
+                }
                 let c = begin_write_btree_page(self, &page1, None)?;
 
                 // Pin page1 to prevent eviction while stored in state machine
@@ -6111,6 +6129,10 @@ impl Pager {
         self.set_schema_cookie(None);
         if schema_did_change {
             *connection.schema.write() = connection.db.clone_schema();
+            // Programs prepared against the rolled-back schema may use btrees
+            // that no longer exist, and later DDL can bring the schema version
+            // back to the number they were prepared with.
+            connection.bump_prepare_context_generation();
         }
         if is_write {
             if let Some(wal) = self.wal.as_ref() {
@@ -6536,6 +6558,46 @@ mod tests {
         default_page1, CacheFlushState, CollectingState, Page, PageRef, Pager, SharedPagerState,
     };
     use crate::{Buffer, Completion, CompletionError, LimboError};
+
+    #[test]
+    fn record_pool_frees_buffers_of_rows_larger_than_a_page() {
+        let io = Arc::new(MemoryIO::new());
+        let db =
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT NOT NULL, tag TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, CAST(zeroblob(6 * 1024 * 1024) AS TEXT), 'big')")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (2, CAST(zeroblob(5000) AS TEXT), 'small')")
+            .unwrap();
+        conn.execute("SELECT body FROM t WHERE id = 1").unwrap();
+        conn.execute("UPDATE t SET tag = 'updated' WHERE id = 1")
+            .unwrap();
+        conn.execute("UPDATE t SET tag = 'updated' WHERE id = 2")
+            .unwrap();
+
+        let pager = conn.get_pager();
+        let pool = pager.record_pool.lock();
+        assert!(!pool.is_empty());
+        for buf in pool.iter() {
+            assert!(buf.capacity() <= super::PageSize::MAX as usize);
+        }
+    }
+
+    #[test]
+    fn checkpoint_reset_does_not_reuse_failed_header_read() {
+        let pager = pager_with_cache_capacity(10, 2);
+        let completion =
+            Completion::new_read(Arc::new(Buffer::new_temporary(4096)), Box::new(|_| None));
+        completion.abort();
+        *pager.header_ref_state.write() = super::HeaderRefState::CreateHeader {
+            page: default_page1(None),
+            completion: Some(completion),
+        };
+        pager.reset_checkpoint_state();
+        pager.io.block(|| pager.with_header(|_| ())).unwrap();
+    }
 
     #[test]
     fn page_id_changes_keep_header_access_at_the_correct_offset() {
@@ -7128,6 +7190,7 @@ mod checkpoint_phase_tests {
     use crate::storage::wal::CheckpointMode;
     use crate::sync::atomic::Ordering;
     use crate::types::IOResult;
+    use crate::ConnectOpts;
     use crate::Database;
     use crate::SqliteDialect;
 
@@ -7182,7 +7245,7 @@ mod checkpoint_phase_tests {
     fn checkpoint_db_sync_completion_still_leaves_backfill_unpublished_until_proof_install() {
         let (db, dir) = open_checkpoint_test_database();
         let db_path = dir.path().join("test.db");
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value blob)")
             .unwrap();

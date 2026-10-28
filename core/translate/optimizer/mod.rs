@@ -11,11 +11,10 @@ use super::{
 };
 use crate::alloc::TursoIteratorExt;
 use crate::schema::GeneratedType;
-use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::{
-    function::{AggFunc, Deterministic},
+    function::{AggFunc, Deterministic, Func},
     index_method::{IndexMethodAttachment, IndexMethodCostContext, IndexMethodCostEstimate},
     numeric::Numeric,
     schema::{
@@ -104,10 +103,18 @@ impl AvailableIndexes {
             .joined_tables()
             .iter()
             .filter(|jt| matches!(jt.table, Table::BTree(_) | Table::Virtual(_))) // only b-tree tables can have indexes
+            .filter(|jt| jt.btree().is_none_or(|btree| btree.has_rowid))
             .filter_map(|jt| {
-                let indexes = resolver.with_schema(jt.database_id, |schema| {
-                    schema.indexes.get(jt.table.get_name()).cloned()
-                })?;
+                let indexes: VecDeque<_> =
+                    resolver.with_schema(jt.namespace.database_id, |schema| {
+                        schema
+                            .indices_including_backing(jt.namespace.id, jt.table.get_name())
+                            .cloned()
+                            .collect()
+                    });
+                if indexes.is_empty() {
+                    return None;
+                }
                 Some((jt.internal_id, indexes))
             })
             .collect();
@@ -371,8 +378,8 @@ fn try_match_index_method_pattern(
     let pattern_has_order_by = !pattern.order_by.is_empty();
     let pattern_has_limit = pattern.limit.is_some();
 
-    // If pattern has ORDER BY, it must match exactly
-    if pattern_has_order_by && order_by.len() != pattern.order_by.len() {
+    // If pattern has ORDER BY or LIMIT, ORDER BY must match exactly
+    if (pattern_has_order_by || pattern_has_limit) && order_by.len() != pattern.order_by.len() {
         return None;
     }
 
@@ -786,10 +793,9 @@ fn transform_match_to_fts_match(
             .find(|t| t.internal_id == table_id)
             .and_then(|t| {
                 if let Table::BTree(btree) = &t.table {
-                    Some(
-                        resolver
-                            .with_schema(t.database_id, |schema| schema.has_fts_index(&btree.name)),
-                    )
+                    Some(resolver.with_schema(t.namespace.database_id, |schema| {
+                        schema.has_fts_index(t.namespace.id, &btree.name)
+                    }))
                 } else {
                     None
                 }
@@ -871,6 +877,7 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
         || plan.group_by.is_some()
         || plan.contains_constant_false_condition
         || plan.aggregates.first().unwrap().filter_expr.is_some()
+        || !plan.aggregates.first().unwrap().order_by().is_empty()
     {
         return None;
     }
@@ -1113,7 +1120,7 @@ fn find_select_plan_form(
     }
 
     plan.simple_aggregate = detect_simple_aggregate(plan);
-    let table_plan = find_table_access_plan(
+    let mut table_plan = find_table_access_plan(
         schema,
         resolver,
         &mut plan.result_columns,
@@ -1185,6 +1192,20 @@ fn find_select_plan_form(
     }
 
     plan_correlated_subqueries(plan, resolver, &subquery_calls, cache, save_subquery_plans)?;
+    // The unmatched-right-row plans copied the WHERE subqueries before the
+    // correlated ones were planned. Copy the planned subqueries instead.
+    if let Some(table_plan) = table_plan.as_mut() {
+        for unmatched_plan in table_plan.unmatched_right_rows_plans.iter_mut().flatten() {
+            for copied_subquery in &mut unmatched_plan.subqueries {
+                *copied_subquery = plan
+                    .non_from_clause_subqueries
+                    .iter()
+                    .find(|subquery| subquery.internal_id == copied_subquery.internal_id)
+                    .expect("a copied WHERE subquery must still be in the query")
+                    .clone();
+            }
+        }
+    }
 
     let table_cost = table_cost.or_else(|| {
         plan.table_references
@@ -1426,12 +1447,16 @@ fn update_write_set_reason(
             .iter()
             .map(|set_clause| set_clause.column_index)
             .try_collect()?;
-        let database_id = table_ref.database_id;
+        let updated_col_names: Vec<_> = plan
+            .set_clauses
+            .iter()
+            .flat_map(|set_clause| set_clause.column_names.iter().cloned())
+            .try_collect()?;
         if has_triggers_including_temp(
             resolver,
-            database_id,
+            table_ref.namespace,
             TriggerEvent::Update,
-            Some(&updated_cols),
+            Some(&updated_col_names),
             btree_table,
         ) {
             break 'requires Some(DmlSafetyReason::Trigger);
@@ -1444,8 +1469,8 @@ fn update_write_set_reason(
         // twice. Self-referential cascades likewise rewrite rows in the
         // target during the scan. Materialize target rowids first to keep
         // the write set stable. (See issue #6460.)
-        let referencing_fks = resolver.with_schema(database_id, |s| {
-            s.resolved_fks_referencing(&btree_table.name)
+        let referencing_fks = resolver.with_schema(table_ref.namespace.database_id, |s| {
+            s.resolved_fks_referencing(table_ref.namespace.id, &btree_table.name)
         })?;
         for fk in &referencing_fks {
             if matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict) {
@@ -1493,24 +1518,16 @@ fn update_write_set_reason(
             break 'requires Some(DmlSafetyReason::KeyMutation);
         }
 
+        // The UPDATE must not change entries of the index that it scans.
         let Some(index) = table_ref.op.index() else {
             break 'requires None;
         };
-
-        let affected_cols = btree_table.columns_affected_by_update(&updated_cols)?;
-        for c in index.columns.iter() {
-            if let Some(ref expr) = c.expr {
-                let expr_idx_cols_mask =
-                    expression_index_column_usage(expr.as_ref(), table_ref, resolver)?;
-                if expr_idx_cols_mask
-                    .iter()
-                    .any(|cidx| affected_cols.get(cidx))
-                {
-                    break 'requires Some(DmlSafetyReason::KeyMutation);
-                }
-            } else if affected_cols.get(c.pos_in_table) {
-                break 'requires Some(DmlSafetyReason::KeyMutation);
-            }
+        if plan
+            .indexes_to_update
+            .iter()
+            .any(|updated| updated.name == index.name)
+        {
+            break 'requires Some(DmlSafetyReason::KeyMutation);
         }
         break 'requires None;
     };
@@ -1620,6 +1637,7 @@ fn build_update_write_set_plan(
             join_type: JoinType::Inner,
             using: vec![],
             no_reorder: false,
+            lateral: false,
         });
         from_tables.add_joined_table(target_table);
         from_tables
@@ -1695,7 +1713,6 @@ fn build_update_write_set_plan(
             ephemeral_subs
         },
         simple_aggregate: None,
-        phantom_params: vec![],
     };
 
     plan.write_set_plan = Some(WriteSetPlan {
@@ -2072,7 +2089,10 @@ fn base_row_estimate(
 ) -> RowCountEstimate {
     match &table.table {
         Table::BTree(btree) => {
-            if let Some(stats) = schema.analyze_stats.table_stats(&btree.name) {
+            if let Some(stats) = schema
+                .analyze_stats
+                .table_stats(table.namespace.id, &btree.name)
+            {
                 if let Some(rows) = stats.row_count.or_else(|| {
                     stats
                         .index_stats
@@ -2153,13 +2173,15 @@ fn group_count_from_analyze(plan: &SelectPlan, group_by: &GroupBy, schema: &Sche
         .iter()
         .find(|table| table.internal_id == table_id)?;
     let btree = table.btree()?;
-    let table_stats = schema.analyze_stats.table_stats(&btree.name)?;
+    let table_stats = schema
+        .analyze_stats
+        .table_stats(table.namespace.id, &btree.name)?;
 
     table_stats
         .index_stats
         .iter()
         .filter_map(|(index_name, index_stats)| {
-            let index = schema.get_index(&btree.name, index_name)?;
+            let index = schema.get_index(table.namespace.id, &btree.name, index_name)?;
             if index.where_clause.is_some() || index.columns.len() < columns.len() {
                 return None;
             }
@@ -2347,6 +2369,12 @@ fn enforce_indexed_by_hints(
         match indexed {
             ast::Indexed::IndexedBy(name) => {
                 let idx_name = name.as_str();
+                if table_ref.btree().is_some_and(|btree| !btree.has_rowid) {
+                    crate::bail_parse_error!(
+                        "INDEXED BY is not supported on WITHOUT ROWID tables: {}",
+                        idx_name
+                    );
+                }
                 // Verify the index exists and belongs to this table.
                 let forced_index =
                     available_indexes.btree_index_by_name(table_ref.internal_id, idx_name);
@@ -3802,7 +3830,7 @@ fn mark_seek_constraints_consumed(
     }
 }
 
-fn mark_partial_index_predicate_terms_consumed(
+pub(crate) fn mark_partial_index_predicate_terms_consumed(
     index: &Index,
     table_reference: &JoinedTable,
     where_clause: &mut [WhereTerm],
@@ -4108,7 +4136,12 @@ impl Optimizable for ast::Expr {
                 else {
                     return false;
                 };
-                func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
+                // Like SQLite's SQLITE_FUNC_SLOCHNG functions, the date and time
+                // functions return the same value for the whole statement, so they
+                // can be computed once instead of on every row.
+                let same_for_whole_statement = func.is_deterministic()
+                    || matches!(func, Func::Scalar(f) if f.is_date_time_function());
+                same_for_whole_statement && args.iter().all(|arg| arg.is_constant(resolver))
             }
             Expr::FunctionCallStar { .. } => false,
             // A merged USING column reads table columns, so its value changes from row to row.
@@ -4327,6 +4360,7 @@ fn ephemeral_index_build(
             .is_some_and(|btree| btree.has_rowid),
         index_method: None,
         on_conflict: None,
+        constraint_name: None,
     };
 
     Ok(ephemeral_index)
@@ -4864,6 +4898,7 @@ mod tests {
         database_schemas: &'a RwLock<HashMap<usize, crate::sync::Arc<Schema>>>,
         temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
+        namespaces: &'a crate::Namespaces,
         syms: &'a SymbolTable,
     ) -> Resolver<'a> {
         Resolver::new(
@@ -4871,11 +4906,12 @@ mod tests {
             database_schemas,
             temp_database,
             attached_databases,
+            namespaces,
             syms,
             true,
             DoubleQuotedDml::Enabled,
             crate::sync::Arc::new(crate::dialect::SqliteDialect),
-            &None,
+            None,
         )
     }
 
@@ -4903,12 +4939,14 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
+        let namespaces = crate::Namespaces::default();
         let temp_database = RwLock::new(None);
         let resolver = empty_resolver(
             &schema,
             &database_schemas,
             &temp_database,
             &attached_databases,
+            &namespaces,
             &syms,
         );
 
@@ -4939,12 +4977,14 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
+        let namespaces = crate::Namespaces::default();
         let temp_database = RwLock::new(None);
         let resolver = empty_resolver(
             &schema,
             &database_schemas,
             &temp_database,
             &attached_databases,
+            &namespaces,
             &syms,
         );
 

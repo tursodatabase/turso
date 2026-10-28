@@ -119,7 +119,12 @@ pub(super) fn translate_in_list(
                         rhs: rhs_reg,
                         target_pc: label_ok,
                         flags: cmp_flags,
-                        collation: program.curr_collation(),
+                        collation: comparison_collation(
+                            lhs,
+                            expr,
+                            referenced_tables,
+                            Some(resolver),
+                        )?,
                     });
                 } else {
                     program.emit_insn(Insn::NotNull {
@@ -133,7 +138,7 @@ pub(super) fn translate_in_list(
                     rhs: rhs_reg,
                     target_pc: condition_metadata.jump_target_when_false,
                     flags: cmp_flags.jump_if_null(),
-                    collation: program.curr_collation(),
+                    collation: comparison_collation(lhs, expr, referenced_tables, Some(resolver))?,
                 });
             } else {
                 program.emit_insn(Insn::IsNull {
@@ -271,6 +276,26 @@ pub fn translate_condition_expr(
     condition_metadata: ConditionMetadata,
     resolver: &Resolver,
 ) -> Result<()> {
+    if resolver.resolve_cached_expr_reg(expr).is_some() {
+        let reg = program.alloc_register();
+        translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
+        emit_cond_jump(program, condition_metadata, reg);
+        return Ok(());
+    }
+    if has_expression_index_values(program, Some(referenced_tables)) {
+        let index_value_reg = program.alloc_register();
+        if try_emit_expression_index_value(
+            program,
+            Some(referenced_tables),
+            expr,
+            index_value_reg,
+            resolver,
+        )? {
+            emit_cond_jump(program, condition_metadata, index_value_reg);
+            return Ok(());
+        }
+        program.release_registers(index_value_reg, 1);
+    }
     match expr {
         ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
             // In a binary AND, never jump to the parent 'jump_target_when_true' label on the first condition, because

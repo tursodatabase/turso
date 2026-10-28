@@ -1,6 +1,7 @@
 use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 
+use crate::namespace::NamespaceRef;
 use crate::schema::{EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
@@ -9,7 +10,7 @@ use crate::translate::plan::{ColumnMask, Operation};
 use crate::translate::planner::ROWID_STRS;
 use crate::{
     bail_parse_error,
-    schema::{Schema, Table},
+    schema::Table,
     util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     CaptureDataChangesExt, Connection,
@@ -22,7 +23,10 @@ use super::optimizer::optimize_plan;
 use super::plan::{
     ColumnUsedMask, DmlSafety, JoinedTable, Plan, TableReferences, UpdatePlan, UpdateSetClause,
 };
-use super::planner::{append_vtab_predicates_to_where_clause, parse_from, parse_where};
+use super::planner::{
+    append_vtab_predicates_to_where_clause, collect_subquery_table_refs_in_expr, parse_from,
+    parse_where,
+};
 use super::subquery::{
     mark_shared_cte_materialization_requirements, plan_subqueries_from_returning,
     plan_subqueries_from_update_sets, plan_subqueries_from_where_clause,
@@ -201,7 +205,8 @@ fn prepare_and_optimize_update_plan(
 }
 
 fn validate_update(
-    schema: &Schema,
+    resolver: &Resolver,
+    namespace: NamespaceRef,
     table_name: &str,
     is_internal_schema_change: bool,
     conn: &Arc<Connection>,
@@ -214,15 +219,19 @@ fn validate_update(
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
-    // Check if this is a materialized view
-    if schema.is_materialized_view(table_name) {
+    // Check if this is a materialized view. Must look up the schema of the
+    // table's own database: a table in an attached database can share a name
+    // with a materialized view in a different database.
+    if resolver.with_schema(namespace.database_id, |s| {
+        s.is_materialized_view(namespace.id, table_name)
+    }) {
         bail_parse_error!("cannot modify materialized view {}", table_name);
     }
 
     // Check if this table has any incompatible dependent views
-    schema.with_incompatible_dependent_views(table_name, |views| {
+    resolver.with_schema(namespace.database_id, |schema| schema.with_incompatible_dependent_views(namespace.id, table_name, |views| {
     if !views.is_empty() {
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        use crate::incremental::view::DBSP_CIRCUIT_VERSION;
         crate::bail_parse_error!(
             "Cannot UPDATE table '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
              These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
@@ -231,7 +240,7 @@ fn validate_update(
         );
     }
     Ok(())
-    })
+    }))
 }
 
 fn prepare_update_plan(
@@ -241,10 +250,12 @@ fn prepare_update_plan(
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
 ) -> crate::Result<UpdatePlan> {
-    let database_id = resolver.resolve_existing_table_database_id_qualified(&body.tbl_name)?;
-    let schema = resolver.schema();
+    let namespace = resolver.resolve_queried_table(&body.tbl_name)?;
+    let database_id = namespace.database_id;
     let target_name = &body.tbl_name.name;
-    let table = match resolver.with_schema(database_id, |s| s.get_table(target_name.as_str())) {
+    let table = match resolver.with_schema(database_id, |s| {
+        s.get_table(namespace.id, target_name.as_str())
+    }) {
         Some(table) => table,
         None => bail_parse_error!(
             "no such table: {}",
@@ -263,7 +274,8 @@ fn prepare_update_plan(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     validate_update(
-        schema,
+        resolver,
+        namespace,
         target_name.as_str(),
         is_internal_schema_change,
         connection,
@@ -279,6 +291,7 @@ fn prepare_update_plan(
     let target_table = JoinedTable {
         table: table.as_ref().clone(),
         identifier: body.tbl_name.identifier(),
+        has_alias: body.tbl_name.alias.is_some(),
         internal_id: program.table_reference_counter.next(),
         op: Operation::default_scan_for(&table),
         unmatched_right_rows_plan: None,
@@ -286,10 +299,22 @@ fn prepare_update_plan(
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
-        database_id,
+        namespace,
         indexed,
         plan_estimate: None,
     };
+    let mut table_refs_outside_from = Vec::new();
+    for set in &body.sets {
+        collect_subquery_table_refs_in_expr(&set.expr, &mut table_refs_outside_from);
+    }
+    if let Some(where_clause) = &body.where_clause {
+        collect_subquery_table_refs_in_expr(where_clause, &mut table_refs_outside_from);
+    }
+    for column in &body.returning {
+        if let ast::ResultColumn::Expr(expr, _) = column {
+            collect_subquery_table_refs_in_expr(expr, &mut table_refs_outside_from);
+        }
+    }
     let mut from_tables = TableReferences::new_empty();
     let mut where_clause = vec![];
     let mut vtab_predicates = vec![];
@@ -298,7 +323,7 @@ fn prepare_update_plan(
         resolver,
         program,
         with,
-        true,
+        &table_refs_outside_from,
         &mut where_clause,
         &mut vtab_predicates,
         &mut from_tables,
@@ -321,7 +346,7 @@ fn prepare_update_plan(
     let mut non_from_clause_subqueries = vec![];
     // Reject fairly specific cases like UPDATE t SET x=5 FROM t.
     let illegal_target_reference = from_tables.joined_tables().iter().any(|joined| {
-        joined.database_id == database_id
+        joined.namespace == namespace
             && normalize_ident(joined.identifier.as_str()) == target_identifier
             && normalize_ident(joined.table.get_name()) == target_table_name
     });
@@ -380,6 +405,7 @@ fn prepare_update_plan(
         // under its schema name so `RETURNING t.col` works while `RETURNING alias.col`
         // still fails.
         returning_target.identifier = table_name.to_string();
+        returning_target.has_alias = false;
         let mut returning_table_references = TableReferences::new(
             vec![returning_target],
             read_scope_tables.outer_query_refs().to_vec(),
@@ -421,7 +447,7 @@ fn prepare_update_plan(
     let indexes_to_update = collect_indexes_to_update(
         &table,
         table_name,
-        database_id,
+        namespace,
         columns,
         &set_clauses,
         &mut read_scope_tables,
@@ -475,26 +501,41 @@ fn collect_update_set_clauses(
                     table.columns()[*idx].ensure_not_generated("UPDATE", col_name.as_str())?;
                     *idx
                 }
-                None if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) => table
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .find(|(_i, c)| c.is_rowid_alias())
-                    .map_or(ROWID_SENTINEL, |(idx, _col)| idx),
-                None => crate::bail_parse_error!("no such column: {}.{}", table_name, col_name),
+                None => match rowid_name_column_index(table, &ident) {
+                    Some(idx) => idx,
+                    None => {
+                        crate::bail_parse_error!("no such column: {}.{}", table_name, col_name)
+                    }
+                },
             };
 
             match set_clauses
                 .iter_mut()
                 .find(|set| set.column_index == col_index)
             {
-                Some(existing) => compose_update_set_clause(existing, expr),
-                None => set_clauses.push(UpdateSetClause::new(col_index, expr)),
+                Some(existing) => {
+                    existing.column_names.push(col_name.clone());
+                    compose_update_set_clause(existing, expr)
+                }
+                None => set_clauses.push(UpdateSetClause::new(col_index, col_name.clone(), expr)),
             }
         }
     }
 
     Ok(set_clauses)
+}
+
+pub(crate) fn rowid_name_column_index(table: &Table, name: &str) -> Option<usize> {
+    if !ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+        return None;
+    }
+    Some(
+        table
+            .columns()
+            .iter()
+            .position(|c| c.is_rowid_alias())
+            .unwrap_or(ROWID_SENTINEL),
+    )
 }
 
 fn compose_update_set_clause(existing: &mut UpdateSetClause, expr: Box<Expr>) {
@@ -528,15 +569,17 @@ fn compose_update_set_clause(existing: &mut UpdateSetClause, expr: Box<Expr>) {
 fn collect_indexes_to_update(
     table: &Table,
     table_name: &str,
-    database_id: usize,
+    namespace: NamespaceRef,
     columns: &[crate::schema::Column],
     set_clauses: &[UpdateSetClause],
     read_scope_tables: &mut TableReferences,
     resolver: &Resolver,
 ) -> crate::Result<Vec<Arc<crate::schema::Index>>> {
     use crate::alloc::TursoIteratorExt;
-    let indexes: crate::alloc::Vec<_> = resolver.with_schema(database_id, |s| {
-        s.get_indices(table_name).cloned().try_collect()
+    let indexes: crate::alloc::Vec<_> = resolver.with_schema(namespace.database_id, |s| {
+        s.get_indices(namespace.id, table_name)
+            .cloned()
+            .try_collect()
     })?;
     let target_table_ref = read_scope_tables
         .joined_tables()
@@ -639,7 +682,7 @@ fn check_update_from_column_ambiguity(
             .any(|preceding| preceding.identifier == table.identifier)
         {
             let db_name = connection
-                .get_database_name_by_index(table.database_id)
+                .namespace_name(table.namespace.database_id)
                 .unwrap_or_else(|| "main".to_string());
             bail_parse_error!(
                 "ambiguous column name: {db_name}.{}._ROWID_",

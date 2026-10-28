@@ -269,7 +269,7 @@ pub(super) fn choose_best_btree_candidate(
         has_valid_candidate = true;
 
         let index_info = match candidate.index.as_ref() {
-            Some(index) => IndexInfo {
+            Some(index) => Some(IndexInfo {
                 unique: index.unique,
                 covering: rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
@@ -278,13 +278,14 @@ pub(super) fn choose_best_btree_candidate(
                     rhs_table,
                     params.rows_per_table_page,
                 ),
-            },
-            None => IndexInfo {
+            }),
+            None if usable_constraint_refs.is_empty() => None,
+            None => Some(IndexInfo {
                 unique: true,
-                covering: !usable_constraint_refs.is_empty(),
+                covering: true,
                 column_count: 1,
                 rows_per_leaf_page: params.rows_per_table_page,
-            },
+            }),
         };
 
         let (iter_dir, is_index_ordered, order_satisfiability_bonus) =
@@ -339,6 +340,10 @@ pub(super) fn choose_best_btree_candidate(
                 (IterationDirection::Forwards, false, Cost(0.0))
             };
 
+        if index_info.is_none() && !is_index_ordered {
+            continue;
+        }
+
         let analyze_ctx = AnalyzeCtx {
             rhs_table,
             index: candidate.index.as_ref(),
@@ -367,7 +372,7 @@ pub(super) fn choose_best_btree_candidate(
             None => base_row_count,
         };
         let cost = estimate_cost_for_scan_or_seek(
-            Some(index_info),
+            index_info,
             &rhs_constraints.constraints,
             &usable_constraint_refs,
             input_cardinality,
@@ -1353,6 +1358,7 @@ pub fn try_hash_join_access_method(
     probe_multiplier: f64,
     hash_can_replace_build_index: bool,
     subqueries: &[NonFromClauseSubquery],
+    joined_tables: &[JoinedTable],
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     if probe_table
@@ -1364,7 +1370,7 @@ pub fn try_hash_join_access_method(
     }
     let hash_join_type = hash_join_type(probe_table);
 
-    if should_not_use_hash_join(build_table, probe_table, subqueries) {
+    if should_not_use_hash_join(build_table, probe_table, subqueries, joined_tables) {
         return Ok(None);
     }
 
@@ -1508,6 +1514,7 @@ fn should_not_use_hash_join(
     build_table: &JoinedTable,
     probe_table: &JoinedTable,
     subqueries: &[NonFromClauseSubquery],
+    joined_tables: &[JoinedTable],
 ) -> bool {
     let (Table::BTree(build_btree), Table::BTree(probe_btree)) =
         (&build_table.table, &probe_table.table)
@@ -1577,6 +1584,12 @@ fn should_not_use_hash_join(
             })
     };
 
+    let some_lateral_subqueries_read_tables_on_their_left = || -> bool {
+        joined_tables
+            .iter()
+            .any(|table| table.join_info.as_ref().is_some_and(|ji| ji.lateral))
+    };
+
     // we should not use a hash join if...
     !both_sides_have_rowid()
         || both_tables_are_the_same_table()
@@ -1585,6 +1598,7 @@ fn should_not_use_hash_join(
         || build_table_is_null_row()
         || is_using_or_natural_join()
         || some_correlated_subqueries_reference_the_joined_tables()
+        || some_lateral_subqueries_read_tables_on_their_left()
 }
 
 fn hash_join_type(probe_table: &JoinedTable) -> HashJoinType {
@@ -2125,6 +2139,7 @@ fn materialized_subquery_ephemeral_index(
         has_rowid: true,
         index_method: None,
         on_conflict: None,
+        constraint_name: None,
     }))
 }
 

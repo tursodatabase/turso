@@ -18,6 +18,7 @@
 //! <https://www.sqlite.org/opcode.html>
 
 use crate::alloc::{TryReserveError, TursoFromIterator};
+use crate::namespace::NamespaceId;
 use crate::translate::plan::BitSet;
 use crate::types::IOResultOr;
 use crate::types::{Extendable, Text, ValueBlob};
@@ -113,17 +114,171 @@ use tracing::{instrument, Level};
 
 const MAX_CHECK_INTERVAL: u64 = 256;
 
-type MvccCommitStateMachine = CommitStateMachine<MvccClock, DynAllocator>;
+pub(crate) type MvccCommitStateMachine = CommitStateMachine<MvccClock, DynAllocator>;
 
-/// State machine for committing view deltas with I/O handling
-#[derive(Debug, Clone)]
-pub enum ViewDeltaCommitState {
+/// State machine for applying pending view deltas with I/O handling.
+///
+/// Each touched materialized view is maintained by stepping a compiled VDBE
+/// maintenance program to completion; the parked statement makes the state
+/// machine re-entrant across I/O yields.
+#[derive(Debug)]
+pub enum ViewDeltaApplyState {
     NotStarted,
     Processing {
-        views: Vec<String>, // view names (all materialized views have storage)
+        views: crate::alloc::Vec<String>, // view names (all materialized views have storage)
         current_index: usize,
+        /// The maintenance statement currently being stepped for
+        /// `views[current_index]`, parked across I/O yields.
+        stmt: Option<Box<crate::statement::Statement>>,
     },
     Done,
+}
+
+/// Advance one transaction change-log batch through every subscribed
+/// materialized view in dependency order.
+///
+/// This runner is independent of a parent [`ProgramState`] so both statement
+/// completion and a materialized-view cursor can use exactly the same
+/// maintenance programs. The latter matters when a write statement reads a
+/// view before reaching `Halt`: there must not be a second query evaluator for
+/// that read-your-writes path.
+#[instrument(skip_all, level = Level::DEBUG)]
+pub(crate) fn step_view_delta_batch(
+    connection: &Arc<Connection>,
+    state: &mut ViewDeltaApplyState,
+    rollback: bool,
+    pager: &Arc<Pager>,
+) -> Result<IOResult<()>> {
+    loop {
+        match state {
+            ViewDeltaApplyState::NotStarted => {
+                if connection.transaction_changes.is_empty() {
+                    return Ok(IOResult::Done(()));
+                }
+
+                if rollback {
+                    connection.transaction_changes.clear();
+                    return Ok(IOResult::Done(()));
+                }
+
+                let schema = connection.schema.read();
+                let views = schema.materialized_view_maintenance_order(
+                    NamespaceId::ROOT,
+                    connection.transaction_changes.get_view_names()?,
+                )?;
+                for view_name in &views {
+                    if let Some(view_mutex) =
+                        schema.get_materialized_view(NamespaceId::ROOT, view_name)
+                    {
+                        let view = view_mutex.lock();
+                        turso_assert_ne!(
+                            view.get_root_page(),
+                            0,
+                            "Materialized view should have a root page",
+                            { "view_name": view_name }
+                        );
+                    }
+                }
+
+                *state = ViewDeltaApplyState::Processing {
+                    views,
+                    current_index: 0,
+                    stmt: None,
+                };
+            }
+
+            ViewDeltaApplyState::Processing {
+                views,
+                current_index,
+                stmt,
+            } => {
+                if *current_index >= views.len() {
+                    connection.transaction_changes.clear();
+                    *state = ViewDeltaApplyState::Done;
+                    return Ok(IOResult::Done(()));
+                }
+
+                let view_name = &views[*current_index];
+                if stmt.is_none() {
+                    // Downstream views acquire their subscription while an
+                    // upstream maintenance program changes its input btree.
+                    let has_delta = connection
+                        .transaction_changes
+                        .get(view_name)
+                        .is_some_and(|tx_state| !tx_state.is_empty());
+                    if !has_delta {
+                        *current_index += 1;
+                        continue;
+                    }
+
+                    let schema = connection.schema.read();
+                    let Some(view_mutex) =
+                        schema.get_materialized_view(NamespaceId::ROOT, view_name)
+                    else {
+                        *current_index += 1;
+                        continue;
+                    };
+                    let (select, root_page, num_view_columns) = {
+                        let view = view_mutex.lock();
+                        (
+                            view.select_stmt.clone(),
+                            view.get_root_page(),
+                            view.column_schema.flat_columns()?.len(),
+                        )
+                    };
+                    let program =
+                        crate::incremental::vdbe_maintenance::compile_maintenance_program(
+                            view_name,
+                            &select,
+                            root_page,
+                            num_view_columns,
+                            crate::incremental::vdbe_maintenance::MaintenanceInput::TransactionDelta,
+                            &schema,
+                            connection,
+                        )?;
+                    *stmt = Some(Box::new(crate::statement::Statement::new_with_origin(
+                        program,
+                        pager.clone(),
+                        crate::QueryMode::Normal,
+                        0,
+                        crate::statement::StatementOrigin::Subprogram,
+                        false,
+                    )));
+                }
+
+                let statement = stmt.as_mut().expect("maintenance statement was just built");
+                match statement.step_subprogram()? {
+                    StepResult::Done => {
+                        *stmt = None;
+                        *current_index += 1;
+                    }
+                    StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                        let io = statement
+                            .take_io_completions()
+                            .unwrap_or_else(|| IOCompletions(crate::Completion::new_yield()));
+                        return Ok(IOResult::IO(io));
+                    }
+                    StepResult::Row => {
+                        return Err(LimboError::InternalError(
+                            "materialized view maintenance program produced a row".to_string(),
+                        ));
+                    }
+                    StepResult::Busy => return Err(LimboError::Busy),
+                    StepResult::Interrupt => return Err(LimboError::Interrupt),
+                }
+            }
+
+            ViewDeltaApplyState::Done => return Ok(IOResult::Done(())),
+        }
+    }
+}
+
+/// Parked state for materialized-view initial population
+/// (Insn::PopulateMaterializedViews).
+#[derive(Debug)]
+pub struct PopulateMatViewsState {
+    pub view_idx: usize,
+    pub stmt: Option<Box<crate::statement::Statement>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -729,6 +884,7 @@ impl ActiveOpStateSlot {
         OpDeleteState,
         OpDeleteState {
             sub_state: OpDeleteSubState::MaybeCaptureRecord,
+            route: None,
             deleted_record: None,
         }
     );
@@ -776,7 +932,7 @@ impl ActiveOpStateSlot {
         OpInsertState,
         OpInsertState {
             sub_state: OpInsertSubState::MaybeCaptureRecord,
-            has_dependent_views: false,
+            route: None,
             old_record: None,
             is_noop_update: false,
         }
@@ -886,6 +1042,9 @@ pub struct ProgramState {
     pub(crate) extension_state: crate::native_ext::ExtensionState,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
+    /// Database id associated with each opened cursor. Ephemeral and pseudo
+    /// cursors have no database id.
+    cursor_databases: Vec<Option<usize>>,
     /// Immutable execution/storage context captured when each index-method
     /// cursor is first opened for this statement.
     pub(crate) index_method_contexts:
@@ -948,6 +1107,9 @@ pub struct ProgramState {
     /// `SQLITE_BUSY` halt through `op_halt`, which would mis-wrap it as
     /// a constraint error.
     pub sequence_inner_retry_count: u32,
+    /// The time "now" means for the date and time functions during the
+    /// current step. See `StatementClock`.
+    pub(crate) current_time: Option<crate::WallClockInstant>,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     active_op_state: ActiveOpStateSlot,
@@ -956,7 +1118,10 @@ pub struct ProgramState {
     pub metrics: StatementMetrics,
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
-    view_delta_state: ViewDeltaCommitState,
+    view_delta_state: ViewDeltaApplyState,
+    /// Parked state for Insn::PopulateMaterializedViews: the population
+    /// statement currently being stepped, re-entrant across I/O yields.
+    pub(crate) populate_matviews_state: Option<PopulateMatViewsState>,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
@@ -973,9 +1138,10 @@ pub struct ProgramState {
     /// When a constraint error occurs with FAIL resolve type in autocommit mode,
     /// we need to commit partial changes before returning the error.
     pub(crate) pending_fail_error: Option<LimboError>,
-    /// FAIL can escape a trigger before the parent reaches its Halt opcode.
-    /// Keep the error here while index-method writes from earlier rows finish
-    /// through the normal resumable I/O path.
+    /// A FAIL-mode error ends the statement without reaching the normal
+    /// Halt completion, but keeps the rows written before it. Keep the error
+    /// here while those rows reach the materialized views and their
+    /// index-method writes finish, through the normal resumable I/O path.
     pending_fail_prepare_error: Option<LimboError>,
     /// True once the Halt opcode has started finishing the statement. The
     /// statement's outcome is decided at that point, so an interrupt request
@@ -1008,6 +1174,7 @@ pub struct ProgramState {
     /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
     /// the statement subtransactionwill roll back.
     fk_immediate_violations_during_stmt: AtomicIsize,
+    fk_immediate_violation: Option<LimboError>,
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
@@ -1018,6 +1185,12 @@ pub struct ProgramState {
     /// The connection's MvStore handle, revalidated with one pointer compare
     /// per use instead of a full ArcSwap load (see `ProgramState::mv_store`).
     mv_store_cache: Option<arc_swap::Cache<MvStoreHandle, Option<Arc<MvStore>>>>,
+    /// Set when `begin_fresh_mvcc_tx` succeeds for the first statement of a
+    /// deferred explicit transaction (`Pending { .. }`). Holds (db_index,
+    /// concurrent_flag). When the statement fails before returning any rows,
+    /// the error path rolls back the MVCC tx and restores `Pending` so the
+    /// snapshot is taken at the first SUCCESSFUL statement instead.
+    pub(crate) pending_fresh_tx: Option<(usize, bool)>,
 }
 
 /// Lets an `arc_swap::Cache` follow the MvStore slot of a database.
@@ -1049,6 +1222,7 @@ crate::assert::assert_send_sync!(ProgramState);
 impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
         let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
+        let cursor_databases = vec![None; max_cursors];
         let cursor_seqs = vec![0i64; max_cursors];
         let registers = (0..max_registers)
             .map(|_| Register::Value(Value::Null))
@@ -1061,6 +1235,7 @@ impl ProgramState {
             extension_state: crate::native_ext::ExtensionState::None,
             pc: 0,
             cursors,
+            cursor_databases,
             index_method_contexts: vec![None; max_cursors],
             closed_index_method_cursors: Vec::new(),
             index_method_finalize_cursor: 0,
@@ -1083,6 +1258,7 @@ impl ProgramState {
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
             sequence_inner_retry_count: 0,
+            current_time: None,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
             active_op_state: ActiveOpStateSlot::default(),
@@ -1090,10 +1266,12 @@ impl ProgramState {
             metrics: StatementMetrics::new(),
             distinct_key_values: Vec::new(),
             op_vacuum_state: VacuumOpState::None,
-            view_delta_state: ViewDeltaCommitState::NotStarted,
+            view_delta_state: ViewDeltaApplyState::NotStarted,
+            populate_matviews_state: None,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
+            fk_immediate_violation: None,
             rowsets: HashMap::default(),
             spare_agg_payloads: Vec::new(),
             bloom_filters: HashMap::default(),
@@ -1112,6 +1290,7 @@ impl ProgramState {
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
             mv_store_cache: None,
+            pending_fresh_tx: None,
         }
     }
 
@@ -1176,6 +1355,7 @@ impl ProgramState {
 
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);
+            self.cursor_databases.resize(max_cursors, None);
             self.index_method_contexts.resize_with(max_cursors, || None);
             self.cursor_seqs.resize(max_cursors, 0);
             self.deferred_seeks.resize(max_cursors, None);
@@ -1189,6 +1369,7 @@ impl ProgramState {
             self.registers = registers.into_boxed_slice();
         }
         // reset cursors as they can have cached information which will be no longer relevant on next program execution
+        self.cursor_databases.fill(None);
         for (cursor, context) in self
             .cursors
             .iter_mut()
@@ -1231,6 +1412,7 @@ impl ProgramState {
         self.execution_state = ProgramExecutionState::Init;
         self.query_deadline = None;
         self.explicit_checkpoint_guard = None;
+        self.current_time = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
 
@@ -1249,9 +1431,11 @@ impl ProgramState {
         // here only releases its references.
         self.sequence_inner_commit = None;
         self.op_vacuum_state = VacuumOpState::None;
-        self.view_delta_state = ViewDeltaCommitState::NotStarted;
+        self.view_delta_state = ViewDeltaApplyState::NotStarted;
+        self.populate_matviews_state = None;
         self.auto_txn_cleanup = TxnCleanup::None;
         *self.fk_immediate_violations_during_stmt.get_mut() = 0;
+        self.fk_immediate_violation = None;
         *self.fk_deferred_violations_when_stmt_started.get_mut() = 0;
         if !self.rowsets.is_empty() {
             self.rowsets.clear();
@@ -1279,6 +1463,7 @@ impl ProgramState {
         self.halt_in_progress = false;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
+        self.pending_fresh_tx = None;
     }
 
     pub(crate) fn record_statement_change(&self) {
@@ -1568,6 +1753,7 @@ impl ProgramState {
         // Reset the immediate foreign key violations counter to 0. If this is nonzero when the statement completes, the statement subtransaction will roll back.
         self.fk_immediate_violations_during_stmt
             .store(0, Ordering::Release);
+        self.fk_immediate_violation = None;
         Ok(IOResult::Done(()))
     }
 
@@ -1583,6 +1769,7 @@ impl ProgramState {
         pager: &Arc<Pager>,
         end_statement: EndStatement,
     ) -> Result<()> {
+        let ends_write_statement = self.is_active_write;
         if self.is_active_write {
             let previous = connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
             turso_assert!(
@@ -1591,11 +1778,33 @@ impl ProgramState {
             );
             self.is_active_write = false;
         }
+        // A write statement that keeps its changes must have applied them to
+        // the materialized views first (see
+        // `Program::maintain_views_for_kept_changes`). Everything left in the
+        // transaction change log after this point would be applied later,
+        // by some other statement. The check is one atomic load.
+        if ends_write_statement && end_statement == EndStatement::ReleaseSavepoint {
+            turso_assert!(
+                connection.transaction_changes.is_empty(),
+                "write statement kept changes that never reached its materialized views"
+            );
+        }
         // If begin_statement was never called, no savepoint/FK cleanup needed.
         if !self.has_stmt_transaction {
             return Ok(());
         }
         self.has_stmt_transaction = false;
+
+        // The change log was empty when this write statement started (see
+        // `Program::maintain_views_for_kept_changes`), so everything in it now
+        // was captured by this statement. Rolling the statement back therefore
+        // discards the whole log, together with the btree writes it mirrors.
+        if ends_write_statement
+            && end_statement == EndStatement::RollbackSavepoint
+            && !connection.transaction_changes.is_empty()
+        {
+            connection.transaction_changes.clear();
+        }
 
         // Drain attached pagers upfront so we can clean them up regardless of path.
         let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
@@ -1745,6 +1954,12 @@ impl ProgramState {
             .load(Ordering::Acquire)
     }
 
+    pub(crate) fn immediate_foreign_key_error(&self) -> LimboError {
+        self.fk_immediate_violation.clone().unwrap_or_else(|| {
+            LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string())
+        })
+    }
+
     pub fn increment_fk_immediate_violations_during_stmt(&self, v: isize) {
         self.fk_immediate_violations_during_stmt
             .fetch_add(v, Ordering::AcqRel);
@@ -1864,6 +2079,7 @@ pub struct PreparedProgram {
     /// mirrors: <https://sqlite.org/c3ref/stmt_readonly.html>.
     pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
+    pub result_column_types: Vec<Option<crate::statement::ColumnTypeInfo>>,
     pub table_references: TableReferences,
     pub sql: String,
     /// The statement is ANALYZE, so its completion refreshes the in-memory
@@ -1878,6 +2094,14 @@ pub struct PreparedProgram {
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.
     pub is_subprogram: bool,
+    /// Whether the schema this program was translated against has any
+    /// materialized views. Lets `op_insert`/`op_delete` skip change-log
+    /// routing entirely for ordinary databases. A schema change always bumps
+    /// the schema cookie, which forces this program to be reprepared (see
+    /// `CheckSchemaCookie` in `core/vdbe/execute.rs`) before it can observe a
+    /// materialized view that didn't exist when it was built, so the flag
+    /// can't go stale while this program is running.
+    pub has_materialized_views: bool,
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
     /// Set of attached database indices that need write transactions.
@@ -2307,6 +2531,9 @@ impl Program {
             }
             _ => {}
         }
+        if !matches!(result, ProgramStep::IO | ProgramStep::Yield) {
+            state.current_time = None;
+        }
         return result;
 
         #[inline(never)]
@@ -2505,11 +2732,12 @@ impl Program {
         None
     }
 
-    /// A trigger returned FAIL before the parent program reached Halt. FAIL
-    /// keeps changes made by earlier rows, so their index-method writes must
-    /// finish before abort() releases the statement savepoint and commits
-    /// those partial changes. None means the staging finished its IO inline
-    /// and the loop starts over.
+    /// A FAIL-mode error (ON CONFLICT FAIL, or RAISE(FAIL) in a trigger)
+    /// ended the statement before the normal Halt completion. FAIL keeps
+    /// changes made by earlier rows, so they must reach the materialized
+    /// views and their index-method writes must finish before abort()
+    /// releases the statement savepoint and commits those partial changes.
+    /// None means this work finished its IO inline and the loop starts over.
     #[cold]
     #[inline(never)]
     fn prepare_pending_fail(
@@ -2522,7 +2750,12 @@ impl Program {
             .pending_fail_prepare_error
             .take()
             .expect("the caller checked the pending error");
-        match execute::index_method_stage_statement_all(state) {
+        let prepared = match self.maintain_views_for_kept_changes(state, pager) {
+            Ok(IOResult::Done(())) => execute::index_method_stage_statement_all(state),
+            Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+            Err(err) => Err(Box::new(err)),
+        };
+        match prepared {
             Ok(IOResult::Done(())) => {
                 if let Err(abort_err) = self.abort(pager, Some(&fail_error), state, true) {
                     tracing::error!("Abort failed after preparing FAIL index methods: {abort_err}");
@@ -2544,11 +2777,13 @@ impl Program {
             }
             Err(prepare_error) => {
                 // FAIL may keep earlier base-table rows only when every
+                // dependent materialized view was maintained and every
                 // matching index-method write was staged successfully.
-                // Once preparation fails, committing those rows would
-                // leave the table and index out of sync, so roll back the
-                // whole transaction while returning the real preparation
-                // error to the caller.
+                // Once either fails, committing those rows would leave the
+                // table out of sync with its views or indexes. A FAIL
+                // statement usually has no statement journal to undo just
+                // its own rows, so roll back the whole transaction while
+                // returning the real preparation error to the caller.
                 let rollback_error =
                     LimboError::Raise(ResolveType::Rollback, prepare_error.to_string());
                 if let Err(abort_err) = self.abort(pager, Some(&rollback_error), state, true) {
@@ -2677,18 +2912,19 @@ impl Program {
         pager: &Arc<Pager>,
         err: LimboError,
     ) -> Option<ProgramStep> {
-        match err {
+        match err.into_structured_constraint() {
             LimboError::Busy => Some(ProgramStep::Busy),
             LimboError::BusySnapshot
-                if self.connection.transaction_state.get() == TransactionState::None =>
+                if matches!(
+                    self.connection.transaction_state.get(),
+                    TransactionState::None | TransactionState::Pending { .. }
+                ) =>
             {
-                // For interactive transactions that are already in a read transaction, retrying BusySnapshot is pointless
-                // because the snapshot will continue to be stale no matter how many times we retry.
-                // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
-                // back, so auto-retrying can be useful.
                 Some(ProgramStep::Busy)
             }
-            err if (matches!(err, LimboError::Constraint(_))
+            err if ((matches!(err, LimboError::Constraint(_))
+                || matches!(err, LimboError::ConstraintViolation(_)))
+                && !err.is_foreign_key_constraint()
                 && self.resolve_type == ResolveType::Fail)
                 || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
             {
@@ -2704,108 +2940,55 @@ impl Program {
         }
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
-    fn apply_view_deltas(
+    /// Apply and consume the transaction change log, resetting the resumable
+    /// state once the batch is complete.
+    ///
+    /// Write statements that keep their changes call this (through
+    /// `maintain_views_for_kept_changes`) before releasing their statement
+    /// savepoint. Consequently the view btree and every hidden
+    /// operator integral advance in the same transaction as the base-table
+    /// write. Commit calls it as well to consume any batch left by an unusual
+    /// execution path.
+    pub(crate) fn apply_pending_view_deltas(
         &self,
         state: &mut ProgramState,
         rollback: bool,
         pager: &Arc<Pager>,
-    ) -> IOResultOr<()> {
-        use crate::types::IOResult;
-
-        loop {
-            match &state.view_delta_state {
-                ViewDeltaCommitState::NotStarted => {
-                    if self.connection.view_transaction_states.is_empty() {
-                        return Ok(IOResult::Done(()));
-                    }
-
-                    if rollback {
-                        // On rollback, just clear and done
-                        self.connection.view_transaction_states.clear();
-                        return Ok(IOResult::Done(()));
-                    }
-
-                    // Not a rollback - proceed with processing
-                    let schema = self.connection.schema.read();
-
-                    // Collect materialized views - they should all have storage
-                    let mut views = Vec::new();
-                    for view_name in self.connection.view_transaction_states.get_view_names() {
-                        if let Some(view_mutex) = schema.get_materialized_view(&view_name) {
-                            let view = view_mutex.lock();
-                            let root_page = view.get_root_page();
-
-                            // Materialized views should always have storage (root_page != 0)
-                            turso_assert_ne!(
-                                root_page, 0,
-                                "Materialized view should have a root page",
-                                { "view_name": view_name }
-                            );
-
-                            views.push(view_name);
-                        }
-                    }
-
-                    state.view_delta_state = ViewDeltaCommitState::Processing {
-                        views,
-                        current_index: 0,
-                    };
-                }
-
-                ViewDeltaCommitState::Processing {
-                    views,
-                    current_index,
-                } => {
-                    // At this point we know it's not a rollback
-                    if *current_index >= views.len() {
-                        // All done, clear the transaction states
-                        self.connection.view_transaction_states.clear();
-                        state.view_delta_state = ViewDeltaCommitState::Done;
-                        return Ok(IOResult::Done(()));
-                    }
-
-                    let view_name = &views[*current_index];
-
-                    let table_deltas = self
-                        .connection
-                        .view_transaction_states
-                        .get(view_name)
-                        .expect("view should have transaction state")
-                        .get_table_deltas();
-
-                    let schema = self.connection.schema.read();
-                    if let Some(view_mutex) = schema.get_materialized_view(view_name) {
-                        let mut view = view_mutex.lock();
-
-                        // Create a DeltaSet from the per-table deltas
-                        let mut delta_set = crate::incremental::compiler::DeltaSet::new();
-                        for (table_name, delta) in table_deltas {
-                            delta_set.insert(table_name, delta);
-                        }
-
-                        // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
-                        match view.merge_delta(delta_set, pager.clone())? {
-                            IOResult::Done(_) => {
-                                // Move to next view
-                                state.view_delta_state = ViewDeltaCommitState::Processing {
-                                    views: views.clone(),
-                                    current_index: current_index + 1,
-                                };
-                            }
-                            IOResult::IO(io) => {
-                                // Return I/O, will resume at same index
-                                return Ok(IOResult::IO(io));
-                            }
-                        }
-                    }
-                }
-
-                ViewDeltaCommitState::Done => {
-                    return Ok(IOResult::Done(()));
-                }
+    ) -> Result<IOResult<()>> {
+        match step_view_delta_batch(
+            &self.connection,
+            &mut state.view_delta_state,
+            rollback,
+            pager,
+        )? {
+            IOResult::IO(io) => Ok(IOResult::IO(io)),
+            IOResult::Done(()) => {
+                state.view_delta_state = ViewDeltaApplyState::NotStarted;
+                Ok(IOResult::Done(()))
             }
         }
+    }
+
+    /// Apply the changes a finishing write statement keeps to the
+    /// materialized views, before its statement savepoint is released.
+    ///
+    /// Every path on which a write statement ends and keeps its changes runs
+    /// this first: the normal Halt, and a FAIL-mode error (ON CONFLICT FAIL
+    /// or RAISE(FAIL)), which keeps the rows written before the error. So the
+    /// transaction change log is empty whenever no write statement is
+    /// running. That lets a statement rollback discard the whole log, and
+    /// lets a named savepoint ignore it. Statements that captured nothing
+    /// (no materialized view reads what they wrote) stop at the emptiness
+    /// check.
+    pub(crate) fn maintain_views_for_kept_changes(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+    ) -> Result<IOResult<()>> {
+        if !state.is_active_write || self.connection.transaction_changes.is_empty() {
+            return Ok(IOResult::Done(()));
+        }
+        self.apply_pending_view_deltas(state, false, pager)
     }
 
     pub fn commit_txn(
@@ -2825,14 +3008,11 @@ impl Program {
             );
         }
 
-        // Apply view deltas with I/O handling
-        match self.apply_view_deltas(program_state, rollback, &pager)? {
+        // Apply any view deltas not already consumed at statement completion.
+        match self.apply_pending_view_deltas(program_state, rollback, &pager)? {
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
             IOResult::Done(_) => {}
         }
-
-        // Reset state for next use
-        program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
         // Drop virtual table cursors before the `is_nested_stmt()` check
         // below: a pragma virtual table cursor owns a nested helper statement
         // whose guard would otherwise make this top-level statement classify
@@ -2954,7 +3134,8 @@ impl Program {
                     self.end_attached_read_txns(&connection);
                     Ok(IOResult::Done(()))
                 }
-                TransactionState::None => {
+                TransactionState::None | TransactionState::Pending { .. } => {
+                    connection.set_tx_state(TransactionState::None);
                     match self.end_attached_write_txns(&connection, rollback)? {
                         IOResult::Done(_) => {}
                         IOResult::IO(io) => {
@@ -3004,10 +3185,9 @@ impl Program {
             if let Some(tx_id) = conn.get_mv_tx_id() {
                 let state_machine = mv_store.commit_tx(tx_id, &conn, crate::MAIN_DB_ID)?;
                 program_state.commit_state = CommitState::CommittingMvcc { state_machine };
+            } else {
+                conn.set_tx_state(TransactionState::None);
             }
-            // If no main MVCC tx, commit_state stays Ready and we fall
-            // through directly to phase 2 (the CommittingMvcc and
-            // CommittingAttachedMvcc checks will both miss).
         }
 
         if matches!(
@@ -3021,9 +3201,7 @@ impl Program {
             match self.step_end_mvcc_txn(state_machine, mv_store)? {
                 IOResult::Done(_) => {
                     assert!(state_machine.is_finalized());
-                    conn.set_mv_tx(None);
-                    conn.set_tx_state(TransactionState::None);
-                    pager.end_read_tx();
+                    conn.end_committed_main_mvcc_tx(&pager);
                     program_state.commit_state = CommitState::Ready;
                     // Fall through to attached phase
                 }
@@ -3374,7 +3552,9 @@ impl Program {
         let keeps_prior_changes = match err {
             Some(LimboError::RaiseIgnore) => true,
             Some(LimboError::Raise(ResolveType::Fail, _)) => true,
-            Some(LimboError::Constraint(_)) => self.resolve_type == ResolveType::Fail,
+            Some(error @ (LimboError::Constraint(_) | LimboError::ConstraintViolation(_))) => {
+                !error.is_foreign_key_constraint() && self.resolve_type == ResolveType::Fail
+            }
             _ => false,
         };
         if (err.is_some() || state.execution_state.is_running()) && !keeps_prior_changes {
@@ -3423,6 +3603,7 @@ impl Program {
         }
         // Errors from nested statements are handled by the parent statement.
         if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
+            state.pending_fresh_tx = None;
             let unfinished_statement_reset_or_drop =
                 err.is_none() && state.execution_state.is_running();
             let inside_explicit_transaction = !self.connection.get_auto_commit();
@@ -3440,6 +3621,13 @@ impl Program {
                 // statement, we cannot pretend COMMIT is still safe: there is
                 // no statement savepoint to undo only the partial UPDATE.
                 self.connection.mark_tx_poisoned();
+                // The transaction can no longer commit. Drop the unfinished
+                // writer's view changes too, so the change log stays empty
+                // while no write statement runs (see
+                // `maintain_views_for_kept_changes`).
+                if !self.connection.transaction_changes.is_empty() {
+                    self.connection.transaction_changes.clear();
+                }
             }
 
             let can_autocommit_now = state.can_autocommit_now(&self.connection, self_counted);
@@ -3462,7 +3650,9 @@ impl Program {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
                 // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
-                let is_fail_constraint = (matches!(err, Some(LimboError::Constraint(_)))
+                let is_fail_constraint = ((matches!(err, Some(LimboError::Constraint(_)))
+                    || matches!(err, Some(LimboError::ConstraintViolation(_))))
+                    && !err.is_some_and(LimboError::is_foreign_key_constraint)
                     && self.resolve_type == ResolveType::Fail)
                     || matches!(err, Some(LimboError::Raise(ResolveType::Fail, _)));
                 if !is_fail_constraint {
@@ -3517,7 +3707,7 @@ impl Program {
                 // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.
                 // FK errors always behave like ABORT: rollback statement,
                 // rollback transaction in autocommit mode.
-                Some(LimboError::ForeignKeyConstraint(_)) => {
+                Some(error) if error.is_foreign_key_constraint() => {
                     if must_rollback_tx_if_needed {
                         self.rollback_current_txn(pager);
                     }
@@ -3529,7 +3719,9 @@ impl Program {
                 // - ROLLBACK: rollback the entire transaction regardless of autocommit mode
                 // - FAIL: don't rollback anything - changes persist, transaction stays active
                 // - ABORT (default): rollback statement, rollback txn if autocommit
-                Some(LimboError::Constraint(_)) | Some(LimboError::Raise(_, _)) => {
+                Some(LimboError::Constraint(_))
+                | Some(LimboError::ConstraintViolation(_))
+                | Some(LimboError::Raise(_, _)) => {
                     let effective_resolve = match err {
                         Some(LimboError::Raise(rt, _)) => *rt,
                         _ => self.resolve_type,
@@ -3554,6 +3746,11 @@ impl Program {
                                     "Failed to release statement savepoint during abort",
                                 );
                             }
+                            // The fresh MVCC tx opened for the first statement of a Pending
+                            // explicit tx is now adopted — FAIL keeps changes in the tx.
+                            // Clear it so rollback_pending_fresh_tx_if_needed does not
+                            // undo it after abort() returns.
+                            state.pending_fresh_tx = None;
                             if can_autocommit_now {
                                 // Autocommit FAIL: commit partial changes.
                                 // This matches halt()'s FAIL+autocommit path.
@@ -3607,8 +3804,11 @@ impl Program {
                                 // delivered it before returning the error;
                                 // only the trigger RAISE(FAIL) shape reaches
                                 // the commit through this arm.
-                                let halt_already_delivered =
-                                    matches!(err, Some(LimboError::Constraint(_)));
+                                let halt_already_delivered = matches!(
+                                    err,
+                                    Some(LimboError::Constraint(_))
+                                        | Some(LimboError::ConstraintViolation(_))
+                                );
                                 if committed && !halt_already_delivered {
                                     execute::index_method_on_transaction_committed_all(
                                         state,
@@ -4018,7 +4218,7 @@ fn start_blob_register(dest: &mut Register, blob_data: &[u8]) -> Result<()> {
 /// Decodes the value of `serial_type` at the front of `data` into `dest`
 /// and moves `data` past it.
 #[inline(always)]
-fn decode_serial_type_into_register(
+pub(crate) fn decode_serial_type_into_register(
     serial_type: u64,
     data: &mut &[u8],
     dest: &mut Register,
@@ -4163,6 +4363,7 @@ fn decode_serial_type_into_register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ConnectOpts;
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     #[test]
@@ -4193,7 +4394,7 @@ mod tests {
             let io = Arc::new(crate::MemoryIO::new());
             let db =
                 crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
-            let conn = db.connect().unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
             conn.set_vdbe_trace(trace);
             let mut stmt = conn.prepare("SELECT 1 UNION ALL SELECT 2").unwrap();
             assert_eq!(stmt.execution_state(), ProgramExecutionState::Init);
@@ -4364,7 +4565,7 @@ mod tests {
 
         *state.active_op_state.insert() = OpInsertState {
             sub_state: OpInsertSubState::Seek,
-            has_dependent_views: false,
+            route: None,
             old_record: None,
             is_noop_update: false,
         };

@@ -2,7 +2,7 @@ use asserting::prelude::*;
 use std::sync::Arc;
 use turso::IoBackend;
 use turso_core::SqliteDialect;
-use turso_core::{Database, OpenFlags};
+use turso_core::{ConnectOpts, Database, OpenFlags};
 use turso_sdk_kit::rsapi::{TursoDatabase, TursoDatabaseConfig, TursoStatusCode};
 
 /// Regression test: DATABASE_MANAGER registry returns stale Database after
@@ -33,7 +33,7 @@ fn test_database_rename_registry_stale() {
     )
     .unwrap();
 
-    let conn_a = db_a.connect().unwrap();
+    let conn_a = db_a.connect(ConnectOpts::new()).unwrap();
     conn_a.execute("CREATE TABLE t(x INTEGER)").unwrap();
     conn_a.execute("INSERT INTO t VALUES (42)").unwrap();
 
@@ -66,7 +66,7 @@ fn test_database_rename_registry_stale() {
     .unwrap();
 
     // 5. The new A.db should be empty — querying table 't' should fail.
-    let conn_a2 = db_a2.connect().unwrap();
+    let conn_a2 = db_a2.connect(ConnectOpts::new()).unwrap();
     // A new database at A.db has no table `t`. Before the fix,
     // DATABASE_MANAGER returned the stale Database after the rename.
     assert_that!(conn_a2.execute("SELECT x FROM t")).is_err();
@@ -171,6 +171,34 @@ fn test_open_refuses_file_with_unknown_virtual_table_module() {
     }
 }
 
+/// The SQLite dialect must refuse a table written by the PostgreSQL frontend,
+/// as sqlite3 does. Reading it as a plain SQLite table drops the PostgreSQL
+/// column types and rowid alias, so writes store values tursopg cannot read.
+#[test]
+fn test_open_refuses_file_with_postgres_table() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("postgres.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            "CREATE TABLE t(id serial PRIMARY KEY, n numeric(10,2));
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema SET sql = '/* turso_frontend:postgres */ ' || sql
+              WHERE name = 't';",
+        )
+        .unwrap();
+    drop(sqlite);
+
+    let err = match open_plain_file(&path) {
+        Err(err) => err,
+        Ok(_) => panic!("expected malformed schema error, got a successful open"),
+    };
+    let turso_core::LimboError::Corrupt(msg) = err else {
+        panic!("expected malformed schema error, got {err:?}");
+    };
+    assert_that!(msg).contains("malformed database schema");
+}
+
 /// Regression test: TursoConnection.close() must finalize outstanding statements
 /// so that the Statement → Arc<Connection> → Arc<Database> chain is broken.
 ///
@@ -256,7 +284,7 @@ fn test_sdk_close_finalizes_leaked_statements() {
     .unwrap();
 
     // 7. The new A.db should be empty — table 't' should NOT exist.
-    let conn_a2 = db_a2.connect().unwrap();
+    let conn_a2 = db_a2.connect(ConnectOpts::new()).unwrap();
     let result = conn_a2.execute("SELECT x FROM t");
     assert!(
         result.is_err(),
@@ -285,7 +313,7 @@ fn test_database_open_with_options() {
             .flags(OpenFlags::Create),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
@@ -429,4 +457,90 @@ fn test_do_open_skips_registry() {
         Arc::ptr_eq(&registered, &registered_again),
         "open() must still return the registered instance; do_open must not replace it"
     );
+}
+
+/// Division by zero is a dialect property: a dialect that overrides
+/// `errors_on_zero_divisor()` to return `true` raises `LimboError::DivisionByZero`;
+/// the default SQLite dialect returns NULL. A NULL dividend returns NULL in
+/// both cases.
+#[test]
+fn test_errors_on_zero_divisor_dialect() {
+    use crate::common::TempDatabase;
+    use std::sync::Arc;
+    use turso_core::{Dialect, LimboError, SqliteDialect};
+
+    struct DivisionRaisesErrorDialect;
+    impl Dialect for DivisionRaisesErrorDialect {
+        fn name(&self) -> &'static str {
+            SqliteDialect.name()
+        }
+        fn parse(&self, sql: &str) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            SqliteDialect.parse(sql)
+        }
+        fn parse_table_sql(
+            &self,
+            sql: &str,
+            root_page: i64,
+        ) -> turso_core::Result<turso_core::schema::BTreeTable> {
+            SqliteDialect.parse_table_sql(sql, root_page)
+        }
+        fn parse_table_sql_ast(&self, sql: &str) -> turso_core::Result<turso_parser::ast::Stmt> {
+            SqliteDialect.parse_table_sql_ast(sql)
+        }
+        fn table_sql_for_replay(&self, sql: &str) -> turso_core::Result<String> {
+            SqliteDialect.table_sql_for_replay(sql)
+        }
+        fn format_table_sql(
+            &self,
+            input: &str,
+            tbl_name: &turso_parser::ast::QualifiedName,
+            body: &turso_parser::ast::CreateTableBody,
+        ) -> turso_core::Result<String> {
+            SqliteDialect.format_table_sql(input, tbl_name, body)
+        }
+        fn register_catalog(
+            &self,
+            schema: &mut turso_core::schema::Schema,
+            enable_custom_types: bool,
+        ) -> turso_core::Result<()> {
+            SqliteDialect.register_catalog(schema, enable_custom_types)
+        }
+        fn resolve_function(
+            &self,
+            name: &str,
+            arg_count: usize,
+        ) -> turso_core::Result<Option<turso_core::Func>> {
+            SqliteDialect.resolve_function(name, arg_count)
+        }
+        fn errors_on_zero_divisor(&self) -> bool {
+            true
+        }
+    }
+
+    let raising = TempDatabase::builder()
+        .with_dialect(Arc::new(DivisionRaisesErrorDialect))
+        .build();
+    let conn = raising.connect_limbo();
+    for sql in ["SELECT 1/0", "SELECT 1 % 0", "SELECT 1/0.0"] {
+        let err = conn.execute(sql).expect_err(sql);
+        assert!(
+            matches!(err, LimboError::DivisionByZero),
+            "{sql}: expected DivisionByZero, got {err:?}"
+        );
+    }
+    let mut stmt = conn.prepare("SELECT NULL/0").unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert!(matches!(rows[0][0], turso_core::Value::Null));
+
+    let defaulted = TempDatabase::builder().build();
+    let conn = defaulted.connect_limbo();
+    for sql in ["SELECT 1/0", "SELECT 1 % 0", "SELECT 1/0.0"] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert!(
+            matches!(rows[0][0], turso_core::Value::Null),
+            "{sql}: default must return NULL, got {:?}",
+            rows[0][0]
+        );
+    }
 }

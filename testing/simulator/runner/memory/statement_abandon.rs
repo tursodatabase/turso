@@ -3,7 +3,7 @@ use std::sync::Arc;
 use turso_core::SqliteDialect;
 
 use anyhow::Result;
-use turso_core::{Connection, Database, DatabaseOpts, IO, OpenFlags, StepResult};
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, IO, OpenFlags, StepResult};
 
 use crate::runner::SimIO;
 use crate::runner::memory::io::MemorySimIO;
@@ -38,7 +38,7 @@ fn open_conn(io: Arc<MemorySimIO>, path: &str) -> Result<Arc<Connection>> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
     Ok(conn)
 }
 
@@ -51,8 +51,8 @@ fn open_two_conns(io: Arc<MemorySimIO>, path: &str) -> Result<(Arc<Connection>, 
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn1 = db.connect()?;
-    let conn2 = db.connect()?;
+    let conn1 = db.connect(ConnectOpts::new())?;
+    let conn2 = db.connect(ConnectOpts::new())?;
     Ok((conn1, conn2))
 }
 
@@ -93,10 +93,11 @@ fn query_rows(conn: &Arc<Connection>, io: &MemorySimIO) -> Result<Vec<(i64, Stri
 
 #[test]
 fn sim_abandon_during_dml_rolls_back() -> Result<()> {
-    let (conn, io) = make_conn(1)?;
+    let (conn, writer, io) = make_two_conns(1)?;
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
 
-    let mut stmt = conn.prepare("INSERT INTO t VALUES (1, 'a'), (2, 'b') RETURNING id")?;
+    // `writer` has not cached the table's pages, so the INSERT waits on IO.
+    let mut stmt = writer.prepare("INSERT INTO t VALUES (1, 'a'), (2, 'b') RETURNING id")?;
     let first = stmt.step()?;
     assert!(
         matches!(first, StepResult::IO),
@@ -113,11 +114,12 @@ fn sim_abandon_during_dml_rolls_back() -> Result<()> {
 
 #[test]
 fn sim_abandon_after_first_returning_row_commits() -> Result<()> {
-    let (conn, io) = make_conn(2)?;
+    let (conn, writer, io) = make_two_conns(2)?;
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
 
+    // `writer` has not cached the table's pages, so the INSERT waits on IO.
     let mut stmt =
-        conn.prepare("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c') RETURNING id")?;
+        writer.prepare("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c') RETURNING id")?;
     let mut saw_io = false;
     loop {
         match stmt.step()? {

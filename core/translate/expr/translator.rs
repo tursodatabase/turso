@@ -15,7 +15,7 @@ pub enum NoConstantOptReason {
     ///    datetime('now')), so hoisting would produce incorrect results.
     ///
     /// 2. Even if the encode function were deterministic, the encode is
-    ///    applied in-place to the target register inside the update loop.
+    ///    applied in-place to the target register inside the row loop.
     ///    If the original value were hoisted (evaluated once before the
     ///    loop), the second iteration would read the already-encoded value
     ///    from the register and encode it again, causing progressive
@@ -284,28 +284,14 @@ fn copy_cached_expr_reg(
                 if let Some((_, table)) = referenced_tables.find_table_by_internal_id(*table_ref_id)
                 {
                     if let Some(col) = table.get_column_at(*column) {
-                        if let Some(type_def) = resolver
-                            .schema()
-                            .get_type_def(&col.ty_str, table.is_strict())
-                        {
-                            if let Some(decode_expr) = type_def.decode() {
-                                let skip_label = program.allocate_label();
-                                program.emit_insn(Insn::IsNull {
-                                    reg: target_register,
-                                    target_pc: skip_label,
-                                });
-                                emit_type_expr(
-                                    program,
-                                    decode_expr,
-                                    target_register,
-                                    target_register,
-                                    col,
-                                    type_def,
-                                    resolver,
-                                )?;
-                                program.preassign_label_to_next_insn(skip_label);
-                            }
-                        }
+                        emit_user_facing_column_value(
+                            program,
+                            target_register,
+                            target_register,
+                            col,
+                            table.is_strict(),
+                            resolver,
+                        )?;
                     }
                 }
             }
@@ -325,17 +311,23 @@ fn try_emit_expression_index_value_if_any(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<bool> {
-    let has_expression_indexes = !program.flags.skip_expression_index_values()
+    if !has_expression_index_values(program, referenced_tables) {
+        return Ok(false);
+    }
+    try_emit_expression_index_value(program, referenced_tables, expr, target_register, resolver)
+}
+
+pub(super) fn has_expression_index_values(
+    program: &ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+) -> bool {
+    !program.flags.skip_expression_index_values()
         && referenced_tables.is_some_and(|tables| {
             tables
                 .joined_tables()
                 .iter()
                 .any(|t| !t.expression_index_usages.is_empty())
-        });
-    if !has_expression_indexes {
-        return Ok(false);
-    }
-    try_emit_expression_index_value(program, referenced_tables, expr, target_register, resolver)
+        })
 }
 
 #[inline(never)]
@@ -759,9 +751,24 @@ fn translate_cast_expr(
     };
     translate_expr(program, referenced_tables, expr, target_register, resolver)?;
 
-    // Check if casting to a custom type
-    if let Some(ref tn) = type_name {
-        if let Some(resolved) = resolver.schema().resolve_type_unchecked(&tn.name)? {
+    let cast_type_name = type_name.as_ref().map(|tn| crate::util::dequote(&tn.name));
+
+    if let (Some(tn), Some(cast_type_name)) = (type_name, &cast_type_name) {
+        if tn.array_dimensions > 0 {
+            let mut column = Column::new(
+                None,
+                cast_type_name.clone(),
+                None,
+                None,
+                Type::Null,
+                None,
+                ColDef::default(),
+            );
+            column.set_array_dimensions(tn.array_dimensions);
+            super::arrays::emit_array_encode(program, target_register, &column, resolver, "")?;
+            return Ok(target_register);
+        }
+        if let Some(resolved) = resolver.schema().resolve_type_unchecked(cast_type_name)? {
             // Build ty_params from AST TypeSize so parametric types
             // (e.g. numeric(10,2)) get their parameters passed through.
             let ty_params: Vec<Box<ast::Expr>> = match &tn.size {
@@ -776,15 +783,6 @@ fn translate_cast_expr(
             // on the encoded value (domain CHECK sees the stored representation).
             if resolved.is_domain() {
                 // Apply encode from parent custom types (domain itself has encode: None)
-                let cast_col = Column::new(
-                    None,
-                    tn.name.clone(),
-                    None,
-                    None,
-                    Type::Null,
-                    None,
-                    ColDef::default(),
-                );
                 for td in &resolved.chain {
                     if let Some(encode_expr) = td.encode() {
                         emit_type_expr(
@@ -792,7 +790,7 @@ fn translate_cast_expr(
                             encode_expr,
                             target_register,
                             target_register,
-                            &cast_col,
+                            &[],
                             td,
                             resolver,
                         )?;
@@ -810,17 +808,6 @@ fn translate_cast_expr(
             // CAST(x AS numeric(10,2))), fall through to regular CAST.
             let user_param_count = type_def.user_params().count();
             if user_param_count == 0 || ty_params.len() == user_param_count {
-                let mut cast_col = Column::new(
-                    None,
-                    tn.name.clone(),
-                    None,
-                    None,
-                    Type::Null,
-                    None,
-                    ColDef::default(),
-                );
-                cast_col.ty_params = ty_params;
-
                 // CAST to custom type applies only the encode function,
                 // producing the stored representation.
                 // e.g. CAST(42 AS cents) → 4200
@@ -830,7 +817,7 @@ fn translate_cast_expr(
                         encode_expr,
                         target_register,
                         target_register,
-                        &cast_col,
+                        &ty_params,
                         type_def,
                         resolver,
                     )?;
@@ -841,9 +828,8 @@ fn translate_cast_expr(
     }
 
     // SQLite allows CAST(x AS) without a type name, treating it as NUMERIC affinity
-    let type_affinity = type_name
-        .as_ref()
-        .map(|t| Affinity::affinity(&t.name))
+    let type_affinity = cast_type_name
+        .map(|name| Affinity::of_written_type(&name))
         .unwrap_or(Affinity::Numeric);
     program.emit_insn(Insn::Cast {
         reg: target_register,
@@ -1929,7 +1915,9 @@ fn translate_function_call_expr(
                 | ScalarFunc::NumericMul
                 | ScalarFunc::NumericDiv
                 | ScalarFunc::NumericLt
-                | ScalarFunc::NumericEq => translate_function(
+                | ScalarFunc::NumericEq
+                | ScalarFunc::DatePlus
+                | ScalarFunc::DateMinus => translate_function(
                     program,
                     args,
                     referenced_tables,
@@ -2059,14 +2047,17 @@ fn translate_function_call_expr(
                     target_register,
                     func_ctx,
                 ),
-                ScalarFunc::CurrVal => translate_function(
-                    program,
-                    args,
-                    referenced_tables,
-                    resolver,
-                    target_register,
-                    func_ctx,
-                ),
+                ScalarFunc::CurrVal => {
+                    let runtime_args = qualify_sequence_argument(args, resolver);
+                    translate_function(
+                        program,
+                        runtime_args.as_deref().unwrap_or(args),
+                        referenced_tables,
+                        resolver,
+                        target_register,
+                        func_ctx,
+                    )
+                }
             }
         }
         Func::Math(math_func) => match math_func.arity() {
@@ -2356,7 +2347,7 @@ fn translate_self_table_column_expr(
                     resolver,
                 )
             }
-            Some(SelfTableContext::ForDML { dml_ctx, table }) => {
+            Some(SelfTableContext::ForDML { dml_ctx, table, .. }) => {
                 let Some(table_column) = table.columns().get(*column) else {
                     crate::bail_parse_error!("column index out of bounds");
                 };
@@ -2537,26 +2528,27 @@ fn translate_column_expr(
                 match table_column.generated_type() {
                     // if we're reading from an index that contains this virtual column,
                     // the index already has the computed value, so read it from the index
-                    GeneratedType::Virtual { expr, .. } if !read_from_index => {
-                        resolver.with_self_table_context(
+                    GeneratedType::Virtual { .. } if !read_from_index => {
+                        let row_cursor_id = if is_btree_index {
+                            index_cursor_id.expect("index cursor should be opened")
+                        } else {
+                            table_cursor_id
+                                .or(index_cursor_id)
+                                .expect("cursor should be opened")
+                        };
+                        do_emit_table_column(
                             program,
-                            Some(&SelfTableContext::ForSelect {
+                            row_cursor_id,
+                            &SelfTableContext::ForSelect {
                                 table_ref_id: *table_ref_id,
                                 referenced_tables: referenced_tables.unwrap().clone(),
-                            }),
-                            |program, _| {
-                                translate_expr(
-                                    program,
-                                    referenced_tables,
-                                    expr,
-                                    target_register,
-                                    resolver,
-                                )?;
-                                Ok(())
                             },
+                            referenced_tables,
+                            table_column,
+                            *column,
+                            target_register,
+                            resolver,
                         )?;
-
-                        program.emit_column_affinity(target_register, table_column.affinity());
                         // The virtual column's declared collation must override
                         // whatever collation the inner expression resolved to.
                         program.set_collation(Some((table_column.collation(), false)));
@@ -2591,24 +2583,13 @@ fn translate_column_expr(
                             *column
                         };
 
-                        // For custom type columns with ENCODE/DECODE and a
-                        // default, suppress the Column instruction's default.
-                        // We handle short records (ALTER TABLE ADD COLUMN) via
-                        // ColumnHasField after the Column instruction.
-                        let col_ref = table.get_column_at(column);
-                        if let Some(col) = col_ref {
-                            if col.default.is_some() {
-                                if let Ok(Some(resolved)) = resolver
-                                    .schema()
-                                    .resolve_type(&col.ty_str, table.is_strict())
-                                {
-                                    if resolved.chain.iter().any(|td| td.encode().is_some()) {
-                                        program.flags.set_suppress_column_default(true);
-                                    }
-                                }
-                            }
-                        }
-                        program.emit_column_or_rowid(read_cursor, column, target_register);
+                        emit_stored_column(
+                            program,
+                            read_cursor,
+                            column,
+                            target_register,
+                            resolver,
+                        )?;
                     }
                 }
                 let table_col_idx = *column;
@@ -2635,57 +2616,6 @@ fn translate_column_expr(
                 // Decode custom type columns (skipped when building ORDER BY sort keys
                 // for types without a `<` operator, so the sorter sorts on encoded values)
                 if !program.flags.suppress_custom_type_decode() {
-                    // For custom type columns with ENCODE and a DEFAULT,
-                    // we suppressed the Column default so short records
-                    // (ALTER TABLE ADD COLUMN) return NULL.  Use
-                    // ColumnHasField to detect short records and compute
-                    // ENCODE(DEFAULT) at runtime via bytecode.
-                    if let Some(type_def) = resolver
-                        .schema()
-                        .get_type_def(&column.ty_str, table.is_strict())
-                    {
-                        if type_def.encode().is_some() {
-                            if let Some(ref default_expr) = column.default {
-                                // Reconstruct the cursor id used for reading
-                                let read_cursor = if read_from_index {
-                                    index_cursor_id.expect("index cursor should be opened")
-                                } else {
-                                    table_cursor_id
-                                        .or(index_cursor_id)
-                                        .expect("cursor should be opened")
-                                };
-                                let done_label = program.allocate_label();
-                                // Jump past the default block if the record
-                                // actually has this column (not a short record).
-                                program.emit_column_has_field(
-                                    read_cursor,
-                                    table_col_idx,
-                                    done_label,
-                                );
-                                // Short record: compute DEFAULT then ENCODE it
-                                translate_expr_no_constant_opt(
-                                    program,
-                                    referenced_tables,
-                                    default_expr,
-                                    target_register,
-                                    resolver,
-                                    NoConstantOptReason::RegisterReuse,
-                                )?;
-                                if let Some(encode_expr) = type_def.encode() {
-                                    emit_type_expr(
-                                        program,
-                                        encode_expr,
-                                        target_register,
-                                        target_register,
-                                        column,
-                                        type_def,
-                                        resolver,
-                                    )?;
-                                }
-                                program.preassign_label_to_next_insn(done_label);
-                            }
-                        }
-                    }
                     emit_user_facing_column_value(
                         program,
                         target_register,
@@ -3175,6 +3105,7 @@ fn translate_raise_expr(
             }
             // RAISE(IGNORE): halt the trigger subprogram and skip the triggering row
             program.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: 0,
                 description: String::new(),
                 on_error: Some(ResolveType::Ignore),
@@ -3194,6 +3125,7 @@ fn translate_raise_expr(
                 Some(e) => match e.as_ref() {
                     ast::Expr::Literal(ast::Literal::String(s)) => {
                         program.emit_insn(Insn::Halt {
+                            constraint_info: None,
                             err_code,
                             description: sanitize_string(s),
                             on_error: Some(*resolve_type),
@@ -3205,6 +3137,7 @@ fn translate_raise_expr(
                         let reg = program.alloc_register();
                         translate_expr(program, referenced_tables, e, reg, resolver)?;
                         program.emit_insn(Insn::Halt {
+                            constraint_info: None,
                             err_code,
                             description: String::new(),
                             on_error: Some(*resolve_type),

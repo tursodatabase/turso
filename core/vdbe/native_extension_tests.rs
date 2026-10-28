@@ -1,11 +1,12 @@
 use crate::alloc::TryClone;
 use crate::function::ExternalFunc;
+use crate::namespace::NamespaceId;
 use crate::native_ext::*;
 use crate::sync::{Arc, Mutex};
 use crate::types::{AggContext, ExternalAggState, IOCompletions, IOResultOr};
 use crate::{
-    Completion, Connection, Database, IOResult, LimboError, MemoryIO, Numeric, OpenOptions,
-    Register, Result, SqliteDialect, Statement, StepResult, Value,
+    Completion, ConnectOpts, Connection, Database, IOResult, LimboError, MemoryIO, Numeric,
+    OpenOptions, Register, Result, SqliteDialect, Statement, StepResult, Value,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -104,7 +105,7 @@ fn native_scalar_receives_each_executing_connection() {
             .unwrap(),
         ),
     );
-    let other = conn.db.connect().unwrap();
+    let other = conn.db.connect(ConnectOpts::new()).unwrap();
     conn.execute("CREATE TABLE t(x)").unwrap();
     conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
     other.execute("INSERT INTO t VALUES (4)").unwrap();
@@ -391,7 +392,7 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
                     conn.execute("COMMIT").unwrap();
                 }
                 conn.execute("INSERT INTO audit VALUES (504)").unwrap();
-                let other = conn.db.connect().unwrap();
+                let other = conn.db.connect(ConnectOpts::new()).unwrap();
                 for table in ["parent", "child"] {
                     assert!(other
                         .prepare(format!("SELECT id FROM {table}"))
@@ -654,7 +655,7 @@ fn scalar_calls_resume_independently_and_create_once() {
         ),
     );
     let mut first = conn.prepare("SELECT delayed(7, 3)").unwrap();
-    let other = conn.db.connect().unwrap();
+    let other = conn.db.connect(ConnectOpts::new()).unwrap();
     let mut second = other.prepare("SELECT delayed(2, 9)").unwrap();
     assert!(matches!(first.step().unwrap(), StepResult::IO));
     assert!(matches!(second.step().unwrap(), StepResult::IO));
@@ -877,7 +878,7 @@ fn aggregates_resume_steps_and_finalization_for_each_group() {
         ]
     );
     assert_eq!(created.load(Ordering::SeqCst), 4);
-    let other = conn.db.connect().unwrap();
+    let other = conn.db.connect(ConnectOpts::new()).unwrap();
     other.set_vdbe_trace(true);
     let mut empty = other.prepare("SELECT weighted(3, 7) WHERE 0").unwrap();
     assert_eq!(
@@ -1088,7 +1089,10 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
         )
         .unwrap();
     assert!(matches!(
-        schema.get_table("reloaded").unwrap().as_ref(),
+        schema
+            .get_table(NamespaceId::ROOT, "reloaded")
+            .unwrap()
+            .as_ref(),
         crate::schema::Table::Virtual(_)
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 5);
@@ -1200,7 +1204,7 @@ fn native_table_functions_survive_mvcc_schema_refresh_and_other_connection_ddl()
             collect(&mut stmt, &queue),
             vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]]
         );
-        let other = conn.db.connect().unwrap();
+        let other = conn.db.connect(ConnectOpts::new()).unwrap();
         other.execute("CREATE TABLE unrelated(value)").unwrap();
         stmt.reset().unwrap();
         assert_eq!(
@@ -1247,16 +1251,18 @@ fn native_table_function_views_survive_checkpoint_and_reopen() {
                 .run_collect_rows()
                 .unwrap()
         };
-        let expected_columns = vec![
-            vec![Value::build_text("value")],
-            vec![Value::build_text("lower_bound")],
-        ];
+        let expected_columns = vec![vec![Value::build_text("value")]];
+        let expected_rows = vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]];
         {
             let db = open();
-            let conn = db.connect().unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
             if mvcc {
                 conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
             }
+            let mut direct = conn
+                .prepare("SELECT * FROM native_rows(8) ORDER BY value")
+                .unwrap();
+            assert_eq!(collect(&mut direct, &queue), expected_rows);
             conn.execute("CREATE VIEW native_view AS SELECT * FROM native_rows(8)")
                 .unwrap();
             assert_eq!(columns(&conn), expected_columns);
@@ -1264,15 +1270,12 @@ fn native_table_function_views_survive_checkpoint_and_reopen() {
             assert_eq!(columns(&conn), expected_columns);
         }
         let db = open();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         assert_eq!(columns(&conn), expected_columns);
         let mut stmt = conn
-            .prepare("SELECT value FROM native_view ORDER BY value")
+            .prepare("SELECT * FROM native_view ORDER BY value")
             .unwrap();
-        assert_eq!(
-            collect(&mut stmt, &queue),
-            vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]]
-        );
+        assert_eq!(collect(&mut stmt, &queue), expected_rows);
     }
 }
 
@@ -1326,7 +1329,10 @@ fn native_modules_require_trigger_permission_for_both_table_kinds() {
         } else {
             [("restricted_rows", false), ("allowed_rows", true)]
         } {
-            let table = conn.current_schema().get_table(name).unwrap();
+            let table = conn
+                .current_schema()
+                .get_table(NamespaceId::ROOT, name)
+                .unwrap();
             let crate::schema::Table::Virtual(table) = table.as_ref() else {
                 panic!("expected virtual table {name}");
             };
@@ -1670,7 +1676,7 @@ fn c_extensions_still_execute_with_native_registration() {
                     .unwrap(),
             ),
     );
-    let other = conn.db.connect().unwrap();
+    let other = conn.db.connect(ConnectOpts::new()).unwrap();
     assert_eq!(
         other
             .prepare("SELECT c_open_double(7)")
@@ -1784,7 +1790,7 @@ fn c_and_native_tables_share_cursor_dispatch() {
 fn connection(options: OpenOptions) -> Arc<Connection> {
     Database::open(Arc::new(MemoryIO::new()), ":memory:", options)
         .unwrap()
-        .connect()
+        .connect(ConnectOpts::new())
         .unwrap()
 }
 

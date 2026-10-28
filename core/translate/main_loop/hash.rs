@@ -2,7 +2,7 @@ use super::*;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
-use crate::translate::expr::comparison_affinity;
+use crate::translate::expr::{comparison_affinity, maybe_apply_affinity};
 use crate::translate::plan::ColumnUsedMask;
 use crate::vdbe::builder::SelfTableContext;
 
@@ -282,7 +282,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             planner.program.emit_insn(Insn::OpenRead {
                 cursor_id: planner.hash_build_cursor_id,
                 root_page: btree.root_page,
-                db: build_table.database_id,
+                db: build_table.namespace.database_id,
             });
         }
 
@@ -394,6 +394,25 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                             payload_reg + i,
                             build_table.columns()[col_idx].affinity(),
                         );
+                    }
+                    Some(_) if !config.uses_materialized_keys_and_payload => {
+                        emit_stored_column(
+                            planner.program,
+                            payload_source_cursor_id,
+                            col_idx,
+                            payload_reg + i,
+                            &planner.t_ctx.resolver,
+                        )?;
+                        let column = &build_table.columns()[col_idx];
+                        if planner
+                            .t_ctx
+                            .resolver
+                            .schema()
+                            .get_type_def(&column.ty_str, build_table.table.is_strict())
+                            .is_none()
+                        {
+                            maybe_apply_affinity(column.ty(), payload_reg + i, planner.program);
+                        }
                     }
                     _ => planner.program.emit_column_or_rowid(
                         payload_source_cursor_id,
@@ -512,7 +531,7 @@ pub(super) fn build_prefilter_where_terms(
         {
             continue;
         }
-        if expr_references_outer_query(&cond.expr, table_references) {
+        if expr_reads_an_outer_query(&cond.expr, table_references, subqueries)? {
             continue;
         }
         term_indices.push(cond_idx);
@@ -628,7 +647,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                 self.program.emit_insn(Insn::OpenRead {
                     cursor_id,
                     root_page: btree.root_page,
-                    db: build_table.database_id,
+                    db: build_table.namespace.database_id,
                 });
                 cursor_id
             })
@@ -653,11 +672,10 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         let hash_table_id: usize = build_table.internal_id.into();
         let num_keys = self.hash_join_op.join_keys.len();
 
-        // A prior probe pass must not hide unmatched build rows in this pass.
-        if self.hash_join_op.join_type.keeps_unmatched_build_rows() {
-            self.program
-                .emit_insn(Insn::HashResetMatched { hash_table_id });
-        }
+        // The build runs once; every pass through this loop probes it again and
+        // must not see probe rows, grace progress or matched marks of a prior pass.
+        self.program
+            .emit_insn(Insn::HashProbeInit { hash_table_id });
 
         self.program.emit_insn(Insn::Rewind {
             cursor_id: self.probe_cursor_id,

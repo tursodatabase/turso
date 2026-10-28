@@ -588,8 +588,8 @@ impl WindowFunc {
     ///
     /// This is taken from SQLite's `sqlite3WindowUpdate` table at `window.c:699-708`.
     pub fn coerced_frame(&self) -> Option<crate::translate::plan::Frame> {
-        use crate::translate::plan::{Frame, FrameBoundary};
-        use turso_parser::ast::{Expr, FrameMode, Literal};
+        use crate::translate::plan::Frame;
+        use turso_parser::ast::{Expr, FrameBound, FrameMode, Literal};
         match self {
             // Lag shares row_number's streaming frame even though its lookup
             // can point forward (negative offset): SQLite emits a row as soon
@@ -598,40 +598,40 @@ impl WindowFunc {
             // using the same frame rather than caching the whole partition.
             Self::RowNumber | Self::Lag => Some(Frame {
                 mode: FrameMode::Rows,
-                start: FrameBoundary::UnboundedPreceding,
-                end: FrameBoundary::CurrentRow,
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::CurrentRow,
                 exclude: None,
             }),
             Self::Rank | Self::DenseRank => Some(Frame {
                 mode: FrameMode::Range,
-                start: FrameBoundary::UnboundedPreceding,
-                end: FrameBoundary::CurrentRow,
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::CurrentRow,
                 exclude: None,
             }),
             Self::PercentRank => Some(Frame {
                 mode: FrameMode::Groups,
-                start: FrameBoundary::CurrentRow,
-                end: FrameBoundary::UnboundedFollowing,
+                start: FrameBound::CurrentRow,
+                end: FrameBound::UnboundedFollowing,
                 exclude: None,
             }),
             Self::CumeDist => Some(Frame {
                 mode: FrameMode::Groups,
-                start: FrameBoundary::Following(Box::new(Expr::Literal(Literal::Numeric(
+                start: FrameBound::Following(Box::new(Expr::Literal(Literal::Numeric(
                     "1".to_string(),
                 )))),
-                end: FrameBoundary::UnboundedFollowing,
+                end: FrameBound::UnboundedFollowing,
                 exclude: None,
             }),
             Self::Ntile => Some(Frame {
                 mode: FrameMode::Rows,
-                start: FrameBoundary::CurrentRow,
-                end: FrameBoundary::UnboundedFollowing,
+                start: FrameBound::CurrentRow,
+                end: FrameBound::UnboundedFollowing,
                 exclude: None,
             }),
             Self::Lead => Some(Frame {
                 mode: FrameMode::Rows,
-                start: FrameBoundary::UnboundedPreceding,
-                end: FrameBoundary::UnboundedFollowing,
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::UnboundedFollowing,
                 exclude: None,
             }),
             Self::FirstValue | Self::LastValue | Self::NthValue => None,
@@ -942,6 +942,9 @@ pub enum ScalarFunc {
     NumericDiv,
     NumericLt,
     NumericEq,
+    // Date type functions
+    DatePlus,
+    DateMinus,
     // Array construction / element access (desugared from ARRAY[…] and expr[n] syntax)
     Array,
     ArrayElement,
@@ -1070,7 +1073,9 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::NumericMul
             | ScalarFunc::NumericDiv
             | ScalarFunc::NumericLt
-            | ScalarFunc::NumericEq => true,
+            | ScalarFunc::NumericEq
+            | ScalarFunc::DatePlus
+            | ScalarFunc::DateMinus => true,
             ScalarFunc::Array
             | ScalarFunc::ArrayElement
             | ScalarFunc::ArraySetElement
@@ -1115,6 +1120,19 @@ impl ScalarFunc {
                 | Self::ArrayRemove
                 | Self::ArraySlice
                 | Self::StringToArray
+        )
+    }
+
+    pub fn is_date_time_function(&self) -> bool {
+        matches!(
+            self,
+            Self::Date
+                | Self::Time
+                | Self::DateTime
+                | Self::JulianDay
+                | Self::UnixEpoch
+                | Self::StrfTime
+                | Self::TimeDiff
         )
     }
 }
@@ -1219,6 +1237,8 @@ impl Display for ScalarFunc {
             Self::NumericDiv => "numeric_div",
             Self::NumericLt => "numeric_lt",
             Self::NumericEq => "numeric_eq",
+            Self::DatePlus => "date_plus",
+            Self::DateMinus => "date_minus",
             Self::Array => "array",
             Self::ArrayElement => "array_element",
             Self::ArraySetElement => "array_set_element",
@@ -1366,7 +1386,9 @@ impl ScalarFunc {
             | Self::NumericMul
             | Self::NumericDiv
             | Self::NumericLt
-            | Self::NumericEq => &[2],
+            | Self::NumericEq
+            | Self::DatePlus
+            | Self::DateMinus => &[2],
             Self::NumericEncode => &[3],
             // Array construction / element access
             Self::Array => &[-1], // variable arity

@@ -10,6 +10,7 @@ use crate::index_method::toy_vector_sparse_ivf::VectorSparseInvertedIndexMethod;
 use crate::index_method::{
     BACKING_BTREE_INDEX_METHOD_NAME, TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME,
 };
+use crate::namespace::NamespaceId;
 use crate::schema::{Schema, Table};
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Mutex;
@@ -87,7 +88,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
                 let Ok(schema) = Schema::try_make_mut(&mut guard) else {
                     return ResultCode::Error;
                 };
-                schema.tables.insert(name_str, table);
+                schema.insert_table(NamespaceId::ROOT, name_str, table);
             } else {
                 return ResultCode::Error;
             }

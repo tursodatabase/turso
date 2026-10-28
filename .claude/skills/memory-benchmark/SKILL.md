@@ -26,6 +26,29 @@ The crate is split into a library and binaries. The workload engine lives in
 dhat/RSS measurement. Randomized profiles (`read-heavy`, `mixed`) use a fixed
 RNG seed (`profile::WORKLOAD_RNG_SEED`) so workloads are identical across runs.
 
+## MVCC Memory Per Row
+
+The `mvcc-row-memory` binary measures the heap that one MVCC transaction keeps
+for each row it writes: one `INSERT`, `UPDATE` or `DELETE` over every row of
+`t(id INTEGER PRIMARY KEY, v BLOB)`. `update` and `delete` change rows that a
+checkpoint already wrote to the B-tree. Use it to measure changes to MvStore
+data structures (version chains, write sets, tombstones).
+
+```bash
+cargo run -p memory-benchmark --bin mvcc-row-memory -- \
+  --statement insert|update|delete --rows 100000 --payload-bytes 100 \
+  --mode mvcc|wal --dhat-file /tmp/rows.json
+python3 perf/memory/analyze-dhat.py /tmp/rows.json --sort-by eb --top 10
+```
+
+The JSON report has `uncommitted_bytes_per_row` (before `COMMIT`),
+`statement_peak_bytes_per_row`, `commit_peak_bytes_per_row`,
+`committed_bytes_per_row` (after `COMMIT`, with automatic checkpoints and GC
+off) and `statement_allocations_per_row`. The byte values are requested bytes,
+so a debug build gives the same numbers as an optimized build. The dhat file's
+"At exit" values are the live allocations at the committed measurement. See
+`perf/memory/README.md` for details.
+
 ## FTS Query Allocations
 
 The `fts-memory` binary and `perf/memory/codspeed/benches/fts_queries.rs` share

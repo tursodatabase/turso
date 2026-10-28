@@ -11,14 +11,15 @@ use crate::mvcc::database::{
     BootstrapState, CheckpointReadLockState, CheckpointStateMachine, TxID,
 };
 use crate::mvcc::MvccClock;
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::numeric::Numeric;
 use crate::schema::{
     render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
-    SCHEMA_TABLE_NAME, SQLITE_SEQUENCE_TABLE_NAME,
+    SCHEMA_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
-    integrity_check, CursorStep, CursorTrait, IntegrityCheckError, IntegrityCheckState,
+    integrity_check, CursorStep, CursorTrait, IntegrityCheckError, IntegrityCheckState, KeptRead,
     PageCategory,
 };
 use crate::storage::database::DatabaseFile;
@@ -35,13 +36,11 @@ use crate::types::{
     IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
-    escape_sql_string_literal, normalize_ident, rename_identifiers,
-    rename_identifiers_scoped_when_clause, rewrite_check_expr_table_refs,
+    escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
     rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
     rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
-    rewrite_inline_col_fk_target_if_needed, rewrite_trigger_cmd_column_refs,
-    rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
-    trigger_still_references_renamed_column, trim_ascii_whitespace, RewrittenView,
+    rewrite_inline_col_fk_target_if_needed, rewrite_trigger_cmd_table_refs,
+    rewrite_view_sql_for_column_rename, trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -49,14 +48,14 @@ use crate::vdbe::affinity::{
 use crate::vdbe::hash_table::{
     HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
 };
-use crate::vdbe::insn::InsertFlags;
+use crate::vdbe::insn::{AlterColumnData, ConstraintInfo, InsertFlags};
 use crate::vdbe::metrics::HashJoinMetrics;
 use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
-    registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
-    StepResult, TxnCleanup, VacuumOpState,
+    decode_serial_type_into_register, registers_to_ref_values, DeferredSeekState, EndStatement,
+    OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup, VacuumOpState,
 };
 use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
@@ -73,9 +72,9 @@ use crate::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
-    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, Connection, Database,
-    DatabaseStorage, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement, TransactionState,
-    ValueRef, WalAutoActions, MAIN_DB_ID, TEMP_DB_ID,
+    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Clock, Completion, ConnectOpts, Connection,
+    Database, DatabaseStorage, IOExt, MonotonicInstant, MvCursor, NonNan, OpenFlags, QueryMode,
+    Statement, TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
 };
 use crate::{
     error::{
@@ -86,7 +85,8 @@ use crate::{
     function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
         datetime::{
-            exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_unixepoch,
+            exec_date, exec_date_minus, exec_date_plus, exec_datetime_full, exec_julianday,
+            exec_strftime, exec_time, exec_unixepoch,
         },
         printf::exec_printf,
     },
@@ -100,6 +100,7 @@ use std::any::Any;
 use std::str::FromStr;
 use std::{
     borrow::BorrowMut,
+    cell::Cell,
     num::NonZero,
     sync::{atomic::Ordering, Arc},
 };
@@ -158,7 +159,7 @@ use super::{
     },
     insn::{
         AddSequenceData, AggStepData, ArrayEncodeData, ClearBtreeCount, Cookie, IntegrityCkData,
-        RegisterOrLiteral, SortComparatorType, SorterOpenData,
+        IvmSumKind, RegisterOrLiteral, SortComparatorType, SorterOpenData,
     },
     CommitState,
 };
@@ -568,7 +569,7 @@ fn integer_operands(state: &ProgramState, lhs: usize, rhs: usize) -> Option<(i64
 }
 
 pub fn op_divide(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -581,6 +582,7 @@ pub fn op_divide(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    check_divisor(program, state, *lhs, *rhs)?;
     op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_divide)
 }
 
@@ -590,7 +592,14 @@ pub fn op_drop_index(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(DropIndex { index, db }, insn);
+    load_insn!(
+        DropIndex {
+            index,
+            db,
+            namespace
+        },
+        insn
+    );
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store_for_db(*db).is_some();
     conn.with_database_schema_mut(*db, |schema| {
@@ -600,14 +609,14 @@ pub fn op_drop_index(
         if is_mvcc && index.root_page > 0 {
             schema.dropped_root_pages.insert(index.root_page);
         }
-        schema.remove_index(index);
+        schema.remove_index(*namespace, index);
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_remainder(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -620,7 +629,33 @@ pub fn op_remainder(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    check_divisor(program, state, *lhs, *rhs)?;
     op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_remainder)
+}
+
+fn check_divisor(
+    program: &Program,
+    state: &ProgramState,
+    lhs: usize,
+    rhs: usize,
+) -> Result<(), Box<LimboError>> {
+    if !program.connection.dialect().errors_on_zero_divisor() {
+        return Ok(());
+    }
+    if matches!(state.registers[lhs].get_value(), Value::Null) {
+        return Ok(());
+    }
+    let rhs_val = state.registers[rhs].get_value();
+    if let Value::Text(t) = rhs_val {
+        match Numeric::from_value_strict(rhs_val) {
+            None => return Err(LimboError::InvalidTextRepresentation(t.as_str().to_owned()).into()),
+            Some(n) if !n.to_bool() => return Err(LimboError::DivisionByZero.into()),
+            _ => {}
+        }
+    } else if Numeric::from_value(rhs_val).is_some_and(|n| !n.to_bool()) {
+        return Err(LimboError::DivisionByZero.into());
+    }
+    Ok(())
 }
 
 pub fn op_bit_and(
@@ -686,13 +721,6 @@ pub fn op_checkpoint(
         },
         insn
     );
-    if !program.connection.auto_commit.load(Ordering::SeqCst) {
-        // TODO: sqlite returns "Runtime error: database table is locked (6)" when a table is in use
-        // when a checkpoint is attempted. We don't have table locks, so return TableLocked for any
-        // attempt to checkpoint in an interactive transaction. This does not end the transaction,
-        // however.
-        return Err(LimboError::TableLocked.into());
-    }
     if *database == crate::TEMP_DB_ID && program.connection.temp.database.read().is_none() {
         set_not_in_wal_result(state, *dest);
         state.pc += 1;
@@ -700,6 +728,16 @@ pub fn op_checkpoint(
     }
 
     let pager = program.get_pager_from_database_index(database)?;
+    // Like SQLite, refuse only when this connection's open transaction has already
+    // read or written the database. After a plain BEGIN nothing is held yet, so the
+    // checkpoint runs. The error does not end the transaction.
+    if !program.connection.auto_commit.load(Ordering::SeqCst)
+        && (pager.holds_read_lock()
+            || pager.holds_write_lock()
+            || program.connection.get_mv_tx_for_db(*database).is_some())
+    {
+        return Err(LimboError::TableLocked.into());
+    }
     if !pager.has_wal() {
         set_not_in_wal_result(state, *dest);
         state.pc += 1;
@@ -1386,6 +1424,7 @@ pub fn op_open_read(
 
     let pager = pager_for_db(program, pager, *db)?;
     let mv_store = mv_store_for_db(program, state, *db);
+    state.cursor_databases[*cursor_id] = Some(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if mv_store.is_some() {
@@ -1423,6 +1462,7 @@ pub fn op_open_read(
         CursorType::BTreeTable(table_rc) => table_rc.columns().len(),
         CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
         CursorType::MaterializedView(table_rc, _) => table_rc.columns().len(),
+        CursorType::ViewDelta { table, .. } => table.columns().len(),
         _ => unreachable!("This should not have happened"),
     };
 
@@ -1447,7 +1487,29 @@ pub fn op_open_read(
         };
 
     match cursor_type {
-        CursorType::MaterializedView(_, view_mutex) => {
+        CursorType::ViewDelta { view_name, table } => {
+            // In-memory cursor over the transaction's captured delta for one
+            // base table of a materialized view. Opened by maintenance
+            // programs when a pending batch is applied; the snapshot is taken
+            // here.
+            let delta_cursor = match program.connection.transaction_changes.get(view_name) {
+                Some(tx_state) => {
+                    let delta = tx_state.table_delta(table);
+                    crate::incremental::vdbe_maintenance::DeltaCursor::new(
+                        delta,
+                        table.columns().len(),
+                    )
+                }
+                None => {
+                    crate::incremental::vdbe_maintenance::DeltaCursor::empty(table.columns().len())
+                }
+            };
+            cursors
+                .get_mut(*cursor_id)
+                .expect("cursor_id should be valid")
+                .replace(Cursor::new_delta(delta_cursor));
+        }
+        CursorType::MaterializedView(_, _) => {
             // This is a materialized view with storage
             // Create btree cursor for reading the persistent data
 
@@ -1459,25 +1521,18 @@ pub fn op_open_read(
             .into_boxed();
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
 
-            // Get the view name and look up or create its transaction state
-            let view_name = view_mutex.lock().name().to_string();
-            let tx_state = program
-                .connection
-                .view_transaction_states
-                .get_or_create(&view_name);
-
-            // Create materialized view cursor with this view's transaction state
-            let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
+            // The cursor observes the transaction-wide change-log generation
+            // for read-your-own-writes.
+            let view_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
                 cursor.into_dyn(),
-                view_mutex.clone(),
                 pager,
-                tx_state,
-            )?;
+                program.connection.clone(),
+            );
 
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(Cursor::new_materialized_view(mv_cursor));
+                .replace(Cursor::new_btree_dyn(Box::new(view_cursor)));
         }
         CursorType::BTreeTable(table) => {
             // Regular table
@@ -1905,6 +1960,7 @@ pub fn op_open_pseudo(
         },
         insn
     );
+    state.cursor_databases[*cursor_id] = None;
     {
         let cursors = &mut state.cursors;
         let cursor = PseudoCursor::new(*content_reg);
@@ -1944,11 +2000,8 @@ pub fn op_rewind(
                 return_if_io!(state, btree_cursor.rewind());
                 btree_cursor.is_empty()
             }
-            Cursor::MaterializedView(mv_cursor) => {
-                return_if_io!(state, mv_cursor.rewind());
-                !mv_cursor.is_valid()?
-            }
-            _ => panic!("Rewind on non-btree/materialized-view cursor"),
+            Cursor::Delta(delta_cursor) => !return_if_io!(state, delta_cursor.rewind()),
+            _ => panic!("Rewind on non-btree cursor"),
         }
     };
     if is_empty {
@@ -2191,12 +2244,21 @@ fn op_column_fetch(
         }
         _ => return op_column_fetch_other(program, state, cursor_id, column, dest, default),
     };
-    let Some(payload) = return_if_io!(state, cursor.record_payload()) else {
+    let Some((payload, payload_size)) = return_if_io!(state, cursor.payload_fetch()) else {
         // A null-row cursor, or one that is not positioned on a valid row
         // (e.g., empty table). Return NULL, not the column's default value.
         state.registers[dest].set_null();
         return Ok(InsnFunctionStepResult::Step);
     };
+    if payload.len() != payload_size {
+        return op_column_fetch_overflowing(
+            state,
+            cursor_id,
+            column,
+            dest,
+            std::slice::from_ref(default),
+        );
+    }
     match ValueIterator::new(payload)?.nth_into_register(column, &mut state.registers[dest]) {
         Some(result) => result?,
         None => {
@@ -2261,18 +2323,16 @@ fn op_column_fetch_other(
     dest: usize,
     default: &Option<Value>,
 ) -> InsnResult {
-    // First check if this is a MaterializedViewCursor
     {
         let cursor = state.get_cursor(cursor_id);
-        if let Cursor::MaterializedView(mv_cursor) = cursor {
-            // Handle materialized view column access
-            let value = return_if_io!(state, mv_cursor.column(column));
-            state.registers[dest].set_value(value);
-            return Ok(InsnFunctionStepResult::Step);
-        }
         if matches!(cursor, Cursor::NullRow) {
             tracing::trace!("op_column(null_row placeholder)");
             state.registers[dest].set_null();
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        if let Cursor::Delta(delta_cursor) = cursor {
+            let value = delta_cursor.column(column);
+            state.registers[dest].set_value(value);
             return Ok(InsnFunctionStepResult::Step);
         }
         // Fall back to normal handling
@@ -2359,6 +2419,9 @@ fn op_column_fetch_other(
         CursorType::VirtualTable(_) => {
             panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
         }
+        CursorType::ViewDelta { .. } => {
+            unreachable!("Cursor::Delta columns are handled before cursor_type dispatch");
+        }
     }
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2405,12 +2468,15 @@ fn op_column_range_fetch(
             defaults,
         );
     };
-    let Some(payload) = return_if_io!(state, cursor.record_payload()) else {
+    let Some((payload, payload_size)) = return_if_io!(state, cursor.payload_fetch()) else {
         for reg in &mut state.registers[dest..dest + count] {
             reg.set_null();
         }
         return Ok(InsnFunctionStepResult::Step);
     };
+    if payload.len() != payload_size {
+        return op_column_fetch_overflowing(state, cursor_id, start_column, dest, defaults);
+    }
     let filled = ValueIterator::new(payload)?
         .decode_into_registers_after(start_column, &mut state.registers[dest..dest + count])?;
     if filled < count {
@@ -2422,6 +2488,71 @@ fn op_column_range_fetch(
         {
             apply_column_default(default, reg)?;
         }
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Column and ColumnRange for a record that spills into overflow pages: reads
+/// columns `start_column..` into the registers from `dest`, one per default,
+/// following SQLite's OP_Column (vdbe.c). Values on the b-tree page are
+/// decoded in place, and a value that reaches into overflow pages is read on
+/// its own, without the rest of the record. Kept out of line, as SQLite keeps
+/// vdbeColumnFromOverflow out of OP_Column, so the common case of a record on
+/// the page stays fast.
+#[cold]
+#[inline(never)]
+fn op_column_fetch_overflowing(
+    state: &mut ProgramState,
+    cursor_id: usize,
+    start_column: usize,
+    dest: usize,
+    defaults: &[Option<Value>],
+) -> InsnResult {
+    let Some(Cursor::BTree(cursor, ..)) = state.cursors[cursor_id].as_mut() else {
+        unreachable!("the caller read the record through a b-tree cursor");
+    };
+    let (mut columns, on_page) = return_if_io!(state, cursor.record_columns());
+    // (register index, offset in the record, serial type) of each value
+    // that does not end on the page.
+    let mut values_in_overflow: SmallVec<[(usize, usize, u64); 4]> = SmallVec::new();
+    let mut values_end = 0;
+    // Step over the columns before the requested ones one at a time, so a
+    // corrupt header there is reported instead of skipped.
+    for _ in 0..start_column {
+        if columns.next().transpose()?.is_none() {
+            break;
+        }
+    }
+    let regs = &mut state.registers[dest..dest + defaults.len()];
+    for (i, (reg, default)) in regs.iter_mut().zip(defaults).enumerate() {
+        match columns.next().transpose()? {
+            // The record has fewer columns, as rows written before an ADD COLUMN do.
+            None => apply_column_default(default, reg)?,
+            Some((offset, len, serial_type)) if offset + len <= on_page.len() => {
+                decode_serial_type_into_register(serial_type, &mut &on_page[offset..], reg)?;
+            }
+            Some((offset, len, serial_type)) => {
+                values_in_overflow.push((i, offset, serial_type));
+                values_end = offset + len;
+            }
+        }
+    }
+    // The columns are consecutive, so the values that do not end on the page
+    // are one run of bytes. Read just that run, as SQLite's
+    // vdbeColumnFromOverflow reads just the bytes of the value.
+    let Some(&(_, values_start, _)) = values_in_overflow.first() else {
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let bytes = return_if_io!(
+        state,
+        cursor.read_payload(KeptRead::Values, values_start, values_end - values_start)
+    );
+    for (i, offset, serial_type) in values_in_overflow {
+        decode_serial_type_into_register(
+            serial_type,
+            &mut &bytes[offset - values_start..],
+            &mut state.registers[dest + i],
+        )?;
     }
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2583,11 +2714,11 @@ pub fn op_column_has_field(
             let cursor_ref =
                 must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "ColumnHasField");
             if matches!(cursor_ref, Cursor::NullRow) {
-                false
+                true
             } else {
                 let cursor = cursor_ref.as_btree_mut();
                 if cursor.get_null_flag() {
-                    false
+                    true
                 } else {
                     match return_if_io!(state, cursor.record()) {
                         Some(record) => record.column_count() > *column,
@@ -3483,7 +3614,7 @@ pub fn op_blob_read(
         Ok(IOResult::Done(())) => {}
         Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
         Err(err) if matches!(*err, LimboError::BlobHandleExpired) => {
-            return Ok(blob_expired_ack(state, *dest))
+            return Ok(blob_expired_ack(state, *dest));
         }
         Err(err) => return Err(err),
     }
@@ -3552,7 +3683,7 @@ pub fn op_blob_write(
         Ok(IOResult::Done(())) => {}
         Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
         Err(err) if matches!(*err, LimboError::BlobHandleExpired) => {
-            return Ok(blob_expired_ack(state, *dest))
+            return Ok(blob_expired_ack(state, *dest));
         }
         Err(err) => return Err(err),
     }
@@ -3639,9 +3770,9 @@ pub fn op_next(
                 CursorStep::Error(err) => Err(err),
                 CursorStep::IO(io) => Ok(IOResult::IO(io)),
             },
-            Cursor::MaterializedView(mv_cursor) => mv_cursor.next(),
+            Cursor::Delta(delta_cursor) => delta_cursor.next().map_err(Into::into),
             Cursor::IndexMethod(_) => cursor.as_index_method_mut().query_next(),
-            _ => panic!("Next on non-btree/materialized-view cursor"),
+            _ => panic!("Next on non-btree cursor"),
         }
     }
 }
@@ -3697,6 +3828,7 @@ pub fn halt(
     err_code: usize,
     description: &str,
     on_error: Option<ResolveType>,
+    constraint_info: Option<&ConstraintInfo>,
 ) -> InsnResult {
     state.halt_in_progress = true;
     let mv_store = state.mv_store(&program.connection).cloned();
@@ -3725,57 +3857,31 @@ pub fn halt(
         vtab_rollback_all(&program.connection)?;
     }
 
-    // Handle RAISE errors - these carry their own resolve type
-    if let Some(resolve_type) = on_error {
-        // RAISE(IGNORE) signals the parent to skip the current row
-        if resolve_type == ResolveType::Ignore {
-            // RAISE(IGNORE) is not an error: the frame unwinds, but everything
-            // the trigger wrote before the RAISE is kept. Stage index-method
-            // writes now, exactly like the normal trigger-subprogram halt
-            // below, so the kept base rows keep their index entries too.
-            if program.is_trigger_subprogram() {
-                return_if_io!(state, index_method_stage_statement_all(state));
-            }
-            return Err(LimboError::RaiseIgnore.into());
+    // RAISE(IGNORE) signals the parent to skip the current row
+    if on_error == Some(ResolveType::Ignore) {
+        // RAISE(IGNORE) is not an error: the frame unwinds, but everything
+        // the trigger wrote before the RAISE is kept. Stage index-method
+        // writes now, exactly like the normal trigger-subprogram halt
+        // below, so the kept base rows keep their index entries too.
+        if program.is_trigger_subprogram() {
+            return_if_io!(state, index_method_stage_statement_all(state));
         }
-        if err_code > 0 {
-            let error = match resolve_type {
-                ResolveType::Abort | ResolveType::Rollback | ResolveType::Fail => {
-                    LimboError::Raise(resolve_type, description.to_string())
-                }
-                ResolveType::Ignore => unreachable!("handled above"),
-                ResolveType::Replace => unreachable!("Replace not valid for RAISE"),
-            };
-
-            // Trigger subprograms must not commit — just propagate the error.
-            // The parent program's abort() handles transaction state.
-            if program.is_trigger_subprogram() {
-                return Err(error.into());
-            }
-
-            return Err(error.into());
-        }
+        return Err(LimboError::RaiseIgnore.into());
     }
 
-    // Determine the constraint error (if any) based on error code
     let constraint_error = match err_code {
         0 => None,
-        SQLITE_CONSTRAINT_PRIMARYKEY => Some(LimboError::Constraint(format!(
-            "UNIQUE constraint failed: {description}"
-        ))),
-        SQLITE_CONSTRAINT_CHECK => Some(LimboError::Constraint(format!(
-            "CHECK constraint failed: {description}"
-        ))),
-        SQLITE_CONSTRAINT_NOTNULL => Some(LimboError::Constraint(format!(
-            "NOT NULL constraint failed: {description}"
-        ))),
-        SQLITE_CONSTRAINT_UNIQUE => Some(LimboError::Constraint(format!(
-            "UNIQUE constraint failed: {description}"
-        ))),
-        SQLITE_CONSTRAINT_FOREIGNKEY => {
-            Some(LimboError::ForeignKeyConstraint(description.to_string()))
-        }
-        SQLITE_CONSTRAINT_TRIGGER => Some(LimboError::Constraint(description.to_string())),
+        SQLITE_CONSTRAINT_PRIMARYKEY
+        | SQLITE_CONSTRAINT_UNIQUE
+        | SQLITE_CONSTRAINT_CHECK
+        | SQLITE_CONSTRAINT_NOTNULL
+        | SQLITE_CONSTRAINT_FOREIGNKEY
+        | SQLITE_CONSTRAINT_TRIGGER => Some(build_constraint_violation_error(
+            state,
+            constraint_info,
+            err_code,
+            description,
+        )),
         SQLITE_FULL => Some(LimboError::DatabaseFull),
         // SQLITE_ERROR is a generic error (e.g. ALTER TABLE validation), not a constraint.
         // SqlError displays bare like sqlite3_errmsg and abort() doesn't apply
@@ -3788,6 +3894,12 @@ pub fn halt(
 
     // Handle constraint errors
     if let Some(error) = constraint_error {
+        // The instruction's own resolve type (RAISE, a constraint-level ON
+        // CONFLICT clause, or a trigger step's OR clause) is embedded in the
+        // error, so whichever program aborts applies it instead of its own.
+        if let Some(resolve_type) = on_error {
+            return Err(LimboError::Raise(resolve_type, error.to_string()).into());
+        }
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
         // Note: ON CONFLICT FAIL does NOT apply to FK violations, so we check for those first.
@@ -3796,20 +3908,19 @@ pub fn halt(
             if program.connection.foreign_keys_enabled()
                 && state.get_fk_immediate_violations_during_stmt() > 0
             {
-                return Err(LimboError::ForeignKeyConstraint(
-                    "FOREIGN KEY constraint failed".to_string(),
-                )
-                .into());
+                return Err(state.immediate_foreign_key_error().into());
             }
 
-            // Stage every custom index before releasing the statement
-            // savepoint, then commit the partial FAIL changes. Yielding for
+            // Maintain materialized views with the kept rows and stage every
+            // custom index before releasing the statement savepoint, then
+            // commit the partial FAIL changes. Yielding for
             // I/O here is safe because Halt is re-entrant: the whole opcode
             // runs again on resume, recomputes the same outcome from the same
             // registers, and `pending_fail_error` carries the decided error
             // across resumes further down. `halt_in_progress` keeps
             // interrupt, deadline, and progress-handler requests from
             // replacing the outcome while the staged work is in flight.
+            return_if_io!(state, program.maintain_views_for_kept_changes(state, pager));
             vtab_commit_all(&program.connection)?;
             return_if_io!(state, index_method_stage_statement_all(state));
             state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
@@ -3825,19 +3936,6 @@ pub fn halt(
                     state.pending_fail_error = Some(error);
                     return Ok(state.suspend_on_io(io));
                 }
-            }
-        }
-
-        // A FAIL resolution that cannot commit here because an outer statement
-        // is still running (this is a trigger subprogram fired mid-statement)
-        // must still tell the enclosing statement to keep the changes made
-        // before the error. Re-tag the constraint as a FAIL raise so the outer
-        // program's abort() preserves and commits them instead of rolling the
-        // statement back. FK errors do not respect ON CONFLICT, so leave them
-        // as-is.
-        if program.resolve_type == ResolveType::Fail {
-            if let LimboError::Constraint(msg) = error {
-                return Err(LimboError::Raise(ResolveType::Fail, msg).into());
             }
         }
 
@@ -3857,9 +3955,7 @@ pub fn halt(
     if program.connection.foreign_keys_enabled()
         && state.get_fk_immediate_violations_during_stmt() > 0
     {
-        return Err(
-            LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string()).into(),
-        );
+        return Err(state.immediate_foreign_key_error().into());
     }
 
     if program.is_trigger_subprogram() {
@@ -3870,6 +3966,14 @@ pub fn halt(
         return_if_io!(state, index_method_stage_statement_all(state));
         return Ok(InsnFunctionStepResult::Done);
     }
+
+    // Maintain materialized views before releasing this write statement's
+    // savepoint. The maintenance program is the sole evaluator for committed
+    // and same-transaction state, and its writes roll back atomically with the
+    // base-table statement on error. Internal helper statements are never
+    // the active writer, so they leave the enclosing root statement in
+    // control of this batch.
+    return_if_io!(state, program.maintain_views_for_kept_changes(state, pager));
 
     if auto_commit {
         // In autocommit mode, a statement that leaves deferred violations must fail here,
@@ -3988,6 +4092,51 @@ pub fn halt(
         }
         Ok(InsnFunctionStepResult::Done)
     }
+}
+
+fn build_constraint_violation_error(
+    state: &ProgramState,
+    info: Option<&ConstraintInfo>,
+    err_code: usize,
+    description: &str,
+) -> LimboError {
+    use crate::{ConstraintKind, ConstraintViolation};
+    let (kind, message) = match err_code {
+        SQLITE_CONSTRAINT_PRIMARYKEY => (
+            ConstraintKind::PrimaryKey,
+            format!("UNIQUE constraint failed: {description}"),
+        ),
+        SQLITE_CONSTRAINT_UNIQUE => (
+            ConstraintKind::Unique,
+            format!("UNIQUE constraint failed: {description}"),
+        ),
+        SQLITE_CONSTRAINT_CHECK => (
+            ConstraintKind::Check,
+            format!("CHECK constraint failed: {description}"),
+        ),
+        SQLITE_CONSTRAINT_NOTNULL => (
+            ConstraintKind::NotNull,
+            format!("NOT NULL constraint failed: {description}"),
+        ),
+        SQLITE_CONSTRAINT_FOREIGNKEY => (ConstraintKind::ForeignKey, description.to_string()),
+        _ => (ConstraintKind::Other, description.to_string()),
+    };
+    let mut violation = ConstraintViolation::new(kind, message);
+    if let Some(info) = info {
+        violation.kind = info.kind;
+        violation.table_name = Some(info.table_name.clone());
+        violation.constraint_name.clone_from(&info.constraint_name);
+        violation.index_name.clone_from(&info.index_name);
+        violation.column_names.clone_from(&info.column_names);
+        violation.values = info
+            .violation_regs
+            .iter()
+            .map(|&reg| state.registers[reg].get_value().clone())
+            .collect();
+        violation.row_values = !info.row_col_names.is_empty();
+        violation.parent_table.clone_from(&info.parent_table);
+    }
+    LimboError::ConstraintViolation(Box::new(violation))
 }
 
 /// Call xCommit on all virtual tables that participated in the current transaction.
@@ -4248,6 +4397,7 @@ pub fn op_halt(
 ) -> InsnResult {
     load_insn!(
         Halt {
+            constraint_info,
             err_code,
             description,
             on_error,
@@ -4262,7 +4412,15 @@ pub fn op_halt(
     } else {
         description.to_string()
     };
-    halt(program, state, pager, *err_code, &desc, *on_error)
+    halt(
+        program,
+        state,
+        pager,
+        *err_code,
+        &desc,
+        *on_error,
+        constraint_info.as_deref(),
+    )
 }
 
 pub fn op_halt_if_null(
@@ -4273,14 +4431,24 @@ pub fn op_halt_if_null(
 ) -> InsnResult {
     load_insn!(
         HaltIfNull {
+            constraint_info,
             target_reg,
             err_code,
             description,
+            on_error,
         },
         insn
     );
     if matches!(state.registers[*target_reg].get_value(), Value::Null) {
-        halt(program, state, pager, *err_code, description, None)
+        halt(
+            program,
+            state,
+            pager,
+            *err_code,
+            description,
+            *on_error,
+            constraint_info.as_deref(),
+        )
     } else {
         state.pc += 1;
         Ok(InsnFunctionStepResult::Step)
@@ -4716,13 +4884,15 @@ pub fn op_transaction_inner(
                             true,
                         ),
                         (TransactionState::Read, false) => (TransactionState::Read, false),
-                        (TransactionState::None, true) => (
+                        (TransactionState::None | TransactionState::Pending { .. }, true) => (
                             TransactionState::Write {
                                 schema_did_change: false,
                             },
                             true,
                         ),
-                        (TransactionState::None, false) => (TransactionState::Read, true),
+                        (TransactionState::None | TransactionState::Pending { .. }, false) => {
+                            (TransactionState::Read, true)
+                        }
                     }
                 };
 
@@ -4736,26 +4906,20 @@ pub fn op_transaction_inner(
 
                         let current_mv_tx = conn.get_mv_tx_for_db(*db);
                         if current_mv_tx.is_none() {
-                            // Reject CONCURRENT on an attached DB if the main
-                            // DB already started with BEGIN DEFERRED.
-                            let conn_has_executed_begin_deferred =
-                                !conn.auto_commit.load(Ordering::SeqCst)
-                                    && conn.get_mv_tx().is_none();
-                            if conn_has_executed_begin_deferred
-                                && *tx_mode == TransactionMode::Concurrent
-                            {
-                                mark_unlikely();
-                                return Err(LimboError::TxError(
-                                    "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
-                                        .to_string(),
-                                )
-                                .into());
-                            }
                             // Use the same tx_mode as the main DB's active
                             // transaction when available, so BEGIN CONCURRENT
-                            // applies to all databases uniformly.
+                            // applies to all databases uniformly — including
+                            // when the main DB has not materialized its
+                            // transaction yet and only the BEGIN CONCURRENT
+                            // flag records the intent.
                             let effective_mode =
-                                conn.get_mv_tx().map(|(_, mode)| mode).unwrap_or(*tx_mode);
+                                conn.get_mv_tx().map(|(_, mode)| mode).unwrap_or_else(|| {
+                                    if conn.begin_concurrent_is_pending() {
+                                        TransactionMode::Concurrent
+                                    } else {
+                                        *tx_mode
+                                    }
+                                });
                             #[cfg(any(test, injected_yields))]
                             {
                                 if let Some(IOResult::IO(io)) =
@@ -4807,8 +4971,7 @@ pub fn op_transaction_inner(
                         }
                     } else {
                         // Main database MVCC path (unchanged logic)
-                        let started_read_tx =
-                            updated && matches!(current_state, TransactionState::None);
+                        let started_read_tx = updated && current_state.no_btree_tx_open();
                         if started_read_tx {
                             turso_assert!(
                                 !conn.is_nested_stmt(),
@@ -4825,23 +4988,6 @@ pub fn op_transaction_inner(
                             pager.mvcc_refresh_if_db_changed();
                         }
 
-                        let conn_has_executed_begin_deferred = !has_existing_mv_tx
-                            && !program.connection.auto_commit.load(Ordering::SeqCst);
-                        if conn_has_executed_begin_deferred
-                            && *tx_mode == TransactionMode::Concurrent
-                        {
-                            mark_unlikely();
-                            if started_read_tx {
-                                conn.set_tx_state(TransactionState::None);
-                                state.auto_txn_cleanup = TxnCleanup::None;
-                            }
-                            return Err(LimboError::TxError(
-                                "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
-                                    .to_string(),
-                            )
-                            .into());
-                        }
-
                         if !has_existing_mv_tx {
                             // Gate the begin on the connection's prepared schema generation,
                             // captured here (atomically with the connection.schema == db.schema
@@ -4856,7 +5002,7 @@ pub fn op_transaction_inner(
                                     Ok(generation) => generation,
                                     Err(err) => {
                                         if started_read_tx {
-                                            conn.set_tx_state(TransactionState::None);
+                                            conn.set_tx_state(current_state);
                                             state.auto_txn_cleanup = TxnCleanup::None;
                                         }
                                         return Err(err.into());
@@ -4875,24 +5021,41 @@ pub fn op_transaction_inner(
                                     return Ok(state.suspend_on_io(io));
                                 }
                             }
+                            // An explicit transaction started with BEGIN
+                            // CONCURRENT materializes here, on its first
+                            // statement, in concurrent mode. A plain BEGIN
+                            // keeps the statement's mode and with it the
+                            // SQLite-style exclusive upgrade on first write.
+                            let fresh_mode = if conn.begin_concurrent_is_pending() {
+                                TransactionMode::Concurrent
+                            } else {
+                                *tx_mode
+                            };
                             match begin_fresh_mvcc_tx(
                                 mv_store,
                                 &pager,
-                                tx_mode,
+                                &fresh_mode,
                                 &conn,
                                 expected_schema_generation,
                             ) {
                                 Ok(tx_id) => {
                                     program
                                         .connection
-                                        .set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
+                                        .set_mv_tx_for_db(*db, Some((tx_id, fresh_mode)));
                                     if started_read_tx && conn.get_auto_commit() {
                                         state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                                    }
+                                    if matches!(current_state, TransactionState::Pending { .. }) {
+                                        let concurrent = matches!(
+                                            current_state,
+                                            TransactionState::Pending { concurrent: true }
+                                        );
+                                        state.pending_fresh_tx = Some((*db, concurrent));
                                     }
                                 }
                                 Err(err) => {
                                     if started_read_tx {
-                                        conn.set_tx_state(TransactionState::None);
+                                        conn.set_tx_state(current_state);
                                         state.auto_txn_cleanup = TxnCleanup::None;
                                     }
                                     return Err(err.into());
@@ -4921,7 +5084,7 @@ pub fn op_transaction_inner(
                                 ) {
                                     if started_read_tx {
                                         pager.end_read_tx();
-                                        conn.set_tx_state(TransactionState::None);
+                                        conn.set_tx_state(current_state);
                                         state.auto_txn_cleanup = TxnCleanup::None;
                                     }
                                     return Err(err.into());
@@ -4975,7 +5138,7 @@ pub fn op_transaction_inner(
                             }
                             continue;
                         }
-                    } else if updated && matches!(current_state, TransactionState::None) {
+                    } else if updated && current_state.no_btree_tx_open() {
                         turso_assert!(
                             !conn.is_nested_stmt(),
                             "nested stmt should not begin a new read transaction"
@@ -5011,6 +5174,11 @@ pub fn op_transaction_inner(
                                 } => {
                                     pager.end_read_tx();
                                     conn.set_tx_state(TransactionState::None);
+                                    state.auto_txn_cleanup = TxnCleanup::None;
+                                }
+                                TransactionState::Pending { concurrent } => {
+                                    pager.end_read_tx();
+                                    conn.set_tx_state(TransactionState::Pending { concurrent });
                                     state.auto_txn_cleanup = TxnCleanup::None;
                                 }
                                 TransactionState::Read
@@ -5131,6 +5299,7 @@ pub fn op_transaction_inner(
                             state
                                 .fk_immediate_violations_during_stmt
                                 .store(0, Ordering::Release);
+                            state.fk_immediate_violation = None;
                         }
                         if let Some(mv_store) = mv_store.as_ref() {
                             // Attached MVCC DB: open an MvStore savepoint.
@@ -5165,6 +5334,10 @@ pub fn op_transaction_inner(
                         turso_assert!(
                             previous == 0,
                             "starting a writer while {previous} writer(s) are already active"
+                        );
+                        turso_assert!(
+                            program.connection.transaction_changes.is_empty(),
+                            "write statement started with view changes left by an earlier statement"
                         );
                         state.is_active_write = true;
                     }
@@ -5232,7 +5405,8 @@ pub fn op_auto_commit(
     load_insn!(
         AutoCommit {
             auto_commit,
-            rollback
+            rollback,
+            concurrent
         },
         insn
     );
@@ -5333,6 +5507,9 @@ pub fn op_auto_commit(
                 conn.rollback_temp_schema();
                 vtab_rollback_all(&conn)?;
                 conn.index_methods_on_transaction_rolled_back();
+                if let Some(hooks) = conn.hooks() {
+                    hooks.transaction_rolled_back(&conn);
+                }
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 conn.set_cdc_transaction_id(-1);
@@ -5362,6 +5539,31 @@ pub fn op_auto_commit(
                     !conn.tx_is_poisoned(),
                     "rollback-only marker leaked outside an explicit transaction"
                 );
+                if *concurrent && mv_store.is_none() {
+                    return Err(LimboError::TxError(
+                        "Concurrent transaction mode is only supported when MVCC is enabled"
+                            .to_string(),
+                    )
+                    .into());
+                }
+                // BEGIN IMMEDIATE/EXCLUSIVE: Insn::Transaction runs before us and
+                // already advanced the state to Write; leave it alone. For BEGIN
+                // DEFERRED and BEGIN CONCURRENT no Transaction instruction precedes
+                // AutoCommit, so state is None here unless a SELECT is still active
+                // (state = Read) from a prior autocommit query on the same connection.
+                //
+                // Only move to Pending in MVCC mode. In WAL-only mode a deferred
+                // BEGIN has no snapshot to defer; keeping the state at None
+                // preserves the pre-existing behavior and lets schema-reload
+                // checks that gate on None continue to work.
+                if conn.get_tx_state() == TransactionState::None && mv_store.is_some() {
+                    conn.set_tx_state(TransactionState::Pending {
+                        concurrent: *concurrent,
+                    });
+                }
+                // Write: set by Transaction opcode for BEGIN IMMEDIATE/EXCLUSIVE; leave as-is.
+                // Read: a SELECT in autocommit mode is still open; leave as-is — the
+                //       next write inside the explicit transaction will upgrade to Write.
                 conn.auto_commit.store(false, Ordering::SeqCst);
                 return Ok(InsnFunctionStepResult::Done);
             }
@@ -5462,6 +5664,14 @@ pub fn op_savepoint(
         })
         .into());
     }
+    // With no write statement running, every kept change has already reached
+    // the materialized views, so a named savepoint needs no position in the
+    // transaction change log: ROLLBACK TO undoes the view btrees together
+    // with the base tables.
+    turso_assert!(
+        conn.is_nested_stmt() || conn.transaction_changes.is_empty(),
+        "savepoint operation with view changes no statement applied"
+    );
 
     match *op {
         SavepointOp::Begin => {
@@ -5495,15 +5705,19 @@ pub fn op_savepoint(
                         let tx_id = if let Some(tx_id) = conn.get_mv_tx_id() {
                             tx_id
                         } else {
-                            let tx_id = begin_fresh_mvcc_tx(
-                                mv_store,
-                                pager,
-                                &TransactionMode::Read,
-                                &conn,
-                                None,
-                            )?;
-                            conn.set_mv_tx(Some((tx_id, TransactionMode::Read)));
-                            if matches!(conn.get_tx_state(), TransactionState::None) {
+                            // Inside BEGIN CONCURRENT, SAVEPOINT is the first
+                            // statement to materialize the transaction, so it
+                            // must materialize it in concurrent mode — Read
+                            // would make the first write upgrade to exclusive.
+                            let fresh_mode = if conn.begin_concurrent_is_pending() {
+                                TransactionMode::Concurrent
+                            } else {
+                                TransactionMode::Read
+                            };
+                            let tx_id =
+                                begin_fresh_mvcc_tx(mv_store, pager, &fresh_mode, &conn, None)?;
+                            conn.set_mv_tx(Some((tx_id, fresh_mode)));
+                            if conn.get_tx_state().no_btree_tx_open() {
                                 conn.set_tx_state(TransactionState::Read);
                             }
                             tx_id
@@ -5526,7 +5740,7 @@ pub fn op_savepoint(
                         if !pager.holds_read_lock() {
                             pager.begin_read_tx()?;
                         }
-                        if matches!(conn.get_tx_state(), TransactionState::None) {
+                        if conn.get_tx_state().no_btree_tx_open() {
                             conn.set_tx_state(TransactionState::Read);
                         }
                         pager.open_subjournal()?;
@@ -5548,6 +5762,7 @@ pub fn op_savepoint(
                         main_schema_snapshot,
                         temp_schema_snapshot,
                         staged_schema_snapshot,
+                        hooks_memo: conn.hooks().map(|hooks| hooks.savepoint_created(&conn)),
                     };
                     // Mirror onto attached/temp pagers. If any pager fails
                     // mid-flight, earlier ones already opened a savepoint
@@ -5595,6 +5810,12 @@ pub fn op_savepoint(
             .map_err(Into::into)
         }
         SavepointOp::Release => {
+            // A RELEASE that commits the transaction may suspend on I/O inside
+            // op_auto_commit after the savepoint was already removed. On
+            // re-entry, resume that commit instead of looking up the savepoint again.
+            if !matches!(state.commit_state, CommitState::Ready) {
+                return op_auto_commit(program, state, &release_commit_insn(), pager);
+            }
             let release_result = if let Some(mv_store) = mv_store.as_ref() {
                 match conn.get_mv_tx_id() {
                     Some(tx_id) => mv_store.release_named_savepoint(tx_id, name)?,
@@ -5622,11 +5843,7 @@ pub fn op_savepoint(
                         SavepointMirror::Release(name),
                     )?;
                     // This means that releasing the savepoint caused the transaction to commit, so we need to auto-commit here.
-                    let auto_commit = Insn::AutoCommit {
-                        auto_commit: true,
-                        rollback: false,
-                    };
-                    return op_auto_commit(program, state, &auto_commit, pager);
+                    return op_auto_commit(program, state, &release_commit_insn(), pager);
                 }
             }
 
@@ -5681,6 +5898,9 @@ pub fn op_savepoint(
                 }
                 *conn.database_schemas().write() = info.staged_schema_snapshot;
                 conn.bump_prepare_context_generation();
+                if let (Some(hooks), Some(memo)) = (conn.hooks(), &info.hooks_memo) {
+                    hooks.rolled_back_to_savepoint(&conn, memo);
+                }
             }
 
             // Invalidate cached schema cookies on ALL pagers whose pages may
@@ -5698,6 +5918,14 @@ pub fn op_savepoint(
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
+    }
+}
+
+fn release_commit_insn() -> Insn {
+    Insn::AutoCommit {
+        auto_commit: true,
+        rollback: false,
+        concurrent: false,
     }
 }
 
@@ -5964,6 +6192,10 @@ pub fn op_program(
                 // so we must not call it again after the loop.
                 let mut subprogram_aborted = false;
                 loop {
+                    let now = *state
+                        .current_time
+                        .get_or_insert_with(|| pager.io.current_time_wall_clock());
+                    statement.set_current_time(now);
                     let res = statement.step_subprogram();
                     match res {
                         Ok(step_result) => match step_result {
@@ -5991,7 +6223,10 @@ pub fn op_program(
                                 return Err(LimboError::Busy.into());
                             }
                         },
-                        Err(LimboError::Constraint(constraint_err)) => {
+                        Err(
+                            error
+                            @ (LimboError::Constraint(_) | LimboError::ConstraintViolation(_)),
+                        ) if !error.is_foreign_key_constraint() => {
                             if program.resolve_type != ResolveType::Ignore {
                                 subprogram_aborted = true;
                                 finish_subprogram(
@@ -6002,7 +6237,7 @@ pub fn op_program(
                                     saved_last_insert_rowid,
                                     saved_last_changes_value,
                                 );
-                                return Err(LimboError::Constraint(constraint_err).into());
+                                return Err(error.into());
                             }
                             subprogram_aborted = true;
                             break;
@@ -6224,18 +6459,14 @@ fn op_row_id_read(state: &mut ProgramState, cursor_id: usize, dest: usize) -> In
     fn row_id_of_other_cursor(cursor: &mut Option<Cursor>) -> IOResultOr<Option<i64>> {
         match cursor {
             Some(Cursor::NullRow) => Ok(IOResult::Done(None)),
-            Some(Cursor::Virtual(virtual_cursor)) => {
-                let rowid = virtual_cursor.rowid();
-                Ok(IOResult::Done((rowid != 0).then_some(rowid)))
-            }
-            Some(Cursor::MaterializedView(mv_cursor)) => mv_cursor.rowid(),
+            Some(Cursor::Virtual(virtual_cursor)) => Ok(IOResult::Done(virtual_cursor.rowid())),
+            Some(Cursor::Delta(delta_cursor)) => Ok(IOResult::Done(Some(delta_cursor.rowid()))),
             Some(Cursor::IndexMethod(cursor)) => cursor.query_rowid(),
             Some(Cursor::Pseudo(_)) => Ok(IOResult::Done(None)),
             _ => {
                 mark_unlikely();
                 Err(LimboError::InternalError(
-                    "RowId: cursor is not a table, virtual, or materialized view cursor"
-                        .to_string(),
+                    "RowId: cursor is not a table or virtual table cursor".to_string(),
                 )
                 .into())
             }
@@ -6293,32 +6524,7 @@ pub fn op_seek_rowid(
     let (pc, did_seek) = {
         let cursor = get_cursor!(state, *cursor_id);
 
-        // Handle MaterializedView cursor
         let (pc, did_seek) = match cursor {
-            Cursor::MaterializedView(mv_cursor) => {
-                let rowid = match state.registers[*src_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
-                    Value::Null => None,
-                    _ => None,
-                };
-
-                match rowid {
-                    Some(rowid) => {
-                        let seek_result = return_if_io!(
-                            state,
-                            mv_cursor
-                                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                        );
-                        let pc = if !matches!(seek_result, SeekResult::Found) {
-                            target_pc.as_offset_int()
-                        } else {
-                            state.pc + 1
-                        };
-                        (pc, true)
-                    }
-                    None => (target_pc.as_offset_int(), false),
-                }
-            }
             Cursor::BTree(..) | Cursor::Dyn(..) => {
                 let btree_cursor = cursor.as_btree_mut();
                 let rowid = match state.registers[*src_reg].get_value() {
@@ -6357,7 +6563,7 @@ pub fn op_seek_rowid(
                     None => (target_pc.as_offset_int(), false),
                 }
             }
-            _ => panic!("SeekRowid on non-btree/materialized-view cursor"),
+            _ => panic!("SeekRowid on non-btree cursor"),
         };
         (pc, did_seek)
     };
@@ -6436,13 +6642,10 @@ fn seek_deferred_row(
     table_cursor_id: usize,
     rowid: i64,
 ) -> IOResultOr<SeekResult> {
-    let key = SeekKey::TableRowId(rowid);
-    let op = SeekOp::GE { eq_only: true };
-    match state.get_cursor(table_cursor_id) {
-        // Materialized views should not use deferred seeks, but seek them correctly if one does.
-        Cursor::MaterializedView(mv_cursor) => mv_cursor.seek(key, op),
-        table_cursor => table_cursor.as_btree_mut().seek(key, op),
-    }
+    state
+        .get_cursor(table_cursor_id)
+        .as_btree_mut()
+        .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
 }
 
 fn count_deferred_seek(state: &mut ProgramState) {
@@ -7774,6 +7977,289 @@ const SPARE_AGG_PAYLOADS: usize = 8;
 /// - **Min/Max**: Returns the tracked extreme value directly
 /// - **GroupConcat/StringAgg**: Returns the accumulated string
 /// - **JsonGroup***: Parses accumulated raw JSONB bytes into proper JSON output
+pub fn op_agg_context_load(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        AggContextLoad {
+            acc_reg,
+            payload_start_reg,
+            func,
+        },
+        insn
+    );
+    let func = func.expect_agg();
+    let width = agg_payload_width(func).ok_or_else(|| {
+        mark_unlikely();
+        LimboError::InternalError(format!("aggregate {func:?} has no fixed-width state"))
+    })?;
+    let mut payload = crate::alloc::vec![];
+    payload.try_reserve(width)?;
+    for j in 0..width {
+        payload.push(state.registers[*payload_start_reg + j].get_value().clone());
+    }
+    state.registers[*acc_reg] = Register::Aggregate(AggContext::Builtin(payload));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_agg_context_store(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        AggContextStore {
+            acc_reg,
+            payload_start_reg,
+            func,
+        },
+        insn
+    );
+    let func = func.expect_agg();
+    let width = agg_payload_width(func).ok_or_else(|| {
+        mark_unlikely();
+        LimboError::InternalError(format!("aggregate {func:?} has no fixed-width state"))
+    })?;
+    let values: Vec<Value> = match &state.registers[*acc_reg] {
+        Register::Aggregate(AggContext::Builtin(payload)) => {
+            let payload_len = payload.len();
+            turso_assert!(
+                payload_len == width,
+                "aggregate state payload width {payload_len} does not match expected {width}"
+            );
+            payload.to_vec()
+        }
+        _ => {
+            mark_unlikely();
+            return Err(LimboError::InternalError(
+                "AggContextStore on an uninitialized accumulator".to_string(),
+            )
+            .into());
+        }
+    };
+    for (j, value) in values.into_iter().enumerate() {
+        state.registers[*payload_start_reg + j].set_value(value);
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_ivm_sum_step(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(IvmSumStep { data }, insn);
+    ivm_sum_apply(state, data)?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Add one row's contribution, times its z-set weight, to a materialized
+/// view's SUM/TOTAL/AVG state. A positive weight adds the row that many
+/// times, a negative weight retracts it. See `IvmSumData` for the state
+/// layout; this is the whole of IVM's xStep/xInverse for these functions.
+fn ivm_sum_apply(state: &mut ProgramState, data: &crate::vdbe::insn::IvmSumData) -> Result<()> {
+    fn reg_int(state: &ProgramState, reg: usize, what: &str) -> Result<i64> {
+        state.registers[reg].get_value().as_int().ok_or_else(|| {
+            LimboError::InternalError(format!("IVM sum: {what} register is not an integer"))
+        })
+    }
+    // A count is a number of live rows, so a weight can never take it below
+    // zero: that would retract rows the state never held.
+    fn add_to_count(state: &mut ProgramState, reg: usize, weight: i64) -> Result<()> {
+        let count = reg_int(state, reg, "count")?
+            .checked_add(weight)
+            .or_overflow()?;
+        if count < 0 {
+            mark_unlikely();
+            return Err(LimboError::InternalError(
+                "IVM sum: a retraction removed more rows than the state holds".to_string(),
+            ));
+        }
+        state.registers[reg].set_int(count);
+        Ok(())
+    }
+
+    let weight = reg_int(state, data.weight_reg, "weight")?;
+    let arg = state.registers[data.arg_reg].get_value().clone();
+    match classify_numeric_arg(&arg) {
+        NumericArg::Null => {}
+        NumericArg::Integer(i) => {
+            let wrapped = reg_int(state, data.int_wrapped_reg, "int_wrapped")?;
+            let wrap_count = reg_int(state, data.int_wrap_count_reg, "int_wrap_count")?;
+            let (new_wrapped, new_wrap_count) =
+                ivm_sum_add_weighted_int(wrapped, wrap_count, i, weight)?;
+            state.registers[data.int_wrapped_reg].set_int(new_wrapped);
+            state.registers[data.int_wrap_count_reg].set_int(new_wrap_count);
+            add_to_count(state, data.non_null_count_reg, weight)?;
+        }
+        NumericArg::Float(f) => {
+            let mut acc = state.registers[data.float_sum_reg].get_value().clone();
+            let r_err = state.registers[data.float_err_reg]
+                .get_value()
+                .to_float_or_zero();
+            let mut sum_state = SumAggState {
+                r_err,
+                ..Default::default()
+            };
+            apply_kbn_step(&mut acc, f * weight as f64, &mut sum_state);
+            state.registers[data.float_sum_reg].set_value(acc);
+            state.registers[data.float_err_reg].set_value(Value::from_f64(sum_state.r_err));
+            add_to_count(state, data.non_null_count_reg, weight)?;
+            add_to_count(state, data.non_int_count_reg, weight)?;
+        }
+    }
+    Ok(())
+}
+
+/// Add `weight * value` to the exact integer total `wrapped + wrap_count *
+/// 2^64`, returning the new `(wrapped, wrap_count)`.
+fn ivm_sum_add_weighted_int(
+    wrapped: i64,
+    wrap_count: i64,
+    value: i64,
+    weight: i64,
+) -> Result<(i64, i64)> {
+    // Split the exact product the same way as the total: `low` is its low
+    // 64 bits read as a signed number, `high` the number of 2^64 above that.
+    let product = i128::from(weight) * i128::from(value);
+    let low = product as i64;
+    let high = ((product - i128::from(low)) >> 64) as i64;
+    let (new_wrapped, overflowed) = wrapped.overflowing_add(low);
+    // Adding two i64 values overflows only in the direction the added value
+    // points: up for `low >= 0`, down otherwise.
+    let carry = match (overflowed, low >= 0) {
+        (false, _) => 0,
+        (true, true) => 1,
+        (true, false) => -1,
+    };
+    let new_wrap_count = wrap_count
+        .checked_add(high)
+        .and_then(|count| count.checked_add(carry))
+        .or_overflow()?;
+    Ok((new_wrapped, new_wrap_count))
+}
+
+pub fn op_ivm_sum_finalize(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(IvmSumFinalize { data }, insn);
+    let int_of = |reg: usize, what: &str| -> Result<i64> {
+        state.registers[reg].get_value().as_int().ok_or_else(|| {
+            LimboError::InternalError(format!("IVM sum: {what} register is not an integer"))
+        })
+    };
+    let wrapped = int_of(data.int_wrapped_reg, "int_wrapped")?;
+    let wrap_count = int_of(data.int_wrap_count_reg, "int_wrap_count")?;
+    let float_sum = state.registers[data.float_sum_reg].get_value().clone();
+    let float_err = state.registers[data.float_err_reg]
+        .get_value()
+        .to_float_or_zero();
+    let non_int_count = int_of(data.non_int_count_reg, "non_int_count")?;
+    let non_null_count = int_of(data.non_null_count_reg, "non_null_count")?;
+
+    let result = finalize_ivm_sum(
+        data.kind,
+        wrapped,
+        wrap_count,
+        float_sum,
+        float_err,
+        non_int_count,
+        non_null_count,
+    )?;
+    state.registers[data.dest_reg].set_value(result);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// `2^64`, used to convert an exact-integer total that overflowed i64
+/// (`wrapped + wrap_count * 2^64`) into an approximate REAL.
+const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
+
+/// Compute SUM, TOTAL, or AVG's current result from IVM's linear state: an
+/// exact integer total, a floating-point total, and two row counts. Unlike
+/// the shared window-function/regular-aggregate implementation this mirrors,
+/// every field here is a pure function of the view's current rows, so the
+/// result always matches a fresh evaluation of the defining SELECT. See
+/// "Divergences from DBSP" in docs/ivm-vdbe-rewrite-writeup.md for the one
+/// place this intentionally disagrees with sum()'s own (order-dependent)
+/// overflow reporting.
+fn finalize_ivm_sum(
+    kind: IvmSumKind,
+    wrapped: i64,
+    wrap_count: i64,
+    float_sum: Value,
+    float_err: f64,
+    non_int_count: i64,
+    non_null_count: i64,
+) -> Result<Value> {
+    if non_null_count == 0 {
+        return Ok(match kind {
+            IvmSumKind::Sum | IvmSumKind::Avg => Value::Null,
+            IvmSumKind::Total => Value::from_f64(0.0),
+        });
+    }
+    // A SUM over only exact-integer contributions stays an exact integer, or
+    // errors the same way sum() does if that exact total does not fit in i64.
+    if matches!(kind, IvmSumKind::Sum) && non_int_count == 0 {
+        if wrap_count != 0 {
+            mark_unlikely();
+            return Err(LimboError::IntegerOverflow);
+        }
+        return Ok(Value::from_i64(wrapped));
+    }
+    let mut acc = float_sum;
+    let mut sum_state = SumAggState {
+        r_err: float_err,
+        ..Default::default()
+    };
+    if wrap_count == 0 {
+        if wrapped != 0 {
+            apply_kbn_step_int(&mut acc, wrapped, &mut sum_state);
+        }
+    } else {
+        // The exact integer total overflowed i64, but a non-integer
+        // contribution already forces a REAL result, so approximate it
+        // instead of erroring (see the module doc comment above).
+        let approx = wrap_count as f64 * TWO_POW_64 + wrapped as f64;
+        apply_kbn_step(&mut acc, approx, &mut sum_state);
+    }
+    if matches!(acc, Value::Null) {
+        // A non-integer contribution produced NaN (e.g. +Infinity and
+        // -Infinity both appear): "the result is NULL", matching sum()'s
+        // documented NaN rule.
+        return Ok(Value::Null);
+    }
+    let total = acc.to_float_or_zero() + sum_state.r_err;
+    Ok(match kind {
+        IvmSumKind::Sum | IvmSumKind::Total => Value::from_f64(total),
+        IvmSumKind::Avg => Value::from_f64(total / non_null_count as f64),
+    })
+}
+
+/// Number of payload slots for aggregates whose state is a fixed-width value
+/// vector, i.e. the aggregates that can be persisted to a materialized view's
+/// state table and maintained incrementally. Returns None for aggregates with
+/// variable-size or non-invertible state.
+pub(crate) fn agg_payload_width(func: &AggFunc) -> Option<usize> {
+    match func {
+        AggFunc::Count | AggFunc::Count0 => Some(1),
+        AggFunc::Avg => Some(3),
+        AggFunc::Sum | AggFunc::Total => Some(5),
+        _ => None,
+    }
+}
+
 fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
     let val = match func {
         AggFunc::Count | AggFunc::Count0 => payload[0].clone(),
@@ -7835,7 +8321,12 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
             }
         }
         AggFunc::Min | AggFunc::Max => payload[0].clone(),
-        AggFunc::GroupConcat | AggFunc::StringAgg => payload[0].clone(),
+        AggFunc::GroupConcat | AggFunc::StringAgg => match payload {
+            [Value::Null, Value::Numeric(Numeric::Integer(count)), ..] if *count > 0 => {
+                Value::build_text(String::new())
+            }
+            _ => payload[0].clone(),
+        },
         AggFunc::ArrayAgg => {
             // payload[0] = count, payload[1..] = accumulated values.
             // Serialize to a record blob only once at finalization.
@@ -8848,7 +9339,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             };
             let remove_len = value_len.checked_add(separator_len).or_overflow()?;
             let Value::Text(text) = acc else {
-                unreachable!("GroupConcat accumulator is Text after a non-NULL xStep");
+                return Ok(());
             };
             let accumulated_len = text.as_str().len();
             if remove_len < accumulated_len && !text.as_str().is_char_boundary(remove_len) {
@@ -9215,6 +9706,7 @@ pub fn op_agg_final(
             state,
             ext_func.finalize_aggregate(&mut state.registers[acc_reg])
         );
+        value.check_length_limit()?;
         state.registers[dest_reg].set_value(value);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -9236,6 +9728,7 @@ pub fn op_agg_final(
                     _ => finalize_agg_payload(func, payload)?,
                 },
             };
+            value.check_length_limit()?;
             if acc_reg == dest_reg {
                 let accumulator =
                     std::mem::replace(&mut state.registers[acc_reg], Register::Value(value));
@@ -10193,14 +10686,18 @@ pub fn op_function(
                 // to the schema). Resolve the sequence first so currval
                 // on a dropped sequence reports "does not exist" rather
                 // than silently returning the stale per-session value.
-                program.connection.find_sequence(&seq_name)?;
-                match program.connection.get_sequence_currval(&seq_name) {
+                let (namespace, sequence) = program.connection.find_sequence(&seq_name)?;
+                match program
+                    .connection
+                    .get_sequence_currval(namespace.database_id, &sequence.name)
+                {
                     Some(val) => {
                         state.registers[*dest].set_value(Value::from_i64(val));
                     }
                     None => {
                         return Err(crate::LimboError::ParseError(format!(
-                            "currval of sequence \"{seq_name}\" is not yet defined in this session",
+                            "currval of sequence \"{}\" is not yet defined in this session",
+                            sequence.name
                         ))
                         .into());
                     }
@@ -10250,7 +10747,7 @@ pub fn op_function(
                     )
                     .into());
                 }
-                let seq = program.connection.find_sequence(&seq_name)?;
+                let (_, seq) = program.connection.find_sequence(&seq_name)?;
                 if value < seq.min_value || value > seq.max_value {
                     return Err(crate::LimboError::ParseError(format!(
                         "setval: value {} is out of bounds for sequence \"{}\" ({}..{})",
@@ -10335,7 +10832,9 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Random => {
-                state.registers[*dest].set_int(pager.io.generate_random_number());
+                let bits = pager.io.generate_random_number();
+                let value = program.connection.dialect().random_value(bits);
+                state.registers[*dest].set_value(value);
             }
             #[cfg(feature = "test_helper")]
             ScalarFunc::TestNondetCounter => {
@@ -10433,13 +10932,15 @@ pub fn op_function(
             ScalarFunc::Date => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_date(values);
+                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+                let result = exec_date(&clock, values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Time => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_time(values);
+                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+                let result = exec_time(&clock, values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::TimeDiff => {
@@ -10449,7 +10950,8 @@ pub fn op_function(
                     let start = state.registers[*start_reg].get_value();
                     let end = state.registers[*start_reg + 1].get_value();
 
-                    let result = crate::functions::datetime::exec_timediff([start, end]);
+                    let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+                    let result = crate::functions::datetime::exec_timediff(&clock, [start, end]);
 
                     state.registers[*dest].set_value(result);
                 }
@@ -10462,19 +10964,22 @@ pub fn op_function(
             ScalarFunc::DateTime => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_datetime_full(values);
+                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+                let result = exec_datetime_full(&clock, values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::JulianDay => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_julianday(values);
+                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+                let result = exec_julianday(&clock, values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::UnixEpoch => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_unixepoch(values);
+                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+                let result = exec_unixepoch(&clock, values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::TursoVersion => {
@@ -10524,7 +11029,8 @@ pub fn op_function(
             ScalarFunc::StrfTime => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_strftime(values);
+                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+                let result = exec_strftime(&clock, values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Printf => {
@@ -10538,7 +11044,8 @@ pub fn op_function(
                     return Err(LimboError::InvalidArgument(
                         "table_columns_json_array: turso must be compiled with JSON support"
                             .to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 #[cfg(feature = "json")]
                 {
@@ -10554,7 +11061,7 @@ pub fn op_function(
                     };
                     let table = {
                         let schema = program.connection.schema.read();
-                        match schema.get_table(table.as_str()) {
+                        match schema.get_table(NamespaceId::ROOT, table.as_str()) {
                             Some(table) => table,
                             None => {
                                 return Err(LimboError::InvalidArgument(format!(
@@ -10592,7 +11099,8 @@ pub fn op_function(
                     return Err(LimboError::InvalidArgument(
                         "bin_record_json_object: turso must be compiled with JSON support"
                             .to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 #[cfg(feature = "json")]
                 'outer: {
@@ -10819,20 +11327,11 @@ pub fn op_function(
                         .into());
                     }
                 };
-                let (db_id, sequence_key) =
-                    if let Some((schema_name, sequence_name)) = sequence_name.split_once('.') {
-                        (
-                            program.connection.get_database_id_by_name(schema_name)?,
-                            crate::util::normalize_ident(sequence_name),
-                        )
-                    } else {
-                        (MAIN_DB_ID, crate::util::normalize_ident(sequence_name))
-                    };
-                program.connection.find_sequence(sequence_name)?;
+                let (namespace, sequence) = program.connection.find_sequence(sequence_name)?;
                 let watermark = program
                     .connection
-                    .mv_store_for_db(db_id)
-                    .and_then(|mv_store| mv_store.sequence_watermark(&sequence_key));
+                    .mv_store_for_db(namespace.database_id)
+                    .and_then(|mv_store| mv_store.sequence_watermark(&sequence.name));
                 match watermark {
                     Some(watermark) => state.registers[*dest].set_int(watermark),
                     None => state.registers[*dest].set_value(Value::Null),
@@ -11190,6 +11689,18 @@ pub fn op_function(
                     }
                 };
             }
+            ScalarFunc::DatePlus | ScalarFunc::DateMinus => {
+                check_arg_count!(arg_count, 2);
+                let lhs = state.registers[*start_reg].get_value();
+                let rhs = state.registers[*start_reg + 1].get_value();
+                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+                let result = match scalar_func {
+                    ScalarFunc::DatePlus => exec_date_plus(&clock, lhs, rhs)?,
+                    ScalarFunc::DateMinus => exec_date_minus(&clock, lhs, rhs)?,
+                    _ => unreachable!(),
+                };
+                state.registers[*dest].set_value(result);
+            }
             ScalarFunc::ArrayAppend => {
                 check_arg_count!(arg_count, 2);
                 let arr_val = state.registers[*start_reg].get_value().clone();
@@ -11391,9 +11902,23 @@ pub fn op_function(
             }
 
             MathFuncArity::Binary => {
-                let lhs = &state.registers[*start_reg];
-                let rhs = &state.registers[*start_reg + 1];
-                let result = lhs.get_value().exec_math_binary(rhs.get_value(), math_func);
+                let lhs = state.registers[*start_reg].get_value();
+                let rhs = state.registers[*start_reg + 1].get_value();
+                let dialect = program.connection.dialect();
+                let result =
+                    lhs.exec_math_binary(rhs, math_func, dialect.errors_on_zero_divisor())?;
+                let result = match (
+                    math_func,
+                    Numeric::from_value_strict(lhs),
+                    Numeric::from_value_strict(rhs),
+                ) {
+                    (MathFunc::Mod, Some(Numeric::Integer(lhs)), Some(Numeric::Integer(rhs)))
+                        if rhs != 0 && dialect.mod_of_integers_is_integer() =>
+                    {
+                        Value::from_i64(lhs.wrapping_rem(rhs))
+                    }
+                    _ => result,
+                };
                 state.registers[*dest].set_value(result);
             }
 
@@ -11625,7 +12150,7 @@ pub fn op_function(
                                     // Rebuild with new table identifier so SQL persists the new name.
                                     let new_stmt = ast::Stmt::CreateTable {
                                         tbl_name: ast::QualifiedName {
-                                            db_name: None,
+                                            namespace: None,
                                             name: ast::Name::exact(original_rename_to.to_string()),
                                             alias: None,
                                         },
@@ -11679,7 +12204,7 @@ pub fn op_function(
                                     let new_stmt =
                                         ast::Stmt::CreateVirtualTable(ast::CreateVirtualTable {
                                             tbl_name: ast::QualifiedName {
-                                                db_name: tbl_name.db_name,
+                                                namespace: tbl_name.namespace,
                                                 name: ast::Name::exact(
                                                     original_rename_to.to_string(),
                                                 ),
@@ -11708,7 +12233,7 @@ pub fn op_function(
                                 // Rewrite ON table name if it matches the renamed table
                                 let new_trigger_tbl_name = if trigger_tbl == rename_from {
                                     ast::QualifiedName {
-                                        db_name: trigger_tbl_name.db_name,
+                                        namespace: trigger_tbl_name.namespace,
                                         name: ast::Name::exact(original_rename_to.to_string()),
                                         alias: None,
                                     }
@@ -11811,7 +12336,7 @@ pub fn op_function(
                                 idx_name,
                                 mut where_clause,
                                 using,
-                                with_clause,
+                                mut with_clause,
                             } => {
                                 if table != normalize_ident(tbl_name.as_str()) {
                                     break 'sql None;
@@ -11831,6 +12356,22 @@ pub fn op_function(
                                         &rename_from,
                                         column_def.col_name.as_str(),
                                     );
+                                }
+
+                                if let Some(using) = &using {
+                                    let syms = program.connection.syms.read();
+                                    let Some(index_method) = syms.index_methods.get(using.as_str())
+                                    else {
+                                        return Err(LimboError::InternalError(format!(
+                                            "index method {using} not found during ALTER TABLE RENAME COLUMN"
+                                        ))
+                                        .into());
+                                    };
+                                    index_method.rename_column_in_with_clause(
+                                        &mut with_clause,
+                                        &rename_from,
+                                        column_def.col_name.as_str(),
+                                    )?;
                                 }
 
                                 Some(
@@ -12118,11 +12659,44 @@ pub fn op_function(
             unreachable!("Window functions should not be handled here")
         }
     }
+    state.registers[*dest].get_value().check_length_limit()?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub(crate) type OpAttachState = crate::connection::AttachDatabaseState;
+/// The clock seen by the date and time functions. Like SQLite's
+/// `sqlite3StmtCurrentTime`, it reads the wall clock on the first request and
+/// returns that same time until the step that requested it ends.
+struct StatementClock<'a> {
+    io: &'a dyn Clock,
+    now: &'a Cell<Option<WallClockInstant>>,
+}
+
+impl<'a> StatementClock<'a> {
+    fn new(io: &'a dyn Clock, now: &'a mut Option<WallClockInstant>) -> Self {
+        Self {
+            io,
+            now: Cell::from_mut(now),
+        }
+    }
+}
+
+impl Clock for StatementClock<'_> {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        self.io.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        let now = self
+            .now
+            .get()
+            .unwrap_or_else(|| self.io.current_time_wall_clock());
+        self.now.set(Some(now));
+        now
+    }
+}
+
+pub(crate) type OpAttachState = crate::dialect::sqlite::attach::AttachDatabaseState;
 
 /// LIKE with an operand that is not TEXT: both are converted to TEXT first.
 #[inline(never)]
@@ -12302,11 +12876,74 @@ pub fn op_yield(
 
 pub struct OpInsertState {
     pub sub_state: OpInsertSubState,
-    pub has_dependent_views: bool,
+    /// Change-log routing for the written table, resolved once per row in
+    /// MaybeCaptureRecord and reused by every later sub-state. Avoids
+    /// re-acquiring the schema read lock and re-walking the dependent-view
+    /// list on every sub-state transition.
+    pub(crate) route: Option<ChangeLogRoute>,
     pub old_record: Option<(i64, crate::alloc::Vec<Value>)>,
     /// Set by the NoopCheck sub-state to indicate the row already has the exact
     /// same payload, so the physical write can be skipped.
     pub is_noop_update: bool,
+}
+
+pub(crate) struct ChangeLogRoute {
+    table: Arc<crate::schema::BTreeTable>,
+    dependent_views: crate::alloc::Vec<String>,
+    is_materialized_view: bool,
+}
+
+/// Resolve change-log routing from the btree being written, never from the
+/// SQL spelling carried in the opcode for tracing/update hooks.
+fn change_log_route(
+    program: &Program,
+    state: &ProgramState,
+    cursor_id: usize,
+) -> Result<Option<ChangeLogRoute>> {
+    // Materialized views currently live in main. Writes to temp or attached
+    // databases must not be resolved through main's schema just because a
+    // table there happens to have the same name or root page.
+    if state.cursor_databases.get(cursor_id).copied().flatten() != Some(MAIN_DB_ID) {
+        return Ok(None);
+    }
+    let cursor_table = match program.cursor_ref.get(cursor_id) {
+        Some((_, CursorType::BTreeTable(table)))
+        | Some((_, CursorType::MaterializedView(table, _))) => table.clone(),
+        _ => return Ok(None),
+    };
+    let schema = program.connection.schema.read();
+    // Check for dependent views before doing anything else: a plain write to
+    // a table with no materialized views is the overwhelmingly common case,
+    // and it must stay as cheap as it was before change-log routing existed,
+    // i.e. a single schema-map lookup rather than also resolving the
+    // schema-owned table descriptor and the is_materialized_view check below.
+    let dependent_views =
+        schema.get_dependent_materialized_views(NamespaceId::ROOT, &cursor_table.name);
+    if dependent_views.is_empty() {
+        return Ok(None);
+    }
+    // Maintenance write cursors intentionally use a synthetic physical
+    // descriptor that includes the trailing weight column. Resolve the bound
+    // cursor back to the schema-owned descriptor so change capture always
+    // deals in the relation's logical row shape.
+    let Some(table) = schema.get_btree_table(NamespaceId::ROOT, &cursor_table.name) else {
+        return Ok(None);
+    };
+    // A zero root belongs to a cursor whose btree is assigned at runtime
+    // (CREATE) or to an ephemeral relation. Otherwise the root is part of the
+    // bound relation identity and must still match the current schema.
+    if cursor_table.root_page != 0 && cursor_table.root_page != table.root_page {
+        return Err(LimboError::InternalError(format!(
+            "changed btree {} has root {}, but the current schema binds it to root {}",
+            cursor_table.name, cursor_table.root_page, table.root_page
+        )));
+    }
+    let is_materialized_view = schema.is_materialized_view(NamespaceId::ROOT, &table.name);
+    Ok(Some(ChangeLogRoute {
+        table,
+        dependent_views,
+        is_materialized_view,
+    }))
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -12333,8 +12970,99 @@ pub enum OpInsertSubState {
     /// Updating last_insert_rowid may return IO, so we need a separate state for it so that we don't
     /// start inserting the same row multiple times.
     UpdateLastRowid,
-    /// If there are dependent incremental views, apply the change.
-    ApplyViewChange,
+    /// If the row being overwritten had dependent views, record its retraction.
+    ApplyRetraction,
+    /// Recording the retraction started a change-log spill; wait for it to
+    /// finish before recording anything else.
+    WaitForRetractionSpill,
+    /// Record the new row's contribution to any dependent views.
+    ApplyInsertion,
+    /// Recording the insertion started a change-log spill; wait for it to
+    /// finish before this opcode is done.
+    WaitForInsertionSpill,
+}
+
+fn materialized_view_record_change(
+    table_name: &str,
+    table: &crate::schema::BTreeTable,
+    mut physical_values: crate::alloc::Vec<Value>,
+    direction: isize,
+) -> Result<(crate::alloc::Vec<Value>, isize)> {
+    let logical_width = table.columns().len();
+    if physical_values.len() != logical_width + 1 {
+        return Err(LimboError::Corrupt(format!(
+            "materialized view {table_name} record has {} fields, expected {} logical fields and one weight",
+            physical_values.len(),
+            logical_width
+        )));
+    }
+    let stored_weight = match physical_values.pop() {
+        Some(Value::Numeric(Numeric::Integer(weight))) => weight,
+        _ => {
+            return Err(LimboError::Corrupt(format!(
+                "materialized view {table_name} record has a non-integer weight"
+            )));
+        }
+    };
+    if stored_weight <= 0 {
+        return Err(LimboError::Corrupt(format!(
+            "materialized view {table_name} record has non-positive weight {stored_weight}"
+        )));
+    }
+    let stored_weight = isize::try_from(stored_weight).map_err(|_| {
+        LimboError::Corrupt(format!(
+            "materialized view {table_name} weight does not fit the maintenance weight type"
+        ))
+    })?;
+    let weight = stored_weight.checked_mul(direction).ok_or_else(|| {
+        LimboError::Corrupt(format!(
+            "materialized view {table_name} maintenance weight overflow"
+        ))
+    })?;
+    Ok((physical_values, weight))
+}
+
+fn normalize_table_change_record(
+    table: &crate::schema::BTreeTable,
+    rowid: i64,
+    mut values: crate::alloc::Vec<Value>,
+) -> Result<crate::alloc::Vec<Value>> {
+    if values.len() > table.columns().len() {
+        return Err(LimboError::Corrupt(format!(
+            "table {} record has {} fields, but the schema has {} columns",
+            table.name,
+            values.len(),
+            table.columns().len()
+        )));
+    }
+
+    values.try_reserve(table.columns().len() - values.len())?;
+    for column in table.columns().iter().skip(values.len()) {
+        let mut value = if column.is_rowid_alias() {
+            Value::from_i64(rowid)
+        } else if let Some(default) = column.default.as_deref() {
+            crate::translate::alter::eval_constant_default_value(default)?
+        } else {
+            Value::Null
+        };
+        if let Some(converted) = column.affinity().convert(&value) {
+            value = match converted {
+                Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
+                Either::Left(_) => {
+                    unreachable!("affinity conversion returned an unexpected borrowed value")
+                }
+                Either::Right(value) => value,
+            };
+        }
+        values.push(value);
+    }
+
+    for (index, column) in table.columns().iter().enumerate() {
+        if column.is_rowid_alias() {
+            values[index] = Value::from_i64(rowid);
+        }
+    }
+    Ok(values)
 }
 
 pub fn op_insert(
@@ -12357,19 +13085,21 @@ pub fn op_insert(
     loop {
         match state.active_op_state.insert().sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
-                let has_dependent_views = {
-                    let schema = program.connection.schema.read();
-                    !schema
-                        .get_dependent_materialized_views(table_name)
-                        .is_empty()
+                let route = if program.prepared().has_materialized_views {
+                    change_log_route(program, state, *cursor_id)?
+                } else {
+                    None
                 };
-                state.active_op_state.insert().has_dependent_views = has_dependent_views;
+                let has_change_log_subscribers = route
+                    .as_ref()
+                    .is_some_and(|route| !route.dependent_views.is_empty());
+                state.active_op_state.insert().route = route;
                 // If there are no dependent views, we don't need to capture the old record.
                 // We also don't need to do it if the rowid of the UPDATEd row was changed, because
                 // op_delete already captured the deletion for IVM, and this insert only needs to
                 // record the new row (which ApplyViewChange handles without old_record).
                 let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                    has_change_log_subscribers && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
 
                 if flag.has(InsertFlags::REQUIRE_SEEK) {
                     state.active_op_state.insert().sub_state = OpInsertSubState::Seek;
@@ -12405,9 +13135,14 @@ pub fn op_insert(
                 )? {
                     return Ok(state.suspend_on_io(io));
                 }
-                let has_dependent_views = state.active_op_state.insert().has_dependent_views;
+                let has_change_log_subscribers = state
+                    .active_op_state
+                    .insert()
+                    .route
+                    .as_ref()
+                    .is_some_and(|route| !route.dependent_views.is_empty());
                 let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                    has_change_log_subscribers && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
                 if needs_capture {
                     state.active_op_state.insert().sub_state = OpInsertSubState::CaptureRecord;
                 } else {
@@ -12433,29 +13168,35 @@ pub fn op_insert(
                 let cursor = state.get_cursor(*cursor_id);
                 let cursor = cursor.as_btree_mut();
                 let maybe_key = return_if_io!(state, cursor.rowid());
-                let old_record = if let Some(key) = maybe_key {
-                    if key == insert_key {
-                        let maybe_record = return_if_io!(state, cursor.record());
-                        if let Some(record) = maybe_record {
-                            let mut values = record.get_values_owned()?;
-                            let schema = program.connection.schema.read();
-                            if let Some(table) = schema.get_table(table_name) {
-                                for (i, col) in table.columns().iter().enumerate() {
-                                    if col.is_rowid_alias() && i < values.len() {
-                                        values[i] = Value::from_i64(key);
-                                    }
-                                }
+                let old_record =
+                    if let Some(key) = maybe_key {
+                        if key == insert_key {
+                            let maybe_record = return_if_io!(state, cursor.record());
+                            if let Some(record) = maybe_record {
+                                let values = record.get_values_owned()?;
+                                let route =
+                                    state.active_op_state.insert().route.as_ref().ok_or_else(
+                                        || {
+                                            LimboError::InternalError(format!(
+                                                "changed btree for {table_name} missing from schema"
+                                            ))
+                                        },
+                                    )?;
+                                let values = if route.is_materialized_view {
+                                    values
+                                } else {
+                                    normalize_table_change_record(&route.table, key, values)?
+                                };
+                                Some((key, values))
+                            } else {
+                                None
                             }
-                            Some((key, values))
                         } else {
                             None
                         }
                     } else {
                         None
-                    }
-                } else {
-                    None
-                };
+                    };
                 state.active_op_state.insert().old_record = old_record;
                 state.active_op_state.insert().sub_state = OpInsertSubState::NoopCheck;
                 continue;
@@ -12548,14 +13289,16 @@ pub fn op_insert(
                     let cursor = cursor.as_btree_mut();
                     cursor.root_page()
                 };
-                if root_page != 1
-                    && table_name != SQLITE_SEQUENCE_TABLE_NAME
-                    && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
-                {
+                // An MVCC cursor reports its table id as the root page, so the
+                // schema table shows up as SQLITE_SCHEMA_MVCC_TABLE_ID there
+                // instead of page 1.
+                let is_schema_root = root_page == 1
+                    || root_page == i64::from(crate::mvcc::database::SQLITE_SCHEMA_MVCC_TABLE_ID);
+                if !is_schema_root && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT) {
                     state.active_op_state.insert().sub_state = OpInsertSubState::UpdateLastRowid;
                 } else {
-                    // Schema table writes (sqlite_master, sqlite_sequence, ephemeral)
-                    // must not produce view deltas. The p4 table_name on these inserts
+                    // Schema table and ephemeral writes must not produce
+                    // view deltas. The p4 table_name on these inserts
                     // refers to the *target* table (for the update hook), not the table
                     // actually being written to. Tracking deltas here would feed the
                     // sqlite_master record into the DBSP circuit as if it were data
@@ -12592,22 +13335,85 @@ pub fn op_insert(
                         state.record_statement_change();
                     }
                 }
-                if state.active_op_state.insert().has_dependent_views {
+                let has_change_log_subscribers = state
+                    .active_op_state
+                    .insert()
+                    .route
+                    .as_ref()
+                    .is_some_and(|route| !route.dependent_views.is_empty());
+                if has_change_log_subscribers {
                     if !has_rowid {
                         return Err(LimboError::ParseError(
                             "WITHOUT ROWID tables with dependent materialized views are not supported"
                                 .to_string(),
                         ).into());
                     }
-                    state.active_op_state.insert().sub_state = OpInsertSubState::ApplyViewChange;
+                    state.active_op_state.insert().sub_state = OpInsertSubState::ApplyRetraction;
                     continue;
                 }
                 break;
             }
-            OpInsertSubState::ApplyViewChange => {
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                assert!(!dependent_views.is_empty());
+            OpInsertSubState::ApplyRetraction => {
+                if state.active_op_state.insert().is_noop_update {
+                    state.active_op_state.insert().old_record = None;
+                    break;
+                }
+                let Some((key, values)) = state.active_op_state.insert().old_record.take() else {
+                    state.active_op_state.insert().sub_state = OpInsertSubState::ApplyInsertion;
+                    continue;
+                };
+                let insert_state = state.active_op_state.insert();
+                let route = insert_state.route.as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "changed btree for {table_name} missing from schema"
+                    ))
+                })?;
+                assert!(!route.dependent_views.is_empty());
+
+                let spill_started = if route.is_materialized_view {
+                    let (values, weight) = materialized_view_record_change(
+                        &route.table.name,
+                        &route.table,
+                        values,
+                        -1,
+                    )?;
+                    program.connection.transaction_changes.change(
+                        &route.table,
+                        &route.dependent_views,
+                        key,
+                        values,
+                        weight,
+                        program.connection.get_temp_store(),
+                    )?
+                } else {
+                    program.connection.transaction_changes.delete(
+                        &route.table,
+                        &route.dependent_views,
+                        key,
+                        values,
+                        program.connection.get_temp_store(),
+                    )?
+                };
+                state.active_op_state.insert().sub_state = if spill_started {
+                    OpInsertSubState::WaitForRetractionSpill
+                } else {
+                    OpInsertSubState::ApplyInsertion
+                };
+                continue;
+            }
+            OpInsertSubState::WaitForRetractionSpill => {
+                return_if_io!(state, program.connection.transaction_changes.finish_spill());
+                state.active_op_state.insert().sub_state = OpInsertSubState::ApplyInsertion;
+                continue;
+            }
+            OpInsertSubState::ApplyInsertion => {
+                let insert_state = state.active_op_state.insert();
+                let route = insert_state.route.as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "changed btree for {table_name} missing from schema"
+                    ))
+                })?;
+                assert!(!route.dependent_views.is_empty());
 
                 let (key, values) = {
                     let key = match &state.registers[*key_reg].get_value() {
@@ -12628,39 +13434,49 @@ pub fn op_insert(
                     };
 
                     // Add insertion of new row to view deltas
-                    let mut new_values = record.get_values_owned()?;
-
-                    // Fix rowid alias columns: replace Null with actual rowid value
-                    let schema = program.connection.schema.read();
-                    if let Some(table) = schema.get_table(table_name) {
-                        for (i, col) in table.columns().iter().enumerate() {
-                            if col.is_rowid_alias() && i < new_values.len() {
-                                new_values[i] = Value::from_i64(key);
-                            }
-                        }
-                    }
+                    let new_values = record.get_values_owned()?;
+                    let new_values = if route.is_materialized_view {
+                        new_values
+                    } else {
+                        normalize_table_change_record(&route.table, key, new_values)?
+                    };
 
                     (key, new_values)
                 };
 
-                if let Some((key, values)) = state.active_op_state.insert().old_record.take() {
-                    for view_name in dependent_views.iter() {
-                        let tx_state = program
-                            .connection
-                            .view_transaction_states
-                            .get_or_create(view_name);
-                        tx_state.delete(table_name, key, values.to_vec());
-                    }
+                let spill_started = if route.is_materialized_view {
+                    let (values, weight) = materialized_view_record_change(
+                        &route.table.name,
+                        &route.table,
+                        values,
+                        1,
+                    )?;
+                    program.connection.transaction_changes.change(
+                        &route.table,
+                        &route.dependent_views,
+                        key,
+                        values,
+                        weight,
+                        program.connection.get_temp_store(),
+                    )?
+                } else {
+                    program.connection.transaction_changes.insert(
+                        &route.table,
+                        &route.dependent_views,
+                        key,
+                        values,
+                        program.connection.get_temp_store(),
+                    )?
+                };
+                if spill_started {
+                    state.active_op_state.insert().sub_state =
+                        OpInsertSubState::WaitForInsertionSpill;
+                    continue;
                 }
-                for view_name in dependent_views.iter() {
-                    let tx_state = program
-                        .connection
-                        .view_transaction_states
-                        .get_or_create(view_name);
-
-                    tx_state.insert(table_name, key, values.to_vec());
-                }
-
+                break;
+            }
+            OpInsertSubState::WaitForInsertionSpill => {
+                return_if_io!(state, program.connection.transaction_changes.finish_spill());
                 break;
             }
         }
@@ -12693,6 +13509,11 @@ pub fn op_int_64(
 
 pub struct OpDeleteState {
     pub sub_state: OpDeleteSubState,
+    /// Change-log routing for the deleted table, resolved once per row in
+    /// MaybeCaptureRecord and reused by every later sub-state. Avoids
+    /// re-acquiring the schema read lock and re-walking the dependent-view
+    /// list on every sub-state transition.
+    pub(crate) route: Option<ChangeLogRoute>,
     pub deleted_record: Option<(i64, crate::alloc::Vec<Value>)>,
 }
 
@@ -12704,6 +13525,9 @@ pub enum OpDeleteSubState {
     Delete,
     /// Apply the change to the dependent views.
     ApplyViewChange,
+    /// Recording the change started a change-log spill; wait for it to
+    /// finish before this opcode is done.
+    WaitForSpill,
 }
 
 pub fn op_delete(
@@ -12724,9 +13548,17 @@ pub fn op_delete(
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                if dependent_views.is_empty() {
+                let route = if program.prepared().has_materialized_views {
+                    change_log_route(program, state, *cursor_id)?
+                } else {
+                    None
+                };
+                let Some(route) = route else {
+                    state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
+                    continue;
+                };
+                if route.dependent_views.is_empty() {
+                    state.active_op_state.delete().route = Some(route);
                     state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                     continue;
                 }
@@ -12742,22 +13574,19 @@ pub fn op_delete(
                     // Get the current record before deletion and extract values
                     let maybe_record = return_if_io!(state, cursor.record());
                     if let Some(record) = maybe_record {
-                        let mut values = record.get_values_owned()?;
-
-                        // Fix rowid alias columns: replace Null with actual rowid value
-                        if let Some(table) = schema.get_table(table_name) {
-                            for (i, col) in table.columns().iter().enumerate() {
-                                if col.is_rowid_alias() && i < values.len() {
-                                    values[i] = Value::from_i64(key);
-                                }
-                            }
-                        }
+                        let values = record.get_values_owned()?;
+                        let values = if route.is_materialized_view {
+                            values
+                        } else {
+                            normalize_table_change_record(&route.table, key, values)?
+                        };
                         Some((key, values))
                     } else {
                         None
                     }
                 };
                 state.active_op_state.delete().deleted_record = deleted_record;
+                state.active_op_state.delete().route = Some(route);
                 state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                 continue;
             }
@@ -12769,28 +13598,63 @@ pub fn op_delete(
                 }
                 // Increment metrics for row write (DELETE is a write operation)
                 state.record_rows_written(1);
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                if dependent_views.is_empty() {
+                let has_change_log_subscribers = state
+                    .active_op_state
+                    .delete()
+                    .route
+                    .as_ref()
+                    .is_some_and(|route| !route.dependent_views.is_empty());
+                if !has_change_log_subscribers {
                     break;
                 }
                 state.active_op_state.delete().sub_state = OpDeleteSubState::ApplyViewChange;
                 continue;
             }
             OpDeleteSubState::ApplyViewChange => {
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                assert!(!dependent_views.is_empty());
-                let maybe_deleted_record = state.active_op_state.delete().deleted_record.take();
-                if let Some((key, values)) = maybe_deleted_record {
-                    for view_name in dependent_views {
-                        let tx_state = program
-                            .connection
-                            .view_transaction_states
-                            .get_or_create(&view_name);
-                        tx_state.delete(table_name, key, values.to_vec());
-                    }
+                let Some((key, values)) = state.active_op_state.delete().deleted_record.take()
+                else {
+                    // No record existed at the delete position; nothing to publish.
+                    break;
+                };
+                let delete_state = state.active_op_state.delete();
+                let route = delete_state.route.as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "changed btree for {table_name} missing from schema"
+                    ))
+                })?;
+                assert!(!route.dependent_views.is_empty());
+                let spill_started = if route.is_materialized_view {
+                    let (values, weight) = materialized_view_record_change(
+                        &route.table.name,
+                        &route.table,
+                        values,
+                        -1,
+                    )?;
+                    program.connection.transaction_changes.change(
+                        &route.table,
+                        &route.dependent_views,
+                        key,
+                        values,
+                        weight,
+                        program.connection.get_temp_store(),
+                    )?
+                } else {
+                    program.connection.transaction_changes.delete(
+                        &route.table,
+                        &route.dependent_views,
+                        key,
+                        values,
+                        program.connection.get_temp_store(),
+                    )?
+                };
+                if spill_started {
+                    state.active_op_state.delete().sub_state = OpDeleteSubState::WaitForSpill;
+                    continue;
                 }
+                break;
+            }
+            OpDeleteSubState::WaitForSpill => {
+                return_if_io!(state, program.connection.transaction_changes.finish_spill());
                 break;
             }
         }
@@ -13413,6 +14277,45 @@ pub fn op_must_be_int(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_get_subtype(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(GetSubtype { src_reg, dest_reg }, insn);
+    let subtype = state.registers[*src_reg].get_value().exec_subtype();
+    state.registers[*dest_reg] = Register::Value(subtype);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_set_subtype(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        SetSubtype {
+            subtype_reg,
+            dest_reg
+        },
+        insn
+    );
+    let subtype = state.registers[*subtype_reg]
+        .get_value()
+        .as_int()
+        .ok_or_else(|| LimboError::InternalError("stored subtype must be an integer".into()))?;
+    let subtype = crate::types::TextSubtype::try_from(subtype)
+        .map_err(|value| LimboError::InternalError(format!("unknown stored subtype: {value}")))?;
+    if let Register::Value(Value::Text(text)) = &mut state.registers[*dest_reg] {
+        text.subtype = subtype;
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_soft_null(
     _program: &Program,
     state: &mut ProgramState,
@@ -13616,6 +14519,7 @@ pub fn op_open_write(
     }
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
+    state.cursor_databases[*cursor_id] = Some(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if mv_store.is_some() {
@@ -13661,11 +14565,7 @@ pub fn op_open_write(
                 )
                 .into());
             };
-            if !mv_store.is_exclusive_tx(&tx_id) {
-                return Err(LimboError::TxError(
-                    "DDL statements require an exclusive transaction (use BEGIN instead of BEGIN CONCURRENT)".to_string(),
-                ).into());
-            }
+            upgrade_mv_tx_to_exclusive(program, &pager, mv_store, *db, tx_id)?;
         }
     }
 
@@ -14210,7 +15110,15 @@ pub fn op_drop_table(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(DropTable { db, table_name, .. }, insn);
+    load_insn!(
+        DropTable {
+            db,
+            namespace,
+            table_name,
+            ..
+        },
+        insn
+    );
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store_for_db(*db).is_some();
     {
@@ -14220,7 +15128,7 @@ pub fn op_drop_table(
             // to include them to avoid "page never used" false positives.
             if is_mvcc {
                 let table = schema
-                    .get_table(table_name)
+                    .get_table(*namespace, table_name)
                     .expect("DROP TABLE: table must exist in schema");
                 if let Some(btree) = table.btree() {
                     // Only track positive root pages (checkpointed tables).
@@ -14230,17 +15138,19 @@ pub fn op_drop_table(
                     }
                 }
                 // Capture index root pages (table may not have indexes)
-                if let Some(indexes) = schema.indexes.get(table_name) {
-                    for index in indexes.iter() {
-                        if index.root_page > 0 {
-                            schema.dropped_root_pages.insert(index.root_page);
-                        }
+                let index_root_pages: Vec<i64> = schema
+                    .indices_including_backing(*namespace, table_name)
+                    .map(|index| index.root_page)
+                    .collect();
+                for root_page in index_root_pages {
+                    if root_page > 0 {
+                        schema.dropped_root_pages.insert(root_page);
                     }
                 }
             }
-            schema.remove_indices_for_table(table_name);
-            schema.remove_triggers_for_table(table_name);
-            schema.remove_table(table_name);
+            schema.remove_indices_for_table(*namespace, table_name);
+            schema.remove_triggers_for_table(*namespace, table_name);
+            schema.remove_table(*namespace, table_name);
         })?;
         // SQLite also removes temp triggers that target the dropped table.
         // Only needed when dropping from a non-temp database. We must
@@ -14250,7 +15160,11 @@ pub fn op_drop_table(
         if *db != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
             let dropped_db = *db;
             conn.with_database_schema_mut(crate::TEMP_DB_ID, |temp_schema| {
-                temp_schema.remove_triggers_for_table_with_db(table_name, dropped_db);
+                temp_schema.remove_triggers_for_table_with_db(
+                    NamespaceId::ROOT,
+                    table_name,
+                    dropped_db,
+                );
             })?;
         }
     }
@@ -14264,11 +15178,18 @@ pub fn op_drop_view(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(DropView { db, view_name }, insn);
+    load_insn!(
+        DropView {
+            db,
+            namespace,
+            view_name
+        },
+        insn
+    );
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
-        schema.remove_view(view_name).ok();
-        schema.broken_views.remove(view_name);
+        schema.remove_view(*namespace, view_name).ok();
+        schema.remove_broken_view(*namespace, view_name);
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -14298,6 +15219,7 @@ pub fn op_add_sequence(
     load_insn!(AddSequence { data }, insn);
     let AddSequenceData {
         db,
+        namespace,
         name,
         start,
         increment,
@@ -14315,9 +15237,7 @@ pub fn op_add_sequence(
     )?;
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
-        schema
-            .sequences
-            .insert(crate::util::normalize_ident(name), std::sync::Arc::new(seq));
+        schema.add_sequence(*namespace, seq);
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -14329,7 +15249,14 @@ pub fn op_drop_sequence(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(DropSequence { db, seq_name }, insn);
+    load_insn!(
+        DropSequence {
+            db,
+            namespace,
+            seq_name
+        },
+        insn
+    );
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store_for_db(*db).is_some();
     conn.with_database_schema_mut(*db, |schema| {
@@ -14340,14 +15267,14 @@ pub fn op_drop_sequence(
             let backing_table_name =
                 crate::translate::sequence::sequence_backing_table_name(seq_name);
             let root_page = schema
-                .get_btree_table(&backing_table_name)
+                .get_btree_table(NamespaceId::ROOT, &backing_table_name)
                 .expect("DROP SEQUENCE: backing table must exist in schema")
                 .root_page;
             if root_page > 0 {
                 schema.dropped_root_pages.insert(root_page);
             }
         }
-        schema.remove_sequence(seq_name);
+        schema.remove_sequence(*namespace, seq_name);
     })?;
     // Drop this connection's stale currval. Otherwise a same-session
     // DROP SEQUENCE + CREATE SEQUENCE <same name> would let currval()
@@ -14355,7 +15282,7 @@ pub fn op_drop_sequence(
     // "not yet defined in this session" — covered by the regression
     // test `currval-after-drop-then-recreate-uses-new-sequence-currval`
     // in `sequence_adversarial.sqltest`.
-    conn.clear_sequence_currval(seq_name);
+    conn.clear_sequence_currval(*db, seq_name);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -14395,7 +15322,8 @@ pub fn op_sequence_compute_next(
     load_insn!(
         SequenceComputeNext {
             db,
-            seq_name_reg,
+            namespace,
+            seq_name,
             in_value_reg,
             in_is_called_reg,
             was_empty_reg,
@@ -14404,27 +15332,9 @@ pub fn op_sequence_compute_next(
         insn
     );
 
-    let seq_name = match state.registers[*seq_name_reg].get_value() {
-        Value::Text(t) => t.as_str().to_string(),
-        _ => {
-            return Err(crate::LimboError::ParseError(
-                "SequenceComputeNext: seq_name_reg must be text".to_string(),
-            )
-            .into());
-        }
-    };
-
-    // Strip the schema-qualifier from the user's spelling when the
-    // register contains a qualified name like "aux.my_seq" — the
-    // schema's sequences map is keyed by the bare name. The opcode's
-    // `db` field already encodes the target database.
-    let bare_seq_name = seq_name
-        .rsplit_once('.')
-        .map(|(_, n)| n)
-        .unwrap_or(&seq_name);
     let seq = program
         .connection
-        .with_schema(*db, |s| s.get_sequence(bare_seq_name).cloned())
+        .with_schema(*db, |s| s.get_sequence(*namespace, seq_name).cloned())
         .ok_or_else(|| {
             crate::LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
         })?;
@@ -14508,21 +15418,13 @@ pub fn op_set_sequence_currval(
 ) -> InsnResult {
     load_insn!(
         SetSequenceCurrval {
-            seq_name_reg,
+            db,
+            seq_name,
             value_reg,
         },
         insn
     );
 
-    let seq_name = match state.registers[*seq_name_reg].get_value() {
-        Value::Text(t) => t.as_str().to_string(),
-        _ => {
-            return Err(crate::LimboError::ParseError(
-                "SetSequenceCurrval: seq_name_reg must be text".to_string(),
-            )
-            .into());
-        }
-    };
     let value = state.registers[*value_reg]
         .get_value()
         .as_int()
@@ -14532,7 +15434,9 @@ pub fn op_set_sequence_currval(
             )
         })?;
 
-    program.connection.set_sequence_currval(&seq_name, value);
+    program
+        .connection
+        .set_sequence_currval(*db, seq_name, value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -14552,21 +15456,13 @@ pub fn op_sequence_track_allocation(
     load_insn!(
         SequenceTrackAllocation {
             db,
-            seq_name_reg,
+            namespace,
+            seq_name,
             value_reg,
         },
         insn
     );
 
-    let seq_name = match state.registers[*seq_name_reg].get_value() {
-        Value::Text(t) => t.as_str().to_string(),
-        _ => {
-            return Err(crate::LimboError::ParseError(
-                "SequenceTrackAllocation: seq_name_reg must be text".to_string(),
-            )
-            .into());
-        }
-    };
     let value = state.registers[*value_reg]
         .get_value()
         .as_int()
@@ -14576,26 +15472,20 @@ pub fn op_sequence_track_allocation(
             )
         })?;
 
-    let bare_seq_name = seq_name
-        .rsplit_once('.')
-        .map(|(_, n)| n)
-        .unwrap_or(&seq_name);
-    let normalized_seq_name = crate::util::normalize_ident(bare_seq_name);
-
     if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
         let seq = program
             .connection
-            .with_schema(*db, |s| s.get_sequence(&normalized_seq_name).cloned())
+            .with_schema(*db, |s| s.get_sequence(*namespace, seq_name).cloned())
             .ok_or_else(|| {
                 crate::LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
             })?;
         let current_watermark =
             crate::mvcc::database::first_unsafe_sequence_watermark(&seq, value, true);
-        mv_store.set_sequence_watermark(&normalized_seq_name, current_watermark);
+        mv_store.set_sequence_watermark(seq_name, current_watermark);
 
         if let Some((tx_id, _)) = program.connection.get_mv_tx_for_db(*db) {
             if mv_store.is_tx_rollbackable(tx_id) {
-                mv_store.register_sequence_allocation(tx_id, &normalized_seq_name, value)?;
+                mv_store.register_sequence_allocation(tx_id, seq_name, value)?;
             }
         }
     }
@@ -14631,7 +15521,7 @@ pub fn op_sequence_register_allocation(
     load_insn!(
         SequenceRegisterAllocation {
             db,
-            seq_name_reg,
+            seq_name,
             value_reg,
             saved_outer_reg,
         },
@@ -14651,15 +15541,6 @@ pub fn op_sequence_register_allocation(
         return Ok(InsnFunctionStepResult::Step);
     };
 
-    let seq_name = match state.registers[*seq_name_reg].get_value() {
-        Value::Text(t) => t.as_str().to_string(),
-        _ => {
-            return Err(crate::LimboError::ParseError(
-                "SequenceRegisterAllocation: seq_name_reg must be text".to_string(),
-            )
-            .into());
-        }
-    };
     let value = state.registers[*value_reg]
         .get_value()
         .as_int()
@@ -14669,15 +15550,9 @@ pub fn op_sequence_register_allocation(
             )
         })?;
 
-    let bare_seq_name = seq_name
-        .rsplit_once('.')
-        .map(|(_, n)| n)
-        .unwrap_or(&seq_name);
-    let normalized_seq_name = crate::util::normalize_ident(bare_seq_name);
-
     if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
         if mv_store.is_tx_rollbackable(outer_tx_id) {
-            mv_store.register_sequence_allocation(outer_tx_id, &normalized_seq_name, value)?;
+            mv_store.register_sequence_allocation(outer_tx_id, seq_name, value)?;
         }
     }
 
@@ -14944,18 +15819,19 @@ pub fn op_sequence_commit_inner_tx(
                 .connection
                 .sequence_inner_retries
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if state.sequence_inner_retry_count > SEQUENCE_INNER_TX_RETRY_BUDGET {
-                state.sequence_inner_retry_count = 0;
-                let _ = err;
-                return Err(LimboError::Busy.into());
-            }
-            // Re-export the specific class via the status register —
-            // the translator-emitted retry uses it to decide whether
-            // to jump back.
             let _ = err;
+            // The translator-emitted retry jump reads the status register.
+            // Busy is returned only after pc moves to that jump: the inner
+            // tx is already rolled back, so stepping the statement again
+            // must begin a fresh inner tx, not commit the outer tx that the
+            // connection points at now.
             state.registers[*status_reg]
                 .set_value(Value::from_i64(SEQ_COMMIT_STATUS_CONFLICT_RETRY));
             state.pc += 1;
+            if state.sequence_inner_retry_count > SEQUENCE_INNER_TX_RETRY_BUDGET {
+                state.sequence_inner_retry_count = 0;
+                return Err(LimboError::Busy.into());
+            }
             Ok(InsnFunctionStepResult::Step)
         }
         Err(e) => {
@@ -14978,11 +15854,18 @@ pub fn op_drop_trigger(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(DropTrigger { db, trigger_name }, insn);
+    load_insn!(
+        DropTrigger {
+            db,
+            namespace,
+            trigger_name
+        },
+        insn
+    );
 
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
-        schema.remove_trigger(trigger_name).ok();
+        schema.remove_trigger(*namespace, trigger_name).ok();
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -15018,6 +15901,7 @@ pub fn op_close(
         .get_mut(*cursor_id)
         .expect("cursor_id should be valid")
         .take();
+    state.cursor_databases[*cursor_id] = None;
     if let Some(deferred_seek) = state.deferred_seeks.get_mut(*cursor_id) {
         deferred_seek.take();
     }
@@ -15119,7 +16003,7 @@ pub fn op_parse_schema(
     // For attached databases, qualify the sqlite_schema table with the database name
     let schema_table = if *db != crate::MAIN_DB_ID {
         let db_name = conn
-            .get_database_name_by_index(*db)
+            .namespace_name(*db)
             .unwrap_or_else(|| "main".to_string());
         format!("{db_name}.sqlite_schema")
     } else {
@@ -15225,10 +16109,8 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 let schema = Schema::try_make_mut(&mut inner.schema_arc)?;
                 let syms = conn.syms.read();
                 let attached_resolver = |alias: &str| -> Option<usize> {
-                    conn.attached_databases()
-                        .read()
-                        .get_database_by_name(&crate::util::normalize_ident(alias))
-                        .map(|(idx, _)| idx)
+                    conn.namespaces()
+                        .database_id(&crate::util::normalize_ident(alias))
                 };
                 schema.handle_schema_row(
                     ty,
@@ -15247,7 +16129,11 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 )?;
                 if ty == "trigger" {
                     if let Some(target_database_id) = inner.trigger_target_database_id {
-                        schema.set_trigger_target_database_id(name, target_database_id)?;
+                        schema.set_trigger_target_database_id(
+                            NamespaceId::ROOT,
+                            name,
+                            target_database_id,
+                        )?;
                     }
                 }
                 continue;
@@ -15274,16 +16160,14 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 let mv_store = stmt.mv_store();
                 let syms = conn.syms.read();
 
-                let res1 = schema.populate_indices(
+                let populate_result = schema.populate_materialized_views_then_indices(
                     &syms,
-                    from_sql_indexes,
-                    automatic_indices,
-                    mv_store.is_some(),
-                );
-                let res2 = schema.populate_materialized_views(
                     materialized_view_info,
                     dbsp_state_roots,
                     dbsp_state_index_roots,
+                    from_sql_indexes,
+                    automatic_indices,
+                    mv_store.is_some(),
                 );
 
                 // Store the modified schema back
@@ -15312,7 +16196,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 drop(stmt);
                 conn.auto_commit
                     .store(previous_auto_commit, Ordering::SeqCst);
-                let _ = (res1?, res2?);
+                populate_result?;
 
                 state.pc += 1;
                 state.active_op_state.clear();
@@ -15572,22 +16456,42 @@ pub fn op_populate_materialized_views(
 
     let conn = program.connection.clone();
 
-    // For each view, get its cursor and root page
-    let mut view_info = Vec::new();
-    {
-        let cursors_ref = &state.cursors;
-        for (view_name, cursor_id) in cursors {
-            // Get the cursor to find the root page
-            let cursor = cursors_ref
-                .get(*cursor_id)
-                .and_then(|c| c.as_ref())
-                .ok_or_else(|| {
-                    LimboError::InternalError(format!("Cursor {cursor_id} not found"))
-                })?;
+    // Each view is populated by its maintenance program compiled with the
+    // base table as input (every row weight +1); the statement is parked in
+    // ProgramState across I/O yields. The write cursor opened by the CREATE
+    // program is only used to learn the view btree's root page — the
+    // population program opens its own cursor.
+    loop {
+        if state.populate_matviews_state.is_none() {
+            state.populate_matviews_state = Some(crate::vdbe::PopulateMatViewsState {
+                view_idx: 0,
+                stmt: None,
+            });
+        }
+        let view_idx = state
+            .populate_matviews_state
+            .as_ref()
+            .expect("populate state was just initialized")
+            .view_idx;
 
-            let root_page = match cursor {
-                crate::types::Cursor::BTree(btree_cursor, ..) => btree_cursor.root_page(),
-                crate::types::Cursor::Dyn(btree_cursor, ..) => btree_cursor.root_page(),
+        if view_idx >= cursors.len() {
+            state.populate_matviews_state = None;
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+
+        let (view_name, cursor_id) = &cursors[view_idx];
+
+        let needs_build = state
+            .populate_matviews_state
+            .as_ref()
+            .expect("populate state exists")
+            .stmt
+            .is_none();
+        if needs_build {
+            let root_page = match state.cursors.get(*cursor_id).and_then(|c| c.as_ref()) {
+                Some(crate::types::Cursor::BTree(btree_cursor, ..)) => btree_cursor.root_page(),
+                Some(crate::types::Cursor::Dyn(btree_cursor, ..)) => btree_cursor.root_page(),
                 _ => {
                     return Err(LimboError::InternalError(
                         "Expected BTree cursor for materialized view".into(),
@@ -15596,51 +16500,74 @@ pub fn op_populate_materialized_views(
                 }
             };
 
-            view_info.push((view_name.clone(), root_page, *cursor_id));
-        }
-    }
-
-    // Now populate the views (after releasing the schema borrow)
-    for (view_name, _root_page, cursor_id) in view_info {
-        let schema = conn.schema.read();
-        if let Some(view) = schema.get_materialized_view(&view_name) {
-            let mut view = view.lock();
-            // Drop the schema borrow before calling populate_from_table
-            drop(schema);
-
-            // Get the cursor for writing
-            // Get a mutable reference to the cursor
-            let cursors_ref = &mut state.cursors;
-            let cursor = cursors_ref
-                .get_mut(cursor_id)
-                .and_then(|c| c.as_mut())
-                .ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "Cursor {cursor_id} not found for population"
-                    ))
-                })?;
-
-            // Extract the BTreeCursor
-            let btree_cursor = match cursor {
-                crate::types::Cursor::BTree(..) | crate::types::Cursor::Dyn(..) => {
-                    cursor.as_btree_mut()
-                }
-                _ => {
-                    return Err(LimboError::InternalError(
-                        "Expected BTree cursor for materialized view population".into(),
-                    )
-                    .into());
-                }
+            let schema = conn.schema.read();
+            let Some(view_mutex) = schema.get_materialized_view(NamespaceId::ROOT, view_name)
+            else {
+                return Err(LimboError::InternalError(format!(
+                    "materialized view {view_name} missing from schema during population"
+                ))
+                .into());
             };
+            let (select, num_view_columns) = {
+                let view = view_mutex.lock();
+                (
+                    view.select_stmt.clone(),
+                    view.column_schema.flat_columns()?.len(),
+                )
+            };
+            let populate_program =
+                crate::incremental::vdbe_maintenance::compile_maintenance_program(
+                    view_name,
+                    &select,
+                    root_page,
+                    num_view_columns,
+                    crate::incremental::vdbe_maintenance::MaintenanceInput::BaseTable,
+                    &schema,
+                    &conn,
+                )?;
+            state
+                .populate_matviews_state
+                .as_mut()
+                .expect("populate state exists")
+                .stmt = Some(Box::new(crate::statement::Statement::new_with_origin(
+                populate_program,
+                pager.clone(),
+                crate::QueryMode::Normal,
+                0,
+                crate::statement::StatementOrigin::Subprogram,
+                false,
+            )));
+        }
 
-            // Now populate it with the cursor for writing
-            return_if_io!(state, view.populate_from_table(&conn, pager, btree_cursor));
+        let populate_state = state
+            .populate_matviews_state
+            .as_mut()
+            .expect("populate state exists");
+        let statement = populate_state
+            .stmt
+            .as_mut()
+            .expect("population statement was just built");
+        match statement.step_subprogram()? {
+            StepResult::Done => {
+                populate_state.stmt = None;
+                populate_state.view_idx += 1;
+            }
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                let io = statement
+                    .take_io_completions()
+                    .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
+                return Ok(state.suspend_on_io(io));
+            }
+            StepResult::Row => {
+                return Err(LimboError::InternalError(
+                    "materialized view population program produced a row".to_string(),
+                )
+                .into());
+            }
+            StepResult::Busy => return Err(LimboError::Busy.into()),
+            StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
         }
     }
-
-    // All views populated, advance to next instruction
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_read_cookie(
@@ -15712,13 +16639,9 @@ pub fn op_set_cookie(
             )
             .into());
         };
-        if !mv_store.is_exclusive_tx(&tx_id) {
-            // Header cookies are global metadata with no row-level conflict keys; require
-            // SQLite-style single-writer semantics (same policy as DDL in MVCC).
-            return Err(LimboError::TxError(
-                "Header updates require an exclusive transaction (use BEGIN instead of BEGIN CONCURRENT)".to_string(),
-            ).into());
-        }
+        // Header cookies are global metadata with no row-level conflict keys; they need
+        // SQLite-style single-writer semantics (same policy as DDL in MVCC).
+        upgrade_mv_tx_to_exclusive(program, &pager, mv_store, *db, tx_id)?;
     }
 
     match with_header_mut(&pager, mv_store.as_ref(), program, *db, |header| {
@@ -15762,6 +16685,9 @@ pub fn op_set_cookie(
                         TransactionState::None => unreachable!(
                             "invalid transaction state for SetCookie: TransactionState::None, should be write"
                         ),
+                        TransactionState::Pending { .. } => unreachable!(
+                            "invalid transaction state for SetCookie: TransactionState::Pending, should be write"
+                        ),
                         TransactionState::PendingUpgrade { .. } => unreachable!(
                             "invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"
                         ),
@@ -15790,6 +16716,27 @@ pub fn op_set_cookie(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// DDL and header updates need SQLite single-writer semantics. When they run
+/// inside a concurrent MVCC transaction, upgrade it to exclusive in place
+/// instead of failing the statement. The upgrade returns Busy if another
+/// transaction committed after this one began (the snapshot is stale) or if
+/// another transaction holds the exclusive slot.
+fn upgrade_mv_tx_to_exclusive(
+    program: &Program,
+    pager: &Arc<Pager>,
+    mv_store: &MvStore,
+    db: usize,
+    tx_id: TxID,
+) -> Result<()> {
+    if !mv_store.is_exclusive_tx(&tx_id) {
+        mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id), &program.connection, None)?;
+    }
+    program
+        .connection
+        .set_mv_tx_for_db(db, Some((tx_id, TransactionMode::Write)));
+    Ok(())
 }
 
 pub fn op_shift_right(
@@ -16040,6 +16987,7 @@ pub fn op_open_ephemeral(
         Insn::OpenAutoindex { cursor_id } => (*cursor_id, false),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
+    state.cursor_databases[cursor_id] = None;
     let mv_store = program.connection.mv_store();
     match state.active_op_state.open_ephemeral() {
         OpOpenEphemeralState::Start => {
@@ -16082,6 +17030,7 @@ pub fn op_open_ephemeral(
                 Arc::new(SharedPagerState::new(Some(default_page1(None)))),
             )?);
 
+            pager.mark_ephemeral();
             pager.set_initial_page_size(page_size)?;
 
             *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::StartingTxn {
@@ -16207,6 +17156,9 @@ pub fn op_open_ephemeral(
                 CursorType::MaterializedView(_, _) => {
                     panic!("OpenEphemeral on materialized view cursor");
                 }
+                CursorType::ViewDelta { .. } => {
+                    panic!("OpenEphemeral on view delta cursor");
+                }
             }
 
             state.pc += 1;
@@ -16230,6 +17182,7 @@ pub fn op_open_dup(
         },
         insn
     );
+    state.cursor_databases[*new_cursor_id] = state.cursor_databases[*original_cursor_id];
     let mv_store = program.connection.mv_store();
 
     let original_cursor = state.get_cursor(*original_cursor_id);
@@ -16737,12 +17690,12 @@ fn regenerate_trigger_sql(trigger: &crate::schema::Trigger) -> String {
     use crate::translate::trigger::create_trigger_to_sql;
 
     let trigger_name = QualifiedName {
-        db_name: None,
+        namespace: None,
         name: Name::from_string(&trigger.name),
         alias: None,
     };
     let tbl_name = QualifiedName {
-        db_name: None,
+        namespace: None,
         name: Name::from_string(&trigger.table_name),
         alias: None,
     };
@@ -16770,18 +17723,6 @@ fn sql_might_reference_identifier(sql: &str, ident: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(ident))
 }
 
-fn with_relevant_trigger_schemas_mut(
-    conn: &Connection,
-    table_db_id: usize,
-    mut f: impl FnMut(&mut Schema) -> crate::Result<()>,
-) -> crate::Result<()> {
-    conn.with_database_schema_mut(table_db_id, |schema| f(schema))??;
-    if table_db_id != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
-        conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| f(schema))??;
-    }
-    Ok(())
-}
-
 fn rewrite_trigger_for_table_rename(
     trigger: &mut crate::schema::Trigger,
     normalized_from: &str,
@@ -16800,52 +17741,21 @@ fn rewrite_trigger_for_table_rename(
     }
 }
 
-fn rewrite_trigger_for_column_rename(
-    trigger: &mut crate::schema::Trigger,
-    table_name: &str,
-    old_col: &str,
-    new_col: &str,
-) -> crate::Result<()> {
-    let trigger_tbl = normalize_ident(&trigger.table_name);
-    let old_sql = trigger.sql.clone();
-    if let Some(ref mut when) = trigger.when_clause {
-        rename_identifiers_scoped_when_clause(when, table_name, &trigger_tbl, old_col, new_col);
-    }
-    if trigger_tbl == table_name {
-        if let ast::TriggerEvent::UpdateOf(ref mut cols) = trigger.event {
-            for col in cols {
-                if normalize_ident(col.as_str()) == normalize_ident(old_col) {
-                    *col = ast::Name::exact(new_col.to_owned());
-                }
-            }
-        }
-    }
-    for cmd in &mut trigger.commands {
-        rewrite_trigger_cmd_column_refs(cmd, table_name, &trigger_tbl, old_col, new_col);
-    }
-    if trigger_still_references_renamed_column(trigger, table_name, old_col) {
-        return Err(LimboError::ParseError(format!(
-            "error in trigger {} after rename: no such column: {}",
-            trigger.name, old_col
-        )));
-    }
-    // Keep trigger.sql in sync with the rewritten in-memory AST so a subsequent
-    // RENAME COLUMN sees the current column name (the translate step uses the
-    // in-memory trigger.sql as the source of the next rewrite).
-    let new_sql = regenerate_trigger_sql(trigger);
-    if new_sql != old_sql {
-        trigger.sql = new_sql;
-    }
-    Ok(())
-}
-
 pub fn op_rename_table(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(RenameTable { db, from, to }, insn);
+    load_insn!(
+        RenameTable {
+            db,
+            namespace,
+            from,
+            to
+        },
+        insn
+    );
 
     let normalized_from = normalize_ident(from.as_str());
     let normalized_to = normalize_ident(to.as_str());
@@ -16853,7 +17763,7 @@ pub fn op_rename_table(
     let conn = program.connection.clone();
 
     conn.with_database_schema_mut(*db, |schema| -> crate::Result<()> {
-        if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
+        if let Some(mut indexes) = schema.take_indices(*namespace, &normalized_from) {
             let autoindex_prefix = format!("sqlite_autoindex_{normalized_from}_");
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
@@ -16864,12 +17774,11 @@ pub fn op_rename_table(
                 }
             });
 
-            schema.indexes.insert(normalized_to.to_owned(), indexes);
+            schema.insert_indices(*namespace, normalized_to.to_owned(), indexes);
         };
 
         let mut table = schema
-            .tables
-            .remove(&normalized_from)
+            .take_table(*namespace, &normalized_from)
             .expect("table being renamed should be in schema");
         #[cfg(feature = "conn_raw_api")]
         schema.unregister_table_root_page(table.as_ref());
@@ -16879,7 +17788,9 @@ pub fn op_rename_table(
                 // update this table's own foreign keys
                 for fk_arc in &mut btree.foreign_keys {
                     let fk = Arc::make_mut(fk_arc);
-                    if normalize_ident(&fk.parent_table) == normalized_from {
+                    if fk.parent_namespace == *namespace
+                        && normalize_ident(&fk.parent_table) == normalized_from
+                    {
                         fk.parent_table.clone_from(&normalized_to);
                     }
                 }
@@ -16906,17 +17817,19 @@ pub fn op_rename_table(
 
         #[cfg(feature = "conn_raw_api")]
         schema.register_table_root_page(&normalized_to, table.as_ref());
-        schema.tables.insert(normalized_to.to_owned(), table);
+        schema.insert_table(*namespace, normalized_to.to_owned(), table);
 
-        for (tname, t_arc) in schema.tables.iter_mut() {
+        for (child_namespace, tname, t_arc) in schema.all_tables_mut() {
             // skip the table we just renamed
-            if normalize_ident(tname) == normalized_to {
+            if child_namespace == *namespace && normalize_ident(tname) == normalized_to {
                 continue;
             }
             if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
                 let child_btree = Arc::make_mut(child_btree_arc);
                 for fk_arc in &mut child_btree.foreign_keys {
-                    if normalize_ident(&fk_arc.parent_table) == normalized_from {
+                    if fk_arc.parent_namespace == *namespace
+                        && normalize_ident(&fk_arc.parent_table) == normalized_from
+                    {
                         let fk = Arc::make_mut(fk_arc);
                         fk.parent_table.clone_from(&normalized_to);
                     }
@@ -16926,13 +17839,13 @@ pub fn op_rename_table(
 
         // Update triggers: move from old table name key to new, and update
         // each trigger's table_name field and body commands.
-        if let Some(mut triggers) = schema.triggers.remove(&normalized_from) {
+        if let Some(mut triggers) = schema.take_triggers(*namespace, &normalized_from) {
             for trigger_arc in &mut triggers {
                 let trigger = Arc::make_mut(trigger_arc);
                 normalized_to.clone_into(&mut trigger.table_name);
                 rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
             }
-            schema.triggers.insert(normalized_to.to_owned(), triggers);
+            schema.insert_triggers(*namespace, normalized_to.to_owned(), triggers);
         }
 
         // If the renamed table owned an implicit AUTOINCREMENT sequence,
@@ -16948,7 +17861,7 @@ pub fn op_rename_table(
         // implicit sequence for AUTOINCREMENT table" until the next
         // schema reparse.
         let old_seq_name = crate::schema::autoincrement_sequence_name(&normalized_from);
-        if let Some(mut seq_arc) = schema.sequences.remove(&old_seq_name) {
+        if let Some(mut seq_arc) = schema.take_sequence(*namespace, &old_seq_name) {
             let new_seq_name = crate::schema::autoincrement_sequence_name(&normalized_to);
             // Mutate the Sequence's `name` field so its internal identity
             // tracks the new table. `seq.name` is used by the exhaustion
@@ -16962,25 +17875,24 @@ pub fn op_rename_table(
                 crate::translate::sequence::sequence_backing_table_name(&old_seq_name);
             let new_backing_table =
                 crate::translate::sequence::sequence_backing_table_name(&new_seq_name);
-            schema.sequences.insert(new_seq_name, seq_arc);
-            if let Some(mut backing_arc) = schema.tables.remove(&old_backing_table) {
+            schema.insert_sequence(NamespaceId::ROOT, new_seq_name, seq_arc);
+            if let Some(mut backing_arc) = schema.take_table(NamespaceId::ROOT, &old_backing_table)
+            {
                 if let Table::BTree(btree_arc) = Arc::make_mut(&mut backing_arc) {
                     Arc::make_mut(btree_arc).name.clone_from(&new_backing_table);
                 }
-                schema.tables.insert(new_backing_table, backing_arc);
+                schema.insert_table(NamespaceId::ROOT, new_backing_table, backing_arc);
             }
         }
 
         // Also update triggers on OTHER tables that reference the renamed table
         // in their body commands (e.g., INSERT INTO old_name in a trigger on another table)
-        for (_, triggers) in schema.triggers.iter_mut() {
-            for trigger_arc in triggers.iter_mut() {
-                if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {
-                    continue;
-                }
-                let trigger = Arc::make_mut(trigger_arc);
-                rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+        for trigger_arc in schema.triggers_mut(*namespace) {
+            if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {
+                continue;
             }
+            let trigger = Arc::make_mut(trigger_arc);
+            rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
         }
 
         Ok(())
@@ -16993,8 +17905,8 @@ pub fn op_rename_table(
             // move its TEMP triggers to the new name. Changing only the stored
             // SQL would leave them under the old name, so they would no longer
             // run.
-            let temp_shadows_old_name = schema.tables.contains_key(&normalized_from);
-            if let Some(triggers) = schema.triggers.remove(&normalized_from) {
+            let temp_shadows_old_name = schema.has_table(NamespaceId::ROOT, &normalized_from);
+            if let Some(triggers) = schema.take_triggers(NamespaceId::ROOT, &normalized_from) {
                 let mut triggers_to_keep = std::collections::VecDeque::new();
                 let mut triggers_to_rename = std::collections::VecDeque::new();
                 for mut trigger_arc in triggers {
@@ -17012,25 +17924,25 @@ pub fn op_rename_table(
                     }
                 }
                 if !triggers_to_keep.is_empty() {
-                    schema
-                        .triggers
-                        .insert(normalized_from.to_owned(), triggers_to_keep);
+                    schema.insert_triggers(
+                        NamespaceId::ROOT,
+                        normalized_from.to_owned(),
+                        triggers_to_keep,
+                    );
                 }
-                schema
-                    .triggers
-                    .entry(normalized_to.to_owned())
-                    .or_default()
-                    .extend(triggers_to_rename);
+                schema.append_triggers(
+                    NamespaceId::ROOT,
+                    normalized_to.to_owned(),
+                    triggers_to_rename,
+                );
             }
 
-            for triggers in schema.triggers.values_mut() {
-                for trigger_arc in triggers.iter_mut() {
-                    if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {
-                        continue;
-                    }
-                    let trigger = Arc::make_mut(trigger_arc);
-                    rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+            for trigger_arc in schema.triggers_mut(NamespaceId::ROOT) {
+                if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {
+                    continue;
                 }
+                let trigger = Arc::make_mut(trigger_arc);
+                rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
             }
             Ok(())
         })??;
@@ -17049,6 +17961,7 @@ pub fn op_drop_column(
     load_insn!(
         DropColumn {
             db,
+            namespace,
             table,
             column_index
         },
@@ -17061,8 +17974,7 @@ pub fn op_drop_column(
 
     let column_name = conn.with_schema(*db, |schema| {
         let table = schema
-            .tables
-            .get(&normalized_table_name)
+            .get_table(*namespace, &normalized_table_name)
             .expect("table being ALTERed should be in schema");
         table
             .get_column_at(*column_index)
@@ -17075,8 +17987,7 @@ pub fn op_drop_column(
 
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let table = schema
-            .tables
-            .get_mut(&normalized_table_name)
+            .table_mut(*namespace, &normalized_table_name)
             .expect("table being renamed should be in schema");
 
         let table = Arc::get_mut(table).expect("this should be the only strong reference");
@@ -17100,17 +18011,15 @@ pub fn op_drop_column(
     })??;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
-        if let Some(indexes) = schema.indexes.get(&normalized_table_name) {
-            for index in indexes {
-                if index
-                    .columns
-                    .iter()
-                    .any(|column| column.pos_in_table == *column_index)
-                {
-                    return Err(LimboError::ParseError(format!(
-                        "cannot drop column \"{column_name}\": indexed"
-                    )));
-                }
+        for index in schema.indices_including_backing(*namespace, &normalized_table_name) {
+            if index
+                .columns
+                .iter()
+                .any(|column| column.pos_in_table == *column_index)
+            {
+                return Err(LimboError::ParseError(format!(
+                    "cannot drop column \"{column_name}\": indexed"
+                )));
             }
         }
         Ok(())
@@ -17120,28 +18029,26 @@ pub fn op_drop_column(
     // expressions, to account for the dropped column. For example, if the dropped column had index
     // 2, then anything that was indexed on column 3 or higher should be decremented by 1.
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
-        if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
-            for index in indexes {
-                let index = Arc::get_mut(index).expect("this should be the only strong reference");
-                for index_column in index.columns.iter_mut() {
-                    if index_column.pos_in_table != EXPR_INDEX_SENTINEL
-                        && index_column.pos_in_table > *column_index
-                    {
-                        index_column.pos_in_table -= 1;
-                    }
-                    if let Some(ref mut expr) = index_column.expr {
-                        crate::translate::expr::walk_expr_mut(expr, &mut |e| {
-                            if let ast::Expr::Column {
-                                table, column: c, ..
-                            } = e
-                            {
-                                if table.is_self_table() && *c > *column_index {
-                                    *c -= 1;
-                                }
+        for index in schema.indices_of_table_mut(*namespace, &normalized_table_name) {
+            let index = Arc::make_mut(index);
+            for index_column in index.columns.iter_mut() {
+                if index_column.pos_in_table != EXPR_INDEX_SENTINEL
+                    && index_column.pos_in_table > *column_index
+                {
+                    index_column.pos_in_table -= 1;
+                }
+                if let Some(ref mut expr) = index_column.expr {
+                    crate::translate::expr::walk_expr_mut(expr, &mut |e| {
+                        if let ast::Expr::Column {
+                            table, column: c, ..
+                        } = e
+                        {
+                            if table.is_self_table() && *c > *column_index {
+                                *c -= 1;
                             }
-                            Ok(crate::translate::expr::WalkControl::Continue)
-                        })?;
-                    }
+                        }
+                        Ok(crate::translate::expr::WalkControl::Continue)
+                    })?;
                 }
             }
         }
@@ -17149,8 +18056,8 @@ pub fn op_drop_column(
     })??;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
-        for (view_name, view) in schema.views.iter() {
-            let view_select_sql = format!("SELECT * FROM {view_name}");
+        for (view_name, view) in schema.views(*namespace) {
+            let view_select_sql = select_from_view_sql(&conn, *db, view_name);
             let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                 LimboError::ParseError(format!(
                     "cannot drop column \"{}\": referenced in VIEW {view_name}: {}. {e}",
@@ -17163,6 +18070,19 @@ pub fn op_drop_column(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// SQL that selects from the view `view_name` of database `db`, named with
+/// its database so the lookup does not go through the search path.
+fn select_from_view_sql(conn: &Connection, db: usize, view_name: &str) -> String {
+    let database_name = conn
+        .namespace_name(db)
+        .expect("the database of a view has a name");
+    format!(
+        "SELECT * FROM \"{}\".\"{}\"",
+        database_name.replace('"', "\"\""),
+        view_name.replace('"', "\"\"")
+    )
 }
 
 pub fn op_add_column(
@@ -17180,8 +18100,7 @@ pub fn op_add_column(
 
     conn.with_database_schema_mut(data.db, |schema| -> Result<()> {
         let table_ref = schema
-            .tables
-            .get_mut(&normalized_table_name)
+            .table_mut(data.namespace, &normalized_table_name)
             .expect("table being altered should be in schema");
 
         let table_ref = Arc::make_mut(table_ref);
@@ -17212,24 +18131,23 @@ pub fn op_alter_column(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(
-        AlterColumn {
-            db,
-            table: table_name,
-            column_index,
-            definition,
-            rename,
-        },
-        insn
-    );
+    load_insn!(AlterColumn { data }, insn);
+    let AlterColumnData {
+        db,
+        namespace,
+        table: table_name,
+        column_index,
+        definition,
+        rename,
+        rewritten_triggers,
+    } = data.as_ref();
 
     let conn = program.connection.clone();
 
     let normalized_table_name = normalize_ident(table_name.as_str());
     let (old_column_name, is_strict) = conn.with_schema(*db, |schema| {
         let table = schema
-            .tables
-            .get(&normalized_table_name)
+            .get_table(*namespace, &normalized_table_name)
             .expect("table being ALTERed should be in schema");
         let old_column_name = table
             .get_column_at(*column_index)
@@ -17241,29 +18159,42 @@ pub fn op_alter_column(
         (old_column_name, table.is_strict())
     });
     let new_column = crate::schema::Column::from_definition(
-        definition.as_ref(),
+        definition,
         FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, is_strict),
     )?;
     let new_name = definition.col_name.as_str().to_owned();
+    let (domain_not_null, domain_checks) = if is_strict && !*rename {
+        conn.with_schema(*db, |schema| schema.column_domain_constraints(&new_column))?
+    } else {
+        (false, crate::alloc::vec![])
+    };
 
-    let view_rewrites: Vec<(usize, String, RewrittenView)> = if *rename {
-        let target_db_name = conn.get_database_name_by_index(*db).ok_or_else(|| {
+    let view_rewrites: Vec<(NamespaceRef, String, RewrittenView)> = if *rename {
+        let target_db_name = conn.namespace_name(*db).ok_or_else(|| {
             LimboError::InternalError(format!("unknown database id {} during ALTER TABLE", *db))
         })?;
         let mut all_rewrites = conn.with_schema(
             *db,
-            |schema| -> crate::Result<Vec<(usize, String, RewrittenView)>> {
+            |schema| -> crate::Result<Vec<(NamespaceRef, String, RewrittenView)>> {
                 let mut rewrites = Vec::new();
-                for (view_name, view) in schema.views.iter() {
+                for (view_name, view) in schema.views(*namespace) {
                     if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                         &view.sql,
                         schema,
+                        *namespace,
                         table_name.as_str(),
                         &target_db_name,
                         &old_column_name,
                         &new_name,
                     )? {
-                        rewrites.push((*db, view_name.clone(), rewritten));
+                        rewrites.push((
+                            NamespaceRef {
+                                database_id: *db,
+                                id: *namespace,
+                            },
+                            view_name.to_string(),
+                            rewritten,
+                        ));
                     }
                 }
                 Ok(rewrites)
@@ -17273,18 +18204,23 @@ pub fn op_alter_column(
         if *db != crate::TEMP_DB_ID {
             let temp_rewrites = conn.with_schema(
                 crate::TEMP_DB_ID,
-                |schema| -> crate::Result<Vec<(usize, String, RewrittenView)>> {
+                |schema| -> crate::Result<Vec<(NamespaceRef, String, RewrittenView)>> {
                     let mut rewrites = Vec::new();
-                    for (view_name, view) in schema.views.iter() {
+                    for (view_name, view) in schema.views(NamespaceId::ROOT) {
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                             &view.sql,
                             schema,
+                            NamespaceId::ROOT,
                             table_name.as_str(),
                             &target_db_name,
                             &old_column_name,
                             &new_name,
                         )? {
-                            rewrites.push((crate::TEMP_DB_ID, view_name.clone(), rewritten));
+                            rewrites.push((
+                                NamespaceRef::root_of(crate::TEMP_DB_ID),
+                                view_name.to_string(),
+                                rewritten,
+                            ));
                         }
                     }
                     Ok(rewrites)
@@ -17298,9 +18234,8 @@ pub fn op_alter_column(
     };
 
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
-        let table_arc = schema
-            .tables
-            .get_mut(&normalized_table_name)
+        let (table_arc, indexes) = schema
+            .table_with_indices_mut(*namespace, &normalized_table_name)
             .expect("table being ALTERed should be in schema");
         let table = Arc::make_mut(table_arc);
 
@@ -17315,6 +18250,14 @@ pub fn op_alter_column(
                 .get(*column_index)
                 .is_some_and(|column| column.is_rowid_alias())
             && !new_column.is_rowid_alias();
+
+        // Rename the key column before columns_mut(), whose drop rebuilds the
+        // WITHOUT ROWID key order from primary_key_columns by name.
+        for (pk_name, _ord) in &mut btree.primary_key_columns {
+            if pk_name.eq_ignore_ascii_case(&old_column_name) {
+                pk_name.clone_from(&new_name);
+            }
+        }
 
         if *rename {
             btree.columns_mut()[*column_index].name = Some(new_name.clone());
@@ -17338,41 +18281,32 @@ pub fn op_alter_column(
         btree.prepare_generated_columns()?;
 
         // Update this table's indexes that reference the old column.
-        if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
-            for idx in idxs {
-                let idx = Arc::make_mut(idx);
-                for ic in &mut idx.columns {
-                    if let Some(expr) = &mut ic.expr {
-                        rename_identifiers(expr.as_mut(), &old_column_name, &new_name);
-                        if ic.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL {
-                            ic.name = expr.to_string();
-                        }
-                    }
-                    if ic.pos_in_table != crate::schema::EXPR_INDEX_SENTINEL {
-                        let table_column = btree
-                            .columns()
-                            .get(ic.pos_in_table)
-                            .expect("indexed column position should exist");
-                        if let Some(name) = &table_column.name {
-                            ic.name.clone_from(name);
-                        }
-                        ic.default.clone_from(&table_column.default);
-                        ic.expr = table_column
-                            .generated_expr()
-                            .map(|expr| Box::new(expr.clone()));
+        for idx in indexes {
+            let idx = Arc::make_mut(idx);
+            for ic in &mut idx.columns {
+                if let Some(expr) = &mut ic.expr {
+                    rename_identifiers(expr.as_mut(), &old_column_name, &new_name);
+                    if ic.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL {
+                        ic.name = expr.to_string();
                     }
                 }
-                // Update partial index WHERE clause column references
-                if let Some(ref mut wc) = idx.where_clause {
-                    rename_identifiers(wc, &old_column_name, &new_name);
+                if ic.pos_in_table != crate::schema::EXPR_INDEX_SENTINEL {
+                    let table_column = btree
+                        .columns()
+                        .get(ic.pos_in_table)
+                        .expect("indexed column position should exist");
+                    if let Some(name) = &table_column.name {
+                        ic.name.clone_from(name);
+                    }
+                    ic.default.clone_from(&table_column.default);
+                    ic.expr = table_column
+                        .generated_expr()
+                        .map(|expr| Box::new(expr.clone()));
                 }
             }
-        }
-
-        // Keep primary_key_columns consistent (names may change on rename)
-        for (pk_name, _ord) in &mut btree.primary_key_columns {
-            if pk_name.eq_ignore_ascii_case(&old_column_name) {
-                pk_name.clone_from(&new_name);
+            // Update partial index WHERE clause column references
+            if let Some(ref mut wc) = idx.where_clause {
+                rename_identifiers(wc, &old_column_name, &new_name);
             }
         }
 
@@ -17406,6 +18340,26 @@ pub fn op_alter_column(
             if clears_autoincrement_sequence {
                 btree.has_autoincrement = false;
             }
+
+            btree
+                .check_constraints
+                .retain(|check| check.column.as_deref() != Some(new_name.as_str()));
+            for constraint in &definition.constraints {
+                if let ast::ColumnConstraint::Check { expr, source } = &constraint.constraint {
+                    btree
+                        .check_constraints
+                        .push(crate::schema::CheckConstraint::new(
+                            constraint.name.as_ref(),
+                            expr,
+                            source.as_deref(),
+                            Some(&new_name),
+                        ));
+                }
+            }
+            btree.check_constraints.extend(domain_checks);
+            if domain_not_null {
+                btree.columns_mut()[*column_index].set_notnull(true);
+            }
         }
 
         // Update this table's OWN foreign keys
@@ -17418,7 +18372,9 @@ pub fn op_alter_column(
                 }
             }
             // parent side: if self-referencing, rename parent column too
-            if normalize_ident(&fk.parent_table) == normalized_table_name {
+            if fk.parent_namespace == *namespace
+                && normalize_ident(&fk.parent_table) == normalized_table_name
+            {
                 for pc in &mut fk.parent_columns {
                     if pc.eq_ignore_ascii_case(&old_column_name) {
                         pc.clone_from(&new_name);
@@ -17427,15 +18383,17 @@ pub fn op_alter_column(
             }
         }
 
-        // fix OTHER tables that reference this table as parent
-        for (tname, t_arc) in schema.tables.iter_mut() {
-            if normalize_ident(tname) == normalized_table_name {
+        // fix OTHER tables, of any namespace, that reference this table as parent
+        for (child_namespace, tname, t_arc) in schema.all_tables_mut() {
+            if child_namespace == *namespace && normalize_ident(tname) == normalized_table_name {
                 continue;
             }
             if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
                 let child_btree = Arc::make_mut(child_btree_arc);
                 for fk_arc in &mut child_btree.foreign_keys {
-                    if normalize_ident(&fk_arc.parent_table) != normalized_table_name {
+                    if fk_arc.parent_namespace != *namespace
+                        || normalize_ident(&fk_arc.parent_table) != normalized_table_name
+                    {
                         continue;
                     }
                     let fk = Arc::make_mut(fk_arc);
@@ -17451,46 +18409,37 @@ pub fn op_alter_column(
     })??;
 
     if *rename {
-        // Update in-memory trigger objects for the renamed column in both the
-        // altered schema and temp, since temp triggers may reference main/attached tables.
-        with_relevant_trigger_schemas_mut(&conn, *db, |schema| {
-            for triggers in schema.triggers.values_mut() {
-                for trigger_arc in triggers.iter_mut() {
-                    let trigger = Arc::make_mut(trigger_arc);
-                    rewrite_trigger_for_column_rename(
-                        trigger,
-                        &normalized_table_name,
-                        &old_column_name,
-                        &new_name,
-                    )?;
-                }
-            }
-            Ok(())
-        })?;
-
-        for (view_db, view_name, rewritten) in view_rewrites {
-            conn.with_database_schema_mut(view_db, move |schema| -> crate::Result<()> {
-                if let Some(view_arc) = schema.views.get_mut(&view_name) {
-                    let view = Arc::make_mut(view_arc);
-                    view.sql = rewritten.sql;
-                    view.select_stmt = rewritten.select_stmt;
-                    view.columns = rewritten.columns;
-                }
-                Ok(())
+        for (trigger_namespace, trigger_name, sql) in rewritten_triggers {
+            conn.with_database_schema_mut(trigger_namespace.database_id, |schema| {
+                replace_trigger_sql(schema, trigger_namespace.id, trigger_name, sql)
             })??;
+        }
+
+        for (view_namespace, view_name, rewritten) in view_rewrites {
+            conn.with_database_schema_mut(
+                view_namespace.database_id,
+                move |schema| -> crate::Result<()> {
+                    if let Some(view_arc) = schema.view_mut(view_namespace.id, &view_name) {
+                        let view = Arc::make_mut(view_arc);
+                        view.sql = rewritten.sql;
+                        view.select_stmt = rewritten.select_stmt;
+                        view.columns = rewritten.columns;
+                    }
+                    Ok(())
+                },
+            )??;
         }
 
         if *db != crate::MAIN_DB_ID {
             conn.with_schema(*db, |schema| -> crate::Result<()> {
                 let table = schema
-                    .tables
-                    .get(&normalized_table_name)
+                    .get_table(*namespace, &normalized_table_name)
                     .expect("table being ALTERed should be in schema");
                 let _column = table
                     .get_column_at(*column_index)
                     .expect("column being ALTERed should be in schema");
-                for (view_name, view) in schema.views.iter() {
-                    let view_select_sql = format!("SELECT * FROM {view_name}");
+                for (view_name, view) in schema.views(NamespaceId::ROOT) {
+                    let view_select_sql = select_from_view_sql(&conn, *db, view_name);
                     let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                         LimboError::ParseError(format!(
                             "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",
@@ -17505,6 +18454,35 @@ pub fn op_alter_column(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn replace_trigger_sql(
+    schema: &mut Schema,
+    namespace: NamespaceId,
+    trigger_name: &str,
+    sql: &str,
+) -> Result<()> {
+    let mut parser = Parser::new(sql.as_bytes());
+    let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
+        event,
+        when_clause,
+        commands,
+        ..
+    })) = parser.next_cmd()?
+    else {
+        return Err(LimboError::ParseError(format!(
+            "invalid trigger sql: {sql}"
+        )));
+    };
+    let trigger = schema
+        .trigger_mut(namespace, trigger_name)
+        .expect("rewritten trigger should be in schema");
+    let trigger = Arc::make_mut(trigger);
+    trigger.sql = sql.to_string();
+    trigger.event = event;
+    trigger.when_clause = when_clause.map(|expr| *expr);
+    trigger.commands = commands;
+    Ok(())
 }
 
 pub fn op_if_neg(
@@ -17615,6 +18593,7 @@ pub fn op_fk_counter(
 ) -> InsnResult {
     load_insn!(
         FkCounter {
+            constraint_info,
             increment_value,
             deferred,
         },
@@ -17622,6 +18601,18 @@ pub fn op_fk_counter(
     );
     if !*deferred {
         state.increment_fk_immediate_violations_during_stmt(*increment_value);
+        if state.get_fk_immediate_violations_during_stmt() == 0 {
+            state.fk_immediate_violation = None;
+        } else if *increment_value > 0 {
+            if let Some(info) = constraint_info.as_deref() {
+                state.fk_immediate_violation = Some(build_constraint_violation_error(
+                    state,
+                    Some(info),
+                    SQLITE_CONSTRAINT_FOREIGNKEY,
+                    "FOREIGN KEY constraint failed",
+                ));
+            }
+        }
     } else {
         // Transaction-level counter: add/subtract for deferred FKs.
         program
@@ -17687,6 +18678,9 @@ pub fn op_fk_check(
         state.get_fk_immediate_violations_during_stmt()
     };
     if v > 0 {
+        if !*deferred {
+            return Err(state.immediate_foreign_key_error().into());
+        }
         return Err(
             LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string()).into(),
         );
@@ -18167,15 +19161,15 @@ pub fn op_hash_clear(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub fn op_hash_reset_matched(
+pub fn op_hash_probe_init(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(HashResetMatched { hash_table_id }, insn);
+    load_insn!(HashProbeInit { hash_table_id }, insn);
     if let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) {
-        hash_table.reset_matched_bits();
+        hash_table.begin_probe_pass();
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -18484,10 +19478,11 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                 value,
                 Value::Numeric(Numeric::Integer(_)) | Value::Null | Value::Blob(_)
             ),
-            Affinity::Real => matches!(
-                value,
-                Value::Numeric(Numeric::Float(_)) | Value::Null | Value::Blob(_)
-            ),
+            Affinity::Real => match value {
+                Value::Numeric(Numeric::Float(f)) => *f != 0.0,
+                Value::Null | Value::Blob(_) => true,
+                _ => false,
+            },
         };
         if settled {
             return true;
@@ -18578,7 +19573,14 @@ fn apply_affinity_char_slow(target: &mut Register, affinity: Affinity) -> bool {
                     *value = Value::from_f64(*i as f64);
                     return true;
                 }
-                Value::Numeric(Numeric::Float(_)) | Value::Null => {
+                Value::Numeric(Numeric::Float(f)) => {
+                    // SQLite stores a whole-number real as an integer, so -0.0 is read back as 0.0
+                    if *f == 0.0 {
+                        *value = Value::from_f64(0.0);
+                    }
+                    return true;
+                }
+                Value::Null => {
                     return true;
                 }
                 Value::Text(t) => {
@@ -19357,19 +20359,13 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
     load_insn!(
         VacuumInto {
             schema_name,
-            dest_path
+            dest_reg
         },
         insn
     );
 
     if matches!(state.op_vacuum_state, VacuumOpState::None) {
         let source_db_id = program.connection.get_database_id_by_name(schema_name)?;
-
-        // Matches sqlite that treats VACUUM temp INTO as a no-op (no file created)
-        if source_db_id == TEMP_DB_ID {
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
-        }
 
         state.op_vacuum_state = VacuumOpState::IntoFile(Box::new(VacuumIntoOpContext {
             escaped_schema_name: schema_name.replace('"', "\"\""),
@@ -19415,19 +20411,44 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     .into());
                 }
 
-                // we always vacuum into a new file, so check if it exists
-                if std::path::Path::new(dest_path).exists() {
-                    return Err(LimboError::ParseError(format!(
-                        "output file already exists: {dest_path}"
-                    ))
+                let Value::Text(dest_path) = state.registers[*dest_reg].get_value() else {
+                    return Err(LimboError::InvalidArgument("non-text filename".to_string()).into());
+                };
+                let dest_path = dest_path.as_str().to_string();
+                let target = crate::util::OpenOptions::parse(&dest_path)?;
+                if target.cipher.is_some() || target.hexkey.is_some() {
+                    return Err(LimboError::InvalidArgument(
+                        "VACUUM INTO does not support the cipher and hexkey URI parameters"
+                            .to_string(),
+                    )
                     .into());
+                }
+                let output_in_memory = target.path.is_empty()
+                    || target.path == crate::util::MEMORY_PATH
+                    || target.mode == crate::util::OpenMode::Memory;
+                if !output_in_memory {
+                    if target.mode != crate::util::OpenMode::ReadWriteCreate {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "unable to open database: {dest_path}"
+                        ))
+                        .into());
+                    }
+                    if std::fs::metadata(&target.path).is_ok_and(|m| m.len() > 0) {
+                        return Err(LimboError::ParseError(format!(
+                            "output file already exists: {}",
+                            target.path
+                        ))
+                        .into());
+                    }
                 }
 
                 // Pin source metadata before building the output database. The
                 // BEGIN and pragma helpers here are blocking convenience wrappers;
                 // async work starts with the schema scan in vacuum_target_build_step.
+                // Spelled BEGIN DEFERRED so a non-SQLite dialect (postgres maps
+                // plain BEGIN to BEGIN CONCURRENT) cannot reinterpret it.
                 let source_db = program.connection.get_source_database(source_db_id);
-                program.connection.execute("BEGIN")?;
+                program.connection.execute("BEGIN DEFERRED")?;
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                 let page_size: u32 = extract_pragma_int(
                     &program
@@ -19471,19 +20492,44 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                         .io
                         .block(|| pager.with_header(|header| header.reserved_space))?
                 };
+                // Like SQLite, a valid size from the last PRAGMA page_size wins over the
+                // source's, except when the source is in memory. A 512-byte page has too
+                // little usable space for more than 32 reserved bytes, so SQLite uses 1024.
+                let next_page_size = program.connection.next_page_size.load(Ordering::SeqCst);
+                let page_size =
+                    if PageSize::new(next_page_size).is_some() && !source_db.is_in_memory_db() {
+                        next_page_size
+                    } else {
+                        page_size
+                    };
+                let page_size = if reserved_space > 32 && page_size == 512 {
+                    1024
+                } else {
+                    page_size
+                };
 
                 // Mirror source feature flags to the output so schema replay
                 // can resolve custom types, generated columns, vtab modules, etc.
                 let output_opts = vacuum_target_opts_from_source(&source_db);
 
-                // Always use PlatformIO for the output file, even if source
-                // is in-memory. This ensures VACUUM INTO writes to disk.
-                let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+                let (io, dest_path): (Arc<dyn crate::IO>, String) = if output_in_memory {
+                    (
+                        Arc::new(crate::MemoryIO::new()),
+                        crate::util::MEMORY_PATH.to_string(),
+                    )
+                } else if crate::is_memory_like(&target.path) {
+                    (
+                        Arc::new(crate::io::PlatformIO::new()?),
+                        format!("./{}", target.path),
+                    )
+                } else {
+                    (Arc::new(crate::io::PlatformIO::new()?), target.path)
+                };
                 let page_codec = source_pager.page_codec_external();
                 let output_db = match &page_codec {
                     Some(codec) => crate::Database::open(
                         io,
-                        dest_path,
+                        &dest_path,
                         crate::OpenOptions::new(source_db.dialect())
                             .flags(OpenFlags::Create)
                             .db_opts(output_opts)
@@ -19491,7 +20537,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     )?,
                     None => crate::Database::open_file_with_flags(
                         io,
-                        dest_path,
+                        &dest_path,
                         OpenFlags::Create,
                         output_opts,
                         None,
@@ -19499,8 +20545,8 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     )?,
                 };
                 let output_conn = match page_codec {
-                    Some(codec) => output_db.connect_with_page_codec(codec)?,
-                    None => output_db.connect()?,
+                    Some(codec) => output_db.connect(ConnectOpts::new().with_page_codec(codec))?,
+                    None => output_db.connect(ConnectOpts::new())?,
                 };
                 output_conn.reset_page_size(MAIN_DB_ID, page_size)?;
                 // set reserved_space on output to match source
@@ -19706,7 +20752,71 @@ mod tests {
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::BranchOffset;
     use crate::SqliteDialect;
-    use crate::{Database, DatabaseOpts, MemoryIO, IO};
+    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, IO};
+
+    /// A weighted step must leave the same exact total as the weighted sum
+    /// computed in 128-bit arithmetic, including when the i64 part wraps.
+    #[test]
+    fn ivm_sum_weighted_int_matches_exact_total() {
+        let exact =
+            |wrapped: i64, wrap_count: i64| i128::from(wrapped) + (i128::from(wrap_count) << 64);
+        let steps: &[(i64, i64)] = &[
+            (i64::MAX, 3),
+            (7, -2),
+            (i64::MIN, 5),
+            (i64::MIN, -5),
+            (-1, i64::MAX),
+            (i64::MAX, 1),
+            (12345, 1),
+            (i64::MAX, -3),
+        ];
+        let (mut wrapped, mut wrap_count) = (0i64, 0i64);
+        let mut expected = 0i128;
+        for &(value, weight) in steps {
+            (wrapped, wrap_count) =
+                ivm_sum_add_weighted_int(wrapped, wrap_count, value, weight).unwrap();
+            expected += i128::from(value) * i128::from(weight);
+            assert_eq!(
+                exact(wrapped, wrap_count),
+                expected,
+                "after {value} x {weight}"
+            );
+        }
+        // The steps cancel except for 12345 and -2 * 7.
+        assert_eq!((wrapped, wrap_count), (12345 - 14, 0));
+    }
+
+    #[test]
+    fn set_subtype_non_integer_returns_error() {
+        assert_set_subtype_error(Value::build_text("74"), "stored subtype must be an integer");
+    }
+
+    #[test]
+    fn set_subtype_unknown_integer_returns_error() {
+        assert_set_subtype_error(Value::from_i64(75), "unknown stored subtype: 75");
+    }
+
+    fn assert_set_subtype_error(subtype: Value, expected_message: &str) {
+        let stmt = prepare_test_statement();
+        let mut state = ProgramState::new(2, 0);
+        let original = Value::build_text("unchanged");
+        state.set_register(0, Register::Value(subtype));
+        state.set_register(1, Register::Value(original.clone()));
+        let insn = Insn::SetSubtype {
+            subtype_reg: 0,
+            dest_reg: 1,
+        };
+        let err = match op_set_subtype(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+            Ok(_) => panic!("invalid subtype must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(*err, LimboError::InternalError(ref message) if message == expected_message),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(state.pc, 0);
+        assert_eq!(state.get_register(1).get_value(), &original);
+    }
 
     fn prepare_test_statement() -> Statement {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -19719,7 +20829,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.prepare("SELECT 1;").unwrap()
     }
 
@@ -19780,7 +20890,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(x)").unwrap();
         conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
@@ -19845,7 +20955,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         conn.execute(format!(
             "ATTACH DATABASE '{}' AS att",
@@ -19907,7 +21017,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("ATTACH 'savepoint-aux.db' AS aux").unwrap();
         conn.execute("CREATE TABLE aux.t(x)").unwrap();
 
@@ -19932,7 +21042,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
         for i in 0..128 {
@@ -19977,7 +21087,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
         for i in 0..32 {
@@ -20660,7 +21770,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             conn.execute("SELECT -X'18530E218A8D2D8D8F7456733370E68357745AFE13FC1B94751B77FCB00D0CAD971017936278BFF49BB4C8BD47F874ECA5226D3A433B7DFCD18661673598CED1FDB30A795F6F25'[2]")

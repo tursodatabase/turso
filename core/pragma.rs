@@ -153,11 +153,11 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         ),
         IntegrityCheck => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::ReadOnly | PragmaFlags::Result0,
-            &["message"],
+            &["integrity_check"],
         ),
         QuickCheck => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::ReadOnly | PragmaFlags::Result0,
-            &["message"],
+            &["quick_check"],
         ),
         CaptureDataChangesConn | UnstableCaptureDataChangesConn => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
@@ -485,14 +485,14 @@ impl PragmaVirtualTableCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Database, MemoryIO, SqliteDialect};
+    use crate::{ConnectOpts, Database, MemoryIO, SqliteDialect};
 
     #[test]
     fn filter_starts_each_pragma_scan_at_rowid_one() {
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let db =
             Database::open_file(io, crate::util::MEMORY_PATH, Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE scan_target(first, second)")
             .unwrap();
 

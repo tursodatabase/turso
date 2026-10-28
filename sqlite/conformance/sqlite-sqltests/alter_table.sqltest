@@ -69,6 +69,40 @@ expect {
     a|x
 }
 
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@cross-check-integrity
+test alter-table-rename-column-without-rowid-first-key-column {
+    CREATE TABLE t (a, b, c, PRIMARY KEY (a, b, c)) WITHOUT ROWID;
+    INSERT INTO t VALUES (1, 2, 3);
+    ALTER TABLE t RENAME COLUMN a TO x;
+    SELECT * FROM t;
+    SELECT count(*) FROM t WHERE x = 1;
+    INSERT INTO t VALUES (4, 5, 6);
+    SELECT * FROM t;
+    SELECT count(*) FROM t WHERE x = 4 AND b = 5 AND c = 6;
+}
+expect {
+    1|2|3
+    1
+    1|2|3
+    4|5|6
+    1
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@cross-check-integrity
+test alter-table-rename-column-without-rowid-two-column-key {
+    CREATE TABLE t (a, b, PRIMARY KEY (a, b)) WITHOUT ROWID;
+    INSERT INTO t VALUES (1, 2);
+    ALTER TABLE t RENAME COLUMN a TO x;
+    SELECT * FROM t;
+    SELECT count(*) FROM t WHERE x = 1;
+}
+expect {
+    1|2
+    1
+}
+
 @skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view {
     CREATE TABLE t (a, b);
@@ -857,6 +891,25 @@ expect {
     1|hello
 }
 
+# Differential-fuzzer regression: successful ADD COLUMN statements can expose
+# empty result metadata, so their observable result is the resulting schema.
+@cross-check-integrity
+test strict-alter-add-column-resulting-schema {
+    CREATE TABLE tbl_imaginative_chris (
+        col_captivating_building INTEGER PRIMARY KEY,
+        col_ravishing_yearzero TEXT UNIQUE
+    ) STRICT;
+    ALTER TABLE tbl_imaginative_chris ADD COLUMN col_loyal_sarnoff TEXT;
+    SELECT name, type
+      FROM pragma_table_info('tbl_imaginative_chris')
+     ORDER BY cid;
+}
+expect {
+    col_captivating_building|INTEGER
+    col_ravishing_yearzero|TEXT
+    col_loyal_sarnoff|TEXT
+}
+
 @cross-check-integrity
 test strict-alter-add-column-any {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -1643,6 +1696,133 @@ expect {
     1|55
 }
 
+test alter-table-rename-column-trigger-subquery-reads-other-table {
+    DROP TABLE IF EXISTS t;
+    DROP TABLE IF EXISTS u;
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t (a INT);
+    CREATE TABLE u (a INT);
+    CREATE TABLE src (v INT);
+    CREATE TABLE log (x);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN
+        INSERT INTO log SELECT (SELECT a FROM u) FROM t;
+        INSERT INTO log SELECT (SELECT a FROM (SELECT 8 AS a)) FROM t;
+    END;
+    CREATE TRIGGER tr_t AFTER INSERT ON t BEGIN
+        INSERT INTO log SELECT (SELECT a FROM u) + 10;
+    END;
+    INSERT INTO u VALUES (7);
+    ALTER TABLE t RENAME COLUMN a TO b;
+    INSERT INTO t VALUES (100);
+    INSERT INTO src VALUES (1);
+    SELECT x FROM log;
+    SELECT sql FROM sqlite_schema WHERE name = 'tr';
+}
+expect pattern {
+    17\s+7\s+8\s+CREATE TRIGGER tr AFTER INSERT ON src\s+BEGIN\s+INSERT INTO log SELECT \(SELECT a FROM u\) FROM t;\s+INSERT INTO log SELECT \(SELECT a FROM \(SELECT 8 AS a\)\) FROM t;?\s+END
+}
+
+test alter-table-rename-column-trigger-subquery-reads-view-or-table-valued-function {
+    DROP TABLE IF EXISTS t;
+    DROP VIEW IF EXISTS vw;
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t (a INT, value INT);
+    CREATE VIEW vw AS SELECT 5 AS a;
+    CREATE TABLE src (v INT);
+    CREATE TABLE log (x);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN
+        INSERT INTO log SELECT (SELECT a FROM vw) FROM t;
+        INSERT INTO log SELECT (SELECT value FROM json_each('[3]')) FROM t;
+    END;
+    INSERT INTO t VALUES (100, 200);
+    ALTER TABLE t RENAME COLUMN a TO b;
+    ALTER TABLE t RENAME COLUMN value TO c;
+    INSERT INTO src VALUES (1);
+    SELECT x FROM log;
+    SELECT sql FROM sqlite_schema WHERE name = 'tr';
+}
+expect pattern {
+    5\s+3\s+CREATE TRIGGER tr AFTER INSERT ON src\s+BEGIN\s+INSERT INTO log SELECT \(SELECT a FROM vw\) FROM t;\s+INSERT INTO log SELECT \(SELECT value FROM json_each\s?\('\[3\]'\)\) FROM t;?\s+END
+}
+
+test alter-table-rename-column-trigger-subquery-reads-cte-or-join {
+    DROP TABLE IF EXISTS t;
+    DROP TABLE IF EXISTS u;
+    DROP TABLE IF EXISTS w;
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t (a INT);
+    CREATE TABLE u (a INT);
+    CREATE TABLE w (k INT);
+    CREATE TABLE src (v INT);
+    CREATE TABLE log (x);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN
+        INSERT INTO log WITH u AS (SELECT 1 AS z) SELECT (SELECT a FROM u) FROM t;
+        INSERT INTO log SELECT (SELECT count(*) FROM u JOIN w ON a = k) FROM t;
+        INSERT INTO log SELECT count(*) FROM t JOIN w ON a = k;
+    END;
+    INSERT INTO t VALUES (5);
+    INSERT INTO u VALUES (7);
+    INSERT INTO w VALUES (7);
+    ALTER TABLE t RENAME COLUMN a TO b;
+    INSERT INTO src VALUES (1);
+    SELECT x FROM log;
+    SELECT sql FROM sqlite_schema WHERE name = 'tr';
+}
+expect pattern {
+    5\s+1\s+0\s+CREATE TRIGGER tr AFTER INSERT ON src\s+BEGIN\s+INSERT INTO log WITH u AS \(SELECT 1 AS z\) SELECT \(SELECT b FROM u\) FROM t;\s+INSERT INTO log SELECT \(SELECT count\s?\(\*\) FROM u JOIN w ON a = k\) FROM t;\s+INSERT INTO log SELECT count\s?\(\*\) FROM t JOIN w ON b = k;?\s+END
+}
+
+test alter-table-rename-column-trigger-subquery-reads-star-of-other-table {
+    DROP TABLE IF EXISTS t;
+    DROP TABLE IF EXISTS u;
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t (a INT);
+    CREATE TABLE u (a INT);
+    CREATE TABLE src (v INT);
+    CREATE TABLE log (x);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN
+        INSERT INTO log SELECT (SELECT a FROM (SELECT * FROM u)) FROM t;
+        INSERT INTO log SELECT (SELECT a FROM (SELECT u.* FROM u) AS d) FROM t;
+    END;
+    INSERT INTO t VALUES (100);
+    INSERT INTO u VALUES (7);
+    ALTER TABLE t RENAME COLUMN a TO b;
+    INSERT INTO src VALUES (1);
+    SELECT x FROM log;
+    SELECT sql FROM sqlite_schema WHERE name = 'tr';
+}
+expect pattern {
+    7\s+7\s+CREATE TRIGGER tr AFTER INSERT ON src\s+BEGIN\s+INSERT INTO log SELECT \(SELECT a FROM \(SELECT \* FROM u\)\) FROM t;\s+INSERT INTO log SELECT \(SELECT a FROM \(SELECT u\.\* FROM u\) AS d\) FROM t;?\s+END
+}
+
+test alter-table-rename-column-trigger-table-valued-function-reads-left-tables {
+    DROP TABLE IF EXISTS t;
+    DROP TABLE IF EXISTS u;
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t (a INT);
+    CREATE TABLE u (a INT);
+    CREATE TABLE src (v INT);
+    CREATE TABLE log (x);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN
+        INSERT INTO log SELECT j.value FROM t, json_each(a) AS j;
+        INSERT INTO log SELECT (SELECT j.value FROM u, json_each(a) AS j) FROM t;
+    END;
+    INSERT INTO t VALUES ('[1]');
+    INSERT INTO u VALUES ('[7]');
+    ALTER TABLE t RENAME COLUMN a TO b;
+    INSERT INTO src VALUES (1);
+    SELECT x FROM log;
+    SELECT sql FROM sqlite_schema WHERE name = 'tr';
+}
+expect pattern {
+    1\s+7\s+CREATE TRIGGER tr AFTER INSERT ON src\s+BEGIN\s+INSERT INTO log SELECT j\.value FROM t, json_each\s?\(b\) AS j;\s+INSERT INTO log SELECT \(SELECT j\.value FROM u, json_each\s?\(a\) AS j\) FROM t;?\s+END
+}
+
 test alter-table-rename-trigger-exists-subquery {
     DROP TABLE IF EXISTS t1;
     DROP TABLE IF EXISTS t2;
@@ -1660,6 +1840,43 @@ test alter-table-rename-trigger-exists-subquery {
 }
 expect {
     42
+}
+
+# A FROM subquery cannot see the other tables in the same FROM clause, so the
+# unqualified `a` in `(SELECT a FROM u)` reads u.a and must not be renamed.
+@cross-check-integrity
+test alter-table-rename-column-trigger-keeps-from-subquery-column {
+    CREATE TABLE t(a INT);
+    CREATE TABLE u(a INT);
+    CREATE TABLE src(v INT);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN
+        SELECT s.a FROM t, (SELECT a FROM u) AS s;
+    END;
+    ALTER TABLE t RENAME COLUMN a TO b;
+    INSERT INTO src VALUES (1);
+    SELECT count(*) FROM src;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test alter-table-rename-column-trigger-from-subquery-reads-other-table {
+    CREATE TABLE t(a INT);
+    CREATE TABLE u(a INT, b INT);
+    CREATE TABLE src(v INT);
+    CREATE TABLE log(x);
+    INSERT INTO t VALUES (100);
+    INSERT INTO u VALUES (1, 2);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN
+        INSERT INTO log SELECT s.a FROM t, (SELECT a FROM u) AS s;
+    END;
+    ALTER TABLE t RENAME COLUMN a TO b;
+    INSERT INTO src VALUES (1);
+    SELECT x FROM log;
+}
+expect {
+    1
 }
 
 test alter-table-rename-then-rename-column-trigger {
@@ -3168,6 +3385,24 @@ expect error {
     Cannot add a column with non-constant default
 }
 
+# A default that names a column is rejected even on an empty table, as in
+# CREATE TABLE. A bare name is a string literal.
+test alter-table-add-column-default-with-column-name-errors {
+    CREATE TABLE t_cnd(x INTEGER);
+    ALTER TABLE t_cnd ADD COLUMN b DEFAULT (x * 0 + 4);
+}
+expect error {
+    is not constant
+}
+
+test alter-table-add-column-parenthesized-column-name-default-errors {
+    CREATE TABLE t_cnd2(x INTEGER);
+    ALTER TABLE t_cnd2 ADD COLUMN b DEFAULT (x);
+}
+expect error {
+    is not constant
+}
+
 # The following preserve-schema-collate tests ensure that alter table
 # preserve the original collation defined on table creation.
 # https://github.com/tursodatabase/turso/issues/8254
@@ -3210,4 +3445,44 @@ test alter-table-add-column-preserve-schema-collate-locale {
 }
 expect {
     CREATE TABLE tbl (c TEXT COLLATE "fr-FR", d)
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-view-rejected {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS SELECT a FROM t;
+    ALTER TABLE v RENAME TO w;
+}
+expect error {
+    view v may not be altered
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-add-column-to-view-rejected {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS SELECT a FROM t;
+    ALTER TABLE v ADD COLUMN z;
+}
+expect error {
+    Cannot add a column to a view
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-view-column-rejected {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS SELECT a FROM t;
+    ALTER TABLE v RENAME COLUMN a TO q;
+}
+expect error {
+    cannot rename columns of view "v"
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-drop-view-column-rejected {
+    CREATE TABLE t(a, b);
+    CREATE VIEW v AS SELECT a, b FROM t;
+    ALTER TABLE v DROP COLUMN a;
+}
+expect error {
+    cannot drop column from view "v"
 }

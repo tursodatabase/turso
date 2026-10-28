@@ -1,0 +1,29 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@skip-file-if sqlite "materialized views are a turso-specific feature"
+@requires-file materialized_views "requires materialized view support"
+
+setup matview {
+    CREATE TABLE t (id INT PRIMARY KEY, type TEXT, amt INT);
+    INSERT INTO t VALUES (1, 'x', 2), (2, 'y', 3);
+    CREATE MATERIALIZED VIEW tm AS SELECT type, sum(amt) AS totamt FROM t GROUP BY type;
+}
+
+@setup matview
+test left-join-matview-without-match-reads-nulls {
+    SELECT t.id, tm.type, tm.totamt, tm.rowid FROM t LEFT JOIN tm ON tm.type = t.type || 'z' ORDER BY t.id;
+}
+expect {
+    1|||
+    2|||
+}
+
+@setup matview
+test left-join-matview-reads-nulls-after-finding-a-row-that-fails-the-on-clause {
+    CREATE TABLE r AS SELECT rowid AS rid, type FROM tm;
+    SELECT r.type, tm.type, CAST(tm.totamt AS INTEGER), tm.rowid IS NULL FROM r LEFT JOIN tm ON tm.rowid = r.rid AND tm.type = 'x' ORDER BY r.type;
+}
+expect {
+    x|x|2|0
+    y|||1
+}

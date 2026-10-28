@@ -401,13 +401,13 @@ fn emit_unmatched_right_rows(
             program.emit_insn(Insn::OpenRead {
                 cursor_id: table_cursor_id,
                 root_page: btree.root_page,
-                db: table.database_id,
+                db: table.namespace.database_id,
             });
             for (index, index_cursor_id) in &unmatched_index_cursors {
                 program.emit_insn(Insn::OpenRead {
                     cursor_id: *index_cursor_id,
                     root_page: index.root_page,
-                    db: table.database_id,
+                    db: table.namespace.database_id,
                 });
             }
         }
@@ -1008,9 +1008,9 @@ fn emit_unmatched_rows_subquery(
             *subquery_plan,
             &subquery.query_type,
             subquery.correlated,
-            false,
         )
-    })
+    })?;
+    Ok(())
 }
 
 pub(super) struct AutoIndexResult {
@@ -1118,7 +1118,7 @@ pub(super) fn emit_autoindex(
                 }
             }
         }
-        program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, reg);
+        emit_stored_column(program, table_cursor_id, col.pos_in_table, reg, resolver)?;
     }
     if table_has_rowid {
         program.emit_insn(Insn::RowId {
