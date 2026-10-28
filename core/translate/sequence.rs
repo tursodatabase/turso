@@ -15,7 +15,7 @@ use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
 
 use crate::bail_parse_error;
-use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::namespace::{is_reserved_object_name, NamespaceId, NamespaceRef};
 use crate::schema::{
     BTreeTable, Sequence, AUTOINCREMENT_SEQ_PREFIX, SEQ_BACKING_TABLE_PREFIX,
     SQLITE_SEQUENCE_TABLE_NAME,
@@ -31,6 +31,7 @@ use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
     to_u32, AddSequenceData, CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral,
 };
+use crate::Connection;
 use crate::Result;
 use turso_parser::ast;
 
@@ -868,6 +869,7 @@ pub fn translate_create_sequence(
     max_value: &Option<i64>,
     cycle: bool,
     resolver: &Resolver,
+    connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let namespace = resolver.resolve_namespace_for_create(seq_name)?;
@@ -893,6 +895,17 @@ pub fn translate_create_sequence(
         bail_parse_error!(
             "sequence name \"{}\" is reserved for internal AUTOINCREMENT use",
             normalized_name
+        );
+    }
+
+    if is_reserved_object_name(
+        resolver.catalog.dialect.supports_namespaces(),
+        &normalized_name,
+    ) && !connection.is_nested_stmt()
+    {
+        bail_parse_error!(
+            "Object name reserved for internal use: {}",
+            seq_name.name.as_str()
         );
     }
 

@@ -1,5 +1,6 @@
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
@@ -8,7 +9,7 @@ use crate::translate::ProgramBuilderOpts;
 use crate::util::{escape_sql_string_literal, normalize_ident};
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, Result, MAIN_DB_ID};
+use crate::{bail_parse_error, Connection, Result, MAIN_DB_ID};
 use turso_parser::ast::{self, QualifiedName};
 
 /// Reconstruct SQL string from CREATE TRIGGER AST
@@ -95,13 +96,18 @@ pub fn translate_create_trigger(
     if_not_exists: bool,
     time: Option<ast::TriggerTime>,
     tbl_name: QualifiedName,
+    connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
     sql: String,
     commands: &[ast::TriggerCmd],
     when_clause: Option<&ast::Expr>,
 ) -> Result<()> {
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
-    if is_reserved_object_name(&normalized_trigger_name) {
+    if is_reserved_object_name(
+        resolver.catalog.dialect.supports_namespaces(),
+        &normalized_trigger_name,
+    ) && !connection.is_nested_stmt()
+    {
         bail_parse_error!(
             "Object name reserved for internal use: {}",
             trigger_name.name.as_str()

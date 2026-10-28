@@ -309,6 +309,7 @@ pub fn translate_inner(
                 if_not_exists,
                 time,
                 tbl_name,
+                connection,
                 program,
                 sql,
                 &commands,
@@ -328,6 +329,7 @@ pub fn translate_inner(
             &columns,
             temporary,
             if_not_exists,
+            connection,
             program,
         )?,
         ast::Stmt::CreateMaterializedView {
@@ -515,6 +517,7 @@ pub fn translate_inner(
                 &max_value,
                 cycle,
                 resolver,
+                connection,
                 program,
             )?;
         }

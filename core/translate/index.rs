@@ -71,7 +71,7 @@ fn validate(
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
         crate::bail_parse_error!("table sqlite_sequence may not be indexed");
     }
-    if (is_reserved_object_name(idx_name)
+    if (is_reserved_object_name(connection.dialect().supports_namespaces(), idx_name)
         || RESERVED_TABLE_PREFIXES
             .iter()
             .any(|prefix| tbl_name.starts_with(prefix)))
