@@ -68,6 +68,7 @@ pub enum Action {
     Optimize,
     Attach,
     Detach,
+    Execute,
 }
 
 impl fmt::Display for Action {
@@ -87,6 +88,7 @@ impl fmt::Display for Action {
             Action::Optimize => "optimize",
             Action::Attach => "attach",
             Action::Detach => "detach",
+            Action::Execute => "execute",
         };
         f.write_str(name)
     }
@@ -111,6 +113,8 @@ pub enum Object {
     Sequence(String),
     /// A type or domain, by name.
     Type(String),
+    /// A function, by name, such as `load_extension`.
+    Function(String),
     /// A role, by name.
     Role(String),
     /// A connection or database setting, such as a pragma.
@@ -130,6 +134,7 @@ impl fmt::Display for Object {
             Object::Trigger(name) => write!(f, "trigger {name}"),
             Object::Sequence(name) => write!(f, "sequence {name}"),
             Object::Type(name) => write!(f, "type {name}"),
+            Object::Function(name) => write!(f, "function {name}"),
             Object::Role(name) => write!(f, "role {name}"),
             Object::Setting(name) => write!(f, "setting {name}"),
             Object::File(name) => write!(f, "file {name}"),
