@@ -39,8 +39,9 @@ use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
     rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
     rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
-    rewrite_inline_col_fk_target_if_needed, rewrite_trigger_cmd_table_refs,
-    rewrite_view_sql_for_column_rename, trim_ascii_whitespace, RewrittenView,
+    rewrite_inline_col_fk_target_if_needed, rewrite_select_table_refs,
+    rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename, trim_ascii_whitespace,
+    RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -12275,6 +12276,12 @@ pub fn op_function(
                                     .to_string(),
                                 )
                             }
+                            view @ ast::Stmt::CreateView { .. } => rewrite_view_for_table_rename(
+                                view,
+                                &rename_from,
+                                original_rename_to.as_str(),
+                            )
+                            .map(|(new_sql, _)| new_sql),
                             _ => None,
                         }
                     };
@@ -17901,6 +17908,28 @@ pub fn op_rename_table(
             rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
         }
 
+        let mut view_rewrites = Vec::new();
+        for (view_name, view) in schema.views(NamespaceId::ROOT) {
+            if !sql_might_reference_identifier(&view.sql, &normalized_from) {
+                continue;
+            }
+            let Some(ast::Cmd::Stmt(stmt)) = conn.dialect().parse(&view.sql)?.0 else {
+                continue;
+            };
+            if let Some(rewrite) = rewrite_view_for_table_rename(stmt, &normalized_from, to) {
+                view_rewrites.push((view_name.to_string(), rewrite));
+            }
+        }
+        for (view_name, (new_sql, new_select)) in view_rewrites {
+            let view = Arc::make_mut(
+                schema
+                    .view_mut(NamespaceId::ROOT, &view_name)
+                    .expect("view being rewritten should be in schema"),
+            );
+            view.sql = new_sql;
+            view.select_stmt = new_select;
+        }
+
         Ok(())
     })??;
 
@@ -17956,6 +17985,37 @@ pub fn op_rename_table(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn rewrite_view_for_table_rename(
+    view: ast::Stmt,
+    normalized_from: &str,
+    to: &str,
+) -> Option<(String, ast::Select)> {
+    let ast::Stmt::CreateView {
+        temporary,
+        if_not_exists,
+        view_name,
+        columns,
+        mut select,
+    } = view
+    else {
+        panic!("rewrite_view_for_table_rename called with a statement that is not CREATE VIEW");
+    };
+    let old_select = select.clone();
+    rewrite_select_table_refs(&mut select, normalized_from, to);
+    if select == old_select {
+        return None;
+    }
+    let new_sql = ast::Stmt::CreateView {
+        temporary,
+        if_not_exists,
+        view_name,
+        columns,
+        select: select.clone(),
+    }
+    .to_string();
+    Some((new_sql, select))
 }
 
 pub fn op_drop_column(
