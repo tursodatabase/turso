@@ -1187,3 +1187,62 @@ mod allocation_failures {
         }
     }
 }
+
+/// 25 documents inserted by one statement, so the index holds them in one segment in id order:
+/// ids 1 to 20 match 'hello' and the rest do not, and every match is in category 0 but the last,
+/// id 20, in category 1.
+fn documents_in_categories() -> Arc<Connection> {
+    let db = crate::Database::open(
+        Arc::new(crate::MemoryIO::new()),
+        ":memory:",
+        crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
+            .db_opts(crate::DatabaseOpts::default().with_index_method(true)),
+    )
+    .unwrap();
+    let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT, cat INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    let rows: Vec<String> = (1..=25i64)
+        .map(|id| {
+            let body = if id <= 20 {
+                "hello ".repeat((id % 3 + 1) as usize) + "world"
+            } else {
+                "goodbye world".to_string()
+            };
+            format!("({id}, '{body}', {})", i64::from(id == 20))
+        })
+        .collect();
+    conn.execute(format!("INSERT INTO docs VALUES {}", rows.join(", ")))
+        .unwrap();
+    conn
+}
+
+fn collected(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
+    conn.prepare(sql).unwrap().run_collect_rows().unwrap()
+}
+
+/// An FTS pattern with LIMIT applies the LIMIT to the matches it gives out, so it cannot serve a
+/// query whose aggregate or DISTINCT comes before the LIMIT: the aggregate counts every match, and
+/// the DISTINCT keeps every category.
+#[test]
+fn fts_limit_applies_after_aggregates_and_distinct() {
+    let conn = documents_in_categories();
+    assert_eq!(
+        collected(
+            &conn,
+            "SELECT count(*) FROM docs WHERE fts_match(body, 'hello') LIMIT 5"
+        ),
+        vec![vec![Value::from_i64(20)]]
+    );
+    let mut categories = collected(
+        &conn,
+        "SELECT DISTINCT cat FROM docs WHERE fts_match(body, 'hello') LIMIT 2",
+    );
+    categories.sort_by_key(|row| row[0].as_int());
+    assert_eq!(
+        categories,
+        vec![vec![Value::from_i64(0)], vec![Value::from_i64(1)]]
+    );
+}

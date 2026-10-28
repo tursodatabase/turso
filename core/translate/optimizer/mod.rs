@@ -1136,6 +1136,9 @@ fn find_select_plan_form(
         &mut plan.offset,
         plan.input_cardinality_hint.unwrap_or(1.0),
         cost_limit,
+        // Every row the WHERE clause keeps reaches the LIMIT unless an aggregate or DISTINCT
+        // comes between.
+        !plan.distinctness.is_distinct() && plan.aggregates.is_empty(),
     )?;
 
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
@@ -1917,6 +1920,7 @@ fn optimize_table_access_with_custom_modules(
     group_by: &mut Option<GroupBy>,
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
+    rows_pass_through: bool,
 ) -> Result<bool> {
     let tables = table_references.joined_tables();
     if tables.is_empty() {
@@ -1960,6 +1964,13 @@ fn optimize_table_access_with_custom_modules(
                 if !table_mask_from_expr(argument, table_references, subqueries)?.is_empty() {
                     continue 'patterns;
                 }
+            }
+
+            // A pattern with LIMIT applies the LIMIT to the rows it gives out, so it serves only
+            // a query whose rows reach the LIMIT as they leave the WHERE clause, with no
+            // aggregate or DISTINCT between.
+            if pattern_match.pattern_has_limit && !rows_pass_through {
+                continue;
             }
 
             // Mark WHERE clause as consumed
@@ -2471,6 +2482,7 @@ fn optimize_table_access(
         offset,
         initial_input_cardinality,
         None,
+        true,
     )?
     else {
         return Ok(None);
@@ -2507,6 +2519,7 @@ fn find_table_access_plan(
     offset: &mut Option<Box<Expr>>,
     initial_input_cardinality: f64,
     cost_limit: Option<Cost>,
+    rows_pass_through: bool,
 ) -> Result<Option<TableAccessPlan>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
@@ -2639,6 +2652,7 @@ fn find_table_access_plan(
             group_by,
             limit,
             offset,
+            rows_pass_through,
         )?;
         if optimized {
             return Ok(None);
