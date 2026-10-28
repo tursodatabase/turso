@@ -2068,7 +2068,7 @@ fn metadata_root_page(conn: &Arc<Connection>) -> u32 {
     // also avoids opening a read statement that would block the Truncate checkpoint below.
     let schema = conn.schema.read();
     let table = schema
-        .get_table("__turso_internal_mvcc_meta")
+        .get_table(NamespaceId::ROOT, "__turso_internal_mvcc_meta")
         .expect("expected exactly one metadata table row");
     table
         .btree()
