@@ -39,9 +39,9 @@ use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
     rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
     rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
-    rewrite_inline_col_fk_target_if_needed, rewrite_select_table_refs,
-    rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename, trim_ascii_whitespace,
-    RewrittenView,
+    rewrite_inline_col_fk_target_if_needed, rewrite_select_namespace_table_refs,
+    rewrite_select_table_refs, rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
+    trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -11934,6 +11934,9 @@ pub fn op_function(
                         }
                     };
                     let rename_to = normalize_ident(original_rename_to.as_str());
+                    let supports_namespaces = program.connection.dialect().supports_namespaces();
+                    let row_namespace =
+                        crate::namespace::demangle_name(supports_namespaces, &name).0;
 
                     let new_name = if let Some(column) =
                         &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
@@ -12208,12 +12211,30 @@ pub fn op_function(
                                     .to_string(),
                                 )
                             }
-                            view @ ast::Stmt::CreateView { .. } => rewrite_view_for_table_rename(
-                                view,
-                                &rename_from,
-                                original_rename_to.as_str(),
-                            )
-                            .map(|(new_sql, _)| new_sql),
+                            view @ ast::Stmt::CreateView { .. } => {
+                                // The view text names the table as its own SQL
+                                // does: by its bare name, maybe with a qualifier.
+                                let (table_namespace, from) = crate::namespace::demangle_name(
+                                    supports_namespaces,
+                                    &rename_from,
+                                );
+                                let (_, to) = crate::namespace::demangle_name(
+                                    supports_namespaces,
+                                    original_rename_to.as_str(),
+                                );
+                                let qualifiers =
+                                    program.connection.with_schema(crate::MAIN_DB_ID, |schema| {
+                                        table_qualifiers(schema, table_namespace)
+                                    });
+                                rewrite_view_for_table_rename(
+                                    view,
+                                    from,
+                                    to,
+                                    row_namespace == table_namespace,
+                                    qualifiers.as_deref(),
+                                )
+                                .map(|(new_sql, _)| new_sql)
+                            }
                             _ => None,
                         }
                     };
@@ -17889,22 +17910,32 @@ pub fn op_rename_table(
             rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
         }
 
+        let qualifiers = table_qualifiers(schema, *namespace);
         let mut view_rewrites = Vec::new();
-        for (view_name, view) in schema.views(NamespaceId::ROOT) {
-            if !sql_might_reference_identifier(&view.sql, &normalized_from) {
-                continue;
-            }
-            let Some(ast::Cmd::Stmt(stmt)) = conn.dialect().parse(&view.sql)?.0 else {
-                continue;
-            };
-            if let Some(rewrite) = rewrite_view_for_table_rename(stmt, &normalized_from, to) {
-                view_rewrites.push((view_name.to_string(), rewrite));
+        let view_namespaces: Vec<NamespaceId> = schema.namespace_ids().collect();
+        for view_namespace in view_namespaces {
+            for (view_name, view) in schema.views(view_namespace) {
+                if !sql_might_reference_identifier(&view.sql, &normalized_from) {
+                    continue;
+                }
+                let Some(ast::Cmd::Stmt(stmt)) = conn.dialect().parse(&view.sql)?.0 else {
+                    continue;
+                };
+                if let Some(rewrite) = rewrite_view_for_table_rename(
+                    stmt,
+                    &normalized_from,
+                    to,
+                    view_namespace == *namespace,
+                    qualifiers.as_deref(),
+                ) {
+                    view_rewrites.push((view_namespace, view_name.to_string(), rewrite));
+                }
             }
         }
-        for (view_name, (new_sql, new_select)) in view_rewrites {
+        for (view_namespace, view_name, (new_sql, new_select)) in view_rewrites {
             let view = Arc::make_mut(
                 schema
-                    .view_mut(NamespaceId::ROOT, &view_name)
+                    .view_mut(view_namespace, &view_name)
                     .expect("view being rewritten should be in schema"),
             );
             view.sql = new_sql;
@@ -17968,10 +17999,16 @@ pub fn op_rename_table(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Renames the table `normalized_from` to `to` in a view. In a database
+/// with namespaces, `unqualified_names_table` says whether the view is in
+/// the table's namespace, and `table_qualifiers` are the names of that
+/// namespace; without namespaces both are ignored.
 fn rewrite_view_for_table_rename(
     view: ast::Stmt,
     normalized_from: &str,
     to: &str,
+    unqualified_names_table: bool,
+    table_qualifiers: Option<&[String]>,
 ) -> Option<(String, ast::Select)> {
     let ast::Stmt::CreateView {
         temporary,
@@ -17984,7 +18021,16 @@ fn rewrite_view_for_table_rename(
         panic!("rewrite_view_for_table_rename called with a statement that is not CREATE VIEW");
     };
     let old_select = select.clone();
-    rewrite_select_table_refs(&mut select, normalized_from, to);
+    match table_qualifiers {
+        Some(qualifiers) => rewrite_select_namespace_table_refs(
+            &mut select,
+            normalized_from,
+            to,
+            unqualified_names_table,
+            qualifiers,
+        ),
+        None => rewrite_select_table_refs(&mut select, normalized_from, to),
+    }
     if select == old_select {
         return None;
     }
@@ -17997,6 +18043,20 @@ fn rewrite_view_for_table_rename(
     }
     .to_string();
     Some((new_sql, select))
+}
+
+/// The qualifiers that name `namespace` in the body of a view, or None when
+/// the database has no namespaces and any qualifier may name a table.
+fn table_qualifiers(schema: &Schema, namespace: NamespaceId) -> Option<Vec<String>> {
+    if !schema.supports_namespaces() {
+        return None;
+    }
+    let name = if namespace.is_root() {
+        Some("main")
+    } else {
+        schema.namespace_name(namespace)
+    };
+    Some(name.into_iter().map(str::to_string).collect())
 }
 
 pub fn op_drop_column(

@@ -4117,12 +4117,38 @@ pub fn rewrite_select_table_refs(select: &mut ast::Select, old_tbl: &str, new_tb
     rewrite_select_in_scope(select, TableRenameScope::new(old_tbl, new_tbl));
 }
 
+/// Renames the table `old_tbl` of a namespace to `new_tbl` in `select`, the
+/// body of a view. A name written without a qualifier is the table only when
+/// `unqualified_names_table`, that is, when the view is in the table's
+/// namespace; a qualified name is the table only when its qualifier is one
+/// of `table_qualifiers`, the names of the table's namespace.
+pub fn rewrite_select_namespace_table_refs(
+    select: &mut ast::Select,
+    old_tbl: &str,
+    new_tbl: &str,
+    unqualified_names_table: bool,
+    table_qualifiers: &[String],
+) {
+    rewrite_select_in_scope(
+        select,
+        TableRenameScope {
+            unqualified_names_table,
+            table_qualifiers: Some(table_qualifiers),
+            ..TableRenameScope::new(old_tbl, new_tbl)
+        },
+    );
+}
+
 #[derive(Clone, Copy)]
 struct TableRenameScope<'a> {
     old_tbl: &'a str,
     new_tbl: &'a str,
     table_is_visible: bool,
     qualifier_is_table: bool,
+    /// Whether a name written without a qualifier can be the table.
+    unqualified_names_table: bool,
+    /// The qualifiers that name the table's namespace; None takes any.
+    table_qualifiers: Option<&'a [String]>,
 }
 
 impl<'a> TableRenameScope<'a> {
@@ -4132,6 +4158,8 @@ impl<'a> TableRenameScope<'a> {
             new_tbl,
             table_is_visible: true,
             qualifier_is_table: true,
+            unqualified_names_table: true,
+            table_qualifiers: None,
         }
     }
 
@@ -4192,7 +4220,18 @@ impl<'a> TableRenameScope<'a> {
     }
 
     fn renames_table(&self, name: &ast::QualifiedName) -> bool {
-        (self.table_is_visible || name.namespace.is_some()) && self.is_old_name(&name.name)
+        let names_table = match &name.namespace {
+            Some(qualifier) => self.qualifier_names_table_namespace(qualifier),
+            None => self.table_is_visible && self.unqualified_names_table,
+        };
+        names_table && self.is_old_name(&name.name)
+    }
+
+    fn qualifier_names_table_namespace(&self, qualifier: &ast::Name) -> bool {
+        self.table_qualifiers.is_none_or(|qualifiers| {
+            let qualifier = normalize_ident(qualifier.as_str());
+            qualifiers.contains(&qualifier)
+        })
     }
 
     fn renames_qualifier(&self, name: &ast::Name) -> bool {

@@ -182,6 +182,37 @@ expect {
     1
 }
 
+test rename-table-keeps-the-views-that-read-it {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    CREATE VIEW v AS SELECT x FROM t;
+    CREATE VIEW v2 AS SELECT x FROM public.t;
+    ALTER TABLE t RENAME TO u;
+    SELECT x FROM v;
+    SELECT x FROM v2;
+}
+expect {
+    1
+    1
+}
+
+test rename-table-leaves-views-of-a-table-of-the-same-name-in-another-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (2);
+    CREATE VIEW app.v AS SELECT x FROM public.t;
+    CREATE VIEW app.w AS SELECT x FROM app.t;
+    ALTER TABLE t RENAME TO u;
+    SELECT x FROM app.v;
+    SELECT x FROM app.w;
+}
+expect {
+    1
+    2
+}
+
 test sequence-in-schema {
     CREATE SCHEMA app;
     CREATE SEQUENCE app.s;
