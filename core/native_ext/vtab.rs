@@ -33,6 +33,12 @@ pub trait VirtualTable: Debug + Send + Sync {
     fn readonly(&self) -> bool {
         true
     }
+    /// Whether a role that is not a superuser may read this table. A table
+    /// that reads stored data directly, without the privilege checks on
+    /// tables, must keep the default.
+    fn readable_without_privileges(&self) -> bool {
+        false
+    }
     fn create_update(&mut self, _args: Vec<Value>) -> Result<Box<dyn TableUpdate>> {
         Err(LimboError::ReadOnly)
     }
@@ -92,6 +98,10 @@ pub(crate) struct NativeTable(Arc<RwLock<Box<dyn TableInstance>>>);
 impl NativeTable {
     pub(crate) fn readonly(&self) -> bool {
         self.0.read().readonly()
+    }
+
+    pub(crate) fn readable_without_privileges(&self) -> bool {
+        self.0.read().readable_without_privileges()
     }
 
     pub(crate) fn best_index(
@@ -160,6 +170,7 @@ trait TableInstance: Debug + Send + Sync {
         order_by: &[OrderByInfo],
     ) -> Result<IndexInfo, ResultCode>;
     fn readonly(&self) -> bool;
+    fn readable_without_privileges(&self) -> bool;
     fn create_update(&mut self, args: Vec<Value>) -> Result<Box<dyn TableUpdate>>;
     fn begin(&mut self) -> Result<()>;
     fn commit(&mut self) -> Result<()>;
@@ -183,6 +194,10 @@ impl<T: VirtualTable> TableInstance for T {
 
     fn readonly(&self) -> bool {
         VirtualTable::readonly(self)
+    }
+
+    fn readable_without_privileges(&self) -> bool {
+        VirtualTable::readable_without_privileges(self)
     }
 
     fn create_update(&mut self, args: Vec<Value>) -> Result<Box<dyn TableUpdate>> {
