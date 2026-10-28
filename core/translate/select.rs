@@ -949,6 +949,7 @@ fn first_aggregate_without_over_clause<'a>(
         {
             Ok(Some(crate::function::Func::Agg(_))) => true,
             _ => resolver
+                .catalog
                 .symbol_table
                 .resolve_function(name.as_str(), args_count)
                 .is_some_and(|f| f.func.is_aggregate()),

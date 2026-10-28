@@ -467,6 +467,7 @@ pub fn translate_insert(
     }
 
     if resolver
+        .catalog
         .dialect
         .upsert_rejects_row_written_by_same_statement()
         && upsert_actions

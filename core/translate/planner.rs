@@ -641,6 +641,7 @@ pub fn resolve_window_and_aggregate_functions(
                     }
                     None => {
                         if let Some(f) = resolver
+                            .catalog
                             .symbol_table
                             .resolve_function(name.as_str(), args_count)
                         {
@@ -737,7 +738,11 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                     }
                     None => {
-                        if let Some(f) = resolver.symbol_table.resolve_function(name.as_str(), 0) {
+                        if let Some(f) = resolver
+                            .catalog
+                            .symbol_table
+                            .resolve_function(name.as_str(), 0)
+                        {
                             let func = AggFunc::External(f.func.clone().into());
                             if f.func.is_aggregate() {
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {

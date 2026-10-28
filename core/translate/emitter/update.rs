@@ -905,7 +905,7 @@ fn emit_update_column_values<'a>(
                             // against this column's union type. See ProgramBuilder::target_union_type.
                             let union_td = t_ctx
                                 .resolver
-                                .schema
+                                .schema()
                                 .get_type_def_unchecked(&table_column.ty_str)
                                 .filter(|td| td.is_union())
                                 .cloned();
@@ -917,7 +917,7 @@ fn emit_update_column_values<'a>(
                             // comment on NoConstantOptReason::CustomTypeEncode.
                             let has_custom_encode = t_ctx
                                 .resolver
-                                .schema
+                                .schema()
                                 .resolve_type_unchecked(&table_column.ty_str)
                                 .ok()
                                 .flatten()
