@@ -387,3 +387,24 @@ test temp-does-not-name-a-schema {
 expect error {
     schema "temp" does not exist
 }
+
+test sequence-in-a-schema-named-with-a-dot {
+    CREATE SCHEMA "a.b";
+    CREATE SEQUENCE "a.b".s START WITH 5;
+    SELECT nextval('"a.b".s');
+    CREATE TABLE "a.b".t (id serial, v int);
+    INSERT INTO "a.b".t (v) VALUES (7);
+    INSERT INTO "a.b".t (v) VALUES (8);
+    SELECT id, v FROM "a.b".t ORDER BY id;
+    SELECT schemaname, sequencename FROM pg_sequences WHERE schemaname = 'a.b' ORDER BY sequencename;
+    DROP SCHEMA "a.b" CASCADE;
+    SELECT count(*) FROM pg_sequences WHERE schemaname = 'a.b';
+}
+expect {
+    5
+    1|7
+    2|8
+    a.b|s
+    a.b|t_id_seq
+    0
+}

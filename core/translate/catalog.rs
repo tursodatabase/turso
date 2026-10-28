@@ -507,7 +507,11 @@ impl<'a> CatalogContext<'a> {
         let namespace_name = self
             .name_of_namespace(namespace)
             .expect("the namespace of a sequence has a name");
-        format!("{namespace_name}.{seq_name}")
+        format!(
+            "{}.{}",
+            ast::Name::exact(namespace_name).as_ident(),
+            ast::Name::exact(seq_name.to_string()).as_ident()
+        )
     }
 
     /// The namespace that the qualifier of `qualified_name` refers to, or

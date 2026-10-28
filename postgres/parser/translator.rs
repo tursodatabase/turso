@@ -638,7 +638,9 @@ impl PostgreSQLTranslator {
                 name: exact_name("nextval"),
                 distinctness: None,
                 args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                    "'{namespace}.{seq_name}'"
+                    "'{}.{}'",
+                    crate::quote_identifier(&namespace),
+                    crate::quote_identifier(&seq_name)
                 ))))],
                 order_by: vec![],
                 within_group: vec![],

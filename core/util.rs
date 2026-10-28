@@ -131,6 +131,54 @@ pub fn normalize_ident(identifier: &str) -> String {
     identifier.to_ascii_lowercase()
 }
 
+/// Splits a name written in a string, like the argument of nextval, into
+/// its namespace and its name. A part written in double quotes may contain
+/// dots and doubled quotes; an unquoted namespace ends at the first dot
+/// and an unquoted name runs to the end. The parts keep their case.
+pub fn split_qualified_name(name: &str) -> (Option<String>, String) {
+    match quoted_part(name) {
+        Some((namespace, rest)) => match rest.strip_prefix('.') {
+            Some(rest) => (Some(namespace), unquoted(rest)),
+            None if rest.is_empty() => (None, namespace),
+            None => (None, name.to_string()),
+        },
+        None => match name.split_once('.') {
+            Some((namespace, rest)) => (Some(namespace.to_string()), unquoted(rest)),
+            None => (None, name.to_string()),
+        },
+    }
+}
+
+/// The part in double quotes that `name` starts with, with its quotes
+/// removed and doubled quotes undoubled, and what follows it.
+fn quoted_part(name: &str) -> Option<(String, &str)> {
+    let mut part = String::new();
+    let mut chars = name.strip_prefix('"')?.char_indices();
+    while let Some((_, c)) = chars.next() {
+        if c != '"' {
+            part.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some((_, '"')) => part.push('"'),
+            Some((next, _)) => return Some((part, &name[1 + next..])),
+            None => return Some((part, "")),
+        }
+    }
+    None
+}
+
+fn unquoted(name: &str) -> String {
+    let stripped = name
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .filter(|inner| !inner.is_empty());
+    match stripped {
+        Some(inner) => inner.replace("\"\"", "\""),
+        None => name.to_string(),
+    }
+}
+
 /// Escape a SQL string literal payload for safe interpolation inside single quotes.
 pub fn escape_sql_string_literal(literal: &str) -> String {
     literal.replace('\'', "''")
