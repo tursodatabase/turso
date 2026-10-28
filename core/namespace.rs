@@ -12,9 +12,9 @@
 //! namespace has an id, and the schema of its database keeps its
 //! objects apart from the objects of the other namespaces by that id. On
 //! disk, an object of a namespace is stored under a name that starts
-//! with `__turso_ns<id>_`, and the namespace exists while its row of type
-//! `schema` in `sqlite_schema` exists, so creating and dropping one is DDL
-//! of its database: it is part of the transaction, other
+//! with `__turso_ns<id>_`, and the namespace exists while its row in
+//! `__turso_internal_namespaces` exists, so creating and dropping one is
+//! DDL of its database: it is part of the transaction, other
 //! connections see it when the schema changes, and the schema has the
 //! namespaces whenever it is loaded. Only the schema loader and the code
 //! that writes schema rows use the mangled names; every lookup uses the
