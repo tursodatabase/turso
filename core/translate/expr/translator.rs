@@ -1940,6 +1940,7 @@ fn translate_function_call_expr(
                 | ScalarFunc::NumericSub
                 | ScalarFunc::NumericMul
                 | ScalarFunc::NumericDiv
+                | ScalarFunc::NumericMod
                 | ScalarFunc::NumericLt
                 | ScalarFunc::NumericEq
                 | ScalarFunc::DatePlus

@@ -11574,7 +11574,8 @@ pub fn op_function(
             ScalarFunc::NumericAdd
             | ScalarFunc::NumericSub
             | ScalarFunc::NumericMul
-            | ScalarFunc::NumericDiv => {
+            | ScalarFunc::NumericDiv
+            | ScalarFunc::NumericMod => {
                 check_arg_count!(arg_count, 2);
                 let lhs_val = state.registers[*start_reg].get_value().clone();
                 let rhs_val = state.registers[*start_reg + 1].get_value().clone();
@@ -11587,7 +11588,7 @@ pub fn op_function(
                             ScalarFunc::NumericAdd => a + b,
                             ScalarFunc::NumericSub => a - b,
                             ScalarFunc::NumericMul => a * b,
-                            ScalarFunc::NumericDiv => {
+                            ScalarFunc::NumericDiv | ScalarFunc::NumericMod => {
                                 use bigdecimal::Zero;
                                 if b.is_zero() {
                                     return Err(LimboError::Constraint(
@@ -11595,7 +11596,11 @@ pub fn op_function(
                                     )
                                     .into());
                                 }
-                                a / b
+                                if matches!(scalar_func, ScalarFunc::NumericDiv) {
+                                    a / b
+                                } else {
+                                    a % b
+                                }
                             }
                             _ => unreachable!(),
                         };

@@ -388,6 +388,27 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test numeric-modulo {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, '1.50');
+    INSERT INTO t1 VALUES (2, '-7.25');
+    SELECT val % 1, val % 0.3, 5 % val, val % val FROM t1 ORDER BY id;
+}
+expect {
+    0.50|0.00|0.50|0.00
+    -0.25|-0.05|5.00|0.00
+}
+
+@requires strict "uses STRICT tables"
+test numeric-modulo-by-zero {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('1.50');
+    SELECT val % 0 FROM t1;
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
 test numeric-less-than {
     CREATE TABLE t1(val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES ('1.00');
