@@ -2693,7 +2693,7 @@ impl Database {
             closed: AtomicBool::new(false),
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
-            namespaces: crate::Namespaces::default(),
+            qualifiers: crate::Qualifiers::default(),
             search_path: RwLock::new(None),
             has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),
@@ -3593,7 +3593,7 @@ pub(crate) struct AttachedDatabase {
 }
 
 /// The databases of a connection other than main and temp, by database id.
-/// Their names are in the connection's [`crate::Namespaces`].
+/// Their names are in the connection's [`crate::Qualifiers`].
 // Optimized for fast get() operations and supports unlimited attached databases.
 pub(crate) struct DatabaseCatalog {
     allocated: Vec<u64>,

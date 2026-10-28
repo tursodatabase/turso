@@ -155,26 +155,27 @@ impl Namespace {
     }
 }
 
-/// The names of a connection's namespaces.
+/// The qualifiers a connection accepts: each name that may qualify an object
+/// name in SQL, with the database or namespace it names.
 #[derive(Default)]
-pub struct Namespaces {
+pub struct Qualifiers {
     name_to_namespace: RwLock<HashMap<String, Namespace>>,
 }
 
-impl Namespaces {
+impl Qualifiers {
     /// These names together with the namespaces of the main database, with
     /// their ids; a database added here under the same name hides one.
     pub fn with_namespaces<'a>(
         &self,
         namespaces: impl IntoIterator<Item = (NamespaceId, &'a str)>,
-    ) -> Namespaces {
+    ) -> Qualifiers {
         let mut name_to_namespace = self.name_to_namespace.read().clone();
         for (id, name) in namespaces {
             name_to_namespace
                 .entry(name.to_string())
                 .or_insert_with(|| Namespace::in_main(name, id));
         }
-        Namespaces {
+        Qualifiers {
             name_to_namespace: RwLock::new(name_to_namespace),
         }
     }
@@ -312,7 +313,7 @@ impl Namespaces {
 mod tests {
     use super::{
         demangle_name, is_reserved_object_name, mangle_name, Namespace, NamespaceId, NamespaceRef,
-        Namespaces,
+        Qualifiers,
     };
     use crate::{MAIN_DB_ID, TEMP_DB_ID};
 
@@ -326,8 +327,8 @@ mod tests {
         assert_ne!(NamespaceRef::root_of(3), NamespaceRef::root_of(MAIN_DB_ID));
     }
 
-    fn namespaces_with_app_and_other() -> Namespaces {
-        let namespaces = Namespaces::default();
+    fn namespaces_with_app_and_other() -> Qualifiers {
+        let namespaces = Qualifiers::default();
         namespaces.add(Namespace::database("app", 2));
         namespaces.add(Namespace::database("other", 3));
         namespaces

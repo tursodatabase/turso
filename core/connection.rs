@@ -3,7 +3,7 @@ use crate::connection_hooks::{ConnectionHooks, SavepointMemo};
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
-use crate::namespace::{Namespace, NamespaceId, NamespaceRef, Namespaces};
+use crate::namespace::{Namespace, NamespaceId, NamespaceRef, Qualifiers};
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
@@ -415,7 +415,7 @@ pub struct Connection {
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
     /// The names that qualify object names in SQL, each referring to a
     /// database.
-    pub(super) namespaces: Namespaces,
+    pub(super) qualifiers: Qualifiers,
     /// The namespace names that a name without a namespace is looked up
     /// through, in order. None means main, then the other databases by id.
     pub(super) search_path: RwLock<Option<Vec<String>>>,
@@ -1483,7 +1483,7 @@ impl Connection {
                     // Resolver so attached-db qualifiers in temp triggers can be
                     // mapped to their actual index on this connection.
                     let attached_resolver = |name: &str| -> Option<usize> {
-                        self.namespaces
+                        self.qualifiers
                             .database_id(&crate::util::normalize_ident(name))
                     };
                     crate::return_if_io!(crate::util::parse_schema_rows(
@@ -2865,7 +2865,7 @@ impl Connection {
             let mut materialized_view_info = HashMap::default();
 
             let attached_resolver = |name: &str| -> Option<usize> {
-                self.namespaces
+                self.qualifiers
                     .database_id(&crate::util::normalize_ident(name))
             };
             for (ty, name, table_name, root_page, sql) in &rows_data {
@@ -2966,7 +2966,7 @@ impl Connection {
     }
 
     pub fn attached_database_names(&self) -> Vec<String> {
-        self.namespaces
+        self.qualifiers
             .attached_databases()
             .into_iter()
             .map(|namespace| namespace.name)
@@ -3216,7 +3216,7 @@ impl Connection {
     }
 
     pub(crate) fn is_attached(&self, alias: &str) -> bool {
-        self.namespaces
+        self.qualifiers
             .attached_databases()
             .iter()
             .any(|namespace| namespace.name == alias)
@@ -3319,7 +3319,7 @@ impl Connection {
 
     /// The qualifiers the connection accepts, as of the schema it has: its
     /// databases and the namespaces of its main database.
-    pub(crate) fn current_qualifiers(&self) -> Namespaces {
+    pub(crate) fn current_qualifiers(&self) -> Qualifiers {
         self.maybe_update_schema();
         let schema = self.schema.read().clone();
         self.qualifiers(&schema)
@@ -3327,19 +3327,19 @@ impl Connection {
 
     /// The qualifiers the connection accepts as of `schema`, the main
     /// database's schema: its databases and the namespaces of `schema`.
-    pub(crate) fn qualifiers(&self, schema: &Schema) -> Namespaces {
-        self.namespaces.with_namespaces(schema.namespaces())
+    pub(crate) fn qualifiers(&self, schema: &Schema) -> Qualifiers {
+        self.qualifiers.with_namespaces(schema.namespaces())
     }
 
     /// Adds `namespace` under its name, so that `name.t` names its objects.
     pub fn add_namespace(&self, namespace: Namespace) {
-        self.namespaces.add(namespace);
+        self.qualifiers.add(namespace);
         self.bump_prepare_context_generation();
     }
 
     /// Removes namespace `name` and returns the database it referred to.
     pub fn remove_namespace(&self, name: &str) -> Option<usize> {
-        let database_id = self.namespaces.remove(name);
+        let database_id = self.qualifiers.remove(name);
         self.bump_prepare_context_generation();
         database_id
     }
@@ -3386,7 +3386,7 @@ impl Connection {
 
     /// The name of the namespace that is the whole of database `database_id`.
     pub fn namespace_name(&self, database_id: usize) -> Option<String> {
-        self.namespaces
+        self.qualifiers
             .of_database(database_id)
             .map(|namespace| namespace.name)
     }
@@ -3486,7 +3486,7 @@ impl Connection {
 
         // Add attached databases
         let attached_dbs = self.attached_databases.read();
-        for namespace in self.namespaces.attached_databases() {
+        for namespace in self.qualifiers.attached_databases() {
             let seq_number = namespace.database_id();
             let file_path = if let Some(entry) = attached_dbs.index_to_data.get(&seq_number) {
                 Self::get_canonical_path_for_database(&entry.db)
@@ -5333,7 +5333,7 @@ mod tests {
 
     // given a attached 'alias', return the Database and Pager for that attached database
     fn attached_entry(conn: &Connection, alias: &str) -> (Arc<Database>, Arc<Pager>) {
-        let index = conn.namespaces.database_id(alias).unwrap();
+        let index = conn.qualifiers.database_id(alias).unwrap();
         let catalog = conn.attached_databases.read();
         let entry = catalog.index_to_data.get(&index).unwrap();
         (entry.db.clone(), entry.pager.clone())
