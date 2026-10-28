@@ -3671,6 +3671,11 @@ impl Connection {
             .remove(&(database_id, normalized));
     }
 
+    /// Drop this connection's currval entries for every sequence.
+    pub fn clear_sequence_currvals(&self) {
+        self.sequence_currvals.write().clear();
+    }
+
     /// Drop this connection's currval entries of every sequence of a
     /// database. Called on DETACH, since the next ATTACH can get the same
     /// database id.

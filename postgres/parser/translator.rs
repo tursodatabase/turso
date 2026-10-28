@@ -6111,8 +6111,17 @@ fn pg_fk_action_to_string(action: &str) -> Result<Option<String>, ParseError> {
 /// Represents a parsed SET statement from the PostgreSQL protocol.
 pub struct PgSetStmt {
     pub name: String,
-    pub values: Vec<PgSetValue>,
+    pub to: PgSetTo,
     pub is_local: bool,
+}
+
+/// What a SET statement sets its parameter to.
+pub enum PgSetTo {
+    Values(Vec<PgSetValue>),
+    /// RESET and SET ... TO DEFAULT.
+    Default,
+    /// SET ... FROM CURRENT, which keeps the current value.
+    Current,
 }
 
 #[derive(Clone)]
@@ -6181,10 +6190,11 @@ pub struct PgShowStmt {
     pub name: String,
 }
 
-/// Try to extract a SET statement from a PG parse result.
-/// Returns None if the statement is not a SET.
+/// Try to extract a SET, SET ... TO DEFAULT, SET ... FROM CURRENT or RESET
+/// statement of one parameter from a PG parse result.
+/// Returns None if the statement is not one of those.
 pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
-    use pg_query::NodeRef;
+    use pg_query::{protobuf::VariableSetKind, NodeRef};
 
     if parse_result.protobuf.nodes().is_empty() {
         return None;
@@ -6196,23 +6206,44 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
         _ => return None,
     };
 
-    // Only handle VAR_SET_VALUE (kind == 1)
-    if set_stmt.kind != 1 {
-        return None;
-    }
-
-    // Extract the value from args
-    let values = set_stmt
-        .args
-        .iter()
-        .map(PgSetValue::from_node)
-        .collect::<Option<Vec<_>>>()?;
+    let to = match VariableSetKind::try_from(set_stmt.kind).ok()? {
+        VariableSetKind::VarSetValue => PgSetTo::Values(
+            set_stmt
+                .args
+                .iter()
+                .map(PgSetValue::from_node)
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        VariableSetKind::VarSetDefault | VariableSetKind::VarReset => PgSetTo::Default,
+        VariableSetKind::VarSetCurrent => PgSetTo::Current,
+        _ => return None,
+    };
 
     Some(PgSetStmt {
         name: set_stmt.name.clone(),
-        values,
+        to,
         is_local: set_stmt.is_local,
     })
+}
+
+/// Returns true if the parse result is a RESET ALL statement.
+pub fn is_reset_all(parse_result: &ParseResult) -> bool {
+    use pg_query::{protobuf::VariableSetKind, NodeRef};
+
+    matches!(
+        parse_result.protobuf.nodes().first().map(|node| &node.0),
+        Some(NodeRef::VariableSetStmt(stmt)) if stmt.kind == VariableSetKind::VarResetAll as i32
+    )
+}
+
+/// Returns true if the parse result is a DISCARD ALL statement.
+pub fn is_discard_all(parse_result: &ParseResult) -> bool {
+    use pg_query::{protobuf::DiscardMode, NodeRef};
+
+    matches!(
+        parse_result.protobuf.nodes().first().map(|node| &node.0),
+        Some(NodeRef::DiscardStmt(stmt)) if stmt.target == DiscardMode::DiscardAll as i32
+    )
 }
 
 fn check_transaction_options(

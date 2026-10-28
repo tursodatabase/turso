@@ -3926,6 +3926,22 @@ fn test_postgres_show_search_path_reads_the_setting_when_executed(db: TempDataba
 }
 
 #[turso_macros::test]
+fn test_postgres_show_names_its_column_after_the_parameter(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("SET \"MY.X\" = 'a'").unwrap();
+    conn.execute("SET my.y = 'b'").unwrap();
+    for (sql, expected) in [
+        ("SHOW \"Search_Path\"", "search_path"),
+        ("SHOW \"MY.X\"", "MY.X"),
+        ("SHOW my.x", "MY.X"),
+        ("SHOW \"MY.Y\"", "my.y"),
+    ] {
+        let stmt = conn.prepare(sql).unwrap();
+        assert_eq!(stmt.get_column_name(0), expected, "{sql}");
+    }
+}
+
+#[turso_macros::test]
 fn test_postgres_prepared_statement_keeps_search_path_after_schema_change(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE demo (label text)").unwrap();

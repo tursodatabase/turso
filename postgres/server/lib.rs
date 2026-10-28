@@ -831,6 +831,8 @@ fn is_pg_non_query(sql: &str) -> bool {
     let upper = sql.trim().to_uppercase();
     upper.starts_with("COPY")
         || upper.starts_with("SET")
+        || upper.starts_with("RESET")
+        || upper.starts_with("DISCARD")
         || upper.starts_with("LOCK")
         || upper.starts_with("CREATE SCHEMA")
         || upper.starts_with("DROP SCHEMA")
@@ -885,6 +887,10 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("RELEASE")
     } else if upper.starts_with("SET") {
         Tag::new("SET")
+    } else if upper.starts_with("RESET") {
+        Tag::new("RESET")
+    } else if upper.starts_with("DISCARD") {
+        Tag::new("DISCARD ALL")
     } else if upper.starts_with("LOCK") {
         Tag::new("LOCK TABLE")
     } else if upper.starts_with("COPY") {
@@ -1346,6 +1352,18 @@ mod tests {
         assert!(!is_pg_non_query(
             "SELECT set_config('search_path', '', false)"
         ));
+    }
+
+    #[test]
+    fn test_reset_and_discard_are_non_queries() {
+        for (sql, tag) in [
+            ("RESET app.mode", "RESET"),
+            ("reset all", "RESET"),
+            ("DISCARD ALL", "DISCARD ALL"),
+        ] {
+            assert!(is_pg_non_query(sql), "{sql}");
+            assert_eq!(command_tag(sql, 0), Tag::new(tag), "{sql}");
+        }
     }
 
     #[test]

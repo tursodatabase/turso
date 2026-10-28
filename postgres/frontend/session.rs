@@ -7,20 +7,22 @@ use std::sync::Arc;
 
 use crate::catalog::{self, PostgresDialect};
 use crate::error::sqlstate_error;
-use crate::functions::ConfigParameter;
-use crate::settings::{PgSessionState, SettingScope};
+use crate::functions::{find_parameter, ConfigParameter, Parameter};
+use crate::settings::{ConnectionSettings, PgSessionState, SettingScope};
 use turso_core::{is_memory_like, Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST, SQLSTATE_FEATURE_NOT_SUPPORTED,
-    SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_SCHEMA_NAME,
+    SQLSTATE_ACTIVE_SQL_TRANSACTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME,
+    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_NAME,
     SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
-    check_set_transaction, is_comment_on, is_drop_matview, is_refresh_matview,
-    try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
-    try_extract_show, unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt,
-    PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
+    check_set_transaction, is_comment_on, is_discard_all, is_drop_matview, is_refresh_matview,
+    is_reset_all, try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema,
+    try_extract_set, try_extract_show, unnamed_index_name, unqualified_create_table_name_location,
+    PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetTo, PgSetValue,
+    PgShowStmt, PostgreSQLTranslator,
 };
 use turso_pg_parser::ParseError;
 
@@ -572,6 +574,24 @@ fn try_prepare_special(
         return Ok(Some(crate::Statement::new(stmt)));
     }
 
+    if is_reset_all(&parse_result) {
+        let inner = noop_statement(&pg_conn.conn)?;
+        let conn = Arc::clone(&pg_conn.conn);
+        return Ok(Some(crate::Statement::with_deferred(
+            inner,
+            Box::new(move |_inner| reset_all_settings(&conn)),
+        )));
+    }
+
+    if is_discard_all(&parse_result) {
+        let inner = noop_statement(&pg_conn.conn)?;
+        let conn = Arc::clone(&pg_conn.conn);
+        return Ok(Some(crate::Statement::with_deferred(
+            inner,
+            Box::new(move |_inner| discard_all(&conn)),
+        )));
+    }
+
     if let Some(stmt) =
         try_extract_create_schema(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
     {
@@ -647,33 +667,56 @@ fn execute_sqlite(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
 }
 
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
-    if set_stmt.name == "search_path" {
-        let path = set_stmt
-            .values
-            .iter()
-            .map(|value| {
-                value
-                    .as_search_path_name()
-                    .map(turso_pg_parser::quote_identifier)
-            })
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| LimboError::ParseError("incorrect format".to_string()))?
-            .join(", ");
-        // Change the setting when the statement runs, not when it is prepared.
-        // set_config returns text, so IS NULL prevents SET from returning rows.
-        return pg_conn.conn.prepare(format!(
-            "SELECT 0 WHERE set_config('search_path', '{}', {}) IS NULL",
-            path.replace('\'', "''"),
-            set_stmt.is_local
-        ));
-    }
-    if set_value_already_in_effect(&set_stmt.name, &set_stmt.values) {
-        return noop_statement(&pg_conn.conn);
-    }
-    Err(LimboError::ParseError(format!(
-        "SET {} is not supported",
-        set_stmt.name
-    )))
+    let name = &set_stmt.name;
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "''"));
+    let value = match (find_parameter(name), &set_stmt.to) {
+        // A NULL value sets the default, as RESET does.
+        (Some(_), PgSetTo::Default) => "NULL".to_string(),
+        (Some(_), PgSetTo::Current) => format!("current_setting({})", quote(name)),
+        (Some(Parameter::BuiltIn(ConfigParameter::SearchPath)), PgSetTo::Values(values)) => quote(
+            &values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_search_path_name()
+                        .map(turso_pg_parser::quote_identifier)
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| LimboError::ParseError("incorrect format".to_string()))?
+                .join(", "),
+        ),
+        (Some(Parameter::Custom(_)), PgSetTo::Values(values)) => match values.as_slice() {
+            [PgSetValue::Identifier(value)
+            | PgSetValue::StringLiteral(value)
+            | PgSetValue::Number(value)] => quote(value),
+            [_] => return Err(LimboError::ParseError("incorrect format".to_string())),
+            _ => {
+                return Err(sqlstate_error(
+                    SQLSTATE_INVALID_PARAMETER_VALUE,
+                    format!("SET {name} takes only one argument"),
+                ))
+            }
+        },
+        (None, PgSetTo::Values(values)) if set_value_already_in_effect(name, values) => {
+            return noop_statement(&pg_conn.conn);
+        }
+        (None, to) => {
+            let command = match to {
+                PgSetTo::Default => "RESET",
+                PgSetTo::Values(_) | PgSetTo::Current => "SET",
+            };
+            return Err(LimboError::ParseError(format!(
+                "{command} {name} is not supported"
+            )));
+        }
+    };
+    // Change the setting when the statement runs, not when it is prepared.
+    // set_config returns text, so IS NULL prevents SET from returning rows.
+    pg_conn.conn.prepare(format!(
+        "SELECT 0 WHERE set_config({}, {value}, {}) IS NULL",
+        quote(name),
+        set_stmt.is_local
+    ))
 }
 
 fn set_value_already_in_effect(name: &str, values: &[PgSetValue]) -> bool {
@@ -727,15 +770,47 @@ fn set_value_already_in_effect(name: &str, values: &[PgSetValue]) -> bool {
 }
 
 fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show_stmt: &PgShowStmt) -> Result<Statement> {
-    match show_stmt.name.parse::<ConfigParameter>() {
-        Ok(ConfigParameter::SearchPath) => pg_conn
-            .conn
-            .prepare("SELECT current_setting('search_path') AS search_path"),
-        Err(_) => Err(LimboError::ParseError(format!(
-            "SHOW {} is not supported",
-            show_stmt.name
-        ))),
+    let name = &show_stmt.name;
+    // PostgreSQL names the column after the parameter, not after the name
+    // SHOW was given.
+    let column = match find_parameter(name) {
+        Some(Parameter::BuiltIn(ConfigParameter::SearchPath)) => SEARCH_PATH_SETTING.to_owned(),
+        Some(Parameter::Custom(_)) => session_state(&pg_conn.conn)?
+            .name_as_defined(name)
+            .unwrap_or_else(|| name.clone()),
+        None => {
+            return Err(LimboError::ParseError(format!(
+                "SHOW {name} is not supported"
+            )))
+        }
+    };
+    pg_conn.conn.prepare(format!(
+        "SELECT current_setting('{}') AS {}",
+        name.replace('\'', "''"),
+        turso_pg_parser::quote_identifier(&column)
+    ))
+}
+
+/// Sets every parameter to its default value, as RESET ALL does.
+fn reset_all_settings(conn: &Connection) -> Result<()> {
+    session_state(conn)?.mutate(conn, ConnectionSettings::reset_all);
+    set_search_path(conn, None, SettingScope::Session)?;
+    Ok(())
+}
+
+/// Resets the session as DISCARD ALL does. tursopg has no temporary
+/// tables, SQL-level prepared statements or cached plans to drop. A server
+/// client's protocol-level prepared statements are not dropped.
+fn discard_all(conn: &Connection) -> Result<()> {
+    if !conn.get_auto_commit() {
+        return Err(sqlstate_error(
+            SQLSTATE_ACTIVE_SQL_TRANSACTION,
+            "DISCARD ALL cannot run inside a transaction block",
+        ));
     }
+    reset_all_settings(conn)?;
+    conn.clear_sequence_currvals();
+    Ok(())
 }
 
 /// `$user` stands for a schema named after the session user, which does
@@ -781,7 +856,7 @@ pub(crate) fn set_custom_parameter(
         ));
     }
     session_state(conn)?.mutate(conn, |settings| {
-        settings.set(&name.to_ascii_lowercase(), value.map(str::to_owned), scope)
+        settings.set(name, value.map(str::to_owned), scope)
     });
     Ok(Value::build_text(value.unwrap_or_default().to_owned()))
 }
