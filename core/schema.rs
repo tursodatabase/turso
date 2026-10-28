@@ -4804,7 +4804,10 @@ impl BTreeTable {
                 // Arrays are stored as record-format blobs regardless of element type.
                 col.set_ty(Type::Blob);
                 col.override_affinity(Affinity::Blob);
-                col.set_type_ordering(Some(TypeOrdering::Array));
+                col.set_type_ordering(crate::translate::expr::expr_type::type_ordering(
+                    &crate::translate::expr::expr_type::column_type(col, true, schema),
+                    schema,
+                ));
                 continue;
             }
             if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&col.ty_str) {

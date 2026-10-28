@@ -470,3 +470,28 @@ test cmp-array-window-range-offset-is-an-error {
 expect error {
     RANGE with offset PRECEDING/FOLLOWING is not supported for column type array
 }
+
+@requires strict "uses STRICT tables"
+test cmp-text-array-elements-compare-as-text {
+    -- The elements of a text[] are texts, also when an array is read from its
+    -- text form: '{1}' and '{1.0}' are different arrays, and '{b,10}' sorts
+    -- before '{b,9}'. Expected rows are from PostgreSQL.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a text[]) STRICT;
+    INSERT INTO t VALUES (1, '{1}'), (2, '{1.0}'), (3, '{b,10}'), (4, '{b,9}');
+    SELECT 'union', a FROM (SELECT a FROM t UNION SELECT a FROM t) ORDER BY a;
+    SELECT 'distinct', count(*) FROM (SELECT DISTINCT a FROM t);
+    SELECT 'eq', id FROM t WHERE a = '{1}';
+    SELECT 'order', id FROM t ORDER BY a;
+}
+expect {
+    union|{1}
+    union|{1.0}
+    union|{b,10}
+    union|{b,9}
+    distinct|4
+    eq|1
+    order|1
+    order|2
+    order|3
+    order|4
+}

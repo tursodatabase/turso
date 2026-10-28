@@ -12,13 +12,18 @@ use std::hash::{Hash, Hasher};
 use crate::numeric::decimal::{numeric_compare, numeric_hash};
 use crate::numeric::Numeric;
 use crate::types::AsValueRef;
-use crate::vdbe::array::{array_values_from_blob, parse_text_array};
+use crate::vdbe::array::{array_values_from_blob, parse_text_array, parse_text_array_of_texts};
 use crate::{Value, ValueRef};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TypeOrdering {
     Numeric,
+    /// Arrays whose elements are not texts, such as `integer[]`. An array in
+    /// text form is read with numbers for its elements.
     Array,
+    /// Arrays whose elements are texts, such as `text[]`. An array in text
+    /// form is read with texts for its elements, so `{1}` and `{1.0}` differ.
+    TextArray,
     /// Test types: unsigned integers stored as text, and text that sorts by its
     /// reversed characters.
     TestUint,
@@ -26,9 +31,10 @@ pub enum TypeOrdering {
 }
 
 impl TypeOrdering {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Numeric,
         Self::Array,
+        Self::TextArray,
         Self::TestUint,
         Self::StringReverse,
     ];
@@ -50,6 +56,7 @@ impl TypeOrdering {
         match self {
             Self::Numeric => "numeric",
             Self::Array => "array",
+            Self::TextArray => "text_array",
             Self::TestUint => "test_uint",
             Self::StringReverse => "string_reverse",
         }
@@ -58,7 +65,10 @@ impl TypeOrdering {
     pub fn compare(self, left: ValueRef, right: ValueRef) -> Ordering {
         match self {
             Self::Numeric => numeric_compare(left, right),
-            Self::Array => ArraySortKey::of(left).cmp(&ArraySortKey::of(right)),
+            Self::Array => ArraySortKey::of(left, parse_text_array)
+                .cmp(&ArraySortKey::of(right, parse_text_array)),
+            Self::TextArray => ArraySortKey::of(left, parse_text_array_of_texts)
+                .cmp(&ArraySortKey::of(right, parse_text_array_of_texts)),
             Self::TestUint => UintSortKey::of(left).cmp(&UintSortKey::of(right)),
             Self::StringReverse => ReversedSortKey::of(left).compare(&ReversedSortKey::of(right)),
         }
@@ -67,7 +77,8 @@ impl TypeOrdering {
     pub fn hash<H: Hasher>(self, value: ValueRef, state: &mut H) {
         match self {
             Self::Numeric => numeric_hash(value, state),
-            Self::Array => ArraySortKey::of(value).hash(state),
+            Self::Array => ArraySortKey::of(value, parse_text_array).hash(state),
+            Self::TextArray => ArraySortKey::of(value, parse_text_array_of_texts).hash(state),
             Self::TestUint => UintSortKey::of(value).hash(state),
             // Two texts reverse to the same text only if they are the same.
             Self::StringReverse => hash_sqlite_value(value, state),
@@ -85,11 +96,12 @@ enum ArraySortKey<'a> {
 }
 
 impl<'a> ArraySortKey<'a> {
-    fn of(value: ValueRef<'a>) -> Self {
+    /// `parse_text` reads an array in text form.
+    fn of(value: ValueRef<'a>, parse_text: fn(&str) -> Option<Vec<Value>>) -> Self {
         let elements = match value {
             ValueRef::Null => return Self::Null,
             ValueRef::Blob(blob) => array_values_from_blob(blob).ok(),
-            ValueRef::Text(text) => parse_text_array(text.as_str()),
+            ValueRef::Text(text) => parse_text(text.as_str()),
             ValueRef::Numeric(_) => None,
         };
         match elements {

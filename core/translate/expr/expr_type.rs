@@ -480,7 +480,17 @@ fn field_type(
 pub(crate) fn type_ordering(ty: &ExprType, schema: &Schema) -> Option<TypeOrdering> {
     match ty {
         ExprType::Custom { type_def, .. } => schema.type_ordering(type_def),
-        ExprType::Array { .. } => Some(TypeOrdering::Array),
+        ExprType::Array { element, .. } => {
+            let element_is_text = matches!(
+                sqlite_operand_type(element.as_ref().clone(), schema),
+                ExprType::Builtin(BuiltinType::Text) | ExprType::Untyped
+            );
+            Some(if element_is_text {
+                TypeOrdering::TextArray
+            } else {
+                TypeOrdering::Array
+            })
+        }
         ExprType::Builtin(_) | ExprType::Untyped | ExprType::Null | ExprType::Unknown => None,
     }
 }
@@ -497,6 +507,9 @@ pub(crate) fn column_type(column: &Column, is_strict: bool, schema: &Schema) -> 
         None if is_strict && column.ty_str.eq_ignore_ascii_case("blob") => {
             ExprType::Builtin(BuiltinType::Blob)
         }
+        // An array column stores blobs, so its affinity says nothing about its
+        // elements; the declared element type does.
+        None if column.is_array() => builtin_type_of_affinity(Affinity::affinity(&column.ty_str)),
         None => builtin_type_of_affinity(column.affinity()),
     };
     ExprType::array(scalar, column.array_dimensions())
