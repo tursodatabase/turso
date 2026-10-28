@@ -495,6 +495,8 @@ pub fn emit_upsert(
     table_references: &mut TableReferences,
     table_alias: Option<&str>,
 ) -> crate::Result<()> {
+    let constraint_on_error = do_update_constraint_on_error(program);
+
     // Seek & snapshot CURRENT
     program.emit_insn(Insn::SeekRowid {
         cursor_id: ctx.cursor_id,
@@ -738,7 +740,7 @@ pub fn emit_upsert(
                 target_reg: layout.to_register(new_start, *col_idx),
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
-                on_error: None,
+                on_error: constraint_on_error,
             });
         }
         if col.is_rowid_alias() {
@@ -830,7 +832,6 @@ pub fn emit_upsert(
         }
 
         // Evaluate CHECK constraints on the new values
-        let check_halt_on_error = program.constraint_halt_on_error(ast::ResolveType::Abort);
         emit_check_constraints(
             program,
             &bt.check_constraints,
@@ -844,7 +845,7 @@ pub fn emit_upsert(
             }),
             connection,
             ast::ResolveType::Abort,
-            check_halt_on_error,
+            constraint_on_error,
             ctx.loop_labels.row_done,
             Some(table_references),
         )?;
@@ -1130,7 +1131,7 @@ pub fn emit_upsert(
                     .and_then(|c| c.name.as_deref())
                     .unwrap_or("rowid")
             ),
-            on_error: None,
+            on_error: constraint_on_error,
             description_reg: None,
         });
         program.preassign_label_to_next_insn(ok);
@@ -1312,7 +1313,7 @@ pub fn emit_upsert(
                     constraint_info,
                     err_code,
                     description,
-                    on_error: None,
+                    on_error: constraint_on_error,
                     description_reg: None,
                 });
                 program.preassign_label_to_next_insn(ok);
@@ -1680,6 +1681,19 @@ pub fn emit_upsert(
         target_pc: ctx.loop_labels.row_done,
     });
     Ok(())
+}
+
+/// The resolve type a constraint Halt in the DO UPDATE arm carries. SQLite
+/// runs that UPDATE with ABORT whatever the statement's OR clause is
+/// (`sqlite3UpsertDoUpdate` passes `OE_Abort`). A Halt without an override
+/// keeps the original constraint error, so the override is left off when the
+/// program already resolves conflicts with ABORT.
+fn do_update_constraint_on_error(program: &ProgramBuilder) -> Option<ast::ResolveType> {
+    if program.resolve_type == ast::ResolveType::Abort && program.trigger.is_none() {
+        None
+    } else {
+        Some(ast::ResolveType::Abort)
+    }
 }
 
 fn compute_new_row_virtual_columns(

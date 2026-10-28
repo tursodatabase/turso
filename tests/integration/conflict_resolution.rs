@@ -4891,3 +4891,110 @@ fn test_update_replace_deferred_fk_multiple_children(tmp_db: TempDatabase) {
         "SELECT * FROM parent ORDER BY id",
     );
 }
+
+// ---------------------------------------------------------------------------
+// UPSERT DO UPDATE always runs with ABORT
+// ---------------------------------------------------------------------------
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/7839
+///
+/// SQLite runs the UPDATE of an UPSERT's DO UPDATE arm with ABORT whatever the
+/// statement's OR clause is. A constraint failure in the arm must undo the
+/// whole statement, including rows inserted before it, and must leave an
+/// explicit transaction open.
+#[turso_macros::test]
+fn test_upsert_do_update_failure_aborts_statement(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    drop(tmp_db);
+
+    let ddl = "CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE, c INT UNIQUE, \
+               n INT NOT NULL, k INT CHECK(k < 100)); \
+               CREATE TABLE log(x INT UNIQUE); \
+               CREATE TRIGGER tr AFTER UPDATE OF k ON t BEGIN INSERT INTO log VALUES (NEW.k); END; \
+               INSERT INTO t VALUES (1,1,10,1,1), (2,2,20,2,2); \
+               INSERT INTO log VALUES (1);";
+    let clauses: &[(&str, &str)] = &[
+        ("INSERT OR FAIL INTO", "or_fail"),
+        ("INSERT OR ROLLBACK INTO", "or_rollback"),
+        ("INSERT OR REPLACE INTO", "or_replace"),
+        ("INSERT OR ABORT INTO", "or_abort"),
+    ];
+    // Each SET makes the DO UPDATE arm for the conflicting row fail.
+    let failing_sets: &[(&str, &str)] = &[
+        ("c = 20", "unique"),
+        ("n = NULL", "not_null"),
+        ("k = 500", "check"),
+        ("id = 2", "rowid"),
+    ];
+    let verify_sqls = [
+        "SELECT * FROM t ORDER BY id",
+        "SELECT * FROM log ORDER BY x",
+    ];
+
+    let mut failures: Vec<String> = Vec::new();
+
+    for &(clause, clause_name) in clauses {
+        for &(set, set_name) in failing_sets {
+            for in_txn in [false, true] {
+                let label = format!(
+                    "upsert_abort__{clause_name}__{set_name}__{}",
+                    if in_txn { "txn" } else { "autocommit" }
+                );
+
+                let limbo_db = TempDatabase::builder()
+                    .with_db_name(format!("{label}.db"))
+                    .build();
+                let limbo_conn = limbo_db.connect_limbo();
+                limbo_conn.prepare_execute_batch(ddl)?;
+
+                let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+                sqlite_conn.execute_batch(ddl).unwrap();
+
+                // The first row is a plain insert; the second conflicts on u = 1
+                // and runs the failing DO UPDATE arm.
+                let upsert = format!(
+                    "{clause} t VALUES (10,5,50,5,5), (11,1,60,6,6) \
+                     ON CONFLICT(u) DO UPDATE SET {set}"
+                );
+                let stmts: Vec<String> = if in_txn {
+                    vec![
+                        "BEGIN".to_string(),
+                        "INSERT INTO t VALUES (7,7,70,7,7)".to_string(),
+                        upsert,
+                        "COMMIT".to_string(),
+                    ]
+                } else {
+                    vec![upsert]
+                };
+
+                for stmt in &stmts {
+                    if let Err(e) = exec_and_compare(&label, &sqlite_conn, &limbo_conn, stmt) {
+                        failures.push(format!("{e} (statement: {stmt})"));
+                    }
+                }
+                for verify_sql in verify_sqls {
+                    if let Some(e) = compare_tables(&label, &sqlite_conn, &limbo_conn, verify_sql) {
+                        failures.push(format!("{e} ({verify_sql})"));
+                    }
+                }
+
+                let db_path = limbo_db.path.clone();
+                drop(limbo_conn);
+                drop(limbo_db);
+                let ic = sqlite_integrity_check(&db_path);
+                if ic != "ok" {
+                    failures.push(format!("[{label}] integrity_check: {ic}"));
+                }
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "{} failure(s) in UPSERT DO UPDATE abort test:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    Ok(())
+}
