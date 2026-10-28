@@ -13,6 +13,7 @@
 //! All DDL generators are schema-aware to avoid naming conflicts.
 
 pub mod alter_table;
+pub mod constant_false;
 pub mod create_index;
 pub mod create_table;
 pub mod create_table_as;
