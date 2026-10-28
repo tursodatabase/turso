@@ -3631,3 +3631,16 @@ expect {
     9
     1
 }
+
+@cross-check-integrity
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-updates-view-with-quote-in-name {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+    CREATE VIEW "it's" AS SELECT a FROM t;
+    ALTER TABLE t RENAME COLUMN a TO b;
+    SELECT * FROM "it's";
+}
+expect {
+    1
+}
