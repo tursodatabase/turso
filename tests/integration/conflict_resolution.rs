@@ -4899,9 +4899,9 @@ fn test_update_replace_deferred_fk_multiple_children(tmp_db: TempDatabase) {
 /// Regression test for https://github.com/tursodatabase/turso/issues/7839
 ///
 /// SQLite runs the UPDATE of an UPSERT's DO UPDATE arm with ABORT whatever the
-/// statement's OR clause is. A constraint failure in the arm must undo the
-/// whole statement, including rows inserted before it, and must leave an
-/// explicit transaction open.
+/// statement's OR clause is. A constraint failure in the arm, or in a trigger
+/// the arm fires, must undo the whole statement, including rows inserted
+/// before it, and must leave an explicit transaction open.
 #[turso_macros::test]
 fn test_upsert_do_update_failure_aborts_statement(tmp_db: TempDatabase) -> anyhow::Result<()> {
     drop(tmp_db);
@@ -4924,6 +4924,7 @@ fn test_upsert_do_update_failure_aborts_statement(tmp_db: TempDatabase) -> anyho
         ("n = NULL", "not_null"),
         ("k = 500", "check"),
         ("id = 2", "rowid"),
+        ("k = 1", "trigger"),
     ];
     let verify_sqls = [
         "SELECT * FROM t ORDER BY id",
