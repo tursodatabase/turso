@@ -101,6 +101,7 @@ pub enum Object {
     Schema(String),
     Table(String),
     View(String),
+    MaterializedView(String),
     Index(String),
     Trigger(String),
     Sequence(String),
@@ -108,6 +109,8 @@ pub enum Object {
     Role(String),
     /// A connection or database setting, such as a pragma.
     Setting(String),
+    /// Storage that does not belong to a known object.
+    Storage,
 }
 
 impl fmt::Display for Object {
@@ -117,12 +120,14 @@ impl fmt::Display for Object {
             Object::Schema(name) => write!(f, "schema {name}"),
             Object::Table(name) => write!(f, "table {name}"),
             Object::View(name) => write!(f, "view {name}"),
+            Object::MaterializedView(name) => write!(f, "materialized view {name}"),
             Object::Index(name) => write!(f, "index {name}"),
             Object::Trigger(name) => write!(f, "trigger {name}"),
             Object::Sequence(name) => write!(f, "sequence {name}"),
             Object::Type(name) => write!(f, "type {name}"),
             Object::Role(name) => write!(f, "role {name}"),
             Object::Setting(name) => write!(f, "setting {name}"),
+            Object::Storage => f.write_str("database storage"),
         }
     }
 }

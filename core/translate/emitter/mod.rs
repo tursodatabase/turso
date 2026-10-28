@@ -1149,7 +1149,7 @@ pub fn prepare_cdc_if_necessary(
         crate::bail_parse_error!("no such table: {}", cdc_table);
     };
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(cdc_btree.clone()));
-    program.emit_insn(Insn::OpenWrite {
+    program.emit_change_capture_open_write(Insn::OpenWrite {
         cursor_id,
         root_page: cdc_btree.root_page.into(),
         db: crate::MAIN_DB_ID, // CDC table always lives in the main database
