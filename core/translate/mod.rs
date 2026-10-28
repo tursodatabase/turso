@@ -153,6 +153,11 @@ pub fn translate(
         Ok(WalkControl::Continue)
     })?;
 
+    let check_privileges = matches!(origin, crate::statement::StatementOrigin::Root);
+    if check_privileges {
+        roles::check_statement_privileges(&stmt, &resolver, &connection)?;
+    }
+
     match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {

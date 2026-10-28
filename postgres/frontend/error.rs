@@ -386,6 +386,7 @@ fn permission_denied_message(denial: &PermissionDenied) -> String {
         (Action::SetRole, Object::Role(name)) => {
             format!("permission denied to set role \"{name}\"")
         }
+        _ => denial.to_string(),
     }
 }
 
