@@ -753,106 +753,64 @@ impl IncrementalView {
     /// before binding them. The executable DAG is still produced by the main
     /// bound planner; this walker is identity metadata only.
     /// The tables `select` reads, each with the namespace it is written
-    /// with, if any. A CTE counts only when the SELECT reads it, as the
-    /// planner skips unused CTEs.
+    /// with, if any. A name that is a CTE of the select is not a table.
     pub(crate) fn referenced_tables(
         select: &ast::Select,
     ) -> std::vec::Vec<(Option<String>, String)> {
-        type Tables = HashSet<(Option<String>, String)>;
-        type CollectedCtes = HashSet<*const ast::CommonTableExpr>;
-
         fn collect_source(
             source: &ast::SelectTable,
-            ctes: &[&ast::With],
-            tables: &mut Tables,
-            collected_ctes: &mut CollectedCtes,
+            cte_names: &HashSet<String>,
+            tables: &mut HashSet<(Option<String>, String)>,
         ) {
             match source {
                 ast::SelectTable::Table(name, _, _) => {
-                    collect_table_name(name, ctes, tables, collected_ctes)
+                    if cte_names
+                        .iter()
+                        .any(|cte| cte.eq_ignore_ascii_case(name.name.as_str()))
+                    {
+                        return;
+                    }
+                    tables.insert((
+                        name.namespace
+                            .as_ref()
+                            .map(|namespace| crate::util::normalize_ident(namespace.as_str())),
+                        crate::util::normalize_ident(name.name.as_str()),
+                    ));
                 }
                 ast::SelectTable::Select { select, .. } => {
-                    collect_select(select, ctes, tables, collected_ctes)
+                    collect_select(select, cte_names, tables)
                 }
                 ast::SelectTable::Sub(from, _) => {
-                    collect_source(&from.select, ctes, tables, collected_ctes);
+                    collect_source(&from.select, cte_names, tables);
                     for join in &from.joins {
-                        collect_source(&join.table, ctes, tables, collected_ctes);
+                        collect_source(&join.table, cte_names, tables);
                     }
                 }
-                ast::SelectTable::TableCall(_, args, _) => collect_exprs(
-                    args.iter().map(|arg| arg.as_ref()),
-                    ctes,
-                    tables,
-                    collected_ctes,
-                ),
+                ast::SelectTable::TableCall(_, _, _) => {}
             }
-        }
-
-        /// Adds the table or view `name`, or what the CTE named `name` reads.
-        fn collect_table_name(
-            name: &ast::QualifiedName,
-            ctes: &[&ast::With],
-            tables: &mut Tables,
-            collected_ctes: &mut CollectedCtes,
-        ) {
-            if name.namespace.is_none() {
-                let table_name = crate::util::normalize_ident(name.name.as_str());
-                // The CTE body sees its own WITH and the ones outside it.
-                let cte = ctes.iter().enumerate().rev().find_map(|(depth, with)| {
-                    with.ctes
-                        .iter()
-                        .find(|cte| {
-                            crate::util::normalize_ident(cte.tbl_name.as_str()) == table_name
-                        })
-                        .map(|cte| (cte, &ctes[..=depth]))
-                });
-                if let Some((cte, cte_scope)) = cte {
-                    if collected_ctes.insert(std::ptr::from_ref(cte)) {
-                        collect_select(&cte.select, cte_scope, tables, collected_ctes);
-                    }
-                    return;
-                }
-            }
-            tables.insert((
-                name.namespace
-                    .as_ref()
-                    .map(|database| crate::util::normalize_ident(database.as_str())),
-                crate::util::normalize_ident(name.name.as_str()),
-            ));
         }
 
         fn collect_one(
             select: &ast::OneSelect,
-            ctes: &[&ast::With],
-            tables: &mut Tables,
-            collected_ctes: &mut CollectedCtes,
+            cte_names: &HashSet<String>,
+            tables: &mut HashSet<(Option<String>, String)>,
         ) {
-            let (columns, from, where_clause, group_by, window_clause) = match select {
-                ast::OneSelect::Select {
-                    columns,
-                    from,
-                    where_clause,
-                    group_by,
-                    window_clause,
-                    ..
-                } => (columns, from, where_clause, group_by, window_clause),
-                ast::OneSelect::Values(rows) => {
-                    collect_exprs(
-                        rows.iter().flatten().map(|expr| expr.as_ref()),
-                        ctes,
-                        tables,
-                        collected_ctes,
-                    );
-                    return;
-                }
+            let ast::OneSelect::Select {
+                columns,
+                from,
+                where_clause,
+                group_by,
+                ..
+            } = select
+            else {
+                return;
             };
             let mut exprs = Vec::new();
             if let Some(from) = from {
                 for source in std::iter::once(from.select.as_ref())
                     .chain(from.joins.iter().map(|join| join.table.as_ref()))
                 {
-                    collect_source(source, ctes, tables, collected_ctes);
+                    collect_source(source, cte_names, tables);
                 }
                 for join in &from.joins {
                     if let Some(ast::JoinConstraint::On(on)) = &join.constraint {
@@ -870,42 +828,15 @@ impl IncrementalView {
                 exprs.extend(group_by.exprs.iter().map(|expr| expr.as_ref()));
                 exprs.extend(group_by.having.as_deref());
             }
-            for window_def in window_clause {
-                let window = &window_def.window;
-                exprs.extend(window.partition_by.iter().map(|expr| expr.as_ref()));
-                exprs.extend(window.order_by.iter().map(|column| column.expr.as_ref()));
-                if let Some(frame) = &window.frame_clause {
-                    for bound in std::iter::once(&frame.start).chain(frame.end.as_ref()) {
-                        if let ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) =
-                            bound
-                        {
-                            exprs.push(expr.as_ref());
-                        }
-                    }
-                }
-            }
-            collect_exprs(exprs.into_iter(), ctes, tables, collected_ctes);
-        }
-
-        /// Subqueries in expressions read tables too: the planner may turn
-        /// `EXISTS (SELECT ... FROM t)` into a join with `t`.
-        fn collect_exprs<'a>(
-            exprs: impl Iterator<Item = &'a ast::Expr>,
-            ctes: &[&ast::With],
-            tables: &mut Tables,
-            collected_ctes: &mut CollectedCtes,
-        ) {
+            // Subqueries in expressions read tables too: the planner may turn
+            // `EXISTS (SELECT ... FROM t)` into a join with `t`.
             for expr in exprs {
                 crate::translate::expr::walk_expr(expr, &mut |expr: &ast::Expr| {
                     match expr {
                         ast::Expr::Exists(select)
                         | ast::Expr::Subquery(select)
                         | ast::Expr::InSelect { rhs: select, .. } => {
-                            collect_select(select, ctes, tables, collected_ctes);
-                        }
-                        // With arguments, `rhs` is a table-valued function.
-                        ast::Expr::InTable { rhs, args, .. } if args.is_empty() => {
-                            collect_table_name(rhs, ctes, tables, collected_ctes);
+                            collect_select(select, cte_names, tables);
                         }
                         _ => {}
                     }
@@ -917,26 +848,25 @@ impl IncrementalView {
 
         fn collect_select(
             select: &ast::Select,
-            outer_ctes: &[&ast::With],
-            tables: &mut Tables,
-            collected_ctes: &mut CollectedCtes,
+            inherited_ctes: &HashSet<String>,
+            tables: &mut HashSet<(Option<String>, String)>,
         ) {
-            let mut ctes = outer_ctes.to_vec();
-            ctes.extend(select.with.as_ref());
-            collect_one(&select.body.select, &ctes, tables, collected_ctes);
-            for compound in &select.body.compounds {
-                collect_one(&compound.select, &ctes, tables, collected_ctes);
+            let mut cte_names = inherited_ctes.clone();
+            if let Some(with) = &select.with {
+                for cte in &with.ctes {
+                    cte_names.insert(crate::util::normalize_ident(cte.tbl_name.as_str()));
+                }
+                for cte in &with.ctes {
+                    collect_select(&cte.select, &cte_names, tables);
+                }
             }
-            let order_by = select.order_by.iter().map(|column| column.expr.as_ref());
-            let limit = select
-                .limit
-                .iter()
-                .flat_map(|limit| std::iter::once(&limit.expr).chain(limit.offset.as_ref()))
-                .map(|expr| expr.as_ref());
-            collect_exprs(order_by.chain(limit), &ctes, tables, collected_ctes);
+            collect_one(&select.body.select, &cte_names, tables);
+            for compound in &select.body.compounds {
+                collect_one(&compound.select, &cte_names, tables);
+            }
         }
         let mut tables = HashSet::default();
-        collect_select(select, &[], &mut tables, &mut HashSet::default());
+        collect_select(select, &HashSet::default(), &mut tables);
         tables.into_iter().collect()
     }
 }

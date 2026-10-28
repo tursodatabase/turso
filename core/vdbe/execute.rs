@@ -17970,8 +17970,7 @@ pub fn op_rename_table(
                     .view_mut(view_namespace, &view_name)
                     .expect("view being rewritten should be in schema"),
             );
-            view.sql = new_sql;
-            view.select_stmt = new_select;
+            view.replace_select(new_sql, new_select);
         }
 
         Ok(())
@@ -18572,8 +18571,7 @@ pub fn op_alter_column(
                 move |schema| -> crate::Result<()> {
                     if let Some(view_arc) = schema.view_mut(view_namespace.id, &view_name) {
                         let view = Arc::make_mut(view_arc);
-                        view.sql = rewritten.sql;
-                        view.select_stmt = rewritten.select_stmt;
+                        view.replace_select(rewritten.sql, rewritten.select_stmt);
                         view.columns = rewritten.columns;
                     }
                     Ok(())

@@ -2333,19 +2333,28 @@ fn reject_rename_with_unresolvable_view(
     resolver: &Resolver,
     namespace: NamespaceRef,
 ) -> Result<()> {
+    // A TEMP view can read the tables of other databases, which the temp
+    // schema does not hold.
+    if namespace.database_id == crate::TEMP_DB_ID {
+        return Ok(());
+    }
     let database_name = resolver.namespace_name(namespace.database_id);
     resolver.with_schema(namespace.database_id, |s| {
         for (view_name, view) in s.views(namespace.id) {
-            let read_names =
-                crate::incremental::view::IncrementalView::referenced_tables(&view.select_stmt);
-            let reads = s.resolve_read_names(namespace.database_id, namespace.id, &read_names);
-            let missing_name = reads.iter().find(|(read_namespace, name)| {
-                s.view_source_is_missing(*read_namespace, namespace.database_id, name)
-            });
-            match (missing_name, &database_name) {
+            let Ok(column_schema) =
+                crate::util::extract_view_columns(namespace.id, &view.select_stmt, s)
+            else {
+                continue;
+            };
+            let missing_table = column_schema
+                .tables
+                .iter()
+                .find(|table| table.found == crate::util::ViewTableFound::Nothing);
+            match (missing_table, &database_name) {
                 (None, _) => {}
-                (Some((_, missing_name)), Some(database_name)) => crate::bail_parse_error!(
-                    "error in view {view_name}: no such table: {database_name}.{missing_name}"
+                (Some(missing_table), Some(database_name)) => crate::bail_parse_error!(
+                    "error in view {view_name}: no such table: {database_name}.{}",
+                    missing_table.name
                 ),
                 (Some(_), None) => crate::bail_parse_error!("error in view {view_name}"),
             }

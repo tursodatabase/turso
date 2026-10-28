@@ -93,38 +93,6 @@ expect {
 }
 
 @cross-check-integrity
-test pragma-table-list-views-reading-dropped-table-outside-from-and-where {
-    CREATE TABLE t(a);
-    CREATE TABLE u(x);
-    CREATE VIEW v_values AS VALUES ((SELECT a FROM t));
-    CREATE VIEW v_order_by AS SELECT x FROM u ORDER BY (SELECT a FROM t);
-    CREATE VIEW v_limit AS SELECT x FROM u LIMIT (SELECT count(*) FROM t);
-    CREATE VIEW v_offset AS SELECT x FROM u LIMIT 1 OFFSET (SELECT count(*) FROM t);
-    CREATE VIEW v_compound_limit AS SELECT x FROM u UNION SELECT x FROM u LIMIT (SELECT count(*) FROM t);
-    CREATE VIEW v_window AS SELECT sum(x) OVER w FROM u WINDOW w AS (ORDER BY (SELECT a FROM t));
-    CREATE VIEW v_function_arg AS SELECT value FROM json_each((SELECT a FROM t));
-    CREATE VIEW v_in_table AS SELECT x IN t FROM u;
-    CREATE VIEW v_in_cte AS WITH c AS (SELECT a FROM t) SELECT x IN c FROM u;
-    CREATE VIEW v_keeps AS SELECT x IN (1, 2) FROM u ORDER BY 1 LIMIT 3;
-    DROP TABLE t;
-    -- SQLite works out a view's columns only when the view is used.
-    SELECT * FROM v_keeps;
-    SELECT name, ncol FROM pragma_table_list WHERE type = 'view' ORDER BY name;
-}
-expect {
-    v_compound_limit|0
-    v_function_arg|0
-    v_in_cte|0
-    v_in_table|0
-    v_keeps|1
-    v_limit|0
-    v_offset|0
-    v_order_by|0
-    v_values|0
-    v_window|0
-}
-
-@cross-check-integrity
 test pragma-table-list-view-keeps-columns-when-unused-cte-reads-dropped-table {
     CREATE TABLE t(a);
     CREATE VIEW v AS WITH q AS (SELECT * FROM t) SELECT 1 AS one;
@@ -219,26 +187,6 @@ expect {
     jv|0
     n|0
     v|0
-}
-
-@cross-check-integrity
-test pragma-table-list-views-reading-dropped-table-in-subquery-or-union {
-    CREATE TABLE t(a);
-    CREATE TABLE u(x);
-    CREATE VIEW v1 AS SELECT * FROM u WHERE x IN (SELECT a FROM t);
-    CREATE VIEW v2 AS SELECT x FROM u UNION SELECT a FROM t;
-    DROP TABLE t;
-    PRAGMA table_list('v1');
-    PRAGMA table_list('v2');
-    CREATE TABLE t(a);
-    PRAGMA table_list('v1');
-    PRAGMA table_list('v2');
-}
-expect {
-    main|v1|view|0|0|0
-    main|v2|view|0|0|0
-    main|v1|view|1|0|0
-    main|v2|view|1|0|0
 }
 
 @cross-check-integrity

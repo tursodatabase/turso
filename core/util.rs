@@ -1606,6 +1606,19 @@ pub struct ViewTable {
     pub db_name: Option<String>,
     /// Optional alias (e.g., "c" in "FROM customers c")
     pub alias: Option<String>,
+    /// What the view finds under `name`.
+    pub found: ViewTableFound,
+}
+
+/// What a view finds under the name of a table it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewTableFound {
+    /// A table, or a view that has columns.
+    Readable,
+    /// No table or view.
+    Nothing,
+    /// A view that has no columns because it cannot be read either.
+    UnreadableView,
 }
 
 /// Information about a column in the view's output
@@ -2148,14 +2161,6 @@ fn view_source_from_select_table(
             }
 
             let table_index = tables.len();
-            tables.push(ViewTable {
-                name: table_name.clone(),
-                db_name: name
-                    .namespace
-                    .as_ref()
-                    .map(|db| normalize_ident(db.as_str())),
-                alias: table_alias,
-            });
             let table_namespace = view_source_namespace(schema, namespace, name);
             let mut table = schema.get_table(table_namespace, &table_name);
             let mut view = table
@@ -2173,11 +2178,23 @@ fn view_source_from_select_table(
                     view = None;
                 }
             }
-            let source_columns: &[Column] = match (&table, &view) {
-                (Some(table), _) => table.columns(),
-                (None, Some(view)) => &view.columns,
-                (None, None) => &[],
+            let (source_columns, found): (&[Column], _) = match (&table, &view) {
+                (Some(table), _) => (table.columns(), ViewTableFound::Readable),
+                (None, Some(view)) if view.columns.is_empty() => {
+                    (&[], ViewTableFound::UnreadableView)
+                }
+                (None, Some(view)) => (&view.columns, ViewTableFound::Readable),
+                (None, None) => (&[], ViewTableFound::Nothing),
             };
+            tables.push(ViewTable {
+                name: table_name,
+                db_name: name
+                    .namespace
+                    .as_ref()
+                    .map(|db| normalize_ident(db.as_str())),
+                alias: table_alias,
+                found,
+            });
             let columns = source_columns
                 .iter()
                 .cloned()
@@ -2241,6 +2258,7 @@ fn view_source_from_select_table(
                     .as_ref()
                     .map(|db| normalize_ident(db.as_str())),
                 alias: table_alias,
+                found: ViewTableFound::Readable,
             });
             let columns = schema
                 .get_table(namespace, &table_name)
@@ -2753,12 +2771,10 @@ pub fn extract_view_columns(
 /// list, which stops being true when ALTER TABLE adds or drops a column of a
 /// table that `SELECT *` reads.
 pub(crate) fn view_columns_with_names(
-    namespace: NamespaceId,
-    select_stmt: &ast::Select,
-    schema: &Schema,
+    column_schema: ViewColumnSchema,
     explicit_names: &[String],
 ) -> Result<crate::alloc::Vec<Column>> {
-    let mut columns = extract_view_columns(namespace, select_stmt, schema)?.flat_columns()?;
+    let mut columns = column_schema.flat_columns()?;
     if explicit_names.is_empty() {
         return Ok(columns);
     }
@@ -2929,8 +2945,10 @@ mod rename_column_view {
                 .iter()
                 .map(|column| column.col_name.as_str().to_string())
                 .collect();
-            let original_columns =
-                view_columns_with_names(namespace, &original_select, schema, &explicit_names)?;
+            let original_columns = view_columns_with_names(
+                extract_view_columns(namespace, &original_select, schema)?,
+                &explicit_names,
+            )?;
 
             let ctx = ViewRewriteCtx::new(
                 schema,
