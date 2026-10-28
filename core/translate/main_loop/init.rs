@@ -98,12 +98,14 @@ impl InitLoop {
                 1,
                 "DISTINCT aggregate functions must have exactly one argument"
             );
-            let collations = vec![get_collseq_from_expr_with_symbols(
-                &agg.args[0],
-                tables,
-                Some(t_ctx.resolver.symbol_table),
-            )?
-            .unwrap_or(CollationSeq::Binary)];
+            let collations = vec![
+                crate::translate::collate::resolve_comparison_collseq_with_symbols(
+                    &agg.args[0],
+                    &agg.args[0],
+                    tables,
+                    Some(t_ctx.resolver.symbol_table),
+                )?,
+            ];
             let hash_table_id = program.alloc_hash_table_id();
             agg.distinctness = Distinctness::Distinct {
                 ctx: Some(DistinctCtx {
