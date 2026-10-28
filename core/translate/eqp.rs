@@ -451,6 +451,14 @@ pub(crate) fn seek_constraint_parts(index: &Index, seek_def: &SeekDef) -> Vec<St
             parts.push(format!("{}{op_str}?", col.name));
         }
     }
+    if let Some(col) = index.columns.get(range_col_idx) {
+        if parts.len() == range_col_idx + 2
+            && ((col.order == SortOrder::Desc)
+                != (seek_def.iter_dir == IterationDirection::Backwards))
+        {
+            parts.swap(range_col_idx, range_col_idx + 1);
+        }
+    }
     parts
 }
 
