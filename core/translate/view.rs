@@ -407,7 +407,7 @@ pub fn translate_create_view(
     crate::util::validate_select_for_views(select_stmt, view_name.namespace.as_ref())?;
 
     let mut select_stmt = select_stmt.clone();
-    if resolver.dialect.binds_names_at_create() {
+    if resolver.catalog.dialect.binds_names_at_create() {
         bind_sequence_names_in_select(&mut select_stmt, resolver)?;
     }
     let sql = create_view_to_str("VIEW", &view_name.name.as_ident(), columns, &select_stmt);

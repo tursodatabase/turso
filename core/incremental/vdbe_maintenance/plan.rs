@@ -628,7 +628,8 @@ fn plan_expr_collation(
     tables: &TableReferences,
     resolver: &Resolver,
 ) -> Result<Option<CollationSeq>> {
-    let collation = get_collseq_from_expr_with_symbols(expr, tables, Some(resolver.symbol_table))?;
+    let collation =
+        get_collseq_from_expr_with_symbols(expr, tables, Some(resolver.catalog.symbol_table))?;
     if collation.is_some_and(|collation| collation.is_custom()) {
         return unsupported("custom collations on grouping or dedup keys");
     }

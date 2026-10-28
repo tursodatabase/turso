@@ -3,6 +3,7 @@ use crate::namespace::NamespaceRef;
 use crate::schema::{
     SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME, TEMP_SCHEMA_TABLE_NAME_ALT,
 };
+use crate::translate::catalog::CatalogContext;
 use crate::translate::plan::{
     is_schema_table, merge_columns, resolve_unqualified_column, unqualified_column_sources,
     ColumnLookup, OuterQueryReference, ResolvedColumn,
@@ -504,7 +505,13 @@ pub fn bind_and_rewrite_expr<'a>(
                     }
                 }
                 Expr::FunctionCallStar { name, filter_over } => {
-                    validate_function_tail(name.as_str(), 0, filter_over, false, resolver)?;
+                    validate_function_tail(
+                        name.as_str(),
+                        0,
+                        filter_over,
+                        false,
+                        &resolver.catalog,
+                    )?;
                     // For functions that need star expansion (json_object, jsonb_object),
                     // expand the * to all columns from the referenced tables as key-value pairs
                     // This needs to happen during bind/rewrite so WHERE clauses can use these functions
@@ -587,7 +594,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         args.len(),
                         filter_over,
                         !order_by.is_empty(),
-                        resolver,
+                        &resolver.catalog,
                     )?;
                     validate_custom_type_function_call(name.as_str(), args, resolver)?;
                 }
@@ -604,7 +611,7 @@ pub(crate) fn validate_function_tail(
     arg_count: usize,
     filter_over: &ast::FunctionTail,
     has_order_by: bool,
-    resolver: &Resolver,
+    resolver: &CatalogContext,
 ) -> Result<()> {
     if !has_order_by && filter_over.filter_clause.is_none() && filter_over.over_clause.is_none() {
         return Ok(());
@@ -743,7 +750,10 @@ fn resolve_qualified_name(
     table_name: &str,
     column_name: &str,
 ) -> Result<QualifiedNameMatch> {
-    let use_nearest_table_only = resolver.dialect.qualified_column_uses_nearest_table_only();
+    let use_nearest_table_only = resolver
+        .catalog
+        .dialect
+        .qualified_column_uses_nearest_table_only();
     let mut table_found = false;
     let mut found = None;
     for joined_table in table_references.joined_tables() {

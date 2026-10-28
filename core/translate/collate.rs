@@ -384,7 +384,7 @@ pub fn resolve_comparison_collseq_with_resolver(
     referenced_tables: &TableReferences,
     resolver: Option<&Resolver>,
 ) -> Result<Option<CollationSeq>> {
-    let symbol_table = resolver.map(|resolver| resolver.symbol_table);
+    let symbol_table = resolver.map(|resolver| resolver.catalog.symbol_table);
     let (lhs_explicit, lhs_column) = get_collseq_parts_from_expr_with_symbols(
         lhs_expr,
         referenced_tables,

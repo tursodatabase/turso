@@ -7,6 +7,7 @@ use crate::{
     schema::{BTreeTable, Index, RESERVED_TABLE_PREFIXES},
     storage::pager::CreateBTreeFlags,
     translate::{
+        catalog::CatalogContext,
         emitter::Resolver,
         schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
     },
@@ -33,7 +34,7 @@ type AnalyzeTarget = (Arc<BTreeTable>, Option<Arc<Index>>);
 /// - An index name: analyze just that index
 fn resolve_analyze_targets(
     target_opt: &Option<ast::QualifiedName>,
-    resolver: &Resolver,
+    resolver: &CatalogContext,
 ) -> Result<(NamespaceRef, Vec<AnalyzeTarget>)> {
     match target_opt {
         Some(target) => {
@@ -97,7 +98,10 @@ fn resolve_analyze_targets(
 }
 
 /// Collect all user tables in the given database.
-fn collect_all_tables_in_db(namespace: NamespaceRef, resolver: &Resolver) -> Vec<AnalyzeTarget> {
+fn collect_all_tables_in_db(
+    namespace: NamespaceRef,
+    resolver: &CatalogContext,
+) -> Vec<AnalyzeTarget> {
     resolver.with_schema(namespace.database_id, |schema| {
         schema
             .tables(namespace.id)
@@ -119,7 +123,7 @@ fn collect_all_tables_in_db(namespace: NamespaceRef, resolver: &Resolver) -> Vec
 fn resolve_targets_in_db(
     name: &str,
     namespace: NamespaceRef,
-    resolver: &Resolver,
+    resolver: &CatalogContext,
 ) -> Result<Vec<AnalyzeTarget>> {
     // Try as a table first
     let table_opt: Option<Arc<BTreeTable>> = resolver.with_schema(namespace.database_id, |s| {
@@ -139,7 +143,7 @@ fn resolve_targets_in_db(
 fn find_index_target(
     name: &str,
     namespace: NamespaceRef,
-    resolver: &Resolver,
+    resolver: &CatalogContext,
 ) -> Option<AnalyzeTarget> {
     resolver.with_schema(namespace.database_id, |schema| {
         schema.indexes(namespace.id).find_map(|index| {
@@ -158,7 +162,7 @@ pub fn translate_analyze(
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     // Resolve the target database and collect analyze targets.
-    let (namespace, analyze_targets) = resolve_analyze_targets(&target_opt, resolver)?;
+    let (namespace, analyze_targets) = resolve_analyze_targets(&target_opt, &resolver.catalog)?;
     let database_id = namespace.database_id;
 
     // Register a write transaction for the target database so that the

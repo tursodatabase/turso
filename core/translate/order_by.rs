@@ -201,7 +201,7 @@ impl EmitOrderBy {
                     column,
                     column,
                     referenced_tables,
-                    Some(t_ctx.resolver.symbol_table),
+                    Some(t_ctx.resolver.catalog.symbol_table),
                 )?);
                 let pos_in_table = index_columns.len();
                 // Have enough space pre-allocatoed to push without realloc
@@ -702,7 +702,7 @@ pub(crate) fn sorter_open_data<'a>(
             expr,
             expr,
             tables,
-            Some(resolver.symbol_table),
+            Some(resolver.catalog.symbol_table),
         )?;
         data.order_collations_nulls
             .try_push((direction, Some(collation), nulls))?;
