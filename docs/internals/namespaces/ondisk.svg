@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="500" viewBox="0 0 860 500" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14">
+  <title>On-disk format of stored namespaces</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#57606a"/>
+    </marker>
+  </defs>
+  <style>
+    .box { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1.5; rx: 8; }
+    .ns { fill: #ddf4ff; stroke: #54aeff; stroke-width: 1.5; rx: 8; }
+    .table { fill: #ffffff; stroke: #d4a72c; stroke-width: 1.5; }
+    .header { fill: #fff8c5; }
+    .line { stroke: #d4a72c; stroke-width: 1; }
+    .title { font-weight: 600; fill: #24292f; font-size: 15px; }
+    .head { font-weight: 600; fill: #24292f; font-size: 13px; }
+    .mono { font-family: Menlo, Consolas, monospace; font-size: 13px; fill: #24292f; }
+    .label { fill: #57606a; font-size: 13px; }
+    .arrow { stroke: #57606a; stroke-width: 1.5; fill: none; marker-end: url(#arrow); }
+  </style>
+
+  <rect width="860" height="470" fill="#ffffff"/>
+
+  <!-- Schema in memory -->
+  <rect class="box" x="40" y="30" width="780" height="120"/>
+  <text class="title" x="56" y="54">Schema in memory, keyed by (namespace id, name)</text>
+  <rect class="ns" x="56" y="70" width="370" height="64"/>
+  <text class="title" x="70" y="92">namespace 1: public</text>
+  <text class="mono" x="70" y="118">users</text>
+  <rect class="ns" x="442" y="70" width="362" height="64"/>
+  <text class="title" x="456" y="92">namespace 2: app</text>
+  <text class="mono" x="456" y="118">users</text>
+
+  <!-- encode / decode -->
+  <path class="arrow" d="M 230 150 L 230 238"/>
+  <text class="label" x="244" y="186">DDL writers encode</text>
+  <text class="mono" x="244" y="206">(2, "users") → __turso_ns2_users</text>
+
+  <path class="arrow" d="M 640 238 L 640 150"/>
+  <text class="label" x="654" y="186">Loader decodes</text>
+  <text class="label" x="654" y="206">PostgreSQL dialect only</text>
+
+  <!-- sqlite_schema on disk -->
+  <text class="title" x="40" y="262">sqlite_schema on disk</text>
+  <rect class="table" x="40" y="272" width="780" height="140"/>
+  <rect class="header" x="40" y="272" width="780" height="28"/>
+  <line class="line" x1="40" y1="300" x2="820" y2="300"/>
+  <line class="line" x1="40" y1="328" x2="820" y2="328"/>
+  <line class="line" x1="40" y1="356" x2="820" y2="356"/>
+  <line class="line" x1="40" y1="384" x2="820" y2="384"/>
+  <line class="line" x1="110" y1="272" x2="110" y2="412"/>
+  <line class="line" x1="290" y1="272" x2="290" y2="412"/>
+  <line class="line" x1="360" y1="272" x2="360" y2="412"/>
+  <line class="line" x1="700" y1="272" x2="700" y2="412"/>
+  <text class="head" x="52" y="291">type</text>
+  <text class="head" x="122" y="291">name</text>
+  <text class="head" x="300" y="291">rootpage</text>
+  <text class="head" x="372" y="291">sql</text>
+  <text class="head" x="712" y="291">meaning</text>
+
+  <text class="mono" x="52" y="319">schema</text>
+  <text class="mono" x="122" y="319">public</text>
+  <text class="mono" x="300" y="319">1</text>
+  <text class="mono" x="372" y="319">CREATE SCHEMA public</text>
+  <text class="label" x="712" y="319">public has id 1</text>
+
+  <text class="mono" x="52" y="347">schema</text>
+  <text class="mono" x="122" y="347">app</text>
+  <text class="mono" x="300" y="347">2</text>
+  <text class="mono" x="372" y="347">CREATE SCHEMA app</text>
+  <text class="label" x="712" y="347">app has id 2</text>
+
+  <text class="mono" x="52" y="375">table</text>
+  <text class="mono" x="122" y="375">__turso_ns1_users</text>
+  <text class="mono" x="300" y="375">3</text>
+  <text class="mono" x="372" y="375">CREATE TABLE __turso_ns1_users (...)</text>
+  <text class="label" x="712" y="375">public.users</text>
+
+  <text class="mono" x="52" y="403">table</text>
+  <text class="mono" x="122" y="403">__turso_ns2_users</text>
+  <text class="mono" x="300" y="403">4</text>
+  <text class="mono" x="372" y="403">CREATE TABLE __turso_ns2_users (...)</text>
+  <text class="label" x="712" y="403">app.users</text>
+
+  <text class="label" x="40" y="448">A row of type schema records a namespace: its name, and its id in rootpage.</text>
+  <text class="label" x="40" y="468">The objects of namespace 2 are stored under names that start with __turso_ns2_.</text>
+</svg>
