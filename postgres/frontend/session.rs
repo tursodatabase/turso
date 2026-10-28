@@ -130,7 +130,10 @@ pub fn set_up_new_database(db: &Arc<turso_core::Database>) -> crate::Result<()> 
 
 impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> crate::Result<Self> {
-        let conn = db.connect_with_hooks(Arc::new(PgSessionState::default()))?;
+        let conn = db.connect_with_hooks(
+            turso_core::ConnectOpts::new(),
+            Arc::new(PgSessionState::default()),
+        )?;
         refuse_tables_in_no_schema(&conn)?;
         set_search_path(&conn, None, SettingScope::Session)?;
         Ok(Self {

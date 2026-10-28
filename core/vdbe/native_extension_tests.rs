@@ -138,10 +138,13 @@ fn native_scalar_connection_context_survives_io_and_helper_queries() {
         ),
     );
     let context = Arc::new(AtomicI64::new(7));
-    let first = plain.db.connect_with_context(context.clone()).unwrap();
+    let first = plain
+        .db
+        .connect_with_context(crate::ConnectOpts::new(), context.clone())
+        .unwrap();
     let second = plain
         .db
-        .connect_with_context(Arc::new(AtomicI64::new(19)))
+        .connect_with_context(crate::ConnectOpts::new(), Arc::new(AtomicI64::new(19)))
         .unwrap();
     let mut statement = first.prepare("SELECT connection_context_read(1)").unwrap();
     assert!(matches!(statement.step().unwrap(), StepResult::IO));
