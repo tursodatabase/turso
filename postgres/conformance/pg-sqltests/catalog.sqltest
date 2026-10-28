@@ -730,6 +730,32 @@ test pg-tables-no-internal-tables {
 }
 expect {}
 
+test pg-views-lists-created-views {
+    CREATE TABLE t (id int, a text);
+    CREATE VIEW v AS SELECT id FROM t;
+    CREATE VIEW Lower_Me AS SELECT a FROM t;
+    CREATE VIEW gone AS SELECT 1 AS one;
+    DROP VIEW gone;
+    SELECT schemaname, viewname FROM pg_views
+    WHERE schemaname = 'public' AND definition LIKE '%FROM t%'
+    ORDER BY viewname;
+}
+expect {
+    public|lower_me
+    public|v
+}
+
+test pg-views-lists-views-of-every-schema {
+    CREATE SCHEMA catalog_views_extra;
+    CREATE TABLE catalog_views_extra.u (x int);
+    CREATE VIEW catalog_views_extra.uv AS SELECT x FROM catalog_views_extra.u;
+    SELECT schemaname, viewname FROM pg_catalog.pg_views
+    WHERE viewname = 'uv';
+}
+expect {
+    catalog_views_extra|uv
+}
+
 test pg-tables-and-pg-class-hide-tables-of-sequences {
     CREATE SEQUENCE s;
     CREATE TABLE t (id serial);

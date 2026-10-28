@@ -1180,6 +1180,41 @@ impl SnapshotRows for PgTablesTable {
     }
 }
 
+/// Virtual table implementation for pg_views
+/// Maps user views to PostgreSQL's pg_views view
+#[derive(Debug)]
+struct PgViewsTable;
+
+impl SnapshotRows for PgViewsTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_views (
+            schemaname TEXT,
+            viewname TEXT,
+            viewowner TEXT,
+            definition TEXT
+        )";
+    const TABLE_OID: Option<i64> = None;
+    const ESTIMATED_COST: f64 = 1000.0;
+    const ESTIMATED_ROWS: u32 = 100;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let schema = conn.current_schema();
+        let mut rows = Vec::new();
+        for namespace in namespaces_sorted(&schema) {
+            let mut views: Vec<_> = schema.views(namespace).collect();
+            views.sort_by_key(|(name, _)| *name);
+            for (_, view) in views {
+                rows.push(vec![
+                    Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
+                    Value::build_text(view.name.clone()),                              // viewname
+                    Value::Text("turso".into()),                                       // viewowner
+                    Value::build_text(view.select_stmt.to_string()),                   // definition
+                ]);
+            }
+        }
+        rows
+    }
+}
+
 #[derive(Debug)]
 struct PgIndexesTable;
 
@@ -2297,6 +2332,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         "pg_tables",
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgTablesTable>(PhantomData),
+    );
+    options = options.native_module(
+        "pg_views",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgViewsTable>(PhantomData),
     );
     options = options.native_module(
         "pg_indexes",
@@ -3918,6 +3958,7 @@ mod tests {
             "pg_proc",
             "pg_database",
             "pg_tables",
+            "pg_views",
             "pg_indexes",
             "pg_get_tabledef",
             "pg_index",
