@@ -1569,8 +1569,9 @@ mod tests {
 /// from the value's type, and would compare '10.00' before '9.50'.
 #[cfg(test)]
 mod typed_value_order_tests {
+    use super::CollationSeq;
     use crate::sync::Arc;
-    use crate::vdbe::insn::Insn;
+    use crate::vdbe::{builder::CursorType, insn::Insn};
     use crate::{
         ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, IO,
     };
@@ -1628,6 +1629,25 @@ mod typed_value_order_tests {
         ("SELECT t.n FROM t LEFT JOIN u ON t.n = u.m", 0),
         ("SELECT t.n FROM t, u WHERE t.n > u.m", 0),
         ("SELECT t.n FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.m = t.n)", 0),
+        // A value without a type compared with typed values.
+        ("SELECT n FROM t WHERE 1.5 IN (n, 2)", 0),
+        ("SELECT n FROM t WHERE '{1}' IN (a)", 0),
+        // Registers that stand for columns.
+        (
+            "INSERT INTO w VALUES (1, '{1}', 1.5) ON CONFLICT(k) DO UPDATE \
+             SET a = excluded.a WHERE excluded.a > w.a AND excluded.n > w.n",
+            0,
+        ),
+        ("UPDATE w SET a = '{2}'", 0),
+        ("INSERT INTO w VALUES (2, '{1}', 1.5) RETURNING a > '{0}', n > 1.5", 0),
+        // Array function results.
+        ("SELECT n FROM t WHERE b = ARRAY['9'] OR array_append(a, 1) > a", 0),
+        ("SELECT n FROM t WHERE string_to_array('9', ',') = b", 0),
+        // A compound subquery in FROM.
+        ("SELECT x FROM (SELECT n AS x FROM t UNION ALL SELECT m FROM u) WHERE x > 1.5", 0),
+        ("SELECT DISTINCT x FROM (SELECT 1 AS x UNION ALL SELECT n FROM t)", 0),
+        // Automatic indexes.
+        ("SELECT t.n FROM t, u WHERE t.n = u.m AND u.m > 1", 0),
     ];
 
     #[test]
@@ -1636,14 +1656,35 @@ mod typed_value_order_tests {
         let mut failures = Vec::new();
         for &(sql, internal_comparisons) in QUERIES {
             let stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-            let with_text_collation: Vec<String> = stmt
-                .get_program()
-                .prepared
+            let program = &stmt.get_program().prepared;
+            let instructions = program
                 .insns
                 .iter()
                 .filter(|(insn, _)| compares_values(insn))
-                .map(|(insn, _)| format!("{insn:?}"))
-                .filter(|insn| insn.contains("Text("))
+                .flat_map(|(insn, _)| {
+                    insn.collations()
+                        .into_iter()
+                        .map(move |collation| (format!("{insn:?}"), collation))
+                });
+            let index_keys = program
+                .cursor_ref
+                .iter()
+                .filter_map(|(_, cursor_type)| match cursor_type {
+                    CursorType::BTreeIndex(index) if index.ephemeral => Some(index),
+                    _ => None,
+                })
+                .flat_map(|index| {
+                    index.columns.iter().map(move |column| {
+                        (
+                            format!("key {} of index {}", column.name, index.name),
+                            column.collation,
+                        )
+                    })
+                });
+            let with_text_collation: Vec<String> = instructions
+                .chain(index_keys)
+                .filter(|(_, collation)| matches!(collation, CollationSeq::Text(_)))
+                .map(|(place, _)| place)
                 .collect();
             if with_text_collation.len() != internal_comparisons {
                 failures.push(format!("{sql}\n    {}", with_text_collation.join("\n    ")));
@@ -1651,7 +1692,7 @@ mod typed_value_order_tests {
         }
         assert!(
             failures.is_empty(),
-            "instructions on typed values that use a text collation:\n{}",
+            "comparisons of typed values that use a text collation:\n{}",
             failures.join("\n")
         );
     }
@@ -1682,6 +1723,13 @@ mod typed_value_order_tests {
             .unwrap();
         conn.execute("CREATE TABLE u(m numeric(10,2)) STRICT")
             .unwrap();
+        conn.execute("CREATE TABLE w(k int PRIMARY KEY, a integer[], n numeric(10,2)) STRICT")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER w_grew AFTER UPDATE ON w WHEN NEW.a > OLD.a AND NEW.n > OLD.n \
+             BEGIN SELECT 1; END",
+        )
+        .unwrap();
         conn
     }
 }
