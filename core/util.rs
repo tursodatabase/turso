@@ -351,6 +351,8 @@ pub fn parse_schema_rows(
         inner.automatic_indices,
         has_mv_store,
     )?;
+    // The connection reparses only the main schema.
+    schema.refresh_all_view_columns(crate::MAIN_DB_ID)?;
 
     Ok(IOResult::Done(()))
 }

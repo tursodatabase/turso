@@ -50,6 +50,17 @@ expect {
 }
 
 @cross-check-integrity
+test pragma-table-list-view-created-over-missing-table-has-no-columns {
+    CREATE VIEW v AS SELECT * FROM missing;
+    CREATE VIEW w AS SELECT 1 FROM missing;
+    SELECT name, ncol FROM pragma_table_list WHERE type = 'view' ORDER BY name;
+}
+expect {
+    v|0
+    w|0
+}
+
+@cross-check-integrity
 test pragma-table-list-values-view-columns {
     CREATE VIEW v AS VALUES (1, 'x');
     CREATE VIEW w AS SELECT * FROM v;

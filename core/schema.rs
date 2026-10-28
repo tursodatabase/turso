@@ -2064,8 +2064,27 @@ impl Schema {
         objects.views.get(&name).cloned()
     }
 
-    /// Work out the columns again of every view that reads one of
-    /// `changed_names`, directly or through other views, from its SELECT and
+    /// Work out the columns again of every view once the whole schema has
+    /// loaded. A view's columns are first worked out when its schema row is
+    /// read, which can come before the rows of the tables it reads.
+    /// `database_id` is the database of this schema.
+    pub fn refresh_all_view_columns(&mut self, database_id: usize) -> Result<()> {
+        let mut names = std::vec::Vec::new();
+        for namespace in self.namespace_ids() {
+            let objects = self.namespace(namespace);
+            for name in objects.tables.keys().chain(objects.views.keys()) {
+                names.push((namespace, name.clone()));
+            }
+        }
+        let names: std::vec::Vec<(NamespaceId, &str)> = names
+            .iter()
+            .map(|(namespace, name)| (*namespace, name.as_str()))
+            .collect();
+        self.refresh_view_columns(database_id, &names)
+    }
+
+    /// Work out the columns again of every view in `changed_names` and every
+    /// view that reads one of them, directly or through other views, from its SELECT and
     /// the current schema. Call it after a statement creates, drops or alters
     /// those tables or views; otherwise `View::columns` keeps the columns the
     /// view had before. As in SQLite, a view has no columns when its FROM
@@ -2086,15 +2105,18 @@ impl Schema {
                 })
             })
         });
-        if !changed_names_are_read {
+        let changed_names_include_a_view = changed_names
+            .iter()
+            .any(|(namespace, name)| self.get_view(*namespace, name).is_some());
+        if !changed_names_are_read && !changed_names_include_a_view {
             return Ok(());
         }
         // The names a view reads only decide which views to refresh and in
         // what order. Whether they resolve is decided by working out the
         // view's columns.
-        let mut view_reads: HashMap<(NamespaceId, String), std::vec::Vec<(NamespaceId, String)>> =
+        let mut view_reads: HashMap<(NamespaceId, String), Vec<(NamespaceId, String)>> =
             HashMap::default();
-        let mut readers: HashMap<(NamespaceId, String), std::vec::Vec<(NamespaceId, String)>> =
+        let mut readers: HashMap<(NamespaceId, String), Vec<(NamespaceId, String)>> =
             HashMap::default();
         for namespace in self.namespace_ids() {
             for (view_name, view) in &self.namespace(namespace).views {
@@ -2167,7 +2189,7 @@ impl Schema {
         &mut self,
         view: &(NamespaceId, String),
         database_id: usize,
-        view_reads: &HashMap<(NamespaceId, String), std::vec::Vec<(NamespaceId, String)>>,
+        view_reads: &HashMap<(NamespaceId, String), Vec<(NamespaceId, String)>>,
         views_to_refresh: &HashSet<(NamespaceId, String)>,
         views_in_progress: &mut HashSet<(NamespaceId, String)>,
         refreshed: &mut HashSet<(NamespaceId, String)>,
@@ -2795,6 +2817,9 @@ impl Schema {
                             acc.automatic_indices,
                             mv_cursor.is_some(),
                         )?;
+                        // Only TEMP views are refreshed differently, and a
+                        // TEMP database is empty when it is opened.
+                        self.refresh_all_view_columns(crate::MAIN_DB_ID)?;
 
                         state.phase = MakeFromBtreePhase::Done;
                         return Ok(IOResult::Done(()));

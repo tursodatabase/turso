@@ -2329,10 +2329,20 @@ pub fn translate_alter_table(
 /// Like SQLite, RENAME COLUMN fails when a view of the database reads a
 /// missing table or view. A trigger that reads such a view would otherwise
 /// have its columns resolved against the wrong table and renamed.
+/// SQLite also fails on any other error in a view's SELECT, such as a missing
+/// column, and checks TEMP views; this checks only missing tables, and only
+/// in views of the database being altered.
 fn reject_rename_with_unresolvable_view(
     resolver: &Resolver,
     namespace: NamespaceRef,
 ) -> Result<()> {
+    if !resolver
+        .catalog
+        .dialect
+        .rename_column_fails_on_view_of_missing_table()
+    {
+        return Ok(());
+    }
     // A TEMP view can read the tables of other databases, which the temp
     // schema does not hold.
     if namespace.database_id == crate::TEMP_DB_ID {

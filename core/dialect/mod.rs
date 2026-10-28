@@ -236,6 +236,16 @@ pub trait Dialect: Send + Sync + 'static {
     fn add_column_computes_default_for_existing_rows(&self) -> bool {
         false
     }
+
+    /// Whether `ALTER TABLE RENAME COLUMN` fails when a view of the database
+    /// reads a missing table or view.
+    ///
+    /// SQLite resolves every view during the rename and fails on the first
+    /// one that does not resolve. PostgreSQL binds a view's tables when the
+    /// view is created, so a rename never depends on other views.
+    fn rename_column_fails_on_view_of_missing_table(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
