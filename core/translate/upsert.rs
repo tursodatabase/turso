@@ -830,6 +830,7 @@ pub fn emit_upsert(
         }
 
         // Evaluate CHECK constraints on the new values
+        let check_halt_on_error = program.constraint_halt_on_error(ast::ResolveType::Abort);
         emit_check_constraints(
             program,
             &bt.check_constraints,
@@ -843,6 +844,7 @@ pub fn emit_upsert(
             }),
             connection,
             ast::ResolveType::Abort,
+            check_halt_on_error,
             ctx.loop_labels.row_done,
             Some(table_references),
         )?;

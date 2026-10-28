@@ -676,6 +676,7 @@ fn emit_column_constraints_validation(
         );
         let mut check_resolver = resolver.fork();
         let skip_row_label = program.allocate_label();
+        let check_halt_on_error = program.constraint_halt_on_error(ast::ResolveType::Abort);
         emit_check_constraints(
             program,
             &check_constraints,
@@ -693,6 +694,7 @@ fn emit_column_constraints_validation(
                 }),
             connection,
             ast::ResolveType::Abort,
+            check_halt_on_error,
             skip_row_label,
             Some(&table_references),
         )?;

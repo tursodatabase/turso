@@ -825,6 +825,7 @@ pub fn translate_insert(
     }
 
     // Evaluate CHECK constraints after NOT NULL default substitution and before index mutations.
+    let check_halt_on_error = program.constraint_halt_on_error(ctx.on_conflict);
     emit_check_constraints(
         program,
         &ctx.table.check_constraints,
@@ -845,6 +846,7 @@ pub fn translate_insert(
         }),
         connection,
         ctx.on_conflict,
+        check_halt_on_error,
         ctx.loop_labels.row_done,
         Some(&table_references),
     )?;
