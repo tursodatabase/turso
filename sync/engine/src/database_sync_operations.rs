@@ -1165,6 +1165,7 @@ fn portable_origin_client_id(txn: &PortableLogicalTxn) -> Result<String> {
 struct DecodedSchemaRow {
     row_type: String,
     name: String,
+    rootpage: i64,
     sql: String,
 }
 
@@ -1204,10 +1205,8 @@ fn decode_schema_row(record: &[u8]) -> Result<DecodedSchemaRow> {
     Ok(DecodedSchemaRow {
         row_type: schema_text_value(&values[0], "type")?,
         name: schema_text_value(&values[1], "name")?,
-        sql: {
-            let _rootpage = schema_integer_value(&values[3], "rootpage")?;
-            schema_text_value(&values[4], "sql")?
-        },
+        rootpage: schema_integer_value(&values[3], "rootpage")?,
+        sql: schema_text_value(&values[4], "sql")?,
     })
 }
 
@@ -1270,11 +1269,18 @@ fn append_schema_ops(
                 non_table_creates.push(schema_logical_op(&new, LogicalSchemaAction::Create)?)
             }
             (Some(old), None) => drops.push(schema_logical_op(&old, LogicalSchemaAction::Drop)?),
-            (Some(old), Some(new)) if !old.row_type.eq_ignore_ascii_case(&new.row_type) => {
-                return Err(Error::DatabaseSyncEngineError(format!(
-                    "schema row {} changed type from '{}' to '{}'",
-                    new.name, old.row_type, new.row_type
-                )));
+            // Like SQLite, MVCC reuses the rowid of a deleted sqlite_schema row, so one
+            // transaction can drop an object and create a different one under the same
+            // rowid. The root page identifies the object: ALTER TABLE rewrites the row
+            // but keeps it, while a new table or index gets a new one.
+            (Some(old), Some(new)) if !is_same_schema_object(&old, &new) => {
+                drops.push(schema_logical_op(&old, LogicalSchemaAction::Drop)?);
+                if is_table(&new) {
+                    table_refreshes_and_creates
+                        .push(schema_logical_op(&new, LogicalSchemaAction::Create)?);
+                } else {
+                    non_table_creates.push(schema_logical_op(&new, LogicalSchemaAction::Create)?);
+                }
             }
             (Some(_), Some(new)) if is_table(&new) => table_refreshes_and_creates
                 .push(schema_logical_op(&new, LogicalSchemaAction::Refresh)?),
@@ -1293,6 +1299,10 @@ fn append_schema_ops(
 
 fn is_table(row: &DecodedSchemaRow) -> bool {
     row.row_type.eq_ignore_ascii_case("table")
+}
+
+fn is_same_schema_object(old: &DecodedSchemaRow, new: &DecodedSchemaRow) -> bool {
+    old.row_type.eq_ignore_ascii_case(&new.row_type) && old.rootpage == new.rootpage
 }
 
 fn decode_update_header_op(payload: &[u8]) -> Result<LogicalOp> {
