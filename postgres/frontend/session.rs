@@ -130,7 +130,16 @@ pub fn set_up_new_database(db: &Arc<turso_core::Database>) -> crate::Result<()> 
 
 impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> crate::Result<Self> {
-        let conn = db.connect_with_hooks(Arc::new(PgSessionState::default()))?;
+        Self::connect_with(db, turso_core::ConnectOpts::new())
+    }
+
+    /// Opens a session on `db`, connecting with `opts`, such as the
+    /// encryption key. The session has its own transaction and settings.
+    pub fn connect_with(
+        db: &Arc<turso_core::Database>,
+        opts: turso_core::ConnectOpts,
+    ) -> crate::Result<Self> {
+        let conn = db.connect_with_hooks(opts, Arc::new(PgSessionState::default()))?;
         refuse_tables_in_no_schema(&conn)?;
         set_search_path(&conn, None, SettingScope::Session)?;
         Ok(Self {
