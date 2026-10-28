@@ -51,6 +51,43 @@ impl NamespaceRef {
     }
 }
 
+/// What a mangled name starts with, before the namespace's id and an
+/// underscore.
+pub const MANGLED_NAME_PREFIX: &str = "__turso_ns";
+
+/// The name that object `name` of namespace `namespace` is stored under in
+/// the schema rows of its database.
+pub fn mangle_name(namespace: NamespaceId, name: &str) -> String {
+    if namespace.is_root() {
+        return name.to_string();
+    }
+    format!("{MANGLED_NAME_PREFIX}{}_{name}", namespace.as_u32())
+}
+
+/// The namespace and name of the object whose mangled name is `mangled`:
+/// the root namespace and the whole name when the name has no namespace
+/// id in front.
+///
+/// `supports_namespaces` says whether the database supports namespaces at all.
+/// When it does not, a name that looks like a mangled name is an ordinary
+/// name of the root namespace: SQLite allows such names, and a database
+/// made by SQLite may hold them.
+pub fn demangle_name(supports_namespaces: bool, mangled: &str) -> (NamespaceId, &str) {
+    if !supports_namespaces {
+        return (NamespaceId::ROOT, mangled);
+    }
+    let Some(rest) = mangled.strip_prefix(MANGLED_NAME_PREFIX) else {
+        return (NamespaceId::ROOT, mangled);
+    };
+    let Some((id, name)) = rest.split_once('_') else {
+        return (NamespaceId::ROOT, mangled);
+    };
+    match id.parse::<u32>() {
+        Ok(id) if id != 0 => (NamespaceId::new(id), name),
+        _ => (NamespaceId::ROOT, mangled),
+    }
+}
+
 /// A name that qualifies object names in SQL and the namespace it refers
 /// to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,7 +247,7 @@ impl Namespaces {
 
 #[cfg(test)]
 mod tests {
-    use super::{Namespace, NamespaceId, NamespaceRef, Namespaces};
+    use super::{demangle_name, mangle_name, Namespace, NamespaceId, NamespaceRef, Namespaces};
     use crate::{MAIN_DB_ID, TEMP_DB_ID};
 
     #[test]
@@ -328,6 +365,41 @@ mod tests {
         assert_eq!(names_of(&order), vec!["app_in_main", "public"]);
         assert_eq!(order[0].target.id, NamespaceId::new(17));
         assert_eq!(order[1].target, NamespaceRef::root_of(MAIN_DB_ID));
+    }
+
+    #[test]
+    fn a_mangled_name_says_which_namespace_the_object_is_in() {
+        assert_eq!(mangle_name(NamespaceId::ROOT, "t"), "t");
+        assert_eq!(mangle_name(NamespaceId::new(17), "t"), "__turso_ns17_t");
+        assert_eq!(
+            mangle_name(NamespaceId::new(1), "sub.t"),
+            "__turso_ns1_sub.t"
+        );
+        assert_eq!(demangle_name(true, "t"), (NamespaceId::ROOT, "t"));
+        assert_eq!(
+            demangle_name(false, "__turso_ns17_t"),
+            (NamespaceId::ROOT, "__turso_ns17_t")
+        );
+        assert_eq!(
+            demangle_name(true, "__turso_ns17_t"),
+            (NamespaceId::new(17), "t")
+        );
+        assert_eq!(
+            demangle_name(true, "__turso_ns1_sub.t"),
+            (NamespaceId::new(1), "sub.t")
+        );
+        assert_eq!(
+            demangle_name(true, "__turso_ns17"),
+            (NamespaceId::ROOT, "__turso_ns17")
+        );
+        assert_eq!(
+            demangle_name(true, "__turso_nsx_t"),
+            (NamespaceId::ROOT, "__turso_nsx_t")
+        );
+        assert_eq!(
+            demangle_name(true, "__turso_ns0_t"),
+            (NamespaceId::ROOT, "__turso_ns0_t")
+        );
     }
 
     #[test]
