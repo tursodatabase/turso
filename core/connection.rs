@@ -1514,10 +1514,14 @@ impl Connection {
                         self.db.dialect().as_ref(),
                     ));
 
-                    if inner.fresh.has_table(
-                        NamespaceId::ROOT,
-                        crate::schema::TURSO_NAMESPACES_TABLE_NAME,
-                    ) {
+                    // Under a dialect without namespaces, a table of that name
+                    // is an ordinary table.
+                    if inner.fresh.supports_namespaces()
+                        && inner.fresh.has_table(
+                            NamespaceId::ROOT,
+                            crate::schema::TURSO_NAMESPACES_TABLE_NAME,
+                        )
+                    {
                         // Install the schema so the namespaces table can be read.
                         self.with_schema_mut(|schema| {
                             *schema = inner.fresh.try_clone()?;

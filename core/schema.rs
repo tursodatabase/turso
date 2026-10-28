@@ -1111,6 +1111,12 @@ impl Schema {
         Ok(())
     }
 
+    /// Whether the schema rows may hold the objects of namespaces, as the
+    /// dialect of the database says.
+    pub fn supports_namespaces(&self) -> bool {
+        self.supports_namespaces
+    }
+
     /// Whether the names of the namespaces are loaded.
     pub fn namespace_names_loaded(&self) -> bool {
         self.namespace_names_loaded
