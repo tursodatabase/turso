@@ -92,7 +92,7 @@ pub fn translate_create_materialized_view(
     validate_materialized(&connection, namespace, resolver, &normalized_view_name)?;
 
     // Check for cross-database table references first
-    crate::util::validate_select_for_views(select_stmt, view_name.namespace.as_ref())?;
+    crate::util::validate_select_for_views(select_stmt, resolver, database_id)?;
 
     let mut view_column_schema = resolver.with_schema(database_id, |s| {
         extract_view_columns(namespace.id, select_stmt, s)
@@ -419,7 +419,7 @@ pub fn translate_create_view(
         }));
     }
 
-    crate::util::validate_select_for_views(select_stmt, view_name.namespace.as_ref())?;
+    crate::util::validate_select_for_views(select_stmt, resolver, database_id)?;
 
     let mut select_stmt = select_stmt.clone();
     if resolver.catalog.dialect.binds_names_at_create() {

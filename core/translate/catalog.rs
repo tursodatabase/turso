@@ -363,6 +363,18 @@ impl<'a> CatalogContext<'a> {
         // same way a top-level query does, sqlite_schema included.
         if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if ctx.restricts_db_references() {
+                // The virtual tables of main are found from the namespaces of
+                // main only: an attached database's view or trigger sees its
+                // own database, as SQLite's fixer binds it there.
+                if ctx.namespace.database_id == crate::MAIN_DB_ID
+                    && !self.with_schema(ctx.namespace.database_id, |schema| {
+                        Self::namespace_has_table_like_object(schema, ctx.namespace.id, table_name)
+                    })
+                {
+                    if let Some(root) = self.root_virtual_table(table_name) {
+                        return Some(root);
+                    }
+                }
                 return Some(ctx.namespace);
             }
         }
@@ -371,7 +383,33 @@ impl<'a> CatalogContext<'a> {
             return Some(namespace);
         }
 
-        self.find_unqualified_existing(table_name, Self::namespace_has_table_like_object)
+        let found =
+            self.find_unqualified_existing(table_name, Self::namespace_has_table_like_object);
+        match found {
+            Some(namespace)
+                if self.with_schema(namespace.database_id, |schema| {
+                    Self::namespace_has_table_like_object(schema, namespace.id, table_name)
+                }) =>
+            {
+                Some(namespace)
+            }
+            other => self.root_virtual_table(table_name).or(other),
+        }
+    }
+
+    /// The root namespace of the main database when it has a virtual table
+    /// called `table_name`. The engine's virtual tables, such as table-valued
+    /// functions and a frontend's catalog tables, exist only there and are
+    /// found from every namespace, the way PostgreSQL's `pg_catalog` is on
+    /// every search path.
+    fn root_virtual_table(&self, table_name: &str) -> Option<NamespaceRef> {
+        self.with_schema(crate::MAIN_DB_ID, |schema| {
+            matches!(
+                schema.get_table(NamespaceId::ROOT, table_name).as_deref(),
+                Some(crate::schema::Table::Virtual(_))
+            )
+        })
+        .then(|| NamespaceRef::root_of(crate::MAIN_DB_ID))
     }
 
     fn namespace_of_schema_table(table_name: &str) -> Option<NamespaceRef> {

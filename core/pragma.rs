@@ -1,5 +1,5 @@
 use crate::sync::Arc;
-use crate::util::{escape_sql_string_literal, quote_identifier};
+use crate::util::{escape_sql_string_literal, normalize_ident, quote_identifier};
 use crate::{Connection, LimboError, Statement, StepResult, Value};
 use bitflags::bitflags;
 use strum::IntoEnumIterator;
@@ -430,6 +430,42 @@ impl PragmaVirtualTableCursor {
         Ok(value)
     }
 
+    /// The namespace that `name` resolves to through the connection's
+    /// search order, for a pragma that takes the name of a table, view or
+    /// index. The inner statement runs without the search path, as every
+    /// engine statement does, so the name is qualified for it. None when no
+    /// namespace of the search order has the object, which leaves the
+    /// pragma its own default.
+    fn namespace_of_object(&self, name: &str) -> Option<String> {
+        let names_an_index = match self.pragma_name.as_str() {
+            "index_info" | "index_xinfo" => true,
+            "table_info" | "table_xinfo" | "index_list" | "foreign_key_list" => false,
+            _ => return None,
+        };
+        let name = normalize_ident(name);
+        let has_object = |namespace: &crate::Namespace| {
+            let id = namespace.target.id;
+            self.conn.with_schema(namespace.database_id(), |schema| {
+                if names_an_index {
+                    schema
+                        .indexes(id)
+                        .any(|index| index.name.eq_ignore_ascii_case(&name))
+                } else {
+                    schema.get_table(id, &name).is_some()
+                        || schema.get_view(id, &name).is_some()
+                        || schema.get_materialized_view(id, &name).is_some()
+                }
+            })
+        };
+        // Temp comes before the search order, as it does for every name.
+        let temp = self
+            .conn
+            .namespace("temp")
+            .filter(|namespace| self.conn.has_temp_database() && has_object(namespace));
+        temp.or_else(|| self.conn.search_order().into_iter().find(has_object))
+            .map(|namespace| namespace.name)
+    }
+
     pub(crate) fn filter(&mut self, args: crate::alloc::Vec<Value>) -> crate::Result<bool> {
         if args.len() > self.max_arg_count {
             return Err(LimboError::ParseError(format!(
@@ -462,9 +498,14 @@ impl PragmaVirtualTableCursor {
             )));
         }
 
+        let qualifier = match (&schema, &self.arg) {
+            (Some(schema), _) => Some(schema.clone()),
+            (None, Some(arg)) => self.namespace_of_object(arg),
+            (None, None) => None,
+        };
         let mut sql = String::from("PRAGMA ");
-        if let Some(schema) = &schema {
-            sql.push_str(&quote_identifier(schema));
+        if let Some(qualifier) = &qualifier {
+            sql.push_str(&quote_identifier(qualifier));
             sql.push('.');
         }
         sql.push_str(&self.pragma_name);
