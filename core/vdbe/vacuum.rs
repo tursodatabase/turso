@@ -612,26 +612,6 @@ pub(crate) fn vacuum_target_build_step(
                     })?;
                 }
 
-                // The rows of the namespaces table are copied with the data,
-                // but the tables of a namespace are copied by the namespace's
-                // name, so the target needs the names before that.
-                let namespaces: Vec<(NamespaceId, String)> =
-                    config
-                        .source_conn
-                        .with_schema(config.source_db_id, |schema| {
-                            schema
-                                .namespaces()
-                                .map(|(id, name)| (id, name.to_string()))
-                                .collect()
-                        });
-                if !namespaces.is_empty() {
-                    state.target_conn.with_schema_mut(|target_schema| {
-                        for (id, name) in &namespaces {
-                            target_schema.name_namespace(*id, name);
-                        }
-                    })?;
-                }
-
                 // Auto-vacuum must be installed before MVCC bootstrap creates
                 // internal tables, otherwise full auto-vacuum can reserve page
                 // 2 as a ptrmap page after MVCC has already used it as a root.
@@ -752,6 +732,27 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::PrepareCreateTable { idx } => {
                 let entries_len = state.tables_to_create.len();
                 if idx >= entries_len {
+                    // The rows of the namespaces table are copied with the
+                    // data, but the tables of a namespace are copied by the
+                    // namespace's name, so the target needs the names first.
+                    // Naming them any earlier would not last: switching the
+                    // target to MVCC reloads its schema.
+                    let namespaces: Vec<(NamespaceId, String)> =
+                        config
+                            .source_conn
+                            .with_schema(config.source_db_id, |schema| {
+                                schema
+                                    .namespaces()
+                                    .map(|(id, name)| (id, name.to_string()))
+                                    .collect()
+                            });
+                    if !namespaces.is_empty() {
+                        state.target_conn.with_schema_mut(|target_schema| {
+                            for (id, name) in &namespaces {
+                                target_schema.name_namespace(*id, name);
+                            }
+                        })?;
+                    }
                     // Done creating tables, start copying data
                     state.phase = VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 };
                     continue;

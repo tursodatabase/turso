@@ -229,6 +229,31 @@ fn objects_of_a_namespace_survive_reopening_and_renaming(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn vacuum_into_keeps_the_ids_of_namespaces(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.create_namespace("app").unwrap();
+    let shop = conn.create_namespace("shop").unwrap();
+    assert_eq!(shop.target.id, NamespaceId::new(3));
+    conn.execute("CREATE TABLE shop.t(x INTEGER); INSERT INTO shop.t VALUES(7)")
+        .unwrap();
+    conn.drop_namespace("app").unwrap();
+    let copy = db.path.with_file_name(format!(
+        "{}-copy.db",
+        db.path.file_stem().unwrap().to_str().unwrap()
+    ));
+    conn.execute(format!("VACUUM INTO '{}'", copy.display()))
+        .unwrap();
+
+    let copied_db = reopen(&copy);
+    let copied = copied_db.connect_limbo();
+    assert_eq!(
+        copied.qualifier("shop"),
+        Some(Qualifier::in_main("shop", NamespaceId::new(3)))
+    );
+    assert_eq!(query_i64(&copied, "SELECT x FROM shop.t"), 7);
+}
+
+#[turso_macros::test]
 fn pragma_table_info_finds_a_view_of_a_namespace_through_the_search_path(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.create_namespace("app").unwrap();
