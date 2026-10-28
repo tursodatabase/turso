@@ -7,12 +7,20 @@
 //! current role.
 //!
 //! Ownership and `GRANT` do not exist yet, so a role that is not a superuser
-//! may not write to any table, use a sequence or change the schema. It may
-//! read tables, which row-level security limits, and switch roles.
+//! has no privileges on any database object. It may still run statements that
+//! touch no database object, such as `SELECT 1`, switch roles, and read the
+//! catalog: the schema table, the types table and the role table.
+//!
+//! Only statements from the user are checked. Statements that the engine
+//! prepares for itself run SQL that the engine wrote, such as reads of
+//! sequence state or table statistics to load the schema. The one such
+//! statement whose rows reach the user, the PRAGMA that a PRAGMA table
+//! function runs, is checked when the function is compiled.
 
 use crate::namespace::NamespaceId;
 use turso_parser::ast;
 
+use crate::schema::{Schema, SEQ_BACKING_TABLE_PREFIX};
 use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::security::roles::{
     CREATE_ROLES_NAME_INDEX_SQL, CREATE_ROLES_TABLE_SQL, ROLES_NAME_INDEX_NAME, ROLES_TABLE_NAME,
@@ -174,8 +182,82 @@ fn database_denial(action: Action) -> PermissionDenied {
     PermissionDenied::privilege(action, Object::Database(MAIN_SCHEMA_NAME.to_string()))
 }
 
+/// Fails if the compiled program reads or writes a database object that the
+/// current role has no privileges on. Every access to stored data goes
+/// through one of the instructions checked here, so a statement cannot reach
+/// an object without being checked.
+pub fn check_storage_access(program: &ProgramBuilder, resolver: &Resolver) -> Result<()> {
+    if !resolver.role_is_not_superuser {
+        return Ok(());
+    }
+    for (insn, _) in &program.insns {
+        let (action, db, root_page) = match insn {
+            Insn::OpenRead { db, root_page, .. } => (Action::Read, *db, Some(*root_page)),
+            Insn::OpenWrite {
+                db,
+                root_page: RegisterOrLiteral::Literal(root_page),
+                ..
+            } => (Action::Write, *db, Some(*root_page)),
+            Insn::OpenWrite { db, .. } => (Action::Write, *db, None),
+            Insn::ClearBtree { db, root, .. } | Insn::Destroy { db, root, .. } => {
+                (Action::Write, *db, Some(*root))
+            }
+            Insn::CreateBtree { db, .. } => (Action::Write, *db, None),
+            _ => continue,
+        };
+        let object = root_page
+            .and_then(|root_page| {
+                resolver.with_schema(db, |schema| object_with_root_page(schema, root_page))
+            })
+            .unwrap_or(Object::Storage);
+        if action == Action::Read && is_catalog_table(&object) {
+            continue;
+        }
+        return Err(permission_denied(PermissionDenied::privilege(
+            action, object,
+        )));
+    }
+    Ok(())
+}
+
 fn permission_denied(denial: PermissionDenied) -> LimboError {
     LimboError::PermissionDenied(Box::new(denial))
+}
+
+/// Returns the object stored at `root_page`. An index is reported as the
+/// table it belongs to.
+fn object_with_root_page(schema: &Schema, root_page: i64) -> Option<Object> {
+    let (namespace, table_name) = schema.namespace_ids().find_map(|namespace| {
+        schema.tables(namespace).find_map(|table| {
+            let btree = table.btree()?;
+            let has_root_page = btree.root_page == root_page
+                || schema
+                    .get_indices(namespace, &btree.name)
+                    .any(|index| index.root_page == root_page);
+            has_root_page.then(|| (namespace, btree.name.clone()))
+        })
+    })?;
+    if let Some(sequence_name) = table_name.strip_prefix(SEQ_BACKING_TABLE_PREFIX) {
+        let (_, sequence_name) = schema.demangle_name(sequence_name);
+        return Some(Object::Sequence(sequence_name.to_string()));
+    }
+    if schema.is_materialized_view(namespace, &table_name) {
+        return Some(Object::MaterializedView(table_name));
+    }
+    Some(Object::Table(table_name))
+}
+
+fn is_catalog_table(object: &Object) -> bool {
+    matches!(
+        object,
+        Object::Table(name)
+            if [
+                crate::schema::SCHEMA_TABLE_NAME,
+                crate::schema::TURSO_TYPES_TABLE_NAME,
+                ROLES_TABLE_NAME,
+            ]
+            .contains(&name.as_str())
+    )
 }
 
 /// Creates a role that is not a superuser and cannot log in.

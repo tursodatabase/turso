@@ -186,6 +186,8 @@ pub fn translate(
 
     program.epilogue(schema);
 
+    roles::check_storage_access(&program, &resolver)?;
+
     program.build(connection, change_cnt_on, input)
 }
 

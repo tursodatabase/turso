@@ -429,6 +429,17 @@ expect error {
     permission denied for schema public
 }
 
+test role-without-privileges-cannot-read-rows {
+    CREATE TABLE rw_read (x int);
+    INSERT INTO rw_read VALUES (1);
+    CREATE ROLE rw_reader;
+    SET ROLE rw_reader;
+    SELECT x FROM rw_read;
+}
+expect error {
+    permission denied for table rw_read
+}
+
 test role-without-privileges-cannot-insert-rows {
     CREATE TABLE rw_insert (x int);
     INSERT INTO rw_insert VALUES (1);

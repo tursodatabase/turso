@@ -489,3 +489,54 @@ fn role_names(conn: &PgConnection) -> Vec<String> {
         .map(|row| row[0].to_string())
         .collect()
 }
+
+#[test]
+fn role_without_privileges_can_read_the_catalog() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    let mut stmt = conn
+        .inner()
+        .prepare("SELECT count(*) FROM sqlite_schema WHERE type = 'table'")
+        .unwrap();
+
+    assert_ne!(stmt.run_collect_rows().unwrap()[0][0].to_string(), "0");
+}
+
+#[test]
+fn role_without_privileges_can_read_the_schema_again() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    conn.inner().force_reparse_schema().unwrap();
+
+    assert!(conn.inner().role_catalog().get_by_name("alice").is_some());
+}
+
+#[test]
+fn open_pragma_cursor_does_not_skip_privilege_checks() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    let mut pragma = conn
+        .inner()
+        .prepare("SELECT * FROM pragma_table_info('t')")
+        .unwrap();
+    assert!(matches!(
+        pragma.step().unwrap(),
+        turso_core::StepResult::Row
+    ));
+    conn.execute("SET ROLE alice").unwrap();
+
+    let error = conn.execute("SELECT * FROM t").unwrap_err();
+
+    assert_eq!(error.to_string(), "permission denied for table t");
+}
