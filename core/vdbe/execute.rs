@@ -7763,7 +7763,7 @@ fn update_agg_payload(
             let Value::Blob(separator_lengths) = separator_lengths_slot else {
                 unreachable!("GroupConcat separator queue is Blob");
             };
-            let first_term = matches!(acc, Value::Null);
+            let first_term = *count == 0;
             if first_term {
                 // Start an empty Text accumulator; append below without an
                 // intermediate String for Text inputs.
@@ -9287,9 +9287,15 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
                     "GroupConcat xInverse removes {remove_len} bytes from {accumulated_len}"
                 )));
             }
-            if remove_len >= accumulated_len {
+            if *count == 0 {
+                // No values remain, so the empty string cannot be told apart
+                // from "nothing accumulated" unless the accumulator is Null.
                 *acc = Value::Null;
                 separator_lengths.clear();
+            } else if remove_len >= accumulated_len {
+                // Empty values can still remain; keep the accumulator as Text
+                // so the next step appends a separator before its value.
+                text.value.to_mut().clear();
             } else {
                 text.value.to_mut().drain(..remove_len);
             }
