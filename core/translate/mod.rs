@@ -124,12 +124,13 @@ pub fn translate(
     } else {
         connection.search_path()
     };
+    let qualifiers = connection.qualifiers(schema);
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
-        connection.namespaces(),
+        &qualifiers,
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
@@ -205,6 +206,8 @@ pub fn translate_inner(
             | ast::Stmt::Insert { .. }
             | ast::Stmt::CreateSequence { .. }
             | ast::Stmt::DropSequence { .. }
+            | ast::Stmt::CreateSchema { .. }
+            | ast::Stmt::DropSchema { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -521,6 +524,12 @@ pub fn translate_inner(
         } => {
             sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
         }
+        ast::Stmt::CreateSchema { name, id } => {
+            schema::translate_create_schema(&name, id, resolver, program)?;
+        }
+        ast::Stmt::DropSchema { name } => {
+            schema::translate_drop_schema(&name, resolver, program)?;
+        }
     };
 
     if is_write {
@@ -597,6 +606,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::Optimize { .. } => "optimize",
         ast::Stmt::CreateSequence { .. } => "create_sequence",
         ast::Stmt::DropSequence { .. } => "drop_sequence",
+        ast::Stmt::CreateSchema { .. } => "create_schema",
+        ast::Stmt::DropSchema { .. } => "drop_schema",
     }
 }
 

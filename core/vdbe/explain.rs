@@ -1979,6 +1979,15 @@ pub fn insn_to_row(
                 0,
                 format!("DROP SEQUENCE {seq_name}"),
             ),
+            Insn::DropNamespace { db, namespace } => (
+                "DropNamespace",
+                *db as i64,
+                i64::from(namespace.as_u32()),
+                0,
+                Value::Null,
+                0,
+                format!("DROP SCHEMA id={}", namespace.as_u32()),
+            ),
             Insn::SequenceComputeNext {
                 db,
                 namespace: _,

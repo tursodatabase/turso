@@ -11953,6 +11953,10 @@ pub fn op_function(
                         let Value::Text(sql) = sql else {
                             break 'sql None;
                         };
+                        // A namespace's row names no table or column.
+                        if entry_type.as_str() == "schema" {
+                            break 'sql None;
+                        }
 
                         let cmd = parse_schema_sql_for_alter(
                             program.connection.dialect().as_ref(),
@@ -12251,6 +12255,10 @@ pub fn op_function(
                         let Value::Text(sql) = sql else {
                             break 'sql None;
                         };
+                        // A namespace's row names no table or column.
+                        if entry_type.as_str() == "schema" {
+                            break 'sql None;
+                        }
 
                         let cmd = parse_schema_sql_for_alter(
                             program.connection.dialect().as_ref(),
@@ -15226,6 +15234,21 @@ pub fn op_drop_sequence(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_drop_namespace(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(DropNamespace { db, namespace }, insn);
+    let conn = program.connection.clone();
+    conn.with_database_schema_mut(*db, |schema| {
+        schema.unname_namespace(*namespace);
+    })?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_add_type(
     program: &Program,
     state: &mut ProgramState,
@@ -16053,7 +16076,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 let schema = Schema::try_make_mut(&mut inner.schema_arc)?;
                 let syms = conn.syms.read();
                 let attached_resolver = |alias: &str| -> Option<usize> {
-                    conn.namespaces()
+                    conn.current_qualifiers()
                         .database_id(&crate::util::normalize_ident(alias))
                 };
                 schema.handle_schema_row(

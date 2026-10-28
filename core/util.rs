@@ -1767,7 +1767,9 @@ where
         | ast::Stmt::Savepoint { .. }
         | ast::Stmt::Optimize { .. }
         | ast::Stmt::CreateSequence { .. }
-        | ast::Stmt::DropSequence { .. } => {}
+        | ast::Stmt::DropSequence { .. }
+        | ast::Stmt::CreateSchema { .. }
+        | ast::Stmt::DropSchema { .. } => {}
     }
     Ok(())
 }
@@ -4388,7 +4390,7 @@ pub mod tests {
     fn schema_with_a_table_t_in_two_namespaces() -> (Schema, NamespaceId) {
         let mut schema = schema_with_table("CREATE TABLE t (a)");
         let other = NamespaceId::new(1);
-        schema.add_namespace(other);
+        schema.add_namespace(other, "other");
         let table = BTreeTable::from_sql("CREATE TABLE t (b, c)", 3)
             .expect("test CREATE TABLE should parse");
         schema

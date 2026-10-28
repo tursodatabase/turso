@@ -786,11 +786,18 @@ pub struct Schema {
 
     /// Custom type registry, loaded from sqlite_turso_types
     pub type_registry: HashMap<String, Arc<TypeDef>>,
+
+    /// Whether the database supports namespaces, as the dialect of the
+    /// database says, so that the loader reads its `schema` rows.
+    supports_namespaces: bool,
 }
 
 /// The objects of one namespace, by name.
 #[derive(Debug, Default)]
 pub struct NamespaceSchema {
+    /// The name of a namespace. The root namespace has none: it is
+    /// named by its database.
+    name: Option<String>,
     tables: HashMap<String, Arc<Table>>,
 
     /// Track which tables are actually materialized views
@@ -827,6 +834,20 @@ pub struct NamespaceSchema {
 
     /// Named sequences (CREATE SEQUENCE)
     sequences: HashMap<String, Arc<Sequence>>,
+}
+
+impl NamespaceSchema {
+    /// Whether any object is stored under the namespace.
+    fn has_objects(&self) -> bool {
+        !self.tables.is_empty()
+            || !self.views.is_empty()
+            || !self.materialized_view_names.is_empty()
+            || !self.triggers.is_empty()
+            || !self.indexes.is_empty()
+            || !self.sequences.is_empty()
+            || !self.incompatible_views.is_empty()
+            || !self.broken_views.is_empty()
+    }
 }
 
 impl Default for Schema {
@@ -950,6 +971,7 @@ impl Schema {
             analyze_stats: AnalyzeStats::default(),
             dropped_root_pages: HashSet::default(),
             type_registry,
+            supports_namespaces: dialect.supports_namespaces(),
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -964,19 +986,72 @@ impl Schema {
         self.namespaces.contains_key(&id)
     }
 
-    /// Adds the empty namespace `id`, which must not be the root and must not
-    /// exist yet.
-    pub fn add_namespace(&mut self, id: NamespaceId) {
+    /// Adds the empty namespace `id` called `name`, which must not be
+    /// the root and must not exist yet.
+    pub fn add_namespace(&mut self, id: NamespaceId, name: &str) {
         turso_assert!(!id.is_root(), "the root namespace always exists");
-        let previous = self.namespaces.insert(id, NamespaceSchema::default());
+        let previous = self.namespaces.insert(
+            id,
+            NamespaceSchema {
+                name: Some(name.to_string()),
+                ..NamespaceSchema::default()
+            },
+        );
         turso_assert!(previous.is_none(), "namespace already exists", { "id": id.as_u32() });
     }
 
-    /// Removes namespace `id` with all its objects. The root cannot be
-    /// removed.
     pub fn remove_namespace(&mut self, id: NamespaceId) -> bool {
         turso_assert!(!id.is_root(), "the root namespace always exists");
         self.namespaces.remove(&id).is_some()
+    }
+
+    /// The namespaces of the schema, with their names: the ones
+    /// whose `schema` row the schema has.
+    pub fn namespaces(&self) -> impl Iterator<Item = (NamespaceId, &str)> {
+        self.namespaces
+            .iter()
+            .filter_map(|(id, objects)| Some((*id, objects.name.as_deref()?)))
+    }
+
+    /// The name of namespace `id`. None for the root and for a
+    /// namespace that has objects but no `schema` row.
+    pub fn namespace_name(&self, id: NamespaceId) -> Option<&str> {
+        self.namespaces.get(&id)?.name.as_deref()
+    }
+
+    /// The id of the namespace called `name`.
+    pub fn namespace_named(&self, name: &str) -> Option<NamespaceId> {
+        self.namespaces()
+            .find(|(_, namespace_name)| *namespace_name == name)
+            .map(|(id, _)| id)
+    }
+
+    /// The id for the next namespace: one more than the largest id
+    /// that a namespace or any object stored under a namespace has,
+    /// so that an id whose objects are still stored is not given out again.
+    pub fn next_namespace_id(&self) -> NamespaceId {
+        let largest = self
+            .namespaces
+            .iter()
+            .filter(|(_, objects)| objects.name.is_some() || objects.has_objects())
+            .map(|(id, _)| id.as_u32())
+            .max()
+            .unwrap_or(0);
+        NamespaceId::new(largest + 1)
+    }
+
+    /// Records that the namespace `id` is called `name`, as its
+    /// `schema` row says.
+    fn name_namespace(&mut self, id: NamespaceId, name: &str) {
+        self.namespaces.entry(id).or_default().name = Some(name.to_string());
+    }
+
+    /// Forgets the name of namespace `id` when its `schema` row is
+    /// deleted. Its objects, if any are left, stay until they are removed.
+    pub(crate) fn unname_namespace(&mut self, id: NamespaceId) {
+        if let Some(objects) = self.namespaces.get_mut(&id) {
+            objects.name = None;
+        }
     }
 
     pub fn tables(&self, namespace: NamespaceId) -> impl Iterator<Item = &Arc<Table>> {
@@ -3313,6 +3388,20 @@ impl Schema {
                     tbl_name.name.as_str(),
                 )?;
             }
+            "schema" => {
+                if !self.supports_namespaces {
+                    return Ok(());
+                }
+                let id = u32::try_from(root_page)
+                    .ok()
+                    .filter(|id| *id != 0)
+                    .ok_or_else(|| {
+                        LimboError::Corrupt(format!(
+                            "sqlite_schema row of schema '{name}' has no namespace id: rootpage={root_page}"
+                        ))
+                    })?;
+                self.name_namespace(NamespaceId::new(id), name);
+            }
             // Types are stored in sqlite_turso_types, not sqlite_schema
             _ => {}
         };
@@ -3818,6 +3907,7 @@ impl TryClone for Schema {
             analyze_stats: self.analyze_stats.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
+            supports_namespaces: self.supports_namespaces,
         })
     }
 }
@@ -3875,6 +3965,7 @@ impl TryClone for NamespaceSchema {
         let incompatible_materialized_view_roots =
             self.incompatible_materialized_view_roots.try_clone()?;
         Ok(Self {
+            name: self.name.clone(),
             tables,
             materialized_view_names,
             materialized_view_sql,
@@ -7523,7 +7614,7 @@ mod tests {
     fn a_namespace_holds_only_its_own_objects() {
         let mut schema = Schema::new();
         let other = NamespaceId::new(1);
-        schema.add_namespace(other);
+        schema.add_namespace(other, "other");
         schema
             .add_btree_table(NamespaceId::ROOT, table("CREATE TABLE t (x)", 2))
             .unwrap();
@@ -7550,7 +7641,7 @@ mod tests {
     fn removing_a_namespace_removes_its_objects() {
         let mut schema = Schema::new();
         let other = NamespaceId::new(7);
-        schema.add_namespace(other);
+        schema.add_namespace(other, "other");
         schema
             .add_btree_table(other, table("CREATE TABLE t (x)", 3))
             .unwrap();
@@ -7566,7 +7657,7 @@ mod tests {
     fn a_cloned_schema_keeps_every_namespace() {
         let mut schema = Schema::new();
         let other = NamespaceId::new(2);
-        schema.add_namespace(other);
+        schema.add_namespace(other, "other");
         schema
             .add_btree_table(other, table("CREATE TABLE t (x)", 3))
             .unwrap();
@@ -7578,7 +7669,7 @@ mod tests {
     fn a_foreign_key_finds_its_parent_in_the_parent_namespace() {
         let mut schema = Schema::new();
         let other = NamespaceId::new(1);
-        schema.add_namespace(other);
+        schema.add_namespace(other, "other");
         schema
             .add_btree_table(
                 NamespaceId::ROOT,
@@ -7615,7 +7706,7 @@ mod tests {
     fn schema_wide_scans_see_every_namespace() {
         let mut schema = Schema::new();
         let other = NamespaceId::new(1);
-        schema.add_namespace(other);
+        schema.add_namespace(other, "other");
         schema
             .add_btree_table(other, table("CREATE TABLE t (x UNIQUE)", 3))
             .unwrap();
@@ -7650,7 +7741,7 @@ mod tests {
     fn tables_of_the_same_name_in_two_namespaces_keep_their_own_statistics() {
         let mut schema = Schema::new();
         let other = NamespaceId::new(1);
-        schema.add_namespace(other);
+        schema.add_namespace(other, "other");
         schema
             .add_btree_table(NamespaceId::ROOT, table("CREATE TABLE t (x)", 2))
             .unwrap();
