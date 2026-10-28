@@ -23,6 +23,24 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test op-window-range-offset-needs-matching-plus {
+    -- A RANGE offset is added with the type's own `+`. This type only adds
+    -- two test_uint values, so an integer offset has no operator.
+    CREATE TYPE test_uint(value any) BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value)
+        OPERATOR '+' test_uint_add
+        OPERATOR '<' test_uint_lt
+        OPERATOR '=' test_uint_eq;
+    CREATE TABLE t1(a test_uint) STRICT;
+    INSERT INTO t1 VALUES (1), (2), (5);
+    SELECT a, count(*) OVER (ORDER BY a RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t1;
+}
+expect error {
+    operator does not exist: test_uint \+ integer
+}
+
+@requires strict "uses STRICT tables"
 test op-same-type-where-eq {
     -- WHERE with = between two custom type columns.
     CREATE TYPE test_uint(value any) BASE text

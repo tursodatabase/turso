@@ -20,7 +20,6 @@ use crate::translate::plan::{
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::result_row::emit_select_result;
 use crate::translate::subquery::plan_subqueries_from_select_plan;
-use crate::type_ordering::TypeOrdering;
 use crate::types::KeyInfo;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -2556,18 +2555,12 @@ fn emit_window_range_test(
         (op, false)
     };
     let collation = expr_collation(order_expr, Some(&plan.table_references), resolver)?;
-    // When the ORDER BY value's type has an order, its own `+` or `-` adds the
-    // offset (numeric's adds exactly). None means SQLite's operator runs. Of
-    // the types with an order only numeric has a distance to add, as in
-    // PostgreSQL.
+    // When the ORDER BY value's type has an order, the type's own `+` or `-`
+    // adds the offset (numeric's adds exactly). None means SQLite's operator
+    // runs. A type with an order but no such operator has no distance to
+    // add, so RANGE offsets are an error for it.
     let type_arithmetic = match collation {
-        CollationSeq::Type(ordering) if ordering != TypeOrdering::Numeric => {
-            crate::bail_parse_error!(
-                "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {}",
-                ordering.name()
-            )
-        }
-        CollationSeq::Type(_) => {
+        CollationSeq::Type(ordering) => {
             let offset_expr = frame_offset_expr(&window.frame, offset_bound);
             let operator = if subtract {
                 turso_parser::ast::Operator::Subtract
@@ -2581,14 +2574,14 @@ fn emit_window_range_test(
             );
             let env = TypeEnv::new(Some(&plan.table_references), resolver);
             let call = custom_operator_call(&arithmetic, &env)?;
-            // The numeric type has a `+` and `-` for every operand except
-            // NULL. A NULL offset is rejected before any arithmetic, so it
-            // needs no call.
-            turso_assert!(
-                call.is_some() || matches!(type_of(offset_expr, &env), ExprType::Null),
-                "a numeric RANGE offset has no numeric operator",
-                { "offset": offset_expr.to_string() }
-            );
+            // A NULL offset is rejected before any arithmetic, so it needs no
+            // call.
+            if call.is_none() && !matches!(type_of(offset_expr, &env), ExprType::Null) {
+                crate::bail_parse_error!(
+                    "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {}",
+                    ordering.name()
+                )
+            }
             call
         }
         CollationSeq::Text(_) => None,
