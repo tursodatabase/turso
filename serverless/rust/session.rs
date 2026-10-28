@@ -142,7 +142,7 @@ impl Session {
             last_insert_rowid: AtomicI64::new(0),
         });
         let session = Self {
-            client: reqwest::Client::new(),
+            client: http_client(),
             auth_token,
             remote_encryption_key,
             base_url: normalize_url(url),
@@ -459,9 +459,47 @@ impl Session {
     }
 }
 
+fn http_client() -> reqwest::Client {
+    reqwest::Client::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[cfg(all(feature = "tls-aws-lc", not(feature = "tls-ring")))]
+    async fn remote_connection_does_not_install_a_global_crypto_provider() {
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+        let database = crate::Builder::new_remote("https://db.example.invalid")
+            .build()
+            .await
+            .expect("database handle should initialize without network access");
+        let _connection = database
+            .connect()
+            .expect("connection should initialize without a global crypto provider");
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "tls-ring")]
+    async fn remote_connection_uses_the_installed_crypto_provider() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("Ring should install before creating a connection");
+        let provider = rustls::crypto::CryptoProvider::get_default().unwrap();
+        let database = crate::Builder::new_remote("https://db.example.invalid")
+            .build()
+            .await
+            .expect("database handle should initialize without network access");
+        let _connection = database
+            .connect()
+            .expect("connection should initialize with the installed crypto provider");
+        assert!(Arc::ptr_eq(
+            provider,
+            rustls::crypto::CryptoProvider::get_default().unwrap()
+        ));
+    }
 
     #[test]
     fn normalize_url_rewrites_schemes() {
