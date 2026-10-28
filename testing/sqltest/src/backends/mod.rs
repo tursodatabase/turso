@@ -1,7 +1,9 @@
 pub mod cli;
 pub mod js;
-pub mod pg;
+pub mod pg_connection;
+pub mod postgres;
 pub mod rust;
+pub mod tursopg;
 
 use crate::parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
@@ -31,12 +33,18 @@ pub struct QueryResult {
     pub rows: Vec<Vec<String>>,
     /// Error message if the query failed
     pub error: Option<String>,
+    /// SQLSTATE of the error, from backends that speak the PostgreSQL wire protocol
+    pub sqlstate: Option<String>,
 }
 
 impl QueryResult {
     /// Create a successful result with rows
     pub fn success(rows: Vec<Vec<String>>) -> Self {
-        Self { rows, error: None }
+        Self {
+            rows,
+            error: None,
+            sqlstate: None,
+        }
     }
 
     /// Create an error result
@@ -44,6 +52,16 @@ impl QueryResult {
         Self {
             rows: Vec::new(),
             error: Some(message.into()),
+            sqlstate: None,
+        }
+    }
+
+    /// Create an error result with the SQLSTATE that the server sent.
+    /// `None` means that the server did not send one.
+    pub fn error_with_sqlstate(message: impl Into<String>, sqlstate: Option<String>) -> Self {
+        Self {
+            sqlstate,
+            ..Self::error(message)
         }
     }
 
@@ -125,6 +143,18 @@ pub trait SqlBackend: Send + Sync {
         false
     }
 
+    /// Whether the errors of this backend have a SQLSTATE. The runner rejects
+    /// a test with `@sqlstate` on a backend whose errors have none.
+    fn reports_sqlstate(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend can compare typed materialized-view results with
+    /// their defining SELECT after each statement.
+    fn supports_materialized_view_verification(&self) -> bool {
+        false
+    }
+
     /// Create a new isolated database instance
     async fn create_database(
         &self,
@@ -153,6 +183,17 @@ pub trait DatabaseInstance: Send + Sync {
     /// Execute SQL and return results
     /// For in-memory databases, this will combine any buffered setup SQL with the query.
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, BackendError>;
+
+    /// Execute SQL while checking every live materialized view after each
+    /// successful statement. Only called when the backend advertises support.
+    async fn execute_with_materialized_view_verification(
+        &mut self,
+        _sql: &str,
+    ) -> Result<QueryResult, BackendError> {
+        Err(BackendError::NotAvailable(
+            "typed materialized-view verification is not implemented by this backend".to_string(),
+        ))
+    }
 
     /// Close and cleanup the database, returning a handle that keeps the file alive
     async fn close(self: Box<Self>) -> Result<DatabaseFileHandle, BackendError>;

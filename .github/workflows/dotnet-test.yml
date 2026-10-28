@@ -41,6 +41,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
 
       - name: Install dotnet sdk 9.0

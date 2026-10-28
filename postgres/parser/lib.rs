@@ -1,12 +1,25 @@
-use pg_query::ParseResult;
+pub mod copy;
+pub use pg_query::ParseResult;
 use thiserror::Error;
 
+pub mod sqlstate;
 pub mod translator;
 
 #[derive(Debug, Error)]
 pub enum ParseError {
     #[error("{0}")]
     ParseError(String),
+    /// An error that PostgreSQL reports with this SQLSTATE.
+    #[error("{message}")]
+    Sqlstate {
+        sqlstate: &'static str,
+        message: String,
+    },
+    /// A schema-qualified name of an object that the translator accepts only
+    /// without a schema. If the schema does not exist, PostgreSQL reports the
+    /// missing schema. Only a caller with a connection can find that out.
+    #[error("a schema-qualified {kind} name is not supported")]
+    SchemaQualifiedName { kind: String, schema: String },
 }
 
 /// Parse a PostgreSQL SQL statement using pg_query
@@ -61,6 +74,22 @@ pub fn quote_identifier(ident: &str) -> String {
         return ident.to_string();
     }
     format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// `sql` with `schema` in front of the table name that starts at byte
+/// offset `location`.
+pub fn qualify_create_table_name(sql: &str, location: usize, schema: &str) -> String {
+    let mut sql = sql.to_string();
+    sql.insert_str(location, &format!("{}.", quote_identifier(schema)));
+    sql
+}
+
+/// `sql` with the index name `name` before the `ON` keyword of a CREATE
+/// INDEX statement, which starts at byte offset `location`.
+pub fn name_create_index(sql: &str, location: usize, name: &str) -> String {
+    let mut sql = sql.to_string();
+    sql.insert_str(location, &format!("{} ", quote_identifier(name)));
+    sql
 }
 
 /// pg_query's scanner is the same lexer the PostgreSQL server uses, so its

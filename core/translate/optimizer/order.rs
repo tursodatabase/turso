@@ -1055,6 +1055,7 @@ fn index_columns_order_consumed<'a>(
             break;
         }
         if !order_target.is_extremum()
+            && target_can_be_null(target_col, table_ref)
             && target_col.effective_nulls_order() != idx_col.nulls_order(iter_dir)
         {
             break;
@@ -1086,5 +1087,13 @@ fn index_columns_order_consumed<'a>(
     OrderConsumption {
         consumed: col_idx,
         includes_rowid,
+    }
+}
+
+fn target_can_be_null(target_col: &ColumnOrder, table_ref: &JoinedTable) -> bool {
+    match target_col.target {
+        ColumnTarget::RowId => false,
+        ColumnTarget::Column(col_no) => !table_ref.table.columns()[col_no].notnull(),
+        ColumnTarget::Expr(_) => true,
     }
 }

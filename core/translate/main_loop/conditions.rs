@@ -46,6 +46,7 @@ fn emit_correlated_subqueries(
                     join_order,
                     subqueries,
                     Some(table_references),
+                    resolver,
                 )
             }) {
                 subqueries_to_emit.push(subquery_index);
@@ -65,14 +66,14 @@ fn emit_correlated_subqueries(
     for subquery_index in subqueries_to_emit {
         let subquery = &mut subqueries[subquery_index];
         let subquery_plan = subquery.consume_plan(EvalAt::Loop(join_index));
-        emit_non_from_clause_subquery(
+        let subroutine = emit_non_from_clause_subquery(
             program,
             resolver,
             *subquery_plan,
             &subquery.query_type,
             true,
-            false,
         )?;
+        subquery.set_subroutine(subroutine);
     }
     Ok(())
 }
@@ -111,7 +112,13 @@ fn emit_conditions(
         .map(|(_, cond)| cond)
         .filter(|cond| cond.origin.is_outer_join() == from_outer_join)
         .filter(|cond| {
-            cond.should_eval_at_loop(join_index, join_order, subqueries, Some(table_references))
+            cond.should_eval_at_loop(
+                join_index,
+                join_order,
+                subqueries,
+                Some(table_references),
+                &t_ctx.resolver,
+            )
         })
         .filter(|cond| match subquery_ref_filter {
             SubqueryRefFilter::WithoutSubqueryRefs => {
@@ -190,7 +197,7 @@ fn emit_index_method_predicate(
     program.emit_insn(Insn::OpenRead {
         cursor_id,
         root_page: query.index.root_page,
-        db: table.database_id,
+        db: table.namespace.database_id,
     });
     program.preassign_label_to_next_insn(opened);
 
@@ -221,7 +228,7 @@ fn emit_index_method_predicate(
         )?;
     }
     program.emit_insn(Insn::IndexMethodQuery {
-        db: table.database_id,
+        db: table.namespace.database_id,
         cursor_id,
         start_reg,
         count_reg: query.arguments.len() + 1,

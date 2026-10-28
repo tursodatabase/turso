@@ -47,3 +47,18 @@ test limit-non-integer-datatype-mismatch {
 expect error {
     datatype mismatch
 }
+
+test aggregate-limit-zero-skips-output {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1),(2);
+    SELECT sum(a) FROM t LIMIT 0;
+    SELECT sum(a) FROM t LIMIT (SELECT 0);
+    SELECT EXISTS(SELECT sum(a) FROM t LIMIT 0);
+    CREATE TABLE dst(value INTEGER);
+    INSERT INTO dst SELECT sum(a) FROM t LIMIT 0;
+    SELECT count(*) FROM dst;
+}
+expect {
+    0
+    0
+}

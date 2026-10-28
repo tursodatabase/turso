@@ -1232,6 +1232,7 @@ mod tests {
     };
     use crate::alloc::TursoIteratorExt;
     use crate::alloc::TursoSliceExt;
+    use crate::namespace::NamespaceRef;
     use crate::{
         schema::{
             BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn,
@@ -1315,12 +1316,13 @@ mod tests {
             unmatched_right_rows_plan: None,
             table,
             identifier: name,
+            has_alias: false,
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
             indexed: None,
         }
@@ -1385,6 +1387,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -1394,6 +1397,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -1418,6 +1422,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             })]),
         );
 
@@ -1562,6 +1567,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             })]),
         );
 
@@ -1647,6 +1653,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -1670,6 +1677,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             })]),
         );
 
@@ -1826,6 +1834,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -1851,6 +1860,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             })]),
         );
 

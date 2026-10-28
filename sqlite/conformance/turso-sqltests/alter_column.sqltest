@@ -887,3 +887,37 @@ expect {
     text
     ok
 }
+
+@requires strict "uses STRICT tables"
+test alter-column-strict-rejects-value-of-wrong-type {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    INSERT INTO t VALUES (1, 'abc');
+    ALTER TABLE t ALTER COLUMN v TO v2 INTEGER;
+}
+expect error {
+    cannot store TEXT value in INTEGER column t.v2
+}
+
+@requires strict "uses STRICT tables"
+@cross-check-integrity
+test alter-column-strict-converts-value-to-new-type {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    INSERT INTO t VALUES (1, '42'), (2, NULL);
+    ALTER TABLE t ALTER COLUMN v TO v2 INTEGER;
+    SELECT id, v2, typeof(v2) FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|42|integer
+    2||null
+    ok
+}
+
+test alter-column-adds-column-check {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);
+    ALTER TABLE t ALTER COLUMN v TO v2 INTEGER CHECK (v2 > 0);
+    INSERT INTO t VALUES (1, -1);
+}
+expect error {
+    CHECK constraint failed
+}

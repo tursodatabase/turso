@@ -192,28 +192,25 @@ pub(super) fn translate_sequence_function(
     let is_nextval = matches!(&func_ctx.func, Func::Scalar(ScalarFunc::NextVal));
 
     let seq_name_raw = extract_string_literal(&args[0])?;
-    let (database_id, normalized_name) = if let Some((schema, name)) = seq_name_raw.split_once('.')
-    {
+    let (namespace, normalized_name) = if let Some((schema, name)) = seq_name_raw.split_once('.') {
         let schema_norm = normalize_ident(schema);
-        let db_id = match schema_norm.as_str() {
-            "main" => crate::MAIN_DB_ID,
-            "temp" => crate::TEMP_DB_ID,
-            _ => resolver
-                .get_attached_database(&schema_norm)
-                .map(|(idx, _)| idx)
-                .ok_or_else(|| {
-                    LimboError::InvalidArgument(format!("no such database: {schema_norm}"))
-                })?,
-        };
-        (db_id, normalize_ident(name))
+        let namespace = resolver.namespace_named(&schema_norm).ok_or_else(|| {
+            LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist"))
+        })?;
+        (namespace, normalize_ident(name))
     } else {
-        (crate::MAIN_DB_ID, normalize_ident(&seq_name_raw))
+        let name = normalize_ident(&seq_name_raw);
+        (resolver.resolve_existing_sequence(&name)?, name)
     };
+    let database_id = namespace.database_id;
+    let runtime_args = qualify_sequence_argument(args, resolver);
+    let args = runtime_args.as_deref().unwrap_or(args);
 
     let backing_table_name =
         crate::translate::sequence::sequence_backing_table_name(&normalized_name);
-    let backing_table =
-        resolver.with_schema(database_id, |s| s.get_btree_table(&backing_table_name));
+    let backing_table = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(namespace.id, &backing_table_name)
+    });
     if backing_table.is_none() {
         crate::bail_parse_error!("sequence \"{}\" does not exist", seq_name_raw);
     }
@@ -222,7 +219,9 @@ pub(super) fn translate_sequence_function(
     // baked into the bytecode as literal Integers since they never change
     // for a given sequence object.
     let seq_arc = resolver
-        .with_schema(database_id, |s| s.get_sequence(&normalized_name).cloned())
+        .with_schema(database_id, |s| {
+            s.get_sequence(namespace.id, &normalized_name).cloned()
+        })
         .ok_or_else(|| {
             LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist"))
         })?;
@@ -236,20 +235,13 @@ pub(super) fn translate_sequence_function(
     program.begin_write_on_database(database_id, schema_cookie)?;
 
     if is_nextval {
-        // Reuse `start_reg` (the user's raw arg, possibly schema-qualified
-        // such as `'aux.my_seq'`) as the seq-name register so per-session
-        // `currval` stays keyed by the user's original spelling. The
-        // runtime handler strips the schema prefix when looking up the
-        // sequence object; the opcode's `db` field already encodes the
-        // correct database id resolved here.
         crate::translate::sequence::emit_disk_read_nextval(
             program,
             resolver,
-            database_id,
+            namespace,
             &normalized_name,
             &seq_arc,
             target_register,
-            Some(start_reg),
         )?;
     } else {
         // setval keeps its own cursor lifecycle: open the backing table,
@@ -328,11 +320,15 @@ pub(super) fn translate_sequence_function(
             cursor: cursor_id,
             key_reg: start_reg + 1,
             record_reg,
-            flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+            flag: InsertFlags::new()
+                .require_seek()
+                .skip_last_rowid()
+                .skip_all_change_counts(),
             table_name: normalized_name.clone(),
         });
         program.emit_insn(Insn::SetSequenceCurrval {
-            seq_name_reg: start_reg,
+            db: database_id,
+            seq_name: normalized_name.clone(),
             value_reg: start_reg + 1,
         });
         program.emit_insn(Insn::Close { cursor_id });
@@ -351,4 +347,29 @@ pub(super) fn translate_sequence_function(
     }
 
     Ok(target_register)
+}
+
+/// `args` of nextval, currval or setval with the sequence name in the first
+/// argument qualified with the database it resolves to. The handlers look
+/// the sequence up again by that string when the statement runs, and the
+/// currval session value is keyed by it. None when the name keeps its
+/// spelling: it has a schema, it is not a string literal, or the search
+/// order is empty.
+pub(crate) fn qualify_sequence_argument(
+    args: &[Box<ast::Expr>],
+    resolver: &Resolver,
+) -> Option<Box<[Box<ast::Expr>]>> {
+    let seq_name_raw = extract_string_literal(args.first()?).ok()?;
+    if seq_name_raw.contains('.') {
+        return None;
+    }
+    let name = normalize_ident(&seq_name_raw);
+    let namespace = resolver.find_existing_sequence(&name)?;
+    let runtime_name = resolver.runtime_sequence_name(namespace, &name);
+    let mut args = args.to_vec();
+    args[0] = Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+        "'{}'",
+        runtime_name.replace('\'', "''")
+    ))));
+    Some(args.into_boxed_slice())
 }

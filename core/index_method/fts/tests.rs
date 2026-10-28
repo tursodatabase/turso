@@ -1,14 +1,15 @@
 use super::*;
 use crate::{
+    alloc::TursoVecInExt,
     index_method::{
-        IndexMethodAttachment, IndexMethodConfiguration, IndexMethodCostContext,
+        IndexMethod, IndexMethodAttachment, IndexMethodConfiguration, IndexMethodCostContext,
         IndexMethodCostEstimate,
     },
     schema::IndexColumn,
 };
 use rustc_hash::FxHashMap;
 use std::num::NonZeroU32;
-use turso_parser::ast::{Expr, Literal, UnaryOperator, Variable};
+use turso_parser::ast::{Expr, Literal, Name, UnaryOperator, Variable};
 
 #[test]
 fn field_weights_reject_non_finite_and_non_positive_values() {
@@ -70,6 +71,29 @@ fn field_weights_accept_finite_positive_boundaries() {
     }
 }
 
+#[test]
+fn field_weights_rename_column() {
+    let rename = |weights: &str, to: &str| -> Result<String> {
+        let mut with_clause = vec![(
+            Name::exact("WEIGHTS".to_string()),
+            Box::new(Expr::Literal(Literal::String(weights.to_string()))),
+        )];
+        FtsIndexMethod.rename_column_in_with_clause(&mut with_clause, "title", to)?;
+        let Expr::Literal(Literal::String(weights)) = *with_clause.remove(0).1 else {
+            panic!("weights must stay a string literal");
+        };
+        Ok(weights)
+    };
+    assert_eq!(
+        rename("'Title=2.0, body=1.5'", "Heading").unwrap(),
+        "'Heading=2.0,body=1.5'"
+    );
+    assert_eq!(rename("'body = 1.5'", "heading").unwrap(), "'body = 1.5'");
+    for to in ["a,b", "a=b", " a", "a ", "it's"] {
+        assert!(rename("'title=2.0'", to).is_err(), "accepted {to:?}");
+    }
+}
+
 fn test_attachment() -> FtsIndexAttachment {
     FtsIndexAttachment::new(IndexMethodConfiguration {
         table_name: "docs".to_string(),
@@ -120,7 +144,7 @@ fn score_result_uses_the_fields_selected_by_the_query() {
 #[test]
 fn indexed_text_is_not_duplicated_in_tantivy_document_store() {
     let attachment = test_attachment();
-    for (_, field) in attachment.text_fields {
+    for (_, field) in attachment.indexed_fields {
         assert!(
             !attachment.schema.get_field_entry(field).is_stored(),
             "FTS projections come from the base table, so storing indexed text duplicates data"
@@ -228,11 +252,13 @@ fn snapshot_directory_reads_shared_file_bytes_without_copying() {
     use tantivy::directory::Directory;
 
     let path = std::path::Path::new("segment.term");
-    let mut bytes = DynVec::new_in(DynAllocator::default());
+    let mut bytes =
+        <DynVec<u8> as TursoVecInExt<u8, DynAllocator>>::new_in(DynAllocator::default());
     bytes.try_extend([3, 5, 7, 11, 13]).unwrap();
     let data = Arc::new(bytes);
     let files = HashMap::from_iter([(path.to_path_buf(), Arc::clone(&data))]);
-    let mut meta_json = DynVec::new_in(DynAllocator::default());
+    let mut meta_json =
+        <DynVec<u8> as TursoVecInExt<u8, DynAllocator>>::new_in(DynAllocator::default());
     meta_json.try_extend(b"metadata".iter().copied()).unwrap();
     let directory = SnapshotDirectory::new(files, meta_json);
     assert!(directory.exists(path).unwrap());
@@ -287,7 +313,7 @@ fn build_and_load_segment(
     for (rowid, text) in docs {
         let mut doc = TantivyDocument::default();
         doc.add_i64(attachment.rowid_field, *rowid);
-        doc.add_text(attachment.text_fields[0].1, *text);
+        doc.add_text(attachment.indexed_fields[0].1, *text);
         cursor_docs.push(BufferedDoc { rowid: *rowid, doc });
     }
     let mut cursor = FtsCursor::new(attachment);
@@ -382,7 +408,9 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
     let mut stray = files;
     stray.insert(
         PathBuf::from("meta.json"),
-        Arc::new(DynVec::new_in(DynAllocator::default())),
+        Arc::new(<DynVec<u8> as TursoVecInExt<u8, DynAllocator>>::new_in(
+            DynAllocator::default(),
+        )),
     );
     assert!(matches!(
         rename_segment_files(stray, &segment.id(), &minted),

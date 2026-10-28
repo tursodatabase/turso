@@ -36,7 +36,6 @@ pub struct TempDatabaseBuilder {
     db_name: Option<String>,
     opts: Option<turso_core::DatabaseOpts>,
     init_sql: Option<String>,
-    enable_mvcc: bool,
     enable_views: bool,
 }
 
@@ -121,7 +120,6 @@ impl TempDatabaseBuilder {
             db_name: None,
             opts: None,
             init_sql: None,
-            enable_mvcc: false,
             enable_views: false,
         }
     }
@@ -142,8 +140,8 @@ impl TempDatabaseBuilder {
         self
     }
 
-    pub fn with_mvcc(mut self, enable: bool) -> Self {
-        self.enable_mvcc = enable;
+    #[allow(dead_code)]
+    pub fn with_mvcc(self, _enable: bool) -> Self {
         self
     }
 
@@ -192,12 +190,6 @@ impl TempDatabaseBuilder {
         )
         .unwrap();
 
-        if self.enable_mvcc {
-            let conn = db.connect(ConnectOpts::new()).unwrap();
-            conn.pragma_update("journal_mode", "'mvcc'")
-                .expect("enable mvcc");
-        }
-
         TempDatabase {
             path: db_path,
             io,
@@ -217,6 +209,6 @@ impl TempDatabase {
     }
 
     pub fn connect_postgres(&self) -> Connection {
-        Connection::new(self.connect_limbo())
+        Connection::connect(&self.db).unwrap()
     }
 }

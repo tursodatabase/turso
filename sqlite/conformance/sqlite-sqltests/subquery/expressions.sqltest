@@ -442,6 +442,35 @@ expect {
     row|1
 }
 
+test subquery-scalar-limit-zero-not-integer {
+    SELECT (SELECT 5 LIMIT '0'), (SELECT 5 LIMIT 0.0), (SELECT 5 LIMIT 0+0), (SELECT 5 LIMIT 0.5);
+}
+expect {
+    |||5
+}
+
+test subquery-correlated-scalar-limit-offset-expression {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT o.x, (SELECT i.x FROM t i WHERE i.x >= o.x ORDER BY i.x LIMIT 1+0 OFFSET 1+0) FROM t o ORDER BY o.x;
+}
+expect {
+    1|2
+    2|3
+    3|
+}
+
+test subquery-correlated-exists-limit-expression {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT x FROM t o WHERE EXISTS (SELECT 1 FROM t i WHERE i.x = o.x LIMIT 1+0) ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+}
+
 # =============================================================================
 # Joins between subqueries
 # =============================================================================

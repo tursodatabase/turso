@@ -203,6 +203,9 @@ fn emit_loop_source<'a>(
                         for expr in agg.args.iter() {
                             let agg_reg = cur_reg;
                             cur_reg += 1;
+                            if !agg.order_by().is_empty() {
+                                continue;
+                            }
                             translate_expr(
                                 program,
                                 Some(&plan.table_references),
@@ -262,7 +265,7 @@ fn emit_loop_source<'a>(
                 let comparator = custom_type_comparator(
                     &min_max.argument,
                     &plan.table_references,
-                    t_ctx.resolver.schema(),
+                    &t_ctx.resolver,
                 );
                 program.emit_insn(Insn::AggStep {
                     data: Box::new(AggStepData {
@@ -312,13 +315,13 @@ fn emit_loop_source<'a>(
                     None
                 };
 
-                translate_aggregation_step(
+                emit_aggregate_step(
                     program,
                     &plan.table_references,
+                    agg,
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
                     reg,
                     &t_ctx.resolver,
-                    agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -573,6 +576,13 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
         let mut m = TableMask::default();
         m.set(build_table_idx)?;
         m.set(probe_table_idx)?;
+        // The unmatched scan also reloads the payload columns of the tables
+        // stored in a materialized build input.
+        if let Some(input) = t_ctx.materialized_build_inputs.get(&build_table_idx) {
+            for table_idx in input.prefix_tables.iter() {
+                m.set(table_idx)?;
+            }
+        }
         // When there's a gosub wrapping inner tables, we must also allow
         // conditions that reference outer tables (those appearing before the
         // hash join probe in the join order), since their cursors are valid
@@ -598,6 +608,23 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
         .iter()
         .position(|member| member.original_idx == probe_table_idx)
         .expect("probe table must be in join order");
+    // A correlated subquery that runs in the probe loop last ran for a matched
+    // row. Run it again so that it reads this unmatched row.
+    for subquery in plan.non_from_clause_subqueries.iter() {
+        if let SubqueryState::Evaluated {
+            evaluated_at: EvalAt::Loop(loop_index),
+            subroutine: Some(subroutine),
+            ..
+        } = &subquery.state
+        {
+            if *loop_index == probe_join_index {
+                program.emit_insn(Insn::Gosub {
+                    target_pc: subroutine.label,
+                    return_reg: subroutine.return_reg,
+                });
+            }
+        }
+    }
     // Terms the hash build already applied hold for every row in the hash
     // table, so the unmatched scan does not repeat them.
     let prefiltered_terms = super::conditions::hash_build_prefilter_where_terms(

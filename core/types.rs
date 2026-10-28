@@ -64,9 +64,28 @@ impl Display for ValueType {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TextSubtype {
-    Text,
+    Text = 0,
     #[cfg(feature = "json")]
-    Json,
+    Json = 74,
+}
+
+impl From<TextSubtype> for i64 {
+    fn from(subtype: TextSubtype) -> Self {
+        subtype as Self
+    }
+}
+
+impl TryFrom<i64> for TextSubtype {
+    type Error = i64;
+
+    fn try_from(value: i64) -> std::result::Result<Self, Self::Error> {
+        match value {
+            value if value == i64::from(Self::Text) => Ok(Self::Text),
+            #[cfg(feature = "json")]
+            value if value == i64::from(Self::Json) => Ok(Self::Json),
+            _ => Err(value),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1673,6 +1692,10 @@ mod immutable_record {
         pub fn alloc() -> Self {
             Self(crate::alloc::vec![])
         }
+
+        pub fn capacity(&self) -> usize {
+            self.0.capacity()
+        }
     }
 
     impl ImmutableRecord {
@@ -1909,6 +1932,9 @@ mod immutable_record {
 
             let header_size = Record::calc_header_size(size_header);
             let total_size = header_size + size_values;
+            if total_size > Value::MAX_BLOB_LENGTH as usize {
+                return Err(LimboError::TooBig);
+            }
             buf.try_reserve_exact(total_size)?;
             buf.resize(total_size, 0);
 
@@ -3472,10 +3498,11 @@ pub enum Cursor {
     Pseudo(Box<PseudoCursor>),
     Sorter(Box<Sorter>),
     Virtual(VirtualTableCursor),
-    MaterializedView(Box<crate::incremental::cursor::MaterializedViewCursor>),
     /// Permanently-null placeholder installed by `NullRow` on a
     /// never-opened cursor slot; all reads yield NULL.
     NullRow,
+    /// In-memory cursor over a transaction's captured materialized-view delta.
+    Delta(Box<crate::incremental::vdbe_maintenance::DeltaCursor>),
 }
 
 impl Debug for Cursor {
@@ -3487,8 +3514,8 @@ impl Debug for Cursor {
             Self::Pseudo(..) => f.debug_tuple("Pseudo").finish(),
             Self::Sorter(..) => f.debug_tuple("Sorter").finish(),
             Self::Virtual(..) => f.debug_tuple("Virtual").finish(),
-            Self::MaterializedView(..) => f.debug_tuple("MaterializedView").finish(),
             Self::NullRow => f.debug_tuple("NullRow").finish(),
+            Self::Delta(..) => f.debug_tuple("Delta").finish(),
         }
     }
 }
@@ -3515,10 +3542,18 @@ impl Cursor {
         Self::Sorter(Box::new(cursor))
     }
 
-    pub fn new_materialized_view(
-        cursor: crate::incremental::cursor::MaterializedViewCursor,
-    ) -> Self {
-        Self::MaterializedView(Box::new(cursor))
+    pub fn new_delta(cursor: crate::incremental::vdbe_maintenance::DeltaCursor) -> Self {
+        Self::Delta(Box::new(cursor))
+    }
+
+    pub fn as_delta_mut(&mut self) -> &mut crate::incremental::vdbe_maintenance::DeltaCursor {
+        match self {
+            Self::Delta(cursor) => cursor,
+            _ => {
+                mark_unlikely();
+                panic!("Cursor is not a delta cursor");
+            }
+        }
     }
 
     pub fn as_btree_mut(&mut self) -> &mut dyn CursorTrait {
@@ -3585,18 +3620,6 @@ impl Cursor {
         }
     }
 
-    pub fn as_materialized_view_mut(
-        &mut self,
-    ) -> &mut crate::incremental::cursor::MaterializedViewCursor {
-        match self {
-            Self::MaterializedView(cursor) => cursor,
-            _ => {
-                mark_unlikely();
-                panic!("Cursor is not a materialized view cursor");
-            }
-        }
-    }
-
     pub fn as_index_method_mut(&mut self) -> &mut dyn IndexMethodCursor {
         match self {
             Self::IndexMethod(cursor) => cursor.as_mut(),
@@ -3639,10 +3662,7 @@ impl Cursor {
             Self::Dyn(cursor, ..) => cursor.get_null_flag(),
             Self::Virtual(cursor) => cursor.get_null_flag(),
             Self::NullRow => true,
-            Self::IndexMethod(_)
-            | Self::Pseudo(_)
-            | Self::Sorter(_)
-            | Self::MaterializedView(_) => false,
+            Self::IndexMethod(_) | Self::Pseudo(_) | Self::Sorter(_) | Self::Delta(_) => false,
         }
     }
 }
@@ -3918,6 +3938,22 @@ mod tests {
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
     use asserting::prelude::*;
+
+    #[test]
+    fn text_subtype_integer_conversion() {
+        assert_eq!(i64::from(TextSubtype::Text), 0);
+        assert_eq!(TextSubtype::try_from(0_i64), Ok(TextSubtype::Text));
+        #[cfg(feature = "json")]
+        {
+            assert_eq!(i64::from(TextSubtype::Json), 74);
+            assert_eq!(TextSubtype::try_from(74_i64), Ok(TextSubtype::Json));
+        }
+        #[cfg(not(feature = "json"))]
+        assert_eq!(TextSubtype::try_from(74_i64), Err(74));
+        for value in [-1, 1, 73, 75, 256, i64::MAX] {
+            assert_eq!(TextSubtype::try_from(value), Err(value));
+        }
+    }
 
     #[test]
     fn is_ascii_checks_every_byte_of_every_length() {

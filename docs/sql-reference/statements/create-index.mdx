@@ -105,7 +105,7 @@ CREATE INDEX idx_active_orders ON orders (customer_id)
 SELECT * FROM orders WHERE status = 'active' AND customer_id = 42;
 ```
 
-The `WHERE` clause of a partial index can reference any column of the table and may use operators, literal values, and built-in functions. Subqueries are not allowed.
+The `WHERE` clause of a partial index can reference any column of the table and may use operators, literal values, and deterministic built-in functions. Subqueries and the time-dependent keywords `CURRENT_DATE`, `CURRENT_TIME`, and `CURRENT_TIMESTAMP` are not allowed.
 
 ## Expression Indexes
 

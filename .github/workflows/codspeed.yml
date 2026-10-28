@@ -19,6 +19,11 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: 10
   CARGO_TERM_COLOR: always
+  # The bench profile inherits release, which uses thin LTO. Every bench
+  # target is its own binary, so the LTO step runs once per benchmark and
+  # made up most of the build time. CodSpeed compares each PR against main
+  # built the same way, so the comparison does not need LTO.
+  CARGO_PROFILE_BENCH_LTO: "false"
 
 jobs:
   memory:
@@ -34,6 +39,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       benchmarks: ${{ steps.benchmarks.outputs.benchmarks }}
+      shards: ${{ steps.benchmarks.outputs.shards }}
     steps:
       - uses: actions/checkout@v4
 
@@ -59,6 +65,41 @@ jobs:
 
           json=$(printf '%s\n' "${benchmarks[@]}" | jq -R . | jq -cs .)
           echo "benchmarks=$json" >> "$GITHUB_OUTPUT"
+
+          # The slowest benchmark targets run in several jobs. Each job gets
+          # a filter that `cargo codspeed run` matches against every
+          # benchmark's name, e.g.
+          #   core/benches/fts_benchmark.rs::fts_benches::bench_fts_cold_query::FTS Cold Query::cold_query[1000_rows]
+          # The filters of one target split on a single character using
+          # character sets that together cover every character, so each
+          # benchmark, including ones added later, runs in exactly one job.
+          #   fts_benchmark: last letter of the benchmark function's name;
+          #     functions ending in "n" are split again on the character
+          #     before the final "]" (0-1 / anything else, incl. no "]").
+          #   prepare_benchmark: the character before the final "]".
+          splits='{
+            "fts_benchmark": [
+              "^[^:]*::[^:]*::[^:]*n::.*[01]\\]$",
+              "^[^:]*::[^:]*::[^:]*n(::(.*[^01]\\]|.*[^\\]]|\\]?))?$",
+              "^[^:]*::[^:]*::[^:]*e(::|$)",
+              "^[^:]*::[^:]*::[^:]*[^ne:](::|$)"
+            ],
+            "prepare_benchmark": [
+              "[0-9]\\]$",
+              "([^0-9]\\]|[^\\]])$"
+            ]
+          }'
+          shards=$(jq -c --argjson splits "$splits" '
+            [.[] as $bench
+              | if $splits[$bench] then
+                  $splits[$bench] | to_entries[]
+                  | {bench: $bench, name: "\($bench) (\(.key + 1)/\($splits[$bench] | length))", filter: .value}
+                else
+                  {bench: $bench, name: $bench, filter: ""}
+                end]' <<< "$json")
+          printf 'Benchmark jobs:\n'
+          jq -r '.[] | "  \(.name)  \(.filter)"' <<< "$shards"
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
 
   build-stable:
     name: "Build benchmarks (stable)"
@@ -88,6 +129,7 @@ jobs:
         with:
           prefix-key: "v1-rust-codspeed-${{ env.TOOLCHAIN_LABEL }}"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
 
       - name: Install cargo-codspeed
@@ -113,15 +155,24 @@ jobs:
           bench_args=$(jq -r '.[] | "--bench " + .' <<< "$BENCHMARKS_JSON" | tr '\n' ' ')
           cargo +${{ env.TOOLCHAIN_VERSION }} codspeed build -m simulation $bench_args --features codspeed
 
+          # Every bench binary contains its own copy of turso_core, so the
+          # binaries are mostly the same bytes. A zip compresses each file
+          # on its own (~2 GB); zstd with long-distance matching stores the
+          # shared parts once. Every benchmark job downloads this archive.
+          tar -cf - -C target codspeed | zstd -q -3 -T0 --long=31 -o codspeed-benchmarks.tar.zst
+          ls -lh codspeed-benchmarks.tar.zst
+
       - name: Upload benchmark binaries
         id: upload_artifact
         if: steps.build_benchmarks.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: codspeed-benchmarks-${{ env.TOOLCHAIN_LABEL }}
-          path: target/codspeed
+          path: codspeed-benchmarks.tar.zst
           if-no-files-found: error
           retention-days: 1
+          # Already compressed.
+          compression-level: 0
 
       - name: Record build status
         id: build_status
@@ -157,6 +208,7 @@ jobs:
         with:
           prefix-key: "v1-rust-codspeed-${{ env.TOOLCHAIN_LABEL }}"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
 
       - name: Install cargo-codspeed
@@ -182,15 +234,24 @@ jobs:
           bench_args=$(jq -r '.[] | "--bench " + .' <<< "$BENCHMARKS_JSON" | tr '\n' ' ')
           cargo +${{ env.TOOLCHAIN_VERSION }} codspeed build -m simulation $bench_args --features codspeed
 
+          # Every bench binary contains its own copy of turso_core, so the
+          # binaries are mostly the same bytes. A zip compresses each file
+          # on its own (~2 GB); zstd with long-distance matching stores the
+          # shared parts once. Every benchmark job downloads this archive.
+          tar -cf - -C target codspeed | zstd -q -3 -T0 --long=31 -o codspeed-benchmarks.tar.zst
+          ls -lh codspeed-benchmarks.tar.zst
+
       - name: Upload benchmark binaries
         id: upload_artifact
         if: steps.build_benchmarks.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: codspeed-benchmarks-${{ env.TOOLCHAIN_LABEL }}
-          path: target/codspeed
+          path: codspeed-benchmarks.tar.zst
           if-no-files-found: error
           retention-days: 1
+          # Already compressed.
+          compression-level: 0
 
       - name: Record build status
         id: build_status
@@ -198,7 +259,7 @@ jobs:
         run: echo "built=${{ steps.build_benchmarks.outcome == 'success' && steps.upload_artifact.outcome == 'success' }}" >> "$GITHUB_OUTPUT"
 
   benchmarks-stable:
-    name: "Run benchmark (stable, ${{ matrix.benchmark }})"
+    name: "Run benchmark (stable, ${{ matrix.shard.name }})"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     needs:
       - discover
@@ -214,7 +275,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        benchmark: ${{ fromJson(needs.discover.outputs.benchmarks) }}
+        shard: ${{ fromJson(needs.discover.outputs.shards) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -232,13 +293,16 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: codspeed-benchmarks-${{ env.TOOLCHAIN_LABEL }}
-          path: target/codspeed
 
-      - name: Restore binary permissions
-        run: find target/codspeed -type f -exec chmod +x {} +
+      # tar keeps the executable bits, so no chmod is needed.
+      - name: Unpack benchmark binaries
+        run: |
+          mkdir -p target
+          zstd -q -d --long=31 -c codspeed-benchmarks.tar.zst | tar -xf - -C target
+          rm codspeed-benchmarks.tar.zst
 
       - name: Generate graph-queries DBs
-        if: matrix.benchmark == 'graph_queries_benchmark'
+        if: matrix.shard.bench == 'graph_queries_benchmark'
         run: |
           python3 perf/graph-queries/generate_seed.py | sqlite3 perf/graph-queries/graph-queries.db
           cp perf/graph-queries/graph-queries.db perf/graph-queries/graph-queries-analyzed.db
@@ -250,10 +314,12 @@ jobs:
           RUSTFLAGS: ${{ env.TOOLCHAIN_RUSTFLAGS }}
         with:
           mode: simulation
-          run: cargo +${{ env.TOOLCHAIN_VERSION }} codspeed run --bench ${{ matrix.benchmark }}
+          # The CodSpeed runner runs this line with `bash -c`, so the quotes
+          # keep the filter's regex characters away from the shell.
+          run: cargo +${{ env.TOOLCHAIN_VERSION }} codspeed run ${{ matrix.shard.filter != '' && format('''{0}''', matrix.shard.filter) || '' }} --bench ${{ matrix.shard.bench }}
 
   benchmarks-nightly:
-    name: "Run benchmark (nightly, ${{ matrix.benchmark }})"
+    name: "Run benchmark (nightly, ${{ matrix.shard.name }})"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     needs:
       - discover
@@ -269,7 +335,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        benchmark: ${{ fromJson(needs.discover.outputs.benchmarks) }}
+        shard: ${{ fromJson(needs.discover.outputs.shards) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -287,13 +353,16 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: codspeed-benchmarks-${{ env.TOOLCHAIN_LABEL }}
-          path: target/codspeed
 
-      - name: Restore binary permissions
-        run: find target/codspeed -type f -exec chmod +x {} +
+      # tar keeps the executable bits, so no chmod is needed.
+      - name: Unpack benchmark binaries
+        run: |
+          mkdir -p target
+          zstd -q -d --long=31 -c codspeed-benchmarks.tar.zst | tar -xf - -C target
+          rm codspeed-benchmarks.tar.zst
 
       - name: Generate graph-queries DBs
-        if: matrix.benchmark == 'graph_queries_benchmark'
+        if: matrix.shard.bench == 'graph_queries_benchmark'
         run: |
           python3 perf/graph-queries/generate_seed.py | sqlite3 perf/graph-queries/graph-queries.db
           cp perf/graph-queries/graph-queries.db perf/graph-queries/graph-queries-analyzed.db
@@ -305,7 +374,9 @@ jobs:
           RUSTFLAGS: ${{ env.TOOLCHAIN_RUSTFLAGS }}
         with:
           mode: simulation
-          run: cargo +${{ env.TOOLCHAIN_VERSION }} codspeed run --bench ${{ matrix.benchmark }}
+          # The CodSpeed runner runs this line with `bash -c`, so the quotes
+          # keep the filter's regex characters away from the shell.
+          run: cargo +${{ env.TOOLCHAIN_VERSION }} codspeed run ${{ matrix.shard.filter != '' && format('''{0}''', matrix.shard.filter) || '' }} --bench ${{ matrix.shard.bench }}
 
   # tpc-h:
   #   runs-on: ubuntu-latest

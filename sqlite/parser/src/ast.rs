@@ -1127,7 +1127,11 @@ pub enum SelectTable {
     /// table function call
     TableCall(QualifiedName, Vec<Box<Expr>>, Option<As>),
     /// `SELECT` subquery
-    Select(Select, Option<As>),
+    Select {
+        select: Select,
+        alias: Option<As>,
+        lateral: bool,
+    },
     /// subquery
     Sub(FromClause, Option<As>),
 }
@@ -1360,8 +1364,9 @@ impl Name {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct QualifiedName {
-    /// schema
-    pub db_name: Option<Name>,
+    /// namespace of the object: in SQLite, the name of a database (`main`,
+    /// `temp` or an attached database)
+    pub namespace: Option<Name>,
     /// object name
     pub name: Name,
     /// alias
@@ -1372,23 +1377,23 @@ impl QualifiedName {
     /// Constructor
     pub const fn single(name: Name) -> Self {
         Self {
-            db_name: None,
+            namespace: None,
             name,
             alias: None,
         }
     }
     /// Constructor
-    pub const fn fullname(db_name: Name, name: Name) -> Self {
+    pub const fn fullname(namespace: Name, name: Name) -> Self {
         Self {
-            db_name: Some(db_name),
+            namespace: Some(namespace),
             name,
             alias: None,
         }
     }
     /// Constructor
-    pub const fn xfullname(db_name: Name, name: Name, alias: Name) -> Self {
+    pub const fn xfullname(namespace: Name, name: Name, alias: Name) -> Self {
         Self {
-            db_name: Some(db_name),
+            namespace: Some(namespace),
             name,
             alias: Some(alias),
         }
@@ -1396,7 +1401,7 @@ impl QualifiedName {
     /// Constructor
     pub const fn alias(name: Name, alias: Name) -> Self {
         Self {
-            db_name: None,
+            namespace: None,
             name,
             alias: Some(alias),
         }
@@ -2165,6 +2170,10 @@ pub struct TypeField {
     /// field/variant type (recursive — allows nested STRUCT/UNION)
     pub field_type: Type,
 }
+
+/// The most dimensions an array type can have. A column stores its number of
+/// dimensions in three bits.
+pub const MAX_ARRAY_DIMENSIONS: u32 = 7;
 
 /// Column type
 // https://sqlite.org/syntax/type-name.html

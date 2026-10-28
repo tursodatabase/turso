@@ -439,6 +439,40 @@ expect {
 }
 
 @cross-check-integrity
+test hash-join-spilled-probed-once-per-outer-row {
+    -- the hash join is built once and probed once per row of a; with 1000 build rows
+    -- it spills under the debug budget, and the second pass used to count too few (#9774)
+    CREATE TABLE a(x INTEGER PRIMARY KEY, y INT);
+    CREATE TABLE c(k INT, v INT);
+    CREATE TABLE d(k INT, w INT);
+    INSERT INTO a VALUES (1, 0), (2, 1000000);
+    INSERT INTO c SELECT value % 50, value FROM generate_series(1, 1000);
+    INSERT INTO d SELECT value % 70, value FROM generate_series(1, 1000);
+    SELECT a.x, (SELECT count(*) FROM c JOIN d ON c.k = d.k AND d.w < a.y) FROM a;
+}
+expect {
+    1|0
+    2|14400
+}
+
+@cross-check-integrity
+test hash-join-spilled-same-answer-on-every-pass {
+    -- three identical outer rows must get the same count; leftovers of one pass
+    -- used to leak into the next one and give three different answers
+    CREATE TABLE c(k INT, v INT);
+    CREATE TABLE d(k INT, w INT);
+    INSERT INTO c SELECT value % 50, value FROM generate_series(1, 1000);
+    INSERT INTO d SELECT value % 70, value FROM generate_series(1, 1000);
+    SELECT a.x, (SELECT count(*) FROM c JOIN d ON c.k = d.k AND d.w < a.y)
+    FROM (SELECT 1 AS x, 1000000 AS y UNION ALL SELECT 2, 1000000 UNION ALL SELECT 3, 1000000) a;
+}
+expect {
+    1|14400
+    2|14400
+    3|14400
+}
+
+@cross-check-integrity
 test hash-join-offset-continues-with-the-next-match {
     CREATE TABLE offset_hash_left(id INTEGER PRIMARY KEY, key INTEGER);
     CREATE TABLE offset_hash_right(id INTEGER PRIMARY KEY, key INTEGER);

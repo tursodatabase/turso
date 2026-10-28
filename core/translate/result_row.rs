@@ -13,8 +13,9 @@ use turso_parser::ast;
 use super::{
     emitter::{LimitCtx, Resolver},
     expr::{
-        emit_array_decode, expr_is_array, translate_expr, translate_expr_no_constant_opt,
-        walk_expr, NoConstantOptReason, WalkControl,
+        emit_array_decode,
+        expr_type::{type_of, TypeEnv},
+        translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
     },
     plan::{Distinctness, QueryDestination, ResultSetColumn, SelectPlan, TableReferences},
 };
@@ -102,17 +103,6 @@ pub fn emit_select_result(
                     resolver,
                 )?;
             }
-        }
-    } else {
-        // EXISTS optimization skips column evaluation, but parameters in those
-        // expressions must still be registered for bind validation to succeed.
-        for rc in plan.result_columns.iter() {
-            let _ = walk_expr(&rc.expr, &mut |e| {
-                if let ast::Expr::Variable(variable) = e {
-                    program.register_variable(variable);
-                }
-                Ok(WalkControl::Continue)
-            });
         }
     }
 
@@ -515,22 +505,17 @@ pub(crate) fn emit_array_decode_for_results(
     start_reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
+    let env = TypeEnv::new(Some(table_references), resolver);
     for (i, rc) in result_columns.iter().enumerate() {
-        // Check if this is a column reference to an array column
-        let array_col = if let ast::Expr::Column { table, column, .. } = &rc.expr {
-            table_references
-                .find_table_by_internal_id(*table)
-                .map(|(_, t)| t)
-                .and_then(|t| t.get_column_at(*column))
-                .filter(|col| col.is_array())
-        } else {
-            None
-        };
-
-        // Check if this expression produces an array (function call, || operator, etc.)
-        let is_array_expr = array_col.is_none() && expr_is_array(&rc.expr, Some(table_references));
-
-        if array_col.is_some() || is_array_expr {
+        if type_of(&rc.expr, &env).is_array() {
+            // An array column's elements may have a custom type to decode.
+            let array_col = if let ast::Expr::Column { table, column, .. } = &rc.expr {
+                table_references
+                    .find_table_by_internal_id(*table)
+                    .and_then(|(_, t)| t.get_column_at(*column))
+            } else {
+                None
+            };
             let reg = start_reg + i;
             let skip = program.allocate_label();
             program.emit_insn(Insn::IsNull {
@@ -540,7 +525,7 @@ pub(crate) fn emit_array_decode_for_results(
 
             if let Some(col) = array_col {
                 emit_array_decode(program, reg, col, resolver)?;
-            } else {
+            } else if !program.flags.keep_array_results_as_blobs() {
                 program.emit_insn(Insn::ArrayDecode { reg });
             }
 

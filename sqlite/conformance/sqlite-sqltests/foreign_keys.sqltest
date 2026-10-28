@@ -338,6 +338,47 @@ expect {
     5|5
 }
 
+# A multi-row INSERT checks an immediate FK at the end of the statement, so a
+# later row can insert the parent of an earlier row.
+@cross-check-integrity
+test fk-self-ipk-multi-row-later-row-inserts-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE n(id INTEGER PRIMARY KEY, parent_id REFERENCES n(id));
+    INSERT INTO n VALUES (1, 2), (2, NULL);
+    SELECT id, parent_id FROM n ORDER BY id;
+}
+expect {
+    1|2
+    2|
+}
+
+@cross-check-integrity
+test fk-self-unique-multi-row-later-row-inserts-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE k(a, b, pa, pb, UNIQUE(a, b), FOREIGN KEY(pa, pb) REFERENCES k(a, b));
+    INSERT INTO k VALUES (1, 1, 2, 2), (2, 2, NULL, NULL);
+    INSERT INTO k SELECT 3, 3, 4, 4 UNION ALL SELECT 4, 4, NULL, NULL;
+    SELECT a, b, pa, pb FROM k ORDER BY a;
+}
+expect {
+    1|1|2|2
+    2|2||
+    3|3|4|4
+    4|4||
+}
+
+# A parent that no later row inserts still fails the statement.
+@cross-check-integrity
+test fk-self-ipk-multi-row-orphan-rolls-back-statement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE n(id INTEGER PRIMARY KEY, parent_id REFERENCES n(id));
+    BEGIN;
+    INSERT INTO n VALUES (10, NULL);
+    INSERT INTO n VALUES (1, 3), (2, NULL);
+}
+expect error {
+}
+
 # Self-reference with mismatched value: should fail immediately (no counter semantics used)
 @cross-check-integrity
 test fk-self-ipk-single-mismatch {
@@ -468,6 +509,150 @@ test fk-parent-unique-index-missing {
     INSERT INTO child  VALUES (2,'A','X');   -- no ('A','X') in parent
 }
 expect error {
+}
+
+# A parent key without a UNIQUE index is a mismatch, but only statements that
+# check the key report it. An UPDATE that does not assign the FK column succeeds.
+@cross-check-integrity
+test fk-mismatch-update-other-column-ok {
+    CREATE TABLE p(a, b);
+    CREATE TABLE c(x, y REFERENCES p(b));
+    INSERT INTO c VALUES (1, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET x = 2;
+    SELECT * FROM c;
+}
+expect {
+    2|
+}
+
+@cross-check-integrity
+test fk-mismatch-update-from-other-column-ok {
+    CREATE TABLE p(a, b);
+    CREATE TABLE c(x, y REFERENCES p(b));
+    CREATE TABLE t(v);
+    INSERT INTO t VALUES (5);
+    INSERT INTO c VALUES (1, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET x = t.v FROM t;
+    SELECT * FROM c;
+}
+expect {
+    5|
+}
+
+test fk-mismatch-update-fk-column {
+    CREATE TABLE p(a, b);
+    CREATE TABLE c(x, y REFERENCES p(b));
+    INSERT INTO c VALUES (1, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET y = 2;
+}
+expect error {
+    foreign key mismatch - "c" referencing "p"
+}
+
+@cross-check-integrity
+test fk-mismatch-update-parent-other-column-ok {
+    CREATE TABLE p(a, b);
+    CREATE TABLE c(x, y REFERENCES p(b));
+    INSERT INTO p VALUES (1, 1);
+    PRAGMA foreign_keys=ON;
+    UPDATE p SET a = 2;
+    SELECT * FROM p;
+}
+expect {
+    2|1
+}
+
+test fk-mismatch-self-ref-update-parent-key {
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x, y REFERENCES c(x));
+    INSERT INTO c VALUES (1, 1, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET x = 7;
+}
+expect error {
+    foreign key mismatch - "c" referencing "c"
+}
+
+test fk-mismatch-self-ref-deferred-update-parent-key {
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x, y REFERENCES c(x) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO c VALUES (1, 1, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET x = 7;
+}
+expect error {
+    foreign key mismatch - "c" referencing "c"
+}
+
+test fk-mismatch-self-ref-upsert-parent-key {
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x, y REFERENCES c(x));
+    INSERT INTO c VALUES (1, 1, NULL);
+    PRAGMA foreign_keys=ON;
+    INSERT INTO c VALUES (1, 1, NULL) ON CONFLICT(id) DO UPDATE SET x = 9;
+}
+expect error {
+    foreign key mismatch - "c" referencing "c"
+}
+
+@cross-check-integrity
+test fk-mismatch-self-ref-update-other-column-ok {
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x, y REFERENCES c(x));
+    INSERT INTO c VALUES (1, 1, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET id = 7;
+    SELECT * FROM c;
+}
+expect {
+    7|1|
+}
+
+# A self-referencing FK is checked whenever the UPDATE changes any FK key of
+# the table, even when its own child columns are not assigned.
+test fk-mismatch-self-ref-other-fk-parent-key-changed {
+    CREATE TABLE c(x UNIQUE, w, y REFERENCES c(x), z REFERENCES c(w));
+    INSERT INTO c VALUES (1, 1, NULL, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET x = 5;
+}
+expect error {
+    foreign key mismatch - "c" referencing "c"
+}
+
+test fk-mismatch-self-ref-other-fk-child-key-changed {
+    CREATE TABLE p(a UNIQUE);
+    CREATE TABLE c(w, q REFERENCES p(a), z REFERENCES c(w));
+    INSERT INTO c VALUES (1, NULL, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET q = NULL;
+}
+expect error {
+    foreign key mismatch - "c" referencing "c"
+}
+
+test fk-mismatch-self-ref-other-table-parent-key-changed {
+    CREATE TABLE c(x UNIQUE, w, z REFERENCES c(w));
+    CREATE TABLE d(r REFERENCES c(x));
+    INSERT INTO c VALUES (1, 1, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET x = 5;
+}
+expect error {
+    foreign key mismatch - "c" referencing "c"
+}
+
+@cross-check-integrity
+test fk-update-parent-key-columns-in-other-order-ok {
+    CREATE TABLE p(b, c, UNIQUE(b, c));
+    CREATE TABLE ch(y, z, FOREIGN KEY(y, z) REFERENCES p(c, b));
+    INSERT INTO p VALUES (1, 2);
+    PRAGMA foreign_keys=ON;
+    UPDATE p SET b = 5;
+    INSERT INTO p VALUES (5, 2) ON CONFLICT(b, c) DO UPDATE SET b = 6;
+    SELECT * FROM p;
+}
+expect {
+    6|2
 }
 
 # NULL in child short-circuits FK check
@@ -803,6 +988,77 @@ test fk-deferred-update-fixes-parent-before-commit {
 }
 expect {
     1|50
+}
+
+# The child FK column is the rowid alias, so it is not stored in the record.
+@cross-check-integrity
+test fk-deferred-insert-parent-fixes-rowid-alias-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER PRIMARY KEY REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c(pid) VALUES(1);
+    INSERT INTO p(id) VALUES(1);
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test fk-deferred-update-parent-fixes-rowid-alias-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER PRIMARY KEY REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(5);
+    BEGIN;
+    INSERT INTO c(pid) VALUES(2);
+    UPDATE p SET id=2 WHERE id=5;
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test fk-update-parent-referenced-by-rowid-alias-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER PRIMARY KEY REFERENCES p(id));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    UPDATE p SET id=3;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-delete-parent-referenced-by-rowid-alias-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER PRIMARY KEY REFERENCES p(id));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-drop-parent-referenced-by-rowid-alias-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER PRIMARY KEY REFERENCES p(id));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    DROP TABLE p;
+}
+expect error {
+    FOREIGN KEY constraint failed
 }
 
 # Self-referential: row referencing itself should succeed
@@ -2381,6 +2637,43 @@ expect {
     0
 }
 
+@cross-check-integrity
+test fk-cascade-delete-self-referential-deletes-grandchild-under-sibling {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    INSERT INTO t VALUES(1,NULL),(2,1),(3,1),(4,2);
+    DELETE FROM t WHERE id=1;
+    SELECT id, k FROM t;
+}
+expect {
+}
+
+@cross-check-integrity
+test fk-cascade-delete-self-referential-tree-across-leaf-pages {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id) ON DELETE CASCADE, pad TEXT);
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 12)
+    INSERT INTO t SELECT x, CASE WHEN x > 1 THEN x / 2 END, printf('%.900c', 'x') FROM s;
+    DELETE FROM t WHERE id = 1;
+    SELECT id FROM t;
+}
+expect {
+}
+
+@cross-check-integrity
+test fk-cascade-delete-into-self-referential-set-null-child-deletes-every-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id) ON DELETE CASCADE, p INTEGER REFERENCES b(id) ON DELETE SET NULL);
+    INSERT INTO a VALUES(1);
+    INSERT INTO b VALUES(1,1,NULL),(2,1,1),(3,1,2),(4,1,3);
+    DELETE FROM a WHERE id=1;
+    SELECT count(*) FROM b;
+}
+expect {
+    0
+}
+
 # EXPLAIN should print the recursive FK action once and then stop.
 test fk-cascade-delete-self-referential-explain-terminates {
     PRAGMA foreign_keys=ON;
@@ -2632,6 +2925,102 @@ test fk-setnull-delete-two-table-cycle {
 }
 expect {
     2|
+}
+
+@cross-check-integrity
+test fk-setnull-delete-self-referential-keeps-rows-that-did-not-match {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p REFERENCES t ON DELETE SET NULL);
+    CREATE INDEX tp ON t(p);
+    INSERT INTO t VALUES (1, NULL), (2, 1), (3, 1);
+    DELETE FROM t WHERE p IS NULL;
+    SELECT * FROM t;
+}
+expect {
+    2|
+    3|
+}
+
+@cross-check-integrity
+test fk-setnull-delete-self-referential-deletes-every-matching-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id) ON DELETE SET NULL);
+    INSERT INTO t VALUES (1, NULL), (2, 1), (3, 2), (4, 3), (5, 4), (6, 5);
+    DELETE FROM t WHERE id > 1;
+    SELECT group_concat(id) FROM t;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test fk-setnull-delete-self-referential-index-across-pages-keeps-rows-that-did-not-match {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INTEGER REFERENCES t(id) ON DELETE SET NULL, pad TEXT);
+    CREATE INDEX tp ON t(p, pad);
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 40)
+    INSERT INTO t SELECT x, CASE WHEN x > 1 THEN 1 END, printf('%.900c', 'x') FROM s;
+    DELETE FROM t WHERE p IS NULL;
+    SELECT count(*) FROM t;
+}
+expect {
+    39
+}
+
+@cross-check-integrity
+test fk-setdefault-delete-self-referential-deletes-every-matching-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id) ON DELETE SET DEFAULT);
+    INSERT INTO t VALUES (1, NULL), (2, 1), (3, 2), (4, 3), (5, 4), (6, 5);
+    DELETE FROM t WHERE id > 1;
+    SELECT group_concat(id) FROM t;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test fk-setnull-delete-self-referential-continues-after-first-cell-of-page {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id) ON DELETE SET NULL, pad TEXT);
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 12)
+    INSERT INTO t SELECT x, CASE WHEN x > 1 THEN x - 1 END, printf('%.900c', 'x') FROM s;
+    DELETE FROM t WHERE id > 4;
+    SELECT group_concat(id) FROM t;
+}
+expect {
+    1,2,3,4
+}
+
+@cross-check-integrity
+test fk-setnull-delete-update-write-back-deletes-every-matching-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, cref INTEGER REFERENCES c(x) ON UPDATE SET NULL);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INTEGER UNIQUE REFERENCES t(id) ON DELETE SET NULL);
+    INSERT INTO t VALUES (1, NULL), (2, NULL), (3, NULL), (4, NULL), (5, NULL), (6, NULL);
+    INSERT INTO c(x) VALUES (2), (3), (4), (5), (6);
+    INSERT INTO t VALUES (1002, 2), (1003, 3), (1004, 4), (1005, 5), (1006, 6);
+    DELETE FROM t WHERE id BETWEEN 2 AND 6;
+    SELECT group_concat(id) FROM t;
+}
+expect {
+    1,1002,1003,1004,1005,1006
+}
+
+@cross-check-integrity
+test fk-setnull-delete-update-write-back-continues-after-first-cell-of-page {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, cref INTEGER REFERENCES c(x) ON UPDATE SET NULL, pad TEXT);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INTEGER UNIQUE REFERENCES t(id) ON DELETE SET NULL);
+    WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 12)
+    INSERT INTO t SELECT n, NULL, printf('%.900c', 'x') FROM s;
+    INSERT INTO c(x) VALUES (5);
+    INSERT INTO t VALUES (1005, 5, NULL);
+    DELETE FROM t WHERE id BETWEEN 5 AND 12;
+    SELECT group_concat(id) FROM t;
+}
+expect {
+    1,2,3,4,1005
 }
 
 # Basic ON UPDATE SET NULL
