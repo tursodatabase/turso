@@ -66,8 +66,11 @@ pub fn open_database_with_io(
     flags: turso_core::OpenFlags,
     opts: turso_core::DatabaseOpts,
 ) -> crate::Result<Arc<turso_core::Database>> {
+    let is_new = turso_core::is_memory_like(path) || io.open_file(path, flags, true)?.size()? == 0;
+    if !is_new {
+        refuse_a_file_with_tables_in_no_schema(&io, path, flags, opts)?;
+    }
     let file = io.open_file(path, flags, true)?;
-    let is_new = turso_core::is_memory_like(path) || file.size()? == 0;
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
     let db = turso_core::Database::open(
         io,
@@ -81,6 +84,31 @@ pub fn open_database_with_io(
         set_up_new_database(&db)?;
     }
     Ok(db)
+}
+
+/// Refuses an existing file whose tables are in no schema before it is
+/// opened with MVCC, which converts a file that is not in MVCC mode yet:
+/// looking at it read-only and without MVCC first leaves a refused file as
+/// it was. A file in MVCC mode is not converted, so connecting checks it.
+fn refuse_a_file_with_tables_in_no_schema(
+    io: &Arc<dyn turso_core::IO>,
+    path: &str,
+    flags: turso_core::OpenFlags,
+    opts: turso_core::DatabaseOpts,
+) -> crate::Result<()> {
+    let db = turso_core::Database::open(
+        io.clone(),
+        path,
+        turso_core::OpenOptions::new(Arc::new(PostgresDialect))
+            .flags(flags | turso_core::OpenFlags::ReadOnly)
+            .db_opts(opts.with_mvcc(false)),
+    )?;
+    if db.mvcc_enabled() {
+        return Ok(());
+    }
+    let conn = db.connect(turso_core::ConnectOpts::new())?;
+    refuse_tables_in_no_schema(&conn)?;
+    Ok(())
 }
 
 /// Sets up a database that was just made: creates the schema `public`, as

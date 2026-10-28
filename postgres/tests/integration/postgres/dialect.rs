@@ -1015,35 +1015,35 @@ fn test_postgres_drop_schema_public_cascade(db: TempDatabase) {
 fn test_postgres_refuses_a_database_file_whose_tables_are_in_no_schema() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("main.db");
-    let path = path.to_str().unwrap();
-    let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
-    let sqlite_db = turso_core::Database::open_file(
-        io.clone(),
-        path,
-        std::sync::Arc::new(turso_core::SqliteDialect),
-    )
-    .unwrap();
-    sqlite_db
-        .connect(turso_core::ConnectOpts::new())
+    rusqlite::Connection::open(&path)
         .unwrap()
-        .execute("CREATE TABLE counted (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        .execute_batch(
+            "CREATE TABLE counted (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT); \
+             INSERT INTO counted (v) VALUES ('a');",
+        )
         .unwrap();
-    drop(sqlite_db);
-    let db = turso_pg::open_database_with_io(
-        io,
-        path,
-        turso_core::OpenFlags::default(),
-        turso_core::DatabaseOpts::new(),
-    )
-    .unwrap();
+    let before = std::fs::read(&path).unwrap();
 
     // The file is not new, so no public schema is made for it, and its
     // table is in no schema: the frontend refuses it rather than hide it.
-    let error = match turso_pg::PgConnection::connect(&db) {
+    let error = match turso_pg::open_database_with_io(
+        std::sync::Arc::new(turso_core::PlatformIO::new().unwrap()),
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new(),
+    ) {
         Ok(_) => panic!("expected the database to be refused"),
         Err(error) => error.to_string(),
     };
     assert!(error.contains("in no schema"), "{error}");
+
+    // Refusing it writes nothing, so SQLite still reads it as it was.
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let v: String = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT v FROM counted", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(v, "a");
 }
 
 #[turso_macros::test]
