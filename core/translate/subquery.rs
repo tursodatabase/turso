@@ -19,7 +19,7 @@ use crate::{
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
-        collate::comparison_collation_across_queries,
+        collate::in_subquery_collation,
         compound_select::emit_program_for_compound_select,
         emitter::select::{
             emit_materialized_build_inputs, emit_program_for_select_with_resolver, emit_query,
@@ -1033,11 +1033,11 @@ fn get_subquery_parser<'a>(
                     .iter()
                     .enumerate()
                     .map(|(i, c)| {
-                        let collation = comparison_collation_across_queries(
+                        let collation = in_subquery_collation(
                             lhs_exprs[i],
                             Some(referenced_tables),
-                            &c.expr,
-                            Some(table_references),
+                            &plan,
+                            i,
                             resolver,
                         )?;
                         Ok::<_, crate::LimboError>(IndexColumn {

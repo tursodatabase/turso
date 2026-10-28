@@ -9,8 +9,8 @@ use crate::{
     sync::{Arc, LazyLock, RwLock, Weak},
     translate::{
         emitter::Resolver,
-        expr::expr_type::{type_of, type_ordering, TypeEnv},
-        plan::TableReferences,
+        expr::expr_type::{query_column_type, type_of, type_ordering, TypeEnv},
+        plan::{Plan, TableReferences},
     },
     type_ordering::TypeOrdering,
     types::ValueRef,
@@ -518,6 +518,32 @@ pub fn comparison_collation_across_queries(
     ))
 }
 
+/// [comparison_collation_across_queries] for `x IN (SELECT ...)`, where the
+/// right operand is column `column` of `query`. The column's type is the one
+/// [query_column_type] gives it, which in a compound SELECT comes from every
+/// SELECT, not only from `rhs`, the column of the rightmost SELECT. `rhs`
+/// gives the text collation, as in SQLite.
+pub fn in_subquery_collation(
+    lhs: &Expr,
+    lhs_tables: Option<&TableReferences>,
+    query: &Plan,
+    column: usize,
+    resolver: &Resolver,
+) -> Result<CollationSeq> {
+    let rhs = &query.select_result_columns()[column].expr;
+    let rhs_tables = Some(query.select_table_references());
+    let rhs_ordering = type_ordering(
+        &query_column_type(query, column, resolver),
+        resolver.schema(),
+    );
+    let lhs_ordering = expr_type_ordering(lhs, lhs_tables, resolver);
+    let has_collate = has_collate_operator(lhs) || has_collate_operator(rhs);
+    if let Some(ordering) = common_ordering([lhs_ordering, rhs_ordering], has_collate)? {
+        return Ok(CollationSeq::Type(ordering));
+    }
+    comparison_collation_across_queries(lhs, lhs_tables, rhs, rhs_tables, resolver)
+}
+
 /// The collation of one expression, BINARY when it has none. Sort, grouping,
 /// DISTINCT, compound select, window partition and index keys use it, and so
 /// does `x IN (y1, ..., yN)`, which compares with the collation of x alone.
@@ -576,11 +602,26 @@ fn common_type_ordering<'a>(
     exprs: impl IntoIterator<Item = (&'a Expr, Option<&'a TableReferences>)>,
     resolver: &Resolver,
 ) -> Result<Option<TypeOrdering>> {
-    let mut found: Option<TypeOrdering> = None;
     let mut has_collate = false;
-    for (expr, tables) in exprs {
-        has_collate |= has_collate_operator(expr);
-        let Some(ordering) = expr_type_ordering(expr, tables, resolver) else {
+    let orderings: Vec<Option<TypeOrdering>> = exprs
+        .into_iter()
+        .map(|(expr, tables)| {
+            has_collate |= has_collate_operator(expr);
+            expr_type_ordering(expr, tables, resolver)
+        })
+        .collect();
+    common_ordering(orderings, has_collate)
+}
+
+/// The one order among `orderings`, as [common_type_ordering] decides it.
+/// `has_collate` says whether any of the values has a COLLATE operator.
+fn common_ordering(
+    orderings: impl IntoIterator<Item = Option<TypeOrdering>>,
+    has_collate: bool,
+) -> Result<Option<TypeOrdering>> {
+    let mut found: Option<TypeOrdering> = None;
+    for ordering in orderings {
+        let Some(ordering) = ordering else {
             continue;
         };
         match found {

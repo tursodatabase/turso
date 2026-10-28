@@ -495,3 +495,25 @@ expect {
     order|3
     order|4
 }
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-in-compound-subquery {
+    -- The column of a compound SELECT is a numeric when any SELECT gives a
+    -- numeric and the others give integers, decimals or NULL, so IN compares
+    -- with numeric's order whichever SELECT comes first. Expected values are
+    -- from PostgreSQL.
+    CREATE TABLE a(n numeric(10,2)) STRICT;
+    INSERT INTO a VALUES (1.5);
+    SELECT 1.5 IN (SELECT n FROM a UNION SELECT 3);
+    SELECT 1.5 IN (SELECT n FROM a UNION ALL SELECT NULL);
+    SELECT '1.5' IN (SELECT 3 UNION SELECT n FROM a);
+    SELECT 1.50 NOT IN (SELECT n FROM a UNION SELECT 3);
+    SELECT 3 IN (SELECT n FROM a UNION SELECT 3.00);
+}
+expect {
+    1
+    1
+    1
+    0
+    1
+}
