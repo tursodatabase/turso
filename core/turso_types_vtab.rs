@@ -21,6 +21,10 @@ impl TursoTypesTable {
 }
 
 impl InternalVirtualTable for TursoTypesTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "sqlite_turso_types".to_string()
     }

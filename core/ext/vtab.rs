@@ -76,6 +76,13 @@ impl ExtensionTable {
         }
     }
 
+    pub(crate) fn readable_without_privileges(&self) -> bool {
+        match self {
+            Self::C(_) => false,
+            Self::Native(table) => table.readable_without_privileges(),
+        }
+    }
+
     pub(crate) fn best_index(
         &self,
         constraints: &[ConstraintInfo],
