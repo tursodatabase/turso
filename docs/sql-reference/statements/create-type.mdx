@@ -101,7 +101,7 @@ The first parameter is always the input `value`. Additional parameters are the a
 
 ### COERCE
 
-The COERCE expression fits an already encoded value to the column's parameters, such as the maximum length of a `varchar(100)` or the scale of a `numeric(10,2)`. `value` is the output of ENCODE, and each parameter is the column's argument for it. COERCE should only round the value or reject it with RAISE; it should not change what kind of value it is.
+The COERCE expression fits an already encoded value to the column's parameters, such as the maximum length of a `varchar(100)` or the scale of a `numeric(10,2)`. `value` is the output of ENCODE, and each parameter is the column's argument for it. COERCE should only round the value or reject it with RAISE; it should not change what kind of value it is. A type without parameters can't have a COERCE clause; it checks its values in ENCODE.
 
 - **When it runs**: on INSERT, UPDATE, and column defaults, after ENCODE, and on `CAST(x AS t(args))`. `CAST(x AS t)` without arguments is SQLite's CAST, so `CAST(x AS NUMERIC)` keeps its SQLite meaning.
 - **When it does not run**: on a column declared without arguments (`name varchar`), on NULL values, and on constants compared with a column. For a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false, because `3.504` is encoded but not rounded. An index lookup uses the same rule, so it finds the same rows as a table scan.

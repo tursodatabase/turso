@@ -693,7 +693,7 @@ impl TypeDef {
                 operators,
                 default,
             } => {
-                check_type_params_only_in_coerce(params, encode, decode)?;
+                check_type_param_use(params, encode, coerce, decode)?;
                 Self {
                     name: type_name.to_string(),
                     is_builtin,
@@ -841,9 +841,12 @@ impl TypeDef {
 /// column may store, so only COERCE may read them. ENCODE also converts index
 /// seek keys and operator arguments, which are compared and never limited: on a
 /// numeric(10,2) column `n = 3.504` matches no row instead of matching 3.50.
-pub(crate) fn check_type_params_only_in_coerce(
+/// COERCE runs only for a column that gives the type's parameters, so a type
+/// without parameters can't have one: it checks its values in ENCODE.
+pub(crate) fn check_type_param_use(
     params: &[ast::TypeParam],
     encode: &Option<Box<ast::Expr>>,
+    coerce: &Option<Box<ast::Expr>>,
     decode: &Option<Box<ast::Expr>>,
 ) -> crate::Result<()> {
     let type_params: std::vec::Vec<String> = params
@@ -851,6 +854,12 @@ pub(crate) fn check_type_params_only_in_coerce(
         .map(|p| normalize_ident(&p.name))
         .filter(|name| name != "value")
         .collect();
+    if coerce.is_some() && type_params.is_empty() {
+        return Err(crate::LimboError::ParseError(
+            "COERCE needs type parameters: a type without parameters checks its values in ENCODE"
+                .to_string(),
+        ));
+    }
     for (clause, expr) in [("ENCODE", encode), ("DECODE", decode)] {
         let Some(expr) = expr else {
             continue;

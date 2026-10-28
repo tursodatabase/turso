@@ -809,6 +809,15 @@ expect error {
     DECODE cannot use type parameter "f": only COERCE can
 }
 
+test cmp-coerce-without-type-parameters-is-rejected {
+    -- COERCE runs only for a column that gives the type's parameters, so on
+    -- a type without parameters it would never run.
+    CREATE TYPE positive(value integer) BASE integer COERCE CASE WHEN value > 0 THEN value ELSE RAISE(ABORT, 'not positive') END;
+}
+expect error {
+    COERCE needs type parameters: a type without parameters checks its values in ENCODE
+}
+
 @requires strict "uses STRICT tables"
 test cmp-coerce-rejects-stored-value {
     CREATE TYPE capped(value integer, maxval integer) BASE integer COERCE CASE WHEN value <= maxval THEN value ELSE RAISE(ABORT, 'value above maximum for capped') END OPERATOR '<';
