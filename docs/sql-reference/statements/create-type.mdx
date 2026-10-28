@@ -269,7 +269,7 @@ Turso provides the following built-in custom types in STRICT tables:
 | `time` | text | -- | ISO 8601 time (HH:MM:SS), validated on insert. |
 | `timestamp` | text | -- | ISO 8601 datetime, validated on insert. |
 | `timestamptz` | text | -- | ISO 8601 datetime with the same validation and normalization as `timestamp`. PostgreSQL-compatible name; the stored text carries no offset. |
-| `numeric(P,S)` | blob | `precision`, `scale` | Fixed-point decimal with P total digits and S decimal places. Supports arithmetic operators. |
+| `numeric(P,S)` | blob | `precision`, `scale` | Fixed-point decimal with P total digits and S decimal places. Supports `+`, `-`, `*`, `/`, `%` and unary `-`. |
 | `uuid` | blob | -- | UUID stored as 16-byte blob, displayed as string. Default: `uuid4_str()`. |
 | `inet` | text | -- | Validated IP address (IPv4 or IPv6). |
 | `cidr` | text | -- | Network address in CIDR notation. Stored as given; no validation yet. |
