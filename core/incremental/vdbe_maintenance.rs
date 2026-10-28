@@ -220,8 +220,9 @@ impl Connection {
         view_name: &str,
     ) -> Result<Vec<Option<String>>> {
         let schema = self.schema.read().clone();
+        let (namespace, name) = schema.demangle_name(view_name);
         let view = schema
-            .get_materialized_view(crate::namespace::NamespaceId::ROOT, view_name)
+            .get_materialized_view(namespace, name)
             .ok_or_else(|| {
                 LimboError::InvalidArgument(format!("no such materialized view: {view_name}"))
             })?;
@@ -260,9 +261,13 @@ fn build_plan_for_connection(
     // names the same way CREATE did: within the view's own database, never
     // through a TEMP table that happens to share a source table's name
     // (#9456). Materialized views always live in main.
+    let (namespace, name) = schema.demangle_name(view_name);
     resolver.with_view_scope(
-        NamespaceRef::root_of(crate::MAIN_DB_ID),
-        view_name.to_string(),
+        NamespaceRef {
+            database_id: crate::MAIN_DB_ID,
+            id: namespace,
+        },
+        name.to_string(),
         || plan_view(view_name, select, &resolver, connection),
     )
 }

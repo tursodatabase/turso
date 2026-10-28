@@ -191,7 +191,8 @@ pub fn emit_disk_read_nextval(
     target_register: usize,
 ) -> Result<()> {
     let database_id = namespace.database_id;
-    let backing_table_name = sequence_backing_table_name(seq_name);
+    let mangled_seq_name = resolver.mangle_name(namespace, seq_name);
+    let backing_table_name = sequence_backing_table_name(&mangled_seq_name);
     let backing_table = resolver
         .with_schema(database_id, |s| {
             s.get_btree_table(NamespaceId::ROOT, &backing_table_name)
@@ -366,7 +367,7 @@ pub fn emit_disk_read_nextval(
         program,
         resolver,
         database_id,
-        seq_name,
+        &mangled_seq_name,
         target_register,
     )?;
 
@@ -377,6 +378,7 @@ pub fn emit_disk_read_nextval(
     // `op_sequence_register_allocation`.
     program.emit_insn(Insn::SequenceRegisterAllocation {
         db: database_id,
+        namespace: namespace.id,
         seq_name: seq_name.to_string(),
         value_reg: target_register,
         saved_outer_reg,
@@ -414,6 +416,7 @@ pub fn emit_disk_read_nextval(
 
     program.emit_insn(Insn::SetSequenceCurrval {
         db: database_id,
+        namespace: namespace.id,
         seq_name: seq_name.to_string(),
         value_reg: target_register,
     });
@@ -439,7 +442,8 @@ pub fn emit_disk_advance_past(
     value_reg: usize,
 ) -> Result<()> {
     let database_id = namespace.database_id;
-    let backing_table_name = sequence_backing_table_name(seq_name);
+    let mangled_seq_name = resolver.mangle_name(namespace, seq_name);
+    let backing_table_name = sequence_backing_table_name(&mangled_seq_name);
     let backing_table = resolver
         .with_schema(database_id, |s| {
             s.get_btree_table(NamespaceId::ROOT, &backing_table_name)
@@ -579,6 +583,7 @@ pub fn emit_disk_advance_past(
     });
     program.emit_insn(Insn::SetSequenceCurrval {
         db: database_id,
+        namespace: namespace.id,
         seq_name: seq_name.to_string(),
         value_reg,
     });
@@ -614,7 +619,13 @@ pub fn emit_disk_advance_past(
     // row even though the engine's autoinc state is unchanged. Repro
     // covered by `mvcc-autoinc-explicit-low-rowid-preserves-sqlite-sequence`
     // in `sqlite/conformance/turso-sqltests/mvcc_sequence.sqltest`.
-    emit_autoincrement_sqlite_sequence_sync(program, resolver, database_id, seq_name, value_reg)?;
+    emit_autoincrement_sqlite_sequence_sync(
+        program,
+        resolver,
+        database_id,
+        &mangled_seq_name,
+        value_reg,
+    )?;
 
     program.preassign_label_to_next_insn(done_seek_label);
     program.emit_insn(Insn::Close { cursor_id });
@@ -878,6 +889,7 @@ pub fn translate_create_sequence(
     program.begin_write_on_database(database_id, schema_cookie)?;
 
     let normalized_name = normalize_ident(seq_name.name.as_str());
+    let mangled_seq_name = resolver.mangle_name(namespace, &normalized_name);
 
     // `__turso_internal_autoincrement_<table>` is reserved for the
     // implicit sequences CREATE TABLE ... AUTOINCREMENT installs.
@@ -947,7 +959,7 @@ pub fn translate_create_sequence(
         resolver,
         database_id,
         sqlite_schema_cursor_id,
-        &normalized_name,
+        &mangled_seq_name,
         seq.start_value,
         seq.increment_by,
         seq.min_value,
@@ -997,7 +1009,8 @@ pub(crate) fn emit_drop_sequence_cleanup(
     seq_name: &str,
 ) -> Result<bool> {
     let database_id = namespace.database_id;
-    let backing_table_name = sequence_backing_table_name(seq_name);
+    let backing_table_name =
+        sequence_backing_table_name(&resolver.mangle_name(namespace, seq_name));
     let root_page = resolver.with_schema(database_id, |s| {
         s.get_sequence(namespace.id, seq_name)?;
         Some(
@@ -1168,7 +1181,7 @@ fn bind_sequence_call(expr: &mut ast::Expr, resolver: &Resolver) -> bool {
     true
 }
 
-fn is_sequence_function(name: &str) -> bool {
+pub(crate) fn is_sequence_function(name: &str) -> bool {
     name.eq_ignore_ascii_case("nextval")
         || name.eq_ignore_ascii_case("currval")
         || name.eq_ignore_ascii_case("setval")

@@ -415,7 +415,7 @@ pub struct Connection {
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
     /// The names that qualify object names in SQL, each referring to a
     /// database.
-    pub(super) namespaces: crate::Namespaces,
+    pub(super) namespaces: Namespaces,
     /// The namespace names that a name without a namespace is looked up
     /// through, in order. None means main, then the other databases by id.
     pub(super) search_path: RwLock<Option<Vec<String>>>,
@@ -1549,11 +1549,8 @@ impl Connection {
                         };
                         let (backing_table_name, seq_name) = entry;
                         let normalized = crate::util::normalize_ident(&seq_name);
-                        if inner
-                            .fresh
-                            .get_sequence(NamespaceId::ROOT, &normalized)
-                            .is_some()
-                        {
+                        let (namespace, sequence_name) = inner.fresh.demangle_name(&normalized);
+                        if inner.fresh.get_sequence(namespace, sequence_name).is_some() {
                             *idx += 1;
                             *stmt = None;
                             *meta = None;
@@ -1570,7 +1567,7 @@ impl Connection {
                                 meta,
                             ));
                             *seq = Some(Self::sequence_from_descriptor_meta(
-                                &seq_name,
+                                sequence_name,
                                 &backing_table_name,
                                 *meta,
                             )?);
@@ -1593,11 +1590,9 @@ impl Connection {
                             mv_store.set_sequence_watermark(&normalized, watermark);
                         }
                         let sequence = seq.take().expect("sequence set above");
-                        inner.fresh.insert_sequence(
-                            NamespaceId::ROOT,
-                            normalized,
-                            Arc::new(sequence),
-                        );
+                        inner
+                            .fresh
+                            .insert_sequence_under_mangled_name(&normalized, Arc::new(sequence));
                         *idx += 1;
                         *stmt = None;
                         *meta = None;
@@ -3802,8 +3797,12 @@ impl Connection {
                     };
                     let (backing_table_name, seq_name) = entry;
                     let normalized = crate::util::normalize_ident(&seq_name);
+                    let (namespace, sequence_name) = crate::namespace::demangle_name(
+                        self.dialect().supports_namespaces(),
+                        &normalized,
+                    );
                     let already_present = self.with_schema(MAIN_DB_ID, |s| {
-                        s.get_sequence(NamespaceId::ROOT, &normalized).is_some()
+                        s.get_sequence(namespace, sequence_name).is_some()
                     });
                     if already_present {
                         *idx += 1;
@@ -3822,7 +3821,7 @@ impl Connection {
                             meta,
                         ));
                         *seq = Some(Self::sequence_from_descriptor_meta(
-                            &seq_name,
+                            sequence_name,
                             &backing_table_name,
                             *meta,
                         )?);
@@ -3846,11 +3845,7 @@ impl Connection {
                     }
                     let sequence = seq.take().expect("sequence set above");
                     self.with_database_schema_mut(MAIN_DB_ID, |schema| {
-                        schema.insert_sequence(
-                            NamespaceId::ROOT,
-                            normalized.clone(),
-                            Arc::new(sequence),
-                        );
+                        schema.insert_sequence_under_mangled_name(&normalized, Arc::new(sequence));
                     })?;
                     *idx += 1;
                     *stmt = None;
@@ -5176,7 +5171,7 @@ mod tests {
         }
 
         fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<crate::schema::BTreeTable> {
-            SqliteDialect.parse_table_sql(sql, root_page)
+            crate::schema::BTreeTable::from_stored_sql(sql, root_page, true)
         }
 
         fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_parser::ast::Stmt> {

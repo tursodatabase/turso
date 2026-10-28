@@ -1461,10 +1461,12 @@ pub fn emit_upsert(
         if table.btree().is_some_and(|bt| bt.has_autoincrement)
             && connection.mv_store_for_db(upsert_database_id).is_some()
         {
-            let seq_name = crate::schema::autoincrement_sequence_name(table.get_name());
+            let seq_name = crate::schema::autoincrement_sequence_name(
+                &resolver.mangle_name(upsert_namespace, table.get_name()),
+            );
             let seq = resolver
                 .with_schema(upsert_database_id, |s| {
-                    s.get_sequence(ctx.namespace.id, &seq_name).cloned()
+                    s.get_sequence(NamespaceId::ROOT, &seq_name).cloned()
                 })
                 .ok_or_else(|| {
                     crate::LimboError::InternalError(format!(
@@ -1475,7 +1477,7 @@ pub fn emit_upsert(
             crate::translate::sequence::emit_disk_advance_past(
                 program,
                 resolver,
-                upsert_namespace,
+                NamespaceRef::root_of(upsert_database_id),
                 &seq_name,
                 &seq,
                 rnew,

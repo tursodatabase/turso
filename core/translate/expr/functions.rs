@@ -1,4 +1,5 @@
 use super::*;
+use crate::namespace::NamespaceId;
 use crate::translate::sequence::emit_sequence_descriptor_literals;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{to_u32, InsertFlags, RegisterOrLiteral};
@@ -208,13 +209,14 @@ pub(super) fn translate_sequence_function(
         (resolver.resolve_existing_sequence(&name)?, name)
     };
     let database_id = namespace.database_id;
+    let mangled_seq_name = resolver.mangle_name(namespace, &normalized_name);
     let runtime_args = qualify_sequence_argument(args, resolver);
     let args = runtime_args.as_deref().unwrap_or(args);
 
     let backing_table_name =
-        crate::translate::sequence::sequence_backing_table_name(&normalized_name);
+        crate::translate::sequence::sequence_backing_table_name(&mangled_seq_name);
     let backing_table = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(namespace.id, &backing_table_name)
+        s.get_btree_table(NamespaceId::ROOT, &backing_table_name)
     });
     if backing_table.is_none() {
         crate::bail_parse_error!("sequence \"{}\" does not exist", seq_name_raw);
@@ -333,6 +335,7 @@ pub(super) fn translate_sequence_function(
         });
         program.emit_insn(Insn::SetSequenceCurrval {
             db: database_id,
+            namespace: namespace.id,
             seq_name: normalized_name.clone(),
             value_reg: start_reg + 1,
         });
@@ -346,7 +349,7 @@ pub(super) fn translate_sequence_function(
             program,
             resolver,
             database_id,
-            &normalized_name,
+            &mangled_seq_name,
             start_reg + 1,
         )?;
     }

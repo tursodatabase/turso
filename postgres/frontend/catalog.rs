@@ -88,7 +88,7 @@ impl Dialect for PostgresDialect {
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
         match stmt {
             turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } => {
-                BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)
+                BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, false)
             }
             _ => Err(LimboError::ParseError(
                 "expected CREATE TABLE statement".to_string(),

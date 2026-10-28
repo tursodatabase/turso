@@ -1885,6 +1885,7 @@ pub enum Insn {
     /// register operation.
     SetSequenceCurrval {
         db: usize,
+        namespace: NamespaceId,
         seq_name: String,
         value_reg: usize,
     },
@@ -1905,6 +1906,7 @@ pub enum Insn {
     /// closes.
     SequenceRegisterAllocation {
         db: usize,
+        namespace: NamespaceId,
         seq_name: String,
         value_reg: usize,
         /// Register holding the encoded saved outer mv_tx (the blob written
