@@ -400,6 +400,20 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test numeric-negation {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, '1.50');
+    INSERT INTO t1 VALUES (2, '-7.25');
+    INSERT INTO t1 VALUES (3, NULL);
+    SELECT id, -val FROM t1 ORDER BY id;
+}
+expect {
+    1|-1.50
+    2|7.25
+    3|
+}
+
+@requires strict "uses STRICT tables"
 test numeric-modulo-by-zero {
     CREATE TABLE t1(val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES ('1.50');

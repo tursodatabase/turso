@@ -264,6 +264,17 @@ expect {
     |||
 }
 
+test table-numeric-column-negation-keeps-scale {
+    CREATE TABLE nm (id int PRIMARY KEY, v numeric(10,2), w numeric(10,3));
+    INSERT INTO nm VALUES (1, 1.5, 0.4), (2, -7.25, 2), (3, NULL, 1);
+    SELECT -v, -w FROM nm ORDER BY id;
+}
+expect {
+    -1.50|-0.400
+    7.25|-2.000
+    |-1.000
+}
+
 test table-uuid-column-omitted-from-insert-is-null {
     CREATE TABLE t (id int PRIMARY KEY, u uuid);
     INSERT INTO t (id) VALUES (1);

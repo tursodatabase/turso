@@ -177,6 +177,33 @@ pub(super) struct ResolvedOperator {
     encode_info: Option<OperatorEncodeInfo>,
 }
 
+/// Find the operator of a built-in type that computes `-operand` as
+/// `zero - operand`. This only applies when the type takes integers as values,
+/// so `zero` can be encoded as a value of the type: numeric does, while date,
+/// whose `-` takes a date and a number of days, keeps SQLite's negation. Types
+/// created with CREATE TYPE keep SQLite's negation too, because their `-` may
+/// not accept a result below zero.
+pub(super) fn find_custom_type_negation(
+    zero: &ast::Expr,
+    operand: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Option<ResolvedOperator> {
+    find_custom_type_operator(
+        zero,
+        operand,
+        &ast::Operator::Subtract,
+        referenced_tables,
+        resolver,
+    )
+    .filter(|resolved| {
+        resolved
+            .encode_info
+            .as_ref()
+            .is_some_and(|encode_info| encode_info.type_def.is_builtin)
+    })
+}
+
 /// Find a custom type operator function for a binary expression.
 ///
 /// Operators fire when:

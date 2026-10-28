@@ -3209,6 +3209,25 @@ fn translate_unary_expr(
             Ok(target_register)
         }
         (UnaryOperator::Negative, _) => {
+            let zero = ast::Expr::Literal(ast::Literal::Numeric("0".to_string()));
+            if let Some(resolved) =
+                find_custom_type_negation(&zero, expr, referenced_tables, resolver)
+            {
+                let result_reg = emit_custom_type_operator(
+                    program,
+                    referenced_tables,
+                    &zero,
+                    expr,
+                    &resolved,
+                    resolver,
+                )?;
+                program.emit_insn(Insn::Copy {
+                    src_reg: result_reg,
+                    dst_reg: target_register,
+                    extra_amount: 0,
+                });
+                return Ok(target_register);
+            }
             let value = 0;
 
             let reg = program.alloc_register();
