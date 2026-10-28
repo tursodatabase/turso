@@ -3434,7 +3434,7 @@ impl PgGetTableDefCursor {
 
             let postgres_ddl = match self.sql_map.get(&mangle_name(namespace, table_name)) {
                 Some(schema_sql) => decode_stored_pg_schema_sql(schema_sql)
-                    .map(str::to_string)
+                    .map(|sql| ddl_with_user_names(&schema, namespace, table_name, sql))
                     .unwrap_or_else(|| self.convert_to_postgres_ddl(schema_sql)),
                 None => self.convert_to_postgres_ddl(&btree_table.to_sql()),
             };
@@ -3479,6 +3479,45 @@ impl PgGetTableDefCursor {
 
         postgres_ddl
     }
+}
+
+/// `sql`, the stored text of table `table_name` of `namespace`, with the
+/// names a user writes: the stored text names the table and the tables its
+/// foreign keys refer to by their mangled names. A foreign key target in
+/// another schema is named with its schema.
+fn ddl_with_user_names(
+    schema: &Schema,
+    namespace: NamespaceId,
+    table_name: &str,
+    sql: &str,
+) -> String {
+    let Ok(parse_result) = turso_pg_parser::parse(sql) else {
+        return sql.to_string();
+    };
+    let mut ddl = sql.to_string();
+    // From the last name to the first, so the offsets of the others hold.
+    for table in turso_pg_parser::foreign_key_tables(&parse_result)
+        .iter()
+        .rev()
+    {
+        let (target, bare) = schema.demangle_name(&table.name);
+        if target.is_root() {
+            continue;
+        }
+        let Ok(renamed) = turso_pg_parser::name_at(&ddl, table.location, bare) else {
+            return sql.to_string();
+        };
+        ddl = if target == namespace {
+            renamed
+        } else {
+            turso_pg_parser::qualify_create_table_name(
+                &renamed,
+                table.location,
+                schema_name_of(schema, target),
+            )
+        };
+    }
+    turso_pg_parser::name_create_table(&ddl, table_name).unwrap_or(ddl)
 }
 
 impl VirtualTableCursor for PgGetTableDefCursor {
