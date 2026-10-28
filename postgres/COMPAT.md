@@ -84,7 +84,7 @@ Basics not enumerated by the official feature matrix.
 
 The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 `pg_namespace`, `pg_attribute`, `pg_type` (builtin + array + enum types),
-`pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_sequence`, `pg_sequences`,
+`pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_views`, `pg_sequence`, `pg_sequences`,
 `pg_database`, `pg_roles` (built-in `postgres` superuser and `pg_database_owner`, and roles from `CREATE ROLE`), `pg_auth_members` (memberships from `GRANT role TO role`), `pg_proc`, `pg_am`,
 `pg_policy` (row-level security policies, with `polqual` and `polwithcheck`
 as the text `pg_get_expr` prints), `pg_policies`, plus `pg_input_error_info`. Present but
