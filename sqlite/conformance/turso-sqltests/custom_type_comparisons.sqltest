@@ -417,3 +417,56 @@ expect {
     1
     1
 }
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-window-range-offset {
+    -- A RANGE offset frame adds the offset to a numeric ORDER BY value with
+    -- numeric's + and compares with numeric's order. Expected rows are from
+    -- PostgreSQL.
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (9.5), (10), (10.5), (12), (NULL);
+    SELECT 'p1', n, count(*) OVER (ORDER BY n RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY n IS NULL, n;
+    SELECT 'f1', n, count(*) OVER (ORDER BY n RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t ORDER BY n IS NULL, n;
+    SELECT 'p05', n, count(*) OVER (ORDER BY n RANGE BETWEEN 0.5 PRECEDING AND 0.5 FOLLOWING) FROM t ORDER BY n IS NULL, n;
+    SELECT 'desc', n, count(*) OVER (ORDER BY n DESC RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY n IS NULL, n;
+    SELECT 'expr', n, count(*) OVER (ORDER BY n + 0 RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY n IS NULL, n;
+}
+expect {
+    p1|9.50|1
+    p1|10.00|2
+    p1|10.50|3
+    p1|12.00|1
+    p1||1
+    f1|9.50|3
+    f1|10.00|2
+    f1|10.50|1
+    f1|12.00|1
+    f1||1
+    p05|9.50|2
+    p05|10.00|3
+    p05|10.50|2
+    p05|12.00|1
+    p05||1
+    desc|9.50|3
+    desc|10.00|2
+    desc|10.50|1
+    desc|12.00|1
+    desc||1
+    expr|9.50|1
+    expr|10.00|2
+    expr|10.50|3
+    expr|12.00|1
+    expr||1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-array-window-range-offset-is-an-error {
+    -- An array has an order but no distance, so a RANGE offset on it is an
+    -- error, as in PostgreSQL.
+    CREATE TABLE t(a integer[]) STRICT;
+    INSERT INTO t VALUES ('{1}');
+    SELECT count(*) OVER (ORDER BY a RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type array
+}

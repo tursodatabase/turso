@@ -385,17 +385,52 @@ pub(super) fn emit_operator_call(
         }
     }
     let result_reg = program.alloc_register();
+    emit_function(program, call, start_reg, result_reg);
+    Ok(result_reg)
+}
+
+/// Emits `call` on operands that are already in registers, one register per
+/// operand, and writes the result to `dest`.
+pub(crate) fn emit_operator_call_on_registers(
+    program: &mut ProgramBuilder,
+    call: &OperatorCall,
+    operand_regs: &[usize],
+    dest: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    assert_eq!(
+        operand_regs.len(),
+        call.encode.len(),
+        "one argument per operand"
+    );
+    let start_reg = program.alloc_registers(operand_regs.len());
+    for (i, (&operand_reg, encode)) in operand_regs.iter().zip(&call.encode).enumerate() {
+        match encode {
+            Some(to) => {
+                emit_encode(program, to, operand_reg, start_reg + i, resolver)?;
+            }
+            None => program.emit_insn(Insn::Copy {
+                src_reg: operand_reg,
+                dst_reg: start_reg + i,
+                extra_amount: 0,
+            }),
+        }
+    }
+    emit_function(program, call, start_reg, dest);
+    Ok(())
+}
+
+fn emit_function(program: &mut ProgramBuilder, call: &OperatorCall, start_reg: usize, dest: usize) {
     program.emit_insn(Insn::Function {
         constant_mask: 0,
         start_reg,
-        dest: result_reg,
+        dest,
         func: FuncCtx {
             func: call.func.clone(),
             arg_count: call.encode.len(),
             collation: CollationSeq::BINARY,
         },
     });
-    Ok(result_reg)
 }
 
 fn emit_encode(

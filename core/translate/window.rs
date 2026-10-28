@@ -6,7 +6,9 @@ use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::collate::{expr_collation, CollationSeq};
 use crate::translate::emitter::{Resolver, TranslateCtx};
+use crate::translate::expr::expr_type::TypeEnv;
 use crate::translate::expr::{
+    custom_operator_call, emit_operator_call_on_registers,
     expr_contains_nondeterministic_scalar_function, translate_expr, translate_expr_no_constant_opt,
     walk_expr, walk_expr_mut, NoConstantOptReason, WalkControl,
 };
@@ -18,6 +20,7 @@ use crate::translate::plan::{
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::result_row::emit_select_result;
 use crate::translate::subquery::plan_subqueries_from_select_plan;
+use crate::type_ordering::TypeOrdering;
 use crate::types::KeyInfo;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -1702,6 +1705,7 @@ impl EmitWindow {
                         registers
                             .end_offset_reg
                             .expect("bounded RANGE end has an offset register"),
+                        FrameBoundPosition::End,
                         cursors.csr_end,
                         label_done,
                         &t_ctx.resolver,
@@ -1805,6 +1809,7 @@ impl EmitWindow {
                         RangeCmp::Ge,
                         cursors.csr_current,
                         registers.end_offset_reg.expect("checked above"),
+                        FrameBoundPosition::End,
                         cursors.csr_end,
                         label_done,
                         &t_ctx.resolver,
@@ -2510,6 +2515,7 @@ fn emit_window_range_test(
     op: RangeCmp,
     csr1: CursorID,
     offset_reg: usize,
+    offset_bound: FrameBoundPosition,
     csr2: CursorID,
     target_pc: BranchOffset,
     resolver: &Resolver,
@@ -2550,6 +2556,36 @@ fn emit_window_range_test(
         (op, false)
     };
     let collation = expr_collation(order_expr, Some(&plan.table_references), resolver)?;
+    // When the ORDER BY value's type has an order, its own `+` or `-` adds the
+    // offset (numeric's adds exactly). None means SQLite's operator runs. Of
+    // the types with an order only numeric has a distance to add, as in
+    // PostgreSQL.
+    let type_arithmetic = match collation {
+        CollationSeq::Type(ordering) if ordering != TypeOrdering::Numeric => {
+            crate::bail_parse_error!(
+                "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {}",
+                ordering.name()
+            )
+        }
+        CollationSeq::Type(_) => {
+            let offset_expr = frame_offset_expr(&window.frame, offset_bound);
+            let operator = if subtract {
+                turso_parser::ast::Operator::Subtract
+            } else {
+                turso_parser::ast::Operator::Add
+            };
+            let arithmetic = Expr::Binary(
+                Box::new(order_expr.clone()),
+                operator,
+                Box::new(offset_expr.clone()),
+            );
+            custom_operator_call(
+                &arithmetic,
+                &TypeEnv::new(Some(&plan.table_references), resolver),
+            )?
+        }
+        CollationSeq::Text(_) => None,
+    };
     let big_null = matches!(
         (sort_order, nulls_order),
         (SortOrder::Asc, Some(turso_parser::ast::NullsOrder::Last))
@@ -2593,20 +2629,24 @@ fn emit_window_range_test(
     }
 
     // Text and blobs sort at or above the empty string, so only numeric
-    // values fall through to Add/Subtract. NULL arithmetic remains NULL.
-    let reg_empty = program.alloc_register();
+    // values fall through to Add/Subtract. NULL arithmetic remains NULL. A
+    // value of a type with an order is never skipped: numeric's values are
+    // texts, and its `+` reads them.
     let label_after_arithmetic = program.allocate_label();
-    program.emit_insn(Insn::String8 {
-        value: String::new(),
-        dest: reg_empty,
-    });
-    program.emit_insn(Insn::Ge {
-        lhs: reg1,
-        rhs: reg_empty,
-        target_pc: label_after_arithmetic,
-        flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
-    });
+    if matches!(collation, CollationSeq::Text(_)) {
+        let reg_empty = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            value: String::new(),
+            dest: reg_empty,
+        });
+        program.emit_insn(Insn::Ge {
+            lhs: reg1,
+            rhs: reg_empty,
+            target_pc: label_after_arithmetic,
+            flags: crate::vdbe::insn::CmpInsFlags::default(),
+            collation: CollationSeq::for_internal_values(),
+        });
+    }
 
     // SQLite performs this comparison before arithmetic in the two cases
     // where overflow to +/-infinity cannot change a successful result.
@@ -2621,7 +2661,9 @@ fn emit_window_range_test(
             collation,
         );
     }
-    if subtract {
+    if let Some(call) = &type_arithmetic {
+        emit_operator_call_on_registers(program, call, &[reg1, offset_reg], reg1, resolver)?;
+    } else if subtract {
         program.emit_insn(Insn::Subtract {
             lhs: reg1,
             rhs: offset_reg,
@@ -2646,6 +2688,18 @@ fn emit_window_range_test(
     );
     program.preassign_label_to_next_insn(label_done);
     Ok(())
+}
+
+/// The `N` of the frame's `N PRECEDING` or `N FOLLOWING` bound.
+fn frame_offset_expr(frame: &crate::translate::plan::Frame, bound: FrameBoundPosition) -> &Expr {
+    let bound = match bound {
+        FrameBoundPosition::Start => &frame.start,
+        FrameBoundPosition::End => &frame.end,
+    };
+    match bound {
+        FrameBound::Preceding(offset) | FrameBound::Following(offset) => offset,
+        _ => unreachable!("a RANGE offset comes from an N PRECEDING or N FOLLOWING bound"),
+    }
 }
 
 /// Emit one of the three operations that move the frame forward — add a
@@ -2739,6 +2793,7 @@ fn emit_window_op(
                             RangeCmp::Le,
                             cursors.csr_current,
                             reg,
+                            FrameBoundPosition::Start,
                             cursor_for_op,
                             label_done,
                             &t_ctx.resolver,
@@ -2750,6 +2805,7 @@ fn emit_window_op(
                             RangeCmp::Ge,
                             cursor_for_op,
                             reg,
+                            FrameBoundPosition::Start,
                             cursors.csr_current,
                             label_done,
                             &t_ctx.resolver,
@@ -2762,6 +2818,7 @@ fn emit_window_op(
                     RangeCmp::Gt,
                     cursor_for_op,
                     reg,
+                    FrameBoundPosition::End,
                     cursors.csr_current,
                     label_done,
                     &t_ctx.resolver,
