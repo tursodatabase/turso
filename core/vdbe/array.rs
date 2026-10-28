@@ -589,31 +589,6 @@ pub(crate) fn make_array_from_registers(
     Ok(Value::Blob(record.into_payload()))
 }
 
-/// Element-wise comparison of two record-format array blobs.
-/// Compares corresponding elements using ValueRef ordering.
-/// If all common elements are equal, the shorter array is less.
-/// Returns Err if either blob is not a valid record.
-pub(crate) fn compare_arrays(a: &[u8], b: &[u8]) -> Result<std::cmp::Ordering> {
-    let iter_a = ValueIterator::new(a)?;
-    let iter_b = ValueIterator::new(b)?;
-    let mut count_a = 0usize;
-    let mut count_b = 0usize;
-    for (va, vb) in iter_a.zip(iter_b) {
-        count_a += 1;
-        count_b += 1;
-        let (va, vb) = (va?, vb?);
-        let ord = va.cmp(&vb);
-        if !ord.is_eq() {
-            return Ok(ord);
-        }
-    }
-    // Count remaining elements in the longer array
-    //TODO don't start another iterator, because it will deserialize the whole record again.
-    let len_a = count_a + ValueIterator::new(a)?.skip(count_a).count();
-    let len_b = count_b + ValueIterator::new(b)?.skip(count_b).count();
-    Ok(len_a.cmp(&len_b))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

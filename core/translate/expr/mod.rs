@@ -15,7 +15,7 @@ use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::schema::{
     BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, ParenthesizedJoinColumn,
-    ParenthesizedJoinColumnVisibility, Table, Type, TypeDef,
+    ParenthesizedJoinColumnVisibility, ResolvedType, Table, Type, TypeDef,
 };
 use crate::sync::Arc;
 use crate::translate::expression_index::selected_expression_index;

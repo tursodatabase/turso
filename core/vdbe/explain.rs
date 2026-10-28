@@ -1400,7 +1400,6 @@ pub fn insn_to_row(
                 acc_reg,
                 delimiter: _,
                 col,
-                comparator: _,
             } => (
                 "AggInverse",
                 0,

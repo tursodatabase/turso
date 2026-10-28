@@ -14,6 +14,7 @@ use crate::schema::{Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::translate::plan::{Plan, SelectPlan, TableReferences};
+use crate::type_ordering::TypeOrdering;
 use crate::vdbe::affinity::Affinity;
 
 /// Type parameters are kept as written, in the same form as `Column::ty_params`.
@@ -117,10 +118,6 @@ impl<'a> TypeEnv<'a> {
 
     pub(crate) fn resolver(&self) -> &Resolver<'a> {
         self.resolver
-    }
-
-    pub(crate) fn tables(&self) -> Option<&'a TableReferences> {
-        self.tables
     }
 }
 
@@ -477,6 +474,17 @@ fn field_type(
     }
 }
 
+/// The order values of this type compare in, if the type has one: an array,
+/// or a custom type whose `OPERATOR '<'` names a function. A domain has the
+/// order of the type it is based on.
+pub(crate) fn type_ordering(ty: &ExprType, schema: &Schema) -> Option<TypeOrdering> {
+    match ty {
+        ExprType::Custom { type_def, .. } => schema.type_ordering(type_def),
+        ExprType::Array { .. } => Some(TypeOrdering::Array),
+        ExprType::Builtin(_) | ExprType::Untyped | ExprType::Null | ExprType::Unknown => None,
+    }
+}
+
 /// Custom types only apply to columns of STRICT tables.
 pub(crate) fn column_type(column: &Column, is_strict: bool, schema: &Schema) -> ExprType {
     let scalar = match schema.get_type_def(&column.ty_str, is_strict) {
@@ -725,8 +733,10 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
 /// written in the statement mixed with an integer stays a decimal: both are
 /// exact, as in PostgreSQL. String literals count
 /// as text. The same custom type with different parameters, such as numeric(10,2)
-/// and numeric(5,1), is that type without parameters. A custom type mixed with any
-/// other type counts as the type it is stored as. Any other mix is `Any`.
+/// and numeric(5,1), is that type without parameters. A type that computes with
+/// exact numbers, such as numeric, mixed with an integer or a decimal is that
+/// type without parameters. A custom type mixed with any other type counts as
+/// the type it is stored as. Any other mix is `Any`.
 fn common_type<'e>(exprs: impl Iterator<Item = &'e ast::Expr>, env: &TypeEnv) -> ExprType {
     common_of_types(exprs.map(|expr| type_of(expr, env)), env.schema())
 }
@@ -785,6 +795,18 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
         // PostgreSQL: coalesce(date_column, '2024-01-01') is a date.
         (custom @ ExprType::Custom { .. }, ExprType::Untyped)
         | (ExprType::Untyped, custom @ ExprType::Custom { .. }) => custom,
+        // An integer or a decimal mixed with a type that computes with exact
+        // numbers is a value of that type without parameters, as PostgreSQL
+        // converts integer to numeric: coalesce(numeric_column, 0) is a numeric.
+        (ExprType::Custom { type_def, .. }, ExprType::Builtin(Integer | Decimal))
+        | (ExprType::Builtin(Integer | Decimal), ExprType::Custom { type_def, .. })
+            if type_def.computes_with_exact_numbers() =>
+        {
+            ExprType::Custom {
+                type_def,
+                params: Vec::new(),
+            }
+        }
         // Mixed with anything else, including another custom type, a custom value
         // is a value of the type it is stored as: coalesce(smallint_column, 0) and
         // coalesce(smallint_column, bigint_column) are integers.
@@ -910,6 +932,19 @@ mod tests {
                 "coalesce(CAST(1 AS cents), 1)",
                 builtin(BuiltinType::Integer),
             ),
+            // Except that numeric computes with integers and decimals.
+            (
+                "coalesce(CAST(1 AS numeric(10, 2)), 0)",
+                custom("numeric", &[]),
+            ),
+            (
+                "coalesce(CAST(1 AS numeric(10, 2)), 0.5)",
+                custom("numeric", &[]),
+            ),
+            (
+                "coalesce(CAST(1 AS numeric(10, 2)), CAST(0.5 AS REAL))",
+                builtin(BuiltinType::Any),
+            ),
             // Two different custom types have their common stored type.
             (
                 "coalesce(CAST(1 AS cents), CAST(2 AS smallint))",
@@ -933,9 +968,7 @@ mod tests {
             ("-CAST(1 AS cents)", ExprType::Unknown),
             ("~CAST(1 AS cents)", ExprType::Unknown),
             ("CAST(1 AS cents) & 1", ExprType::Unknown),
-            // SQLite's unary minus for now; numeric_neg once comparisons use
-            // numeric's order.
-            ("-CAST(1 AS numeric(10, 2))", builtin(BuiltinType::Numeric)),
+            ("-CAST(1 AS numeric(10, 2))", custom("numeric", &[])),
             ("-CAST(1 AS smallint)", builtin(BuiltinType::Integer)),
             ("CAST(1 AS smallint) << 1", builtin(BuiltinType::Integer)),
             ("abs(CAST(1 AS cents))", builtin(BuiltinType::Integer)),

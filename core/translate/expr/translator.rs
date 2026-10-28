@@ -646,19 +646,35 @@ fn translate_case_expr(
         )?;
     };
     for (when_expr, then_expr) in when_then_pairs {
-        translate_expr_no_constant_opt(
-            program,
-            referenced_tables,
-            when_expr,
-            expr_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+        let when_reg = match base.as_deref() {
+            Some(base_expr)
+                if type_to_read_constant_as(when_expr, base_expr, referenced_tables, resolver)?
+                    .is_some() =>
+            {
+                let when_reg = program.alloc_register();
+                translate_comparison_operand(
+                    program,
+                    referenced_tables,
+                    when_expr,
+                    base_expr,
+                    when_reg,
+                    resolver,
+                )?
+            }
+            _ => translate_expr_no_constant_opt(
+                program,
+                referenced_tables,
+                when_expr,
+                expr_reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?,
+        };
         match base_reg {
             // CASE 1 WHEN 0 THEN 0 ELSE 1 becomes 1==0, Ne branch to next clause
             Some(base_reg) => program.emit_insn(Insn::Ne {
                 lhs: base_reg,
-                rhs: expr_reg,
+                rhs: when_reg,
                 target_pc: next_case_label,
                 // A NULL result is considered untrue when evaluating WHEN terms.
                 flags: CmpInsFlags::default()
@@ -680,7 +696,7 @@ fn translate_case_expr(
             }),
             // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
             None => program.emit_insn(Insn::IfNot {
-                reg: expr_reg,
+                reg: when_reg,
                 target_pc: next_case_label,
                 jump_if_null: true,
             }),

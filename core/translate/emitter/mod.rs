@@ -410,15 +410,18 @@ impl<'a> Resolver<'a> {
         f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> Result<T>,
     ) -> Result<T> {
         match ctx {
-            Some(ctx) => {
-                let scope = SelfTableScope::new(ctx.clone());
-                let prev = self.self_table_scope.borrow_mut().replace(scope);
-                let result = f(program, Some(ctx));
-                *self.self_table_scope.borrow_mut() = prev;
-                result
-            }
+            Some(ctx) => self.with_self_table(ctx, || f(program, Some(ctx))),
             None => f(program, None),
         }
+    }
+
+    /// Runs `f` with `SELF_TABLE` column references referring to `ctx`.
+    pub(crate) fn with_self_table<T>(&self, ctx: &SelfTableContext, f: impl FnOnce() -> T) -> T {
+        let scope = SelfTableScope::new(ctx.clone());
+        let prev = self.self_table_scope.borrow_mut().replace(scope);
+        let result = f();
+        *self.self_table_scope.borrow_mut() = prev;
+        result
     }
 
     pub(crate) fn with_existing_self_table_context<T>(

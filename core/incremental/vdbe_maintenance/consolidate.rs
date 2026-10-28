@@ -80,7 +80,6 @@ pub(super) fn consolidate_delta(
             order_collations_nulls: (0..key_width)
                 .map(|_| (SortOrder::Asc, CollationSeq::Binary, None))
                 .try_collect()?,
-            comparators: (0..key_width).map(|_| None).try_collect()?,
         }),
     });
     let entry_start = program.alloc_registers(entry_width);

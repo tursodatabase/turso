@@ -3239,7 +3239,6 @@ fn emit_function_step(
                         col: arg_load_start.unwrap_or(0),
                         delimiter: 0,
                         func: AccumulatorFunc::Window(win_func.clone()),
-                        comparator: None,
                         collation: CollationSeq::Binary,
                     }),
                 });
@@ -3350,7 +3349,6 @@ fn emit_function_inverse(
                 col: arg_load_start.unwrap_or(0),
                 delimiter: 0,
                 func: func.func.clone(),
-                comparator: None,
             });
 
             if let Some(label) = filter_skip_label {

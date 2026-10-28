@@ -103,7 +103,11 @@ pub(super) fn translate_in_list(
     for (i, expr) in rhs.iter().enumerate() {
         let last_condition = i == rhs.len() - 1;
         let rhs_reg = program.alloc_registers(lhs_arity);
-        let _ = translate_expr(program, referenced_tables, expr, rhs_reg, resolver)?;
+        if lhs_arity == 1 {
+            translate_comparison_operand(program, referenced_tables, expr, lhs, rhs_reg, resolver)?;
+        } else {
+            translate_expr(program, referenced_tables, expr, rhs_reg, resolver)?;
+        }
 
         if lhs_arity == 1 {
             // Scalar comparison path

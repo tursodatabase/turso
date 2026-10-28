@@ -4441,11 +4441,7 @@ fn autoindex_prefilter(
             let depends_on_another_table = !constraint.lhs_mask.is_empty();
             let is_virtual_column = column.is_virtual_generated();
             let is_array = column.is_array();
-            let has_custom_type = resolver
-                .schema()
-                .get_type_def(&column.ty_str, table_reference.table.is_strict())
-                .is_some();
-            if depends_on_another_table || is_virtual_column || is_array || has_custom_type {
+            if depends_on_another_table || is_virtual_column || is_array {
                 continue;
             }
 

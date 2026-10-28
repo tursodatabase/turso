@@ -8,7 +8,7 @@ use crate::{
         ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
     },
     translate::{
-        collate::{expr_collation, CollationSeq},
+        collate::{expr_collation_ignoring_type, CollationSeq},
         emitter::{Resolver, UpdateRowSource},
         expr::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
@@ -38,7 +38,7 @@ use turso_parser::ast::{
 use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
-use super::expr::expr_type::{query_column_type, type_of, TypeEnv};
+use super::expr::expr_type::{query_column_type, type_of, type_ordering, TypeEnv};
 
 /// Infer the affinity of a subquery result column from its expression.
 ///
@@ -3125,7 +3125,8 @@ pub(super) fn query_output_columns(
     let env = TypeEnv::new(Some(table_references), resolver);
     for (column_index, column) in columns.iter_mut().enumerate() {
         let result_expr = &result_columns[column_index].expr;
-        let dimensions = type_of(result_expr, &env).array_dimensions();
+        let result_type = type_of(result_expr, &env);
+        let dimensions = result_type.array_dimensions();
         if dimensions > ast::MAX_ARRAY_DIMENSIONS {
             crate::bail_parse_error!(
                 "result column {} is an array with {dimensions} dimensions, but arrays have at most {}",
@@ -3134,11 +3135,12 @@ pub(super) fn query_output_columns(
             );
         }
         column.set_array_dimensions(dimensions);
-        column.set_collation(Some(expr_collation(
+        column.set_collation(Some(expr_collation_ignoring_type(
             result_expr,
             Some(table_references),
             resolver,
         )?));
+        column.set_type_ordering(type_ordering(&result_type, resolver.schema()));
     }
     Ok(columns)
 }

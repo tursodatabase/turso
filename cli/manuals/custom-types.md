@@ -120,7 +120,7 @@ SELECT val FROM t1 WHERE val < 25;
 
 ## Ordering
 
-Sorting and indexing always operate on **encoded (on-disk) values**, not decoded values. DECODE is purely a presentation layer — it controls how values appear in query results, but has no effect on sort order or index structure.
+A type whose `OPERATOR '<'` names a function has an order (`numeric_lt`, `array_lt`), and values of the type sort and compare by it, whether they are stored or decoded. Other types sort and index by their **encoded (on-disk) values**: there DECODE is purely a presentation layer — it controls how values appear in query results, but has no effect on sort order or index structure.
 
 Custom types that support ordering must declare `OPERATOR '<'`. Without it, `ORDER BY` and `CREATE INDEX` on columns of that type are **forbidden** — attempting either produces a clear error.
 
@@ -193,6 +193,23 @@ SELECT val FROM t ORDER BY val;
 -- banana
 -- cherry
 ```
+
+### Comparisons
+
+A type with an order uses it in every comparison of its values: `=`, `<` and the other operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins and indexes. The same query returns the same rows with and without an index, and expressions of the type compare the same way:
+
+```sql
+CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), i integer) STRICT;
+INSERT INTO t VALUES (1, 4.50, 6), (2, 9.50, 0);
+SELECT max(n + i) FROM t;            -- 10.50, not '9.50'
+SELECT id FROM t WHERE n + i IN (10.5);  -- 1
+SELECT id FROM t WHERE n = 4.504;    -- nothing: the constant is not rounded to 2 places
+SELECT n FROM t UNION SELECT 4.5;    -- two rows: 4.5 equals 4.50
+```
+
+A COLLATE on a value of such a type is an error (`collations are not supported by type numeric`).
+
+A type without an order compares the values the column reads as, with SQLite's rules. A constant compared with such a value is first converted to the type, so `uuid_column = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'` matches the lowercase uuid, and an invalid constant is an error. An index on such a column serves `=` lookups only, since it is ordered by the encoded form.
 
 ### Non-Orderable Types
 

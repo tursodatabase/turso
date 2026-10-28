@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::collate::CollationSeq;
 use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
 use turso_parser::ast::NullsOrder;
@@ -41,6 +42,12 @@ fn encode_seek_keys_for_custom_types(
             break;
         }
         let idx_col = &seek_index.columns[idx_col_pos];
+        // A type ordering compares the value as given, so the key is not
+        // encoded: encoding would round 3.504 to the column's scale. An
+        // expression column holds the expression's value, not the column's.
+        if matches!(idx_col.collation, CollationSeq::Type(_)) || idx_col.expr.is_some() {
+            continue;
+        }
         let table_col = match columns.get(idx_col.pos_in_table) {
             Some(c) => c,
             None => continue,

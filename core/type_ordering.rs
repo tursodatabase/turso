@@ -15,7 +15,7 @@ use crate::types::AsValueRef;
 use crate::vdbe::array::{array_values_from_blob, parse_text_array};
 use crate::{Value, ValueRef};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TypeOrdering {
     Numeric,
     Array,
@@ -26,6 +26,13 @@ pub enum TypeOrdering {
 }
 
 impl TypeOrdering {
+    pub const ALL: [Self; 4] = [
+        Self::Numeric,
+        Self::Array,
+        Self::TestUint,
+        Self::StringReverse,
+    ];
+
     /// The order named by `OPERATOR '<' name` in CREATE TYPE, or None when no
     /// Rust order implements that function.
     pub fn from_less_than_function(name: &str) -> Option<Self> {
@@ -35,6 +42,16 @@ impl TypeOrdering {
             "test_uint_lt" => Some(Self::TestUint),
             "string_reverse" => Some(Self::StringReverse),
             _ => None,
+        }
+    }
+
+    /// The name EXPLAIN shows for the order.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Numeric => "numeric",
+            Self::Array => "array",
+            Self::TestUint => "test_uint",
+            Self::StringReverse => "string_reverse",
         }
     }
 

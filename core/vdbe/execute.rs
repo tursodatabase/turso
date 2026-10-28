@@ -31,7 +31,6 @@ use crate::storage::pager::{
 };
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
-use crate::type_ordering::TypeOrdering;
 use crate::types::IOResultOr;
 use crate::types::{
     compare_immutable, compare_record, AsValueRef, Extendable, IOCompletions, IOResult,
@@ -154,7 +153,7 @@ impl OpenedBTree {
 
 use super::{
     array::{
-        array_values_from_blob, compare_arrays, compute_array_length, compute_array_length_at_dim,
+        array_values_from_blob, compute_array_length, compute_array_length_at_dim,
         exec_array_append, exec_array_cat, exec_array_contains, exec_array_contains_all,
         exec_array_overlap, exec_array_position, exec_array_prepend, exec_array_remove,
         exec_array_slice, exec_array_to_string, exec_string_to_array, make_array_from_registers,
@@ -274,26 +273,6 @@ impl<T> OrOverflow<T> for Option<T> {
             Some(value) => Ok(value),
             None => Err(LimboError::IntegerOverflow),
         }
-    }
-}
-
-fn make_sort_comparator(ordering: TypeOrdering) -> crate::vdbe::sorter::SortComparator {
-    std::sync::Arc::new(move |a: &ValueRef, b: &ValueRef| ordering.compare(*a, *b))
-}
-
-/// Compare two values using the specified collation for text values.
-/// Non-text values are compared using their natural ordering.
-fn compare_with_collation(
-    lhs: &Value,
-    rhs: &Value,
-    collation: CollationSeq,
-    collation_comparator: &Option<crate::vdbe::sorter::SortComparator>,
-) -> Result<std::cmp::Ordering> {
-    match (lhs, rhs, collation_comparator) {
-        (Value::Text(_), Value::Text(_), Some(comparator)) => {
-            Ok(comparator(&lhs.as_ref(), &rhs.as_ref()))
-        }
-        _ => Ok(collation.compare(lhs.as_ref(), rhs.as_ref())),
     }
 }
 
@@ -1006,12 +985,17 @@ macro_rules! comparison_opcode {
                 return Err(unresolved_branch_target(*target_pc));
             };
 
-            // Two integers compare directly: no NULL handling, affinity or collation.
+            // Two integers compare directly: no NULL handling, affinity or
+            // text collation. A type's order may place integers differently.
             if let (
                 Register::Value(Value::Numeric(Numeric::Integer(l))),
                 Register::Value(Value::Numeric(Numeric::Integer(r))),
-            ) = (&state.registers[*lhs], &state.registers[*rhs])
-            {
+                true,
+            ) = (
+                &state.registers[*lhs],
+                &state.registers[*rhs],
+                collation.compares_non_text_like_sqlite(),
+            ) {
                 let jumps = $jumps;
                 state.pc = if jumps(*l, *r) {
                     target_pc
@@ -1107,20 +1091,6 @@ fn op_comparison_slow(
                 jump_if_null
             };
             take_jump_if!(should_jump);
-        }
-        (Value::Blob(lb), Value::Blob(rb)) if flags.has_array_cmp() => {
-            // Element-wise array comparison
-            if let Ok(ord) = compare_arrays(lb, rb) {
-                let should_jump = match op {
-                    ComparisonOp::Eq => ord.is_eq(),
-                    ComparisonOp::Ne => !ord.is_eq(),
-                    ComparisonOp::Lt => ord.is_lt(),
-                    ComparisonOp::Le => ord.is_le(),
-                    ComparisonOp::Gt => ord.is_gt(),
-                    ComparisonOp::Ge => ord.is_ge(),
-                };
-                take_jump_if!(should_jump);
-            }
         }
         (_, _) => {}
     }
@@ -7436,7 +7406,6 @@ fn update_agg_payload(
     maybe_arg2: Option<&Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
     payload: &mut crate::alloc::Vec<Value>,
     collation: CollationSeq,
-    comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
 ) -> Result<()> {
     match func {
         AggFunc::Count => {
@@ -7609,15 +7578,7 @@ fn update_agg_payload(
                 return Ok(());
             }
             use std::cmp::Ordering;
-            let comparator = comparator()?;
-            // Use custom type comparator if available, otherwise fall back to collation
-            let cmp = if let Some(ref cmp_fn) = comparator {
-                let arg_ref = arg.as_ref();
-                let payload_ref = payload[0].as_ref();
-                cmp_fn(&arg_ref, &payload_ref)
-            } else {
-                compare_with_collation(arg, &payload[0], collation, &comparator)?
-            };
+            let cmp = collation.compare(arg.as_ref(), payload[0].as_ref());
             let should_update = match func {
                 AggFunc::Max => cmp == Ordering::Greater,
                 AggFunc::Min => cmp == Ordering::Less,
@@ -8909,7 +8870,6 @@ pub fn op_agg_inverse(
             col,
             delimiter: _,
             func,
-            comparator: _,
         },
         insn
     );
@@ -9337,7 +9297,7 @@ pub fn op_agg_step(
                     }
                 }
             }
-            AggFunc::Min | AggFunc::Max if data.comparator.is_none() => {
+            AggFunc::Min | AggFunc::Max if data.collation.compares_non_text_like_sqlite() => {
                 if let Register::Value(Value::Numeric(Numeric::Integer(arg))) =
                     state.registers[data.col]
                 {
@@ -9371,7 +9331,6 @@ fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult 
         col,
         delimiter,
         func,
-        comparator,
         collation,
     } = data;
 
@@ -9422,9 +9381,6 @@ fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult 
     }
 
     let collation = *collation;
-    let comparator_factory = move || -> Result<Option<crate::vdbe::sorter::SortComparator>> {
-        Ok(comparator.as_ref().map(|c| make_sort_comparator(*c)))
-    };
 
     // Step the aggregate
     match func {
@@ -9465,14 +9421,7 @@ fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult 
                 .into());
             };
             let payload = agg.payload_vec_mut();
-            update_agg_payload(
-                func,
-                arg,
-                maybe_arg2.as_ref(),
-                payload,
-                collation,
-                comparator_factory,
-            )?;
+            update_agg_payload(func, arg, maybe_arg2.as_ref(), payload, collation)?;
         }
     };
 
@@ -9613,7 +9562,6 @@ pub fn op_sorter_open(
         cursor_id,
         columns: _,
         order_collations_nulls,
-        comparators,
     } = data.as_ref();
     // be careful here - we must not use any async operations after pager.with_header because this op-code has no proper state-machine
     let page_size = match pager.with_header(|header| header.page_size) {
@@ -9640,22 +9588,11 @@ pub fn op_sorter_open(
         collations.push(*coll);
         nulls_orders.push(*nulls);
     }
-    let mut sort_comparators =
-        crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())?;
-    for idx in 0..order_collations_nulls.len() {
-        let comparator = comparators
-            .get(idx)
-            .and_then(|c| c.as_ref())
-            .map(|c| make_sort_comparator(*c));
-        // Preallocated for every ORDER BY term above, so this push cannot grow the vector.
-        sort_comparators.push(comparator);
-    }
     let temp_store = program.connection.get_temp_store();
     let cursor = Sorter::new(
         &order,
         collations,
         nulls_orders,
-        sort_comparators,
         max_buffer_size_bytes,
         page_size,
         pager.io.clone(),
@@ -21390,7 +21327,6 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(5)); // unchanged
@@ -21405,7 +21341,6 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(6));
@@ -21426,7 +21361,6 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(10));
@@ -21437,7 +21371,6 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(15));
@@ -21458,7 +21391,6 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(10)); // unchanged
@@ -21474,7 +21406,6 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(5));
@@ -21486,7 +21417,6 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(3));
@@ -21498,7 +21428,6 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(3));
@@ -21518,7 +21447,6 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_f64(10.0));
@@ -21530,7 +21458,6 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_f64(30.0));
@@ -21582,7 +21509,6 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            || Ok(None),
         )
         .unwrap();
         update_agg_payload(
@@ -21591,7 +21517,6 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            || Ok(None),
         )
         .unwrap();
 

@@ -12,7 +12,6 @@ pub fn to_u32(v: usize) -> u32 {
 use super::{execute, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::function::AccumulatorFunc;
 use crate::namespace::{NamespaceId, NamespaceRef};
-use crate::type_ordering::TypeOrdering;
 use crate::{
     schema::{BTreeTable, CheckConstraint, Column, ForeignKey, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
@@ -74,7 +73,6 @@ impl CmpInsFlags {
     const NULL_EQ: usize = 0x80;
     const JUMP_IF_NULL: usize = 0x10;
     const AFFINITY_MASK: usize = 0x47;
-    const ARRAY_CMP: usize = 0x100;
 
     fn has(&self, flag: usize) -> bool {
         (self.0 & flag) != 0
@@ -107,15 +105,6 @@ impl CmpInsFlags {
     pub fn get_affinity(&self) -> Affinity {
         let aff_code = (self.0 & Self::AFFINITY_MASK) as u8;
         Affinity::from_char_code(aff_code)
-    }
-
-    pub fn array_cmp(mut self) -> Self {
-        self.0 |= Self::ARRAY_CMP;
-        self
-    }
-
-    pub fn has_array_cmp(&self) -> bool {
-        self.has(Self::ARRAY_CMP)
     }
 }
 
@@ -346,9 +335,6 @@ pub struct SorterOpenData {
         CollationSeq,
         Option<turso_parser::ast::NullsOrder>,
     )>,
-    /// Per-column custom type comparators for ORDER BY sorting.
-    /// When present, the comparator is used instead of standard value comparison.
-    pub comparators: crate::alloc::Vec<Option<TypeOrdering>>,
 }
 
 /// Data for AggStep instruction (boxed to keep Insn small).
@@ -358,8 +344,6 @@ pub struct AggStepData {
     pub col: usize,
     pub delimiter: usize,
     pub func: AccumulatorFunc,
-    /// Optional custom type comparator for MIN/MAX aggregates.
-    pub comparator: Option<TypeOrdering>,
     /// The collation MIN, MAX, mode and percentile compare the argument with.
     /// BINARY for the aggregates that do not compare values.
     pub collation: CollationSeq,
@@ -1405,7 +1389,6 @@ pub enum Insn {
         col: usize,
         delimiter: usize,
         func: AccumulatorFunc,
-        comparator: Option<TypeOrdering>,
     },
 
     AggFinal {

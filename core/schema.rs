@@ -401,15 +401,7 @@ fn builtin_signatures(type_name: &str) -> std::vec::Vec<OperatorSignature> {
                     signatures.extend(sqlite_operator(op, Real));
                 }
             }
-            // TODO: run numeric_neg once every comparison uses numeric's
-            // order. Until then its text result would compare as text in IN,
-            // CASE, min/max and index seeks, where SQLite's REAL compares right.
-            signatures.push(OperatorSignature {
-                op: "-",
-                args: std::vec![Value],
-                func: None,
-                result: None,
-            });
+            signatures.push(call("-", &[Value], "numeric_neg", Some("numeric")));
             signatures
         }
         "date" => std::vec![
@@ -477,6 +469,15 @@ impl ResolvedType {
     /// Whether the leaf type is a domain.
     pub fn is_domain(&self) -> bool {
         self.chain[0].is_domain
+    }
+
+    /// The order values of the type compare in. A domain has the order of the
+    /// type it is based on.
+    pub fn ordering(&self) -> Option<TypeOrdering> {
+        self.chain
+            .iter()
+            .find(|type_def| !type_def.is_domain)
+            .and_then(|type_def| type_def.ordering())
     }
 
     pub fn reads_stored_values_unchanged(&self) -> bool {
@@ -588,6 +589,17 @@ impl TypeDef {
             TypeDefKind::Custom { ordering, .. } => *ordering,
             _ => None,
         }
+    }
+
+    /// Whether arithmetic with an integer or a decimal gives a value of this
+    /// type, as `numeric + 1` gives a numeric.
+    pub fn computes_with_exact_numbers(&self) -> bool {
+        self.all_operator_signatures().iter().any(|signature| {
+            signature.args.contains(&OperatorArg::Exact)
+                && signature
+                    .result
+                    .is_some_and(|result| result.eq_ignore_ascii_case(&self.name))
+        })
     }
 
     /// How `op` with `operand_count` operands can run on a value of this type,
@@ -1554,6 +1566,17 @@ impl Schema {
         self.type_registry.get(&type_registry_key(type_name))
     }
 
+    /// The order values of `type_def` compare in. A domain has the order of
+    /// the type it is based on.
+    pub fn type_ordering(&self, type_def: &TypeDef) -> Option<TypeOrdering> {
+        if !type_def.is_domain {
+            return type_def.ordering();
+        }
+        self.resolve_type_unchecked(&type_def.name)
+            .ok()??
+            .ordering()
+    }
+
     /// Whether the column's values are encoded before they are stored: an array column, or a
     /// column whose type is a custom type of a STRICT table.
     pub fn column_has_custom_type(&self, column: &Column, is_strict: bool) -> bool {
@@ -1744,7 +1767,7 @@ impl Schema {
         {
             let bt = table.btree().expect("checked btree table");
             let mut modified = (*bt).clone();
-            modified.resolve_custom_type_affinities(self);
+            modified.resolve_custom_types(self);
             modified.propagate_domain_constraints(self)?;
             tables.push((
                 namespace,
@@ -2737,6 +2760,7 @@ impl Schema {
                 &unparsed_sql_from_index.sql,
                 unparsed_sql_from_index.root_page,
                 table.as_ref(),
+                self,
             )?;
             self.add_index(NamespaceId::ROOT, Arc::new(index))?;
         }
@@ -3354,7 +3378,7 @@ impl Schema {
                     }
 
                     let mut table = table;
-                    table.resolve_custom_type_affinities(self);
+                    table.resolve_custom_types(self);
                     table.propagate_domain_constraints(self)?;
                     let has_autoinc = table.has_autoincrement;
                     let tbl_name = table.name.clone();
@@ -4764,11 +4788,12 @@ impl BTreeTable {
         Ok(Arc::new(modified))
     }
 
-    /// Override column type metadata for custom type columns so that
-    /// SQLite's name-based type/affinity rules use the BASE type
-    /// instead of the custom type name (e.g. "doubled" contains "DOUB"
-    /// which would incorrectly map to REAL instead of INTEGER).
-    pub fn resolve_custom_type_affinities(&mut self, schema: &Schema) {
+    /// Fill in what custom type columns get from their type:
+    /// - SQLite's name-based type/affinity rules use the BASE type instead of
+    ///   the custom type name (e.g. "doubled" contains "DOUB" which would
+    ///   incorrectly map to REAL instead of INTEGER).
+    /// - Keys on the column use the order of its type, when it has one.
+    pub fn resolve_custom_types(&mut self, schema: &Schema) {
         if !self.is_strict {
             return;
         }
@@ -4777,12 +4802,14 @@ impl BTreeTable {
                 // Arrays are stored as record-format blobs regardless of element type.
                 col.set_ty(Type::Blob);
                 col.override_affinity(Affinity::Blob);
+                col.set_type_ordering(Some(TypeOrdering::Array));
                 continue;
             }
             if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&col.ty_str) {
                 let (base_ty, _) = type_from_name(&resolved.primitive);
                 col.set_ty(base_ty);
                 col.override_affinity(Affinity::affinity(&resolved.primitive));
+                col.set_type_ordering(resolved.ordering());
             }
         }
     }
@@ -5373,6 +5400,9 @@ fn push_collation(sql: &mut String, collation: Option<CollationSeq>) {
         }
         CollationSeq::Custom(_) => {
             // Custom collation is not allowed in schema definitions
+        }
+        CollationSeq::Type(_) => {
+            unreachable!("a type's order comes from the column's type, not a COLLATE clause")
         }
     };
 }
@@ -6777,6 +6807,10 @@ pub struct Column {
     /// collation of its expression. None means BINARY. Kept apart from
     /// `info` because a custom collation does not fit in its bits.
     collation: Option<CollationSeq>,
+    /// The order of the column's type, when it has one (numeric, arrays).
+    /// Keys on the column use it instead of `collation`. Set from the schema's
+    /// types by `BTreeTable::resolve_custom_types`, never stored in the SQL.
+    type_ordering: Option<TypeOrdering>,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -6933,6 +6967,7 @@ impl Column {
             generated_always: false,
             info,
             collation: col,
+            type_ordering: None,
             explicit_notnull: coldef.flags.contains(ColDefFlags::ExplicitNotNull),
             notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
@@ -7064,11 +7099,7 @@ impl Column {
 
     #[inline]
     pub fn collation_opt(&self) -> Option<CollationSeq> {
-        if self.has_explicit_collation() {
-            Some(self.collation())
-        } else {
-            None
-        }
+        self.collation
     }
 
     #[inline]
@@ -7139,9 +7170,36 @@ impl Column {
     pub fn set_ty(&mut self, ty: Type) {
         self.info.set_ty(ty)
     }
+    /// How values of the column compare in keys: the order of its type when
+    /// it has one, otherwise the declared collation, BINARY when none.
     #[inline]
     pub fn collation(&self) -> CollationSeq {
+        match self.type_ordering {
+            Some(ordering) => CollationSeq::Type(ordering),
+            None => self.declared_collation(),
+        }
+    }
+    /// The collation from the column's COLLATE clause, or for a column of a
+    /// subquery, view or CTE the collation of its expression by SQLite's
+    /// rules. BINARY when none.
+    #[inline]
+    pub fn declared_collation(&self) -> CollationSeq {
         self.collation.unwrap_or(CollationSeq::Binary)
+    }
+    #[inline]
+    pub fn type_ordering(&self) -> Option<TypeOrdering> {
+        self.type_ordering
+    }
+    /// Whether an index on this column is ordered differently from how its
+    /// values compare. A custom type without an ordering is indexed by its
+    /// stored form, which does not sort like the values the column reads as,
+    /// so such an index can serve `=` but not a range or ORDER BY.
+    pub fn index_order_differs_from_value_order(&self, schema: &Schema, is_strict: bool) -> bool {
+        self.type_ordering.is_none() && schema.get_type_def(&self.ty_str, is_strict).is_some()
+    }
+    #[inline]
+    pub fn set_type_ordering(&mut self, ordering: Option<TypeOrdering>) {
+        self.type_ordering = ordering;
     }
     #[inline]
     pub fn has_explicit_collation(&self) -> bool {
@@ -7388,6 +7446,7 @@ impl Index {
         sql: &str,
         root_page: i64,
         table: &BTreeTable,
+        schema: &Schema,
     ) -> Result<Index> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
@@ -7403,7 +7462,7 @@ impl Index {
                 ..
             })) => {
                 let index_name = normalize_ident(idx_name.name.as_str());
-                let index_columns = resolve_sorted_columns(table, &columns)?;
+                let index_columns = resolve_sorted_columns(table, &columns, schema, syms)?;
                 if let Some(using) = using {
                     if where_clause.is_some() {
                         bail_parse_error!("custom index module do not support partial indices");
@@ -7884,6 +7943,7 @@ mod tests {
                         "CREATE INDEX i ON t (x)",
                         4,
                         t.as_ref(),
+                        &schema,
                     )
                     .unwrap(),
                 ),

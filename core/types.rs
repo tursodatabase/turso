@@ -2811,13 +2811,16 @@ where
 {
     if right_values.len() != 0 && index_info.num_cols <= 13 {
         let val = right_values.peek().unwrap();
+        let collation = index_info.key_info[0].collation;
         match val.as_value_ref() {
-            ValueRef::Numeric(Numeric::Integer(key)) => RecordCompare::Int {
-                rhs_first_value: key,
-            },
-            ValueRef::Text(_) if index_info.key_info[0].collation == CollationSeq::Binary => {
-                RecordCompare::String
+            ValueRef::Numeric(Numeric::Integer(key))
+                if collation.compares_non_text_like_sqlite() =>
+            {
+                RecordCompare::Int {
+                    rhs_first_value: key,
+                }
             }
+            ValueRef::Text(_) if collation == CollationSeq::Binary => RecordCompare::String,
             _ => RecordCompare::Generic,
         }
     } else {

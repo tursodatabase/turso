@@ -91,8 +91,8 @@ pub(super) fn find_operator_call(
 
 /// The symbol and operands of `expr` when it is an operator that custom types
 /// decide: `-x` is `-` with one operand, `a & b` is `&` with two. Comparisons
-/// are decided by `find_custom_comparison`, and unary `+` gives its operand
-/// unchanged.
+/// use the order of the operands' type (see `comparison_collation`), and unary
+/// `+` gives its operand unchanged.
 ///
 /// Without custom types no operand can have one, so plain SQLite does no more
 /// work per operator than before custom types existed.

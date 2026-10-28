@@ -26,30 +26,7 @@ use super::{
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
-use super::expr::expr_type::{column_custom_type, type_of, TypeEnv};
 use crate::translate::eqp::{EqpDetail, EqpSortMethod};
-use crate::type_ordering::TypeOrdering;
-
-/// Returns the comparator for sorting an expression: element by element for an
-/// array, or the function behind the `<` operator of a column's custom type when
-/// the sorter knows it. Returns None otherwise, which sorts by the stored bytes.
-pub(crate) fn custom_type_comparator(
-    expr: &ast::Expr,
-    referenced_tables: &TableReferences,
-    resolver: &Resolver,
-) -> Option<TypeOrdering> {
-    let env = TypeEnv::new(Some(referenced_tables), resolver);
-    if type_of(expr, &env).is_array() {
-        return Some(TypeOrdering::Array);
-    }
-    column_custom_type(expr, &env)?
-        .type_def
-        .operators()
-        .iter()
-        .find(|op| op.op == "<")
-        .and_then(|op| op.func_name.as_ref())
-        .and_then(|func_name| TypeOrdering::from_less_than_function(func_name))
-}
 
 /// For a result column expression that is a column reference to a custom type,
 /// returns the column definition and type definition.
@@ -265,13 +242,12 @@ impl EmitOrderBy {
             )?;
 
             if has_sequence {
-                // sequence column: ascending with BINARY collation, no comparator, no nulls order
+                // sequence column: ascending with BINARY collation, no nulls order
                 data.order_collations_nulls.try_push((
                     SortOrder::Asc,
                     CollationSeq::Binary,
                     None,
                 ))?;
-                data.comparators.try_push(None)?;
             }
 
             data.columns = data.order_collations_nulls.len();
@@ -682,14 +658,11 @@ pub(crate) fn sorter_open_data<'a>(
         cursor_id,
         columns: 0,
         order_collations_nulls: Vec::try_with_capacity_ext(capacity)?,
-        comparators: Vec::try_with_capacity_ext(capacity)?,
     };
     for (expr, direction, nulls) in terms {
         let collation = expr_collation(expr, Some(tables), resolver)?;
         data.order_collations_nulls
             .try_push((direction, collation, nulls))?;
-        data.comparators
-            .try_push(custom_type_comparator(expr, tables, resolver))?;
     }
     data.columns = data.order_collations_nulls.len();
     Ok(data)

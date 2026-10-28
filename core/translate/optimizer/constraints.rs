@@ -325,10 +325,8 @@ pub(super) fn automatic_index_terms(
         let column = &columns[term
             .table_col_pos
             .expect("a term that can drive an index seek has a column")];
-        let has_custom_type = schema
-            .get_type_def(&column.ty_str, table.table.is_strict())
-            .is_some();
-        !has_custom_type || term.operator == ast::Operator::Equals.into()
+        !column.index_order_differs_from_value_order(schema, table.table.is_strict())
+            || term.operator == ast::Operator::Equals.into()
     };
     let usable_constraints: SmallVec<[&Constraint; 4]> = constraints
         .constraints
@@ -1300,17 +1298,10 @@ pub fn constraints_from_where_clause(
                     }
                     if let Some(table_col_pos) = constraint.table_col_pos {
                         let constrained_column = &table_reference.table.columns()[table_col_pos];
-                        // Custom type columns encode values as blobs. Blob ordering (memcmp)
-                        // doesn't necessarily match the custom type's semantic ordering, so
-                        // range constraints (>, <, >=, <=) can't use the index. Equality (=)
-                        // still works because encoded(A) == encoded(B) iff A == B.
-                        if schema
-                            .get_type_def(
-                                &constrained_column.ty_str,
-                                table_reference.table.is_strict(),
-                            )
-                            .is_some()
-                            && constraint.operator != ast::Operator::Equals.into()
+                        if constrained_column.index_order_differs_from_value_order(
+                            schema,
+                            table_reference.table.is_strict(),
+                        ) && constraint.operator != ast::Operator::Equals.into()
                         {
                             continue;
                         }

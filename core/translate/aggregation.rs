@@ -499,7 +499,6 @@ pub(crate) fn open_aggregate_sorter(
         CollationSeq::Binary,
         None,
     ))?;
-    data.comparators.try_push(None)?;
     data.columns = aggregate.order_by().len() + 1 + 2 * aggregate.args.len();
     program.emit_insn(Insn::SorterOpen {
         data: Box::new(data),
@@ -543,7 +542,6 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Avg),
-                    comparator: None,
                     collation: CollationSeq::Binary,
                 }),
             });
@@ -559,7 +557,6 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Count0),
-                    comparator: None,
                     collation: CollationSeq::Binary,
                 }),
             });
@@ -577,7 +574,6 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Count),
-                    comparator: None,
                     collation: CollationSeq::Binary,
                 }),
             });
@@ -605,7 +601,6 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: delimiter_reg,
                     func: AccumulatorFunc::Agg(AggFunc::GroupConcat),
-                    comparator: None,
                     collation: CollationSeq::Binary,
                 }),
             });
@@ -620,15 +615,12 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
             let arg_collation = expr_collation(expr, Some(referenced_tables), resolver)?;
-            let comparator =
-                super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Max),
-                    comparator,
                     collation: arg_collation,
                 }),
             });
@@ -642,15 +634,12 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
             let arg_collation = expr_collation(expr, Some(referenced_tables), resolver)?;
-            let comparator =
-                super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Min),
-                    comparator,
                     collation: arg_collation,
                 }),
             });
@@ -671,7 +660,6 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: value_reg,
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupObject),
-                    comparator: None,
                     collation: CollationSeq::Binary,
                 }),
             });
@@ -690,7 +678,6 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupArray),
-                    comparator: None,
                     collation: CollationSeq::Binary,
                 }),
             });
@@ -711,7 +698,6 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: delimiter_reg,
                     func: AccumulatorFunc::Agg(AggFunc::StringAgg),
-                    comparator: None,
                     collation: CollationSeq::Binary,
                 }),
             });
@@ -730,7 +716,6 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Sum),
-                    comparator: None,
                     collation: CollationSeq::Binary,
                 }),
             });
@@ -748,7 +733,6 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Total),
-                    comparator: None,
                     collation: CollationSeq::Binary,
                 }),
             });
@@ -767,7 +751,6 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::ArrayAgg),
-                    comparator: None,
                     collation: CollationSeq::Binary,
                 }),
             });
@@ -788,7 +771,6 @@ pub fn translate_aggregation_step(
                     col: value_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Mode),
-                    comparator: None,
                     collation: arg_collation,
                 }),
             });
@@ -813,7 +795,6 @@ pub fn translate_aggregation_step(
                     col: value_reg,
                     delimiter: fraction_reg,
                     func: AccumulatorFunc::Agg(func.clone()),
-                    comparator: None,
                     collation: arg_collation,
                 }),
             });
@@ -855,7 +836,6 @@ pub fn translate_aggregation_step(
                     } else {
                         func.clone()
                     })),
-                    comparator: None,
                     collation: CollationSeq::Binary,
                 }),
             });

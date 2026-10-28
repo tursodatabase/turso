@@ -7,15 +7,20 @@ use turso_parser::ast::{Expr, TableInternalId, UnaryOperator};
 use crate::{
     function::ExternalCollation,
     sync::{Arc, LazyLock, RwLock, Weak},
-    translate::{emitter::Resolver, plan::TableReferences},
+    translate::{
+        emitter::Resolver,
+        expr::expr_type::{type_of, type_ordering, TypeEnv},
+        plan::TableReferences,
+    },
+    type_ordering::TypeOrdering,
     types::ValueRef,
     vdbe::hash_table::normalized_f64_bits,
     LimboError, Numeric, Result,
 };
 
-/// **Pre defined collation sequences**\
-/// Collating functions only matter when comparing string values.
-/// Numeric values are always compared numerically, and BLOBs are always compared byte-by-byte using memcmp().
+/// How two values compare. A text collation (all but [Self::Type]) only
+/// changes how two texts compare: numbers always compare numerically, and
+/// blobs byte by byte.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub enum CollationSeq {
     Binary,
@@ -26,6 +31,10 @@ pub enum CollationSeq {
     /// number in [CUSTOM_COLLATIONS]. Two registrations of the same name get
     /// different numbers.
     Custom(u32),
+    /// The order of a custom type, such as numeric's order by value. Unlike a
+    /// text collation it decides how every pair of values compares. A
+    /// comparison gets it when an operand's type has an order.
+    Type(TypeOrdering),
 }
 
 /// Every registered custom collation, by its number in [CollationSeq::Custom].
@@ -83,8 +92,13 @@ impl CollationSeq {
             Self::Rtrim => 3,
             Self::Locale(id) => id.to_bits(),
             Self::Custom(_) => Self::NO_COLLATION_BITS,
+            Self::Type(ordering) => Self::FIRST_TYPE_ORDERING_BITS + ordering as u16,
         }
     }
+
+    /// Type orderings take the numbers from here up to the first number of a
+    /// locale collation.
+    const FIRST_TYPE_ORDERING_BITS: u16 = 4;
 
     /// The collation [Self::to_bits] turned into `bits`. Any other value,
     /// including [Self::NO_COLLATION_BITS], is an error.
@@ -93,6 +107,16 @@ impl CollationSeq {
             1 => Ok(Self::Binary),
             2 => Ok(Self::NoCase),
             3 => Ok(Self::Rtrim),
+            bits if (Self::FIRST_TYPE_ORDERING_BITS..LocaleCollationId::FIRST_STORAGE_BIT)
+                .contains(&bits) =>
+            {
+                let ordering = TypeOrdering::ALL
+                    .get(usize::from(bits - Self::FIRST_TYPE_ORDERING_BITS))
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!("no collation has the number {bits}"))
+                    })?;
+                Ok(Self::Type(*ordering))
+            }
             bits if bits >= LocaleCollationId::FIRST_STORAGE_BIT
                 && LocaleCollationRegistry::global()
                     .is_registered(LocaleCollationId::from_bits(bits)) =>
@@ -116,6 +140,14 @@ impl CollationSeq {
     #[inline]
     pub const fn can_hash(self) -> bool {
         !self.is_custom()
+    }
+
+    /// Whether this collation compares numbers with numbers, and blobs with
+    /// blobs, as SQLite does, which the B-tree's fast paths for integer and text
+    /// keys rely on. Only a type's order differs.
+    #[inline]
+    pub const fn compares_non_text_like_sqlite(self) -> bool {
+        !matches!(self, Self::Type(_))
     }
 
     /// Gives a new custom collation a number and returns the
@@ -163,15 +195,18 @@ impl CollationSeq {
             Self::Rtrim => "RTrim".to_string(),
             Self::Locale(id) => LocaleCollationRegistry::global().name(id),
             Self::Custom(_) => self.external().name.clone(),
+            Self::Type(ordering) => ordering.name().to_string(),
         }
     }
 
-    /// Orders two values. Values of different kinds order as NULL, numbers,
-    /// text, blobs; two texts compare with this collation.
+    /// Orders two values. With a type's order, as the type orders them.
+    /// Otherwise values of different kinds order as NULL, numbers, text,
+    /// blobs, and two texts compare with this collation.
     #[inline(always)]
     pub fn compare(self, lhs: ValueRef, rhs: ValueRef) -> Ordering {
-        match (lhs, rhs) {
-            (ValueRef::Text(lhs), ValueRef::Text(rhs)) => {
+        match (self, lhs, rhs) {
+            (Self::Type(ordering), _, _) => ordering.compare(lhs, rhs),
+            (_, ValueRef::Text(lhs), ValueRef::Text(rhs)) => {
                 self.compare_strings(lhs.as_str(), rhs.as_str())
             }
             _ => lhs.cmp(&rhs),
@@ -182,6 +217,9 @@ impl CollationSeq {
     /// equal hash the same. Integers hash like the equal REAL, so 10 and 10.0
     /// land in the same bucket.
     pub fn hash_value(self, value: ValueRef, hasher: &mut impl Hasher) {
+        if let Self::Type(ordering) = self {
+            return ordering.hash(value, hasher);
+        }
         const NULL_HASH: u8 = 0;
         const INT_HASH: u8 = 1;
         const FLOAT_HASH: u8 = 2;
@@ -233,6 +271,7 @@ impl CollationSeq {
             Self::Custom(_) => {
                 unreachable!("hash tables reject collations that cannot hash (see can_hash)")
             }
+            Self::Type(_) => unreachable!("hash_value hashes a type's order without hash_text"),
         }
     }
 
@@ -244,6 +283,7 @@ impl CollationSeq {
             Self::Rtrim => Self::rtrim_cmp(lhs, rhs),
             Self::Locale(id) => LocaleCollationRegistry::global().compare(id, lhs, rhs),
             Self::Custom(_) => self.external().compare(lhs, rhs),
+            Self::Type(_) => unreachable!("compare orders values with a type's order"),
         }
     }
 
@@ -283,7 +323,8 @@ impl std::fmt::Display for CollationSeq {
 pub struct LocaleCollationId(u16);
 
 impl LocaleCollationId {
-    const FIRST_STORAGE_BIT: u16 = 4;
+    const FIRST_STORAGE_BIT: u16 =
+        CollationSeq::FIRST_TYPE_ORDERING_BITS + TypeOrdering::ALL.len() as u16;
 
     fn from_index(index: usize) -> Result<Self> {
         if index > (u16::MAX - Self::FIRST_STORAGE_BIT) as usize {
@@ -394,7 +435,12 @@ impl LocaleCollationRegistry {
 /// The collation a comparison between `lhs` and `rhs` uses. This and
 /// [expr_collation] are the only places that decide a collation from
 /// expressions; every comparison, sort key, grouping key and hash key gets its
-/// collation from one of them. The rules are SQLite's
+/// collation from one of them.
+///
+/// When an operand's type has an order (numeric, arrays, and custom types
+/// whose `OPERATOR '<'` names a function), the comparison uses that order. An
+/// explicit COLLATE next to such an operand, or two operands with different
+/// orders, is an error, as in PostgreSQL. Otherwise the rules are SQLite's
 /// (`sqlite3BinaryCompareCollSeq`):
 ///
 /// 1. If an operand contains a COLLATE operator anywhere outside a subquery,
@@ -423,6 +469,10 @@ pub fn comparison_collation_across_queries(
     rhs_tables: Option<&TableReferences>,
     resolver: &Resolver,
 ) -> Result<CollationSeq> {
+    let operands = [(lhs, lhs_tables), (rhs, rhs_tables)];
+    if let Some(ordering) = common_type_ordering(operands, resolver)? {
+        return Ok(CollationSeq::Type(ordering));
+    }
     let collation = if has_collate_operator(lhs) {
         expr_collation_if_any(lhs, lhs_tables, resolver)?
     } else if has_collate_operator(rhs) {
@@ -439,7 +489,22 @@ pub fn comparison_collation_across_queries(
 /// The collation of one expression, BINARY when it has none. Sort, grouping,
 /// DISTINCT, compound select, window partition and index keys use it, and so
 /// does `x IN (y1, ..., yN)`, which compares with the collation of x alone.
+/// An expression whose type has an order uses that order.
 pub fn expr_collation(
+    expr: &Expr,
+    tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<CollationSeq> {
+    if let Some(ordering) = common_type_ordering([(expr, tables)], resolver)? {
+        return Ok(CollationSeq::Type(ordering));
+    }
+    expr_collation_ignoring_type(expr, tables, resolver)
+}
+
+/// [expr_collation] by SQLite's rules alone, for a subquery or view column:
+/// the order of the column's type is kept apart (see `Column::collation`), so
+/// that `CAST(col AS text)` in the outer query does not compare with it.
+pub(crate) fn expr_collation_ignoring_type(
     expr: &Expr,
     tables: Option<&TableReferences>,
     resolver: &Resolver,
@@ -453,17 +518,66 @@ pub fn expr_collation(
 /// arguments with the collation of the first argument that has one (functions
 /// marked `SQLITE_FUNC_NEEDCOLL`), and a compound SELECT compares a result
 /// column with the collation of the leftmost SELECT whose column has one.
-/// Each expression comes with the tables its columns refer to.
+/// Each expression comes with the tables its columns refer to. As in
+/// [comparison_collation], an expression whose type has an order decides.
 pub fn first_collation<'a>(
-    exprs: impl IntoIterator<Item = (&'a Expr, Option<&'a TableReferences>)>,
+    exprs: impl IntoIterator<Item = (&'a Expr, Option<&'a TableReferences>)> + Clone,
     resolver: &Resolver,
 ) -> Result<CollationSeq> {
+    if let Some(ordering) = common_type_ordering(exprs.clone(), resolver)? {
+        return Ok(CollationSeq::Type(ordering));
+    }
     for (expr, tables) in exprs {
         if let Some(collation) = expr_collation_if_any(expr, tables, resolver)? {
             return Ok(collation);
         }
     }
     Ok(CollationSeq::Binary)
+}
+
+/// The order that values compared with each other use when one of them has a
+/// type with an order. Text collations do not apply to such types, so an
+/// explicit COLLATE among them is an error, and so are two different orders:
+/// PostgreSQL has no operator that compares numeric with an array.
+fn common_type_ordering<'a>(
+    exprs: impl IntoIterator<Item = (&'a Expr, Option<&'a TableReferences>)>,
+    resolver: &Resolver,
+) -> Result<Option<TypeOrdering>> {
+    let mut found: Option<TypeOrdering> = None;
+    let mut has_collate = false;
+    for (expr, tables) in exprs {
+        has_collate |= has_collate_operator(expr);
+        let Some(ordering) = expr_type_ordering(expr, tables, resolver) else {
+            continue;
+        };
+        match found {
+            Some(other) if other != ordering => {
+                return Err(LimboError::ParseError(format!(
+                    "cannot compare type {} with type {}",
+                    other.name(),
+                    ordering.name()
+                )));
+            }
+            _ => found = Some(ordering),
+        }
+    }
+    if let (Some(ordering), true) = (found, has_collate) {
+        return Err(LimboError::ParseError(format!(
+            "collations are not supported by type {}",
+            ordering.name()
+        )));
+    }
+    Ok(found)
+}
+
+/// The order of the expression's type, if its type has one.
+pub(crate) fn expr_type_ordering(
+    expr: &Expr,
+    tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Option<TypeOrdering> {
+    let ty = type_of(expr, &TypeEnv::new(tables, resolver));
+    type_ordering(&ty, resolver.schema())
 }
 
 /// The collation of one expression, or None when it has none (SQLite's
@@ -549,7 +663,7 @@ fn referenced_column_collation(
 /// A column has its declared collation, BINARY when it declares none. A rowid
 /// alias (INTEGER PRIMARY KEY) is the rowid and has none, as in SQLite.
 pub(crate) fn column_collation(column: &crate::schema::Column) -> Option<CollationSeq> {
-    (!column.is_rowid_alias()).then(|| column.collation())
+    (!column.is_rowid_alias()).then(|| column.declared_collation())
 }
 
 /// Whether the expression contains a COLLATE operator outside of a subquery
@@ -697,7 +811,10 @@ mod tests {
             CollationSeq::NoCase,
             CollationSeq::Rtrim,
             locale,
-        ] {
+        ]
+        .into_iter()
+        .chain(TypeOrdering::ALL.map(CollationSeq::Type))
+        {
             assert_eq!(
                 CollationSeq::from_bits(collation.to_bits()).unwrap(),
                 collation

@@ -8,7 +8,7 @@ use crate::translate::emitter::{
 };
 use crate::translate::eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod};
 use crate::translate::expr::translate_expr;
-use crate::translate::order_by::{custom_type_comparator, sorter_insert};
+use crate::translate::order_by::sorter_insert;
 use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_columns_to_destination;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -905,28 +905,11 @@ fn emit_compound_order_by(
     let sorter_column_count = order_by.len() + 1 + non_dedup_count;
 
     let sort_cursor = program.alloc_cursor_id(CursorType::Sorter);
-    // Resolve custom type comparators for ORDER BY columns (e.g. numeric(10,2) needs
-    // numeric to sort correctly instead of default blob/text comparison).
-    let comparators: crate::alloc::Vec<Option<crate::type_ordering::TypeOrdering>> = order_by
-        .iter()
-        .map(|(col_idx, _, _, _)| {
-            program.result_columns.get(*col_idx).and_then(|rc| {
-                custom_type_comparator(
-                    &rc.expr,
-                    &program.table_references,
-                    &right_most_ctx.resolver,
-                )
-            })
-        })
-        // No comparator needed for the sequence tie-breaker column
-        .chain(std::iter::once(None))
-        .try_collect()?;
     program.emit_insn(Insn::SorterOpen {
         data: Box::new(SorterOpenData {
             cursor_id: sort_cursor,
             columns: order_collations_nulls.len(),
             order_collations_nulls,
-            comparators,
         }),
     });
 

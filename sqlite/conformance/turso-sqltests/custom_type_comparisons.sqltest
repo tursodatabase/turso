@@ -245,3 +245,164 @@ expect {
     u|1
     ts|1
 }
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-arithmetic-results {
+    -- n + i is a numeric, so max, IN and CASE compare it with numeric's order:
+    -- as text '9.50' would sort after '10.50' and not equal 10.5. Every query
+    -- runs before and after the indexes exist.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), i integer) STRICT;
+    INSERT INTO t VALUES (1, 4.50, 6), (2, 9.50, 0), (3, 3.50, 7), (4, NULL, 1), (5, 1.50, 0);
+    SELECT 'max', max(n + i), min(n + i) FROM t;
+    SELECT 'in', id FROM t WHERE n + i IN (10.5) ORDER BY id;
+    SELECT 'case', id, CASE n + i WHEN 10.5 THEN 'y' ELSE 'n' END FROM t ORDER BY id;
+    SELECT 'order', id FROM t WHERE n IS NOT NULL ORDER BY n + i, id;
+    CREATE INDEX t_n ON t(n);
+    CREATE INDEX t_ni ON t(n + i);
+    SELECT 'max', max(n + i), min(n + i) FROM t;
+    SELECT 'in', id FROM t WHERE n + i IN (10.5) ORDER BY id;
+    SELECT 'case', id, CASE n + i WHEN 10.5 THEN 'y' ELSE 'n' END FROM t ORDER BY id;
+    SELECT 'order', id FROM t WHERE n IS NOT NULL ORDER BY n + i, id;
+}
+expect {
+    max|10.50|1.50
+    in|1
+    in|3
+    case|1|y
+    case|2|n
+    case|3|y
+    case|4|n
+    case|5|n
+    order|5
+    order|2
+    order|1
+    order|3
+    max|10.50|1.50
+    in|1
+    in|3
+    case|1|y
+    case|2|n
+    case|3|y
+    case|4|n
+    case|5|n
+    order|5
+    order|2
+    order|1
+    order|3
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-expression-index-same-rows-as-scan {
+    -- An index on n * 2 holds numerics, so a seek on it finds the rows a scan
+    -- finds. For n = 3.5, =, IN and CASE all match 7.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 3.50), (2, 4.50), (3, 9.50), (4, 10.50), (5, 5.00), (6, NULL);
+    CREATE INDEX t_n2 ON t(n * 2);
+    SELECT 'gt', id FROM t WHERE n * 2 > 10 ORDER BY id;
+    SELECT 'gt-scan', id FROM t NOT INDEXED WHERE n * 2 > 10 ORDER BY id;
+    SELECT 'eq', id FROM t WHERE n * 2 = 19.0 ORDER BY id;
+    SELECT 'eq-scan', id FROM t NOT INDEXED WHERE n * 2 = 19.0 ORDER BY id;
+    SELECT 'seven', id FROM t WHERE n * 2 = 7;
+    SELECT 'seven-in', id FROM t WHERE n * 2 IN (7);
+    SELECT 'seven-case', id FROM t WHERE CASE n * 2 WHEN 7 THEN 1 ELSE 0 END;
+    SELECT 'seven-scan', id FROM t NOT INDEXED WHERE n * 2 = 7;
+}
+expect {
+    gt|3
+    gt|4
+    gt-scan|3
+    gt-scan|4
+    eq|3
+    eq-scan|3
+    seven|1
+    seven-in|1
+    seven-case|1
+    seven-scan|1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-order-distinct-union {
+    -- ORDER BY puts 9.5 before 10.5, which text order would not. DISTINCT and
+    -- UNION treat 1.50, 1.5 and 1.500 as one value, as = does.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 10.50), (2, 9.50), (3, 1.50);
+    SELECT 'order', n FROM t ORDER BY n;
+    SELECT 'order-expr', n + 0 FROM t ORDER BY n + 0;
+    SELECT 'order-subquery', x FROM (SELECT n + 0 AS x FROM t) ORDER BY x;
+    SELECT 'distinct', count(*) FROM (SELECT DISTINCT x FROM (SELECT n AS x FROM t WHERE id = 3 UNION ALL SELECT n * 1.0 FROM t WHERE id = 3));
+    SELECT 'union', count(*) FROM (SELECT n FROM t WHERE id = 3 UNION SELECT n * 1.0 FROM t WHERE id = 3);
+    SELECT 'union-scales', count(*) FROM (SELECT n FROM t WHERE id = 3 UNION SELECT CAST(1.5 AS numeric(10,1)));
+    SELECT 'equal', (SELECT n FROM t WHERE id = 3) = (SELECT n * 1.0 FROM t WHERE id = 3);
+}
+expect {
+    order|1.50
+    order|9.50
+    order|10.50
+    order-expr|1.50
+    order-expr|9.50
+    order-expr|10.50
+    order-subquery|1.50
+    order-subquery|9.50
+    order-subquery|10.50
+    distinct|1
+    union|1
+    union-scales|1
+    equal|1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-with-infinite-real {
+    -- A numeric compared with a REAL holding infinity: every finite numeric is
+    -- below inf and above -inf.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), r real) STRICT;
+    INSERT INTO t VALUES (1, 4.50, 9e999), (2, 9.50, -9e999), (3, 3.50, 1.0), (4, 1.50, 0.5);
+    SELECT id, n - 1 < r, n - 1 > r, n - 1 = r FROM t ORDER BY id;
+}
+expect {
+    1|1|0|0
+    2|0|1|0
+    3|0|1|0
+    4|0|0|1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-negation {
+    -- -n is a numeric and keeps the scale, as numeric_neg computes it.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 4.50), (2, -9.50), (3, 0), (4, NULL);
+    SELECT id, -n FROM t ORDER BY -n;
+}
+expect {
+    4|
+    1|-4.50
+    3|0.00
+    2|9.50
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-coalesce-with-integer {
+    -- coalesce(n, 0) is a numeric, so 0.00 equals 0.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 0), (2, NULL), (3, 1.50);
+    SELECT id FROM t WHERE coalesce(n, 0) = 0 ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-row-value-subquery-components {
+    -- Each column of a row subquery compares with its own type: n compares as
+    -- a numeric even when it is not the first column.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 1.50);
+    SELECT (1, 1.5) = (SELECT id, n FROM t);
+    SELECT (SELECT id, n FROM t) = (1, 1.5);
+    SELECT (SELECT id, n FROM t) < (1, 2.5);
+}
+expect {
+    1
+    1
+    1
+}
