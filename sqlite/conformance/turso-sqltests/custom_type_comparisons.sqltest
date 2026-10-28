@@ -773,3 +773,38 @@ expect {
     4.00
     3.51
 }
+
+@requires strict "uses STRICT tables"
+test cmp-varchar-index-seek-key-is-not-length-checked {
+    -- varchar's length limits what the column may store. A longer seek key
+    -- equals no row, as in PostgreSQL, instead of raising an error.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v varchar(5)) STRICT;
+    INSERT INTO t VALUES (1, 'abc');
+    CREATE INDEX t_v ON t(v);
+    SELECT id FROM t WHERE v = 'abc';
+    SELECT count(*) FROM t WHERE v = 'abcdefgh';
+    SELECT count(*) FROM t a, t b WHERE a.v = b.v;
+}
+expect {
+    1
+    0
+    1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-index-seek-key-uses-type-parameters {
+    -- A user type's ENCODE may use its parameters, so a seek key is encoded
+    -- with the column's parameters, as the stored values were.
+    CREATE TYPE scaled(value integer, f integer) BASE integer ENCODE value * f DECODE value / f OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x scaled(10)) STRICT;
+    INSERT INTO t VALUES (1, 5), (2, 7);
+    CREATE INDEX t_x ON t(x);
+    SELECT id FROM t WHERE x = 5;
+    SELECT id FROM t WHERE x > 6;
+    SELECT id FROM t WHERE x IN (7, 8);
+}
+expect {
+    1
+    2
+    2
+}

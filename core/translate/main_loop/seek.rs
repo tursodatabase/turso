@@ -59,11 +59,13 @@ pub(super) fn encode_seek_keys_for_custom_types(
         if resolved.chain.iter().all(|td| td.encode().is_none()) {
             continue;
         }
-        // The index holds encoded values, so the key is encoded too. The
-        // type's parameters (numeric's precision and scale, say) limit what
-        // the column may store; they are not part of the encoding. They are
-        // passed as NULL so that a key is converted but never rounded or
-        // rejected: `n = 3.504` on a numeric(10,2) column matches no row.
+        // The index holds encoded values, so the key is encoded too, with the
+        // column's type parameters, because a user type's ENCODE may use them
+        // (`ENCODE value * f`). The parameters of the built-in types
+        // (numeric's precision and scale, varchar's length) only limit what
+        // the column may store. They are passed as NULL so that a key is
+        // converted but never rounded or rejected: `n = 3.504` on a
+        // numeric(10,2) column matches no row.
         let reg = start_reg + i;
         let skip_label = program.allocate_label();
         program.emit_insn(Insn::IsNull {
@@ -72,16 +74,22 @@ pub(super) fn encode_seek_keys_for_custom_types(
         });
         for td in &resolved.chain {
             if let Some(encode_expr) = td.encode() {
-                let no_limits: Vec<Box<ast::Expr>> = td
-                    .user_params()
-                    .map(|_| Box::new(ast::Expr::Literal(ast::Literal::Null)))
-                    .collect();
+                let no_limits: Vec<Box<ast::Expr>>;
+                let params = if td.is_builtin {
+                    no_limits = td
+                        .user_params()
+                        .map(|_| Box::new(ast::Expr::Literal(ast::Literal::Null)))
+                        .collect();
+                    &no_limits
+                } else {
+                    &table_col.ty_params
+                };
                 crate::translate::expr::emit_type_expr(
                     program,
                     encode_expr,
                     reg,
                     reg,
-                    &no_limits,
+                    params,
                     td,
                     resolver,
                 )?;

@@ -319,7 +319,7 @@ expect {
     timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END|value||'<'
     timestamptz(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END|value||'<'
     uuid(value any)|blob|CASE WHEN value IS NULL THEN NULL WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE coalesce (uuid_blob (value), RAISE (ABORT, 'invalid UUID value')) END|uuid_str (value)||'<'
-    varchar(value text, maxlen integer)|text|CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
+    varchar(value text, maxlen integer)|text|CASE WHEN maxlen IS NULL OR length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
 }
 
 @requires strict "uses STRICT tables"
@@ -354,7 +354,7 @@ expect {
     timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END|value||'<'
     timestamptz(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END|value||'<'
     uuid(value any)|blob|CASE WHEN value IS NULL THEN NULL WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE coalesce (uuid_blob (value), RAISE (ABORT, 'invalid UUID value')) END|uuid_str (value)||'<'
-    varchar(value text, maxlen integer)|text|CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
+    varchar(value text, maxlen integer)|text|CASE WHEN maxlen IS NULL OR length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
 }
 
 @requires strict "uses STRICT tables"
