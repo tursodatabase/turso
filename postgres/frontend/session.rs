@@ -9,7 +9,7 @@ use crate::error::sqlstate_error;
 use crate::functions::{find_parameter, ConfigParameter, Parameter};
 use crate::settings::{ConnectionSettings, PgSessionState, SettingScope};
 use turso_core::schema::{Table, SEQ_BACKING_TABLE_PREFIX};
-use turso_core::{Connection, LimboError, Namespace, Result, Statement, Value};
+use turso_core::{Connection, LimboError, Qualifier, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::foreign_key_tables;
 use turso_pg_parser::sqlstate::{
@@ -90,12 +90,12 @@ pub fn open_database_with_io(
 /// database is left as it is.
 pub fn set_up_new_database(db: &Arc<turso_core::Database>) -> crate::Result<()> {
     let conn = db.connect(turso_core::ConnectOpts::new())?;
-    if conn.namespace("public").is_some() || conn.is_readonly(turso_core::MAIN_DB_ID) {
+    if conn.qualifier("public").is_some() || conn.is_readonly(turso_core::MAIN_DB_ID) {
         return Ok(());
     }
     match conn.create_namespace("public") {
         Ok(_) => Ok(()),
-        Err(_) if conn.namespace("public").is_some() => Ok(()),
+        Err(_) if conn.qualifier("public").is_some() => Ok(()),
         Err(error) => Err(error.into()),
     }
 }
@@ -210,7 +210,7 @@ pub fn split_statements(sql: &str) -> crate::Result<Vec<String>> {
 /// database instead. A database that has a schema, or none and no tables,
 /// is opened as it is: a dropped `public` is not recreated.
 fn refuse_tables_in_no_schema(conn: &Arc<Connection>) -> Result<()> {
-    if conn.namespace("public").is_some() {
+    if conn.qualifier("public").is_some() {
         return Ok(());
     }
     let schema = conn.current_schema();
@@ -419,7 +419,7 @@ fn name_foreign_key_tables<'a>(
     let mut sql = sql.into_owned();
     for table in tables.iter().rev() {
         let namespace = match table.schema.as_deref() {
-            Some(schema) => conn.namespace(&schema.to_lowercase()).ok_or_else(|| {
+            Some(schema) => conn.qualifier(&schema.to_lowercase()).ok_or_else(|| {
                 LimboError::ParseError(format!("schema \"{schema}\" does not exist"))
             })?,
             None => foreign_key_table_namespace(conn, &table.name).ok_or_else(|| {
@@ -437,9 +437,9 @@ fn name_foreign_key_tables<'a>(
 /// The schema that a foreign key target named without a schema is in: the
 /// first schema of the search path that has a table of that name, or the
 /// first schema of the search path, where the statement creates its table.
-fn foreign_key_table_namespace(conn: &Arc<Connection>, name: &str) -> Option<Namespace> {
+fn foreign_key_table_namespace(conn: &Arc<Connection>, name: &str) -> Option<Qualifier> {
     let schema = conn.current_schema();
-    let candidates: Vec<Namespace> = conn
+    let candidates: Vec<Qualifier> = conn
         .search_order()
         .into_iter()
         .filter(|namespace| namespace.database_id() == turso_core::MAIN_DB_ID)
@@ -572,16 +572,16 @@ fn reject_drop_of_other_view_kind(
 pub(crate) fn relation_lookup_namespaces(
     conn: &Arc<Connection>,
     schema: Option<&str>,
-) -> Vec<Namespace> {
+) -> Vec<Qualifier> {
     match schema {
-        Some(schema) => conn.namespace(&schema.to_lowercase()).into_iter().collect(),
+        Some(schema) => conn.qualifier(&schema.to_lowercase()).into_iter().collect(),
         None => {
             let has_temp = conn
                 .list_all_databases()
                 .iter()
                 .any(|(id, _, _)| *id == turso_core::TEMP_DB_ID);
             has_temp
-                .then(|| Namespace::database("temp", turso_core::TEMP_DB_ID))
+                .then(|| Qualifier::database("temp", turso_core::TEMP_DB_ID))
                 .into_iter()
                 .chain(conn.search_order())
                 .collect()
@@ -591,7 +591,7 @@ pub(crate) fn relation_lookup_namespaces(
 
 /// The name of the database that has the objects of `namespace`, for
 /// reading its sqlite_schema.
-pub(crate) fn database_of(conn: &Connection, namespace: &Namespace) -> String {
+pub(crate) fn database_of(conn: &Connection, namespace: &Qualifier) -> String {
     conn.namespace_name(namespace.database_id())
         .expect("the database of a namespace has a name")
 }
@@ -1047,7 +1047,7 @@ fn handle_pg_create_schema(
 ) -> Result<()> {
     let conn = &pg_conn.conn;
     let name = stmt.name.to_lowercase();
-    if conn.namespace(&name).is_some() {
+    if conn.qualifier(&name).is_some() {
         if stmt.if_not_exists {
             return Ok(());
         }
@@ -1176,7 +1176,7 @@ impl SchemaObject {
 /// them: views first, because they depend on tables. Indexes and triggers
 /// go with their tables.
 fn schema_objects(conn: &Arc<Connection>, schema: &str) -> Vec<SchemaObject> {
-    let Some(namespace) = conn.namespace(schema) else {
+    let Some(namespace) = conn.qualifier(schema) else {
         return Vec::new();
     };
     let namespace = namespace.target.id;
@@ -1219,7 +1219,7 @@ fn schema_objects(conn: &Arc<Connection>, schema: &str) -> Vec<SchemaObject> {
 /// Whether `schema_name` is a schema: a namespace stored in the main
 /// database. `main` and `temp` name databases, not schemas.
 fn schema_exists(conn: &Connection, schema_name: &str) -> bool {
-    conn.namespace(schema_name)
+    conn.qualifier(schema_name)
         .is_some_and(|namespace| !namespace.is_database())
 }
 
@@ -1476,7 +1476,7 @@ mod tests {
             conn.execute("CREATE SCHEMA s").unwrap();
             assert!(
                 conn.inner()
-                    .namespace("s")
+                    .qualifier("s")
                     .is_some_and(|namespace| !namespace.is_database()),
                 "{path}"
             );
@@ -1506,7 +1506,7 @@ mod tests {
         conn.execute("DROP SCHEMA public CASCADE").unwrap();
 
         let later = PgConnection::connect(&db).unwrap();
-        assert!(later.inner().namespace("public").is_none());
+        assert!(later.inner().qualifier("public").is_none());
         let error = later
             .execute("CREATE TABLE t (x int)")
             .unwrap_err()

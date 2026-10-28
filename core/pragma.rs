@@ -443,7 +443,7 @@ impl PragmaVirtualTableCursor {
             _ => return None,
         };
         let name = normalize_ident(name);
-        let has_object = |namespace: &crate::Namespace| {
+        let has_object = |namespace: &crate::Qualifier| {
             let id = namespace.target.id;
             self.conn.with_schema(namespace.database_id(), |schema| {
                 if names_an_index {
@@ -460,7 +460,7 @@ impl PragmaVirtualTableCursor {
         // Temp comes before the search order, as it does for every name.
         let temp = self
             .conn
-            .namespace("temp")
+            .qualifier("temp")
             .filter(|namespace| self.conn.has_temp_database() && has_object(namespace));
         temp.or_else(|| self.conn.search_order().into_iter().find(has_object))
             .map(|namespace| namespace.name)

@@ -628,7 +628,7 @@ const BUILTIN_SCHEMAS: [(i64, &str); 2] = [(11, "pg_catalog"), (11394, "informat
 pub(crate) fn namespace_exists(conn: &Connection, name: &str) -> bool {
     BUILTIN_SCHEMAS.iter().any(|(_, schema)| *schema == name)
         || conn
-            .namespace(name)
+            .qualifier(name)
             .is_some_and(|namespace| !namespace.is_database())
 }
 

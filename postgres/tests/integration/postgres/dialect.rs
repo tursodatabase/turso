@@ -943,8 +943,8 @@ fn a_schema_keeps_its_oid_and_id_while_others_come_and_go(db: TempDatabase) {
     conn.execute("CREATE SCHEMA c").unwrap();
     assert_eq!(oid_of("c"), "16388");
     assert_eq!(
-        conn.inner().namespace("c"),
-        Some(turso_core::Namespace::in_main(
+        conn.inner().qualifier("c"),
+        Some(turso_core::Qualifier::in_main(
             "c",
             turso_core::NamespaceId::new(4)
         ))

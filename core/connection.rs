@@ -3,7 +3,7 @@ use crate::connection_hooks::{ConnectionHooks, SavepointMemo};
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
-use crate::namespace::{Namespace, NamespaceId, NamespaceRef, Qualifiers};
+use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
@@ -3401,14 +3401,15 @@ impl Connection {
         Cow::Owned(self.qualifiers.with_namespaces(schema.namespaces()))
     }
 
-    /// Adds `namespace` under its name, so that `name.t` names its objects.
-    pub fn add_namespace(&self, namespace: Namespace) {
-        self.qualifiers.add(namespace);
+    /// Adds `qualifier`, so that `name.t` names the objects of the
+    /// namespace it refers to.
+    pub fn add_qualifier(&self, qualifier: Qualifier) {
+        self.qualifiers.add(qualifier);
         self.bump_prepare_context_generation();
     }
 
-    /// Removes namespace `name` and returns the database it referred to.
-    pub fn remove_namespace(&self, name: &str) -> Option<usize> {
+    /// Removes the qualifier `name` and returns the database it referred to.
+    pub fn remove_qualifier(&self, name: &str) -> Option<usize> {
         let database_id = self.qualifiers.remove(name);
         self.bump_prepare_context_generation();
         database_id
@@ -3418,7 +3419,7 @@ impl Connection {
     /// connection's transaction, and returns it. The schema keeps the
     /// objects of the namespace under its id, so `name` can be anything
     /// that no namespace is called yet.
-    pub fn create_namespace(self: &Arc<Self>, name: &str) -> Result<Namespace> {
+    pub fn create_namespace(self: &Arc<Self>, name: &str) -> Result<Qualifier> {
         let statement = turso_parser::ast::Stmt::CreateSchema {
             name: turso_parser::ast::Name::exact(name.to_string()),
         };
@@ -3460,8 +3461,8 @@ impl Connection {
             .map(|namespace| namespace.name)
     }
 
-    /// The namespace called `name`. `name` is normalized.
-    pub fn namespace(&self, name: &str) -> Option<Namespace> {
+    /// The qualifier `name`. `name` is normalized.
+    pub fn qualifier(&self, name: &str) -> Option<Qualifier> {
         self.current_qualifiers().get(name)
     }
 
@@ -3483,7 +3484,7 @@ impl Connection {
     /// The namespaces that a name without a namespace is looked up in, in
     /// order. The first one is where CREATE puts an object whose name has
     /// no namespace.
-    pub fn search_order(&self) -> Vec<Namespace> {
+    pub fn search_order(&self) -> Vec<Qualifier> {
         self.current_qualifiers()
             .search_order(self.search_path.read().as_deref())
     }
@@ -5280,15 +5281,15 @@ mod tests {
 
         conn.execute("BEGIN").unwrap();
         conn.create_namespace("app").unwrap();
-        assert!(conn.namespace("app").is_some());
-        assert_eq!(other.namespace("app"), None);
+        assert!(conn.qualifier("app").is_some());
+        assert_eq!(other.qualifier("app"), None);
         conn.execute("ROLLBACK").unwrap();
-        assert_eq!(conn.namespace("app"), None);
+        assert_eq!(conn.qualifier("app"), None);
 
         conn.create_namespace("app").unwrap();
         assert_eq!(
-            other.namespace("app"),
-            Some(Namespace::in_main("app", NamespaceId::new(1)))
+            other.qualifier("app"),
+            Some(Qualifier::in_main("app", NamespaceId::new(1)))
         );
         assert!(conn.create_namespace("app").is_err());
 
@@ -5296,15 +5297,15 @@ mod tests {
         drop(conn);
         let reopened = open_connection_storing_namespaces(&path);
         assert_eq!(
-            reopened.namespace("app"),
-            Some(Namespace::in_main("app", NamespaceId::new(1)))
+            reopened.qualifier("app"),
+            Some(Qualifier::in_main("app", NamespaceId::new(1)))
         );
         reopened.drop_namespace("app").unwrap();
-        assert_eq!(reopened.namespace("app"), None);
+        assert_eq!(reopened.qualifier("app"), None);
         assert!(reopened.drop_namespace("app").is_err());
         drop(reopened);
         let reopened = open_connection_storing_namespaces(&path);
-        assert_eq!(reopened.namespace("app"), None);
+        assert_eq!(reopened.qualifier("app"), None);
     }
 
     #[test]
@@ -5326,7 +5327,7 @@ mod tests {
         let conn = open_connection(&temp_dir.path().join("main.db"));
         assert!(conn.prepare("CREATE SCHEMA app").is_err());
         assert!(conn.create_namespace("app").is_err());
-        assert_eq!(conn.namespace("app"), None);
+        assert_eq!(conn.qualifier("app"), None);
     }
 
     fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) -> Result<()> {
@@ -5626,8 +5627,8 @@ mod tests {
             Arc::new(StoringDialect),
         );
         assert_eq!(
-            copied.namespace("shop"),
-            Some(Namespace::in_main("shop", NamespaceId::new(2)))
+            copied.qualifier("shop"),
+            Some(Qualifier::in_main("shop", NamespaceId::new(2)))
         );
         assert_eq!(query_single_i64(&copied, "SELECT x FROM shop.t"), 7);
     }
@@ -5654,8 +5655,8 @@ mod tests {
         conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(1)")
             .unwrap();
         let app = conn.create_namespace("app").unwrap();
-        assert_eq!(app, Namespace::in_main("app", NamespaceId::new(1)));
-        assert_eq!(conn.namespace("app"), Some(app));
+        assert_eq!(app, Qualifier::in_main("app", NamespaceId::new(1)));
+        assert_eq!(conn.qualifier("app"), Some(app));
         assert!(conn.create_namespace("app").is_err());
         assert!(conn.create_namespace("main").is_err());
         conn.execute("CREATE TABLE app.t(x INTEGER); INSERT INTO app.t VALUES(5)")
@@ -5705,7 +5706,7 @@ mod tests {
         );
         assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 1);
         conn.drop_namespace("app").unwrap();
-        assert_eq!(conn.namespace("app"), None);
+        assert_eq!(conn.qualifier("app"), None);
         assert!(conn.prepare("SELECT x FROM app.t").is_err());
         assert!(conn.drop_namespace("app").is_err());
         assert!(conn.drop_namespace("main").is_err());
@@ -5741,9 +5742,9 @@ mod tests {
         conn.execute("CREATE TABLE app.t(x INTEGER); INSERT INTO app.t VALUES(5)")
             .unwrap();
         assert_eq!(query_single_i64(&conn, "SELECT x FROM app.t"), 5);
-        assert_eq!(other.namespace("app"), None);
+        assert_eq!(other.qualifier("app"), None);
         conn.execute("ROLLBACK").unwrap();
-        assert_eq!(conn.namespace("app"), None);
+        assert_eq!(conn.qualifier("app"), None);
         assert!(conn.prepare("SELECT x FROM app.t").is_err());
 
         conn.execute("BEGIN").unwrap();
@@ -5752,8 +5753,8 @@ mod tests {
             .unwrap();
         conn.execute("COMMIT").unwrap();
         assert_eq!(
-            other.namespace("app"),
-            Some(Namespace::in_main("app", NamespaceId::new(1)))
+            other.qualifier("app"),
+            Some(Qualifier::in_main("app", NamespaceId::new(1)))
         );
         assert_eq!(query_single_i64(&other, "SELECT x FROM app.t"), 5);
 
@@ -5761,8 +5762,8 @@ mod tests {
         drop(conn);
         let reopened = open();
         assert_eq!(
-            reopened.namespace("app"),
-            Some(Namespace::in_main("app", NamespaceId::new(1)))
+            reopened.qualifier("app"),
+            Some(Qualifier::in_main("app", NamespaceId::new(1)))
         );
         assert_eq!(query_single_i64(&reopened, "SELECT x FROM app.t"), 5);
     }
