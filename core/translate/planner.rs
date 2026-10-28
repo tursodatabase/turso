@@ -2194,6 +2194,7 @@ fn parse_table(
         schema.get_view(namespace.id, table_name.as_str())
     });
     if let Some(view) = regular_view {
+        program.referenced_views.push(view.name.clone());
         // Views are essentially query aliases, so just Expand the view as a subquery.
         let has_alias = maybe_alias.is_some();
         let view_alias = maybe_alias
@@ -2529,6 +2530,9 @@ fn add_ctes_read_by_subqueries_as_outer_refs(
         if !ctes_read[cte_definition_index] {
             continue;
         }
+        // Planning the CTE here only names it for nested FROM clauses; the
+        // views it reads are recorded when a query reads the CTE.
+        let views_read_before_planning = program.referenced_views.len();
         let joined_table = plan_cte(
             cte_definition_index,
             cte_definitions,
@@ -2538,6 +2542,9 @@ fn add_ctes_read_by_subqueries_as_outer_refs(
             connection,
             false,
         )?;
+        program
+            .referenced_views
+            .truncate(views_read_before_planning);
         table_references.add_outer_query_reference(OuterQueryReference {
             identifier: cte_definition.name.clone(),
             has_alias: false,

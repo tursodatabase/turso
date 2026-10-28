@@ -176,6 +176,12 @@ pub fn check_storage_access(
     {
         return Ok(());
     }
+    if let Some(view_name) = program.referenced_views.first() {
+        return Err(permission_denied(PermissionDenied::privilege(
+            Action::Read,
+            Object::View(view_name.clone()),
+        )));
+    }
     for (insn, index) in &program.insns {
         if program.change_capture_writes.contains(index) {
             continue;
@@ -615,6 +621,46 @@ mod tests {
         assert_eq!(
             denial(error),
             PermissionDenied::privilege(Action::Read, Object::Table("t".to_string()))
+        );
+    }
+
+    #[test]
+    fn role_without_privileges_cannot_read_views() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        conn.execute("CREATE VIEW over_table AS SELECT x FROM t")
+            .unwrap();
+        conn.execute("CREATE VIEW constant AS SELECT 'secret' AS value")
+            .unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        for view in ["over_table", "constant"] {
+            let error = conn.execute(format!("SELECT * FROM {view}")).unwrap_err();
+            assert_eq!(
+                denial(error),
+                PermissionDenied::privilege(Action::Read, Object::View(view.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn view_in_an_unused_cte_is_not_read() {
+        let conn = open_connection();
+        conn.execute("CREATE VIEW constant AS SELECT 'secret' AS value")
+            .unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        conn.execute("WITH unused AS (SELECT * FROM constant) SELECT (SELECT 1)")
+            .unwrap();
+
+        let error = conn
+            .execute("WITH used AS (SELECT * FROM constant) SELECT (SELECT value FROM used)")
+            .unwrap_err();
+        assert_eq!(
+            denial(error),
+            PermissionDenied::privilege(Action::Read, Object::View("constant".to_string()))
         );
     }
 
