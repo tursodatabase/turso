@@ -109,6 +109,22 @@ pub fn name_create_table(sql: &str, name: &str) -> Result<String, ParseError> {
     name_at(sql, relation.location as usize, name)
 }
 
+/// The schema, if the statement names one, and the name of the table that
+/// a CREATE TABLE statement creates.
+pub fn create_table_name(parse_result: &ParseResult) -> Option<(Option<String>, String)> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some((NodeRef::CreateStmt(create), ..)) = nodes.first() else {
+        return None;
+    };
+    let relation = create.relation.as_ref()?;
+    Some((
+        (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
+        relation.relname.clone(),
+    ))
+}
+
 /// A table that a foreign key of a CREATE TABLE or ALTER TABLE statement
 /// refers to: the byte offset of its name in the statement, the schema the
 /// name has, if any, and the name itself, as PostgreSQL reads them.

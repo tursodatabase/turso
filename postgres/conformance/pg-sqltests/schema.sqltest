@@ -221,6 +221,18 @@ expect {
     1
 }
 
+test foreign-key-to-the-table-being-created-names-that-table {
+    CREATE SCHEMA app;
+    CREATE TABLE c (id int PRIMARY KEY);
+    SET search_path TO app, public;
+    CREATE TABLE c (id int PRIMARY KEY, p int REFERENCES c (id));
+    SELECT CASE WHEN confrelid = conrelid THEN 'itself' ELSE 'another table' END
+    FROM pg_constraint WHERE contype = 'f';
+}
+expect {
+    itself
+}
+
 test sequence-in-schema {
     CREATE SCHEMA app;
     CREATE SEQUENCE app.s;

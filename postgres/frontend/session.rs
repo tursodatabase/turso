@@ -444,15 +444,16 @@ fn name_foreign_key_tables<'a>(
     if tables.is_empty() {
         return Ok((sql, parse_result));
     }
+    let created = created_table(conn, &parse_result);
     let mut sql = sql.into_owned();
     for table in tables.iter().rev() {
         let namespace = match table.schema.as_deref() {
             Some(schema) => conn.qualifier(&schema.to_lowercase()).ok_or_else(|| {
                 LimboError::ParseError(format!("schema \"{schema}\" does not exist"))
             })?,
-            None => foreign_key_table_namespace(conn, &table.name).ok_or_else(|| {
-                LimboError::ParseError("no schema has been selected to create in".to_string())
-            })?,
+            None => foreign_key_table_namespace(conn, &table.name, created.as_ref()).ok_or_else(
+                || LimboError::ParseError("no schema has been selected to create in".to_string()),
+            )?,
         };
         sql = turso_pg_parser::name_at(&sql, table.location, &namespace.mangle_name(&table.name))
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
@@ -462,10 +463,28 @@ fn name_foreign_key_tables<'a>(
     Ok((Cow::Owned(sql), parse_result))
 }
 
+/// The schema and name of the table that a CREATE TABLE statement creates.
+fn created_table(
+    conn: &Arc<Connection>,
+    parse_result: &turso_pg_parser::ParseResult,
+) -> Option<(Qualifier, String)> {
+    let (schema, name) = turso_pg_parser::create_table_name(parse_result)?;
+    let schema = match schema {
+        Some(schema) => schema.to_lowercase(),
+        None => current_schema(conn)?,
+    };
+    Some((conn.qualifier(&schema)?, name))
+}
+
 /// The schema that a foreign key target named without a schema is in: the
-/// first schema of the search path that has a table of that name, or the
-/// first schema of the search path, where the statement creates its table.
-fn foreign_key_table_namespace(conn: &Arc<Connection>, name: &str) -> Option<Qualifier> {
+/// first schema of the search path that has a table of that name, counting
+/// the table the statement creates, which PostgreSQL makes before its
+/// foreign keys; or else the first schema of the search path.
+fn foreign_key_table_namespace(
+    conn: &Arc<Connection>,
+    name: &str,
+    created: Option<&(Qualifier, String)>,
+) -> Option<Qualifier> {
     let schema = conn.current_schema();
     let candidates: Vec<Qualifier> = conn
         .search_order()
@@ -474,7 +493,12 @@ fn foreign_key_table_namespace(conn: &Arc<Connection>, name: &str) -> Option<Qua
         .collect();
     candidates
         .iter()
-        .find(|namespace| schema.has_table(namespace.target.id, name))
+        .find(|namespace| {
+            schema.has_table(namespace.target.id, name)
+                || created.is_some_and(|(created_namespace, created_name)| {
+                    created_namespace == *namespace && created_name == name
+                })
+        })
         .or_else(|| candidates.first())
         .cloned()
 }
