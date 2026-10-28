@@ -35,7 +35,8 @@ use crate::{
     util::{
         check_expr_references_column, escape_sql_string_literal, is_builtin_strict_type,
         normalize_ident, parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
-        rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
+        rewrite_trigger_cmd_table_refs, rewrite_view_for_table_rename,
+        rewrite_view_sql_for_column_rename,
     },
     vdbe::{
         affinity::Affinity,
@@ -1555,7 +1556,44 @@ pub fn translate_alter_table(
                 }
             }
 
-            let temp_schema_version = if !temp_triggers_to_rewrite.is_empty() {
+            let temp_views_to_rewrite = if database_id == crate::TEMP_DB_ID {
+                Vec::new()
+            } else {
+                let renamed_db_name = resolver
+                    .namespace_name(database_id)
+                    .map(|name| normalize_ident(&name))
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "unknown database id {database_id} during ALTER TABLE"
+                        ))
+                    })?;
+                resolver.with_schema(crate::TEMP_DB_ID, |s| -> Result<_> {
+                    let temp_has_table = s
+                        .get_table(NamespaceId::ROOT, &normalized_old_name)
+                        .is_some();
+                    let mut rewrites = Vec::new();
+                    for (view_name, view) in s.views(NamespaceId::ROOT) {
+                        let Some(ast::Cmd::Stmt(stmt)) = connection.dialect().parse(&view.sql)?.0
+                        else {
+                            continue;
+                        };
+                        if let Some((new_sql, _)) = rewrite_view_for_table_rename(
+                            stmt,
+                            &normalized_old_name,
+                            new_name,
+                            !temp_has_table,
+                            Some(std::slice::from_ref(&renamed_db_name)),
+                        ) {
+                            rewrites.push((view_name.to_string(), new_sql));
+                        }
+                    }
+                    Ok(rewrites)
+                })?
+            };
+
+            let temp_schema_version = if !temp_triggers_to_rewrite.is_empty()
+                || !temp_views_to_rewrite.is_empty()
+            {
                 let schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
                 program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie)?;
                 Some(schema_cookie)
@@ -1711,6 +1749,18 @@ pub fn translate_alter_table(
                     connection,
                     input,
                     |_program| {},
+                )?;
+            }
+
+            for (view_name, new_sql) in temp_views_to_rewrite {
+                emit_view_sql_update(
+                    program,
+                    resolver,
+                    connection,
+                    input,
+                    crate::TEMP_DB_ID,
+                    &view_name,
+                    &new_sql,
                 )?;
             }
 
@@ -2189,35 +2239,14 @@ pub fn translate_alter_table(
 
             // Update view SQL for renamed columns
             for (view_database_id, view_name, new_sql) in views_to_rewrite {
-                let escaped_sql = escape_sql_string_literal(&new_sql);
-                let view_schema_table = schema_table_name_for_db(resolver, view_database_id);
-                let update_stmt = format!(
-                    r#"
-                        UPDATE {view_schema_table}
-                        SET sql = '{escaped_sql}'
-                        WHERE name = '{view_name}' COLLATE NOCASE AND type = 'view'
-                    "#,
-                );
-
-                let mut parser = Parser::new(update_stmt.as_bytes());
-                let cmd = parser.next_cmd().map_err(|e| {
-                    LimboError::ParseError(format!(
-                        "failed to parse view update SQL for {view_name}: {e}"
-                    ))
-                })?;
-                let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
-                    return Err(LimboError::ParseError(format!(
-                        "failed to parse view update SQL for {view_name}",
-                    )));
-                };
-
-                translate_update_for_schema_change(
-                    update,
-                    resolver,
+                emit_view_sql_update(
                     program,
+                    resolver,
                     connection,
                     input,
-                    |_program| {},
+                    view_database_id,
+                    &view_name,
+                    &new_sql,
                 )?;
             }
 
@@ -2323,6 +2352,41 @@ pub fn translate_alter_table(
     };
 
     Ok(())
+}
+
+fn emit_view_sql_update(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    input: &str,
+    view_database_id: usize,
+    view_name: &str,
+    new_sql: &str,
+) -> Result<()> {
+    let escaped_sql = escape_sql_string_literal(new_sql);
+    let escaped_view_name = escape_sql_string_literal(view_name);
+    let view_schema_table = schema_table_name_for_db(resolver, view_database_id);
+    let update_stmt = format!(
+        r#"
+            UPDATE {view_schema_table}
+            SET sql = '{escaped_sql}'
+            WHERE name = '{escaped_view_name}' COLLATE NOCASE AND type = 'view'
+        "#,
+    );
+
+    let mut parser = Parser::new(update_stmt.as_bytes());
+    let cmd = parser.next_cmd().map_err(|e| {
+        LimboError::ParseError(format!(
+            "failed to parse view update SQL for {view_name}: {e}"
+        ))
+    })?;
+    let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
+        return Err(LimboError::ParseError(format!(
+            "failed to parse view update SQL for {view_name}",
+        )));
+    };
+
+    translate_update_for_schema_change(update, resolver, program, connection, input, |_program| {})
 }
 
 /// Reject ALTER TABLE on a plain or materialized view with SQLite's messages
