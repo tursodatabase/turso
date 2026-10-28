@@ -423,14 +423,20 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
 /// and numeric(5,1), is that type without parameters. A custom type mixed with any
 /// other type counts as the type it is stored as. Any other mix is `Any`.
 fn common_type<'e>(exprs: impl Iterator<Item = &'e ast::Expr>, env: &TypeEnv) -> ExprType {
+    common_type_of(exprs.map(|expr| type_of(expr, env)), env.schema())
+}
+
+/// [`common_type`] for types that are already worked out, such as the types of
+/// one result column in each SELECT of a compound SELECT.
+pub(crate) fn common_type_of(types: impl Iterator<Item = ExprType>, schema: &Schema) -> ExprType {
     let mut common: Option<ExprType> = None;
-    for ty in exprs.map(|expr| type_of(expr, env)) {
+    for ty in types {
         common = Some(match (common, ty) {
             (None, ty) | (Some(ExprType::Null), ty) => ty,
             (Some(common), ExprType::Null) => common,
             (Some(common @ ExprType::Array { .. }), _) => common,
             (_, ty @ ExprType::Array { .. }) => ty,
-            (Some(common), ty) => common_scalar_type(common, ty, env.schema()),
+            (Some(common), ty) => common_scalar_type(common, ty, schema),
         });
     }
     common.unwrap_or(ExprType::Null)
