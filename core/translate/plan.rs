@@ -14,6 +14,7 @@ use crate::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
             lookup_unqualified_column, StorageClassMask,
         },
+        expr_context::ExprContext,
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
@@ -51,7 +52,7 @@ use super::expr::expr_type::{type_of, TypeEnv};
 /// The affinity (and whether it's a real declared one) determines comparison
 /// behavior in IN expressions, etc.
 fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> Affinity {
-    get_expr_affinity(expr, tables, None)
+    get_expr_affinity(expr, &ExprContext::new(tables, None))
 }
 
 /// Computes the affinity of column `i` of a compound (UNION/INTERSECT/EXCEPT)
@@ -71,13 +72,23 @@ pub(super) fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affini
     let col_affinities = |arm: &SelectPlan| {
         arm.result_columns
             .get(i)
-            .map(|rc| get_expr_affinity(&rc.expr, Some(&arm.table_references), None))
+            .map(|rc| {
+                get_expr_affinity(
+                    &rc.expr,
+                    &ExprContext::new(Some(&arm.table_references), None),
+                )
+            })
             .unwrap_or(Affinity::None)
     };
     let col_data_type = |arm: &SelectPlan| {
         arm.result_columns
             .get(i)
-            .map(|rc| expr_data_type(&rc.expr, Some(&arm.table_references)))
+            .map(|rc| {
+                expr_data_type(
+                    &rc.expr,
+                    &ExprContext::new(Some(&arm.table_references), None),
+                )
+            })
             .unwrap_or(StorageClassMask::from_null())
     };
 
@@ -172,7 +183,7 @@ impl ResultSetColumn {
     /// Returns the canonical short type name for this column's affinity,
     /// matching SQLite's `azType[]` in `createTableStmt()` (build.c).
     pub fn declared_type(&self, tables: &TableReferences) -> &'static str {
-        get_expr_affinity(&self.expr, Some(tables), None).short_type_name()
+        get_expr_affinity(&self.expr, &ExprContext::new(Some(tables), None)).short_type_name()
     }
 }
 
@@ -3147,8 +3158,8 @@ pub(super) fn query_output_columns(
         column.set_array_dimensions(dimensions);
         column.set_collation(Some(expr_collation(
             result_expr,
-            Some(table_references),
-            resolver,
+            &ExprContext::new(Some(table_references), Some(resolver)),
+            &resolver.catalog,
         )?));
     }
     Ok(columns)

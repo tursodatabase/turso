@@ -472,7 +472,11 @@ fn translate_subquery_result_expr(
                     rhs: column_check_reg,
                     target_pc: label_null_checks_next,
                     flags: CmpInsFlags::default().with_affinity(affinity),
-                    collation: expr_collation(lhs_columns[i], referenced_tables, resolver)?,
+                    collation: expr_collation(
+                        lhs_columns[i],
+                        &ExprContext::new(referenced_tables, Some(resolver)),
+                        &resolver.catalog,
+                    )?,
                 });
             }
             // All Ne comparisons fell through -> this row has all NULLs -> result is NULL
@@ -697,15 +701,14 @@ fn translate_case_expr(
                         base.as_deref()
                             .expect("base_reg is set only with a base expression"),
                         when_expr.as_ref(),
-                        referenced_tables,
-                        Some(resolver),
+                        &ExprContext::new(referenced_tables, Some(resolver)),
                     )),
                 collation: comparison_collation(
                     base.as_deref()
                         .expect("base_reg is set only with a base expression"),
                     when_expr,
-                    referenced_tables,
-                    resolver,
+                    &ExprContext::new(referenced_tables, Some(resolver)),
+                    &resolver.catalog,
                 )?,
             }),
             // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
@@ -902,8 +905,13 @@ fn translate_function_call_expr(
     let func = func_type.unwrap();
     let collation = if func.needs_collation() {
         first_collation(
-            args.iter().map(|arg| (arg.as_ref(), referenced_tables)),
-            resolver,
+            args.iter().map(|arg| {
+                (
+                    arg.as_ref(),
+                    ExprContext::new(referenced_tables, Some(resolver)),
+                )
+            }),
+            &resolver.catalog,
         )?
     } else {
         CollationSeq::Binary

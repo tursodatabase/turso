@@ -1287,8 +1287,7 @@ impl Statement {
         let column = &self.program.result_columns.get(idx)?;
         let affinity = translate::expr::get_expr_affinity(
             &column.expr,
-            Some(&self.program.table_references),
-            None,
+            &translate::expr_context::ExprContext::new(Some(&self.program.table_references), None),
         );
         affinity_to_primitive(affinity).map(str::to_string)
     }

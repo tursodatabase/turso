@@ -1127,14 +1127,16 @@ fn column_pair_compares_the_same(
     tables: &TableReferences,
     resolver: &Resolver,
 ) -> Result<bool> {
-    if get_expr_affinity(&pair.inner, Some(tables), None)
-        != get_expr_affinity(&pair.outer, Some(tables), None)
+    let affinity_metadata = super::ExprContext::new(Some(tables), None);
+    if get_expr_affinity(&pair.inner, &affinity_metadata)
+        != get_expr_affinity(&pair.outer, &affinity_metadata)
     {
         return Ok(false);
     }
 
-    let inner_collation = expr_collation(&pair.inner, Some(tables), resolver)?;
-    let outer_collation = expr_collation(&pair.outer, Some(tables), resolver)?;
+    let collation_metadata = super::ExprContext::new(Some(tables), Some(resolver));
+    let inner_collation = expr_collation(&pair.inner, &collation_metadata, &resolver.catalog)?;
+    let outer_collation = expr_collation(&pair.outer, &collation_metadata, &resolver.catalog)?;
     Ok(inner_collation == outer_collation)
 }
 

@@ -8,6 +8,7 @@ use crate::translate::emitter::{
 };
 use crate::translate::eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod};
 use crate::translate::expr::translate_expr;
+use crate::translate::expr_context::ExprContext;
 use crate::translate::order_by::{custom_type_comparator, sorter_insert};
 use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_columns_to_destination;
@@ -830,10 +831,10 @@ fn compound_collations(
                 selects.clone().map(|select| {
                     (
                         &select.result_columns[column].expr,
-                        Some(&select.table_references),
+                        ExprContext::new(Some(&select.table_references), Some(resolver)),
                     )
                 }),
-                resolver,
+                &resolver.catalog,
             )
         })
         .collect()

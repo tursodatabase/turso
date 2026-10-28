@@ -187,6 +187,7 @@ pub(super) fn emit_binary_expr_row_valued(
         Greater,
     }
 
+    let metadata = ExprContext::new(referenced_tables, Some(resolver));
     let mut emit_eq = |result_reg: usize, null_eq: bool| -> Result<()> {
         let null_seen_reg = if null_eq {
             None
@@ -206,8 +207,8 @@ pub(super) fn emit_binary_expr_row_valued(
                 lhs_expr,
                 rhs_expr,
                 i,
-                referenced_tables,
-                resolver,
+                &metadata,
+                &resolver.catalog,
             )?;
             program.emit_insn(Insn::Eq {
                 lhs: lhs_start + i,
@@ -284,8 +285,8 @@ pub(super) fn emit_binary_expr_row_valued(
                     lhs_expr,
                     rhs_expr,
                     i,
-                    referenced_tables,
-                    resolver,
+                    &metadata,
+                    &resolver.catalog,
                 )?;
                 let lhs = lhs_start + i;
                 let rhs = rhs_start + i;
@@ -396,8 +397,8 @@ pub(super) fn row_component_affinity_collation(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     idx: usize,
-    referenced_tables: Option<&TableReferences>,
-    resolver: &Resolver,
+    metadata: &impl ExprMetadata<SourceId = TableInternalId, SubqueryId = TableInternalId>,
+    catalog: &crate::translate::catalog::CatalogContext<'_>,
 ) -> Result<(Affinity, CollationSeq)> {
     // If one side is a decomposable row literal and the other is not, still prefer
     // the component that is available instead of falling back both sides.
@@ -407,8 +408,8 @@ pub(super) fn row_component_affinity_collation(
     let lhs_for_cmp = row_value_component_expr(lhs_expr, idx)?.unwrap_or(lhs_expr);
     let rhs_for_cmp = row_value_component_expr(rhs_expr, idx)?.unwrap_or(rhs_expr);
     Ok((
-        comparison_affinity(lhs_for_cmp, rhs_for_cmp, referenced_tables, Some(resolver)),
-        comparison_collation(lhs_for_cmp, rhs_for_cmp, referenced_tables, resolver)?,
+        comparison_affinity(lhs_for_cmp, rhs_for_cmp, metadata),
+        comparison_collation(lhs_for_cmp, rhs_for_cmp, metadata, catalog)?,
     ))
 }
 
@@ -424,11 +425,12 @@ pub(super) fn emit_binary_insn(
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
 ) -> Result<()> {
+    let metadata = ExprContext::new(referenced_tables, Some(resolver));
     let mut affinity = Affinity::Blob;
     if op.is_comparison() {
-        affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables, Some(resolver));
+        affinity = comparison_affinity(lhs_expr, rhs_expr, &metadata);
     }
-    let collation = || comparison_collation(lhs_expr, rhs_expr, referenced_tables, resolver);
+    let collation = || comparison_collation(lhs_expr, rhs_expr, &metadata, &resolver.catalog);
     let is_array_cmp = is_array(lhs_expr, referenced_tables, resolver)
         && is_array(rhs_expr, referenced_tables, resolver);
     let cmp_flags = || {
@@ -742,11 +744,12 @@ pub(super) fn emit_binary_condition_insn(
     condition_metadata: ConditionMetadata,
     resolver: &Resolver,
 ) -> Result<()> {
+    let metadata = ExprContext::new(referenced_tables, Some(resolver));
     let mut affinity = Affinity::Blob;
     if op.is_comparison() {
-        affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables, Some(resolver));
+        affinity = comparison_affinity(lhs_expr, rhs_expr, &metadata);
     }
-    let collation = || comparison_collation(lhs_expr, rhs_expr, referenced_tables, resolver);
+    let collation = || comparison_collation(lhs_expr, rhs_expr, &metadata, &resolver.catalog);
 
     let opposite_op = match op {
         ast::Operator::NotEquals => ast::Operator::Equals,

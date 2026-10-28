@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::alloc::TursoSliceExt;
+use crate::translate::expr_context::ExprContext;
 
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
@@ -862,8 +863,10 @@ fn get_subquery_parser<'a>(
 
                 if reg_count == 1 {
                     if let Some(result_col) = plan.result_columns.first() {
-                        let affinity =
-                            get_expr_affinity(&result_col.expr, Some(&plan.table_references), None);
+                        let affinity = get_expr_affinity(
+                            &result_col.expr,
+                            &ExprContext::new(Some(&plan.table_references), None),
+                        );
                         resolver
                             .subquery_affinities
                             .borrow_mut()
@@ -1004,13 +1007,15 @@ fn get_subquery_parser<'a>(
                 let mut affinity_chars = String::with_capacity(lhs_column_count);
                 let mut lhs_exprs = Vec::with_capacity(lhs_column_count);
                 for (i, lhs_expr) in lhs_columns.enumerate() {
-                    let lhs_affinity = get_expr_affinity(lhs_expr, Some(referenced_tables), None);
+                    let lhs_affinity = get_expr_affinity(
+                        lhs_expr,
+                        &ExprContext::new(Some(referenced_tables), None),
+                    );
                     affinity_chars.push(
                         comparison_affinity(
                             &result_columns[i].expr,
                             lhs_affinity,
-                            Some(table_references),
-                            None,
+                            &ExprContext::new(Some(table_references), None),
                         )
                         .aff_mask(),
                     );
@@ -1024,10 +1029,10 @@ fn get_subquery_parser<'a>(
                     .map(|(i, c)| {
                         let collation = comparison_collation_across_queries(
                             lhs_exprs[i],
-                            Some(referenced_tables),
+                            &ExprContext::new(Some(referenced_tables), Some(resolver)),
                             &c.expr,
-                            Some(table_references),
-                            resolver,
+                            &ExprContext::new(Some(table_references), Some(resolver)),
+                            &resolver.catalog,
                         )?;
                         Ok::<_, crate::LimboError>(IndexColumn {
                             name: c.name(table_references).unwrap_or("").to_string(),

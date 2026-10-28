@@ -1,6 +1,7 @@
 use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
+use crate::translate::expr_context::{ExprContext, ExprMetadata};
 use crate::{
     schema::{Column, Index, IndexColumn, Schema},
     translate::{
@@ -168,7 +169,8 @@ impl Constraint {
             // known through it. Without it, `text_col < (SELECT int_col ...)`
             // would take the TEXT side's affinity and the seek would compare
             // the integer as text.
-            affinity = comparison_affinity(lhs, rhs, referenced_tables, resolver);
+            affinity =
+                comparison_affinity(lhs, rhs, &ExprContext::new(referenced_tables, resolver));
         }
 
         if side == BinaryExprSide::Lhs {
@@ -571,10 +573,12 @@ pub(super) fn add_implied_column_equalities(
             continue;
         }
 
-        let left_affinity = get_expr_affinity(left, Some(table_references), None);
-        let right_affinity = get_expr_affinity(right, Some(table_references), None);
-        let left_collation = expr_collation(left, Some(table_references), resolver)?;
-        let right_collation = expr_collation(right, Some(table_references), resolver)?;
+        let affinity_metadata = ExprContext::new(Some(table_references), None);
+        let collation_metadata = ExprContext::new(Some(table_references), Some(resolver));
+        let left_affinity = get_expr_affinity(left, &affinity_metadata);
+        let right_affinity = get_expr_affinity(right, &affinity_metadata);
+        let left_collation = expr_collation(left, &collation_metadata, &resolver.catalog)?;
+        let right_collation = expr_collation(right, &collation_metadata, &resolver.catalog)?;
         if left_affinity != right_affinity
             || left_collation != right_collation
             || !matches!(
@@ -827,13 +831,19 @@ pub fn constraints_from_where_clause(
                 let cmp_aff = operator
                     .as_ast_operator()
                     .filter(|op| op.is_comparison())
-                    .map(|_| comparison_affinity(lhs, rhs, Some(table_references), None));
+                    .map(|_| {
+                        comparison_affinity(
+                            lhs,
+                            rhs,
+                            &ExprContext::new(Some(table_references), None),
+                        )
+                    });
                 let cmp_collation = match operator.as_ast_operator() {
                     Some(op) if op.is_comparison() => Some(comparison_collation(
                         lhs,
                         rhs,
-                        Some(table_references),
-                        resolver,
+                        &ExprContext::new(Some(table_references), Some(resolver)),
+                        &resolver.catalog,
                     )?),
                     _ => None,
                 };
@@ -1086,9 +1096,16 @@ pub fn constraints_from_where_clause(
                 let selectivity = estimate_in_selectivity(estimated_values, row_count, *not);
                 // SQLite's `comparisonAffinity` for IN-list (`x IN (lit, ...)`)
                 // is the LHS column's affinity; the RHS literals are not folded.
-                let cmp_aff = Some(get_expr_affinity(lhs, Some(table_references), None));
+                let cmp_aff = Some(get_expr_affinity(
+                    lhs,
+                    &ExprContext::new(Some(table_references), None),
+                ));
                 // `x IN (y1, ..., yN)` compares with the collation of x alone.
-                let cmp_collation = Some(expr_collation(lhs, Some(table_references), resolver)?);
+                let cmp_collation = Some(expr_collation(
+                    lhs,
+                    &ExprContext::new(Some(table_references), Some(resolver)),
+                    &resolver.catalog,
+                )?);
 
                 match lhs.as_ref() {
                     ast::Expr::Column { table, column, .. }
@@ -2207,10 +2224,21 @@ pub(crate) fn summarize_binary_term_for_index(
         is_rowid,
         ..
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
-    let comparison_collation =
-        comparison_collation(lhs, rhs, Some(table_references), resolver).ok()?;
+    let comparison_collation = comparison_collation(
+        lhs,
+        rhs,
+        &ExprContext::new(Some(table_references), Some(resolver)),
+        &resolver.catalog,
+    )
+    .ok()?;
 
-    let affinity = term_comparison_affinity(lhs, rhs, operator, table_col_pos, table_references);
+    let affinity = term_comparison_affinity(
+        lhs,
+        rhs,
+        operator,
+        table_col_pos,
+        &ExprContext::new(Some(table_references), None),
+    );
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
         operator,
@@ -2274,10 +2302,21 @@ pub(crate) fn analyze_binary_term_for_index(
         side,
         is_rowid,
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
-    let comparison_collation =
-        comparison_collation(lhs, rhs, Some(table_references), resolver).ok()?;
+    let comparison_collation = comparison_collation(
+        lhs,
+        rhs,
+        &ExprContext::new(Some(table_references), Some(resolver)),
+        &resolver.catalog,
+    )
+    .ok()?;
 
-    let affinity = term_comparison_affinity(lhs, rhs, operator, table_col_pos, table_references);
+    let affinity = term_comparison_affinity(
+        lhs,
+        rhs,
+        operator,
+        table_col_pos,
+        &ExprContext::new(Some(table_references), None),
+    );
     // Find the best index for this constraint
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
@@ -2361,11 +2400,11 @@ fn term_comparison_affinity(
     rhs: &ast::Expr,
     operator: ConstraintOperator,
     table_col_pos: Option<usize>,
-    table_references: &TableReferences,
+    metadata: &impl ExprMetadata<SourceId = TableInternalId, SubqueryId = TableInternalId>,
 ) -> Affinity {
     match operator.as_ast_operator() {
         Some(op) if op.is_comparison() && table_col_pos.is_some() => {
-            comparison_affinity(lhs, rhs, Some(table_references), None)
+            comparison_affinity(lhs, rhs, metadata)
         }
         _ => Affinity::Blob,
     }

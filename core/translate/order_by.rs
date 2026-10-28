@@ -1,3 +1,4 @@
+use crate::translate::expr_context::ExprContext;
 use crate::{alloc::TursoVecExt, sync::Arc};
 
 use crate::alloc::*;
@@ -197,7 +198,11 @@ impl EmitOrderBy {
                         "heap sort cannot express an explicit NULLS ordering".to_string(),
                     ));
                 }
-                let collation = expr_collation(column, Some(referenced_tables), &t_ctx.resolver)?;
+                let collation = expr_collation(
+                    column,
+                    &ExprContext::new(Some(referenced_tables), Some(&t_ctx.resolver)),
+                    &t_ctx.resolver.catalog,
+                )?;
                 let pos_in_table = index_columns.len();
                 // Have enough space pre-allocatoed to push without realloc
                 index_columns.push(IndexColumn {
@@ -697,7 +702,11 @@ pub(crate) fn sorter_open_data<'a>(
         comparators: Vec::try_with_capacity_ext(capacity)?,
     };
     for (expr, direction, nulls) in terms {
-        let collation = expr_collation(expr, Some(tables), resolver)?;
+        let collation = expr_collation(
+            expr,
+            &ExprContext::new(Some(tables), Some(resolver)),
+            &resolver.catalog,
+        )?;
         data.order_collations_nulls
             .try_push((direction, collation, nulls))?;
         data.comparators

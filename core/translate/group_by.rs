@@ -1,4 +1,5 @@
 use crate::alloc::TursoIteratorExt;
+use crate::translate::expr_context::ExprContext;
 use turso_parser::ast::{self, SortOrder};
 
 use super::{
@@ -170,8 +171,11 @@ impl EmitGroupBy {
                 .zip(sort_order.iter())
                 .zip(group_by.nulls_order.iter())
                 .map(|((expr, ord), nulls)| {
-                    let collation =
-                        expr_collation(expr, Some(&plan.table_references), &t_ctx.resolver)?;
+                    let collation = expr_collation(
+                        expr,
+                        &ExprContext::new(Some(&plan.table_references), Some(&t_ctx.resolver)),
+                        &t_ctx.resolver.catalog,
+                    )?;
                     Ok::<_, crate::LimboError>((*ord, collation, *nulls))
                 })
                 .try_collect::<Result<crate::alloc::Vec<_>>>()??;
@@ -701,7 +705,11 @@ pub fn group_by_process_single_group(
         .map(|expr| {
             Ok(KeyInfo {
                 sort_order: SortOrder::Asc,
-                collation: expr_collation(expr, Some(&plan.table_references), &t_ctx.resolver)?,
+                collation: expr_collation(
+                    expr,
+                    &ExprContext::new(Some(&plan.table_references), Some(&t_ctx.resolver)),
+                    &t_ctx.resolver.catalog,
+                )?,
                 nulls_order: None,
             })
         })
