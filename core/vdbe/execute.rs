@@ -1939,6 +1939,8 @@ pub fn op_rewind(
         insn
     );
     assert!(pc_if_empty.is_offset());
+    // Like SQLite, positioning the cursor cancels a DeferredSeek still pending on it.
+    state.deferred_seeks[*cursor_id] = None;
     // Clear any bloom filter associated with this cursor so stale filter data
     // does not incorrectly reject valid matches in subsequent iterations.
     if let Some(filter) = state.get_bloom_filter_mut(*cursor_id) {
@@ -1980,6 +1982,8 @@ pub fn op_last(
         insn
     );
     assert!(pc_if_empty.is_offset());
+    // Like SQLite, positioning the cursor cancels a DeferredSeek still pending on it.
+    state.deferred_seeks[*cursor_id] = None;
     let is_empty = {
         let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Last");
         let cursor = cursor.as_btree_mut();
@@ -6677,6 +6681,9 @@ pub fn op_seek(
         target_pc.is_offset(),
         "op_seek: target_pc should be an offset, is: {target_pc:?}"
     );
+    // Like SQLite, positioning the cursor cancels a DeferredSeek still pending on it.
+    // Otherwise RowId and Column would keep reading the row that seek saved.
+    state.deferred_seeks[*cursor_id] = None;
     let has_null_that_cannot_match = match insn {
         Insn::SeekGE {
             eq_only: true,
