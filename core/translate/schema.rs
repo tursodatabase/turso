@@ -2948,11 +2948,12 @@ fn persist_type_definition(
     // Ensure sqlite_turso_types table exists (lazy creation)
     let types_table: Arc<BTreeTable>;
     let types_root_page: RegisterOrLiteral<i64>;
-
-    if let Some(existing) = resolver
+    let existing_types_table = resolver
         .schema()
-        .get_btree_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME)
-    {
+        .get_btree_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME);
+    let creating_types_table = existing_types_table.is_none();
+
+    if let Some(existing) = existing_types_table {
         types_table = existing.clone();
         types_root_page = RegisterOrLiteral::Literal(existing.root_page);
     } else {
@@ -2990,6 +2991,12 @@ fn persist_type_definition(
             table_root_reg,
             Some(create_sql),
         )?;
+
+        // `SetCookie` is what marks the transaction as having changed the schema, so that a
+        // rollback restores the connection schema (see `Pager::rollback`). It has to precede
+        // `ParseSchema`: if a later instruction fails - `AddType` re-parses the type SQL and can -
+        // the schema would otherwise keep the types table while the rollback removed its page.
+        emit_schema_cookie(resolver, program);
 
         // Parse schema to register the new table in-memory
         program.emit_insn(Insn::ParseSchema {
@@ -3040,14 +3047,27 @@ fn persist_type_definition(
         sql,
     });
 
+    if !creating_types_table {
+        // Only when this path emitted no cookie above. `AddType` registers the type in the
+        // connection schema but allocates nothing, so its failure needs no restore and a cookie
+        // emitted before it only leaves the connection and the database out of step: inside an
+        // explicit transaction, the statement rollback restores neither and `COMMIT` fails with
+        // "Database schema changed".
+        emit_schema_cookie(resolver, program);
+    }
+
+    Ok(())
+}
+
+/// Marks the transaction as having changed the schema, so that a rollback restores the connection
+/// schema, and bumps the schema cookie of the main database.
+fn emit_schema_cookie(resolver: &Resolver, program: &mut ProgramBuilder) {
     program.emit_insn(Insn::SetCookie {
         db: MAIN_DB_ID,
         cookie: Cookie::SchemaVersion,
         value: (resolver.schema().schema_version + 1) as i32,
         p5: 0,
     });
-
-    Ok(())
 }
 
 pub fn translate_create_type(
