@@ -353,7 +353,7 @@ impl EmitOrderBy {
             // (on-disk) value (decode was suppressed during sorter insert). Apply
             // DECODE now so the result set contains human-readable values.
             if remapping.deduplicated {
-                if let Some((col, type_def)) = result_column_custom_type_info(
+                if let Some((_, type_def)) = result_column_custom_type_info(
                     &rc.expr,
                     &plan.table_references,
                     t_ctx.resolver.schema(),
@@ -369,8 +369,6 @@ impl EmitOrderBy {
                             decode_expr,
                             reg,
                             reg,
-                            &col.ty_params,
-                            &type_def,
                             &t_ctx.resolver,
                         )?;
                         program.preassign_label_to_next_insn(skip_label);

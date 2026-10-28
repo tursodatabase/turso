@@ -784,12 +784,12 @@ Lists all available types (built-in and custom) with their metadata.
 
 ```sql
 PRAGMA list_types;
--- type    | parent | encode | decode | default | operators
--- INTEGER |        |        |        |         |
--- REAL    |        |        |        |         |
--- TEXT    |        |        |        |         |
--- BLOB    |        |        |        |         |
--- ANY     |        |        |        |         |
+-- type    | parent | encode | coerce | decode | default | operators
+-- INTEGER |        |        |        |        |         |
+-- REAL    |        |        |        |        |         |
+-- TEXT    |        |        |        |        |         |
+-- BLOB    |        |        |        |        |         |
+-- ANY     |        |        |        |        |         |
 ```
 
 The `operators` column lists the type's `OPERATOR` clauses and the built-in operators that run a function, such as `'+' numeric_add` for `numeric`.

@@ -970,6 +970,7 @@ pub enum ScalarFunc {
     ValidateIpAddr,
     // Numeric type functions
     NumericEncode,
+    NumericFit,
     NumericDecode,
     NumericAdd,
     NumericSub,
@@ -1105,6 +1106,7 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::IntToBoolean
             | ScalarFunc::ValidateIpAddr
             | ScalarFunc::NumericEncode
+            | ScalarFunc::NumericFit
             | ScalarFunc::NumericDecode
             | ScalarFunc::NumericAdd
             | ScalarFunc::NumericSub
@@ -1271,6 +1273,7 @@ impl Display for ScalarFunc {
             Self::IntToBoolean => "int_to_boolean",
             Self::ValidateIpAddr => "validate_ipaddr",
             Self::NumericEncode => "numeric_encode",
+            Self::NumericFit => "numeric_fit",
             Self::NumericDecode => "numeric_decode",
             Self::NumericAdd => "numeric_add",
             Self::NumericSub => "numeric_sub",
@@ -1424,6 +1427,7 @@ impl ScalarFunc {
             Self::BooleanToInt
             | Self::IntToBoolean
             | Self::ValidateIpAddr
+            | Self::NumericEncode
             | Self::NumericDecode
             | Self::NumericNeg => &[1],
             Self::NumericAdd
@@ -1436,7 +1440,7 @@ impl ScalarFunc {
             | Self::DatePlus
             | Self::DateMinus
             | Self::DateDiff => &[2],
-            Self::NumericEncode => &[3],
+            Self::NumericFit => &[3],
             // Array construction / element access
             Self::Array => &[-1], // variable arity
             Self::ArrayElement => &[2],

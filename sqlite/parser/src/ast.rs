@@ -1518,6 +1518,10 @@ pub enum CreateTypeBody {
         base: String,
         /// encode expression (called on write), uses `value` placeholder for input
         encode: Option<Box<Expr>>,
+        /// coerce expression (called on write after encode, and by a CAST with
+        /// type parameters). Rounds or rejects the encoded `value` to fit the
+        /// type parameters, which only this expression can reference.
+        coerce: Option<Box<Expr>>,
         /// decode expression (called on read), uses `value` placeholder for input
         decode: Option<Box<Expr>>,
         /// operator-to-function mappings

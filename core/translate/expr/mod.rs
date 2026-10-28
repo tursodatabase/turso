@@ -100,7 +100,7 @@ pub use condition::translate_condition_expr;
 pub(crate) use custom_type_operators::{custom_operator_call, emit_operator_call_on_registers};
 pub(crate) use custom_types::runs_custom_type_function;
 pub(crate) use custom_types::{
-    emit_dml_expr_index_value, emit_trigger_decode_registers, emit_type_expr,
+    emit_dml_expr_index_value, emit_store_value, emit_trigger_decode_registers, emit_type_expr,
     emit_user_facing_column_value,
 };
 pub use emission::{

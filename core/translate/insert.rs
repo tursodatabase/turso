@@ -2960,7 +2960,7 @@ fn translate_column(
         };
         let has_custom_encode = resolved
             .as_ref()
-            .is_some_and(|r| r.chain.iter().any(|td| td.encode().is_some()));
+            .is_some_and(|r| r.chain.iter().any(|td| td.has_encode_or_coerce()));
         if has_custom_encode {
             translate_expr_no_constant_opt(
                 program,

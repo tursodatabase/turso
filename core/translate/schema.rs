@@ -537,6 +537,7 @@ fn resolve_scalar_func_return_type(
         | ScalarFunc::TestUintMul
         | ScalarFunc::TestUintDiv
         | ScalarFunc::NumericEncode
+        | ScalarFunc::NumericFit
         | ScalarFunc::NumericDecode
         | ScalarFunc::NumericAdd
         | ScalarFunc::NumericSub
@@ -3085,9 +3086,11 @@ pub fn translate_create_type(
         bail_parse_error!("type {normalized_name} already exists");
     }
 
-    // Validate encode/decode expressions for safety (only for custom types)
+    // Validate encode/coerce/decode expressions for safety (only for custom types)
     if let ast::CreateTypeBody::CustomType {
+        ref params,
         ref encode,
+        ref coerce,
         ref decode,
         ..
     } = body
@@ -3095,9 +3098,13 @@ pub fn translate_create_type(
         if let Some(ref encode) = encode {
             validate_type_expr(encode, "ENCODE", &resolver.catalog)?;
         }
+        if let Some(ref coerce) = coerce {
+            validate_type_expr(coerce, "COERCE", &resolver.catalog)?;
+        }
         if let Some(ref decode) = decode {
             validate_type_expr(decode, "DECODE", &resolver.catalog)?;
         }
+        crate::schema::check_type_params_only_in_coerce(params, encode, decode)?;
     }
 
     // Build canonical SQL (without IF NOT EXISTS) for persistence
@@ -3118,6 +3125,7 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
             params,
             base,
             encode,
+            coerce,
             decode,
             default,
             operators,
@@ -3145,6 +3153,9 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
             };
             if let Some(ref encode) = encode {
                 sql.push_str(&format!(" ENCODE {encode}"));
+            }
+            if let Some(ref coerce) = coerce {
+                sql.push_str(&format!(" COERCE {coerce}"));
             }
             if let Some(ref decode) = decode {
                 sql.push_str(&format!(" DECODE {decode}"));

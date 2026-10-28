@@ -920,7 +920,9 @@ fn emit_update_column_values<'a>(
                                 .resolve_type_unchecked(&table_column.ty_str)
                                 .ok()
                                 .flatten()
-                                .is_some_and(|r| r.chain.iter().any(|td| td.encode().is_some()));
+                                .is_some_and(|r| {
+                                    r.chain.iter().any(|td| td.has_encode_or_coerce())
+                                });
                             let translate_result = if has_custom_encode {
                                 translate_expr_no_constant_opt(
                                     program,

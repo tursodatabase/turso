@@ -641,8 +641,9 @@ fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
     ExprType::array(scalar, type_name.array_dimensions)
 }
 
-/// A CAST to a custom type that needs arguments but has none, such as
-/// `CAST(x AS numeric)` for `numeric(precision, scale)`, is a plain SQLite CAST.
+/// A CAST to a custom type with some but not all of its arguments, such as
+/// `CAST(x AS numeric(10))` for `numeric(precision, scale)`, is a plain SQLite
+/// CAST. Without arguments it converts to the type without limits.
 fn custom_cast_target(name: &str, type_name: &ast::Type, schema: &Schema) -> Option<ExprType> {
     let type_def = schema.get_type_def_unchecked(name)?;
     let params: Vec<Box<ast::Expr>> = match &type_name.size {
@@ -651,7 +652,7 @@ fn custom_cast_target(name: &str, type_name: &ast::Type, schema: &Schema) -> Opt
         None => Vec::new(),
     };
     let needed_params = type_def.user_params().count();
-    if !type_def.is_domain && needed_params != 0 && params.len() != needed_params {
+    if !type_def.is_domain && !params.is_empty() && params.len() != needed_params {
         return None;
     }
     Some(ExprType::Custom {

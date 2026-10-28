@@ -11327,6 +11327,17 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::NumericEncode => {
+                check_arg_count!(arg_count, 1);
+                let result = match state.registers[*start_reg].get_value() {
+                    Value::Null => Value::Null,
+                    other => {
+                        let bd = numeric_from_value(other)?;
+                        Value::from_blob(crate::numeric::decimal::bigdecimal_to_blob(&bd))
+                    }
+                };
+                state.registers[*dest].set_value(result);
+            }
+            ScalarFunc::NumericFit => {
                 check_arg_count!(arg_count, 3);
                 let val = &state.registers[*start_reg];
                 let precision_reg = &state.registers[*start_reg + 1];
@@ -11339,23 +11350,18 @@ pub fn op_function(
                         };
 
                         let bd = numeric_from_value(other)?;
-                        // NULL precision and scale mean no limit: the value is
-                        // only converted, as for an index seek key.
-                        let encoded = match (precision_reg.get_value(), scale_reg.get_value()) {
-                            (Value::Null, Value::Null) => bd,
-                            (
-                                Value::Numeric(Numeric::Integer(precision)),
-                                Value::Numeric(Numeric::Integer(scale)),
-                            ) => validate_precision_scale(&bd, *precision, *scale)?,
-                            _ => {
-                                return Err(LimboError::Constraint(
-                                    "numeric_encode: precision and scale must be integers"
-                                        .to_string(),
-                                )
-                                .into());
-                            }
+                        let (
+                            Value::Numeric(Numeric::Integer(precision)),
+                            Value::Numeric(Numeric::Integer(scale)),
+                        ) = (precision_reg.get_value(), scale_reg.get_value())
+                        else {
+                            return Err(LimboError::Constraint(
+                                "numeric_fit: precision and scale must be integers".to_string(),
+                            )
+                            .into());
                         };
-                        Value::from_blob(bigdecimal_to_blob(&encoded))
+                        let fitted = validate_precision_scale(&bd, *precision, *scale)?;
+                        Value::from_blob(bigdecimal_to_blob(&fitted))
                     }
                 };
                 state.registers[*dest].set_value(result);

@@ -313,7 +313,9 @@ fn call_for(
         .args
         .iter()
         .map(|arg| match arg {
-            OperatorArg::EncodableLiteral if ty.type_def.encode().is_some() => Some(ty.type_name()),
+            OperatorArg::EncodableLiteral if ty.type_def.encode().is_some() => {
+                Some(Arc::clone(&ty.type_def))
+            }
             _ => None,
         })
         .collect();
@@ -342,7 +344,7 @@ fn call_for(
 pub(crate) struct OperatorCall {
     func: Func,
     /// For each operand, the type to encode it to before the call.
-    encode: Vec<Option<ast::Type>>,
+    encode: Vec<Option<Arc<TypeDef>>>,
     /// The type the function returns. `None` when it is not known, as for a
     /// user type's function.
     pub(super) result: Option<ast::Type>,
@@ -432,26 +434,18 @@ fn emit_function(program: &mut ProgramBuilder, call: &OperatorCall, start_reg: u
     });
 }
 
+/// Converts an operand to the type. The column's type parameters are not
+/// applied: `n = 3.504` on a numeric(10,2) column compares with 3.504, not
+/// with 3.50.
 fn emit_encode(
     program: &mut ProgramBuilder,
-    to: &ast::Type,
+    to: &TypeDef,
     value_reg: usize,
     dest_reg: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    let type_def = resolver
-        .schema()
-        .get_type_def_unchecked(&to.name)
-        .ok_or_else(|| LimboError::InternalError(format!("type not found: {}", to.name)))?;
-    let encode = type_def.encode().ok_or_else(|| {
-        LimboError::InternalError(format!("type {} has no ENCODE", type_def.name))
-    })?;
-    let params: Vec<Box<ast::Expr>> = match &to.size {
-        Some(ast::TypeSize::MaxSize(max)) => vec![max.clone()],
-        Some(ast::TypeSize::TypeSize(precision, scale)) => vec![precision.clone(), scale.clone()],
-        None => Vec::new(),
-    };
-    emit_type_expr(
-        program, encode, value_reg, dest_reg, &params, type_def, resolver,
-    )
+    let encode = to
+        .encode()
+        .ok_or_else(|| LimboError::InternalError(format!("type {} has no ENCODE", to.name)))?;
+    emit_type_expr(program, encode, value_reg, dest_reg, resolver)
 }

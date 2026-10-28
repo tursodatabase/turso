@@ -1,7 +1,6 @@
 use super::*;
 use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
-use turso_parser::ast;
 use turso_parser::ast::NullsOrder;
 
 fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
@@ -59,13 +58,10 @@ pub(super) fn encode_seek_keys_for_custom_types(
         if resolved.chain.iter().all(|td| td.encode().is_none()) {
             continue;
         }
-        // The index holds encoded values, so the key is encoded too, with the
-        // column's type parameters, because a user type's ENCODE may use them
-        // (`ENCODE value * f`). The parameters of the built-in types
-        // (numeric's precision and scale, varchar's length) only limit what
-        // the column may store. They are passed as NULL so that a key is
-        // converted but never rounded or rejected: `n = 3.504` on a
-        // numeric(10,2) column matches no row.
+        // The index holds encoded values, so the key is encoded too. COERCE
+        // does not run: the column's limits apply to what it stores, not to
+        // what it is compared with. `n = 3.504` on a numeric(10,2) column
+        // matches no row instead of matching 3.50.
         let reg = start_reg + i;
         let skip_label = program.allocate_label();
         program.emit_insn(Insn::IsNull {
@@ -74,25 +70,7 @@ pub(super) fn encode_seek_keys_for_custom_types(
         });
         for td in &resolved.chain {
             if let Some(encode_expr) = td.encode() {
-                let no_limits: Vec<Box<ast::Expr>>;
-                let params = if td.is_builtin {
-                    no_limits = td
-                        .user_params()
-                        .map(|_| Box::new(ast::Expr::Literal(ast::Literal::Null)))
-                        .collect();
-                    &no_limits
-                } else {
-                    &table_col.ty_params
-                };
-                crate::translate::expr::emit_type_expr(
-                    program,
-                    encode_expr,
-                    reg,
-                    reg,
-                    params,
-                    td,
-                    resolver,
-                )?;
+                crate::translate::expr::emit_type_expr(program, encode_expr, reg, reg, resolver)?;
             }
         }
         program.preassign_label_to_next_insn(skip_label);

@@ -792,21 +792,89 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test cmp-index-seek-key-uses-type-parameters {
-    -- A user type's ENCODE may use its parameters, so a seek key is encoded
-    -- with the column's parameters, as the stored values were.
-    CREATE TYPE scaled(value integer, f integer) BASE integer ENCODE value * f DECODE value / f OPERATOR '<';
-    CREATE TABLE t(id INTEGER PRIMARY KEY, x scaled(10)) STRICT;
-    INSERT INTO t VALUES (1, 5), (2, 7);
-    CREATE INDEX t_x ON t(x);
-    SELECT id FROM t WHERE x = 5;
-    SELECT id FROM t WHERE x > 6;
-    SELECT id FROM t WHERE x IN (7, 8);
+test cmp-type-parameter-in-encode-is-rejected {
+    -- ENCODE also converts seek keys and operator arguments, which the
+    -- column's limits do not apply to, so it cannot read the parameters.
+    CREATE TYPE scaled(value integer, f integer) BASE integer ENCODE value * f DECODE value;
+}
+expect error {
+    ENCODE cannot use type parameter "f": only COERCE can
+}
+
+@requires strict "uses STRICT tables"
+test cmp-type-parameter-in-decode-is-rejected {
+    CREATE TYPE scaled(value integer, f integer) BASE integer ENCODE value DECODE value / f;
+}
+expect error {
+    DECODE cannot use type parameter "f": only COERCE can
+}
+
+@requires strict "uses STRICT tables"
+test cmp-coerce-rejects-stored-value {
+    CREATE TYPE capped(value integer, maxval integer) BASE integer COERCE CASE WHEN value <= maxval THEN value ELSE RAISE(ABORT, 'value above maximum for capped') END OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x capped(10)) STRICT;
+    INSERT INTO t VALUES (1, 11);
+}
+expect error {
+    value above maximum for capped
+}
+
+@requires strict "uses STRICT tables"
+test cmp-coerce-rejects-updated-value {
+    CREATE TYPE capped(value integer, maxval integer) BASE integer COERCE CASE WHEN value <= maxval THEN value ELSE RAISE(ABORT, 'value above maximum for capped') END OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x capped(10)) STRICT;
+    INSERT INTO t VALUES (1, 10);
+    UPDATE t SET x = 11;
+}
+expect error {
+    value above maximum for capped
+}
+
+@requires strict "uses STRICT tables"
+test cmp-coerce-runs-on-cast-with-type-arguments {
+    CREATE TYPE capped(value integer, maxval integer) BASE integer COERCE CASE WHEN value <= maxval THEN value ELSE RAISE(ABORT, 'value above maximum for capped') END OPERATOR '<';
+    SELECT CAST(11 AS capped(10));
+}
+expect error {
+    value above maximum for capped
+}
+
+@requires strict "uses STRICT tables"
+test cmp-coerce-does-not-run-on-cast-without-type-arguments {
+    CREATE TYPE capped(value integer, maxval integer) BASE integer COERCE CASE WHEN value <= maxval THEN value ELSE RAISE(ABORT, 'value above maximum for capped') END OPERATOR '<';
+    SELECT CAST(11 AS capped), CAST(NULL AS capped(10));
 }
 expect {
+    11|
+}
+
+@requires strict "uses STRICT tables"
+test cmp-coerce-does-not-run-on-index-seek-key {
+    -- The column's limit applies to what it stores. A larger seek key equals
+    -- no row instead of raising an error.
+    CREATE TYPE capped(value integer, maxval integer) BASE integer COERCE CASE WHEN value <= maxval THEN value ELSE RAISE(ABORT, 'value above maximum for capped') END OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x capped(10)) STRICT;
+    INSERT INTO t VALUES (1, 5), (2, 7);
+    CREATE INDEX t_x ON t(x);
+    SELECT count(*) FROM t WHERE x = 11;
+    SELECT id FROM t WHERE x < 11 ORDER BY id;
+}
+expect {
+    0
     1
     2
-    2
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-cast-rounds-only-with-type-arguments {
+    -- As in PostgreSQL, numeric(10,2) rounds to two decimals. numeric
+    -- without arguments is SQLite's CAST, which keeps every decimal.
+    SELECT CAST('3.504' AS numeric(10,2)) = 3.50, CAST('3.504' AS numeric) = 3.504;
+    SELECT CAST('3.504' AS numeric(10,2)) = 3.504, CAST('3.504' AS numeric) = 3.50;
+}
+expect {
+    1|1
+    0|0
 }
 
 @requires strict "uses STRICT tables"
