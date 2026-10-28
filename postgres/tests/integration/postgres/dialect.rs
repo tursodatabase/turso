@@ -2635,6 +2635,60 @@ fn test_postgres_natural_join(db: TempDatabase) {
     assert_eq!(results, vec!["10,100"]);
 }
 
+#[turso_macros::test(mvcc)]
+fn test_postgres_rejects_duplicate_common_join_columns(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE a (x INTEGER, id INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE b (y INTEGER, id INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE c (z INTEGER, id INTEGER)")
+        .unwrap();
+
+    for sql in [
+        "SELECT * FROM (a JOIN b USING (id)) JOIN c USING (id)",
+        "SELECT * FROM (a JOIN b USING (id)) NATURAL JOIN c",
+    ] {
+        conn.prepare(sql).unwrap().run_collect_rows().unwrap();
+    }
+
+    for (sql, expected_error) in [
+        (
+            "SELECT * FROM a JOIN b ON true JOIN c USING (id)",
+            "common column name \"id\" appears more than once in left table",
+        ),
+        (
+            "SELECT * FROM a JOIN b ON true NATURAL JOIN c",
+            "common column name \"id\" appears more than once in left table",
+        ),
+        (
+            "SELECT * FROM (a JOIN b ON true) JOIN c USING (id)",
+            "common column name \"id\" appears more than once in left table",
+        ),
+        (
+            "SELECT * FROM (a JOIN b ON true) NATURAL JOIN c",
+            "common column name \"id\" appears more than once in left table",
+        ),
+        (
+            "SELECT * FROM a JOIN (b JOIN c ON true) USING (id)",
+            "common column name \"id\" appears more than once in right table",
+        ),
+        (
+            "SELECT * FROM a NATURAL JOIN (b JOIN c ON true)",
+            "common column name \"id\" appears more than once in right table",
+        ),
+    ] {
+        let error = match conn.prepare(sql) {
+            Ok(mut statement) => match statement.run_collect_rows() {
+                Ok(rows) => panic!("{sql}: duplicate common columns were accepted: {rows:?}"),
+                Err(error) => error.to_string(),
+            },
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(expected_error), "{sql}: {error}");
+    }
+}
+
 #[turso_macros::test]
 fn test_postgres_compound_order_by(db: TempDatabase) {
     let conn = db.connect_postgres();

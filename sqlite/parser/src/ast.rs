@@ -1176,6 +1176,8 @@ bitflags::bitflags! {
         const RIGHT   = 0x10;
         /// `OUTER`
         const OUTER   = 0x20;
+        /// PostgreSQL frontend marker for strict USING/NATURAL column resolution.
+        const POSTGRES_COMPAT = 0x40;
     }
 }
 

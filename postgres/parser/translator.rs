@@ -2779,6 +2779,9 @@ impl PostgreSQLTranslator {
         if join_expr.is_natural {
             jt |= ast::JoinType::NATURAL;
         }
+        // The core planner uses this marker to preserve PostgreSQL's stricter
+        // duplicate-column rules without changing SQLite join behavior.
+        jt |= ast::JoinType::POSTGRES_COMPAT;
         let operator = ast::JoinOperator::TypedJoin(if jt.is_empty() { None } else { Some(jt) });
 
         // Translate join constraint (ON / USING)
