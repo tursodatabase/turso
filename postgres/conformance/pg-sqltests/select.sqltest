@@ -371,6 +371,22 @@ expect {
     1
 }
 
+test exists-subquery-with-empty-select-list-rejects-order-by-position {
+    SELECT a FROM (VALUES (1)) AS t1(a)
+    WHERE EXISTS (SELECT FROM (VALUES (2)) AS t2(b) ORDER BY 1);
+}
+@sqlstate 42P10
+expect error {
+}
+
+test exists-subquery-with-empty-select-list-rejects-group-by-position {
+    SELECT a FROM (VALUES (1)) AS t1(a)
+    WHERE EXISTS (SELECT FROM (VALUES (2)) AS t2(b) GROUP BY 1);
+}
+@sqlstate 42P10
+expect error {
+}
+
 test select-current-data-and-time {
     SELECT 'ok'
     WHERE CURRENT_DATE IS NOT NULL

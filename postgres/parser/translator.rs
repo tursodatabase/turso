@@ -4302,6 +4302,7 @@ impl PostgreSQLTranslator {
         {
             return self.translate_select(select);
         }
+        reject_positions_in_empty_select_list(select)?;
         let one = AConst {
             val: Some(a_const::Val::Ival(Integer { ival: 1 })),
             ..Default::default()
@@ -7189,6 +7190,38 @@ fn reject_into_clause(
             | pg_query::protobuf::OnCommitAction::OncommitDrop)
     ) {
         return Err(not_supported("ON COMMIT DELETE ROWS / DROP"));
+    }
+    Ok(())
+}
+
+/// ORDER BY and GROUP BY read an integer constant as a position in the select
+/// list, so with no columns PostgreSQL rejects every such position.
+fn reject_positions_in_empty_select_list(
+    select: &pg_query::protobuf::SelectStmt,
+) -> Result<(), ParseError> {
+    use pg_query::protobuf::{a_const, node::Node, AConst};
+
+    let order_by = select
+        .sort_clause
+        .iter()
+        .filter_map(|item| match &item.node {
+            Some(Node::SortBy(sort_by)) => sort_by.node.as_deref(),
+            _ => None,
+        });
+    let items = order_by
+        .map(|item| ("ORDER BY", item))
+        .chain(select.group_clause.iter().map(|item| ("GROUP BY", item)));
+    for (clause, item) in items {
+        if let Some(Node::AConst(AConst {
+            val: Some(a_const::Val::Ival(position)),
+            ..
+        })) = &item.node
+        {
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_INVALID_COLUMN_REFERENCE,
+                message: format!("{clause} position {} is not in select list", position.ival),
+            });
+        }
     }
     Ok(())
 }
