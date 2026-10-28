@@ -213,6 +213,14 @@ expect {
     2
 }
 
+test create-sequence-may-be-named-like-a-table-of-the-engine {
+    CREATE SEQUENCE sqlite_s;
+    SELECT nextval('sqlite_s');
+}
+expect {
+    1
+}
+
 test sequence-in-schema {
     CREATE SCHEMA app;
     CREATE SEQUENCE app.s;

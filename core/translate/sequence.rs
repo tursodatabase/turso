@@ -15,7 +15,7 @@ use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
 
 use crate::bail_parse_error;
-use crate::namespace::{is_reserved_object_name, NamespaceId, NamespaceRef};
+use crate::namespace::{NamespaceId, NamespaceRef, MANGLED_NAME_PREFIX};
 use crate::schema::{
     BTreeTable, Sequence, AUTOINCREMENT_SEQ_PREFIX, SEQ_BACKING_TABLE_PREFIX,
     SQLITE_SEQUENCE_TABLE_NAME,
@@ -910,10 +910,13 @@ pub fn translate_create_sequence(
         );
     }
 
-    if is_reserved_object_name(
-        resolver.catalog.dialect.supports_namespaces(),
-        &normalized_name,
-    ) && !connection.is_nested_stmt()
+    // A sequence of a namespace is stored under its mangled name, so a name
+    // like that would be read as a sequence of another namespace. The other
+    // reserved prefixes are for tables: a sequence's backing table has a
+    // prefix of its own, so they cannot collide.
+    if resolver.catalog.dialect.supports_namespaces()
+        && normalized_name.starts_with(MANGLED_NAME_PREFIX)
+        && !connection.is_nested_stmt()
     {
         bail_parse_error!(
             "Object name reserved for internal use: {}",
