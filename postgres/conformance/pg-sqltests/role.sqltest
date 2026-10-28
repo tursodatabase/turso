@@ -1,0 +1,33 @@
+# CREATE ROLE through the PostgreSQL frontend.
+# PostgreSQL roles belong to the whole server, not to one database, so every
+# test uses its own role names.
+
+@database :memory:
+
+test bootstrap-superuser-is-postgres {
+    SELECT rolname FROM pg_roles WHERE oid = 10 AND rolsuper;
+}
+expect {
+    postgres
+}
+
+test pg-roles-does-not-list-public {
+    SELECT count(*) FROM pg_roles WHERE rolname = 'public';
+}
+expect {
+    0
+}
+
+test pg-get-userbyid-of-public-oid-is-unknown {
+    SELECT pg_get_userbyid(0);
+}
+expect {
+    unknown (OID=0)
+}
+
+test bootstrap-superuser-bypasses-row-level-security {
+    SELECT count(*) FROM pg_roles WHERE oid = 10 AND rolbypassrls;
+}
+expect {
+    1
+}
