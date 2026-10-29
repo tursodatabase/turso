@@ -131,6 +131,51 @@ fn roles_are_kept_after_vacuum() {
 }
 
 #[test]
+fn statement_prepared_before_set_role_is_checked_against_the_new_role() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    let mut select = conn.prepare("SELECT x FROM t").unwrap();
+
+    conn.execute("SET ROLE alice").unwrap();
+
+    let error = select.run_collect_rows().unwrap_err();
+    assert_eq!(error.to_string(), "permission denied for table t");
+}
+
+#[test]
+fn statement_prepared_as_role_without_privileges_runs_after_reset_role() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    let mut select = conn.prepare("SELECT x FROM t").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+    assert!(select.run_collect_rows().is_err());
+    select.reset().unwrap();
+
+    conn.execute("RESET ROLE").unwrap();
+
+    assert_eq!(select.run_collect_rows().unwrap().len(), 1);
+}
+
+#[test]
+fn set_role_changes_only_its_own_connection() {
+    let db = TempDatabase::builder().build();
+    let conn1 = db.connect_postgres();
+    let conn2 = db.connect_postgres();
+    conn1.execute("CREATE TABLE t (x int)").unwrap();
+    conn1.execute("CREATE ROLE alice").unwrap();
+
+    conn1.execute("SET ROLE alice").unwrap();
+
+    assert!(conn1.execute("SELECT x FROM t").is_err());
+    conn2.execute("SELECT x FROM t").unwrap();
+}
+
+#[test]
 fn set_role_inside_transaction_block_fails() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();
@@ -145,6 +190,38 @@ fn set_role_inside_transaction_block_fails() {
     );
     conn.execute("ROLLBACK").unwrap();
     assert_eq!(current_user(&conn), "postgres");
+}
+
+#[test]
+fn role_without_privileges_cannot_create_schema() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    let error = conn.execute("CREATE SCHEMA s").unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .starts_with("permission denied for database "),
+        "{error}"
+    );
+}
+
+#[turso_macros::test]
+fn role_without_privileges_cannot_drop_schema_or_copy_from_a_file(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SCHEMA s").unwrap();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    let drop_schema = conn.execute("DROP SCHEMA s").unwrap_err();
+    let copy = conn.execute("COPY t FROM '/nonexistent'").unwrap_err();
+
+    assert_eq!(drop_schema.to_string(), "must be owner of schema s");
+    assert_eq!(copy.to_string(), "permission denied to COPY from a file");
 }
 
 #[test]

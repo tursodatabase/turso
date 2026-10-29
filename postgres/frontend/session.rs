@@ -12,6 +12,7 @@ use crate::settings::{
 };
 use crate::statement::{PgTxState, PostRunFn, TxRole};
 use turso_core::schema::Table;
+use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::{
     Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
 };
@@ -1048,15 +1049,33 @@ impl DeferredOperation {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
+                        require_superuser(conn, || {
+                            PermissionDenied::privilege(
+                                Action::Create,
+                                Object::Database(catalog::db_name_from_path(conn.db_file_path())),
+                            )
+                        })?;
                         create_schema_commands(conn, stmt)?
                     }
                     FrontendStmt::DropSchema(stmt) => {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
+                        require_superuser(conn, || {
+                            PermissionDenied::owner(
+                                Action::Drop,
+                                Object::Schema(stmt.name.to_lowercase()),
+                            )
+                        })?;
                         drop_schema_commands(conn, stmt)?
                     }
                     FrontendStmt::CopyFrom(stmt) => {
+                        require_superuser(conn, || {
+                            PermissionDenied::privilege(
+                                Action::Read,
+                                Object::File(stmt.filename.clone()),
+                            )
+                        })?;
                         *active = Some(crate::Statement::new(prepare_copy_columns(
                             conn,
                             &stmt.table_name,
@@ -1664,6 +1683,16 @@ fn prepare_set_transaction(
         Ok(())
     });
     Ok(crate::Statement::new_with_post_run(inner, post_run))
+}
+
+/// Statements that the frontend runs itself, outside the privilege checks of
+/// core, are allowed only for a superuser.
+fn require_superuser(conn: &Connection, denial: impl FnOnce() -> PermissionDenied) -> Result<()> {
+    if conn.role_catalog().is_superuser(conn.current_role()) {
+        Ok(())
+    } else {
+        Err(LimboError::PermissionDenied(Box::new(denial())))
+    }
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
