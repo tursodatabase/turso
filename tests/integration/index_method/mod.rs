@@ -514,7 +514,7 @@ fn vector_index_rejected_update_rollback(tmp_db: TempDatabase) {
         assert!(error
             .to_string()
             .contains("first value must be sparse vector"));
-        assert!(conn.get_auto_commit());
+        assert_eq!(conn.get_auto_commit(), !explicit_transaction);
         assert_eq!(
             limbo_exec_rows(&conn, "SELECT id, vector_extract(e) FROM v"),
             vec![row![1, "[1,0,0]"]]
@@ -527,6 +527,9 @@ fn vector_index_rejected_update_rollback(tmp_db: TempDatabase) {
             ),
             vec![row![1]]
         );
+        if explicit_transaction {
+            conn.execute("COMMIT").unwrap();
+        }
     }
     assert_eq!(integrity_results, vec![vec![row!["ok"]]; 2]);
 }
