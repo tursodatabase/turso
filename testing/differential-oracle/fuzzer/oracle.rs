@@ -11,9 +11,9 @@ use std::{
 };
 
 use anyhow::Result;
+use query_result_oracle::diff_result_sets;
+pub use query_result_oracle::{ResultSet, Row, Value as QueryValue};
 use sql_gen::Schema;
-use sql_gen_prop::SqlValue;
-use sql_gen_prop::result::diff_results;
 use turso_core::SubqueryUnnestingMode;
 use turso_core::{Numeric, Value};
 
@@ -55,10 +55,6 @@ impl OracleResult {
     }
 }
 
-/// A row of values from a query result.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Row(pub Vec<SqlValue>);
-
 /// Trait for oracles that can check database properties.
 pub trait Oracle {
     /// Check the oracle after executing a statement.
@@ -76,9 +72,9 @@ pub trait Oracle {
 /// Result of executing a query on a database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryResult {
-    /// Query executed successfully with rows.
-    Rows(Vec<Row>),
-    /// Query executed successfully with no rows (e.g., INSERT, UPDATE, DELETE).
+    /// A statement with a result schema, including an empty SELECT.
+    Rows(ResultSet),
+    /// A statement with no result columns (e.g., INSERT, UPDATE, DELETE).
     Ok,
     /// Query failed with an error.
     Error(String),
@@ -107,7 +103,7 @@ impl Oracle for DifferentialOracle {
 
         match (turso_result, sqlite_result) {
             (QueryResult::Rows(turso_rows), QueryResult::Rows(sqlite_rows)) => {
-                let diff = diff_results(turso_rows, sqlite_rows);
+                let diff = diff_result_sets(turso_rows, sqlite_rows);
                 if !diff.is_empty() {
                     // For non-deterministic LIMIT queries, the result set may legitimately differ
                     // since the chosen rows are not stable across engines. Return a warning instead
@@ -118,13 +114,13 @@ impl Oracle for DifferentialOracle {
                             "row_set_mismatch",
                             turso_rows.len(),
                             sqlite_rows.len(),
-                            diff.only_in_first.len(),
-                            diff.only_in_second.len(),
+                            diff.total_only_in_left as usize,
+                            diff.total_only_in_right as usize,
                         ));
                     }
                     return OracleResult::Fail(format!(
-                        "Row set mismatch:\n  SQL: {stmt}\n  Only in Turso: {:?}\n  Only in SQLite: {:?}",
-                        diff.only_in_first, diff.only_in_second
+                        "Row set mismatch:\n  SQL: {stmt}\n{}",
+                        diff.describe("Turso", "SQLite", 20)
                     ));
                 }
 
@@ -143,7 +139,10 @@ impl Oracle for DifferentialOracle {
                 "SQLite errored but Turso succeeded:\n  SQL: {stmt}\n  Error: {sqlite_err}"
             )),
             (QueryResult::Rows(rows), QueryResult::Ok) => {
-                if rows.is_empty() {
+                if stmt.is_ddl && rows.is_empty() {
+                    // SQLite can expose result metadata for a schema change even
+                    // though it returns no rows. The runner compares the resulting
+                    // schemas after every successful DDL statement.
                     OracleResult::Pass
                 } else if has_unordered_limit {
                     OracleResult::Warning(format_nondet_limit_warning(
@@ -156,13 +155,16 @@ impl Oracle for DifferentialOracle {
                     ))
                 } else {
                     OracleResult::Fail(format!(
-                        "Turso returned {} rows but SQLite returned no rows:\n  SQL: {stmt}",
-                        rows.len()
+                        "Turso returned a {}-column result with {} rows but SQLite returned no result columns:\n  SQL: {stmt}",
+                        rows.column_count(),
+                        rows.len(),
                     ))
                 }
             }
             (QueryResult::Ok, QueryResult::Rows(rows)) => {
-                if rows.is_empty() {
+                if stmt.is_ddl && rows.is_empty() {
+                    // Keep the normalization symmetric in case either engine
+                    // reports metadata for a zero-row schema change.
                     OracleResult::Pass
                 } else if has_unordered_limit {
                     OracleResult::Warning(format_nondet_limit_warning(
@@ -175,8 +177,9 @@ impl Oracle for DifferentialOracle {
                     ))
                 } else {
                     OracleResult::Fail(format!(
-                        "SQLite returned {} rows but Turso returned no rows:\n  SQL: {stmt}",
-                        rows.len()
+                        "SQLite returned a {}-column result with {} rows but Turso returned no result columns:\n  SQL: {stmt}",
+                        rows.column_count(),
+                        rows.len(),
                     ))
                 }
             }
@@ -247,6 +250,7 @@ impl DifferentialOracle {
     pub fn execute_turso(conn: &Arc<turso_core::Connection>, sql: &str) -> QueryResult {
         let execute = || {
             let mut stmt = conn.prepare(sql)?;
+            let column_count = stmt.num_columns();
 
             let mut rows = Vec::new();
             stmt.run_with_row_callback(|row| {
@@ -259,11 +263,14 @@ impl DifferentialOracle {
                 Ok(())
             })?;
 
-            let res = if rows.is_empty() {
-                QueryResult::Ok
-            } else {
-                QueryResult::Rows(rows)
-            };
+            let res =
+                if column_count == 0 {
+                    QueryResult::Ok
+                } else {
+                    QueryResult::Rows(ResultSet::new(column_count, rows).map_err(|error| {
+                        turso_core::LimboError::InternalError(error.to_string())
+                    })?)
+                };
             Ok(res)
         };
         let result: Result<QueryResult, turso_core::LimboError> = execute();
@@ -279,27 +286,26 @@ impl DifferentialOracle {
         let execute = || {
             let mut stmt = conn.prepare(sql)?;
             let column_count = stmt.column_count();
-            let res = if column_count == 0 {
-                // Statement doesn't return rows (INSERT, UPDATE, DELETE, etc.)
-                stmt.execute([])?;
-                QueryResult::Ok
-            } else {
-                let mut query_rows = stmt.query([])?;
-                let mut rows = Vec::new();
-                while let Some(row) = query_rows.next()? {
-                    let mut values = Vec::new();
-                    for i in 0..column_count {
-                        let value = Self::convert_sqlite_value(row.get_ref(i).ok());
-                        values.push(value);
-                    }
-                    rows.push(Row(values));
-                }
-                if rows.is_empty() {
+            let res =
+                if column_count == 0 {
+                    // Statement doesn't return rows (INSERT, UPDATE, DELETE, etc.)
+                    stmt.execute([])?;
                     QueryResult::Ok
                 } else {
-                    QueryResult::Rows(rows)
-                }
-            };
+                    let mut query_rows = stmt.query([])?;
+                    let mut rows = Vec::new();
+                    while let Some(row) = query_rows.next()? {
+                        let mut values = Vec::new();
+                        for i in 0..column_count {
+                            let value = Self::convert_sqlite_value(row.get_ref(i).ok());
+                            values.push(value);
+                        }
+                        rows.push(Row(values));
+                    }
+                    QueryResult::Rows(ResultSet::new(column_count, rows).map_err(|error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?)
+                };
             stmt.finalize()?;
             Ok(res)
         };
@@ -310,26 +316,26 @@ impl DifferentialOracle {
         }
     }
 
-    fn convert_turso_value(value: Value) -> SqlValue {
+    fn convert_turso_value(value: Value) -> QueryValue {
         match value {
-            Value::Null => SqlValue::Null,
-            Value::Numeric(Numeric::Integer(i)) => SqlValue::Integer(i),
-            Value::Numeric(Numeric::Float(f)) => SqlValue::Real(f64::from(f)),
-            Value::Text(s) => SqlValue::Text(s.as_str().to_string()),
-            Value::Blob(b) => SqlValue::Blob(b),
+            Value::Null => QueryValue::Null,
+            Value::Numeric(Numeric::Integer(i)) => QueryValue::Integer(i),
+            Value::Numeric(Numeric::Float(f)) => QueryValue::Real(f64::from(f)),
+            Value::Text(s) => QueryValue::Text(s.as_str().to_string()),
+            Value::Blob(b) => QueryValue::Blob(b),
         }
     }
 
-    fn convert_sqlite_value(value: Option<rusqlite::types::ValueRef<'_>>) -> SqlValue {
+    fn convert_sqlite_value(value: Option<rusqlite::types::ValueRef<'_>>) -> QueryValue {
         match value {
-            None => SqlValue::Null,
-            Some(rusqlite::types::ValueRef::Null) => SqlValue::Null,
-            Some(rusqlite::types::ValueRef::Integer(i)) => SqlValue::Integer(i),
-            Some(rusqlite::types::ValueRef::Real(f)) => SqlValue::Real(f),
+            None => QueryValue::Null,
+            Some(rusqlite::types::ValueRef::Null) => QueryValue::Null,
+            Some(rusqlite::types::ValueRef::Integer(i)) => QueryValue::Integer(i),
+            Some(rusqlite::types::ValueRef::Real(f)) => QueryValue::Real(f),
             Some(rusqlite::types::ValueRef::Text(s)) => {
-                SqlValue::Text(String::from_utf8_lossy(s).to_string())
+                QueryValue::Text(String::from_utf8_lossy(s).to_string())
             }
-            Some(rusqlite::types::ValueRef::Blob(b)) => SqlValue::Blob(b.to_vec()),
+            Some(rusqlite::types::ValueRef::Blob(b)) => QueryValue::Blob(b.to_vec()),
         }
     }
 
@@ -352,13 +358,12 @@ impl DifferentialOracle {
             let sqlite_rows = Self::execute_sqlite(sqlite_conn, &snapshot_sql);
             match (turso_rows, sqlite_rows) {
                 (QueryResult::Rows(turso_rows), QueryResult::Rows(sqlite_rows)) => {
-                    let diff = diff_results(&turso_rows, &sqlite_rows);
+                    let diff = diff_result_sets(&turso_rows, &sqlite_rows);
                     if !diff.is_empty() {
                         return OracleResult::Fail(format!(
-                            "Post-DML table snapshot mismatch for {}:\n  SQL: {stmt}\n  Only in Turso: {:?}\n  Only in SQLite: {:?}",
+                            "Post-DML table snapshot mismatch for {}:\n  SQL: {stmt}\n{}",
                             table.qualified_name(),
-                            diff.only_in_first,
-                            diff.only_in_second
+                            diff.describe("Turso", "SQLite", 20),
                         ));
                     }
                 }
@@ -382,20 +387,18 @@ impl DifferentialOracle {
                     ));
                 }
                 (QueryResult::Rows(turso_rows), QueryResult::Ok) => {
-                    if !turso_rows.is_empty() {
-                        return OracleResult::Fail(format!(
-                            "Turso snapshot returned rows for {} but SQLite returned none:\n  SQL: {stmt}",
-                            table.qualified_name()
-                        ));
-                    }
+                    return OracleResult::Fail(format!(
+                        "Turso snapshot returned a {}-column result for {} but SQLite returned no result columns:\n  SQL: {stmt}",
+                        turso_rows.column_count(),
+                        table.qualified_name()
+                    ));
                 }
                 (QueryResult::Ok, QueryResult::Rows(sqlite_rows)) => {
-                    if !sqlite_rows.is_empty() {
-                        return OracleResult::Fail(format!(
-                            "SQLite snapshot returned rows for {} but Turso returned none:\n  SQL: {stmt}",
-                            table.qualified_name()
-                        ));
-                    }
+                    return OracleResult::Fail(format!(
+                        "SQLite snapshot returned a {}-column result for {} but Turso returned no result columns:\n  SQL: {stmt}",
+                        sqlite_rows.column_count(),
+                        table.qualified_name()
+                    ));
                 }
             }
         }
@@ -416,9 +419,10 @@ impl Drop for RestoreAutomaticUnnesting<'_> {
 fn format_explain_query_plan(result: &QueryResult) -> String {
     match result {
         QueryResult::Rows(rows) => rows
+            .rows()
             .iter()
             .map(|row| match row.0.get(3) {
-                Some(SqlValue::Text(detail)) => detail.clone(),
+                Some(QueryValue::Text(detail)) => detail.clone(),
                 _ => format!("{row:?}"),
             })
             .collect::<Vec<_>>()
@@ -458,13 +462,13 @@ fn check_subquery_unnesting_invariant(
 
     Some(match (&rewritten, &correlated) {
         (QueryResult::Rows(rewritten), QueryResult::Rows(correlated)) => {
-            let diff = diff_results(rewritten, correlated);
+            let diff = diff_result_sets(rewritten, correlated);
             if diff.is_empty() {
                 OracleResult::Pass
             } else {
                 OracleResult::Fail(format!(
-                    "Subquery unnesting changed the result:\n  SQL: {stmt}\n  Only with forced unnesting: {:?}\n  Only with unnesting disabled: {:?}",
-                    diff.only_in_first, diff.only_in_second
+                    "Subquery unnesting changed the result:\n  SQL: {stmt}\n{}",
+                    diff.describe("forced unnesting", "unnesting disabled", 20)
                 ))
             }
         }
@@ -557,17 +561,17 @@ mod tests {
     use turso_core::Database;
 
     #[test]
-    fn test_sql_value_equality() {
-        assert_eq!(SqlValue::Null, SqlValue::Null);
-        assert_eq!(SqlValue::Integer(42), SqlValue::Integer(42));
-        assert_ne!(SqlValue::Integer(42), SqlValue::Integer(43));
+    fn test_query_value_equality() {
+        assert_eq!(QueryValue::Null, QueryValue::Null);
+        assert_eq!(QueryValue::Integer(42), QueryValue::Integer(42));
+        assert_ne!(QueryValue::Integer(42), QueryValue::Integer(43));
         assert_eq!(
-            SqlValue::Text("hello".into()),
-            SqlValue::Text("hello".into())
+            QueryValue::Text("hello".into()),
+            QueryValue::Text("hello".into())
         );
         assert_eq!(
-            SqlValue::Real(f64::consts::PI),
-            SqlValue::Real(f64::consts::PI)
+            QueryValue::Real(f64::consts::PI),
+            QueryValue::Real(f64::consts::PI)
         );
     }
 
@@ -603,8 +607,10 @@ mod tests {
             unordered_limit_reason: Some("limit_order_by_scalar_subquery".to_string()),
             check_unnesting_invariant: false,
         };
-        let turso = QueryResult::Rows(vec![Row(vec![SqlValue::Integer(1)])]);
-        let sqlite = QueryResult::Rows(vec![Row(vec![SqlValue::Integer(2)])]);
+        let turso =
+            QueryResult::Rows(ResultSet::new(1, vec![Row(vec![QueryValue::Integer(1)])]).unwrap());
+        let sqlite =
+            QueryResult::Rows(ResultSet::new(1, vec![Row(vec![QueryValue::Integer(2)])]).unwrap());
 
         let oracle = DifferentialOracle;
         let res = oracle.check(&stmt, &turso, &sqlite);
@@ -618,6 +624,44 @@ mod tests {
             }
             other => panic!("expected warning, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn empty_result_schema_normalization_is_ddl_only() {
+        let empty_rows = || QueryResult::Rows(ResultSet::new(1, Vec::new()).unwrap());
+        let mut stmt = GeneratedStatement {
+            sql: "ALTER TABLE t ADD COLUMN b TEXT".to_string(),
+            is_ddl: true,
+            mutates_data: false,
+            has_unordered_limit: false,
+            unordered_limit_reason: None,
+            check_unnesting_invariant: false,
+        };
+        let oracle = DifferentialOracle;
+
+        assert!(
+            oracle
+                .check(&stmt, &QueryResult::Ok, &empty_rows())
+                .is_pass()
+        );
+        assert!(
+            oracle
+                .check(&stmt, &empty_rows(), &QueryResult::Ok)
+                .is_pass()
+        );
+
+        stmt.sql = "SELECT b FROM t WHERE 0".to_string();
+        stmt.is_ddl = false;
+        assert!(
+            oracle
+                .check(&stmt, &QueryResult::Ok, &empty_rows())
+                .is_fail()
+        );
+        assert!(
+            oracle
+                .check(&stmt, &empty_rows(), &QueryResult::Ok)
+                .is_fail()
+        );
     }
 
     #[test]

@@ -522,8 +522,8 @@ fn execute_query_rusqlite(
         );
     }
     match query {
-        Query::Select(select) => {
-            let mut stmt = connection.prepare(select.to_string().as_str())?;
+        Query::Select(_) | Query::LateralSelect(_) => {
+            let mut stmt = connection.prepare(query.to_string().as_str())?;
             let rows = stmt.query_map([], |row| {
                 let mut values = vec![];
                 for i in 0.. {

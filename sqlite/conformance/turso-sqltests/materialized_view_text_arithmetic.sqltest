@@ -1,6 +1,7 @@
 @database :memory:
 @requires-file materialized_views ""
 @skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
 
 # Test that materialized views correctly coerce text values to numeric
 # in arithmetic operations, matching SQLite behavior.

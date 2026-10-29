@@ -1,0 +1,146 @@
+@database :memory:
+
+setup users {
+    CREATE TABLE users (id int, name text, email text);
+    INSERT INTO users VALUES
+        (7, 'alice', 'alice@example.com'),
+        (19, 'bob', 'bob@example.com');
+}
+
+@setup users
+test copy-pg-dump-column-list {
+    COPY public.users (id, name, email) TO stdout;
+}
+expect unordered {
+    7|alice|alice@example.com
+    19|bob|bob@example.com
+}
+
+@setup users
+test copy-all-columns {
+    COPY users TO STDOUT;
+}
+expect unordered {
+    7|alice|alice@example.com
+    19|bob|bob@example.com
+}
+
+@setup users
+test copy-reordered-columns-and-explicit-text-format {
+    COPY users (email, id) TO STDOUT WITH (FORMAT text);
+}
+expect unordered {
+    alice@example.com|7
+    bob@example.com|19
+}
+
+test copy-text-escapes-null-empty-and-booleans {
+    CREATE TABLE items (id int, value text, active boolean);
+    INSERT INTO items VALUES
+        (7, E'one\ttwo\nthree\rfour\b\f\013', true),
+        (9, '', false),
+        (11, NULL, NULL),
+        (23, E'\\\\N', true);
+    COPY items (id, active, value) TO STDOUT;
+}
+expect unordered {
+    7|t|one\ttwo\nthree\rfour\b\f\v
+    9|f|
+    11|\N|\N
+    23|t|\\\\N
+}
+
+test copy-empty-table-continues-the-batch {
+    CREATE TABLE items (id int);
+    SELECT 'before';
+    COPY items TO STDOUT;
+    SELECT 'after';
+}
+expect {
+    before
+    after
+}
+
+test copy-and-select-return-rows-in-statement-order {
+    CREATE TABLE items (id int);
+    INSERT INTO items VALUES (7);
+    SELECT 'before';
+    COPY items TO STDOUT;
+    UPDATE items SET id = 19;
+    COPY items TO STDOUT;
+    SELECT 'after';
+}
+expect {
+    before
+    7
+    19
+    after
+}
+
+test copy-quoted-identifiers-and-unicode {
+    CREATE TABLE "A""B;C" (id int, "Text Value" text);
+    INSERT INTO "A""B;C" VALUES (19, 'São Paulo');
+    COPY public."A""B;C" ("Text Value", id) TO STDOUT;
+}
+expect {
+    São Paulo|19
+}
+
+test copy-uses-search-path-and-explicit-schema {
+    CREATE TABLE items (id int);
+    INSERT INTO items VALUES (7);
+    CREATE SCHEMA IF NOT EXISTS copy_sp;
+    DROP TABLE IF EXISTS copy_sp.items;
+    CREATE TABLE copy_sp.items (id int);
+    INSERT INTO copy_sp.items VALUES (19);
+    SET search_path TO copy_sp, public;
+    COPY items TO STDOUT;
+    COPY public.items TO STDOUT;
+    DROP TABLE copy_sp.items;
+}
+expect {
+    19
+    7
+}
+
+setup items {
+    CREATE TABLE items (id int);
+    INSERT INTO items VALUES (7);
+}
+
+@setup items
+test copy-reads-uncommitted-changes-without-committing {
+    BEGIN;
+    UPDATE items SET id = 19;
+    COPY items TO STDOUT;
+    ROLLBACK;
+    COPY items TO STDOUT;
+}
+expect {
+    19
+    7
+}
+
+test copy-missing-table-errors {
+    COPY missing TO STDOUT;
+}
+expect error {}
+
+@setup users
+test copy-missing-column-errors {
+    COPY users (missing) TO STDOUT;
+}
+expect error {}
+
+@setup users
+test copy-duplicate-column-errors {
+    COPY users (id, id) TO STDOUT;
+}
+expect error {}
+
+@setup users
+test copy-view-errors {
+    CREATE VIEW user_view AS SELECT id FROM users;
+    COPY user_view TO STDOUT;
+}
+expect error {}

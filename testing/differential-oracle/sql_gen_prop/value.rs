@@ -87,14 +87,7 @@ impl PartialEq for SqlValue {
             (SqlValue::Null, SqlValue::Null) => true,
             (SqlValue::Integer(a), SqlValue::Integer(b)) => a == b,
             (SqlValue::Real(a), SqlValue::Real(b)) => {
-                // Handle NaN and compare with tolerance for floating point
-                if a.is_nan() && b.is_nan() {
-                    true
-                } else if a.is_nan() || b.is_nan() {
-                    false
-                } else {
-                    (a - b).abs() < 1e-10 || a == b
-                }
+                canonical_real_bits(*a) == canonical_real_bits(*b)
             }
             (SqlValue::Text(a), SqlValue::Text(b)) => a == b,
             (SqlValue::Blob(a), SqlValue::Blob(b)) => a == b,
@@ -111,14 +104,22 @@ impl Hash for SqlValue {
         match self {
             SqlValue::Integer(i) => i.hash(state),
             SqlValue::Real(f) => {
-                // Normalize -0.0 to 0.0 for consistent hashing (they compare equal via PartialEq)
-                let normalized = if *f == 0.0 { 0.0 } else { *f };
-                normalized.to_bits().hash(state);
+                canonical_real_bits(*f).hash(state);
             }
             SqlValue::Text(s) => s.hash(state),
             SqlValue::Blob(b) => b.hash(state),
             SqlValue::Null => {}
         }
+    }
+}
+
+fn canonical_real_bits(value: f64) -> u64 {
+    if value == 0.0 {
+        0.0f64.to_bits()
+    } else if value.is_nan() {
+        0x7ff8_0000_0000_0000
+    } else {
+        value.to_bits()
     }
 }
 
@@ -215,5 +216,21 @@ mod tests {
         assert_eq!(SqlValue::Text("it's".to_string()).to_string(), "'it''s'");
         assert_eq!(SqlValue::Blob(vec![0xDE, 0xAD]).to_string(), "X'DEAD'");
         assert_eq!(SqlValue::Null.to_string(), "NULL");
+    }
+
+    #[test]
+    fn test_real_equality_matches_hashing() {
+        use std::collections::HashSet;
+
+        let mut values = HashSet::new();
+        values.insert(SqlValue::Real(0.0));
+        values.insert(SqlValue::Real(-0.0));
+        assert_eq!(values.len(), 1);
+
+        values.insert(SqlValue::Real(f64::NAN));
+        values.insert(SqlValue::Real(f64::from_bits(0x7ff0_0000_0000_0001)));
+        assert_eq!(values.len(), 2);
+
+        assert_ne!(SqlValue::Real(1.0), SqlValue::Real(1.0 + 5e-11));
     }
 }

@@ -231,6 +231,48 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test smallint-compared-with-integer-out-of-its-range {
+    -- The range limits what a column stores, not what it is compared with.
+    CREATE TABLE t1(val smallint) STRICT;
+    INSERT INTO t1 VALUES (5);
+    SELECT val FROM t1 WHERE val < 100000;
+    SELECT val FROM t1 WHERE val IN (5, 100000);
+    SELECT val = 100000 FROM t1;
+}
+expect {
+    5
+    5
+    0
+}
+
+@requires strict "uses STRICT tables"
+test smallint-update-overflow {
+    CREATE TABLE t1(val smallint) STRICT;
+    INSERT INTO t1 VALUES (5);
+    UPDATE t1 SET val = 40000;
+}
+expect error {
+    integer out of range for smallint
+}
+
+test smallint-cast-out-of-range {
+    SELECT CAST(100000 AS smallint);
+}
+expect error {
+    integer out of range for smallint
+}
+
+# A CAST to a domain stores the value as the domain's base type does, so
+# smallint's range check runs.
+test smallint-cast-to-domain-out-of-range {
+    CREATE DOMAIN small_pos AS smallint CHECK (value > 0);
+    SELECT CAST(100000 AS small_pos);
+}
+expect error {
+    integer out of range for smallint
+}
+
+@requires strict "uses STRICT tables"
 test smallint-alias-int2 {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val int2) STRICT;
     INSERT INTO t1 VALUES (1, 100);
@@ -452,4 +494,40 @@ test numeric-invalid-input {
     INSERT INTO t1 VALUES ('not-a-number');
 }
 expect error {
+}
+
+@requires strict "uses STRICT tables"
+test numeric-input-ignores-surrounding-whitespace {
+    -- As in PostgreSQL, spaces, tabs and newlines around the number are
+    -- skipped, and text equal to a stored value apart from them compares equal.
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, ' 1.5 '), (2, char(9) || '2' || char(10));
+    SELECT id, val FROM t1 ORDER BY id;
+    SELECT id FROM t1 WHERE val = ' 2 ';
+    SELECT val + ' 1' FROM t1 WHERE id = 1;
+}
+expect {
+    1|1.50
+    2|2.00
+    2
+    2.50
+}
+
+@requires strict "uses STRICT tables"
+test numeric-limits-refuse-zero-with-too-many-decimals {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1);
+    SELECT val + '0e-20000' FROM t1;
+}
+expect error {
+    value overflows numeric format
+}
+
+@requires strict "uses STRICT tables"
+test numeric-input-rejects-space-inside-the-number {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('1 .5');
+}
+expect error {
+    invalid input syntax for type numeric: "1 .5"
 }

@@ -29,6 +29,7 @@ void test_sqlite3_mprintf();
 void test_sqlite3_exec_null_values();
 void test_sqlite3_prepare_no_statements();
 void test_sqlite3_close_with_unfinalized_stmt();
+void test_sqlite3_open_v2_flags();
 
 int allocated = 0;
 
@@ -57,6 +58,7 @@ int main(void)
     test_sqlite3_exec_null_values();
     test_sqlite3_prepare_no_statements();
     test_sqlite3_close_with_unfinalized_stmt();
+    test_sqlite3_open_v2_flags();
     return 0;
 }
 
@@ -1245,4 +1247,53 @@ void test_sqlite3_exec_null_values()
 
     sqlite3_close(db);
     printf("test_sqlite3_exec_null_values test passed\n");
+}
+
+void test_sqlite3_open_v2_flags()
+{
+    const char *path = "open_v2_flags_test.db";
+    sqlite3 *db;
+    sqlite3 *reader;
+    sqlite3_stmt *stmt;
+    int rc;
+
+    remove(path);
+    rc = sqlite3_open_v2(path, &db,
+                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX |
+                             SQLITE_OPEN_PRIVATECACHE,
+                         NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES (1);", NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_create_collation_v2(db, "unused", SQLITE_UTF8, NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
+    sqlite3_close(db);
+
+    rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_exec(db, "INSERT INTO t VALUES (2);", NULL, NULL, NULL);
+    assert(rc != SQLITE_OK);
+    sqlite3_close(db);
+    remove(path);
+
+    rc = sqlite3_open_v2("file:open_v2_flags?mode=memory&cache=shared", &db,
+                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI |
+                             SQLITE_OPEN_SHAREDCACHE,
+                         NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_open_v2("file:open_v2_flags?mode=memory&cache=shared", &reader,
+                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI | SQLITE_OPEN_SHAREDCACHE,
+                         NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES (42);", NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_prepare_v2(reader, "SELECT x FROM t", -1, &stmt, NULL);
+    assert(rc == SQLITE_OK);
+    assert(sqlite3_step(stmt) == SQLITE_ROW);
+    assert(sqlite3_column_int64(stmt, 0) == 42);
+    sqlite3_finalize(stmt);
+    sqlite3_close(reader);
+    sqlite3_close(db);
+
+    printf("test_sqlite3_open_v2_flags test passed\n");
 }

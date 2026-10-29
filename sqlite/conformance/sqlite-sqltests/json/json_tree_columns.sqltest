@@ -1,8 +1,8 @@
 @database :memory:
 
 # json_tree and json_each expose rowid like any virtual table, so a query
-# can select or join on rt.rowid. The value itself is the engine's own
-# row counter, so only its presence and type are checked here.
+# can select or join on rt.rowid. As in SQLite, rowid counts the rows of a
+# scan from 0, separately from the id column.
 
 test json-tree-rowid-is-selectable {
     SELECT count(*) FROM (SELECT rt.rowid AS n FROM json_tree('{"a":[1,2]}') AS rt WHERE rt.type NOT IN ('object','array'));
@@ -26,6 +26,59 @@ test json-tree-rowid-into-table {
 expect {
     $.a[0]|1
     $.a[1]|2
+}
+
+test json-each-rowid-counts-rows-from-zero {
+    SELECT typeof(rowid), rowid, value FROM json_each('[5,[6],7]');
+}
+expect {
+    integer|0|5
+    integer|1|[6]
+    integer|2|7
+}
+
+test json-each-rowid-of-primitive-root {
+    SELECT rowid, value FROM json_each('5');
+}
+expect {
+    0|5
+}
+
+test json-tree-rowid-counts-rows-from-zero {
+    SELECT typeof(rowid), rowid, fullkey FROM json_tree('[5,[6,{"a":1}],7]');
+}
+expect {
+    integer|0|$
+    integer|1|$[0]
+    integer|2|$[1]
+    integer|3|$[1][0]
+    integer|4|$[1][1]
+    integer|5|$[1][1].a
+    integer|6|$[2]
+}
+
+test json-tree-rowid-of-primitive-root {
+    SELECT rowid, value FROM json_tree('5');
+}
+expect {
+    0|5
+}
+
+test json-each-rowid-restarts-for-each-outer-row {
+    SELECT a.value, b.rowid FROM json_each('[1,2]') AS a, json_each('[3,4]') AS b;
+}
+expect {
+    1|0
+    1|1
+    2|0
+    2|1
+}
+
+test json-each-rowid-is-null-on-unmatched-left-join-row {
+    SELECT x, typeof(j.rowid) FROM (SELECT 1 AS x) LEFT JOIN json_each('[]') AS j;
+}
+expect {
+    1|null
 }
 
 # fullkey quotes an object key unless it starts with an ASCII letter and
@@ -69,4 +122,144 @@ test json-tree-atom-matches-extract {
 }
 expect {
     0
+}
+
+# json_each and json_tree columns have no declared type, so they have no
+# affinity: comparing a text path with a number does not convert the number,
+# and CREATE TABLE AS SELECT copies no column types.
+
+test json-each-columns-have-no-affinity {
+    SELECT count(*) FROM json_each('{"a":1}') WHERE fullkey < 0;
+    SELECT fullkey < 0, path < 0 FROM json_each('{"a":1}');
+}
+expect {
+    0
+    0|0
+}
+
+test json-tree-columns-have-no-affinity {
+    SELECT count(*) FROM json_tree('{"a":1}') WHERE fullkey < 0;
+    SELECT fullkey < 0, path < 0, type < 0 FROM json_tree('{"a":1}') WHERE fullkey = '$.a';
+}
+expect {
+    0
+    0|0|0
+}
+
+test json-each-ctas-copies-no-column-types {
+    CREATE TABLE t AS SELECT key, value, type, atom, id, parent, fullkey, path FROM json_each('{"a":1}');
+    SELECT name, type FROM pragma_table_info('t');
+}
+expect {
+    key|
+    value|
+    type|
+    atom|
+    id|
+    parent|
+    fullkey|
+    path|
+}
+
+test json-tree-ctas-copies-no-column-types {
+    CREATE TABLE t AS SELECT key, value, type, atom, id, parent, fullkey, path FROM json_tree('{"a":1}');
+    SELECT name, type FROM pragma_table_info('t');
+}
+expect {
+    key|
+    value|
+    type|
+    atom|
+    id|
+    parent|
+    fullkey|
+    path|
+}
+
+test json-each-columns-have-no-declared-type {
+    SELECT name, type, hidden FROM pragma_table_xinfo('json_each');
+}
+expect {
+    key||0
+    value||0
+    type||0
+    atom||0
+    id||0
+    parent||0
+    fullkey||0
+    path||0
+    json||1
+    root||1
+}
+
+test json-tree-columns-have-no-declared-type {
+    SELECT name, type, hidden FROM pragma_table_xinfo('json_tree');
+}
+expect {
+    key||0
+    value||0
+    type||0
+    atom||0
+    id||0
+    parent||0
+    fullkey||0
+    path||0
+    json||1
+    root||1
+}
+
+# id is the byte offset of the element in the JSONB form of the input, and
+# for an object member it is the offset of its key. parent is the id of the
+# containing element, and json_each always returns NULL for it.
+
+test json-tree-id-and-parent-are-jsonb-offsets {
+    SELECT id, parent, fullkey FROM json_tree('{"a":[1,2],"b":{"c":3}}');
+}
+expect {
+    0||$
+    2|0|$.a
+    5|2|$.a[0]
+    7|2|$.a[1]
+    9|0|$.b
+    12|9|$.b.c
+}
+
+test json-each-id-is-jsonb-offset {
+    SELECT id, typeof(parent) FROM json_each('[1,[2,3],{"x":4},5]');
+}
+expect {
+    2|null
+    4|null
+    9|null
+    14|null
+}
+
+test json-tree-id-and-parent-with-root-path {
+    SELECT id, parent, fullkey FROM json_tree('{"a":[1,2],"b":{"c":3}}', '$.b');
+}
+expect {
+    9||$.b
+    12|9|$.b.c
+}
+
+test json-each-id-with-root-path-to-array-element {
+    SELECT id, fullkey FROM json_each('[1,[2,[3,4]]]', '$[1][1]');
+}
+expect {
+    7|$[1][1][0]
+    9|$[1][1][1]
+}
+
+test json-each-id-of-primitive-under-object-key {
+    SELECT id, value FROM json_each('{"a":[1,2],"b":{"c":3}}', '$.b.c');
+}
+expect {
+    12|3
+}
+
+test json-tree-id-with-two-byte-container-header {
+    SELECT max(id), count(*) FROM json_tree((SELECT json_group_array(value) FROM generate_series(1, 500)));
+}
+expect {
+    1891|501
 }

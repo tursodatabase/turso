@@ -1,0 +1,14 @@
+---
+source: nulls-first-last.sqltest
+expression: SELECT y FROM nn ORDER BY y NULLS LAST;
+info:
+  statement_type: SELECT
+  tables:
+  - nn
+  setup_blocks:
+  - not-null-index-table
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN nn USING COVERING INDEX nn_y
+`--USE SORTER FOR ORDER BY

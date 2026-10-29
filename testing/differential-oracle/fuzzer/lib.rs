@@ -3,6 +3,7 @@
 //! differential oracle to compare Turso results with SQLite.
 
 pub mod generate;
+pub mod ivm;
 pub mod memory;
 pub mod oracle;
 pub mod printf_gen;

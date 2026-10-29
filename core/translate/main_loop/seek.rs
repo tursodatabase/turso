@@ -45,30 +45,28 @@ fn encode_seek_keys_for_custom_types(
             Some(c) => c,
             None => continue,
         };
-        let type_def = match resolver
+        let Ok(Some(resolved)) = resolver
             .schema()
-            .get_type_def(&table_col.ty_str, table.is_strict())
-        {
-            Some(td) => td,
-            None => continue,
+            .resolve_type(&table_col.ty_str, table.is_strict())
+        else {
+            continue;
         };
-        let encode_expr = match type_def.encode() {
-            Some(e) => e,
-            None => continue,
-        };
+        if resolved.chain.iter().all(|td| !td.has_encode_or_coerce()) {
+            continue;
+        }
+        // The index holds stored values, so the key goes through the same
+        // ENCODE and COERCE steps as a stored value.
         let reg = start_reg + i;
         let skip_label = program.allocate_label();
         program.emit_insn(Insn::IsNull {
             reg,
             target_pc: skip_label,
         });
-        crate::translate::expr::emit_type_expr(
+        crate::translate::expr::emit_store_value(
             program,
-            encode_expr,
+            &resolved.chain,
             reg,
-            reg,
-            table_col,
-            type_def,
+            &table_col.ty_params,
             resolver,
         )?;
         program.preassign_label_to_next_insn(skip_label);
@@ -426,7 +424,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 flags: CmpInsFlags::default()
                     .jump_if_null()
                     .with_affinity(affinity.unwrap()),
-                collation: self.program.curr_collation(),
+                collation: CollationSeq::for_internal_values(),
             }),
             (false, SeekOp::GT) => self.program.emit_insn(Insn::Gt {
                 lhs: rowid_reg.unwrap(),
@@ -435,7 +433,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 flags: CmpInsFlags::default()
                     .jump_if_null()
                     .with_affinity(affinity.unwrap()),
-                collation: self.program.curr_collation(),
+                collation: CollationSeq::for_internal_values(),
             }),
             (false, SeekOp::LE { .. }) => self.program.emit_insn(Insn::Le {
                 lhs: rowid_reg.unwrap(),
@@ -444,7 +442,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 flags: CmpInsFlags::default()
                     .jump_if_null()
                     .with_affinity(affinity.unwrap()),
-                collation: self.program.curr_collation(),
+                collation: CollationSeq::for_internal_values(),
             }),
             (false, SeekOp::LT) => self.program.emit_insn(Insn::Lt {
                 lhs: rowid_reg.unwrap(),
@@ -453,7 +451,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 flags: CmpInsFlags::default()
                     .jump_if_null()
                     .with_affinity(affinity.unwrap()),
-                collation: self.program.curr_collation(),
+                collation: CollationSeq::for_internal_values(),
             }),
         }
         Ok(())

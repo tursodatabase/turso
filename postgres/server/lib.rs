@@ -1,34 +1,54 @@
+use std::fmt::Debug;
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 
 use async_trait::async_trait;
-use futures::stream;
+use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
-use turso_core::Value;
-use turso_pg::{split_statements, Connection, PgConnection};
+use turso_core::{ConnectOpts, Database, Value};
+use turso_pg::{split_statements, PgConnection, TransactionState};
+use turso_pg_parser::cmdtag::CommandTag;
+use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
+use turso_pg_parser::{returns_rows, ParseResult};
 
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format, Portal};
-use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::query::{
+    send_execution_response, send_query_response, send_ready_for_query, ExtendedQueryHandler,
+    SimpleQueryHandler,
+};
 use pgwire::api::results::{
     DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
     QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
-use pgwire::api::{ClientInfo, NoopHandler, PgWireServerHandlers, Type};
+use pgwire::api::store::PortalStore;
+use pgwire::api::{
+    ClientInfo, ClientPortalStore, NoopHandler, PgWireConnectionState, PgWireServerHandlers, Type,
+};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::copy::{CopyData, CopyDone, CopyOutResponse};
 use pgwire::messages::data::DataRow;
+use pgwire::messages::extendedquery::{Describe, Execute};
+use pgwire::messages::response::{
+    EmptyQueryResponse, ErrorResponse, ReadyForQuery, TransactionStatus,
+};
+use pgwire::messages::simplequery::Query;
+use pgwire::messages::PgWireBackendMessage;
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
 
 pub struct TursoPgServer {
     address: String,
     db_file: String,
-    conn: Arc<Mutex<PgConnection>>,
+    db: Arc<Database>,
+    /// The settings that each session connects with, such as the encryption
+    /// key.
+    connect_opts: ConnectOpts,
     interrupt_count: Arc<AtomicUsize>,
 }
 
@@ -36,13 +56,15 @@ impl TursoPgServer {
     pub fn new(
         address: String,
         db_file: String,
-        conn: Connection,
+        db: Arc<Database>,
+        connect_opts: ConnectOpts,
         interrupt_count: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             address,
             db_file,
-            conn: Arc::new(Mutex::new(conn)),
+            db,
+            connect_opts,
             interrupt_count,
         }
     }
@@ -59,25 +81,40 @@ impl TursoPgServer {
             listener.local_addr()?,
             self.db_file
         );
+        self.serve(listener).await
+    }
 
-        let factory = Arc::new(TursoPgFactory {
-            handler: Arc::new(TursoPgHandler {
-                conn: self.conn.clone(),
-                db_file: self.db_file.clone(),
-                query_parser: Arc::new(NoopQueryParser::new()),
-            }),
-        });
-
+    /// Accepts clients on `listener` until the server is interrupted. Each
+    /// client gets its own session, with its own transaction and settings.
+    pub async fn serve(&self, listener: TcpListener) -> anyhow::Result<()> {
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
                         Ok((socket, addr)) => {
                             info!("PostgreSQL client connected from {}", addr);
-                            let factory_ref = factory.clone();
+                            let session = match PgConnection::connect_with(
+                                &self.db,
+                                self.connect_opts.clone(),
+                            ) {
+                                Ok(session) => session,
+                                Err(e) => {
+                                    error!("Error opening a session for {}: {}", addr, e);
+                                    continue;
+                                }
+                            };
+                            let factory = Arc::new(TursoPgFactory {
+                                handler: Arc::new(TursoPgHandler {
+                                    conn: session.clone(),
+                                    query_parser: Arc::new(NoopQueryParser::new()),
+                                }),
+                            });
                             tokio::spawn(async move {
-                                if let Err(e) = process_socket(socket, None, factory_ref).await {
+                                if let Err(e) = process_socket(socket, None, factory).await {
                                     error!("Error processing connection from {}: {}", addr, e);
+                                }
+                                if let Err(e) = session.close() {
+                                    error!("Error closing the session of {}: {}", addr, e);
                                 }
                             });
                         }
@@ -103,55 +140,8 @@ impl TursoPgServer {
 }
 
 struct TursoPgHandler {
-    conn: Arc<Mutex<PgConnection>>,
-    db_file: String,
+    conn: PgConnection,
     query_parser: Arc<NoopQueryParser>,
-}
-
-impl TursoPgHandler {
-    /// After a DROP SCHEMA query succeeds, delete the schema's database file.
-    /// Uses simple string matching to detect DROP SCHEMA statements.
-    fn cleanup_dropped_schema_file(&self, query: &str) {
-        if self.db_file == ":memory:" {
-            return;
-        }
-        // Simple detection: look for DROP SCHEMA pattern
-        let trimmed = query.trim().to_lowercase();
-        if !trimmed.starts_with("drop schema") {
-            return;
-        }
-        // Extract schema name: "drop schema [if exists] <name> [cascade|restrict]"
-        let rest = trimmed.strip_prefix("drop schema").unwrap().trim();
-        let rest = rest
-            .strip_prefix("if exists")
-            .map(|s| s.trim())
-            .unwrap_or(rest);
-        // Take the first word as the schema name
-        let name = rest
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_matches('"');
-        if name.is_empty() || name == "public" {
-            return;
-        }
-        let parent = std::path::Path::new(&self.db_file)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let schema_file = parent.join(format!("turso-postgres-schema-{name}.db"));
-        if schema_file.exists() {
-            if let Err(e) = std::fs::remove_file(&schema_file) {
-                tracing::warn!("Failed to delete schema file {:?}: {}", schema_file, e);
-            } else {
-                tracing::info!("Deleted schema file {:?}", schema_file);
-            }
-            // Also clean up WAL and SHM files
-            let wal = schema_file.with_extension("db-wal");
-            let shm = schema_file.with_extension("db-shm");
-            let _ = std::fs::remove_file(wal);
-            let _ = std::fs::remove_file(shm);
-        }
-    }
 }
 
 struct TursoPgFactory {
@@ -174,27 +164,34 @@ impl PgWireServerHandlers for TursoPgFactory {
 
 #[async_trait]
 impl SimpleQueryHandler for TursoPgHandler {
+    async fn on_query<C>(&self, client: &mut C, query: Query) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let result = self.run_simple_query(client, query).await;
+        let status = wire_transaction_status(&self.conn);
+        finish_query(client, result, false, status).await
+    }
+
     async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = &self.conn;
 
         // Per the PostgreSQL simple query protocol, a query string may contain
         // multiple semicolon-separated statements. Split and execute each one.
-        let statements = split_statements(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let statements = split_statements(query).map_err(pg_error)?;
 
         let mut responses = Vec::new();
         for sql in &statements {
-            let mut stmt = conn
-                .prepare(sql)
-                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            let mut stmt = conn.prepare(sql).map_err(pg_error)?;
+            let parsed = parse_statement(sql)?;
 
-            self.cleanup_dropped_schema_file(sql);
-
-            if stmt.num_columns() == 0 || is_pg_non_query(sql) {
-                responses.push(execute_non_query(&mut stmt, sql)?);
+            if stmt.num_columns() == 0 || !returns_rows(&parsed) {
+                responses.push(execute_non_query(&mut stmt, &parsed)?);
             } else {
                 let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
                 responses.push(execute_query(&mut stmt, header)?);
@@ -205,10 +202,169 @@ impl SimpleQueryHandler for TursoPgHandler {
     }
 }
 
+impl TursoPgHandler {
+    async fn run_simple_query<C>(&self, client: &mut C, query: Query) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+            return Err(PgWireError::NotReadyForQuery);
+        }
+        client.set_state(PgWireConnectionState::QueryInProgress);
+        let conn = &self.conn;
+        // Errors raised here never reach PgConnection::prepare, so report
+        // them to the session: any error inside a transaction block aborts
+        // the block.
+        let parse_error = |error: turso_pg_parser::ParseError| {
+            conn.abort_transaction_block_on_error();
+            pg_error(turso_core::LimboError::ParseError(error.to_string()).into())
+        };
+        turso_pg_parser::parse(&query.query).map_err(parse_error)?;
+        let statements = turso_pg_parser::split_statements(&query.query).map_err(parse_error)?;
+        if statements.is_empty() {
+            client
+                .feed(PgWireBackendMessage::EmptyQueryResponse(
+                    EmptyQueryResponse::new(),
+                ))
+                .await?;
+        }
+        for sql in statements {
+            match parse_copy_to_stdout(&sql).map_err(parse_error)? {
+                Some(copy) => copy_to_stdout(client, conn, &copy).await?,
+                None => {
+                    for response in SimpleQueryHandler::do_query(self, client, &sql).await? {
+                        match response {
+                            Response::Query(mut result) => {
+                                send_query_response(client, &mut result, true).await?
+                            }
+                            Response::Execution(tag) => {
+                                send_execution_response(client, tag).await?
+                            }
+                            _ => unreachable!("simple queries return query or execution responses"),
+                        }
+                    }
+                }
+            }
+            client.set_transaction_status(wire_transaction_status(conn));
+        }
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        send_ready_for_query(client, client.transaction_status()).await
+    }
+}
+
+async fn copy_to_stdout<C>(
+    client: &mut C,
+    conn: &PgConnection,
+    copy: &CopyToStdout,
+) -> PgWireResult<()>
+where
+    C: Sink<PgWireBackendMessage> + Unpin,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    let mut stmt = conn.prepare_copy_to_stdout(copy).map_err(pg_error)?;
+    let mut has_row = stmt
+        .run_one_step_blocking(|| Ok(()), || Ok(()))
+        .map_err(pg_error)?
+        .is_some();
+    let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+    let column_count = i16::try_from(fields.len())
+        .map_err(|error| PgWireError::UserError(Box::new(error_info(&error.to_string()))))?;
+    client
+        .send(PgWireBackendMessage::CopyOutResponse(CopyOutResponse::new(
+            0,
+            column_count,
+            vec![0; fields.len()],
+        )))
+        .await?;
+    let mut row_count = 0;
+    while has_row {
+        let data = encode_copy_row(stmt.row().expect("COPY row is present"), fields.clone())?;
+        client
+            .send(PgWireBackendMessage::CopyData(CopyData::new(data.into())))
+            .await?;
+        row_count += 1;
+        has_row = stmt
+            .run_one_step_blocking(|| Ok(()), || Ok(()))
+            .map_err(pg_error)?
+            .is_some();
+    }
+    client
+        .send(PgWireBackendMessage::CopyDone(CopyDone::new()))
+        .await?;
+    send_execution_response(client, Tag::new("COPY").with_rows(row_count)).await
+}
+
+fn encode_copy_row(row: &turso_core::Row, fields: Arc<Vec<FieldInfo>>) -> PgWireResult<Vec<u8>> {
+    assert_eq!(row.len(), fields.len());
+    let mut encoder = DataRowEncoder::new(fields.clone());
+    for (value, field) in row.get_values().zip(fields.iter()) {
+        encode_value(&mut encoder, value, field.datatype())
+            .map_err(|error| PgWireError::UserError(Box::new(error_info(&error.to_string()))))?;
+    }
+    let row = encoder.finish()?;
+    let mut values = row.data.as_ref();
+    let mut output = Vec::new();
+    for index in 0..fields.len() {
+        if index > 0 {
+            output.push(b'\t');
+        }
+        let (length, remaining) = values.split_at(4);
+        let length = i32::from_be_bytes(length.try_into().unwrap());
+        values = remaining;
+        if length == -1 {
+            output.extend_from_slice(b"\\N");
+            continue;
+        }
+        assert!(length >= 0);
+        for byte in &values[..length as usize] {
+            match byte {
+                b'\\' => output.extend_from_slice(b"\\\\"),
+                b'\t' => output.extend_from_slice(b"\\t"),
+                b'\n' => output.extend_from_slice(b"\\n"),
+                b'\r' => output.extend_from_slice(b"\\r"),
+                8 => output.extend_from_slice(b"\\b"),
+                12 => output.extend_from_slice(b"\\f"),
+                11 => output.extend_from_slice(b"\\v"),
+                byte => output.push(*byte),
+            }
+        }
+        values = &values[length as usize..];
+    }
+    output.push(b'\n');
+    Ok(output)
+}
+
 #[async_trait]
 impl ExtendedQueryHandler for TursoPgHandler {
     type Statement = String;
     type QueryParser = NoopQueryParser;
+
+    async fn on_execute<C>(&self, client: &mut C, message: Execute) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let result = self._on_execute(client, message).await;
+        let status = wire_transaction_status(&self.conn);
+        finish_query(client, result, true, status).await
+    }
+
+    async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let result = self._on_describe(client, message).await;
+        let status = wire_transaction_status(&self.conn);
+        finish_query(client, result, true, status).await
+    }
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
         self.query_parser.clone()
@@ -223,21 +379,18 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = &self.conn;
         let query = &portal.statement.statement;
 
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
-
-        // Clean up schema file after successful DROP SCHEMA
-        self.cleanup_dropped_schema_file(query);
+        let mut stmt = conn.prepare(query).map_err(pg_error)?;
 
         // Bind parameters from the portal
         bind_portal_parameters(&mut stmt, portal)?;
 
-        if stmt.num_columns() == 0 || is_pg_non_query(query) {
-            return execute_non_query(&mut stmt, query);
+        let parsed = parse_statement(query)?;
+        if stmt.num_columns() == 0 || !returns_rows(&parsed) {
+            return execute_non_query(&mut stmt, &parsed)
+                .map(|response| with_transaction_state(conn, response));
         }
 
         let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
@@ -252,10 +405,8 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
-        let stmt = conn
-            .prepare(&target.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let conn = &self.conn;
+        let stmt = conn.prepare(&target.statement).map_err(pg_error)?;
 
         let param_types: Vec<Type> = target
             .parameter_types
@@ -263,7 +414,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
             .map(|t| t.clone().unwrap_or(Type::TEXT))
             .collect();
 
-        let fields = build_field_info(&stmt, &Format::UnifiedText);
+        let fields = describe_fields(&stmt, &target.statement, &Format::UnifiedText)?;
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -275,18 +426,39 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = &self.conn;
         let stmt = conn
             .prepare(&portal.statement.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            .map_err(pg_error)?;
 
-        let fields = build_field_info(&stmt, &portal.result_column_format);
+        let fields = describe_fields(
+            &stmt,
+            &portal.statement.statement,
+            &portal.result_column_format,
+        )?;
         Ok(DescribePortalResponse::new(fields))
     }
 }
 
+/// The fields of the rows that `sql` returns, or none if it returns no rows.
+fn describe_fields(
+    stmt: &turso_pg::Statement,
+    sql: &str,
+    format: &Format,
+) -> PgWireResult<Vec<FieldInfo>> {
+    if !returns_rows(&parse_statement(sql)?) {
+        return Ok(vec![]);
+    }
+    Ok(build_field_info(stmt, format))
+}
+
+fn parse_statement(sql: &str) -> PgWireResult<ParseResult> {
+    turso_pg_parser::parse(sql)
+        .map_err(|error| pg_error(turso_core::LimboError::ParseError(error.to_string()).into()))
+}
+
 /// Build FieldInfo metadata from a prepared statement's column information.
-fn build_field_info(stmt: &turso_core::Statement, format: &Format) -> Vec<FieldInfo> {
+fn build_field_info(stmt: &turso_pg::Statement, format: &Format) -> Vec<FieldInfo> {
     (0..stmt.num_columns())
         .map(|i| {
             let name = stmt.get_column_name(i).into_owned();
@@ -305,7 +477,7 @@ fn build_field_info(stmt: &turso_core::Statement, format: &Format) -> Vec<FieldI
 /// or `Err` (custom types not enabled — won't happen in PG mode, but the wire
 /// layer shouldn't panic if it does), the safe default is TEXT;
 /// `encode_value` already handles per-value type mismatches.
-fn resolve_pg_type_for_column(stmt: &turso_core::Statement, idx: usize) -> Type {
+fn resolve_pg_type_for_column(stmt: &turso_pg::Statement, idx: usize) -> Type {
     use turso_core::ColumnTypeKind;
 
     let Some(info) = stmt.get_column_type_info(idx).ok().flatten() else {
@@ -384,7 +556,7 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
 
 /// Execute a query that returns rows and build a Query response.
 fn execute_query(
-    stmt: &mut turso_core::Statement,
+    stmt: &mut turso_pg::Statement,
     header: Arc<Vec<FieldInfo>>,
 ) -> PgWireResult<Response> {
     let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
@@ -402,20 +574,61 @@ fn execute_query(
         rows.push(encoder.finish());
         Ok(())
     })
-    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+    .map_err(pg_error)?;
 
     let data_stream = stream::iter(rows);
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
 }
 
 /// Execute a non-SELECT statement and build an Execution response.
-fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireResult<Response> {
-    stmt.run_ignore_rows()
-        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+fn execute_non_query(
+    stmt: &mut turso_pg::Statement,
+    parsed: &ParseResult,
+) -> PgWireResult<Response> {
+    stmt.run_ignore_rows().map_err(pg_error)?;
 
-    let affected = stmt.n_change();
-    let tag = command_tag(query, affected as usize);
+    let affected = stmt.n_change() as usize;
+    // A COMMIT that ended an aborted block performed a rollback; its tag
+    // cannot come from the statement text.
+    let tag = match stmt.command_tag_override() {
+        Some(tag) => Tag::new(tag),
+        None => wire_tag(CommandTag::of(parsed), affected),
+    };
     Ok(Response::Execution(tag))
+}
+
+fn wire_tag(tag: CommandTag, affected_rows: usize) -> Tag {
+    match tag {
+        // INSERT also reports the OID of the inserted row, which is always 0
+        // because tables have no OIDs.
+        CommandTag::Insert => Tag::new(tag.name()).with_oid(0).with_rows(affected_rows),
+        _ if tag.has_row_count() => Tag::new(tag.name()).with_rows(affected_rows),
+        _ => Tag::new(tag.name()),
+    }
+}
+
+/// Reflect the session's transaction state onto the wire protocol: pgwire
+/// derives the ReadyForQuery status byte from TransactionStart and
+/// TransactionEnd responses, so report which side of a transaction block the
+/// statement left the session on.
+fn with_transaction_state(conn: &PgConnection, response: Response) -> Response {
+    let Response::Execution(tag) = response else {
+        return response;
+    };
+    match conn.transaction_state() {
+        TransactionState::Idle => Response::TransactionEnd(tag),
+        TransactionState::Active | TransactionState::Aborted => Response::TransactionStart(tag),
+    }
+}
+
+/// The ReadyForQuery status byte for the session's current transaction
+/// state: 'I' idle, 'T' in a transaction block, 'E' in a failed one.
+fn wire_transaction_status(conn: &PgConnection) -> TransactionStatus {
+    match conn.transaction_state() {
+        TransactionState::Idle => TransactionStatus::Idle,
+        TransactionState::Active => TransactionStatus::Transaction,
+        TransactionState::Aborted => TransactionStatus::Error,
+    }
 }
 
 /// Extract parameters from a Portal and bind them to a prepared statement.
@@ -425,7 +638,7 @@ fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireRes
 /// order than the $N numbering (e.g. if $2 appears before $1 in the SQL), so we
 /// look up each parameter's internal index by name.
 fn bind_portal_parameters(
-    stmt: &mut turso_core::Statement,
+    stmt: &mut turso_pg::Statement,
     portal: &Portal<String>,
 ) -> PgWireResult<()> {
     for i in 0..portal.parameter_len() {
@@ -527,13 +740,25 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
     if hex.len() % 2 != 0 {
         return Err("odd-length hex string".to_owned());
     }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2], 16)
-                .map_err(|e| format!("invalid hex at position {i}: {e}"))
+    hex.as_bytes()
+        .chunks_exact(2)
+        .enumerate()
+        .map(|(pair_index, pair)| {
+            let position = 2 * pair_index;
+            let high = decode_hex_digit(pair[0], position)?;
+            let low = decode_hex_digit(pair[1], position + 1)?;
+            Ok((high << 4) | low)
         })
         .collect()
+}
+
+fn decode_hex_digit(byte: u8, position: usize) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(format!("invalid hex at position {position}")),
+    }
 }
 
 fn encode_value(
@@ -633,137 +858,364 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
     }
 }
 
-/// PG statements handled by `try_prepare_pg()` that return a dummy SELECT
-/// but should produce a command-tag response, not a result set.
-fn is_pg_non_query(sql: &str) -> bool {
-    let upper = sql.trim().to_uppercase();
-    upper.starts_with("COPY")
-        || upper.starts_with("SET")
-        || upper.starts_with("CREATE SCHEMA")
-        || upper.starts_with("DROP SCHEMA")
-        || upper.starts_with("REFRESH MATERIALIZED VIEW")
-        || upper.starts_with("COMMENT")
-}
-
-fn command_tag(query: &str, affected_rows: usize) -> Tag {
-    let upper = query.trim().to_uppercase();
-    if upper.starts_with("INSERT") {
-        Tag::new("INSERT").with_oid(0).with_rows(affected_rows)
-    } else if upper.starts_with("UPDATE") {
-        Tag::new("UPDATE").with_rows(affected_rows)
-    } else if upper.starts_with("DELETE") || upper.starts_with("TRUNCATE") {
-        Tag::new("DELETE").with_rows(affected_rows)
-    } else if upper.starts_with("CREATE VIEW") {
-        Tag::new("CREATE VIEW")
-    } else if upper.starts_with("CREATE INDEX") {
-        Tag::new("CREATE INDEX")
-    } else if upper.starts_with("CREATE SCHEMA") {
-        Tag::new("CREATE SCHEMA")
-    } else if is_create_table_as(&upper) {
-        // PostgreSQL reports CREATE TABLE AS completion as `SELECT n` (the
-        // rows inserted), except WITH NO DATA which skips the insert and
-        // keeps the plain tag.
-        if ends_with_with_no_data(&upper) {
-            Tag::new("CREATE TABLE AS")
-        } else {
-            Tag::new("SELECT").with_rows(affected_rows)
-        }
-    } else if upper.starts_with("CREATE") {
-        Tag::new("CREATE TABLE")
-    } else if upper.starts_with("DROP VIEW") {
-        Tag::new("DROP VIEW")
-    } else if upper.starts_with("DROP INDEX") {
-        Tag::new("DROP INDEX")
-    } else if upper.starts_with("DROP SCHEMA") {
-        Tag::new("DROP SCHEMA")
-    } else if upper.starts_with("DROP") {
-        Tag::new("DROP TABLE")
-    } else if upper.starts_with("ALTER") {
-        Tag::new("ALTER TABLE")
-    } else if upper.starts_with("BEGIN") || upper.starts_with("START") {
-        Tag::new("BEGIN")
-    } else if upper.starts_with("COMMIT") {
-        Tag::new("COMMIT")
-    } else if upper.starts_with("ROLLBACK") {
-        Tag::new("ROLLBACK")
-    } else if upper.starts_with("SAVEPOINT") {
-        Tag::new("SAVEPOINT")
-    } else if upper.starts_with("RELEASE") {
-        Tag::new("RELEASE")
-    } else if upper.starts_with("SET") {
-        Tag::new("SET")
-    } else if upper.starts_with("COPY") {
-        Tag::new("COPY").with_rows(affected_rows)
-    } else if upper.starts_with("COMMENT") {
-        Tag::new("COMMENT")
-    } else if upper.starts_with("SELECT") || upper.starts_with("WITH") {
-        // Row-returning SELECTs never reach command_tag (they take the
-        // query-response path), so a zero-column SELECT- or WITH-prefixed
-        // statement is SELECT ... INTO (writable CTEs are unsupported),
-        // which PostgreSQL reports as `SELECT n` like CREATE TABLE AS.
-        Tag::new("SELECT").with_rows(affected_rows)
-    } else {
-        Tag::new("OK")
-    }
-}
-
-/// Whether the statement ends with `WITH NO DATA`, token-wise (ignoring
-/// trailing whitespace and statement terminators).
-fn ends_with_with_no_data(upper: &str) -> bool {
-    let mut tokens = upper
-        .trim_end()
-        .trim_end_matches(';')
-        .split_whitespace()
-        .rev();
-    tokens.next() == Some("DATA") && tokens.next() == Some("NO") && tokens.next() == Some("WITH")
-}
-
-/// Best-effort detection of `CREATE [TEMP|UNLOGGED] TABLE [IF NOT EXISTS]
-/// <name> AS ...` from the statement text, in the same spirit as the prefix
-/// matching in `command_tag`. Quoted table names containing whitespace are
-/// not recognized and fall back to the plain CREATE TABLE tag.
-fn is_create_table_as(upper: &str) -> bool {
-    let mut tokens = upper.split_whitespace();
-    if tokens.next() != Some("CREATE") {
-        return false;
-    }
-    let mut tok = tokens.next();
-    while matches!(
-        tok,
-        Some("TEMP" | "TEMPORARY" | "UNLOGGED" | "GLOBAL" | "LOCAL")
-    ) {
-        tok = tokens.next();
-    }
-    if tok != Some("TABLE") {
-        return false;
-    }
-    tok = tokens.next();
-    if tok == Some("IF") {
-        if tokens.next() != Some("NOT") || tokens.next() != Some("EXISTS") {
-            return false;
-        }
-        tok = tokens.next();
-    }
-    // `tok` is the table name; AS must follow it (possibly fused with an
-    // opening parenthesis, as in `AS(SELECT 1)`).
-    let Some(name) = tok else {
-        return false;
-    };
-    // A quoted name that opens without closing in the same token spans
-    // whitespace, so the next token is part of the name, not AS.
-    if name.starts_with('"') && (name.len() == 1 || !name.ends_with('"')) {
-        return false;
-    }
-    matches!(tokens.next(), Some(t) if t == "AS" || t.starts_with("AS("))
-}
-
 fn error_info(message: &str) -> ErrorInfo {
-    ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), message.to_owned())
+    ErrorInfo::new(
+        "ERROR".to_owned(),
+        "XX000".to_owned(),
+        error_field_value(message),
+    )
+}
+
+/// ErrorResponse fields are NUL-terminated strings, so a NUL inside a value
+/// would end the field early and the client would read the rest as more
+/// fields. PostgreSQL fills these fields from C strings, which also end at
+/// the first NUL, so cut the value there.
+fn error_field_value(value: &str) -> String {
+    match value.find('\0') {
+        Some(end) => value[..end].to_owned(),
+        None => value.to_owned(),
+    }
+}
+
+fn pg_error(error: turso_pg::Error) -> PgWireError {
+    PgWireError::ApiError(Box::new(error))
+}
+
+async fn finish_query<C>(
+    client: &mut C,
+    result: PgWireResult<()>,
+    wait_for_sync: bool,
+    status: TransactionStatus,
+) -> PgWireResult<()>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    let Err(PgWireError::ApiError(error)) = result else {
+        return result;
+    };
+    let error = match error.downcast::<turso_pg::Error>() {
+        Ok(error) => error,
+        Err(error) => return Err(PgWireError::ApiError(error)),
+    };
+    let mut fields = vec![
+        (b'S', "ERROR".to_string()),
+        (b'C', error.sqlstate.to_string()),
+        (b'M', error_field_value(&error.message)),
+    ];
+    for (tag, value) in [
+        (b'D', &error.detail),
+        (b't', &error.table_name),
+        (b'c', &error.column_name),
+        (b'n', &error.constraint_name),
+    ] {
+        if let Some(value) = value {
+            fields.push((tag, error_field_value(value)));
+        }
+    }
+    client
+        .send(PgWireBackendMessage::ErrorResponse(ErrorResponse::new(
+            fields,
+        )))
+        .await?;
+    client.set_transaction_status(status);
+    if wait_for_sync {
+        client.set_state(PgWireConnectionState::AwaitingSync);
+    } else {
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        client
+            .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                status,
+            )))
+            .await?;
+    }
+    client.flush().await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use turso_pg_client::{BackendEvent, ConnParams, PgConn};
+
+    #[test]
+    fn error_response_fields_end_at_nul() {
+        let (mut client, _conn) = copy_test_client();
+        let events = client
+            .simple_query("SELECT set_config('nodot' || chr(0) || 'Dinjected detail', 'x', false)")
+            .unwrap();
+        let fields = events
+            .iter()
+            .find_map(|event| match event {
+                BackendEvent::ErrorResponse(fields) => Some(fields),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{events:?}"));
+        assert_eq!(
+            fields.get(&b'M').map(String::as_str),
+            Some("unrecognized configuration parameter \"nodot"),
+            "{fields:?}"
+        );
+        assert!(!fields.contains_key(&b'D'), "{fields:?}");
+        assert!(
+            matches!(events.last(), Some(BackendEvent::ReadyForQuery(_))),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn copy_to_stdout_sends_text_in_statement_order() {
+        let (mut client, conn) = copy_test_client();
+        let events = client
+            .simple_query(
+                r#"CREATE TABLE "A""B;C" (id INT, value TEXT, active BOOLEAN, data BYTEA);
+                   INSERT INTO "A""B;C" VALUES
+                     (7, E'one\ttwo\nthree\rfour\b\f\013\\N', true, NULL),
+                     (9, '', false, NULL), (11, NULL, NULL, NULL);"#,
+            )
+            .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::ErrorResponse(_))),
+            "{events:?}"
+        );
+        for (id, bytes) in [(7, vec![0, 255]), (11, Vec::new())] {
+            let mut stmt = conn
+                .prepare(r#"UPDATE "A""B;C" SET data = $1 WHERE id = $2"#)
+                .unwrap();
+            stmt.bind_at(NonZero::new(1).unwrap(), Value::from_blob(bytes))
+                .unwrap();
+            stmt.bind_at(NonZero::new(2).unwrap(), Value::from_i64(id))
+                .unwrap();
+            stmt.run_ignore_rows().unwrap();
+        }
+        let messages = query_messages(
+            &mut client,
+            r#"SELECT 41; /* export */ COPY public."A""B;C" (value, id, active, data) TO stdout (FORMAT text); SELECT 43"#,
+        );
+        let tags: Vec<_> = messages.iter().map(|message| message.0).collect();
+        let errors: Vec<_> = messages
+            .iter()
+            .filter(|m| m.0 == b'E')
+            .map(|m| String::from_utf8_lossy(&m.1))
+            .collect();
+        assert_eq!(tags, b"TDCHdddcCTDCZ", "{errors:?}");
+        assert_eq!(messages[3].1, [0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            messages[4].1,
+            b"one\\ttwo\\nthree\\rfour\\b\\f\\v\\\\N\t7\tt\t\\\\x00ff\n"
+        );
+        assert_eq!(messages[5].1, b"\t9\tf\t\\N\n");
+        assert_eq!(messages[6].1, b"\\N\t11\t\\N\t\\\\x\n");
+        assert_eq!(messages[8].1, b"COPY 3\0");
+        assert_eq!(messages.last().unwrap().1, b"I");
+    }
+
+    #[test]
+    fn copy_to_stdout_handles_empty_tables_and_transactions() {
+        let (mut client, _) = copy_test_client();
+        client
+            .simple_query("CREATE TABLE empty_table (id INT)")
+            .unwrap();
+        let messages = query_messages(&mut client, "BEGIN; COPY empty_table TO STDOUT");
+        let tags: Vec<_> = messages.iter().map(|message| message.0).collect();
+        assert_eq!(tags, b"CHcCZ");
+        assert_eq!(messages[3].1, b"COPY 0\0");
+        assert_eq!(messages[4].1, b"T");
+        let messages = query_messages(&mut client, "COMMIT");
+        assert_eq!(messages.last().unwrap().1, b"I");
+        let messages = query_messages(&mut client, "BEGIN; COPY missing TO STDOUT; COMMIT");
+        assert_eq!(messages.iter().map(|m| m.0).collect::<Vec<_>>(), b"CEZ");
+        assert_eq!(messages.last().unwrap().1, b"E");
+        let messages = query_messages(&mut client, "ROLLBACK");
+        assert_eq!(messages.last().unwrap().1, b"I");
+        for sql in ["", "; ;", "-- no statement"] {
+            let messages = query_messages(&mut client, sql);
+            assert_eq!(messages.iter().map(|m| m.0).collect::<Vec<_>>(), b"IZ");
+        }
+    }
+
+    #[test]
+    fn copy_to_stdout_reports_errors_without_running_later_statements() {
+        let (mut client, _) = copy_test_client();
+        client
+            .simple_query("CREATE TABLE items (id INT); INSERT INTO items VALUES (7); CREATE VIEW item_view AS SELECT id FROM items")
+            .unwrap();
+        for sql in [
+            "COPY items TO STDOUT (FORMAT csv); DELETE FROM items",
+            "COPY items TO ''; DELETE FROM items",
+            "COPY items (missing) TO STDOUT; DELETE FROM items",
+            "COPY missing TO STDOUT; DELETE FROM items",
+            "COPY items (id, id) TO STDOUT; DELETE FROM items",
+            "COPY items (rowid) TO STDOUT; DELETE FROM items",
+            "COPY item_view TO STDOUT; DELETE FROM items",
+            "INSERT INTO items VALUES (99); COPY items TO STDOUT WHERE id > 0",
+        ] {
+            let messages = query_messages(&mut client, sql);
+            assert_eq!(
+                messages.iter().map(|m| m.0).collect::<Vec<_>>(),
+                b"EZ",
+                "{sql}: {messages:?}"
+            );
+            assert_eq!(messages.last().unwrap().1, b"I");
+        }
+        let messages = query_messages(&mut client, "COPY items TO STDOUT");
+        assert_eq!(messages[1].1, b"7\n");
+        assert_eq!(messages[3].1, b"COPY 1\0");
+    }
+
+    #[test]
+    fn copy_to_stdout_uses_the_schema_and_search_path() {
+        let (mut client, conn) = copy_test_client();
+        conn.inner().execute("ATTACH ':memory:' AS other").unwrap();
+        conn.execute(
+            r#"CREATE TABLE public.items (id INT);
+               INSERT INTO public.items VALUES (7);
+               CREATE TABLE other.items (id INT, "Text Value" TEXT);
+               INSERT INTO other.items VALUES (19, 'São Paulo');"#,
+        )
+        .unwrap();
+        conn.inner()
+            .execute("CREATE TRIGGER items AFTER INSERT ON items BEGIN SELECT 1; END")
+            .unwrap();
+        client
+            .simple_query("SET search_path TO other, public")
+            .unwrap();
+        let messages = query_messages(&mut client, r#"COPY items ("Text Value", id) TO STDOUT"#);
+        assert_eq!(messages[1].1, "São Paulo\t19\n".as_bytes());
+        let messages = query_messages(&mut client, "COPY public.items TO STDOUT");
+        assert_eq!(messages[1].1, b"7\n");
+        conn.execute("DROP TABLE other.items; CREATE VIEW other.items AS SELECT 23 AS id")
+            .unwrap();
+        let messages = query_messages(&mut client, "COPY items TO STDOUT");
+        assert_eq!(messages.iter().map(|m| m.0).collect::<Vec<_>>(), b"EZ");
+        client
+            .simple_query("SELECT set_config('search_path', '', false)")
+            .unwrap();
+        let messages = query_messages(&mut client, "COPY items TO STDOUT");
+        assert_eq!(messages.iter().map(|m| m.0).collect::<Vec<_>>(), b"EZ");
+    }
+
+    #[test]
+    fn copy_to_stdout_sends_rows_before_a_later_read_error() {
+        let (mut client, conn) = copy_test_client();
+        conn.execute(
+            "CREATE TABLE items (id INT);
+             WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM numbers WHERE n < 10000)
+             INSERT INTO items SELECT n FROM numbers",
+        )
+        .unwrap();
+        let steps = AtomicUsize::new(0);
+        conn.inner().set_progress_handler(
+            1,
+            Some(Box::new(move || {
+                steps.fetch_add(1, Ordering::SeqCst) > 1000
+            })),
+        );
+        let messages = query_messages(&mut client, "COPY items TO STDOUT; DELETE FROM items");
+        conn.inner().set_progress_handler(0, None);
+        assert_eq!(messages[0].0, b'H', "{messages:?}");
+        let rows: Vec<_> = messages.iter().filter(|m| m.0 == b'd').collect();
+        assert!(!rows.is_empty());
+        assert!(rows.len() < 10000);
+        assert_eq!(rows[0].1, b"1\n");
+        assert_eq!(messages[messages.len() - 2].0, b'E');
+        assert_eq!(messages.last().unwrap().1, b"I");
+        assert!(!messages.iter().any(|m| matches!(m.0, b'c' | b'C')));
+        let messages = query_messages(&mut client, "SELECT count(*) FROM items");
+        assert_eq!(
+            turso_pg_client::parse_data_row(&messages[1].1).unwrap(),
+            vec![Some("10000".to_owned())]
+        );
+    }
+
+    fn copy_test_client() -> (PgConn, PgConnection) {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new().with_attach(true),
+        )
+        .unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
+        let handler = Arc::new(TursoPgHandler {
+            conn: conn.clone(),
+            query_parser: Arc::new(NoopQueryParser::new()),
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let listener = TcpListener::from_std(listener).unwrap();
+                    let (socket, _) = listener.accept().await.unwrap();
+                    process_socket(socket, None, Arc::new(TursoPgFactory { handler }))
+                        .await
+                        .unwrap();
+                });
+        });
+        let client = PgConn::connect(
+            &ConnParams {
+                host: address.ip().to_string(),
+                port: address.port(),
+                user: "turso".to_owned(),
+                password: None,
+                database: "main".to_owned(),
+            },
+            &[],
+        )
+        .unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        (client, conn)
+    }
+
+    #[test]
+    fn server_side_parse_errors_abort_the_block_on_the_wire() {
+        // A syntax error fails the server's own parse of the query string and
+        // never reaches PgConnection::prepare, but it is still an error
+        // inside the transaction block: later statements must get 25P02 and
+        // COMMIT must roll the block back.
+        let (mut client, _) = copy_test_client();
+        query_messages(&mut client, "CREATE TABLE d1 (x INT)");
+        query_messages(&mut client, "BEGIN");
+        query_messages(&mut client, "INSERT INTO d1 VALUES (1)");
+        let messages = query_messages(&mut client, "SELCT 1");
+        assert_eq!(messages.iter().map(|m| m.0).collect::<Vec<_>>(), b"EZ");
+        assert_eq!(messages.last().unwrap().1, b"E");
+        let messages = query_messages(&mut client, "SELECT 'after'");
+        assert_eq!(messages.iter().map(|m| m.0).collect::<Vec<_>>(), b"EZ");
+        assert!(
+            String::from_utf8_lossy(&messages[0].1).contains("25P02"),
+            "{messages:?}"
+        );
+        let messages = query_messages(&mut client, "COMMIT");
+        assert_eq!(messages[0].1, b"ROLLBACK\0");
+        assert_eq!(messages.last().unwrap().1, b"I");
+        let messages = query_messages(&mut client, "SELECT count(*) FROM d1");
+        assert_eq!(messages[1].1, b"\0\x01\0\0\0\x010");
+    }
+
+    fn query_messages(client: &mut PgConn, sql: &str) -> Vec<(u8, Vec<u8>)> {
+        client.send_query(sql).unwrap();
+        let mut messages = Vec::new();
+        loop {
+            let message = client.read_message().unwrap();
+            let done = message.0 == b'Z';
+            messages.push(message);
+            if done {
+                return messages;
+            }
+        }
+    }
 
     #[test]
     fn test_pg_is_in_recovery_returns_true_text_on_wire() {
@@ -774,7 +1226,7 @@ mod tests {
             turso_pg::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = Connection::connect(&db).unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
         for sql in [
             "SELECT pg_catalog.pg_is_in_recovery()",
             "SELECT pg_is_in_recovery() AS recovery",
@@ -799,14 +1251,100 @@ mod tests {
     }
 
     #[test]
-    fn test_set_transaction_is_non_query() {
-        assert!(is_pg_non_query(
-            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+    fn test_aborted_transaction_wire_status_and_commit_tag() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+
+        let mut begin = conn.prepare("BEGIN").unwrap();
+        let response =
+            execute_non_query(&mut begin, &turso_pg_parser::parse("BEGIN").unwrap()).unwrap();
+        assert!(matches!(
+            with_transaction_state(&conn, response),
+            Response::TransactionStart(_)
         ));
-        assert!(is_pg_non_query("  set\ntransaction read only"));
-        assert!(!is_pg_non_query(
-            "SELECT set_config('search_path', '', false)"
-        ));
+        assert_eq!(
+            wire_transaction_status(&conn),
+            TransactionStatus::Transaction
+        );
+
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        assert!(conn.execute("SELECT 1/0").is_err());
+        assert_eq!(wire_transaction_status(&conn), TransactionStatus::Error);
+
+        // COMMIT ends the aborted block as a rollback and reports it so.
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        let response =
+            execute_non_query(&mut commit, &turso_pg_parser::parse("COMMIT").unwrap()).unwrap();
+        let wrapped = with_transaction_state(&conn, response);
+        let Response::TransactionEnd(tag) = wrapped else {
+            panic!("COMMIT must report the end of the transaction block");
+        };
+        assert_eq!(tag, Tag::new("ROLLBACK"));
+        assert_eq!(wire_transaction_status(&conn), TransactionStatus::Idle);
+    }
+
+    #[test]
+    fn test_integer_case_and_function_results_are_int4_on_wire() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
+        conn.execute("CREATE TABLE t(id int PRIMARY KEY, x int)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+        for sql in [
+            "SELECT x * 2 FROM t",
+            "SELECT coalesce(x, 2) * coalesce(x, 3) FROM t",
+            "SELECT abs(x) * 2 FROM t",
+            "SELECT CASE WHEN x = 1 THEN x ELSE 0 END - 1 FROM t",
+            "SELECT coalesce(x, 2) FROM t",
+        ] {
+            let stmt = conn.prepare(sql).unwrap();
+            let fields = build_field_info(&stmt, &Format::UnifiedText);
+            assert_eq!(*fields[0].datatype(), Type::INT4, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_access_share_lock_has_no_result_fields() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = turso_pg::PgConnection::connect(&db).unwrap();
+        conn.execute("CREATE TABLE items (v INTEGER)").unwrap();
+        let stmt = conn
+            .prepare("LOCK TABLE items IN ACCESS SHARE MODE")
+            .unwrap();
+        for format in [Format::UnifiedText, Format::UnifiedBinary] {
+            assert!(
+                describe_fields(&stmt, "LOCK TABLE items IN ACCESS SHARE MODE", &format)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let sql = "SELECT 'LOCK TABLE items'";
+        let query = conn.prepare(sql).unwrap();
+        assert_eq!(
+            describe_fields(&query, sql, &Format::UnifiedText)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -864,6 +1402,16 @@ mod tests {
     }
 
     #[test]
+    fn test_pg_bytes_to_value_bytea_rejects_multi_byte_character() {
+        let result = pg_bytes_to_value("\\x\u{20ac}a".as_bytes(), &Type::BYTEA);
+        assert!(matches!(
+            result,
+            Err(PgWireError::UserError(info))
+                if info.message == "invalid bytea hex parameter: invalid hex at position 0"
+        ));
+    }
+
+    #[test]
     fn test_pg_bytes_to_value_unknown_type_as_text() {
         // Unknown types should be treated as text
         let val = pg_bytes_to_value(b"some-uuid-value", &Type::UUID).unwrap();
@@ -895,9 +1443,28 @@ mod tests {
             vec![0xDE, 0xAD, 0xBE, 0xEF]
         );
         assert_eq!(decode_hex("00ff").unwrap(), vec![0x00, 0xFF]);
+        assert_eq!(decode_hex("0aff").unwrap(), vec![0x0A, 0xFF]);
+        assert_eq!(
+            decode_hex("0123456789abcdefABCDEF").unwrap(),
+            vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xAB, 0xCD, 0xEF]
+        );
         assert_eq!(decode_hex("").unwrap(), Vec::<u8>::new());
         assert!(decode_hex("0").is_err()); // odd length
         assert!(decode_hex("GG").is_err()); // invalid hex
+        assert!(decode_hex("zz").is_err());
+        assert!(decode_hex("+f").is_err());
+    }
+
+    #[test]
+    fn test_decode_hex_rejects_multi_byte_character() {
+        assert_eq!(
+            decode_hex("\u{20ac}a"),
+            Err("invalid hex at position 0".to_owned())
+        );
+        assert_eq!(
+            decode_hex("a\u{20ac}"),
+            Err("invalid hex at position 1".to_owned())
+        );
     }
 
     #[test]
@@ -944,37 +1511,5 @@ mod tests {
         // UNKNOWN type should keep text for non-numeric strings
         let val = pg_bytes_to_value(b"hello", &Type::UNKNOWN).unwrap();
         assert!(matches!(val, Value::Text(_)));
-    }
-
-    #[test]
-    fn test_is_create_table_as() {
-        assert!(is_create_table_as("CREATE TABLE T AS SELECT 1"));
-        assert!(is_create_table_as("CREATE TEMP TABLE T AS SELECT 1"));
-        assert!(is_create_table_as("CREATE UNLOGGED TABLE T AS SELECT 1"));
-        assert!(is_create_table_as(
-            "CREATE TABLE IF NOT EXISTS T AS SELECT 1"
-        ));
-        assert!(is_create_table_as("CREATE TABLE S.T AS SELECT 1"));
-        assert!(is_create_table_as("CREATE TABLE T AS(SELECT 1)"));
-        assert!(is_create_table_as("CREATE TABLE \"T\" AS SELECT 1"));
-
-        assert!(!is_create_table_as("CREATE TABLE T (X INT)"));
-        assert!(!is_create_table_as("CREATE INDEX I ON T (X)"));
-        assert!(!is_create_table_as("CREATE VIEW V AS SELECT 1"));
-        // Quoted name containing whitespace: `AS` is part of the name.
-        assert!(!is_create_table_as("CREATE TABLE \"A AS B\" (X INT)"));
-    }
-
-    #[test]
-    fn test_ends_with_with_no_data() {
-        assert!(ends_with_with_no_data(
-            "CREATE TABLE T AS SELECT 1 WITH NO DATA"
-        ));
-        assert!(ends_with_with_no_data(
-            "CREATE TABLE T AS SELECT 1 WITH  NO\nDATA ; "
-        ));
-
-        assert!(!ends_with_with_no_data("CREATE TABLE T AS SELECT 1"));
-        assert!(!ends_with_with_no_data("SELECT 'WITH NO DATA'"));
     }
 }

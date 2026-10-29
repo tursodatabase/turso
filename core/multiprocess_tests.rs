@@ -1,4 +1,5 @@
 use super::*;
+use crate::database::remove_file_from_database_registry;
 use crate::storage::database::DatabaseFile;
 use crate::sync::atomic::Ordering;
 use std::process::Command;
@@ -183,7 +184,6 @@ fn open_db_async_state_drop_clears_opening_registry_entry() {
     );
     {
         let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
         manager.insert(key.clone(), RegistryEntry::Opening);
     }
 
@@ -191,12 +191,11 @@ fn open_db_async_state_drop_clears_opening_registry_entry() {
     state.registry_key = Some(key.clone());
     drop(state);
 
-    let mut manager = DATABASE_MANAGER.lock();
+    let manager = DATABASE_MANAGER.lock();
     assert!(
         !manager.contains_key(&key),
         "dropping an incomplete async open must clear the Opening sentinel"
     );
-    manager.clear();
 }
 
 fn flip_db_header_reserved_byte(path: &std::path::Path) {
@@ -614,9 +613,7 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
 
     drop(conn_a);
     drop(db_a);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let db_b = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
@@ -671,9 +668,7 @@ fn database_open_reuses_trusted_tshm_snapshot_without_disk_scan_when_no_backfill
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
@@ -748,9 +743,7 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     let mut expected_snapshot = snapshot_before;
@@ -829,9 +822,7 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
@@ -894,9 +885,7 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
     drop(conn);
     drop(db);
     flip_db_header_reserved_byte(&db_path);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     let mut expected_snapshot = snapshot_before;
@@ -1852,9 +1841,7 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let current_exe = std::env::current_exe().unwrap();
     let mut child = Command::new(&current_exe)
@@ -1901,9 +1888,7 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
 
     drop(reopened_conn);
     drop(reopened);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let wal_len = std::fs::metadata(format!("{db_path_str}-wal"))
         .unwrap_or_else(|_| panic!("expected WAL file at {db_path_str}-wal"))
@@ -2029,9 +2014,7 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
@@ -2109,9 +2092,7 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     let reopened_authority = reopened.shared_wal_coordination().unwrap().unwrap();
@@ -2192,9 +2173,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
 
     drop(conn_a);
     drop(db_a);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let db_b = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
@@ -3117,4 +3096,38 @@ fn checkpoints_and_reads_stay_correct_while_a_reader_holds_a_late_wal_frame() {
         get_rows(&fresh, "PRAGMA integrity_check")[0][0].to_string(),
         "ok"
     );
+}
+
+#[test]
+fn subprocess_idle_begin_sees_table_created_by_other_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-idle-begin-schema.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("begin").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let schema_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_SCHEMA_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        schema_output.status.success(),
+        "child schema process failed: stderr={}",
+        String::from_utf8_lossy(&schema_output.stderr)
+    );
+
+    let result = conn
+        .prepare("select value from child_table")
+        .and_then(|mut stmt| stmt.run_collect_rows());
+    let rows = result.unwrap();
+    assert_eq!(rows.len(), 1);
+    conn.execute("commit").unwrap();
 }

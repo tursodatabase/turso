@@ -11,6 +11,7 @@ pub fn to_u32(v: usize) -> u32 {
 
 use super::{execute, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::function::AccumulatorFunc;
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::{
     schema::{BTreeTable, CheckConstraint, Column, ForeignKey, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
@@ -301,10 +302,24 @@ impl From<BitSet> for NullMatchingMask {
 #[derive(Debug, Clone)]
 pub struct AddColumnData {
     pub db: usize,
+    pub namespace: NamespaceId,
     pub table: String,
     pub column: Column,
     pub check_constraints: Vec<CheckConstraint>,
     pub foreign_keys: Vec<Arc<ForeignKey>>,
+}
+
+/// Data for AlterColumn instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct AlterColumnData {
+    pub db: usize,
+    pub namespace: NamespaceId,
+    pub table: String,
+    pub column_index: usize,
+    pub definition: turso_parser::ast::ColumnDefinition,
+    pub rename: bool,
+    pub rewritten_triggers: Vec<(NamespaceRef, String, String)>,
+    pub renamed_index_methods: Vec<(String, Arc<dyn crate::index_method::IndexMethodAttachment>)>,
 }
 
 /// Data for IntegrityCk instruction (boxed to keep Insn small).
@@ -321,6 +336,7 @@ pub struct IntegrityCkData {
 #[derive(Debug, Clone)]
 pub struct AddSequenceData {
     pub db: usize,
+    pub namespace: NamespaceId,
     pub name: String,
     pub start: i64,
     pub increment: i64,
@@ -337,7 +353,7 @@ pub struct SorterOpenData {
     /// Combined order, collation, and nulls ordering per column.
     pub order_collations_nulls: crate::alloc::Vec<(
         SortOrder,
-        Option<CollationSeq>,
+        CollationSeq,
         Option<turso_parser::ast::NullsOrder>,
     )>,
     /// Per-column custom type comparators for ORDER BY sorting.
@@ -354,9 +370,66 @@ pub struct AggStepData {
     pub func: AccumulatorFunc,
     /// Optional custom type comparator for MIN/MAX aggregates.
     pub comparator: Option<SortComparatorType>,
-    /// Collation for comparison-based aggregates (MIN/MAX), resolved at
-    /// translation time from the argument expression.
-    pub collation: Option<CollationSeq>,
+    /// The collation MIN, MAX, mode and percentile compare the argument with.
+    /// BINARY for the aggregates that do not compare values.
+    pub collation: CollationSeq,
+}
+
+/// Which of SUM, TOTAL, or AVG an `IvmSumFinalize` instruction computes. The
+/// three share one linear state (see `IvmSumData`); only the finalize step
+/// tells them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IvmSumKind {
+    Sum,
+    Total,
+    Avg,
+}
+
+/// Incremental-view state for SUM/TOTAL/AVG (boxed to keep Insn small).
+///
+/// A materialized view must equal a fresh evaluation of its defining SELECT
+/// over the table's current rows, so this state combines by plain addition,
+/// with no sticky flag that survives a retraction it should not. A row is
+/// added `weight` times: its z-set weight, negative for a retraction. See
+/// "Divergences from DBSP" in docs/ivm-vdbe-rewrite-writeup.md.
+///
+/// Fields:
+/// - `int_wrapped`/`int_wrap_count`: the exact sum of every live INTEGER (or
+///   integer-valued TEXT) contribution, stored as `int_wrapped + int_wrap_count
+///   * 2^64` so an i64 overflow is still exactly undone by a later retraction.
+/// - `float_sum`/`float_err`: the Kahan-Babuska-Neumaier running sum of every
+///   live non-integer contribution (REAL, or TEXT/BLOB that sum() treats as
+///   approximate).
+/// - `non_int_count`: count of live non-integer contributions; decides
+///   whether SUM's result is INTEGER or REAL.
+/// - `non_null_count`: count of live non-NULL contributions; decides the
+///   empty-group result and AVG's divisor.
+#[derive(Debug, Clone)]
+pub struct IvmSumData {
+    pub arg_reg: usize,
+    /// The row's z-set weight: an integer, negative for a retraction.
+    pub weight_reg: usize,
+    pub int_wrapped_reg: usize,
+    pub int_wrap_count_reg: usize,
+    pub float_sum_reg: usize,
+    pub float_err_reg: usize,
+    pub non_int_count_reg: usize,
+    pub non_null_count_reg: usize,
+}
+
+/// Data for the `IvmSumFinalize` instruction (boxed to keep Insn small): the
+/// same state fields as `IvmSumData`, minus the row's argument and weight,
+/// plus which function to compute and where to write the result.
+#[derive(Debug, Clone)]
+pub struct IvmSumFinalizeData {
+    pub kind: IvmSumKind,
+    pub int_wrapped_reg: usize,
+    pub int_wrap_count_reg: usize,
+    pub float_sum_reg: usize,
+    pub float_err_reg: usize,
+    pub non_int_count_reg: usize,
+    pub non_null_count_reg: usize,
+    pub dest_reg: usize,
 }
 
 /// Data for ArrayEncode instruction (boxed to keep Insn small).
@@ -384,6 +457,101 @@ pub enum ClearBtreeCount {
     Nothing,
     RowsWritten,
     ChangesAndRowsWritten,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConstraintInfo {
+    pub kind: crate::ConstraintKind,
+    pub constraint_name: Option<String>,
+    pub index_name: Option<String>,
+    pub table_name: String,
+    pub column_names: Vec<String>,
+    pub violation_regs: Vec<usize>,
+    pub row_col_names: Vec<String>,
+    pub parent_table: Option<String>,
+}
+
+impl ConstraintInfo {
+    pub fn primary_key(
+        table: &str,
+        name: Option<String>,
+        cols: Vec<String>,
+        regs: Vec<usize>,
+    ) -> Self {
+        Self {
+            kind: crate::ConstraintKind::PrimaryKey,
+            constraint_name: name,
+            index_name: None,
+            table_name: table.to_string(),
+            column_names: cols,
+            violation_regs: regs,
+            row_col_names: vec![],
+            parent_table: None,
+        }
+    }
+
+    pub fn unique_index(table: &str, index: &Index, regs: Vec<usize>) -> Self {
+        Self {
+            kind: crate::ConstraintKind::Unique,
+            constraint_name: index.constraint_name.clone(),
+            index_name: Some(index.name.clone()),
+            table_name: table.to_string(),
+            column_names: index.columns.iter().map(|col| col.name.clone()).collect(),
+            violation_regs: regs,
+            row_col_names: vec![],
+            parent_table: None,
+        }
+    }
+
+    pub fn not_null(table: &str, col: String) -> Self {
+        Self {
+            kind: crate::ConstraintKind::NotNull,
+            constraint_name: None,
+            index_name: None,
+            table_name: table.to_string(),
+            column_names: vec![col],
+            violation_regs: vec![],
+            row_col_names: vec![],
+            parent_table: None,
+        }
+    }
+
+    pub fn check(
+        table: &str,
+        name: Option<String>,
+        regs: Vec<usize>,
+        row_names: Vec<String>,
+    ) -> Self {
+        Self {
+            kind: crate::ConstraintKind::Check,
+            constraint_name: name,
+            index_name: None,
+            table_name: table.to_string(),
+            column_names: vec![],
+            violation_regs: regs,
+            row_col_names: row_names,
+            parent_table: None,
+        }
+    }
+
+    pub fn fk(
+        child_table: &str,
+        name: Option<String>,
+        cols: Vec<String>,
+        regs: Vec<usize>,
+        parent_table: String,
+    ) -> Self {
+        Self {
+            kind: crate::ConstraintKind::ForeignKey,
+            constraint_name: name,
+            index_name: None,
+            table_name: child_table.to_string(),
+            column_names: cols,
+            violation_regs: regs,
+            row_col_names: vec![],
+            parent_table: Some(parent_table),
+        }
+    }
 }
 
 // The opcodes the dispatch loop matches directly come first.
@@ -456,7 +624,7 @@ pub enum Insn {
         /// Without the jump_if_null flag it would not jump because the logical comparison "id != NULL" is never true.
         /// This flag indicates that if either is null we should still jump.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if they are not equal.
     Ne {
@@ -467,7 +635,7 @@ pub enum Insn {
         ///
         /// jump_if_null jumps if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is less than the right-hand side.
     Lt {
@@ -476,7 +644,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     Le {
         lhs: usize,
@@ -484,7 +652,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is greater than the right-hand side.
     Gt {
@@ -493,7 +661,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is greater than or equal to the right-hand side.
     Ge {
@@ -502,7 +670,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[jump_if_null\] != 0)
     If {
@@ -996,9 +1164,10 @@ pub enum Insn {
 
     /// Halt the program.
     Halt {
+        constraint_info: Option<Box<ConstraintInfo>>,
         err_code: usize,
         description: String,
-        /// Override the program's resolve_type for error handling (used by RAISE).
+        /// Override the program's resolve_type for error handling.
         on_error: Option<ResolveType>,
         /// If set, read the error description from this register instead of
         /// the static `description` field (used by RAISE with expression messages).
@@ -1007,9 +1176,12 @@ pub enum Insn {
 
     /// Halt the program if P3 is null.
     HaltIfNull {
+        constraint_info: Option<Box<ConstraintInfo>>,
         target_reg: usize,   // P3
         description: String, // p4
         err_code: usize,     // p1
+        /// Override the program's resolve_type for error handling.
+        on_error: Option<ResolveType>, // p2
     },
 
     /// Start a transaction.
@@ -1020,9 +1192,14 @@ pub enum Insn {
     },
 
     /// Set database auto-commit mode and potentially rollback.
+    /// On BEGIN (`auto_commit: false`), `concurrent` records that the
+    /// transaction was started with BEGIN CONCURRENT: like BEGIN DEFERRED
+    /// it opens nothing by itself, and the first statement materializes
+    /// the MVCC transaction in concurrent mode.
     AutoCommit {
         auto_commit: bool,
         rollback: bool,
+        concurrent: bool,
     },
 
     /// Execute a named savepoint operation.
@@ -1256,6 +1433,40 @@ pub enum Insn {
         func: AccumulatorFunc,
     },
 
+    /// Materialize an aggregate accumulator register from its persisted state
+    /// payload, read from `agg_payload_width(func)` registers starting at
+    /// `payload_start_reg`. The counterpart of AggContextStore; used by
+    /// materialized view maintenance to resume a group's aggregate state from
+    /// the view's state table.
+    AggContextLoad {
+        acc_reg: usize,
+        payload_start_reg: usize,
+        func: AccumulatorFunc,
+    },
+
+    /// Persist an aggregate accumulator's state payload into
+    /// `agg_payload_width(func)` registers starting at `payload_start_reg`,
+    /// for storage in a materialized view's state table.
+    AggContextStore {
+        acc_reg: usize,
+        payload_start_reg: usize,
+        func: AccumulatorFunc,
+    },
+
+    /// Add `arg_reg`'s row, `weight_reg` times, to a materialized view's
+    /// SUM/TOTAL/AVG state. A negative weight retracts the row. See
+    /// `IvmSumData`.
+    IvmSumStep {
+        data: Box<IvmSumData>,
+    },
+
+    /// Compute SUM, TOTAL, or AVG's current result from the state registers
+    /// `IvmSumStep` maintains, into `dest_reg`. See
+    /// `IvmSumFinalizeData`.
+    IvmSumFinalize {
+        data: Box<IvmSumFinalizeData>,
+    },
+
     /// Open a sorter.
     SorterOpen {
         data: Box<SorterOpenData>,
@@ -1404,6 +1615,21 @@ pub enum Insn {
         target_pc: Option<BranchOffset>,
     },
 
+    /// Write the subtype of src_reg to dest_reg as an integer.
+    /// Values without a subtype produce zero; JSON text produces 74.
+    GetSubtype {
+        src_reg: usize,
+        dest_reg: usize,
+    },
+
+    /// Read a supported integer subtype from subtype_reg and apply it to the
+    /// text value in dest_reg without changing its contents. Non-text values
+    /// are unchanged. Zero clears the subtype; 74 marks JSON when enabled.
+    SetSubtype {
+        subtype_reg: usize,
+        dest_reg: usize,
+    },
+
     SoftNull {
         reg: usize,
     },
@@ -1522,6 +1748,8 @@ pub enum Insn {
     DropTable {
         ///  The database within which this b-tree needs to be dropped (P1).
         db: usize,
+        /// The namespace of the table being dropped.
+        namespace: NamespaceId,
         ///  unused register p2
         _p2: usize,
         ///  unused register p3
@@ -1532,12 +1760,16 @@ pub enum Insn {
     DropView {
         /// The database within which this view needs to be dropped
         db: usize,
+        /// The namespace of the view being dropped.
+        namespace: NamespaceId,
         /// The name of the view being dropped
         view_name: String,
     },
     DropIndex {
         ///  The database within which this index needs to be dropped (P1).
         db: usize,
+        /// The namespace of the index being dropped.
+        namespace: NamespaceId,
         //  The name of the index being dropped
         index: Arc<Index>,
     },
@@ -1545,6 +1777,8 @@ pub enum Insn {
     DropTrigger {
         /// The database within which this trigger needs to be dropped (P1).
         db: usize,
+        /// The namespace of the trigger being dropped.
+        namespace: NamespaceId,
         /// The name of the trigger being dropped
         trigger_name: String,
     },
@@ -1564,8 +1798,28 @@ pub enum Insn {
     DropSequence {
         /// The database within which this sequence needs to be dropped
         db: usize,
+        /// The namespace of the sequence being dropped.
+        namespace: NamespaceId,
         /// The name of the sequence being dropped
         seq_name: String,
+    },
+    /// Name a namespace in the in-memory schema, after CREATE SCHEMA
+    /// inserted its row into the namespaces table.
+    AddNamespace {
+        /// The database the namespace is stored in
+        db: usize,
+        /// The namespace being created
+        namespace: NamespaceId,
+        /// The name of the namespace
+        name: String,
+    },
+    /// Forget a namespace in the in-memory schema, after DROP SCHEMA
+    /// deleted its row.
+    DropNamespace {
+        /// The database the namespace is stored in
+        db: usize,
+        /// The namespace being dropped
+        namespace: NamespaceId,
     },
     /// Begin the autonomous inner transaction that wraps a sequence
     /// read-modify-write. The translator emits this immediately before
@@ -1631,25 +1885,28 @@ pub enum Insn {
     /// `LimboError::SequenceExhausted` on overflow when `cycle` is false.
     SequenceComputeNext {
         db: usize,
-        seq_name_reg: usize,
+        namespace: NamespaceId,
+        seq_name: String,
         in_value_reg: usize,
         in_is_called_reg: usize,
         was_empty_reg: usize,
         out_value_reg: usize,
     },
-    /// Record this connection's currval for a sequence after a successful
-    /// nextval/setval. Pure synchronous register operation. currval is
-    /// per-connection global (not schema-qualified), so no database id
-    /// is carried — schema-qualified currvals would be a separate feature.
+    /// Record this connection's currval for the sequence `seq_name` of
+    /// database `db` after a successful nextval/setval. Pure synchronous
+    /// register operation.
     SetSequenceCurrval {
-        seq_name_reg: usize,
+        db: usize,
+        namespace: NamespaceId,
+        seq_name: String,
         value_reg: usize,
     },
     /// Publish sequence allocation metadata for sync watermarks after a
     /// successful sequence RMW commit.
     SequenceTrackAllocation {
         db: usize,
-        seq_name_reg: usize,
+        namespace: NamespaceId,
+        seq_name: String,
         value_reg: usize,
     },
     /// Register an in-flight sequence allocation against the *outer*
@@ -1661,7 +1918,8 @@ pub enum Insn {
     /// closes.
     SequenceRegisterAllocation {
         db: usize,
-        seq_name_reg: usize,
+        namespace: NamespaceId,
+        seq_name: String,
         value_reg: usize,
         /// Register holding the encoded saved outer mv_tx (the blob written
         /// by `SequenceBeginInnerTx`). Empty blob means "no outer tx".
@@ -1893,11 +2151,13 @@ pub enum Insn {
     },
     RenameTable {
         db: usize,
+        namespace: NamespaceId,
         from: String,
         to: String,
     },
     DropColumn {
         db: usize,
+        namespace: NamespaceId,
         table: String,
         column_index: usize,
     },
@@ -1905,11 +2165,7 @@ pub enum Insn {
         data: Box<AddColumnData>,
     },
     AlterColumn {
-        db: usize,
-        table: String,
-        column_index: usize,
-        definition: Box<turso_parser::ast::ColumnDefinition>,
-        rename: bool,
+        data: Box<AlterColumnData>,
     },
     /// Try to set the maximum page count for database P1 to the value in P3.
     /// Do not let the maximum page count fall below the current page count and
@@ -1957,6 +2213,7 @@ pub enum Insn {
     // If P1 is non-zero, the database constraint counter is incremented (deferred foreign key constraints).
     // Otherwise, if P1 is zero, the statement counter is incremented (immediate foreign key constraints).
     FkCounter {
+        constraint_info: Option<Box<ConstraintInfo>>,
         increment_value: isize,
         deferred: bool,
     },
@@ -2049,10 +2306,12 @@ pub enum Insn {
         hash_table_id: usize,
     },
 
-    /// Reset all matched_bits in a hash table to false.
-    /// Emitted at the start of each outer-loop iteration so that marks from
-    /// a previous probe pass don't suppress NULL-fill rows in the current one.
-    HashResetMatched {
+    /// Start a probe pass over an already built hash table.
+    /// The build side is built once (under `Once`) but probed again every time
+    /// the join runs inside an outer loop or a correlated subquery, so this
+    /// drops what the previous pass left behind: buffered and spilled probe
+    /// rows, grace progress, loaded build partitions and the matched marks.
+    HashProbeInit {
         hash_table_id: usize,
     },
 
@@ -2116,8 +2375,8 @@ pub enum Insn {
     VacuumInto {
         /// Database name to vacuum
         schema_name: String,
-        /// Destination file path for the vacuumed database
-        dest_path: String,
+        /// Register holding the destination file path for the vacuumed database
+        dest_reg: usize,
     },
 
     /// In-place VACUUM - compact the database (by writing to a temporary location and then copying
@@ -2273,6 +2532,10 @@ impl InsnVariants {
             InsnVariants::AggStep => execute::op_agg_step,
             InsnVariants::AggInverse => execute::op_agg_inverse,
             InsnVariants::AggFinal | InsnVariants::AggValue => execute::op_agg_final,
+            InsnVariants::AggContextLoad => execute::op_agg_context_load,
+            InsnVariants::AggContextStore => execute::op_agg_context_store,
+            InsnVariants::IvmSumStep => execute::op_ivm_sum_step,
+            InsnVariants::IvmSumFinalize => execute::op_ivm_sum_finalize,
             InsnVariants::SorterOpen => execute::op_sorter_open,
             InsnVariants::SorterInsert => execute::op_sorter_insert,
             InsnVariants::SorterSort => execute::op_sorter_sort,
@@ -2293,6 +2556,8 @@ impl InsnVariants {
             InsnVariants::Delete => execute::op_delete,
             InsnVariants::NewRowid => execute::op_new_rowid,
             InsnVariants::MustBeInt => execute::op_must_be_int,
+            InsnVariants::GetSubtype => execute::op_get_subtype,
+            InsnVariants::SetSubtype => execute::op_set_subtype,
             InsnVariants::SoftNull => execute::op_soft_null,
             InsnVariants::NoConflict => execute::op_no_conflict,
             InsnVariants::NotExists => execute::op_not_exists,
@@ -2312,6 +2577,8 @@ impl InsnVariants {
             InsnVariants::DropType => execute::op_drop_type,
             InsnVariants::AddSequence => execute::op_add_sequence,
             InsnVariants::DropSequence => execute::op_drop_sequence,
+            InsnVariants::AddNamespace => execute::op_add_namespace,
+            InsnVariants::DropNamespace => execute::op_drop_namespace,
             InsnVariants::SequenceComputeNext => execute::op_sequence_compute_next,
             InsnVariants::SetSequenceCurrval => execute::op_set_sequence_currval,
             InsnVariants::SequenceTrackAllocation => execute::op_sequence_track_allocation,
@@ -2373,7 +2640,7 @@ impl InsnVariants {
             InsnVariants::HashClose => execute::op_hash_close,
             InsnVariants::HashClear => execute::op_hash_clear,
             InsnVariants::HashMarkMatched => execute::op_hash_mark_matched,
-            InsnVariants::HashResetMatched => execute::op_hash_reset_matched,
+            InsnVariants::HashProbeInit => execute::op_hash_probe_init,
             InsnVariants::HashScanUnmatched => execute::op_hash_scan_unmatched,
             InsnVariants::HashNextUnmatched => execute::op_hash_next_unmatched,
             InsnVariants::HashGraceInit => execute::op_hash_grace_init,
@@ -2433,6 +2700,8 @@ impl Insn {
             | Self::DropType { .. }
             | Self::AddSequence { .. }
             | Self::DropSequence { .. }
+            | Self::AddNamespace { .. }
+            | Self::DropNamespace { .. }
             | Self::SequenceComputeNext { .. }
             | Self::SetSequenceCurrval { .. }
             | Self::SequenceTrackAllocation { .. }
