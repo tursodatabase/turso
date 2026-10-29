@@ -188,6 +188,7 @@ impl PostgreSQLTranslator {
             NodeRef::CreateEnumStmt(enum_stmt) => translate_create_enum(enum_stmt)?,
             NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain)?,
             NodeRef::CreateRoleStmt(role) => translate_create_role(role)?,
+            NodeRef::VariableSetStmt(set) if is_role_setting(&set.name) => translate_set_role(set)?,
             NodeRef::CopyStmt(_) => {
                 return Err(ParseError::ParseError(
                     "COPY is handled at the postgres frontend layer".to_string(),
@@ -5956,6 +5957,48 @@ struct PgForeignKey {
     on_update: Option<String>,
 }
 
+fn translate_set_role(stmt: &pg_query::protobuf::VariableSetStmt) -> Result<ast::Stmt, ParseError> {
+    use pg_query::protobuf::VariableSetKind;
+
+    if stmt.is_local {
+        return Err(ParseError::ParseError(
+            "SET LOCAL ROLE is not supported".to_string(),
+        ));
+    }
+    let role_name = match VariableSetKind::try_from(stmt.kind) {
+        Ok(VariableSetKind::VarReset | VariableSetKind::VarSetDefault) => None,
+        Ok(VariableSetKind::VarSetValue) => {
+            let [arg] = stmt.args.as_slice() else {
+                return Err(ParseError::ParseError(
+                    "SET ROLE takes one role name".to_string(),
+                ));
+            };
+            let role_name = role_name_arg(arg)
+                .ok_or_else(|| ParseError::ParseError("SET ROLE takes a role name".to_string()))?;
+            (role_name != "none").then_some(role_name)
+        }
+        _ => {
+            return Err(ParseError::ParseError(
+                "unsupported form of SET ROLE".to_string(),
+            ))
+        }
+    };
+    Ok(ast::Stmt::SetRole { role_name })
+}
+
+fn role_name_arg(arg: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::{a_const::Val, node::Node};
+
+    match &arg.node {
+        Some(Node::AConst(a_const)) => match &a_const.val {
+            Some(Val::Sval(name)) => Some(name.sval.clone()),
+            _ => None,
+        },
+        Some(Node::String(name)) => Some(name.sval.clone()),
+        _ => None,
+    }
+}
+
 fn translate_create_role(
     stmt: &pg_query::protobuf::CreateRoleStmt,
 ) -> Result<ast::Stmt, ParseError> {
@@ -6401,6 +6444,10 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
         _ => return None,
     };
 
+    // SET ROLE and RESET ROLE are their own statement.
+    if is_role_setting(&set_stmt.name) {
+        return None;
+    }
     let to = match VariableSetKind::try_from(set_stmt.kind).ok()? {
         VariableSetKind::VarSetValue => PgSetTo::Values(
             set_stmt
@@ -6419,6 +6466,10 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
         to,
         is_local: set_stmt.is_local,
     })
+}
+
+fn is_role_setting(name: &str) -> bool {
+    name.eq_ignore_ascii_case("role")
 }
 
 /// Returns true if the parse result is a RESET ALL statement.

@@ -131,6 +131,36 @@ fn roles_are_kept_after_vacuum() {
 }
 
 #[test]
+fn set_role_inside_transaction_block_fails() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("BEGIN").unwrap();
+
+    let error = conn.execute("SET ROLE alice").unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "SET ROLE inside a transaction block is not supported"
+    );
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(current_user(&conn), "postgres");
+}
+
+#[test]
+fn set_role_finds_role_created_by_another_connection_after_prepare() {
+    let db = TempDatabase::builder().build();
+    let conn1 = db.connect_postgres();
+    let conn2 = db.connect_postgres();
+    let mut set_role = conn1.prepare("SET ROLE alice").unwrap();
+
+    conn2.execute("CREATE ROLE alice").unwrap();
+
+    set_role.run_ignore_rows().unwrap();
+    assert_eq!(current_user(&conn1), "alice");
+}
+
+#[test]
 fn current_user_and_session_user_name_the_superuser() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();

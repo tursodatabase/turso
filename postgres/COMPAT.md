@@ -422,7 +422,7 @@ Upgrade is not supported.
 | Per user/database connection limits | ❌ Not supported | |
 | Predefined roles | ❌ Not supported | |
 | Privileges for setting configuration parameters | ❌ Not supported | |
-| ROLES | 🟡 Partial | `CREATE ROLE name` only, with no options; `pg_roles` lists the built-in `postgres` superuser, `pg_database_owner`, and created roles |
+| ROLES | 🟡 Partial | `CREATE ROLE name` (no options), `SET ROLE`, `RESET ROLE`; `pg_roles` lists the built-in `postgres` superuser, `pg_database_owner`, and created roles |
 | Row-level security | ❌ Not supported | |
 | SCRAM-SHA-256 authentication | ❌ Not supported | |
 | Search+bind mode operation for LDAP authentication | ❌ Not supported | |
