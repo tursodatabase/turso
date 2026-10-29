@@ -1193,6 +1193,45 @@ expect {
     lt|3
 }
 
+# Each component of a row value compares the way a single value does, so with
+# ENCODE -value, (c, d) > (1, 0) holds only where c is 1, like c > 1 holds for
+# no row and c = 1 for one. This holds with and without an index on (c, d).
+@requires strict "uses STRICT tables"
+test cmp-row-value-components-use-stored-value {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c neg, d integer) STRICT;
+    INSERT INTO t VALUES (1, 1, 5), (2, 5, 5), (3, 10, 5);
+    SELECT 'gt', id FROM t WHERE (c, d) > (1, 0) ORDER BY id;
+    SELECT 'gt-none', id FROM t WHERE (c, d) > (1, 9) ORDER BY id;
+    SELECT 'lt', id FROM t WHERE (c, d) < (5, 9) ORDER BY id;
+    SELECT 'eq', id FROM t WHERE (c, d) = (5, 5) ORDER BY id;
+    SELECT 'in', id FROM t WHERE (c, d) IN ((5, 5), (7, 0)) ORDER BY id;
+    SELECT 'subquery', id FROM t WHERE (c, d) >= (SELECT 5, 5) ORDER BY id;
+    CREATE INDEX t_cd ON t(c, d);
+    SELECT 'gt', id FROM t WHERE (c, d) > (1, 0) ORDER BY id;
+    SELECT 'gt-none', id FROM t WHERE (c, d) > (1, 9) ORDER BY id;
+    SELECT 'lt', id FROM t WHERE (c, d) < (5, 9) ORDER BY id;
+    SELECT 'eq', id FROM t WHERE (c, d) = (5, 5) ORDER BY id;
+    SELECT 'in', id FROM t WHERE (c, d) IN ((5, 5), (7, 0)) ORDER BY id;
+    SELECT 'subquery', id FROM t WHERE (c, d) >= (SELECT 5, 5) ORDER BY id;
+}
+expect {
+    gt|1
+    lt|2
+    lt|3
+    eq|2
+    in|2
+    subquery|1
+    subquery|2
+    gt|1
+    lt|2
+    lt|3
+    eq|2
+    in|2
+    subquery|1
+    subquery|2
+}
+
 # A value compared with a date column goes through the date's ENCODE, so a
 # malformed date fails the same way in a table scan and in an index search.
 @requires strict "uses STRICT tables"
