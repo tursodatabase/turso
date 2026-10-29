@@ -64,7 +64,7 @@ RESET ROLE
 
 **Description:**
 
-`SET ROLE` makes `role_name` the current role of the session. Statements are
+`SET ROLE` makes `role_name` the current role of the session. Privileges are
 then checked against that role. `current_user` and `current_role` return it,
 and `session_user` keeps returning the role that the session logged in as.
 
@@ -86,10 +86,10 @@ keeps the role, and `DISCARD ALL` resets it.
 
 **Notes:**
 
-Ownership, `GRANT` and table privileges are not supported yet. A role that is
-not a superuser may read the rows of every table, but it cannot insert,
-update, delete or truncate rows, call `nextval` or `setval`, create, alter or
-drop objects, create roles, or `COPY FROM` a file.
+Ownership and `GRANT` are not supported yet. A role that is not a superuser
+therefore has no privileges on tables, views, or sequences, and cannot create
+or drop objects, create roles, or `COPY FROM` a file. It can still run
+statements that use no database objects, such as `SELECT 1`, and switch roles.
 
 **Examples:**
 
@@ -110,11 +110,11 @@ SELECT current_user, session_user;
 ```
 
 ```sql
-DROP TABLE accounts;
+SELECT * FROM accounts;
 ```
 
 ```
-ERROR:  must be owner of table accounts
+ERROR:  permission denied for table accounts
 ```
 
 ```sql

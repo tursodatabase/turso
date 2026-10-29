@@ -402,6 +402,7 @@ fn permission_denied_message(denial: &PermissionDenied) -> String {
             format!("permission denied to set role \"{name}\"")
         }
         (_, Object::File(_)) => "permission denied to COPY from a file".into(),
+        (_, Object::Storage) => "permission denied to access database storage".into(),
         (_, object) => format!("permission denied for {}", object_name(object)),
     }
 }

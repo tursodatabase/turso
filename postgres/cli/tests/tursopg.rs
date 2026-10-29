@@ -451,6 +451,27 @@ fn role_without_privileges_cannot_load_extensions() {
 }
 
 #[test]
+fn role_without_privileges_cannot_read_storage_through_debug_functions() {
+    for query in [
+        "SELECT count(*) FROM btree_dump('t');",
+        "SELECT count(*) FROM sqlite_dbpage;",
+    ] {
+        let input = format!(
+            "CREATE TABLE t (x text);\n\
+             INSERT INTO t VALUES ('secret');\n\
+             CREATE ROLE alice;\n\
+             SET ROLE alice;\n\
+             {query}\n"
+        );
+        let output = stdout(&run_tursopg(input.as_bytes()));
+        assert!(
+            output.contains("permission denied for function"),
+            "{query} should be denied, got: {output}"
+        );
+    }
+}
+
+#[test]
 fn role_without_privileges_can_use_table_valued_functions() {
     let output = run_tursopg(
         b"CREATE ROLE alice;\n\
