@@ -133,7 +133,7 @@ set test_files {
   collate5             fail
   collate6             fail
   collate7             fail
-  collate8             fail
+  collate8             pass
   collate9             fail
   collateA             pass
   collateB             pass
@@ -212,7 +212,7 @@ set test_files {
   e_fkey               fail
   e_insert             fail
   e_reindex            fail
-  e_resolve            fail
+  e_resolve            pass
   e_select             fail
   e_select2            pass
   e_totalchanges       fail
@@ -310,14 +310,14 @@ set test_files {
   init                 fail
   insert               fail
   insert2              pass
-  insert3              fail
+  insert3              pass
   insert4              fail
   insert5              pass
   instr                pass
   intarray             fail
   interrupt            fail
   interrupt2           fail
-  intpkey              fail
+  intpkey              pass
   intreal              fail
   io                   fail
   istrue               fail
@@ -410,7 +410,7 @@ set test_files {
   notify3              fail
   notnull              fail
   notnull2             fail
-  null                 fail
+  null                 pass
   nulls1               fail
   numcast              fail
   numindex1            pass
@@ -570,7 +570,7 @@ set test_files {
   temptable2           fail
   temptable3           fail
   temptrigger          fail
-  timediff1            fail
+  timediff1            pass
   tkt-02a8e81d44       pass
   tkt-18458b1a         pass
   tkt-26ff0c2d1e       pass
@@ -688,7 +688,7 @@ set test_files {
   tkt3541              pass
   tkt3554              pass
   tkt3581              pass
-  tkt35xx              fail
+  tkt35xx              pass
   tkt3630              pass
   tkt3718              fail
   tkt3731              pass

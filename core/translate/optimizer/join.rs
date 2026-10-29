@@ -18,11 +18,12 @@ use crate::{
     schema::Schema,
     stats::AnalyzeStats,
     translate::{
+        emitter::Resolver,
         expr::expr_references_subquery_id,
         optimizer::{
             access_method::{
-                estimate_hash_join_cost, tables_in_equal_test, try_hash_join_access_method,
-                AccessMethodParams,
+                estimate_hash_join_cost, tables_in_hashable_equal_test,
+                try_hash_join_access_method, AccessMethodParams,
             },
             cost::{
                 estimate_rows_per_seek, index_access_is_unique_point_lookup,
@@ -35,12 +36,12 @@ use crate::{
             HashJoinKey, HashJoinType, JoinInfo, JoinOrderMember, JoinOrigin, JoinedTable,
             NonFromClauseSubquery, SubqueryOrigin, SubqueryState, TableReferences, WhereTerm,
         },
-        planner::{table_mask_from_expr, TableMask},
+        planner::{expr_reads_an_outer_query, table_mask_from_expr, TableMask},
     },
     LimboError, Result,
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 /// Small bag of planner context that needs to flow through join enumeration.
 ///
 /// Keeping this as a struct avoids threading more ad-hoc parameters through the
@@ -51,16 +52,21 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub cost_limit: Option<Cost>,
     /// Whether this table read may build an automatic index.
     pub allow_automatic_index: bool,
+    pub resolver: &'a Resolver<'a>,
 }
 
 impl<'a> JoinPlanningContext<'a> {
     /// Convenience constructor used by the default planner entrypoints and tests.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn default_with_order_target(maybe_order_target: Option<&'a OrderTarget>) -> Self {
+    fn default_with_order_target(
+        maybe_order_target: Option<&'a OrderTarget>,
+        resolver: &'a Resolver<'a>,
+    ) -> Self {
         Self {
             maybe_order_target,
             cost_limit: None,
             allow_automatic_index: true,
+            resolver,
         }
     }
 }
@@ -810,7 +816,6 @@ fn join_lhs_and_rhs<'a>(
             let hash_can_replace_build_index =
                 can_replace_build_index_with_hash(rhs_constraints, build_read_is_in_seek);
 
-            let build_table_is_last = build_table_idx == last_lhs_table_idx;
             // The unmatched-right pass can set every earlier table cursor to NULL.
             // Hash materialization makes these values independent of that cursor state.
             let build_is_left_of_right_or_full_join =
@@ -870,6 +875,7 @@ fn join_lhs_and_rhs<'a>(
                     probe_multiplier,
                     hash_can_replace_build_index,
                     subqueries,
+                    joined_tables,
                     params,
                 )? {
                     let mut hash_join_method = hash_join_method;
@@ -892,7 +898,6 @@ fn join_lhs_and_rhs<'a>(
                             &prior_mask,
                             &prior_hash_build_mask,
                         ) || build_table_is_prior_probe
-                            || !build_table_is_last
                             || build_read_is_in_seek
                             || build_access_method_uses_constraints;
                         let estimated_materialized_rows = input_cardinality;
@@ -903,10 +908,19 @@ fn join_lhs_and_rhs<'a>(
                         let build_is_eligible =
                             build_am_is_plain_table_scan || needs_materialization;
 
+                        let materialization_reads_an_outer_query = needs_materialization
+                            && materialized_build_input_reads_an_outer_query(
+                                where_clause,
+                                table_references,
+                                subqueries,
+                                &lhs_mask,
+                            )?;
+
                         hash_join_allowed = build_is_eligible
                             && (!needs_materialization || build_has_rowid)
                             && (!materialization_too_large
-                                || *join_type == HashJoinType::FullOuter);
+                                || *join_type == HashJoinType::FullOuter)
+                            && !materialization_reads_an_outer_query;
 
                         if hash_join_allowed {
                             let should_materialize = needs_materialization && build_has_rowid;
@@ -1096,6 +1110,23 @@ fn join_lhs_and_rhs<'a>(
     }))
 }
 
+fn materialized_build_input_reads_an_outer_query(
+    where_clause: &[WhereTerm],
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+    build_input_mask: &TableMask,
+) -> Result<bool> {
+    for term in where_clause.iter() {
+        let term_mask = table_mask_from_expr(&term.expr, table_references, subqueries)?;
+        if build_input_mask.contains_all_set_bits_of(&term_mask)
+            && expr_reads_an_outer_query(&term.expr, table_references, subqueries)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn can_replace_build_index_with_hash(
     probe_constraints: &TableConstraints,
     build_read_is_in_seek: bool,
@@ -1222,11 +1253,12 @@ pub fn compute_best_join_order<'a>(
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     schema: &Schema,
+    resolver: &Resolver,
 ) -> Result<Option<BestJoinOrderResult>> {
     compute_best_join_order_with_context(
         joined_tables,
         initial_input_cardinality,
-        JoinPlanningContext::default_with_order_target(maybe_order_target),
+        JoinPlanningContext::default_with_order_target(maybe_order_target, resolver),
         constraints,
         base_table_rows,
         access_methods_arena,
@@ -1272,7 +1304,12 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // The DP algorithm has O(2^n) complexity which becomes prohibitively slow
     // beyond ~12 tables. The greedy algorithm is O(n²) and produces good
     // (though not always optimal) plans.
-    let where_terms = build_where_term_info(where_clause, table_references, subqueries)?;
+    let where_terms = build_where_term_info(
+        where_clause,
+        table_references,
+        subqueries,
+        planning_context.resolver,
+    )?;
     if num_tables > GREEDY_JOIN_THRESHOLD {
         return compute_greedy_join_order(
             joined_tables,
@@ -1416,60 +1453,20 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
     // If there are outer joins in the plan, ensure correct ordering.
     let (left_join_illegal_map, required_lhs_by_table) = {
-        let ordering_constrained_count = joined_tables
-            .iter()
-            .filter(|t| {
-                t.join_info
-                    .as_ref()
-                    .is_some_and(|j| j.is_ordering_constrained())
-            })
-            .count();
-        let has_full_outer = joined_tables
-            .iter()
-            .any(|t| t.join_info.as_ref().is_some_and(|j| j.is_full_outer()));
-        if ordering_constrained_count == 0 && !has_full_outer {
+        let required_lhs_by_table = required_lhs_by_table(joined_tables)?;
+        if required_lhs_by_table.iter().all(TableMask::is_empty) {
             (None, None)
         } else {
-            // map from rhs table index to lhs table index
-            let mut left_join_illegal_map: HashMap<usize, TableMask> =
-                HashMap::with_capacity_and_hasher(ordering_constrained_count, Default::default());
-            let mut required_lhs_by_table = vec![TableMask::default(); num_tables];
-            for (i, _) in joined_tables.iter().enumerate() {
-                for (j, joined_table) in joined_tables.iter().enumerate().skip(i + 1) {
-                    // LEFT/FULL OUTER, SEMI, and ANTI joins all require the RHS table
-                    // to appear after the LHS table in the join order.
-                    if joined_table
-                        .join_info
-                        .as_ref()
-                        .is_some_and(|j| j.is_ordering_constrained())
-                    {
-                        required_lhs_by_table[j].set(i)?;
-                        // bitwise OR the masks
-                        if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
-                            illegal_lhs.set(j)?;
-                        } else {
-                            let mut mask = TableMask::default();
-                            mask.set(j)?;
-                            left_join_illegal_map.insert(i, mask);
-                        }
-                    }
-                }
-            }
-            // A RIGHT or FULL JOIN is a reordering barrier in both directions.
-            // A later table cannot move before its right operand because the
-            // unmatched-right scan runs after the normal loops.
-            for (k, t) in joined_tables.iter().enumerate() {
-                if !t.join_info.as_ref().is_some_and(JoinInfo::keeps_right_rows) {
-                    continue;
-                }
-                for (j, required_lhs) in required_lhs_by_table.iter_mut().enumerate().skip(k + 1) {
-                    required_lhs.set(k)?;
-                    if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&k) {
-                        illegal_lhs.set(j)?;
+            // map from lhs table index to the rhs tables that must come after it
+            let mut left_join_illegal_map: HashMap<usize, TableMask> = HashMap::default();
+            for (rhs, required_lhs) in required_lhs_by_table.iter().enumerate() {
+                for lhs in required_lhs.iter() {
+                    if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&lhs) {
+                        illegal_lhs.set(rhs)?;
                     } else {
                         let mut mask = TableMask::default();
-                        mask.set(j)?;
-                        left_join_illegal_map.insert(k, mask);
+                        mask.set(rhs)?;
+                        left_join_illegal_map.insert(lhs, mask);
                     }
                 }
             }
@@ -1767,23 +1764,11 @@ fn compute_greedy_join_order<'a>(
         return Ok(None);
     }
 
-    // Outer join RHS tables require all preceding tables to be joined first.
-    let left_join_deps: HashMap<usize, TableMask> = joined_tables
-        .iter()
+    let left_join_deps: HashMap<usize, TableMask> = required_lhs_by_table(joined_tables)?
+        .into_iter()
         .enumerate()
-        .filter(|(_, t)| {
-            t.join_info
-                .as_ref()
-                .is_some_and(|ji| ji.is_ordering_constrained())
-        })
-        .map(|(j, _)| {
-            let mut required = TableMask::default();
-            for k in 0..j {
-                required.set(k)?;
-            }
-            Ok((j, required))
-        })
-        .collect::<Result<_>>()?;
+        .filter(|(_, required)| !required.is_empty())
+        .collect();
 
     let mut remaining: TableMask = (0..num_tables).try_collect()?;
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
@@ -1916,6 +1901,36 @@ fn compute_greedy_join_order<'a>(
         best_plan: current_plan.expect("loop invariant: current_plan always Some"),
         best_ordered_plan: None, // Greedy doesn't track ordered variants
     }))
+}
+
+/// For each table, the tables that must come before it in any join order.
+fn required_lhs_by_table(joined_tables: &[JoinedTable]) -> Result<Vec<TableMask>> {
+    let mut required_lhs_by_table = vec![TableMask::default(); joined_tables.len()];
+    for (j, joined_table) in joined_tables.iter().enumerate() {
+        // LEFT/FULL OUTER, SEMI, and ANTI joins all require the RHS table
+        // to appear after the LHS table in the join order.
+        if joined_table
+            .join_info
+            .as_ref()
+            .is_some_and(|j| j.is_ordering_constrained())
+        {
+            for i in 0..j {
+                required_lhs_by_table[j].set(i)?;
+            }
+        }
+    }
+    // A RIGHT or FULL JOIN is a reordering barrier in both directions.
+    // A later table cannot move before its right operand because the
+    // unmatched-right scan runs after the normal loops.
+    for (k, t) in joined_tables.iter().enumerate() {
+        if !t.join_info.as_ref().is_some_and(JoinInfo::keeps_right_rows) {
+            continue;
+        }
+        for required_lhs in required_lhs_by_table.iter_mut().skip(k + 1) {
+            required_lhs.set(k)?;
+        }
+    }
+    Ok(required_lhs_by_table)
 }
 
 /// Select the best starting table for greedy join ordering by evaluating indexed-seek benefits.
@@ -2274,25 +2289,28 @@ fn build_where_term_info(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
+    resolver: &Resolver,
 ) -> Result<Vec<WhereTermInfo>> {
     where_clause
         .iter()
         .map(|term| {
+            let equal_tables = if term.consumed {
+                None
+            } else {
+                tables_in_hashable_equal_test(&term.expr, table_references, resolver)?
+            };
             Ok(WhereTermInfo {
                 table_mask: table_mask_from_expr(&term.expr, table_references, subqueries)?,
                 // FIXME: The row cost also includes one simple condition. Give row work
                 // and condition work separate costs so this does not need to subtract one.
                 extra_steps: where_expr_steps(&term.expr).saturating_sub(1),
-                equal_tables: (!term.consumed)
-                    .then(|| tables_in_equal_test(&term.expr))
-                    .flatten()
-                    .map(|(left, right)| {
-                        (
-                            left,
-                            right,
-                            term.origin.join_origin().and_then(JoinOrigin::outer_table),
-                        )
-                    }),
+                equal_tables: equal_tables.map(|(left, right)| {
+                    (
+                        left,
+                        right,
+                        term.origin.join_origin().and_then(JoinOrigin::outer_table),
+                    )
+                }),
             })
         })
         .collect()
@@ -2380,10 +2398,11 @@ fn generate_join_bitmasks(table_number_max_exclusive: usize, how_many: usize) ->
 mod tests {
     use std::{collections::VecDeque, sync::Arc};
 
-    use turso_parser::ast::{self, Expr, Operator, TableInternalId};
+    use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
 
     use super::*;
     use crate::alloc::TursoSliceExt;
+    use crate::namespace::NamespaceRef;
     use crate::{
         schema::{
             BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn,
@@ -2391,10 +2410,12 @@ mod tests {
         },
         stats::AnalyzeStats,
         translate::{
+            collate::CollationSeq,
             optimizer::{
                 access_method::AccessMethodParams,
                 constraints::{constraints_from_where_clause, BinaryExprSide, RangeConstraintRef},
                 cost_params::DEFAULT_PARAMS,
+                order::{ColumnOrder, ColumnTarget, EliminatesSortBy, OrderTargetPurpose},
             },
             plan::{
                 ColumnUsedMask, IterationDirection, JoinInfo, JoinType, Operation, TableReferences,
@@ -2452,6 +2473,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         let mut access_methods = Vec::new();
@@ -2472,6 +2494,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .unwrap()
@@ -2496,6 +2519,7 @@ mod tests {
                 join_type: JoinType::Inner,
                 using: vec![],
                 no_reorder: false,
+                lateral: false,
             }),
             table_id_counter.next(),
         );
@@ -2521,6 +2545,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -2570,7 +2595,12 @@ mod tests {
             Operator::Or,
             Box::new(check(second_id)),
         ))];
-        let where_terms = build_where_term_info(&two_table_where, &table_references, &[])?;
+        let where_terms = build_where_term_info(
+            &two_table_where,
+            &table_references,
+            &[],
+            &Resolver::empty_for_tests(),
+        )?;
 
         let mut joined_mask = TableMask::default();
         joined_mask.set(0)?;
@@ -2588,7 +2618,12 @@ mod tests {
         ));
         term.origin = WhereTermOrigin::Join(JoinOrigin::Outer(second_id));
         let outer_join_where = vec![term];
-        let where_terms = build_where_term_info(&outer_join_where, &table_references, &[])?;
+        let where_terms = build_where_term_info(
+            &outer_join_where,
+            &table_references,
+            &[],
+            &Resolver::empty_for_tests(),
+        )?;
 
         let mut joined_mask = TableMask::default();
         joined_mask.set(0)?;
@@ -2638,6 +2673,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )?;
         let base_table_rows =
             [1.0, 1_000_000.0, 10.0, 10.0].map(RowCountEstimate::HardcodedFallback);
@@ -2658,6 +2694,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )?
         .unwrap()
         .best_plan;
@@ -2690,6 +2727,7 @@ mod tests {
         super::super::constraints::add_implied_column_equalities(
             &mut where_clause,
             &table_references,
+            &Resolver::empty_for_tests(),
         )?;
 
         assert_eq!(where_clause.len(), 3);
@@ -2721,6 +2759,7 @@ mod tests {
         super::super::constraints::add_implied_column_equalities(
             &mut where_clause,
             &table_references,
+            &Resolver::empty_for_tests(),
         )?;
 
         assert_eq!(where_clause.len(), 2);
@@ -2761,6 +2800,7 @@ mod tests {
         super::super::constraints::add_implied_column_equalities(
             &mut where_clause,
             &table_references,
+            &Resolver::empty_for_tests(),
         )?;
 
         assert_eq!(where_clause.len(), 2);
@@ -2817,6 +2857,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -2903,6 +2944,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -2923,6 +2965,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         assert!(result.is_none());
@@ -2946,6 +2989,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -2968,6 +3012,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .unwrap();
@@ -2976,6 +3021,77 @@ mod tests {
         let (iter_dir, _, constraint_refs) = _as_btree(access_method);
         assert!(constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
+    }
+
+    #[test]
+    fn full_rowid_scan_costs_the_same_with_and_without_order_by() {
+        let t1 = _create_btree_table(
+            "t1",
+            vec![
+                _create_column_rowid_alias("id"),
+                _create_column_of_type("a", Type::Integer),
+            ],
+        );
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = vec![_create_table_reference(t1, None, table_id_counter.next())];
+        let order_by_id = OrderTarget {
+            columns: vec![ColumnOrder {
+                table_id: joined_tables[0].internal_id,
+                target: ColumnTarget::Column(0),
+                order: SortOrder::Asc,
+                collation: CollationSeq::Binary,
+                nulls_order: None,
+            }],
+            purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
+        };
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let available_indexes = AvailableIndexes::default();
+        let schema = empty_schema();
+        let table_constraints = constraints_from_where_clause(
+            &[],
+            &table_references,
+            &available_indexes,
+            &[],
+            &schema,
+            &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
+        )
+        .unwrap();
+        let base_table_rows = default_base_rows(1);
+
+        let plan_cost = |order_target: Option<&OrderTarget>| {
+            let mut access_methods_arena = Vec::new();
+            let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
+                table_references.joined_tables(),
+                1.0,
+                order_target,
+                &table_constraints,
+                &base_table_rows,
+                &mut access_methods_arena,
+                &mut [],
+                &[],
+                &[],
+                &DEFAULT_PARAMS,
+                &AnalyzeStats::default(),
+                &available_indexes,
+                &table_references,
+                &schema,
+                &Resolver::empty_for_tests(),
+            )
+            .unwrap()
+            .unwrap();
+            let (_, index, constraint_refs) = _as_btree(&access_methods_arena[best_plan.data[0].1]);
+            assert!(index.is_none());
+            assert!(constraint_refs.is_empty());
+            best_plan.cost.0
+        };
+
+        let unordered_cost = plan_cost(None);
+        let ordered_cost = plan_cost(Some(&order_by_id));
+        assert!(
+            (ordered_cost - unordered_cost).abs() < 1e-9,
+            "ordered full rowid scan costs {ordered_cost}, unordered costs {unordered_cost}"
+        );
     }
 
     #[test]
@@ -3001,6 +3117,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -3023,6 +3140,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -3064,13 +3182,18 @@ mod tests {
             name: "sqlite_autoindex_test_table_1".to_string(),
             table_name: "test_table".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn::new("id", 0)],
+            columns: crate::alloc::vec![IndexColumn::new(
+                "id",
+                0,
+                crate::translate::collate::CollationSeq::Binary
+            )],
             unique: true,
             ephemeral: false,
             root_page: 1,
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
         available_indexes.insert_for_table_name(
             table_references.joined_tables(),
@@ -3085,6 +3208,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         // SELECT * FROM test_table WHERE id = 42
@@ -3106,6 +3230,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -3140,6 +3265,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -3154,13 +3280,18 @@ mod tests {
             name: "index1".to_string(),
             table_name: "table1".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn::new("id", 0)],
+            columns: crate::alloc::vec![IndexColumn::new(
+                "id",
+                0,
+                crate::translate::collate::CollationSeq::Binary
+            )],
             unique: true,
             ephemeral: false,
             root_page: 1,
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
         available_indexes.insert_for_table_name(&joined_tables, "table1", VecDeque::from([index1]));
 
@@ -3181,6 +3312,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -3201,6 +3333,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -3261,6 +3394,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -3270,6 +3404,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -3289,13 +3424,18 @@ mod tests {
                     name: index_name,
                     where_clause: None,
                     table_name: table_name.to_string(),
-                    columns: crate::alloc::vec![IndexColumn::new("id", 0)],
+                    columns: crate::alloc::vec![IndexColumn::new(
+                        "id",
+                        0,
+                        crate::translate::collate::CollationSeq::Binary
+                    )],
                     unique: true,
                     ephemeral: false,
                     root_page: 1,
                     has_rowid: true,
                     index_method: None,
                     on_conflict: None,
+                    constraint_name: None,
                 });
                 available_indexes.insert_for_table_name(
                     &joined_tables,
@@ -3307,25 +3447,35 @@ mod tests {
             name: "orders_customer_id_idx".to_string(),
             table_name: "orders".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn::new("customer_id", 1)],
+            columns: crate::alloc::vec![IndexColumn::new(
+                "customer_id",
+                1,
+                crate::translate::collate::CollationSeq::Binary
+            )],
             unique: false,
             ephemeral: false,
             root_page: 1,
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
         let order_id_idx = Arc::new(Index {
             name: "order_items_order_id_idx".to_string(),
             table_name: "order_items".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn::new("order_id", 1)],
+            columns: crate::alloc::vec![IndexColumn::new(
+                "order_id",
+                1,
+                crate::translate::collate::CollationSeq::Binary
+            )],
             unique: false,
             ephemeral: false,
             root_page: 1,
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
 
         available_indexes.push_front_for_table_name(&joined_tables, "orders", customer_id_idx);
@@ -3366,6 +3516,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -3386,6 +3537,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -3456,6 +3608,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -3465,6 +3618,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -3495,6 +3649,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -3515,6 +3670,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .unwrap();
@@ -3597,6 +3753,7 @@ mod tests {
                         join_type: JoinType::Inner,
                         using: vec![],
                         no_reorder: false,
+                        lateral: false,
                     }),
                     table_id_counter.next(),
                 )
@@ -3607,6 +3764,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ));
@@ -3636,6 +3794,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -3656,6 +3815,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -3738,6 +3898,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -3759,6 +3920,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .unwrap();
@@ -3817,13 +3979,17 @@ mod tests {
             name: "idx_xy".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn::new("x", 0), IndexColumn::new("y", 1),],
+            columns: crate::alloc::vec![
+                IndexColumn::new("x", 0, crate::translate::collate::CollationSeq::Binary),
+                IndexColumn::new("y", 1, crate::translate::collate::CollationSeq::Binary),
+            ],
             unique: false,
             root_page: 2,
             ephemeral: false,
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
 
         let mut available_indexes = AvailableIndexes::default();
@@ -3835,11 +4001,12 @@ mod tests {
             table,
             internal_id: table_id_counter.next(),
             identifier: "t1".to_string(),
+            has_alias: false,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
             indexed: None,
         });
@@ -3870,6 +4037,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -3890,6 +4058,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .unwrap();
@@ -3915,9 +4084,9 @@ mod tests {
             table_name: "t1".to_string(),
             where_clause: None,
             columns: crate::alloc::vec![
-                IndexColumn::new("c1", 0),
-                IndexColumn::new("c2", 1),
-                IndexColumn::new("c3", 2),
+                IndexColumn::new("c1", 0, crate::translate::collate::CollationSeq::Binary),
+                IndexColumn::new("c2", 1, crate::translate::collate::CollationSeq::Binary),
+                IndexColumn::new("c3", 2, crate::translate::collate::CollationSeq::Binary),
             ],
             unique: false,
             root_page: 2,
@@ -3925,6 +4094,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
@@ -3933,11 +4103,12 @@ mod tests {
             table,
             internal_id: table_id_counter.next(),
             identifier: "t1".to_string(),
+            has_alias: false,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
             indexed: None,
         });
@@ -3984,6 +4155,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -4004,6 +4176,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .unwrap();
@@ -4040,6 +4213,7 @@ mod tests {
             unique: false,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
@@ -4048,11 +4222,12 @@ mod tests {
             table,
             internal_id: table_id_counter.next(),
             identifier: "t1".to_string(),
+            has_alias: false,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
             indexed: None,
         });
@@ -4113,6 +4288,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -4133,6 +4309,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .unwrap();
@@ -4216,7 +4393,13 @@ mod tests {
             where_clause: None,
             columns: columns
                 .iter()
-                .map(|(name, pos_in_table)| IndexColumn::new((*name).to_string(), *pos_in_table))
+                .map(|(name, pos_in_table)| {
+                    IndexColumn::new(
+                        (*name).to_string(),
+                        *pos_in_table,
+                        crate::translate::collate::CollationSeq::Binary,
+                    )
+                })
                 .try_collect()
                 .unwrap(),
             unique,
@@ -4225,6 +4408,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         })
     }
 
@@ -4241,12 +4425,13 @@ mod tests {
             unmatched_right_rows_plan: None,
             table,
             identifier: name,
+            has_alias: false,
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
             indexed: None,
         }
@@ -4291,6 +4476,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -4348,6 +4534,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -4362,13 +4549,18 @@ mod tests {
             name: "idx_t2_a".to_string(),
             table_name: "t2".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn::new("a", 0)],
+            columns: crate::alloc::vec![IndexColumn::new(
+                "a",
+                0,
+                crate::translate::collate::CollationSeq::Binary
+            )],
             unique: false, // Non-unique index
             ephemeral: false,
             root_page: 2,
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
         available_indexes.insert_for_table_name(&joined_tables, "t2", VecDeque::from([index_t2_a]));
 
@@ -4388,6 +4580,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -4408,6 +4601,7 @@ mod tests {
             &available_indexes,
             &table_references,
             &schema,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -4471,6 +4665,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -4489,6 +4684,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         let joined_before_probe_mask: TableMask = [0].into_iter().try_collect().unwrap();
@@ -4512,6 +4708,7 @@ mod tests {
             1.0,
             true,
             &[],
+            table_references.joined_tables(),
             &DEFAULT_PARAMS,
         )
         .unwrap()
@@ -4532,6 +4729,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
         assert!(!can_replace_build_index_with_hash(&constraints[1], false));

@@ -544,8 +544,8 @@ unsafe fn compare_printf(ctx: &mut Ctx, rng: &mut Rng, sqlite: &Api, turso: &Api
             (turso.sqlite3_snprintf)(n, buf_t.as_mut_ptr() as *mut c_char, c"'%q'".as_ptr(), tp);
         ctx.check(
             "snprintf returns buf",
-            r_s == buf_s.as_mut_ptr() as *mut c_char,
-            r_t == buf_t.as_mut_ptr() as *mut c_char,
+            std::ptr::eq(r_s, buf_s.as_mut_ptr().cast::<c_char>()),
+            std::ptr::eq(r_t, buf_t.as_mut_ptr().cast::<c_char>()),
         );
         if full.len() < n as usize {
             ctx.check(&format!("snprintf n={n}"), buf_s, buf_t);

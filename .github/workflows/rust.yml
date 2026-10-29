@@ -365,6 +365,12 @@ jobs:
           - name: Faultless
             iterations: 10
             args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --io-backend=memory"
+          - name: SavepointStress
+            iterations: 5
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile savepoint_stress --io-backend=memory"
+          - name: WriteStress
+            iterations: 4
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_stress --io-backend=memory"
           - name: IOUring InsertHeavySpill
             iterations: 5
             args: "--io-backend=io-uring --maximum-tests 1000 --profile=write_heavy_spill"
@@ -465,7 +471,7 @@ jobs:
       matrix:
         # Each profile focuses a different workload so CI covers more than the
         # default statement distribution.
-        profile: [balanced, ddl, triggers, writes, correlated-subqueries, joins]
+        profile: [balanced, ddl, triggers, writes, correlated-subqueries, joins, ordered-aggregates]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -492,6 +498,56 @@ jobs:
               || exit_code=$?
             if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
               echo "::error::Differential fuzzer timed out after ${DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS} seconds. Seed: $seed. Profile: ${{ matrix.profile }}."
+            fi
+            if [ "$exit_code" -ne 0 ]; then
+              exit "$exit_code"
+            fi
+          done
+
+  # Same fixed-seed idea as differential-fuzzer above, but with materialized
+  # views turned on (--ivm): the fuzzer creates views over the generated
+  # tables and checks that they stay in sync with a plain re-query. Seeds are
+  # hand-picked, not just 1..6 like the non-IVM job: a few known pre-existing
+  # main bugs unrelated to views (collation precedence in `x IN (subquery)`
+  # #6088, a 3+-arm compound dropping the first arm's collation #6407, and
+  # some INSERT/UPDATE OR FAIL differences vs SQLite) can make a seed fail
+  # here for reasons that have nothing to do with the view code. Widen this
+  # list with more seeds once those bugs are fixed.
+  differential-fuzzer-ivm:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    env:
+      DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [balanced, ddl, triggers, writes, correlated-subqueries, joins]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build differential_fuzzer
+        run: cargo build -p differential-fuzzer --bin differential_fuzzer
+      - name: Run differential_fuzzer in IVM mode on a fixed set of seeds
+        run: |
+          # Reproduce a failure locally with:
+          #   cargo run -p differential-fuzzer --bin differential_fuzzer -- \
+          #     --seed <seed> --profile ${{ matrix.profile }} -n 1000 --ivm
+          for seed in 1 2 3; do
+            exit_code=0
+            # One slow statement must not consume the complete CI job.
+            timeout --kill-after=10s "${DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS}s" \
+              target/debug/differential_fuzzer \
+                --seed "$seed" --profile ${{ matrix.profile }} -n 1000 --ivm \
+              || exit_code=$?
+            if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
+              echo "::error::Differential fuzzer (IVM) timed out after ${DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS} seconds. Seed: $seed. Profile: ${{ matrix.profile }}."
             fi
             if [ "$exit_code" -ne 0 ]; then
               exit "$exit_code"

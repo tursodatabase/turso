@@ -1,0 +1,233 @@
+# SET, SHOW, RESET and DISCARD ALL of configuration parameters through the
+# PostgreSQL frontend.
+
+@database :memory:
+
+test set-and-show-custom-parameter {
+    SET app.user_id = '42';
+    SHOW app.user_id;
+    SET app.user_id TO 43;
+    SHOW app.user_id;
+    SET app.user_id = some_name;
+    SHOW app.user_id;
+    SELECT current_setting('app.user_id');
+}
+expect {
+    42
+    43
+    some_name
+    some_name
+}
+
+test set-custom-parameter-name-is-not-case-sensitive {
+    SET "App.Mixed_Case" = 'v';
+    SHOW app.mixed_case;
+}
+expect {
+    v
+}
+
+test set-custom-parameter-with-two-values-errors {
+    SET app.list = a, b;
+}
+@sqlstate 22023
+expect error {
+    SET app\.list takes only one argument
+}
+
+test show-custom-parameter-set-by-set-config {
+    SELECT set_config('app.from_function', 'v', false);
+    SHOW app.from_function;
+}
+expect {
+    v
+    v
+}
+
+test show-undefined-custom-parameter-errors {
+    SHOW app.never_set;
+}
+@sqlstate 42704
+expect error {
+    unrecognized configuration parameter "app\.never_set"
+}
+
+test set-local-custom-parameter-ends-at-commit {
+    SET app.mode = 'session';
+    BEGIN;
+    SET LOCAL app.mode = 'local';
+    SHOW app.mode;
+    COMMIT;
+    SHOW app.mode;
+}
+expect {
+    local
+    session
+}
+
+test set-custom-parameter-is-undone-by-rollback {
+    SET app.mode = 'before';
+    BEGIN;
+    SET app.mode = 'in transaction';
+    ROLLBACK;
+    SHOW app.mode;
+}
+expect {
+    before
+}
+
+test reset-custom-parameter {
+    SET app.mode = 'v';
+    RESET app.mode;
+    SELECT quote_literal(current_setting('app.mode'));
+    SET app.mode = 'w';
+    SET app.mode TO DEFAULT;
+    SELECT quote_literal(current_setting('app.mode'));
+    SET app.mode = 'x';
+    SET app.mode = DEFAULT;
+    SELECT quote_literal(current_setting('app.mode'));
+}
+expect {
+    ''
+    ''
+    ''
+}
+
+test reset-defines-a-custom-parameter-that-was-never-set {
+    RESET app.never_set;
+    SELECT quote_literal(current_setting('app.never_set'));
+}
+expect {
+    ''
+}
+
+test set-from-current-keeps-the-current-value {
+    SET app.v = 'q';
+    BEGIN;
+    SET LOCAL app.v FROM CURRENT;
+    SHOW app.v;
+    COMMIT;
+    SHOW app.v;
+    SET search_path = a, "B c";
+    SET search_path FROM CURRENT;
+    SHOW search_path;
+}
+expect {
+    q
+    q
+    a, "B c"
+}
+
+test set-from-current-makes-a-local-value-the-session-value {
+    SET app.v = 'session';
+    BEGIN;
+    SET LOCAL app.v = 'local';
+    SET app.v FROM CURRENT;
+    COMMIT;
+    SHOW app.v;
+}
+expect {
+    local
+}
+
+test set-from-current-of-an-undefined-custom-parameter-errors {
+    SET app.never_set FROM CURRENT;
+}
+@sqlstate 42704
+expect error {
+    unrecognized configuration parameter "app\.never_set"
+}
+
+test reset-search-path {
+    SET search_path = other_schema;
+    RESET search_path;
+    SHOW search_path;
+    SET search_path = other_schema;
+    SET search_path TO DEFAULT;
+    SHOW search_path;
+}
+expect {
+    "$user", public
+    "$user", public
+}
+
+test reset-local-search-path-ends-at-commit {
+    SET search_path = other_schema;
+    BEGIN;
+    SET LOCAL search_path TO DEFAULT;
+    SHOW search_path;
+    COMMIT;
+    SHOW search_path;
+}
+expect {
+    "$user", public
+    other_schema
+}
+
+test reset-all {
+    SET app.a = 'a';
+    SET search_path = other_schema;
+    RESET ALL;
+    SELECT quote_literal(current_setting('app.a'));
+    SHOW search_path;
+}
+expect {
+    ''
+    "$user", public
+}
+
+test reset-all-also-resets-local-values {
+    BEGIN;
+    SET LOCAL app.a = 'local';
+    RESET ALL;
+    SELECT quote_literal(current_setting('app.a'));
+    COMMIT;
+}
+expect {
+    ''
+}
+
+test reset-all-is-undone-by-rollback {
+    SET app.a = 'a';
+    SET search_path = other_schema;
+    BEGIN;
+    RESET ALL;
+    ROLLBACK;
+    SHOW app.a;
+    SHOW search_path;
+}
+expect {
+    a
+    other_schema
+}
+
+test discard-all-resets-parameters {
+    SET app.a = 'a';
+    SET search_path = other_schema;
+    DISCARD ALL;
+    SELECT quote_literal(current_setting('app.a'));
+    SHOW search_path;
+}
+expect {
+    ''
+    "$user", public
+}
+
+test discard-all-forgets-currval {
+    CREATE SEQUENCE discard_seq;
+    SELECT nextval('discard_seq');
+    DISCARD ALL;
+    SELECT currval('discard_seq');
+}
+expect error {
+    currval of sequence "discard_seq" is not yet defined in this session
+}
+
+test discard-all-inside-a-transaction-errors {
+    BEGIN;
+    DISCARD ALL;
+}
+@sqlstate 25001
+expect error {
+    DISCARD ALL cannot run inside a transaction block
+}

@@ -1,0 +1,31 @@
+@database :memory:
+
+# Constant expressions in the result list must not run when WHERE filters out
+# the only possible result row.
+test constant_projection_skipped_when_where_is_false {
+    SELECT json('invalid_json') WHERE 0;
+}
+expect {
+}
+
+test constant_projection_still_runs_when_where_is_true {
+    SELECT json('invalid_json') WHERE 1;
+}
+expect error {
+    malformed JSON
+}
+
+# ABS of INT64_MIN is a deterministic expression error that the fuzzer's
+# integer/function grammar can generate without relying on malformed JSON.
+test constant_overflowing_projection_skipped_when_where_is_false {
+    SELECT abs(-9223372036854775808) WHERE 0;
+}
+expect {
+}
+
+test constant_overflowing_projection_still_errors_when_where_is_true {
+    SELECT abs(-9223372036854775808) WHERE 1;
+}
+expect error {
+    integer overflow
+}

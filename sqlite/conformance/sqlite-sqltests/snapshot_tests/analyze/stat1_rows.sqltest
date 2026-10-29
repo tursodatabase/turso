@@ -12,3 +12,45 @@ test analyze-indexed-table-does-not-insert-null-stat1-row {
 expect {
     t|i_t_a|3 2
 }
+
+test analyze-without-tables-creates-stat1 {
+    ANALYZE;
+    SELECT name FROM sqlite_schema;
+}
+expect {
+    sqlite_stat1
+}
+
+test analyze-main-without-tables-creates-stat1 {
+    ANALYZE main;
+    SELECT name FROM sqlite_schema;
+}
+expect {
+    sqlite_stat1
+}
+
+test analyze-with-only-views-creates-stat1 {
+    CREATE VIEW v AS SELECT 1;
+    ANALYZE;
+    SELECT name FROM sqlite_schema WHERE type = 'table';
+}
+expect {
+    sqlite_stat1
+}
+
+test analyze-temp-without-tables-creates-stat1 {
+    ANALYZE temp;
+    SELECT name FROM temp.sqlite_schema;
+}
+expect {
+    sqlite_stat1
+}
+
+test insert-into-stat1-after-analyze-without-tables {
+    ANALYZE;
+    INSERT INTO sqlite_stat1 VALUES ('x', NULL, '1');
+    SELECT tbl, stat FROM sqlite_stat1;
+}
+expect {
+    x|1
+}

@@ -69,6 +69,9 @@ pub struct DatabaseInner {
     /// Weak refs to every shared statement handle created by this database.
     /// `close()` upgrades each live handle and sets it to `None`, which
     /// finalizes the statement and releases its `Arc<Connection>`.
+    /// `prepare()` drops the handles of collected statements whenever the
+    /// vector is full, then keeps room for as many new handles as there are
+    /// live ones, so it scans the vector once per that many prepares.
     stmts: Mutex<Vec<Weak<RefCell<Option<turso_core::Statement>>>>>,
 }
 
@@ -271,14 +274,14 @@ pub fn apply_experimental_features(
     for feature in experimental {
         opts = match feature.as_str() {
             "views" => opts.with_views(true),
-            "strict" => opts, // strict is always enabled, kept for backwards compatibility
+            // always enabled, kept for backwards compatibility
+            "strict" | "generated_columns" => opts,
             "custom_types" => opts.with_custom_types(true),
             "encryption" => opts.with_encryption(true),
             "index_method" => opts.with_index_method(true),
             "autovacuum" => opts.with_autovacuum(true),
             "vacuum" => opts.with_vacuum(true),
             "attach" => opts.with_attach(true),
-            "generated_columns" => opts.with_generated_columns(true),
             "multiprocess_wal" => opts.with_multiprocess_wal(true),
             "without_rowid" => opts.with_without_rowid(true),
             _ => opts,
@@ -505,7 +508,15 @@ impl Database {
             .collect();
         #[allow(clippy::arc_with_non_send_sync)]
         let stmt: StatementHandle = Arc::new(RefCell::new(Some(stmt)));
-        inner.stmts.lock().unwrap().push(Arc::downgrade(&stmt));
+        {
+            let mut stmts = inner.stmts.lock().unwrap();
+            if stmts.len() == stmts.capacity() {
+                stmts.retain(|handle| handle.strong_count() > 0);
+                let live = stmts.len();
+                stmts.reserve(live);
+            }
+            stmts.push(Arc::downgrade(&stmt));
+        }
         Ok(Statement {
             stmt,
             column_names,
@@ -1032,7 +1043,22 @@ fn to_js_value<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::apply_experimental_features;
+    use super::{apply_experimental_features, Database};
+
+    #[test]
+    fn prepare_does_not_keep_handles_of_dropped_statements() {
+        let mut db = Database::new(":memory:".to_string(), None).unwrap();
+        db.connect_sync().unwrap();
+
+        let live = db.prepare("SELECT 1".to_string()).unwrap();
+        for _ in 0..10_000 {
+            drop(db.prepare("SELECT 1".to_string()).unwrap());
+        }
+        assert!(db.inner().unwrap().stmts.lock().unwrap().len() < 100);
+
+        db.close().unwrap();
+        assert!(live.stmt.borrow().is_none());
+    }
 
     #[test]
     fn apply_experimental_features_maps_feature_list() {
@@ -1050,7 +1076,6 @@ mod tests {
             "vacuum",
             "encryption",
             "attach",
-            "generated_columns",
             "multiprocess_wal",
             "without_rowid",
         ]
@@ -1065,15 +1090,18 @@ mod tests {
         assert!(opts.enable_vacuum);
         assert!(opts.enable_encryption);
         assert!(opts.enable_attach);
-        assert!(opts.enable_generated_columns);
         assert!(opts.enable_multiprocess_wal);
         assert!(opts.enable_without_rowid);
 
-        // `strict` and unknown names are no-ops.
+        // `strict`, `generated_columns` and unknown names are no-ops.
         assert_eq!(
             apply_experimental_features(
                 turso_core::DatabaseOpts::new(),
-                &["strict".to_string(), "unknown".to_string()]
+                &[
+                    "strict".to_string(),
+                    "generated_columns".to_string(),
+                    "unknown".to_string()
+                ]
             ),
             turso_core::DatabaseOpts::new()
         );

@@ -11,7 +11,6 @@ use std::any::Any;
 use std::backtrace::Backtrace;
 use std::fs::OpenOptions;
 use std::io::{IsTerminal, Write};
-use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
@@ -531,7 +530,7 @@ fn run_simulation_default(
         if env.opts.disable_integrity_check {
             tracing::info!("skipping integrity check (disabled by configuration)");
         } else {
-            let ic = integrity_check(&env.get_db_path());
+            let ic = simulation_integrity_check(&env);
             if let Err(err) = ic {
                 tracing::error!("integrity check failed: {}", err);
                 result.error = Some(turso_core::LimboError::InternalError(err.to_string()));
@@ -603,23 +602,108 @@ const BANNER: &str = r#"
 
 "#;
 
-fn integrity_check(db_path: &Path) -> anyhow::Result<()> {
-    assert!(db_path.exists());
-    let conn = rusqlite::Connection::open(db_path)?;
-    let mut stmt = conn.prepare("SELECT * FROM pragma_integrity_check;")?;
-    let mut rows = stmt.query(())?;
+fn simulation_integrity_check(env: &SimulatorEnv) -> anyhow::Result<()> {
     let mut result: Vec<String> = Vec::new();
-
-    while let Some(row) = rows.next()? {
-        result.push(row.get(0)?);
+    if env.profile.mvcc {
+        let connection = env
+            .db
+            .as_ref()
+            .expect("simulation database exists")
+            .connect(turso_core::ConnectOpts::new())?;
+        let mut statement = connection.prepare("PRAGMA integrity_check")?;
+        statement.run_with_row_callback(|row| {
+            result.push(row.get::<String>(0)?);
+            Ok(())
+        })?;
+    } else {
+        let db_path = env.get_db_path();
+        assert!(db_path.exists());
+        let connection = rusqlite::Connection::open(db_path)?;
+        let mut statement = connection.prepare("SELECT * FROM pragma_integrity_check")?;
+        let mut rows = statement.query(())?;
+        while let Some(row) = rows.next()? {
+            result.push(row.get(0)?);
+        }
     }
     if result.is_empty() {
         anyhow::bail!("simulation failed: integrity_check should return `ok` or a list of problems")
     }
-    if !result[0].eq_ignore_ascii_case("ok") {
-        // Build a list of problems
-        result.iter_mut().for_each(|row| *row = format!("- {row}"));
+    if result.len() != 1 || !result[0].eq_ignore_ascii_case("ok") {
         anyhow::bail!("simulation failed: {}", result.join("\n"))
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::*;
+
+    #[test]
+    fn wal_integrity_check_uses_exported_database() -> anyhow::Result<()> {
+        let output = tempfile::tempdir()?;
+        let args = SimulatorCLI::parse_from(["limbo_sim", "--io-backend", "memory"]);
+        let env = SimulatorEnv::new(
+            1,
+            &args,
+            Paths::new(output.path()),
+            SimulationType::Default,
+            &Profile::faultless(),
+        );
+        let connection = env
+            .db
+            .as_ref()
+            .unwrap()
+            .connect(turso_core::ConnectOpts::new())?;
+        connection.execute("CREATE TABLE checked(id INTEGER PRIMARY KEY)")?;
+        connection.execute("INSERT INTO checked VALUES (42)")?;
+        env.io.persist_files()?;
+        simulation_integrity_check(&env)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mvcc_integrity_check_and_export_include_committed_log() -> anyhow::Result<()> {
+        let output = tempfile::tempdir()?;
+        let args = SimulatorCLI::parse_from(["limbo_sim", "--io-backend", "memory"]);
+        let env = SimulatorEnv::new(
+            1,
+            &args,
+            Paths::new(output.path()),
+            SimulationType::Default,
+            &Profile {
+                mvcc: true,
+                ..Profile::faultless()
+            },
+        );
+        let connection = env
+            .db
+            .as_ref()
+            .unwrap()
+            .connect(turso_core::ConnectOpts::new())?;
+        connection.execute("CREATE TABLE checked(id INTEGER PRIMARY KEY)")?;
+        connection.execute("INSERT INTO checked VALUES (42)")?;
+        connection.execute("CREATE SEQUENCE checked_seq START 10")?;
+        connection.execute("SELECT nextval('checked_seq')")?;
+        env.io.persist_files()?;
+        simulation_integrity_check(&env)?;
+        assert!(env.get_db_path().with_extension("db-log").metadata()?.len() > 0);
+        let path = env.get_db_path();
+        drop(connection);
+        drop(env);
+        let reopened = turso_core::Database::open_file(
+            Arc::new(turso_core::PlatformIO::new()?),
+            path.to_str().unwrap(),
+            Arc::new(turso_core::SqliteDialect),
+        )?
+        .connect(turso_core::ConnectOpts::new())?;
+        let rows = reopened
+            .prepare("SELECT id FROM checked")?
+            .run_collect_rows()?;
+        assert_eq!(rows[0][0].as_int(), Some(42));
+        let rows = reopened
+            .prepare("SELECT nextval('checked_seq')")?
+            .run_collect_rows()?;
+        assert_eq!(rows[0][0].as_int(), Some(11));
+        Ok(())
+    }
 }

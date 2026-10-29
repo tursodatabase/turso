@@ -116,3 +116,87 @@ expect {
     3|0-r
     4|0-s
 }
+
+# When no row reaches the aggregate, a correlated subquery in the result columns
+# must run against the NULL row, not keep its result for the last outer row.
+setup outer-row-without-match {
+    CREATE TABLE r(a);
+    CREATE TABLE l(x);
+    INSERT INTO r VALUES (5);
+}
+
+@setup outer-row-without-match
+test correlated-subquery-join-zero-rows {
+    SELECT count(*), (SELECT r.a) FROM r JOIN l ON l.x = r.a;
+}
+expect {
+    0|
+}
+
+@setup outer-row-without-match
+test correlated-subquery-join-zero-rows-reads-null-row {
+    SELECT count(*), (SELECT coalesce(r.a, 7)) FROM r JOIN l ON l.x = r.a;
+}
+expect {
+    0|7
+}
+
+@setup outer-row-without-match
+test correlated-subquery-join-zero-rows-max {
+    SELECT max(l.x), (SELECT r.a) FROM r JOIN l ON l.x = r.a;
+}
+expect {
+    |
+}
+
+@setup outer-row-without-match
+test correlated-subquery-cross-join-zero-rows {
+    SELECT count(*), (SELECT r.a) FROM r, l;
+}
+expect {
+    0|
+}
+
+@setup outer-row-without-match
+test correlated-in-and-exists-join-zero-rows {
+    SELECT count(*), 5 IN (SELECT r.a), EXISTS (SELECT 1 WHERE r.a IS NULL) FROM r JOIN l ON l.x = r.a;
+}
+expect {
+    0||1
+}
+
+@setup outer-row-without-match
+test correlated-subquery-join-zero-rows-inside-outer-query {
+    SELECT k, (SELECT x FROM (SELECT count(*), coalesce((SELECT r.a + k), 'n') AS x FROM r JOIN l ON l.x = r.a))
+    FROM (SELECT 1 AS k UNION ALL SELECT 2) ORDER BY k;
+}
+expect {
+    1|n
+    2|n
+}
+
+@setup outer-row-without-match
+test correlated-subquery-inside-aggregate-column-join-zero-rows {
+    SELECT count(*) + (SELECT coalesce(r.a, 100)) FROM r JOIN l ON l.x = r.a;
+}
+expect {
+    100
+}
+
+@setup outer-row-without-match
+test correlated-subquery-inside-aggregate-column-where-zero-rows {
+    SELECT count(*) + (SELECT coalesce(r.a, 100)) FROM r WHERE r.a > 10;
+}
+expect {
+    100
+}
+
+@setup outer-row-without-match
+test correlated-subquery-inside-aggregate-column-zero-rows-inside-outer-query {
+    SELECT k, (SELECT count(*) || coalesce((SELECT r.a + k), 'n') FROM r JOIN l ON l.x = r.a)
+    FROM (SELECT 1 AS k UNION ALL SELECT 2) ORDER BY k;
+}
+expect {
+    1|0n
+    2|0n
+}

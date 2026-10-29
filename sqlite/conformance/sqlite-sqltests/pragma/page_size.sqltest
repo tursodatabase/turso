@@ -11,3 +11,32 @@ expect {
     512
     4096
 }
+
+# Like sqlite3Atoi, the value is read from its leading digits, so 8.192e3 is 8.
+test pragma-page-size-float-reads-leading-digits {
+    PRAGMA page_size=8.192e3;
+    CREATE TABLE t(a);
+    PRAGMA page_size;
+}
+expect {
+    4096
+}
+
+test pragma-page-size-float-drops-fraction {
+    PRAGMA page_size=1024.5;
+    CREATE TABLE t(a);
+    PRAGMA page_size;
+}
+expect {
+    1024
+}
+
+# 4294968320 is 2^32 + 1024; a value outside the 32-bit range reads as 0.
+test pragma-page-size-out-of-range {
+    PRAGMA page_size=4294968320;
+    CREATE TABLE t(a);
+    PRAGMA page_size;
+}
+expect {
+    4096
+}

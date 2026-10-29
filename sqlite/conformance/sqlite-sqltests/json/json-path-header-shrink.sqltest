@@ -1,0 +1,31 @@
+@database :memory:
+
+# Replacing a large integer in a nested array can shrink the array header.
+# The header-length delta must be computed as a signed value.
+test json-set-shrinking-array-value {
+    SELECT json_set('{}', '$.b[0]', 9223372036854775807, '$.b[0]', 0);
+}
+expect {
+    {"b":[0]}
+}
+
+test jsonb-set-shrinking-array-value {
+    SELECT json(jsonb_set('{}', '$.b[0]', 9223372036854775807, '$.b[0]', 0));
+}
+expect {
+    {"b":[0]}
+}
+
+test json-replace-shrinking-array-value {
+    SELECT json_replace('{"b":[9223372036854775807]}', '$.b[0]', 0);
+}
+expect {
+    {"b":[0]}
+}
+
+test jsonb-replace-shrinking-array-value {
+    SELECT json(jsonb_replace('{"b":[9223372036854775807]}', '$.b[0]', 0));
+}
+expect {
+    {"b":[0]}
+}

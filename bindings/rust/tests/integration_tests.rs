@@ -442,6 +442,53 @@ pub async fn test_execute_batch() {
 }
 
 #[tokio::test]
+async fn test_execute_discards_rows_and_runs_statement_to_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let db = Builder::new_local(path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+
+    for sql in [
+        "PRAGMA journal_mode=WAL",
+        "PRAGMA table_info(sqlite_schema)",
+        "PRAGMA user_version",
+        "SELECT 1",
+    ] {
+        conn.execute(sql, ()).await.unwrap();
+    }
+
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; CREATE TABLE t(x); PRAGMA user_version; PRAGMA user_version=3;",
+    )
+    .await
+    .unwrap();
+
+    let rows_changed = conn
+        .execute("INSERT INTO t VALUES (1), (2), (3) RETURNING x", ())
+        .await
+        .unwrap();
+    assert_eq!(rows_changed, 3);
+
+    for (sql, expected) in [
+        ("SELECT COUNT(*) FROM t", Value::Integer(3)),
+        ("PRAGMA user_version", Value::Integer(3)),
+        ("PRAGMA journal_mode", Value::Text("wal".to_string())),
+    ] {
+        let row = conn
+            .prepare(sql)
+            .await
+            .unwrap()
+            .query_row(())
+            .await
+            .unwrap();
+        assert_eq!(row.get_value(0).unwrap(), expected, "{sql}");
+    }
+}
+
+#[tokio::test]
 async fn test_query_row_returns_first_row() {
     let db = Builder::new_local(":memory:").build().await.unwrap();
     let conn = db.connect().unwrap();
@@ -1103,6 +1150,144 @@ async fn test_prepare_cached_reprepare_on_query_only_change() {
 }
 
 #[tokio::test]
+async fn test_drop_column_after_schema_change_in_txn_with_live_index_statement() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t (a TEXT, other TEXT, b TEXT)", ())
+        .await
+        .unwrap();
+    conn.execute("CREATE INDEX t_b ON t(b)", ()).await.unwrap();
+    conn.execute("INSERT INTO t VALUES ('a0', 'discard', 'b0')", ())
+        .await
+        .unwrap();
+
+    conn.execute("BEGIN", ()).await.unwrap();
+    conn.execute("ALTER TABLE t ADD COLUMN extra TEXT", ())
+        .await
+        .unwrap();
+    let mut select = conn.prepare("SELECT a FROM t WHERE b = ?1").await.unwrap();
+    let mut rows = select.query(["b0"]).await.unwrap();
+    while rows.next().await.unwrap().is_some() {}
+    drop(rows);
+
+    conn.execute("ALTER TABLE t DROP COLUMN other", ())
+        .await
+        .unwrap();
+
+    let mut rows = select.query(["b0"]).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<String>(0).unwrap(), "a0");
+    drop(rows);
+    drop(select);
+    conn.execute("COMMIT", ()).await.unwrap();
+
+    assert_eq!(
+        collect_values(&conn, "SELECT * FROM t").await,
+        vec![vec![
+            Value::Text("a0".into()),
+            Value::Text("b0".into()),
+            Value::Null
+        ]]
+    );
+    assert_eq!(
+        collect_values(&conn, "SELECT a FROM t WHERE b = 'b0'").await,
+        vec![vec![Value::Text("a0".into())]]
+    );
+    assert_eq!(
+        collect_values(&conn, "PRAGMA integrity_check").await,
+        vec![vec![Value::Text("ok".into())]]
+    );
+}
+
+#[tokio::test]
+async fn test_drop_column_after_schema_change_in_txn_with_cached_index_statement() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t (a TEXT, other TEXT, b TEXT)", ())
+        .await
+        .unwrap();
+    conn.execute("CREATE INDEX t_b ON t(b)", ()).await.unwrap();
+    conn.execute("INSERT INTO t VALUES ('a0', 'discard', 'b0')", ())
+        .await
+        .unwrap();
+
+    conn.execute("BEGIN", ()).await.unwrap();
+    conn.execute("CREATE TABLE unrelated (x TEXT)", ())
+        .await
+        .unwrap();
+    {
+        let mut select = conn
+            .prepare_cached("SELECT a FROM t WHERE b = ?1")
+            .await
+            .unwrap();
+        let mut rows = select.query(["b0"]).await.unwrap();
+        while rows.next().await.unwrap().is_some() {}
+    }
+
+    conn.execute("ALTER TABLE t DROP COLUMN other", ())
+        .await
+        .unwrap();
+    conn.execute("COMMIT", ()).await.unwrap();
+
+    assert_eq!(
+        collect_values(&conn, "SELECT * FROM t").await,
+        vec![vec![Value::Text("a0".into()), Value::Text("b0".into())]]
+    );
+    assert_eq!(
+        collect_values(&conn, "SELECT a FROM t WHERE b = 'b0'").await,
+        vec![vec![Value::Text("a0".into())]]
+    );
+    assert_eq!(
+        collect_values(&conn, "PRAGMA integrity_check").await,
+        vec![vec![Value::Text("ok".into())]]
+    );
+}
+
+#[tokio::test]
+async fn test_drop_column_after_schema_change_in_txn_with_live_upsert_statement() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "CREATE TABLE t (id TEXT PRIMARY KEY, other TEXT, v TEXT)",
+        (),
+    )
+    .await
+    .unwrap();
+
+    conn.execute("BEGIN", ()).await.unwrap();
+    conn.execute("ALTER TABLE t ADD COLUMN extra TEXT", ())
+        .await
+        .unwrap();
+    let mut upsert = conn
+        .prepare(
+            "INSERT INTO t (id, v) VALUES (?1, ?2) ON CONFLICT(id) DO UPDATE SET v = excluded.v",
+        )
+        .await
+        .unwrap();
+    upsert.execute(["k", "v0"]).await.unwrap();
+
+    conn.execute("ALTER TABLE t DROP COLUMN other", ())
+        .await
+        .unwrap();
+    upsert.execute(["k", "v1"]).await.unwrap();
+    drop(upsert);
+    conn.execute("COMMIT", ()).await.unwrap();
+
+    assert_eq!(
+        collect_values(&conn, "SELECT * FROM t").await,
+        vec![vec![
+            Value::Text("k".into()),
+            Value::Text("v1".into()),
+            Value::Null
+        ]]
+    );
+    assert_eq!(
+        collect_values(&conn, "PRAGMA integrity_check").await,
+        vec![vec![Value::Text("ok".into())]]
+    );
+}
+
+#[tokio::test]
 async fn test_prepare_cached_batch_insert_delete_pattern() {
     #[derive(Clone)]
     struct Host {
@@ -1517,6 +1702,39 @@ async fn test_strict_tables() {
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 1);
     assert_eq!(row.get::<String>(1).unwrap(), "Alice");
+}
+
+#[tokio::test]
+async fn test_generated_columns_work_without_a_flag() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_file = temp_dir.path().join("generated-columns.db");
+    let db_file = db_file.to_str().unwrap();
+
+    {
+        let db = Builder::new_local(db_file).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE t (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2))",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN c AS (a + 1)", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t (a) VALUES (21)", ())
+            .await
+            .unwrap();
+    }
+
+    // Loading a schema that has generated columns does not need a flag either.
+    let db = Builder::new_local(db_file).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn.query("SELECT a, b, c FROM t", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 21);
+    assert_eq!(row.get::<i64>(1).unwrap(), 42);
+    assert_eq!(row.get::<i64>(2).unwrap(), 22);
 }
 
 // Helper to collect all integer values from a single-column query.
@@ -2654,4 +2872,77 @@ async fn test_transactional_batch_joins_an_open_transaction() {
     let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 0);
+}
+const RUNAWAY_COUNT: &str =
+    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c";
+
+async fn first_row_error(conn: &turso::Connection, sql: &str) -> Error {
+    let mut rows = conn.query(sql, ()).await.unwrap();
+    match rows.next().await {
+        Err(err) => err,
+        Ok(row) => panic!(
+            "expected the statement to be interrupted, got {:?}",
+            row.is_some()
+        ),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_timeout_interrupts_a_runaway_statement() {
+    let conn = memory_connection().await;
+    conn.set_query_timeout(std::time::Duration::from_millis(100))
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let err = first_row_error(&conn, RUNAWAY_COUNT).await;
+    assert!(matches!(err, Error::Interrupt(_)), "got {err:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+    // The deadline is per statement: the connection runs the next one normally.
+    let mut rows = conn.query("SELECT 1", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
+
+    // Duration::ZERO disables the limit again.
+    conn.set_query_timeout(std::time::Duration::ZERO).unwrap();
+    let mut rows = conn
+        .query(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 100000) SELECT count(*) FROM c",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 100000);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_interrupt_from_another_thread_stops_a_running_statement() {
+    let conn = memory_connection().await;
+
+    // Interrupting an idle connection does nothing to its next statement.
+    conn.interrupt().unwrap();
+    let mut rows = conn.query("SELECT 1", ()).await.unwrap();
+    assert!(rows.next().await.unwrap().is_some());
+    drop(rows);
+
+    // An interrupt that lands before the statement starts is a no-op, so keep
+    // interrupting until the statement has returned.
+    let handle = conn.clone();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished = done.clone();
+    let interrupter = std::thread::spawn(move || {
+        while !finished.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            handle.interrupt().unwrap();
+        }
+    });
+    let err = first_row_error(&conn, RUNAWAY_COUNT).await;
+    done.store(true, std::sync::atomic::Ordering::Release);
+    interrupter.join().unwrap();
+    assert!(matches!(err, Error::Interrupt(_)), "got {err:?}");
+
+    let mut rows = conn.query("SELECT 2", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 2);
 }

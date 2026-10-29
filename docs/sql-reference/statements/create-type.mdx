@@ -17,8 +17,9 @@ The CREATE TYPE statement defines a user-defined type that controls how values a
 ```sql
 CREATE TYPE [IF NOT EXISTS] type-name [(parameters)]
     BASE base-type
-    ENCODE encode-expr
-    DECODE decode-expr
+    [ENCODE encode-expr]
+    [COERCE coerce-expr]
+    [DECODE decode-expr]
     [OPERATOR 'op' [function-name] ...]
     [DEFAULT default-expr];
 ```
@@ -60,7 +61,7 @@ CREATE TYPE cents BASE integer
 
 The ENCODE expression is evaluated whenever a value is written to a column of this type. The DECODE expression is evaluated whenever a value is read. Both expressions use the identifier `value` to refer to the input.
 
-- **ENCODE**: Transforms the input value into the base storage form. Runs on INSERT, UPDATE, and CAST.
+- **ENCODE**: Transforms the input value into the base storage form. Runs on INSERT, UPDATE, and CAST, and on a constant compared with a column of the type (`WHERE c = 42` encodes `42` first).
 - **DECODE**: Transforms the stored value back into the presentation form. Runs on SELECT.
 - **NULL handling**: NULL values bypass both ENCODE and DECODE. A NULL input produces a NULL output without evaluating the expression.
 
@@ -75,11 +76,11 @@ The ENCODE expression is the place to put validation logic. If the ENCODE expres
 
 ### Parameters
 
-Custom types can accept parameters that are available in the ENCODE and DECODE expressions. Parameters are declared as a parenthesized list after the type name. Each parameter has a name and an optional type annotation.
+Custom types can accept parameters. Parameters are declared as a parenthesized list after the type name. Each parameter has a name and an optional type annotation. Only the COERCE expression can use them; an ENCODE or DECODE that names a parameter fails with `ENCODE cannot use type parameter "maxlen": only COERCE can`.
 
 ```sql
 CREATE TYPE varchar(value text, maxlen integer) BASE text
-    ENCODE CASE
+    COERCE CASE
         WHEN length(value) <= maxlen THEN value
         ELSE RAISE(ABORT, 'value too long for varchar')
     END
@@ -97,6 +98,32 @@ CREATE TABLE users (
 ```
 
 The first parameter is always the input `value`. Additional parameters are the arguments provided in the column type declaration, in order.
+
+### COERCE
+
+The COERCE expression fits an already encoded value to what the column may store, such as the maximum length of a `varchar(100)`, the scale of a `numeric(10,2)` or the range of a `smallint`. `value` is the output of ENCODE, and each parameter is the column's argument for it. COERCE may only round, pad, cut or reject the value (with RAISE), so the result stays the same value in the type's order: a COERCE like `value * f` would make stored values disagree with values that were only encoded, such as index lookup keys. Put limit checks in COERCE, not ENCODE: ENCODE also runs on values that are only compared, so a range check there would make `smallint_col < 100000` fail.
+
+- **When it runs**: on INSERT, UPDATE, and column defaults, after ENCODE, and on `CAST(x AS t(args))`. For a type without parameters it also runs on `CAST(x AS t)`. `CAST(x AS t)` on a type with parameters is SQLite's CAST, so `CAST(x AS NUMERIC)` keeps its SQLite meaning.
+- **When it does not run**: on a column of a type with parameters declared without arguments (`name varchar`), and on NULL values.
+- Index lookups also run ENCODE and COERCE on the key, as do constants passed to a type's operator. For a `numeric(10,2)` column holding `3.50`, `n = 3.504` is true, because `3.504` is rounded to `3.50` first.
+- **DECODE** never sees the parameters.
+
+```sql
+CREATE TYPE capped(value integer, maxval integer) BASE integer
+    COERCE CASE
+        WHEN value <= maxval THEN value
+        ELSE RAISE(ABORT, 'value above maximum for capped')
+    END
+    OPERATOR '<';
+
+CREATE TABLE t(x capped(10)) STRICT;
+INSERT INTO t VALUES (11);
+-- Runtime error: value above maximum for capped
+SELECT CAST(11 AS capped);      -- 11
+SELECT CAST(11 AS capped(10));  -- Runtime error: value above maximum for capped
+```
+
+The built-in `numeric` type uses both clauses: `ENCODE numeric_encode(value)` turns the input into a decimal, and `COERCE numeric_fit(value, precision, scale)` rounds it to `scale` decimal places and rejects it if it has more than `precision` digits.
 
 ### OPERATOR
 
@@ -187,7 +214,7 @@ CREATE TYPE email BASE text
 
 ## CAST Support
 
-The CAST expression applies a custom type's ENCODE logic:
+The CAST expression applies a custom type's ENCODE logic, and its COERCE logic when the CAST gives the type's arguments (see [COERCE](#coerce)):
 
 ```sql
 CREATE TYPE cents BASE integer
@@ -219,18 +246,13 @@ CREATE TABLE products (
 
 ### PRAGMA list_types
 
-Lists all available types, including built-in and user-defined:
+Lists all available types, including built-in and user-defined. The columns are `type`, `parent`, `encode`, `coerce`, `decode`, `default` and `operators`:
 
 ```sql
 PRAGMA list_types;
--- name
--- boolean
--- varchar
--- date
--- time
--- timestamp
--- smallint
--- numeric
+-- type                                                 | parent | encode                | coerce                                 | ...
+-- numeric(value any, precision integer, scale integer) | blob   | numeric_encode(value) | numeric_fit(value, precision, scale)   | ...
+-- varchar(value text, maxlen integer)                  | text   |                       | CASE WHEN length(value) <= maxlen ...  | ...
 -- ...
 ```
 
@@ -265,12 +287,16 @@ Turso provides the following built-in custom types in STRICT tables:
 | `smallint` | integer | -- | Integer constrained to -32768 through 32767. Aliases: `int2`. |
 | `bigint` | integer | -- | Integer (no range constraint). Aliases: `int8`. |
 | `varchar(N)` | text | `maxlen` | Text with a maximum length of N characters. |
-| `date` | text | -- | ISO 8601 date (YYYY-MM-DD), validated on insert. |
+| `date` | text | -- | ISO 8601 date (YYYY-MM-DD), validated on insert. Supports `+` and `-` with whole-day integers. |
 | `time` | text | -- | ISO 8601 time (HH:MM:SS), validated on insert. |
 | `timestamp` | text | -- | ISO 8601 datetime, validated on insert. |
-| `numeric(P,S)` | blob | `precision`, `scale` | Fixed-point decimal with P total digits and S decimal places. Supports arithmetic operators. |
+| `timestamptz` | text | -- | ISO 8601 datetime with the same validation and normalization as `timestamp`. PostgreSQL-compatible name; the stored text carries no offset. |
+| `numeric(P,S)` | blob | `precision`, `scale` | Fixed-point decimal with P total digits and S decimal places. Supports arithmetic operators. As in PostgreSQL, a value may have at most 131072 digits before the decimal point and 16383 after; text such as `'1e100000000'` is an error (`value overflows numeric format`) when it is stored. |
 | `uuid` | blob | -- | UUID stored as 16-byte blob, displayed as string. Default: `uuid4_str()`. |
 | `inet` | text | -- | Validated IP address (IPv4 or IPv6). |
+| `cidr` | text | -- | Network address in CIDR notation. Stored as given; no validation yet. |
+| `macaddr` | text | -- | MAC address text. Stored as given; no validation yet. |
+| `macaddr8` | text | -- | MAC address text, allowing longer (8-byte) forms. Stored as given; no validation yet. |
 | `bytea` | blob | -- | Binary data (PostgreSQL-compatible alias). |
 | `json` | text | -- | Validated JSON text. |
 | `jsonb` | blob | -- | JSON stored in binary format, returned as JSON text on read. |
