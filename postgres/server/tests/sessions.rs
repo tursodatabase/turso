@@ -1,8 +1,9 @@
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tempfile::TempDir;
-use turso_core::ConnectOpts;
+use turso_core::{Clock, ConnectOpts, IO};
 use turso_pg_client::{error_message, BackendEvent, ConnParams, PgConn};
 use turso_pg_server::TursoPgServer;
 
@@ -65,6 +66,58 @@ fn schema_dropped_by_one_client_is_gone_for_another() {
     query(&mut client1, "DROP SCHEMA s CASCADE");
 
     query_error(&mut client2, "SELECT count(*) FROM s.t");
+}
+
+#[tokio::test]
+async fn server_stops_its_io_task_and_propagates_polling_errors() {
+    let io = Arc::new(PollingIO {
+        inner: turso_core::MemoryIO::new(),
+        steps: AtomicUsize::new(0),
+        fail: AtomicBool::new(false),
+    });
+    let db = turso_pg::open_database_with_io(
+        io.clone(),
+        ":memory:",
+        turso_pg::OpenFlags::default(),
+        turso_pg::DatabaseOpts::new(),
+    )
+    .unwrap();
+    let server = TursoPgServer::new(
+        "127.0.0.1:0".to_owned(),
+        ":memory:".to_owned(),
+        db,
+        ConnectOpts::new(),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = Arc::new(server);
+    let serving = server.clone();
+    let initial_steps = io.steps.load(Ordering::SeqCst);
+    let task = tokio::spawn(async move { serving.serve(listener).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while io.steps.load(Ordering::SeqCst) == initial_steps {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    tokio::task::yield_now().await;
+    let steps = io.steps.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(io.steps.load(Ordering::SeqCst), steps);
+
+    io.fail.store(true, Ordering::SeqCst);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(5), server.serve(listener))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("injected polling error"),
+        "{error}"
+    );
 }
 
 struct TestServer {
@@ -136,4 +189,45 @@ fn query_error(client: &mut PgConn, sql: &str) -> String {
         }
     }
     panic!("{sql}: expected an error");
+}
+
+struct PollingIO {
+    inner: turso_core::MemoryIO,
+    steps: AtomicUsize,
+    fail: AtomicBool,
+}
+
+impl Clock for PollingIO {
+    fn current_time_monotonic(&self) -> turso_core::MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> turso_core::WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for PollingIO {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: turso_core::OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn turso_core::File>> {
+        self.inner.open_file(path, flags, direct)
+    }
+
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn step(&self) -> turso_core::Result<()> {
+        self.steps.fetch_add(1, Ordering::SeqCst);
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(turso_core::LimboError::InternalError(
+                "injected polling error".to_owned(),
+            ));
+        }
+        self.inner.step()
+    }
 }

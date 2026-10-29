@@ -19,6 +19,7 @@ rustc-hash = "2.0"
 serde_json = { workspace = true }
 strum = { workspace = true }
 tempfile = { workspace = true }
+tracing = { workspace = true }
 turso_core = { workspace = true, default-features = true, features = [
     "conn_raw_api",
 ] }

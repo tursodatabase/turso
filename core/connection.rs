@@ -3458,7 +3458,7 @@ impl Connection {
     /// Prepares CREATE SCHEMA or DROP SCHEMA. No dialect parses their text, so
     /// preparing the statement again, after another connection changes the
     /// schema, translates the statement itself.
-    fn prepare_namespace_stmt(
+    pub fn prepare_namespace_stmt(
         self: &Arc<Self>,
         statement: turso_parser::ast::Stmt,
     ) -> Result<Statement> {
