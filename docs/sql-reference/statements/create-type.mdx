@@ -60,7 +60,7 @@ CREATE TYPE cents BASE integer
 
 The ENCODE expression is evaluated whenever a value is written to a column of this type. The DECODE expression is evaluated whenever a value is read. Both expressions use the identifier `value` to refer to the input.
 
-- **ENCODE**: Transforms the input value into the base storage form. Runs on INSERT, UPDATE, and CAST, and on a constant compared with a column of the type (`WHERE c = 42` encodes `42` first).
+- **ENCODE**: Transforms the input value into the base storage form. Runs on INSERT, UPDATE, and CAST (which then runs DECODE), and on a constant compared with a column of the type (`WHERE c = 42` encodes `42` first).
 - **DECODE**: Transforms the stored value back into the presentation form. Runs on SELECT.
 - **NULL handling**: NULL values bypass both ENCODE and DECODE. A NULL input produces a NULL output without evaluating the expression.
 
@@ -138,7 +138,7 @@ SELECT w FROM t ORDER BY w;
 -- cherry   (stored as 'yrrehc')
 ```
 
-Comparisons use the same order, so a query returns the same rows with and without an index, and `max(w)` is the last row of `ORDER BY w`. This holds for `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `min`/`max` (also the scalar and window forms), ORDER BY with GROUP BY, and joins. The column's stored value is compared with the other value encoded (a `CAST` to the type is already encoded):
+Comparisons use the same order, so a query returns the same rows with and without an index, and `max(w)` is the last row of `ORDER BY w`. This holds for `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `min`/`max` (also the scalar and window forms), ORDER BY with GROUP BY, and joins. The column's stored value is compared with the other value encoded:
 
 ```sql
 SELECT w FROM t WHERE w < 'cherry';
@@ -146,6 +146,8 @@ SELECT w FROM t WHERE w < 'cherry';
 ```
 
 Because the other value goes through ENCODE, a value that ENCODE rejects is an error: `d = '2024-1-1'` on a `date` column fails with `invalid date value` instead of matching no rows. Comparing values of two different custom types, such as `a = b` where `a` and `b` have types `t1` and `t2`, fails with `cannot compare type t1 with type t2`.
+
+As in PostgreSQL, only a constant becomes a value of the type it is compared with. Comparing a custom type with another expression, such as `d = s` where `d` is a `date` column and `s` a `text` column, fails with `cannot compare type date with text: cast it to date first`. Write `d = CAST(s AS date)` instead.
 
 The built-in `numeric` type and arrays have their own order, and every comparison of a value of such a type uses it: `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins, and indexes. So a query returns the same rows with and without an index, and `numeric` values compare by value: `9 < 10` and `1.5 = 1.50` are true, and DISTINCT and UNION keep one of them. This holds for expressions of the type too: `n + i`, `n * 2`, `-n` and `coalesce(n, 0)` are numerics, and an index on `n * 2` can serve `n * 2 > 10`. A constant is not rounded to the column's scale first: for a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false. A COLLATE on a value of such a type fails with `collations are not supported by type numeric`, and comparing two types with different orders fails with `cannot compare type x with type y`.
 
@@ -214,22 +216,24 @@ CREATE TYPE email BASE text
 
 ## CAST Support
 
-The CAST expression applies a custom type's ENCODE logic, and its COERCE logic when the CAST gives the type's arguments (see [COERCE](#coerce)):
+`CAST(x AS t)` makes `x` a value of type `t`. It runs ENCODE (and COERCE when the CAST gives the type's arguments, see [COERCE](#coerce)) and then DECODE, so the result reads like a column of the type would:
 
 ```sql
 CREATE TYPE cents BASE integer
     ENCODE value * 100
     DECODE value / 100;
 
-SELECT CAST(42.5 AS cents);
--- 4250
+SELECT CAST(42 AS cents);
+-- 42 (stored as 4200)
+SELECT CAST('3.504' AS numeric(10,2));
+-- 3.50
 ```
 
-This is useful for converting values to the encoded form outside of INSERT/UPDATE, such as in WHERE clauses and CHECK constraints.
+A value of type `t` compares with a column of type `t` by stored value. Cast a column of another type to compare it with a custom type column: `d.x = CAST(t.s AS date)`.
 
 ## CHECK Constraints with Custom Types
 
-In STRICT tables with custom types, CHECK constraints operate on the **stored** (encoded) values. When comparing a column of a custom type against a literal, use CAST to encode the literal:
+In STRICT tables with custom types, a CHECK constraint compares a column of a custom type only with a value of the same type, so cast a literal to the type:
 
 ```sql
 CREATE TYPE cents BASE integer
