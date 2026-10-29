@@ -1380,3 +1380,66 @@ expect {
     c|p|p
     d|p|p
 }
+
+test pg-dump-mixed-case-primary-key-and-reference {
+    CREATE TABLE "Parent" ("Mixed Key" TEXT PRIMARY KEY);
+    CREATE TABLE child ("Child Key" TEXT CONSTRAINT "Fk X" REFERENCES "Parent" ON UPDATE CASCADE ON DELETE SET NULL,
+                        "Code" INTEGER CONSTRAINT "U q" UNIQUE);
+    SELECT conname FROM pg_constraint JOIN pg_class ON conrelid = pg_class.oid
+    WHERE contype = 'p' AND relname = 'Parent';
+    SELECT substr(pg_get_indexdef(indexrelid), strpos(pg_get_indexdef(indexrelid), ' ON ') + 4) FROM pg_index JOIN pg_class ON indrelid = pg_class.oid
+    WHERE indisprimary AND relname = 'Parent';
+    SELECT relname FROM pg_class JOIN pg_constraint ON confrelid = pg_class.oid
+    WHERE contype = 'f';
+    SELECT conname, pg_get_constraintdef(c.oid) FROM pg_constraint c JOIN pg_class r ON c.conrelid = r.oid
+    WHERE r.relname = 'child' AND contype IN ('f', 'u') ORDER BY conname;
+    SET search_path TO '';
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f';
+}
+expect {
+    Parent_pkey
+    public."Parent" USING btree ("Mixed Key")
+    Parent
+    Fk X|FOREIGN KEY ("Child Key") REFERENCES "Parent"("Mixed Key") ON UPDATE CASCADE ON DELETE SET NULL
+    U q|UNIQUE ("Code")
+    FOREIGN KEY ("Child Key") REFERENCES public."Parent"("Mixed Key") ON UPDATE CASCADE ON DELETE SET NULL
+}
+
+test pg-mixed-case-names-in-separate-schemas {
+    CREATE SCHEMA other;
+    CREATE TABLE public."Mixed Table" ("Mixed Id" INTEGER CONSTRAINT "Inline PK" PRIMARY KEY);
+    CREATE TABLE other."Mixed Table" ("Mixed Key" TEXT, CONSTRAINT "Table PK" PRIMARY KEY ("Mixed Key"));
+    CREATE TABLE child (key TEXT REFERENCES other."Mixed Table" ("Mixed Key"));
+    SELECT schemaname, tablename FROM pg_tables WHERE tablename = 'Mixed Table' ORDER BY schemaname;
+    SELECT n.nspname, r.relname, c.conname, pg_get_constraintdef(c.oid)
+    FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid
+    JOIN pg_namespace n ON n.oid = r.relnamespace
+    WHERE c.contype = 'p' AND r.relname = 'Mixed Table' ORDER BY n.nspname;
+    SELECT n.nspname, r.relname FROM pg_class r JOIN pg_constraint c ON c.confrelid = r.oid
+    JOIN pg_namespace n ON n.oid = r.relnamespace WHERE c.contype = 'f';
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f';
+    SET search_path TO other, public;
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f';
+    SET search_path TO public, other;
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f';
+    CREATE SCHEMA shadow;
+    CREATE SEQUENCE shadow."Mixed Table";
+    SET search_path TO shadow, other;
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f';
+    DROP SEQUENCE shadow."Mixed Table";
+    CREATE TABLE shadow.holder(id INTEGER);
+    CREATE INDEX "Mixed Table" ON shadow.holder(id);
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f';
+}
+expect {
+    other|Mixed Table
+    public|Mixed Table
+    other|Mixed Table|Table PK|PRIMARY KEY ("Mixed Key")
+    public|Mixed Table|Inline PK|PRIMARY KEY ("Mixed Id")
+    other|Mixed Table
+    FOREIGN KEY (key) REFERENCES other."Mixed Table"("Mixed Key")
+    FOREIGN KEY (key) REFERENCES "Mixed Table"("Mixed Key")
+    FOREIGN KEY (key) REFERENCES other."Mixed Table"("Mixed Key")
+    FOREIGN KEY (key) REFERENCES other."Mixed Table"("Mixed Key")
+    FOREIGN KEY (key) REFERENCES other."Mixed Table"("Mixed Key")
+}

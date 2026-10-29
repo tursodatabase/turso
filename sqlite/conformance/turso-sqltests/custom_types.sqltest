@@ -1900,3 +1900,15 @@ test filter-numeric-group-concat {
 expect {
     Alice,Carol
 }
+
+@requires strict "uses STRICT tables"
+test mixed-case-table-alias-indexed-custom-type {
+    CREATE TABLE "Mixed Table" (amount numeric(10,2)) STRICT;
+    CREATE INDEX mixed_amount_idx ON "Mixed Table" (amount);
+    INSERT INTO "Mixed Table" VALUES (10), (20);
+    SELECT a.amount FROM "Mixed Table" AS a INDEXED BY mixed_amount_idx
+    WHERE a.amount = 10;
+}
+expect {
+    10.00
+}

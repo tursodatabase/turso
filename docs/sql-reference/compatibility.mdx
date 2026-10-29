@@ -40,6 +40,11 @@ The public schema reports `pg_database_owner` as its owner, with `CREATE` and
 The catalogs and role-name lookup expose this built-in role alongside `turso`.
 This metadata does not implement role management or permission enforcement.
 
+PostgreSQL schema catalogs preserve mixed-case table and column names, including
+declared primary-key, unique, and foreign-key constraint names, in dumps.
+Foreign-key definitions quote identifiers and include the parent schema when
+the parent table is not visible through the current `search_path`.
+
 ## See Also
 
 - [Experimental Features](/docs/sql-reference/experimental-features) for how to enable experimental features

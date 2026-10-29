@@ -3112,6 +3112,7 @@ impl Schema {
                 BTreeTable::build_logical_to_physical_map(&cols, &[], true);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
+                declared_name: view_name.clone(),
                 root_page: main_root,
                 columns: cols,
                 primary_key_columns: vec![],
@@ -3402,6 +3403,8 @@ impl Schema {
                     let (namespace, table_name) = self.demangle_name(&table.name);
                     if !namespace.is_root() {
                         table.name = table_name.to_string();
+                        table.declared_name =
+                            self.demangle_name(&table.declared_name).1.to_string();
                         self.add_namespace_of_object(namespace);
                     }
                     // Detect sequence-backing tables by name prefix.
@@ -4063,6 +4066,7 @@ impl TryClone for BTreeTable {
         Ok(Self {
             root_page: self.root_page,
             name: self.name.clone(),
+            declared_name: self.declared_name.clone(),
             primary_key_columns: self.primary_key_columns.try_clone()?,
             primary_key_is_inline: self.primary_key_is_inline,
             columns: self.columns.try_clone()?,
@@ -4698,6 +4702,7 @@ impl GeneratedColGraph {
 pub struct BTreeTable {
     pub root_page: i64,
     pub name: String,
+    pub declared_name: String,
     pub primary_key_columns: Vec<(String, SortOrder)>,
     pub primary_key_is_inline: bool,
     columns: Vec<Column>,
@@ -4776,6 +4781,7 @@ impl BTreeTable {
             );
         Self {
             root_page,
+            declared_name: name.clone(),
             name,
             primary_key_columns,
             primary_key_is_inline,
@@ -6123,7 +6129,7 @@ pub fn create_table(
                         is_primary_key: true,
                         is_inline: false,
                         conflict_clause: *conflict_clause,
-                        constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
+                        constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                     })?;
                 } else if let ast::TableConstraint::Unique {
                     columns,
@@ -6156,7 +6162,7 @@ pub fn create_table(
                         is_primary_key: false,
                         is_inline: false,
                         conflict_clause: *conflict_clause,
-                        constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
+                        constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                     };
                     unique_sets_constraints.try_push(unique_set)?;
                 } else if let ast::TableConstraint::ForeignKey {
@@ -6201,7 +6207,7 @@ pub fn create_table(
                         None => false, // NOT DEFERRABLE INITIALLY IMMEDIATE by default
                     };
                     let fk = ForeignKey {
-                        constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
+                        constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                         parent_table,
                         parent_namespace,
                         parent_columns,
@@ -6349,10 +6355,7 @@ pub fn create_table(
                                 is_primary_key: true,
                                 is_inline: true,
                                 conflict_clause: *conflict_clause,
-                                constraint_name: c_def
-                                    .name
-                                    .as_ref()
-                                    .map(|n| normalize_ident(n.as_str())),
+                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                             })?;
                         }
                         ast::ColumnConstraint::NotNull {
@@ -6382,10 +6385,7 @@ pub fn create_table(
                                 is_primary_key: false,
                                 is_inline: true,
                                 conflict_clause: *conflict,
-                                constraint_name: c_def
-                                    .name
-                                    .as_ref()
-                                    .map(|n| normalize_ident(n.as_str())),
+                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                             })?;
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
@@ -6412,10 +6412,7 @@ pub fn create_table(
                             let (parent_namespace, parent_table) =
                                 demangle_name(supports_namespaces, &mangled_parent_table);
                             let fk = ForeignKey {
-                                constraint_name: c_def
-                                    .name
-                                    .as_ref()
-                                    .map(|n| normalize_ident(n.as_str())),
+                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                                 parent_table: parent_table.to_string(),
                                 parent_namespace,
                                 parent_columns: clause
@@ -6615,6 +6612,7 @@ pub fn create_table(
     let mut table = BTreeTable {
         root_page,
         name: table_name,
+        declared_name: tbl_name.to_owned(),
         has_rowid,
         primary_key_columns,
         primary_key_is_inline,
@@ -7386,6 +7384,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
     Ok(BTreeTable {
         root_page: 1,
         name: "sqlite_schema".to_string(),
+        declared_name: "sqlite_schema".to_string(),
         has_rowid: true,
         is_strict: false,
         has_autoincrement: false,
@@ -8847,6 +8846,7 @@ mod tests {
         let table = BTreeTable {
             root_page: 0,
             name: "t1".to_string(),
+            declared_name: "t1".to_string(),
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
@@ -9686,7 +9686,7 @@ mod tests {
 
     #[test]
     fn test_named_unique_constraint_stores_constraint_name() {
-        let sql = r#"CREATE TABLE t_u (id INT, code TEXT CONSTRAINT t_u_code_uq UNIQUE);"#;
+        let sql = r#"CREATE TABLE t_u (id INT, code TEXT CONSTRAINT "T_U Code UQ" UNIQUE);"#;
         let table = BTreeTable::from_sql(sql, 0).unwrap();
         let unique_set = table
             .unique_sets
@@ -9695,7 +9695,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             unique_set.constraint_name,
-            Some("t_u_code_uq".to_string()),
+            Some("T_U Code UQ".to_string()),
             "named UNIQUE constraint must store the constraint name"
         );
 
@@ -9710,7 +9710,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             index.constraint_name,
-            Some("t_u_code_uq".to_string()),
+            Some("T_U Code UQ".to_string()),
             "index built from named UNIQUE constraint must carry the constraint name"
         );
     }
@@ -9718,14 +9718,14 @@ mod tests {
     #[test]
     fn named_primary_and_foreign_keys_survive_sql_reconstruction() {
         for original_sql in [
-            "CREATE TABLE child (id INTEGER CONSTRAINT custom_pk PRIMARY KEY, pid INTEGER CONSTRAINT custom_fk REFERENCES parent(id))",
-            "CREATE TABLE child (id TEXT, pid INTEGER, CONSTRAINT custom_pk PRIMARY KEY (id, pid), CONSTRAINT custom_fk FOREIGN KEY (pid) REFERENCES parent(id))",
+            "CREATE TABLE child (id INTEGER CONSTRAINT \"Custom PK\" PRIMARY KEY, pid INTEGER CONSTRAINT \"Custom FK\" REFERENCES parent(id))",
+            "CREATE TABLE child (id TEXT, pid INTEGER, CONSTRAINT \"Custom PK\" PRIMARY KEY (id, pid), CONSTRAINT \"Custom FK\" FOREIGN KEY (pid) REFERENCES parent(id))",
         ] {
             let table = BTreeTable::from_sql(original_sql, 1).unwrap();
             let sql = table.to_sql();
             let restored = BTreeTable::from_sql(&sql, 1).unwrap();
-            assert_eq!(restored.primary_key_constraint_name.as_deref(), Some("custom_pk"), "{sql}");
-            assert_eq!(restored.foreign_keys[0].constraint_name.as_deref(), Some("custom_fk"), "{sql}");
+            assert_eq!(restored.primary_key_constraint_name.as_deref(), Some("Custom PK"), "{sql}");
+            assert_eq!(restored.foreign_keys[0].constraint_name.as_deref(), Some("Custom FK"), "{sql}");
         }
     }
 
