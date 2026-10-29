@@ -420,3 +420,38 @@ expect {
     {2}
     x
 }
+
+# An index keeps the order it was created with, so ALTER COLUMN can't change
+# how an indexed column sorts.
+@requires strict "uses STRICT tables"
+test alter-column-refuses-to-change-the-order-of-an-indexed-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x blob) STRICT;
+    CREATE INDEX ix ON t(x);
+    ALTER TABLE t ALTER COLUMN x TO y numeric(10,2);
+}
+expect error {
+    cannot ALTER COLUMN "x": it changes how the column sorts, and index ix is sorted by it
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-refuses-to-change-the-order-of-an-indexed-expression {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10,2)) STRICT;
+    CREATE INDEX ix ON t(+x);
+    ALTER TABLE t ALTER COLUMN x TO y blob;
+}
+expect error {
+    cannot ALTER COLUMN "x": it changes how the column sorts, and index ix is sorted by it
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-changes-the-order-of-a-column-without-an-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x text, z int) STRICT;
+    CREATE INDEX iz ON t(z);
+    INSERT INTO t VALUES (1, '10', 1), (2, '9', 2);
+    ALTER TABLE t ALTER COLUMN x TO y numeric(10,2);
+    SELECT y FROM t ORDER BY y;
+}
+expect {
+    9.00
+    10.00
+}

@@ -921,3 +921,26 @@ test alter-column-adds-column-check {
 expect error {
     CHECK constraint failed
 }
+
+# An index keeps the order it was created with, so ALTER COLUMN can't change
+# the collation of an indexed column.
+test alter-column-refuses-to-change-the-collation-of-an-indexed-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT COLLATE NOCASE);
+    CREATE INDEX ix ON t(x);
+    ALTER TABLE t ALTER COLUMN x TO y TEXT;
+}
+expect error {
+    cannot ALTER COLUMN "x": it changes how the column sorts, and index ix is sorted by it
+}
+
+test alter-column-changes-the-collation-under-an-index-that-does-not-sort-by-it {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT COLLATE NOCASE);
+    CREATE INDEX ix ON t(length(x));
+    INSERT INTO t VALUES (1, 'a'), (2, 'B');
+    ALTER TABLE t ALTER COLUMN x TO y TEXT;
+    INSERT INTO t VALUES (3, 'C'), (4, 'b');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}

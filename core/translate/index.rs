@@ -1143,7 +1143,7 @@ fn index_collation(
 
 /// The order of the type of an index expression over `table`'s columns, such
 /// as numeric's order for `n * 2` when n is numeric.
-fn expression_type_ordering(
+pub(crate) fn expression_type_ordering(
     expr: &Expr,
     table: &BTreeTable,
     schema: &Schema,

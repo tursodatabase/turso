@@ -26,6 +26,7 @@ use crate::{
             emit_stored_column, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
             NoConstantOptReason, WalkControl,
         },
+        index::expression_type_ordering,
         plan::{
             ColumnMask, ColumnUsedMask, JoinedTable, Operation, OuterQueryReference,
             TableReferences,
@@ -1952,6 +1953,16 @@ pub fn translate_alter_table(
                 None
             };
 
+            if let Some(altered_table) = &altered_table {
+                reject_change_of_indexed_column_order(
+                    &original_btree,
+                    altered_table,
+                    &table_indexes,
+                    column_index,
+                    resolver.schema(),
+                )?;
+            }
+
             let indexes_to_rewrite = if let Some(altered_table) = &altered_table {
                 if !rewrites_physical_layout && !virtual_generated_values_may_change {
                     Vec::new()
@@ -2394,6 +2405,59 @@ fn reject_alter_of_view(
             crate::bail_parse_error!("cannot drop column from view \"{view_name}\"")
         }
     }
+}
+
+/// Refuse an ALTER COLUMN that changes how an indexed column sorts, such as
+/// `blob` to `numeric` or `COLLATE NOCASE` to no collation. An index keeps
+/// the order it was created with until the schema is read again, so the
+/// rows written in between would be in a different order from the one the
+/// index is read in after a reopen.
+fn reject_change_of_indexed_column_order(
+    original_table: &BTreeTable,
+    rewritten_table: &BTreeTable,
+    indexes: &[Arc<Index>],
+    column_index: usize,
+    schema: &Schema,
+) -> Result<()> {
+    let column_name = original_table.columns()[column_index]
+        .name
+        .as_deref()
+        .expect("ALTER COLUMN target must be named");
+    let new_column = &rewritten_table.columns()[column_index];
+    let new_column_name = new_column
+        .name
+        .as_deref()
+        .expect("ALTER COLUMN replacement must be named");
+    for index in indexes {
+        for index_column in &index.columns {
+            let order_changes = if index_column.pos_in_table == column_index {
+                // After a reopen the index column takes the new column's
+                // order, unless the index names its own collation, which is
+                // then the index column's current one.
+                index_column.collation != new_column.collation()
+            } else if index_column.pos_in_table == EXPR_INDEX_SENTINEL {
+                // An index expression sorts in the order of its type, which
+                // the column's new type can change, as for `x * 2`.
+                let expr = index_column
+                    .expr
+                    .as_ref()
+                    .expect("expression index column must have an expression");
+                let mut renamed = expr.as_ref().clone();
+                rename_identifiers(&mut renamed, column_name, new_column_name);
+                expression_type_ordering(expr, original_table, schema)?
+                    != expression_type_ordering(&renamed, rewritten_table, schema)?
+            } else {
+                false
+            };
+            if order_changes {
+                return Err(LimboError::ParseError(format!(
+                    "cannot ALTER COLUMN \"{column_name}\": it changes how the column sorts, and index {} is sorted by it",
+                    index.name
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 // Return the indexes whose persisted entries may become stale after ALTER COLUMN,
