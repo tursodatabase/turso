@@ -12,14 +12,20 @@ use turso_core::{
 };
 
 use crate::error::in_failed_sql_transaction_error;
+use crate::execution::Execution;
 use crate::Result;
 
 pub(crate) type DeferredExec =
     Box<dyn FnMut(&mut turso_core::Statement) -> turso_core::Result<()> + Send + Sync>;
 
 struct DeferredState {
-    exec: DeferredExec,
+    exec: DeferredOperation,
     completed: bool,
+}
+
+enum DeferredOperation {
+    Immediate(DeferredExec),
+    Resumable(Box<Execution>),
 }
 
 /// How a statement interacts with PostgreSQL's aborted-transaction state.
@@ -128,7 +134,9 @@ pub(crate) type PostRunFn = Arc<dyn Fn(Result<()>) -> Result<()> + Send + Sync>;
 pub struct Statement {
     inner: turso_core::Statement,
     deferred: Option<DeferredState>,
+    io_completion: Option<turso_core::types::IOCompletions>,
     tx_tracking: Option<TxTracking>,
+    started_in_tx: Option<bool>,
     commit_became_rollback: bool,
     /// Applied by all run/step methods after the core statement completes. Used
     /// for BEGIN/COMMIT/ROLLBACK, SAVEPOINT, and SET TRANSACTION so that
@@ -149,7 +157,9 @@ impl Statement {
         Self {
             inner,
             deferred: None,
+            io_completion: None,
             tx_tracking: None,
+            started_in_tx: None,
             commit_became_rollback: false,
             post_run: None,
             marks_query_start: false,
@@ -190,6 +200,14 @@ impl Statement {
     }
 
     pub(crate) fn with_deferred(inner: turso_core::Statement, exec: DeferredExec) -> Self {
+        Self::with_operation(inner, DeferredOperation::Immediate(exec))
+    }
+
+    pub(crate) fn with_execution(inner: turso_core::Statement, execution: Execution) -> Self {
+        Self::with_operation(inner, DeferredOperation::Resumable(Box::new(execution)))
+    }
+
+    fn with_operation(inner: turso_core::Statement, exec: DeferredOperation) -> Self {
         let mut stmt = Self::new(inner);
         stmt.deferred = Some(DeferredState {
             exec,
@@ -205,6 +223,11 @@ impl Statement {
         role: TxRole,
     ) -> Self {
         self.tx_tracking = Some(TxTracking { conn, tx, role });
+        self
+    }
+
+    pub(crate) fn without_tx_tracking(mut self) -> Self {
+        self.tx_tracking = None;
         self
     }
 
@@ -248,7 +271,9 @@ impl Statement {
                 TxRole::RollbackToSavepoint => {}
             }
         }
-        Ok(Some(!t.conn.get_auto_commit()))
+        Ok(Some(
+            *self.started_in_tx.get_or_insert(!t.conn.get_auto_commit()),
+        ))
     }
 
     fn note_execution_error(&self, was_in_tx: bool) {
@@ -289,44 +314,71 @@ impl Statement {
         }
     }
 
-    fn execute_deferred(&mut self, was_in_tx: bool) -> Result<()> {
+    fn execute_deferred(&mut self) -> Result<IOResult<()>> {
         let Some(deferred) = self.deferred.as_mut() else {
-            return Ok(());
+            return Ok(IOResult::Done(()));
         };
         if !deferred.completed {
-            let result: Result<()> = (deferred.exec)(&mut self.inner).map_err(Into::into);
-            if result.is_err() {
-                self.note_execution_error(was_in_tx);
-                return result;
+            match &mut deferred.exec {
+                DeferredOperation::Immediate(exec) => exec(&mut self.inner)?,
+                DeferredOperation::Resumable(execution) => {
+                    if let IOResult::IO(io) = execution.step(&mut self.inner)? {
+                        return Ok(IOResult::IO(io));
+                    }
+                }
             }
             deferred.completed = true;
+        }
+        Ok(IOResult::Done(()))
+    }
+
+    fn execute_deferred_blocking(&mut self) -> Result<()> {
+        while let IOResult::IO(io) = self.execute_deferred()? {
+            io.wait(self.inner._io())?;
         }
         Ok(())
     }
 
     pub fn step(&mut self) -> Result<StepResult> {
-        let Some(was_in_tx) = self.tx_gate()? else {
-            return Ok(StepResult::Done);
-        };
-        self.mark_query_start();
-        if self.deferred.is_some() {
-            self.execute_deferred(was_in_tx)?;
-            return Ok(StepResult::Done);
-        }
-        let result = self.inner.step().map_err(Into::into);
-        self.finish_step(result, was_in_tx)
+        self.step_inner(None)
     }
 
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
+        self.step_inner(Some(waker))
+    }
+
+    fn step_inner(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         let Some(was_in_tx) = self.tx_gate()? else {
             return Ok(StepResult::Done);
         };
         self.mark_query_start();
-        if self.deferred.is_some() {
-            self.execute_deferred(was_in_tx)?;
-            return Ok(StepResult::Done);
-        }
-        let result = self.inner.step_with_waker(waker).map_err(Into::into);
+        let result = if self.deferred.is_some() {
+            match self.execute_deferred() {
+                Ok(IOResult::Done(())) => Ok(StepResult::Done),
+                Ok(IOResult::IO(io)) => {
+                    io.set_waker(waker);
+                    if io.finished() {
+                        io.0.wake();
+                    }
+                    let result = if io.is_explicit_yield() {
+                        StepResult::Yield
+                    } else {
+                        StepResult::IO
+                    };
+                    self.io_completion = Some(io);
+                    Ok(result)
+                }
+                Err(error) if matches!(error.core_error(), LimboError::Interrupt) => {
+                    Ok(StepResult::Interrupt)
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            match waker {
+                Some(waker) => self.inner.step_with_waker(waker).map_err(Into::into),
+                None => self.inner.step().map_err(Into::into),
+            }
+        };
         self.finish_step(result, was_in_tx)
     }
 
@@ -358,8 +410,13 @@ impl Statement {
 
     pub fn reset(&mut self) -> Result<()> {
         if let Some(deferred) = self.deferred.as_mut() {
+            if let DeferredOperation::Resumable(execution) = &mut deferred.exec {
+                execution.reset();
+            }
             deferred.completed = false;
         }
+        self.io_completion = None;
+        self.started_in_tx = None;
         self.commit_became_rollback = false;
         self.inner.reset().map_err(Into::into)
     }
@@ -391,7 +448,8 @@ impl Statement {
         };
         self.mark_query_start();
         if self.deferred.is_some() {
-            return self.execute_deferred(was_in_tx);
+            let result = self.execute_deferred_blocking();
+            return self.finish(result, was_in_tx);
         }
         let result = self.inner.run_ignore_rows().map_err(Into::into);
         self.finish(result, was_in_tx)
@@ -403,7 +461,8 @@ impl Statement {
         };
         self.mark_query_start();
         if self.deferred.is_some() {
-            self.execute_deferred(was_in_tx)?;
+            let result = self.execute_deferred_blocking();
+            self.finish(result, was_in_tx)?;
             return Ok(Vec::new());
         }
         let result = self.inner.run_collect_rows().map_err(Into::into);
@@ -436,8 +495,16 @@ impl Statement {
         };
         self.mark_query_start();
         if self.deferred.is_some() {
-            self.execute_deferred(was_in_tx)?;
-            return Ok(IOResult::Done(()));
+            let result = self.execute_deferred();
+            return match result {
+                Ok(IOResult::Done(())) => {
+                    self.finish(Ok(()), was_in_tx).map(|()| IOResult::Done(()))
+                }
+                Err(error) => self
+                    .finish(Err(error), was_in_tx)
+                    .map(|()| IOResult::Done(())),
+                other => other,
+            };
         }
         match self
             .inner
@@ -459,7 +526,7 @@ impl Statement {
                 StepResult::Done => return Ok(IOResult::Done(())),
                 StepResult::Row => callback(self.row().expect("row should be present"))?,
                 StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
-                    let completions = self.inner.take_io_completions().unwrap_or_else(|| {
+                    let completions = self.take_io_completions().unwrap_or_else(|| {
                         turso_core::types::IOCompletions(turso_core::io::Completion::new_yield())
                     });
                     return Ok(IOResult::IO(completions));
@@ -491,7 +558,9 @@ impl Statement {
     }
 
     pub fn take_io_completions(&mut self) -> Option<turso_core::types::IOCompletions> {
-        self.inner.take_io_completions()
+        self.io_completion
+            .take()
+            .or_else(|| self.inner.take_io_completions())
     }
 
     pub fn clear_bindings(&mut self) {
@@ -499,10 +568,24 @@ impl Statement {
     }
 
     pub fn interrupt(&mut self) {
+        if let Some(DeferredState {
+            exec: DeferredOperation::Resumable(execution),
+            ..
+        }) = &mut self.deferred
+        {
+            execution.interrupt();
+        }
         self.inner.interrupt();
     }
 
     pub fn set_query_timeout_override(&mut self, timeout: Option<Option<Duration>>) {
+        if let Some(DeferredState {
+            exec: DeferredOperation::Resumable(execution),
+            ..
+        }) = &mut self.deferred
+        {
+            execution.set_timeout(timeout);
+        }
         self.inner.set_query_timeout_override(timeout);
     }
 
@@ -516,8 +599,14 @@ impl Statement {
 
     pub fn reset_best_effort(&mut self) {
         if let Some(deferred) = self.deferred.as_mut() {
+            if let DeferredOperation::Resumable(execution) = &mut deferred.exec {
+                execution.reset();
+            }
             deferred.completed = false;
         }
+        self.io_completion = None;
+        self.started_in_tx = None;
+        self.commit_became_rollback = false;
         self.inner.reset_best_effort();
     }
 }

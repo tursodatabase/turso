@@ -916,6 +916,14 @@ fn test_create_table_if_not_exists_serial_on_existing_table_leaves_no_sequence(d
 
     pg_execute(&conn, "CREATE TABLE c (id SERIAL)");
     pg_execute(&conn, "CREATE TABLE IF NOT EXISTS c (extra SERIAL)");
+    let mut prepared = conn
+        .prepare("CREATE TABLE IF NOT EXISTS concurrent (extra SERIAL)")
+        .unwrap();
+    pg_execute(
+        &db.connect_postgres(),
+        "CREATE TABLE concurrent (id INTEGER)",
+    );
+    prepared.run_ignore_rows().unwrap();
     assert_eq!(pg_sequence_names(&conn), vec!["c_id_seq".to_string()]);
 }
 
