@@ -477,6 +477,9 @@ pub struct Connection {
     /// a non-CYCLE nextval means inline backing-table compaction
     /// (or another contended write) was reintroduced.
     pub(crate) sequence_inner_retries: AtomicU64,
+    /// Next value returned by the test-only `test_nondet_counter()` function.
+    #[cfg(feature = "test_helper")]
+    pub(crate) test_nondet_counter: AtomicI64,
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
     /// Per-attached-database MVCC transactions.
     /// Main DB uses `mv_tx` above for zero-cost hot path access.

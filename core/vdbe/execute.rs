@@ -10777,13 +10777,14 @@ pub fn op_function(
             }
             #[cfg(feature = "test_helper")]
             ScalarFunc::TestNondetCounter => {
-                // Test-only: process-global atomic counter that increments on
-                // every evaluation. Used in sqltests to verify that the
-                // planner does not deduplicate equivalent SQL calls that
-                // contain nondeterministic functions.
-                static TEST_NONDET_COUNTER: std::sync::atomic::AtomicI64 =
-                    std::sync::atomic::AtomicI64::new(0);
-                let value = TEST_NONDET_COUNTER.fetch_add(1, Ordering::Relaxed);
+                // Test-only: per-connection counter that increments on every
+                // evaluation. Used in sqltests to verify that the planner does
+                // not deduplicate equivalent SQL calls that contain
+                // nondeterministic functions.
+                let value = program
+                    .connection
+                    .test_nondet_counter
+                    .fetch_add(1, Ordering::Relaxed);
                 state.registers[*dest].set_int(value);
             }
             ScalarFunc::Trim => {
