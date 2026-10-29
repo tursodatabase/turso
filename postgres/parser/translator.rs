@@ -3925,6 +3925,27 @@ impl PostgreSQLTranslator {
             _ => func_name,
         };
 
+        // PostgreSQL reads untyped string literal arguments of age() as
+        // timestamptz. Casting them gives the text the timestamp type's input
+        // rules, so age() only sees timestamps in their stored form.
+        let args = if func_name == "age" {
+            args.into_iter()
+                .map(|arg| match *arg {
+                    ast::Expr::Literal(ast::Literal::String(_)) => Box::new(ast::Expr::Cast {
+                        expr: arg,
+                        type_name: Some(ast::Type {
+                            name: "timestamptz".to_string(),
+                            size: None,
+                            array_dimensions: 0,
+                        }),
+                    }),
+                    _ => arg,
+                })
+                .collect()
+        } else {
+            args
+        };
+
         // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
             "FLOAT8" | "FLOAT4" => Some("REAL"),
