@@ -9686,7 +9686,7 @@ mod tests {
 
     #[test]
     fn test_named_unique_constraint_stores_constraint_name() {
-        let sql = r#"CREATE TABLE t_u (id INT, code TEXT CONSTRAINT t_u_code_uq UNIQUE);"#;
+        let sql = r#"CREATE TABLE t_u (id INT, code TEXT CONSTRAINT "T_U Code UQ" UNIQUE);"#;
         let table = BTreeTable::from_sql(sql, 0).unwrap();
         let unique_set = table
             .unique_sets
@@ -9695,7 +9695,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             unique_set.constraint_name,
-            Some("t_u_code_uq".to_string()),
+            Some("T_U Code UQ".to_string()),
             "named UNIQUE constraint must store the constraint name"
         );
 
@@ -9710,7 +9710,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             index.constraint_name,
-            Some("t_u_code_uq".to_string()),
+            Some("T_U Code UQ".to_string()),
             "index built from named UNIQUE constraint must carry the constraint name"
         );
     }
@@ -9718,14 +9718,14 @@ mod tests {
     #[test]
     fn named_primary_and_foreign_keys_survive_sql_reconstruction() {
         for original_sql in [
-            "CREATE TABLE child (id INTEGER CONSTRAINT custom_pk PRIMARY KEY, pid INTEGER CONSTRAINT custom_fk REFERENCES parent(id))",
-            "CREATE TABLE child (id TEXT, pid INTEGER, CONSTRAINT custom_pk PRIMARY KEY (id, pid), CONSTRAINT custom_fk FOREIGN KEY (pid) REFERENCES parent(id))",
+            "CREATE TABLE child (id INTEGER CONSTRAINT \"Custom PK\" PRIMARY KEY, pid INTEGER CONSTRAINT \"Custom FK\" REFERENCES parent(id))",
+            "CREATE TABLE child (id TEXT, pid INTEGER, CONSTRAINT \"Custom PK\" PRIMARY KEY (id, pid), CONSTRAINT \"Custom FK\" FOREIGN KEY (pid) REFERENCES parent(id))",
         ] {
             let table = BTreeTable::from_sql(original_sql, 1).unwrap();
             let sql = table.to_sql();
             let restored = BTreeTable::from_sql(&sql, 1).unwrap();
-            assert_eq!(restored.primary_key_constraint_name.as_deref(), Some("custom_pk"), "{sql}");
-            assert_eq!(restored.foreign_keys[0].constraint_name.as_deref(), Some("custom_fk"), "{sql}");
+            assert_eq!(restored.primary_key_constraint_name.as_deref(), Some("Custom PK"), "{sql}");
+            assert_eq!(restored.foreign_keys[0].constraint_name.as_deref(), Some("Custom FK"), "{sql}");
         }
     }
 

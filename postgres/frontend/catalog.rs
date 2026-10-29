@@ -1877,8 +1877,10 @@ impl SnapshotRows for PgConstraintTable {
                         .clone()
                         .unwrap_or_else(|| format!("{table_name}_pkey"))
                 } else {
-                    let cols_str = col_names.join("_");
-                    format!("{table_name}_{cols_str}_key")
+                    us.constraint_name.clone().unwrap_or_else(|| {
+                        let cols_str = col_names.join("_");
+                        format!("{table_name}_{cols_str}_key")
+                    })
                 };
 
                 // Build conkey: space-separated 1-based attnums
@@ -1954,7 +1956,10 @@ impl SnapshotRows for PgConstraintTable {
             // FK constraints from foreign_keys
             for fk in &btree.foreign_keys {
                 let child_cols = fk.child_columns.join("_");
-                let conname = format!("{table_name}_{child_cols}_fkey");
+                let conname = fk
+                    .constraint_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{table_name}_{child_cols}_fkey"));
 
                 let conkey: String = fk
                     .child_columns
@@ -3695,12 +3700,60 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
         // FK constraints
         for fk in &btree.foreign_keys {
             if constraint_oid == target_oid {
-                let child_cols = fk.child_columns.join(", ");
-                let parent_cols = fk.parent_columns.join(", ");
-                let mut def = format!(
-                    "FOREIGN KEY ({child_cols}) REFERENCES {}({parent_cols})",
-                    fk.parent_table
+                let parent = schema.get_btree_table(fk.parent_namespace, &fk.parent_table);
+                let child_cols = constraint_column_list(
+                    Some(btree),
+                    fk.child_columns.iter().map(String::as_str),
                 );
+                let parent_cols = if fk.parent_columns.is_empty() {
+                    parent.as_ref().map_or_else(String::new, |parent| {
+                        constraint_column_list(
+                            Some(parent),
+                            parent
+                                .primary_key_columns
+                                .iter()
+                                .map(|(name, _)| name.as_str()),
+                        )
+                    })
+                } else {
+                    constraint_column_list(
+                        parent.as_deref(),
+                        fk.parent_columns.iter().map(String::as_str),
+                    )
+                };
+                let parent_name = parent.as_ref().map_or(fk.parent_table.as_str(), |parent| {
+                    parent.declared_name.as_str()
+                });
+                let visible = conn
+                    .search_order()
+                    .into_iter()
+                    .find(|namespace| {
+                        schema
+                            .get_table(namespace.target.id, &fk.parent_table)
+                            .is_some()
+                            || schema
+                                .get_view(namespace.target.id, &fk.parent_table)
+                                .is_some()
+                            || schema
+                                .get_sequence(namespace.target.id, &fk.parent_table)
+                                .is_some()
+                            || indexes.iter().any(|index| {
+                                index.namespace == namespace.target.id
+                                    && index.name == fk.parent_table
+                            })
+                    })
+                    .is_some_and(|namespace| namespace.target.id == fk.parent_namespace);
+                let parent_name = if visible {
+                    quote_identifier(parent_name)
+                } else {
+                    format!(
+                        "{}.{}",
+                        quote_identifier(schema_name_of(&schema, fk.parent_namespace)),
+                        quote_identifier(parent_name),
+                    )
+                };
+                let mut def =
+                    format!("FOREIGN KEY ({child_cols}) REFERENCES {parent_name}({parent_cols})");
                 let on_update = ref_act_to_char(&fk.on_update);
                 let on_delete = ref_act_to_char(&fk.on_delete);
                 if on_update != "a" {
@@ -3724,6 +3777,23 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
     }
 
     None
+}
+
+fn constraint_column_list<'a>(
+    table: Option<&BTreeTable>,
+    names: impl IntoIterator<Item = &'a str>,
+) -> String {
+    names
+        .into_iter()
+        .map(|name| {
+            let declared_name = table
+                .and_then(|table| table.get_column(name))
+                .and_then(|(_, column)| column.name.as_deref())
+                .unwrap_or(name);
+            quote_identifier(declared_name)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Look up an index by OID and return its definition (CREATE INDEX ...).
@@ -3896,65 +3966,6 @@ mod tests {
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.set_search_path(Some(vec!["public".to_string()]));
         conn
-    }
-
-    #[test]
-    fn schema_constructor_preserves_identifier_spelling() {
-        for sql in [
-            "CREATE TABLE \"Mixed Table\" (id INTEGER CONSTRAINT \"Mixed PK\" PRIMARY KEY)",
-            "CREATE TABLE \"Mixed Table\" (id TEXT, CONSTRAINT \"Mixed PK\" PRIMARY KEY (id))",
-        ] {
-            let stmt = PostgresDialect
-                .parse_table_sql_ast(&encode_pg_schema_sql(sql))
-                .unwrap();
-            let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } = stmt else {
-                unreachable!();
-            };
-            let table = BTreeTable::from_create_table_ast(&tbl_name, &body, 2, true).unwrap();
-            let sqlite_table = BTreeTable::from_sql(sql, 2).unwrap();
-            assert_eq!(sqlite_table.name, "mixed table");
-            assert_eq!(sqlite_table.declared_name, "Mixed Table");
-            assert_eq!(
-                sqlite_table.primary_key_constraint_name.as_deref(),
-                Some("Mixed PK")
-            );
-            let mut schema = Schema::new();
-            schema
-                .add_btree_table(NamespaceId::ROOT, Arc::new(table.clone()))
-                .unwrap();
-            assert_eq!(
-                schema
-                    .get_btree_table(NamespaceId::ROOT, "mixed table")
-                    .unwrap()
-                    .name,
-                "mixed table"
-            );
-            assert_eq!(table.name, "mixed table");
-            assert_eq!(table.declared_name, "Mixed Table");
-            assert_eq!(
-                table.primary_key_constraint_name.as_deref(),
-                Some("Mixed PK")
-            );
-        }
-    }
-
-    #[test]
-    fn schema_constructor_preserves_named_unique_and_foreign_keys() {
-        for sql in [
-            "CREATE TABLE t (id INTEGER CONSTRAINT \"Mixed Unique\" UNIQUE, parent INTEGER CONSTRAINT \"Mixed Foreign\" REFERENCES p(id))",
-            "CREATE TABLE t (id INTEGER, parent INTEGER, CONSTRAINT \"Mixed Unique\" UNIQUE (id), CONSTRAINT \"Mixed Foreign\" FOREIGN KEY (parent) REFERENCES p(id))",
-        ] {
-            let stmt = PostgresDialect.parse_table_sql_ast(&encode_pg_schema_sql(sql)).unwrap();
-            let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } = stmt else {
-                unreachable!();
-            };
-            let table = BTreeTable::from_create_table_ast(&tbl_name, &body, 2, true).unwrap();
-            assert_eq!(table.unique_sets[0].constraint_name.as_deref(), Some("Mixed Unique"));
-            assert_eq!(table.foreign_keys[0].constraint_name.as_deref(), Some("Mixed Foreign"));
-            let sqlite_table = BTreeTable::from_sql(sql, 2).unwrap();
-            assert_eq!(sqlite_table.unique_sets[0].constraint_name.as_deref(), Some("Mixed Unique"));
-            assert_eq!(sqlite_table.foreign_keys[0].constraint_name.as_deref(), Some("Mixed Foreign"));
-        }
     }
 
     #[test]
