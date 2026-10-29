@@ -46,12 +46,6 @@ pub enum TextCollation {
     Custom(u32),
 }
 
-impl From<TextCollation> for CollationSeq {
-    fn from(collation: TextCollation) -> Self {
-        Self::Text(collation)
-    }
-}
-
 /// Every registered custom collation, by its number in [CollationSeq::Custom].
 /// Comparing with a custom collation looks up its callback here, so the
 /// comparison works without a connection.
