@@ -2653,9 +2653,6 @@ pub fn op_column_has_field(
         | CursorType::MaterializedView(_, _) => {
             let cursor_ref =
                 must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "ColumnHasField");
-            // A null row (e.g. the unmatched side of a LEFT JOIN) reads every
-            // column as NULL, so jump past the DEFAULT: it only applies to a
-            // real record that is shorter than the table.
             if matches!(cursor_ref, Cursor::NullRow) {
                 true
             } else {
